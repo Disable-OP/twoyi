@@ -28,6 +28,7 @@ import com.microsoft.appcenter.crashes.Crashes;
 
 import java.lang.reflect.Field;
 
+import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.RomManager;
 
 /**
@@ -41,6 +42,7 @@ public class TwoyiApplication extends Application {
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
 
+        ProfileManager.initializeProfiles(base);
         RomManager.ensureBootFiles(base);
 
         TwoyiSocketServer.getInstance(base).start();

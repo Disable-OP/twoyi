@@ -40,6 +40,15 @@ public class AppKV {
         getPref(context).edit().putBoolean(key, value).commit();
     }
 
+    public static String getStringConfig(Context context, String key, String fallback) {
+        return getPref(context).getString(key, fallback);
+    }
+
+    @SuppressLint("ApplySharedPref")
+    public static void setStringConfig(Context context, String key, String value) {
+        getPref(context).edit().putString(key, value).commit();
+    }
+
     private static SharedPreferences getPref(Context context) {
         return context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE);
     }
