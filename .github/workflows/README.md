@@ -29,19 +29,30 @@ Before the workflow can successfully build the APK, you need to:
 - **Manual trigger** via workflow_dispatch
 - **Artifact uploads** - APKs are stored for 30 days
 - **Cargo-xdk caching** - Speeds up builds by caching the Rust toolchain helper
+- **Android target** - Automatically installs aarch64-linux-android Rust target
+
+## Build Configuration
+
+- Uses NDK r22b as required by the project
+- compileSdk set to 31 (compatible with build tools 30.0.3)
+- targetSdk remains 28 as per project requirements
+- Uses mavenCentral for dependency resolution (JCenter is deprecated)
+- libp7zip replaced with jitpack alternative (com.github.hzy3774:AndroidP7zip)
 
 ## Running Locally
 
 To test the build locally before committing:
 
 1. Install Rust and Cargo: https://www.rust-lang.org/tools/install
-2. Install cargo-xdk: `cargo install cargo-xdk`
-3. Install Android NDK r22b
-4. Add rootfs.7z to assets
-5. Run: `./gradlew assembleRelease`
+2. Install Rust Android target: `rustup target add aarch64-linux-android`
+3. Install cargo-xdk: `cargo install cargo-xdk`
+4. Install Android NDK r22b (or set ANDROID_NDK_HOME to compatible version)
+5. Add rootfs.7z to assets
+6. Run: `./gradlew assembleRelease`
 
 ## Notes
 
 - The workflow uses NDK r22b as required by the project
 - Build artifacts are automatically uploaded after successful builds
 - The workflow validates YAML syntax with yamllint
+- Rust target aarch64-linux-android is installed automatically

@@ -118,10 +118,14 @@ if ("weishu".equalsIgnoreCase(author) || "twoyi".equalsIgnoreCase(author)) {
 
 ## 7. Build Configuration Updates
 
-**Changed:** `app/build.gradle`
+**Changed:** `app/build.gradle`, `build.gradle`
 
-- Updated `compileSdkVersion` from 31 to 35
+- Updated dependency resolution to use mavenCentral (JCenter deprecated)
+- Replaced `com.hzy:libp7zip:1.7.0` with `com.github.hzy3774:AndroidP7zip:v1.7.1` (jitpack)
+- Reverted `compileSdkVersion` to 31 (from 35) for compatibility with build tools 30.0.3
 - Maintains `targetSdkVersion` at 27 as required
+
+**Why:** JCenter repository was shut down in 2022, making the original libp7zip dependency unavailable. The jitpack alternative provides the same functionality.
 
 ## 8. Other Changes
 

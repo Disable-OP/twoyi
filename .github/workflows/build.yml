@@ -37,6 +37,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          target: aarch64-linux-android
 
       - name: Cache cargo-xdk
         id: cache-cargo-xdk
@@ -50,6 +51,7 @@ jobs:
         run: cargo install cargo-xdk
 
       - name: Setup Android NDK
+        id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r22b
