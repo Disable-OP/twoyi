@@ -353,12 +353,28 @@ public class SettingsActivity extends AppCompatActivity {
                 File rootfsDir = RomManager.getRootfsDir(activity);
                 File exportFile = new File(activity.getCacheDir(), "rootfs_export.tar");
                 
-                // Create tar archive using system tar command
-                Process process = Runtime.getRuntime().exec(new String[]{
-                    "tar", "-cf", exportFile.getAbsolutePath(),
-                    "-C", rootfsDir.getParent(), rootfsDir.getName()
-                });
-                process.waitFor();
+                // Validate paths to prevent command injection
+                String rootfsDirPath = rootfsDir.getAbsolutePath();
+                String exportFilePath = exportFile.getAbsolutePath();
+                String parentPath = rootfsDir.getParent();
+                
+                // Ensure paths don't contain shell metacharacters
+                if (rootfsDirPath.contains(";") || rootfsDirPath.contains("&") || 
+                    exportFilePath.contains(";") || exportFilePath.contains("&")) {
+                    throw new SecurityException("Invalid path detected");
+                }
+                
+                // Create tar archive using ProcessBuilder for better security
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-cf", exportFilePath,
+                    "-C", parentPath, rootfsDir.getName()
+                );
+                Process process = pb.start();
+                int exitCode = process.waitFor();
+                
+                if (exitCode != 0) {
+                    throw new IOException("tar command failed with exit code: " + exitCode);
+                }
                 
                 return exportFile;
             }).done(exportFile -> {
@@ -425,11 +441,21 @@ public class SettingsActivity extends AppCompatActivity {
                     // Extract 7z archive using RomManager
                     exitCode = RomManager.extractRootfs(activity, tempFile);
                 } else {
-                    // Extract tar archive
-                    Process process = Runtime.getRuntime().exec(new String[]{
-                        "tar", "-xf", tempFile.getAbsolutePath(),
-                        "-C", rootfsDir.getParent()
-                    });
+                    // Validate paths to prevent command injection
+                    String tempFilePath = tempFile.getAbsolutePath();
+                    String parentPath = rootfsDir.getParent();
+                    
+                    if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
+                        parentPath.contains(";") || parentPath.contains("&")) {
+                        throw new SecurityException("Invalid path detected");
+                    }
+                    
+                    // Extract tar archive using ProcessBuilder for better security
+                    ProcessBuilder pb = new ProcessBuilder(
+                        "tar", "-xf", tempFilePath,
+                        "-C", parentPath
+                    );
+                    Process process = pb.start();
                     exitCode = process.waitFor();
                 }
 

@@ -188,15 +188,19 @@ public class ProfileManager {
         File oldRootfs = new File(context.getDataDir(), "rootfs");
         File defaultProfileRootfs = getProfileRootfsDir(context, DEFAULT_PROFILE);
 
-        if (oldRootfs.exists() && !Files.isSymbolicLink(oldRootfs.toPath())) {
-            // Migrate old rootfs to default profile
-            try {
-                defaultProfileRootfs.getParentFile().mkdirs();
-                Files.move(oldRootfs.toPath(), defaultProfileRootfs.toPath());
-                Log.i(TAG, "Migrated old rootfs to default profile");
-            } catch (IOException e) {
-                Log.e(TAG, "Failed to migrate old rootfs", e);
+        try {
+            if (oldRootfs.exists() && !Files.isSymbolicLink(oldRootfs.toPath())) {
+                // Migrate old rootfs to default profile
+                try {
+                    defaultProfileRootfs.getParentFile().mkdirs();
+                    Files.move(oldRootfs.toPath(), defaultProfileRootfs.toPath());
+                    Log.i(TAG, "Migrated old rootfs to default profile");
+                } catch (IOException e) {
+                    Log.e(TAG, "Failed to migrate old rootfs", e);
+                }
             }
+        } catch (Exception e) {
+            Log.e(TAG, "Error checking rootfs symlink status", e);
         }
 
         // Ensure default profile exists

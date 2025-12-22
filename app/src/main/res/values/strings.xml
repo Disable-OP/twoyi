@@ -112,4 +112,4 @@
     <string name="export_rootfs_failed">Failed to export rootfs: %1$s</string>
     <string name="import_rootfs_success">Rootfs imported successfully. Please reboot.</string>
     <string name="import_rootfs_failed">Failed to import rootfs: %1$s</string>
-</string>
+</resources>
