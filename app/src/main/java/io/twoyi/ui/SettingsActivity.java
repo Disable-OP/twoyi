@@ -36,10 +36,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
+import java.util.List;
 
 import io.twoyi.R;
 import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
+import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.RomManager;
 import io.twoyi.utils.UIHelper;
 
@@ -51,6 +53,8 @@ import io.twoyi.utils.UIHelper;
 public class SettingsActivity extends AppCompatActivity {
 
     private static final int REQUEST_GET_FILE = 1000;
+    private static final int REQUEST_IMPORT_ROOTFS = 1001;
+    private static final int REQUEST_EXPORT_ROOTFS = 1002;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -97,17 +101,28 @@ public class SettingsActivity extends AppCompatActivity {
         public void onViewCreated(View view, @Nullable Bundle savedInstanceState) {
             super.onViewCreated(view, savedInstanceState);
 
+            Preference launchContainer = findPreference(R.string.settings_key_launch_container);
             Preference importApp = findPreference(R.string.settings_key_import_app);
             Preference export = findPreference(R.string.settings_key_manage_files);
 
             Preference shutdown = findPreference(R.string.settings_key_shutdown);
             Preference reboot = findPreference(R.string.settings_key_reboot);
+            
+            Preference profileManager = findPreference(R.string.settings_key_profile_manager);
+            Preference importRootfs = findPreference(R.string.settings_key_import_rootfs);
+            Preference exportRootfs = findPreference(R.string.settings_key_export_rootfs);
             Preference replaceRom = findPreference(R.string.settings_key_replace_rom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
             Preference donate = findPreference(R.string.settings_key_donate);
             Preference sendLog = findPreference(R.string.settings_key_sendlog);
             Preference about = findPreference(R.string.settings_key_about);
+
+            launchContainer.setOnPreferenceClickListener(preference -> {
+                Intent intent = new Intent(getContext(), io.twoyi.Render2Activity.class);
+                startActivity(intent);
+                return true;
+            });
 
             importApp.setOnPreferenceClickListener(preference -> {
                 UIHelper.startActivity(getContext(), SelectAppActivity.class);
@@ -132,6 +147,29 @@ public class SettingsActivity extends AppCompatActivity {
                 Activity activity = getActivity();
                 activity.finishAndRemoveTask();
                 RomManager.reboot(activity);
+                return true;
+            });
+
+            profileManager.setOnPreferenceClickListener(preference -> {
+                showProfileManagerDialog();
+                return true;
+            });
+
+            importRootfs.setOnPreferenceClickListener(preference -> {
+                Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
+                intent.setType("*/*");
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                try {
+                    startActivityForResult(intent, REQUEST_IMPORT_ROOTFS);
+                } catch (Throwable ignored) {
+                    Toast.makeText(getContext(), "Error", Toast.LENGTH_SHORT).show();
+                }
+                return true;
+            });
+
+            exportRootfs.setOnPreferenceClickListener(preference -> {
+                exportRootfsToTar();
                 return true;
             });
 
@@ -203,10 +241,201 @@ public class SettingsActivity extends AppCompatActivity {
             });
         }
 
+        private void showProfileManagerDialog() {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            List<String> profiles = ProfileManager.getProfiles(activity);
+            String activeProfile = ProfileManager.getActiveProfile(activity);
+            
+            String[] items = new String[profiles.size() + 1];
+            for (int i = 0; i < profiles.size(); i++) {
+                String profile = profiles.get(i);
+                if (profile.equals(activeProfile)) {
+                    items[i] = profile + " (" + getString(R.string.profile_active) + ")";
+                } else {
+                    items[i] = profile;
+                }
+            }
+            items[profiles.size()] = getString(R.string.profile_create);
+
+            UIHelper.getDialogBuilder(activity)
+                .setTitle(R.string.profile_manager_title)
+                .setItems(items, (dialog, which) -> {
+                    if (which == profiles.size()) {
+                        // Create new profile
+                        showCreateProfileDialog();
+                    } else {
+                        String selectedProfile = profiles.get(which);
+                        if (selectedProfile.equals(activeProfile)) {
+                            Toast.makeText(activity, R.string.profile_active, Toast.LENGTH_SHORT).show();
+                        } else {
+                            showProfileActionsDialog(selectedProfile);
+                        }
+                    }
+                })
+                .show();
+        }
+
+        private void showCreateProfileDialog() {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            android.widget.EditText input = new android.widget.EditText(activity);
+            input.setHint(R.string.profile_name_hint);
+
+            UIHelper.getDialogBuilder(activity)
+                .setTitle(R.string.profile_create)
+                .setView(input)
+                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                    String profileName = input.getText().toString().trim();
+                    if (!profileName.isEmpty()) {
+                        if (ProfileManager.createProfile(activity, profileName)) {
+                            Toast.makeText(activity, "Profile created: " + profileName, Toast.LENGTH_SHORT).show();
+                        } else {
+                            Toast.makeText(activity, "Failed to create profile", Toast.LENGTH_SHORT).show();
+                        }
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+        }
+
+        private void showProfileActionsDialog(String profileName) {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            String[] actions = {getString(R.string.profile_switch), getString(R.string.profile_delete)};
+            
+            UIHelper.getDialogBuilder(activity)
+                .setTitle(profileName)
+                .setItems(actions, (dialog, which) -> {
+                    if (which == 0) {
+                        // Switch profile
+                        UIHelper.getDialogBuilder(activity)
+                            .setMessage(getString(R.string.profile_switch_confirm, profileName))
+                            .setPositiveButton(android.R.string.ok, (d, w) -> {
+                                if (ProfileManager.switchProfile(activity, profileName)) {
+                                    RomManager.reboot(activity);
+                                } else {
+                                    Toast.makeText(activity, "Failed to switch profile", Toast.LENGTH_SHORT).show();
+                                }
+                            })
+                            .setNegativeButton(android.R.string.cancel, null)
+                            .show();
+                    } else if (which == 1) {
+                        // Delete profile
+                        UIHelper.getDialogBuilder(activity)
+                            .setMessage(getString(R.string.profile_delete_confirm, profileName))
+                            .setPositiveButton(android.R.string.ok, (d, w) -> {
+                                if (ProfileManager.deleteProfile(activity, profileName)) {
+                                    Toast.makeText(activity, "Profile deleted: " + profileName, Toast.LENGTH_SHORT).show();
+                                } else {
+                                    Toast.makeText(activity, "Failed to delete profile", Toast.LENGTH_SHORT).show();
+                                }
+                            })
+                            .setNegativeButton(android.R.string.cancel, null)
+                            .show();
+                    }
+                })
+                .show();
+        }
+
+        private void exportRootfsToTar() {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            ProgressDialog dialog = UIHelper.getProgressDialog(activity);
+            dialog.setCancelable(false);
+            dialog.show();
+
+            UIHelper.defer().when(() -> {
+                File rootfsDir = RomManager.getRootfsDir(activity);
+                File exportFile = new File(activity.getCacheDir(), "rootfs_export.tar");
+                
+                // Create tar archive using system tar command
+                Process process = Runtime.getRuntime().exec(new String[]{
+                    "tar", "-cf", exportFile.getAbsolutePath(),
+                    "-C", rootfsDir.getParent(), rootfsDir.getName()
+                });
+                process.waitFor();
+                
+                return exportFile;
+            }).done(exportFile -> {
+                UIHelper.dismiss(dialog);
+                
+                // Share the file
+                Uri uri = FileProvider.getUriForFile(activity, "io.twoyi.fileprovider", exportFile);
+                Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
+                shareIntent.setDataAndType(uri, "application/x-tar");
+                shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                activity.startActivity(Intent.createChooser(shareIntent, getString(R.string.settings_key_export_rootfs)));
+                
+                Toast.makeText(activity, R.string.export_rootfs_success, Toast.LENGTH_SHORT).show();
+            }).fail(result -> activity.runOnUiThread(() -> {
+                Toast.makeText(activity, getString(R.string.export_rootfs_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+            }));
+        }
+
+        private void importRootfsFromFile(Uri uri) {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            ProgressDialog dialog = UIHelper.getProgressDialog(activity);
+            dialog.setCancelable(false);
+            dialog.show();
+
+            UIHelper.defer().when(() -> {
+                File rootfsDir = RomManager.getRootfsDir(activity);
+                File tempFile = new File(activity.getCacheDir(), "rootfs_import.tar");
+
+                // Copy file to temp location
+                ContentResolver contentResolver = activity.getContentResolver();
+                try (InputStream inputStream = contentResolver.openInputStream(uri);
+                     OutputStream os = new FileOutputStream(tempFile)) {
+                    byte[] buffer = new byte[8192];
+                    int count;
+                    while ((count = inputStream.read(buffer)) > 0) {
+                        os.write(buffer, 0, count);
+                    }
+                }
+
+                // Delete old rootfs
+                io.twoyi.utils.IOUtils.deleteDirectory(rootfsDir);
+                rootfsDir.mkdirs();
+
+                // Extract tar archive
+                Process process = Runtime.getRuntime().exec(new String[]{
+                    "tar", "-xf", tempFile.getAbsolutePath(),
+                    "-C", rootfsDir.getParent()
+                });
+                process.waitFor();
+
+                tempFile.delete();
+                return true;
+            }).done(result -> {
+                UIHelper.dismiss(dialog);
+                AppKV.setBooleanConfig(activity, AppKV.SHOULD_USE_THIRD_PARTY_ROM, false);
+                Toast.makeText(activity, R.string.import_rootfs_success, Toast.LENGTH_SHORT).show();
+            }).fail(result -> activity.runOnUiThread(() -> {
+                Toast.makeText(activity, getString(R.string.import_rootfs_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+            }));
+        }
+
 
         @Override
         public void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
             super.onActivityResult(requestCode, resultCode, data);
+
+            if (requestCode == REQUEST_IMPORT_ROOTFS && resultCode == Activity.RESULT_OK) {
+                if (data != null && data.getData() != null) {
+                    importRootfsFromFile(data.getData());
+                }
+                return;
+            }
 
             if (!(requestCode == REQUEST_GET_FILE && resultCode == Activity.RESULT_OK)) {
                 return;
@@ -252,12 +481,6 @@ public class SettingsActivity extends AppCompatActivity {
                 if (romInfo.isValid()) {
 
                     String author = romInfo.author;
-                    if ("weishu".equalsIgnoreCase(author) || "twoyi".equalsIgnoreCase(author)) {
-                        Toast.makeText(activity, R.string.replace_rom_unofficial_tips, Toast.LENGTH_SHORT).show();
-                        rootfs3rd.delete();
-                        return;
-
-                    }
                     UIHelper.getDialogBuilder(activity)
                             .setTitle(R.string.replace_rom_confirm_title)
                             .setMessage(getString(R.string.replace_rom_confirm_message, author, romInfo.version, romInfo.desc))

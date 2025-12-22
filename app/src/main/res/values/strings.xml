@@ -92,4 +92,24 @@
     <string name="settings_key_shutdown">Shutdown</string>
     <string name="settings_key_reboot">Reboot</string>
     <string name="replace_rom_unofficial_tips">Sorry, please edit the rom info and avoid using official author name :)</string>
-</resources>
+    <string name="settings_key_launch_container">Launch Container</string>
+    <string name="settings_launch_container_summary">Start the Android container</string>
+    <string name="settings_key_import_rootfs">Import Rootfs</string>
+    <string name="settings_import_rootfs_summary">Import rootfs from .tar or .7z file</string>
+    <string name="settings_key_export_rootfs">Export Rootfs</string>
+    <string name="settings_export_rootfs_summary">Export rootfs to .tar file</string>
+    <string name="settings_key_profile_manager">Profile Manager</string>
+    <string name="settings_profile_manager_summary">Manage different profiles</string>
+    <string name="profile_manager_title">Profile Manager</string>
+    <string name="profile_create">Create Profile</string>
+    <string name="profile_switch">Switch Profile</string>
+    <string name="profile_delete">Delete Profile</string>
+    <string name="profile_name_hint">Profile name</string>
+    <string name="profile_active">Active</string>
+    <string name="profile_switch_confirm">Switch to profile %1$s? (Requires reboot)</string>
+    <string name="profile_delete_confirm">Delete profile %1$s?</string>
+    <string name="export_rootfs_success">Rootfs exported successfully</string>
+    <string name="export_rootfs_failed">Failed to export rootfs: %1$s</string>
+    <string name="import_rootfs_success">Rootfs imported successfully. Please reboot.</string>
+    <string name="import_rootfs_failed">Failed to import rootfs: %1$s</string>
+</string>
