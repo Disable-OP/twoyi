@@ -4,6 +4,10 @@
 # provided without any warranty, express or implied, including warranties
 # of merchantability, fitness for a particular purpose, or non-infringement.
 # Use at your own risk.
+#
+# NOTE: Before this workflow can build successfully, you must add
+# rootfs.7z to app/src/main/assets/ directory.
+# Download from: https://github.com/cyanmint/twoyi/releases/download/original/rootfs.7z
 ---
 name: Build APK
 

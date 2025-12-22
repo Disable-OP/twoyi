@@ -389,7 +389,21 @@ public class SettingsActivity extends AppCompatActivity {
 
             UIHelper.defer().when(() -> {
                 File rootfsDir = RomManager.getRootfsDir(activity);
-                File tempFile = new File(activity.getCacheDir(), "rootfs_import.tar");
+                
+                // Get file name to determine type
+                String fileName = uri.getLastPathSegment();
+                if (fileName == null) {
+                    fileName = "import";
+                }
+                
+                File tempFile;
+                boolean is7z = fileName.endsWith(".7z");
+                
+                if (is7z) {
+                    tempFile = new File(activity.getCacheDir(), "rootfs_import.7z");
+                } else {
+                    tempFile = new File(activity.getCacheDir(), "rootfs_import.tar");
+                }
 
                 // Copy file to temp location
                 ContentResolver contentResolver = activity.getContentResolver();
@@ -404,21 +418,31 @@ public class SettingsActivity extends AppCompatActivity {
 
                 // Delete old rootfs
                 io.twoyi.utils.IOUtils.deleteDirectory(rootfsDir);
-                rootfsDir.mkdirs();
+                rootfsDir.getParentFile().mkdirs();
 
-                // Extract tar archive
-                Process process = Runtime.getRuntime().exec(new String[]{
-                    "tar", "-xf", tempFile.getAbsolutePath(),
-                    "-C", rootfsDir.getParent()
-                });
-                process.waitFor();
+                int exitCode;
+                if (is7z) {
+                    // Extract 7z archive using RomManager
+                    exitCode = RomManager.extractRootfs(activity, tempFile);
+                } else {
+                    // Extract tar archive
+                    Process process = Runtime.getRuntime().exec(new String[]{
+                        "tar", "-xf", tempFile.getAbsolutePath(),
+                        "-C", rootfsDir.getParent()
+                    });
+                    exitCode = process.waitFor();
+                }
 
                 tempFile.delete();
-                return true;
+                return exitCode == 0;
             }).done(result -> {
                 UIHelper.dismiss(dialog);
-                AppKV.setBooleanConfig(activity, AppKV.SHOULD_USE_THIRD_PARTY_ROM, false);
-                Toast.makeText(activity, R.string.import_rootfs_success, Toast.LENGTH_SHORT).show();
+                if (result) {
+                    AppKV.setBooleanConfig(activity, AppKV.SHOULD_USE_THIRD_PARTY_ROM, false);
+                    Toast.makeText(activity, R.string.import_rootfs_success, Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(activity, R.string.import_rootfs_failed, Toast.LENGTH_SHORT).show();
+                }
             }).fail(result -> activity.runOnUiThread(() -> {
                 Toast.makeText(activity, getString(R.string.import_rootfs_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
                 dialog.dismiss();

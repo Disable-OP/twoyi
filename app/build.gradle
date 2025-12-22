@@ -11,7 +11,7 @@ plugins {
 }
 
 android {
-    compileSdkVersion 31
+    compileSdkVersion 35
     buildToolsVersion "30.0.3"
 
     def buildSerial = new SimpleDateFormat("MMddHHmm").format(new Date())

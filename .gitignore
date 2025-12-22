@@ -14,3 +14,7 @@
 .cxx
 local.properties
 dl.sh
+
+# Placeholder assets - real rootfs should be provided by user
+app/src/main/assets/rootfs.7z
+app/src/main/assets/rom.ini
