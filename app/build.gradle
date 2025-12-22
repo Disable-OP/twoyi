@@ -91,10 +91,6 @@ dependencies {
 
     // Use jitpack alternative since com.hzy:libp7zip is no longer available
     implementation 'com.github.hzy3774:AndroidP7zip:v1.7.1'
-//    implementation 'com.hzy:libp7zip:1.7.0'
-//    implementation "com.github.seven332.a7zip:extract:master-SNAPSHOT"
-//    implementation 'com.github.omicronapps:7-Zip-JBinding-4Android:Release-16.02-2.02'
-//    implementation 'com.victor:lib:1.0.4'
     implementation 'com.cleveroad:androidmanimation:0.9.1'
 
     def appCenterSdkVersion = '4.3.1'
