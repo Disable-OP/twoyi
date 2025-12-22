@@ -33,7 +33,7 @@ Before the workflow can successfully build the APK, you need to:
 
 ## Build Configuration
 
-- Uses NDK r22b as required by the project
+- Uses NDK r27c (upgraded from r22b for Rust compatibility)
 - compileSdk set to 31 (compatible with build tools 30.0.3)
 - targetSdk remains 28 as per project requirements
 - Uses mavenCentral for dependency resolution (JCenter is deprecated)
@@ -46,13 +46,14 @@ To test the build locally before committing:
 1. Install Rust and Cargo: https://www.rust-lang.org/tools/install
 2. Install Rust Android target: `rustup target add aarch64-linux-android`
 3. Install cargo-xdk: `cargo install cargo-xdk`
-4. Install Android NDK r22b (or set ANDROID_NDK_HOME to compatible version)
-5. Add rootfs.7z to assets
+4. Install Android NDK r27c (or compatible version 26+)
+5. Add rootfs.7z to assets (placeholder included for CI)
 6. Run: `./gradlew assembleRelease`
 
 ## Notes
 
-- The workflow uses NDK r22b as required by the project
+- The workflow uses NDK r27c (r22b has compatibility issues with modern Rust)
 - Build artifacts are automatically uploaded after successful builds
 - The workflow validates YAML syntax with yamllint
 - Rust target aarch64-linux-android is installed automatically
+- Placeholder assets are included to allow CI builds (not functional without real rootfs)

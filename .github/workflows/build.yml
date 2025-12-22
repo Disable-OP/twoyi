@@ -5,9 +5,9 @@
 # of merchantability, fitness for a particular purpose, or non-infringement.
 # Use at your own risk.
 #
-# NOTE: Before this workflow can build successfully, you must add
-# rootfs.7z to app/src/main/assets/ directory.
-# Download from: https://github.com/cyanmint/twoyi/releases/download/original/rootfs.7z
+# NOTE: Placeholder assets are included to allow CI builds.
+# For a functional APK, replace app/src/main/assets/rootfs.7z with:
+# https://github.com/cyanmint/twoyi/releases/download/original/rootfs.7z
 ---
 name: Build APK
 
@@ -54,7 +54,8 @@ jobs:
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r22b
+          ndk-version: r27c
+          add-to-path: false
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
