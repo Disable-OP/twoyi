@@ -483,38 +483,43 @@ public class ProfileManagerActivity extends AppCompatActivity {
         for (String line : lines) {
             line = line.trim();
             
-            if (line.startsWith("<boolean")) {
-                String name = extractAttribute(line, "name");
-                String value = extractAttribute(line, "value");
-                if (name != null && value != null) {
-                    editor.putBoolean(name, Boolean.parseBoolean(value));
+            try {
+                if (line.startsWith("<boolean")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putBoolean(name, Boolean.parseBoolean(value));
+                    }
+                } else if (line.startsWith("<string")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractTagContent(line);
+                    if (name != null && value != null) {
+                        // Unescape XML entities (order matters: do &amp; last to avoid re-escaping)
+                        value = value.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&");
+                        editor.putString(name, value);
+                    }
+                } else if (line.startsWith("<int")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putInt(name, Integer.parseInt(value));
+                    }
+                } else if (line.startsWith("<long")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putLong(name, Long.parseLong(value));
+                    }
+                } else if (line.startsWith("<float")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putFloat(name, Float.parseFloat(value));
+                    }
                 }
-            } else if (line.startsWith("<string")) {
-                String name = extractAttribute(line, "name");
-                String value = extractTagContent(line);
-                if (name != null && value != null) {
-                    // Unescape XML entities
-                    value = value.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&");
-                    editor.putString(name, value);
-                }
-            } else if (line.startsWith("<int")) {
-                String name = extractAttribute(line, "name");
-                String value = extractAttribute(line, "value");
-                if (name != null && value != null) {
-                    editor.putInt(name, Integer.parseInt(value));
-                }
-            } else if (line.startsWith("<long")) {
-                String name = extractAttribute(line, "name");
-                String value = extractAttribute(line, "value");
-                if (name != null && value != null) {
-                    editor.putLong(name, Long.parseLong(value));
-                }
-            } else if (line.startsWith("<float")) {
-                String name = extractAttribute(line, "name");
-                String value = extractAttribute(line, "value");
-                if (name != null && value != null) {
-                    editor.putFloat(name, Float.parseFloat(value));
-                }
+            } catch (NumberFormatException e) {
+                // Skip malformed numeric values
+                android.util.Log.w("ProfileManager", "Skipping malformed preference value in line: " + line, e);
             }
         }
 
