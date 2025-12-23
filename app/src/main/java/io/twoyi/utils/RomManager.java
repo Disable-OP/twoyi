@@ -113,10 +113,21 @@ public final class RomManager {
     }
 
     private static void saveLastKmsg(Context context) {
+        // Save global last kmsg
         File lastKmsgFile = LogEvents.getLastKmsgFile(context);
         File kmsgFile = LogEvents.getKmsgFile(context);
         try {
             Files.move(kmsgFile.toPath(), lastKmsgFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException ignored) {
+        }
+        
+        // Save profile-specific last kmsg
+        File profileLastKmsgFile = LogEvents.getProfileLastKmsgFile(context);
+        File profileKmsgFile = LogEvents.getProfileKmsgFile(context);
+        try {
+            if (profileKmsgFile.exists()) {
+                Files.move(profileKmsgFile.toPath(), profileLastKmsgFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
         } catch (IOException ignored) {
         }
     }
