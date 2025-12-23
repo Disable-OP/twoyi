@@ -91,7 +91,7 @@
     <string name="settings_key_select_rom">ROM選択</string>
     <string name="settings_select_rom_summary">現在のプロファイルにROMファイルをインポート</string>
     <string name="settings_key_import_rootfs">Rootfsインポート</string>
-    <string name="settings_import_rootfs_summary">.tar または .7z ファイルから rootfs をインポート</string>
+    <string name="settings_import_rootfs_summary">.tar ファイルから rootfs をインポート</string>
     <string name="settings_key_export_rootfs">Rootfsエクスポート</string>
     <string name="settings_export_rootfs_summary">rootfs を .tar ファイルにエクスポート</string>
     <string name="settings_key_profile_manager">プロファイルマネージャー</string>
@@ -115,8 +115,8 @@
     <string name="import_rootfs_failed">rootfsのインポートに失敗しました: %1$s</string>
     <string name="no_rootfs_title">ROMがインストールされていません</string>
     <string name="no_rootfs_message">続行するにはrootfsをインポートしてください</string>
-    <string name="no_rootfs_guide">ROMがインストールされていません。設定 → 詳細設定 → Rootfsインポートに移動し、rootfs.7zファイルを選択して開始してください。</string>
-    <string name="no_rootfs_select_rom">ROMがインストールされていません。rootfs.7zファイルを選択してインポートし、システムを起動してください。</string>
+    <string name="no_rootfs_guide">ROMがインストールされていません。設定 → 詳細設定 → Rootfsインポートに移動し、rootfs.tarファイルを選択して開始してください。</string>
+    <string name="no_rootfs_select_rom">ROMがインストールされていません。rootfs.tarファイルを選択してインポートし、システムを起動してください。</string>
     <string name="select_rom_file">ROMファイルを選択</string>
     <string name="go_to_settings">設定へ</string>
 </resources>

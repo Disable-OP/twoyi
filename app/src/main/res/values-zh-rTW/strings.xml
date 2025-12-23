@@ -91,7 +91,7 @@
     <string name="settings_key_select_rom">選擇 ROM</string>
     <string name="settings_select_rom_summary">為當前配置文件匯入 ROM 文件</string>
     <string name="settings_key_import_rootfs">匯入 Rootfs</string>
-    <string name="settings_import_rootfs_summary">從 .tar 或 .7z 文件匯入 rootfs</string>
+    <string name="settings_import_rootfs_summary">從 .tar 文件匯入 rootfs</string>
     <string name="settings_key_export_rootfs">匯出 Rootfs</string>
     <string name="settings_export_rootfs_summary">將 rootfs 匯出為 .tar 文件</string>
     <string name="settings_key_profile_manager">配置文件管理器</string>
@@ -115,8 +115,8 @@
     <string name="import_rootfs_failed">匯入 rootfs 失敗: %1$s</string>
     <string name="no_rootfs_title">未安裝 ROM</string>
     <string name="no_rootfs_message">請匯入 rootfs 以繼續</string>
-    <string name="no_rootfs_guide">未安裝 ROM。請前往設定 → 進階 → 匯入 Rootfs，選擇一個 rootfs.7z 文件開始使用。</string>
-    <string name="no_rootfs_select_rom">未安裝 ROM。請選擇一個 rootfs.7z 文件匯入並啟動系統。</string>
+    <string name="no_rootfs_guide">未安裝 ROM。請前往設定 → 進階 → 匯入 Rootfs，選擇一個 rootfs.tar 文件開始使用。</string>
+    <string name="no_rootfs_select_rom">未安裝 ROM。請選擇一個 rootfs.tar 文件匯入並啟動系統。</string>
     <string name="select_rom_file">選擇 ROM 文件</string>
     <string name="go_to_settings">前往設定</string>
 </resources>
