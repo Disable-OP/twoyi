@@ -260,17 +260,16 @@ public class ProfileManagerActivity extends AppCompatActivity {
         }).done(exportFile -> {
             UIHelper.dismiss(dialog);
             
+            // Share the file like log export
             Uri uri = FileProvider.getUriForFile(this, "io.twoyi.fileprovider", exportFile);
             Intent shareIntent = new Intent(Intent.ACTION_SEND);
             shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
             shareIntent.setDataAndType(uri, "application/x-tar");
             shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(shareIntent, getString(R.string.profile_export)));
-            
-            Toast.makeText(this, R.string.profile_export_success, Toast.LENGTH_SHORT).show();
         }).fail(result -> runOnUiThread(() -> {
+            UIHelper.dismiss(dialog);
             Toast.makeText(this, getString(R.string.profile_export_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
-            dialog.dismiss();
         }));
     }
 

@@ -176,7 +176,7 @@ public class ProfileManager {
     }
 
     /**
-     * Copy a profile
+     * Copy a profile using tar for reliable symlink preservation
      */
     public static boolean copyProfile(Context context, String sourceName, String targetName) {
         if (targetName == null || targetName.trim().isEmpty()) {
@@ -196,9 +196,58 @@ public class ProfileManager {
             return false;
         }
 
+        File tempTarFile = new File(context.getCacheDir(), "profile_copy_temp.tar");
+        
         try {
-            // Copy the directory
-            copyDirectory(sourceDir, targetDir);
+            // Create tar from source
+            String sourceDirPath = sourceDir.getAbsolutePath();
+            String tempTarPath = tempTarFile.getAbsolutePath();
+            String sourceParentPath = sourceDir.getParent();
+            
+            if (sourceDirPath.contains(";") || sourceDirPath.contains("&") ||
+                tempTarPath.contains(";") || tempTarPath.contains("&")) {
+                throw new SecurityException("Invalid path detected");
+            }
+            
+            // Pack the source profile into tar
+            ProcessBuilder pb1 = new ProcessBuilder(
+                "tar", "-cf", tempTarPath,
+                "-C", sourceParentPath, sourceDir.getName()
+            );
+            Process process1 = pb1.start();
+            int exitCode1 = process1.waitFor();
+            
+            if (exitCode1 != 0) {
+                throw new IOException("tar create failed with exit code: " + exitCode1);
+            }
+            
+            // Create target directory
+            File profilesDir = getProfilesDir(context);
+            String profilesDirPath = profilesDir.getAbsolutePath();
+            
+            if (profilesDirPath.contains(";") || profilesDirPath.contains("&")) {
+                throw new SecurityException("Invalid path detected");
+            }
+            
+            // Extract tar to target
+            ProcessBuilder pb2 = new ProcessBuilder(
+                "tar", "-xf", tempTarPath,
+                "-C", profilesDirPath
+            );
+            Process process2 = pb2.start();
+            int exitCode2 = process2.waitFor();
+            
+            if (exitCode2 != 0) {
+                throw new IOException("tar extract failed with exit code: " + exitCode2);
+            }
+            
+            // Rename extracted directory to target name if needed
+            File extractedDir = new File(profilesDir, sourceDir.getName());
+            if (!extractedDir.equals(targetDir)) {
+                if (!extractedDir.renameTo(targetDir)) {
+                    throw new IOException("Failed to rename extracted profile");
+                }
+            }
 
             // Copy settings
             SharedPreferences sourcePrefs = context.getSharedPreferences(
@@ -219,11 +268,14 @@ public class ProfileManager {
             }
 
             return true;
-        } catch (IOException e) {
+        } catch (Exception e) {
             Log.e(TAG, "Failed to copy profile", e);
             // Clean up partial copy
             IOUtils.deleteDirectory(targetDir);
             return false;
+        } finally {
+            // Clean up temp tar file
+            tempTarFile.delete();
         }
     }
 
