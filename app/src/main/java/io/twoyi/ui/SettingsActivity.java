@@ -110,6 +110,9 @@ public class SettingsActivity extends AppCompatActivity {
             
             Preference profileManager = findPreference(R.string.settings_key_profile_manager);
             CheckBoxPreference verboseLogging = (CheckBoxPreference) findPreference(R.string.settings_key_verbose_logging);
+            Preference displayWidth = findPreference(R.string.settings_key_display_width);
+            Preference displayHeight = findPreference(R.string.settings_key_display_height);
+            Preference displayDpi = findPreference(R.string.settings_key_display_dpi);
             Preference selectRom = findPreference(R.string.settings_key_select_rom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
@@ -122,6 +125,71 @@ public class SettingsActivity extends AppCompatActivity {
             verboseLogging.setOnPreferenceChangeListener((preference, newValue) -> {
                 ProfileSettings.setVerboseLogging(getActivity(), (Boolean) newValue);
                 return true;
+            });
+
+            // Initialize display configuration preferences
+            android.preference.EditTextPreference displayWidthPref = (android.preference.EditTextPreference) displayWidth;
+            android.preference.EditTextPreference displayHeightPref = (android.preference.EditTextPreference) displayHeight;
+            android.preference.EditTextPreference displayDpiPref = (android.preference.EditTextPreference) displayDpi;
+
+            displayWidthPref.setText(String.valueOf(ProfileSettings.getDisplayWidth(getActivity())));
+            displayWidthPref.setSummary("Virtual display width in pixels (current: " + ProfileSettings.getDisplayWidth(getActivity()) + ")");
+            displayWidthPref.setOnPreferenceChangeListener((preference, newValue) -> {
+                try {
+                    int width = Integer.parseInt(newValue.toString());
+                    if (width > 0 && width <= 4096) {
+                        ProfileSettings.setDisplayWidth(getActivity(), width);
+                        displayWidthPref.setSummary("Virtual display width in pixels (current: " + width + ")");
+                        Toast.makeText(getActivity(), "Display settings will take effect after reboot", Toast.LENGTH_SHORT).show();
+                        return true;
+                    } else {
+                        Toast.makeText(getActivity(), "Width must be between 1 and 4096", Toast.LENGTH_SHORT).show();
+                        return false;
+                    }
+                } catch (NumberFormatException e) {
+                    Toast.makeText(getActivity(), "Invalid number", Toast.LENGTH_SHORT).show();
+                    return false;
+                }
+            });
+
+            displayHeightPref.setText(String.valueOf(ProfileSettings.getDisplayHeight(getActivity())));
+            displayHeightPref.setSummary("Virtual display height in pixels (current: " + ProfileSettings.getDisplayHeight(getActivity()) + ")");
+            displayHeightPref.setOnPreferenceChangeListener((preference, newValue) -> {
+                try {
+                    int height = Integer.parseInt(newValue.toString());
+                    if (height > 0 && height <= 4096) {
+                        ProfileSettings.setDisplayHeight(getActivity(), height);
+                        displayHeightPref.setSummary("Virtual display height in pixels (current: " + height + ")");
+                        Toast.makeText(getActivity(), "Display settings will take effect after reboot", Toast.LENGTH_SHORT).show();
+                        return true;
+                    } else {
+                        Toast.makeText(getActivity(), "Height must be between 1 and 4096", Toast.LENGTH_SHORT).show();
+                        return false;
+                    }
+                } catch (NumberFormatException e) {
+                    Toast.makeText(getActivity(), "Invalid number", Toast.LENGTH_SHORT).show();
+                    return false;
+                }
+            });
+
+            displayDpiPref.setText(String.valueOf(ProfileSettings.getDisplayDpi(getActivity())));
+            displayDpiPref.setSummary("Virtual display DPI (current: " + ProfileSettings.getDisplayDpi(getActivity()) + ")");
+            displayDpiPref.setOnPreferenceChangeListener((preference, newValue) -> {
+                try {
+                    int dpi = Integer.parseInt(newValue.toString());
+                    if (dpi > 0 && dpi <= 640) {
+                        ProfileSettings.setDisplayDpi(getActivity(), dpi);
+                        displayDpiPref.setSummary("Virtual display DPI (current: " + dpi + ")");
+                        Toast.makeText(getActivity(), "Display settings will take effect after reboot", Toast.LENGTH_SHORT).show();
+                        return true;
+                    } else {
+                        Toast.makeText(getActivity(), "DPI must be between 1 and 640", Toast.LENGTH_SHORT).show();
+                        return false;
+                    }
+                } catch (NumberFormatException e) {
+                    Toast.makeText(getActivity(), "Invalid number", Toast.LENGTH_SHORT).show();
+                    return false;
+                }
             });
 
             launchContainer.setOnPreferenceClickListener(preference -> {

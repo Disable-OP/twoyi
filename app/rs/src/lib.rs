@@ -43,6 +43,8 @@ pub fn renderer_init(
     _clz: jclass,
     surface: jobject,
     loader: jstring,
+    width: jint,
+    height: jint,
     xdpi: jfloat,
     ydpi: jfloat,
     fps: jint,
@@ -60,12 +62,16 @@ pub fn renderer_init(
 
     let window = unsafe { ndk::native_window::NativeWindow::from_ptr(window) };
 
-    let width = window.width();
-    let height = window.height();
+    let surface_width = window.width();
+    let surface_height = window.height();
+    
+    // Use the virtual display dimensions passed from Java
+    let virtual_width = width;
+    let virtual_height = height;
 
     info!(
-        "renderer_init width: {}, height: {}, fps: {}",
-        width, height, fps
+        "renderer_init surface: {}x{}, virtual: {}x{}, fps: {}",
+        surface_width, surface_height, virtual_width, virtual_height, fps
     );
 
     if RENDERER_STARTED.compare_exchange(false, true, 
@@ -73,10 +79,11 @@ pub fn renderer_init(
         let win = window.ptr().as_ptr() as *mut c_void;
         unsafe {
             renderer_bindings::setNativeWindow(win);
-            renderer_bindings::resetSubWindow(win, 0, 0, width, height, width, height, 1.0, 0.0);
+            renderer_bindings::resetSubWindow(win, 0, 0, surface_width, surface_height, 
+                                             virtual_width, virtual_height, 1.0, 0.0);
         }
     } else {
-        input::start_input_system(width, height);
+        input::start_input_system(virtual_width, virtual_height);
 
         thread::spawn(move || {
             let win = window.ptr().as_ptr() as *mut c_void;
@@ -84,8 +91,8 @@ pub fn renderer_init(
             unsafe {
                 renderer_bindings::startOpenGLRenderer(
                     win,
-                    width,
-                    height,
+                    virtual_width,
+                    virtual_height,
                     xdpi as i32,
                     ydpi as i32,
                     fps as i32,
@@ -116,11 +123,13 @@ pub fn renderer_reset_window(
     _left: jint,
     _width: jint,
     _height: jint,
+    _fb_width: jint,
+    _fb_height: jint,
 ) {
-    debug!("reset_window");
+    debug!("reset_window: surface={}x{}, framebuffer={}x{}", _width, _height, _fb_width, _fb_height);
     unsafe {
         let window = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface);
-        renderer_bindings::resetSubWindow(window as *mut c_void, 0, 0, _width, _height, _width, _height, 1.0, 0.0);
+        renderer_bindings::resetSubWindow(window as *mut c_void, 0, 0, _width, _height, _fb_width, _fb_height, 1.0, 0.0);
     }
 }
 
@@ -195,11 +204,11 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
 
     let class_name: &str = "io/twoyi/Renderer";
     let jni_methods = [
-        jni_method!(init, renderer_init, "(Landroid/view/Surface;Ljava/lang/String;FFI)V"),
+        jni_method!(init, renderer_init, "(Landroid/view/Surface;Ljava/lang/String;IIFFI)V"),
         jni_method!(
             resetWindow,
             renderer_reset_window,
-            "(Landroid/view/Surface;IIII)V"
+            "(Landroid/view/Surface;IIIIII)V"
         ),
         jni_method!(
             removeWindow,
