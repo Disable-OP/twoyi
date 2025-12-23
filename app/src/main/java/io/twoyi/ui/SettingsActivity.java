@@ -53,6 +53,8 @@ import io.twoyi.utils.UIHelper;
 
 public class SettingsActivity extends AppCompatActivity {
 
+    private static final int REQUEST_SELECT_ROM = 1001;
+
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -108,6 +110,7 @@ public class SettingsActivity extends AppCompatActivity {
             
             Preference profileManager = findPreference(R.string.settings_key_profile_manager);
             CheckBoxPreference verboseLogging = (CheckBoxPreference) findPreference(R.string.settings_key_verbose_logging);
+            Preference selectRom = findPreference(R.string.settings_key_select_rom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
             Preference donate = findPreference(R.string.settings_key_donate);
@@ -158,16 +161,30 @@ public class SettingsActivity extends AppCompatActivity {
                 return true;
             });
 
+            selectRom.setOnPreferenceClickListener(preference -> {
+                Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
+                intent.setType("*/*");
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                try {
+                    startActivityForResult(intent, REQUEST_SELECT_ROM);
+                } catch (Throwable ignored) {
+                    Toast.makeText(getContext(), "Error", Toast.LENGTH_SHORT).show();
+                }
+                return true;
+            });
+
             factoryReset.setOnPreferenceClickListener(preference -> {
                 UIHelper.getDialogBuilder(getActivity())
                         .setTitle(android.R.string.dialog_alert_title)
                         .setMessage(R.string.factory_reset_confirm_message)
                         .setPositiveButton(R.string.i_confirm_it, (dialog, which) -> {
-                            // Clear the rootfs completely so next boot will prompt for ROM
+                            // Clear the active profile's rootfs completely so next boot will prompt for ROM
                             Activity activity = getActivity();
                             if (activity != null) {
-                                File rootfsDir = RomManager.getRootfsDir(activity);
-                                io.twoyi.utils.IOUtils.deleteDirectory(rootfsDir);
+                                String activeProfile = ProfileManager.getActiveProfile(activity);
+                                File profileRootfsDir = ProfileManager.getProfileRootfsDir(activity, activeProfile);
+                                io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
                             }
                             dialog.dismiss();
 
@@ -217,7 +234,58 @@ public class SettingsActivity extends AppCompatActivity {
         @Override
         public void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
             super.onActivityResult(requestCode, resultCode, data);
-            // No longer handling profile import here - handled by ProfileManagerActivity
+            
+            if (requestCode == REQUEST_SELECT_ROM && resultCode == Activity.RESULT_OK) {
+                if (data != null && data.getData() != null) {
+                    importRomForActiveProfile(data.getData());
+                }
+            }
+        }
+
+        private void importRomForActiveProfile(Uri uri) {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            ProgressDialog dialog = UIHelper.getProgressDialog(activity);
+            dialog.setCancelable(false);
+            dialog.show();
+
+            UIHelper.defer().when(() -> {
+                String activeProfile = ProfileManager.getActiveProfile(activity);
+                File profileRootfsDir = ProfileManager.getProfileRootfsDir(activity, activeProfile);
+                
+                File tempFile = new File(activity.getCacheDir(), "rootfs_import.7z");
+
+                ContentResolver contentResolver = activity.getContentResolver();
+                try (InputStream inputStream = contentResolver.openInputStream(uri);
+                     OutputStream os = new FileOutputStream(tempFile)) {
+                    byte[] buffer = new byte[8192];
+                    int count;
+                    while ((count = inputStream.read(buffer)) > 0) {
+                        os.write(buffer, 0, count);
+                    }
+                }
+
+                // Extract ROM to profile rootfs
+                int exitCode = RomManager.extractRootfs(activity, tempFile);
+                tempFile.delete();
+                
+                if (exitCode == 0) {
+                    RomManager.initRootfs(activity);
+                }
+                
+                return exitCode == 0;
+            }).done(result -> {
+                UIHelper.dismiss(dialog);
+                if (result) {
+                    Toast.makeText(activity, "ROM imported successfully. Please reboot.", Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(activity, "Failed to import ROM", Toast.LENGTH_SHORT).show();
+                }
+            }).fail(result -> activity.runOnUiThread(() -> {
+                Toast.makeText(activity, "Error importing ROM: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+            }));
         }
     }
 }

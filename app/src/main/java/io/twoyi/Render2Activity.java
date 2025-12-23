@@ -55,6 +55,7 @@ import io.twoyi.utils.UIHelper;
 public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private static final String TAG = "Render2Activity";
+    private static final int REQUEST_SELECT_ROM = 1001;
 
     private SurfaceView mSurfaceView;
 
@@ -150,17 +151,30 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         boolean romExist = RomManager.romExist(this);
 
         if (!romExist) {
-            // ROM doesn't exist - show message to user
+            // ROM doesn't exist - show message to user and prompt to select ROM
             runOnUiThread(() -> {
                 mLoadingView.stopAnimation();
                 mLoadingLayout.setVisibility(View.VISIBLE);
                 mLoadingText.setText(R.string.no_rootfs_message);
                 
-                // Show dialog to guide user
+                // Show dialog to let user choose ROM file
                 UIHelper.getDialogBuilder(this)
                     .setTitle(R.string.no_rootfs_title)
-                    .setMessage(R.string.no_rootfs_guide)
-                    .setPositiveButton(R.string.go_to_settings, (dialog, which) -> {
+                    .setMessage(R.string.no_rootfs_select_rom)
+                    .setPositiveButton(R.string.select_rom_file, (dialog, which) -> {
+                        // Prompt user to select ROM file
+                        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
+                        intent.setType("*/*");
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);
+                        try {
+                            startActivityForResult(intent, REQUEST_SELECT_ROM);
+                        } catch (Throwable ignored) {
+                            Toast.makeText(this, "Error selecting file", Toast.LENGTH_SHORT).show();
+                            finish();
+                        }
+                    })
+                    .setNegativeButton(android.R.string.cancel, (dialog, which) -> {
                         finish();
                     })
                     .setCancelable(false)
@@ -276,5 +290,66 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         Log.w(TAG, "current fps: " + fps);
         return fps;
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        
+        if (requestCode == REQUEST_SELECT_ROM && resultCode == RESULT_OK) {
+            if (data != null && data.getData() != null) {
+                importRomAndStart(data.getData());
+            }
+        }
+    }
+
+    private void importRomAndStart(android.net.Uri uri) {
+        mLoadingLayout.setVisibility(View.VISIBLE);
+        mLoadingView.startAnimation();
+        mLoadingText.setText(R.string.extracting_tips);
+
+        android.app.ProgressDialog dialog = UIHelper.getProgressDialog(this);
+        dialog.setCancelable(false);
+        dialog.show();
+
+        UIHelper.defer().when(() -> {
+            String activeProfile = ProfileManager.getActiveProfile(this);
+            File profileRootfsDir = ProfileManager.getProfileRootfsDir(this, activeProfile);
+            
+            File tempFile = new File(getCacheDir(), "rootfs_import.7z");
+
+            android.content.ContentResolver contentResolver = getContentResolver();
+            try (java.io.InputStream inputStream = contentResolver.openInputStream(uri);
+                 java.io.OutputStream os = new java.io.FileOutputStream(tempFile)) {
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = inputStream.read(buffer)) > 0) {
+                    os.write(buffer, 0, count);
+                }
+            }
+
+            // Extract ROM to profile rootfs
+            int exitCode = RomManager.extractRootfs(this, tempFile);
+            tempFile.delete();
+            
+            if (exitCode == 0) {
+                RomManager.initRootfs(this);
+            }
+            
+            return exitCode == 0;
+        }).done(result -> {
+            UIHelper.dismiss(dialog);
+            if (result) {
+                // ROM imported successfully, restart to boot
+                RomManager.reboot(this);
+            } else {
+                Toast.makeText(this, "Failed to import ROM", Toast.LENGTH_SHORT).show();
+                finish();
+            }
+        }).fail(result -> runOnUiThread(() -> {
+            Toast.makeText(this, "Error importing ROM: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+            dialog.dismiss();
+            finish();
+        }));
     }
 }

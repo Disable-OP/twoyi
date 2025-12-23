@@ -87,9 +87,13 @@
     <string name="no_rootfs_title">未安装 ROM</string>
     <string name="no_rootfs_message">请导入 rootfs 以继续</string>
     <string name="no_rootfs_guide">未安装 ROM。请前往设置 → 高级 → 导入 Rootfs，选择一个 rootfs.7z 文件开始使用。</string>
+    <string name="no_rootfs_select_rom">未安装 ROM。请选择一个 rootfs.7z 文件导入并启动系统。</string>
+    <string name="select_rom_file">选择 ROM 文件</string>
     <string name="go_to_settings">前往设置</string>
     <string name="settings_key_verbose_logging">详细日志</string>
     <string name="settings_verbose_logging_summary">启用详细日志记录（默认：开启）</string>
+    <string name="settings_key_select_rom">选择 ROM</string>
+    <string name="settings_select_rom_summary">为当前配置文件导入 ROM 文件</string>
     <string name="profile_copy_hint">新配置文件名称</string>
     <string name="profile_export_success">配置文件导出成功</string>
     <string name="profile_export_failed">导出配置文件失败: %1$s</string>

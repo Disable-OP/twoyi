@@ -90,6 +90,8 @@
     <string name="settings_launch_container_summary">Start the Android container</string>
     <string name="settings_key_verbose_logging">Verbose Logging</string>
     <string name="settings_verbose_logging_summary">Enable detailed logging (default: ON)</string>
+    <string name="settings_key_select_rom">Select ROM</string>
+    <string name="settings_select_rom_summary">Import a ROM file for the active profile</string>
     <string name="settings_key_import_rootfs">Import Rootfs</string>
     <string name="settings_import_rootfs_summary">Import rootfs from .tar or .7z file</string>
     <string name="settings_key_export_rootfs">Export Rootfs</string>
@@ -123,5 +125,7 @@
     <string name="no_rootfs_title">No ROM Installed</string>
     <string name="no_rootfs_message">Please import a rootfs to continue</string>
     <string name="no_rootfs_guide">No ROM is installed. Please go to Settings → Advanced → Import Rootfs and select a rootfs.7z file to get started.</string>
+    <string name="no_rootfs_select_rom">No ROM is installed. Please select a rootfs.7z file to import and start the system.</string>
+    <string name="select_rom_file">Select ROM File</string>
     <string name="go_to_settings">Go to Settings</string>
 </resources>

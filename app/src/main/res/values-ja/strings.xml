@@ -87,9 +87,13 @@
     <string name="no_rootfs_title">ROMがインストールされていません</string>
     <string name="no_rootfs_message">続行するにはrootfsをインポートしてください</string>
     <string name="no_rootfs_guide">ROMがインストールされていません。設定 → 詳細設定 → Rootfsインポートに移動し、rootfs.7zファイルを選択して開始してください。</string>
+    <string name="no_rootfs_select_rom">ROMがインストールされていません。rootfs.7zファイルを選択してインポートし、システムを起動してください。</string>
+    <string name="select_rom_file">ROMファイルを選択</string>
     <string name="go_to_settings">設定へ</string>
     <string name="settings_key_verbose_logging">詳細ログ</string>
     <string name="settings_verbose_logging_summary">詳細ログを有効にする（デフォルト：オン）</string>
+    <string name="settings_key_select_rom">ROM選択</string>
+    <string name="settings_select_rom_summary">現在のプロファイルにROMファイルをインポート</string>
     <string name="profile_copy_hint">新しいプロファイル名</string>
     <string name="profile_export_success">プロファイルのエクスポートに成功しました</string>
     <string name="profile_export_failed">プロファイルのエクスポートに失敗しました: %1$s</string>

@@ -46,6 +46,11 @@
             android:defaultValue="true" />
 
         <Preference
+            android:key="@string/settings_key_select_rom"
+            android:summary="@string/settings_select_rom_summary"
+            android:title="@string/settings_key_select_rom" />
+
+        <Preference
             android:key="@string/settings_key_factory_reset"
             android:summary="@string/settings_factory_reset_summary"
             android:title="@string/settings_key_factory_reset" />

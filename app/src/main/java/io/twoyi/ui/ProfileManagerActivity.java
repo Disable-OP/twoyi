@@ -104,18 +104,9 @@ public class ProfileManagerActivity extends AppCompatActivity {
         } else if (action.equals(getString(R.string.profile_delete))) {
             confirmDelete(profileName);
         } else if (action.equals(getString(R.string.profile_from_scratch))) {
-            createEmptyProfile(profileName);
+            showCreateProfileDialog(false);
         } else if (action.equals(getString(R.string.profile_from_import))) {
-            mPendingImportProfileName = profileName;
-            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
-            intent.setType("*/*");
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            try {
-                startActivityForResult(intent, REQUEST_IMPORT_PROFILE);
-            } catch (Throwable ignored) {
-                Toast.makeText(this, "Error", Toast.LENGTH_SHORT).show();
-            }
+            showCreateProfileDialog(true);
         }
     }
 
@@ -250,6 +241,36 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     refreshProfiles();
                 } else {
                     Toast.makeText(this, "Failed to delete profile", Toast.LENGTH_SHORT).show();
+                }
+            })
+            .setNegativeButton(android.R.string.cancel, null)
+            .show();
+    }
+
+    private void showCreateProfileDialog(boolean isImport) {
+        android.widget.EditText input = new android.widget.EditText(this);
+        input.setHint(R.string.profile_name_hint);
+
+        UIHelper.getDialogBuilder(this)
+            .setTitle(R.string.profile_create)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                String profileName = input.getText().toString().trim();
+                if (!profileName.isEmpty()) {
+                    if (isImport) {
+                        mPendingImportProfileName = profileName;
+                        Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
+                        intent.setType("*/*");
+                        intent.addCategory(Intent.CATEGORY_OPENABLE);
+                        try {
+                            startActivityForResult(intent, REQUEST_IMPORT_PROFILE);
+                        } catch (Throwable ignored) {
+                            Toast.makeText(this, "Error", Toast.LENGTH_SHORT).show();
+                        }
+                    } else {
+                        createEmptyProfile(profileName);
+                    }
                 }
             })
             .setNegativeButton(android.R.string.cancel, null)
