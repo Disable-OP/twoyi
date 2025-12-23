@@ -79,6 +79,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private int mVirtualDisplayWidth;
     private int mVirtualDisplayHeight;
     private int mVirtualDisplayDpi;
+    
+    private int mSurfaceWidth;
+    private int mSurfaceHeight;
+    private int mSurfaceOffsetX;
+    private int mSurfaceOffsetY;
 
     private final AtomicBoolean mIsExtracting = new AtomicBoolean(false);
 
@@ -197,22 +202,23 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         float virtualAspect = (float) mVirtualDisplayWidth / (float) mVirtualDisplayHeight;
         float screenAspect = (float) screenWidth / (float) screenHeight;
 
-        int surfaceWidth;
-        int surfaceHeight;
-
         // Fit the virtual display within the screen while maintaining aspect ratio
         if (virtualAspect > screenAspect) {
             // Virtual display is wider - fit to width
-            surfaceWidth = screenWidth;
-            surfaceHeight = (int) (screenWidth / virtualAspect);
+            mSurfaceWidth = screenWidth;
+            mSurfaceHeight = (int) (screenWidth / virtualAspect);
+            mSurfaceOffsetX = 0;
+            mSurfaceOffsetY = (screenHeight - mSurfaceHeight) / 2;
         } else {
             // Virtual display is taller - fit to height
-            surfaceHeight = screenHeight;
-            surfaceWidth = (int) (screenHeight * virtualAspect);
+            mSurfaceHeight = screenHeight;
+            mSurfaceWidth = (int) (screenHeight * virtualAspect);
+            mSurfaceOffsetX = (screenWidth - mSurfaceWidth) / 2;
+            mSurfaceOffsetY = 0;
         }
 
         // Center the surface view with black letterboxing/pillarboxing
-        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(surfaceWidth, surfaceHeight);
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(mSurfaceWidth, mSurfaceHeight);
         params.gravity = android.view.Gravity.CENTER;
         mSurfaceView.setLayoutParams(params);
         
@@ -221,7 +227,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         Log.i(TAG, "Virtual display: " + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight +
                 ", Screen: " + screenWidth + "x" + screenHeight +
-                ", Surface: " + surfaceWidth + "x" + surfaceHeight);
+                ", Surface: " + mSurfaceWidth + "x" + mSurfaceHeight +
+                ", Offset: " + mSurfaceOffsetX + "," + mSurfaceOffsetY);
     }
 
     private void bootSystem() {
@@ -334,7 +341,25 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     @Override
     public boolean onTouch(View v, MotionEvent event) {
-        Renderer.handleTouch(event);
+        // Transform touch coordinates from screen space to virtual display space
+        MotionEvent transformedEvent = MotionEvent.obtain(event);
+        
+        // Calculate the transformation matrix
+        android.graphics.Matrix matrix = new android.graphics.Matrix();
+        
+        // First, translate by the offset to get coordinates relative to the surface
+        matrix.postTranslate(-mSurfaceOffsetX, -mSurfaceOffsetY);
+        
+        // Then scale from surface dimensions to virtual display dimensions
+        float scaleX = (float) mVirtualDisplayWidth / mSurfaceWidth;
+        float scaleY = (float) mVirtualDisplayHeight / mSurfaceHeight;
+        matrix.postScale(scaleX, scaleY);
+        
+        // Transform the event
+        transformedEvent.transform(matrix);
+        
+        Renderer.handleTouch(transformedEvent);
+        transformedEvent.recycle();
         return true;
     }
 
