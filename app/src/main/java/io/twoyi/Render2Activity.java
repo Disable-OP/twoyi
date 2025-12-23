@@ -341,16 +341,16 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     @Override
     public boolean onTouch(View v, MotionEvent event) {
-        // Transform touch coordinates from screen space to virtual display space
+        // Transform touch coordinates from surface space to virtual display space
+        // Note: event coordinates are already relative to the SurfaceView (not screen)
+        // since the touch listener is attached to mSurfaceView
         MotionEvent transformedEvent = MotionEvent.obtain(event);
         
         // Calculate the transformation matrix
         android.graphics.Matrix matrix = new android.graphics.Matrix();
         
-        // First, translate by the offset to get coordinates relative to the surface
-        matrix.postTranslate(-mSurfaceOffsetX, -mSurfaceOffsetY);
-        
-        // Then scale from surface dimensions to virtual display dimensions
+        // Scale from surface dimensions to virtual display dimensions
+        // No translation needed since coordinates are already relative to SurfaceView
         float scaleX = (float) mVirtualDisplayWidth / mSurfaceWidth;
         float scaleY = (float) mVirtualDisplayHeight / mSurfaceHeight;
         matrix.postScale(scaleX, scaleY);
