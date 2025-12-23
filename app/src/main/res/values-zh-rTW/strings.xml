@@ -72,11 +72,6 @@
     <string name="confirm_for_android12">請務必確認您已經按照教學設定！！否則系統可能將無法啟動！！！</string>
     <string name="i_confirm_it">我已確認</string>
     <string name="menu_not_show_32bit">不顯示 32 位應用</string>
-    <string name="settings_key_replace_rom">取代 ROM</string>
-    <string name="settings_replace_rom_summary">使用自訂的 ROM 啟動兩儀</string>
-    <string name="replace_rom_invalid">您選擇的文件不是兩儀 ROM</string>
-    <string name="replace_rom_confirm_title">ROM 訊息確認</string>
-    <string name="replace_rom_confirm_message">ROM 作者：%1$s\nROM 版本：%2$s\nROM 訊息：%3$s\n\n重啟後生效，確認？</string>
     <string name="settings_category_basic">基礎</string>
     <string name="settings_category_advanced">進階</string>
     <string name="settings_category_other">其他</string>
@@ -89,7 +84,6 @@
     <string name="settings_export_summary">匯入/匯出兩儀內部文件</string>
     <string name="settings_key_shutdown">關機</string>
     <string name="settings_key_reboot">重啟</string>
-    <string name="replace_rom_unofficial_tips">抱歉，請修改 ROM 描述資訊，並且儘量不要使用官方作者的名字 :)</string>
     <string name="no_rootfs_title">未安裝 ROM</string>
     <string name="no_rootfs_message">請匯入 rootfs 以繼續</string>
     <string name="no_rootfs_guide">未安裝 ROM。請前往設定 → 進階 → 匯入 Rootfs，選擇一個 rootfs.7z 文件開始使用。</string>

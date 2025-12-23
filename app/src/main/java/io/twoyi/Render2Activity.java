@@ -46,6 +46,7 @@ import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.NavUtils;
 import io.twoyi.utils.RomManager;
+import io.twoyi.utils.UIHelper;
 
 /**
  * @author weishu

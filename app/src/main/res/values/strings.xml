@@ -74,11 +74,6 @@
     <string name="confirm_for_android12" >Make sure you\'ve followed the tutorial to set it up!!Otherwise the system may fail to boot!!!</string>
     <string name="i_confirm_it">I confirm it</string>
     <string name="menu_not_show_32bit">Don\'t show 32bit apps</string>
-    <string name="settings_key_replace_rom">Replace ROM</string>
-    <string name="settings_replace_rom_summary">Boot twoyi with your custom ROM</string>
-    <string name="replace_rom_invalid">The ROM is not a valid ROM :(</string>
-    <string name="replace_rom_confirm_title">ROM confirm</string>
-    <string name="replace_rom_confirm_message">ROM author: %1$s\nROM version: %2$s\nROM desc: %3$s\n\n the ROM will be replaced in next boot.</string>
     <string name="settings_category_basic">Basic</string>
     <string name="settings_category_advanced">Advanced</string>
     <string name="settings_category_other">Other</string>
@@ -91,7 +86,6 @@
     <string name="settings_export_summary">Import/Export files in twoyi</string>
     <string name="settings_key_shutdown">Shutdown</string>
     <string name="settings_key_reboot">Reboot</string>
-    <string name="replace_rom_unofficial_tips">Sorry, please edit the rom info and avoid using official author name :)</string>
     <string name="settings_key_launch_container">Launch Container</string>
     <string name="settings_launch_container_summary">Start the Android container</string>
     <string name="settings_key_import_rootfs">Import Rootfs</string>

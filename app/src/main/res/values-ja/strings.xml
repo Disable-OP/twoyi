@@ -72,11 +72,6 @@
     <string name="confirm_for_android12" >チュートリアルに沿ってセットアップしたことを確認してください！！！そうでなければ、システムが起動しない可能性があります。</string>
     <string name="i_confirm_it">確認する</string>
     <string name="menu_not_show_32bit">32bit アプリを表示しない</string>
-    <string name="settings_key_replace_rom">ROMを置き換える</string>
-    <string name="settings_replace_rom_summary">twoyiをカスタムROMで起動</string>
-    <string name="replace_rom_invalid">このROMは有効なROMではございません :(</string>
-    <string name="replace_rom_confirm_title">ROMの確認</string>
-    <string name="replace_rom_confirm_message">ROMの作者: %1$s\nROMのバージョン: %2$s\nROMの概要: %3$s\n\n 次の起動からROMが置き換えられます。</string>
     <string name="settings_category_basic">基本</string>
     <string name="settings_category_advanced">高度</string>
     <string name="settings_category_other">その他</string>
@@ -89,7 +84,6 @@
     <string name="settings_export_summary">ファイルをtwoyiから(インポート/エクスポート)</string>
     <string name="settings_key_shutdown">シャットダウン</string>
     <string name="settings_key_reboot">再起動</string>
-    <string name="replace_rom_unofficial_tips">申し訳ございませんが、rom情報の編集と正式な作者名の使用を避けてください。 :)</string>
     <string name="no_rootfs_title">ROMがインストールされていません</string>
     <string name="no_rootfs_message">続行するにはrootfsをインポートしてください</string>
     <string name="no_rootfs_guide">ROMがインストールされていません。設定 → 詳細設定 → Rootfsインポートに移動し、rootfs.7zファイルを選択して開始してください。</string>

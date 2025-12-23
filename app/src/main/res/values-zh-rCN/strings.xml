@@ -72,11 +72,6 @@
     <string name="confirm_for_android12">请务必确认您已经按照教程设置！！否则系统可能将无法启动！！！</string>
     <string name="i_confirm_it">我已确认</string>
     <string name="menu_not_show_32bit">不显示 32 位应用</string>
-    <string name="settings_key_replace_rom">替换 ROM</string>
-    <string name="settings_replace_rom_summary">使用自定义的 ROM 启动两仪</string>
-    <string name="replace_rom_invalid">您选择的文件不是两仪 ROM</string>
-    <string name="replace_rom_confirm_title">ROM 信息确认</string>
-    <string name="replace_rom_confirm_message">ROM 作者：%1$s\nROM 版本：%2$s\nROM 信息：%3$s\n\n重启后生效，确认？</string>
     <string name="settings_category_basic">基础</string>
     <string name="settings_category_advanced">高级</string>
     <string name="settings_category_other">其他</string>
@@ -89,7 +84,6 @@
     <string name="settings_export_summary">导入/导出两仪内部文件</string>
     <string name="settings_key_shutdown">关机</string>
     <string name="settings_key_reboot">重启</string>
-    <string name="replace_rom_unofficial_tips">抱歉，请修改 ROM 描述信息，并且尽量不要使用官方作者的名字 :)</string>
     <string name="no_rootfs_title">未安装 ROM</string>
     <string name="no_rootfs_message">请导入 rootfs 以继续</string>
     <string name="no_rootfs_guide">未安装 ROM。请前往设置 → 高级 → 导入 Rootfs，选择一个 rootfs.7z 文件开始使用。</string>
