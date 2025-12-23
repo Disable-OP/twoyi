@@ -259,9 +259,9 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     throw new SecurityException("Invalid path detected");
                 }
                 
-                // Create single tar archive with all contents
+                // Create single tar archive with all contents (preserve symlinks)
                 ProcessBuilder pb = new ProcessBuilder(
-                    "tar", "-chf", exportFilePath,
+                    "tar", "-cf", exportFilePath,
                     "-C", tempDirPath, "."
                 );
                 pb.redirectErrorStream(true);

@@ -209,10 +209,9 @@ public class ProfileManager {
                 throw new SecurityException("Invalid path detected");
             }
             
-            // Pack the source profile into tar
-            // Use -h to dereference symlinks in the profile directory itself
+            // Pack the source profile into tar (preserve symlinks)
             ProcessBuilder pb1 = new ProcessBuilder(
-                "tar", "-chf", tempTarPath,
+                "tar", "-cf", tempTarPath,
                 "-C", sourceParentPath, sourceDir.getName()
             );
             pb1.redirectErrorStream(true);
