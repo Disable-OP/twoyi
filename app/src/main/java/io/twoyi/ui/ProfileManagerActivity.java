@@ -279,7 +279,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
     }
     
     /**
-     * Copy directory recursively while preserving symlinks
+     * Copy directory recursively while preserving symlinks and handling errors gracefully
      */
     private void copyDirectoryPreservingSymlinks(File source, File target) throws IOException {
         File[] files = source.listFiles();
@@ -292,33 +292,41 @@ public class ProfileManagerActivity extends AppCompatActivity {
             Path sourcePath = file.toPath();
             Path targetPath = destFile.toPath();
             
-            // Skip socket files (file type 140000) - tar cannot archive them
             try {
-                java.nio.file.attribute.BasicFileAttributes attrs = 
-                    Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
-                                       java.nio.file.LinkOption.NOFOLLOW_LINKS);
-                if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
-                    // Skip special files like sockets, named pipes, etc.
-                    Log.d("ProfileManager", "Skipping special file: " + file.getName());
+                // Skip socket files (file type 140000) - tar cannot archive them
+                try {
+                    java.nio.file.attribute.BasicFileAttributes attrs = 
+                        Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
+                                           java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
+                        // Skip special files like sockets, named pipes, etc.
+                        Log.d("ProfileManager", "Skipping special file: " + file.getName());
+                        continue;
+                    }
+                } catch (Exception e) {
+                    Log.w("ProfileManager", "Could not check file type for: " + file.getName() + ", skipping");
                     continue;
                 }
+                
+                if (Files.isSymbolicLink(sourcePath)) {
+                    // Preserve symlink
+                    Path linkTarget = Files.readSymbolicLink(sourcePath);
+                    Files.createSymbolicLink(targetPath, linkTarget);
+                    Log.d("ProfileManager", "Created symlink: " + destFile.getName() + " -> " + linkTarget);
+                } else if (file.isDirectory()) {
+                    // Recursively copy directory
+                    destFile.mkdirs();
+                    copyDirectoryPreservingSymlinks(file, destFile);
+                } else {
+                    // Copy regular file
+                    Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                }
+            } catch (java.nio.file.AccessDeniedException e) {
+                // Soft fail on permission errors - log and continue
+                Log.w("ProfileManager", "Permission denied copying: " + file.getAbsolutePath() + ", skipping");
             } catch (Exception e) {
-                Log.w("ProfileManager", "Could not check file type for: " + file.getName() + ", skipping");
-                continue;
-            }
-            
-            if (Files.isSymbolicLink(sourcePath)) {
-                // Preserve symlink
-                Path linkTarget = Files.readSymbolicLink(sourcePath);
-                Files.createSymbolicLink(targetPath, linkTarget);
-                Log.d("ProfileManager", "Created symlink: " + destFile.getName() + " -> " + linkTarget);
-            } else if (file.isDirectory()) {
-                // Recursively copy directory
-                destFile.mkdirs();
-                copyDirectoryPreservingSymlinks(file, destFile);
-            } else {
-                // Copy regular file
-                Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                // Soft fail on other errors - log and continue
+                Log.w("ProfileManager", "Error copying: " + file.getAbsolutePath() + " - " + e.getMessage() + ", skipping");
             }
         }
     }

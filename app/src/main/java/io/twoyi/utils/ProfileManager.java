@@ -233,7 +233,7 @@ public class ProfileManager {
     }
     
     /**
-     * Copy directory recursively while preserving symlinks and skipping sockets
+     * Copy directory recursively while preserving symlinks and skipping sockets - soft fail on errors
      */
     private static void copyDirectoryPreservingSymlinks(File source, File target) throws IOException {
         File[] files = source.listFiles();
@@ -246,33 +246,41 @@ public class ProfileManager {
             Path sourcePath = file.toPath();
             Path targetPath = destFile.toPath();
             
-            // Skip socket files (file type 140000) - tar cannot archive them
             try {
-                java.nio.file.attribute.BasicFileAttributes attrs = 
-                    Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
-                                       java.nio.file.LinkOption.NOFOLLOW_LINKS);
-                if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
-                    // Skip special files like sockets, named pipes, etc.
-                    Log.d(TAG, "Skipping special file: " + file.getName());
+                // Skip socket files (file type 140000) - tar cannot archive them
+                try {
+                    java.nio.file.attribute.BasicFileAttributes attrs = 
+                        Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
+                                           java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
+                        // Skip special files like sockets, named pipes, etc.
+                        Log.d(TAG, "Skipping special file: " + file.getName());
+                        continue;
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Could not check file type for: " + file.getName() + ", skipping");
                     continue;
                 }
+                
+                if (Files.isSymbolicLink(sourcePath)) {
+                    // Preserve symlink
+                    Path linkTarget = Files.readSymbolicLink(sourcePath);
+                    Files.createSymbolicLink(targetPath, linkTarget);
+                    Log.d(TAG, "Created symlink: " + destFile.getName() + " -> " + linkTarget);
+                } else if (file.isDirectory()) {
+                    // Recursively copy directory
+                    destFile.mkdirs();
+                    copyDirectoryPreservingSymlinks(file, destFile);
+                } else {
+                    // Copy regular file
+                    Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                }
+            } catch (java.nio.file.AccessDeniedException e) {
+                // Soft fail on permission errors - log and continue
+                Log.w(TAG, "Permission denied copying: " + file.getAbsolutePath() + ", skipping");
             } catch (Exception e) {
-                Log.w(TAG, "Could not check file type for: " + file.getName() + ", skipping");
-                continue;
-            }
-            
-            if (Files.isSymbolicLink(sourcePath)) {
-                // Preserve symlink
-                Path linkTarget = Files.readSymbolicLink(sourcePath);
-                Files.createSymbolicLink(targetPath, linkTarget);
-                Log.d(TAG, "Created symlink: " + destFile.getName() + " -> " + linkTarget);
-            } else if (file.isDirectory()) {
-                // Recursively copy directory
-                destFile.mkdirs();
-                copyDirectoryPreservingSymlinks(file, destFile);
-            } else {
-                // Copy regular file
-                Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                // Soft fail on other errors - log and continue
+                Log.w(TAG, "Error copying: " + file.getAbsolutePath() + " - " + e.getMessage() + ", skipping");
             }
         }
     }
