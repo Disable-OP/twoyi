@@ -14,6 +14,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
@@ -519,7 +520,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 }
             } catch (NumberFormatException e) {
                 // Skip malformed numeric values
-                android.util.Log.w("ProfileManager", "Skipping malformed preference value in line: " + line, e);
+                Log.w("ProfileManager", "Skipping malformed preference value in line: " + line, e);
             }
         }
 
@@ -576,7 +577,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     Files.delete(sourcePath);
                 } else if (file.isDirectory()) {
                     moveDirectory(file, targetFile);
-                    file.delete();
+                    Files.delete(sourcePath);
                 } else {
                     Files.move(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 }
