@@ -9,9 +9,12 @@ package io.twoyi.ui;
 import android.app.Activity;
 import android.app.ProgressDialog;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
@@ -31,10 +34,14 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
 import io.twoyi.R;
+import io.twoyi.utils.IOUtils;
 import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.RomManager;
 import io.twoyi.utils.UIHelper;
@@ -192,44 +199,136 @@ public class ProfileManagerActivity extends AppCompatActivity {
 
         UIHelper.defer().when(() -> {
             File profileDir = ProfileManager.getProfileDir(this, profileName);
+            File profileRootfs = ProfileManager.getProfileRootfsDir(this, profileName);
             File exportFile = new File(getCacheDir(), "profile_" + profileName + "_export.tar");
+            File tempDir = new File(getCacheDir(), "profile_export_temp");
             
-            String profileDirPath = profileDir.getAbsolutePath();
-            String exportFilePath = exportFile.getAbsolutePath();
-            String parentPath = profileDir.getParent();
-            
-            if (profileDirPath.contains(";") || profileDirPath.contains("&") || 
-                exportFilePath.contains(";") || exportFilePath.contains("&")) {
-                throw new SecurityException("Invalid path detected");
+            // Clean up temp directory if it exists
+            if (tempDir.exists()) {
+                IOUtils.deleteDirectory(tempDir);
             }
+            tempDir.mkdirs();
             
-            ProcessBuilder pb = new ProcessBuilder(
-                "tar", "-cf", exportFilePath,
-                "-C", parentPath, profileDir.getName()
-            );
-            Process process = pb.start();
-            int exitCode = process.waitFor();
-            
-            if (exitCode != 0) {
-                throw new IOException("tar command failed with exit code: " + exitCode);
+            try {
+                // Export SharedPreferences to XML file
+                File prefsXml = new File(tempDir, "preference.xml");
+                SharedPreferences prefs = getSharedPreferences("profile_settings_" + profileName, Context.MODE_PRIVATE);
+                exportPreferencesToXml(prefs, prefsXml);
+                
+                // Copy rootfs contents recursively to temp directory if rootfs exists
+                if (profileRootfs.exists() && profileRootfs.isDirectory()) {
+                    Log.d("ProfileManager", "Copying rootfs from: " + profileRootfs.getAbsolutePath());
+                    copyDirectoryPreservingSymlinks(profileRootfs, tempDir);
+                }
+                
+                String tempDirPath = tempDir.getAbsolutePath();
+                String exportFilePath = exportFile.getAbsolutePath();
+                
+                if (tempDirPath.contains(";") || tempDirPath.contains("&") || 
+                    exportFilePath.contains(";") || exportFilePath.contains("&")) {
+                    throw new SecurityException("Invalid path detected");
+                }
+                
+                // Create tar archive from temp directory (preserve symlinks)
+                Log.d("ProfileManager", "Creating tar archive: " + exportFilePath);
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-cf", exportFilePath,
+                    "-C", tempDirPath, "."
+                );
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+                
+                // Read any error output
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(process.getInputStream()));
+                StringBuilder output = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append("\n");
+                    Log.d("ProfileManager", "tar output: " + line);
+                }
+                
+                int exitCode = process.waitFor();
+                
+                if (exitCode != 0) {
+                    Log.e("ProfileManager", "tar create failed. Output: " + output.toString());
+                    throw new IOException("tar command failed with exit code: " + exitCode + "\nOutput: " + output.toString());
+                }
+                
+                Log.d("ProfileManager", "Export successful, tar file size: " + exportFile.length());
+                return exportFile;
+            } finally {
+                // Clean up temp directory
+                IOUtils.deleteDirectory(tempDir);
             }
-            
-            return exportFile;
         }).done(exportFile -> {
             UIHelper.dismiss(dialog);
             
+            // Share the file like log export
             Uri uri = FileProvider.getUriForFile(this, "io.twoyi.fileprovider", exportFile);
             Intent shareIntent = new Intent(Intent.ACTION_SEND);
             shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
             shareIntent.setDataAndType(uri, "application/x-tar");
             shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(shareIntent, getString(R.string.profile_export)));
-            
-            Toast.makeText(this, R.string.profile_export_success, Toast.LENGTH_SHORT).show();
         }).fail(result -> runOnUiThread(() -> {
-            Toast.makeText(this, getString(R.string.profile_export_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
-            dialog.dismiss();
+            UIHelper.dismiss(dialog);
+            Toast.makeText(this, getString(R.string.profile_export_failed, result.getMessage()), Toast.LENGTH_LONG).show();
+            Log.e("ProfileManager", "Export failed", result);
         }));
+    }
+    
+    /**
+     * Copy directory recursively while preserving symlinks and handling errors gracefully
+     */
+    private void copyDirectoryPreservingSymlinks(File source, File target) throws IOException {
+        File[] files = source.listFiles();
+        if (files == null) {
+            return;
+        }
+        
+        for (File file : files) {
+            File destFile = new File(target, file.getName());
+            Path sourcePath = file.toPath();
+            Path targetPath = destFile.toPath();
+            
+            try {
+                // Skip socket files (file type 140000) - tar cannot archive them
+                try {
+                    java.nio.file.attribute.BasicFileAttributes attrs = 
+                        Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
+                                           java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
+                        // Skip special files like sockets, named pipes, etc.
+                        Log.d("ProfileManager", "Skipping special file: " + file.getName());
+                        continue;
+                    }
+                } catch (Exception e) {
+                    Log.w("ProfileManager", "Could not check file type for: " + file.getName() + ", skipping");
+                    continue;
+                }
+                
+                if (Files.isSymbolicLink(sourcePath)) {
+                    // Preserve symlink
+                    Path linkTarget = Files.readSymbolicLink(sourcePath);
+                    Files.createSymbolicLink(targetPath, linkTarget);
+                    Log.d("ProfileManager", "Created symlink: " + destFile.getName() + " -> " + linkTarget);
+                } else if (file.isDirectory()) {
+                    // Recursively copy directory
+                    destFile.mkdirs();
+                    copyDirectoryPreservingSymlinks(file, destFile);
+                } else {
+                    // Copy regular file
+                    Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                }
+            } catch (java.nio.file.AccessDeniedException e) {
+                // Soft fail on permission errors - log and continue
+                Log.w("ProfileManager", "Permission denied copying: " + file.getAbsolutePath() + ", skipping");
+            } catch (Exception e) {
+                // Soft fail on other errors - log and continue
+                Log.w("ProfileManager", "Error copying: " + file.getAbsolutePath() + " - " + e.getMessage() + ", skipping");
+            }
+        }
     }
 
     private void confirmDelete(String profileName) {
@@ -304,42 +403,85 @@ public class ProfileManagerActivity extends AppCompatActivity {
 
         UIHelper.defer().when(() -> {
             File profileDir = ProfileManager.getProfileDir(this, profileName);
+            File profileRootfs = ProfileManager.getProfileRootfsDir(this, profileName);
             
             if (profileDir.exists()) {
                 throw new IOException("Profile already exists: " + profileName);
             }
 
             File tempFile = new File(getCacheDir(), "profile_import.tar");
+            File tempExtractDir = new File(getCacheDir(), "profile_import_temp");
 
-            ContentResolver contentResolver = getContentResolver();
-            try (InputStream inputStream = contentResolver.openInputStream(uri);
-                 OutputStream os = new FileOutputStream(tempFile)) {
-                byte[] buffer = new byte[8192];
-                int count;
-                while ((count = inputStream.read(buffer)) > 0) {
-                    os.write(buffer, 0, count);
+            // Clean up temp extract directory if it exists
+            if (tempExtractDir.exists()) {
+                IOUtils.deleteDirectory(tempExtractDir);
+            }
+            tempExtractDir.mkdirs();
+
+            try {
+                // Copy uploaded file to temp
+                ContentResolver contentResolver = getContentResolver();
+                try (InputStream inputStream = contentResolver.openInputStream(uri);
+                     OutputStream os = new FileOutputStream(tempFile)) {
+                    byte[] buffer = new byte[8192];
+                    int count;
+                    while ((count = inputStream.read(buffer)) > 0) {
+                        os.write(buffer, 0, count);
+                    }
                 }
+
+                String tempFilePath = tempFile.getAbsolutePath();
+                String tempExtractPath = tempExtractDir.getAbsolutePath();
+                
+                if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
+                    tempExtractPath.contains(";") || tempExtractPath.contains("&")) {
+                    throw new SecurityException("Invalid path detected");
+                }
+                
+                // Extract tar to temp directory
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-xf", tempFilePath,
+                    "-C", tempExtractPath
+                );
+                Process process = pb.start();
+                int exitCode = process.waitFor();
+
+                if (exitCode != 0) {
+                    throw new IOException("tar extract failed with exit code: " + exitCode);
+                }
+
+                // Create profile directory structure
+                profileDir.mkdirs();
+                profileRootfs.mkdirs();
+
+                // Import preferences from XML if it exists
+                File prefsXml = new File(tempExtractDir, "preference.xml");
+                if (prefsXml.exists()) {
+                    SharedPreferences prefs = getSharedPreferences("profile_settings_" + profileName, Context.MODE_PRIVATE);
+                    importPreferencesFromXml(prefsXml, prefs);
+                }
+
+                // Move all files except preference.xml to rootfs
+                File[] files = tempExtractDir.listFiles();
+                if (files != null) {
+                    for (File file : files) {
+                        if (!file.getName().equals("preference.xml")) {
+                            File targetFile = new File(profileRootfs, file.getName());
+                            if (file.isDirectory()) {
+                                moveDirectory(file, targetFile);
+                            } else {
+                                Files.move(file.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                            }
+                        }
+                    }
+                }
+
+                return true;
+            } finally {
+                // Clean up temp files
+                tempFile.delete();
+                IOUtils.deleteDirectory(tempExtractDir);
             }
-
-            profileDir.mkdirs();
-
-            String tempFilePath = tempFile.getAbsolutePath();
-            String profilesPath = ProfileManager.getProfilesDir(this).getAbsolutePath();
-            
-            if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
-                profilesPath.contains(";") || profilesPath.contains("&")) {
-                throw new SecurityException("Invalid path detected");
-            }
-            
-            ProcessBuilder pb = new ProcessBuilder(
-                "tar", "-xf", tempFilePath,
-                "-C", profilesPath
-            );
-            Process process = pb.start();
-            int exitCode = process.waitFor();
-
-            tempFile.delete();
-            return exitCode == 0;
         }).done(result -> {
             UIHelper.dismiss(dialog);
             if (result) {
@@ -352,6 +494,152 @@ public class ProfileManagerActivity extends AppCompatActivity {
             Toast.makeText(this, getString(R.string.profile_import_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
             dialog.dismiss();
         }));
+    }
+
+    /**
+     * Export SharedPreferences to XML file
+     */
+    private void exportPreferencesToXml(SharedPreferences prefs, File xmlFile) throws IOException {
+        StringBuilder xml = new StringBuilder();
+        xml.append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+        xml.append("<preferences>\n");
+        
+        for (String key : prefs.getAll().keySet()) {
+            Object value = prefs.getAll().get(key);
+            if (value instanceof Boolean) {
+                xml.append("  <boolean name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+            } else if (value instanceof String) {
+                String escapedValue = ((String) value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+                xml.append("  <string name=\"").append(key).append("\">").append(escapedValue).append("</string>\n");
+            } else if (value instanceof Integer) {
+                xml.append("  <int name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+            } else if (value instanceof Long) {
+                xml.append("  <long name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+            } else if (value instanceof Float) {
+                xml.append("  <float name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+            }
+        }
+        
+        xml.append("</preferences>\n");
+        IOUtils.writeContent(xmlFile, xml.toString());
+    }
+
+    /**
+     * Import SharedPreferences from XML file
+     */
+    private void importPreferencesFromXml(File xmlFile, SharedPreferences prefs) throws IOException {
+        String xmlContent = IOUtils.readContent(xmlFile);
+        if (xmlContent == null || xmlContent.isEmpty()) {
+            return;
+        }
+
+        SharedPreferences.Editor editor = prefs.edit();
+        editor.clear();
+
+        // Simple XML parsing (avoiding full XML parser for minimal dependencies)
+        String[] lines = xmlContent.split("\n");
+        for (String line : lines) {
+            line = line.trim();
+            
+            try {
+                if (line.startsWith("<boolean")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putBoolean(name, Boolean.parseBoolean(value));
+                    }
+                } else if (line.startsWith("<string")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractTagContent(line);
+                    if (name != null && value != null) {
+                        // Unescape XML entities (order matters: do &amp; last to avoid re-escaping)
+                        value = value.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&");
+                        editor.putString(name, value);
+                    }
+                } else if (line.startsWith("<int")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putInt(name, Integer.parseInt(value));
+                    }
+                } else if (line.startsWith("<long")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putLong(name, Long.parseLong(value));
+                    }
+                } else if (line.startsWith("<float")) {
+                    String name = extractAttribute(line, "name");
+                    String value = extractAttribute(line, "value");
+                    if (name != null && value != null) {
+                        editor.putFloat(name, Float.parseFloat(value));
+                    }
+                }
+            } catch (NumberFormatException e) {
+                // Skip malformed numeric values
+                Log.w("ProfileManager", "Skipping malformed preference value in line: " + line, e);
+            }
+        }
+
+        editor.commit();
+    }
+
+    /**
+     * Extract attribute value from XML tag
+     */
+    private String extractAttribute(String line, String attributeName) {
+        String pattern = attributeName + "=\"";
+        int start = line.indexOf(pattern);
+        if (start == -1) {
+            return null;
+        }
+        start += pattern.length();
+        int end = line.indexOf("\"", start);
+        if (end == -1) {
+            return null;
+        }
+        return line.substring(start, end);
+    }
+
+    /**
+     * Extract content from XML tag
+     */
+    private String extractTagContent(String line) {
+        int start = line.indexOf(">") + 1;
+        int end = line.indexOf("<", start);
+        if (start <= 0 || end == -1) {
+            return null;
+        }
+        return line.substring(start, end);
+    }
+
+    /**
+     * Move directory recursively, preserving symlinks
+     */
+    private void moveDirectory(File source, File target) throws IOException {
+        if (!target.exists()) {
+            target.mkdirs();
+        }
+
+        File[] files = source.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                File targetFile = new File(target, file.getName());
+                Path sourcePath = file.toPath();
+                Path targetPath = targetFile.toPath();
+                
+                if (Files.isSymbolicLink(sourcePath)) {
+                    Path linkTarget = Files.readSymbolicLink(sourcePath);
+                    Files.createSymbolicLink(targetPath, linkTarget);
+                    Files.delete(sourcePath);
+                } else if (file.isDirectory()) {
+                    moveDirectory(file, targetFile);
+                    Files.delete(sourcePath);
+                } else {
+                    Files.move(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
     }
 
     private class ProfilesAdapter extends BaseExpandableListAdapter {

@@ -11,24 +11,16 @@ import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.os.Build;
 import android.os.Process;
-import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 
-import com.hzy.libp7zip.P7ZipApi;
 import com.topjohnwu.superuser.Shell;
 
-import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
-import org.apache.commons.compress.archivers.sevenz.SevenZFile;
-
-import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -180,25 +172,6 @@ public final class RomManager {
         return new File(applicationInfo.nativeLibraryDir, LOADER_FILE).getAbsolutePath();
     }
 
-    public static RomInfo getRomInfo(File rom) {
-        try (SevenZFile zFile = new SevenZFile(rom)) {
-
-            SevenZArchiveEntry entry;
-
-            while ((entry = zFile.getNextEntry()) != null) {
-                if (entry.getName().equals("rootfs/rom.ini")) {
-                    byte[] content = new byte[(int) entry.getSize()];
-                    zFile.read(content, 0, content.length);
-                    ByteArrayInputStream bais = new ByteArrayInputStream(content);
-                    return getRomInfo(bais);
-                }
-            }
-        } catch (Throwable e) {
-            LogEvents.trackError(e);
-        }
-        return DEFAULT_ROM_INFO;
-    }
-
 
 
     public static void extractRootfs(Context context, boolean romExist, boolean needsUpgrade, boolean forceInstall, boolean use3rdRom) {
@@ -221,17 +194,6 @@ public final class RomManager {
         System.exit(0);
         Process.killProcess(Process.myPid());
     }
-
-
-
-    public static int extractRootfs(Context context, File rootfs7z) {
-
-        int cpu = Runtime.getRuntime().availableProcessors();
-        return P7ZipApi.executeCommand(String.format(Locale.US, "7z x -mmt=%d -aoa '%s' '-o%s'",
-                cpu, rootfs7z, context.getDataDir()));
-    }
-
-
 
     public static File getRootfsDir(Context context) {
         return new File(context.getDataDir(), "rootfs");

@@ -325,7 +325,13 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             String activeProfile = ProfileManager.getActiveProfile(this);
             File profileRootfsDir = ProfileManager.getProfileRootfsDir(this, activeProfile);
             
-            File tempFile = new File(getCacheDir(), "rootfs_import.7z");
+            // Clear existing rootfs
+            if (profileRootfsDir.exists()) {
+                io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
+            }
+            profileRootfsDir.mkdirs();
+            
+            File tempFile = new File(getCacheDir(), "rootfs_import.tar");
 
             ContentResolver contentResolver = getContentResolver();
             try (InputStream inputStream = contentResolver.openInputStream(uri);
@@ -337,8 +343,22 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                 }
             }
 
-            // Extract ROM to profile rootfs
-            int exitCode = RomManager.extractRootfs(this, tempFile);
+            String tempFilePath = tempFile.getAbsolutePath();
+            String rootfsPath = profileRootfsDir.getAbsolutePath();
+            
+            if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
+                rootfsPath.contains(";") || rootfsPath.contains("&")) {
+                throw new SecurityException("Invalid path detected");
+            }
+            
+            // Extract tar to rootfs directory
+            ProcessBuilder pb = new ProcessBuilder(
+                "tar", "-xf", tempFilePath,
+                "-C", rootfsPath
+            );
+            Process process = pb.start();
+            int exitCode = process.waitFor();
+            
             tempFile.delete();
             
             if (exitCode == 0) {

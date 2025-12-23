@@ -254,7 +254,13 @@ public class SettingsActivity extends AppCompatActivity {
                 String activeProfile = ProfileManager.getActiveProfile(activity);
                 File profileRootfsDir = ProfileManager.getProfileRootfsDir(activity, activeProfile);
                 
-                File tempFile = new File(activity.getCacheDir(), "rootfs_import.7z");
+                // Clear existing rootfs
+                if (profileRootfsDir.exists()) {
+                    io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
+                }
+                profileRootfsDir.mkdirs();
+                
+                File tempFile = new File(activity.getCacheDir(), "rootfs_import.tar");
 
                 ContentResolver contentResolver = activity.getContentResolver();
                 try (InputStream inputStream = contentResolver.openInputStream(uri);
@@ -266,8 +272,22 @@ public class SettingsActivity extends AppCompatActivity {
                     }
                 }
 
-                // Extract ROM to profile rootfs
-                int exitCode = RomManager.extractRootfs(activity, tempFile);
+                String tempFilePath = tempFile.getAbsolutePath();
+                String rootfsPath = profileRootfsDir.getAbsolutePath();
+                
+                if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
+                    rootfsPath.contains(";") || rootfsPath.contains("&")) {
+                    throw new SecurityException("Invalid path detected");
+                }
+                
+                // Extract tar to rootfs directory
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-xf", tempFilePath,
+                    "-C", rootfsPath
+                );
+                Process process = pb.start();
+                int exitCode = process.waitFor();
+                
                 tempFile.delete();
                 
                 if (exitCode == 0) {

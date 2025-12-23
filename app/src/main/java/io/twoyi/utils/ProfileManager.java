@@ -176,7 +176,7 @@ public class ProfileManager {
     }
 
     /**
-     * Copy a profile
+     * Copy a profile - copies files manually then creates tar
      */
     public static boolean copyProfile(Context context, String sourceName, String targetName) {
         if (targetName == null || targetName.trim().isEmpty()) {
@@ -197,8 +197,12 @@ public class ProfileManager {
         }
 
         try {
-            // Copy the directory
-            copyDirectory(sourceDir, targetDir);
+            // Create target directory
+            targetDir.mkdirs();
+            
+            // Copy directory contents manually (preserving symlinks, skipping sockets)
+            Log.d(TAG, "Copying profile from " + sourceDir + " to " + targetDir);
+            copyDirectoryPreservingSymlinks(sourceDir, targetDir);
 
             // Copy settings
             SharedPreferences sourcePrefs = context.getSharedPreferences(
@@ -218,17 +222,71 @@ public class ProfileManager {
                 }
             }
 
+            Log.d(TAG, "Profile copied successfully");
             return true;
-        } catch (IOException e) {
+        } catch (Exception e) {
             Log.e(TAG, "Failed to copy profile", e);
             // Clean up partial copy
             IOUtils.deleteDirectory(targetDir);
             return false;
         }
     }
+    
+    /**
+     * Copy directory recursively while preserving symlinks and skipping sockets - soft fail on errors
+     */
+    private static void copyDirectoryPreservingSymlinks(File source, File target) throws IOException {
+        File[] files = source.listFiles();
+        if (files == null) {
+            return;
+        }
+        
+        for (File file : files) {
+            File destFile = new File(target, file.getName());
+            Path sourcePath = file.toPath();
+            Path targetPath = destFile.toPath();
+            
+            try {
+                // Skip socket files (file type 140000) - tar cannot archive them
+                try {
+                    java.nio.file.attribute.BasicFileAttributes attrs = 
+                        Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
+                                           java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                    if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
+                        // Skip special files like sockets, named pipes, etc.
+                        Log.d(TAG, "Skipping special file: " + file.getName());
+                        continue;
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Could not check file type for: " + file.getName() + ", skipping");
+                    continue;
+                }
+                
+                if (Files.isSymbolicLink(sourcePath)) {
+                    // Preserve symlink
+                    Path linkTarget = Files.readSymbolicLink(sourcePath);
+                    Files.createSymbolicLink(targetPath, linkTarget);
+                    Log.d(TAG, "Created symlink: " + destFile.getName() + " -> " + linkTarget);
+                } else if (file.isDirectory()) {
+                    // Recursively copy directory
+                    destFile.mkdirs();
+                    copyDirectoryPreservingSymlinks(file, destFile);
+                } else {
+                    // Copy regular file
+                    Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+                }
+            } catch (java.nio.file.AccessDeniedException e) {
+                // Soft fail on permission errors - log and continue
+                Log.w(TAG, "Permission denied copying: " + file.getAbsolutePath() + ", skipping");
+            } catch (Exception e) {
+                // Soft fail on other errors - log and continue
+                Log.w(TAG, "Error copying: " + file.getAbsolutePath() + " - " + e.getMessage() + ", skipping");
+            }
+        }
+    }
 
     /**
-     * Helper to copy a directory recursively
+     * Helper to copy a directory recursively, preserving symlinks
      */
     private static void copyDirectory(File source, File target) throws IOException {
         if (!target.exists()) {
@@ -239,10 +297,18 @@ public class ProfileManager {
         if (files != null) {
             for (File file : files) {
                 File targetFile = new File(target, file.getName());
-                if (file.isDirectory()) {
+                Path sourcePath = file.toPath();
+                Path targetPath = targetFile.toPath();
+                
+                // Handle symlinks specially
+                if (Files.isSymbolicLink(sourcePath)) {
+                    // Read the symlink target and create a new symlink
+                    Path linkTarget = Files.readSymbolicLink(sourcePath);
+                    Files.createSymbolicLink(targetPath, linkTarget);
+                } else if (file.isDirectory()) {
                     copyDirectory(file, targetFile);
                 } else {
-                    Files.copy(file.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
         }
