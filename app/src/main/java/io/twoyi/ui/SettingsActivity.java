@@ -86,6 +86,11 @@ public class SettingsActivity extends AppCompatActivity {
 
     public static class SettingsFragment extends PreferenceFragment {
         
+        // Validation constants
+        private static final int MAX_DISPLAY_DIMENSION = 4096;
+        private static final int MAX_DPI = 640;
+        private static final int MIN_VALUE = 1;
+        
         @Override
         public void onCreate(@Nullable Bundle savedInstanceState) {
             super.onCreate(savedInstanceState);
@@ -137,13 +142,13 @@ public class SettingsActivity extends AppCompatActivity {
             displayWidthPref.setOnPreferenceChangeListener((preference, newValue) -> {
                 try {
                     int width = Integer.parseInt(newValue.toString());
-                    if (width > 0 && width <= 4096) {
+                    if (width >= MIN_VALUE && width <= MAX_DISPLAY_DIMENSION) {
                         ProfileSettings.setDisplayWidth(getActivity(), width);
                         displayWidthPref.setSummary("Virtual display width in pixels (current: " + width + ")");
-                        Toast.makeText(getActivity(), "Display settings will take effect after reboot", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
-                        Toast.makeText(getActivity(), "Width must be between 1 and 4096", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), "Width must be between " + MIN_VALUE + " and " + MAX_DISPLAY_DIMENSION, Toast.LENGTH_SHORT).show();
                         return false;
                     }
                 } catch (NumberFormatException e) {
@@ -157,13 +162,13 @@ public class SettingsActivity extends AppCompatActivity {
             displayHeightPref.setOnPreferenceChangeListener((preference, newValue) -> {
                 try {
                     int height = Integer.parseInt(newValue.toString());
-                    if (height > 0 && height <= 4096) {
+                    if (height >= MIN_VALUE && height <= MAX_DISPLAY_DIMENSION) {
                         ProfileSettings.setDisplayHeight(getActivity(), height);
                         displayHeightPref.setSummary("Virtual display height in pixels (current: " + height + ")");
-                        Toast.makeText(getActivity(), "Display settings will take effect after reboot", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
-                        Toast.makeText(getActivity(), "Height must be between 1 and 4096", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), "Height must be between " + MIN_VALUE + " and " + MAX_DISPLAY_DIMENSION, Toast.LENGTH_SHORT).show();
                         return false;
                     }
                 } catch (NumberFormatException e) {
@@ -177,13 +182,13 @@ public class SettingsActivity extends AppCompatActivity {
             displayDpiPref.setOnPreferenceChangeListener((preference, newValue) -> {
                 try {
                     int dpi = Integer.parseInt(newValue.toString());
-                    if (dpi > 0 && dpi <= 640) {
+                    if (dpi >= MIN_VALUE && dpi <= MAX_DPI) {
                         ProfileSettings.setDisplayDpi(getActivity(), dpi);
                         displayDpiPref.setSummary("Virtual display DPI (current: " + dpi + ")");
-                        Toast.makeText(getActivity(), "Display settings will take effect after reboot", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
-                        Toast.makeText(getActivity(), "DPI must be between 1 and 640", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), "DPI must be between " + MIN_VALUE + " and " + MAX_DPI, Toast.LENGTH_SHORT).show();
                         return false;
                     }
                 } catch (NumberFormatException e) {
