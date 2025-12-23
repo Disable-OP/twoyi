@@ -6,5 +6,6 @@
 
 <paths>
     <cache-path name="twoyi_cache" path="."/>
+    <files-path name="twoyi_files" path="."/>
     <root-path name="root" path="." />
 </paths>

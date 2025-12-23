@@ -90,6 +90,13 @@
     <string name="settings_launch_container_summary">Start the Android container</string>
     <string name="settings_key_verbose_logging">Verbose Logging</string>
     <string name="settings_verbose_logging_summary">Enable detailed logging (default: ON)</string>
+    <string name="settings_key_display_width">Display Width</string>
+    <string name="settings_display_width_summary">Virtual display width in pixels (default: 1080)</string>
+    <string name="settings_key_display_height">Display Height</string>
+    <string name="settings_display_height_summary">Virtual display height in pixels (default: 1920)</string>
+    <string name="settings_key_display_dpi">Display DPI</string>
+    <string name="settings_display_dpi_summary">Virtual display DPI (default: 160)</string>
+    <string name="settings_display_change_reboot">Display settings will take effect after reboot</string>
     <string name="settings_key_select_rom">Select ROM</string>
     <string name="settings_select_rom_summary">Import a ROM file for the active profile</string>
     <string name="settings_key_import_rootfs">Import Rootfs</string>

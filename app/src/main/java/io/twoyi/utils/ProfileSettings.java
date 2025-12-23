@@ -1,3 +1,10 @@
+// Copyright Disclaimer: AI-Generated Content
+// This file was created by GitHub Copilot, an AI coding assistant.
+// AI-generated content is not subject to copyright protection and is provided
+// without any warranty, express or implied, including warranties of merchantability,
+// fitness for a particular purpose, or non-infringement.
+// Use at your own risk.
+
 /*
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -20,6 +27,9 @@ public class ProfileSettings {
     
     // Setting keys
     public static final String VERBOSE_LOGGING = "verbose_logging";
+    public static final String DISPLAY_WIDTH = "display_width";
+    public static final String DISPLAY_HEIGHT = "display_height";
+    public static final String DISPLAY_DPI = "display_dpi";
 
     /**
      * Get SharedPreferences for the active profile
@@ -104,5 +114,47 @@ public class ProfileSettings {
      */
     public static void setVerboseLogging(Context context, boolean enabled) {
         setBoolean(context, VERBOSE_LOGGING, enabled);
+    }
+
+    /**
+     * Get display width for active profile (default: 1080)
+     */
+    public static int getDisplayWidth(Context context) {
+        return getInt(context, DISPLAY_WIDTH, 1080);
+    }
+
+    /**
+     * Set display width for active profile
+     */
+    public static void setDisplayWidth(Context context, int width) {
+        setInt(context, DISPLAY_WIDTH, width);
+    }
+
+    /**
+     * Get display height for active profile (default: 1920)
+     */
+    public static int getDisplayHeight(Context context) {
+        return getInt(context, DISPLAY_HEIGHT, 1920);
+    }
+
+    /**
+     * Set display height for active profile
+     */
+    public static void setDisplayHeight(Context context, int height) {
+        setInt(context, DISPLAY_HEIGHT, height);
+    }
+
+    /**
+     * Get display DPI for active profile (default: 160)
+     */
+    public static int getDisplayDpi(Context context) {
+        return getInt(context, DISPLAY_DPI, 160);
+    }
+
+    /**
+     * Set display DPI for active profile
+     */
+    public static void setDisplayDpi(Context context, int dpi) {
+        setInt(context, DISPLAY_DPI, dpi);
     }
 }

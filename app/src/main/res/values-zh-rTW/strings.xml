@@ -88,6 +88,13 @@
     <string name="settings_launch_container_summary">啟動 Android 容器</string>
     <string name="settings_key_verbose_logging">詳細日誌</string>
     <string name="settings_verbose_logging_summary">啟用詳細日誌記錄（預設：開啟）</string>
+    <string name="settings_key_display_width">顯示寬度</string>
+    <string name="settings_display_width_summary">虛擬顯示寬度（像素）（預設：1080）</string>
+    <string name="settings_key_display_height">顯示高度</string>
+    <string name="settings_display_height_summary">虛擬顯示高度（像素）（預設：1920）</string>
+    <string name="settings_key_display_dpi">顯示 DPI</string>
+    <string name="settings_display_dpi_summary">虛擬顯示 DPI（預設：160）</string>
+    <string name="settings_display_change_reboot">顯示設定將在重啟後生效</string>
     <string name="settings_key_select_rom">選擇 ROM</string>
     <string name="settings_select_rom_summary">為當前配置文件匯入 ROM 文件</string>
     <string name="settings_key_import_rootfs">匯入 Rootfs</string>

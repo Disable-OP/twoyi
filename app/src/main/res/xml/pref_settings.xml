@@ -45,6 +45,27 @@
             android:summary="@string/settings_verbose_logging_summary"
             android:defaultValue="true" />
 
+        <EditTextPreference
+            android:key="@string/settings_key_display_width"
+            android:title="@string/settings_key_display_width"
+            android:summary="@string/settings_display_width_summary"
+            android:defaultValue="1080"
+            android:inputType="number" />
+
+        <EditTextPreference
+            android:key="@string/settings_key_display_height"
+            android:title="@string/settings_key_display_height"
+            android:summary="@string/settings_display_height_summary"
+            android:defaultValue="1920"
+            android:inputType="number" />
+
+        <EditTextPreference
+            android:key="@string/settings_key_display_dpi"
+            android:title="@string/settings_key_display_dpi"
+            android:summary="@string/settings_display_dpi_summary"
+            android:defaultValue="160"
+            android:inputType="number" />
+
         <Preference
             android:key="@string/settings_key_select_rom"
             android:summary="@string/settings_select_rom_summary"

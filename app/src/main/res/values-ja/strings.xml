@@ -88,6 +88,13 @@
     <string name="settings_launch_container_summary">Androidコンテナを起動</string>
     <string name="settings_key_verbose_logging">詳細ログ</string>
     <string name="settings_verbose_logging_summary">詳細ログを有効にする（デフォルト：オン）</string>
+    <string name="settings_key_display_width">表示幅</string>
+    <string name="settings_display_width_summary">仮想ディスプレイの幅（ピクセル）（デフォルト：1080）</string>
+    <string name="settings_key_display_height">表示高さ</string>
+    <string name="settings_display_height_summary">仮想ディスプレイの高さ（ピクセル）（デフォルト：1920）</string>
+    <string name="settings_key_display_dpi">ディスプレイ DPI</string>
+    <string name="settings_display_dpi_summary">仮想ディスプレイの DPI（デフォルト：160）</string>
+    <string name="settings_display_change_reboot">ディスプレイ設定は再起動後に有効になります</string>
     <string name="settings_key_select_rom">ROM選択</string>
     <string name="settings_select_rom_summary">現在のプロファイルにROMファイルをインポート</string>
     <string name="settings_key_import_rootfs">Rootfsインポート</string>

@@ -36,6 +36,7 @@ import android.view.SurfaceView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -54,6 +55,7 @@ import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.NavUtils;
 import io.twoyi.utils.ProfileManager;
+import io.twoyi.utils.ProfileSettings;
 import io.twoyi.utils.RomManager;
 import io.twoyi.utils.UIHelper;
 
@@ -74,30 +76,50 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private View mLoadingLayout;
     private View mBootLogView;
 
+    private int mVirtualDisplayWidth;
+    private int mVirtualDisplayHeight;
+    private int mVirtualDisplayDpi;
+    
+    private int mSurfaceWidth;
+    private int mSurfaceHeight;
+    private int mSurfaceOffsetX;
+    private int mSurfaceOffsetY;
+
     private final AtomicBoolean mIsExtracting = new AtomicBoolean(false);
 
     private final SurfaceHolder.Callback mSurfaceCallback = new SurfaceHolder.Callback() {
         @Override
         public void surfaceCreated(@NonNull SurfaceHolder holder) {
             Surface surface = holder.getSurface();
+            
+            // Calculate proper DPI based on physical screen and virtual display scaling
             WindowManager windowManager = getWindowManager();
             Display defaultDisplay = windowManager.getDefaultDisplay();
             DisplayMetrics displayMetrics = new DisplayMetrics();
             defaultDisplay.getRealMetrics(displayMetrics);
+            
+            // Calculate the scaling factor between physical and virtual display
+            float scaleX = (float) displayMetrics.widthPixels / (float) mVirtualDisplayWidth;
+            float scaleY = (float) displayMetrics.heightPixels / (float) mVirtualDisplayHeight;
+            
+            // Use the physical DPI scaled appropriately for the virtual display
+            // This ensures proper scaling when virtual DPI differs from physical DPI
+            float xdpi = displayMetrics.xdpi * scaleX * mVirtualDisplayDpi / displayMetrics.densityDpi;
+            float ydpi = displayMetrics.ydpi * scaleY * mVirtualDisplayDpi / displayMetrics.densityDpi;
 
-            float xdpi = displayMetrics.xdpi;
-            float ydpi = displayMetrics.ydpi;
+            Renderer.init(surface, RomManager.getLoaderPath(getApplicationContext()), 
+                    mVirtualDisplayWidth, mVirtualDisplayHeight, xdpi, ydpi, (int) getBestFps());
 
-            Renderer.init(surface, RomManager.getLoaderPath(getApplicationContext()), xdpi, ydpi, (int) getBestFps());
-
-            Log.i(TAG, "surfaceCreated");
+            Log.i(TAG, "surfaceCreated with virtual display: " + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight + 
+                    " @ " + mVirtualDisplayDpi + " DPI, calculated xdpi=" + xdpi + ", ydpi=" + ydpi);
         }
 
         @Override
         public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
             Surface surface = holder.getSurface();
-            Renderer.resetWindow(surface, 0, 0, mSurfaceView.getWidth(), mSurfaceView.getHeight());
-            Log.i(TAG, "surfaceChanged: " + mSurfaceView.getWidth() + "x" + mSurfaceView.getHeight());
+            // Pass both physical surface dimensions and virtual framebuffer dimensions
+            Renderer.resetWindow(surface, 0, 0, width, height, mVirtualDisplayWidth, mVirtualDisplayHeight);
+            Log.i(TAG, "surfaceChanged: physical=" + width + "x" + height + ", virtual=" + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight);
         }
 
         @Override
@@ -126,11 +148,19 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         super.onCreate(savedInstanceState);
 
+        // Load virtual display settings from profile
+        mVirtualDisplayWidth = ProfileSettings.getDisplayWidth(this);
+        mVirtualDisplayHeight = ProfileSettings.getDisplayHeight(this);
+        mVirtualDisplayDpi = ProfileSettings.getDisplayDpi(this);
+
         setContentView(R.layout.ac_render);
         mRootView = findViewById(R.id.root);
 
         mSurfaceView = new SurfaceView(this);
         mSurfaceView.getHolder().addCallback(mSurfaceCallback);
+
+        // Size and center the SurfaceView based on virtual display dimensions
+        setupSurfaceViewLayout();
 
         mLoadingLayout = findViewById(R.id.loadingLayout);
         mLoadingView = findViewById(R.id.loading);
@@ -154,6 +184,51 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         // we don't support state restore, just reboot.
         finish();
         RomManager.reboot(this);
+    }
+
+    /**
+     * Setup the SurfaceView layout to fit and center the virtual display
+     */
+    private void setupSurfaceViewLayout() {
+        WindowManager windowManager = getWindowManager();
+        Display defaultDisplay = windowManager.getDefaultDisplay();
+        DisplayMetrics displayMetrics = new DisplayMetrics();
+        defaultDisplay.getRealMetrics(displayMetrics);
+
+        int screenWidth = displayMetrics.widthPixels;
+        int screenHeight = displayMetrics.heightPixels;
+
+        // Calculate aspect ratios
+        float virtualAspect = (float) mVirtualDisplayWidth / (float) mVirtualDisplayHeight;
+        float screenAspect = (float) screenWidth / (float) screenHeight;
+
+        // Fit the virtual display within the screen while maintaining aspect ratio
+        if (virtualAspect > screenAspect) {
+            // Virtual display is wider - fit to width
+            mSurfaceWidth = screenWidth;
+            mSurfaceHeight = (int) (screenWidth / virtualAspect);
+            mSurfaceOffsetX = 0;
+            mSurfaceOffsetY = (screenHeight - mSurfaceHeight) / 2;
+        } else {
+            // Virtual display is taller - fit to height
+            mSurfaceHeight = screenHeight;
+            mSurfaceWidth = (int) (screenHeight * virtualAspect);
+            mSurfaceOffsetX = (screenWidth - mSurfaceWidth) / 2;
+            mSurfaceOffsetY = 0;
+        }
+
+        // Center the surface view with black letterboxing/pillarboxing
+        FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(mSurfaceWidth, mSurfaceHeight);
+        params.gravity = android.view.Gravity.CENTER;
+        mSurfaceView.setLayoutParams(params);
+        
+        // Set black background on root to provide letterboxing/pillarboxing
+        mRootView.setBackgroundColor(0xFF000000);
+
+        Log.i(TAG, "Virtual display: " + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight +
+                ", Screen: " + screenWidth + "x" + screenHeight +
+                ", Surface: " + mSurfaceWidth + "x" + mSurfaceHeight +
+                ", Offset: " + mSurfaceOffsetX + "," + mSurfaceOffsetY);
     }
 
     private void bootSystem() {
@@ -266,7 +341,25 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     @Override
     public boolean onTouch(View v, MotionEvent event) {
-        Renderer.handleTouch(event);
+        // Transform touch coordinates from surface space to virtual display space
+        // Note: event coordinates are already relative to the SurfaceView (not screen)
+        // since the touch listener is attached to mSurfaceView
+        MotionEvent transformedEvent = MotionEvent.obtain(event);
+        
+        // Calculate the transformation matrix
+        android.graphics.Matrix matrix = new android.graphics.Matrix();
+        
+        // Scale from surface dimensions to virtual display dimensions
+        // No translation needed since coordinates are already relative to SurfaceView
+        float scaleX = (float) mVirtualDisplayWidth / mSurfaceWidth;
+        float scaleY = (float) mVirtualDisplayHeight / mSurfaceHeight;
+        matrix.postScale(scaleX, scaleY);
+        
+        // Transform the event
+        transformedEvent.transform(matrix);
+        
+        Renderer.handleTouch(transformedEvent);
+        transformedEvent.recycle();
         return true;
     }
 
