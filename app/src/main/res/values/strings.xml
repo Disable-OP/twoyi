@@ -114,6 +114,8 @@
     <string name="profile_export_failed">Failed to export profile: %1$s</string>
     <string name="profile_import_success">Profile imported successfully</string>
     <string name="profile_import_failed">Failed to import profile: %1$s</string>
+    <string name="profile_from_scratch">From Scratch</string>
+    <string name="profile_from_import">From Import</string>
     <string name="export_rootfs_success">Rootfs exported successfully</string>
     <string name="export_rootfs_failed">Failed to export rootfs: %1$s</string>
     <string name="import_rootfs_success">Rootfs imported successfully. Please reboot.</string>

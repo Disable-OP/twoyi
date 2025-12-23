@@ -88,4 +88,13 @@
     <string name="no_rootfs_message">続行するにはrootfsをインポートしてください</string>
     <string name="no_rootfs_guide">ROMがインストールされていません。設定 → 詳細設定 → Rootfsインポートに移動し、rootfs.7zファイルを選択して開始してください。</string>
     <string name="go_to_settings">設定へ</string>
+    <string name="settings_key_verbose_logging">詳細ログ</string>
+    <string name="settings_verbose_logging_summary">詳細ログを有効にする（デフォルト：オン）</string>
+    <string name="profile_copy_hint">新しいプロファイル名</string>
+    <string name="profile_export_success">プロファイルのエクスポートに成功しました</string>
+    <string name="profile_export_failed">プロファイルのエクスポートに失敗しました: %1$s</string>
+    <string name="profile_import_success">プロファイルのインポートに成功しました</string>
+    <string name="profile_import_failed">プロファイルのインポートに失敗しました: %1$s</string>
+    <string name="profile_from_scratch">ゼロから作成</string>
+    <string name="profile_from_import">ファイルからインポート</string>
 </resources>

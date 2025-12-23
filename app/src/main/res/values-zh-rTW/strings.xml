@@ -88,4 +88,13 @@
     <string name="no_rootfs_message">請匯入 rootfs 以繼續</string>
     <string name="no_rootfs_guide">未安裝 ROM。請前往設定 → 進階 → 匯入 Rootfs，選擇一個 rootfs.7z 文件開始使用。</string>
     <string name="go_to_settings">前往設定</string>
+    <string name="settings_key_verbose_logging">詳細日誌</string>
+    <string name="settings_verbose_logging_summary">啟用詳細日誌記錄（預設：開啟）</string>
+    <string name="profile_copy_hint">新配置文件名稱</string>
+    <string name="profile_export_success">配置文件匯出成功</string>
+    <string name="profile_export_failed">匯出配置文件失敗: %1$s</string>
+    <string name="profile_import_success">配置文件匯入成功</string>
+    <string name="profile_import_failed">匯入配置文件失敗: %1$s</string>
+    <string name="profile_from_scratch">從頭開始</string>
+    <string name="profile_from_import">從文件匯入</string>
 </resources>

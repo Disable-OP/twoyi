@@ -53,9 +53,6 @@ import io.twoyi.utils.UIHelper;
 
 public class SettingsActivity extends AppCompatActivity {
 
-    private static final int REQUEST_IMPORT_PROFILE = 1001;
-    private static final int REQUEST_EXPORT_PROFILE = 1002;
-
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -86,8 +83,6 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     public static class SettingsFragment extends PreferenceFragment {
-        
-        private String mCurrentProfileForOperation;
         
         @Override
         public void onCreate(@Nullable Bundle savedInstanceState) {
@@ -159,7 +154,7 @@ public class SettingsActivity extends AppCompatActivity {
             });
 
             profileManager.setOnPreferenceClickListener(preference -> {
-                showProfileManagerDialog();
+                UIHelper.startActivity(getContext(), ProfileManagerActivity.class);
                 return true;
             });
 
@@ -219,7 +214,13 @@ public class SettingsActivity extends AppCompatActivity {
             });
         }
 
-        private void exportRootfsToTar() {
+        @Override
+        public void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
+            super.onActivityResult(requestCode, resultCode, data);
+            // No longer handling profile import here - handled by ProfileManagerActivity
+        }
+    }
+}
             Activity activity = getActivity();
             if (activity == null) return;
 
