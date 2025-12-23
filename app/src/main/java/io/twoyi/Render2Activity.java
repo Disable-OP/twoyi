@@ -19,6 +19,10 @@
 package io.twoyi;
 
 import android.app.Activity;
+import android.app.ProgressDialog;
+import android.content.ContentResolver;
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
@@ -39,12 +43,17 @@ import androidx.annotation.NonNull;
 
 import com.cleveroad.androidmanimation.LoadingAnimationView;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.NavUtils;
+import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.RomManager;
 import io.twoyi.utils.UIHelper;
 
@@ -303,12 +312,12 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         }
     }
 
-    private void importRomAndStart(android.net.Uri uri) {
+    private void importRomAndStart(Uri uri) {
         mLoadingLayout.setVisibility(View.VISIBLE);
         mLoadingView.startAnimation();
         mLoadingText.setText(R.string.extracting_tips);
 
-        android.app.ProgressDialog dialog = UIHelper.getProgressDialog(this);
+        ProgressDialog dialog = UIHelper.getProgressDialog(this);
         dialog.setCancelable(false);
         dialog.show();
 
@@ -318,9 +327,9 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             
             File tempFile = new File(getCacheDir(), "rootfs_import.7z");
 
-            android.content.ContentResolver contentResolver = getContentResolver();
-            try (java.io.InputStream inputStream = contentResolver.openInputStream(uri);
-                 java.io.OutputStream os = new java.io.FileOutputStream(tempFile)) {
+            ContentResolver contentResolver = getContentResolver();
+            try (InputStream inputStream = contentResolver.openInputStream(uri);
+                 OutputStream os = new FileOutputStream(tempFile)) {
                 byte[] buffer = new byte[8192];
                 int count;
                 while ((count = inputStream.read(buffer)) > 0) {
