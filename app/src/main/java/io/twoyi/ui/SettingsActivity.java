@@ -13,6 +13,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
+import android.preference.CheckBoxPreference;
 import android.preference.Preference;
 import android.preference.PreferenceFragment;
 import android.provider.DocumentsContract;
@@ -41,6 +42,7 @@ import io.twoyi.R;
 import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.ProfileManager;
+import io.twoyi.utils.ProfileSettings;
 import io.twoyi.utils.RomManager;
 import io.twoyi.utils.UIHelper;
 
@@ -51,8 +53,8 @@ import io.twoyi.utils.UIHelper;
 
 public class SettingsActivity extends AppCompatActivity {
 
-    private static final int REQUEST_IMPORT_ROOTFS = 1001;
-    private static final int REQUEST_EXPORT_ROOTFS = 1002;
+    private static final int REQUEST_IMPORT_PROFILE = 1001;
+    private static final int REQUEST_EXPORT_PROFILE = 1002;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -84,6 +86,9 @@ public class SettingsActivity extends AppCompatActivity {
     }
 
     public static class SettingsFragment extends PreferenceFragment {
+        
+        private String mCurrentProfileForOperation;
+        
         @Override
         public void onCreate(@Nullable Bundle savedInstanceState) {
             super.onCreate(savedInstanceState);
@@ -107,13 +112,19 @@ public class SettingsActivity extends AppCompatActivity {
             Preference reboot = findPreference(R.string.settings_key_reboot);
             
             Preference profileManager = findPreference(R.string.settings_key_profile_manager);
-            Preference importRootfs = findPreference(R.string.settings_key_import_rootfs);
-            Preference exportRootfs = findPreference(R.string.settings_key_export_rootfs);
+            CheckBoxPreference verboseLogging = (CheckBoxPreference) findPreference(R.string.settings_key_verbose_logging);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
             Preference donate = findPreference(R.string.settings_key_donate);
             Preference sendLog = findPreference(R.string.settings_key_sendlog);
             Preference about = findPreference(R.string.settings_key_about);
+
+            // Initialize verbose logging checkbox with profile-specific value
+            verboseLogging.setChecked(ProfileSettings.isVerboseLoggingEnabled(getActivity()));
+            verboseLogging.setOnPreferenceChangeListener((preference, newValue) -> {
+                ProfileSettings.setVerboseLogging(getActivity(), (Boolean) newValue);
+                return true;
+            });
 
             launchContainer.setOnPreferenceClickListener(preference -> {
                 Intent intent = new Intent(getContext(), io.twoyi.Render2Activity.class);
@@ -149,24 +160,6 @@ public class SettingsActivity extends AppCompatActivity {
 
             profileManager.setOnPreferenceClickListener(preference -> {
                 showProfileManagerDialog();
-                return true;
-            });
-
-            importRootfs.setOnPreferenceClickListener(preference -> {
-                Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
-                intent.setType("*/*");
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                try {
-                    startActivityForResult(intent, REQUEST_IMPORT_ROOTFS);
-                } catch (Throwable ignored) {
-                    Toast.makeText(getContext(), "Error", Toast.LENGTH_SHORT).show();
-                }
-                return true;
-            });
-
-            exportRootfs.setOnPreferenceClickListener(preference -> {
-                exportRootfsToTar();
                 return true;
             });
 
@@ -226,37 +219,57 @@ public class SettingsActivity extends AppCompatActivity {
             });
         }
 
-        private void showProfileManagerDialog() {
+        private void exportRootfsToTar() {
             Activity activity = getActivity();
             if (activity == null) return;
 
-            List<String> profiles = ProfileManager.getProfiles(activity);
-            String activeProfile = ProfileManager.getActiveProfile(activity);
+            String[] actions = {
+                getString(R.string.profile_switch), 
+                getString(R.string.profile_rename),
+                getString(R.string.profile_copy),
+                getString(R.string.profile_export),
+                getString(R.string.profile_delete)
+            };
             
-            String[] items = new String[profiles.size() + 1];
-            for (int i = 0; i < profiles.size(); i++) {
-                String profile = profiles.get(i);
-                if (profile.equals(activeProfile)) {
-                    items[i] = profile + " (" + getString(R.string.profile_active) + ")";
-                } else {
-                    items[i] = profile;
-                }
-            }
-            items[profiles.size()] = getString(R.string.profile_create);
-
             UIHelper.getDialogBuilder(activity)
-                .setTitle(R.string.profile_manager_title)
-                .setItems(items, (dialog, which) -> {
-                    if (which == profiles.size()) {
-                        // Create new profile
-                        showCreateProfileDialog();
-                    } else {
-                        String selectedProfile = profiles.get(which);
-                        if (selectedProfile.equals(activeProfile)) {
-                            Toast.makeText(activity, R.string.profile_active, Toast.LENGTH_SHORT).show();
-                        } else {
-                            showProfileActionsDialog(selectedProfile);
-                        }
+                .setTitle(profileName)
+                .setItems(actions, (dialog, which) -> {
+                    switch (which) {
+                        case 0: // Switch
+                            UIHelper.getDialogBuilder(activity)
+                                .setMessage(getString(R.string.profile_switch_confirm, profileName))
+                                .setPositiveButton(android.R.string.ok, (d, w) -> {
+                                    if (ProfileManager.switchProfile(activity, profileName)) {
+                                        RomManager.reboot(activity);
+                                    } else {
+                                        Toast.makeText(activity, "Failed to switch profile", Toast.LENGTH_SHORT).show();
+                                    }
+                                })
+                                .setNegativeButton(android.R.string.cancel, null)
+                                .show();
+                            break;
+                        case 1: // Rename
+                            showRenameProfileDialog(profileName);
+                            break;
+                        case 2: // Copy
+                            showCopyProfileDialog(profileName);
+                            break;
+                        case 3: // Export
+                            exportProfile(profileName);
+                            break;
+                        case 4: // Delete
+                            UIHelper.getDialogBuilder(activity)
+                                .setMessage(getString(R.string.profile_delete_confirm, profileName))
+                                .setPositiveButton(android.R.string.ok, (d, w) -> {
+                                    if (ProfileManager.deleteProfile(activity, profileName)) {
+                                        Toast.makeText(activity, "Profile deleted: " + profileName, Toast.LENGTH_SHORT).show();
+                                    } else {
+                                        Toast.makeText(activity, "Failed to delete profile", Toast.LENGTH_SHORT).show();
+                                    }
+                                })
+                                .setNegativeButton(android.R.string.cancel, null)
+                                .show();
+                            break;
                     }
                 })
                 .show();
@@ -286,44 +299,177 @@ public class SettingsActivity extends AppCompatActivity {
                 .show();
         }
 
-        private void showProfileActionsDialog(String profileName) {
+        private void showRenameProfileDialog(String oldName) {
             Activity activity = getActivity();
             if (activity == null) return;
 
-            String[] actions = {getString(R.string.profile_switch), getString(R.string.profile_delete)};
-            
+            android.widget.EditText input = new android.widget.EditText(activity);
+            input.setHint(R.string.profile_name_hint);
+            input.setText(oldName);
+
             UIHelper.getDialogBuilder(activity)
-                .setTitle(profileName)
-                .setItems(actions, (dialog, which) -> {
-                    if (which == 0) {
-                        // Switch profile
-                        UIHelper.getDialogBuilder(activity)
-                            .setMessage(getString(R.string.profile_switch_confirm, profileName))
-                            .setPositiveButton(android.R.string.ok, (d, w) -> {
-                                if (ProfileManager.switchProfile(activity, profileName)) {
-                                    RomManager.reboot(activity);
-                                } else {
-                                    Toast.makeText(activity, "Failed to switch profile", Toast.LENGTH_SHORT).show();
-                                }
-                            })
-                            .setNegativeButton(android.R.string.cancel, null)
-                            .show();
-                    } else if (which == 1) {
-                        // Delete profile
-                        UIHelper.getDialogBuilder(activity)
-                            .setMessage(getString(R.string.profile_delete_confirm, profileName))
-                            .setPositiveButton(android.R.string.ok, (d, w) -> {
-                                if (ProfileManager.deleteProfile(activity, profileName)) {
-                                    Toast.makeText(activity, "Profile deleted: " + profileName, Toast.LENGTH_SHORT).show();
-                                } else {
-                                    Toast.makeText(activity, "Failed to delete profile", Toast.LENGTH_SHORT).show();
-                                }
-                            })
-                            .setNegativeButton(android.R.string.cancel, null)
-                            .show();
+                .setTitle(R.string.profile_rename)
+                .setView(input)
+                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                    String newName = input.getText().toString().trim();
+                    if (!newName.isEmpty() && !newName.equals(oldName)) {
+                        if (ProfileManager.renameProfile(activity, oldName, newName)) {
+                            Toast.makeText(activity, "Profile renamed to: " + newName, Toast.LENGTH_SHORT).show();
+                            if (oldName.equals(ProfileManager.getActiveProfile(activity))) {
+                                // Active profile was renamed, need to reboot
+                                RomManager.reboot(activity);
+                            }
+                        } else {
+                            Toast.makeText(activity, "Failed to rename profile", Toast.LENGTH_SHORT).show();
+                        }
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+        }
+
+        private void showCopyProfileDialog(String sourceName) {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            android.widget.EditText input = new android.widget.EditText(activity);
+            input.setHint(R.string.profile_copy_hint);
+            input.setText(sourceName + "_copy");
+
+            UIHelper.getDialogBuilder(activity)
+                .setTitle(R.string.profile_copy)
+                .setView(input)
+                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                    String targetName = input.getText().toString().trim();
+                    if (!targetName.isEmpty()) {
+                        ProgressDialog progressDialog = UIHelper.getProgressDialog(activity);
+                        progressDialog.setCancelable(false);
+                        progressDialog.show();
+
+                        UIHelper.defer().when(() -> {
+                            return ProfileManager.copyProfile(activity, sourceName, targetName);
+                        }).done(success -> {
+                            UIHelper.dismiss(progressDialog);
+                            if (success) {
+                                Toast.makeText(activity, "Profile copied to: " + targetName, Toast.LENGTH_SHORT).show();
+                            } else {
+                                Toast.makeText(activity, "Failed to copy profile", Toast.LENGTH_SHORT).show();
+                            }
+                        }).fail(result -> activity.runOnUiThread(() -> {
+                            UIHelper.dismiss(progressDialog);
+                            Toast.makeText(activity, "Error: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+                        }));
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+        }
+
+        private void exportProfile(String profileName) {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            mCurrentProfileForOperation = profileName;
+
+            ProgressDialog dialog = UIHelper.getProgressDialog(activity);
+            dialog.setCancelable(false);
+            dialog.show();
+
+            UIHelper.defer().when(() -> {
+                File profileDir = ProfileManager.getProfileDir(activity, profileName);
+                File exportFile = new File(activity.getCacheDir(), "profile_" + profileName + "_export.tar");
+                
+                // Validate paths to prevent command injection
+                String profileDirPath = profileDir.getAbsolutePath();
+                String exportFilePath = exportFile.getAbsolutePath();
+                String parentPath = profileDir.getParent();
+                
+                if (profileDirPath.contains(";") || profileDirPath.contains("&") || 
+                    exportFilePath.contains(";") || exportFilePath.contains("&")) {
+                    throw new SecurityException("Invalid path detected");
+                }
+                
+                // Create tar archive using ProcessBuilder
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-cf", exportFilePath,
+                    "-C", parentPath, profileDir.getName()
+                );
+                Process process = pb.start();
+                int exitCode = process.waitFor();
+                
+                if (exitCode != 0) {
+                    throw new IOException("tar command failed with exit code: " + exitCode);
+                }
+                
+                return exportFile;
+            }).done(exportFile -> {
+                UIHelper.dismiss(dialog);
+                
+                // Share the file
+                Uri uri = FileProvider.getUriForFile(activity, "io.twoyi.fileprovider", exportFile);
+                Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
+                shareIntent.setDataAndType(uri, "application/x-tar");
+                shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                activity.startActivity(Intent.createChooser(shareIntent, getString(R.string.profile_export)));
+                
+                Toast.makeText(activity, R.string.profile_export_success, Toast.LENGTH_SHORT).show();
+            }).fail(result -> activity.runOnUiThread(() -> {
+                Toast.makeText(activity, getString(R.string.profile_export_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+            }));
+        }
+
+        private void showProfileManagerDialog() {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            List<String> profiles = ProfileManager.getProfiles(activity);
+            String activeProfile = ProfileManager.getActiveProfile(activity);
+            
+            String[] items = new String[profiles.size() + 2];
+            for (int i = 0; i < profiles.size(); i++) {
+                String profile = profiles.get(i);
+                if (profile.equals(activeProfile)) {
+                    items[i] = profile + " (" + getString(R.string.profile_active) + ")";
+                } else {
+                    items[i] = profile;
+                }
+            }
+            items[profiles.size()] = getString(R.string.profile_create);
+            items[profiles.size() + 1] = getString(R.string.profile_import);
+
+            UIHelper.getDialogBuilder(activity)
+                .setTitle(R.string.profile_manager_title)
+                .setItems(items, (dialog, which) -> {
+                    if (which == profiles.size()) {
+                        // Create new profile
+                        showCreateProfileDialog();
+                    } else if (which == profiles.size() + 1) {
+                        // Import profile
+                        importProfile();
+                    } else {
+                        String selectedProfile = profiles.get(which);
+                        if (selectedProfile.equals(activeProfile)) {
+                            Toast.makeText(activity, R.string.profile_active, Toast.LENGTH_SHORT).show();
+                        } else {
+                            showProfileActionsDialog(selectedProfile);
+                        }
                     }
                 })
                 .show();
+        }
+
+        private void importProfile() {
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
+            intent.setType("*/*");
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            try {
+                startActivityForResult(intent, REQUEST_IMPORT_PROFILE);
+            } catch (Throwable ignored) {
+                Toast.makeText(getContext(), "Error", Toast.LENGTH_SHORT).show();
+            }
         }
 
         private void exportRootfsToTar() {
@@ -464,11 +610,94 @@ public class SettingsActivity extends AppCompatActivity {
         public void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
             super.onActivityResult(requestCode, resultCode, data);
 
-            if (requestCode == REQUEST_IMPORT_ROOTFS && resultCode == Activity.RESULT_OK) {
+            if (requestCode == REQUEST_IMPORT_PROFILE && resultCode == Activity.RESULT_OK) {
                 if (data != null && data.getData() != null) {
-                    importRootfsFromFile(data.getData());
+                    importProfileFromFile(data.getData());
                 }
             }
+        }
+
+        private void importProfileFromFile(Uri uri) {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            // Ask for profile name
+            android.widget.EditText input = new android.widget.EditText(activity);
+            input.setHint(R.string.profile_name_hint);
+
+            UIHelper.getDialogBuilder(activity)
+                .setTitle(R.string.profile_import)
+                .setView(input)
+                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                    String profileName = input.getText().toString().trim();
+                    if (!profileName.isEmpty()) {
+                        performProfileImport(uri, profileName);
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+        }
+
+        private void performProfileImport(Uri uri, String profileName) {
+            Activity activity = getActivity();
+            if (activity == null) return;
+
+            ProgressDialog dialog = UIHelper.getProgressDialog(activity);
+            dialog.setCancelable(false);
+            dialog.show();
+
+            UIHelper.defer().when(() -> {
+                File profileDir = ProfileManager.getProfileDir(activity, profileName);
+                
+                if (profileDir.exists()) {
+                    throw new IOException("Profile already exists: " + profileName);
+                }
+
+                File tempFile = new File(activity.getCacheDir(), "profile_import.tar");
+
+                // Copy file to temp location
+                ContentResolver contentResolver = activity.getContentResolver();
+                try (InputStream inputStream = contentResolver.openInputStream(uri);
+                     OutputStream os = new FileOutputStream(tempFile)) {
+                    byte[] buffer = new byte[8192];
+                    int count;
+                    while ((count = inputStream.read(buffer)) > 0) {
+                        os.write(buffer, 0, count);
+                    }
+                }
+
+                // Create profile directory
+                profileDir.mkdirs();
+
+                // Extract tar archive
+                String tempFilePath = tempFile.getAbsolutePath();
+                String profilesPath = ProfileManager.getProfilesDir(activity).getAbsolutePath();
+                
+                if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
+                    profilesPath.contains(";") || profilesPath.contains("&")) {
+                    throw new SecurityException("Invalid path detected");
+                }
+                
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-xf", tempFilePath,
+                    "-C", profilesPath
+                );
+                Process process = pb.start();
+                int exitCode = process.waitFor();
+
+                tempFile.delete();
+                return exitCode == 0;
+            }).done(result -> {
+                UIHelper.dismiss(dialog);
+                if (result) {
+                    Toast.makeText(activity, R.string.profile_import_success, Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(activity, R.string.profile_import_failed, Toast.LENGTH_SHORT).show();
+                }
+            }).fail(result -> activity.runOnUiThread(() -> {
+                Toast.makeText(activity, getString(R.string.profile_import_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+            }));
         }
     }
 }
