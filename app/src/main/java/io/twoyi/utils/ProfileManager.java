@@ -176,7 +176,7 @@ public class ProfileManager {
     }
 
     /**
-     * Copy a profile using tar for reliable symlink preservation
+     * Copy a profile - copies files manually then creates tar
      */
     public static boolean copyProfile(Context context, String sourceName, String targetName) {
         if (targetName == null || targetName.trim().isEmpty()) {
@@ -196,81 +196,13 @@ public class ProfileManager {
             return false;
         }
 
-        File tempTarFile = new File(context.getCacheDir(), "profile_copy_temp.tar");
-        
         try {
-            // Create tar from source
-            String sourceDirPath = sourceDir.getAbsolutePath();
-            String tempTarPath = tempTarFile.getAbsolutePath();
-            String sourceParentPath = sourceDir.getParent();
-            
-            if (sourceDirPath.contains(";") || sourceDirPath.contains("&") ||
-                tempTarPath.contains(";") || tempTarPath.contains("&")) {
-                throw new SecurityException("Invalid path detected");
-            }
-            
-            // Pack the source profile into tar (preserve symlinks)
-            ProcessBuilder pb1 = new ProcessBuilder(
-                "tar", "-cf", tempTarPath,
-                "-C", sourceParentPath, sourceDir.getName()
-            );
-            pb1.redirectErrorStream(true);
-            Process process1 = pb1.start();
-            
-            // Read any error output
-            java.io.BufferedReader reader = new java.io.BufferedReader(
-                new java.io.InputStreamReader(process1.getInputStream()));
-            StringBuilder output = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
-            }
-            
-            int exitCode1 = process1.waitFor();
-            
-            if (exitCode1 != 0) {
-                Log.e(TAG, "tar create output: " + output.toString());
-                throw new IOException("tar create failed with exit code: " + exitCode1);
-            }
-            
             // Create target directory
-            File profilesDir = getProfilesDir(context);
-            String profilesDirPath = profilesDir.getAbsolutePath();
+            targetDir.mkdirs();
             
-            if (profilesDirPath.contains(";") || profilesDirPath.contains("&")) {
-                throw new SecurityException("Invalid path detected");
-            }
-            
-            // Extract tar to target
-            ProcessBuilder pb2 = new ProcessBuilder(
-                "tar", "-xf", tempTarPath,
-                "-C", profilesDirPath
-            );
-            pb2.redirectErrorStream(true);
-            Process process2 = pb2.start();
-            
-            // Read any error output
-            reader = new java.io.BufferedReader(
-                new java.io.InputStreamReader(process2.getInputStream()));
-            output = new StringBuilder();
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
-            }
-            
-            int exitCode2 = process2.waitFor();
-            
-            if (exitCode2 != 0) {
-                Log.e(TAG, "tar extract output: " + output.toString());
-                throw new IOException("tar extract failed with exit code: " + exitCode2);
-            }
-            
-            // Rename extracted directory to target name if needed
-            File extractedDir = new File(profilesDir, sourceDir.getName());
-            if (!extractedDir.equals(targetDir)) {
-                if (!extractedDir.renameTo(targetDir)) {
-                    throw new IOException("Failed to rename extracted profile");
-                }
-            }
+            // Copy directory contents manually (preserving symlinks, skipping sockets)
+            Log.d(TAG, "Copying profile from " + sourceDir + " to " + targetDir);
+            copyDirectoryPreservingSymlinks(sourceDir, targetDir);
 
             // Copy settings
             SharedPreferences sourcePrefs = context.getSharedPreferences(
@@ -290,15 +222,58 @@ public class ProfileManager {
                 }
             }
 
+            Log.d(TAG, "Profile copied successfully");
             return true;
         } catch (Exception e) {
             Log.e(TAG, "Failed to copy profile", e);
             // Clean up partial copy
             IOUtils.deleteDirectory(targetDir);
             return false;
-        } finally {
-            // Clean up temp tar file
-            tempTarFile.delete();
+        }
+    }
+    
+    /**
+     * Copy directory recursively while preserving symlinks and skipping sockets
+     */
+    private static void copyDirectoryPreservingSymlinks(File source, File target) throws IOException {
+        File[] files = source.listFiles();
+        if (files == null) {
+            return;
+        }
+        
+        for (File file : files) {
+            File destFile = new File(target, file.getName());
+            Path sourcePath = file.toPath();
+            Path targetPath = destFile.toPath();
+            
+            // Skip socket files (file type 140000) - tar cannot archive them
+            try {
+                java.nio.file.attribute.BasicFileAttributes attrs = 
+                    Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
+                                       java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
+                    // Skip special files like sockets, named pipes, etc.
+                    Log.d(TAG, "Skipping special file: " + file.getName());
+                    continue;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Could not check file type for: " + file.getName() + ", skipping");
+                continue;
+            }
+            
+            if (Files.isSymbolicLink(sourcePath)) {
+                // Preserve symlink
+                Path linkTarget = Files.readSymbolicLink(sourcePath);
+                Files.createSymbolicLink(targetPath, linkTarget);
+                Log.d(TAG, "Created symlink: " + destFile.getName() + " -> " + linkTarget);
+            } else if (file.isDirectory()) {
+                // Recursively copy directory
+                destFile.mkdirs();
+                copyDirectoryPreservingSymlinks(file, destFile);
+            } else {
+                // Copy regular file
+                Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            }
         }
     }
 

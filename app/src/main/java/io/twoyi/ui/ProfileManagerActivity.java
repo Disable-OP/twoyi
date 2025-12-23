@@ -215,40 +215,10 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 SharedPreferences prefs = getSharedPreferences("profile_settings_" + profileName, Context.MODE_PRIVATE);
                 exportPreferencesToXml(prefs, prefsXml);
                 
-                // Copy rootfs contents to temp directory if rootfs exists
+                // Copy rootfs contents recursively to temp directory if rootfs exists
                 if (profileRootfs.exists() && profileRootfs.isDirectory()) {
-                    File[] rootfsFiles = profileRootfs.listFiles();
-                    if (rootfsFiles != null) {
-                        for (File file : rootfsFiles) {
-                            File destFile = new File(tempDir, file.getName());
-                            if (file.isDirectory()) {
-                                // For directories, create symlink or copy
-                                if (Files.isSymbolicLink(file.toPath())) {
-                                    Path linkTarget = Files.readSymbolicLink(file.toPath());
-                                    Files.createSymbolicLink(destFile.toPath(), linkTarget);
-                                } else {
-                                    // Create hard link or copy
-                                    try {
-                                        Files.createLink(destFile.toPath(), file.toPath());
-                                    } catch (Exception e) {
-                                        // If hard link fails, create symlink to original
-                                        Files.createSymbolicLink(destFile.toPath(), file.toPath());
-                                    }
-                                }
-                            } else if (Files.isSymbolicLink(file.toPath())) {
-                                Path linkTarget = Files.readSymbolicLink(file.toPath());
-                                Files.createSymbolicLink(destFile.toPath(), linkTarget);
-                            } else {
-                                // For regular files, create hard link or copy
-                                try {
-                                    Files.createLink(destFile.toPath(), file.toPath());
-                                } catch (Exception e) {
-                                    // If hard link fails, copy the file
-                                    Files.copy(file.toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                                }
-                            }
-                        }
-                    }
+                    Log.d("ProfileManager", "Copying rootfs from: " + profileRootfs.getAbsolutePath());
+                    copyDirectoryPreservingSymlinks(profileRootfs, tempDir);
                 }
                 
                 String tempDirPath = tempDir.getAbsolutePath();
@@ -259,7 +229,8 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     throw new SecurityException("Invalid path detected");
                 }
                 
-                // Create single tar archive with all contents (preserve symlinks)
+                // Create tar archive from temp directory (preserve symlinks)
+                Log.d("ProfileManager", "Creating tar archive: " + exportFilePath);
                 ProcessBuilder pb = new ProcessBuilder(
                     "tar", "-cf", exportFilePath,
                     "-C", tempDirPath, "."
@@ -274,15 +245,17 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     output.append(line).append("\n");
+                    Log.d("ProfileManager", "tar output: " + line);
                 }
                 
                 int exitCode = process.waitFor();
                 
                 if (exitCode != 0) {
-                    Log.e("ProfileManager", "tar create output: " + output.toString());
-                    throw new IOException("tar command failed with exit code: " + exitCode);
+                    Log.e("ProfileManager", "tar create failed. Output: " + output.toString());
+                    throw new IOException("tar command failed with exit code: " + exitCode + "\nOutput: " + output.toString());
                 }
                 
+                Log.d("ProfileManager", "Export successful, tar file size: " + exportFile.length());
                 return exportFile;
             } finally {
                 // Clean up temp directory
@@ -300,8 +273,54 @@ public class ProfileManagerActivity extends AppCompatActivity {
             startActivity(Intent.createChooser(shareIntent, getString(R.string.profile_export)));
         }).fail(result -> runOnUiThread(() -> {
             UIHelper.dismiss(dialog);
-            Toast.makeText(this, getString(R.string.profile_export_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.profile_export_failed, result.getMessage()), Toast.LENGTH_LONG).show();
+            Log.e("ProfileManager", "Export failed", result);
         }));
+    }
+    
+    /**
+     * Copy directory recursively while preserving symlinks
+     */
+    private void copyDirectoryPreservingSymlinks(File source, File target) throws IOException {
+        File[] files = source.listFiles();
+        if (files == null) {
+            return;
+        }
+        
+        for (File file : files) {
+            File destFile = new File(target, file.getName());
+            Path sourcePath = file.toPath();
+            Path targetPath = destFile.toPath();
+            
+            // Skip socket files (file type 140000) - tar cannot archive them
+            try {
+                java.nio.file.attribute.BasicFileAttributes attrs = 
+                    Files.readAttributes(sourcePath, java.nio.file.attribute.BasicFileAttributes.class, 
+                                       java.nio.file.LinkOption.NOFOLLOW_LINKS);
+                if (!attrs.isRegularFile() && !attrs.isDirectory() && !attrs.isSymbolicLink()) {
+                    // Skip special files like sockets, named pipes, etc.
+                    Log.d("ProfileManager", "Skipping special file: " + file.getName());
+                    continue;
+                }
+            } catch (Exception e) {
+                Log.w("ProfileManager", "Could not check file type for: " + file.getName() + ", skipping");
+                continue;
+            }
+            
+            if (Files.isSymbolicLink(sourcePath)) {
+                // Preserve symlink
+                Path linkTarget = Files.readSymbolicLink(sourcePath);
+                Files.createSymbolicLink(targetPath, linkTarget);
+                Log.d("ProfileManager", "Created symlink: " + destFile.getName() + " -> " + linkTarget);
+            } else if (file.isDirectory()) {
+                // Recursively copy directory
+                destFile.mkdirs();
+                copyDirectoryPreservingSymlinks(file, destFile);
+            } else {
+                // Copy regular file
+                Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            }
+        }
     }
 
     private void confirmDelete(String profileName) {
