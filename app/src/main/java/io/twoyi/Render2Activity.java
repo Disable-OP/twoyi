@@ -87,14 +87,26 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         public void surfaceCreated(@NonNull SurfaceHolder holder) {
             Surface surface = holder.getSurface();
             
-            // Use custom DPI from settings
-            float xdpi = mVirtualDisplayDpi;
-            float ydpi = mVirtualDisplayDpi;
+            // Calculate proper DPI based on physical screen and virtual display scaling
+            WindowManager windowManager = getWindowManager();
+            Display defaultDisplay = windowManager.getDefaultDisplay();
+            DisplayMetrics displayMetrics = new DisplayMetrics();
+            defaultDisplay.getRealMetrics(displayMetrics);
+            
+            // Calculate the scaling factor between physical and virtual display
+            float scaleX = (float) displayMetrics.widthPixels / (float) mVirtualDisplayWidth;
+            float scaleY = (float) displayMetrics.heightPixels / (float) mVirtualDisplayHeight;
+            
+            // Use the physical DPI scaled appropriately for the virtual display
+            // This ensures proper scaling when virtual DPI differs from physical DPI
+            float xdpi = displayMetrics.xdpi * scaleX * mVirtualDisplayDpi / displayMetrics.densityDpi;
+            float ydpi = displayMetrics.ydpi * scaleY * mVirtualDisplayDpi / displayMetrics.densityDpi;
 
             Renderer.init(surface, RomManager.getLoaderPath(getApplicationContext()), 
                     mVirtualDisplayWidth, mVirtualDisplayHeight, xdpi, ydpi, (int) getBestFps());
 
-            Log.i(TAG, "surfaceCreated with virtual display: " + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight + " @ " + mVirtualDisplayDpi + " DPI");
+            Log.i(TAG, "surfaceCreated with virtual display: " + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight + 
+                    " @ " + mVirtualDisplayDpi + " DPI, calculated xdpi=" + xdpi + ", ydpi=" + ydpi);
         }
 
         @Override

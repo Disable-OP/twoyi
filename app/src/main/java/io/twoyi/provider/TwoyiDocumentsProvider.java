@@ -181,7 +181,7 @@ public class TwoyiDocumentsProvider extends DocumentsProvider {
     }
 
     private String getRootSummary() {
-        return getContext().getResources().getString(R.string.app_name) + " Data";
+        return "/data/data/io.twoyi";
     }
 
     private void includeFile(MatrixCursor result, String docId, File file)
