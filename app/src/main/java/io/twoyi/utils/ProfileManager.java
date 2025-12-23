@@ -228,7 +228,7 @@ public class ProfileManager {
     }
 
     /**
-     * Helper to copy a directory recursively
+     * Helper to copy a directory recursively, preserving symlinks
      */
     private static void copyDirectory(File source, File target) throws IOException {
         if (!target.exists()) {
@@ -239,10 +239,18 @@ public class ProfileManager {
         if (files != null) {
             for (File file : files) {
                 File targetFile = new File(target, file.getName());
-                if (file.isDirectory()) {
+                Path sourcePath = file.toPath();
+                Path targetPath = targetFile.toPath();
+                
+                // Handle symlinks specially
+                if (Files.isSymbolicLink(sourcePath)) {
+                    // Read the symlink target and create a new symlink
+                    Path linkTarget = Files.readSymbolicLink(sourcePath);
+                    Files.createSymbolicLink(targetPath, linkTarget);
+                } else if (file.isDirectory()) {
                     copyDirectory(file, targetFile);
                 } else {
-                    Files.copy(file.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    Files.copy(sourcePath, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 }
             }
         }
