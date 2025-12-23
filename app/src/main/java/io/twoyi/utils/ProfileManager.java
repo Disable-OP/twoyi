@@ -210,14 +210,27 @@ public class ProfileManager {
             }
             
             // Pack the source profile into tar
+            // Use -h to dereference symlinks in the profile directory itself
             ProcessBuilder pb1 = new ProcessBuilder(
-                "tar", "-cf", tempTarPath,
+                "tar", "-chf", tempTarPath,
                 "-C", sourceParentPath, sourceDir.getName()
             );
+            pb1.redirectErrorStream(true);
             Process process1 = pb1.start();
+            
+            // Read any error output
+            java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(process1.getInputStream()));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            
             int exitCode1 = process1.waitFor();
             
             if (exitCode1 != 0) {
+                Log.e(TAG, "tar create output: " + output.toString());
                 throw new IOException("tar create failed with exit code: " + exitCode1);
             }
             
@@ -234,10 +247,21 @@ public class ProfileManager {
                 "tar", "-xf", tempTarPath,
                 "-C", profilesDirPath
             );
+            pb2.redirectErrorStream(true);
             Process process2 = pb2.start();
+            
+            // Read any error output
+            reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(process2.getInputStream()));
+            output = new StringBuilder();
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            
             int exitCode2 = process2.waitFor();
             
             if (exitCode2 != 0) {
+                Log.e(TAG, "tar extract output: " + output.toString());
                 throw new IOException("tar extract failed with exit code: " + exitCode2);
             }
             

@@ -215,41 +215,72 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 SharedPreferences prefs = getSharedPreferences("profile_settings_" + profileName, Context.MODE_PRIVATE);
                 exportPreferencesToXml(prefs, prefsXml);
                 
+                // Copy rootfs contents to temp directory if rootfs exists
+                if (profileRootfs.exists() && profileRootfs.isDirectory()) {
+                    File[] rootfsFiles = profileRootfs.listFiles();
+                    if (rootfsFiles != null) {
+                        for (File file : rootfsFiles) {
+                            File destFile = new File(tempDir, file.getName());
+                            if (file.isDirectory()) {
+                                // For directories, create symlink or copy
+                                if (Files.isSymbolicLink(file.toPath())) {
+                                    Path linkTarget = Files.readSymbolicLink(file.toPath());
+                                    Files.createSymbolicLink(destFile.toPath(), linkTarget);
+                                } else {
+                                    // Create hard link or copy
+                                    try {
+                                        Files.createLink(destFile.toPath(), file.toPath());
+                                    } catch (Exception e) {
+                                        // If hard link fails, create symlink to original
+                                        Files.createSymbolicLink(destFile.toPath(), file.toPath());
+                                    }
+                                }
+                            } else if (Files.isSymbolicLink(file.toPath())) {
+                                Path linkTarget = Files.readSymbolicLink(file.toPath());
+                                Files.createSymbolicLink(destFile.toPath(), linkTarget);
+                            } else {
+                                // For regular files, create hard link or copy
+                                try {
+                                    Files.createLink(destFile.toPath(), file.toPath());
+                                } catch (Exception e) {
+                                    // If hard link fails, copy the file
+                                    Files.copy(file.toPath(), destFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                                }
+                            }
+                        }
+                    }
+                }
+                
                 String tempDirPath = tempDir.getAbsolutePath();
                 String exportFilePath = exportFile.getAbsolutePath();
-                String rootfsPath = profileRootfs.getAbsolutePath();
                 
                 if (tempDirPath.contains(";") || tempDirPath.contains("&") || 
-                    exportFilePath.contains(";") || exportFilePath.contains("&") ||
-                    rootfsPath.contains(";") || rootfsPath.contains("&")) {
+                    exportFilePath.contains(";") || exportFilePath.contains("&")) {
                     throw new SecurityException("Invalid path detected");
                 }
                 
-                // Create tar with rootfs contents and preference.xml
-                // First, tar the preference.xml from temp dir
-                ProcessBuilder pb1 = new ProcessBuilder(
-                    "tar", "-cf", exportFilePath,
-                    "-C", tempDirPath, "preference.xml"
+                // Create single tar archive with all contents
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-chf", exportFilePath,
+                    "-C", tempDirPath, "."
                 );
-                Process process1 = pb1.start();
-                int exitCode1 = process1.waitFor();
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
                 
-                if (exitCode1 != 0) {
-                    throw new IOException("tar command failed with exit code: " + exitCode1);
+                // Read any error output
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(process.getInputStream()));
+                StringBuilder output = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append("\n");
                 }
                 
-                // Then append rootfs contents to the tar (if rootfs exists)
-                if (profileRootfs.exists() && profileRootfs.isDirectory()) {
-                    ProcessBuilder pb2 = new ProcessBuilder(
-                        "tar", "-rf", exportFilePath,
-                        "-C", rootfsPath, "."
-                    );
-                    Process process2 = pb2.start();
-                    int exitCode2 = process2.waitFor();
-                    
-                    if (exitCode2 != 0) {
-                        throw new IOException("tar append command failed with exit code: " + exitCode2);
-                    }
+                int exitCode = process.waitFor();
+                
+                if (exitCode != 0) {
+                    Log.e("ProfileManager", "tar create output: " + output.toString());
+                    throw new IOException("tar command failed with exit code: " + exitCode);
                 }
                 
                 return exportFile;
