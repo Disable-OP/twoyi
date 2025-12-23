@@ -50,11 +50,6 @@
             android:title="@string/settings_key_export_rootfs" />
 
         <Preference
-            android:key="@string/settings_key_replace_rom"
-            android:summary="@string/settings_replace_rom_summary"
-            android:title="@string/settings_key_replace_rom" />
-
-        <Preference
             android:key="@string/settings_key_factory_reset"
             android:summary="@string/settings_factory_reset_summary"
             android:title="@string/settings_key_factory_reset" />

@@ -147,33 +147,30 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private void bootSystem() {
         boolean romExist = RomManager.romExist(this);
-        boolean factoryRomUpdated = RomManager.needsUpgrade(this);
-        boolean forceInstall = AppKV.getBooleanConfig(getApplicationContext(), AppKV.FORCE_ROM_BE_RE_INSTALL, false);
-        boolean use3rdRom = AppKV.getBooleanConfig(getApplicationContext(), AppKV.SHOULD_USE_THIRD_PARTY_ROM, false);
 
-        boolean shouldExtractRom = !romExist || forceInstall || (!use3rdRom && factoryRomUpdated);
-
-        if (shouldExtractRom) {
-            Log.i(TAG, "extracting rom...");
-
-            showTipsForFirstBoot();
-
-            new Thread(() -> {
-                mIsExtracting.set(true);
-                RomManager.extractRootfs(getApplicationContext(), romExist, factoryRomUpdated, forceInstall, use3rdRom);
-                mIsExtracting.set(false);
-
-                RomManager.initRootfs(getApplicationContext());
-
-                runOnUiThread(() -> {
-                    mRootView.addView(mSurfaceView, 0);
-                    showBootingProcedure();
-                });
-            }, "extract-rom").start();
-        } else {
-            mRootView.addView(mSurfaceView, 0);
-            showBootingProcedure();
+        if (!romExist) {
+            // ROM doesn't exist - show message to user
+            runOnUiThread(() -> {
+                mLoadingView.stopAnimation();
+                mLoadingLayout.setVisibility(View.VISIBLE);
+                mLoadingText.setText(R.string.no_rootfs_message);
+                
+                // Show dialog to guide user
+                UIHelper.getDialogBuilder(this)
+                    .setTitle(R.string.no_rootfs_title)
+                    .setMessage(R.string.no_rootfs_guide)
+                    .setPositiveButton(R.string.go_to_settings, (dialog, which) -> {
+                        finish();
+                    })
+                    .setCancelable(false)
+                    .show();
+            });
+            return;
         }
+
+        // ROM exists, boot normally
+        mRootView.addView(mSurfaceView, 0);
+        showBootingProcedure();
     }
 
     private void showTipsForFirstBoot() {

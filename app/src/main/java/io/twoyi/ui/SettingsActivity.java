@@ -26,7 +26,6 @@ import androidx.annotation.StringRes;
 import androidx.appcompat.app.ActionBar;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.FileProvider;
-import androidx.core.util.Pair;
 
 import com.microsoft.appcenter.crashes.Crashes;
 
@@ -52,7 +51,6 @@ import io.twoyi.utils.UIHelper;
 
 public class SettingsActivity extends AppCompatActivity {
 
-    private static final int REQUEST_GET_FILE = 1000;
     private static final int REQUEST_IMPORT_ROOTFS = 1001;
     private static final int REQUEST_EXPORT_ROOTFS = 1002;
 
@@ -111,7 +109,6 @@ public class SettingsActivity extends AppCompatActivity {
             Preference profileManager = findPreference(R.string.settings_key_profile_manager);
             Preference importRootfs = findPreference(R.string.settings_key_import_rootfs);
             Preference exportRootfs = findPreference(R.string.settings_key_export_rootfs);
-            Preference replaceRom = findPreference(R.string.settings_key_replace_rom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
             Preference donate = findPreference(R.string.settings_key_donate);
@@ -173,29 +170,17 @@ public class SettingsActivity extends AppCompatActivity {
                 return true;
             });
 
-            replaceRom.setOnPreferenceClickListener(preference -> {
-
-                Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
-
-                // you can only select one rootfs
-                intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false);
-                intent.setType("*/*"); // apk file
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                try {
-                    startActivityForResult(intent, REQUEST_GET_FILE);
-                } catch (Throwable ignored) {
-                    Toast.makeText(getContext(), "Error", Toast.LENGTH_SHORT).show();
-                }
-                return true;
-            });
-
             factoryReset.setOnPreferenceClickListener(preference -> {
                 UIHelper.getDialogBuilder(getActivity())
                         .setTitle(android.R.string.dialog_alert_title)
                         .setMessage(R.string.factory_reset_confirm_message)
                         .setPositiveButton(R.string.i_confirm_it, (dialog, which) -> {
-                            AppKV.setBooleanConfig(getActivity(), AppKV.SHOULD_USE_THIRD_PARTY_ROM, false);
-                            AppKV.setBooleanConfig(getActivity(), AppKV.FORCE_ROM_BE_RE_INSTALL, true);
+                            // Clear the rootfs completely so next boot will prompt for ROM
+                            Activity activity = getActivity();
+                            if (activity != null) {
+                                File rootfsDir = RomManager.getRootfsDir(activity);
+                                io.twoyi.utils.IOUtils.deleteDirectory(rootfsDir);
+                            }
                             dialog.dismiss();
 
                             RomManager.reboot(getActivity());
@@ -464,7 +449,6 @@ public class SettingsActivity extends AppCompatActivity {
             }).done(result -> {
                 UIHelper.dismiss(dialog);
                 if (result) {
-                    AppKV.setBooleanConfig(activity, AppKV.SHOULD_USE_THIRD_PARTY_ROM, false);
                     Toast.makeText(activity, R.string.import_rootfs_success, Toast.LENGTH_SHORT).show();
                 } else {
                     Toast.makeText(activity, R.string.import_rootfs_failed, Toast.LENGTH_SHORT).show();
@@ -484,76 +468,7 @@ public class SettingsActivity extends AppCompatActivity {
                 if (data != null && data.getData() != null) {
                     importRootfsFromFile(data.getData());
                 }
-                return;
             }
-
-            if (!(requestCode == REQUEST_GET_FILE && resultCode == Activity.RESULT_OK)) {
-                return;
-            }
-
-            if (data == null) {
-                return;
-            }
-
-            Uri uri = data.getData();
-            if (uri == null) {
-                return;
-            }
-
-            Activity activity = getActivity();
-            ProgressDialog dialog = UIHelper.getProgressDialog(activity);
-            dialog.setCancelable(false);
-            dialog.show();
-
-            // start copy 3rd rom
-            UIHelper.defer().when(() -> {
-
-                File rootfs3rd = RomManager.get3rdRootfsFile(activity);
-
-                ContentResolver contentResolver = activity.getContentResolver();
-                try (InputStream inputStream = contentResolver.openInputStream(uri); OutputStream os = new FileOutputStream(rootfs3rd)) {
-                    byte[] buffer = new byte[1024];
-                    int count;
-                    while ((count = inputStream.read(buffer)) > 0) {
-                        os.write(buffer, 0, count);
-                    }
-                }
-
-                RomManager.RomInfo romInfo = RomManager.getRomInfo(rootfs3rd);
-                return Pair.create(rootfs3rd, romInfo);
-            }).done(result -> {
-
-                File rootfs3rd = result.first;
-                RomManager.RomInfo romInfo = result.second;
-                UIHelper.dismiss(dialog);
-
-                // copy finished, show dialog confirm
-                if (romInfo.isValid()) {
-
-                    String author = romInfo.author;
-                    UIHelper.getDialogBuilder(activity)
-                            .setTitle(R.string.replace_rom_confirm_title)
-                            .setMessage(getString(R.string.replace_rom_confirm_message, author, romInfo.version, romInfo.desc))
-                            .setPositiveButton(R.string.i_confirm_it, (dialog1, which) -> {
-                                AppKV.setBooleanConfig(activity, AppKV.SHOULD_USE_THIRD_PARTY_ROM, true);
-                                AppKV.setBooleanConfig(activity, AppKV.FORCE_ROM_BE_RE_INSTALL, true);
-
-                                dialog1.dismiss();
-
-                                RomManager.reboot(getActivity());
-                            })
-                            .setNegativeButton(android.R.string.cancel, (dialog12, which) -> dialog12.dismiss())
-                            .show();
-                } else {
-                    Toast.makeText(activity, R.string.replace_rom_invalid, Toast.LENGTH_SHORT).show();
-                    rootfs3rd.delete();
-                }
-            }).fail(result -> activity.runOnUiThread(() -> {
-                Toast.makeText(activity, getResources().getString(R.string.install_failed_reason, result.getMessage()), Toast.LENGTH_SHORT).show();
-                dialog.dismiss();
-                activity.finish();
-            }));
-
         }
     }
 }
