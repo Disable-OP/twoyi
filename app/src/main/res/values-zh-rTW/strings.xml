@@ -81,13 +81,17 @@
     <string name="settings_category_advanced">進階</string>
     <string name="settings_category_other">其他</string>
     <string name="settings_key_factory_reset">復原出廠設定</string>
-    <string name="settings_factory_reset_summary">復原為出廠官方系統（資料會保留）</string>
+    <string name="settings_factory_reset_summary">清除 rootfs（下次需要重新匯入 ROM）</string>
     <string name="settings_key_wipe_all_data">清除所有資料</string>
     <string name="settings_wipe_all_data_summary">兩儀內部資料將會被全部刪除</string>
-    <string name="factory_reset_confirm_message">兩儀內部系統將復原到初始狀態，資料將會保留，但系統設定會遺失，第三方系統將會被移除，是否繼續？</string>
+    <string name="factory_reset_confirm_message">復原出廠設定將完全刪除 rootfs。下次啟動時需要重新匯入 ROM 文件。是否繼續？</string>
     <string name="settings_key_manage_files">文件管理</string>
     <string name="settings_export_summary">匯入/匯出兩儀內部文件</string>
     <string name="settings_key_shutdown">關機</string>
     <string name="settings_key_reboot">重啟</string>
     <string name="replace_rom_unofficial_tips">抱歉，請修改 ROM 描述資訊，並且儘量不要使用官方作者的名字 :)</string>
+    <string name="no_rootfs_title">未安裝 ROM</string>
+    <string name="no_rootfs_message">請匯入 rootfs 以繼續</string>
+    <string name="no_rootfs_guide">未安裝 ROM。請前往設定 → 進階 → 匯入 Rootfs，選擇一個 rootfs.7z 文件開始使用。</string>
+    <string name="go_to_settings">前往設定</string>
 </resources>

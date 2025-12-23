@@ -81,13 +81,17 @@
     <string name="settings_category_advanced">高度</string>
     <string name="settings_category_other">その他</string>
     <string name="settings_key_factory_reset">ファクトリーリセット</string>
-    <string name="settings_factory_reset_summary">twoyiの公式内部ROMを起動 (データは保持されます)</string>
+    <string name="settings_factory_reset_summary">rootfsをクリア (次回ROMを再インポートする必要があります)</string>
     <string name="settings_key_wipe_all_data">全データの削除</string>
     <string name="settings_wipe_all_data_summary">twoyiの全データが削除されます</string>
-    <string name="factory_reset_confirm_message">ファクトリーリセットではtwoyiのROMをリセットし、サードパーティーのROMを置き換え、データは保持されます、続行しますか？</string>
+    <string name="factory_reset_confirm_message">ファクトリーリセットはrootfsを完全に削除します。次回起動時にROMファイルを再インポートする必要があります。続行しますか？</string>
     <string name="settings_key_manage_files">ファイルマネージャー</string>
     <string name="settings_export_summary">ファイルをtwoyiから(インポート/エクスポート)</string>
     <string name="settings_key_shutdown">シャットダウン</string>
     <string name="settings_key_reboot">再起動</string>
     <string name="replace_rom_unofficial_tips">申し訳ございませんが、rom情報の編集と正式な作者名の使用を避けてください。 :)</string>
+    <string name="no_rootfs_title">ROMがインストールされていません</string>
+    <string name="no_rootfs_message">続行するにはrootfsをインポートしてください</string>
+    <string name="no_rootfs_guide">ROMがインストールされていません。設定 → 詳細設定 → Rootfsインポートに移動し、rootfs.7zファイルを選択して開始してください。</string>
+    <string name="go_to_settings">設定へ</string>
 </resources>

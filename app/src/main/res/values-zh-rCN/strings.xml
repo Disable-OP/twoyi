@@ -81,13 +81,17 @@
     <string name="settings_category_advanced">高级</string>
     <string name="settings_category_other">其他</string>
     <string name="settings_key_factory_reset">恢复出厂设置</string>
-    <string name="settings_factory_reset_summary">恢复为出厂官方系统（数据会保留）</string>
+    <string name="settings_factory_reset_summary">清除 rootfs（下次需要重新导入 ROM）</string>
     <string name="settings_key_wipe_all_data">清除所有数据</string>
     <string name="settings_wipe_all_data_summary">两仪内部数据将会被全部删除</string>
-    <string name="factory_reset_confirm_message">两仪内部系统将恢复到初始状态，数据将会保留，但系统设置会丢失，第三方系统将会被移除，是否继续？</string>
+    <string name="factory_reset_confirm_message">恢复出厂设置将完全删除 rootfs。下次启动时需要重新导入 ROM 文件。是否继续？</string>
     <string name="settings_key_manage_files">文件管理</string>
     <string name="settings_export_summary">导入/导出两仪内部文件</string>
     <string name="settings_key_shutdown">关机</string>
     <string name="settings_key_reboot">重启</string>
     <string name="replace_rom_unofficial_tips">抱歉，请修改 ROM 描述信息，并且尽量不要使用官方作者的名字 :)</string>
+    <string name="no_rootfs_title">未安装 ROM</string>
+    <string name="no_rootfs_message">请导入 rootfs 以继续</string>
+    <string name="no_rootfs_guide">未安装 ROM。请前往设置 → 高级 → 导入 Rootfs，选择一个 rootfs.7z 文件开始使用。</string>
+    <string name="go_to_settings">前往设置</string>
 </resources>
