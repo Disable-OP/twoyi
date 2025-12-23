@@ -8,6 +8,11 @@
 
     <PreferenceCategory android:title="@string/settings_category_basic">
         <Preference
+            android:key="@string/settings_key_profile_manager"
+            android:summary="@string/settings_profile_manager_summary"
+            android:title="@string/settings_key_profile_manager" />
+
+        <Preference
             android:key="@string/settings_key_launch_container"
             android:summary="@string/settings_launch_container_summary"
             android:title="@string/settings_key_launch_container" />
@@ -34,25 +39,16 @@
 
     <PreferenceCategory android:title="@string/settings_category_advanced">
 
-        <Preference
-            android:key="@string/settings_key_profile_manager"
-            android:summary="@string/settings_profile_manager_summary"
-            android:title="@string/settings_key_profile_manager" />
+        <CheckBoxPreference
+            android:key="@string/settings_key_verbose_logging"
+            android:title="@string/settings_key_verbose_logging"
+            android:summary="@string/settings_verbose_logging_summary"
+            android:defaultValue="true" />
 
         <Preference
-            android:key="@string/settings_key_import_rootfs"
-            android:summary="@string/settings_import_rootfs_summary"
-            android:title="@string/settings_key_import_rootfs" />
-
-        <Preference
-            android:key="@string/settings_key_export_rootfs"
-            android:summary="@string/settings_export_rootfs_summary"
-            android:title="@string/settings_key_export_rootfs" />
-
-        <Preference
-            android:key="@string/settings_key_replace_rom"
-            android:summary="@string/settings_replace_rom_summary"
-            android:title="@string/settings_key_replace_rom" />
+            android:key="@string/settings_key_select_rom"
+            android:summary="@string/settings_select_rom_summary"
+            android:title="@string/settings_key_select_rom" />
 
         <Preference
             android:key="@string/settings_key_factory_reset"

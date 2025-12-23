@@ -7,6 +7,7 @@
 package io.twoyi.utils;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.util.Log;
 
 import java.io.File;
@@ -14,6 +15,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -114,6 +116,139 @@ public class ProfileManager {
     }
 
     /**
+     * Rename a profile
+     */
+    public static boolean renameProfile(Context context, String oldName, String newName) {
+        if (DEFAULT_PROFILE.equals(oldName)) {
+            Log.w(TAG, "Cannot rename default profile");
+            return false;
+        }
+
+        if (newName == null || newName.trim().isEmpty()) {
+            Log.w(TAG, "New profile name is empty");
+            return false;
+        }
+
+        File oldProfileDir = getProfileDir(context, oldName);
+        if (!oldProfileDir.exists()) {
+            Log.w(TAG, "Old profile does not exist: " + oldName);
+            return false;
+        }
+
+        File newProfileDir = getProfileDir(context, newName);
+        if (newProfileDir.exists()) {
+            Log.w(TAG, "Profile already exists: " + newName);
+            return false;
+        }
+
+        // Rename the directory
+        if (!oldProfileDir.renameTo(newProfileDir)) {
+            Log.e(TAG, "Failed to rename profile directory");
+            return false;
+        }
+
+        // Copy settings to new profile name and delete old
+        SharedPreferences oldPrefs = context.getSharedPreferences(
+                "profile_settings_" + oldName, Context.MODE_PRIVATE);
+        SharedPreferences newPrefs = context.getSharedPreferences(
+                "profile_settings_" + newName, Context.MODE_PRIVATE);
+        
+        newPrefs.edit().clear().commit();
+        for (String key : oldPrefs.getAll().keySet()) {
+            Object value = oldPrefs.getAll().get(key);
+            if (value instanceof Boolean) {
+                newPrefs.edit().putBoolean(key, (Boolean) value).commit();
+            } else if (value instanceof String) {
+                newPrefs.edit().putString(key, (String) value).commit();
+            } else if (value instanceof Integer) {
+                newPrefs.edit().putInt(key, (Integer) value).commit();
+            }
+        }
+        oldPrefs.edit().clear().commit();
+
+        // Update active profile if it was the renamed one
+        if (oldName.equals(getActiveProfile(context))) {
+            setActiveProfile(context, newName);
+            updateRootfsSymlink(context);
+        }
+
+        return true;
+    }
+
+    /**
+     * Copy a profile
+     */
+    public static boolean copyProfile(Context context, String sourceName, String targetName) {
+        if (targetName == null || targetName.trim().isEmpty()) {
+            Log.w(TAG, "Target profile name is empty");
+            return false;
+        }
+
+        File sourceDir = getProfileDir(context, sourceName);
+        if (!sourceDir.exists()) {
+            Log.w(TAG, "Source profile does not exist: " + sourceName);
+            return false;
+        }
+
+        File targetDir = getProfileDir(context, targetName);
+        if (targetDir.exists()) {
+            Log.w(TAG, "Target profile already exists: " + targetName);
+            return false;
+        }
+
+        try {
+            // Copy the directory
+            copyDirectory(sourceDir, targetDir);
+
+            // Copy settings
+            SharedPreferences sourcePrefs = context.getSharedPreferences(
+                    "profile_settings_" + sourceName, Context.MODE_PRIVATE);
+            SharedPreferences targetPrefs = context.getSharedPreferences(
+                    "profile_settings_" + targetName, Context.MODE_PRIVATE);
+            
+            targetPrefs.edit().clear().commit();
+            for (String key : sourcePrefs.getAll().keySet()) {
+                Object value = sourcePrefs.getAll().get(key);
+                if (value instanceof Boolean) {
+                    targetPrefs.edit().putBoolean(key, (Boolean) value).commit();
+                } else if (value instanceof String) {
+                    targetPrefs.edit().putString(key, (String) value).commit();
+                } else if (value instanceof Integer) {
+                    targetPrefs.edit().putInt(key, (Integer) value).commit();
+                }
+            }
+
+            return true;
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to copy profile", e);
+            // Clean up partial copy
+            IOUtils.deleteDirectory(targetDir);
+            return false;
+        }
+    }
+
+    /**
+     * Helper to copy a directory recursively
+     */
+    private static void copyDirectory(File source, File target) throws IOException {
+        if (!target.exists()) {
+            target.mkdirs();
+        }
+
+        File[] files = source.listFiles();
+        if (files != null) {
+            for (File file : files) {
+                File targetFile = new File(target, file.getName());
+                if (file.isDirectory()) {
+                    copyDirectory(file, targetFile);
+                } else {
+                    Files.copy(file.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+    }
+
+    /**
      * Delete a profile
      */
     public static boolean deleteProfile(Context context, String profileName) {
@@ -131,6 +266,9 @@ public class ProfileManager {
         if (!profileDir.exists()) {
             return false;
         }
+
+        // Delete profile settings
+        ProfileSettings.deleteProfileSettings(context, profileName);
 
         return IOUtils.deleteDirectory(profileDir);
     }

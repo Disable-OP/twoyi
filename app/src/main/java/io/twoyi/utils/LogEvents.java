@@ -70,6 +70,18 @@ public class LogEvents {
         return new File(context.getDataDir(), "last_kmsg.txt");
     }
 
+    public static File getProfileKmsgFile(Context context) {
+        String activeProfile = ProfileManager.getActiveProfile(context);
+        File profileDir = ProfileManager.getProfileDir(context, activeProfile);
+        return new File(profileDir, "log.txt");
+    }
+
+    public static File getProfileLastKmsgFile(Context context) {
+        String activeProfile = ProfileManager.getActiveProfile(context);
+        File profileDir = ProfileManager.getProfileDir(context, activeProfile);
+        return new File(profileDir, "last_kmsg.txt");
+    }
+
     private static class ReportItem {
         File file;
         String entry;
@@ -94,13 +106,27 @@ public class LogEvents {
         // file, entry
         List<ReportItem> reportItems = new ArrayList<>();
 
-        // current kmsg log
+        // Global kmsg log
         File initLogFile = getKmsgFile(context);
-        reportItems.add(ReportItem.create(initLogFile, "kmsg.txt"));
+        reportItems.add(ReportItem.create(initLogFile, "global_kmsg.txt"));
 
-        // last kmsg log
+        // Global last kmsg log
         File lastKmsgFile = getLastKmsgFile(context);
-        reportItems.add(ReportItem.create(lastKmsgFile));
+        reportItems.add(ReportItem.create(lastKmsgFile, "global_last_kmsg.txt"));
+
+        // Profile-specific kmsg log
+        File profileKmsgFile = getProfileKmsgFile(context);
+        if (profileKmsgFile.exists()) {
+            String activeProfile = ProfileManager.getActiveProfile(context);
+            reportItems.add(ReportItem.create(profileKmsgFile, "profile_" + activeProfile + "_kmsg.txt"));
+        }
+
+        // Profile-specific last kmsg log
+        File profileLastKmsgFile = getProfileLastKmsgFile(context);
+        if (profileLastKmsgFile.exists()) {
+            String activeProfile = ProfileManager.getActiveProfile(context);
+            reportItems.add(ReportItem.create(profileLastKmsgFile, "profile_" + activeProfile + "_last_kmsg.txt"));
+        }
 
         // logcat
         File logcatFile = getLogcatFile(context);
@@ -162,6 +188,11 @@ public class LogEvents {
             PackageInfo packageInfo = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);
             pw.println("PACKAGE: " + packageInfo.packageName);
             pw.println("VERSION: " + packageInfo.versionName);
+            
+            // Profile information
+            String activeProfile = ProfileManager.getActiveProfile(context);
+            pw.println("ACTIVE_PROFILE: " + activeProfile);
+            pw.println("VERBOSE_LOGGING: " + ProfileSettings.isVerboseLoggingEnabled(context));
         } catch (Throwable ignored) {}
 
         reportItems.add(ReportItem.create(buildInfo));

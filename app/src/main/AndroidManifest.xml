@@ -53,6 +53,11 @@
             android:label="@string/create_app_activity"
             android:screenOrientation="portrait" />
 
+        <activity
+            android:name=".ui.ProfileManagerActivity"
+            android:label="@string/profile_manager_title"
+            android:screenOrientation="portrait" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="io.twoyi.fileprovider"
