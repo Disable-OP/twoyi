@@ -186,38 +186,75 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     register_natives(&jvm, class_name, jni_methods.as_ref())
 }
 
-// Main function for standalone execution
-// This allows the .so to be executed directly from shell
+// Exported C functions that can be called from shell or other tools
+// These provide the same functionality as the JNI interface but without Android dependencies
+
+/// Start the input system - can be called from shell via dlopen/dlsym
+#[no_mangle]
+pub extern "C" fn twoyi_start_input_system(width: i32, height: i32) {
+    input::start_input_system(width, height);
+}
+
+/// Display version and help information
+#[no_mangle]
+pub extern "C" fn twoyi_print_help() {
+    use std::io::{self, Write};
+    let _ = writeln!(io::stdout(), "Twoyi Native Library - v0.1.0");
+    let _ = writeln!(io::stdout(), "\nExported Functions:");
+    let _ = writeln!(io::stdout(), "  twoyi_start_input_system(width, height) - Start input system");
+    let _ = writeln!(io::stdout(), "  twoyi_print_help() - Show this help");
+    let _ = writeln!(io::stdout(), "  twoyi_send_keycode(keycode) - Send a keycode event");
+    let _ = writeln!(io::stdout(), "\nUsage from shell:");
+    let _ = writeln!(io::stdout(), "  This library can be loaded via System.loadLibrary(\"twoyi\") in Android apps");
+    let _ = writeln!(io::stdout(), "  Or called from shell using the twoyi wrapper script");
+}
+
+/// Send a keycode - exposed for shell access
+#[no_mangle]
+pub extern "C" fn twoyi_send_keycode(keycode: i32) {
+    input::send_key_code(keycode);
+}
+
+// Main function for standalone execution when run as ./libtwoyi.so
+// This requires a proper ELF executable setup, which we'll handle via wrapper
 #[no_mangle]
 pub extern "C" fn main(argc: i32, argv: *const *const i8) -> i32 {
     use std::ffi::CStr;
+    use std::io::{self, Write};
     
-    // Initialize simple logging to stdout for CLI mode
-    println!("Twoyi Renderer - Standalone Mode");
-    println!("argc: {}", argc);
+    // Safety check: if argv is null, we're not being called properly
+    if argv.is_null() {
+        let _ = writeln!(io::stderr(), "Error: argv is null");
+        return 1;
+    }
+    
+    // Use write! to stderr/stdout directly
+    let _ = writeln!(io::stdout(), "Twoyi Renderer - Standalone Mode");
+    let _ = writeln!(io::stdout(), "argc: {}", argc);
     
     if argc > 1 {
-        println!("Arguments:");
+        let _ = writeln!(io::stdout(), "Arguments:");
         for i in 0..argc {
             unsafe {
                 let arg_ptr = *argv.offset(i as isize);
                 if !arg_ptr.is_null() {
-                    let arg = CStr::from_ptr(arg_ptr as *const u8);
-                    println!("  [{}]: {:?}", i, arg);
+                    if let Ok(arg) = CStr::from_ptr(arg_ptr as *const u8).to_str() {
+                        let _ = writeln!(io::stdout(), "  [{}]: {}", i, arg);
+                    }
                 }
             }
         }
     }
     
-    println!("\nUsage: ./libtwoyi.so [OPTIONS]");
-    println!("Options:");
-    println!("  --help                Show this help message");
-    println!("  --width <width>       Set virtual display width (default: 720)");
-    println!("  --height <height>     Set virtual display height (default: 1280)");
-    println!("  --loader <path>       Set loader path");
-    println!("  --start-input         Start input system only");
-    println!("\nNote: This library is primarily designed to be loaded by the Twoyi app.");
-    println!("For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")");
+    let _ = writeln!(io::stdout(), "\nUsage: ./libtwoyi.so [OPTIONS]");
+    let _ = writeln!(io::stdout(), "Options:");
+    let _ = writeln!(io::stdout(), "  --help                Show this help message");
+    let _ = writeln!(io::stdout(), "  --width <width>       Set virtual display width (default: 720)");
+    let _ = writeln!(io::stdout(), "  --height <height>     Set virtual display height (default: 1280)");
+    let _ = writeln!(io::stdout(), "  --loader <path>       Set loader path");
+    let _ = writeln!(io::stdout(), "  --start-input         Start input system only");
+    let _ = writeln!(io::stdout(), "\nNote: This library is primarily designed to be loaded by the Twoyi app.");
+    let _ = writeln!(io::stdout(), "For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")");
     
     // Parse arguments and provide standalone functionality
     let mut width = 720;
@@ -229,39 +266,43 @@ pub extern "C" fn main(argc: i32, argv: *const *const i8) -> i32 {
         while i < argc {
             let arg_ptr = *argv.offset(i as isize);
             if !arg_ptr.is_null() {
-                let arg = CStr::from_ptr(arg_ptr as *const u8).to_string_lossy();
-                match arg.as_ref() {
-                    "--help" | "-h" => {
-                        return 0;
-                    }
-                    "--width" => {
-                        i += 1;
-                        if i < argc {
-                            let val_ptr = *argv.offset(i as isize);
-                            if !val_ptr.is_null() {
-                                let val = CStr::from_ptr(val_ptr as *const u8).to_string_lossy();
-                                if let Ok(w) = val.parse::<i32>() {
-                                    width = w;
+                if let Ok(arg) = CStr::from_ptr(arg_ptr as *const u8).to_str() {
+                    match arg {
+                        "--help" | "-h" => {
+                            twoyi_print_help();
+                            return 0;
+                        }
+                        "--width" => {
+                            i += 1;
+                            if i < argc {
+                                let val_ptr = *argv.offset(i as isize);
+                                if !val_ptr.is_null() {
+                                    if let Ok(val) = CStr::from_ptr(val_ptr as *const u8).to_str() {
+                                        if let Ok(w) = val.parse::<i32>() {
+                                            width = w;
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    "--height" => {
-                        i += 1;
-                        if i < argc {
-                            let val_ptr = *argv.offset(i as isize);
-                            if !val_ptr.is_null() {
-                                let val = CStr::from_ptr(val_ptr as *const u8).to_string_lossy();
-                                if let Ok(h) = val.parse::<i32>() {
-                                    height = h;
+                        "--height" => {
+                            i += 1;
+                            if i < argc {
+                                let val_ptr = *argv.offset(i as isize);
+                                if !val_ptr.is_null() {
+                                    if let Ok(val) = CStr::from_ptr(val_ptr as *const u8).to_str() {
+                                        if let Ok(h) = val.parse::<i32>() {
+                                            height = h;
+                                        }
+                                    }
                                 }
                             }
                         }
+                        "--start-input" => {
+                            start_input = true;
+                        }
+                        _ => {}
                     }
-                    "--start-input" => {
-                        start_input = true;
-                    }
-                    _ => {}
                 }
             }
             i += 1;
@@ -269,9 +310,9 @@ pub extern "C" fn main(argc: i32, argv: *const *const i8) -> i32 {
     }
     
     if start_input {
-        println!("\nStarting input system with dimensions: {}x{}", width, height);
-        input::start_input_system(width, height);
-        println!("Input system started. Press Ctrl+C to exit.");
+        let _ = writeln!(io::stdout(), "\nStarting input system with dimensions: {}x{}", width, height);
+        twoyi_start_input_system(width, height);
+        let _ = writeln!(io::stdout(), "Input system started. Press Ctrl+C to exit.");
         
         // Keep the program running
         loop {
