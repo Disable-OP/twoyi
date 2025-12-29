@@ -1,7 +1,7 @@
 fn main() {
     println!("cargo:rustc-link-search=native=../src/main/jniLibs/arm64-v8a");
     
-    // Make the shared library executable by setting entry point
-    println!("cargo:rustc-cdylib-link-arg=-Wl,-e,main");
-    println!("cargo:rustc-cdylib-link-arg=-Wl,--export-dynamic");
+    // Note: We do NOT set a custom entry point because it causes segfaults
+    // Users should use the wrapper script (twoyi) which invokes via linker64
+    // Direct execution of .so files requires proper ELF initialization
 }

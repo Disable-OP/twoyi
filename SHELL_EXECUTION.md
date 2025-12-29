@@ -1,3 +1,12 @@
+<!--
+Copyright Disclaimer: AI-Generated Content
+This file was created by GitHub Copilot, an AI coding assistant.
+AI-generated content is not subject to copyright protection and is provided
+without any warranty, express or implied, including warranties of merchantability,
+fitness for a particular purpose, or non-infringement.
+Use at your own risk.
+-->
+
 # libtwoyi.so - Dual-Mode Execution Guide
 
 ## Overview
@@ -40,35 +49,36 @@ The JNI entry point `JNI_OnLoad` registers native methods that can be called fro
 
 ### 2. Shell Executable Mode
 
-The library can be executed from the shell in two ways:
+**IMPORTANT**: The library CANNOT be executed directly as `./libtwoyi.so` - this will cause a segmentation fault. You MUST use one of the methods below:
 
-#### Method A: Using the Wrapper Script (Recommended)
+#### Method A: Using the Wrapper Script (REQUIRED for shell execution)
 
 ```bash
-# Copy to device
+# Copy both files to device
 adb push app/src/main/jniLibs/arm64-v8a/twoyi /data/local/tmp/
 adb push app/src/main/jniLibs/arm64-v8a/libtwoyi.so /data/local/tmp/
 
-# Execute
+# Execute via wrapper script
 adb shell /data/local/tmp/twoyi --help
 adb shell /data/local/tmp/twoyi --start-input --width 1080 --height 1920
 ```
 
-The wrapper script uses Android's linker to properly load and execute the library.
+The wrapper script uses Android's linker (`/system/bin/linker64`) to properly load and execute the library with correct runtime initialization.
 
-#### Method B: Direct Execution (Advanced)
+#### Method B: Direct Linker Invocation (Alternative)
 
-The library has a custom entry point and can be executed directly:
+You can also invoke the linker directly without the wrapper script:
 
 ```bash
-# Copy to device
+# Copy library to device
 adb push app/src/main/jniLibs/arm64-v8a/libtwoyi.so /data/local/tmp/
 
 # Execute using linker64 directly
 adb shell /system/bin/linker64 /data/local/tmp/libtwoyi.so --help
+adb shell /system/bin/linker64 /data/local/tmp/libtwoyi.so --start-input --width 720 --height 1280
 ```
 
-**Note**: Direct execution may cause segfaults if the Android linker doesn't properly initialize the Rust runtime. Use Method A (wrapper script) for reliable execution.
+**Why not `./libtwoyi.so`?**: Shared libraries (`.so` files) are not designed to be executed directly. They require proper dynamic linker initialization which doesn't happen with direct execution. Always use the wrapper script or invoke via `linker64`.
 
 ### Available Command-Line Options
 
@@ -215,23 +225,33 @@ Usage: ./libtwoyi.so [OPTIONS]
 
 ### Segmentation Fault When Running ./libtwoyi.so
 
-**Problem**: Direct execution causes segfault due to incomplete runtime initialization.
+**Problem**: Attempting to execute the library directly with `./libtwoyi.so` or `chmod +x libtwoyi.so && ./libtwoyi.so` causes a segmentation fault.
 
-**Solution**: Use the wrapper script instead:
+**Explanation**: Shared libraries (`.so` files) are not standalone executables. They lack the proper ELF initialization code that executables have. When you try to execute them directly, the dynamic linker doesn't initialize the runtime environment correctly, causing crashes.
+
+**Solution**: NEVER execute `./libtwoyi.so` directly. Instead, use one of these methods:
+
+**Option 1 - Wrapper Script (Easiest):**
 ```bash
+adb push app/src/main/jniLibs/arm64-v8a/twoyi /data/local/tmp/
+adb push app/src/main/jniLibs/arm64-v8a/libtwoyi.so /data/local/tmp/
+adb shell chmod +x /data/local/tmp/twoyi
 adb shell /data/local/tmp/twoyi --help
 ```
 
-Or use linker64 directly:
+**Option 2 - Direct Linker Invocation:**
 ```bash
 adb shell /system/bin/linker64 /data/local/tmp/libtwoyi.so --help
 ```
 
-### Library not executable
+The wrapper script or linker64 properly loads the library with correct runtime initialization.
+
+### Library not executable (wrapper script)
 ```bash
-adb shell chmod +x /path/to/libtwoyi.so
 adb shell chmod +x /path/to/twoyi
 ```
+
+Note: The `.so` file itself doesn't need to be executable since it's loaded by the linker, not executed directly.
 
 ### Permission denied
 Ensure the library is in a directory with execute permissions (e.g., `/data/local/tmp/` works with adb).
