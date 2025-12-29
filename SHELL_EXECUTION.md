@@ -67,16 +67,21 @@ The wrapper script uses Android's linker (`/system/bin/linker64`) to properly lo
 
 #### Method B: Direct Linker Invocation (Alternative)
 
-You can also invoke the linker directly without the wrapper script:
+You can also invoke the linker directly without the wrapper script. Arguments are now properly parsed:
 
 ```bash
 # Copy library to device
 adb push app/src/main/jniLibs/arm64-v8a/libtwoyi.so /data/local/tmp/
 
-# Execute using linker64 directly
+# Execute using linker64 directly with arguments
 adb shell /system/bin/linker64 /data/local/tmp/libtwoyi.so --help
 adb shell /system/bin/linker64 /data/local/tmp/libtwoyi.so --start-input --width 720 --height 1280
+
+# Or with LD_LIBRARY_PATH if library has dependencies
+adb shell LD_LIBRARY_PATH=/data/local/tmp /system/bin/linker64 /data/local/tmp/libtwoyi.so --help
 ```
+
+**Note**: The library uses `std::env::args()` to properly parse arguments passed via linker64, so command-line options work correctly.
 
 **Why not `./libtwoyi.so`?**: Shared libraries (`.so` files) are not designed to be executed directly. They require proper dynamic linker initialization which doesn't happen with direct execution. Always use the wrapper script or invoke via `linker64`.
 
@@ -129,9 +134,24 @@ nm -D libtwoyi.so | grep -E "(main|JNI_OnLoad|twoyi_)"
 
 The library is configured with:
 - Built as a `cdylib` (C-compatible dynamic library)
-- Entry point set to `main` function via linker flag: `-Wl,-e,main`
-- All symbols exported via: `-Wl,--export-dynamic`
-- Executable permissions set by build script
+- No custom entry point (entry point: 0x0) - standard shared library
+- Entry point defaults to system initialization code
+- Exports `main`, `JNI_OnLoad`, and `twoyi_*` functions
+
+### Argument Parsing
+
+When invoked via `linker64`, the library's `main` function receives arguments through the environment rather than traditional argc/argv parameters. The implementation uses `std::env::args()` to properly parse command-line arguments:
+
+```rust
+pub extern "C" fn main(_argc: i32, _argv: *const *const i8) -> i32 {
+    // argc/argv from linker64 may not be properly initialized
+    // Use std::env::args() which reads from the environment correctly
+    let args: Vec<String> = env::args().collect();
+    // ... parse args ...
+}
+```
+
+This ensures command-line options like `--help`, `--width`, `--height`, and `--start-input` work correctly when invoked via linker64.
 
 ### Wrapper Script
 

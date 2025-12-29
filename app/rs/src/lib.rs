@@ -215,38 +215,29 @@ pub extern "C" fn twoyi_send_keycode(keycode: i32) {
     input::send_key_code(keycode);
 }
 
-// Main function for standalone execution when run as ./libtwoyi.so
-// This requires a proper ELF executable setup, which we'll handle via wrapper
+// Main function for standalone execution when invoked via linker64
+// Note: When called via linker64, argc/argv may not be properly initialized
+// We use std::env::args() as a fallback to get arguments from the environment
 #[no_mangle]
-pub extern "C" fn main(argc: i32, argv: *const *const i8) -> i32 {
-    use std::ffi::CStr;
+pub extern "C" fn main(_argc: i32, _argv: *const *const i8) -> i32 {
     use std::io::{self, Write};
+    use std::env;
     
-    // Safety check: if argv is null, we're not being called properly
-    if argv.is_null() {
-        let _ = writeln!(io::stderr(), "Error: argv is null");
-        return 1;
-    }
-    
-    // Use write! to stderr/stdout directly
     let _ = writeln!(io::stdout(), "Twoyi Renderer - Standalone Mode");
-    let _ = writeln!(io::stdout(), "argc: {}", argc);
     
-    if argc > 1 {
+    // When invoked via linker64, argc might be garbage/uninitialized
+    // Use std::env::args() instead which reads from the environment properly
+    let args: Vec<String> = env::args().collect();
+    
+    let _ = writeln!(io::stdout(), "Arguments received: {}", args.len());
+    if !args.is_empty() {
         let _ = writeln!(io::stdout(), "Arguments:");
-        for i in 0..argc {
-            unsafe {
-                let arg_ptr = *argv.offset(i as isize);
-                if !arg_ptr.is_null() {
-                    if let Ok(arg) = CStr::from_ptr(arg_ptr as *const u8).to_str() {
-                        let _ = writeln!(io::stdout(), "  [{}]: {}", i, arg);
-                    }
-                }
-            }
+        for (i, arg) in args.iter().enumerate() {
+            let _ = writeln!(io::stdout(), "  [{}]: {}", i, arg);
         }
     }
     
-    let _ = writeln!(io::stdout(), "\nUsage: ./libtwoyi.so [OPTIONS]");
+    let _ = writeln!(io::stdout(), "\nUsage: twoyi [OPTIONS] or linker64 libtwoyi.so [OPTIONS]");
     let _ = writeln!(io::stdout(), "Options:");
     let _ = writeln!(io::stdout(), "  --help                Show this help message");
     let _ = writeln!(io::stdout(), "  --width <width>       Set virtual display width (default: 720)");
@@ -256,57 +247,40 @@ pub extern "C" fn main(argc: i32, argv: *const *const i8) -> i32 {
     let _ = writeln!(io::stdout(), "\nNote: This library is primarily designed to be loaded by the Twoyi app.");
     let _ = writeln!(io::stdout(), "For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")");
     
-    // Parse arguments and provide standalone functionality
+    // Parse arguments using env::args() which works correctly with linker64
     let mut width = 720;
     let mut height = 1280;
     let mut start_input = false;
     
-    unsafe {
-        let mut i = 1;
-        while i < argc {
-            let arg_ptr = *argv.offset(i as isize);
-            if !arg_ptr.is_null() {
-                if let Ok(arg) = CStr::from_ptr(arg_ptr as *const u8).to_str() {
-                    match arg {
-                        "--help" | "-h" => {
-                            twoyi_print_help();
-                            return 0;
-                        }
-                        "--width" => {
-                            i += 1;
-                            if i < argc {
-                                let val_ptr = *argv.offset(i as isize);
-                                if !val_ptr.is_null() {
-                                    if let Ok(val) = CStr::from_ptr(val_ptr as *const u8).to_str() {
-                                        if let Ok(w) = val.parse::<i32>() {
-                                            width = w;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        "--height" => {
-                            i += 1;
-                            if i < argc {
-                                let val_ptr = *argv.offset(i as isize);
-                                if !val_ptr.is_null() {
-                                    if let Ok(val) = CStr::from_ptr(val_ptr as *const u8).to_str() {
-                                        if let Ok(h) = val.parse::<i32>() {
-                                            height = h;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        "--start-input" => {
-                            start_input = true;
-                        }
-                        _ => {}
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                twoyi_print_help();
+                return 0;
+            }
+            "--width" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(w) = args[i].parse::<i32>() {
+                        width = w;
                     }
                 }
             }
-            i += 1;
+            "--height" => {
+                i += 1;
+                if i < args.len() {
+                    if let Ok(h) = args[i].parse::<i32>() {
+                        height = h;
+                    }
+                }
+            }
+            "--start-input" => {
+                start_input = true;
+            }
+            _ => {}
         }
+        i += 1;
     }
     
     if start_input {
