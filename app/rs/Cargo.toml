@@ -27,6 +27,9 @@ jni = { version = "0.19.0", default-features = false }
 uinput-sys = "0.1.7"
 unix_socket = "0.5.0"
 
+# for CLI argument parsing
+clap = { version = "4.0", features = ["derive"] }
+
 
 [patch.crates-io]
 uinput-sys = { git = 'https://github.com/tiann/rust-uinput-sys' }

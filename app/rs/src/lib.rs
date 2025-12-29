@@ -6,20 +6,15 @@ use jni::objects::JValue;
 use jni::sys::{jclass, jfloat, jint, jobject, JNI_ERR, jstring};
 use jni::JNIEnv;
 use jni::{JavaVM, NativeMethod};
-use log::{error, info, Level, debug};
+use log::{debug, error, Level};
 use ndk_sys;
 use std::ffi::c_void;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-
 use android_logger::Config;
-
-use std::fs::File;
-use std::process::{Command, Stdio};
 
 mod input;
 mod renderer_bindings;
+mod core;
 
 /// ## Examples
 /// ```
@@ -34,8 +29,6 @@ macro_rules! jni_method {
         }
     }};
 }
-
-static RENDERER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[no_mangle]
 pub fn renderer_init(
@@ -69,49 +62,20 @@ pub fn renderer_init(
     let virtual_width = width;
     let virtual_height = height;
 
-    info!(
-        "renderer_init surface: {}x{}, virtual: {}x{}, fps: {}",
-        surface_width, surface_height, virtual_width, virtual_height, fps
+    let loader_path: String = env.get_string(loader.into()).unwrap().into();
+    let window_ptr = window.ptr().as_ptr() as *mut c_void;
+
+    core::init_renderer(
+        window_ptr,
+        loader_path,
+        surface_width,
+        surface_height,
+        virtual_width,
+        virtual_height,
+        xdpi as i32,
+        ydpi as i32,
+        fps as i32,
     );
-
-    if RENDERER_STARTED.compare_exchange(false, true, 
-        Ordering::Acquire, Ordering::Relaxed).is_err() {
-        let win = window.ptr().as_ptr() as *mut c_void;
-        unsafe {
-            renderer_bindings::setNativeWindow(win);
-            renderer_bindings::resetSubWindow(win, 0, 0, surface_width, surface_height, 
-                                             virtual_width, virtual_height, 1.0, 0.0);
-        }
-    } else {
-        input::start_input_system(virtual_width, virtual_height);
-
-        thread::spawn(move || {
-            let win = window.ptr().as_ptr() as *mut c_void;
-            info!("win: {:#?}", win);
-            unsafe {
-                renderer_bindings::startOpenGLRenderer(
-                    win,
-                    virtual_width,
-                    virtual_height,
-                    xdpi as i32,
-                    ydpi as i32,
-                    fps as i32,
-                );
-            }
-        });
-
-        let loader_path: String = env.get_string(loader.into()).unwrap().into();
-        let working_dir = "/data/data/io.twoyi/rootfs";
-        let log_path = "/data/data/io.twoyi/log.txt";
-        let outputs = File::create(log_path).unwrap();
-        let errors = outputs.try_clone().unwrap();
-        let _ = Command::new("./init")
-            .current_dir(working_dir)
-            .env("TYLOADER", loader_path)
-            .stdout(Stdio::from(outputs))
-            .stderr(Stdio::from(errors))
-            .spawn();
-    }
 }
 
 #[no_mangle]
@@ -129,7 +93,7 @@ pub fn renderer_reset_window(
     debug!("reset_window: surface={}x{}, framebuffer={}x{}", _width, _height, _fb_width, _fb_height);
     unsafe {
         let window = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface);
-        renderer_bindings::resetSubWindow(window as *mut c_void, 0, 0, _width, _height, _fb_width, _fb_height, 1.0, 0.0);
+        core::reset_window(window as *mut c_void, _top, _left, _width, _height, _fb_width, _fb_height);
     }
 }
 
@@ -139,7 +103,7 @@ pub fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
 
     unsafe {
         let window = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface);
-        renderer_bindings::removeSubWindow(window as *mut c_void);
+        core::remove_window(window as *mut c_void);
     }
 }
 
@@ -220,4 +184,100 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     ];
 
     register_natives(&jvm, class_name, jni_methods.as_ref())
+}
+
+// Main function for standalone execution
+// This allows the .so to be executed directly from shell
+#[no_mangle]
+pub extern "C" fn main(argc: i32, argv: *const *const i8) -> i32 {
+    use std::ffi::CStr;
+    
+    // Initialize simple logging to stdout for CLI mode
+    println!("Twoyi Renderer - Standalone Mode");
+    println!("argc: {}", argc);
+    
+    if argc > 1 {
+        println!("Arguments:");
+        for i in 0..argc {
+            unsafe {
+                let arg_ptr = *argv.offset(i as isize);
+                if !arg_ptr.is_null() {
+                    let arg = CStr::from_ptr(arg_ptr as *const u8);
+                    println!("  [{}]: {:?}", i, arg);
+                }
+            }
+        }
+    }
+    
+    println!("\nUsage: ./libtwoyi.so [OPTIONS]");
+    println!("Options:");
+    println!("  --help                Show this help message");
+    println!("  --width <width>       Set virtual display width (default: 720)");
+    println!("  --height <height>     Set virtual display height (default: 1280)");
+    println!("  --loader <path>       Set loader path");
+    println!("  --start-input         Start input system only");
+    println!("\nNote: This library is primarily designed to be loaded by the Twoyi app.");
+    println!("For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")");
+    
+    // Parse arguments and provide standalone functionality
+    let mut width = 720;
+    let mut height = 1280;
+    let mut start_input = false;
+    
+    unsafe {
+        let mut i = 1;
+        while i < argc {
+            let arg_ptr = *argv.offset(i as isize);
+            if !arg_ptr.is_null() {
+                let arg = CStr::from_ptr(arg_ptr as *const u8).to_string_lossy();
+                match arg.as_ref() {
+                    "--help" | "-h" => {
+                        return 0;
+                    }
+                    "--width" => {
+                        i += 1;
+                        if i < argc {
+                            let val_ptr = *argv.offset(i as isize);
+                            if !val_ptr.is_null() {
+                                let val = CStr::from_ptr(val_ptr as *const u8).to_string_lossy();
+                                if let Ok(w) = val.parse::<i32>() {
+                                    width = w;
+                                }
+                            }
+                        }
+                    }
+                    "--height" => {
+                        i += 1;
+                        if i < argc {
+                            let val_ptr = *argv.offset(i as isize);
+                            if !val_ptr.is_null() {
+                                let val = CStr::from_ptr(val_ptr as *const u8).to_string_lossy();
+                                if let Ok(h) = val.parse::<i32>() {
+                                    height = h;
+                                }
+                            }
+                        }
+                    }
+                    "--start-input" => {
+                        start_input = true;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+    }
+    
+    if start_input {
+        println!("\nStarting input system with dimensions: {}x{}", width, height);
+        input::start_input_system(width, height);
+        println!("Input system started. Press Ctrl+C to exit.");
+        
+        // Keep the program running
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    
+    0
 }
