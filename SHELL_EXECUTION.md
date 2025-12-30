@@ -49,25 +49,11 @@ The JNI entry point `JNI_OnLoad` registers native methods that can be called fro
 
 ### 2. Shell Executable Mode
 
-**IMPORTANT**: The library CANNOT be executed directly as `./libtwoyi.so` - this will cause a segmentation fault. You MUST use one of the methods below:
+The library can now be executed directly from the shell via Android's linker64. The library has been configured with a proper entry point so it can be invoked without a wrapper script.
 
-#### Method A: Using the Wrapper Script (REQUIRED for shell execution)
+#### Direct Linker Invocation
 
-```bash
-# Copy both files to device
-adb push app/src/main/jniLibs/arm64-v8a/twoyi /data/local/tmp/
-adb push app/src/main/jniLibs/arm64-v8a/libtwoyi.so /data/local/tmp/
-
-# Execute via wrapper script
-adb shell /data/local/tmp/twoyi --help
-adb shell /data/local/tmp/twoyi --start-input --width 1080 --height 1920
-```
-
-The wrapper script uses Android's linker (`/system/bin/linker64`) to properly load and execute the library with correct runtime initialization.
-
-#### Method B: Direct Linker Invocation (Alternative)
-
-You can also invoke the linker directly without the wrapper script. Arguments are now properly parsed:
+Invoke the linker directly to execute the library. Arguments are properly parsed:
 
 ```bash
 # Copy library to device
@@ -83,7 +69,7 @@ adb shell LD_LIBRARY_PATH=/data/local/tmp /system/bin/linker64 /data/local/tmp/l
 
 **Note**: The library uses `std::env::args()` to properly parse arguments passed via linker64, so command-line options work correctly.
 
-**Why not `./libtwoyi.so`?**: Shared libraries (`.so` files) are not designed to be executed directly. They require proper dynamic linker initialization which doesn't happen with direct execution. Always use the wrapper script or invoke via `linker64`.
+**Why not `./libtwoyi.so`?**: While the library now has a proper entry point, it's still a shared library (`.so` file) and should be invoked via `linker64` for proper dynamic linker initialization. Direct execution as `./libtwoyi.so` may still fail depending on the Android version and linker behavior.
 
 ### Available Command-Line Options
 
@@ -134,9 +120,10 @@ nm -D libtwoyi.so | grep -E "(main|JNI_OnLoad|twoyi_)"
 
 The library is configured with:
 - Built as a `cdylib` (C-compatible dynamic library)
-- No custom entry point (entry point: 0x0) - standard shared library
-- Entry point defaults to system initialization code
+- Entry point set to `main` function (via `-Wl,-e,main` linker flag)
 - Exports `main`, `JNI_OnLoad`, and `twoyi_*` functions
+
+This configuration allows the library to be executed directly via linker64 without requiring a wrapper script.
 
 ### Argument Parsing
 
@@ -153,16 +140,16 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const i8) -> i32 {
 
 This ensures command-line options like `--help`, `--width`, `--height`, and `--start-input` work correctly when invoked via linker64.
 
-### Wrapper Script
+### Wrapper Script (Optional)
 
-The `twoyi` wrapper script invokes the Android linker to properly load and execute the library:
+A `twoyi` wrapper script is provided for convenience, which invokes the Android linker to load and execute the library:
 
 ```sh
 #!/system/bin/sh
 exec /system/bin/linker64 "$SCRIPT_DIR/libtwoyi.so" "$@"
 ```
 
-This ensures proper runtime initialization that might not happen with direct execution.
+However, the wrapper is now optional since the library can be invoked directly via linker64.
 
 ### Target SDK
 
@@ -245,33 +232,26 @@ Usage: ./libtwoyi.so [OPTIONS]
 
 ### Segmentation Fault When Running ./libtwoyi.so
 
-**Problem**: Attempting to execute the library directly with `./libtwoyi.so` or `chmod +x libtwoyi.so && ./libtwoyi.so` causes a segmentation fault.
+**Problem**: Attempting to execute the library directly with `./libtwoyi.so` or `chmod +x libtwoyi.so && ./libtwoyi.so` may cause a segmentation fault.
 
-**Explanation**: Shared libraries (`.so` files) are not standalone executables. They lack the proper ELF initialization code that executables have. When you try to execute them directly, the dynamic linker doesn't initialize the runtime environment correctly, causing crashes.
+**Explanation**: Even though the library now has a proper entry point set, shared libraries (`.so` files) are designed to be loaded by the dynamic linker, not executed directly. Direct execution may fail depending on Android version and linker behavior.
 
-**Solution**: NEVER execute `./libtwoyi.so` directly. Instead, use one of these methods:
+**Solution**: Always use linker64 to invoke the library:
 
-**Option 1 - Wrapper Script (Easiest):**
 ```bash
-adb push app/src/main/jniLibs/arm64-v8a/twoyi /data/local/tmp/
+# Copy library to device
 adb push app/src/main/jniLibs/arm64-v8a/libtwoyi.so /data/local/tmp/
-adb shell chmod +x /data/local/tmp/twoyi
-adb shell /data/local/tmp/twoyi --help
+adb shell LD_LIBRARY_PATH=/data/local/tmp /system/bin/linker64 /data/local/tmp/libtwoyi.so --help
 ```
 
-**Option 2 - Direct Linker Invocation:**
+### Library not executable
+
+The `.so` file doesn't need to be executable since it's loaded by the linker, not executed directly. Ensure the linker can access it:
+
 ```bash
-adb shell /system/bin/linker64 /data/local/tmp/libtwoyi.so --help
+# Make sure the library is readable
+adb shell chmod 644 /path/to/libtwoyi.so
 ```
-
-The wrapper script or linker64 properly loads the library with correct runtime initialization.
-
-### Library not executable (wrapper script)
-```bash
-adb shell chmod +x /path/to/twoyi
-```
-
-Note: The `.so` file itself doesn't need to be executable since it's loaded by the linker, not executed directly.
 
 ### Permission denied
 Ensure the library is in a directory with execute permissions (e.g., `/data/local/tmp/` works with adb).

@@ -1,7 +1,7 @@
 fn main() {
     println!("cargo:rustc-link-search=native=../src/main/jniLibs/arm64-v8a");
     
-    // Note: We do NOT set a custom entry point because it causes segfaults
-    // Users should use the wrapper script (twoyi) which invokes via linker64
-    // Direct execution of .so files requires proper ELF initialization
+    // The entry point is set via RUSTFLAGS in build_rs.sh: -Wl,-e,main
+    // This allows the library to be executed directly via linker64
+    // Without this, the entry point would be 0x0 causing segmentation faults
 }
