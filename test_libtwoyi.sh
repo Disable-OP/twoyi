@@ -20,7 +20,8 @@ echo ""
 # Check if library exists
 if [ ! -f "$LIB_PATH" ]; then
     echo "ERROR: Library not found at $LIB_PATH"
-    echo "Please build the library first: cd app/rs && sh build_rs.sh --release"
+    echo "Please build the library first:"
+    echo "  cd app/rs && sh build_rs.sh --release"
     exit 1
 fi
 
@@ -37,8 +38,8 @@ echo "ELF Header:"
 readelf -h "$LIB_PATH" | grep -E "(Type|Entry)"
 echo ""
 
-# Get entry point address (get the last field which is the hex address)
-ENTRY_POINT=$(readelf -h "$LIB_PATH" | awk '/Entry point address:/ {print $NF}')
+# Get entry point address (extract the hex value from readelf output)
+ENTRY_POINT=$(readelf -h "$LIB_PATH" | awk '/Entry point address:/ {print $4}')
 echo "Entry point address: $ENTRY_POINT"
 
 if [ "$ENTRY_POINT" = "0x0" ]; then
@@ -56,8 +57,11 @@ if ! command -v nm >/dev/null 2>&1; then
     exit 1
 fi
 
-# Try to get the main symbol
-if ! MAIN_ADDR=$(nm -D "$LIB_PATH" 2>/dev/null | grep " T main$" | awk '{print $1}'); then
+# Try to read symbols from the library
+MAIN_ADDR=$(nm -D "$LIB_PATH" 2>/dev/null | grep " T main$" | awk '{print $1}')
+NM_EXIT=$?
+
+if [ $NM_EXIT -ne 0 ]; then
     echo "ERROR: Failed to read symbols from library using 'nm -D'"
     echo "The library may be incompatible or nm may not support this format"
     exit 1
@@ -71,8 +75,12 @@ fi
 echo "✓ main symbol found at address: 0x$MAIN_ADDR"
 echo ""
 
-# Verify entry point matches main address
-if [ "$ENTRY_POINT" = "0x$MAIN_ADDR" ]; then
+# Verify entry point matches main address (normalize hex values for comparison)
+# Remove leading zeros and convert to lowercase for comparison
+ENTRY_NORMALIZED=$(echo "$ENTRY_POINT" | sed 's/^0x//' | tr '[:upper:]' '[:lower:]' | sed 's/^0*//')
+MAIN_NORMALIZED=$(echo "$MAIN_ADDR" | sed 's/^0x//' | tr '[:upper:]' '[:lower:]' | sed 's/^0*//')
+
+if [ "$ENTRY_NORMALIZED" = "$MAIN_NORMALIZED" ]; then
     echo "✓ Entry point matches 'main' function address"
 else
     echo "WARNING: Entry point ($ENTRY_POINT) does not match main address (0x$MAIN_ADDR)"
