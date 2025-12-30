@@ -16,6 +16,16 @@ mod input;
 mod renderer_bindings;
 mod core;
 
+// Reference the interp symbol from C to force it to be linked
+extern "C" {
+    #[link_name = "interp"]
+    static INTERP: [u8; 0];
+}
+
+// Force the interp symbol to be included by referencing it
+#[used]
+static INTERP_REF: &'static [u8; 0] = unsafe { &INTERP };
+
 /// ## Examples
 /// ```
 /// let method:NativeMethod = jni_method!(native_method, "(Ljava/lang/String;)V");

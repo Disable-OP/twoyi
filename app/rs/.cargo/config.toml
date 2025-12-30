@@ -6,15 +6,16 @@
 # Use at your own risk.
 
 [target.aarch64-linux-android]
-# Configure the library to be directly executable (./libtwoyi.so)
-# 1. Set entry point to 'main' for execution
-# 2. Add INTERP section to specify dynamic linker
-# 3. Set RPATH to $ORIGIN to find libraries in current directory
+# Configure as PIE (Position Independent Executable) for direct execution
+# PIE is an EXEC-type binary that can be directly executed and also loaded by dlopen
 rustflags = [
     "-C", "link-arg=-Wl,-e,main",
     "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
     "-C", "link-arg=-Wl,-rpath,$ORIGIN",
-    "-C", "link-arg=-Wl,--enable-new-dtags"
+    "-C", "link-arg=-Wl,--enable-new-dtags",
+    "-C", "link-arg=-pie",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-Wl,--undefined=interp"
 ]
 
 [target.x86_64-linux-android]

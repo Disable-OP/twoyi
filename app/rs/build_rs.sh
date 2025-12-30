@@ -13,9 +13,9 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 
-# Configure library for direct execution (./libtwoyi.so)
-# This also sets INTERP and RPATH in addition to config.toml
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-e,main -C link-arg=-Wl,--dynamic-linker=/system/bin/linker64 -C link-arg=-Wl,-rpath,\$ORIGIN -C link-arg=-Wl,--enable-new-dtags"
+# Configure as PIE executable for direct execution with JNI compatibility
+# PIE with INTERP segment allows direct execution: ./libtwoyi.so
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-e,main -C link-arg=-Wl,--dynamic-linker=/system/bin/linker64 -C link-arg=-Wl,-rpath,\$ORIGIN -C link-arg=-Wl,--enable-new-dtags -C link-arg=-pie -C relocation-model=pic -C link-arg=-Wl,--undefined=interp"
 cargo xdk -t arm64-v8a -o ../src/main/jniLibs build $1
 
 # Copy wrapper script and make it executable

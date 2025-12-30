@@ -6,8 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-# This must contain at least cdylib for Android libraries to be generated.
+# Build as cdylib which will be converted to PIE executable via linker flags
 crate-type = ["cdylib"]
+
+[build-dependencies]
+cc = "1.0"
 
 [dependencies]
 
