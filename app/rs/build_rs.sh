@@ -13,10 +13,9 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 
-# Set entry point to 'main' so the library can be executed directly via linker64
-# This is also configured in .cargo/config.toml, but we set it here explicitly
-# to ensure it works even if config.toml is not read by the build tool
-export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-e,main"
+# Configure library for direct execution (./libtwoyi.so)
+# This also sets INTERP and RPATH in addition to config.toml
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-e,main -C link-arg=-Wl,--dynamic-linker=/system/bin/linker64 -C link-arg=-Wl,-rpath,\$ORIGIN -C link-arg=-Wl,--enable-new-dtags"
 cargo xdk -t arm64-v8a -o ../src/main/jniLibs build $1
 
 # Copy wrapper script and make it executable

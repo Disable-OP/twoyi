@@ -215,21 +215,32 @@ pub extern "C" fn twoyi_send_keycode(keycode: i32) {
     input::send_key_code(keycode);
 }
 
-// Main function for standalone execution when invoked via linker64
-// Note: When called via linker64, argc/argv may not be properly initialized
-// We use std::env::args() as a fallback to get arguments from the environment
+// Main function for standalone execution when invoked directly or via linker64
 #[no_mangle]
-pub extern "C" fn main(_argc: i32, _argv: *const *const i8) -> i32 {
+pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
     use std::io::{self, Write};
-    use std::env;
+    use std::ffi::CStr;
     
     let _ = writeln!(io::stdout(), "Twoyi Renderer - Standalone Mode");
     
-    // When invoked via linker64, argc might be garbage/uninitialized
-    // Use std::env::args() instead which reads from the environment properly
-    let args: Vec<String> = env::args().collect();
+    // Parse arguments from argc/argv
+    let mut args: Vec<String> = Vec::new();
     
-    let _ = writeln!(io::stdout(), "Arguments received: {}", args.len());
+    if argc > 0 && !argv.is_null() {
+        unsafe {
+            for i in 0..argc as isize {
+                let arg_ptr = *argv.offset(i);
+                if !arg_ptr.is_null() {
+                    // arg_ptr is *const i8, CStr::from_ptr expects *const i8
+                    if let Ok(arg_cstr) = CStr::from_ptr(arg_ptr).to_str() {
+                        args.push(arg_cstr.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    let _ = writeln!(io::stdout(), "argc: {}", argc);
     if !args.is_empty() {
         let _ = writeln!(io::stdout(), "Arguments:");
         for (i, arg) in args.iter().enumerate() {
@@ -237,7 +248,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const i8) -> i32 {
         }
     }
     
-    let _ = writeln!(io::stdout(), "\nUsage: twoyi [OPTIONS] or linker64 libtwoyi.so [OPTIONS]");
+    let _ = writeln!(io::stdout(), "\nUsage: ./libtwoyi.so [OPTIONS]");
     let _ = writeln!(io::stdout(), "Options:");
     let _ = writeln!(io::stdout(), "  --help                Show this help message");
     let _ = writeln!(io::stdout(), "  --width <width>       Set virtual display width (default: 720)");
@@ -247,7 +258,7 @@ pub extern "C" fn main(_argc: i32, _argv: *const *const i8) -> i32 {
     let _ = writeln!(io::stdout(), "\nNote: This library is primarily designed to be loaded by the Twoyi app.");
     let _ = writeln!(io::stdout(), "For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")");
     
-    // Parse arguments using env::args() which works correctly with linker64
+    // Parse arguments
     let mut width = 720;
     let mut height = 1280;
     let mut start_input = false;

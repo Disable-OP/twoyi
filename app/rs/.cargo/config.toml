@@ -6,9 +6,22 @@
 # Use at your own risk.
 
 [target.aarch64-linux-android]
-# Set the entry point to 'main' so the library can be executed directly via linker64
-# This allows direct invocation: /system/bin/linker64 libtwoyi.so --help
-# We use 'main' because it's the exported Rust function that implements CLI mode
-# For shared libraries invoked via linker64, 'main' is the appropriate entry point
-# (Note: '_start' is used for standalone executables, not shared libraries)
-rustflags = ["-C", "link-arg=-Wl,-e,main"]
+# Configure the library to be directly executable (./libtwoyi.so)
+# 1. Set entry point to 'main' for execution
+# 2. Add INTERP section to specify dynamic linker
+# 3. Set RPATH to $ORIGIN to find libraries in current directory
+rustflags = [
+    "-C", "link-arg=-Wl,-e,main",
+    "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
+    "-C", "link-arg=-Wl,--enable-new-dtags"
+]
+
+[target.x86_64-linux-android]
+# Same configuration for x86_64 (for testing in redroid)
+rustflags = [
+    "-C", "link-arg=-Wl,-e,main",
+    "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
+    "-C", "link-arg=-Wl,--enable-new-dtags"
+]
