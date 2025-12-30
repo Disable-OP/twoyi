@@ -1,5 +1,4 @@
-#! /bin/bash
-
+#!/system/bin/sh
 #
 # Copyright Disclaimer: AI-Generated Content
 # This file was created by GitHub Copilot, an AI coding assistant.
@@ -12,9 +11,19 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
+# Wrapper script to execute libtwoyi.so from command line
+# This script loads the library and calls its main function
 
-cargo xdk -t arm64-v8a -o ../src/main/jniLibs build $1
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_PATH="$SCRIPT_DIR/libtwoyi.so"
 
-# Copy wrapper script and make it executable
-cp twoyi.sh ../src/main/jniLibs/arm64-v8a/twoyi 2>/dev/null || true
-chmod +x ../src/main/jniLibs/arm64-v8a/twoyi 2>/dev/null || true
+# Check if library exists
+if [ ! -f "$LIB_PATH" ]; then
+    echo "Error: libtwoyi.so not found at $LIB_PATH"
+    exit 1
+fi
+
+# Execute the library using the linker directly
+# This allows the .so to be executed as if it were an executable
+exec /system/bin/linker64 "$LIB_PATH" "$@"

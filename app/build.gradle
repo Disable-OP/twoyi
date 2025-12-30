@@ -20,7 +20,7 @@ android {
         applicationId "io.twoyi"
         minSdkVersion 27
         //noinspection ExpiredTargetSdkVersion
-        targetSdkVersion 27
+        targetSdkVersion 28
         versionCode 30505
         versionName "3.5.5-${buildSerial}"
 
