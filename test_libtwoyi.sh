@@ -50,13 +50,22 @@ echo ""
 
 # Check for main symbol
 echo "Checking for 'main' symbol:"
-if ! MAIN_ADDR=$(nm -D "$LIB_PATH" 2>/dev/null | grep " T main$" | awk '{print $1}'); then
-    echo "ERROR: 'main' symbol not found or nm failed"
-    echo "This could mean the library is stripped or nm is not available"
+# First check if nm is available
+if ! command -v nm >/dev/null 2>&1; then
+    echo "ERROR: 'nm' command not found. Please install binutils."
     exit 1
 fi
+
+# Try to get the main symbol
+if ! MAIN_ADDR=$(nm -D "$LIB_PATH" 2>/dev/null | grep " T main$" | awk '{print $1}'); then
+    echo "ERROR: Failed to read symbols from library using 'nm -D'"
+    echo "The library may be incompatible or nm may not support this format"
+    exit 1
+fi
+
 if [ -z "$MAIN_ADDR" ]; then
     echo "ERROR: 'main' symbol not found in dynamic symbol table"
+    echo "The library was not built with the main function exported"
     exit 1
 fi
 echo "✓ main symbol found at address: 0x$MAIN_ADDR"

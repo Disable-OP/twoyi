@@ -14,7 +14,8 @@
 #
 
 # Set entry point to 'main' so the library can be executed directly via linker64
-# Append to existing RUSTFLAGS to avoid overwriting any existing flags
+# This is also configured in .cargo/config.toml, but we set it here explicitly
+# to ensure it works even if config.toml is not read by the build tool
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-e,main"
 cargo xdk -t arm64-v8a -o ../src/main/jniLibs build $1
 

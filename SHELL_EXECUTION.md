@@ -74,7 +74,7 @@ adb shell LD_LIBRARY_PATH=/data/local/tmp /system/bin/linker64 /data/local/tmp/l
 ### Available Command-Line Options
 
 ```
-Usage: twoyi [OPTIONS] or ./libtwoyi.so [OPTIONS]
+Usage: linker64 libtwoyi.so [OPTIONS]
 Options:
   --help                Show this help message
   --width <width>       Set virtual display width (default: 720)
