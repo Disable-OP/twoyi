@@ -79,7 +79,8 @@ Options:
 Test the exact command from the problem statement:
 
 ```bash
-adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=. /system/bin/linker64 \$(realpath libtwoyi.so) --loader \$(realpath libloader.so) --help"
+# Navigate to directory on device and test
+adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=. /system/bin/linker64 ./libtwoyi.so --loader ./libloader.so --help"
 ```
 
 This should work without segmentation fault and display the help message.

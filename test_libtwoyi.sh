@@ -37,8 +37,8 @@ echo "ELF Header:"
 readelf -h "$LIB_PATH" | grep -E "(Type|Entry)"
 echo ""
 
-# Get entry point address
-ENTRY_POINT=$(readelf -h "$LIB_PATH" | grep "Entry point" | awk '{print $4}')
+# Get entry point address (get the last field which is the hex address)
+ENTRY_POINT=$(readelf -h "$LIB_PATH" | awk '/Entry point address:/ {print $NF}')
 echo "Entry point address: $ENTRY_POINT"
 
 if [ "$ENTRY_POINT" = "0x0" ]; then
@@ -50,9 +50,13 @@ echo ""
 
 # Check for main symbol
 echo "Checking for 'main' symbol:"
-MAIN_ADDR=$(nm -D "$LIB_PATH" | grep " T main$" | awk '{print $1}')
+if ! MAIN_ADDR=$(nm -D "$LIB_PATH" 2>/dev/null | grep " T main$" | awk '{print $1}'); then
+    echo "ERROR: 'main' symbol not found or nm failed"
+    echo "This could mean the library is stripped or nm is not available"
+    exit 1
+fi
 if [ -z "$MAIN_ADDR" ]; then
-    echo "ERROR: 'main' symbol not found"
+    echo "ERROR: 'main' symbol not found in dynamic symbol table"
     exit 1
 fi
 echo "✓ main symbol found at address: 0x$MAIN_ADDR"
