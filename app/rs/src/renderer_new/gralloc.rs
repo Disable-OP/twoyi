@@ -14,7 +14,7 @@
 //! This module provides graphics buffer allocation and management using
 //! Android's ANativeWindow API, which interfaces with the gralloc HAL.
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::ffi::c_void;
 use std::io;
 use ndk_sys::{
@@ -173,6 +173,7 @@ impl GrallocManager {
     }
     
     /// Get the buffer format
+    #[allow(dead_code)]
     pub fn get_format(&self) -> i32 {
         self.format
     }
