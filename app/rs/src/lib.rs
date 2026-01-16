@@ -6,7 +6,7 @@ use jni::objects::JValue;
 use jni::sys::{jclass, jfloat, jint, jobject, JNI_ERR, jstring};
 use jni::JNIEnv;
 use jni::{JavaVM, NativeMethod};
-use log::{debug, error, Level};
+use log::{debug, error, info, Level};
 use ndk_sys;
 use std::ffi::c_void;
 
