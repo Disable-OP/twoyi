@@ -104,14 +104,14 @@ pub fn set_native_window(window: *mut c_void) -> i32 {
 /// This function mimics the old `resetSubWindow` API
 pub fn reset_window(
     window: *mut c_void,
-    wx: i32,
-    wy: i32,
+    _wx: i32,
+    _wy: i32,
     ww: i32,
     wh: i32,
     fbw: i32,
     fbh: i32,
-    dpr: f32,
-    z_rot: f32,
+    _dpr: f32,
+    _z_rot: f32,
 ) -> i32 {
     debug!("Resetting window: surface={}x{}, framebuffer={}x{}", ww, wh, fbw, fbh);
     
@@ -136,10 +136,10 @@ pub fn reset_window(
 /// Remove subwindow
 /// 
 /// This function mimics the old `removeSubWindow` API
-pub fn remove_window(window: *mut c_void) -> i32 {
+pub fn remove_window(_window: *mut c_void) -> i32 {
     debug!("Removing window");
     
-    let mut renderer = RENDERER.lock().unwrap();
+    let renderer = RENDERER.lock().unwrap();
     if renderer.is_some() {
         // Keep the renderer alive but acknowledge the window removal
         0
@@ -152,6 +152,7 @@ pub fn remove_window(window: *mut c_void) -> i32 {
 /// Destroy the OpenGL subwindow
 /// 
 /// This function mimics the old `destroyOpenGLSubwindow` API
+#[allow(dead_code)]
 pub fn destroy_subwindow() -> i32 {
     info!("Destroying OpenGL subwindow");
     
@@ -171,6 +172,7 @@ pub fn destroy_subwindow() -> i32 {
 /// Repaint the OpenGL display
 /// 
 /// This function mimics the old `repaintOpenGLDisplay` API
+#[allow(dead_code)]
 pub fn repaint_display() {
     debug!("Repainting display");
     

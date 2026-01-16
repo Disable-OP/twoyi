@@ -23,6 +23,4 @@ pub use renderer::{
     reset_window,
     remove_window,
     set_native_window,
-    destroy_subwindow,
-    repaint_display,
 };

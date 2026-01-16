@@ -14,13 +14,14 @@
 //! This module handles the OpenGL ES command protocol communication
 //! with the container's graphics backend.
 
-use log::{debug, error, info};
-use std::io::{self, Write};
+use log::{debug, info};
 use super::pipe::PipeConnection;
+use std::io;
 
 /// OpenGL ES command types
 #[repr(u32)]
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum GLCommand {
     Initialize = 0x1000,
     SetWindowSize = 0x1001,
@@ -104,6 +105,7 @@ impl GLContext {
     }
     
     /// Swap buffers to display rendered content
+    #[allow(dead_code)]
     pub fn swap_buffers(&mut self) -> io::Result<()> {
         let cmd = GLCommand::SwapBuffers as u32;
         self.pipe.write_all(&cmd.to_le_bytes())?;
@@ -112,6 +114,7 @@ impl GLContext {
     }
     
     /// Repaint the display
+    #[allow(dead_code)]
     pub fn repaint(&mut self) -> io::Result<()> {
         let cmd = GLCommand::Repaint as u32;
         self.pipe.write_all(&cmd.to_le_bytes())?;
@@ -132,6 +135,7 @@ impl GLContext {
     }
     
     /// Check if context is initialized
+    #[allow(dead_code)]
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }

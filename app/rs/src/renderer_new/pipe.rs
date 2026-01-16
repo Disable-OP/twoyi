@@ -14,7 +14,7 @@
 //! This module implements the QEMU pipe protocol for communication with the
 //! container's OpenGL ES endpoints, similar to Anbox's pipe_connection_creator.
 
-use log::{debug, error, info, warn};
+use log::{debug, info};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -72,6 +72,7 @@ impl PipeConnection {
     }
     
     /// Write data to the pipe
+    #[allow(dead_code)]
     pub fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.file.write(data)
     }
@@ -82,11 +83,13 @@ impl PipeConnection {
     }
     
     /// Read data from the pipe
+    #[allow(dead_code)]
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.file.read(buf)
     }
     
     /// Read exact amount of data from the pipe
+    #[allow(dead_code)]
     pub fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
         self.file.read_exact(buf)
     }
@@ -97,6 +100,7 @@ impl PipeConnection {
     }
     
     /// Get the raw file descriptor
+    #[allow(dead_code)]
     pub fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
     }
