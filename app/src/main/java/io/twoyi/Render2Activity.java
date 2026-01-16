@@ -92,6 +92,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         public void surfaceCreated(@NonNull SurfaceHolder holder) {
             Surface surface = holder.getSurface();
             
+            // Set renderer type before initializing
+            boolean useNewRenderer = ProfileSettings.useNewRenderer(getApplicationContext());
+            Renderer.setRendererType(useNewRenderer ? 1 : 0);
+            Log.i(TAG, "Using " + (useNewRenderer ? "new" : "old") + " renderer");
+            
             // Calculate proper DPI based on physical screen and virtual display scaling
             WindowManager windowManager = getWindowManager();
             Display defaultDisplay = windowManager.getDefaultDisplay();

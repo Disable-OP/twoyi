@@ -30,6 +30,7 @@ public class ProfileSettings {
     public static final String DISPLAY_WIDTH = "display_width";
     public static final String DISPLAY_HEIGHT = "display_height";
     public static final String DISPLAY_DPI = "display_dpi";
+    public static final String USE_NEW_RENDERER = "use_new_renderer";
 
     /**
      * Get SharedPreferences for the active profile
@@ -156,5 +157,19 @@ public class ProfileSettings {
      */
     public static void setDisplayDpi(Context context, int dpi) {
         setInt(context, DISPLAY_DPI, dpi);
+    }
+
+    /**
+     * Check if new renderer should be used for active profile (default: false)
+     */
+    public static boolean useNewRenderer(Context context) {
+        return getBoolean(context, USE_NEW_RENDERER, false);
+    }
+
+    /**
+     * Set renderer type for active profile
+     */
+    public static void setUseNewRenderer(Context context, boolean useNew) {
+        setBoolean(context, USE_NEW_RENDERER, useNew);
     }
 }

@@ -118,6 +118,7 @@ public class SettingsActivity extends AppCompatActivity {
             Preference displayWidth = findPreference(R.string.settings_key_display_width);
             Preference displayHeight = findPreference(R.string.settings_key_display_height);
             Preference displayDpi = findPreference(R.string.settings_key_display_dpi);
+            CheckBoxPreference useNewRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_use_new_renderer);
             Preference selectRom = findPreference(R.string.settings_key_select_rom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
@@ -195,6 +196,14 @@ public class SettingsActivity extends AppCompatActivity {
                     Toast.makeText(getActivity(), "Invalid number", Toast.LENGTH_SHORT).show();
                     return false;
                 }
+            });
+
+            // Initialize renderer type checkbox with profile-specific value
+            useNewRenderer.setChecked(ProfileSettings.useNewRenderer(getActivity()));
+            useNewRenderer.setOnPreferenceChangeListener((preference, newValue) -> {
+                ProfileSettings.setUseNewRenderer(getActivity(), (Boolean) newValue);
+                Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
+                return true;
             });
 
             launchContainer.setOnPreferenceClickListener(preference -> {
