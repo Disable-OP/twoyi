@@ -11,7 +11,7 @@ This document describes the new open-source OpenGL renderer implementation in Ru
 
 ## Overview
 
-The new renderer is a fully open-source implementation written in Rust that communicates with the container's OpenGL ES endpoints via QEMU pipes. This implementation is inspired by the [Anbox project](https://github.com/Ananbox/anbox) and provides an alternative to the proprietary `libOpenglRender.so`.
+The new renderer is a fully open-source implementation written in Rust that communicates with the container's OpenGL ES endpoints via QEMU pipes. This implementation is inspired by the [Anbox project](https://github.com/anbox/anbox) and provides an alternative to the proprietary `libOpenglRender.so`.
 
 ## Architecture
 
@@ -138,8 +138,8 @@ Potential enhancements for the new renderer:
 
 ## References
 
-- [Anbox Graphics Implementation](https://github.com/Ananbox/anbox/tree/master/src/anbox/graphics)
-- [QEMU Pipe Connection Creator](https://github.com/Ananbox/anbox/blob/master/src/anbox/qemu/pipe_connection_creator.h)
+- [Anbox Graphics Implementation](https://github.com/anbox/anbox/tree/master/src/anbox/graphics)
+- [QEMU Pipe Connection Creator](https://github.com/anbox/anbox/blob/master/src/anbox/qemu/pipe_connection_creator.h)
 - [Android QEMU Pipe Documentation](https://android.googlesource.com/platform/external/qemu/+/master/docs/ANDROID-QEMU-PIPE.TXT)
 
 ## Contributing

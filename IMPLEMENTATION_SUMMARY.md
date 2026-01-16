@@ -273,8 +273,8 @@ Potential enhancements:
 
 Implementation based on:
 
-- [Anbox Graphics](https://github.com/Ananbox/anbox/tree/master/src/anbox/graphics)
-- [Anbox Pipe Connection Creator](https://github.com/Ananbox/anbox/blob/master/src/anbox/qemu/pipe_connection_creator.h)
+- [Anbox Graphics](https://github.com/anbox/anbox/tree/master/src/anbox/graphics)
+- [Anbox Pipe Connection Creator](https://github.com/anbox/anbox/blob/master/src/anbox/qemu/pipe_connection_creator.h)
 - Existing Twoyi architecture and patterns
 
 ## Conclusion
