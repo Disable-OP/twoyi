@@ -13,9 +13,12 @@
 //! 
 //! This module implements an open-source OpenGL ES renderer that communicates
 //! with the container via QEMU pipes, similar to the Anbox implementation.
+//! It also integrates with Android's gralloc system for proper graphics
+//! buffer management.
 
 pub mod pipe;
 pub mod opengles;
+pub mod gralloc;
 pub mod renderer;
 
 pub use renderer::{

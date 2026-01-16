@@ -20,12 +20,14 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 use super::opengles::GLContext;
+use super::gralloc::GrallocManager;
 
 /// Global renderer state
 static RENDERER: Lazy<Mutex<Option<RendererState>>> = Lazy::new(|| Mutex::new(None));
 
 struct RendererState {
     gl_context: GLContext,
+    gralloc_manager: Option<GrallocManager>,
     window: *mut c_void,
     width: i32,
     height: i32,
@@ -83,10 +85,25 @@ pub fn start_renderer(
     }
     info!("[NEW_RENDERER] GL context initialized successfully");
     
+    // Initialize gralloc manager for buffer management
+    debug!("[NEW_RENDERER] Initializing gralloc manager...");
+    let gralloc_manager = match GrallocManager::new(window, width, height) {
+        Ok(manager) => {
+            info!("[NEW_RENDERER] Gralloc manager initialized successfully");
+            Some(manager)
+        },
+        Err(e) => {
+            warn!("[NEW_RENDERER] Failed to initialize gralloc manager: {}", e);
+            warn!("[NEW_RENDERER] Continuing without gralloc buffer management");
+            None
+        }
+    };
+    
     // Store the renderer state
     debug!("[NEW_RENDERER] Storing renderer state...");
     let state = RendererState {
         gl_context,
+        gralloc_manager,
         window,
         width,
         height,
@@ -111,6 +128,13 @@ pub fn set_native_window(window: *mut c_void) -> i32 {
     if let Some(state) = renderer.as_mut() {
         debug!("[NEW_RENDERER] Updating window pointer in renderer state");
         state.window = window;
+        
+        // Update gralloc manager if available
+        if let Some(ref gralloc) = state.gralloc_manager {
+            debug!("[NEW_RENDERER] Gralloc manager is active");
+            info!("[NEW_RENDERER] Buffer size: {}x{}", gralloc.get_size().0, gralloc.get_size().1);
+        }
+        
         info!("[NEW_RENDERER] Native window updated successfully");
         0
     } else {
@@ -143,6 +167,17 @@ pub fn reset_window(
         state.window = window;
         state.width = fbw;
         state.height = fbh;
+        
+        // Update gralloc manager buffer size if available
+        if let Some(ref mut gralloc) = state.gralloc_manager {
+            debug!("[NEW_RENDERER] Updating gralloc buffer size to {}x{}", fbw, fbh);
+            if let Err(e) = gralloc.set_size(fbw, fbh) {
+                error!("[NEW_RENDERER] Failed to update gralloc buffer size: {}", e);
+                // Continue anyway - not fatal
+            } else {
+                info!("[NEW_RENDERER] Gralloc buffer size updated successfully");
+            }
+        }
         
         debug!("[NEW_RENDERER] Setting window size in GL context...");
         if let Err(e) = state.gl_context.set_window_size(ww, wh, fbw, fbh) {
@@ -206,6 +241,28 @@ pub fn repaint_display() {
     
     let mut renderer = RENDERER.lock().unwrap();
     if let Some(state) = renderer.as_mut() {
+        // Demonstrate gralloc buffer management (lock/unlock cycle)
+        if let Some(ref gralloc) = state.gralloc_manager {
+            debug!("[NEW_RENDERER] Using gralloc buffer management for repaint");
+            
+            // Lock buffer for potential CPU access
+            match gralloc.lock_buffer() {
+                Ok(buffer) => {
+                    debug!("[NEW_RENDERER] Buffer locked: {}x{}, stride: {}", 
+                           buffer.width, buffer.height, buffer.stride);
+                    
+                    // Unlock and post the buffer for display
+                    if let Err(e) = gralloc.unlock_and_post() {
+                        error!("[NEW_RENDERER] Failed to unlock/post buffer: {}", e);
+                    }
+                },
+                Err(e) => {
+                    warn!("[NEW_RENDERER] Failed to lock buffer: {}", e);
+                }
+            }
+        }
+        
+        // Perform the actual GL repaint
         if let Err(e) = state.gl_context.repaint() {
             error!("[NEW_RENDERER] Failed to repaint display: {}", e);
         } else {
