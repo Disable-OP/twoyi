@@ -14,7 +14,7 @@
 //! This module handles the OpenGL ES command protocol communication
 //! with the container's graphics backend.
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use super::pipe::PipeConnection;
 use std::io;
 
@@ -42,8 +42,20 @@ pub struct GLContext {
 impl GLContext {
     /// Create a new OpenGL ES context
     pub fn new() -> io::Result<Self> {
-        let pipe = super::pipe::create_opengles_connection()?;
+        info!("[NEW_RENDERER] Creating new GL context");
+        debug!("[NEW_RENDERER] Establishing pipe connection...");
+        let pipe = match super::pipe::create_opengles_connection() {
+            Ok(p) => {
+                info!("[NEW_RENDERER] Pipe connection established successfully");
+                p
+            },
+            Err(e) => {
+                warn!("[NEW_RENDERER] Failed to create pipe connection: {}", e);
+                return Err(e);
+            }
+        };
         
+        info!("[NEW_RENDERER] GL context created successfully");
         Ok(GLContext {
             pipe,
             width: 0,
@@ -54,10 +66,13 @@ impl GLContext {
     
     /// Initialize the OpenGL ES context
     pub fn initialize(&mut self, width: i32, height: i32, xdpi: i32, ydpi: i32, fps: i32) -> io::Result<()> {
-        info!("Initializing GL context: {}x{} @ {} fps", width, height, fps);
+        info!("[NEW_RENDERER] Initializing GL context: {}x{}, DPI: {}x{}, FPS: {}", 
+              width, height, xdpi, ydpi, fps);
         
         // Send initialization command
         let cmd = GLCommand::Initialize as u32;
+        debug!("[NEW_RENDERER] Sending Initialize command: 0x{:04x}", cmd);
+        
         let data = [
             cmd.to_le_bytes(),
             width.to_le_bytes(),
@@ -67,24 +82,31 @@ impl GLContext {
             fps.to_le_bytes(),
         ];
         
-        for bytes in &data {
+        debug!("[NEW_RENDERER] Sending {} parameter sets", data.len());
+        for (i, bytes) in data.iter().enumerate() {
+            debug!("[NEW_RENDERER] Writing param {}: {:?}", i, bytes);
             self.pipe.write_all(bytes)?;
         }
+        
+        debug!("[NEW_RENDERER] Flushing initialization data...");
         self.pipe.flush()?;
         
         self.width = width;
         self.height = height;
         self.initialized = true;
         
-        debug!("GL context initialized successfully");
+        info!("[NEW_RENDERER] GL context initialized successfully");
         Ok(())
     }
     
     /// Set or update window size
     pub fn set_window_size(&mut self, width: i32, height: i32, fb_width: i32, fb_height: i32) -> io::Result<()> {
-        debug!("Setting window size: surface={}x{}, framebuffer={}x{}", width, height, fb_width, fb_height);
+        info!("[NEW_RENDERER] Setting window size: surface={}x{}, framebuffer={}x{}", 
+              width, height, fb_width, fb_height);
         
         let cmd = GLCommand::SetWindowSize as u32;
+        debug!("[NEW_RENDERER] Sending SetWindowSize command: 0x{:04x}", cmd);
+        
         let data = [
             cmd.to_le_bytes(),
             width.to_le_bytes(),
@@ -93,7 +115,8 @@ impl GLContext {
             fb_height.to_le_bytes(),
         ];
         
-        for bytes in &data {
+        for (i, bytes) in data.iter().enumerate() {
+            debug!("[NEW_RENDERER] Writing param {}: {:?}", i, bytes);
             self.pipe.write_all(bytes)?;
         }
         self.pipe.flush()?;
@@ -101,36 +124,43 @@ impl GLContext {
         self.width = fb_width;
         self.height = fb_height;
         
+        info!("[NEW_RENDERER] Window size updated successfully");
         Ok(())
     }
     
     /// Swap buffers to display rendered content
     #[allow(dead_code)]
     pub fn swap_buffers(&mut self) -> io::Result<()> {
+        debug!("[NEW_RENDERER] Swapping buffers");
         let cmd = GLCommand::SwapBuffers as u32;
         self.pipe.write_all(&cmd.to_le_bytes())?;
         self.pipe.flush()?;
+        debug!("[NEW_RENDERER] Buffers swapped");
         Ok(())
     }
     
     /// Repaint the display
     #[allow(dead_code)]
     pub fn repaint(&mut self) -> io::Result<()> {
+        debug!("[NEW_RENDERER] Repainting display");
         let cmd = GLCommand::Repaint as u32;
         self.pipe.write_all(&cmd.to_le_bytes())?;
         self.pipe.flush()?;
+        debug!("[NEW_RENDERER] Display repainted");
         Ok(())
     }
     
     /// Destroy the GL context
     pub fn destroy(&mut self) -> io::Result<()> {
-        info!("Destroying GL context");
+        info!("[NEW_RENDERER] Destroying GL context");
         
         let cmd = GLCommand::Destroy as u32;
+        debug!("[NEW_RENDERER] Sending Destroy command: 0x{:04x}", cmd);
         self.pipe.write_all(&cmd.to_le_bytes())?;
         self.pipe.flush()?;
         
         self.initialized = false;
+        info!("[NEW_RENDERER] GL context destroyed");
         Ok(())
     }
     
