@@ -144,6 +144,7 @@ pub fn handle_touch(env: JNIEnv, _clz: jclass, event: jobject) {
     }
 }
 
+#[no_mangle]
 pub fn send_key_code(_env: JNIEnv, _clz: jclass, keycode: jint) {
     debug!("send key code!");
     input::send_key_code(keycode);
@@ -160,6 +161,11 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
         Ok(clazz) => clazz,
         Err(e) => {
             error!("java class not found : {:?}", e);
+            // Check for pending exception and clear it
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_describe();
+                let _ = env.exception_clear();
+            }
             return JNI_ERR;
         }
     };
@@ -171,7 +177,12 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
         debug!("register_natives : succeed");
         version
     } else {
-        error!("register_natives : failed ");
+        error!("register_natives : failed {:?}", result);
+        // Check for pending exception and clear it
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+        }
         JNI_ERR
     }
 }
