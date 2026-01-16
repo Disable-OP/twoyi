@@ -40,4 +40,10 @@ public class Renderer {
     public static native void handleTouch(MotionEvent event);
 
     public static native void sendKeycode(int keycode);
+    
+    /**
+     * Set the renderer type to use
+     * @param useNewRenderer true to use new open-source renderer, false for old renderer
+     */
+    public static native void setRendererType(int useNewRenderer);
 }

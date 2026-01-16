@@ -14,6 +14,7 @@ use android_logger::Config;
 
 mod input;
 mod renderer_bindings;
+mod renderer_new;
 mod core;
 
 // Reference the interp symbol from C to force it to be linked
@@ -86,6 +87,16 @@ pub fn renderer_init(
         ydpi as i32,
         fps as i32,
     );
+}
+
+#[no_mangle]
+pub fn set_renderer_type(
+    _env: JNIEnv,
+    _clz: jclass,
+    use_new_renderer: jint,
+) {
+    debug!("set_renderer_type: {}", use_new_renderer);
+    core::set_renderer_type(use_new_renderer != 0);
 }
 
 #[no_mangle]
@@ -191,6 +202,7 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
         ),
         jni_method!(handleTouch, handle_touch, "(Landroid/view/MotionEvent;)V"),
         jni_method!(sendKeycode, send_key_code, "(I)V"),
+        jni_method!(setRendererType, set_renderer_type, "(I)V"),
     ];
 
     register_natives(&jvm, class_name, jni_methods.as_ref())
