@@ -151,14 +151,27 @@ pub fn send_key_code(_env: JNIEnv, _clz: jclass, keycode: jint) {
 }
 
 unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMethod]) -> jint {
-    let env: JNIEnv = jvm.get_env().unwrap();
+    // Try to get env - if this fails, we can't continue
+    let env: JNIEnv = match jvm.get_env() {
+        Ok(e) => e,
+        Err(e) => {
+            // Can't log here since logger might not be initialized
+            eprintln!("Failed to get JNI environment: {:?}", e);
+            return JNI_ERR;
+        }
+    };
+    
     let jni_version = env.get_version().unwrap();
     let version: jint = jni_version.into();
 
     debug!("JNI Version : {:#?} ", jni_version);
+    debug!("Registering {} methods for class: {}", methods.len(), class_name);
 
     let clazz = match env.find_class(class_name) {
-        Ok(clazz) => clazz,
+        Ok(clazz) => {
+            debug!("Found class: {}", class_name);
+            clazz
+        },
         Err(e) => {
             error!("java class not found : {:?}", e);
             // Check for pending exception and clear it
@@ -174,7 +187,7 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
     let result = env.register_native_methods(clazz, &methods);
 
     if result.is_ok() {
-        debug!("register_natives : succeed");
+        info!("register_natives : succeed - registered {} methods", methods.len());
         version
     } else {
         error!("register_natives : failed {:?}", result);
@@ -190,13 +203,14 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
 #[no_mangle]
 #[allow(non_snake_case)]
 unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
-    android_logger::init_once(
+    // Initialize logger - if this fails, continue anyway
+    let _ = android_logger::init_once(
         Config::default()
             .with_min_level(Level::Info)
             .with_tag("CLIENT_EGL"),
     );
 
-    debug!("JNI_OnLoad");
+    debug!("JNI_OnLoad started");
 
     let class_name: &str = "io/twoyi/Renderer";
     let jni_methods = [
@@ -216,7 +230,9 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
         jni_method!(setRendererType, set_renderer_type, "(I)V"),
     ];
 
-    register_natives(&jvm, class_name, jni_methods.as_ref())
+    let result = register_natives(&jvm, class_name, jni_methods.as_ref());
+    debug!("JNI_OnLoad completed with result: {}", result);
+    result
 }
 
 // Exported C functions that can be called from shell or other tools
