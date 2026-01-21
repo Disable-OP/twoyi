@@ -56,6 +56,58 @@ Users can choose between the old and new renderer via the app settings:
 
 The setting is profile-specific, so different profiles can use different renderers.
 
+## Debug Renderer Mode
+
+For advanced debugging and diagnostics, the app now includes a **Debug Renderer** option that captures extensive logging when enabled.
+
+### Enabling Debug Mode
+
+1. Go to **Settings** → **Advanced**
+2. Toggle **Debug Renderer** checkbox
+3. Reboot the container for changes to take effect
+
+**⚠️ WARNING**: Debug mode produces **very large log files** and should only be enabled when troubleshooting renderer issues. The default is OFF.
+
+### What Gets Logged
+
+When debug renderer mode is enabled, the following data is dumped to `/sdcard/twoyi_renderer_debug/`:
+
+1. **QEMU Pipe Communication** (`pipe_*.log`)
+   - All data written to OpenGL ES pipes (`/opengles`, `/opengles2`, `/opengles3`)
+   - All data read from pipes
+   - Data is logged in hex, ASCII, and as integers
+
+2. **OpenGL ES Commands** (`opengles_commands.log`)
+   - All GL commands sent (Initialize, SetWindowSize, SwapBuffers, etc.)
+   - Command parameters and timestamps
+
+3. **Gralloc Buffer Operations** (`gralloc_*.log`)
+   - Buffer lock/unlock operations
+   - Buffer dimensions, stride, and format
+   - Buffer posting events
+
+4. **Container Socket Communication** (`socket_*.log`)
+   - Input sockets: `/dev/input/key0`, `/dev/input/touch`
+   - Service sockets: property_service, vold, cryptd, netd, dnsproxyd, mdns, fwmarkd, zygote, webview_zygote
+   - Binder sockets: vbinder, vndbinder, hwbinder (bcs, bhs, bis)
+   - Debug socket: `/data/system/ndebugsocket`
+   - All socket data in hex and ASCII
+
+### Log File Location
+
+All debug logs are written to: `<app_data_dir>/files/twoyi_renderer_debug/`
+
+This is the app's private files directory and is automatically included in the **Send Log** bugreport when debug renderer is enabled.
+
+You can access these logs:
+1. Using the **Send Log** feature in Settings (creates bugreport.zip with logs)
+2. Via `adb` if the device is rooted
+3. Via Android backup/restore mechanisms
+
+### Performance Impact
+
+Debug mode has significant performance impact due to extensive file I/O operations. It should **only** be used for debugging purposes and disabled during normal use.
+
 ## Comparison: Old vs New Renderer
 
 | Feature | Old Renderer | New Renderer |
@@ -133,7 +185,7 @@ Potential enhancements for the new renderer:
 - [ ] Hardware acceleration integration
 - [ ] Performance optimizations
 - [ ] Better error handling and diagnostics
-- [ ] Detailed logging for debugging
+- [x] Detailed logging for debugging (Debug Renderer mode)
 - [ ] Support for additional graphics protocols
 
 ## References

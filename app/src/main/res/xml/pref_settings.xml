@@ -72,6 +72,12 @@
             android:summary="@string/settings_use_new_renderer_summary"
             android:defaultValue="false" />
 
+        <CheckBoxPreference
+            android:key="@string/settings_key_debug_renderer"
+            android:title="@string/settings_debug_renderer_title"
+            android:summary="@string/settings_debug_renderer_summary"
+            android:defaultValue="false" />
+
         <Preference
             android:key="@string/settings_key_select_rom"
             android:summary="@string/settings_select_rom_summary"

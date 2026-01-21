@@ -141,6 +141,11 @@ impl GrallocManager {
         debug!("[NEW_RENDERER][GRALLOC] Buffer: {}x{}, stride: {}, format: {}",
                buffer.width, buffer.height, buffer.stride, buffer.format);
         
+        // Dump buffer info to debug log
+        if super::is_debug_mode() {
+            self.dump_buffer_info("lock", &buffer);
+        }
+        
         Ok(buffer)
     }
     
@@ -150,6 +155,11 @@ impl GrallocManager {
     /// for display by the compositor.
     pub fn unlock_and_post(&self) -> io::Result<()> {
         debug!("[NEW_RENDERER][GRALLOC] Unlocking buffer and posting for display");
+        
+        // Dump unlock event to debug log
+        if super::is_debug_mode() {
+            self.dump_gralloc_event("unlock_and_post");
+        }
         
         let result = unsafe {
             ANativeWindow_unlockAndPost(self.window)
@@ -176,6 +186,55 @@ impl GrallocManager {
     #[allow(dead_code)]
     pub fn get_format(&self) -> i32 {
         self.format
+    }
+    
+    /// Dump buffer info to debug log
+    fn dump_buffer_info(&self, event: &str, buffer: &ANativeWindow_Buffer) {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        
+        let log_dir = super::get_debug_log_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_path = format!("{}/gralloc_buffers.log", log_dir);
+        
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(file, "[{}] BUFFER_{}: width={}, height={}, stride={}, format={}", 
+                            timestamp, event.to_uppercase(), buffer.width, buffer.height, buffer.stride, buffer.format);
+        }
+    }
+    
+    /// Dump gralloc event to debug log
+    fn dump_gralloc_event(&self, event: &str) {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        
+        let log_dir = super::get_debug_log_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let log_path = format!("{}/gralloc_events.log", log_dir);
+        
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = writeln!(file, "[{}] {}", timestamp, event.to_uppercase());
+        }
     }
 }
 

@@ -108,6 +108,12 @@ impl PipeConnection {
     /// Write all data to the pipe
     pub fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         debug!("[NEW_RENDERER] Writing {} bytes to pipe", data.len());
+        
+        // Debug mode: dump data to log file
+        if super::is_debug_mode() {
+            self.dump_data_to_file("write", data);
+        }
+        
         match self.file.write_all(data) {
             Ok(_) => {
                 debug!("[NEW_RENDERER] Successfully wrote data to pipe");
@@ -123,13 +129,31 @@ impl PipeConnection {
     /// Read data from the pipe
     #[allow(dead_code)]
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buf)
+        let result = self.file.read(buf);
+        
+        // Debug mode: dump data to log file
+        if super::is_debug_mode() {
+            if let Ok(size) = result {
+                self.dump_data_to_file("read", &buf[..size]);
+            }
+        }
+        
+        result
     }
     
     /// Read exact amount of data from the pipe
     #[allow(dead_code)]
     pub fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.file.read_exact(buf)
+        let result = self.file.read_exact(buf);
+        
+        // Debug mode: dump data to log file
+        if super::is_debug_mode() {
+            if result.is_ok() {
+                self.dump_data_to_file("read", buf);
+            }
+        }
+        
+        result
     }
     
     /// Flush the pipe
@@ -142,6 +166,62 @@ impl PipeConnection {
     #[allow(dead_code)]
     pub fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+    
+    /// Dump data to a debug log file
+    fn dump_data_to_file(&self, direction: &str, data: &[u8]) {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        // Create a debug log file path
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        
+        let log_dir = super::get_debug_log_dir();
+        
+        // Create directory and log any errors
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            log::error!("[NEW_RENDERER][PIPE] Failed to create log directory {}: {}", log_dir, e);
+            return;
+        }
+        
+        let service_name = self.service_name.replace("/", "_");
+        let log_path = format!("{}/pipe_{}_{}.log", log_dir, service_name, direction);
+        
+        log::debug!("[NEW_RENDERER][PIPE] Writing {} bytes to {}", data.len(), log_path);
+        
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "\n[{}] {} {} bytes:", timestamp, direction.to_uppercase(), data.len());
+                let _ = writeln!(file, "Hex: {:02x?}", data);
+                
+                // Also write as ASCII if printable
+                let ascii: String = data.iter()
+                    .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                    .collect();
+                let _ = writeln!(file, "ASCII: {}", ascii);
+                
+                // Log integers if data is 4-byte aligned
+                if data.len() >= 4 && data.len() % 4 == 0 {
+                    let _ = write!(file, "i32: [");
+                    for chunk in data.chunks_exact(4) {
+                        let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                        let _ = write!(file, "{}, ", value);
+                    }
+                    let _ = writeln!(file, "]");
+                }
+            }
+            Err(e) => {
+                log::error!("[NEW_RENDERER][PIPE] Failed to open log file {}: {}", log_path, e);
+            }
+        }
     }
 }
 

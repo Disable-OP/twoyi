@@ -34,6 +34,12 @@ pub enum RendererType {
 /// Global renderer type setting
 static RENDERER_TYPE: Lazy<Mutex<RendererType>> = Lazy::new(|| Mutex::new(RendererType::Old));
 
+/// Global debug renderer setting
+static DEBUG_RENDERER: AtomicBool = AtomicBool::new(false);
+
+/// Global debug log directory
+static DEBUG_LOG_DIR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
+
 /// Set the renderer type to use
 pub fn set_renderer_type(use_new_renderer: bool) {
     let mut renderer_type = RENDERER_TYPE.lock().unwrap();
@@ -45,6 +51,29 @@ pub fn set_renderer_type(use_new_renderer: bool) {
     info!("[CORE] ========================================");
     info!("[CORE] Renderer type set to: {:?}", *renderer_type);
     info!("[CORE] ========================================");
+}
+
+/// Set the debug renderer mode
+pub fn set_debug_renderer(debug_enabled: bool) {
+    DEBUG_RENDERER.store(debug_enabled, Ordering::Relaxed);
+    info!("[CORE] ========================================");
+    info!("[CORE] Debug renderer set to: {}", debug_enabled);
+    info!("[CORE] ========================================");
+    
+    // Pass debug flag to the new renderer module
+    renderer_new::set_debug_mode(debug_enabled);
+}
+
+/// Set the debug log directory
+pub fn set_debug_log_dir(log_dir: String) {
+    let mut dir = DEBUG_LOG_DIR.lock().unwrap();
+    *dir = log_dir.clone();
+    info!("[CORE] ========================================");
+    info!("[CORE] Debug log directory set to: {}", log_dir);
+    info!("[CORE] ========================================");
+    
+    // Pass log directory to the new renderer module
+    renderer_new::set_debug_log_dir(log_dir);
 }
 
 /// Initialize the renderer with the given parameters

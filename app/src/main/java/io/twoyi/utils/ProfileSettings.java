@@ -31,6 +31,7 @@ public class ProfileSettings {
     public static final String DISPLAY_HEIGHT = "display_height";
     public static final String DISPLAY_DPI = "display_dpi";
     public static final String USE_NEW_RENDERER = "use_new_renderer";
+    public static final String DEBUG_RENDERER = "debug_renderer";
 
     /**
      * Get SharedPreferences for the active profile
@@ -171,5 +172,19 @@ public class ProfileSettings {
      */
     public static void setUseNewRenderer(Context context, boolean useNew) {
         setBoolean(context, USE_NEW_RENDERER, useNew);
+    }
+
+    /**
+     * Check if debug renderer mode should be enabled for active profile (default: false)
+     */
+    public static boolean isDebugRendererEnabled(Context context) {
+        return getBoolean(context, DEBUG_RENDERER, false);
+    }
+
+    /**
+     * Set debug renderer mode for active profile
+     */
+    public static void setDebugRenderer(Context context, boolean enabled) {
+        setBoolean(context, DEBUG_RENDERER, enabled);
     }
 }

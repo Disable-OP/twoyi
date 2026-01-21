@@ -100,6 +100,27 @@ pub fn set_renderer_type(
 }
 
 #[no_mangle]
+pub fn set_debug_renderer(
+    _env: JNIEnv,
+    _clz: jclass,
+    debug_enabled: jint,
+) {
+    debug!("set_debug_renderer: {}", debug_enabled);
+    core::set_debug_renderer(debug_enabled != 0);
+}
+
+#[no_mangle]
+pub fn set_debug_log_dir(
+    env: JNIEnv,
+    _clz: jclass,
+    log_dir: jstring,
+) {
+    let log_dir_path: String = env.get_string(log_dir.into()).unwrap().into();
+    debug!("set_debug_log_dir: {}", log_dir_path);
+    core::set_debug_log_dir(log_dir_path);
+}
+
+#[no_mangle]
 pub fn renderer_reset_window(
     env: JNIEnv,
     _clz: jclass,
@@ -228,6 +249,8 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
         jni_method!(handleTouch, handle_touch, "(Landroid/view/MotionEvent;)V"),
         jni_method!(sendKeycode, send_key_code, "(I)V"),
         jni_method!(setRendererType, set_renderer_type, "(I)V"),
+        jni_method!(setDebugRenderer, set_debug_renderer, "(I)V"),
+        jni_method!(setDebugLogDir, set_debug_log_dir, "(Ljava/lang/String;)V"),
     ];
 
     let result = register_natives(&jvm, class_name, jni_methods.as_ref());

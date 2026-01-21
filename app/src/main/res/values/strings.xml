@@ -99,6 +99,9 @@
     <string name="settings_display_change_reboot">Display settings will take effect after reboot</string>
     <string name="settings_key_use_new_renderer">Use New Renderer</string>
     <string name="settings_use_new_renderer_summary">Use open-source Rust renderer (experimental, requires reboot)</string>
+    <string name="settings_key_debug_renderer">debug_renderer</string>
+    <string name="settings_debug_renderer_title">Debug Renderer</string>
+    <string name="settings_debug_renderer_summary">Dump all renderer data to log files (WARNING: produces huge logs, default OFF)</string>
     <string name="settings_key_select_rom">Select ROM</string>
     <string name="settings_select_rom_summary">Import a ROM file for the active profile</string>
     <string name="settings_key_import_rootfs">Import Rootfs</string>

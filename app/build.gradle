@@ -52,6 +52,8 @@ task cargoBuild {
             workingDir new File(project.projectDir, "rs")
             //执行shell脚本 "," 传参
             commandLine "sh", "build_rs.sh", "--release"
+            // Ensure build fails on Rust compilation errors
+            ignoreExitValue = false
         }
     }
 }

@@ -119,6 +119,7 @@ public class SettingsActivity extends AppCompatActivity {
             Preference displayHeight = findPreference(R.string.settings_key_display_height);
             Preference displayDpi = findPreference(R.string.settings_key_display_dpi);
             CheckBoxPreference useNewRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_use_new_renderer);
+            CheckBoxPreference debugRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_debug_renderer);
             Preference selectRom = findPreference(R.string.settings_key_select_rom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
@@ -202,6 +203,14 @@ public class SettingsActivity extends AppCompatActivity {
             useNewRenderer.setChecked(ProfileSettings.useNewRenderer(getActivity()));
             useNewRenderer.setOnPreferenceChangeListener((preference, newValue) -> {
                 ProfileSettings.setUseNewRenderer(getActivity(), (Boolean) newValue);
+                Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
+                return true;
+            });
+
+            // Initialize debug renderer checkbox with profile-specific value
+            debugRenderer.setChecked(ProfileSettings.isDebugRendererEnabled(getActivity()));
+            debugRenderer.setOnPreferenceChangeListener((preference, newValue) -> {
+                ProfileSettings.setDebugRenderer(getActivity(), (Boolean) newValue);
                 Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                 return true;
             });

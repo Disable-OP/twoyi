@@ -193,9 +193,25 @@ public class LogEvents {
             String activeProfile = ProfileManager.getActiveProfile(context);
             pw.println("ACTIVE_PROFILE: " + activeProfile);
             pw.println("VERBOSE_LOGGING: " + ProfileSettings.isVerboseLoggingEnabled(context));
+            pw.println("DEBUG_RENDERER: " + ProfileSettings.isDebugRendererEnabled(context));
         } catch (Throwable ignored) {}
 
         reportItems.add(ReportItem.create(buildInfo));
+
+        // Debug renderer logs (if enabled)
+        if (ProfileSettings.isDebugRendererEnabled(context)) {
+            File debugLogsDir = new File(context.getFilesDir(), "twoyi_renderer_debug");
+            if (debugLogsDir.exists() && debugLogsDir.isDirectory()) {
+                File[] debugLogs = debugLogsDir.listFiles();
+                if (debugLogs != null) {
+                    for (File debugLog : debugLogs) {
+                        if (debugLog.isFile()) {
+                            reportItems.add(ReportItem.create(debugLog, "renderer_debug/" + debugLog.getName()));
+                        }
+                    }
+                }
+            }
+        }
 
         for (ReportItem item : reportItems) {
             try {

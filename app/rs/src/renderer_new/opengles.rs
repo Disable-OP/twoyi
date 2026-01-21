@@ -64,10 +64,41 @@ impl GLContext {
         })
     }
     
+    /// Dump command info to debug log if debug mode is enabled
+    fn dump_command(&self, cmd: GLCommand, params: &str) {
+        if super::is_debug_mode() {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::time::{SystemTime, UNIX_EPOCH};
+            
+            let timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            
+            let log_dir = super::get_debug_log_dir();
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log_path = format!("{}/opengles_commands.log", log_dir);
+            
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(file, "[{}] {:?} (0x{:04x}): {}", 
+                                timestamp, cmd, cmd as u32, params);
+            }
+        }
+    }
+    
     /// Initialize the OpenGL ES context
     pub fn initialize(&mut self, width: i32, height: i32, xdpi: i32, ydpi: i32, fps: i32) -> io::Result<()> {
         info!("[NEW_RENDERER] Initializing GL context: {}x{}, DPI: {}x{}, FPS: {}", 
               width, height, xdpi, ydpi, fps);
+        
+        // Dump command to debug log
+        self.dump_command(GLCommand::Initialize, 
+                         &format!("width={}, height={}, xdpi={}, ydpi={}, fps={}", width, height, xdpi, ydpi, fps));
         
         // Send initialization command
         let cmd = GLCommand::Initialize as u32;
@@ -104,6 +135,10 @@ impl GLContext {
         info!("[NEW_RENDERER] Setting window size: surface={}x{}, framebuffer={}x{}", 
               width, height, fb_width, fb_height);
         
+        // Dump command to debug log
+        self.dump_command(GLCommand::SetWindowSize, 
+                         &format!("width={}, height={}, fb_width={}, fb_height={}", width, height, fb_width, fb_height));
+        
         let cmd = GLCommand::SetWindowSize as u32;
         debug!("[NEW_RENDERER] Sending SetWindowSize command: 0x{:04x}", cmd);
         
@@ -132,6 +167,7 @@ impl GLContext {
     #[allow(dead_code)]
     pub fn swap_buffers(&mut self) -> io::Result<()> {
         debug!("[NEW_RENDERER] Swapping buffers");
+        self.dump_command(GLCommand::SwapBuffers, "");
         let cmd = GLCommand::SwapBuffers as u32;
         self.pipe.write_all(&cmd.to_le_bytes())?;
         self.pipe.flush()?;
@@ -143,6 +179,7 @@ impl GLContext {
     #[allow(dead_code)]
     pub fn repaint(&mut self) -> io::Result<()> {
         debug!("[NEW_RENDERER] Repainting display");
+        self.dump_command(GLCommand::Repaint, "");
         let cmd = GLCommand::Repaint as u32;
         self.pipe.write_all(&cmd.to_le_bytes())?;
         self.pipe.flush()?;
@@ -153,6 +190,8 @@ impl GLContext {
     /// Destroy the GL context
     pub fn destroy(&mut self) -> io::Result<()> {
         info!("[NEW_RENDERER] Destroying GL context");
+        
+        self.dump_command(GLCommand::Destroy, "");
         
         let cmd = GLCommand::Destroy as u32;
         debug!("[NEW_RENDERER] Sending Destroy command: 0x{:04x}", cmd);

@@ -1,5 +1,8 @@
 #! /bin/bash
 
+# Exit on error
+set -e
+
 #
 # Copyright Disclaimer: AI-Generated Content
 # This file was created by GitHub Copilot, an AI coding assistant.
