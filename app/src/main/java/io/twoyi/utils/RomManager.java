@@ -87,9 +87,6 @@ public final class RomManager {
         ensureDir(new File(devDir, "socket"));
         ensureDir(new File(devDir, "maps"));
 
-        // Required by `adb install`: the ADB daemon pushes APKs here before pm install
-        ensureDir(new File(getRootfsDir(context), "data/local/tmp"));
-
         ensureDir(new File(context.getDataDir(), "socket"));
 
         createLoaderSymlink(context);
