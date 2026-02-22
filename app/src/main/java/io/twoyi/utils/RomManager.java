@@ -26,6 +26,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.Properties;
 import java.util.TimeZone;
@@ -73,6 +74,24 @@ public final class RomManager {
 
     public static void ensureBootFiles(Context context) {
 
+        // Kill orphan container processes FIRST so they cannot recreate dalvik-cache
+        // entries after we delete them below.
+        killOrphanProcess();
+
+        // Clear the guest Android's dalvik-cache on every startup.
+        // Use shell rm -rf: Java's File.delete() silently fails on files owned by
+        // root (container Zygote runs as root), leaving the stale OAT entries that
+        // cause "No original dex files found" crashes on the next boot.
+        clearDalvikCache(context);
+
+        // Ensure /data/local/tmp exists with world-writable permissions.
+        // twoyi's init.rc omits the mkdir for /data/local/tmp that AOSP includes,
+        // so adbd never has a place to push APKs during `adb install`.
+        // This is done here (not via `adb shell mkdir` in the Installer) to avoid
+        // a synchronous adb call that hangs when adbd is unresponsive.
+        // chmod 777 ensures adbd can write regardless of which UID it runs as.
+        ensureDataLocalTmp(context);
+
         // <rootdir>/dev/
         File devDir = new File(getRootfsDir(context), "dev");
         ensureDir(new File(devDir, "input"));
@@ -82,8 +101,6 @@ public final class RomManager {
         ensureDir(new File(context.getDataDir(), "socket"));
 
         createLoaderSymlink(context);
-
-        killOrphanProcess();
 
         saveLastKmsg(context);
     }
@@ -230,6 +247,26 @@ public final class RomManager {
 
     private static void removeVendorPartition(Context context) {
         removePartition(context, "vendor");
+    }
+
+    private static void clearDalvikCache(Context context) {
+        String path = new File(getRootfsDir(context), "data/dalvik-cache").getAbsolutePath();
+        Shell.Result result = ShellUtil.newSh().newJob().add("rm -rf '" + path + "'").exec();
+        if (!result.isSuccess()) {
+            Log.w(TAG, "rm -rf dalvik-cache failed: " + Arrays.toString(result.getErr().toArray(new String[0])));
+        }
+        Log.i(TAG, "dalvik-cache cleared: " + path);
+    }
+
+    private static void ensureDataLocalTmp(Context context) {
+        String path = new File(getRootfsDir(context), "data/local/tmp").getAbsolutePath();
+        Shell.Result result = ShellUtil.newSh().newJob()
+                .add("mkdir -p '" + path + "'")
+                .add("chmod 777 '" + path + "'")
+                .exec();
+        if (!result.isSuccess()) {
+            Log.w(TAG, "ensureDataLocalTmp failed: " + Arrays.toString(result.getErr().toArray(new String[0])));
+        }
     }
 
     private static RomInfo getRomInfo(InputStream in) {
