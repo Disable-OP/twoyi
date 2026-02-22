@@ -95,17 +95,6 @@ public class Installer {
             return;
         }
 
-        // Ensure /data/local/tmp exists inside the running guest container.
-        // This must be done via `adb shell` (not by pre-creating the directory in the
-        // rootfs) because the container's init sets up /data/local/ after boot and
-        // overwrites anything pre-created on the host-side rootfs before startup.
-        String mkdirCommand = String.format(Locale.US,
-                "%s -P %d -s %s shell mkdir -p /data/local/tmp", adbPath, ADB_PORT, connectTarget);
-        Shell.Result mkdirResult = ShellUtil.newSh().newJob().add(envCmd).add(mkdirCommand).exec();
-        if (!mkdirResult.isSuccess()) {
-            Log.w(TAG, "mkdir /data/local/tmp failed: " + Arrays.toString(mkdirResult.getErr().toArray(new String[0])));
-        }
-
         StringBuilder sb = new StringBuilder();
         for (File file : files) {
             sb.append(file.getAbsolutePath()).append(" ");
