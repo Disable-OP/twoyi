@@ -73,6 +73,14 @@ public final class RomManager {
 
     public static void ensureBootFiles(Context context) {
 
+        // Clear the guest Android's dalvik-cache on every startup.
+        // A dirty shutdown (e.g. host reboot) leaves dalvik-cache in an inconsistent state:
+        // Zygote recompiles boot.art with a new checksum, but services.jar OAT files still
+        // reference the old checksum, causing "No original dex files found" crashes on the
+        // next boot. Clearing dalvik-cache forces a fresh, consistent recompilation from the
+        // system-partition OAT files on every guest Android boot.
+        clearDalvikCache(context);
+
         // <rootdir>/dev/
         File devDir = new File(getRootfsDir(context), "dev");
         ensureDir(new File(devDir, "input"));
@@ -230,6 +238,14 @@ public final class RomManager {
 
     private static void removeVendorPartition(Context context) {
         removePartition(context, "vendor");
+    }
+
+    private static void clearDalvikCache(Context context) {
+        File dalvikCacheDir = new File(getRootfsDir(context), "data/dalvik-cache");
+        if (dalvikCacheDir.exists()) {
+            IOUtils.deleteDirectory(dalvikCacheDir);
+            Log.i(TAG, "dalvik-cache cleared: " + dalvikCacheDir);
+        }
     }
 
     private static RomInfo getRomInfo(InputStream in) {
