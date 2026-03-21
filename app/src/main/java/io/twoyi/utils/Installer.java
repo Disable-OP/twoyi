@@ -104,10 +104,17 @@ public class Installer {
 
         String installCommand;
         if (files.size() == 1) {
-            installCommand = String.format(Locale.US, "%s -P %d -s %s install -t -r %s", adbPath, ADB_PORT, connectTarget, fileArgs);
+            // --no-streaming: force the classic push-then-pm-install path.
+            // Streaming install (the default) pipes the APK directly to the Package Manager
+            // via abb_exec, which writes to a staging directory (/data/app/vmdl*.tmp/) that
+            // the container's installd may not have created yet.  This causes:
+            //   "Error: failed to write; stat failed: ENOENT (No such file or directory)"
+            // With --no-streaming adb first pushes the APK to /data/local/tmp/ (already
+            // ensured by ensureDataLocalTmp) and then calls `pm install` as a separate step.
+            installCommand = String.format(Locale.US, "%s -P %d -s %s install -t -r --no-streaming %s", adbPath, ADB_PORT, connectTarget, fileArgs);
         } else {
             // http://aospxref.com/android-10.0.0_r47/xref/system/core/adb/client/adb_install.cpp#447
-            installCommand = String.format(Locale.US, "%s -P %d -s %s install-multiple -t -r %s", adbPath, ADB_PORT, connectTarget, fileArgs);
+            installCommand = String.format(Locale.US, "%s -P %d -s %s install-multiple -t -r --no-streaming %s", adbPath, ADB_PORT, connectTarget, fileArgs);
         }
 
         Log.w(TAG, "installCommand: " + installCommand);
@@ -120,10 +127,33 @@ public class Installer {
             if (callback == null) {
                 return;
             }
-            if (out1.isSuccess()) {
+
+            // adb install prints "Success" or "Failure [reason]" to stdout; the exit
+            // code mirrors that, but check stdout explicitly as an additional guard.
+            String installOutMsg = Arrays.toString(out1.getOut().toArray(new String[0]));
+            String installErrMsg = Arrays.toString(out1.getErr().toArray(new String[0]));
+            Log.w(TAG, "out: " + installOutMsg + " err: " + installErrMsg);
+
+            boolean successInStdout = false;
+            boolean failureInStdout = false;
+            for (String line : out1.getOut()) {
+                if (line.trim().equals("Success")) {
+                    successInStdout = true;
+                    break;
+                } else if (line.startsWith("Failure [")) {
+                    failureInStdout = true;
+                    break;
+                }
+            }
+
+            boolean success = (out1.isSuccess() && !failureInStdout) || successInStdout;
+
+            if (success) {
                 callback.onSuccess(files);
             } else {
-                String msg = Arrays.toString(out1.getErr().toArray(new String[0]));
+                // Include both stdout and stderr: stdout carries "Failure [INSTALL_FAILED_*]"
+                // while stderr carries connection / push errors.
+                String msg = installOutMsg + installErrMsg;
                 Log.w(TAG, "msg: " + msg);
 
                 callback.onFail(files, msg);

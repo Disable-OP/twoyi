@@ -288,7 +288,14 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             return;
         }
 
-        // ROM exists, boot normally
+        // ROM exists, boot normally.
+        // Clear dalvik-cache if the host build fingerprint changed (e.g. after a host OTA
+        // update), so stale ART OAT entries don't cause "No original dex files found" crashes.
+        // Called synchronously here (UI thread, before addView) to guarantee the cache is
+        // fully cleared before Renderer.init() starts the container.  The existing code
+        // already runs shell commands on the main thread inside attachBaseContext, so the
+        // brief blocking (~100 ms worst-case for rm -rf) is acceptable.
+        RomManager.clearDalvikCacheIfNeeded(this);
         mRootView.addView(mSurfaceView, 0);
         showBootingProcedure();
     }
@@ -323,7 +330,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             if (true) {
                 boolean success = false;
                 try {
-                    success = TwoyiStatusManager.getInstance().waitBoot(15, TimeUnit.SECONDS);
+                    // Allow extra time for a Zygote crash-and-restart cycle: after a host
+                    // reboot the guest ART often needs one Zygote restart to regenerate a
+                    // stale dalvik-cache (~14 s), followed by a full system_server boot
+                    // (~30 s).  60 s comfortably covers both in sequence.
+                    success = TwoyiStatusManager.getInstance().waitBoot(60, TimeUnit.SECONDS);
                 } catch (Throwable ignored) {
                 }
 
