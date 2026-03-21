@@ -1,0 +1,20 @@
+# Copyright Disclaimer: AI-Generated Content
+# This file was created by GitHub Copilot, an AI coding assistant.
+# AI-generated content is not subject to copyright protection and is provided
+# without any warranty, express or implied, including warranties of merchantability,
+# fitness for a particular purpose, or non-infringement.
+# Use at your own risk.
+
+[package]
+name = "loader"
+version = "1.0.0"
+edition = "2021"
+description = "Open-source dynamic library loader - replacement for legacy libloader.so"
+license = "MPL-2.0"
+
+[lib]
+name = "loader"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"

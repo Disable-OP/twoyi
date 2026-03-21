@@ -1,0 +1,2 @@
+# Ignore Cargo.lock for library crates
+Cargo.lock
