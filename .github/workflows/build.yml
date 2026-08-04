@@ -3,8 +3,8 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
 # NOTE: Placeholder assets are included to allow CI builds.
-# For a functional APK, replace app/src/main/assets/rootfs.7z with:
-#   https://github.com/cyanmint/twoyi/releases/download/original/rootfs.7z
+# For a functional APK, replace app/src/main/assets/rootfs.tar.gz with:
+#   https://github.com/cyanmint/twoyi/releases/download/original/rootfs.tar.gz
 ---
 name: Build APK
 
@@ -20,7 +20,7 @@ name: Build APK
         required: false
         default: 'all'
       include_rootfs:
-        description: 'Download and bundle the real rootfs.7z (otherwise APK has placeholder assets)'
+        description: 'Download and bundle the real rootfs.tar.gz (otherwise APK has placeholder assets)'
         required: false
         type: boolean
         default: false
@@ -86,15 +86,15 @@ jobs:
           chmod +x app/rs/loader/build.sh || true
           chmod +x app/rs/openglrenderer/build.sh || true
 
-      - name: Optionally fetch the real rootfs.7z
+      - name: Optionally fetch the real rootfs
         if: ${{ github.event.inputs.include_rootfs == 'true' }}
         run: |
           mkdir -p app/src/main/assets
-          # The rootfs is hosted in the original cyanmint release. Fetching it
-          # makes the APK immediately functional (~50 MB) instead of a stub.
-          curl -L -o app/src/main/assets/rootfs.7z \
-            https://github.com/cyanmint/twoyi/releases/download/original/rootfs.7z
-          ls -lh app/src/main/assets/rootfs.7z
+          # The rootfs is hosted in the cyanmint/twoyi 'original' release as
+          # rootfs.tar.gz (~275 MB). The app's import flow accepts .tar files.
+          curl -L -o app/src/main/assets/rootfs.tar.gz \
+            https://github.com/cyanmint/twoyi/releases/download/original/rootfs.tar.gz
+          ls -lh app/src/main/assets/rootfs.tar.gz
 
       - name: Determine ABIs to build
         id: abis
