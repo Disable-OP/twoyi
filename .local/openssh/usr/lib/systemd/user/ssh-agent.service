@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenSSH Agent
+Documentation=man:ssh-agent(1)
+Requires=ssh-agent.socket
+
+[Service]
+Environment=SSH_ASKPASS_REQUIRE=force
+# If you need to pass extra arguments to ssh-agent, you can use "systemctl
+# --user edit ssh-agent.service" to add a drop-in unit with contents along
+# these lines:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/ssh-agent -D -t 1200
+ExecStart=/usr/bin/ssh-agent -D

@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenSSH Agent socket
+Documentation=man:ssh-agent(1)
+Before=graphical-session-pre.target
+
+[Socket]
+SocketMode=0600
+ListenStream=%t/openssh_agent
+ExecStartPost=/usr/bin/systemctl --user set-environment SSH_AUTH_SOCK=%t/openssh_agent
+ExecStopPre=/usr/bin/systemctl --user unset-environment SSH_AUTH_SOCK
+
+[Install]
+WantedBy=sockets.target
