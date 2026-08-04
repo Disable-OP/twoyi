@@ -161,10 +161,18 @@ public class ProfileSettings {
     }
 
     /**
-     * Check if new renderer should be used for active profile (default: false)
+     * Check if new renderer should be used for active profile.
+     *
+     * Default is false on arm64-v8a (where the legacy closed-source
+     * libOpenglRender.so blob is available and is the more complete
+     * implementation), but true on x86_64 (where the legacy blob is
+     * not shipped and the renderer_bindings stubs would panic).
+     *
+     * The user can still override this via the settings UI.
      */
     public static boolean useNewRenderer(Context context) {
-        return getBoolean(context, USE_NEW_RENDERER, false);
+        boolean defaultVal = !"arm64-v8a".equals(android.os.Build.SUPPORTED_ABIS[0]);
+        return getBoolean(context, USE_NEW_RENDERER, defaultVal);
     }
 
     /**
