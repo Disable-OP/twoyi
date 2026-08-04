@@ -27,7 +27,21 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters "arm64-v8a"
+            // arm64-v8a  — real Android devices (the only ABI the legacy
+            //               closed-source libOpenglRender.so / libloader.so
+            //               blobs ship for, and the only ABI the upstream
+            //               rootfs is built for).
+            // x86_64      — emulators and redroid containers. The open-source
+            //               Rust renderer and loader support x86_64, so a
+            //               developer running tests in a cloud container
+            //               (e.g. GitHub Codespaces + redroid) can install
+            //               the same APK without rebuilding.
+            //
+            // The legacy blobs are only present in jniLibs/arm64-v8a/, so
+            // an x86_64-only install will fall back to the open-source
+            // lib*_new.so variants automatically (see RomManager.LOADER_FILE
+            // and core::RendererType).
+            abiFilters "arm64-v8a", "x86_64"
         }
         archivesBaseName = "twoyi_${versionName}"
     }
@@ -48,11 +62,16 @@ android {
 task cargoBuild {
     doLast {
         exec {
-            //切换到sh文件所在的目录，执行脚本
+            // Build libtwoyi.so for both arm64-v8a and x86_64.
+            // arm64-v8a  → real devices
+            // x86_64     → emulators / redroid containers (CI testing)
+            //
+            // The "all" arg tells build_rs.sh to build every supported ABI.
+            // Override by setting project property -Pabis=arm64-v8a if you
+            // only want one (faster local iteration).
+            def abis = project.hasProperty('abis') ? project.getProperty('abis').split(',') : ['all']
             workingDir new File(project.projectDir, "rs")
-            //执行shell脚本 "," 传参
-            commandLine "sh", "build_rs.sh", "--release"
-            // Ensure build fails on Rust compilation errors
+            commandLine "sh", "build_rs.sh", "--release", *abis
             ignoreExitValue = false
         }
     }

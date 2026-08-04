@@ -19,10 +19,15 @@ rustflags = [
 ]
 
 [target.x86_64-linux-android]
-# Same configuration for x86_64 (for testing in redroid)
+# Same PIE configuration as aarch64 — produces a shared library that is
+# also directly executable as a binary. Used for testing in redroid /
+# Android x86_64 emulators.
 rustflags = [
     "-C", "link-arg=-Wl,-e,main",
     "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
     "-C", "link-arg=-Wl,-rpath,$ORIGIN",
-    "-C", "link-arg=-Wl,--enable-new-dtags"
+    "-C", "link-arg=-Wl,--enable-new-dtags",
+    "-C", "link-arg=-pie",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-Wl,--undefined=interp"
 ]

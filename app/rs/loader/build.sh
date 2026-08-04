@@ -1,52 +1,85 @@
 #!/bin/bash
 
-# Copyright Disclaimer: AI-Generated Content
-# This file was created by GitHub Copilot, an AI coding assistant.
-# AI-generated content is not subject to copyright protection and is provided
-# without any warranty, express or implied, including warranties of merchantability,
-# fitness for a particular purpose, or non-infringement.
-# Use at your own risk.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Exit on error
+# =============================================================================
+# build.sh — build libloader.so (open-source replacement for the legacy
+# closed-source libloader.so) for one or more Android ABIs.
+#
+# Usage:
+#   ./build.sh [abi ...]
+#
+# Examples:
+#   ./build.sh                       # default: arm64-v8a only
+#   ./build.sh arm64-v8a x86_64
+#   ./build.sh all
+#
+# Supported ABIs:  arm64-v8a, x86_64
+# =============================================================================
+
 set -e
 
+ALL_ABIS=("arm64-v8a" "x86_64")
+
+# Parse args
+ABIS=()
+for arg in "$@"; do
+    case "$arg" in
+        all) ABIS=("${ALL_ABIS[@]}") ;;
+        arm64-v8a|x86_64) ABIS+=("$arg") ;;
+        *) echo "Unknown arg: $arg"; exit 1 ;;
+    esac
+done
+if [ ${#ABIS[@]} -eq 0 ]; then
+    ABIS=("arm64-v8a")
+fi
+
 echo "=========================================="
-echo "Building new libloader.so (loader64)"
+echo "Building libloader.so for ABIs=[${ABIS[*]}]"
 echo "=========================================="
 
-# Build the library using cargo-xdk for Android
 cd "$(dirname "$0")"
 
-# Build for ARM64
-echo "Building for arm64-v8a..."
-cargo xdk -t arm64-v8a build --release
+for ABI in "${ABIS[@]}"; do
+    echo ""
+    echo "------------------------------------------"
+    echo "  Building for $ABI"
+    echo "------------------------------------------"
 
-# Copy the output to jniLibs
-echo "Copying library to jniLibs..."
-cp -v target/aarch64-linux-android/release/libloader.so ../../src/main/jniLibs/arm64-v8a/libloader_new.so
+    cargo xdk -t "$ABI" build --release
 
-# Make it executable (for direct execution as loader64)
-chmod +x ../../src/main/jniLibs/arm64-v8a/libloader_new.so
+    # cargo-xdk's target dir uses the Rust triple, not the Android ABI name
+    case "$ABI" in
+        arm64-v8a) RUST_TARGET="aarch64-linux-android" ;;
+        x86_64)    RUST_TARGET="x86_64-linux-android"  ;;
+    esac
 
+    SRC="target/$RUST_TARGET/release/libloader.so"
+    DST_DIR="../../src/main/jniLibs/$ABI"
+    DST="$DST_DIR/libloader_new.so"
+
+    mkdir -p "$DST_DIR"
+    cp -v "$SRC" "$DST"
+    chmod +x "$DST"
+
+    echo "  → $DST"
+    echo ""
+    echo "Library size comparison ($ABI):"
+    echo "  Legacy: $(ls -lh "$DST_DIR/libloader.so" 2>/dev/null | awk '{print $5}' || echo 'N/A')"
+    echo "  New:    $(ls -lh "$DST" 2>/dev/null | awk '{print $5}' || echo 'N/A')"
+
+    if command -v readelf >/dev/null 2>&1; then
+        echo ""
+        echo "Entry point check ($ABI):"
+        readelf -h "$DST" | grep "Entry point" || true
+        echo "Dynamic interpreter ($ABI):"
+        readelf -l "$DST" | grep interpreter || echo "  (no interpreter found)"
+    fi
+done
+
+echo ""
 echo "=========================================="
 echo "Build complete!"
-echo "New library: app/src/main/jniLibs/arm64-v8a/libloader_new.so"
 echo "=========================================="
-
-# Verify the file
-echo ""
-echo "File info:"
-file ../../src/main/jniLibs/arm64-v8a/libloader_new.so
-
-echo ""
-echo "Library size comparison:"
-echo "Legacy: $(ls -lh ../../src/main/jniLibs/arm64-v8a/libloader.so 2>/dev/null | awk '{print $5}' || echo 'N/A')"
-echo "New:    $(ls -lh ../../src/main/jniLibs/arm64-v8a/libloader_new.so 2>/dev/null | awk '{print $5}' || echo 'N/A')"
-
-echo ""
-echo "Entry point check:"
-readelf -h ../../src/main/jniLibs/arm64-v8a/libloader_new.so | grep "Entry point"
-
-echo ""
-echo "Dynamic interpreter:"
-readelf -l ../../src/main/jniLibs/arm64-v8a/libloader_new.so | grep interpreter || echo "No interpreter found"
