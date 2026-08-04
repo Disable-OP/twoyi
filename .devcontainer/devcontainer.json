@@ -1,0 +1,89 @@
+// For format details, see https://containers.dev/implementors/json_reference/
+//
+// Codespace configuration for twoyi development.
+//
+// Machine size: 4 cores / 16 GB RAM / 32 GB disk (the largest free Codespace
+//   tier as of 2026 — see https://docs.github.com/en/codespaces/overview).
+//   Set in the GitHub UI: Settings → Codespaces → Default machine type.
+//   Cannot be set from inside this file; the user must pick it on first
+//   codespace creation.
+//
+// runArgs: --privileged is included per the user's request to enable
+//   privileged container features. Note: GitHub Codespaces runs on Azure
+//   VMs whose host kernel does NOT expose /dev/kvm to the codespace
+//   container, so --privileged alone does NOT enable KVM. See
+//   scripts/check-kvm.sh which runs on creation and reports the actual
+//   KVM availability — if /dev/kvm is missing, the test scripts fall
+//   back to redroid (Android-in-container, no KVM needed).
+//
+// For more on the KVM question, see:
+//   https://github.com/devcontainers/images/issues/884
+//   https://github.com/orgs/community/discussions/160591
+{
+  "name": "twoyi-dev",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
+
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "version": "latest",
+      "moby": true
+    },
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "17",
+      "jdkDistro": "temurin"
+    },
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "stable",
+      "profile": "minimal"
+    },
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "configureZshAsDefaultShell": true,
+      "username": "vscode"
+    }
+  },
+
+  "runArgs": [
+    "--privileged",
+    "--init"
+  ],
+
+  "mounts": [
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  ],
+
+  "containerEnv": {
+    "ANDROID_HOME": "/workspaces/twoyi/.android-sdk",
+    "ANDROID_NDK_HOME": "/workspaces/twoyi/.android-ndk"
+  },
+
+  "postCreateCommand": "bash .devcontainer/scripts/setup.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "swellaby.rust-pack",
+        "ms-azuretools.vscode-docker",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "rust-analyzer.linkedProjects": [
+          "app/rs/Cargo.toml",
+          "app/rs/loader/Cargo.toml",
+          "app/rs/openglrenderer/Cargo.toml"
+        ],
+        "files.watcherExclude": {
+          "**/target/**": true,
+          "**/.gradle/**": true,
+          "**/build/**": true
+        }
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}
