@@ -55,11 +55,8 @@ const SOCKET_PATHS: &[&str] = &[
     "/opengles",
     "/opengles2",
     "/opengles3",
-    
-    // OpenGL ES sockets (full paths - from legacy renderer)
-    "/data/data/io.twoyi/rootfs/opengles",
-    "/data/data/io.twoyi/rootfs/opengles2",
-    "/data/data/io.twoyi/rootfs/opengles3",
+    // Note: full paths are now dynamic — see start_socket_monitoring()
+    // which appends the data-dir-specific paths from core::get_opengles_paths()
     
     // Debug socket
     "/data/system/ndebugsocket",
@@ -89,6 +86,14 @@ pub fn start_socket_monitoring() {
         let path = socket_path.to_string();
         thread::spawn(move || {
             monitor_socket(&path);
+        });
+    }
+
+    // Also monitor the data-dir-specific OpenGL ES pipe paths
+    // (these change per profile / work profile, so they can't be static)
+    for dyn_path in crate::core::get_opengles_paths() {
+        thread::spawn(move || {
+            monitor_socket(&dyn_path);
         });
     }
     

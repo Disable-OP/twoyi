@@ -181,7 +181,8 @@ public class TwoyiDocumentsProvider extends DocumentsProvider {
     }
 
     private String getRootSummary() {
-        return "/data/data/io.twoyi";
+        // Use the actual data directory — works in work profiles too
+        return getContext().getDataDir().getAbsolutePath();
     }
 
     private void includeFile(MatrixCursor result, String docId, File file)

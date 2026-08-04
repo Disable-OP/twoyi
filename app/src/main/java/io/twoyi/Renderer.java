@@ -58,4 +58,13 @@ public class Renderer {
      * @param logDir absolute path to the directory where debug logs should be written
      */
     public static native void setDebugLogDir(String logDir);
+
+    /**
+     * Set the app's data directory. Must be called before init() so that
+     * all internal paths (rootfs, log, input sockets, opengles pipes)
+     * resolve correctly. In a work profile the data dir is different
+     * from the default /data/data/io.twoyi.
+     * @param dataDir absolute path to the app's data directory
+     */
+    public static native void setDataDir(String dataDir);
 }
