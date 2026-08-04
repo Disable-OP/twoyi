@@ -73,7 +73,10 @@ public class TwoyiSocketServer {
 
     public void start() {
         if (mStarted.compareAndSet(false, true)) {
-            EXECUTOR.submit(this::start0);
+            // Explicit Runnable cast to disambiguate — start0() and start0(int)
+            // both match EXECUTOR.submit(this::start0), causing a "reference to
+            // submit is ambiguous" compile error under JDK 17.
+            EXECUTOR.submit((Runnable) this::start0);
 
             EXECUTOR.submit(()-> {
 
