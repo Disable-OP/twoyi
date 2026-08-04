@@ -86,7 +86,27 @@ public class TwoyiSocketServer {
         }
     }
 
+    /**
+     * Maximum number of times {@link #start0()} will retry binding the
+     * abstract SEQPACKET socket before giving up. Each retry is separated
+     * by an exponential backoff (capped at {@link #MAX_BACKOFF_MS}).
+     *
+     * <p>The previous implementation called {@link #start()} recursively
+     * on every IOException with a fixed 1-second sleep. If the bind kept
+     * failing (e.g. because another twoyi instance held the name, or
+     * because SELinux denied the operation) the executor thread pool
+     * would accumulate one blocked thread per retry, eventually exhausting
+     * {@link #EXECUTOR}'s cached pool and starving the rest of the app.
+     */
+    private static final int MAX_START_RETRIES = 5;
+    private static final long INITIAL_BACKOFF_MS = 1_000L;
+    private static final long MAX_BACKOFF_MS    = 30_000L;
+
     private void start0() {
+        start0(0);
+    }
+
+    private void start0(int attempt) {
         LocalSocket socket = null;
         try {
             socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET);
@@ -99,15 +119,26 @@ public class TwoyiSocketServer {
                 handleSocket(localSocket);
             }
         } catch (IOException e) {
-            Log.e(TAG, "start socket failed", e);
+            Log.e(TAG, "start socket failed (attempt " + (attempt + 1) + "/" + MAX_START_RETRIES + ")", e);
 
+            IOUtils.closeSilently(socket);
             mStarted.set(false);
 
-            // start it again
-            SystemClock.sleep(1000);
+            if (attempt + 1 >= MAX_START_RETRIES) {
+                Log.e(TAG, "giving up after " + MAX_START_RETRIES + " failed bind attempts; "
+                        + "the guest will not be able to send control messages to the host.");
+                return;
+            }
 
-            start();
+            // Exponential backoff with jitter, capped at MAX_BACKOFF_MS.
+            long backoff = Math.min(INITIAL_BACKOFF_MS << attempt, MAX_BACKOFF_MS);
+            long jitter  = (long) (Math.random() * (backoff / 2));
+            SystemClock.sleep(backoff + jitter);
 
+            // Re-submit to the executor instead of recursing on the same
+            // thread, so we don't grow the stack and so a runaway failure
+            // doesn't pin a thread forever.
+            EXECUTOR.submit(() -> start0(attempt + 1));
         } finally {
             IOUtils.closeSilently(socket);
         }
