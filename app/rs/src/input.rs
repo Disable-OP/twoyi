@@ -278,6 +278,18 @@ fn touch_server(width: i32, height: i32) {
     info!("drop listener!");
 }
 
+/// Set the bit at position `n` in a `key_bitmask` byte array.
+/// `key_bitmask` is a bitmap of `KEY_MAX` bits, indexed by Linux keycode.
+/// The guest's `EventHub` reads this via `EVIOCGKEY` to learn which keys
+/// the virtual keyboard can emit.
+fn set_key_bit(bitmask: &mut [u8], keycode: usize) {
+    let byte = keycode / 8;
+    let bit  = keycode % 8;
+    if byte < bitmask.len() {
+        bitmask[byte] |= 1 << bit;
+    }
+}
+
 fn generate_key_device() -> device_info {
     let mut info: device_info = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
 
@@ -288,16 +300,78 @@ fn generate_key_device() -> device_info {
     copy_to_cstr(KEY_PATH, &mut info.physical_location);
     copy_to_cstr(KEY_DEVICE_UNIQUE_ID, &mut info.unique_id);
 
-    info.key_bitmask[14] = 0x1C;
+    // Advertise every key that `android_keycode_to_linux` can emit, so the
+    // guest's InputReader doesn't drop them as "out of capability range".
+    // The legacy `info.key_bitmask[14] = 0x1C` only advertised KEY_BACK,
+    // KEY_HOMEPAGE, and KEY_MENU — which meant KEYCODE_HOME silently
+    // fell back through Android's compatibility shim.
+    for &keycode in &[
+        KEY_HOME,         // 102  — KEYCODE_HOME
+        KEY_BACK,         // 158  — KEYCODE_BACK
+        KEY_END,          // 107  — KEYCODE_ENDCALL
+        KEY_VOLUMEUP,     // 115  — KEYCODE_VOLUME_UP
+        KEY_VOLUMEDOWN,   // 114  — KEYCODE_VOLUME_DOWN
+        KEY_POWER,        // 116  — KEYCODE_POWER
+        KEY_MENU,         // 139  — KEYCODE_MENU
+        KEY_SEARCH,       // 217  — KEYCODE_SEARCH
+        KEY_APPSELECT,    // 0x244 — KEYCODE_APP_SWITCH (recents)
+        KEY_HOMEPAGE,     // 172  — KEYCODE_HOME alternate
+    ] {
+        set_key_bit(&mut info.key_bitmask, keycode as usize);
+    }
 
     info
 }
 
-pub fn send_key_code(_keycode: i32) {
+/// Map an Android `KeyEvent.KEYCODE_*` constant to the corresponding
+/// Linux input subsystem `KEY_*` code, so the guest's `InputManagerService`
+/// receives the correct key event.
+///
+/// Prior to this change, `send_key_code` ignored its `keycode` argument
+/// and always emitted `KEY_BACK`. That worked by accident for the only
+/// caller (`Render2Activity.onBackPressed` → `KEYCODE_HOME`) because the
+/// guest's `InputManagerService` translates a missing `KEY_HOME` capability
+/// on the virtual keyboard device into a fallback. But it broke any future
+/// caller that wanted to send a different key (e.g. volume, recents, power).
+///
+/// Constants are aligned with `linux/input-event-codes.h` and
+/// `android.view.KeyEvent` so the mapping is stable across kernel versions.
+fn android_keycode_to_linux(keycode: i32) -> Option<i32> {
+    // Android KeyEvent.KEYCODE_* constants (subset that makes sense for a
+    // virtual navigation device). See frameworks/base/core/java/android/view/KeyEvent.java
+    // KEY_CALL is intentionally omitted because the uinput-sys crate
+    // (tiann/rust-uinput-sys) doesn't export it.
+    match keycode {
+        3   => Some(KEY_HOME),         // KEYCODE_HOME         → KEY_HOME (102)
+        4   => Some(KEY_BACK),         // KEYCODE_BACK         → KEY_BACK (158)
+        6   => Some(KEY_END),          // KEYCODE_ENDCALL      → KEY_END (107)
+        24  => Some(KEY_VOLUMEUP),     // KEYCODE_VOLUME_UP    → KEY_VOLUMEUP (115)
+        25  => Some(KEY_VOLUMEDOWN),   // KEYCODE_VOLUME_DOWN  → KEY_VOLUMEDOWN (114)
+        26  => Some(KEY_POWER),        // KEYCODE_POWER        → KEY_POWER (116)
+        82  => Some(KEY_MENU),         // KEYCODE_MENU         → KEY_MENU (139)
+        84  => Some(KEY_SEARCH),       // KEYCODE_SEARCH       → KEY_SEARCH (217)
+        187 => Some(KEY_APPSELECT),    // KEYCODE_APP_SWITCH   → KEY_APPSELECT (recents, 0x244)
+        220 => Some(KEY_HOMEPAGE),     // KEYCODE_HOME (alt)   → KEY_HOMEPAGE (172)
+        _   => None,                   // Unknown / unsupported keycode
+    }
+}
+
+pub fn send_key_code(keycode: i32) {
+    let linux_keycode = match android_keycode_to_linux(keycode) {
+        Some(k) => k,
+        None    => {
+            info!("send_key_code: unmapped Android keycode {}, ignoring", keycode);
+            return;
+        }
+    };
+
     if let Some(ref tx) = *KEY_SENDER.lock().unwrap() {
-        input_event_write(tx, EV_KEY, KEY_BACK, 1);
+        // Standard press → sync → release sequence. The guest's EventHub
+        // reads this as a single key event from the virtual `vkey` device.
+        input_event_write(tx, EV_KEY, linux_keycode, 1);
         input_event_write(tx, EV_SYN, SYN_REPORT, SYN_REPORT);
-        input_event_write(tx, EV_KEY, KEY_BACK, 0);
+        input_event_write(tx, EV_KEY, linux_keycode, 0);
+        input_event_write(tx, EV_SYN, SYN_REPORT, SYN_REPORT);
     }
 }
 
