@@ -46,10 +46,25 @@ android {
         archivesBaseName = "twoyi_${versionName}"
     }
 
+    signingConfigs {
+        release {
+            // A self-signed test keystore committed to the repo for
+            // convenience. This lets CI and codespace builds produce
+            // installable APKs without requiring the user to manage
+            // a separate keystore. Replace with your own production
+            // key before publishing.
+            storeFile file('twoyi-release.keystore')
+            storePassword 'twoyi-release'
+            keyAlias 'twoyi-release'
+            keyPassword 'twoyi-release'
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
             debuggable false
+            signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
