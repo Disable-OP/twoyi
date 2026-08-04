@@ -49,14 +49,36 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     ::std::slice::from_raw_parts((p as *const T) as *const u8, ::std::mem::size_of::<T>())
 }
 
-fn copy_to_cstr<const COUNT: usize>(data: &str, arr: &mut [u8; COUNT]) {
+/// Copy a Rust `&str` into a fixed-size C `char` array (NUL-terminated).
+///
+/// `arr` can be either `&mut [u8; N]` (when the field is declared as
+/// `[u8; N]`) or `&mut [c_char; N]` (when the field is declared as
+/// `[c_char; N]`, which on aarch64-linux-android is `[i8; N]`). We accept
+/// a generic mutable slice and cast each byte via `as`, so both layouts
+/// work without changing the call sites.
+///
+/// Note: this function uses pointer casting internally because Rust's
+/// type system doesn't let us write a single generic signature that
+/// accepts both `&mut [u8; N]` and `&mut [i8; N]` without `unsafe`.
+/// The `unsafe` block is bounded and the operation is sound: we never
+/// read past `len` bytes, and `len` is clamped to `COUNT`.
+fn copy_to_cstr<T, const COUNT: usize>(data: &str, arr: &mut [T; COUNT]) {
     let cstr = std::ffi::CString::new(data).expect("create cstring failed");
     let bytes = cstr.as_bytes_with_nul();
     let mut len = bytes.len();
     if len >= COUNT {
         len = COUNT;
     }
-    arr[..len].copy_from_slice(bytes);
+    // Cast the [T; COUNT] array to a [u8; COUNT] pointer for the copy.
+    // This is sound because:
+    //   - On aarch64-linux-android, c_char == i8, and [i8; N] has the same
+    //     memory layout as [u8; N] (both are 1-byte elements, N elements).
+    //   - On targets where c_char == u8, this is a no-op cast.
+    //   - We only write `len` <= COUNT bytes, so we never overflow.
+    unsafe {
+        let ptr = arr.as_mut_ptr() as *mut u8;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
+    }
 }
 
 const MAX_POINTERS: usize = 5;
