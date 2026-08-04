@@ -1,0 +1,83 @@
+[
+  {
+    "url": "https://github.com/devcontainers/images/issues/884",
+    "name": "KVM is not enabled on Jammy Ubuntu variant · Issue #884",
+    "snippet": "Dec 8, 2023 — KVM is a hypervisor provided by the Linux Kernel. Hypervisors allows the creation of isolated virtual machines which run on the same hardware. Read more",
+    "host_name": "github.com",
+    "rank": 0,
+    "date": "Dec 8, 2023",
+    "favicon": ""
+  },
+  {
+    "url": "https://serverfault.com/questions/1167707/dev-kvm-in-docker-swarm-service",
+    "name": "dev/kvm in docker swarm service",
+    "snippet": "Nov 12, 2024 — My node supports kvm and running directly on the node with docker compose when adding privileged : true works fine. But docker swarm doesn't ... Read more",
+    "host_name": "serverfault.com",
+    "rank": 1,
+    "date": "Nov 12, 2024",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.reddit.com/r/docker/comments/jke5du/docker_provider_container_as_a_service_with",
+    "name": "Docker Provider (Container as a Service) with Privileged",
+    "snippet": "Hi there, does anyone know a Docker Provider ( Docker /Container as a Service) which supports Privileged Mode or KVM inside a Container?",
+    "host_name": "www.reddit.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/65435561/how-to-pass-kvm-from-local-machine-to-docker-container",
+    "name": "How to pass KVM from local machine to docker container?",
+    "snippet": "I'm trying to launch Android Emulator (aka AVD) in Docker container, by next command docker run -it img_emulator:v1  but i get the following ...",
+    "host_name": "stackoverflow.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://linuxcommunity.io/t/run-windows-with-docker-compose-kvm/3965",
+    "name": "Run Windows with Docker Compose & KVM",
+    "snippet": "Nov 30, 2024 — This tutorial explains step by step how to install an “arbitrary” Windows version in a Docker container. Read more",
+    "host_name": "linuxcommunity.io",
+    "rank": 4,
+    "date": "Nov 30, 2024",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/sickcodes/Docker-OSX/issues/127",
+    "name": "sickcodes/Docker-OSX - \"/dev/kvm\": no such file or directory",
+    "snippet": "Jan 17, 2021 — If you are using a virtual machine the above error is likely due to nested virtualization being disabled. This can be enabled on KVM and VMware ...",
+    "host_name": "github.com",
+    "rank": 5,
+    "date": "Jan 17, 2021",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=o0c9DexUVpI",
+    "name": "Windows in a Github Codespace Dev Container",
+    "snippet": "Run a fully functional Windows in a Docker container ! and then run it in a Github Codespace! Dev Containers in VS Code with Dockerfiles and  ...",
+    "host_name": "www.youtube.com",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.munenick.me/en/blog/docker-vm-runner",
+    "name": "Building docker-vm-runner to Start Real Virtual Machines with",
+    "snippet": "Jun 11, 2026 — docker-vm-runner is a tool for starting a VM with QEMU/libvirt from inside a Docker container. As the name suggests, it runs a VM with Docker.",
+    "host_name": "www.munenick.me",
+    "rank": 7,
+    "date": "Jun 11, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://blog.nillsf.com/index.php/2020/03/24/creating-nested-vm-using-kvm-on-azure",
+    "name": "Creating nested VM using KVM on Azure - NillsF blog",
+    "snippet": "Mar 24, 2020 — In this post I'll describe how to create a VM using nested virtualization , and how to get access to that VM. Read more",
+    "host_name": "blog.nillsf.com",
+    "rank": 8,
+    "date": "Mar 24, 2020",
+    "favicon": ""
+  }
+]

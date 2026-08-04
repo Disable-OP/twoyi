@@ -1,0 +1,83 @@
+[
+  {
+    "url": "https://github.com/orgs/community/discussions/51909",
+    "name": "Unable to use Golang debugger in codespaces as a non",
+    "snippet": "Apr 3, 2023 — With the devcontainer . json found bellow (figure 2) I am running into an error ・ it can be resolved by running ・ does not exist at all on the ...",
+    "host_name": "github.com",
+    "rank": 0,
+    "date": "Apr 3, 2023",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.reddit.com/r/docker/comments/kd5oz7/vs_code_integration_of_privileged_container_to",
+    "name": "VS Code integration of privileged container to pass through",
+    "snippet": "I've managed to do this by running the container in privileged mode: docker run -it -- rm -- name arm-none-gcc -- user $(id -u):$(id -g) -- ... Read more",
+    "host_name": "www.reddit.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://dev.to/pwd9000/introduction-to-github-codespaces-building-your-first-dev-container-69l",
+    "name": "Introduction to GitHub Codespaces - Building your first",
+    "snippet": "Aug 6, 2022 — A GitHub codespace is a development environment running inside of a container that's remotely hosted on a cloud based Virtual Machine linked to your code ... Read more",
+    "host_name": "dev.to",
+    "rank": 2,
+    "date": "Aug 6, 2022",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/devcontainers/images/issues/884",
+    "name": "KVM is not enabled on Jammy Ubuntu variant · Issue #884",
+    "snippet": "Dec 8, 2023 — To run container in privileged mode, add the following property to your devcontainer.json . Read more about this here \"privileged\": true. To ... Read more",
+    "host_name": "github.com",
+    "rank": 3,
+    "date": "Dec 8, 2023",
+    "favicon": ""
+  },
+  {
+    "url": "https://devcontainers.github.io/implementors/features",
+    "name": "Dev Container Features reference",
+    "snippet": "Development Container Features are self-contained, shareable units of installation code and development container configuration. Read more",
+    "host_name": "devcontainers.github.io",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://podman-desktop.io/blog/develop-using-devcontainer",
+    "name": "Build & run Podman Desktop in a DevContainer",
+    "snippet": "Nov 17, 2022 — It's possible to use -- privileged flag but I prefer to list the subset of permissions. Using -- privileged \" runArgs \": Using the DevContainer . ...",
+    "host_name": "podman-desktop.io",
+    "rank": 5,
+    "date": "Nov 17, 2022",
+    "favicon": ""
+  },
+  {
+    "url": "https://developer.harness.io/docs/cloud-development-environments/deep-dive-into-gitspaces/gitspace-configuration",
+    "name": "Understanding the Gitspace Configuration",
+    "snippet": "Feb 7, 2025 — devcontainer . json File​ ; privileged , Allows the user to cause the container to run in privileged mode (-- privileged ). Defaults to false ; init ... Read more",
+    "host_name": "developer.harness.io",
+    "rank": 6,
+    "date": "Feb 7, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=ldAlq4e4W5w",
+    "name": "Codespaces configuration with dev containers",
+    "snippet": "Take a #GitHub # Codespaces instance to the next level by configuring it using a development container. Find what those files are and how to ...",
+    "host_name": "www.youtube.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://polotek.net/posts/running-pull-requests-in-github-codespaces",
+    "name": "Running Pull Requests in Github Codespaces",
+    "snippet": "Oct 23, 2025 — Getting a Dev Container working . This walkthrough assumes you have a few prerequisites already installed: vs code; Dev Containers extension for ... Read more",
+    "host_name": "polotek.net",
+    "rank": 8,
+    "date": "Oct 23, 2025",
+    "favicon": ""
+  }
+]

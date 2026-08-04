@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://github.com/budtmo/docker-android",
+    "name": "GitHub - budtmo/docker-android: Android in docker solution with",
+    "snippet": "CodespacesInstant dev environments · IssuesPlan and track work · Code ... [boot] command = /bin/bash -c 'chown -v root:kvm /dev/kvm && chmod 660 /dev/kvm'.",
+    "host_name": "github.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://medium.com/techsync/windows-inside-a-container-how-dockur-turns-docker-into-a-full-virtual-machine-host-45c18d6d3811",
+    "name": "Windows Inside a Container: How Dockur Turns Docker Into a Full",
+    "snippet": "Jul 11, 2026 · ... dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN -v \"${PWD ... The project also supports GitHub Codespaces for anyone who wants to try ...",
+    "host_name": "medium.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/qemus/qemu",
+    "name": "qemus/qemu: QEMU in a Docker container. - GitHub",
+    "snippet": "... dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN -v \"${PWD:-.}/qemu ... Open in GitHub Codespaces. Requirements ⚙️. Docker or Podman on a Linux host ...",
+    "host_name": "github.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/thyrlian/androidsdk",
+    "name": "thyrlian/AndroidSDK: Full-fledged Android SDK Docker Image - GitHub",
+    "snippet": "... dev/kvm is not found: VT disabled in BIOS or KVM kernel module not loaded ... --privileged flag docker run -it --device=/dev/ttyUSB0 -v $(pwd)/sdk:/opt ...",
+    "host_name": "github.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/HQarroum/docker-android/blob/main/docker-compose.yml",
+    "name": "docker-android/docker-compose.yml at main - GitHub",
+    "snippet": "CodespacesInstant dev environments · IssuesPlan and track work · Code Review ... dev/kvm android-emulator-cuda: build: context: . dockerfile: ./Dockerfile ...",
+    "host_name": "github.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/LiberCoders/CLaw-Anything",
+    "name": "GitHub - LiberCoders/Claw-Anything: official implementation of",
+    "snippet": "... dev/kvm) android: backend: kvm emulator_image: claw_anything:latest ... The container needs --privileged (the pool already passes it). Trial container ...",
+    "host_name": "github.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/dockur/windows",
+    "name": "GitHub - dockur/windows: Windows inside a Docker container.",
+    "snippet": "... dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN -v \"${PWD:-.}/windows ... Each of these projects uses this container as its backend. GitHub Codespaces: Open in ...",
+    "host_name": "github.com",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/budtmo/docker-android/issues/251",
+    "name": "[Documentation] How to install app via .apk file #251 - GitHub",
+    "snippet": "Jul 10, 2020 · CodespacesInstant dev environments · IssuesPlan and track work · Code ... dev/kvm:/dev/kvm\" restart: always apk-installer: build: context ...",
+    "host_name": "github.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/Jackthegr8at/kasm-qemu-dockur",
+    "name": "GitHub - Jackthegr8at/kasm-qemu-dockur: Windows inside a Docker",
+    "snippet": "... dev/kvm - /dev/net/tun cap_add: - NET_ADMIN ports: - 8006:8006 - 3389:3389 ... Open in GitHub Codespaces. FAQ. How do I use it? Very simple! These are ...",
+    "host_name": "github.com",
+    "rank": 8,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/37300811/android-studio-dev-kvm-device-permission-denied",
+    "name": "Android Studio: /dev/kvm device permission denied",
+    "snippet": "When I try to run my Android app on an emulator I get this error:   /dev/kvm permission denied.   I checked the permissions and added the user I am currently ...",
+    "host_name": "stackoverflow.com",
+    "rank": 9,
+    "date": "",
+    "favicon": ""
+  }
+]

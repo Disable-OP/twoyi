@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://github.com/orgs/community/discussions/160591",
+    "name": "Enable nested virtualization #160591",
+    "snippet": "Dec 19, 2019 — enabling nested virtualization would be a great enhancement. For example, this way we could build Vagrant boxes in GitHub Actions. I don't ...",
+    "host_name": "github.com",
+    "rank": 0,
+    "date": "Dec 19, 2019",
+    "favicon": ""
+  },
+  {
+    "url": "https://serverfault.com/questions/1185118/nested-virtualization-kvm-on-cloud-build-or-alternative-hosted-ci",
+    "name": "Nested virtualization (kvm) on Cloud Build or alternative",
+    "snippet": "Jun 2, 2025 — Github Actions could probably do nested virtualization . Several restrictions on nested exist, notably only Intel processors, and not E2 class ...",
+    "host_name": "serverfault.com",
+    "rank": 1,
+    "date": "Jun 2, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://news.ycombinator.com/item?id=48807908",
+    "name": "Januscape: Guest-to-Host Escape in KVM/x86 [CVE-2026-",
+    "snippet": "Jul 6, 2026 — This is a very nasty vulnerability and risks any service that uses and allows nested x86 virtualization features at risk. Including those ... Read more",
+    "host_name": "news.ycombinator.com",
+    "rank": 2,
+    "date": "Jul 6, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/orgs/community/discussions/8305",
+    "name": "Revisiting KVM support for Hosted GitHub Actions #8305",
+    "snippet": "Dec 7, 2021 — If we offered nested virtualization , would this be sufficient? Or is there more that we would need to provide to support you using KVM ? Read more",
+    "host_name": "github.com",
+    "rank": 3,
+    "date": "Dec 7, 2021",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/actions/runner-images/issues/183",
+    "name": "Enable nested virtualization · Issue #183 · actions/runner-",
+    "snippet": "Dec 19, 2019 — Has anyone tried just running KVM on azure? What happens? Is there even support for it in the stock azure / ubuntu kernel for bionic? Read more",
+    "host_name": "github.com",
+    "rank": 4,
+    "date": "Dec 19, 2019",
+    "favicon": ""
+  },
+  {
+    "url": "https://oneuptime.com/blog/post/2026-02-17-how-to-create-a-nested-virtualization-enabled-vm-on-compute-engine-for-testing/view",
+    "name": "How to Create a Nested Virtualization-Enabled VM on",
+    "snippet": "Feb 17, 2026 — Nested virtualization allows a Compute Engine VM to act as a hypervisor and run its own guest VMs using KVM .",
+    "host_name": "oneuptime.com",
+    "rank": 5,
+    "date": "Feb 17, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://discussion.fedoraproject.org/t/nested-virtualization/179358",
+    "name": "Nested Virtualization - Fedora Discussion",
+    "snippet": "Jan 12, 2026 — January 12, 2026 , it actually supports nested virtualization , Make sure you're running Linux kernel 6.16+. You need an M2 series mac. Download ...",
+    "host_name": "discussion.fedoraproject.org",
+    "rank": 6,
+    "date": "Jan 12, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/microsoft/WSL/issues/13796",
+    "name": "Nested virtualization is not supported on arm based",
+    "snippet": "Nov 27, 2025 — Nested virtualization is not supported on arm based machines. Enable nested virtualization , . If this is a networking issue, 2026 GitHub , Inc.",
+    "host_name": "github.com",
+    "rank": 7,
+    "date": "Nov 27, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://lwn.net/Articles/1055170",
+    "name": "Nested virtualization for KVM RISC-V",
+    "snippet": "Nested virtualization for KVM RISC-V ; Subject: [PATCH 00/27] Nested virtualization for KVM RISC-V ; Date: Tue, 20 Jan 2026 13:29:46 +0530. Read more",
+    "host_name": "lwn.net",
+    "rank": 8,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/npcabrera13/windows11-codespace",
+    "name": "GitHub - npcabrera13/windows11-codespace",
+    "snippet": "🖥️ Windows 11 on GitHub Codespaces Run Windows 11 inside a GitHub Codespace using QEMU/KVM and access it through your browser via noVNC!",
+    "host_name": "github.com",
+    "rank": 9,
+    "date": "Feb 12, 2026",
+    "favicon": ""
+  }
+]
