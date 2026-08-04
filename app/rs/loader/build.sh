@@ -1,48 +1,49 @@
-#!/bin/bash
-
+#!/bin/sh
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
-# =============================================================================
+#
 # build.sh — build libloader.so (open-source replacement for the legacy
 # closed-source libloader.so) for one or more Android ABIs.
 #
 # Usage:
-#   ./build.sh [abi ...]
-#
-# Examples:
 #   ./build.sh                       # default: arm64-v8a only
 #   ./build.sh arm64-v8a x86_64
 #   ./build.sh all
 #
+# POSIX-sh compatible (no bash arrays) so it works under `sh build.sh`.
 # Supported ABIs:  arm64-v8a, x86_64
-# =============================================================================
 
 set -e
 
-ALL_ABIS=("arm64-v8a" "x86_64")
+ALL_ABIS="arm64-v8a x86_64"
 
 # Parse args
-ABIS=()
+ABIS=""
 for arg in "$@"; do
     case "$arg" in
-        all) ABIS=("${ALL_ABIS[@]}") ;;
-        arm64-v8a|x86_64) ABIS+=("$arg") ;;
+        all) ABIS="$ALL_ABIS" ;;
+        arm64-v8a|x86_64)
+            if [ -z "$ABIS" ]; then
+                ABIS="$arg"
+            else
+                ABIS="$ABIS $arg"
+            fi
+            ;;
         *) echo "Unknown arg: $arg"; exit 1 ;;
     esac
 done
-if [ ${#ABIS[@]} -eq 0 ]; then
-    ABIS=("arm64-v8a")
+if [ -z "$ABIS" ]; then
+    ABIS="arm64-v8a"
 fi
 
 echo "=========================================="
-echo "Building libloader.so for ABIs=[${ABIS[*]}]"
+echo "Building libloader.so for ABIs=[$ABIS]"
 echo "=========================================="
 
 cd "$(dirname "$0")"
 
-for ABI in "${ABIS[@]}"; do
+for ABI in $ABIS; do
     echo ""
     echo "------------------------------------------"
     echo "  Building for $ABI"
