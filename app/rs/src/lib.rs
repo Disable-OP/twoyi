@@ -120,6 +120,21 @@ pub fn set_debug_log_dir(
     core::set_debug_log_dir(log_dir_path);
 }
 
+/// Set the app's data directory. This MUST be called before init()
+/// so that all paths (rootfs, log, input sockets, opengles pipes)
+/// resolve correctly — especially in work profiles where the data
+/// dir is /data/user/<uid>/io.twoyi instead of /data/data/io.twoyi.
+#[no_mangle]
+pub fn set_data_dir(
+    env: JNIEnv,
+    _clz: jclass,
+    data_dir: jstring,
+) {
+    let dir: String = env.get_string(data_dir.into()).unwrap().into();
+    debug!("set_data_dir: {}", dir);
+    core::set_data_dir(dir);
+}
+
 #[no_mangle]
 pub fn renderer_reset_window(
     env: JNIEnv,
@@ -251,6 +266,7 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
         jni_method!(setRendererType, set_renderer_type, "(I)V"),
         jni_method!(setDebugRenderer, set_debug_renderer, "(I)V"),
         jni_method!(setDebugLogDir, set_debug_log_dir, "(Ljava/lang/String;)V"),
+        jni_method!(setDataDir, set_data_dir, "(Ljava/lang/String;)V"),
     ];
 
     let result = register_natives(&jvm, class_name, jni_methods.as_ref());

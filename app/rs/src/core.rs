@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use once_cell::sync::Lazy;
 
@@ -23,6 +23,59 @@ use crate::renderer_bindings;
 use crate::renderer_new;
 
 static RENDERER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// The app's data directory, set from Java via `set_data_dir()`.
+///
+/// This replaces the previously hardcoded `/data/data/io.twoyi` path.
+/// In a work profile the path is `/data/user/<uid>/io.twoyi` instead,
+/// so the old hardcoded path would break. The Java side calls
+/// `Renderer.setDataDir(context.getDataDir().getAbsolutePath())` before
+/// `Renderer.init()`, and all Rust paths are derived from this value.
+static DATA_DIR: OnceLock<String> = OnceLock::new();
+
+/// Set the data directory. Called from JNI (`set_data_dir` in lib.rs)
+/// before any rendering or input initialization.
+pub fn set_data_dir(dir: String) {
+    let _ = DATA_DIR.set(dir);
+    info!("[CORE] Data directory set to: {:?}", DATA_DIR.get());
+}
+
+/// Get the data directory. Falls back to the hardcoded path if
+/// `set_data_dir` was never called (backwards compatibility with
+/// older Java code that doesn't call `setDataDir`).
+pub fn get_data_dir() -> &'static str {
+    DATA_DIR.get().map(|s| s.as_str()).unwrap_or("/data/data/io.twoyi")
+}
+
+/// Get the rootfs directory path.
+pub fn get_rootfs_dir() -> String {
+    format!("{}/rootfs", get_data_dir())
+}
+
+/// Get the log file path.
+pub fn get_log_path() -> String {
+    format!("{}/log.txt", get_data_dir())
+}
+
+/// Get the touch device socket path.
+pub fn get_touch_path() -> String {
+    format!("{}/rootfs/dev/input/touch", get_data_dir())
+}
+
+/// Get the key device socket path.
+pub fn get_key_path() -> String {
+    format!("{}/rootfs/dev/input/key0", get_data_dir())
+}
+
+/// Get the OpenGL ES pipe paths (for socket monitoring).
+pub fn get_opengles_paths() -> Vec<String> {
+    let rootfs = get_rootfs_dir();
+    vec![
+        format!("{}/opengles", rootfs),
+        format!("{}/opengles2", rootfs),
+        format!("{}/opengles3", rootfs),
+    ]
+}
 
 /// Renderer type selection
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -181,8 +234,8 @@ pub fn init_renderer(
             }
         });
 
-        let working_dir = "/data/data/io.twoyi/rootfs";
-        let log_path = "/data/data/io.twoyi/log.txt";
+        let working_dir = get_rootfs_dir();
+        let log_path = get_log_path();
         info!("[CORE] Starting container init process");
         info!("[CORE] Working directory: {}", working_dir);
         info!("[CORE] Log path: {}", log_path);

@@ -91,7 +91,15 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         @Override
         public void surfaceCreated(@NonNull SurfaceHolder holder) {
             Surface surface = holder.getSurface();
-            
+
+            // Set the data directory BEFORE anything else — the Rust side
+            // needs it to resolve rootfs, log, and input socket paths.
+            // In a work profile, getDataDir() returns /data/user/<uid>/io.twoyi
+            // instead of /data/data/io.twoyi.
+            String dataDir = getApplicationInfo().dataDir;
+            Renderer.setDataDir(dataDir);
+            Log.i(TAG, "Data directory: " + dataDir);
+
             // Set renderer type before initializing
             boolean useNewRenderer = ProfileSettings.useNewRenderer(getApplicationContext());
             Renderer.setRendererType(useNewRenderer ? 1 : 0);

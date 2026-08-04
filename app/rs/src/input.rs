@@ -18,13 +18,23 @@ use log::info;
 
 const FF_MAX: u16 = 0x7f;
 
-const TOUCH_PATH: &'static str = "/data/data/io.twoyi/rootfs/dev/input/touch";
 const TOUCH_DEVICE_NAME: &'static str = "vtouch";
 const TOUCH_DEVICE_UNIQUE_ID: &'static str = "<vtouch 0>";
 
 const KEY_DEVICE_NAME: &'static str = "vkey";
 const KEY_DEVICE_UNIQUE_ID: &'static str = "<keyboard 0>";
-const KEY_PATH: &'static str = "/data/data/io.twoyi/rootfs/dev/input/key0";
+
+/// Touch device socket path — now dynamic via core::get_touch_path().
+/// In a work profile, the data dir is /data/user/<uid>/io.twoyi instead
+/// of /data/data/io.twoyi, so the path must be resolved at runtime.
+fn touch_path() -> String {
+    crate::core::get_touch_path()
+}
+
+/// Key device socket path — now dynamic via core::get_key_path().
+fn key_path() -> String {
+    crate::core::get_key_path()
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -243,7 +253,7 @@ fn generate_touch_device(width: i32, height: i32) -> device_info {
     };
 
     copy_to_cstr(TOUCH_DEVICE_NAME, &mut info.name);
-    copy_to_cstr(TOUCH_PATH, &mut info.physical_location);
+    copy_to_cstr(&touch_path(), &mut info.physical_location);
     copy_to_cstr(TOUCH_DEVICE_UNIQUE_ID, &mut info.unique_id);
 
     info.prop_bitmask[0] = INPUT_PROP_BUTTONPAD as u8;
@@ -270,8 +280,9 @@ fn generate_touch_device(width: i32, height: i32) -> device_info {
 
 fn touch_server(width: i32, height: i32) {
     let device = generate_touch_device(width, height);
-    let _ = std::fs::remove_file(TOUCH_PATH);
-    let listener = unix_socket::UnixListener::bind(TOUCH_PATH).unwrap();
+    let touch = touch_path();
+    let _ = std::fs::remove_file(&touch);
+    let listener = unix_socket::UnixListener::bind(&touch).unwrap();
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -319,7 +330,7 @@ fn generate_key_device() -> device_info {
     info.id.product = 0x1;
 
     copy_to_cstr(KEY_DEVICE_NAME, &mut info.name);
-    copy_to_cstr(KEY_PATH, &mut info.physical_location);
+    copy_to_cstr(&key_path(), &mut info.physical_location);
     copy_to_cstr(KEY_DEVICE_UNIQUE_ID, &mut info.unique_id);
 
     // Advertise every key that `android_keycode_to_linux` can emit, so the
@@ -399,8 +410,9 @@ pub fn send_key_code(keycode: i32) {
 
 fn key_server() {
     let device = generate_key_device();
-    let _ = std::fs::remove_file(KEY_PATH);
-    let listener = unix_socket::UnixListener::bind(KEY_PATH).unwrap();
+    let key = key_path();
+    let _ = std::fs::remove_file(&key);
+    let listener = unix_socket::UnixListener::bind(&key).unwrap();
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
