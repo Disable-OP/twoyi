@@ -1,14 +1,8 @@
-#! /bin/bash
-
-# Exit on error
-set -e
-
-#
+#!/usr/bin/env bash
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
-
 # =============================================================================
 # build_rs.sh — build libtwoyi.so for one or more Android ABIs.
 #
@@ -18,19 +12,22 @@ set -e
 # Examples:
 #   ./build_rs.sh --release                 # default: arm64-v8a only
 #   ./build_rs.sh --release arm64-v8a x86_64
+#   ./build_rs.sh --release all
 #   ./build_rs.sh arm64-v8a                 # debug build, arm64 only
 #
-# If no abi is specified, defaults to arm64-v8a only (the historical
-# behaviour). Pass "all" to build every supported ABI.
+# This script is intentionally POSIX-sh compatible (no bash arrays) so it
+# works whether invoked via `sh build_rs.sh` (dash on Ubuntu) or
+# `bash build_rs.sh`. The Gradle `cargoBuild` task invokes it via `sh`.
 #
 # Supported ABIs:  arm64-v8a, x86_64
 # =============================================================================
+set -e
 
 # Default ABIs if none are specified on the command line
-DEFAULT_ABIS=("arm64-v8a")
-ALL_ABIS=("arm64-v8a" "x86_64")
+DEFAULT_ABIS="arm64-v8a"
+ALL_ABIS="arm64-v8a x86_64"
 
-# Map Android ABI → Rust target triple + dynamic linker path
+# Map Android ABI → Rust target triple
 abi_to_target() {
     case "$1" in
         arm64-v8a) echo "aarch64-linux-android" ;;
@@ -39,45 +36,55 @@ abi_to_target() {
     esac
 }
 
+# Map Android ABI → dynamic linker path
 abi_to_linker() {
-    case "$1" in
-        arm64-v8a) echo "/system/bin/linker64"   ;;
-        x86_64)    echo "/system/bin/linker64"   ;;
-        *) echo "/system/bin/linker64" ;;
-    esac
+    # Both 64-bit ABIs use linker64 inside the Android system image.
+    echo "/system/bin/linker64"
 }
 
-# Parse args: separate --release / --debug flags from ABI names
+# Parse args: separate --release / --debug flags from ABI names.
+# We use a space-separated string (POSIX sh has no arrays).
 PROFILE_ARG=""
-ABIS=()
+ABIS=""
 for arg in "$@"; do
     case "$arg" in
-        --release)  PROFILE_ARG="--release"; ABIS=("${DEFAULT_ABIS[@]}") ;;
-        --debug)    PROFILE_ARG="" ;;
-        all)        ABIS=("${ALL_ABIS[@]}") ;;
-        arm64-v8a|x86_64) ABIS+=("$arg") ;;
-        *)
-            # Pass through unknown args (e.g. --features=foo) to cargo.
-            # If the user previously set ABIS=() and we see an unknown flag,
-            # fall back to the default ABI list so legacy callers still work.
-            if [ ${#ABIS[@]} -eq 0 ]; then
-                ABIS=("${DEFAULT_ABIS[@]}")
+        --release)
+            PROFILE_ARG="--release"
+            # Don't set ABIS here — wait until after the loop so that
+            # explicit ABI args after --release are honored.
+            ;;
+        --debug)
+            PROFILE_ARG=""
+            ;;
+        all)
+            ABIS="$ALL_ABIS"
+            ;;
+        arm64-v8a|x86_64)
+            # Append to the space-separated list.
+            if [ -z "$ABIS" ]; then
+                ABIS="$arg"
+            else
+                ABIS="$ABIS $arg"
             fi
+            ;;
+        *)
+            # Unknown args are ignored (we don't pass them to cargo yet,
+            # but the case is here for future --features=foo support).
             ;;
     esac
 done
 
-# If only --release was given with no ABIs, use defaults
-if [ ${#ABIS[@]} -eq 0 ]; then
-    ABIS=("${DEFAULT_ABIS[@]}")
+# If no ABIs were specified (e.g. just `--release`), use the default.
+if [ -z "$ABIS" ]; then
+    ABIS="$DEFAULT_ABIS"
 fi
 
-echo "build_rs.sh: building ABIs=[${ABIS[*]}] profile=${PROFILE_ARG:-debug}"
+echo "build_rs.sh: building ABIs=[$ABIS] profile=${PROFILE_ARG:-debug}"
 
 # Configure as PIE executable for direct execution with JNI compatibility.
 # PIE with INTERP segment allows direct execution: ./libtwoyi.so
 # These flags work for both aarch64 and x86_64.
-for ABI in "${ABIS[@]}"; do
+for ABI in $ABIS; do
     TARGET=$(abi_to_target "$ABI")
     LINKER=$(abi_to_linker "$ABI")
 
@@ -91,7 +98,7 @@ for ABI in "${ABIS[@]}"; do
     echo "  Building libtwoyi.so  —  ABI=$ABI  target=$TARGET"
     echo "============================================================"
 
-    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C link-arg=-Wl,-e,main -C link-arg=-Wl,--dynamic-linker=$LINKER -C link-arg=-Wl,-rpath,\$ORIGIN -C link-arg=-Wl,--enable-new-dtags -C link-arg=-pie -C relocation-model=pic -C link-arg=-Wl,--undefined=interp"
+    export RUSTFLAGS="-C link-arg=-Wl,-e,main -C link-arg=-Wl,--dynamic-linker=$LINKER -C link-arg=-Wl,-rpath,\$ORIGIN -C link-arg=-Wl,--enable-new-dtags -C link-arg=-pie -C relocation-model=pic -C link-arg=-Wl,--undefined=interp"
 
     # cargo-xdk takes the Android ABI name (arm64-v8a / x86_64); it maps
     # internally to the right Rust target triple.
