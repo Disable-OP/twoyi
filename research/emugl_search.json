@@ -1,0 +1,74 @@
+[
+  {
+    "url": "https://stackoverflow.com/questions/37163166/android-opengl-render-to-a-framebuffer-in-the-original-small-resolution-and-th",
+    "name": "Android OpenGL Render to a frameBuffer in the original",
+    "snippet": "I have a NV21 (YUV420) camera video which I'm applying on it a fragment shader in order to get some filter effects and YUV to RGB convertion as well. Everything ...",
+    "host_name": "stackoverflow.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=QQ3jr-9Rc1o",
+    "name": "OpenGL Tutorial 18 - Framebuffer & Post-processing",
+    "snippet": "In this tutorial I'll show you how to create a custom framebuffer in OpenGL on which you can apply different post-processing effects.",
+    "host_name": "www.youtube.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/shugaoye/emulator/blob/master/distrib/android-emugl/host/libs/libOpenglRender/FrameBuffer.cpp",
+    "name": "FrameBuffer.cpp - android-emugl",
+    "snippet": "The Android Open Source Project * Implementation of a ColorBuffer ::Helper instance that redirects calls // to a FrameBuffer instance. Create EGL context for  ...\n// Helper class to call the bind_locked() / unbind_locked() properly. // Constructor will call bind_locked() on |fb|. // Use isValid() to check for errors. ScopedBind(FrameBuffer* fb) : mFb(fb) { if (!mFb->bind_locked()) { mFb = NULL; // Returns true if contruction bound the framebuffer context properly. bool isValid() const { return mFb != NULL; }",
+    "host_name": "github.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://android.googlesource.com/platform/sdk/+/bf5b0bc/emulator/opengl/DESIGN",
+    "name": "emulator/opengl/DESIGN - platform/sdk - Git at Google",
+    "snippet": "Hardware GLES emulation in the Android platform is implemented with a mix. The emulator sources related to this projects are:",
+    "host_name": "android.googlesource.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://learnopengl.com/Advanced-OpenGL/Framebuffers",
+    "name": "LearnOpenGL - Framebuffers",
+    "snippet": "OpenGL gives us the flexibility to define our own framebuffers and thus define our own color (and optionally a depth and stencil) buffer. Read more",
+    "host_name": "learnopengl.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://community.khronos.org/t/using-framebuffer-to-rendervideo/106032",
+    "name": "Using Framebuffer to RenderVideo - OpenGL",
+    "snippet": "Jul 15, 2020 — I am working on a project that requires to render Multiple videos in OpenGL Window. Can I use FrameBuffer to store all video frames in it and then render ? Read more",
+    "host_name": "community.khronos.org",
+    "rank": 5,
+    "date": "Jul 15, 2020",
+    "favicon": ""
+  },
+  {
+    "url": "https://source.android.com/docs/core/graphics/arch-egl-opengl",
+    "name": "EGLSurfaces and OpenGL ES",
+    "snippet": "Oct 20, 2025 — Android uses the OpenGL ES (GLES) API to render graphics. To create GLES contexts and provide a windowing system for GLES renderings ... Read more",
+    "host_name": "source.android.com",
+    "rank": 6,
+    "date": "Oct 20, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=atp3bzebWJE",
+    "name": "OpenGL - Framebuffer Objects",
+    "snippet": "OpenGL - Framebuffer Objects. Understanding Data Transfer with Buffers in OpenGL . OpenGL - 3D rendering overview",
+    "host_name": "www.youtube.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  }
+]
