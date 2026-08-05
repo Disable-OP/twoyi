@@ -301,13 +301,13 @@ impl BatteryDevice {
     /// Update the `voltage` file (millivolts, matching the unit
     /// returned by `jni_get_battery_voltage`).
     pub fn update_voltage(&self, mv: u32) -> std::io::Result<()> {
-        self.write_file("voltage", &mv.to_string())
+        self.write_file("voltage_now", &mv.to_string())
     }
 
     /// Update the `temperature` file (1/10 °C, matching the unit
     /// returned by `jni_get_battery_temperature`).
     pub fn update_temperature(&self, decic: u32) -> std::io::Result<()> {
-        self.write_file("temperature", &decic.to_string())
+        self.write_file("temp", &decic.to_string())
     }
 
     /// Update the `technology` file (e.g. `Li-ion`, `Li-poly`).
@@ -346,14 +346,14 @@ impl BatteryDevice {
 
     /// Read the `voltage` file back as a `u32` (mV).
     pub fn read_voltage(&self) -> std::io::Result<u32> {
-        self.read_file_trimmed("voltage")?
+        self.read_file_trimmed("voltage_now")?
             .parse::<u32>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// Read the `temperature` file back as a `u32` (1/10 °C).
     pub fn read_temperature(&self) -> std::io::Result<u32> {
-        self.read_file_trimmed("temperature")?
+        self.read_file_trimmed("temp")?
             .parse::<u32>()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -461,8 +461,8 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     try_write!("capacity",    &level.min(100).to_string());
     try_write!("status",      status.as_str());
     try_write!("charging",    if status.is_charging() { "1" } else { "0" });
-    try_write!("voltage",     &voltage.to_string());
-    try_write!("temperature", &temp.to_string());
+    try_write!("voltage_now",     &voltage.to_string());
+    try_write!("temp", &temp.to_string());
     try_write!("technology",  DEFAULT_TECHNOLOGY);
     try_write!("health",      DEFAULT_HEALTH);
 
@@ -628,8 +628,8 @@ mod tests {
         assert!(dev.dir().exists(), "battery dir should exist");
 
         // All seven files must exist with non-empty content.
-        for name in ["capacity", "status", "charging", "voltage",
-                     "temperature", "technology", "health"] {
+        for name in ["capacity", "status", "charging", "voltage_now",
+                     "temp", "technology", "health"] {
             let p = dev.dir().join(name);
             assert!(p.exists(), "file {} should exist", name);
             let content = fs::read_to_string(&p).unwrap();
@@ -675,8 +675,8 @@ mod tests {
         let dev = BatteryDevice::new(&rootfs).expect("new");
 
         assert_eq!(read_raw(&dev.file("capacity")),    format!("{}\n", DEFAULT_CAPACITY));
-        assert_eq!(read_raw(&dev.file("voltage")),     format!("{}\n", DEFAULT_VOLTAGE_MV));
-        assert_eq!(read_raw(&dev.file("temperature")), format!("{}\n", DEFAULT_TEMP_DECIC));
+        assert_eq!(read_raw(&dev.file("voltage_now")),     format!("{}\n", DEFAULT_VOLTAGE_MV));
+        assert_eq!(read_raw(&dev.file("temp")), format!("{}\n", DEFAULT_TEMP_DECIC));
         assert_eq!(read_raw(&dev.file("status")),      format!("{}\n", BatteryStatus::Discharging.as_str()));
         assert_eq!(read_raw(&dev.file("charging")),    "0\n");
         assert_eq!(read_raw(&dev.file("technology")),  format!("{}\n", DEFAULT_TECHNOLOGY));

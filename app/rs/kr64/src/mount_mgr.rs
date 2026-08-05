@@ -332,6 +332,16 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
 
     // Step 5: pivot_root (or chroot fallback).
     if have_ns {
+        // pivot_root requires new_root to be a mount point. Bind-mount
+        // rootfs to itself to make it a mount point (standard idiom used
+        // by runc, util-linux, and all container runtimes).
+        match mount(&cfg.rootfs, &cfg.rootfs, "", MS_BIND | MS_REC, None) {
+            Ok(()) => info!("[KR64][mount_mgr] self-bind mount on {} succeeded", cfg.rootfs),
+            Err(e) => {
+                warning!("[KR64][mount_mgr] self-bind mount failed: {} — pivot_root will likely fail", e);
+            }
+        }
+
         let old_root = format!("{}/old_root", cfg.rootfs);
         let _ = std::fs::create_dir_all(&old_root);
         match pivot_root(&cfg.rootfs, &old_root) {
