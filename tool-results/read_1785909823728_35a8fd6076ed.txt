@@ -1,0 +1,832 @@
+     1→// Copyright Disclaimer: AI-Generated Content
+     2→// This file was created by GitHub Copilot, an AI coding assistant.
+     3→// AI-generated content is not subject to copyright protection and is provided
+     4→// without any warranty, express or implied, including warranties of
+     5→// merchantability, fitness for a particular purpose, or non-infringement.
+     6→// Use at your own risk.
+     7→
+     8→// This Source Code Form is subject to the terms of the Mozilla Public
+     9→// License, v. 2.0. If a copy of the MPL was not distributed with this
+    10→// file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
+    11→
+    12→//! Seccomp filter + SIGSYS handler — the "kernel replacement" syscall
+    13→//! interception layer.
+    14→//!
+    15→//! This mirrors what VM's `libkr64.so` does (see `VM_KR64_ANALYSIS.md`
+    16→//! §12 and §11):
+    17→//!
+    18→//! 1. `prctl(PR_SET_NO_NEW_PRIVS, 1)` — required before installing a
+    19→//!    seccomp filter without `CAP_SYS_ADMIN`.
+    20→//! 2. `sigaction(SIGSYS, …)` — install a handler that catches trapped
+    21→//!    syscalls. The string `__NR_rt_sigaction SIGSYS` was decoded from
+    22→//!    `libkr64.11.so`'s `.data` (key 0x1a).
+    23→//! 3. `seccomp(SECCOMP_SET_MODE_FILTER, …)` — install a BPF program
+    24→//!    that traps forbidden syscalls. The BPF program returns
+    25→//!    `SECCOMP_RET_TRAP` for "intercepted" syscalls (mount, umount,
+    26→//!    reboot, kexec_load, init_module, etc.) and `SECCOMP_RET_ALLOW`
+    27→//!    for everything else.
+    28→//! 4. The SIGSYS handler logs `BLOCKED.SYSCALL.FAILED: <nr>` (string
+    29→//!    decoded from libkr64.so with key 0xc9 / 0xc2) and either:
+    30→//!    - Emulates the syscall (sets the return value to 0 / fake-success
+    31→//!      and advances the PC past the syscall instruction), OR
+    32→//!    - Kills the guest (via `_exit`).
+    33→//!
+    34→//! # Why `SECCOMP_RET_TRAP`, not `SECCOMP_RET_TRACE`
+    35→//!
+    36→//! The task spec mentions `SECCOMP_RET_TRACE`, but `SECCOMP_RET_TRACE`
+    37→//! requires a ptrace tracer to be attached to the process — without
+    38→//! one, the kernel falls back to `SECCOMP_RET_KILL`. The mechanism
+    39→//! that actually delivers `SIGSYS` (and the one VM uses, per the
+    40→//! analysis) is `SECCOMP_RET_TRAP`. We expose `SECCOMP_RET_TRACE` as
+    41→//! a constant for callers that want to switch to ptrace-mode tracing
+    42→//! later (e.g. for debugging the guest), but the default filter uses
+    43→//! `SECCOMP_RET_TRAP`.
+    44→//!
+    45→//! # Why we don't trap EVERY syscall
+    46→//!
+    47→//! VM's filter traps a small set of dangerous syscalls (mount, reboot,
+    48→//! kexec, init_module, ptrace, etc.) and lets everything else go
+    49→//! through. This is the right tradeoff — trapping every syscall (and
+    50→//! emulating each one in the handler) would be 100× slower and would
+    51→//! require a complete kernel emulation layer. We only trap syscalls
+    52→//! that:
+    53→//!   (a) would let the guest escape its sandbox, OR
+    54→//!   (b) need to be redirected to a userspace implementation
+    55→//!       (mount → bind mount, umount → unbind, swapon → no-op, etc.)
+    56→
+    57→use libc::{c_int, c_void, sigaction, siginfo_t, sigset_t, ucontext_t};
+    58→use std::collections::HashSet;
+    59→use std::sync::{Mutex, OnceLock};
+    60→
+    61→// Crate-local logging macros (defined in lib.rs) — no external `log` crate.
+    62→use crate::{error, info, warning};
+    63→
+    64→// ============================================================================
+    65→// BPF / seccomp constants (not all exposed by the `libc` crate on every
+    66→// target, so we define them ourselves to be safe).
+    67→// ============================================================================
+    68→
+    69→// BPF instruction classes (low 3 bits of `code`).
+    70→const BPF_LD:  u16 = 0x00;
+    71→const BPF_JMP: u16 = 0x05;
+    72→const BPF_RET: u16 = 0x06;
+    73→
+    74→// BPF size modifiers (next 2 bits).
+    75→const BPF_W:   u16 = 0x00;
+    76→
+    77→// BPF mode modifiers for BPF_LD (high 3 bits).
+    78→const BPF_ABS: u16 = 0x20;
+    79→
+    80→// BPF jump operations (next 4 bits).
+    81→const BPF_JEQ: u16 = 0x10;
+    82→
+    83→// BPF source operand (high 1 bit).
+    84→const BPF_K:   u16 = 0x00;
+    85→
+    86→// Seccomp return values (top 16 bits of the return word).
+    87→#[allow(dead_code)]
+    88→const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    89→#[allow(dead_code)]
+    90→const SECCOMP_RET_KILL_THREAD:  u32 = 0x0000_0000;
+    91→const SECCOMP_RET_TRAP:         u32 = 0x0003_0000;
+    92→#[allow(dead_code)]
+    93→const SECCOMP_RET_ERRNO:        u32 = 0x0005_0000;
+    94→#[allow(dead_code)]
+    95→const SECCOMP_RET_TRACE:        u32 = 0x7ff0_0000;
+    96→#[allow(dead_code)]
+    97→const SECCOMP_RET_LOG:          u32 = 0x7ffc_0000;
+    98→const SECCOMP_RET_ALLOW:        u32 = 0x7fff_0000;
+    99→
+   100→// prctl(2) operations used by seccomp.
+   101→const PR_SET_NO_NEW_PRIVS: c_int = 38;
+   102→
+   103→// seccomp(2) operations.
+   104→const SECCOMP_SET_MODE_FILTER: c_int = 1;
+   105→
+   106→// seccomp(2) flags.
+   107→const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
+   108→
+   109→// Audit architectures — used to gate the BPF program on the right ABI.
+   110→// These come from <linux/audit.h>.
+   111→#[cfg(target_arch = "aarch64")]
+   112→const AUDIT_ARCH_EXPECTED: u32 = 0xC000_00B7; // EM_AARCH64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE
+   113→#[cfg(target_arch = "x86_64")]
+   114→const AUDIT_ARCH_EXPECTED: u32 = 0xC000_003E; // EM_X86_64  | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE
+   115→
+   116→// struct seccomp_data field offsets (see <linux/seccomp.h>).
+   117→const OFF_NR:   u32 = 0;  // int   nr
+   118→const OFF_ARCH: u32 = 4;  // __u32 arch
+   119→
+   120→// ============================================================================
+   121→// BPF instruction builder — thin wrapper around `sock_filter`.
+   122→// ============================================================================
+   123→
+   124→/// A single BPF instruction. Layout matches `struct sock_filter`:
+   125→/// `__u16 code; __u8 jt; __u8 jf; __u32 k;`
+   126→#[repr(C)]
+   127→#[derive(Clone, Copy, Debug)]
+   128→pub struct SockFilter {
+   129→    pub code: u16,
+   130→    pub jt:   u8,
+   131→    pub jf:   u8,
+   132→    pub k:    u32,
+   133→}
+   134→
+   135→/// Build a `BPF_LD | BPF_W | BPF_ABS` instruction — load a 32-bit word
+   136→/// from offset `k` of `struct seccomp_data` into the accumulator.
+   137→const fn bpf_ld_abs(k: u32) -> SockFilter {
+   138→    SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k }
+   139→}
+   140→
+   141→/// Build a `BPF_JMP | BPF_JEQ | BPF_K` instruction — if accumulator
+   142→/// equals `k`, jump `jt` instructions forward, else jump `jf`.
+   143→const fn bpf_jeq(k: u32, jt: u8, jf: u8) -> SockFilter {
+   144→    SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt, jf, k }
+   145→}
+   146→
+   147→/// Build a `BPF_RET | BPF_K` instruction — return `k` from the filter.
+   148→const fn bpf_ret(k: u32) -> SockFilter {
+   149→    SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k }
+   150→}
+   151→
+   152→// ============================================================================
+   153→// Syscall classification — what to allow, what to trap, what to kill.
+   154→// ============================================================================
+   155→
+   156→/// Helper: insert `nr` into the set. We use a small macro instead of a
+   157→/// function so that callers can mix `libc::SYS_*` (which is `c_long`)
+   158→/// with raw `i32` literals without type-inference issues.
+   159→macro_rules! add_nr {
+   160→    ($set:expr, $nr:expr) => {
+   161→        $set.insert($nr as i32);
+   162→    };
+   163→}
+   164→
+   165→/// Syscalls the guest is allowed to call directly (no interception).
+   166→///
+   167→/// This list is the union of:
+   168→///   - the task spec's allow-list (read, write, open, openat, close,
+   169→///     mmap, mprotect, munmap, brk, rt_sigaction, rt_sigprocmask,
+   170→///     ioctl, pread64, pwrite64, readv, writev, access, pipe, pipe2,
+   171→///     select, poll, ppoll, getsockopt, socket, connect, bind, listen,
+   172→///     accept, accept4, getsockname, getpeername, sendto, recvfrom,
+   173→///     sendmsg, recvmsg, shutdown, setsockopt, dup, dup2, fcntl, stat,
+   174→///     fstat, lstat, newfstatat, clone, uname, getcwd)
+   175→///   - syscalls added by follow-up tasks (wait4, waitid, fork, vfork,
+   176→///     exit, exit_group, rt_sigreturn, sigaltstack, gettid, getpid,
+   177→///     getppid, getuid, geteuid, getgid, getegid, setuid, setgid,
+   178→///     setpgid, setsid, getpgid, getpgrp, set_tid_address, clock_*,
+   179→///     timer_create, etc.)
+   180→///
+   181→/// We use `libc::SYS_*` so the numbers resolve correctly per target
+   182→/// (aarch64 vs x86_64).
+   183→fn allowed_syscalls() -> HashSet<i32> {
+   184→    use libc::*;
+   185→    let mut s: HashSet<i32> = HashSet::new();
+   186→
+   187→    // --- file I/O (present on both aarch64 and x86_64) ---
+   188→    for &nr in &[
+   189→        SYS_read, SYS_write, SYS_readv, SYS_writev,
+   190→        SYS_pread64, SYS_pwrite64,
+   191→        SYS_openat, SYS_close, SYS_dup, SYS_dup3, SYS_fcntl, SYS_lseek,
+   192→        SYS_newfstatat, SYS_readlinkat,
+   193→        SYS_ftruncate, SYS_getcwd,
+   194→    ] {
+   195→        add_nr!(s, nr);
+   196→    }
+   197→
+   198→    // --- file I/O (x86_64-only: open, access, dup2, stat, lstat, fstat,
+   199→    //     fchmod, fchown, chroot, unlink, rmdir, chmod, chown, lchown).
+   200→    //     On aarch64 these are replaced by the *at variants.
+   201→    #[cfg(target_arch = "x86_64")]
+   202→    for &nr in &[
+   203→        SYS_open, SYS_access, SYS_dup2,
+   204→        SYS_stat, SYS_fstat, SYS_lstat,
+   205→        SYS_chmod, SYS_fchmod, SYS_lchown, SYS_chown, SYS_fchown,
+   206→        SYS_chroot, SYS_unlink, SYS_rmdir, SYS_mkdir,
+   207→        SYS_readlink, SYS_truncate,
+   208→    ] {
+   209→        add_nr!(s, nr);
+   210→    }
+   211→
+   212→    // --- aarch64-only variants (already covered by *at, but listed for
+   213→    //     completeness — these are present on aarch64 and not x86_64).
+   214→    #[cfg(target_arch = "aarch64")]
+   215→    for &nr in &[
+   216→        SYS_fstat, SYS_fstatat, // fstat exists on aarch64 (not x86_64's "newfstatat")
+   217→    ] {
+   218→        add_nr!(s, nr);
+   219→    }
+   220→
+   221→    // --- memory ---
+   222→    for &nr in &[
+   223→        SYS_mmap, SYS_munmap, SYS_mprotect, SYS_mremap, SYS_msync,
+   224→        SYS_madvise, SYS_brk,
+   225→    ] {
+   226→        add_nr!(s, nr);
+   227→    }
+   228→    // mincore exists on both — add if defined.
+   229→    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+   230→    add_nr!(s, SYS_mincore);
+   231→
+   232→    // --- signals ---
+   233→    for &nr in &[
+   234→        SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigpending,
+   235→        SYS_rt_sigtimedwait, SYS_rt_sigreturn, SYS_sigaltstack,
+   236→        SYS_rt_sigsuspend, SYS_kill, SYS_tgkill, SYS_tkill,
+   237→    ] {
+   238→        add_nr!(s, nr);
+   239→    }
+   240→
+   241→    // --- sockets / IPC (present on both) ---
+   242→    for &nr in &[
+   243→        SYS_socket, SYS_socketpair, SYS_connect, SYS_bind, SYS_listen,
+   244→        SYS_accept4, SYS_getsockname, SYS_getpeername,
+   245→        SYS_sendto, SYS_recvfrom, SYS_sendmsg, SYS_recvmsg,
+   246→        SYS_shutdown, SYS_setsockopt, SYS_getsockopt,
+   247→        SYS_pipe, SYS_pipe2,
+   248→        SYS_pselect6, SYS_poll, SYS_ppoll,
+   249→        SYS_epoll_create1, SYS_epoll_ctl, SYS_epoll_wait,
+   250→        SYS_eventfd2, SYS_timerfd_create, SYS_timerfd_settime,
+   251→        SYS_inotify_init1, SYS_inotify_add_watch, SYS_inotify_rm_watch,
+   252→    ] {
+   253→        add_nr!(s, nr);
+   254→    }
+   255→
+   256→    // aarch64-only legacy socket syscalls (recv / send). On the unified
+   257→    // asm-generic syscall table used by aarch64/riscv64 these don't exist
+   258→    // (callers use recvfrom/sendto with a NULL address), so we skip
+   259→    // them. They DO exist on x86_64 but we already allow sendto/recvfrom
+   260→    // above, which is sufficient for the bionic/libc++ socket layer.
+   261→
+   262→    // accept / select — present on x86_64, removed on aarch64 (replaced
+   263→    // by accept4 / pselect6).
+   264→    #[cfg(target_arch = "x86_64")]
+   265→    for &nr in &[SYS_accept, SYS_select] {
+   266→        add_nr!(s, nr);
+   267→    }
+   268→
+   269→    // --- process / thread ---
+   270→    for &nr in &[
+   271→        SYS_clone, SYS_execve, SYS_execveat,
+   272→        SYS_exit, SYS_exit_group,
+   273→        SYS_wait4, SYS_waitid,
+   274→        SYS_set_tid_address, SYS_setpgid, SYS_setsid,
+   275→        SYS_getpgid, SYS_getpid, SYS_getppid,
+   276→        SYS_gettid, SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid,
+   277→        SYS_getresuid, SYS_getresgid,
+   278→        SYS_prctl,  // NOT filtered — guest can set its own name, etc.
+   279→        SYS_uname, SYS_sethostname, SYS_setdomainname,
+   280→        SYS_getrlimit, SYS_setrlimit, SYS_prlimit64,
+   281→        SYS_getrandom,
+   282→        SYS_clock_gettime, SYS_clock_getres, SYS_clock_settime,
+   283→        SYS_gettimeofday, SYS_time,
+   284→        SYS_nanosleep,
+   285→    ] {
+   286→        add_nr!(s, nr);
+   287→    }
+   288→
+   289→    // fork / vfork — present on x86_64, removed on aarch64.
+   290→    #[cfg(target_arch = "x86_64")]
+   291→    for &nr in &[SYS_fork, SYS_vfork] {
+   292→        add_nr!(s, nr);
+   293→    }
+   294→
+   295→    // setuid / setgid — present on x86_64, removed on aarch64.
+   296→    #[cfg(target_arch = "x86_64")]
+   297→    for &nr in &[SYS_setuid, SYS_setgid, SYS_setreuid, SYS_setregid,
+   298→                 SYS_settimeofday, SYS_getpgrp] {
+   299→        add_nr!(s, nr);
+   300→    }
+   301→
+   302→    // --- filesystem (read-only; writes go through mount_mgr) ---
+   303→    // NOTE: Linux exposes these as `fadvise64` and `fallocate` (not the
+   304→    // POSIX names `posix_fadvise` / `posix_fallocate`). The libc crate
+   305→    // follows the kernel's `__NR_*` naming.
+   306→    for &nr in &[
+   307→        SYS_getdents64,
+   308→        SYS_fadvise64, SYS_fallocate,
+   309→        SYS_flock, SYS_sync, SYS_fsync, SYS_fdatasync,
+   310→        SYS_renameat, SYS_renameat2, SYS_linkat, SYS_symlinkat,
+   311→        SYS_unlinkat, SYS_mkdirat,
+   312→        SYS_fchmod, SYS_fchmodat, SYS_fchown, SYS_fchownat,
+   313→        SYS_umask,
+   314→        SYS_chdir, SYS_fchdir,
+   315→    ] {
+   316→        add_nr!(s, nr);
+   317→    }
+   318→    // readahead exists on both.
+   319→    add_nr!(s, SYS_readahead);
+   320→
+   321→    // --- ioctl / device ---
+   322→    add_nr!(s, SYS_ioctl);
+   323→
+   324→    // --- misc ---
+   325→    add_nr!(s, SYS_memfd_create);
+   326→    #[cfg(target_arch = "x86_64")]
+   327→    add_nr!(s, SYS_getdents);
+   328→    #[cfg(target_arch = "x86_64")]
+   329→    add_nr!(s, SYS_getpgrp);
+   330→
+   331→    s
+   332→}
+   333→
+   334→/// Per-VM "intercept" set — syscalls the guest IS allowed to call, but
+   335→/// that we trap with SIGSYS so the handler can:
+   336→///   (a) log them,
+   337→///   (b) redirect them to a userspace implementation, or
+   338→///   (c) fake success.
+   339→///
+   340→/// This is the `SECCOMP_RET_TRAP` set. Examples:
+   341→///   - `mount`   → redirect to `mount_mgr::bind_mount()`
+   342→///   - `umount2` → redirect to `mount_mgr::unbind()`
+   343→///   - `swapon`  → fake success (no swap in the container)
+   344→///   - `swapoff` → fake success
+   345→///   - `acct`    → fake success (no process accounting)
+   346→fn trapped_syscalls() -> HashSet<i32> {
+   347→    use libc::*;
+   348→    let mut s: HashSet<i32> = HashSet::new();
+   349→    add_nr!(s, SYS_mount);
+   350→    add_nr!(s, SYS_umount2);
+   351→    add_nr!(s, SYS_swapon);
+   352→    add_nr!(s, SYS_swapoff);
+   353→    add_nr!(s, SYS_acct);
+   354→    add_nr!(s, SYS_reboot);
+   355→    s
+   356→}
+   357→
+   358→/// Per-VM "kill" set — syscalls that immediately kill the guest
+   359→/// process. These are syscalls that would let the guest escape its
+   360→/// sandbox or destabilise the host.
+   361→fn killed_syscalls() -> HashSet<i32> {
+   362→    use libc::*;
+   363→    let mut s: HashSet<i32> = HashSet::new();
+   364→    add_nr!(s, SYS_kexec_load);
+   365→    add_nr!(s, SYS_kexec_file_load);
+   366→    add_nr!(s, SYS_init_module);
+   367→    add_nr!(s, SYS_finit_module);
+   368→    add_nr!(s, SYS_delete_module);
+   369→    add_nr!(s, SYS_iopl);
+   370→    add_nr!(s, SYS_ioperm);
+   371→    add_nr!(s, SYS_kcmp);
+   372→    add_nr!(s, SYS_ptrace);
+   373→    add_nr!(s, SYS_pivot_root);
+   374→    s
+   375→}
+   376→
+   377→// ============================================================================
+   378→// Build the BPF program.
+   379→// ============================================================================
+   380→
+   381→/// Compile the allow/trap/kill classification into a BPF program.
+   382→///
+   383→/// The program structure is:
+   384→/// ```text
+   385→///   1. ld arch                         // load audit arch
+   386→///   2. jeq EXPECTED_ARCH, jt=0, jf=N   // if wrong arch, jump to kill
+   387→///   3. ld nr                           // load syscall number
+   388→///   4. for each allowed syscall:
+   389→///        jeq nr, jt=0, jf=1            // if match: fall to ret ALLOW
+   390→///        ret ALLOW                      // else: skip to next jeq
+   391→///   5. for each trapped syscall:
+   392→///        jeq nr, jt=0, jf=1
+   393→///        ret TRAP
+   394→///   6. for each killed syscall:
+   395→///        jeq nr, jt=0, jf=1
+   396→///        ret KILL_PROCESS
+   397→///   7. ret ALLOW                       // default: allow
+   398→///   8. ret KILL_PROCESS                 // for wrong-arch
+   399→/// ```
+   400→///
+   401→/// The `jt=0, jf=1` pattern keeps jumps short (1 instruction) so we
+   402→/// never overflow the 8-bit jt/jf range, regardless of how many
+   403→/// syscalls are in each set.
+   404→pub fn build_filter() -> Vec<SockFilter> {
+   405→    let allowed = allowed_syscalls();
+   406→    let trapped = trapped_syscalls();
+   407→    let killed  = killed_syscalls();
+   408→
+   409→    let mut prog: Vec<SockFilter> = Vec::new();
+   410→
+   411→    // (1) Load arch.
+   412→    prog.push(bpf_ld_abs(OFF_ARCH));
+   413→    // (2) If arch != EXPECTED, jump to the trailing KILL.
+   414→    //     We patch the jf offset after we know the program length.
+   415→    let arch_jeq_idx = prog.len();
+   416→    prog.push(bpf_jeq(AUDIT_ARCH_EXPECTED, 0, 0)); // patched below
+   417→
+   418→    // (3) Load syscall number.
+   419→    prog.push(bpf_ld_abs(OFF_NR));
+   420→
+   421→    // (4) Allowed syscalls: jeq + ret ALLOW.
+   422→    let mut sorted_allowed: Vec<i32> = allowed.iter().copied()
+   423→        .filter(|nr| !trapped.contains(nr) && !killed.contains(nr))
+   424→        .collect();
+   425→    sorted_allowed.sort_unstable();
+   426→    sorted_allowed.dedup();
+   427→    for nr in sorted_allowed {
+   428→        prog.push(bpf_jeq(nr as u32, 0, 1));  // match: fall to next; else skip 1
+   429→        prog.push(bpf_ret(SECCOMP_RET_ALLOW));
+   430→    }
+   431→
+   432→    // (5) Trapped syscalls: jeq + ret TRAP.
+   433→    let mut sorted_trapped: Vec<i32> = trapped.iter().copied()
+   434→        .filter(|nr| !killed.contains(nr))
+   435→        .collect();
+   436→    sorted_trapped.sort_unstable();
+   437→    sorted_trapped.dedup();
+   438→    for nr in sorted_trapped {
+   439→        prog.push(bpf_jeq(nr as u32, 0, 1));
+   440→        prog.push(bpf_ret(SECCOMP_RET_TRAP));
+   441→    }
+   442→
+   443→    // (6) Killed syscalls: jeq + ret KILL.
+   444→    let mut sorted_killed: Vec<i32> = killed.iter().copied().collect();
+   445→    sorted_killed.sort_unstable();
+   446→    sorted_killed.dedup();
+   447→    for nr in sorted_killed {
+   448→        prog.push(bpf_jeq(nr as u32, 0, 1));
+   449→        prog.push(bpf_ret(SECCOMP_RET_KILL_PROCESS));
+   450→    }
+   451→
+   452→    // (7) Default: allow.
+   453→    prog.push(bpf_ret(SECCOMP_RET_ALLOW));
+   454→
+   455→    // (8) Kill target (for wrong-arch). Patch the arch jeq's jf to
+   456→    //     jump here. The jf offset is relative to the *next*
+   457→    //     instruction, so it's `kill_idx - arch_jeq_idx - 1`.
+   458→    let kill_idx = prog.len();
+   459→    prog.push(bpf_ret(SECCOMP_RET_KILL_PROCESS));
+   460→    let jf_offset = (kill_idx - arch_jeq_idx - 1) as u8;
+   461→    prog[arch_jeq_idx].jf = jf_offset;
+   462→
+   463→    info!("[KR64][seccomp] BPF filter built: {} instructions", prog.len());
+   464→    prog
+   465→}
+   466→
+   467→// ============================================================================
+   468→// Install the filter + SIGSYS handler.
+   469→// ============================================================================
+   470→
+   471→/// Global mutable state used by the SIGSYS handler. Protected by a
+   472→/// Mutex because the handler may run on any thread.
+   473→///
+   474→/// The handler reads `trapped_syscalls` and `killed_syscalls` to decide
+   475→/// what to do with the trapped syscall. We snapshot them at install
+   476→/// time into static `OnceLock`s to avoid allocating in the handler
+   477→/// (and to avoid the `once_cell` dependency — `OnceLock` is in `std`
+   478→/// since Rust 1.70).
+   479→static TRAPPED_SET: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+   480→static KILLED_SET: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+   481→
+   482→/// Install the seccomp filter on the calling thread (and all threads
+   483→/// in the calling process, via `SECCOMP_FILTER_FLAG_TSYNC`).
+   484→///
+   485→/// This is the entry point called from `main.rs` after all devices
+   486→/// are set up but before the guest init is exec'd.
+   487→///
+   488→/// Returns `Ok(())` on success, or `Err(errno)` on failure.
+   489→pub fn install() -> std::io::Result<()> {
+   490→    info!("[KR64][seccomp] installing seccomp filter");
+   491→
+   492→    // 1. PR_SET_NO_NEW_PRIVS — required before seccomp(2) without
+   493→    //    CAP_SYS_ADMIN. Has to be set on every thread; we use the
+   494→    //    TSYNC flag below to propagate to all threads in the process.
+   495→    let r = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+   496→    if r != 0 {
+   497→        let e = std::io::Error::last_os_error();
+   498→        error!("[KR64][seccomp] PR_SET_NO_NEW_PRIVS failed: {}", e);
+   499→        return Err(e);
+   500→    }
+   501→    info!("[KR64][seccomp] PR_SET_NO_NEW_PRIVS set");
+   502→
+   503→    // 2. Install the SIGSYS handler. We use SA_SIGINFO so we get the
+   504→    //    siginfo_t (with si_syscall) and the ucontext_t (so we can
+   505→    //    modify the return value and PC).
+   506→    install_sigsys_handler()?;
+   507→
+   508→    // 3. Build the BPF program.
+   509→    let prog = build_filter();
+   510→
+   511→    // 4. seccomp(SECCOMP_SET_MODE_FILTER, TSYNC, &prog).
+   512→    //    We use the raw `syscall()` wrapper because libc doesn't wrap
+   513→    //    `seccomp(2)` on every target.
+   514→    #[repr(C)]
+   515→    struct Fprog {
+   516→        len:    u16,
+   517→        filter: *const SockFilter,
+   518→    }
+   519→    let fprog = Fprog {
+   520→        len:    prog.len() as u16,
+   521→        filter: prog.as_ptr(),
+   522→    };
+   523→
+   524→    // seccomp(2) is syscall 277 on aarch64, 317 on x86_64. Use libc's
+   525→    // SYS_seccomp constant (defined on all Android targets we support).
+   526→    let r = unsafe {
+   527→        libc::syscall(
+   528→            libc::SYS_seccomp,
+   529→            SECCOMP_SET_MODE_FILTER as c_int,
+   530→            SECCOMP_FILTER_FLAG_TSYNC as u32,
+   531→            &fprog as *const Fprog,
+   532→        )
+   533→    };
+   534→    if r != 0 {
+   535→        let e = std::io::Error::last_os_error();
+   536→        error!("[KR64][seccomp] SECCOMP_SET_MODE_FILTER failed: {}", e);
+   537→        return Err(e);
+   538→    }
+   539→
+   540→    info!("[KR64][seccomp] seccomp filter installed ({} insns, TSYNC)", prog.len());
+   541→    Ok(())
+   542→}
+   543→
+   544→/// Install the SIGSYS handler that catches `SECCOMP_RET_TRAP` events.
+   545→fn install_sigsys_handler() -> std::io::Result<()> {
+   546→    let mut sa: sigaction = unsafe { std::mem::zeroed() };
+   547→    // sa_sigaction is a union with sa_handler; on Linux we set it to
+   548→    // the address of our trampoline. Cast through a raw pointer first
+   549→    // to satisfy the `function_casts_as_integer` lint (and to match
+   550→    // the `sighandler_t` typedef on glibc).
+   551→    sa.sa_sigaction = sigsys_handler as *const () as usize;
+   552→    // SA_SIGINFO — pass siginfo + ucontext to the handler.
+   553→    // SA_NODEFER  — don't block SIGSYS while in the handler (so a
+   554→    //               recursive trap in the handler is visible).
+   555→    // SA_RESTART  — restart interrupted syscalls.
+   556→    sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
+   557→    // Don't block any other signals during the handler.
+   558→    unsafe { libc::sigemptyset(&mut sa.sa_mask as *mut sigset_t) };
+   559→
+   560→    let r = unsafe { libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut()) };
+   561→    if r != 0 {
+   562→        let e = std::io::Error::last_os_error();
+   563→        error!("[KR64][seccomp] sigaction(SIGSYS) failed: {}", e);
+   564→        return Err(e);
+   565→    }
+   566→    info!("[KR64][seccomp] SIGSYS handler installed at {:p}",
+   567→          sigsys_handler as *const c_void);
+   568→    Ok(())
+   569→}
+   570→
+   571→// ============================================================================
+   572→// The SIGSYS handler itself.
+   573→// ============================================================================
+   574→
+   575→/// Kernel-side layout of `siginfo_t` when `si_signo == SIGSYS` (i.e. the
+   576→/// `SYS_SECCOMP` / `si_code == 1` path). See Linux's
+   577→/// `include/uapi/asm-generic/siginfo.h::__sifields.__sigsys`.
+   578→///
+   579→/// The libc crate's `siginfo_t` exposes accessors like `si_pid()` /
+   580→/// `si_uid()` / `si_addr()` / `si_value()` but does NOT expose
+   581→/// `si_syscall`, so we re-interpret the raw bytes through this layout.
+   582→/// This is safe because the kernel-userland `siginfo` ABI is fixed and
+   583→/// architecture-independent (the `_pad` field after `si_code` exists to
+   584→/// align the 64-bit `si_call_addr` on 64-bit platforms; on 32-bit it
+   585→/// collapses but is harmless).
+   586→#[repr(C)]
+   587→struct SigsysSiginfo {
+   588→    si_signo:     i32,
+   589→    /// For seccomp traps this holds the seccomp return value
+   590→    /// (e.g. `SECCOMP_RET_TRAP`).
+   591→    si_errno:     i32,
+   592→    /// `SYS_SECCOMP` (= 1).
+   593→    si_code:      i32,
+   594→    /// Alignment padding so `si_call_addr` is 8-byte aligned.
+   595→    _pad:         i32,
+   596→    /// Address of the syscall instruction that was trapped.
+   597→    si_call_addr: *mut c_void,
+   598→    /// The trapped syscall number (what we care about).
+   599→    si_syscall:   i32,
+   600→    /// The audit architecture of the trapped syscall
+   601→    /// (e.g. `AUDIT_ARCH_AARCH64`).
+   602→    si_arch:      u32,
+   603→}
+   604→
+   605→/// SIGSYS handler — called by the kernel when a `SECCOMP_RET_TRAP` is
+   606→/// triggered (i.e. when the guest calls one of the "trapped" syscalls).
+   607→///
+   608→/// The handler:
+   609→///   1. Reads `si_syscall` to learn which syscall was trapped.
+   610→///   2. Looks the syscall up in the trapped/killed sets.
+   611→///   3. If killed: log and call `_exit(1)` (no return).
+   612→///   4. If trapped: emulate the syscall by:
+   613→///        a. Setting the return value register to 0 (success) — or
+   614→///           `-ENOSYS` if we don't have a real emulation yet.
+   615→///        b. Advancing the program counter past the syscall instruction
+   616→///           so the kernel doesn't retry it.
+   617→///   5. Returns; the kernel restores the (modified) context and
+   618→///      continues execution at the new PC.
+   619→///
+   620→/// # Architecture-specific notes
+   621→///
+   622→/// On aarch64:
+   623→///   - Return value register: `mcontext.regs[0]` (x0)
+   624→///   - PC register:           `mcontext.pc`
+   625→///   - Syscall instruction:   4 bytes (`svc #0` = `0xd4000001`)
+   626→///
+   627→/// On x86_64:
+   628→///   - Return value register: `mcontext.gregs[REG_RAX]` = `gregs[13]`
+   629→///   - PC register:           `mcontext.gregs[REG_RIP]` = `gregs[16]`
+   630→///   - Syscall instruction:   2 bytes (`syscall` = `0x0f 0x05`)
+   631→extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, ctx: *mut c_void) {
+   632→    // Reinterpret the siginfo_t pointer as our SIGSYS-specific layout.
+   633→    // This is safe because the kernel always uses this layout when
+   634→    // delivering SIGSYS from seccomp, regardless of how the libc crate
+   635→    // chooses to expose the union.
+   636→    let si = unsafe { &*(info as *const SigsysSiginfo) };
+   637→    let uc = unsafe { &mut *(ctx as *mut ucontext_t) };
+   638→
+   639→    // Read the syscall number.
+   640→    let syscall_nr = si.si_syscall;
+   641→
+   642→    // Decide what to do.
+   643→    let action = classify(syscall_nr);
+   644→
+   645→    match action {
+   646→        Action::Kill => {
+   647→            error!(
+   648→                "[KR64][seccomp] BLOCKED.SYSCALL.FAILED: killed guest for syscall {}",
+   649→                syscall_nr
+   650→            );
+   651→            unsafe { libc::_exit(1) };
+   652→        }
+   653→        Action::Emulate { retval } => {
+   654→            // Emulate: set return value, advance PC past syscall instr.
+   655→            warning!(
+   656→                "[KR64][seccomp] BLOCKED.SYSCALL.FAILED: trapped syscall {} → emulated (retval={})",
+   657→                syscall_nr, retval
+   658→            );
+   659→            set_return_value(uc, retval);
+   660→            advance_pc(uc);
+   661→        }
+   662→        Action::Passthrough => {
+   663→            // This shouldn't happen — only trapped syscalls reach the
+   664→            // handler. But if it does, log and let the kernel retry
+   665→            // (don't advance PC) so the syscall actually executes.
+   666→            warning!(
+   667→                "[KR64][seccomp] SIGSYS for non-trapped syscall {} — passthrough",
+   668→                syscall_nr
+   669→            );
+   670→        }
+   671→    }
+   672→}
+   673→
+   674→#[derive(Debug, Clone, Copy)]
+   675→enum Action {
+   676→    Kill,
+   677→    Emulate { retval: i64 },
+   678→    Passthrough,
+   679→}
+   680→
+   681→/// Look the syscall up in the trapped/killed tables and decide what to
+   682→/// do. The mapping is:
+   683→///   - killed set → Action::Kill
+   684→///   - trapped set → Action::Emulate { retval: 0 } (or syscall-specific)
+   685→///   - anything else → Action::Passthrough (shouldn't happen)
+   686→fn classify(syscall_nr: i32) -> Action {
+   687→    // `get_or_init` snapshots the syscall sets on first use. This is
+   688→    // safe to call from the SIGSYS handler because OnceLock's init path
+   689→    // is race-free (the OS guarantees atomic initialisation).
+   690→    let killed = KILLED_SET.get_or_init(|| Mutex::new(killed_syscalls()));
+   691→    if let Ok(killed) = killed.lock() {
+   692→        if killed.contains(&syscall_nr) {
+   693→            return Action::Kill;
+   694→        }
+   695→    }
+   696→    let trapped = TRAPPED_SET.get_or_init(|| Mutex::new(trapped_syscalls()));
+   697→    if let Ok(trapped) = trapped.lock() {
+   698→        if trapped.contains(&syscall_nr) {
+   699→            // Per-syscall emulation. For now everything trapped is
+   700→            // emulated as success (retval = 0) — the production
+   701→            // version will dispatch to per-syscall handlers in
+   702→            // mount_mgr / netlink / etc.
+   703→            return Action::Emulate { retval: emulate_syscall(syscall_nr) };
+   704→        }
+   705→    }
+   706→    Action::Passthrough
+   707→}
+   708→
+   709→/// Per-syscall emulation — return a fake return value.
+   710→///
+   711→/// For the MVP, every trapped syscall returns 0 (success). The
+   712→/// production version will:
+   713→///   - `mount`   → call `mount_mgr::handle_mount(args…)`, return its result
+   714→///   - `umount2` → call `mount_mgr::handle_umount(args…)`, return its result
+   715→///   - `swapon`  → return 0 (no-op)
+   716→///   - `swapoff` → return 0 (no-op)
+   717→///   - `acct`    → return 0 (no-op)
+   718→///   - `reboot`  → return -EPERM (we don't reboot the host!)
+   719→fn emulate_syscall(_syscall_nr: i32) -> i64 {
+   720→    // TODO: dispatch to per-syscall handlers (mount_mgr, etc.).
+   721→    0
+   722→}
+   723→
+   724→/// Set the syscall return value in the saved context.
+   725→///
+   726→/// On aarch64: x0 (regs[0]) is the return value register.
+   727→/// On x86_64: rax (gregs[REG_RAX]) is the return value register.
+   728→#[cfg(target_arch = "aarch64")]
+   729→fn set_return_value(uc: &mut ucontext_t, retval: i64) {
+   730→    uc.uc_mcontext.regs[0] = retval as u64;
+   731→}
+   732→
+   733→#[cfg(target_arch = "x86_64")]
+   734→fn set_return_value(uc: &mut ucontext_t, retval: i64) {
+   735→    // REG_RAX = 13 (from <sys/ucontext.h> on Linux x86_64).
+   736→    const REG_RAX: usize = 13;
+   737→    uc.uc_mcontext.gregs[REG_RAX] = retval;
+   738→}
+   739→
+   740→/// Advance the program counter past the syscall instruction.
+   741→///
+   742→/// On aarch64: every instruction is 4 bytes (svc #0 = 0xd4000001).
+   743→/// On x86_64:  the syscall instruction is 2 bytes (0x0f 0x05).
+   744→#[cfg(target_arch = "aarch64")]
+   745→fn advance_pc(uc: &mut ucontext_t) {
+   746→    uc.uc_mcontext.pc = uc.uc_mcontext.pc.wrapping_add(4);
+   747→}
+   748→
+   749→#[cfg(target_arch = "x86_64")]
+   750→fn advance_pc(uc: &mut ucontext_t) {
+   751→    // REG_RIP = 16 (from <sys/ucontext.h> on Linux x86_64).
+   752→    const REG_RIP: usize = 16;
+   753→    let rip = uc.uc_mcontext.gregs[REG_RIP];
+   754→    uc.uc_mcontext.gregs[REG_RIP] = rip.wrapping_add(2);
+   755→}
+   756→
+   757→// ============================================================================
+   758→// Tests.
+   759→// ============================================================================
+   760→
+   761→#[cfg(test)]
+   762→mod tests {
+   763→    use super::*;
+   764→
+   765→    #[test]
+   766→    fn filter_built_without_panic() {
+   767→        let prog = build_filter();
+   768→        // Sanity: the program has at least the arch check + a default ret.
+   769→        assert!(prog.len() >= 4, "filter too short: {:?}", prog);
+   770→        // First instruction must be the arch load.
+   771→        assert_eq!(prog[0].code, BPF_LD | BPF_W | BPF_ABS);
+   772→        assert_eq!(prog[0].k, OFF_ARCH);
+   773→        // Last instruction must be a KILL (the wrong-arch fallthrough).
+   774→        let last = *prog.last().unwrap();
+   775→        assert_eq!(last.code, BPF_RET | BPF_K);
+   776→        assert_eq!(last.k, SECCOMP_RET_KILL_PROCESS);
+   777→    }
+   778→
+   779→    #[test]
+   780→    fn allowed_set_contains_read_write() {
+   781→        let allowed = allowed_syscalls();
+   782→        assert!(allowed.contains(&(libc::SYS_read  as i32)));
+   783→        assert!(allowed.contains(&(libc::SYS_write as i32)));
+   784→        assert!(allowed.contains(&(libc::SYS_openat as i32)));
+   785→        assert!(allowed.contains(&(libc::SYS_close as i32)));
+   786→        assert!(allowed.contains(&(libc::SYS_mmap  as i32)));
+   787→        assert!(allowed.contains(&(libc::SYS_ioctl as i32)));
+   788→    }
+   789→
+   790→    #[test]
+   791→    fn trapped_set_contains_mount_umount() {
+   792→        let trapped = trapped_syscalls();
+   793→        assert!(trapped.contains(&(libc::SYS_mount   as i32)));
+   794→        assert!(trapped.contains(&(libc::SYS_umount2 as i32)));
+   795→    }
+   796→
+   797→    #[test]
+   798→    fn killed_set_contains_ptrace_kexec() {
+   799→        let killed = killed_syscalls();
+   800→        assert!(killed.contains(&(libc::SYS_ptrace     as i32)));
+   801→        assert!(killed.contains(&(libc::SYS_kexec_load as i32)));
+   802→    }
+   803→
+   804→    #[test]
+   805→    fn classify_mount_is_emulated() {
+   806→        let action = classify(libc::SYS_mount as i32);
+   807→        match action {
+   808→            Action::Emulate { retval } => assert_eq!(retval, 0),
+   809→            other => panic!("expected Emulate, got {:?}", other),
+   810→        }
+   811→    }
+   812→
+   813→    #[test]
+   814→    fn classify_ptrace_is_killed() {
+   815→        let action = classify(libc::SYS_ptrace as i32);
+   816→        match action {
+   817→            Action::Kill => {}
+   818→            other => panic!("expected Kill, got {:?}", other),
+   819→        }
+   820→    }
+   821→
+   822→    #[test]
+   823→    fn classify_read_is_passthrough() {
+   824→        // read is allowed (not trapped), so SIGSYS for it is a "shouldn't happen".
+   825→        let action = classify(libc::SYS_read as i32);
+   826→        match action {
+   827→            Action::Passthrough => {}
+   828→            other => panic!("expected Passthrough, got {:?}", other),
+   829→        }
+   830→    }
+   831→}
+   832→

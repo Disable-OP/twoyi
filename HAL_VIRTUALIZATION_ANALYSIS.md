@@ -1,0 +1,393 @@
+# HAL Virtualization Analysis — Virtual Master → twoyi
+
+> **Task ID:** HAL-1
+> **Date:** 2026-08-05
+> **Author:** general-purpose sub-agent
+> **Inputs:** `download/VM_JAVA_ANALYSIS.md` (Task VM-JAVA-1), `vm-java-src/sources/com/android/vmcore/hal/*`, `app/src/main/java/io/twoyi/*`, `app/rs/src/input.rs`, `app/rs/kr64/src/devices.rs`
+> **Scope:** Technical analysis of every HAL Virtual Master virtualizes, and a concrete build plan for twoyi.
+
+---
+
+## TL;DR
+
+Virtual Master virtualizes **10 HAL domains** (display, input, audio, camera, sensor, location, wifi, phone, battery, network) plus an HW-control shim. Twoyi today ships only **two of those** — Display (via the emugl `/dev/qemu_pipe` path) and Input (via `/dev/input/touch` + `/dev/input/key0`). Closing the gap is mostly Java + JNI callback work, **not** new native kernel-replacement logic, because the device-node plumbing is already in place in `app/rs/kr64/src/devices.rs`.
+
+The single hardest piece is **Audio** (real-time duplex loopback with thread synchronization) and the single most labour-intensive is **Camera** (frame-format negotiation + per-frame YUV→JPEG).
+
+---
+
+## 1. What HALs does Virtual Master virtualize?
+
+Source: `VM_JAVA_ANALYSIS.md` §5.4 + the `com.android.vmcore.hal.*` decompiled classes.
+
+### 1.1 Display
+
+| Field | Value |
+|---|---|
+| **What it does** | Registers a host `android.view.Surface` with the per-VM emugl renderer so the guest's SurfaceFlinger can composite into it. |
+| **Java class** | `com.android.vmcore.hal.DisplayService` — JNI wrapper with `nativeSetup(vmId, dpi)`, `nativeStartService(ptr, w, h)`, `nativeAddSurface(ptr, surfaceId, surface, w, h, rotation)`, `nativeRemoveSurface`, `nativeGetFPS`, `nativeDispose`. |
+| **Native fn** | `libvm.so::nativeAddSurface` (binds the Surface to a per-VM ColorBuffer; uses emugl's `qemu_pipe` GL transport). |
+| **Device path** | `/dev/qemu_pipe` (created by `libkr64.so`, owned by guest SurfaceFlinger). |
+| **IPC mechanism** | Custom binary protocol over the `qemu_pipe` socket (no Java involvement past `nativeAddSurface`). |
+| **What guest sees** | A normal EGL surface that a normal SurfaceFlinger composites into; the framebuffer appears as a real display. Multi-surface supported (live preview + fullscreen). |
+
+### 1.2 Input (Touch + Keys)
+
+| Field | Value |
+|---|---|
+| **What it does** | Forwards host `MotionEvent`s and `KeyEvent`s into the guest's `EventHub`. |
+| **Java class** | `com.android.vmcore.hal.InputService` — `nativeOnTouchEvent(ptr, action, pointerId, t, x, y)`. Coordinate transform (rotation, scale) done in `VMSurfaceView.m5234WWWWWWWW`. |
+| **Native fn** | `libvm.so` writes Linux `input_event` structs to the touch/key sockets. |
+| **Device paths** | `/dev/input/touch`, `/dev/input/key0` (or similar). |
+| **IPC mechanism** | Unix domain socket; the host writes a 96-byte `device_info` header on accept, then streams `struct input_event` records (16 bytes each on aarch64). |
+| **What guest sees** | A standard multi-touch device (`vtouch`) and a 5-key keyboard (`vkey`) — both appear in `/dev/input/` and are picked up by `EventHub.java`. |
+
+### 1.3 Audio
+
+| Field | Value |
+|---|---|
+| **What it does** | Bidirectional audio: guest playback → host `AudioTrack`, host microphone → guest capture. |
+| **Java class** | `com.android.vmcore.hal.AudioService` — owns `List<AudioTrack> mTrackList` and `List<AudioRecord> mRecordList`. JNI: `nativeSetup`, `nativeStartService`, `nativeStopService`, `nativeDispose`. Private `acquireAudioTrack(int[])` / `acquireAudioRecord(int[])` create host tracks at **44100 Hz / 11025 Hz** respectively. |
+| **Native fn** | `libvm.so::nativeStartService` opens `/dev/audio` and pumps PCM frames between the socket and the Java-callback `writeAudioData` / `readRecordData`. |
+| **Device path** | `/dev/audio` (created by `libkr64.so`). |
+| **IPC mechanism** | Unix socket carrying raw PCM samples + a small control header (sample-rate / channel-count / format negotiated on connect). |
+| **What guest sees** | A standard ALSA-style `/dev/audio` node that `AudioFlinger` opens for playback and capture. |
+
+### 1.4 Camera
+
+| Field | Value |
+|---|---|
+| **What it does** | Proxies the deprecated Camera1 API (`android.hardware.Camera`) so the guest can open/start/stop/focus/zoom/take-picture. |
+| **Java class** | `com.android.vmcore.hal.CameraService` (owned by `HALManager`). Called by `HALManager` JNI-callback methods: `CameraConnect`, `CameraDisconnect`, `CameraStart(w,h,fps,client)`, `CameraStop`, `CameraFocus`, `CameraFrame`, `CameraFlash`, `CameraList`. Host→guest frame delivery: `nativeCameraPicture(ptr, client, byte[])` and `nativeCameraPreview(ptr, client, byte[])`. |
+| **Native fn** | `libvm.so` exposes a virtual `/dev/camera*` device node and routes guest ioctl-style requests back into Java. |
+| **Device paths** | `/dev/camera0`, `/dev/camera1` (one per host camera returned by `Camera.getNumberOfCameras()`). |
+| **IPC mechanism** | Custom binary protocol: open/close on connect; preview frames streamed as YUV420/NV21 byte arrays back to Java, which calls `Camera.startPreview` with a `PreviewCallback` and forwards the buffer to native. |
+| **What guest sees** | A `/dev/camera0` that the guest's `cameraserver` HAL opens like real hardware; the legacy `android.hardware.Camera` Java API just works. |
+
+### 1.5 Sensor (12 types)
+
+| Field | Value |
+|---|---|
+| **What it does** | Proxies 12 Android sensor types from the host `SensorManager` to the guest's sensor HAL. |
+| **Java class** | `com.android.vmcore.hal.SensorService`. Static `SparseIntArray` (in `static {}` block at line 61) maps guest indices 0..11 → host `Sensor.TYPE_*` values: **1 (ACCEL), 2 (MAG), 3 (ORIENT), 7 (TEMP), 8 (LIGHT), 5 (PROX), 6 (GYRO), 12 (HUMIDITY), 9 (PRESSURE), 19 (GRAVITY), 18 (STEP_DETECT), 4 (GYRO_UNCAL)**. |
+| **Native fn** | `libvm.so` exposes a virtual `/dev/sensor` (or similar) device node and a per-sensor subscription list. Java callback `nativeSensorChanged(ptr, sensorIdx, timestampNs, x, y, z)` pushes 3-axis samples to native. |
+| **Java callbacks** | `EnableSensors(int idx)`, `DisableSensors(int idx)`, `CheckSensorsSupport(int idx)` — invoked from native via JNI. |
+| **Device paths** | (Inferred) `/dev/input/accel`, `/dev/input/gyro`, …, or a single multiplexed `/dev/sensors` socket. |
+| **IPC mechanism** | Java `SensorManager.registerListener` → host sensor event → `SensorChanged` → `nativeSensorChanged` → guest sensor HAL. |
+| **What guest sees** | A real `/dev/input/*` sensor device that the guest's `sensorservice` reads via the standard input subsystem. |
+
+### 1.6 Location (GPS)
+
+| Field | Value |
+|---|---|
+| **What it does** | Passes host GPS fixes (and NMEA sentences) to the guest; supports fake-location override. |
+| **Java class** | `com.android.vmcore.hal.LocationService implements LocationListener`. Uses `LocationManager` + `addNmeaListener`. JNI callbacks: `nativeGPSNmeaChanged(ptr, nmea)`. Host→guest methods: `SetLocation(lat, lon, …)`, `m5135WWWWWWWW()` (start), `m5136…()` (stop). |
+| **Native fn** | `libvm.so` writes the location update to the guest's GPS HAL socket. |
+| **Device paths** | (Inferred) `/dev/socket/gps` or a character device. |
+| **IPC mechanism** | Java → native → guest GPS HAL via custom binary protocol. |
+| **What guest sees** | A real GPS provider (`gps`); `LocationManager.getLastKnownLocation()` works. |
+
+### 1.7 WiFi Scan
+
+| Field | Value |
+|---|---|
+| **What it does** | Proxies `WifiManager.getScanResults()` and `setWifiEnabled()` from guest to host. |
+| **Java class** | `com.android.vmcore.hal.WiFiService` — holds `WifiManager f9119WWWoWWWo`. Host→guest callback `nativeWIFIChanged(ptr, jsonScanResults)`. Called via `SetWiFiStart()` from native. |
+| **Native fn** | `libvm.so` exposes a virtual wifi HAL node and triggers Java `getScanResults()` when the guest calls it. |
+| **Device paths** | (Inferred) `/dev/socket/wpa_*` or virtual wlan0. |
+| **IPC mechanism** | Custom binary protocol over Unix socket; results encoded as JSON or simple TLV. |
+| **What guest sees** | A working wifi HAL that returns the host's scan results. |
+
+### 1.8 Phone (SIM/SMS/Call)
+
+| Field | Value |
+|---|---|
+| **What it does** | Proxies `TelephonyManager` (SIM state, signal strength, network registration), supports SMS send/receive and dial intents. |
+| **Java class** | `com.android.vmcore.hal.PhoneService` + a `phone/` sub-package (`CallPdu`, `GsmAlphabet`, `CarrierManager`, `MccTable`, `SmsConstants`, `IccUtils`, … ~14 helper classes — full PDU encoding/decoding). Single dispatcher: `ExecPhoneCommand(int cmd, String arg)` (~350 lines, switch on ~25 phone commands). Host→guest unsolicited: `nativePhoneUnsolicited(ptr, json)`. |
+| **Native fn** | `libvm.so` exposes a virtual `/dev/socket/rild`-style node and routes `RIL_REQUEST_*` commands back to Java. |
+| **Device paths** | `/dev/socket/rild`, `/dev/socket/rild-debug` (standard Android RIL paths). |
+| **IPC mechanism** | RIL protocol (compatible with `ReferenceRIL`); Java ↔ native via JNI callbacks. |
+| **What guest sees** | A working `TelephonyManager` with SIM state, signal, and SMS support. |
+
+### 1.9 Battery
+
+| Field | Value |
+|---|---|
+| **What it does** | Mirrors host battery state (level, charging, temperature, voltage) into the guest. |
+| **Java class** | `com.android.vmcore.hal.BatteryService` — registered as a `BroadcastReceiver` for `ACTION_BATTERY_CHANGED`. Holds a `BatteryManager f9019WWWWoWWWWo`. No native callbacks listed (battery is host-pushed periodically). |
+| **Native fn** | `libvm.so` creates `/dev/hal/power_supply*` (per `VM_KR64_ANALYSIS.md` device inventory). |
+| **Device paths** | `/dev/hal/power_supply*`, plus the standard `/sys/class/power_supply/` sysfs tree. |
+| **IPC mechanism** | File-based: host writes battery stats to a virtual sysfs that the guest's `BatteryService` Java polls. |
+| **What guest sees** | A standard `/sys/class/power_supply/battery/` tree. |
+
+### 1.10 Network (tun0)
+
+| Field | Value |
+|---|---|
+| **What it does** | Creates a virtual network interface (`tun0`) with per-VM MAC/IP/gateway/DNS; routes netlink events between guest and host. |
+| **Java class** | `com.android.vmcore.hal.NetlinkManager implements InterfaceC1653WoWo`. Holds a `VMNetworkConfig{ifname, mac, ip, gateway_ip, dns_ip}`. JNI: `nativeSetup`, `nativeStartMgr`, `nativeStopMgr`, `nativeSetNetworkConfig(ptr, cfg)`, `nativeOnWifiConnected`, `nativeOnWifiDisconnected`, `nativeOnWifiScanResultsChanged`. |
+| **Native fn** | `libvm.so` opens a netlink socket and creates `/dev/netlink_client/*` socket(s). |
+| **Device paths** | `/dev/netlink_client/*` (NETLINK_ROUTE emulation), plus the virtual `tun0`. |
+| **IPC mechanism** | Netlink protocol (RTM_NEWADDR, RTM_NEWLINK, …) over a Unix socket. |
+| **What guest sees** | A real ethernet/wlan interface with the configured IP, gateway, and DNS — full TCP/UDP connectivity via the host. |
+
+### 1.11 HW Control (bonus)
+
+| Field | Value |
+|---|---|
+| **What it does** | Hardware button emulation (power/volume) from the host. |
+| **Java class** | `com.android.vmcore.hal.HWControlService`. |
+| **Device paths** | (Same as Input — emits `EV_KEY` on `/dev/input/key0`.) |
+| **What guest sees** | Power/volume button presses. |
+
+---
+
+## 2. What HALs does twoyi need? (priority-ranked)
+
+Cross-reference with current twoyi state:
+
+- **Display:** ✅ Already exists — `Renderer.java` + `app/rs/src/core.rs` + `app/rs/openglrenderer/`. Uses AOSP emugl `qemu_pipe` (single VM, single surface).
+- **Input:** ✅ Already exists — `app/rs/src/input.rs` creates `/dev/input/touch` and `/dev/input/key0` with proper `device_info` headers and `input_event` streaming.
+- **Audio:** ❌ Missing.
+- **Sensor:** ❌ Missing.
+- **Camera:** ❌ Missing.
+- **Location:** ❌ Missing.
+- **WiFi:** ❌ Missing.
+- **Phone:** ❌ Missing.
+- **Battery:** ❌ Missing.
+- **Network:** ❌ Missing.
+
+### Priority 1 — Critical (must have for basic boot)
+
+| HAL | Why critical | twoyi status |
+|---|---|---|
+| **Display** | Without it the guest never renders. | ✅ Done. Needs API refactor to per-VM pointer (see §3.1). |
+| **Input (Touch + Keys)** | Without it the guest boots but is unusable. | ✅ Done. |
+
+### Priority 2 — Important (for a usable experience)
+
+| HAL | Why important | twoyi status |
+|---|---|---|
+| **Audio** | Most apps produce sound; mute guest is unusable for media/notifications. | ❌ Build new. |
+| **Sensor** | Many apps (camera with rotation, games, navigation) refuse to run without accel/gyro/mag. | ❌ Build new. |
+
+### Priority 3 — Nice to have (for full feature parity)
+
+| HAL | Why nice-to-have | twoyi status |
+|---|---|---|
+| **Camera** | Required only by camera apps and barcode scanners. | ❌ Build new. |
+| **Location** | Required only by maps/navigation/weather apps. | ❌ Build new. |
+| **WiFi** | Required only if the guest checks WiFi state (most apps fall back to "no network"). | ❌ Build new. |
+| **Phone** | Required only by dialer/SMS apps. | ❌ Build new. |
+| **Battery** | Guest already inherits host's battery via the standard `/sys` passthrough in many setups; only needed if the guest has its own battery UI. | ❌ Build new. |
+| **Network** | Required only if the guest needs its own IP identity (most apps work with the host's network). | ❌ Build new. |
+
+---
+
+## 3. Implementation approach for each HAL
+
+### 3.1 Display — refactor API, no new HAL needed
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | Java side: replace `Renderer.init/resetWindow/removeWindow` static methods with `DisplayService` instance (per VM). Rust side: `core.rs` already wraps `renderer_bindings::setNativeWindow` and `renderer_new::reset_window` — extend these to take a `ptr` argument. |
+| **Device path** | Already created by kr64: `{rootfs}/dev/qemu_pipe` (`devices.rs::create_qemu_pipe`). No change. |
+| **IPC mechanism** | Already emugl binary protocol over `qemu_pipe`. No change. |
+| **Action** | Refactor `Renderer.java` to `DisplayService.java` with `nativeAddSurface(long ptr, int surfaceId, Surface, w, h, rot)`. This is **VM_JAVA_ANALYSIS.md §7.1 recommendation #1**. Effort: ~1 day. |
+
+### 3.2 Input — already done, just align names
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | Java side: `Render2Activity.onTouch` already calls `Renderer.handleTouch(MotionEvent)`. Rust side: `app/rs/src/input.rs` (touch_server + key_server) already implements the protocol. |
+| **Device paths** | Already created: `{rootfs}/dev/input/touch` and `{rootfs}/dev/input/key0` (`devices.rs::create_touch_device`, `create_key_device`). |
+| **IPC mechanism** | `device_info` (96 bytes) header + `input_event` (16 bytes) stream — matches VM exactly. |
+| **Action** | None functionally. Optional: split `Renderer` statics into `InputService` instance for symmetry with VM. Effort: ~2 hours. |
+
+### 3.3 Audio
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Java (most of it):** `AudioService.java` owning `List<AudioTrack>` and `List<AudioRecord>`. JNI: `nativeSetup`, `nativeStartService`, `nativeStopService`, `nativeDispose`. **Rust (thin):** socket accept loop in `app/rs/src/audio.rs` (new file). |
+| **Device path** | New: `{rootfs}/dev/audio`. Add `create_audio_device(rootfs)` to `app/rs/kr64/src/devices.rs`. |
+| **IPC mechanism** | Unix socket. On connect: client sends `{sample_rate, channel_count, format, direction (playback/capture)}` header (8–16 bytes). Then bidirectional PCM stream. Rust thread pumps bytes between the socket and the JNI callback (`writeAudioData` / `readRecordData`). |
+| **Java callbacks** | `acquireAudioTrack(int[] params)` → `new AudioTrack(STREAM_MUSIC, 44100, STEREO, PCM_16BIT, minBuf, MODE_STREAM)`. `acquireAudioRecord(int[] params)` → `new AudioRecord(MIC, 11025, CHANNEL_IN_MONO, PCM_16BIT, minBuf)`. Match VM's exact sample rates for compatibility. |
+| **Action** | Add `audio.rs` (~200 lines), extend `devices.rs` (~30 lines), write `AudioService.java` (~300 lines, ~1:1 port of VM's decompiled class). Effort: ~3 days. |
+
+### 3.4 Sensor (12 types)
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Java (most of it):** `SensorService.java` owning `Sensor[12]` and `SensorManager`. JNI: `nativeSensorChanged(ptr, idx, ts, x, y, z)`. Callbacks: `EnableSensors`, `DisableSensors`, `CheckSensorsSupport`. **Rust (thin):** accept loop per virtual sensor device, push events to JNI. |
+| **Device path** | New: `{rootfs}/dev/input/sensor` (multiplexed) or 12 × `/dev/input/{accel, gyro, mag, …}`. Multiplexed is simpler — single socket, 4-byte sensor-id header per event. |
+| **IPC mechanism** | Custom: each event = `{u32 sensor_idx, u64 timestamp_ns, f32 x, f32 y, f32 z}` (24 bytes). Java `SensorEventListener.onSensorChanged` → `nativeSensorChanged` → socket. |
+| **Sensor list** | Use the same 12 indices VM uses (see §1.5). Build `SparseIntArray` mapping guest idx → `Sensor.TYPE_*`. |
+| **Action** | Add `sensor.rs` (~150 lines), extend `devices.rs` (~30 lines), write `SensorService.java` (~400 lines, port of VM's). Effort: ~2 days. |
+
+### 3.5 Camera
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Java (most of it):** `CameraService.java` using the deprecated `android.hardware.Camera` API (Camera1, matches VM). JNI: `nativeCameraPicture`, `nativeCameraPreview`. Callbacks: `CameraConnect`, `CameraStart(w,h,fps,client)`, `CameraStop`, `CameraFocus`, `CameraFrame`, `CameraFlash`, `CameraList`. **Rust (thin):** accept loop, route open/close ioctls to Java. |
+| **Device path** | New: `{rootfs}/dev/camera0` (and `camera1` if `Camera.getNumberOfCameras() > 1`). |
+| **IPC mechanism** | Custom: open returns camera capabilities (supported preview sizes, FPS ranges). Preview frames streamed back as NV21 byte arrays (`onPreviewFrame` callback → `nativeCameraPreview`). Picture frames as JPEG (`onPictureTaken` → `nativeCameraPicture`). |
+| **Gotchas** | The hardest part is **frame format negotiation**: guest asks for specific YUV formats; host camera may emit different ones. Plan: support only NV21 + JPEG initially; convert others in Java. |
+| **Action** | Add `camera.rs` (~250 lines), extend `devices.rs` (~30 lines), write `CameraService.java` (~600 lines, port of VM's plus format conversion). Effort: ~5 days. |
+
+### 3.6 Location (GPS)
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Java (most of it):** `LocationService.java implements LocationListener`. Uses `LocationManager.requestLocationUpdates(GPS_PROVIDER, …)` + `addNmeaListener`. JNI: `nativeGPSNmeaChanged(ptr, nmea)`. **Rust (thin):** accept loop, push location updates. |
+| **Device path** | New: `{rootfs}/dev/socket/gps` (or `/dev/gps`). |
+| **IPC mechanism** | Custom: location update = `{f64 lat, f64 lon, f64 alt, f32 speed, f32 bearing, f32 accuracy, u64 ts}`. NMEA = ASCII line. |
+| **Action** | Add `location.rs` (~100 lines), extend `devices.rs` (~20 lines), write `LocationService.java` (~300 lines, port of VM's). Effort: ~2 days. |
+
+### 3.7 WiFi
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Java:** `WiFiService.java` with `WifiManager`. JNI: `nativeWIFIChanged(ptr, jsonScanResults)`. **Rust (thin):** accept loop, route scan-results requests to Java. |
+| **Device path** | New: `{rootfs}/dev/socket/wpa_wlan0` (matches Android's `wpa_supplicant` control socket path). |
+| **IPC mechanism** | wpa_supplicant control protocol (ASCII commands like `SCAN`, `SCAN_RESULTS`). |
+| **Action** | Add `wifi.rs` (~150 lines), extend `devices.rs` (~20 lines), write `WiFiService.java` (~250 lines). Effort: ~2 days. |
+
+### 3.8 Phone (SIM/SMS/Call)
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Java:** `PhoneService.java` + `phone/` sub-package (~14 helper classes — full PDU encoding/decoding). Uses `TelephonyManager`, `SmsManager`. JNI: `nativePhoneUnsolicited(ptr, json)`. **Rust (thin):** accept loop, route RIL commands to Java. |
+| **Device path** | New: `{rootfs}/dev/socket/rild`, `{rootfs}/dev/socket/rild-debug`. |
+| **IPC mechanism** | Standard Android RIL protocol (RIL_REQUEST_*, RIL_UNSOL_*). Guest's `rild` daemon connects and issues `RIL_REQUEST_GET_SIM_STATUS`, `RIL_REQUEST_DIAL`, etc. |
+| **Gotchas** | This is the **largest single port** — VM's `PhoneService.java` is ~700 lines, plus 14 helper classes. Consider whether to port or skip entirely. |
+| **Action** | Add `phone.rs` (~300 lines), extend `devices.rs` (~20 lines), write `PhoneService.java` + `phone/*` (~2000 lines, mostly direct port). Effort: ~8 days. |
+
+### 3.9 Battery
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Java:** `BatteryService.java` registering `ACTION_BATTERY_CHANGED` receiver. **Rust (none):** host writes stats to virtual sysfs files. |
+| **Device path** | New: `{rootfs}/sys/class/power_supply/battery/{uevent, capacity, status, …}` (regular files, refreshed periodically). |
+| **IPC mechanism** | File-based: guest's `BatteryService` polls `/sys/class/power_supply/battery/uevent`. |
+| **Action** | Add `battery.rs` (~100 lines) or just write directly from Java via `NativeHelper.chmodRecursively` style. Write `BatteryService.java` (~150 lines). Effort: ~1 day. |
+
+### 3.10 Network (tun0)
+
+| Aspect | Plan |
+|---|---|
+| **Language split** | **Rust (most of it):** `netlink.rs` (new file) — creates `tun0`, handles RTM_NEWADDR/RTM_NEWLINK, forwards to guest. **Java (thin):** `NetlinkManager.java` with `VMNetworkConfig` POJO. JNI: `nativeSetNetworkConfig(ptr, cfg)`. |
+| **Device path** | New: `{rootfs}/dev/netlink_client/route` (NETLINK_ROUTE emulation). Plus a `/dev/tun0` character device (or just stub it — most guests don't need real TUN). |
+| **IPC mechanism** | Netlink protocol (binary `struct nlmsghdr` + payload). |
+| **Gotchas** | Real networking requires the host to actually route the guest's traffic — this means creating a real `tun` device on the host side and configuring NAT. For an MVP, just stub the interface and let the guest share the host's network via binder-level proxying. |
+| **Action** | Add `netlink.rs` (~400 lines), extend `devices.rs` (~30 lines), write `NetlinkManager.java` (~200 lines). Effort: ~5 days. |
+
+---
+
+## 4. Effort estimate summary
+
+| HAL | Priority | Effort | Java LOC | Rust LOC | New device paths |
+|---|---|---|---|---|---|
+| Display | Critical (✅ done) | **Low** (refactor only) | ~150 (refactor) | ~50 | — (uses `qemu_pipe`) |
+| Input | Critical (✅ done) | **Low** (refactor only) | ~50 (refactor) | — | — (uses `touch`/`key0`) |
+| Audio | Important | **Medium** | ~300 | ~200 | `/dev/audio` |
+| Sensor | Important | **Medium** | ~400 | ~150 | `/dev/input/sensor` |
+| Battery | Nice to have | **Low** | ~150 | ~100 | `/sys/class/power_supply/battery/*` |
+| Location | Nice to have | **Medium** | ~300 | ~100 | `/dev/socket/gps` |
+| WiFi | Nice to have | **Medium** | ~250 | ~150 | `/dev/socket/wpa_wlan0` |
+| Network | Nice to have | **High** | ~200 | ~400 | `/dev/netlink_client/*` |
+| Camera | Nice to have | **High** | ~600 | ~250 | `/dev/camera0` |
+| Phone | Nice to have | **High** | ~2000 (incl. `phone/`) | ~300 | `/dev/socket/rild` |
+| **Total new work** | | | **~4,400** | **~1,700** | 8 new device paths |
+
+### Rough effort tiers
+
+- **Low (1 day):** Battery — file-based, no real-time requirements.
+- **Medium (2–3 days):** Audio, Sensor, Location, WiFi — Unix-socket pump with simple framing; needs careful threading.
+- **High (5–8 days):** Camera, Network, Phone — non-trivial protocols (RIL, wpa_supplicant control, real TUN routing), large Java ports, format negotiation.
+
+### Recommended sequencing
+
+1. **Phase 1 (week 1):** Refactor Display + Input to per-VM instance pattern (unblocks multi-VM, simplifies later HALs).
+2. **Phase 2 (week 1–2):** Audio + Sensor. These unlock most consumer apps (media + games).
+3. **Phase 3 (week 3):** Battery + Location. Cheap wins, no real-time complexity.
+4. **Phase 4 (week 3–4):** WiFi + Camera. Needed for camera apps and connectivity-sensitive apps.
+5. **Phase 5 (week 5+):** Phone + Network. Most complex; only if full VM-parity is a goal.
+
+---
+
+## 5. Cross-cutting concerns
+
+### 5.1 HALManager dispatcher pattern
+
+VM's `HALManager` is a single Java class with a `long mNativePtr` and ~30 private methods (`CameraConnect`, `EnableSensors`, `ExecPhoneCommand`, …) that the native side calls back via JNI. This is the cleanest pattern for twoyi:
+
+```java
+public class HALManager {
+    private long mNativePtr;
+    private final AudioService mAudioService;
+    private final SensorService mSensorService;
+    // ...
+
+    public HALManager(Context ctx, TwoyiProfile profile) {
+        mNativePtr = nativeSetup(profile.getId());
+        mAudioService = new AudioService(ctx, profile, this);
+        mSensorService = new SensorService(ctx, profile, this);
+        // ...
+    }
+
+    // Called from native (JNI callbacks):
+    private void AudioStart(int sampleRate, int channels) { mAudioService.start(...); }
+    private void AudioStop() { mAudioService.stop(); }
+    private void EnableSensors(int idx) { mSensorService.enable(idx); }
+    private void DisableSensors(int idx) { mSensorService.disable(idx); }
+    // ...
+}
+```
+
+Rust side: `nativeSetup` returns a pointer to a `*mut HalDispatcher` struct that holds a `JavaVM` + `jobject` (global ref to the HALManager) + a map of device-path → callback-id. The kr64 daemon's accept loop dispatches each connection to the right callback.
+
+### 5.2 Device-node creation ownership
+
+VM creates all HAL device nodes inside `libkr64.so` (the kernel-replacement daemon). Twoyi's `app/rs/kr64/src/devices.rs` already follows this pattern — extend it with `create_audio_device`, `create_sensor_device`, `create_camera_device`, `create_location_socket`, `create_wifi_socket`, `create_rild_sockets`, `create_power_supply_files`, `create_netlink_socket`. Each one is ~20 lines following the existing `bind_unix_socket` helper.
+
+### 5.3 Java↔Rust threading
+
+Each HAL service needs:
+- **Java side:** A `HandlerThread` (so `SensorManager.registerListener` callbacks don't run on the main thread).
+- **Rust side:** A dedicated thread per socket (so one blocked HAL doesn't stall the others).
+- **JNI up-calls:** Must attach the Rust thread to the JVM via `JavaVM::attach_current_thread` (the `jni` crate handles this).
+
+### 5.4 Permission strategy
+
+VM uses `me.weishu.reflection.BootstrapClass.exemptAll()` (the FreeReflection trick) to bypass hidden-API restrictions. Twoyi currently uses only public APIs. For HAL virtualization we need:
+- `Camera.open()` — public API ✅
+- `SensorManager.registerListener` — public API ✅
+- `LocationManager.requestLocationUpdates` — public API (needs `ACCESS_FINE_LOCATION` permission) ✅
+- `WifiManager.getScanResults` — public API (needs `ACCESS_WIFI_STATE` + `CHANGE_WIFI_STATE`) ✅
+- `TelephonyManager.*` — public API (needs `READ_PHONE_STATE`) ✅
+- `AudioRecord` with `MediaRecorder.AudioSource.MIC` — public API (needs `RECORD_AUDIO`) ✅
+
+**Conclusion: no hidden-API bypass needed for HAL work.** Just declare the permissions in `AndroidManifest.xml`.
+
+### 5.5 Binder virtualization (orthogonal but blocking)
+
+VM's `BinderService.setupBinder(vmId, ...)` creates a per-VM `/vm%d/dev/binder` so the guest's `servicemanager` doesn't talk to the host's. Without this, the guest's `getSystemService(ACTIVITY_SERVICE)` returns the **host's** ActivityManager (per `VM_JAVA_ANALYSIS.md` §7.1 takeaway #4). This is **not** a HAL — it's a separate concern — but it's a prerequisite for some HALs (notably Phone, which needs the guest's `TelephonyManager` to be the guest's, not the host's).
+
+**Action item:** Treat binder virtualization as a separate task (proposed: `BINDER-1`). HAL work can proceed in parallel; only Phone + Network depend on it.
+
+---
+
+## 6. References
+
+- `download/VM_JAVA_ANALYSIS.md` §5.4 — HAL services table.
+- `download/VM_JAVA_ANALYSIS.md` §7 — differences from twoyi.
+- `download/VM_JAVA_ANALYSIS.md` §7.1 — six concrete recommendations.
+- `vm-java-src/sources/com/android/vmcore/hal/HALManager.java` — the JNI dispatcher (line 51+ for `CameraConnect` etc., line 663+ for `nativeSetup`).
+- `vm-java-src/sources/com/android/vmcore/hal/AudioService.java` — JNI + `AudioTrack`/`AudioRecord` lifecycle.
+- `vm-java-src/sources/com/android/vmcore/hal/SensorService.java` line 61 — the 12-sensor `SparseIntArray`.
+- `vm-java-src/sources/com/android/vmcore/hal/NetlinkManager.java` — `VMNetworkConfig` proxy.
+- `app/src/main/java/io/twoyi/Renderer.java` — current static-native API to refactor.
+- `app/rs/src/input.rs` — current touch/key socket implementation (template for new HAL sockets).
+- `app/rs/kr64/src/devices.rs` — current device-node creator (template for new HAL devices).
+
+— End of analysis —

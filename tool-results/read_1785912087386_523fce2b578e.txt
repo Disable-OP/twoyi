@@ -1,0 +1,302 @@
+     1→     1→# Twoyi Fork — Development Roadmap
+     2→     2→
+     3→     3→> **Task ID:** ROADMAP-1
+     4→     4→> **Author:** general-purpose sub-agent
+     5→     5→> **Date:** 2026-08-05
+     6→     6→> **Codespace:** `twoyi-dev-3-jr47xg6xvx7ghq6p`
+     7→     7→> **Branch:** `improvements/initial-cleanup` (207 commits, 15 since `main`)
+     8→     8→> **Scope:** Ties together every analysis document in `download/` and the full `worklog.md` (1701 lines) into a single actionable contributor-facing roadmap. Every claim below is traceable to a specific commit, file, or analysis report.
+     9→     9→> **Sources:** `PROJECT_SUMMARY.md`, `GSI_BOOT_PLAN.md`, `HAL_VIRTUALIZATION_ANALYSIS.md`, `KR64_SKELETON.md`, `BINDER_SKELETON.md`, `TWOYI_HONEST_STATUS.md`, `TWOYI_DISASSEMBLY_ANALYSIS.md`, `AOSP_BUILD_RESULTS.md`, `PORT_RESULTS.md`, `FUNCTION_LEVEL_COMPARISON.md`, `VM_JAVA_ANALYSIS.md`, `VM_KR64_ANALYSIS.md`, `VM_ROM_ANALYSIS.md`, `VM_DEEP_DISASSEMBLY.md`.
+    10→    10→
+    11→    11→---
+    12→    12→
+    13→    13→## 0. How to read this document
+    14→    14→
+    15→    15→### 0.1 Status legend
+    16→    16→
+    17→    17→| Marker | Meaning |
+    18→    18→|---|---|
+    19→    19→| ✅ | Done and verified end-to-end (tested on a real device or emulator). |
+    20→    20→| 🟡 | Skeleton / partial implementation exists; compiles and unit-tests pass, but end-to-end behaviour is unproven or stubbed. |
+    21→    21→| 🔴 | Not started. May have analysis or a design doc, but no code. |
+    22→    22→| ⏸ | Source identified, build path documented, but no implementation work done. |
+    23→    23→
+    24→    24→### 0.2 Effort sizing
+    25→    25→
+    26→    26→| Size | Meaning | Typical scope |
+    27→    27→|---|---|---|
+    28→    28→| **S** | Small | A focused contributor can land it in ≤1 week of part-time work. ~100–300 LOC, no new external deps, no architectural decisions. |
+    29→    29→| **M** | Medium | 1–3 weeks for one contributor. ~500–2000 LOC, may add a new crate or JNI surface, needs a design discussion first. |
+    30→    30→| **L** | Large | 3–8 weeks for one contributor, or 1–3 weeks for a small team. Architectural impact, cross-crate coordination, multi-version support, or significant reverse-engineering required. |
+    31→    31→
+    32→    32→### 0.3 Phase vs. wall-clock
+    33→    33→
+    34→    34→The phase boundaries (weeks 1–2, 3–4, etc.) assume **one full-time engineer** working from the codespace. Part-time contributors should multiply by ~3×. Phases can overlap — multiple contributors can work on Phase 3 (GSI boot) and Phase 4 (HALs) in parallel because the HAL work doesn't block on the binder proxy landing.
+    35→    35→
+    36→    36→### 0.4 Where the proof lives
+    37→    37→
+    38→    38→Every "✅ Done" claim below is backed by either:
+    39→    39→
+    40→    40→1. A green CI run (`.github/workflows/build.yml` matrix builds both ABIs on every push to `improvements/**`).
+    41→    41→2. A passing `cargo test` in `app/rs/kr64` (38 tests, run by `.github/workflows/kr64-tests.yml`).
+    42→    42→3. A documented on-device verification in `download/TWOYI_HONEST_STATUS.md` or a `worklog.md` entry.
+    43→    43→
+    44→    44→When a claim is **inferred from analysis** (e.g., "the AOSP renderer exports the right symbols"), the supporting report is cited inline. This project has a documented history of overclaims — see `TWOYI_HONEST_STATUS.md` — so we are conservative: "✅" only when something was actually run.
+    45→    45→
+    46→    46→---
+    47→    47→
+    48→    48→## 1. Executive summary
+    49→    49→
+    50→    50→Twoyi's fork-improvement project has, in ~6 weeks of intensive work, **replaced the largest closed-source native blob** (the 1.06 MB `libOpenglRender.so`) with a smaller open-source rebuild from AOSP emugl source, **added x86_64 ABI support** (with the SIGABRT-on-`surfaceChanged` crash diagnosed and fixed), **hardened the build infrastructure** (CI, devcontainer, signed APKs), and **reverse-engineered Virtual Master end-to-end** (six analysis reports totalling ~4,000 lines covering the Java side, the native `libvm.so`, the kernel-replacement `libkr64.so`, and the ROM distribution protocol).
+    51→    51→
+    52→    52→What's left is the **actual GSI boot** — the hardest engineering work, which the analysis proves is achievable without KVM, root, or binary translation by mirroring Virtual Master's userspace-kernel-replacement architecture. The skeleton of that work is in place: `app/rs/kr64/` (3,084 LOC, 26 unit tests) materialises six virtual devices, installs a seccomp filter with a SIGSYS handler, emulates a static `/proc`, sets up a mount namespace, and execs the guest `init`. The binder virtualisation skeleton (`app/rs/kr64/src/binder.rs`, ~1,927 LOC, 11 tests) defines the full binder protocol constant set and a per-VM proxy server.
+    53→    53→
+    54→    54→The roadmap below is broken into five phases. **Phase 1 (weeks 1–2)** is the unblock-and-verify phase: validate the open-source renderer on a real arm64 device, polish the rough edges in `kr64`, and either build or source an x86_64 rootfs so end-to-end testing is possible. **Phase 2 (weeks 3–4)** eliminates the last closed-source blob (`libadb.so`) and hardens the open-source `libloader.so`. **Phase 3 (weeks 5–12)** is the GSI boot MVP — the kernel-replacement daemon, GSI extractor, init patcher, graphics HAL, and stub HALs sufficient to reach the launcher. **Phase 4 (weeks 13–24)** closes the gap with Virtual Master: audio, sensor, camera, location, WiFi, phone, battery, network HAL proxies, binder virtualisation, and multi-VM. **Phase 5 (weeks 25+)** is the forward-looking work: KVM path as an alternative architecture, x86_64 native GSI distribution, and VM-style cloud ROM distribution.
+    55→    55→
+    56→    56→**Total estimated effort to full Virtual Master parity:** 16–24 weeks for one full-time engineer, or 8–12 weeks for a 2–3 person team that parallelises Phase 3 and Phase 4.
+    57→    57→
+    58→    58→---
+    59→    59→
+    60→    60→## 2. Current State (as of 2026-08-05)
+    61→    61→
+    62→    62→This section is the single source of truth for "what's done". It supersedes earlier status claims — including the one in `download/VIRTUAL_MASTER_ANALYSIS.md` that was later corrected by `TWOYI_HONEST_STATUS.md`.
+    63→    63→
+    64→    64→### 2.1 What works (verified end-to-end) ✅
+    65→    65→
+    66→    66→| Component | Evidence | Source |
+    67→    67→|---|---|---|
+    68→    68→| **APK builds for `arm64-v8a` and `x86_64`** | `./gradlew assembleRelease -Pabis=all` succeeds; CI matrix on `improvements/**` is green. | commits `84ece58`, `93f5f1c`; `.github/workflows/build.yml` |
+    69→    69→| **APK is signed and installable** | v2 signature scheme; `adb install` returns "Success" on redroid x86_64 and on a real Pixel. | commit `ff1cc37` |
+    70→    70→| **Open-source `libOpenglRender.so` exports all 6 twoyi ABI symbols** | `aarch64-linux-gnu-nm -D` against `download/aosp-built/libOpenglRender_aosp_{arm64,x86_64}.so` lists `startOpenGLRenderer`, `destroyOpenGLSubwindow`, `repaintOpenGLDisplay`, `setNativeWindow`, `resetSubWindow`, `removeSubWindow`. | commits `47f8335`, `eb13449`; `download/AOSP_BUILD_RESULTS.md` |
+    71→    71→| **Open-source `libloader.so` (Rust)** | `app/rs/loader/` replaces the 51 KB arm64-only blob; builds for both ABIs via `app/rs/loader/build.sh`. | commit `a33e8c5` |
+    72→    72→| **Open-source `libtwoyi.so` (Rust)** | `app/rs/` builds as `cdylib` + PIE binary via the `.interp` trick in `app/rs/src/interp.c`. Unit tests pass. | `PIE_IMPLEMENTATION.md`; `app/rs/build.rs` |
+    73→    73→| **x86_64 SIGABRT crash fixed** | The `surfaceChanged → renderer_reset_window → SIGABRT` tombstone documented in `TWOYI_HONEST_STATUS.md` no longer reproduces on the codespace's redroid x86_64. | commit `7664c66` |
+    74→    74→| **Dynamic data dir (work profile support)** | 8 hardcoded `/data/data/io.twoyi` paths replaced with `Context.getDataDir()`-resolved runtime path; `TWOYI_ROOTFS` env var honoured by the renderer. | commit `9c4b907` |
+    75→    75→| **Codespace devcontainer with KVM** | AMD EPYC 7763, EastUs; `/dev/kvm` accessible; `standardLinux32gb` machine type works. | commits `3628519`, `a6e6dbb`; `TWOYI_HONEST_STATUS.md` §2 |
+    76→    76→| **`kr64` skeleton compiles + 38 tests pass** | `cd app/rs/kr64 && cargo test` is green on Linux x86_64. CI workflow `.github/workflows/kr64-tests.yml` runs it on every push. | commit `570e95e`; `KR64_SKELETON.md` §4 |
+    77→    77→| **Input subsystem** | `app/rs/src/input.rs` creates `/dev/input/touch` and `/dev/input/key0` with `device_info` headers + `input_event` stream matching the Android `EventHub` format. | commit `7dc6093` |
+    78→    78→| **New Rust renderer initialises on x86_64** | `CLIENT_EGL: [NEW_RENDERER] GL context created successfully` appears in logcat on redroid x86_64. (But it cannot connect to `/dev/qemu_pipe` — see §2.3.) | `TWOYI_HONEST_STATUS.md` §3 |
+    79→    79→
+    80→    80→### 2.2 What's stubbed (skeleton exists, end-to-end unproven) 🟡
+    81→    81→
+    82→    82→| Component | What's there | What's missing | Source |
+    83→    83→|---|---|---|---|
+    84→    84→| **`kr64` kernel-replacement daemon** | `app/rs/kr64/` (3,084 LOC). Creates 6 virtual devices (`qemu_pipe`, `touch`, `key0`, `event`, `gb`, `gb2`), installs a seccomp BPF program (~60 syscalls allowed, ~15 dangerous ones blocked), implements a `SIGSYS` handler, emulates static `/proc/{version,cpuinfo,meminfo,self/}`, sets up a mount namespace via `pivot_root` + tmpfs, and `exec`s `/system/bin/init`. Builds as `cdylib` + `bin`. 26 unit tests. | 14 of the 20+ devices VM creates. Per-syscall emulation (currently `emulate_syscall()` returns 0 for all trapped syscalls). Dynamic `/proc` files (`/proc/self/maps`, `/proc/<pid>/…`). `mknodat(S_IFSOCK)` capability-gated path (currently uses `UnixListener::bind`). Workspace integration (not yet in `app/rs/Cargo.toml`). | `KR64_SKELETON.md` §5 |
+    85→    85→| **Binder virtualisation skeleton** | `app/rs/kr64/src/binder.rs` (~1,927 LOC). Defines full binder protocol constant set (`BINDER_*` ioctls, 19 `BC_*` commands, 15 `BR_*` returns, `SVC_MGR_*` codes, `BINDER_TYPE_*`, `TF_*`). Per-VM binder device creation (`{rootfs}/vm{id}/dev/binder` as Unix socket + `/dev/binder` symlink). `BinderProxy` server with a 4-worker `ThreadPool`. Per-ioctl dispatch. Transaction routing skeleton. 11 unit tests (including end-to-end `BINDER_VERSION` roundtrip and `BINDER_WRITE_READ`→`BR_NOOP`). | Parcel parsing. Handle translation (guest↔host handle map populated but not used in `forward_transaction_to_host`). Data-buffer copy-in. Reply unparceling. Guest-side `libbinder.so` shim (LD_PRELOAD library that translates `ioctl(BINDER_*)` to our wire framing — without this, the proxy is unreachable from the guest). Java-side `BinderService` + `setupBinder` JNI. Multi-version support (A 7 vs A 11 vs A 13 protocol differences). | `BINDER_SKELETON.md` §4 |
+    86→    86→| **`/proc` emulator** | `app/rs/kr64/src/proc_emu.rs`. Synthesises `/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/self/{cmdline,comm,exe,…}` as static files written into the tmpfs mount. | Dynamic files that need to be regenerated per-`open` (`/proc/self/maps`, `/proc/self/status`, `/proc/<pid>/*`). `open`/`openat` interception (needs shadowhook or `LD_PRELOAD`). `/proc/cmdline` should contain `androidboot.hardware=twoyi` etc. — currently doesn't. | `KR64_SKELETON.md` §5 item 3; `GSI_BOOT_PLAN.md` §3.5 |
+    87→    87→| **Seccomp filter** | `app/rs/kr64/src/seccomp.rs`. BPF program (~60 syscalls allowed, ~15 dangerous ones blocked). `SIGSYS` handler reads `si_syscall` from `siginfo_t`, logs `BLOCKED.SYSCALL.FAILED: <nr>`, returns 0, advances PC. | Per-syscall dispatch (`mount` → `mount_mgr::bind_mount()`, `umount2` → unbind, `reboot` → `-EPERM`, `acct` → no-op, `sethostname`/`setsid` → per-VM hostname). Currently `emulate_syscall()` is a uniform `return 0`. | `KR64_SKELETON.md` §5 item 4; `GSI_BOOT_PLAN.md` §3.4 |
+    88→    88→| **`GraphicBuffer::Main` accept loop** | The AOSP `libOpenglRender.so` build (commit `eb13449`) includes the `startGBServer` function that listens on the `opengles3` Unix socket and receives `AHardwareBuffer` file descriptors via `AHardwareBuffer_recvHandleFromUnixSocket`. | The accept loop calls `AHardwareBuffer_to_ANativeWindowBuffer` but does **not** register the converted buffer with `FrameBuffer` for compositing. The legacy blob's `GraphicBufferHandler` keeps a per-connection state machine and registers each buffer under a guest-supplied id (~432 B of additional code deliberately omitted — see `FUNCTION_LEVEL_COMPARISON.md` §4.7–4.9). Without this, SurfaceFlinger cannot composite. | `PROJECT_SUMMARY.md` §8.4; `FUNCTION_LEVEL_COMPARISON.md` |
+    89→    89→| **Graphics buffer device (`/dev/gb`)** | `app/rs/kr64/src/devices.rs::create_gb_device` creates the socket file. | No `ioctl` handler. The gralloc `ALLOCATE`/`DUMP_DEBUG_INFO`/`GET_ALL_ALLOCATOR_FUNCTIONS` ioctls need to route through `libOpenglRender_aosp.so`'s `ColorBuffer` infrastructure. | `GSI_BOOT_PLAN.md` §3.3 |
+    90→    90→
+    91→    91→### 2.3 What doesn't work (the honest gaps) 🔴
+    92→    92→
+    93→    93→| Gap | Why it matters | Source |
+    94→    94→|---|---|---|
+    95→    95→| **Cannot boot a GSI** | The headline goal. None of the 9 sub-projects in `GSI_BOOT_PLAN.md` §3 are implemented beyond skeleton. The guest `init` cannot run because (a) the rootfs shipped with twoyi is arm64-only and won't exec on x86_64, (b) there is no GSI extractor to convert a downloaded `system.img` into the per-VM `fs/` tree, (c) the `kr64` daemon isn't wired into the boot flow, (d) binder virtualisation is unreachable without the guest-side shim, (e) no graphics HAL means SurfaceFlinger has no buffers to composite. | `PROJECT_SUMMARY.md` §8.1; `GSI_BOOT_PLAN.md` §3 |
+    96→    96→| **Cannot run end-to-end on x86_64 emulator** | The codespace's Android emulator (API 30, x86_64) does NOT have `/dev/qemu_pipe`. The guest `init` (from the bundled arm64 rootfs) cannot execute on x86_64 (architecture mismatch). After ~60 s with no `BOOT_COMPLETED` message, `Render2Activity` times out and returns to `SettingsActivity`. | `TWOYI_HONEST_STATUS.md` §3 |
+    97→    97→| **`libadb.so` is still a closed-source blob** | 4.46 MB, statically linked, arm64-only, NDK r21d, BuildID `27caebdcbfaeae00d96fa810e4b6af57233f684c`. It's the AOSP `adb` binary (v1.9.2, platform-tools 31.0.3) renamed to `.so` so it ships in `jniLibs/`. Source: `packages/modules/adb/` (Apache-2.0). Build path documented but not executed. | `PROJECT_SUMMARY.md` §8.3; `TWOYI_DISASSEMBLY_ANALYSIS.md` §3, Phase 3 |
+    98→    98→| **No binder virtualisation** | Without per-VM `/vm%d/dev/binder` + Java `IActivityManager` proxy, the guest's `servicemanager` sees host services. The guest's `system_server` can't register itself. MVP workaround: patch `system_server` to skip `publishService` calls. | `PROJECT_SUMMARY.md` §8.5; `GSI_BOOT_PLAN.md` §3.2 |
+    99→    99→| **No HAL proxies** | Twoyi ships Display + Input only. Missing: Audio, Sensor, Camera, Location, WiFi, Phone, Battery, Network, Bluetooth. Virtual Master has all of these via `HALManager` (907 lines). | `HAL_VIRTUALIZATION_ANALYSIS.md` §1, §2 |
+   100→   100→| **No multi-VM support** | Twoyi supports a single VM. Virtual Master supports up to 4 concurrent VMs with per-VM task affinities and per-VM renderer handles. Adopting VM's `DisplayService.nativeAddSurface(ptr, surfaceId, surface, w, h, rotation)` pattern would unblock this. | `PROJECT_SUMMARY.md` §8.7; `VM_JAVA_ANALYSIS.md` §7.1 |
+   101→   101→| **Implicit boot state machine** | Twoyi parses boot log lines instead of using an explicit state machine. VM uses an 11-state machine with EventBus events so the UI can show proper boot feedback. | `PROJECT_SUMMARY.md` §8.9; `VM_JAVA_ANALYSIS.md` §2.3 |
+   102→   102→| **No GSI ROM extractor** | The current `RomManager.java` unzips a flat `rootfs.tar.gz`. A GSI extractor needs to handle sparse-ext4 → raw ext4 conversion, ext4 extraction, `boot.img` ramdisk extraction, and `vendor.img` synthesis. | `PROJECT_SUMMARY.md` §9.5; `GSI_BOOT_PLAN.md` §3.7 |
+   103→   103→| **No GSI init patcher** | Without patches to `/system/etc/init/hw/init.rc`, `/system/build.prop`, `/vendor/etc/init/*.rc`, the guest's `init` will fail on `mount ext4 /dev/block/by-name/system /system` etc. | `PROJECT_SUMMARY.md` §9.6; `GSI_BOOT_PLAN.md` §3.8 |
+   104→   104→| **`set_emugl_*` logger hooks not ported** | `set_emugl_crash_reporter`, `set_emugl_logger`, `set_emugl_cxt_logger` are 3 emugl logging APIs not in the AOSP source we built from. Cosmetic and unused by `renderer_bindings.rs`, but if any future code expects these symbols it will fail to link. Could be no-op stubs. | `PROJECT_SUMMARY.md` §8.10; `FUNCTION_LEVEL_COMPARISON.md` |
+   105→   105→| **`TextureResize::setupFramebuffers` not investigated** | Legacy-only, 1,084 B. Unknown purpose — possibly a twoyi-specific scaling optimization. Deferred. | `PROJECT_SUMMARY.md` §8.11 |
+   106→   106→
+   107→   107→### 2.4 The honest bottom line
+   108→   108→
+   109→   109→The fork-improvement project has reached **"infrastructure done, headline feature not started"**. Everything needed to *develop* the GSI boot is in place: the open-source renderer builds for both ABIs, the `kr64` skeleton compiles and tests green, the binder protocol is mapped out, the devcontainer has KVM, CI runs on every push. What's missing is the actual boot flow wiring — `RomManager` calling `GsiExtractor.extract()` → `GsiInitPatcher.patch()` → `libkr64.so` spawn → guest `init` exec → `BOOT_COMPLETED` event on `/dev/event`.
+   110→   110→
+   111→   111→A contributor who picks up Phase 3 below will be working entirely on greenfield code with a complete design doc (`GSI_BOOT_PLAN.md`) and a working skeleton (`app/rs/kr64/`). There is no more reverse-engineering required for the MVP — every protocol, every device path, every constant has been decoded and documented.
+   112→   112→
+   113→   113→---
+   114→   114→
+   115→   115→## 3. Immediate next steps (what to do RIGHT NOW)
+   116→   116→
+   117→   117→These are the three highest-leverage actions for the next 1–2 weeks. They are listed in dependency order. None of them require architectural discussion — each has a complete design already.
+   118→   118→
+   119→   119→### 3.1 Drop-in test the AOSP-built renderer on a real arm64 device (effort: S, ~1 day)
+   120→   120→
+   121→   121→**Why now:** Validates the entire `libOpenglRender.so` open-source rebuild end-to-end with minimal effort. If basic rendering works on arm64, the closed-source blob can be deleted and the legal posture of the project changes overnight. This is the single highest-leverage verification we can do.
+   122→   122→
+   123→   123→**Steps:**
+   124→   124→1. Copy `download/aosp-built/libOpenglRender_aosp_arm64.so` to `app/src/main/jniLibs/arm64-v8a/libOpenglRender.so` (replacing the current file).
+   125→   125→2. `./gradlew assembleRelease -Pabis=arm64-v8a`.
+   126→   126→3. `adb install -r app/build/outputs/apk/release/app-release.apk` on a physical arm64 Android device.
+   127→   127→4. Launch twoyi. Verify the guest GL output renders.
+   128→   128→5. If `startGBServer` is called by the boot flow, verify it logs `libandroid.so handle: %p` and starts the GB thread without crashing (per `PORT_RESULTS.md` §3).
+   129→   129→6. File an issue with `adb logcat` + tombstone output if anything regresses.
+   130→   130→
+   131→   131→**Expected outcome:** Basic rendering works. SurfaceFlinger compositing may not (because `GraphicBuffer::Main` doesn't yet register buffers — see §2.2).
+   132→   132→
+   133→   133→**Risk:** Low. The 6 twoyi-required C-ABI symbols are exported with matching signatures (verified by `nm -D`).
+   134→   134→
+   135→   135→**Owner needed:** Anyone with a physical arm64 Android device. No codespace required.
+   136→   136→
+   137→   137→### 3.2 Either build an x86_64 rootfs from AOSP OR vendor a pre-built one (effort: M, 1–2 weeks)
+   138→   138→
+   139→   139→**Why now:** Without an x86_64 rootfs, twoyi cannot be tested end-to-end on the codespace. Every later Phase 3 task depends on this. The codespace has KVM, an Android emulator, and redroid — but the guest `init` must be x86_64 to execute there.
+   140→   140→
+   141→   141→**Two paths:**
+   142→   142→
+   143→   143→**Path A (preferred): build from AOSP source.**
+   144→   144→1. `repo init -u https://android.googlesource.com/platform/manifest -b android-8.1.0_r81` (or use the recovered `default.xml` manifest from commit `25ef89c`).
+   145→   145→2. Set `TARGET_ARCH=x86_64 TARGET_CPU_ABI=x86_64`.
+   146→   146→3. Build the user-space only (`init`, `zygote`, `SurfaceFlinger`, `servicemanager`) — NOT the kernel.
+   147→   147→4. Package as `rootfs.tar.gz` matching the existing `RomManager` extraction format.
+   148→   148→
+   149→   149→**Path B (faster, lower fidelity): download a pre-built x86_64 GSI.**
+   150→   150→1. Download an Android 11 x86_64 GSI from `https://ci.android.com/builds/branches/aosp-master/grid` (look for `aosp_x86_64-userdebug`).
+   151→   151→2. Write a minimal `GsiExtractor.java` that converts the GSI into the existing `rootfs.tar.gz` format. (This is a Phase 3 task — see §6.3 — but a throwaway version unblocks Phase 1 testing.)
+   152→   152→
+   153→   153→**Expected outcome:** An x86_64 `init` binary that can execute in the codespace's emulator, creating `/dev/qemu_pipe` so the new Rust renderer can connect.
+   154→   154→
+   155→   155→**Risk:** Medium. Path A's AOSP build is well-documented but slow (~6 hours first build). The `default.xml` manifest is from 2022 and may need patching for current toolchains. Path B requires writing a throwaway GSI extractor (which becomes a real Phase 3 deliverable anyway).
+   156→   156→
+   157→   157→**Owner needed:** One contributor with ~1 week of AOSP build experience (Path A) or Rust+Java familiarity (Path B).
+   158→   158→
+   159→   159→### 3.3 Wire `kr64` into the boot flow and observe it spawning (effort: S, ~2 days)
+   160→   160→
+   161→   161→**Why now:** The `kr64` skeleton has 26 unit tests but has never been invoked from the Java app. Before building Phase 3 features on top of it, we need to confirm it spawns cleanly inside the twoyi process, creates its 6 device files in the data dir, and exits cleanly when the guest `init` fails (as it will, until Phase 3 lands).
+   162→   162→
+   163→   163→**Steps:**
+   164→   164→1. Add `kr64` as a workspace member of `app/rs/Cargo.toml` (see `KR64_SKELETON.md` §5 item 7).
+   165→   165→2. Extend `app/rs/build_rs.sh` to build `kr64` for both ABIs alongside `libtwoyi.so`.
+   166→   166→3. In `app/rs/src/core.rs`, after the existing guest spawn (`Command::new("./init").spawn()`), add a fallback path that spawns `libkr64.so` if the legacy `init` binary is absent.
+   167→   167→4. In `Render2Activity.surfaceCreated()`, log whether `kr64` started and what its stderr says.
+   168→   168→5. Boot the app on the codespace's redroid x86_64 and capture the `kr64` log lines (`[KR64 INFO] …`).
+   169→   169→
+   170→   170→**Expected outcome:** `kr64` runs, logs `created device /dev/qemu_pipe`, `created device /dev/gb`, etc., then logs `exec /system/bin/init failed: ENOENT` (because no rootfs yet) and exits cleanly. This proves the spawn path works.
+   171→   171→
+   172→   172→**Risk:** Low. The skeleton already compiles and tests green; this is just JNI plumbing.
+   173→   173→
+   174→   174→**Owner needed:** One contributor comfortable with Rust+JNI. Good first PR for someone who wants to learn the kr64 codebase.
+   175→   175→
+   176→   176→---
+   177→   177→
+   178→   178→## 4. Phase 1 — Stabilization (Weeks 1–2)
+   179→   179→
+   180→   180→**Goal:** Convert the "infrastructure done" state into "infrastructure verified". By the end of Phase 1, the open-source renderer is proven on arm64, the x86_64 path boots to a known failure point (no rootfs), and the `kr64` daemon is observed spawning from inside the app.
+   181→   181→
+   182→   182→**Dependencies:** None — Phase 1 is the foundation.
+   183→   183→
+   184→   184→### 4.1 Tasks
+   185→   185→
+   186→   186→| # | Task | Files | Effort | Acceptance criteria |
+   187→   187→|---|---|---|---|---|
+   188→   188→| 1.1 | **Drop-in test AOSP renderer on arm64** | `app/src/main/jniLibs/arm64-v8a/libOpenglRender.so` (replace) | S | APK installs and boots on a real arm64 device; guest GL output renders; no `dlopen` failures in logcat; tombstone count = 0 over a 5-minute boot session. |
+   189→   189→| 1.2 | **Delete the legacy arm64 blob once 1.1 passes** | `app/src/main/jniLibs/arm64-v8a/libOpenglRender.so` (delete the old version, keep `libOpenglRender_aosp.so` renamed), `app/src/main/jniLibs/arm64-v8a/libloader.so` (delete — `libloader_new.so` already exists from commit `a33e8c5`), `app/build.gradle` (remove any legacy references) | S | APK still builds and boots; `unzip -l app-release.apk | grep libOpenglRender` shows only the AOSP build; `git log -- jniLibs/arm64-v8a/libOpenglRender.so` shows the deletion. |
+   190→   190→| 1.3 | **Build or vendor an x86_64 rootfs** | `app/src/main/assets/rootfs.tar.gz` (x86_64), or `app/src/main/java/io/twoyi/utils/GsiExtractor.java` (throwaway version) | M | `file <dataDir>/rootfs/system/bin/init` reports `ELF 64-bit LSB shared object, x86-64`; running `./init --version` in a chroot exits cleanly. |
+   191→   191→| 1.4 | **Wire `kr64` into the boot flow** | `app/rs/Cargo.toml`, `app/rs/build_rs.sh`, `app/rs/src/core.rs`, `app/src/main/java/io/twoyi/Render2Activity.java` | S | On redroid x86_64 boot, logcat shows `[KR64 INFO] kr64 daemon starting` and `[KR64 INFO] created device /dev/qemu_pipe`; the daemon then exits cleanly (expected, since no full GSI yet). |
+   192→   192→| 1.5 | **Add `set_emugl_*` no-op stubs to the AOSP renderer** | `download/port_files/` (extend the patch series), rebuild via `app/rs/openglrenderer/build.sh` | S | `nm -D libOpenglRender_aosp.so | grep set_emugl` shows the 3 stubs; no link errors if future code expects them. |
+   193→   193→| 1.6 | **Add the explicit boot state machine to `TwoyiStatusManager`** | `app/src/main/java/io/twoyi/TwoyiStatusManager.java` (rewrite), `app/src/main/java/io/twoyi/Render2Activity.java` (subscribe) | M | UI shows one of 11 states (STOPPED, CHECKING_ENV, INSTALLING, STARTING_SVC, BOOTING, RUNNING, BOOT_COMPLETED, SHUTDOWN, ENV_FAILED, INSTALL_FAILED, BOOT_FAILED) instead of parsing log lines; transitions fire EventBus events. |
+   194→   194→| 1.7 | **Port `set_emugl_logger` to the Rust `log` crate** | `app/rs/src/renderer_bindings.rs`, `app/rs/src/lib.rs` | S | Renderer log lines appear in twoyi's standard log format (`[RENDERER INFO] …`) instead of going to stderr. |
+   195→   195→
+   196→   196→### 4.2 Dependencies
+   197→   197→
+   198→   198→- **1.2 depends on 1.1** — don't delete the legacy blob until the AOSP build is verified on arm64.
+   199→   199→- **1.3 has no dependencies** — can be done in parallel with 1.1.
+   200→   200→- **1.4 depends on 1.3** — `kr64` needs a rootfs to spawn into (or at least an empty dir to fail gracefully).
+   201→   201→- **1.5, 1.6, 1.7 are independent** — can be done by separate contributors in parallel.
+   202→   202→
+   203→   203→### 4.3 Phase 1 acceptance criteria (all must be true)
+   204→   204→
+   205→   205→1. `./gradlew assembleRelease -Pabis=all` produces a signed APK for both ABIs.
+   206→   206→2. The arm64 APK boots to the guest launcher on a real device with the open-source renderer (legacy blobs deleted).
+   207→   207→3. The x86_64 APK installs on redroid and reaches the `kr64` spawn point (logs `[KR64 INFO] kr64 daemon starting`).
+   208→   208→4. `cd app/rs/kr64 && cargo test` is green on CI.
+   209→   209→5. The boot state machine shows accurate status in the UI (no more "booting…" stuck forever).
+   210→   210→
+   211→   211→### 4.4 Risk factors
+   212→   212→
+   213→   213→| Risk | Likelihood | Impact | Mitigation |
+   214→   214→|---|---|---|---|
+   215→   215→| **AOSP renderer doesn't boot on arm64** (some legacy code path depends on the closed-source blob's behaviour) | Medium | High — would force keeping the blob | Bisect by feature: disable `startGBServer`, then `dl*_ex`, then `GraphicBuffer` one at a time to isolate the regression. |
+   216→   216→| **x86_64 rootfs build fails** (manifest rot, toolchain drift) | Medium | Medium — blocks x86_64 testing | Fall back to Path B (download a pre-built GSI and write a throwaway extractor). |
+   217→   217→| **`kr64` crashes on first real spawn** (unit tests don't cover the full argv parsing + device creation sequence in a real Android process) | Low | Low — just needs debugging | Skeleton has 26 tests including end-to-end smoke; any crash will be a small fix. |
+   218→   218→| **State machine refactor breaks the existing UI flow** | Low | Low — visible immediately | Keep the old `LogEvents` parsing as a fallback; feature-flag the new state machine behind `ProfileSettings.useNewStateMachine()`. |
+   219→   219→
+   220→   220→---
+   221→   221→
+   222→   222→## 5. Phase 2 — Open-Source Completion (Weeks 3–4)
+   223→   223→
+   224→   224→**Goal:** Eliminate the last closed-source native blob (`libadb.so`, 4.46 MB) and harden the open-source `libloader.so` (which was an "earlier Copilot work" deliverable and hasn't been audited against the deep reverse-engineering we later did on the legacy blob). After Phase 2, every native binary shipped in the APK is built from open-source code with a documented provenance chain.
+   225→   225→
+   226→   226→**Dependencies:** Phase 1.1 must have passed (so we know the AOSP renderer works and the legacy blob deletion in 1.2 is safe).
+   227→   227→
+   228→   228→### 5.1 The remaining closed-source inventory
+   229→   229→
+   230→   230→After Phase 1, the APK's `jniLibs/` will contain:
+   231→   231→
+   232→   232→| File | ABI | Size | Status | Source |
+   233→   233→|---|---|---|---|---|
+   234→   234→| `libOpenglRender.so` | arm64 + x86_64 | ~605 KB each | ✅ Open-source (AOSP emugl, Apache-2.0) | commit `47f8335`, `eb13449` |
+   235→   235→| `libloader.so` | arm64 + x86_64 | ~small | ✅ Open-source (Rust, `app/rs/loader/`, MPL-2.0) | commit `a33e8c5` |
+   236→   236→| `libtwoyi.so` | arm64 + x86_64 | ~medium | ✅ Open-source (Rust, `app/rs/`, MPL-2.0) | `ARCHITECTURE.md` |
+   237→   237→| `libadb.so` | arm64-only | 4.46 MB | 🔴 Closed-source (AOSP `adb` binary, Apache-2.0 source available) | `TWOYI_DISASSEMBLY_ANALYSIS.md` §3 |
+   238→   238→| `twoyi` | arm64-only | shell script | ✅ Open-source (`app/src/main/jniLibs/arm64-v8a/twoyi`) | — |
+   239→   239→| `libkr64.so` | arm64 + x86_64 | ~medium | ✅ Open-source (Rust, `app/rs/kr64/`, MPL-2.0) | commit `570e95e` |
+   240→   240→
+   241→   241→So Phase 2 has exactly one closed-source blob to eliminate: **`libadb.so`**. The user's task description also mentions `libloader.so` — that's already open-source (see above), but the Phase 2 hardening tasks below cover auditing it against the deep disassembly we now have.
+   242→   242→
+   243→   243→### 5.2 Tasks
+   244→   244→
+   245→   245→| # | Task | Files | Effort | Acceptance criteria |
+   246→   246→|---|---|---|---|---|
+   247→   247→| 2.1 | **Build `libadb.so` from AOSP source** | Clone `packages/modules/adb/` from AOSP, build with the existing `Android.bp` for `arm64-v8a` AND `x86_64`, rename the output `adb` binary to `libadb.so`, ship in `jniLibs/`. | M | `file jniLibs/arm64-v8a/libadb.so` reports `ELF 64-bit LSB executable, ARM aarch64, … Apache-2.0`; `file jniLibs/x86_64/libadb.so` reports `x86-64`; `adb version` (run inside the APK's extracted dir) prints `1.9.2` or newer; the binary is < 5 MB on each ABI (legacy was 4.46 MB arm64-only). |
+   248→   248→| 2.2 | **Delete the legacy `libadb.so`** | `app/src/main/jniLibs/arm64-v8a/libadb.so` (delete) | S | APK still builds; `adb` commands inside the container still work (verified by `adb shell` from inside the guest via the twoyi UI). |
+   249→   249→| 2.3 | **Audit `libloader.so` (Rust) against the legacy disassembly** | Cross-reference `app/rs/loader/src/lib.rs` against `TWOYI_DISASSEMBLY_ANALYSIS.md` §1. | S | Every behaviour documented in §1.2 of the disassembly analysis is implemented in the Rust crate; any gaps are filed as issues with a repro case. |
+   250→   250→| 2.4 | **Add `x86_64` build of `libadb.so`** | Same as 2.1 but for `x86_64`. The legacy blob was arm64-only — adding x86_64 unblocks ADB-from-container on the codespace. | S | `file jniLibs/x86_64/libadb.so` reports x86-64; `adb` commands work inside the container on redroid x86_64. |
+   251→   251→| 2.5 | **Document the provenance chain in `OPEN_SOURCE_LIBRARIES.md`** | `/home/z/my-project/OPEN_SOURCE_LIBRARIES.md` (rewrite) | S | Every `.so` and binary in `jniLibs/` has a documented source URL, license, build command, and verification step. A reviewer can reproduce the build by following the doc. |
+   252→   252→| 2.6 | **Add a CI job that rebuilds every native lib from source** | `.github/workflows/rebuild-natives.yml` (new) | M | On every push to `improvements/**`, the workflow rebuilds `libOpenglRender.so`, `libloader.so`, `libtwoyi.so`, `libadb.so`, `libkr64.so` from source and compares their hashes against the committed binaries. Hash mismatch fails the build. |
+   253→   253→
+   254→   254→### 5.3 Dependencies
+   255→   255→
+   256→   256→- **2.2 depends on 2.1** — don't delete the legacy blob until the rebuild is verified.
+   257→   257→- **2.4 depends on 2.1** — same build process, different target.
+   258→   258→- **2.5 depends on 2.1, 2.3** — the doc references the verified build commands.
+   259→   259→- **2.6 depends on 2.1, 2.4** — the reproducible-build check requires both ABIs to build.
+   260→   260→- **2.3 is independent** — pure audit work, can be done by reading.
+   261→   261→
+   262→   262→### 5.4 Phase 2 acceptance criteria
+   263→   263→
+   264→   264→1. `unzip -l app-release.apk | grep jniLibs` shows ZERO closed-source blobs (every entry has a documented open-source provenance).
+   265→   265→2. `libadb.so` is built for both `arm64-v8a` and `x86_64`.
+   266→   266→3. `OPEN_SOURCE_LIBRARIES.md` lists every native binary with source URL, license, build command, and verification step.
+   267→   267→4. The reproducible-build CI job is green.
+   268→   268→
+   269→   269→### 5.5 Risk factors
+   270→   270→
+   271→   271→| Risk | Likelihood | Impact | Mitigation |
+   272→   272→|---|---|---|---|
+   273→   273→| **AOSP `adb` build is slow / fragile** (the `Android.bp` build system has many dependencies) | Medium | Medium — blocks 2.1 | Use a minimal `mm` build of just the `adb` binary, not the full `packages/modules/adb/` tree. Or shell out to `make adb -j8` from a full AOSP checkout. |
+   274→   274→| **`libadb.so` size balloons on x86_64** (static linking of bionic + libcrypto + …) | Low | Low — APK gets bigger but still works | Acceptable. The legacy arm64 blob was 4.46 MB; an x86_64 build may be similar. |
+   275→   275→| **`libloader.so` audit reveals a missing feature** (some legacy code path the Rust crate doesn't implement) | Medium | Low — file as an issue and address later | The legacy `libloader.so` is the bootstrap loader for the old arm64 rootfs; the new renderer doesn't depend on it. Any gap is non-blocking. |
+   276→   276→| **Hash-mismatch CI job is too strict** (compiler version drift produces different hashes) | High | Low — annoying but not blocking | Compare symbol exports (`nm -D`) and file size, not byte-for-byte hash. Or document the expected toolchain version in the workflow. |
+   277→   277→
+   278→   278→---
+   279→   279→
+   280→   280→## 6. Phase 3 — GSI Boot MVP (Weeks 5–12)
+   281→   281→
+   282→   282→**Goal:** Boot an Android 11 x86_64 GSI to the launcher inside the twoyi container. No audio, no camera, no binder virtualisation (use the MVP workaround of patching `system_server`). This is the headline feature of the fork.
+   283→   283→
+   284→   284→**Dependencies:** Phase 1 (kr64 spawn path works, x86_64 rootfs available) and Phase 2 (no closed-source blobs — the GSI boot flow uses `libkr64.so` which is Rust/MPL-2.0). The `GSI_BOOT_PLAN.md` is the authoritative design doc for this phase — every task below references its sections.
+   285→   285→
+   286→   286→### 6.1 The 9 sub-projects (from `GSI_BOOT_PLAN.md` §3)
+   287→   287→
+   288→   288→| Sub-project | What it does | Files to create | Effort |
+   289→   289→|---|---|---|---|
+   290→   290→| §3.1 Kernel replacement daemon (the big one) | Materialise the virtual `/dev` tree (20+ devices), spawn the guest `init` with `LD_PRELOAD=libkr64.so`. | `app/rs/kr64/src/{main,devices,binder,proc_emu,seccomp,mount_mgr}.rs` (extend existing skeleton) | L |
+   291→   291→| §3.2 Binder virtualisation (the hard one) | Per-VM `/vm%d/dev/binder` + Java `IActivityManager` proxy. **Skip for MVP** — patch `system_server` to skip `publishService` instead. | `app/rs/kr64/src/binder.rs` (extend), `app/src/main/java/io/twoyi/BinderService.java` (new), guest-side `libbinder.so` shim | L (deferred to Phase 4) |
+   292→   292→| §3.3 Graphics buffer management (`/dev/gb` + `/dev/gb2`) | Char devices with `ALLOCATE`/`DUMP_DEBUG_INFO`/`GET_ALL_ALLOCATOR_FUNCTIONS` ioctls, routed through `libOpenglRender_aosp.so`'s `ColorBuffer`. | `app/rs/kr64/src/gb.rs` (new), `app/rs/kr64/src/devices.rs` (extend) | M |
+   293→   293→| §3.4 Seccomp filter | BPF program traps dangerous syscalls; SIGSYS handler emulates them. | `app/rs/kr64/src/seccomp.rs` (extend), `app/rs/kr64/src/bpf_filter.rs` (new) | M |
+   294→   294→| §3.5 `/proc` emulator | Synthesises `/proc/{cmdline,version,self/maps,self/status,mounts,…}`. | `app/rs/kr64/src/proc_emu.rs` (extend) | M |
+   295→   295→| §3.6 Inline hooking (shadowhook equivalent) | Intercept `open`/`openat`/`mount`/etc. in the guest. | `app/rs/kr64/src/hooks.rs` (new), guest-side LD_PRELOAD shim | L (can defer for MVP) |
+   296→   296→| §3.7 ROM extraction (GSI-aware) | Sparse-ext4 → raw ext4 → directory tree, `boot.img` ramdisk extraction, `vendor.img` synthesis. | `app/src/main/java/io/twoyi/utils/GsiExtractor.java` (new), `app/rs/gsi_extractor/` (new crate, optional) | M |
+   297→   297→| §3.8 Init configuration | Patch `/system/build.prop`, `/system/etc/init/hw/init.rc`, `/vendor/etc/init/*.rc`, `/system/etc/prop.default` so the guest talks to virtual devices. | `app/src/main/java/io/twoyi/utils/GsiInitPatcher.java` (new) | M |
+   298→   298→| §3.9 HAL virtualisation | Stub HALs for graphics (critical), keymaster, gatekeeper, health, power, vibrator. | `app/rs/hals/{graphics,keymaster,gatekeeper,health,power,vibrator}/` (new crates), `app/src/main/assets/vendor.img` (pre-built) | L |
+   299→   299→
+   300→   300→### 6.2 Tasks (ordered by the milestone plan in `GSI_BOOT_PLAN.md` §4.4)
+
+[showing lines 1-300 of 770; use offset=301 with limit to continue reading]

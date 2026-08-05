@@ -1,0 +1,1424 @@
+     1→// Copyright Disclaimer: AI-Generated Content
+     2→// This file was created by GitHub Copilot, an AI coding assistant.
+     3→// AI-generated content is not subject to copyright protection and is provided
+     4→// without any warranty, express or implied, including warranties of
+     5→// merchantability, fitness for a particular purpose, or non-infringement.
+     6→// Use at your own risk.
+     7→
+     8→// This Source Code Form is subject to the terms of the Mozilla Public
+     9→// License, v. 2.0. If a copy of the MPL was not distributed with this
+    10→// file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
+    11→
+    12→//! Virtual `/dev/audio` — bidirectional PCM pump.
+    13→//!
+    14→//! # Overview
+    15→//!
+    16→//! This module mirrors what Virtual Master's `libvm.so` does for audio
+    17→//! HAL virtualization (see `download/AUDIO_SENSOR_HAL.md` §1): it owns
+    18→//! a Unix-domain socket at `{rootfs}/dev/audio`, accepts the guest's
+    19→//! AudioFlinger connections, and pumps raw 16-bit PCM in both
+    20→//! directions between the guest and the host's `AudioTrack` /
+    21→//! `AudioRecord`.
+    22→//!
+    23→//! VM's `AudioService` is a *top-level* service (not under
+    24→//! `HALManager`) — instantiated directly by `VMInstance` alongside
+    25→//! Input/Display, because audio has hard real-time requirements (a
+    26→//! single blocked `write()` on the PCM path causes an audible glitch).
+    27→//! Twoyi mirrors that split: this module owns its own thread and has
+    28→//! no shared state with the other HALs.
+    29→//!
+    30→//! # Wire protocol — the 16-byte header
+    31→//!
+    32→//! Every connection begins with a 16-byte header sent by the guest:
+    33→//!
+    34→//! ```text
+    35→//!  offset  size  field         description
+    36→//!  ------  ----  -----------   ------------------------------------------
+    37→//!   0       4    magic         Little-endian u32, must be
+    38→//!                               [`AUDIO_HEADER_MAGIC`] = 0x4F444D41
+    39→//!                               (documented in AUDIO_SENSOR_HAL.md §3.1).
+    40→//!   4       1    direction     1 = PLAYBACK, 2 = CAPTURE
+    41→//!                               (see [`AUDIO_DIR_PLAYBACK`] /
+    42→//!                                [`AUDIO_DIR_CAPTURE`]).
+    43→//!   5       3    reserved      Must be zero (padding to align the
+    44→//!                               next u32 to offset 8). Ignored on read.
+    45→//!   8       4    sample_rate   Little-endian u32. INFORMATIONAL ONLY —
+    46→//!                               VM hard-codes 44 100 Hz for playback
+    47→//!                               and 11 025 Hz for capture regardless
+    48→//!                               of what the guest sends here.
+    49→//!  12       2    channels      Little-endian u16. INFORMATIONAL ONLY —
+    50→//!                               VM hard-codes stereo (2) for playback
+    51→//!                               and mono (1) for capture.
+    52→//!  14       2    reserved      Must be zero (trailing padding).
+    53→//!  ------  ----
+    54→//!  total = 16 bytes (see [`AUDIO_HEADER_SIZE`])
+    55→//! ```
+    56→//!
+    57→//! After the header, the connection carries a raw byte stream of
+    58→//! 16-bit PCM samples (host byte order, which on Android is always
+    59→//! little-endian). There is no length prefix, no framing, no
+    60→//! compression — the bytes flow continuously until the guest closes
+    61→//! the socket.
+    62→//!
+    63→//! # Playback flow (guest → host)
+    64→//!
+    65→//! ```text
+    66→//!   Guest AudioFlinger               Host (this module + Java)
+    67→//!   ──────────────────              ────────────────────────────
+    68→//!   PlaybackThread mixer
+    69→//!     → PCM_16BIT @ 44100 stereo
+    70→//!     → write(/dev/audio, buf, n)
+    71→//!                                    accept() on /dev/audio
+    72→//!                                    read 16-byte header (dir=Playback)
+    73→//!                                    [JNI up-call] acquireAudioTrack()
+    74→//!                                       → host AudioTrack (STREAM_MUSIC,
+    75→//!                                         44100, stereo, PCM_16BIT,
+    76→//!                                         MODE_STREAM)
+    77→//!                                    loop {
+    78→//!                                      recv(sock, buf, minBuf)
+    79→//!                                      [JNI up-call] writeAudioData(track, buf, n)
+    80→//!                                        → AudioTrack.write(buf, off, len)
+    81→//!                                    }
+    82→//!                                    [JNI up-call] releaseAudioTrack(track)
+    83→//!   close(/dev/audio)
+    84→//!                                    connection closed
+    85→//! ```
+    86→//!
+    87→//! # Capture flow (host → guest)
+    88→//!
+    89→//! ```text
+    90→//!   Guest AudioFlinger               Host (this module + Java)
+    91→//!   ──────────────────              ────────────────────────────
+    92→//!   RecordThread
+    93→//!     → read(/dev/audio, buf, n)
+    94→//!                                    accept() on /dev/audio
+    95→//!                                    read 16-byte header (dir=Capture)
+    96→//!                                    [JNI up-call] acquireAudioRecord()
+    97→//!                                       → host AudioRecord (MIC source,
+    98→//!                                         11025, mono, PCM_16BIT)
+    99→//!                                    loop {
+   100→//!                                      [JNI up-call] readRecordData(rec, buf, n)
+   101→//!                                        → AudioRecord.read(buf, off, len)
+   102→//!                                      send(sock, buf, n)
+   103→//!                                    }
+   104→//!                                    [JNI up-call] releaseAudioRecord(rec)
+   105→//!   close(/dev/audio)
+   106→//!                                    connection closed
+   107→//! ```
+   108→//!
+   109→//! # JNI callback interface
+   110→//!
+   111→//! The actual `AudioTrack` / `AudioRecord` integration lives on the
+   112→//! Java side (a future `io.twoyi.hal.AudioService.java` modeled on
+   113→//! VM's `com.android.vmcore.hal.AudioService`, 222 lines). This Rust
+   114→//! module invokes it via six JNI up-calls, each mirroring a private
+   115→//! method on VM's `AudioService` (see AUDIO_SENSOR_HAL.md §1.5):
+   116→//!
+   117→//!  | Rust function (stub here)       | Java method (VM's AudioService)              | Returns                  |
+   118→//!  |---------------------------------|-----------------------------------------------|--------------------------|
+   119→//!  | [`jni_acquire_audio_track`]     | `AudioTrack acquireAudioTrack(int[] minBuf)`  | `(jtrack, minBufSize)`   |
+   120→//!  | [`jni_acquire_audio_record`]    | `AudioRecord acquireAudioRecord(int[] minBuf)`| `(jrecord, minBufSize)`  |
+   121→//!  | [`jni_write_audio_data`]        | `int writeAudioData(AudioTrack, byte[], o, l)`| bytes written            |
+   122→//!  | [`jni_read_record_data`]        | `int readRecordData(AudioRecord, byte[], o, l)`| bytes read              |
+   123→//!  | [`jni_release_audio_track`]     | `void releaseAudioTrack(AudioTrack)`          | `()`                     |
+   124→//!  | [`jni_release_audio_record`]    | `void releaseAudioRecord(AudioRecord)`        | `()`                     |
+   125→//!
+   126→//! Each up-call would attach the current thread to the JVM (cached in
+   127→//! a thread-local), find the AudioService class + method by signature,
+   128→//! marshal the args, and return. For the skeleton these are **stubs
+   129→//! that return null/0** — they let the pump loop compile and exercise
+   130→//! the protocol, but no sound is actually produced. The real
+   131→//! implementation will replace these six functions (likely behind a
+   132→//! trait object so the Java side can be wired in without touching the
+   133→//! pump code).
+   134→//!
+   135→//! # Threading
+   136→//!
+   137→//! One accept thread + a fixed-size [`ThreadPool`] of pump workers
+   138→//! (mirrors the pattern in `binder.rs`). Each guest connection is
+   139→//! dispatched to a worker, which runs the appropriate pump loop until
+   140→//! the guest disconnects. Because the pump loops block on socket I/O,
+   141→//! the pool size bounds the maximum number of concurrent audio
+   142→//! streams — default 8, enough for media + ringtone + notification +
+   143→//! alarm + system + voice call + 2 spare (see
+   144→//! [`AUDIO_THREAD_POOL_SIZE`]).
+   145→//!
+   146→//! # Hard-coded format (matches VM)
+   147→//!
+   148→//! VM hard-codes the sample rate / channel count in
+   149→//! `acquireAudioTrack` / `acquireAudioRecord` (see
+   150→//! `download/AUDIO_SENSOR_HAL.md` §1.6 — verbatim from the decompiled
+   151→//! Java source):
+   152→//!
+   153→//!  | Direction | Rate (Hz) | Channels | Encoding   | Android constant                    |
+   154→//!  |-----------|----------:|---------:|------------|-------------------------------------|
+   155→//!  | Playback  |    44 100 |        2 | PCM_16BIT  | STREAM_MUSIC, CHANNEL_OUT_STEREO    |
+   156→//!  | Capture   |    11 025 |        1 | PCM_16BIT  | MIC source, CHANNEL_IN_MONO         |
+   157→//!
+   158→//! The header's `sample_rate` / `channels` fields are informational
+   159→//! only — they're sent by the guest but ignored by the host (the host
+   160→//! always creates an `AudioTrack` at 44 100 Hz stereo or an
+   161→//! `AudioRecord` at 11 025 Hz mono regardless). This means twoyi's
+   162→//! guest ROM **must** also expect these exact rates from its audio
+   163→//! HAL module. If a future twoyi ROM asks for 48 000 Hz, the host's
+   164→//! `AudioTrack` will still play it (Android resamples internally),
+   165→//! but the guest's perception of its own sample rate will be wrong.
+   166→//!
+   167→//! # Latency
+   168→//!
+   169→//! VM uses `AudioTrack` in `MODE_STREAM` which gives ~125 ms host-side
+   170→//! latency + ~80 ms guest AudioFlinger latency ≈ 200 ms total. For a
+   171→//! rhythm game this is perceptible. The fix is `AudioTrack.Builder`
+   172→//! with `setPerformanceMode(PERFORMANCE_MODE_LOW_LATENCY)` and
+   173→//! `setBufferSizeInFrames(192)` (API 26+) — drops to ~20 ms host-side.
+   174→//! This is a Java-only change in `acquireAudioTrack`; the Rust pump
+   175→//! doesn't care. Tracked as follow-up `AUDIO-IMPL-2`.
+   176→
+   177→use std::fs;
+   178→use std::io::{Read, Write};
+   179→use std::os::unix::fs::PermissionsExt;
+   180→use std::os::unix::io::{AsRawFd, RawFd};
+   181→use std::os::unix::net::{UnixListener, UnixStream};
+   182→use std::path::Path;
+   183→use std::sync::atomic::{AtomicBool, Ordering};
+   184→use std::sync::{mpsc, Arc, Mutex};
+   185→use std::thread::{self, JoinHandle};
+   186→
+   187→// Crate-local logging macros (defined in lib.rs) — no external `log` crate.
+   188→#[allow(unused_imports)]
+   189→use crate::{error, info, warning};
+   190→
+   191→// ============================================================================
+   192→// Constants
+   193→// ============================================================================
+   194→
+   195→/// Magic value at offset 0 of the audio header. Documented in
+   196→/// `download/AUDIO_SENSOR_HAL.md` §3.1. Both sides (guest audio HAL +
+   197→/// host pump) must agree on this value — what matters is the numeric
+   198→/// constant, not the ASCII interpretation.
+   199→pub const AUDIO_HEADER_MAGIC: u32 = 0x4F444D41;
+   200→
+   201→/// Total size of the audio header on the wire (and of the
+   202→/// [`AudioHeader`] struct via `#[repr(C)]`).
+   203→pub const AUDIO_HEADER_SIZE: usize = 16;
+   204→
+   205→/// Direction byte at offset 4 of the header: 1 = playback.
+   206→pub const AUDIO_DIR_PLAYBACK: u8 = 1;
+   207→
+   208→/// Direction byte at offset 4 of the header: 2 = capture.
+   209→pub const AUDIO_DIR_CAPTURE: u8 = 2;
+   210→
+   211→/// Hard-coded playback sample rate (Hz). Matches VM's `acquireAudioTrack`
+   212→/// (see AUDIO_SENSOR_HAL.md §1.6). Informational — the host always
+   213→/// creates an AudioTrack at this rate regardless of what the guest sends
+   214→/// in the header.
+   215→pub const PLAYBACK_SAMPLE_RATE: u32 = 44_100;
+   216→
+   217→/// Hard-coded playback channel count. 2 = stereo.
+   218→pub const PLAYBACK_CHANNELS: u16 = 2;
+   219→
+   220→/// Hard-coded capture sample rate (Hz). Matches VM's `acquireAudioRecord`
+   221→/// — note this is the voice rate 11.025 kHz, NOT 44.1.
+   222→pub const CAPTURE_SAMPLE_RATE: u32 = 11_025;
+   223→
+   224→/// Hard-coded capture channel count. 1 = mono.
+   225→pub const CAPTURE_CHANNELS: u16 = 1;
+   226→
+   227→/// Number of worker threads in the audio connection pool. Bounds the
+   228→/// maximum number of simultaneous audio streams the guest can open.
+   229→/// 8 covers media + ringtone + notification + alarm + system + voice
+   230→/// call + 2 spare.
+   231→pub const AUDIO_THREAD_POOL_SIZE: usize = 8;
+   232→
+   233→/// Default scratch-buffer size for the pump loops (8 KiB). The real
+   234→/// buffer size is `min(host_min_buf, 8 KiB)` clamped to ≥256 bytes —
+   235→/// the host's `AudioTrack.getMinBufferSize()` return value (typically
+   236→/// ~125 ms × 176 KB/s ≈ 22 KB for stereo 16-bit @ 44.1 kHz) wins when
+   237→/// available, but we cap it so a misbehaving Java side can't make us
+   238→/// allocate a huge buffer per connection.
+   239→pub const AUDIO_PUMP_BUF_SIZE: usize = 8 * 1024;
+   240→
+   241→// ============================================================================
+   242→// AudioDirection enum
+   243→// ============================================================================
+   244→
+   245→/// The direction of an audio connection, encoded as a single byte at
+   246→/// offset 4 of the header.
+   247→///
+   248→/// `#[repr(u8)]` so `as u8` gives the exact wire value.
+   249→#[repr(u8)]
+   250→#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   251→pub enum AudioDirection {
+   252→    /// Guest → host PCM stream. Host plays it via `AudioTrack`.
+   253→    Playback = AUDIO_DIR_PLAYBACK,
+   254→    /// Host → guest PCM stream. Host captures it via `AudioRecord`.
+   255→    Capture = AUDIO_DIR_CAPTURE,
+   256→}
+   257→
+   258→impl AudioDirection {
+   259→    /// Parse a raw direction byte. Returns `None` for unknown values.
+   260→    pub fn from_u8(v: u8) -> Option<Self> {
+   261→        match v {
+   262→            AUDIO_DIR_PLAYBACK => Some(Self::Playback),
+   263→            AUDIO_DIR_CAPTURE => Some(Self::Capture),
+   264→            _ => None,
+   265→        }
+   266→    }
+   267→
+   268→    /// The sample rate VM hard-codes for this direction.
+   269→    pub fn default_sample_rate(self) -> u32 {
+   270→        match self {
+   271→            Self::Playback => PLAYBACK_SAMPLE_RATE,
+   272→            Self::Capture => CAPTURE_SAMPLE_RATE,
+   273→        }
+   274→    }
+   275→
+   276→    /// The channel count VM hard-codes for this direction.
+   277→    pub fn default_channels(self) -> u16 {
+   278→        match self {
+   279→            Self::Playback => PLAYBACK_CHANNELS,
+   280→            Self::Capture => CAPTURE_CHANNELS,
+   281→        }
+   282→    }
+   283→}
+   284→
+   285→// ============================================================================
+   286→// AudioHeader struct (16 bytes on the wire)
+   287→// ============================================================================
+   288→
+   289→/// The 16-byte audio connection header.
+   290→///
+   291→/// Wire layout (little-endian, see module docs for the full table):
+   292→/// ```text
+   293→///   off 0:  magic        u32 LE
+   294→///   off 4:  direction    u8
+   295→///   off 5:  reserved     3 bytes (zero)
+   296→///   off 8:  sample_rate  u32 LE
+   297→///   off 12: channels     u16 LE
+   298→///   off 14: reserved     2 bytes (zero)
+   299→/// ```
+   300→///
+   301→/// `#[repr(C)]` makes the in-memory layout match the wire layout on
+   302→/// all supported targets (aarch64 / x86_64 — both little-endian with
+   303→/// the same struct padding rules). The compile-time assertion below
+   304→/// guarantees `size_of::<AudioHeader>() == 16`. For actual (de)serial-
+   305→/// isation we use explicit byte slicing via [`AudioHeader::to_bytes`]
+   306→/// / [`AudioHeader::from_bytes`] so the wire format is deterministic
+   307→/// regardless of host endianness or padding.
+   308→#[repr(C)]
+   309→#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   310→pub struct AudioHeader {
+   311→    /// Offset 0. Must be [`AUDIO_HEADER_MAGIC`].
+   312→    pub magic: u32,
+   313→    /// Offset 4. 1 = Playback, 2 = Capture.
+   314→    pub direction: u8,
+   315→    /// Offset 8. Informational — host ignores.
+   316→    pub sample_rate: u32,
+   317→    /// Offset 12. Informational — host ignores.
+   318→    pub channels: u16,
+   319→}
+   320→
+   321→// Compile-time assertion: the C-repr struct must be exactly 16 bytes.
+   322→// (3 bytes padding after `direction` to align `sample_rate`, plus 2
+   323→// bytes trailing padding after `channels`.)
+   324→const _: () = assert!(std::mem::size_of::<AudioHeader>() == AUDIO_HEADER_SIZE);
+   325→
+   326→impl AudioHeader {
+   327→    /// Construct a header with the given direction and the
+   328→    /// VM-hard-coded sample rate / channel count for that direction.
+   329→    pub fn new(direction: AudioDirection) -> Self {
+   330→        Self::with_format(direction, direction.default_sample_rate(), direction.default_channels())
+   331→    }
+   332→
+   333→    /// Construct a header with an explicit sample rate / channel
+   334→    /// count (used in tests; in production the host ignores these
+   335→    /// fields anyway).
+   336→    pub fn with_format(direction: AudioDirection, sample_rate: u32, channels: u16) -> Self {
+   337→        Self {
+   338→            magic: AUDIO_HEADER_MAGIC,
+   339→            direction: direction as u8,
+   340→            sample_rate,
+   341→            channels,
+   342→        }
+   343→    }
+   344→
+   345→    /// Parsed direction, or `None` if `self.direction` is not a
+   346→    /// recognised value.
+   347→    pub fn direction(&self) -> Option<AudioDirection> {
+   348→        AudioDirection::from_u8(self.direction)
+   349→    }
+   350→
+   351→    /// True if magic is correct and direction is recognised.
+   352→    pub fn is_valid(&self) -> bool {
+   353→        self.magic == AUDIO_HEADER_MAGIC && self.direction().is_some()
+   354→    }
+   355→
+   356→    /// Serialise to a 16-byte little-endian array. See the struct docs
+   357→    /// for the exact wire layout.
+   358→    pub fn to_bytes(&self) -> [u8; AUDIO_HEADER_SIZE] {
+   359→        let mut buf = [0u8; AUDIO_HEADER_SIZE];
+   360→        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
+   361→        buf[4] = self.direction;
+   362→        // bytes 5..8 are reserved (already zero)
+   363→        buf[8..12].copy_from_slice(&self.sample_rate.to_le_bytes());
+   364→        buf[12..14].copy_from_slice(&self.channels.to_le_bytes());
+   365→        // bytes 14..16 are reserved (already zero)
+   366→        buf
+   367→    }
+   368→
+   369→    /// Deserialise from a 16-byte (or longer) slice. Only the first
+   370→    /// 16 bytes are read; any trailing bytes are ignored (the caller
+   371→    /// is expected to read the header separately from the PCM stream).
+   372→    ///
+   373→    /// Returns an error if the buffer is too short, the magic is
+   374→    /// wrong, or the direction byte is not a recognised value.
+   375→    pub fn from_bytes(buf: &[u8]) -> Result<Self, AudioHeaderError> {
+   376→        if buf.len() < AUDIO_HEADER_SIZE {
+   377→            return Err(AudioHeaderError::TooShort { got: buf.len() });
+   378→        }
+   379→        let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+   380→        let direction = buf[4];
+   381→        let sample_rate = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+   382→        let channels = u16::from_le_bytes(buf[12..14].try_into().unwrap());
+   383→
+   384→        if magic != AUDIO_HEADER_MAGIC {
+   385→            return Err(AudioHeaderError::BadMagic { got: magic });
+   386→        }
+   387→        if AudioDirection::from_u8(direction).is_none() {
+   388→            return Err(AudioHeaderError::BadDirection { got: direction });
+   389→        }
+   390→
+   391→        Ok(Self { magic, direction, sample_rate, channels })
+   392→    }
+   393→}
+   394→
+   395→/// Error returned by [`AudioHeader::from_bytes`].
+   396→#[derive(Debug, Clone, PartialEq, Eq)]
+   397→pub enum AudioHeaderError {
+   398→    /// Buffer was shorter than 16 bytes.
+   399→    TooShort { got: usize },
+   400→    /// Magic value at offset 0 didn't match [`AUDIO_HEADER_MAGIC`].
+   401→    BadMagic { got: u32 },
+   402→    /// Direction byte at offset 4 wasn't 1 (Playback) or 2 (Capture).
+   403→    BadDirection { got: u8 },
+   404→}
+   405→
+   406→impl std::fmt::Display for AudioHeaderError {
+   407→    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   408→        match self {
+   409→            Self::TooShort { got } => write!(
+   410→                f,
+   411→                "audio header too short: got {} bytes, need {}",
+   412→                got, AUDIO_HEADER_SIZE
+   413→            ),
+   414→            Self::BadMagic { got } => write!(
+   415→                f,
+   416→                "audio header bad magic: got 0x{:08X}, expected 0x{:08X}",
+   417→                got, AUDIO_HEADER_MAGIC
+   418→            ),
+   419→            Self::BadDirection { got } => write!(
+   420→                f,
+   421→                "audio header bad direction: got {}, expected {} (Playback) or {} (Capture)",
+   422→                got, AUDIO_DIR_PLAYBACK, AUDIO_DIR_CAPTURE
+   423→            ),
+   424→        }
+   425→    }
+   426→}
+   427→
+   428→impl std::error::Error for AudioHeaderError {}
+   429→
+   430→// ============================================================================
+   431→// create_audio_device
+   432→// ============================================================================
+   433→
+   434→/// Create the virtual `/dev/audio` Unix socket inside `rootfs`.
+   435→///
+   436→/// Mirrors Virtual Master's pattern (see AUDIO_SENSOR_HAL.md §1.2):
+   437→/// the guest's `AudioFlinger` opens `/dev/audio`, `connect()`s, and
+   438→/// the host's audio pump (this module's [`AudioDevice::spawn`]) is on
+   439→/// the other end of the socket.
+   440→///
+   441→/// This is the audio-specific equivalent of `devices::create_touch_device`
+   442→/// / `create_key_device` / etc., but it returns an [`AudioDevice`] that
+   443→/// owns the listener directly (rather than a generic `DeviceSocket`),
+   444→/// because the audio pump needs its own accept thread + worker pool
+   445→/// and doesn't fit the simple "echo a byte and close" pattern the
+   446→/// other devices use in the MVP.
+   447→///
+   448→/// # Errors
+   449→///
+   450→/// Returns an error if directory creation or `UnixListener::bind`
+   451→/// fails. Stale socket files from a previous run are best-effort
+   452→/// removed before bind (errors are logged but not propagated).
+   453→pub fn create_audio_device(rootfs: &str) -> std::io::Result<AudioDevice> {
+   454→    let path = format!("{}/dev/audio", rootfs);
+   455→
+   456→    // Make sure {rootfs}/dev exists.
+   457→    if let Some(parent) = Path::new(&path).parent() {
+   458→        fs::create_dir_all(parent)?;
+   459→        #[cfg(unix)]
+   460→        {
+   461→            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+   462→        }
+   463→    }
+   464→
+   465→    // Remove stale socket file from a previous run. If the path is a
+   466→    // non-socket file we still try to remove it — `bind()` would fail
+   467→    // with EADDRINUSE otherwise.
+   468→    match fs::remove_file(&path) {
+   469→        Ok(()) => info!("[KR64][audio] removed stale socket: {}", path),
+   470→        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+   471→        Err(e) => warning!("[KR64][audio] could not remove {}: {}", path, e),
+   472→    }
+   473→
+   474→    // Bind. This creates the socket file as a side effect. (A
+   475→    // production version would first `mknodat(S_IFSOCK|0666)` then
+   476→    // `bind()` to it — matching VM's exact pattern at libkr64.so
+   477→    // offset 0x11d770 — but `mknodat` requires CAP_MKNOD which is
+   478→    // unavailable in many sandboxes. `UnixListener::bind` is the
+   479→    // unprivileged fallback and works fine for the skeleton.)
+   480→    let listener = UnixListener::bind(&path)?;
+   481→
+   482→    // chmod 0666 so the guest (which may run as a different uid
+   483→    // inside the chroot) can connect. UnixListener::bind creates the
+   484→    // file with mode 0755 by default (modified by umask).
+   485→    #[cfg(unix)]
+   486→    {
+   487→        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o666));
+   488→    }
+   489→
+   490→    info!(
+   491→        "[KR64][audio] bound unix socket: {} (fd={})",
+   492→        path,
+   493→        listener.as_raw_fd()
+   494→    );
+   495→
+   496→    Ok(AudioDevice {
+   497→        listener: Some(listener),
+   498→        path,
+   499→        shutdown: Arc::new(AtomicBool::new(false)),
+   500→    })
+   501→}
+   502→
+   503→// ============================================================================
+   504→// AudioDevice — owns the listener, spawns accept + pump threads
+   505→// ============================================================================
+   506→
+   507→/// A bound `/dev/audio` Unix socket, ready to accept guest connections.
+   508→///
+   509→/// Created by [`create_audio_device`]. Call [`AudioDevice::spawn`] to
+   510→/// start the accept thread + worker pool (consuming `self`); the
+   511→/// returned [`AudioDeviceHandle`] owns the running threads and will
+   512→/// shut them down on drop.
+   513→///
+   514→/// If `spawn` is not called, dropping the `AudioDevice` closes the
+   515→/// listener and unlinks the socket file.
+   516→pub struct AudioDevice {
+   517→    /// The listener itself. `Option<UnixListener>` so `spawn` can
+   518→    /// take it out (moving it into the accept thread) without
+   519→    /// disturbing the `path` field (needed for the `Drop` impl that
+   520→    /// unlinks the socket file).
+   521→    listener: Option<UnixListener>,
+   522→    /// The filesystem path the socket is bound to (so we can unlink
+   523→    /// it on drop, and so the caller can pass the path to `connect()`).
+   524→    path: String,
+   525→    /// Shutdown flag shared with the accept thread + the handle.
+   526→    /// Set to true by [`AudioDeviceHandle::shutdown`] / drop to ask
+   527→    /// the accept thread to exit.
+   528→    shutdown: Arc<AtomicBool>,
+   529→}
+   530→
+   531→impl AudioDevice {
+   532→    /// The filesystem path the socket is bound to.
+   533→    pub fn path(&self) -> &str {
+   534→        &self.path
+   535→    }
+   536→
+   537→    /// The raw file descriptor of the listener, or -1 if the listener
+   538→    /// has been taken (i.e. `spawn` was called).
+   539→    pub fn raw_fd(&self) -> RawFd {
+   540→        match self.listener.as_ref() {
+   541→            Some(l) => l.as_raw_fd(),
+   542→            None => -1,
+   543→        }
+   544→    }
+   545→
+   546→    /// Spawn the accept thread + worker pool, consuming self.
+   547→    ///
+   548→    /// Returns an [`AudioDeviceHandle`] that holds the shutdown flag
+   549→    /// and the accept-thread `JoinHandle`. When the handle is dropped,
+   550→    /// the shutdown flag is set and the accept thread is joined.
+   551→    pub fn spawn(mut self) -> std::io::Result<AudioDeviceHandle> {
+   552→        let listener = self
+   553→            .listener
+   554→            .take()
+   555→            .expect("AudioDevice::spawn: listener already taken");
+   556→
+   557→        // Make the listening socket non-blocking so the accept thread
+   558→        // can poll the shutdown flag between accept attempts (mirrors
+   559→        // BinderProxy::spawn in binder.rs).
+   560→        let fd = listener.as_raw_fd();
+   561→        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+   562→
+   563→        // Clone the shutdown Arc twice: one for the accept thread, one
+   564→        // for the returned handle. Both share the same AtomicBool.
+   565→        let shutdown_for_thread = Arc::clone(&self.shutdown);
+   566→        let shutdown_for_handle = Arc::clone(&self.shutdown);
+   567→        let path = self.path.clone();
+   568→
+   569→        let accept_thread = thread::Builder::new()
+   570→            .name("kr64-audio-accept".to_string())
+   571→            .spawn(move || {
+   572→                // The pool lives inside the accept thread so its Drop
+   573→                // (which joins workers) runs when the accept thread
+   574→                // exits. This ensures workers are joined BEFORE the
+   575→                // accept thread returns.
+   576→                let pool = ThreadPool::new(AUDIO_THREAD_POOL_SIZE);
+   577→                info!(
+   578→                    "[KR64][audio] accept loop started (pool_size={})",
+   579→                    AUDIO_THREAD_POOL_SIZE
+   580→                );
+   581→
+   582→                while !shutdown_for_thread.load(Ordering::Acquire) {
+   583→                    match listener.accept() {
+   584→                        Ok((stream, _addr)) => {
+   585→                            info!("[KR64][audio] client connected");
+   586→                            pool.execute(move || {
+   587→                                if let Err(e) = handle_connection(stream) {
+   588→                                    warning!("[KR64][audio] connection handler ended: {}", e);
+   589→                                }
+   590→                            });
+   591→                        }
+   592→                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+   593→                            // No pending connection — sleep briefly so
+   594→                            // we don't burn CPU.
+   595→                            std::thread::sleep(std::time::Duration::from_millis(25));
+   596→                        }
+   597→                        Err(e) => {
+   598→                            warning!("[KR64][audio] accept error: {}", e);
+   599→                            std::thread::sleep(std::time::Duration::from_millis(50));
+   600→                        }
+   601→                    }
+   602→                }
+   603→                info!("[KR64][audio] accept loop exiting");
+   604→                // pool drops here → workers receive Terminate and join.
+   605→            })?;
+   606→
+   607→        Ok(AudioDeviceHandle {
+   608→            shutdown: shutdown_for_handle,
+   609→            accept_thread: Some(accept_thread),
+   610→            path,
+   611→        })
+   612→    }
+   613→}
+   614→
+   615→impl Drop for AudioDevice {
+   616→    fn drop(&mut self) {
+   617→        // If the user dropped without calling spawn(), we still own
+   618→        // the listener — close it and unlink the socket file. If
+   619→        // spawn() was called, the listener was moved into the accept
+   620→        // thread and self.listener is None — in that case the
+   621→        // AudioDeviceHandle owns the unlink responsibility (and the
+   622→        // socket file must stay alive for guest connect()s).
+   623→        if self.listener.take().is_some() {
+   624→            let _ = fs::remove_file(&self.path);
+   625→        }
+   626→    }
+   627→}
+   628→
+   629→/// Handle to a running audio device. Dropping this sets the shutdown
+   630→/// flag and joins the accept thread.
+   631→///
+   632→/// Created by [`AudioDevice::spawn`]. The accept thread + worker pool
+   633→/// keep running until either the handle is dropped or
+   634→/// [`AudioDeviceHandle::shutdown`] is called.
+   635→pub struct AudioDeviceHandle {
+   636→    shutdown: Arc<AtomicBool>,
+   637→    accept_thread: Option<JoinHandle<()>>,
+   638→    path: String,
+   639→}
+   640→
+   641→impl AudioDeviceHandle {
+   642→    /// Ask the accept thread to shut down. (Does not join — that
+   643→    /// happens on drop.)
+   644→    pub fn shutdown(&self) {
+   645→        self.shutdown.store(true, Ordering::Release);
+   646→    }
+   647→
+   648→    /// The socket path the device is listening on.
+   649→    pub fn path(&self) -> &str {
+   650→        &self.path
+   651→    }
+   652→}
+   653→
+   654→impl Drop for AudioDeviceHandle {
+   655→    fn drop(&mut self) {
+   656→        self.shutdown.store(true, Ordering::Release);
+   657→        if let Some(t) = self.accept_thread.take() {
+   658→            let _ = t.join();
+   659→        }
+   660→        // Best-effort unlink the socket file so a re-run of the daemon
+   661→        // doesn't fail with EADDRINUSE.
+   662→        let _ = fs::remove_file(&self.path);
+   663→    }
+   664→}
+   665→
+   666→// ============================================================================
+   667→// Per-connection handler — dispatched to a worker thread by the accept loop.
+   668→// ============================================================================
+   669→
+   670→/// Handle one guest connection: read the header, dispatch to the
+   671→/// playback or capture pump. Returns when the guest disconnects (EOF),
+   672→/// the header is invalid, or a JNI up-call reports an error.
+   673→fn handle_connection(mut stream: UnixStream) -> std::io::Result<()> {
+   674→    // 1. Read the 16-byte header.
+   675→    let mut hdr_buf = [0u8; AUDIO_HEADER_SIZE];
+   676→    read_exact(&mut stream, &mut hdr_buf)?;
+   677→
+   678→    // 2. Parse + validate.
+   679→    let header = match AudioHeader::from_bytes(&hdr_buf) {
+   680→        Ok(h) => h,
+   681→        Err(e) => {
+   682→            warning!("[KR64][audio] rejecting connection: bad header: {}", e);
+   683→            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+   684→        }
+   685→    };
+   686→
+   687→    // from_bytes already validated direction, so unwrap is safe.
+   688→    let dir = header.direction().expect("from_bytes validated direction");
+   689→
+   690→    info!(
+   691→        "[KR64][audio] connection: direction={:?}, sample_rate={}, channels={}",
+   692→        dir, header.sample_rate, header.channels
+   693→    );
+   694→
+   695→    // 3. Dispatch to the appropriate pump loop.
+   696→    match dir {
+   697→        AudioDirection::Playback => handle_playback(&mut stream, header),
+   698→        AudioDirection::Capture => handle_capture(&mut stream, header),
+   699→    }
+   700→}
+   701→
+   702→/// Playback pump: guest writes PCM → we read from socket → call Java
+   703→/// `AudioTrack.write()` via the JNI stub. Returns when the guest
+   704→/// closes the socket (EOF) or the JNI up-call reports an error.
+   705→///
+   706→/// See the module docs for the full data-flow diagram.
+   707→fn handle_playback(stream: &mut UnixStream, header: AudioHeader) -> std::io::Result<()> {
+   708→    // 1. Acquire a host AudioTrack via the (stubbed) JNI up-call.
+   709→    //    VM's acquireAudioTrack ignores the rate/channel args and
+   710→    //    always creates a 44100/stereo/PCM_16BIT track; we pass the
+   711→    //    header's values anyway so a future Java side that DOES
+   712→    //    honour them will Just Work.
+   713→    let (track, min_buf) = jni_acquire_audio_track(header.sample_rate, header.channels);
+   714→    if track.is_null() {
+   715→        warning!(
+   716→            "[KR64][audio][playback] acquireAudioTrack returned null — closing connection \
+   717→             (JNI not yet wired up; sound will not be produced)"
+   718→        );
+   719→        return Ok(());
+   720→    }
+   721→
+   722→    // 2. Size the scratch buffer. Host's min_buf wins when available,
+   723→    //    capped to AUDIO_PUMP_BUF_SIZE so a misbehaving Java side
+   724→    //    can't make us allocate a huge buffer per connection.
+   725→    let buf_size = if min_buf > 0 {
+   726→        (min_buf as usize).min(AUDIO_PUMP_BUF_SIZE).max(256)
+   727→    } else {
+   728→        AUDIO_PUMP_BUF_SIZE
+   729→    };
+   730→    let mut buf = vec![0u8; buf_size];
+   731→
+   732→    // 3. Pump loop: read PCM from socket, push into AudioTrack.
+   733→    loop {
+   734→        let n = match stream.read(&mut buf) {
+   735→            Ok(0) => break, // guest closed the socket — clean shutdown
+   736→            Ok(n) => n,
+   737→            Err(e) => {
+   738→                warning!("[KR64][audio][playback] socket read error: {}", e);
+   739→                break;
+   740→            }
+   741→        };
+   742→
+   743→        // JNI up-call: AudioService.writeAudioData(track, buf, 0, n)
+   744→        let written = jni_write_audio_data(track, &buf[..n]);
+   745→        if written <= 0 {
+   746→            warning!("[KR64][audio][playback] writeAudioData returned {}", written);
+   747→            break;
+   748→        }
+   749→    }
+   750→
+   751→    // 4. Release the AudioTrack (frees the host AudioTrack + its
+   752→    //    buffer; matches VM's releaseAudioTrack).
+   753→    jni_release_audio_track(track);
+   754→    info!("[KR64][audio][playback] connection closed, track released");
+   755→    Ok(())
+   756→}
+   757→
+   758→/// Capture pump: call Java `AudioRecord.read()` via the JNI stub to
+   759→/// pull mic data → write to socket. Returns when the guest closes the
+   760→/// socket (write fails) or AudioRecord returns <=0.
+   761→///
+   762→/// See the module docs for the full data-flow diagram.
+   763→fn handle_capture(stream: &mut UnixStream, header: AudioHeader) -> std::io::Result<()> {
+   764→    // 1. Acquire a host AudioRecord via the (stubbed) JNI up-call.
+   765→    //    Returns null if RECORD_AUDIO permission isn't granted or the
+   766→    //    host has no mic — in either case we just close the connection.
+   767→    let (record, min_buf) = jni_acquire_audio_record(header.sample_rate, header.channels);
+   768→    if record.is_null() {
+   769→        warning!(
+   770→            "[KR64][audio][capture] acquireAudioRecord returned null — closing connection \
+   771→             (RECORD_AUDIO permission denied, no mic, or JNI not yet wired up)"
+   772→        );
+   773→        return Ok(());
+   774→    }
+   775→
+   776→    let buf_size = if min_buf > 0 {
+   777→        (min_buf as usize).min(AUDIO_PUMP_BUF_SIZE).max(256)
+   778→    } else {
+   779→        AUDIO_PUMP_BUF_SIZE
+   780→    };
+   781→    let mut buf = vec![0u8; buf_size];
+   782→
+   783→    // 2. Pump loop: pull mic data from AudioRecord, push to socket.
+   784→    loop {
+   785→        // JNI up-call: AudioService.readRecordData(record, buf, 0, len)
+   786→        let n = jni_read_record_data(record, &mut buf);
+   787→        if n <= 0 {
+   788→            warning!("[KR64][audio][capture] readRecordData returned {}", n);
+   789→            break;
+   790→        }
+   791→        if let Err(e) = stream.write_all(&buf[..n as usize]) {
+   792→            warning!("[KR64][audio][capture] socket write error: {}", e);
+   793→            break;
+   794→        }
+   795→    }
+   796→
+   797→    // 3. Release the AudioRecord.
+   798→    jni_release_audio_record(record);
+   799→    info!("[KR64][audio][capture] connection closed, record released");
+   800→    Ok(())
+   801→}
+   802→
+   803→// ============================================================================
+   804→// JNI up-call stubs.
+   805→//
+   806→// These mirror VM's `acquireAudioTrack`, `acquireAudioRecord`,
+   807→// `writeAudioData`, `readRecordData`, `releaseAudioTrack`,
+   808→// `releaseAudioRecord` private methods (see AUDIO_SENSOR_HAL.md §1.5).
+   809→// Each one, in the real implementation, would:
+   810→//   1. Attach the current thread to the JVM (cached in a thread-local
+   811→//      so the first call on each worker thread pays the attach cost
+   812→//      and subsequent calls are free).
+   813→//   2. Find the AudioService class + method by signature.
+   814→//   3. Call the method, marshal args/returns.
+   815→//   4. Return the Java object ref (for acquire) or the int (for
+   816→//      read/write). The acquire functions also return the host's
+   817→//      min-buffer-size (via the int[1] out-param in Java) so the pump
+   818→//      can size its scratch buffer.
+   819→//
+   820→// For the skeleton these are no-ops returning null/0 — they let the
+   821→// pump loop compile and exercise the protocol, but no sound is
+   822→// actually produced. The real implementation will replace these six
+   823→// functions (likely behind a trait object so the Java side can be
+   824→// wired in without touching the pump code).
+   825→// ============================================================================
+   826→
+   827→/// Opaque handle to a host `AudioTrack` or `AudioRecord` object.
+   828→///
+   829→/// In the real implementation this would be a `jni::sys::jobject`
+   830→/// (global ref). For the skeleton it's a `*mut c_void` so we can pass
+   831→/// it around without pulling in the `jni` crate. The stubs never
+   832→/// actually allocate anything, so this is always null in the skeleton.
+   833→pub type JniObject = *mut std::ffi::c_void;
+   834→
+   835→/// `AudioService.acquireAudioTrack(int[] outMinBuf)` → returns a
+   836→/// playing `AudioTrack`. Stubbed: returns `(null, 0)` — no JNI in
+   837→/// skeleton.
+   838→///
+   839→/// Real implementation: attach current thread to JVM, find AudioService
+   840→/// class, call `acquireAudioTrack([I)Landroid/media/AudioTrack;`,
+   841→/// read `outMinBuf[0]` for the buffer size, return the jobject as a
+   842→/// global ref.
+   843→fn jni_acquire_audio_track(_sample_rate: u32, _channels: u16) -> (JniObject, i32) {
+   844→    // Skeleton: return null + 0. handle_playback treats null as
+   845→    // "no audio output available" and gracefully closes the connection.
+   846→    (std::ptr::null_mut(), 0)
+   847→}
+   848→
+   849→/// `AudioService.acquireAudioRecord(int[] outMinBuf)` → returns a
+   850→/// recording `AudioRecord`. Stubbed: returns `(null, 0)`.
+   851→fn jni_acquire_audio_record(_sample_rate: u32, _channels: u16) -> (JniObject, i32) {
+   852→    (std::ptr::null_mut(), 0)
+   853→}
+   854→
+   855→/// `AudioService.writeAudioData(AudioTrack t, byte[] buf, int off, int len)`
+   856→/// → returns bytes written. Stubbed: returns 0 (so the pump loop exits).
+   857→fn jni_write_audio_data(_track: JniObject, _buf: &[u8]) -> i32 {
+   858→    0
+   859→}
+   860→
+   861→/// `AudioService.readRecordData(AudioRecord r, byte[] buf, int off, int len)`
+   862→/// → returns bytes read. Stubbed: returns 0 (so the pump loop exits).
+   863→fn jni_read_record_data(_record: JniObject, _buf: &mut [u8]) -> i32 {
+   864→    0
+   865→}
+   866→
+   867→/// `AudioService.releaseAudioTrack(AudioTrack t)` — releases the host
+   868→/// AudioTrack. Stubbed: no-op.
+   869→fn jni_release_audio_track(_track: JniObject) {}
+   870→
+   871→/// `AudioService.releaseAudioRecord(AudioRecord r)` — releases the host
+   872→/// AudioRecord. Stubbed: no-op.
+   873→fn jni_release_audio_record(_record: JniObject) {}
+   874→
+   875→// ============================================================================
+   876→// Minimal thread pool — fixed-size, MPMC via std::sync::mpsc.
+   877→//
+   878→// We can't add `rayon` / `crossbeam` / etc. (the crate is std + libc
+   879→// only), so we roll our own. This is the classic Rust-book ThreadPool
+   880→// with a Terminate control message added for clean shutdown. Mirrors
+   881→// the implementation in binder.rs (kept private to each module to
+   882→// keep them self-contained).
+   883→// ============================================================================
+   884→
+   885→type Job = Box<dyn FnOnce() + Send + 'static>;
+   886→
+   887→enum Message {
+   888→    Job(Job),
+   889→    Terminate,
+   890→}
+   891→
+   892→struct Worker {
+   893→    thread: Option<JoinHandle<()>>,
+   894→}
+   895→
+   896→impl Worker {
+   897→    fn new(receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Self {
+   898→        let thread = thread::Builder::new()
+   899→            .name("kr64-audio-worker".to_string())
+   900→            .spawn(move || loop {
+   901→                let msg = receiver.lock().unwrap().recv();
+   902→                match msg {
+   903→                    Ok(Message::Job(job)) => job(),
+   904→                    Ok(Message::Terminate) | Err(_) => break,
+   905→                }
+   906→            })
+   907→            .expect("spawn kr64 audio worker");
+   908→        Worker { thread: Some(thread) }
+   909→    }
+   910→}
+   911→
+   912→/// A fixed-size thread pool. Used by [`AudioDevice`] to handle multiple
+   913→/// concurrent guest connections.
+   914→pub struct ThreadPool {
+   915→    workers: Vec<Worker>,
+   916→    sender: Option<mpsc::Sender<Message>>,
+   917→}
+   918→
+   919→impl ThreadPool {
+   920→    /// Create a pool with `size` worker threads. Panics if `size == 0`.
+   921→    pub fn new(size: usize) -> Self {
+   922→        assert!(size > 0, "ThreadPool::new: size must be > 0");
+   923→        let (sender, receiver) = mpsc::channel();
+   924→        let receiver = Arc::new(Mutex::new(receiver));
+   925→        let mut workers = Vec::with_capacity(size);
+   926→        for _ in 0..size {
+   927→            workers.push(Worker::new(Arc::clone(&receiver)));
+   928→        }
+   929→        ThreadPool {
+   930→            workers,
+   931→            sender: Some(sender),
+   932→        }
+   933→    }
+   934→
+   935→    /// Submit a job to the pool. If all workers are busy, the job is
+   936→    /// queued until one becomes free.
+   937→    pub fn execute<F>(&self, f: F)
+   938→    where
+   939→        F: FnOnce() + Send + 'static,
+   940→    {
+   941→        if let Some(s) = &self.sender {
+   942→            if s.send(Message::Job(Box::new(f))).is_err() {
+   943→                warning!("[KR64][audio] thread pool: sender closed, job dropped");
+   944→            }
+   945→        }
+   946→    }
+   947→}
+   948→
+   949→impl Drop for ThreadPool {
+   950→    fn drop(&mut self) {
+   951→        // Send Terminate to each worker so their recv() returns and
+   952→        // they exit cleanly.
+   953→        if let Some(s) = self.sender.take() {
+   954→            for _ in &self.workers {
+   955→                let _ = s.send(Message::Terminate);
+   956→            }
+   957→        }
+   958→        // Join each worker so we don't leak threads.
+   959→        for w in &mut self.workers {
+   960→            if let Some(t) = w.thread.take() {
+   961→                let _ = t.join();
+   962→            }
+   963→        }
+   964→    }
+   965→}
+   966→
+   967→// ============================================================================
+   968→// I/O helpers.
+   969→// ============================================================================
+   970→
+   971→/// Read exactly `buf.len()` bytes from `s`, blocking until all bytes
+   972→/// are available or the peer closes (returns `UnexpectedEof`).
+   973→fn read_exact(s: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<()> {
+   974→    let mut filled = 0;
+   975→    while filled < buf.len() {
+   976→        let n = s.read(&mut buf[filled..])?;
+   977→        if n == 0 {
+   978→            return Err(std::io::ErrorKind::UnexpectedEof.into());
+   979→        }
+   980→        filled += n;
+   981→    }
+   982→    Ok(())
+   983→}
+   984→
+   985→// ============================================================================
+   986→// Tests — pure-Rust, no Android/JNI deps, so they run on the host too.
+   987→// (cargo test --lib)
+   988→// ============================================================================
+   989→#[cfg(test)]
+   990→mod tests {
+   991→    use super::*;
+   992→    use std::env;
+   993→    use std::os::unix::net::UnixStream;
+   994→    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+   995→    use std::time::Duration;
+   996→
+   997→    static COUNTER: AtomicU64 = AtomicU64::new(0);
+   998→
+   999→    /// Each test gets a UNIQUE tmpdir so parallel tests don't collide
+  1000→    /// on the same socket path (which would cause EADDRINUSE on bind).
+  1001→    /// Mirrors the pattern in binder.rs's test module.
+  1002→    fn tmpdir() -> String {
+  1003→        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+  1004→        let mut p = env::temp_dir();
+  1005→        p.push(format!("kr64-audio-test-{}-{}", std::process::id(), n));
+  1006→        fs::create_dir_all(&p).unwrap();
+  1007→        p.to_string_lossy().to_string()
+  1008→    }
+  1009→
+  1010→    // -------- AudioHeader struct layout --------------------------------
+  1011→
+  1012→    #[test]
+  1013→    fn audio_header_size_is_16_bytes() {
+  1014→        // Compile-time assertion exists at the top of the file
+  1015→        // (`const _: () = assert!(size_of::<AudioHeader>() == 16);`),
+  1016→        // but assert again at runtime for clarity in test output.
+  1017→        assert_eq!(std::mem::size_of::<AudioHeader>(), AUDIO_HEADER_SIZE);
+  1018→    }
+  1019→
+  1020→    // -------- AudioHeader serialization roundtrips ---------------------
+  1021→
+  1022→    #[test]
+  1023→    fn audio_header_roundtrip_playback() {
+  1024→        let h = AudioHeader::new(AudioDirection::Playback);
+  1025→        assert_eq!(h.magic, AUDIO_HEADER_MAGIC);
+  1026→        assert_eq!(h.direction, AUDIO_DIR_PLAYBACK);
+  1027→        assert_eq!(h.sample_rate, PLAYBACK_SAMPLE_RATE);
+  1028→        assert_eq!(h.channels, PLAYBACK_CHANNELS);
+  1029→
+  1030→        let bytes = h.to_bytes();
+  1031→        assert_eq!(bytes.len(), AUDIO_HEADER_SIZE);
+  1032→
+  1033→        let h2 = AudioHeader::from_bytes(&bytes).expect("from_bytes");
+  1034→        assert_eq!(h, h2);
+  1035→    }
+  1036→
+  1037→    #[test]
+  1038→    fn audio_header_roundtrip_capture() {
+  1039→        let h = AudioHeader::new(AudioDirection::Capture);
+  1040→        assert_eq!(h.direction, AUDIO_DIR_CAPTURE);
+  1041→        assert_eq!(h.sample_rate, CAPTURE_SAMPLE_RATE);
+  1042→        assert_eq!(h.channels, CAPTURE_CHANNELS);
+  1043→
+  1044→        let bytes = h.to_bytes();
+  1045→        let h2 = AudioHeader::from_bytes(&bytes).expect("from_bytes");
+  1046→        assert_eq!(h, h2);
+  1047→    }
+  1048→
+  1049→    #[test]
+  1050→    fn audio_header_roundtrip_custom_format() {
+  1051→        // VM ignores these fields, but the protocol still has to
+  1052→        // round-trip them faithfully (a guest that asks for 48 kHz
+  1053→        // 5.1 should be able to read its own header back).
+  1054→        let h = AudioHeader::with_format(AudioDirection::Playback, 48_000, 6);
+  1055→        let bytes = h.to_bytes();
+  1056→        let h2 = AudioHeader::from_bytes(&bytes).expect("from_bytes");
+  1057→        assert_eq!(h, h2);
+  1058→        assert_eq!(h2.sample_rate, 48_000);
+  1059→        assert_eq!(h2.channels, 6);
+  1060→    }
+  1061→
+  1062→    #[test]
+  1063→    fn audio_header_reserved_bytes_are_zero() {
+  1064→        // The wire format reserves bytes 5..8 and 14..16 — make sure
+  1065→        // to_bytes always writes zero there (a future Rust struct
+  1066→        // field added in those slots must not leak into the wire).
+  1067→        let h = AudioHeader::new(AudioDirection::Playback);
+  1068→        let b = h.to_bytes();
+  1069→        assert_eq!(&b[5..8], &[0, 0, 0], "reserved bytes 5..8 must be zero");
+  1070→        assert_eq!(&b[14..16], &[0, 0], "reserved bytes 14..16 must be zero");
+  1071→    }
+  1072→
+  1073→    #[test]
+  1074→    fn audio_header_from_bytes_ignores_trailing_bytes() {
+  1075→        // The caller may pass a buffer that's longer than 16 bytes
+  1076→        // (e.g. the header + the first chunk of PCM). Only the first
+  1077→        // 16 bytes should be consumed.
+  1078→        let h = AudioHeader::new(AudioDirection::Playback);
+  1079→        let mut buf = h.to_bytes().to_vec();
+  1080→        buf.extend_from_slice(&[0xAA; 32]); // fake PCM payload
+  1081→        let h2 = AudioHeader::from_bytes(&buf).expect("from_bytes");
+  1082→        assert_eq!(h, h2);
+  1083→    }
+  1084→
+  1085→    // -------- AudioHeader validation -----------------------------------
+  1086→
+  1087→    #[test]
+  1088→    fn audio_header_from_bytes_rejects_short_buffer() {
+  1089→        let short = [0u8; 8];
+  1090→        let r = AudioHeader::from_bytes(&short);
+  1091→        assert_eq!(r, Err(AudioHeaderError::TooShort { got: 8 }));
+  1092→    }
+  1093→
+  1094→    #[test]
+  1095→    fn audio_header_from_bytes_rejects_bad_magic() {
+  1096→        let mut b = AudioHeader::new(AudioDirection::Playback).to_bytes();
+  1097→        // Corrupt magic at offset 0..4.
+  1098→        b[0..4].copy_from_slice(&0xDEADBEEFu32.to_le_bytes());
+  1099→        let r = AudioHeader::from_bytes(&b);
+  1100→        assert_eq!(r, Err(AudioHeaderError::BadMagic { got: 0xDEADBEEF }));
+  1101→    }
+  1102→
+  1103→    #[test]
+  1104→    fn audio_header_from_bytes_rejects_bad_direction() {
+  1105→        let mut b = AudioHeader::new(AudioDirection::Playback).to_bytes();
+  1106→        b[4] = 99; // invalid direction
+  1107→        let r = AudioHeader::from_bytes(&b);
+  1108→        assert_eq!(r, Err(AudioHeaderError::BadDirection { got: 99 }));
+  1109→    }
+  1110→
+  1111→    #[test]
+  1112→    fn audio_header_from_bytes_rejects_zero_direction() {
+  1113→        let mut b = AudioHeader::new(AudioDirection::Playback).to_bytes();
+  1114→        b[4] = 0; // 0 is not a valid direction
+  1115→        let r = AudioHeader::from_bytes(&b);
+  1116→        assert_eq!(r, Err(AudioHeaderError::BadDirection { got: 0 }));
+  1117→    }
+  1118→
+  1119→    #[test]
+  1120→    fn audio_header_is_valid_checks_magic_and_direction() {
+  1121→        let good = AudioHeader::new(AudioDirection::Playback);
+  1122→        assert!(good.is_valid());
+  1123→
+  1124→        let mut bad_magic = good;
+  1125→        bad_magic.magic = 0x12345678;
+  1126→        assert!(!bad_magic.is_valid());
+  1127→
+  1128→        let mut bad_dir = good;
+  1129→        bad_dir.direction = 99;
+  1130→        assert!(!bad_dir.is_valid());
+  1131→    }
+  1132→
+  1133→    #[test]
+  1134→    fn audio_header_error_display_is_informative() {
+  1135→        let e = AudioHeaderError::TooShort { got: 4 };
+  1136→        assert!(e.to_string().contains("4"));
+  1137→        assert!(e.to_string().contains("16"));
+  1138→
+  1139→        let e = AudioHeaderError::BadMagic { got: 0xDEADBEEF };
+  1140→        assert!(e.to_string().contains("0xDEADBEEF"));
+  1141→        assert!(e.to_string().contains("0x4F444D41"));
+  1142→
+  1143→        let e = AudioHeaderError::BadDirection { got: 99 };
+  1144→        assert!(e.to_string().contains("99"));
+  1145→        assert!(e.to_string().contains("Playback"));
+  1146→    }
+  1147→
+  1148→    // -------- AudioDirection enum --------------------------------------
+  1149→
+  1150→    #[test]
+  1151→    fn audio_direction_from_u8_roundtrip() {
+  1152→        assert_eq!(
+  1153→            AudioDirection::from_u8(AUDIO_DIR_PLAYBACK),
+  1154→            Some(AudioDirection::Playback)
+  1155→        );
+  1156→        assert_eq!(
+  1157→            AudioDirection::from_u8(AUDIO_DIR_CAPTURE),
+  1158→            Some(AudioDirection::Capture)
+  1159→        );
+  1160→        assert_eq!(AudioDirection::from_u8(0), None);
+  1161→        assert_eq!(AudioDirection::from_u8(3), None);
+  1162→        assert_eq!(AudioDirection::from_u8(255), None);
+  1163→    }
+  1164→
+  1165→    #[test]
+  1166→    fn audio_direction_repr_matches_wire_byte() {
+  1167→        // `#[repr(u8)]` makes `as u8` give the exact wire value.
+  1168→        assert_eq!(AudioDirection::Playback as u8, AUDIO_DIR_PLAYBACK);
+  1169→        assert_eq!(AudioDirection::Capture as u8, AUDIO_DIR_CAPTURE);
+  1170→    }
+  1171→
+  1172→    #[test]
+  1173→    fn audio_direction_defaults_match_vm() {
+  1174→        // VM hard-codes these (see AUDIO_SENSOR_HAL.md §1.6).
+  1175→        // Don't change them without breaking protocol compat.
+  1176→        assert_eq!(AudioDirection::Playback.default_sample_rate(), 44_100);
+  1177→        assert_eq!(AudioDirection::Playback.default_channels(), 2);
+  1178→        assert_eq!(AudioDirection::Capture.default_sample_rate(), 11_025);
+  1179→        assert_eq!(AudioDirection::Capture.default_channels(), 1);
+  1180→    }
+  1181→
+  1182→    // -------- create_audio_device --------------------------------------
+  1183→
+  1184→    #[test]
+  1185→    fn create_audio_device_creates_socket() {
+  1186→        let rootfs = tmpdir();
+  1187→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1188→
+  1189→        assert!(Path::new(&dev.path).exists(), "socket file should exist");
+  1190→        assert!(dev.path.ends_with("/dev/audio"));
+  1191→        assert!(dev.raw_fd() >= 0);
+  1192→
+  1193→        // drop should unlink the socket file (DeviceSocket::Drop).
+  1194→        let path = dev.path.clone();
+  1195→        drop(dev);
+  1196→        assert!(!Path::new(&path).exists(), "socket file should be unlinked on drop");
+  1197→
+  1198→        let _ = fs::remove_dir_all(&rootfs);
+  1199→    }
+  1200→
+  1201→    #[test]
+  1202→    fn create_audio_device_creates_dev_dir_if_missing() {
+  1203→        let rootfs = tmpdir();
+  1204→        // {rootfs}/dev doesn't exist yet — create_audio_device must
+  1205→        // make it.
+  1206→        assert!(!Path::new(&format!("{}/dev", rootfs)).exists());
+  1207→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1208→        assert!(Path::new(&format!("{}/dev", rootfs)).exists());
+  1209→        assert!(Path::new(&dev.path).exists());
+  1210→        drop(dev);
+  1211→        let _ = fs::remove_dir_all(&rootfs);
+  1212→    }
+  1213→
+  1214→    #[test]
+  1215→    fn create_audio_device_replaces_stale_socket() {
+  1216→        let rootfs = tmpdir();
+  1217→        // First bind.
+  1218→        let dev1 = create_audio_device(&rootfs).expect("first create");
+  1219→        let path = dev1.path.clone();
+  1220→        drop(dev1);
+  1221→        // path is now unlinked by Drop. But simulate a stale socket
+  1222→        // by creating a regular file at the same path.
+  1223→        fs::write(&path, b"stale").unwrap();
+  1224→        assert!(Path::new(&path).exists());
+  1225→
+  1226→        // Second bind should succeed (the stale file is removed first).
+  1227→        let dev2 = create_audio_device(&rootfs).expect("second create over stale");
+  1228→        assert!(Path::new(&path).exists());
+  1229→        drop(dev2);
+  1230→        let _ = fs::remove_dir_all(&rootfs);
+  1231→    }
+  1232→
+  1233→    // -------- AudioDevice::spawn + connection handling ----------------
+  1234→
+  1235→    #[test]
+  1236→    fn audio_device_spawn_accepts_playback_connection() {
+  1237→        let rootfs = tmpdir();
+  1238→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1239→        let path = dev.path().to_string();
+  1240→        let handle = dev.spawn().expect("spawn");
+  1241→
+  1242→        // Give the accept thread a moment to start.
+  1243→        std::thread::sleep(Duration::from_millis(50));
+  1244→
+  1245→        // Connect and send a valid playback header. The stubbed
+  1246→        // jni_acquire_audio_track returns (null, 0), so the handler
+  1247→        // logs a warning and returns Ok — the stream is closed by the
+  1248→        // handler side.
+  1249→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1250→        let hdr = AudioHeader::new(AudioDirection::Playback);
+  1251→        stream.write_all(&hdr.to_bytes()).expect("write header");
+  1252→
+  1253→        // Wait for the worker to process the connection.
+  1254→        std::thread::sleep(Duration::from_millis(50));
+  1255→        drop(stream);
+  1256→
+  1257→        // A second connection should still work (worker pool doesn't
+  1258→        // leak threads).
+  1259→        let mut s2 = UnixStream::connect(&path).expect("connect 2");
+  1260→        let hdr2 = AudioHeader::new(AudioDirection::Capture);
+  1261→        s2.write_all(&hdr2.to_bytes()).expect("write header 2");
+  1262→        std::thread::sleep(Duration::from_millis(50));
+  1263→
+  1264→        drop(s2);
+  1265→        drop(handle);
+  1266→        assert!(!Path::new(&path).exists(), "socket unlinked on handle drop");
+  1267→        let _ = fs::remove_dir_all(&rootfs);
+  1268→    }
+  1269→
+  1270→    #[test]
+  1271→    fn audio_device_spawn_rejects_bad_header() {
+  1272→        let rootfs = tmpdir();
+  1273→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1274→        let path = dev.path().to_string();
+  1275→        let handle = dev.spawn().expect("spawn");
+  1276→
+  1277→        std::thread::sleep(Duration::from_millis(50));
+  1278→
+  1279→        // Send a header with a bad magic — the handler should return
+  1280→        // Err (logged as a warning), then drop the stream.
+  1281→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1282→        let mut bad = AudioHeader::new(AudioDirection::Playback).to_bytes();
+  1283→        bad[0..4].copy_from_slice(&0xBADC0FFEu32.to_le_bytes());
+  1284→        stream.write_all(&bad).expect("write bad header");
+  1285→
+  1286→        // Wait for the worker to process and close.
+  1287→        std::thread::sleep(Duration::from_millis(50));
+  1288→
+  1289→        // The server side has closed the stream — a subsequent read
+  1290→        // should return 0 (EOF) or a connection-reset error.
+  1291→        let mut buf = [0u8; 4];
+  1292→        let _ = stream.read(&mut buf); // may return 0 or Err — both are fine
+  1293→
+  1294→        drop(stream);
+  1295→        drop(handle);
+  1296→        let _ = fs::remove_dir_all(&rootfs);
+  1297→    }
+  1298→
+  1299→    #[test]
+  1300→    fn audio_device_spawn_rejects_short_header() {
+  1301→        let rootfs = tmpdir();
+  1302→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1303→        let path = dev.path().to_string();
+  1304→        let handle = dev.spawn().expect("spawn");
+  1305→
+  1306→        std::thread::sleep(Duration::from_millis(50));
+  1307→
+  1308→        // Connect and send only 4 bytes (less than the 16-byte
+  1309→        // header), then close. The handler's read_exact should hit
+  1310→        // UnexpectedEof and return Err.
+  1311→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1312→        stream.write_all(&[1, 2, 3, 4]).expect("write short");
+  1313→        // Close the write side so the server's read returns EOF.
+  1314→        let _ = stream.shutdown(std::net::Shutdown::Write);
+  1315→
+  1316→        std::thread::sleep(Duration::from_millis(50));
+  1317→
+  1318→        drop(stream);
+  1319→        drop(handle);
+  1320→        let _ = fs::remove_dir_all(&rootfs);
+  1321→    }
+  1322→
+  1323→    #[test]
+  1324→    fn audio_device_handle_shutdown_joins_thread() {
+  1325→        let rootfs = tmpdir();
+  1326→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1327→        let path = dev.path().to_string();
+  1328→        let handle = dev.spawn().expect("spawn");
+  1329→        std::thread::sleep(Duration::from_millis(50));
+  1330→
+  1331→        // Explicit shutdown — should signal the accept thread.
+  1332→        handle.shutdown();
+  1333→        // Drop joins the accept thread.
+  1334→        drop(handle);
+  1335→
+  1336→        // Socket file should be unlinked by the handle's Drop.
+  1337→        assert!(!Path::new(&path).exists());
+  1338→        let _ = fs::remove_dir_all(&rootfs);
+  1339→    }
+  1340→
+  1341→    #[test]
+  1342→    fn audio_device_handle_drop_without_shutdown_still_joins() {
+  1343→        let rootfs = tmpdir();
+  1344→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1345→        let path = dev.path().to_string();
+  1346→        let handle = dev.spawn().expect("spawn");
+  1347→        std::thread::sleep(Duration::from_millis(50));
+  1348→
+  1349→        // Don't call shutdown() — just drop. Drop's first action is
+  1350→        // to set the shutdown flag, then join.
+  1351→        drop(handle);
+  1352→
+  1353→        assert!(!Path::new(&path).exists());
+  1354→        let _ = fs::remove_dir_all(&rootfs);
+  1355→    }
+  1356→
+  1357→    // -------- ThreadPool -----------------------------------------------
+  1358→
+  1359→    #[test]
+  1360→    fn thread_pool_executes_jobs() {
+  1361→        let pool = ThreadPool::new(2);
+  1362→        let counter = Arc::new(AtomicI32::new(0));
+  1363→        let c1 = Arc::clone(&counter);
+  1364→        let c2 = Arc::clone(&counter);
+  1365→        pool.execute(move || {
+  1366→            c1.fetch_add(1, Ordering::SeqCst);
+  1367→        });
+  1368→        pool.execute(move || {
+  1369→            c2.fetch_add(1, Ordering::SeqCst);
+  1370→        });
+  1371→
+  1372→        // Drop the pool — Drop joins all workers, which guarantees
+  1373→        // the jobs have completed before the assert runs.
+  1374→        drop(pool);
+  1375→
+  1376→        assert_eq!(counter.load(Ordering::SeqCst), 2);
+  1377→    }
+  1378→
+  1379→    #[test]
+  1380→    fn thread_pool_queues_jobs_beyond_worker_count() {
+  1381→        // 2 workers, 5 jobs — all should run because they're queued.
+  1382→        let pool = ThreadPool::new(2);
+  1383→        let counter = Arc::new(AtomicI32::new(0));
+  1384→        for _ in 0..5 {
+  1385→            let c = Arc::clone(&counter);
+  1386→            pool.execute(move || {
+  1387→                c.fetch_add(1, Ordering::SeqCst);
+  1388→            });
+  1389→        }
+  1390→        drop(pool);
+  1391→        assert_eq!(counter.load(Ordering::SeqCst), 5);
+  1392→    }
+  1393→
+  1394→    #[test]
+  1395→    #[should_panic(expected = "size must be > 0")]
+  1396→    fn thread_pool_new_zero_panics() {
+  1397→        let _ = ThreadPool::new(0);
+  1398→    }
+  1399→
+  1400→    // -------- I/O helper ------------------------------------------------
+  1401→
+  1402→    #[test]
+  1403→    fn read_exact_returns_eof_on_short_read() {
+  1404→        let rootfs = tmpdir();
+  1405→        let dev = create_audio_device(&rootfs).expect("create_audio_device");
+  1406→        let path = dev.path().to_string();
+  1407→        let handle = dev.spawn().expect("spawn");
+  1408→        std::thread::sleep(Duration::from_millis(50));
+  1409→
+  1410→        // Connect and write 4 bytes (less than 16). The handler will
+  1411→        // call read_exact for the 16-byte header, which should hit
+  1412→        // UnexpectedEof when the guest closes.
+  1413→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1414→        stream.write_all(&[1, 2, 3, 4]).expect("write short");
+  1415→        let _ = stream.shutdown(std::net::Shutdown::Write);
+  1416→
+  1417→        std::thread::sleep(Duration::from_millis(50));
+  1418→
+  1419→        drop(stream);
+  1420→        drop(handle);
+  1421→        let _ = fs::remove_dir_all(&rootfs);
+  1422→    }
+  1423→}
+  1424→
