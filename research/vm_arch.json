@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://source.android.com/docs/core/graphics/architecture",
+    "name": "Graphics architecture",
+    "snippet": "Buffer allocations are performed through the gralloc memory allocator implemented through a vendor-specific HAL interface. SurfaceFlinger, ...\nOct 21, 2025 — A surface produces a buffer queue that is often consumed by SurfaceFlinger . When rendering onto a surface, the result ends up in a buffer that ... Read more\nOct 21, 2025 — This page describes essential elements of the Android system-level graphics architecture and how they are used by the app framework and multimedia system. Read more",
+    "host_name": "source.android.com",
+    "rank": 0,
+    "date": "Oct 21, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.computer.org/csdl/proceedings-article/ipdpsw/2022/974700b018/1Fu9st0jBBK",
+    "name": "Operating System Convergence: An Example via the Maru",
+    "snippet": "by W White · Cited by 2 — When there is no physical framebuffer, mflinger detects no HDMI framebuffer and creates a virtual framebuffer that emulates the HDMI display. Third-party de ...",
+    "host_name": "www.computer.org",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://dl.acm.org/doi/10.1145/3643029",
+    "name": "Trinity: High-Performance and Reliable Mobile Emulation",
+    "snippet": "Our key idea is to capture host-side and guest-side rendering code flows ... SurfaceFlinger system service in Android for compositions. Due to the ...",
+    "host_name": "dl.acm.org",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://medium.com/@meetaurum/best-android-emulator-for-app-development-testing-alternatives-to-genymotion-android-virtual-bf91f2c3cc46",
+    "name": "Best Android Emulator for App Development, Testing",
+    "snippet": "Go to: HKEY_LOCAL_MACHINE/SOFTWARE/BlueStacks/Guests/Android/FrameBuffer/0/. Press enter or click to view image in full size. 3. Open ...",
+    "host_name": "medium.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/36166216/delaying-frames-of-an-android-virtual-display",
+    "name": "Delaying frames of an Android virtual display",
+    "snippet": "The basic issue I am trying to solve is to delay what is sent to a virtual display by a second or so. So basically, I am trying to shift all frames by ...",
+    "host_name": "stackoverflow.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.reddit.com/r/Androidx86/comments/x5sofp/vmware_refuses_to_display_the_desktop_but_the",
+    "name": "VMware refuses to display the desktop but the console only",
+    "snippet": "What I see after a live boot",
+    "host_name": "www.reddit.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=zdQRIYOST64",
+    "name": "Drawn out: How Android renders (Google I/O '18)",
+    "snippet": "We're talking about the process of actually turning all that stuff like buttons and checkboxes and everything on the screen into pixels.",
+    "host_name": "www.youtube.com",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://community.nxp.com/t5/i-MX-Processors-Knowledge-Base/Android-Graphic-UI-with-GPU-Hardware-Acceleration/ta-p/1102023",
+    "name": "Android Graphic UI with GPU Hardware Acceleration",
+    "snippet": "Surfaceflinger is responsible of all surface layers composition, and then generate the framebuffer pixmap for display devices. these graphic surface layers ...",
+    "host_name": "community.nxp.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://staging-git.codelinaro.org/clo/public-release-test/platform/prebuilts/android-emulator",
+    "name": "A android-emulator - prebuilts - Explore projects - CodeLinaro",
+    "snippet": "8776bd8 Fix comments in gralloc pipe 53501e9 TestVmLock: Fix bug in release(). ... 2ef34bc Fix Gingerbread framebuffer display. b2efede Move QEMU1 ...",
+    "host_name": "staging-git.codelinaro.org",
+    "rank": 8,
+    "date": "Nov 15, 2022",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.cnblogs.com/pengdonglin137/articles/5408060.html",
+    "name": "Graphics architecture - dolinux",
+    "snippet": "Apr 19, 2016 — SurfaceFlinger's role is to accept buffers of data from multiple sources, composite them, and send them to the display. Once upon a time this ... Read more",
+    "host_name": "www.cnblogs.com",
+    "rank": 9,
+    "date": "Apr 19, 2016",
+    "favicon": ""
+  }
+]

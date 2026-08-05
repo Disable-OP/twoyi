@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://www.youtube.com/watch?v=m4_m-Qd5iCg",
+    "name": "Exploring VMOS Pro & Virtual Master - VMOS PRO VS Virtual",
+    "snippet": "VMOS is a virtual machine app that runs on Android, which can run another Android OS as the guest operating system.\nVMOS is a virtual machine app that runs on Android , which can run another Android OS as the guest operating system.",
+    "host_name": "www.youtube.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://virtual-master-android-clone.en.softonic.com/android",
+    "name": "Virtual Master - Android Clone (Android) - Download",
+    "snippet": "Virtual Master - Android Clone is a free utility application by developer VM Space Tech. It is an emulator that lets users run the Android mobile OS on their ...\nJul 7, 2026 — Virtual Master - Android Clone is a free utility application by developer VM Space Tech. It is an emulator that lets users run the Android mobile OS on their ... Read more",
+    "host_name": "virtual-master-android-clone.en.softonic.com",
+    "rank": 1,
+    "date": "Jul 7, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=qTW8v-5oz3g",
+    "name": "VMOS vs Virtual Master | VMOS Pro Root v2.9.7 | VMOS Pro",
+    "snippet": "... Virtual Master Virtual Master runs another Android System on your device, based on our Android in Android Virtualization Technology. With ...\n... Virtual Master Virtual Master runs another Android System on your device, based on our Android in Android Virtualization Technology . With ...",
+    "host_name": "www.youtube.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://play.google.com/store/apps/details?id=com.vmos.google&hl=en_US",
+    "name": "VMOS - Apps on Google Play",
+    "snippet": "VMOS is a virtual machine system on Android, which allows you to install different ROMs on your Android phone, run multiple Android systems at the same time,",
+    "host_name": "play.google.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=KeRNRURnz0g",
+    "name": "How to Setup An Android Virtual Machine - VMOS PRO Setup",
+    "snippet": "In this video we will be exploring how to install two versions of android OS on one android phone. Inveriably, installing an Android Virtual ...",
+    "host_name": "www.youtube.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://medium.com/@emmanuelmuturia/the-android-architecture-feat-native-c-c-libraries-android-runtime-8f9e05ede41b",
+    "name": "The Android Architecture [feat. Native C/C++ Libraries &",
+    "snippet": "The Native C/C++ Libraries are a set of core, low-level libraries written in C and C++ that power performance-critical tasks — such as graphics ... Read more",
+    "host_name": "medium.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://vmos-pro.en.softonic.com/android",
+    "name": "VMOS PRO APK for Android - Download",
+    "snippet": "Apr 1, 2026 — VMOS PRO is an Android virtualization app that creates a separate Android system inside your existing device. That virtual space runs ... Read more",
+    "host_name": "vmos-pro.en.softonic.com",
+    "rank": 6,
+    "date": "Apr 1, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.vmos.com",
+    "name": "VMOS — Product Matrix for Global Growth",
+    "snippet": "Manage hundreds of Android devices from a single computer. Real-time mirroring, one-click group control, and HD focus — all over your local network,",
+    "host_name": "www.vmos.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/vmos-dev/open-vmos-aosp_5.1",
+    "name": "vmos-dev/open-vmos-aosp_5.1",
+    "snippet": "This project is a virtual machine source code for use with VMOS Pro. It is based on the Android source code aosp-5.1.1_r38 version and supports devices ... Read more\nVMOS Pro Android 5.1 ROM Technical Architecture The company's core technology, the VMOS Pro virtual operating system, is an Android virtual system that runs on the Android system with ordinary APP permissions.",
+    "host_name": "github.com",
+    "rank": 8,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.andnixsh.com/2023/09/how-to-make-custom-vmos-rom-for-vmos-pro.html",
+    "name": "How to make a custom VMOS ROM for VMOS Pro - andnixsh.com",
+    "snippet": "You would need a kernel source from VMOS, VM drivers sources, AOSP project sources to build and so on, and re-compile VMOS app to support it properly. It’s a lot harder than you think.",
+    "host_name": "www.andnixsh.com",
+    "rank": 9,
+    "date": "Sep 28, 2023",
+    "favicon": ""
+  }
+]

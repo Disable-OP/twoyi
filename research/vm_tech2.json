@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://source.android.com/docs/core/interaction/neural-networks/memory-pools",
+    "name": "Memory pools",
+    "snippet": "This page describes the data structures and methods used to efficiently communicate operand buffers between the driver and the framework. Read more",
+    "host_name": "source.android.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/30648873/sharing-memory-with-android-native-app",
+    "name": "Sharing memory with Android native app",
+    "snippet": "an app process isn't allowed to write in the root directory. If you want to experiment with ordinary files, do so in your app's private storage ...",
+    "host_name": "stackoverflow.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/CypherpunkArmory/UserLAnd/issues/289",
+    "name": "shared memory can not be created · Issue #289",
+    "snippet": "Sep 27, 2018 — Android doesn't have normally shared memory support. As such a workaround is required, but this workaround does not yet work inside chroots like UserLAnd. Read more",
+    "host_name": "github.com",
+    "rank": 2,
+    "date": "Sep 27, 2018",
+    "favicon": ""
+  },
+  {
+    "url": "https://devarea.com/android-creating-shared-memory-using-ashmem",
+    "name": "Android – Creating Shared Memory using Ashmem",
+    "snippet": "Feb 12, 2018 — In this post I will show you how to work with ashmem , creating and using shared memory between 2 untrusted applications (applications from the Play store) Read more",
+    "host_name": "devarea.com",
+    "rank": 3,
+    "date": "Feb 12, 2018",
+    "favicon": ""
+  },
+  {
+    "url": "https://rust-for-linux.com/android-%60ashmem%60",
+    "name": "Android ashmem",
+    "snippet": "ashmem (Anonymous Shared Memory Subsystem for Android) is a new shared memory allocator, because it can discard shared memory units when under memory pressure.",
+    "host_name": "rust-for-linux.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://source.android.com/docs/core/graphics/arch-bq-gralloc",
+    "name": "BufferQueue and Gralloc",
+    "snippet": "Jun 26, 2025 — The BufferQueue class connects components that generate buffers of graphical data. The Gralloc memory allocator performs buffer allocations.  ...",
+    "host_name": "source.android.com",
+    "rank": 5,
+    "date": "Jun 26, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://green-green-avk.github.io/AnotherTerm-docs/installing-sysv-shmem-for-nonrooted-android.html",
+    "name": "Installing System V shmem ashmem wrapper for nonrooted",
+    "snippet": "Better solution: Installing shared memory APIs emulation for nonrooted Android . It's supposed to use a PRooted environment to install it (see Installing Linux ... Read more",
+    "host_name": "green-green-avk.github.io",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "http://www.discoversdk.com/blog/android-shared-memory-ashmem-example",
+    "name": "Android Shared Memory | DiscoverSDK Blog",
+    "snippet": "May 15, 2016 — The common mechanism in android to share data between processes is the binder. Android ashmem . The solution is to create a service that creates ...",
+    "host_name": "www.discoversdk.com",
+    "rank": 7,
+    "date": "May 15, 2016",
+    "favicon": ""
+  },
+  {
+    "url": "https://medium.com/@ledubmurukp/android-system-ipc-mechanisms-3d3b46affa3c",
+    "name": "Android System IPC Mechanisms. Introduction | by PK",
+    "snippet": "ashmem uses reference counting to destroy memory regions, when the processes referring to them have exited. Basically, ashmem is a way used by ... Read more",
+    "host_name": "medium.com",
+    "rank": 8,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://news.ycombinator.com/item?id=44681858",
+    "name": "Terminal app can now run full graphical Linux apps in",
+    "snippet": "It's just an issue that plagued the last 15 years of attempts at getting Linux running in VMs/ containers /etc on Android , and that's the reason it's an issue. Read more",
+    "host_name": "news.ycombinator.com",
+    "rank": 9,
+    "date": "",
+    "favicon": ""
+  }
+]

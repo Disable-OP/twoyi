@@ -1,0 +1,664 @@
+     1→# Twoyi — Architecture & Source Map
+     2→
+     3→> **What this document is.** A deep, code-level architecture write-up of the
+     4→> **`cyanmint/twoyi`** fork (the only currently-active continuation of the
+     5→> archived `twoyi/twoyi` project) as it stands **plus the improvements in
+     6→> this branch** (`improvements/initial-cleanup`).
+     7→>
+     8→> **Date of analysis:** 2026-08-05
+     9→> **Base commit:** `25ef89c` ("rom manifest", 2026-05-09, upstream)
+    10→> **Branch tip:** see `git log --oneline` — adds input, socket, build, CI,
+    11→> and devcontainer improvements.
+    12→
+    13→---
+    14→
+    15→## 1. Project context — why this fork?
+    16→
+    17→### 1.1 The original Twoyi
+    18→
+    19→Twoyi (Chinese: 两仪, pronounced *"two-yi"*) is a **rootless Android-on-Android
+    20→container** created by **weishu** (the author of Taichi/EdXposed). Instead of
+    21→running Android in a virtual machine (like Waydroid does on Linux, or QEMU on
+    22→desktop), Twoyi runs an entire second Android userland **inside one normal
+    23→Android app process**. The host device does **not** need to be rooted, unlocked,
+    24→or modified in any way — the container runs purely as a `targetSdk=28` APK that
+    25→you install from a normal `.apk` file.
+    26→
+    27→The trick works because Android is, at the bottom, just a Linux process tree
+    28→sitting on top of a kernel. Twoyi ships a complete Android 8.1 userland
+    29→(`init`, `zygote`, `system_server`, framework JARs, ART runtime, HALs) as a
+    30→folder inside the app's private data directory, then exec's `./init` from
+    31→that folder the same way the real Android boot sequence does. The result is a
+    32→*second* Android instance that shares the host kernel but has its own
+    33→`system_server`, package manager, surface flinger, and even its own `adbd`.
+    34→
+    35→The original repository is **`github.com/twoyi/twoyi`** — archived in April
+    36→2023 with the maintainer's note *"Due to the complexity of the project and
+    37→lack of any revenue, the project has been discontinued."* At the time of
+    38→archiving it had **1,911 stars** and ~100 forks.
+    39→
+    40→### 1.2 Fork landscape (audited 2026-08-05)
+    41→
+    42→I queried the GitHub fork API for every fork of `twoyi/twoyi` and sorted by
+    43→last-push date. The result is sobering — most forks are dead mirrors pushed
+    44→exactly once on the day they were created (2023-04-20, the archive date).
+    45→
+    46→| Fork | Last push | Stars | Status |
+    47→|---|---|---|---|
+    48→| **`cyanmint/twoyi`** | **2026-07-16** | **18** | **Actively developed, primary fork** |
+    49→| `blank948555/twoyi` | 2026-07-06 | 0 | One-off |
+    50→| `Entersjkhdfkjdhfksjf/twoyi` | 2026-05-15 | 0 | One-off |
+    51→| `roro2239/twoyi` | 2026-04-05 | 0 | One-off |
+    52→| `ColdWindScholar/twoyi` | 2026-03-21 | 0 | One-off |
+    53→| `Faris-0/twoyi` | 2026-03-03 | 1 | Low activity |
+    54→| `adnan-core/twoyi` | 2025-12-26 | 2 | Low activity |
+    55→| `hyowe/twoyi2` | 2023-11-19 | 1 | Stale (2.7 years ago) |
+    56→
+    57→**`cyanmint/twoyi`** is the only continuation worth contributing to. Its
+    58→commit history shows real engineering work across the last 8 months:
+    59→
+    60→- **Open-source `libOpenglRender.so` and `libloader.so` replacements** in Rust
+    61→- **`services.jar` DEX patcher** for fixing an Android 8.0 ENOENT bug
+    62→- **Profile manager** for multiple rootfs instances
+    63→- **`rom manifest`** (May 2026) — AOSP build manifest for the guest ROM
+    64→
+    65→### 1.3 Nogitsune — cyanmint's from-scratch rewrite
+    66→
+    67→While researching cyanmint's profile, I found a second repo: **`cyanmint/Nogitsune`**
+    68→(created 2026-06-03, only 3 commits, originally from `Kitsuri-Studios/Nogitsune`).
+    69→Nogitsune is **twoyi v2** — a from-scratch rewrite in a modern stack:
+    70→
+    71→| Aspect | Twoyi (current) | Nogitsune (rewrite) |
+    72→|---|---|---|
+    73→| Language (app) | Java | **Kotlin** |
+    74→| Language (native) | Rust | **C++** |
+    75→| UI | XML layouts | **Jetpack Compose** |
+    76→| Build | Groovy Gradle | **Kotlin DSL + version catalog** |
+    77→| Storage | SharedPreferences | **Room DB** (multi-instance from day 1) |
+    78→| Application ID | `io.twoyi` | `io.twoyi` (kept same for compatibility!) |
+    79→| Namespace | `io.twoyi` | `io.kitsuri.nogitsune` |
+    80→| License | MPL-2.0 | Apache-2.0 |
+    81→| Status | Active, mature | "still under active development, not yet ready for public use" |
+    82→
+    83→The architecture mirrors twoyi 1:1 (BootHelper, BootStatus, NogitsuneApp,
+    84→NogitsuneMessenger, NogitsuneSocketServer, RootfsExtractor, ShellUtil,
+    85→Renderer) — same concepts, modern implementation. **This is twoyi v2.**
+    86→Improvements we make to v1 may or may not be portable to Nogitsune, but
+    87→fixing v1's bugs is still valuable because (a) v1 is the only usable version
+    88→today and (b) the same bugs likely exist in Nogitsune's reimplementation.
+    89→
+    90→---
+    91→
+    92→## 2. Twoyi at a glance
+    93→
+    94→| Property | Value |
+    95→|---|---|
+    96→| **Package name** | `io.twoyi` |
+    97→| **Host `minSdk` / `targetSdk` / `compileSdk`** | 27 / 28 / 31 |
+    98→| **Guest Android version** | 8.1 (upstream says 8.1–12; only 8.1 ROM exists) |
+    99→| **ABIs (this branch)** | `arm64-v8a` + `x86_64` (was arm64-v8a only) |
+   100→| **License** | MPL-2.0 |
+   101→| **Native languages** | Rust (modern) + Java (UI) + tiny C shims |
+   102→| **Original author** | weishu (`github.com/tiann`) |
+   103→| **Active fork maintainer** | cyanmint (with `copilot-swe-agent` assistance) |
+   104→
+   105→---
+   106→
+   107→## 3. Three-layer architecture
+   108→
+   109→```
+   110→┌──────────────────────────────────────────────────────────────────────┐
+   111→│  GUEST LAYER  (rootfs, unpacked to /data/data/io.twoyi/rootfs/)      │
+   112→│                                                                      │
+   113→│   ./init  ─►  zygote  ─►  system_server  ─►  system services          │
+   114→│                                                                      │
+   115→│   - SurfaceFlinger renders to a virtual framebuffer                  │
+   116→│   - OpenGL ES encoder writes GL commands to /dev/qemu_pipe           │
+   117→│   - EventHub reads input from /dev/input/touch + /dev/input/key0     │
+   118→│   - installd + PackageManager manage in-container APKs               │
+   119→│   - adbd listens on TCP 22122 (connected to by host's libadb.so)     │
+   120→└──────────────────────────────────────────────────────────────────────┘
+   121→                                  ▲ ▼
+   122→                          (sockets + pipes)
+   123→                                  ▲ ▼
+   124→┌──────────────────────────────────────────────────────────────────────┐
+   125→│  NATIVE LAYER  (libtwoyi.so + libloader.so + libOpenglRender.so)     │
+   126→│                                                                      │
+   127→│   JNI entry (lib.rs) ─► core.rs dispatches to:                       │
+   128→│     • input.rs           — virtual uinput touch + key devices         │
+   129→│     • renderer_bindings  — FFI to legacy libOpenglRender.so           │
+   130→│     • renderer_new/      — open-source Rust renderer (QEMU pipe)     │
+   131→│   Spawns the guest: `./init` with TYLOADER env                       │
+   132→└──────────────────────────────────────────────────────────────────────┘
+   133→                                  ▲ ▼
+   134→                              JNI boundary
+   135→                                  ▲ ▼
+   136→┌──────────────────────────────────────────────────────────────────────┐
+   137→│  APP LAYER  (Java, package io.twoyi)                                 │
+   138→│                                                                      │
+   139→│   TwoyiApplication  →  ProfileManager + RomManager.ensureBootFiles   │
+   140→│                     →  TwoyiSocketServer (abstract LocalSocket)      │
+   141→│                                                                      │
+   142→│   SettingsActivity (launcher) ──► Render2Activity                    │
+   143→│       │                                                                  │
+   144→│       ├─ SurfaceHolder.Callback → Renderer.init / resetWindow         │
+   145→│       ├─ View.OnTouchListener   → Renderer.handleTouch                │
+   146→│       └─ onBackPressed          → Renderer.sendKeycode                │
+   147→│                                                                      │
+   148→│   Installer       — runs libadb.so → adb connect localhost:22122     │
+   149→│   TwoyiDocumentsProvider — Storage Access Framework for file share   │
+   150→│   TwoyiStatusManager / TwoyiMessenger — boot latch + IPC             │
+   151→└──────────────────────────────────────────────────────────────────────┘
+   152→```
+   153→
+   154→---
+   155→
+   156→## 4. The app layer (Java)
+   157→
+   158→### 4.1 Entry point — `TwoyiApplication.java`
+   159→
+   160→Every Android app's real entry point is `Application.attachBaseContext()`,
+   161→which runs before any `Activity` is created. Twoyi uses this to do five
+   162→things in strict order:
+   163→
+   164→1. `ProfileManager.initializeProfiles()` — make sure `profiles/default/rootfs/`
+   165→   exists and that `<datadir>/rootfs` is a symlink pointing to the active
+   166→   profile's rootfs.
+   167→2. `RomManager.ensureBootFiles()` — the **boot hygiene** routine. It runs
+   168→   four sub-steps that fix three real-world bugs: orphan container processes,
+   169→   missing `/data/local/tmp`, and a DEX-level bug in Android 8.0's
+   170→   `PackageInstallerSession`.
+   171→3. `TwoyiSocketServer.getInstance(base).start()` — opens an abstract
+   172→   SEQPACKET `LocalSocket` named `TWOYI_SOCK` and waits for the guest to
+   173→   send control messages.
+   174→4. `AppCenter.start(...)` — Microsoft AppCenter crash analytics.
+   175→5. Compute and cache the status-bar height.
+   176→
+   177→### 4.2 The launcher — `SettingsActivity.java`
+   178→
+   179→In this fork the **Settings activity is the LAUNCHER intent**. Users land
+   180→in a settings screen and must explicitly tap "Launch Container" to start
+   181→`Render2Activity`. This lets users configure profiles, display size, DPI,
+   182→and renderer choice *before* committing to a boot.
+   183→
+   184→### 4.3 The container host — `Render2Activity.java`
+   185→
+   186→`Render2Activity` is where the magic happens. Its lifecycle:
+   187→
+   188→1. **`onCreate`** — checks `TwoyiStatusManager.isStarted()`. If the guest
+   189→   is already running, it calls `RomManager.reboot()` to avoid a double-boot.
+   190→2. **`bootSystem()`** — checks `RomManager.romExist()`. If missing, prompts
+   191→   the user to pick a `.tar` file via `ACTION_GET_CONTENT`. If present,
+   192→   calls `RomManager.clearDalvikCacheIfNeeded()` and `addView(mSurfaceView)`.
+   193→3. **`SurfaceHolder.Callback.surfaceCreated`** — sets renderer type and
+   194→   debug mode from profile settings, computes scaled DPI, calls
+   195→   `Renderer.init(surface, loaderPath, vw, vh, xdpi, ydpi, fps)`.
+   196→4. **`surfaceChanged`** — `Renderer.resetWindow(...)`.
+   197→5. **`onTouch`** — applies scale matrix to transform surface-space
+   198→   coordinates into virtual-display-space, then `Renderer.handleTouch(...)`.
+   199→6. **`onBackPressed`** — `Renderer.sendKeycode(KEYCODE_HOME)`.
+   200→7. **`showBootingProcedure()`** — waits up to 60s for `BOOT_COMPLETED`.
+   201→
+   202→### 4.4 ROM management — `RomManager.java`
+   203→
+   204→The densest Java file (746 lines) contains the most clever hack: a
+   205→**DEX-level binary patcher** for the guest's `services.jar`.
+   206→
+   207→#### 4.4.1 `ensureBootFiles()` — the boot hygiene routine
+   208→
+   209→```java
+   210→killOrphanProcess();            // ps -ef | awk '$3==1' | xargs kill -9
+   211→ensureDataLocalTmp(context);    // mkdir -p + chmod 777 on rootfs/data/local/tmp
+   212→patchServicesJarForPackageInstaller(context);  // see §4.4.2
+   213→// create dev/input, dev/socket, dev/maps dirs in rootfs
+   214→createLoaderSymlink(context);   // <datadir>/loader64 → libloader.so
+   215→saveLastKmsg(context);
+   216→```
+   217→
+   218→#### 4.4.2 `patchServicesJarForPackageInstaller()` — DEX surgery
+   219→
+   220→The bug: Android 8.0 (SDK 26) `PackageInstallerSession.openWriteInternal()`
+   221→calls `target.delete()` then `Os.stat(target)`. When `offsetBytes == 0` (a
+   222→fresh install), the file was just deleted, so `Os.stat()` throws
+   223→`ErrnoException(ENOENT)`. SDK 26 doesn't handle `ENOENT` and re-throws as
+   224→`IOException("stat failed: ENOENT...")`. This breaks every in-container
+   225→APK install. AOSP fixed this in SDK 27.
+   226→
+   227→The patch: **rewrites two bytes inside `classes.dex`** to convert the
+   228→`throw v_ioe` instruction into `const/4 v_stat, 0`, mirroring the SDK 27
+   229→behavior. Both instructions are exactly 2 bytes:
+   230→
+   231→| Original | Patched |
+   232→|---|---|
+   233→| `throw vN` = `0x27 0xNN` | `const/4 vM, 0` = `0x12 0x0M` |
+   234→
+   235→The algorithm finds the string `"stat failed: "` in the DEX string pool,
+   236→locates the `throw` instruction via the `move-exception` catch handler,
+   237→patches it in place, recomputes DEX checksums, and writes the patched
+   238→`classes.dex` back into `services.jar`. The patch is idempotent — a flag
+   239→file records the patched JAR's mod-time so it doesn't re-patch unless
+   240→the JAR has been replaced.
+   241→
+   242→### 4.5 IPC — `TwoyiSocketServer` + `TwoyiMessenger`
+   243→
+   244→Host and guest communicate over an **abstract SEQPACKET LocalSocket**
+   245→named `TWOYI_SOCK`. Three message prefixes:
+   246→
+   247→| Message | Action |
+   248→|---|---|
+   249→| `BOOT_COMPLETED` | `TwoyiStatusManager.markStarted()` — releases the boot latch |
+   250→| `SWITCH_HOST` | toggle between host home and guest home |
+   251→| `SETTINGS` | open SettingsActivity from inside the guest |
+   252→
+   253→> **Bug fixed in this branch:** the original `start0()` recursed into
+   254→> `start()` on every `IOException` with a fixed 1-second sleep. If the
+   255→> bind kept failing (e.g. SELinux denial), the cached executor pool
+   256→> would accumulate one blocked thread per retry and eventually starve
+   257→> the app. This branch replaces the recursion with
+   258→> `EXECUTOR.submit(() -> start0(attempt+1))`, caps retries at 5, and
+   259→> uses exponential backoff (1s → 2s → 4s → 8s → 16s, capped at 30s)
+   260→> plus 0-50% jitter.
+   261→
+   262→### 4.6 App installation — `Installer.java`
+   263→
+   264→To install an APK *inside the guest*, Twoyi runs its own bundled
+   265→`libadb.so` (a stripped Android `adb` binary) and uses `adb connect` +
+   266→`adb install`. The flow:
+   267→
+   268→1. Spawn `libadb.so -P 9563 nodaemon server` in the background.
+   269→2. `adb -P 9563 connect localhost:22122`.
+   270→3. `adb -P 9563 -s localhost:22122 install -t -r --no-streaming <apk>`.
+   271→   The `--no-streaming` flag is critical: streaming install pipes the
+   272→   APK through `abb_exec` to a staging directory that the container's
+   273→   `installd` may not have created yet.
+   274→4. Parse stdout for `Success` or `Failure [...]`.
+   275→
+   276→---
+   277→
+   278→## 5. The native layer (Rust)
+   279→
+   280→The native side is **three separate Cargo crates**:
+   281→
+   282→| Crate | Source | Output | Purpose |
+   283→|---|---|---|---|
+   284→| `twoyi` | `app/rs/` | `libtwoyi.so` | JNI entry, renderer dispatch, input system, guest spawn |
+   285→| `loader` | `app/rs/loader/` | `libloader.so` (+ `_new`) | Open-source replacement for legacy `libloader.so` |
+   286→| `openglrenderer` | `app/rs/openglrenderer/` | `libOpenglRender.so` (+ `_new`) | Open-source replacement for legacy `libOpenglRender.so` |
+   287→
+   288→### 5.1 `libtwoyi.so` — `app/rs/`
+   289→
+   290→`JNI_OnLoad` registers 8 native methods on class `io/twoyi/Renderer`:
+   291→`init`, `resetWindow`, `removeWindow`, `handleTouch`, `sendKeycode`,
+   292→`setRendererType`, `setDebugRenderer`, `setDebugLogDir`.
+   293→
+   294→`core::init_renderer()` is the heart of the native side:
+   295→
+   296→1. Acquires the `ANativeWindow` from the Java `Surface`.
+   297→2. Uses `RENDERER_STARTED.compare_exchange(false, true)` as a one-shot
+   298→   guard. On first call:
+   299→   - `input::start_input_system(virtual_width, virtual_height)` — spawns
+   300→     the touch and key device threads.
+   301→   - `thread::spawn` — starts the renderer (Old blob or New Rust impl).
+   302→   - `Command::new("./init").current_dir("/data/data/io.twoyi/rootfs").env("TYLOADER", loader_path).spawn()`
+   303→     — **this is where the guest actually boots**.
+   304→3. On subsequent calls: just calls `resetSubWindow`/`reset_window` to
+   305→   update the window pointer without re-booting.
+   306→
+   307→### 5.1.1 Input system — `input.rs`
+   308→
+   309→Two virtual input devices are created as **unix domain sockets** that the
+   310→guest's `EventHub` connects to:
+   311→
+   312→- `/data/data/io.twoyi/rootfs/dev/input/touch` — multi-touch device
+   313→  named `vtouch` with proper Type-B protocol (ABS_MT_SLOT, TRACKING_ID, etc.).
+   314→- `/data/data/io.twoyi/rootfs/dev/input/key0` — keyboard device
+   315→  named `vkey`.
+   316→
+   317→> **Bug fixed in this branch:** `send_key_code` previously ignored its
+   318→> `keycode` argument and always emitted `KEY_BACK`, regardless of what
+   319→> Java passed in. This happened to work for the only caller
+   320→> (`onBackPressed → KEYCODE_HOME`) because Android falls back when
+   321→> `KEY_HOME` is not in the keyboard's capability bitmap, but it broke
+   322→> any future caller (volume, recents, power, etc.).
+   323→>
+   324→> This branch adds `android_keycode_to_linux()` mapping for the
+   325→> navigation-relevant Android `KeyEvent.KEYCODE_*` constants to their
+   326→> Linux `KEY_*` equivalents, and `generate_key_device()` now advertises
+   327→> every supported key in `key_bitmask` via the new `set_key_bit()`
+   328→> helper. The legacy `info.key_bitmask[14] = 0x1C` is removed.
+   329→
+   330→### 5.1.2 The PIE hack
+   331→
+   332→Three pieces cooperate to make `libtwoyi.so` simultaneously loadable as
+   333→a JNI library and executable as a standalone binary:
+   334→
+   335→1. `src/interp.c` — places `/system/bin/linker64` in the `.interp` ELF section.
+   336→2. `build.rs` — compiles `interp.c` via the `cc` crate.
+   337→3. `build_rs.sh` — sets `RUSTFLAGS` to `-C link-arg=-pie` etc. and runs
+   338→   `cargo xdk -t <abi> -o ../src/main/jniLibs build --release`.
+   339→
+   340→The result: `./libtwoyi.so --help` works from a shell, AND
+   341→`System.loadLibrary("twoyi")` works from Java.
+   342→
+   343→### 5.2 `libloader.so` — open-source replacement
+   344→
+   345→A thin wrapper around `dlopen`/`dlsym`/`dlclose`. The build script
+   346→(`build.sh`) builds it for `arm64-v8a` and (since this branch) `x86_64`,
+   347→copies the output to `libloader_new.so`, and `chmod +x` so it can be
+   348→executed directly as `loader64`.
+   349→
+   350→### 5.3 `libOpenglRender.so` — open-source renderer
+   351→
+   352→A standalone crate exposing the same six-function C ABI as the legacy
+   353→blob. Architecture mirrors `renderer_new/` inside `libtwoyi.so`:
+   354→`pipe.rs` (QEMU pipe), `opengles.rs` (GL protocol), `gralloc.rs`
+   355→(ANativeWindow buffer management).
+   356→
+   357→---
+   358→
+   359→## 6. The guest layer
+   360→
+   361→### 6.1 ROM layout
+   362→
+   363→Once unpacked, `rootfs/` is a fairly standard Android system tree:
+   364→
+   365→```
+   366→rootfs/
+   367→├── init                    ← the binary core.rs exec's
+   368→├── init.rc                 ← boot script
+   369→├── rom.ini                 ← ROM metadata (author, version, md5, code)
+   370→├── system/framework/services.jar   ← patched by RomManager (§4.4.2)
+   371→├── vendor/default.prop     ← host locale + timezone + DPI
+   372→├── data/local/tmp/         ← created by ensureDataLocalTmp (chmod 777)
+   373→├── data/dalvik-cache/      ← wiped on host OTA (clearDalvikCacheIfNeeded)
+   374→├── dev/input/{touch,key0}  ← unix sockets (input.rs)
+   375→└── sdcard/                 ← exposed via TwoyiDocumentsProvider
+   376→```
+   377→
+   378→### 6.2 AOSP manifest — `default.xml`
+   379→
+   380→Pinned at `refs/tags/android-8.1.0_r81`. The standard AOSP project set
+   381→plus twoyi-specific forks in the `twoyi/*` GitHub organization
+   382→(`Magisk`, `Superuser`, `platform_art`, `system_vold`,
+   383→`hardware_libhardware_legacy`, etc.). As of May 2026 the manifest is
+   384→committed but the build infrastructure to turn it into a flashable
+   385→`rootfs.7z` is **not yet complete** — the README still says "Build the
+   386→ROM: WIP". For now, you must extract the rootfs from a prebuilt APK.
+   387→
+   388→### 6.3 Boot sequence (end-to-end)
+   389→
+   390→```
+   391→T+0ms    Application.attachBaseContext
+   392→         ├─ ProfileManager.initializeProfiles
+   393→         ├─ RomManager.ensureBootFiles
+   394→         ├─ TwoyiSocketServer.start (async)
+   395→T+100ms  SettingsActivity.onCreate (user sees settings)
+   396→T+???    User taps "Launch Container"
+   397→T+0      Render2Activity.onCreate
+   398→         ├─ reset TwoyiStatusManager
+   399→         ├─ load profile display settings (W×H×DPI)
+   400→         ├─ setupSurfaceViewLayout (letterboxing)
+   401→         └─ bootSystem
+   402→             ├─ RomManager.romExist? yes → continue
+   403→             ├─ clearDalvikCacheIfNeeded (~100ms if cache exists)
+   404→             └─ mRootView.addView(mSurfaceView, 0)
+   405→T+50ms   surfaceCreated
+   406→         └─ Renderer.init(...)  → JNI → core::init_renderer
+   407→             ├─ input::start_input_system (touch + key threads)
+   408→             ├─ thread::spawn (renderer thread)
+   409→             └─ Command::new("./init").spawn()  ← GUEST BOOTS
+   410→T+200ms  Guest init starts: parse init.rc, mount tmpfs, start ueventd,
+   411→         start zygote, fork system_server, start core services...
+   412→T+3-30s  Guest sends "BOOT_COMPLETED" over TWOYI_SOCK
+   413→         → boot latch released → user sees guest home screen
+   414→```
+   415→
+   416→---
+   417→
+   418→## 7. Build system (this branch)
+   419→
+   420→### 7.1 Gradle
+   421→
+   422→- Root `build.gradle` uses AGP 7.1.1.
+   423→- `app/build.gradle` declares `compileSdkVersion 31`, `targetSdkVersion 28`,
+   424→  `minSdkVersion 27`.
+   425→- **New in this branch:** `abiFilters` now includes both `arm64-v8a` and
+   426→  `x86_64`. The `cargoBuild` task passes `all` to `build_rs.sh` by default
+   427→  and can be overridden with `-Pabis=arm64-v8a` for fast local iteration.
+   428→
+   429→### 7.2 Rust toolchain
+   430→
+   431→- Uses `cargo-xdk` (weishu's tool, `github.com/tiann/cargo-xdk`).
+   432→- NDK r27c (was r22 originally — bumped because r22 has libunwind issues
+   433→  with modern Rust).
+   434→- **New in this branch:** `build_rs.sh`, `loader/build.sh`, and
+   435→  `openglrenderer/build.sh` all accept an ABI list on the command line
+   436→  (`./build_rs.sh --release arm64-v8a x86_64` or `./build_rs.sh --release all`)
+   437→  and loop over each ABI.
+   438→- **New in this branch:** `.cargo/config.toml` now has identical PIE
+   439→  flags for both `aarch64-linux-android` and `x86_64-linux-android`.
+   440→
+   441→### 7.3 GitHub Actions — `.github/workflows/build.yml`
+   442→
+   443→**New in this branch:** the workflow:
+   444→
+   445→- Adds `x86_64-linux-android` to the Rust target list.
+   446→- Triggers on `improvements/**` branches (in addition to main/develop).
+   447→- Adds `workflow_dispatch` inputs:
+   448→  - `abis`: `all` | `arm64-v8a` | `x86_64` (default `all`).
+   449→  - `include_rootfs`: boolean (default false). When true, downloads the
+   450→    real `rootfs.7z` from the cyanmint release and bundles it into the APK.
+   451→- Bumps JDK from 11 to 17.
+   452→- Caches cargo registry + git + per-crate target dirs.
+   453→- Uploads build logs + reports on failure.
+   454→- 30-minute timeout (was unbounded).
+   455→
+   456→### 7.4 Codespace — `.devcontainer/`
+   457→
+   458→**New in this branch:** a complete Codespace configuration:
+   459→
+   460→- `devcontainer.json` — 4-core / 16 GB / 32 GB machine (user-selectable
+   461→  in GitHub UI), `runArgs: ["--privileged", "--init"]`, Docker-outside-of-Docker,
+   462→  JDK 17, Rust, NDK r27c, cargo-xdk.
+   463→- `scripts/setup.sh` — runs on `postCreateCommand`; installs the full
+   464→  Android toolchain.
+   465→- `scripts/check-kvm.sh` — definitive KVM availability check. Writes
+   466→  `/tmp/kvm-verdict.txt` so other scripts can branch on the result.
+   467→- `scripts/run-redroid.sh` — starts an x86_64 `redroid:13.0.0` container
+   468→  with ADB on port 5555.
+   469→- `scripts/test-twoyi.sh` — installs the APK, launches twoyi, takes 8
+   470→  screenshots at increasing intervals.
+   471→- `scripts/analyze-screenshots.sh` — sends each screenshot to a vision
+   472→  LLM (default `glm-4.6v`, override with `TWOYI_VLM_MODEL`) and asks
+   473→  for UI description + tap coordinates for the next action.
+   474→
+   475→#### Why redroid instead of KVM
+   476→
+   477→GitHub Codespaces run on Azure VMs that do NOT expose `/dev/kvm` to the
+   478→devcontainer, even with `--privileged` in `runArgs`. Multiple authoritative
+   479→sources confirm this:
+   480→
+   481→- [devcontainers/images#884](https://github.com/devcontainers/images/issues/884)
+   482→- [dotnet/runtime#77851](https://github.com/dotnet/runtime/issues/77851)
+   483→- [bgplabs.net/4-codespaces](https://bgplabs.net/4-codespaces)
+   484→- [github/community#160591](https://github.com/orgs/community/discussions/160591)
+   485→
+   486→`check-kvm.sh` runs on codespace creation to verify this empirically —
+   487→if `/dev/kvm` is unavailable, the test scripts use redroid (Android-in-
+   488→container, no KVM needed) instead.
+   489→
+   490→---
+   491→
+   492→## 8. Complete file map (this branch)
+   493→
+   494→```
+   495→cyanmint/twoyi (+ improvements/initial-cleanup branch)/
+   496→├── README.md / README_CN.md           Project overview (EN/CN)
+   497→├── LICENSE                            MPL-2.0
+   498→├── ARCHITECTURE.md                    ← NEW: this document
+   499→├── default.xml                        AOSP manifest (android-8.1.0_r81)
+   500→├── build.gradle                       Root Gradle config (AGP 7.1.1)
+   501→├── settings.gradle                    Single-module project (':app')
+   502→├── gradle.properties                  AndroidX + Jetifier enabled
+   503→├── gradlew / gradlew.bat              Gradle wrapper
+   504→│
+   505→├── .github/
+   506→│   └── workflows/build.yml            ← UPDATED: builds arm64 + x86_64
+   507→│
+   508→├── .devcontainer/                     ← NEW: Codespace config
+   509→│   ├── devcontainer.json
+   510→│   └── scripts/
+   511→│       ├── setup.sh                   — runs on postCreateCommand
+   512→│       ├── check-kvm.sh               — definitive KVM check
+   513→│       ├── run-redroid.sh             — start x86_64 redroid
+   514→│       ├── test-twoyi.sh              — install APK + screenshot
+   515→│       └── analyze-screenshots.sh     — VLM-based UI analysis
+   516→│
+   517→├── app/
+   518→│   ├── build.gradle                   ← UPDATED: abiFilters now arm64 + x86_64
+   519→│   └── src/
+   520→│       ├── main/
+   521→│       │   ├── AndroidManifest.xml
+   522→│       │   ├── jniLibs/arm64-v8a/     ← legacy blobs + new Rust variants
+   523→│       │   ├── jniLibs/x86_64/        ← NEW: only the new Rust variants
+   524→│       │   ├── java/io/twoyi/         ← Java sources (mostly unchanged)
+   525→│       │   │   ├── TwoyiApplication.java
+   526→│       │   │   ├── Render2Activity.java
+   527→│       │   │   ├── Renderer.java
+   528→│       │   │   ├── TwoyiSocketServer.java    ← UPDATED: bounded retries
+   529→│       │   │   └── ...
+   530→│       │   └── res/                   ← layouts, strings, themes
+   531→│       └── test/
+   532→│
+   533→└── app/rs/                            ← Rust source
+   534→    ├── Cargo.toml
+   535→    ├── build.rs
+   536→    ├── build_rs.sh                    ← UPDATED: multi-ABI support
+   537→    ├── .cargo/config.toml             ← UPDATED: x86_64 PIE flags
+   538→    ├── src/
+   539→    │   ├── lib.rs                     ← JNI_OnLoad + native method regs
+   540→    │   ├── core.rs                    ← renderer dispatch + guest spawn
+   541→    │   ├── input.rs                   ← UPDATED: keycode mapping + bitmask
+   542→    │   ├── renderer_bindings.rs       ← FFI to legacy libOpenglRender.so
+   543→    │   ├── renderer_new/              ← open-source Rust renderer
+   544→    │   └── interp.c                   ← .interp segment for PIE
+   545→    ├── loader/
+   546→    │   ├── build.sh                   ← UPDATED: multi-ABI support
+   547→    │   └── src/lib.rs
+   548→    └── openglrenderer/
+   549→        ├── build.sh                   ← UPDATED: multi-ABI support
+   550→        └── src/
+   551→```
+   552→
+   553→---
+   554→
+   555→## 9. Improvement opportunities (still open)
+   556→
+   557→Things this branch does NOT fix, but should be done next:
+   558→
+   559→### 9.1 Build & dependency modernization (low risk, high payoff)
+   560→
+   561→- Bump AGP from 7.1.1 to 8.x.
+   562→- Bump `targetSdkVersion` from 28 to 34+.
+   563→- Migrate `cargo-xdk` to `cargo-ndk`.
+   564→- Bump all AndroidX libraries.
+   565→- Bump Rust crates (`jni:0.19` → `0.21`, `ndk:0.6` → `0.9`, etc.).
+   566→
+   567→### 9.2 Replace closed-source blobs (medium risk, very high payoff)
+   568→
+   569→| Blob | Status | Replacement |
+   570→|---|---|---|
+   571→| `libloader.so` | ✅ Replaced | `app/rs/loader/` (Rust) — already builds. Delete the legacy `.so` and update `RomManager.LOADER_FILE` to point at `libloader_new.so`. |
+   572→| `libOpenglRender.so` | ⚠️ Partial | `app/rs/openglrenderer/` exists but the new renderer is behind `use_new_renderer=false` default. Validate it actually renders correctly across devices, then flip the default. |
+   573→| `libadb.so` | ❌ Still closed | Replace with an open-source Java ADB client (e.g., `adblib` from AOSP, or `github.com/MuntashirAkon/adb-android`). |
+   574→
+   575→### 9.3 Architecture cleanups
+   576→
+   577→- Deduplicate `renderer_new/` and `openglrenderer/` (nearly identical code).
+   578→- Convert `Renderer.java` to Kotlin.
+   579→- Replace `jdeferred` with `CompletableFuture`.
+   580→- Replace `com.cleveroad:androidmanimation:0.9.1` with `android.animation.*`.
+   581→- Replace `com.github.clans:fab:1.6.4` with Material `ExtendedFloatingActionButton`.
+   582→
+   583→### 9.4 Runtime behavior improvements
+   584→
+   585→- The 60-second boot timeout doesn't differentiate between "still booting"
+   586→  and "stuck". Add a heartbeat mechanism.
+   587→- The dalvik-cache clear is synchronous on the UI thread. Move to a coroutine.
+   588→- `patchServicesJarForPackageInstaller` should be moved to install time.
+   589→
+   590→### 9.5 Missing features
+   591→
+   592→- Build the ROM from source. The manifest exists; what's missing is build
+   593→  orchestration in CI.
+   594→- Android 10/12/13 guest support.
+   595→- Multi-window mode.
+   596→
+   597→### 9.6 Quality-of-life improvements
+   598→
+   599→- Add instrumented tests.
+   600→- Replace Microsoft AppCenter (being retired) with Sentry or self-hosted.
+   601→- Remove `moe.feng:AlipayZeroSdk:1.1` (donation SDK).
+   602→- Add a `CONTRIBUTING.md` (referenced but missing).
+   603→
+   604→---
+   605→
+   606→## 10. Setting up a development environment
+   607→
+   608→```bash
+   609→# 1. Clone the fork
+   610→git clone https://github.com/Disable-OP/twoyi.git
+   611→cd twoyi
+   612→
+   613→# 2. EITHER set up locally:
+   614→curl https://sh.rustup.rs -sSf | sh
+   615→rustup target add aarch64-linux-android x86_64-linux-android
+   616→cargo install cargo-xdk
+   617→# Install Android Studio with SDK Platform 31 + NDK r27c
+   618→# Download rootfs.7z from cyanmint releases → app/src/main/assets/rootfs.7z
+   619→./gradlew assembleRelease
+   620→
+   621→# 2. OR spin up a Codespace:
+   622→#    - On GitHub: Code → Codespaces → Create codespace on main (or this branch)
+   623→#    - Select 4-core / 16 GB / 32 GB machine
+   624→#    - Wait ~5 min for postCreateCommand to finish
+   625→#    - Run: ./.devcontainer/scripts/check-kvm.sh
+   626→#    - Run: ./.devcontainer/scripts/run-redroid.sh
+   627→#    - Run: ./.devcontainer/scripts/test-twoyi.sh
+   628→#    - Run: ./.devcontainer/scripts/analyze-screenshots.sh
+   629→
+   630→# 3. (Optional) Build only one ABI for faster iteration:
+   631→./gradlew assembleRelease -Pabis=arm64-v8a
+   632→
+   633→# 4. (Optional) Rebuild only the Rust side:
+   634→cd app/rs && ./build_rs.sh --release arm64-v8a x86_64
+   635→```
+   636→
+   637→---
+   638→
+   639→## 11. References
+   640→
+   641→- **Active fork source**: https://github.com/cyanmint/twoyi
+   642→- **This branch's fork**: https://github.com/Disable-OP/twoyi
+   643→- **Original archived repo**: https://github.com/twoyi/twoyi
+   644→- **cyanmint's Nogitsune (twoyi v2 rewrite)**: https://github.com/cyanmint/Nogitsune
+   645→- **Project website**: https://twoyi.app
+   646→- **Original author**: weishu — https://github.com/tiann
+   647→- **cargo-xdk**: https://github.com/tiann/cargo-xdk
+   648→- **Anbox** (graphics/pipe design twoyi's renderer follows): https://github.com/anbox/anbox
+   649→- **AOSP android-8.1.0_r81 reference**:
+   650→  https://android.googlesource.com/platform/manifest/+/refs/tags/android-8.1.0_r81
+   651→- **DEX bytecode reference**:
+   652→  https://source.android.com/docs/core/runtime/dex-format
+   653→- **Codespaces KVM**:
+   654→  https://github.com/devcontainers/images/issues/884
+   655→  https://github.com/dotnet/runtime/issues/77851
+   656→- **Redroid (Android-in-container)**: https://github.com/remote-android/redroid-doc
+   657→
+   658→---
+   659→
+   660→*This document was produced by reading every source file in the
+   661→`cyanmint/twoyi` repository at commit `25ef89c` plus the improvements
+   662→in this branch. It is intended as a living reference — if you improve
+   663→the project, please update the corresponding section.*
+   664→

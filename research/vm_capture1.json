@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://www.computer.org/csdl/journal/tc/2015/10/07005503/13rRUygT7rV",
+    "name": "A Lightweight Virtualization Solution for Android Devices",
+    "snippet": "We treat it as a virtual machine monitor with no untrusted application ever executed in this domain. ... root filesystem means to access the virtual binder device ... Read more",
+    "host_name": "www.computer.org",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://developer.android.com/studio/run/managing-avds",
+    "name": "Create and manage virtual devices | Android Studio",
+    "snippet": "From the Android Studio Welcome screen , select More Actions > Virtual Device Manager. ... If you require elevated privileges ( root ) to aid with app ... Read more\nAfter opening a project, select View > Tool Windows > Device Manager from the main menu bar, then click the +, and then click Create Virtual Device . New Device ...",
+    "host_name": "developer.android.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://source.android.com/docs/core/virtualization/usecases",
+    "name": "Use cases",
+    "snippet": "Jun 24, 2026 — This page contains common use cases for AVF. Isolated compilation As a software -secure enclave, a protected virtual machine ( VM ) provides a safe environment to ... Read more",
+    "host_name": "source.android.com",
+    "rank": 2,
+    "date": "Jun 24, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://forums.imgtec.com/t/cannot-capture-the-surfaceflinger/3391",
+    "name": "Cannot capture the SurfaceFlinger - PowerVR Insider",
+    "snippet": "May 28, 2021 — Upon restarting surface flinger the Carbon recording layer might be able to start recording, killing surface flinger should cause android to ... Read more",
+    "host_name": "forums.imgtec.com",
+    "rank": 3,
+    "date": "May 28, 2021",
+    "favicon": ""
+  },
+  {
+    "url": "https://patents.google.com/patent/CN103593225A/en",
+    "name": "Method for multiplexing Binder IPC mechanism by multiple",
+    "snippet": "... device file corresponding to these virtual Binder equipment distributed to each virtual machine ;. When in virtual machine , the application program of Android ... Read more",
+    "host_name": "patents.google.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://events19.linuxfoundation.org/wp-content/uploads/2017/11/Tutorial-Constructing-App-Streaming-Cloud-Infrastructure-Using-Android-Containers-Dr.-Tzi-cker-Chiueh-_-Sting-Cheng-ICL_ITRI.pdf",
+    "name": "App Streaming Using Android Containers and ARM SOCs",
+    "snippet": "Binder is an Android -specific inter-process communication ( IPC ) mechanism. ... X86 + Android Virtual Machine . ~ 60%. ~$370 USD. < 30W (average). X86 + Android ... Read more",
+    "host_name": "events19.linuxfoundation.org",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.usenix.org/system/files/conference/usenixsecurity25/sec25cycle1-prepub-127-gong-haochen.pdf",
+    "name": "Transparent and Lightweight Protection of Vehicle Control",
+    "snippet": "by H Gong · Cited by 3 — Second, the most commonly used inter-process commu- nication ( IPC ) mechanism in Android , the Binder , is more ... crosvm - the chromeos virtual machine monitor . Read more",
+    "host_name": "www.usenix.org",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://news.ycombinator.com/item?id=41964829",
+    "name": "Trying to reimplement Android without Binder is a doomed",
+    "snippet": "Binder will be local to an app , so you can easily replace it with any IPC . I'd be absolutely shocked if that was even a little bit true. Android's binder & AIDL ... Read more",
+    "host_name": "news.ycombinator.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://play.google.com/store/apps/details?id=com.vmos.virtual&hl=en_US",
+    "name": "VMOS - Android virtual machine - Apps on Google Play",
+    "snippet": "Jul 3, 2026 — VMOS lets you run a complete Android system as a regular app on your phone. No root , no rebooting, no separate device .",
+    "host_name": "play.google.com",
+    "rank": 8,
+    "date": "Jul 3, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.reddit.com/r/androidapps/comments/1i2uf4s/is_there_an_app_like_virtual_machine_or_sandbox",
+    "name": "Is there an app like Virtual Machine Or Sandbox for Android?",
+    "snippet": "A place/app where you can run/install software (mostly apks) \"virtually\" to check,on andriod, like you do in VM or sandbox on desktop.\n\nik one way is to ...",
+    "host_name": "www.reddit.com",
+    "rank": 9,
+    "date": "",
+    "favicon": ""
+  }
+]

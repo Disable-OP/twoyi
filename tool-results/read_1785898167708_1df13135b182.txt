@@ -1,0 +1,908 @@
+     1→package com.android.vmcore.hal;
+     2→
+     3→import android.content.Context;
+     4→import android.content.Intent;
+     5→import android.content.IntentFilter;
+     6→import android.content.SharedPreferences;
+     7→import android.graphics.Rect;
+     8→import android.hardware.Camera;
+     9→import android.hardware.Sensor;
+    10→import android.os.Handler;
+    11→import android.os.HandlerThread;
+    12→import android.os.SystemClock;
+    13→import android.text.TextUtils;
+    14→import android.util.SparseIntArray;
+    15→import androidx.fragment.app.AbstractC1017WWWoWWWo;
+    16→import com.android.vmcore.KLog;
+    17→import com.android.vmcore.StringFog;
+    18→import com.android.vmcore.VMInstance;
+    19→import com.android.vmcore.hal.CameraService;
+    20→import com.android.vmcore.hal.phone.CallPdu;
+    21→import com.android.vmcore.hal.phone.Types;
+    22→import com.google.android.gms.internal.ads.pr0;
+    23→import com.google.firebase.remoteconfig.FirebaseRemoteConfig;
+    24→import java.util.ArrayList;
+    25→import org.apache.commons.compress.archivers.tar.TarConstants;
+    26→import org.apache.commons.compress.harmony.unpack200.bytecode.ConstantPoolEntry;
+    27→import p001WWWWoWWWWo.RunnableC0054WWWWWWWW;
+    28→import x5.WWWWWWWW;
+    29→/* loaded from: classes.dex */
+    30→public class HALManager {
+    31→    private final BatteryService mBatteryService;
+    32→    private final CameraService mCameraService;
+    33→    private final HWControlService mHWControlService;
+    34→    private final LocationService mLocationService;
+    35→    private long mNativePtr;
+    36→    private final PhoneService mPhoneService;
+    37→    private final SensorService mSensorService;
+    38→    private final WiFiService mWiFiService;
+    39→
+    40→    public HALManager(Context context, VMInstance vMInstance) {
+    41→        this.mNativePtr = nativeSetup(vMInstance.f8937WWWoWWWo.f8866WWWWWWWW);
+    42→        this.mCameraService = new CameraService(context, vMInstance, this);
+    43→        this.mLocationService = new LocationService(context, vMInstance, this);
+    44→        this.mHWControlService = new HWControlService(context);
+    45→        this.mWiFiService = new WiFiService(context, vMInstance, this);
+    46→        this.mSensorService = new SensorService(context, vMInstance, this);
+    47→        this.mPhoneService = new PhoneService(vMInstance, this);
+    48→        this.mBatteryService = new BatteryService(context, vMInstance);
+    49→    }
+    50→
+    51→    private int CameraConnect(String str) {
+    52→        this.mCameraService.m5123WWWWWWWW(str);
+    53→        return 0;
+    54→    }
+    55→
+    56→    private int CameraDisconnect(String str) {
+    57→        this.mCameraService.m5122WWWWoWWWWo(str);
+    58→        return 0;
+    59→    }
+    60→
+    61→    private int CameraFlash(String str, String str2) {
+    62→        this.mCameraService.getClass();
+    63→        return 0;
+    64→    }
+    65→
+    66→    private int CameraFocus(String str, String str2, int i10, int i11, int i12, int i13, int i14) {
+    67→        Camera camera = this.mCameraService.f9031WWWWWWWW;
+    68→        String str3 = CameraService.f9028WWWW;
+    69→        if (camera == null) {
+    70→            StringFog.f8859WWWWWWWW.getClass();
+    71→            KLog.m5040WWWWoWWWWo(str3, WWWWWWWW.m17835WWWWWWWW(new byte[]{-111, 124, -42, -58, -108, -63, 3, TarConstants.LF_SYMLINK, -91, 124, -62, -40, -84, -109, ConstantPoolEntry.CP_NameAndType, 27, -22, 124, -42, -58, -108, -63, 3}, new byte[]{-54, 31, -73, -85, -15, -77, 98, 116}));
+    72→            return 0;
+    73→        }
+    74→        try {
+    75→            camera.cancelAutoFocus();
+    76→            Camera.Parameters parameters = camera.getParameters();
+    77→            if (parameters.getMaxNumFocusAreas() > 0) {
+    78→                ArrayList arrayList = new ArrayList();
+    79→                arrayList.add(new Camera.Area(new Rect(i10, i11, i12, i13), i14));
+    80→                parameters.setFocusAreas(arrayList);
+    81→            }
+    82→            if (!TextUtils.isEmpty(str2)) {
+    83→                parameters.setFocusMode(str2);
+    84→            }
+    85→            byte[] bArr = {-98, -17, 57, TarConstants.LF_CHR, 106, 82, -101, -30};
+    86→            StringFog.f8859WWWWWWWW.getClass();
+    87→            if (WWWWWWWW.m17835WWWWWWWW(new byte[]{-8, -122, 65, 86, 14}, bArr).equals(parameters.getFocusMode())) {
+    88→                parameters.setFocusAreas(null);
+    89→            }
+    90→            camera.setParameters(parameters);
+    91→            camera.autoFocus(null);
+    92→            return 0;
+    93→        } catch (Throwable th2) {
+    94→            byte[] bArr2 = {81, 113, -92, 21, 125, -127, 45, 15, 101, 113, -80, ConstantPoolEntry.CP_InterfaceMethodref, 69, -45, 41, TarConstants.LF_LINK, 105, 119, -75, ConstantPoolEntry.CP_NameAndType, 113, -100, 34, 115, 42};
+    95→            byte[] bArr3 = {10, 18, -59, TarConstants.LF_PAX_EXTENDED_HEADER_LC, 24, -13, TarConstants.LF_GNUTYPE_LONGNAME, 73};
+    96→            StringFog.f8859WWWWWWWW.getClass();
+    97→            KLog.m5044WWWoWWWo(str3, WWWWWWWW.m17835WWWWWWWW(bArr2, bArr3), th2);
+    98→            return 0;
+    99→        }
+   100→    }
+   101→
+   102→    private int CameraFrame(String str, float f10, float f11, float f12, float f13, int i10, String str2) {
+   103→        Camera camera = this.mCameraService.f9031WWWWWWWW;
+   104→        String str3 = CameraService.f9028WWWW;
+   105→        if (camera == null) {
+   106→            StringFog.f8859WWWWWWWW.getClass();
+   107→            KLog.m5040WWWWoWWWWo(str3, WWWWWWWW.m17835WWWWWWWW(new byte[]{TarConstants.LF_LINK, 16, -116, 2, 63, 100, -35, -99, 24, 18, Byte.MIN_VALUE, 10, 7, TarConstants.LF_FIFO, -46, -76, 74, 16, -116, 2, 63, 100, -35}, new byte[]{106, 115, -19, 111, 90, 22, -68, -37}));
+   108→            return 0;
+   109→        }
+   110→        try {
+   111→            Camera.Parameters parameters = camera.getParameters();
+   112→            if (!parameters.isZoomSupported() && !parameters.isSmoothZoomSupported()) {
+   113→                StringFog.f8859WWWWWWWW.getClass();
+   114→                KLog.m5040WWWWoWWWWo(str3, WWWWWWWW.m17835WWWWWWWW(new byte[]{-14, 119, 39, 42, 59, 3, 38, 93, -37, 117, 43, 34, 3, 81, 61, 116, -58, 121, 102, 41, TarConstants.LF_LINK, 5, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, 104, -36, 100, TarConstants.LF_FIFO, 40, 44, 5, 34, Byte.MAX_VALUE}, new byte[]{-87, 20, 70, 71, 94, 113, 71, 27}));
+   115→                return 0;
+   116→            }
+   117→            parameters.setZoom(i10);
+   118→            camera.setParameters(parameters);
+   119→            return 0;
+   120→        } catch (Throwable th2) {
+   121→            StringFog.f8859WWWWWWWW.getClass();
+   122→            KLog.m5044WWWoWWWo(str3, WWWWWWWW.m17835WWWWWWWW(new byte[]{-51, -46, -53, 119, -117, -39, -83, -74, -28, -48, -57, Byte.MAX_VALUE, -77, -117, -87, -120, -11, -44, -38, 110, -121, -60, -94, -54, -74}, new byte[]{-106, -79, -86, 26, -18, -85, -52, -16}), th2);
+   123→            return 0;
+   124→        }
+   125→    }
+   126→
+   127→    private String CameraList() {
+   128→        CameraService cameraService = this.mCameraService;
+   129→        boolean m5085WWoWWo = cameraService.f9029WWWWoWWWWo.m5085WWoWWo();
+   130→        String str = CameraService.f9028WWWW;
+   131→        if (!m5085WWoWWo) {
+   132→            byte[] bArr = {40, -77, 91, 107, 19, 111, 62, -16, 22, -83, TarConstants.LF_GNUTYPE_SPARSE, 69, 71, 79, 62, -16, 22, -83, TarConstants.LF_GNUTYPE_SPARSE, 56, 9, 67, 43, -67, 22, -79, TarConstants.LF_GNUTYPE_SPARSE, 122, ConstantPoolEntry.CP_InterfaceMethodref, 73, 59};
+   133→            byte[] bArr2 = {115, -33, TarConstants.LF_SYMLINK, 24, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, 44, 95, -99};
+   134→            StringFog.f8859WWWWWWWW.getClass();
+   135→            KLog.m5043WWWWWWWW(str, WWWWWWWW.m17835WWWWWWWW(bArr, bArr2));
+   136→            return FirebaseRemoteConfig.DEFAULT_VALUE_FOR_STRING;
+   137→        }
+   138→        byte[] bArr3 = {-91, 71, -26, TarConstants.LF_LINK, TarConstants.LF_DIR, -73, -25, 91};
+   139→        StringFog.f8859WWWWWWWW.getClass();
+   140→        String m17835WWWWWWWW = WWWWWWWW.m17835WWWWWWWW(new byte[]{-58, 38, -117, 84, 71, -42}, bArr3);
+   141→        SharedPreferences sharedPreferences = cameraService.f9030WWWWWWWW.getSharedPreferences(m17835WWWWWWWW, 0);
+   142→        String string = sharedPreferences.getString(WWWWWWWW.m17835WWWWWWWW(new byte[]{18, -14, -77, TarConstants.LF_GNUTYPE_SPARSE, -122, -120, -69, TarConstants.LF_FIFO, 24, -32, -86}, new byte[]{113, -109, -34, TarConstants.LF_FIFO, -12, -23, -28, 90}), FirebaseRemoteConfig.DEFAULT_VALUE_FOR_STRING);
+   143→        int i10 = sharedPreferences.getInt(WWWWWWWW.m17835WWWWWWWW(new byte[]{97, -10, -29, -89, -102, 34, 13}, new byte[]{23, -109, -111, -44, -13, TarConstants.LF_MULTIVOLUME, 99, -92}), 0);
+   144→        if (TextUtils.isEmpty(string) || i10 != 1) {
+   145→            StringBuilder sb2 = new StringBuilder();
+   146→            int numberOfCameras = Camera.getNumberOfCameras();
+   147→            for (int i11 = 0; i11 < numberOfCameras; i11++) {
+   148→                try {
+   149→                    sb2.append(CameraService.m5121WWWoWWWo(i11));
+   150→                } catch (Throwable th2) {
+   151→                    byte[] bArr4 = {14, -47, 13, -85, -114, 118, -76, -94, TarConstants.LF_NORMAL, -49, 5, -123, -38, 80, -83, -84, TarConstants.LF_NORMAL, -51, 16, -79, -107, 91, -11};
+   152→                    byte[] bArr5 = {85, -67, 100, -40, -6, TarConstants.LF_DIR, -43, -49};
+   153→                    StringFog.f8859WWWWWWWW.getClass();
+   154→                    KLog.m5044WWWoWWWo(str, WWWWWWWW.m17835WWWWWWWW(bArr4, bArr5), th2);
+   155→                }
+   156→            }
+   157→            string = sb2.toString();
+   158→            SharedPreferences.Editor edit = sharedPreferences.edit();
+   159→            StringFog.f8859WWWWWWWW.getClass();
+   160→            edit.putString(WWWWWWWW.m17835WWWWWWWW(new byte[]{ConstantPoolEntry.CP_InterfaceMethodref, 3, -38, -65, -63, -103, TarConstants.LF_BLK, -39, 1, 17, -61}, new byte[]{104, 98, -73, -38, -77, -8, 107, -75}), string).putInt(WWWWWWWW.m17835WWWWWWWW(new byte[]{-108, 104, -45, 105, -113, TarConstants.LF_FIFO, -120}, new byte[]{-30, 13, -95, 26, -26, 89, -26, -123}), 1).apply();
+   161→        }
+   162→        StringBuilder sb3 = new StringBuilder();
+   163→        pr0.m9002WWWWWWWW(StringFog.f8859WWWWWWWW, new byte[]{-123, -51, -96, -71, 7, -12, -74, -64, -69, -45, -88, -105, TarConstants.LF_GNUTYPE_SPARSE, -44, -74, -64, -69, -45, -88, -22, 16, -40, -94, -61, -86, -127}, new byte[]{-34, -95, -55, -54, 115, -73, -41, -83}, sb3);
+   164→        sb3.append(string.split("\n").length - 1);
+   165→        KLog.m5043WWWWWWWW(str, sb3.toString());
+   166→        return string;
+   167→    }
+   168→
+   169→    private int CameraStart(String str, int i10, int i11, int i12) {
+   170→        return this.mCameraService.m5124WWWWWWWW(i10, i11, i12, str);
+   171→    }
+   172→
+   173→    private int CameraStop(String str) {
+   174→        this.mCameraService.m5125WWWWWWWW(str);
+   175→        return 0;
+   176→    }
+   177→
+   178→    private boolean CheckSensorsSupport(int i10) {
+   179→        SensorService sensorService = this.mSensorService;
+   180→        sensorService.getClass();
+   181→        if (i10 >= 0 && i10 < 12 && (sensorService.f9102WWWWWWWW[i10] & 1) == 1) {
+   182→            return true;
+   183→        }
+   184→        return false;
+   185→    }
+   186→
+   187→    private void DisableSensors(int i10) {
+   188→        SensorService sensorService = this.mSensorService;
+   189→        sensorService.getClass();
+   190→        if (i10 >= 0 && i10 < 12) {
+   191→            int[] iArr = sensorService.f9102WWWWWWWW;
+   192→            iArr[i10] = iArr[i10] & (-5);
+   193→            Sensor sensor = sensorService.f9101WWWWWWWW[i10];
+   194→            if (sensor != null) {
+   195→                sensorService.f9106WWWoWWWo.unregisterListener(sensorService, sensor);
+   196→            }
+   197→        }
+   198→    }
+   199→
+   200→    private void EnableSensors(int i10) {
+   201→        Sensor sensor;
+   202→        SensorService sensorService = this.mSensorService;
+   203→        sensorService.getClass();
+   204→        if (i10 >= 0 && i10 < 12) {
+   205→            int[] iArr = sensorService.f9102WWWWWWWW;
+   206→            int i11 = iArr[i10];
+   207→            if ((i11 & 2) == 2) {
+   208→                iArr[i10] = i11 | 4;
+   209→                if (sensorService.f9104WWWWWWWW && (sensor = sensorService.f9101WWWWWWWW[i10]) != null) {
+   210→                    int i12 = sensorService.f9108WWoWWo[i10];
+   211→                    if (i12 == 0) {
+   212→                        i12 = 1;
+   213→                    }
+   214→                    sensorService.f9106WWWoWWWo.registerListener(sensorService, sensor, i12, sensorService.f9103WWWWWWWW[i10]);
+   215→                }
+   216→            }
+   217→        }
+   218→    }
+   219→
+   220→    /* JADX WARN: Removed duplicated region for block: B:188:0x0767  */
+   221→    /* JADX WARN: Removed duplicated region for block: B:199:0x076f A[SYNTHETIC] */
+   222→    /*
+   223→        Code decompiled incorrectly, please refer to instructions dump.
+   224→    */
+   225→    private String ExecPhoneCommand(int i10, String str) {
+   226→        String m17835WWWWWWWW;
+   227→        int i11;
+   228→        int i12;
+   229→        Types.Cdma2000RegistrationInfo cdma2000RegistrationInfo;
+   230→        boolean z10;
+   231→        int i13 = 3;
+   232→        int i14 = 6;
+   233→        int i15 = 7;
+   234→        int i16 = 5;
+   235→        PhoneService phoneService = this.mPhoneService;
+   236→        phoneService.getClass();
+   237→        StringBuilder sb2 = new StringBuilder();
+   238→        byte[] bArr = {ConstantPoolEntry.CP_NameAndType};
+   239→        byte[] bArr2 = {TarConstants.LF_CONTIG, -86, 87, -59, 81, -88, -63, -120};
+   240→        StringFog.f8859WWWWWWWW.getClass();
+   241→        String[] split = str.split(WWWWWWWW.m17835WWWWWWWW(bArr, bArr2));
+   242→        int length = split.length;
+   243→        int i17 = 0;
+   244→        while (i17 < length) {
+   245→            String str2 = split[i17];
+   246→            byte[] bArr3 = new byte[i16];
+   247→            // fill-array-data instruction
+   248→            bArr3[0] = -87;
+   249→            bArr3[1] = -117;
+   250→            bArr3[2] = -19;
+   251→            bArr3[3] = -30;
+   252→            bArr3[4] = 85;
+   253→            WWWWWWWW wwwwwwww = StringFog.f8859WWWWWWWW;
+   254→            boolean m3444WWWWWWWW = AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, bArr3, new byte[]{-126, -56, -65, -89, 18, 43, 19, Byte.MIN_VALUE}, str2);
+   255→            String str3 = FirebaseRemoteConfig.DEFAULT_VALUE_FOR_STRING;
+   256→            if (m3444WWWWWWWW) {
+   257→                byte[] bArr4 = new byte[i15];
+   258→                // fill-array-data instruction
+   259→                bArr4[0] = -88;
+   260→                bArr4[1] = 16;
+   261→                bArr4[2] = 17;
+   262→                bArr4[3] = -22;
+   263→                bArr4[4] = -43;
+   264→                bArr4[5] = -3;
+   265→                bArr4[6] = 50;
+   266→                if (AbstractC1017WWWoWWWo.m3430WWWWWWWWWW(wwwwwwww, bArr4, new byte[]{-125, TarConstants.LF_GNUTYPE_SPARSE, 67, -81, -110, -64, 13, -119}, str2)) {
+   267→                    str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{-82, -29, 57, -127, -51, 98, 94, -80, -75, -115, TarConstants.LF_PAX_EXTENDED_HEADER_UC, -24, -86, 105, TarConstants.LF_GNUTYPE_LONGNAME, -96, -84}, new byte[]{-123, -96, 107, -60, -118, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 126, -104});
+   268→                } else {
+   269→                    byte[] bArr5 = new byte[i14];
+   270→                    // fill-array-data instruction
+   271→                    bArr5[0] = 29;
+   272→                    bArr5[1] = 57;
+   273→                    bArr5[2] = 61;
+   274→                    bArr5[3] = -95;
+   275→                    bArr5[4] = 18;
+   276→                    bArr5[5] = -1;
+   277→                    if (str2.startsWith(WWWWWWWW.m17835WWWWWWWW(bArr5, new byte[]{TarConstants.LF_FIFO, 122, 111, -28, 85, -62, -54, 1}))) {
+   278→                        try {
+   279→                            byte[] bArr6 = new byte[i14];
+   280→                            // fill-array-data instruction
+   281→                            bArr6[0] = -95;
+   282→                            bArr6[1] = -98;
+   283→                            bArr6[2] = 103;
+   284→                            bArr6[3] = 2;
+   285→                            bArr6[4] = -5;
+   286→                            bArr6[5] = 34;
+   287→                            i11 = Integer.parseInt(str2.substring(WWWWWWWW.m17835WWWWWWWW(bArr6, new byte[]{-118, -35, TarConstants.LF_DIR, 71, -68, 31, 25, -69}).length()));
+   288→                        } catch (Exception unused) {
+   289→                            i11 = -1;
+   290→                        }
+   291→                        if ((i11 >= 0 && i11 <= i13) || i11 == 128) {
+   292→                            phoneService.f9071WWWWWWWW = i11;
+   293→                        } else {
+   294→                            StringFog.f8859WWWWWWWW.getClass();
+   295→                            str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{-23, TarConstants.LF_GNUTYPE_LONGLINK, 109, 92, -106, TarConstants.LF_GNUTYPE_LONGLINK, TarConstants.LF_LINK, TarConstants.LF_GNUTYPE_SPARSE, -115, 90, 26, 57, -125, 62}, new byte[]{-62, 8, 32, 25, -74, 14, 99, 1});
+   296→                        }
+   297→                    } else {
+   298→                        byte[] bArr7 = new byte[i14];
+   299→                        // fill-array-data instruction
+   300→                        bArr7[0] = -67;
+   301→                        bArr7[1] = -39;
+   302→                        bArr7[2] = 32;
+   303→                        bArr7[3] = -124;
+   304→                        bArr7[4] = 65;
+   305→                        bArr7[5] = 20;
+   306→                        if (str2.equals(WWWWWWWW.m17835WWWWWWWW(bArr7, new byte[]{-106, -102, 114, -63, 6, 43, -60, -111}))) {
+   307→                            int m5164WWWWoWWWWo = phoneService.m5164WWWWoWWWWo(true);
+   308→                            int m5174WWWWWWWW = phoneService.m5174WWWWWWWW(m5164WWWWoWWWWo, true);
+   309→                            if (m5174WWWWWWWW == 0) {
+   310→                                m5164WWWWoWWWWo = 0;
+   311→                            }
+   312→                            Object m5173WWWWWWWW = phoneService.m5173WWWWWWWW(m5164WWWWoWWWWo);
+   313→                            Types.RegStateResult regStateResult = new Types.RegStateResult();
+   314→                            regStateResult.f9224WWWWWWWW = m5174WWWWWWWW;
+   315→                            regStateResult.f9223WWWWoWWWWo = m5164WWWWoWWWWo;
+   316→                            regStateResult.f9227WWWoWWWo = m5173WWWWWWWW;
+   317→                            regStateResult.f9225WWWWWWWW = FirebaseRemoteConfig.DEFAULT_VALUE_FOR_STRING;
+   318→                            if (PhoneService.m5161WWWW(m5164WWWWoWWWWo) == 1) {
+   319→                                Types.Cdma2000RegistrationInfo cdma2000RegistrationInfo2 = new Types.Cdma2000RegistrationInfo();
+   320→                                if (m5164WWWWoWWWWo != 4 && m5164WWWWoWWWWo != 5 && m5164WWWWoWWWWo != i14) {
+   321→                                    z10 = true;
+   322→                                } else {
+   323→                                    z10 = false;
+   324→                                }
+   325→                                cdma2000RegistrationInfo2.f9162WWWWWWWW = z10;
+   326→                                if (m5174WWWWWWWW == 1) {
+   327→                                    cdma2000RegistrationInfo2.f9161WWWWoWWWWo = 1;
+   328→                                    cdma2000RegistrationInfo2.f9164WWWoWWWo = 1;
+   329→                                    cdma2000RegistrationInfo2.f9163WWWWWWWW = 1;
+   330→                                } else {
+   331→                                    cdma2000RegistrationInfo2.f9161WWWWoWWWWo = 0;
+   332→                                    cdma2000RegistrationInfo2.f9164WWWoWWWo = 0;
+   333→                                    cdma2000RegistrationInfo2.f9163WWWWWWWW = 0;
+   334→                                }
+   335→                                regStateResult.f9226WWWWWWWW = cdma2000RegistrationInfo2;
+   336→                            }
+   337→                            int i18 = phoneService.f9071WWWWWWWW;
+   338→                            if (i18 != 0 && i18 != 1) {
+   339→                                if (i18 != 2 && i18 != i13) {
+   340→                                    StringBuilder sb3 = new StringBuilder();
+   341→                                    sb3.append(regStateResult.f9224WWWWWWWW);
+   342→                                    sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{-46}, new byte[]{-2, 24, 107, -75, 27, -57, 18, -84}));
+   343→                                    sb3.append(regStateResult.f9223WWWWoWWWWo);
+   344→                                    sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{-48}, new byte[]{-4, -1, -8, -56, 115, -44, 29, -53}));
+   345→                                    if (PhoneService.m5161WWWW(regStateResult.f9223WWWWoWWWWo) == 1 && (cdma2000RegistrationInfo = regStateResult.f9226WWWWWWWW) != null) {
+   346→                                        sb3.append(cdma2000RegistrationInfo.f9162WWWWWWWW ? 1 : 0);
+   347→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{-63}, new byte[]{-19, 108, -67, 85, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 44, 96, -23}));
+   348→                                        sb3.append(regStateResult.f9226WWWWWWWW.f9161WWWWoWWWWo);
+   349→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{42}, new byte[]{6, TarConstants.LF_PAX_EXTENDED_HEADER_UC, Byte.MIN_VALUE, -55, 35, 34, -13, TarConstants.LF_DIR}));
+   350→                                        sb3.append(regStateResult.f9226WWWWWWWW.f9164WWWoWWWo);
+   351→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{-23}, new byte[]{-59, 59, -56, 27, -40, -68, 18, -127}));
+   352→                                        sb3.append(regStateResult.f9226WWWWWWWW.f9163WWWWWWWW);
+   353→                                        i12 = 0;
+   354→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{45}, new byte[]{1, 35, -47, -91, -61, ConstantPoolEntry.CP_NameAndType, TarConstants.LF_FIFO, 37}));
+   355→                                    } else {
+   356→                                        i12 = 0;
+   357→                                        sb3.append(0);
+   358→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{-44}, new byte[]{-8, 119, -115, -113, -16, -67, TarConstants.LF_NORMAL, -71}));
+   359→                                        sb3.append(-1);
+   360→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{91}, new byte[]{119, 87, 16, 5, 14, 81, -68, -121}));
+   361→                                        sb3.append(-1);
+   362→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{80}, new byte[]{124, 84, -50, 33, -75, 107, 123, -92}));
+   363→                                        sb3.append(-1);
+   364→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{126}, new byte[]{82, -105, 94, -93, -29, TarConstants.LF_MULTIVOLUME, -25, TarConstants.LF_MULTIVOLUME}));
+   365→                                    }
+   366→                                    sb3.append(i12);
+   367→                                    byte[] bArr8 = new byte[1];
+   368→                                    bArr8[i12] = -96;
+   369→                                    sb3.append(WWWWWWWW.m17835WWWWWWWW(bArr8, new byte[]{-116, -113, TarConstants.LF_SYMLINK, 118, ConstantPoolEntry.CP_InterfaceMethodref, 80, TarConstants.LF_DIR, 21}));
+   370→                                    sb3.append(PhoneService.m5143WWWWWWWW(regStateResult.f9227WWWoWWWo));
+   371→                                    if (!TextUtils.isEmpty(regStateResult.f9225WWWWWWWW)) {
+   372→                                        sb3.append(WWWWWWWW.m17835WWWWWWWW(new byte[]{-39}, new byte[]{-11, 1, 57, -6, 105, 61, 31, 82}));
+   373→                                        sb3.append(regStateResult.f9225WWWWWWWW);
+   374→                                    } else {
+   375→                                        pr0.m9009WWWoWWWo(new byte[]{-92}, new byte[]{-120, -15, 6, 40, 26, 26, -11, -19}, sb3, FirebaseRemoteConfig.DEFAULT_VALUE_FOR_STRING);
+   376→                                    }
+   377→                                    str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{95, -106, 114, -40, 68, 73, -75}, new byte[]{116, -43, 32, -99, 3, 115, -107, 95}) + phoneService.f9071WWWWWWWW + WWWWWWWW.m17835WWWWWWWW(new byte[]{34}, new byte[]{14, -123, 60, -42, -113, 60, -79, -69}) + sb3.toString();
+   378→                                } else {
+   379→                                    str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{94, 59, 105, -38, 68, -106, -71}, new byte[]{117, TarConstants.LF_PAX_EXTENDED_HEADER_LC, 59, -97, 3, -84, -103, -13}) + phoneService.f9071WWWWWWWW + WWWWWWWW.m17835WWWWWWWW(new byte[]{-90}, new byte[]{-118, 117, 1, 68, 106, -17, -80, -90}) + regStateResult.f9224WWWWWWWW + WWWWWWWW.m17835WWWWWWWW(new byte[]{95, 123, -14, 108, -87, 92, -123, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 21, 96, -93, 108, -87, 92, -123, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 21, 42, -72}, new byte[]{115, TarConstants.LF_GNUTYPE_LONGNAME, -108, 10, -49, 58, -29, 62}) + regStateResult.f9223WWWWoWWWWo;
+   380→                                }
+   381→                            } else {
+   382→                                str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{3, 6, 3, -110, -97, TarConstants.LF_BLK, -76}, new byte[]{40, 69, 81, -41, -40, 14, -108, 31}) + phoneService.f9071WWWWWWWW + WWWWWWWW.m17835WWWWWWWW(new byte[]{58}, new byte[]{22, -39, -106, -69, -29, 22, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, -122}) + regStateResult.f9224WWWWWWWW;
+   383→                            }
+   384→                        } else {
+   385→                            str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{4, 37, 114, 105, -118, -3, 104, 63, 96, TarConstants.LF_BLK, 5, ConstantPoolEntry.CP_NameAndType, -98}, new byte[]{47, 102, 63, 44, -86, -72, 58, 109});
+   386→                        }
+   387→                    }
+   388→                }
+   389→            } else {
+   390→                byte[] bArr9 = new byte[i14];
+   391→                // fill-array-data instruction
+   392→                bArr9[0] = -105;
+   393→                bArr9[1] = -24;
+   394→                bArr9[2] = -42;
+   395→                bArr9[3] = -64;
+   396→                bArr9[4] = -89;
+   397→                bArr9[5] = 17;
+   398→                if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, bArr9, new byte[]{-68, -85, -111, -110, -30, 86, 64, 25}, str2)) {
+   399→                    str3 = phoneService.m5182WWWW(str2);
+   400→                } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{-25, -71, -113, 118}, new byte[]{-52, -6, -36, 39, -125, -127, 7, 45}, str2)) {
+   401→                    str3 = phoneService.m5170WWWWWWWW(str2);
+   402→                } else {
+   403→                    if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{89, -83, -94, -114, 57}, new byte[]{114, -18, -10, -53, 122, Byte.MIN_VALUE, -7, 91}, str2)) {
+   404→                        str3 = phoneService.m5171WWWWWWWW(str2);
+   405→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{99, 100, -70, 102, -63}, new byte[]{72, 39, -7, TarConstants.LF_DIR, -110, -78, 17, -77}, str2)) {
+   406→                        byte[] bArr10 = new byte[i14];
+   407→                        // fill-array-data instruction
+   408→                        bArr10[0] = 114;
+   409→                        bArr10[1] = 113;
+   410→                        bArr10[2] = 75;
+   411→                        bArr10[3] = -79;
+   412→                        bArr10[4] = -92;
+   413→                        bArr10[5] = 108;
+   414→                        if (AbstractC1017WWWoWWWo.m3430WWWWWWWWWW(wwwwwwww, bArr10, new byte[]{89, TarConstants.LF_SYMLINK, 8, -30, -9, TarConstants.LF_GNUTYPE_SPARSE, -5, -75}, str2)) {
+   415→                            str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{85, 100, 92, -81, -50, Byte.MIN_VALUE, 84, -92}, new byte[]{126, 39, 31, -4, -99, -70, 116, -108});
+   416→                        } else {
+   417→                            byte[] bArr11 = new byte[i14];
+   418→                            // fill-array-data instruction
+   419→                            bArr11[0] = -34;
+   420→                            bArr11[1] = 38;
+   421→                            bArr11[2] = 37;
+   422→                            bArr11[3] = -3;
+   423→                            bArr11[4] = -23;
+   424→                            bArr11[5] = -127;
+   425→                            if (!str2.startsWith(WWWWWWWW.m17835WWWWWWWW(bArr11, new byte[]{-11, 101, 102, -82, -70, -68, -57, 47}))) {
+   426→                                str3 = WWWWWWWW.m17835WWWWWWWW(new byte[]{-110, 69, -56, TarConstants.LF_GNUTYPE_SPARSE, TarConstants.LF_PAX_EXTENDED_HEADER_UC, -101, 74, TarConstants.LF_CHR, -10, 84, -65, TarConstants.LF_FIFO, TarConstants.LF_GNUTYPE_LONGNAME}, new byte[]{-71, 6, -123, 22, TarConstants.LF_PAX_EXTENDED_HEADER_LC, -34, 24, 97});
+   427→                            }
+   428→                        }
+   429→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{-116, 23, -122, 104, 74}, new byte[]{-89, 84, -55, 56, 25, 25, -50, 100}, str2)) {
+   430→                        str3 = phoneService.m5180WWoWWo(str2);
+   431→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{TarConstants.LF_CONTIG, 96, TarConstants.LF_CONTIG, 38, -49}, new byte[]{28, 35, 112, 107, -99, -102, TarConstants.LF_CHR, TarConstants.LF_NORMAL}, str2)) {
+   432→                        str3 = phoneService.m5177WWWoWWWo(str2);
+   433→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{-11, 37, -61, -60, -95}, new byte[]{-34, 102, -124, -105, -17, -107, 47, 97}, str2)) {
+   434→                        str3 = phoneService.m5184WoWo(str2);
+   435→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{-36, 80, 99, -126, -72}, new byte[]{-9, 7, TarConstants.LF_CHR, -48, -12, 18, 22, 65}, str2)) {
+   436→                        byte[] bArr12 = new byte[i14];
+   437→                        // fill-array-data instruction
+   438→                        bArr12[0] = 42;
+   439→                        bArr12[1] = 40;
+   440→                        bArr12[2] = 50;
+   441→                        bArr12[3] = -107;
+   442→                        bArr12[4] = 106;
+   443→                        bArr12[5] = 15;
+   444→                        if (AbstractC1017WWWoWWWo.m3430WWWWWWWWWW(StringFog.f8859WWWWWWWW, bArr12, new byte[]{1, Byte.MAX_VALUE, 98, -57, 38, TarConstants.LF_NORMAL, 84, 93}, str2)) {
+   445→                            m17835WWWWWWWW = WWWWWWWW.m17835WWWWWWWW(new byte[]{TarConstants.LF_NORMAL, -31, -4, -56, -91, 61, 40, -17}, new byte[]{27, -74, -84, -102, -23, 7, 8, -34});
+   446→                        } else {
+   447→                            m17835WWWWWWWW = WWWWWWWW.m17835WWWWWWWW(new byte[]{-64, -88, -34, -108, 79, -79, 80, -55, -92, -71, -87, -15, 91}, new byte[]{-21, -21, -109, -47, 111, -12, 2, -101});
+   448→                        }
+   449→                        str3 = m17835WWWWWWWW;
+   450→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{126, TarConstants.LF_CONTIG, TarConstants.LF_DIR, 102, -88}, new byte[]{85, 96, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, 43, -8, 79, 13, -14}, str2)) {
+   451→                        str3 = PhoneService.m5153WWWoWWWo(str2);
+   452→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{TarConstants.LF_CHR, -100, 114, TarConstants.LF_NORMAL, -41}, new byte[]{24, -53, 33, 101, -107, 20, 111, 20}, str2)) {
+   453→                        str3 = phoneService.m5183WW(str2);
+   454→                    } else if (AbstractC1017WWWoWWWo.m3444WWWWWWWW(wwwwwwww, new byte[]{-60, 59, TarConstants.LF_LINK, 44, TarConstants.LF_LINK}, new byte[]{-17, TarConstants.LF_PAX_EXTENDED_HEADER_LC, 99, Byte.MAX_VALUE, 124, 31, -124, -59}, str2)) {
+   455→                        str3 = phoneService.m5163WWWWoWWWWo(str2);
+   456→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-119, -84, TarConstants.LF_GNUTYPE_LONGNAME, -73, -22}, new byte[]{-94, -17, 5, -6, -93, -74, -19, -8}))) {
+   457→                        str3 = phoneService.m5166WWWWWWWW(str2);
+   458→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{21, -17, -114, -64, -70}, new byte[]{62, -84, -56, -107, -12, -59, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 123}))) {
+   459→                        str3 = phoneService.m5165WWWWWWWW(str2);
+   460→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{96, 116, 112, 10, -96}, new byte[]{TarConstants.LF_GNUTYPE_LONGLINK, TarConstants.LF_CONTIG, 32, 67, -18, 69, 72, 4}))) {
+   461→                        str3 = phoneService.m5169WWWWWWWW(str2);
+   462→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-122}, new byte[]{-62, 15, -54, -88, 44, TarConstants.LF_NORMAL, 37, ConstantPoolEntry.CP_NameAndType}))) {
+   463→                        phoneService.m5172WWWWWWWW(str2);
+   464→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{60, -97, -78, 56, -8}, new byte[]{23, -36, -2, 123, -69, -10, 31, -73}))) {
+   465→                        str3 = phoneService.m5167WWWWWWWW(str2);
+   466→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-70, -127, 106, TarConstants.LF_GNUTYPE_LONGLINK, 84}, new byte[]{-111, -62, 34, 7, 16, -98, -126, 102}))) {
+   467→                        str3 = phoneService.m5179WWoWWo(str2);
+   468→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{ConstantPoolEntry.CP_NameAndType, TarConstants.LF_GNUTYPE_SPARSE, -111, 26, -58}, new byte[]{39, 16, -62, 89, -107, 33, -65, 100}))) {
+   469→                        str3 = PhoneService.m5141WWWWWWWWWW(str2);
+   470→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{95, 89, 78, 5, 111}, new byte[]{116, 26, 3, 66, 41, 74, 92, 7}))) {
+   471→                        str3 = PhoneService.m5156WWoWWo(str2);
+   472→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-34, 25, 21, 28, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, -94, 84}, new byte[]{-11, 90, 82, TarConstants.LF_MULTIVOLUME, TarConstants.LF_DIR, -25, 5, -54}))) {
+   473→                        str3 = PhoneService.m5148WWWWWWWW(str2);
+   474→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, 44, 59, -23, -19, -105, -84}, new byte[]{TarConstants.LF_GNUTYPE_LONGNAME, 111, 124, -72, -96, -34, -30, 104}))) {
+   475→                        str3 = PhoneService.m5147WWWWWWWW(str2);
+   476→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{7, 97, -116, -63, -21}, new byte[]{44, 34, -63, -122, -72, -127, -59, 69}))) {
+   477→                        str3 = phoneService.m5168WWWWWWWW(str2);
+   478→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-8, Byte.MAX_VALUE, 90, -5, 115}, new byte[]{-45, 60, 23, -66, TarConstants.LF_FIFO, 38, -80, 105}))) {
+   479→                        str3 = PhoneService.m5152WWWoWWWo(str2);
+   480→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-32, 124, -43, -35, -52}, new byte[]{-53, 63, -104, -120, -104, 19, 102, -1}))) {
+   481→                        str3 = phoneService.m5178WWWoWWWo(str2);
+   482→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-12, -67, -103, 69, -127}, new byte[]{-33, -2, -38, 18, -64, -45, -82, TarConstants.LF_PAX_EXTENDED_HEADER_UC}))) {
+   483→                        str3 = PhoneService.m5144WWWWWWWW(str2);
+   484→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-65, 72, -77, 89, -101}, new byte[]{-108, ConstantPoolEntry.CP_InterfaceMethodref, -2, 22, -33, -4, 86, -9}))) {
+   485→                        str3 = PhoneService.m5157WWoWWo(str2);
+   486→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{TarConstants.LF_CONTIG, 0, -92, TarConstants.LF_NORMAL, -34}, new byte[]{28, 67, -9, 99, -112, Byte.MAX_VALUE, 17, -37}))) {
+   487→                        str3 = PhoneService.m5160WWWW(str2);
+   488→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{99, 78, 86, -24, TarConstants.LF_MULTIVOLUME}, new byte[]{72, 13, 25, -92, 29, -3, -56, -71}))) {
+   489→                        str3 = PhoneService.m5162o(str2);
+   490→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-72, -113, 5, -52, -31}, new byte[]{-109, -52, 80, -97, -91, 108, 44, -13}))) {
+   491→                        str3 = PhoneService.m5158WWoWWo(str2);
+   492→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{113, 85, -17, 4, -68}, new byte[]{90, 22, -84, TarConstants.LF_GNUTYPE_LONGNAME, -13, 15, -104, 39}))) {
+   493→                        str3 = PhoneService.m5151WWWoWWWo(str2);
+   494→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{109, 64, -50, 94, -85}, new byte[]{70, 3, -115, 22, -24, -55, -94, 21}))) {
+   495→                        str3 = PhoneService.m5142WWWWoWWWWo(str2);
+   496→                    } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-36, -55, -125, -37, -115, TarConstants.LF_GNUTYPE_SPARSE, -59}, new byte[]{-9, -118, -60, -98, -33, 22, -107, 3}))) {
+   497→                        str3 = PhoneService.m5146WWWWWWWW(str2);
+   498→                    } else {
+   499→                        byte[] bArr13 = new byte[i14];
+   500→                        // fill-array-data instruction
+   501→                        bArr13[0] = 46;
+   502→                        bArr13[1] = -7;
+   503→                        bArr13[2] = 51;
+   504→                        bArr13[3] = -98;
+   505→                        bArr13[4] = -88;
+   506→                        bArr13[5] = -22;
+   507→                        if (str2.startsWith(StringFog.m5049WWWWWWWW(bArr13, new byte[]{5, -70, 116, -33, -21, -66, 14, 31}))) {
+   508→                            str3 = PhoneService.m5155WWoWWo(str2);
+   509→                        } else if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{126, -54, -41, 37, 25, -4, -46, -88}, new byte[]{85, -119, -112, 97, 90, -77, -100, -4}))) {
+   510→                            str3 = PhoneService.m5145WWWWWWWW(str2);
+   511→                        } else {
+   512→                            if (str2.startsWith(StringFog.m5049WWWWWWWW(new byte[]{-10}, new byte[]{-73, -114, -124, -108, 92, 62, 71, 7}))) {
+   513→                                ArrayList arrayList = phoneService.f9076WWWWWWWW;
+   514→                                int size = arrayList.size();
+   515→                                int i19 = 0;
+   516→                                while (i19 < size) {
+   517→                                    Object obj = arrayList.get(i19);
+   518→                                    i19++;
+   519→                                    CallPdu callPdu = (CallPdu) obj;
+   520→                                    if (callPdu.f9130WWWoWWWo == 4) {
+   521→                                        callPdu.f9130WWWoWWWo = 0;
+   522→                                    }
+   523→                                }
+   524→                            } else {
+   525→                                str3 = StringFog.m5049WWWWWWWW(new byte[]{96, 98, 37, -115, 92, 99, -47, -20, 4, 115, 82, -24, 72}, new byte[]{TarConstants.LF_GNUTYPE_LONGLINK, 33, 104, -56, 124, 38, -125, -66});
+   526→                            }
+   527→                            if (!TextUtils.isEmpty(str3)) {
+   528→                                sb2.append(str3);
+   529→                                sb2.append("\r");
+   530→                            }
+   531→                            i17++;
+   532→                            i13 = 3;
+   533→                            i14 = 6;
+   534→                            i15 = 7;
+   535→                            i16 = 5;
+   536→                        }
+   537→                    }
+   538→                    if (!TextUtils.isEmpty(str3)) {
+   539→                    }
+   540→                    i17++;
+   541→                    i13 = 3;
+   542→                    i14 = 6;
+   543→                    i15 = 7;
+   544→                    i16 = 5;
+   545→                }
+   546→            }
+   547→            if (!TextUtils.isEmpty(str3)) {
+   548→            }
+   549→            i17++;
+   550→            i13 = 3;
+   551→            i14 = 6;
+   552→            i15 = 7;
+   553→            i16 = 5;
+   554→        }
+   555→        if (sb2.length() != 0) {
+   556→            sb2.deleteCharAt(sb2.length() - 1);
+   557→        }
+   558→        return sb2.toString();
+   559→    }
+   560→
+   561→    private void SetDelay(int i10, int i11) {
+   562→        SensorService sensorService = this.mSensorService;
+   563→        sensorService.getClass();
+   564→        if (i10 >= 0 && i10 < 12) {
+   565→            sensorService.f9108WWoWWo[i10] = 0;
+   566→            sensorService.f9103WWWWWWWW[i10] = 0;
+   567→        }
+   568→    }
+   569→
+   570→    private void SetGPSStart() {
+   571→        LocationService locationService = this.mLocationService;
+   572→        locationService.getClass();
+   573→        byte[] bArr = {99, 37, -91, 68, TarConstants.LF_GNUTYPE_LONGNAME, 24, -121, TarConstants.LF_PAX_EXTENDED_HEADER_LC};
+   574→        StringFog.f8859WWWWWWWW.getClass();
+   575→        KLog.m5043WWWWWWWW(LocationService.f9050WWWW, WWWWWWWW.m17835WWWWWWWW(new byte[]{56, 86, -47, 37, 62, 108, -53, 23, 0, 68, -47, 45, 35, 118, -38}, bArr));
+   576→        locationService.f9062WWoWWo = true;
+   577→        locationService.f9061WWWoWWWo = true;
+   578→        if (!locationService.f9056WWWWWWWW) {
+   579→            locationService.m5134WWWWWWWW(true);
+   580→        }
+   581→    }
+   582→
+   583→    private void SetGPSStop() {
+   584→        this.mLocationService.m5135WWWWWWWW();
+   585→    }
+   586→
+   587→    private void SetWiFiStart() {
+   588→        WiFiService wiFiService = this.mWiFiService;
+   589→        wiFiService.f9118WWWWWWWW.post(new RunnableC0054WWWWWWWW(14, wiFiService));
+   590→    }
+   591→
+   592→    private String Vibrate(String str) {
+   593→        String str2;
+   594→        HWControlService hWControlService = this.mHWControlService;
+   595→        hWControlService.getClass();
+   596→        if (str == null) {
+   597→            byte[] bArr = {13, TarConstants.LF_GNUTYPE_LONGNAME, -10, 116};
+   598→            byte[] bArr2 = {99, 57, -102, 24, 23, 2, TarConstants.LF_SYMLINK, -51};
+   599→            StringFog.f8859WWWWWWWW.getClass();
+   600→            return WWWWWWWW.m17835WWWWWWWW(bArr, bArr2);
+   601→        }
+   602→        StringFog.f8859WWWWWWWW.getClass();
+   603→        String[] split = str.split(WWWWWWWW.m17835WWWWWWWW(new byte[]{-39}, new byte[]{-29, 100, -28, -123, -99, -84, -6, -100}));
+   604→        if (split.length >= 2 && (str2 = split[1]) != null) {
+   605→            try {
+   606→                long parseLong = Long.parseLong(str2);
+   607→                if (parseLong <= 0) {
+   608→                    return WWWWWWWW.m17835WWWWWWWW(new byte[]{-44, -11, 94, 66}, new byte[]{-70, Byte.MIN_VALUE, TarConstants.LF_SYMLINK, 46, -50, -29, 98, 81});
+   609→                }
+   610→                if (SystemClock.uptimeMillis() - hWControlService.f9048WWWoWWWo < 100) {
+   611→                    return WWWWWWWW.m17835WWWWWWWW(new byte[]{-78, -106, 124, -9}, new byte[]{-36, -29, 16, -101, TarConstants.LF_SYMLINK, 62, 104, -1});
+   612→                }
+   613→                hWControlService.f9048WWWoWWWo = SystemClock.uptimeMillis();
+   614→                hWControlService.f9047WWWWWWWW.post(new WWWWWWWW(hWControlService, parseLong, 0));
+   615→                return WWWWWWWW.m17835WWWWWWWW(new byte[]{-86, -79, -12, 78}, new byte[]{-60, -60, -104, 34, 40, -57, -112, -85});
+   616→            } catch (Throwable unused) {
+   617→                byte[] bArr3 = {TarConstants.LF_SYMLINK, 17, -119, -50, 110, 110, -4, -56};
+   618→                StringFog.f8859WWWWWWWW.getClass();
+   619→                return WWWWWWWW.m17835WWWWWWWW(new byte[]{92, 100, -27, -94}, bArr3);
+   620→            }
+   621→        }
+   622→        return WWWWWWWW.m17835WWWWWWWW(new byte[]{7, -12, 13, 113}, new byte[]{105, -127, 97, 29, 87, -97, -51, -43});
+   623→    }
+   624→
+   625→    private int getPicture(String str, int i10, int i11, int i12) {
+   626→        CameraService cameraService = this.mCameraService;
+   627→        Camera camera = cameraService.f9031WWWWWWWW;
+   628→        String str2 = CameraService.f9028WWWW;
+   629→        if (camera == null) {
+   630→            byte[] bArr = {32, -74, -92, TarConstants.LF_LINK, 81, 29, -112, -8};
+   631→            StringFog.f8859WWWWWWWW.getClass();
+   632→            KLog.m5040WWWWoWWWWo(str2, WWWWWWWW.m17835WWWWWWWW(new byte[]{123, -47, -63, 69, 1, 116, -13, -116, 85, -60, -63, 108, 113, 115, -1, -40, 67, -41, -55, 84, 35, 124}, bArr));
+   633→        } else {
+   634→            try {
+   635→                Camera.Parameters parameters = camera.getParameters();
+   636→                parameters.setPictureSize(i10, i11);
+   637→                parameters.setJpegQuality(100);
+   638→                parameters.setPictureFormat(i12);
+   639→                camera.setParameters(parameters);
+   640→                camera.takePicture(null, null, cameraService);
+   641→            } catch (Throwable th2) {
+   642→                byte[] bArr2 = {62, 82, -32, 6, -99, -98, -44, TarConstants.LF_GNUTYPE_LONGLINK, 16, 71, -32, 47, -19, -110, -49, 92, 0, 69, -15, 27, -94, -103, -115, 31};
+   643→                byte[] bArr3 = {101, TarConstants.LF_DIR, -123, 114, -51, -9, -73, 63};
+   644→                StringFog.f8859WWWWWWWW.getClass();
+   645→                KLog.m5044WWWoWWWo(str2, WWWWWWWW.m17835WWWWWWWW(bArr2, bArr3), th2);
+   646→            }
+   647→        }
+   648→        return 0;
+   649→    }
+   650→
+   651→    private native void nativeCameraPicture(long j10, String str, byte[] bArr);
+   652→
+   653→    private native void nativeCameraPreview(long j10, String str, byte[] bArr);
+   654→
+   655→    private native void nativeDispose(long j10);
+   656→
+   657→    private native void nativeGPSNmeaChanged(long j10, String str);
+   658→
+   659→    private native void nativePhoneUnsolicited(long j10, String str);
+   660→
+   661→    private native void nativeSensorChanged(long j10, int i10, long j11, float f10, float f11, float f12);
+   662→
+   663→    private native long nativeSetup(int i10);
+   664→
+   665→    private native int nativeStartHALMgr(long j10);
+   666→
+   667→    private native int nativeStopHALMgr(long j10);
+   668→
+   669→    private native void nativeWIFIChanged(long j10, String str);
+   670→
+   671→    public void CameraPicture(String str, byte[] bArr) {
+   672→        nativeCameraPicture(this.mNativePtr, str, bArr);
+   673→    }
+   674→
+   675→    public void CameraPreview(String str, byte[] bArr) {
+   676→        nativeCameraPreview(this.mNativePtr, str, bArr);
+   677→    }
+   678→
+   679→    public void GPSNmeaChanged(String str) {
+   680→        nativeGPSNmeaChanged(this.mNativePtr, str);
+   681→    }
+   682→
+   683→    public void PhoneUnsolicited(String str) {
+   684→        nativePhoneUnsolicited(this.mNativePtr, str);
+   685→    }
+   686→
+   687→    public void SensorChanged(int i10, long j10, float f10, float f11, float f12) {
+   688→        nativeSensorChanged(this.mNativePtr, i10, j10, f10, f11, f12);
+   689→    }
+   690→
+   691→    public void WIFIChanged(String str) {
+   692→        nativeWIFIChanged(this.mNativePtr, str);
+   693→    }
+   694→
+   695→    public void finalize() throws Throwable {
+   696→        try {
+   697→            long j10 = this.mNativePtr;
+   698→            if (j10 != 0) {
+   699→                nativeDispose(j10);
+   700→                this.mNativePtr = 0L;
+   701→            }
+   702→        } finally {
+   703→            super.finalize();
+   704→        }
+   705→    }
+   706→
+   707→    public LocationService getLocationService() {
+   708→        return this.mLocationService;
+   709→    }
+   710→
+   711→    public PhoneService getPhoneService() {
+   712→        return this.mPhoneService;
+   713→    }
+   714→
+   715→    public SensorService getSensorService() {
+   716→        return this.mSensorService;
+   717→    }
+   718→
+   719→    public void onBackground() {
+   720→        Sensor sensor;
+   721→        SensorService sensorService = this.mSensorService;
+   722→        sensorService.getClass();
+   723→        byte[] bArr = {47, 81, 20, -114, -61, 25, -9, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER};
+   724→        StringFog.f8859WWWWWWWW.getClass();
+   725→        KLog.m5043WWWWWWWW(SensorService.f9097WWWWWWWW, WWWWWWWW.m17835WWWWWWWW(new byte[]{116, 62, 122, -52, -94, 122, -100, 0, 93, 62, 97, -32, -89, 68}, bArr));
+   726→        sensorService.f9104WWWWWWWW = false;
+   727→        int i10 = 0;
+   728→        while (true) {
+   729→            SparseIntArray sparseIntArray = SensorService.f9098WWWW;
+   730→            if (i10 >= sparseIntArray.size()) {
+   731→                break;
+   732→            }
+   733→            int keyAt = sparseIntArray.keyAt(i10);
+   734→            if ((sensorService.f9102WWWWWWWW[keyAt] & 4) == 4 && (sensor = sensorService.f9101WWWWWWWW[keyAt]) != null) {
+   735→                sensorService.f9106WWWoWWWo.unregisterListener(sensorService, sensor);
+   736→            }
+   737→            i10++;
+   738→        }
+   739→        this.mLocationService.f9055WWWWWWWW = false;
+   740→        byte[] bArr2 = {17, -12, -103, -120, -56, -27, -98, TarConstants.LF_BLK, 56, -12, -126, -92, -51, -37, -43, 58, 45, -11, -104, -72, -52};
+   741→        byte[] bArr3 = {74, -101, -9, -54, -87, -122, -11, TarConstants.LF_GNUTYPE_SPARSE};
+   742→        StringFog.f8859WWWWWWWW.getClass();
+   743→        KLog.m5043WWWWWWWW(LocationService.f9050WWWW, WWWWWWWW.m17835WWWWWWWW(bArr2, bArr3));
+   744→        CameraService cameraService = this.mCameraService;
+   745→        cameraService.getClass();
+   746→        KLog.m5043WWWWWWWW(CameraService.f9028WWWW, WWWWWWWW.m17835WWWWWWWW(new byte[]{60, -69, -11, 115, 101, 4, -23, -108, 21, -69, -18, 95, 96, 58}, new byte[]{TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, -44, -101, TarConstants.LF_LINK, 4, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, -126, -13}));
+   747→        String str = cameraService.f9032WWWWWWWW;
+   748→        CameraService.CameraState cameraState = cameraService.f9039WWoWWo;
+   749→        if (cameraState == CameraService.CameraState.f9042WWWWWWWW) {
+   750→            cameraService.m5125WWWWWWWW(str);
+   751→        }
+   752→        if (cameraState != CameraService.CameraState.f9041WWWWoWWWWo) {
+   753→            cameraService.m5122WWWWoWWWWo(str);
+   754→        }
+   755→        cameraService.f9032WWWWWWWW = str;
+   756→        cameraService.f9039WWoWWo = cameraState;
+   757→    }
+   758→
+   759→    public void onForeground() {
+   760→        Sensor sensor;
+   761→        SensorService sensorService = this.mSensorService;
+   762→        sensorService.getClass();
+   763→        StringFog.f8859WWWWWWWW.getClass();
+   764→        KLog.m5043WWWWWWWW(SensorService.f9097WWWWWWWW, WWWWWWWW.m17835WWWWWWWW(new byte[]{45, 5, -117, TarConstants.LF_PAX_EXTENDED_HEADER_LC, -127, TarConstants.LF_PAX_EXTENDED_HEADER_LC, -76, TarConstants.LF_GNUTYPE_LONGLINK, 4, 5, -112, 80, -118, 87}, new byte[]{118, 106, -27, 62, -18, 10, -47, 44}));
+   765→        sensorService.f9104WWWWWWWW = true;
+   766→        int i10 = 0;
+   767→        while (true) {
+   768→            SparseIntArray sparseIntArray = SensorService.f9098WWWW;
+   769→            if (i10 >= sparseIntArray.size()) {
+   770→                break;
+   771→            }
+   772→            int keyAt = sparseIntArray.keyAt(i10);
+   773→            if ((sensorService.f9102WWWWWWWW[keyAt] & 4) == 4 && (sensor = sensorService.f9101WWWWWWWW[keyAt]) != null) {
+   774→                int i11 = sensorService.f9108WWoWWo[keyAt];
+   775→                if (i11 == 0) {
+   776→                    i11 = 1;
+   777→                }
+   778→                sensorService.f9106WWWoWWWo.registerListener(sensorService, sensor, i11, sensorService.f9103WWWWWWWW[keyAt]);
+   779→            }
+   780→            i10++;
+   781→        }
+   782→        LocationService locationService = this.mLocationService;
+   783→        locationService.f9055WWWWWWWW = true;
+   784→        boolean z10 = locationService.f9062WWoWWo;
+   785→        String str = LocationService.f9050WWWW;
+   786→        if (z10 && !locationService.f9056WWWWWWWW) {
+   787→            byte[] bArr = {23, 125, 118, TarConstants.LF_FIFO, 60, -42, -71, TarConstants.LF_BLK, 62, 125, 109, 30, TarConstants.LF_CONTIG, -7, -4, 33, 41, 97, 109, 29, TarConstants.LF_FIFO, -124, -80, 60, 47, 115, 108, 25, 60, -54};
+   788→            byte[] bArr2 = {TarConstants.LF_GNUTYPE_LONGNAME, 18, 24, 112, TarConstants.LF_GNUTYPE_SPARSE, -92, -36, TarConstants.LF_GNUTYPE_SPARSE};
+   789→            StringFog.f8859WWWWWWWW.getClass();
+   790→            KLog.m5043WWWWWWWW(str, WWWWWWWW.m17835WWWWWWWW(bArr, bArr2));
+   791→            locationService.m5134WWWWWWWW(locationService.f9061WWWoWWWo);
+   792→        } else {
+   793→            StringFog.f8859WWWWWWWW.getClass();
+   794→            KLog.m5043WWWWWWWW(str, WWWWWWWW.m17835WWWWWWWW(new byte[]{-4, 124, -24, -120, -48, 41, -98, -70, -43, 124, -13, -96, -37, 6, -37, -76, -64, 125, -23, -68, -38}, new byte[]{-89, 19, -122, -50, -65, 91, -5, -35}));
+   795→        }
+   796→        CameraService cameraService = this.mCameraService;
+   797→        cameraService.getClass();
+   798→        StringFog.f8859WWWWWWWW.getClass();
+   799→        KLog.m5043WWWWWWWW(CameraService.f9028WWWW, WWWWWWWW.m17835WWWWWWWW(new byte[]{-47, -106, -120, -120, 110, -125, 24, -112, -8, -106, -109, -96, 101, -84}, new byte[]{-118, -7, -26, -50, 1, -15, 125, -9}));
+   800→        CameraService.CameraState cameraState = cameraService.f9039WWoWWo;
+   801→        if (cameraState != CameraService.CameraState.f9041WWWWoWWWWo) {
+   802→            cameraService.m5123WWWWWWWW(cameraService.f9032WWWWWWWW);
+   803→        }
+   804→        if (cameraState == CameraService.CameraState.f9042WWWWWWWW) {
+   805→            cameraService.m5124WWWWWWWW(cameraService.f9033WWWWWWWW, cameraService.f9034WWWWWWWW, cameraService.f9038WWWoWWWo, cameraService.f9032WWWWWWWW);
+   806→        }
+   807→    }
+   808→
+   809→    public int startHALMgr() {
+   810→        this.mCameraService.getClass();
+   811→        LocationService locationService = this.mLocationService;
+   812→        locationService.getClass();
+   813→        HandlerThread handlerThread = new HandlerThread(LocationService.f9050WWWW);
+   814→        locationService.f9066WoWo = handlerThread;
+   815→        handlerThread.start();
+   816→        locationService.f9057WWWWWWWW = new Handler(locationService.f9066WoWo.getLooper());
+   817→        this.mHWControlService.getClass();
+   818→        WiFiService wiFiService = this.mWiFiService;
+   819→        wiFiService.getClass();
+   820→        HandlerThread handlerThread2 = new HandlerThread(WiFiService.f9114WWoWWo);
+   821→        wiFiService.f9117WWWWWWWW = handlerThread2;
+   822→        handlerThread2.start();
+   823→        wiFiService.f9118WWWWWWWW = new Handler(wiFiService.f9117WWWWWWWW.getLooper());
+   824→        SensorService sensorService = this.mSensorService;
+   825→        sensorService.getClass();
+   826→        HandlerThread handlerThread3 = new HandlerThread(SensorService.f9097WWWWWWWW);
+   827→        sensorService.f9107WWWoWWWo = handlerThread3;
+   828→        handlerThread3.start();
+   829→        sensorService.f9105WWWWWWWW = new Handler(sensorService.f9107WWWoWWWo.getLooper());
+   830→        this.mPhoneService.f9076WWWWWWWW.clear();
+   831→        BatteryService batteryService = this.mBatteryService;
+   832→        batteryService.getClass();
+   833→        String str = BatteryService.f9018WWWWWWWW;
+   834→        HandlerThread handlerThread4 = new HandlerThread(str);
+   835→        batteryService.f9024WWWWWWWW = handlerThread4;
+   836→        handlerThread4.start();
+   837→        batteryService.f9026WWWoWWWo = new Handler(batteryService.f9024WWWWWWWW.getLooper());
+   838→        try {
+   839→            IntentFilter intentFilter = new IntentFilter();
+   840→            byte[] bArr = {-124, 90, -94, 98, 19, -70, ConstantPoolEntry.CP_NameAndType, -126, -116, 90, -78, 117, 18, -89, 70, -51, -122, 64, -81, Byte.MAX_VALUE, 18, -3, 42, -19, -79, 96, -125, 66, 37, -116, 43, -28, -92, 122, -127, 85, 56};
+   841→            byte[] bArr2 = {-27, TarConstants.LF_BLK, -58, 16, 124, -45, 104, -84};
+   842→            StringFog.f8859WWWWWWWW.getClass();
+   843→            intentFilter.addAction(WWWWWWWW.m17835WWWWWWWW(bArr, bArr2));
+   844→            batteryService.f9020WWWWWWWW.registerReceiver(batteryService, intentFilter);
+   845→            batteryService.f9023WWWWWWWW = true;
+   846→            batteryService.m5120WWWWWWWW(new Intent());
+   847→        } catch (Throwable th2) {
+   848→            StringFog.f8859WWWWWWWW.getClass();
+   849→            KLog.m5044WWWoWWWo(str, WWWWWWWW.m17835WWWWWWWW(new byte[]{-86, -121, -47, -18, TarConstants.LF_SYMLINK, -104, 73, -98, -108, -116, -58, -22, TarConstants.LF_NORMAL, -104, 125, -47, -97, -50, -123}, new byte[]{-15, -12, -91, -113, 64, -20, 20, -66}), th2);
+   850→        }
+   851→        return nativeStartHALMgr(this.mNativePtr);
+   852→    }
+   853→
+   854→    public int stopHALMgr() {
+   855→        this.mCameraService.getClass();
+   856→        LocationService locationService = this.mLocationService;
+   857→        HandlerThread handlerThread = locationService.f9066WoWo;
+   858→        if (handlerThread != null) {
+   859→            handlerThread.quit();
+   860→        }
+   861→        locationService.m5135WWWWWWWW();
+   862→        this.mHWControlService.getClass();
+   863→        HandlerThread handlerThread2 = this.mWiFiService.f9117WWWWWWWW;
+   864→        if (handlerThread2 != null) {
+   865→            handlerThread2.quit();
+   866→        }
+   867→        SensorService sensorService = this.mSensorService;
+   868→        HandlerThread handlerThread3 = sensorService.f9107WWWoWWWo;
+   869→        if (handlerThread3 != null) {
+   870→            handlerThread3.quit();
+   871→        }
+   872→        int i10 = 0;
+   873→        while (true) {
+   874→            SparseIntArray sparseIntArray = SensorService.f9098WWWW;
+   875→            if (i10 >= sparseIntArray.size()) {
+   876→                break;
+   877→            }
+   878→            int keyAt = sparseIntArray.keyAt(i10);
+   879→            int[] iArr = sensorService.f9102WWWWWWWW;
+   880→            int i11 = iArr[keyAt];
+   881→            if ((i11 & 4) == 4 && keyAt >= 0 && keyAt < 12) {
+   882→                iArr[keyAt] = i11 & (-5);
+   883→                Sensor sensor = sensorService.f9101WWWWWWWW[keyAt];
+   884→                if (sensor != null) {
+   885→                    sensorService.f9106WWWoWWWo.unregisterListener(sensorService, sensor);
+   886→                }
+   887→            }
+   888→            i10++;
+   889→        }
+   890→        this.mPhoneService.f9076WWWWWWWW.clear();
+   891→        BatteryService batteryService = this.mBatteryService;
+   892→        HandlerThread handlerThread4 = batteryService.f9024WWWWWWWW;
+   893→        if (handlerThread4 != null) {
+   894→            handlerThread4.quit();
+   895→        }
+   896→        if (batteryService.f9023WWWWWWWW) {
+   897→            try {
+   898→                batteryService.f9020WWWWWWWW.unregisterReceiver(batteryService);
+   899→                batteryService.f9023WWWWWWWW = false;
+   900→            } catch (Throwable th2) {
+   901→                StringFog.f8859WWWWWWWW.getClass();
+   902→                KLog.m5044WWWoWWWo(BatteryService.f9018WWWWWWWW, WWWWWWWW.m17835WWWWWWWW(new byte[]{-42, 124, 85, -61, -79, 122, -112, -124, -11, 108, 68, -36, -75, 78, -33, -113, -73, 47}, new byte[]{-115, 15, 33, -84, -63, 39, -80, -31}), th2);
+   903→            }
+   904→        }
+   905→        return nativeStopHALMgr(this.mNativePtr);
+   906→    }
+   907→}
+   908→

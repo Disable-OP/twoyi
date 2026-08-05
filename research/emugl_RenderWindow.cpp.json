@@ -1,0 +1,26 @@
+{
+  "code": 200,
+  "data": {
+    "description": "",
+    "external": {},
+    "html": "<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"initial-scale=1, minimum-scale=1, width=device-width\"><title>Error NOT_FOUND</title><style>*{margin:0;padding:0}html,code{font:15px/22px arial,sans-serif}html{background:#fff;color:#222;padding:15px}body{color:#222;text-align:unset;margin:7% auto 0;max-width:390px;min-height:180px;padding:30px 0 15px;}* > body{background:url(//www.google.com/images/errors/robot.png) 100% 5px no-repeat;padding-right:205px}p{margin:11px 0 22px;overflow:hidden}pre{white-space:pre-wrap;}ins{color:#777;text-decoration:none}a img{border:0}@media screen and (max-width:772px){body{background:none;margin-top:0;max-width:none;padding-right:0}}#logo{background:url(//www.google.com/images/branding/googlelogo/1x/googlelogo_color_150x54dp.png) no-repeat;margin-left:-5px}@media only screen and (min-resolution:192dpi){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat 0% 0%/100% 100%;-moz-border-image:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) 0}}@media only screen and (-webkit-min-device-pixel-ratio:2){#logo{background:url(//www.google.com/images/branding/googlelogo/2x/googlelogo_color_150x54dp.png) no-repeat;-webkit-background-size:100% 100%}}#logo{display:inline-block;height:54px;width:150px}</style><style>body{max-width:none;margin-top:0}</style></head><body><div><a href=\"//www.google.com\"><span id=\"logo\" aria-label=\"Google\"></span></a><p><b>NOT_FOUND: Requested entity was not found</b></p><p>You may not have access to this page. You can retry after signing in.<br><a href=\"https://accounts.google.com/AccountChooser?faa=1&amp;continue=https://android.googlesource.com/login/platform/sdk/%2B/7a712acc02282985dcd32feb81284e1f2b19ec7e/emulator/opengl/host/libs/libOpenglRender/RenderWindow.cpp\" style=\"font-size: 1.4rem;display: inline-block;margin: 5px 0;font-weight: bold;\">Sign in</a></p><pre>[type.googleapis.com/google.rpc.LocalizedMessage]\nlocale: \"en-US\"\nmessage: \"Object is not found\"\n\n[type.googleapis.com/google.rpc.RequestInfo]\nrequest_id: \"7e2f87b250b1474ab7a035c5e1f36e3a\"\n\n</pre></div></body></html>",
+    "httpStatus": 404,
+    "httpStatusText": "",
+    "metadata": {
+      "lang": "en",
+      "viewport": "initial-scale=1, minimum-scale=1, width=device-width"
+    },
+    "title": "Error NOT_FOUND",
+    "url": "https://android.googlesource.com/platform/sdk/+/7a712acc02282985dcd32feb81284e1f2b19ec7e/emulator/opengl/host/libs/libOpenglRender/RenderWindow.cpp",
+    "usage": {
+      "tokens": 665
+    },
+    "warning": "Target URL returned error 404: Not Found"
+  },
+  "meta": {
+    "usage": {
+      "tokens": 665
+    }
+  },
+  "status": 200
+}

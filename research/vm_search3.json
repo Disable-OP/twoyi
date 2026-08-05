@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://f1-vm.en.softonic.com/android",
+    "name": "F1 VM picture-in-picture android virtual machine APK for",
+    "snippet": "Jun 5, 2023 — F1 VM picture-in-picture andro is a free tool enabling you to run apps and games in a virtual system. It is based on the concept of a virtual machine. Read more",
+    "host_name": "f1-vm.en.softonic.com",
+    "rank": 0,
+    "date": "Jun 5, 2023",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=KpMp6Fhpn9U",
+    "name": "Setup F1 VM, X8 Sandbox, VMOS New Virtual Apps for",
+    "snippet": "Setup F1 VM , X8 Sandbox , VMOS New Virtual Apps for Android 11 @rAfz2340 likes33K views5 years ago. How To Fix daemon not running in game",
+    "host_name": "www.youtube.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.reddit.com/r/AndroidQuestions/comments/1c302ru/best_virtual_machine_to_use_on_an_android_device",
+    "name": "Best virtual machine to use on an android device (14)",
+    "snippet": "F1 VM, x8 sandbox, Vmos . Best virtual machine to use on an android device (14) F1 and X8 are flagged with malware from their official website. ...",
+    "host_name": "www.reddit.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://source.android.com/docs/core/graphics/surfaceflinger-windowmanager",
+    "name": "SurfaceFlinger and WindowManager",
+    "snippet": "Jun 17, 2026 — SurfaceFlinger accepts, composes, and sends buffers to the display . SurfaceFlinger creates the layer and sends it to WindowManager .\nSurfaceFlinger accepts, composes, and sends buffers to the display. WindowManager provides SurfaceFlinger with buffers and window metadata, which SurfaceFlinger then uses to composite surfaces to the display. Surface Flinger SurfaceFlinger can accept buffers in two ways: through BufferQueue and SurfaceControl, or through ASurfaceControl. One way SurfaceFlinger accepts buffers is through ...",
+    "host_name": "source.android.com",
+    "rank": 3,
+    "date": "Jun 17, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://play.google.com/store/apps/details?id=com.vmos.virtual&hl=en_US",
+    "name": "VMOS - Android virtual machine - Apps on Google Play",
+    "snippet": "Jul 3, 2026 — VMOS lets you run a complete Android system as a regular app on your phone. No root, no rebooting, no separate device. Read more",
+    "host_name": "play.google.com",
+    "rank": 4,
+    "date": "Jul 3, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://drfone.wondershare.com/root/vmos-alternative-for-android.html",
+    "name": "7 Best Sandbox and VM Apps Like VMOS for Android Users",
+    "snippet": "Switching from VMOS to lightweight alternatives like F1 VM or X8 Sandbox resolves virtualization lag when running dual accounts,",
+    "host_name": "drfone.wondershare.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://f1-vm.en.download.it/android",
+    "name": "F1 VM picture-in-picture android virtual machine APK",
+    "snippet": "F1 VM picture-in-picture android virtual machine introduces a flexible way to run apps and games within an isolated virtual environment on Android devices.",
+    "host_name": "f1-vm.en.download.it",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://xdaforums.com/t/question-about-graphics-stack-in-virtualized-android-vmos-x8-sandbox-f1-vm-etc.4236513",
+    "name": "Question about graphics stack in Virtualized Android",
+    "snippet": "Feb 20, 2021 — Is there anyone who knows how their graphics stack is implemented? It looks like they use host graphics stack, but I've seen ROM's internal ... Read more\nQuestion about graphics stack in Virtualized Android (VMOS, X8 Sandbox, F1 VM, etc.) twaik Feb 20, 2021 android gralloc",
+    "host_name": "xdaforums.com",
+    "rank": 7,
+    "date": "Feb 20, 2021",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/fiveapplesonthetable/android-surfaceflinger-layers",
+    "name": "GitHub - fiveapplesonthetable/android-surfaceflinger-layers",
+    "snippet": "How Android actually puts a frame on the screen. What an app's \"Surface\" really is, how pixels get from an app into a buffer, how that buffer reaches the system compositor (SurfaceFlinger), what double/triple buffering and vsync and fences are for, and how SurfaceFlinger composites many layers across one or more displays into the image you see.",
+    "host_name": "github.com",
+    "rank": 8,
+    "date": "Jun 9, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.meetsakib.com/blog/advanced-mobile-environment-web-app-testing-using-vmos-and-x8-sandbox",
+    "name": "Isolated Mobile Testing with VMOS & X8 Sandbox",
+    "snippet": "This is where Android-based Virtual Machines (VMs) like VMOS and X8 Sandbox become invaluable. In this technical guide, we will explore how to architect isolated mobile testing environments to rigorously evaluate web application performance, Progressive Web Apps (PWAs), and network layer security.",
+    "host_name": "www.meetsakib.com",
+    "rank": 9,
+    "date": "May 9, 2025",
+    "favicon": ""
+  }
+]

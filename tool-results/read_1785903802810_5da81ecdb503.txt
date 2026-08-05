@@ -1,0 +1,2002 @@
+     1→// Copyright Disclaimer: AI-Generated Content
+     2→// This file was created by GitHub Copilot, an AI coding assistant.
+     3→// AI-generated content is not subject to copyright protection and is provided
+     4→// without warranty, express or implied, including warranties of
+     5→// merchantability, fitness for a particular purpose, or non-infringement.
+     6→// Use at your own risk.
+     7→
+     8→// This Source Code Form is subject to the terms of the Mozilla Public
+     9→// License, v. 2.0. If a copy of the MPL was not distributed with this
+    10→// file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
+    11→
+    12→//! Virtual `/dev/sensors` — multiplexed 12-sensor HAL.
+    13→//!
+    14→//! # Overview
+    15→//!
+    16→//! This module mirrors what Virtual Master's `libvm.so` does for sensor
+    17→//! HAL virtualization (see `download/AUDIO_SENSOR_HAL.md` §2): it owns
+    18→//! a Unix-domain socket at `{rootfs}/dev/sensors`, accepts the guest's
+    19→//! `sensorservice` connection, and proxies 12 sensor types between the
+    20→//! guest and the host's `SensorManager`.
+    21→//!
+    22→//! VM's `SensorService` lives under `HALManager` (unlike `AudioService`
+    23→//! which is top-level) — sensor events are bursty and low-rate, so they
+    24→//! don't need the dedicated real-time thread that audio does. Twoyi
+    25→//! mirrors that split: this module shares the same `ThreadPool` pattern
+    26→//! as `audio.rs`, but each connection spawns only one extra sub-thread
+    27→//! (the event pump) instead of dedicating a worker to a long-running
+    28→//! pump loop.
+    29→//!
+    30→//! # The 12-sensor mapping
+    31→//!
+    32→//! Decompiled verbatim from `SensorService.java` lines 61–74 (the
+    33→//! `static {}` block). The `SparseIntArray f9098WWWW` maps **guest
+    34→//! sensor index (0..11) → host `Sensor.TYPE_*`** (see
+    35→//! [`SENSOR_TYPE_MAP`] / [`SensorType`]):
+    36→//!
+    37→//! ```text
+    38→//!  Guest idx | Sensor.TYPE_* | Constant name                | Notes
+    39→//!  ---------:|--------------:|------------------------------|----------------------
+    40→//!      0     |   1           | TYPE_ACCELEROMETER           | auto-rotate + games
+    41→//!      1     |   2           | TYPE_MAGNETIC_FIELD          | compass
+    42→//!      2     |   3           | TYPE_ORIENTATION             | deprecated, emulated
+    43→//!      3     |   7           | TYPE_TEMPERATURE             | ambient
+    44→//!      4     |   8           | TYPE_LIGHT                   | ambient light
+    45→//!      5     |   5           | TYPE_PROXIMITY               | face-detect
+    46→//!      6     |   6           | TYPE_GYROSCOPE               | VR/games
+    47→//!      7     |  12           | TYPE_RELATIVE_HUMIDITY       | rare
+    48→//!      8     |   9           | TYPE_PRESSURE                | barometer
+    49→//!      9     |  19           | TYPE_GRAVITY                 | derived
+    50→//!     10     |  18           | TYPE_STEP_DETECTOR           | pedometer
+    51→//!     11     |   4           | TYPE_GYROSCOPE_UNCALIBRATED  | raw gyro + bias
+    52→//! ```
+    53→//!
+    54→//! The order is **not** contiguous by `TYPE_*` value — it's the order
+    55→//! the guest's sensor HAL expects to enumerate them. The guest opens
+    56→//! the virtual `/dev/sensors` device and queries each sensor by index
+    57→//! 0..11; the Java side translates that index to the host's
+    58→//! `Sensor.TYPE_*` via this table.
+    59→//!
+    60→//! # Wire protocol
+    61→//!
+    62→//! ## Control messages (guest → host, 12 bytes each)
+    63→//!
+    64→//! ```text
+    65→//!  offset  size  field   description
+    66→//!  ------  ----  ------  ------------------------------------------
+    67→//!   0       4    cmd     LE u32 — 1=ENABLE, 2=DISABLE,
+    68→//!                          3=CHECK_SUPPORT, 4=SET_DELAY
+    69→//!   4       4    idx     LE u32 — sensor index 0..11
+    70→//!   8       4    arg     LE u32 — for SET_DELAY: sampling period
+    71→//!                          in nanoseconds; ignored otherwise
+    72→//!  ------  ----
+    73→//!  total = 12 bytes (see [`SENSOR_CONTROL_SIZE`])
+    74→//! ```
+    75→//!
+    76→//! For `CHECK_SUPPORT`, the host replies with a 4-byte LE u32 (0 or 1)
+    77→//! indicating whether the host has that sensor. The other commands
+    78→//! have no reply.
+    79→//!
+    80→//! ## Sensor events (host → guest, 24 bytes each)
+    81→//!
+    82→//! ```text
+    83→//!  offset  size  field   description
+    84→//!  ------  ----  ------  ------------------------------------------
+    85→//!   0       4    idx     LE u32 — sensor index 0..11
+    86→//!   4       8    ts      LE u64 — timestamp in nanoseconds
+    87→//!                          (SystemClock.elapsedRealtimeNanos())
+    88→//!  12       4    x       LE f32 — x-axis value
+    89→//!  16       4    y       LE f32 — y-axis value
+    90→//!  20       4    z       LE f32 — z-axis value (unused slots are 0)
+    91→//!  ------  ----
+    92→//!  total = 24 bytes (see [`SENSOR_EVENT_SIZE`])
+    93→//! ```
+    94→//!
+    95→//! # Data flow (host → guest)
+    96→//!
+    97→//! ```text
+    98→//!   Host Android                                  Guest Android
+    99→//!   ┌──────────────────────────────────────┐    ┌────────────────────────────────────┐
+   100→//!   │  SensorManager (system service)      │    │  sensorservice (native daemon)     │
+   101→//!   │    SensorEventListener callbacks     │    │    sensor HAL module               │
+   102→//!   │       │                              │    │       │                            │
+   103→//!   │       ▼ onSensorChanged(SensorEvent) │    │       │ poll(/dev/sensors)         │
+   104→//!   │  SensorService.onSensorChanged       │    │       │   (blocking read 24 bytes) │
+   105→//!   │    │ posts Runnable to HandlerThread │    │       ▼                            │
+   106→//!   │    ▼                                 │    │   struct sensor_event {            │
+   107→//!   │  HALManager.SensorChanged(idx, ts,   │    │     idx, ts, x, y, z              │
+   108→//!   │                            x, y, z)  │    │   }                               │
+   109→//!   │    │                                 │    │       │                            │
+   110→//!   │    ▼ JNI down-call                   │    │       ▼                            │
+   111→//!   │  nativeSensorChanged(ptr, idx, ts,   │    │   dispatch into sensor framework   │
+   112→//!   │                       x, y, z)       │    │   → SensorEventListener in guest   │
+   113→//!   │    │                                 │    │                                     │
+   114→//!   │    ▼ libvm.so / kr64                 │    │                                     │
+   115→//!   │  write(/dev/sensors,                 │───▶│                                     │
+   116→//!   │        &sensor_event, 24)            │    │                                     │
+   117→//!   └──────────────────────────────────────┘    └────────────────────────────────────┘
+   118→//! ```
+   119→//!
+   120→//! In the skeleton the host side of this flow is stubbed: the JNI
+   121→//! down-call `nativeSensorChanged` isn't wired up, and the pump thread
+   122→//! polls [`jni_read_sensor_event`] which always returns `None`. So no
+   123→//! events actually flow to the guest until SENSOR-IMPL-2 replaces the
+   124→//! stubs with real `SensorManager` integration.
+   125→//!
+   126→//! # The 3-bit state machine
+   127→//!
+   128→//! Each of the 12 sensors has a 3-bit state mask (see [`SensorState`]):
+   129→//!
+   130→//!  | Bit | Mask | Name      | Meaning                                              |
+   131→//!  |----:|-----:|-----------|------------------------------------------------------|
+   132→//!  |  0  |   1  | SUPPORTED | Host has this sensor (`getDefaultSensor()` ≠ null)  |
+   133→//!  |  1  |   2  | ENABLED   | Guest requested enable                               |
+   134→//!  |  2  |   4  | ACTIVE    | `SensorManager.registerListener` was called         |
+   135→//!
+   136→//! State transitions (mirroring `HALManager.java`):
+   137→//! - **`CheckSensorsSupport(idx)`** (line 178) → `(state[idx] & 1) == 1`.
+   138→//! - **`EnableSensors(idx)`** (line 200) → if `(state[idx] & 2) == 2`,
+   139→//!   set `state[idx] |= 4` and `registerListener`.
+   140→//! - **`DisableSensors(idx)`** (line 187) → `state[idx] &= ~4` and
+   141→//!   `unregisterListener`.
+   142→//! - **`SetDelay(idx, delay)`** (line 561) → updates the sampling
+   143→//!   period. (VM has a quirk where this zeroes both the period and
+   144→//!   max-latency arrays, then uses `1` if `0`. Twoyi treats this as
+   145→//!   a normal set-with-floor — see [`MIN_POLL_NS`].)
+   146→//!
+   147→//! # JNI callback interface
+   148→//!
+   149→//! The actual `SensorManager` integration lives on the Java side (a
+   150→//! future `io.twoyi.hal.SensorService.java` modeled on VM's
+   151→//! `com.android.vmcore.hal.SensorService`, 160 lines). This Rust
+   152→//! module invokes it via five JNI up-calls (stubs in this skeleton):
+   153→//!
+   154→//!  | Rust function (stub here)         | Java method on `HALManager` / `SensorService`           | Returns                  |
+   155→//!  |-----------------------------------|----------------------------------------------------------|--------------------------|
+   156→//!  | [`jni_check_sensor_support`]      | `boolean CheckSensorsSupport(int idx)`                   | `bool`                   |
+   157→//!  | [`jni_enable_sensor`]             | `boolean EnableSensors(int idx)`                         | `bool` (success)         |
+   158→//!  | [`jni_disable_sensor`]            | `void DisableSensors(int idx)`                           | `()`                     |
+   159→//!  | [`jni_set_sensor_delay`]          | `void SetDelay(int idx, int delayNs)`                    | `()`                     |
+   160→//!  | [`jni_read_sensor_event`]         | (down-call from `nativeSensorChanged` queue)             | `Option<SensorEvent>`    |
+   161→//!
+   162→//! Each up-call would attach the current thread to the JVM (cached in
+   163→//! a thread-local), find the `HALManager` class + method by signature,
+   164→//! marshal the args, and return. For the skeleton these are **stubs
+   165→//! that return `false`/`None`/`()`** — they let the control + pump
+   166→//! loops compile and exercise the protocol, but no real sensor data
+   167→//! flows. The real implementation will replace these five functions.
+   168→//!
+   169→//! # Threading
+   170→//!
+   171→//! One accept thread + a fixed-size [`ThreadPool`] of control workers
+   172→//! (mirrors `audio.rs` / `binder.rs`). Each guest connection is
+   173→//! dispatched to a worker, which:
+   174→//!
+   175→//! 1. Clones the stream via `UnixStream::try_clone()` (two file
+   176→//!    descriptors over the same underlying socket — one for reads,
+   177→//!    one for writes).
+   178→//! 2. Spawns a sub-thread (`kr64-sensor-pump`) that runs
+   179→//!    [`pump_events`] — polls enabled sensors via the JNI stub and
+   180→//!    writes 24-byte `SensorEvent`s to the guest.
+   181→//! 3. Runs [`handle_control`] in the worker thread itself — reads
+   182→//!    12-byte control requests, dispatches to the JNI stubs, mutates
+   183→//!    the shared `SensorConnState`, and writes 4-byte replies for
+   184→//!    `CHECK_SUPPORT`.
+   185→//! 4. When the control read returns EOF (guest disconnected), the
+   186→//!    worker sets the per-connection shutdown flag, joins the pump
+   187→//!    sub-thread, and returns.
+   188→//!
+   189→//! Because the guest's `sensorservice` typically holds a single
+   190→//! connection for the lifetime of the guest, the pool size
+   191→//! ([`SENSOR_THREAD_POOL_SIZE`] = 4) only needs to cover the case
+   192→//! where the guest reconnects (e.g. after a guest reboot) before the
+   193→//! old connection's worker has fully cleaned up.
+   194→//!
+   195→//! # Skeleton scope
+   196→//!
+   197→//! What's implemented here:
+   198→//! - The full wire protocol (12-byte control + 24-byte event).
+   199→//! - The 12-sensor index ↔ type mapping table (verified against the
+   200→//!   decompiled `SensorService.java` static block).
+   201→//! - The 3-bit `SensorState` bitflags.
+   202→//! - The accept thread + worker pool + per-connection pump sub-thread.
+   203→//! - The five JNI up-call stubs.
+   204→//!
+   205→//! What's NOT implemented (deferred to SENSOR-IMPL-2):
+   206→//! - The actual `SensorManager.registerListener` / `onSensorChanged`
+   207→//!   wiring on the Java side.
+   208→//! - The `nativeSensorChanged` JNI down-call entry point (Java → Rust).
+   209→//! - The manifest permission `HIGH_SAMPLING_RATE_SENSORS` (only needed
+   210→//!   for >200 Hz sensors; accel/gyro/mag don't need it).
+   211→
+   212→use std::fs;
+   213→use std::io::{Read, Write};
+   214→use std::os::unix::fs::PermissionsExt;
+   215→use std::os::unix::io::{AsRawFd, RawFd};
+   216→use std::os::unix::net::{UnixListener, UnixStream};
+   217→use std::path::Path;
+   218→use std::sync::atomic::{AtomicBool, Ordering};
+   219→use std::sync::{mpsc, Arc, Mutex};
+   220→use std::thread::{self, JoinHandle};
+   221→use std::time::Duration;
+   222→
+   223→// Crate-local logging macros (defined in lib.rs) — no external `log` crate.
+   224→#[allow(unused_imports)]
+   225→use crate::{error, info, warning};
+   226→
+   227→// ============================================================================
+   228→// Constants
+   229→// ============================================================================
+   230→
+   231→/// Number of sensors the guest's sensor HAL enumerates. Matches VM's
+   232→/// `SensorService` static `SparseIntArray` (12 entries, indices 0..11).
+   233→/// See `download/AUDIO_SENSOR_HAL.md` §2.1.
+   234→pub const NUM_SENSORS: usize = 12;
+   235→
+   236→/// Control command: enable a sensor (start sending events for it).
+   237→/// Wire value at offset 0 of the 12-byte control message.
+   238→pub const CTL_ENABLE: u32 = 1;
+   239→
+   240→/// Control command: disable a sensor (stop sending events).
+   241→pub const CTL_DISABLE: u32 = 2;
+   242→
+   243→/// Control command: query whether a sensor is supported. Host replies
+   244→/// with a 4-byte LE u32 (0 or 1).
+   245→pub const CTL_CHECK_SUPPORT: u32 = 3;
+   246→
+   247→/// Control command: set the sampling period for a sensor.
+   248→/// The `arg` field carries the period in nanoseconds.
+   249→pub const CTL_SET_DELAY: u32 = 4;
+   250→
+   251→/// Total size of a control message on the wire (3 × u32).
+   252→pub const SENSOR_CONTROL_SIZE: usize = 12;
+   253→
+   254→/// Total size of a sensor event on the wire
+   255→/// (`u32 idx + u64 ts + 3 × f32` = 4 + 8 + 12 = 24 bytes).
+   256→/// See `download/AUDIO_SENSOR_HAL.md` §2.2.
+   257→pub const SENSOR_EVENT_SIZE: usize = 24;
+   258→
+   259→/// Number of worker threads in the sensor connection pool. The guest's
+   260→/// `sensorservice` typically holds a single connection for the
+   261→/// lifetime of the guest, so 4 is ample headroom for reconnect races.
+   262→pub const SENSOR_THREAD_POOL_SIZE: usize = 4;
+   263→
+   264→/// Floor for the pump thread's sleep between polls. Prevents a
+   265→/// `SET_DELAY 0` request from causing a busy-loop. VM has a quirk
+   266→/// where it uses `1` (microsecond) if delay is 0 — we treat that as a
+   267→/// bug, not a feature, and clamp to 1 ms.
+   268→pub const MIN_POLL_NS: u64 = 1_000_000; // 1 ms
+   269→
+   270→/// Ceiling for the pump thread's sleep between polls. Prevents a
+   271→/// huge `SET_DELAY` from making the pump unresponsive to a subsequent
+   272→/// `DISABLE`. 1 second matches the slowest realistic sensor
+   273→/// (step detector ~1 Hz).
+   274→pub const MAX_POLL_NS: u64 = 1_000_000_000; // 1 s
+   275→
+   276→/// Sleep duration for the pump thread when no sensors are enabled.
+   277→/// Keeps the thread alive but idle.
+   278→pub const SENSOR_IDLE_POLL_MS: u64 = 50;
+   279→
+   280→// ============================================================================
+   281→// SensorType enum + index↔type mapping
+   282→// ============================================================================
+   283→
+   284→/// The 12 host `Sensor.TYPE_*` constants that the guest's sensor HAL
+   285→/// can enumerate. Values match `android.hardware.Sensor.TYPE_*`
+   286→/// exactly (verified against the decompiled `SensorService.java`
+   287→/// static block — see `download/AUDIO_SENSOR_HAL.md` §2.1).
+   288→///
+   289→/// `#[repr(u32)]` so `as u32` gives the exact `Sensor.TYPE_*` value.
+   290→#[repr(u32)]
+   291→#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+   292→pub enum SensorType {
+   293→    /// `Sensor.TYPE_ACCELEROMETER` (1). Most-used; auto-rotate + games.
+   294→    Accelerometer = 1,
+   295→    /// `Sensor.TYPE_MAGNETIC_FIELD` (2). Compass.
+   296→    MagneticField = 2,
+   297→    /// `Sensor.TYPE_ORIENTATION` (3). Deprecated in API 8, still emulated.
+   298→    Orientation = 3,
+   299→    /// `Sensor.TYPE_GYROSCOPE_UNCALIBRATED` (4). Raw gyro + bias.
+   300→    GyroscopeUncalibrated = 4,
+   301→    /// `Sensor.TYPE_PROXIMITY` (5). Face-detect during calls.
+   302→    Proximity = 5,
+   303→    /// `Sensor.TYPE_GYROSCOPE` (6). VR/games.
+   304→    Gyroscope = 6,
+   305→    /// `Sensor.TYPE_TEMPERATURE` (7). Ambient.
+   306→    Temperature = 7,
+   307→    /// `Sensor.TYPE_LIGHT` (8). Ambient light.
+   308→    Light = 8,
+   309→    /// `Sensor.TYPE_PRESSURE` (9). Barometer.
+   310→    Pressure = 9,
+   311→    /// `Sensor.TYPE_RELATIVE_HUMIDITY` (12). Rare.
+   312→    RelativeHumidity = 12,
+   313→    /// `Sensor.TYPE_STEP_DETECTOR` (18). Pedometer.
+   314→    StepDetector = 18,
+   315→    /// `Sensor.TYPE_GRAVITY` (19). Derived from accel+gyro.
+   316→    Gravity = 19,
+   317→}
+   318→
+   319→impl SensorType {
+   320→    /// Parse a raw `Sensor.TYPE_*` value. Returns `None` for unknown
+   321→    /// values (i.e. types VM doesn't virtualise).
+   322→    pub fn from_type_value(v: u32) -> Option<Self> {
+   323→        match v {
+   324→            1 => Some(Self::Accelerometer),
+   325→            2 => Some(Self::MagneticField),
+   326→            3 => Some(Self::Orientation),
+   327→            4 => Some(Self::GyroscopeUncalibrated),
+   328→            5 => Some(Self::Proximity),
+   329→            6 => Some(Self::Gyroscope),
+   330→            7 => Some(Self::Temperature),
+   331→            8 => Some(Self::Light),
+   332→            9 => Some(Self::Pressure),
+   333→            12 => Some(Self::RelativeHumidity),
+   334→            18 => Some(Self::StepDetector),
+   335→            19 => Some(Self::Gravity),
+   336→            _ => None,
+   337→        }
+   338→    }
+   339→
+   340→    /// The `Sensor.TYPE_*` numeric constant.
+   341→    pub fn type_value(self) -> u32 {
+   342→        self as u32
+   343→    }
+   344→}
+   345→
+   346→/// Guest sensor index (0..11) → host `Sensor.TYPE_*` value.
+   347→/// Mirrors VM's `SensorService` static `SparseIntArray` verbatim
+   348→/// (see `download/AUDIO_SENSOR_HAL.md` §2.1, table rows 0..11).
+   349→///
+   350→/// Order matters: the guest enumerates by index, and the Java side
+   351→/// translates via this exact table. Changing the order would break
+   352→/// the guest's `SensorManager.getSensorList()` enumeration.
+   353→pub const SENSOR_TYPE_MAP: [SensorType; NUM_SENSORS] = [
+   354→    SensorType::Accelerometer,         // idx 0  → TYPE_ACCELEROMETER (1)
+   355→    SensorType::MagneticField,         // idx 1  → TYPE_MAGNETIC_FIELD (2)
+   356→    SensorType::Orientation,           // idx 2  → TYPE_ORIENTATION (3)
+   357→    SensorType::Temperature,           // idx 3  → TYPE_TEMPERATURE (7)
+   358→    SensorType::Light,                 // idx 4  → TYPE_LIGHT (8)
+   359→    SensorType::Proximity,             // idx 5  → TYPE_PROXIMITY (5)
+   360→    SensorType::Gyroscope,             // idx 6  → TYPE_GYROSCOPE (6)
+   361→    SensorType::RelativeHumidity,      // idx 7  → TYPE_RELATIVE_HUMIDITY (12)
+   362→    SensorType::Pressure,              // idx 8  → TYPE_PRESSURE (9)
+   363→    SensorType::Gravity,               // idx 9  → TYPE_GRAVITY (19)
+   364→    SensorType::StepDetector,          // idx 10 → TYPE_STEP_DETECTOR (18)
+   365→    SensorType::GyroscopeUncalibrated, // idx 11 → TYPE_GYROSCOPE_UNCALIBRATED (4)
+   366→];
+   367→
+   368→/// Map a guest sensor index (0..11) to the host `SensorType`.
+   369→/// Returns `None` for out-of-range indices.
+   370→pub fn index_to_type(idx: u32) -> Option<SensorType> {
+   371→    if (idx as usize) < NUM_SENSORS {
+   372→        Some(SENSOR_TYPE_MAP[idx as usize])
+   373→    } else {
+   374→        None
+   375→    }
+   376→}
+   377→
+   378→/// Reverse mapping: host `SensorType` → guest sensor index (0..11).
+   379→/// Returns `None` if the type isn't one of the 12 VM virtualises.
+   380→/// (Used in tests; not needed in production where the guest always
+   381→/// addresses sensors by index, not by type.)
+   382→pub fn type_to_index(sensor_type: SensorType) -> Option<u32> {
+   383→    SENSOR_TYPE_MAP
+   384→        .iter()
+   385→        .position(|&t| t == sensor_type)
+   386→        .map(|i| i as u32)
+   387→}
+   388→
+   389→// ============================================================================
+   390→// SensorEvent struct (24 bytes on the wire, packed)
+   391→// ============================================================================
+   392→
+   393→/// A single sensor event, 24 bytes on the wire.
+   394→///
+   395→/// Wire layout (little-endian, packed — see module docs for the full
+   396→/// table):
+   397→/// ```text
+   398→///   off 0:  idx  u32 LE — sensor index 0..11
+   399→///   off 4:  ts   u64 LE — timestamp in nanoseconds
+   400→///   off 12: x    f32 LE
+   401→///   off 16: y    f32 LE
+   402→///   off 20: z    f32 LE
+   403→/// ```
+   404→///
+   405→/// `#[repr(C, packed)]` makes the in-memory layout match the wire
+   406→/// layout (no padding between `idx` and `ts`). The compile-time
+   407→/// assertion below guarantees `size_of::<SensorEvent>() == 24`. For
+   408→/// actual (de)serialisation we use explicit byte slicing via
+   409→/// [`SensorEvent::to_bytes`] / [`SensorEvent::from_bytes`] so the
+   410→/// wire format is deterministic regardless of host endianness or
+   411→/// padding (and so we never take a reference to a mis-aligned field
+   412→/// — which `#[repr(packed)]` would make unsafe).
+   413→#[repr(C, packed)]
+   414→#[derive(Debug, Clone, Copy, PartialEq)]
+   415→pub struct SensorEvent {
+   416→    /// Offset 0. Sensor index 0..11 (matches the guest's enumeration).
+   417→    pub idx: u32,
+   418→    /// Offset 4. Timestamp in nanoseconds — should be
+   419→    /// `SystemClock.elapsedRealtimeNanos()` on the host.
+   420→    pub ts: u64,
+   421→    /// Offset 12. X-axis value (units depend on sensor type).
+   422→    pub x: f32,
+   423→    /// Offset 16. Y-axis value.
+   424→    pub y: f32,
+   425→    /// Offset 20. Z-axis value. Unused slots are 0.
+   426→    pub z: f32,
+   427→}
+   428→
+   429→// Compile-time assertion: the packed struct must be exactly 24 bytes.
+   430→const _: () = assert!(std::mem::size_of::<SensorEvent>() == SENSOR_EVENT_SIZE);
+   431→
+   432→impl SensorEvent {
+   433→    /// Construct a new event with the given fields.
+   434→    pub fn new(idx: u32, ts: u64, x: f32, y: f32, z: f32) -> Self {
+   435→        Self { idx, ts, x, y, z }
+   436→    }
+   437→
+   438→    /// Construct a zero-initialised event (all fields 0). Useful as
+   439→    /// a placeholder in tests.
+   440→    pub fn zero() -> Self {
+   441→        Self {
+   442→            idx: 0,
+   443→            ts: 0,
+   444→            x: 0.0,
+   445→            y: 0.0,
+   446→            z: 0.0,
+   447→        }
+   448→    }
+   449→
+   450→    /// True if `idx` is in range 0..[`NUM_SENSORS`].
+   451→    pub fn is_valid(&self) -> bool {
+   452→        (self.idx as usize) < NUM_SENSORS
+   453→    }
+   454→
+   455→    /// Serialise to a 24-byte little-endian array. Reads each field
+   456→    /// by value (safe on `#[repr(packed)]` — we never take a
+   457→    /// reference to a mis-aligned field).
+   458→    pub fn to_bytes(&self) -> [u8; SENSOR_EVENT_SIZE] {
+   459→        let mut buf = [0u8; SENSOR_EVENT_SIZE];
+   460→        buf[0..4].copy_from_slice(&self.idx.to_le_bytes());
+   461→        buf[4..12].copy_from_slice(&self.ts.to_le_bytes());
+   462→        buf[12..16].copy_from_slice(&self.x.to_le_bytes());
+   463→        buf[16..20].copy_from_slice(&self.y.to_le_bytes());
+   464→        buf[20..24].copy_from_slice(&self.z.to_le_bytes());
+   465→        buf
+   466→    }
+   467→
+   468→    /// Deserialise from a 24-byte (or longer) slice. Only the first
+   469→    /// 24 bytes are read; trailing bytes are ignored (the caller is
+   470→    /// expected to read the event out of a larger buffer).
+   471→    ///
+   472→    /// Returns an error if the buffer is too short or the `idx` field
+   473→    /// is outside 0..[`NUM_SENSORS`] (a defensive check — the host
+   474→    /// should never send an out-of-range idx, but if it does, we
+   475→    /// shouldn't silently feed garbage to the guest's sensor
+   476→    /// framework).
+   477→    pub fn from_bytes(buf: &[u8]) -> Result<Self, SensorEventError> {
+   478→        if buf.len() < SENSOR_EVENT_SIZE {
+   479→            return Err(SensorEventError::TooShort { got: buf.len() });
+   480→        }
+   481→        let idx = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+   482→        let ts = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+   483→        let x = f32::from_le_bytes(buf[12..16].try_into().unwrap());
+   484→        let y = f32::from_le_bytes(buf[16..20].try_into().unwrap());
+   485→        let z = f32::from_le_bytes(buf[20..24].try_into().unwrap());
+   486→
+   487→        if (idx as usize) >= NUM_SENSORS {
+   488→            return Err(SensorEventError::BadIndex { got: idx });
+   489→        }
+   490→
+   491→        Ok(Self { idx, ts, x, y, z })
+   492→    }
+   493→}
+   494→
+   495→/// Error returned by [`SensorEvent::from_bytes`].
+   496→#[derive(Debug, Clone, PartialEq, Eq)]
+   497→pub enum SensorEventError {
+   498→    /// Buffer was shorter than 24 bytes.
+   499→    TooShort { got: usize },
+   500→    /// `idx` field was outside 0..[`NUM_SENSORS`].
+   501→    BadIndex { got: u32 },
+   502→}
+   503→
+   504→impl std::fmt::Display for SensorEventError {
+   505→    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   506→        match self {
+   507→            Self::TooShort { got } => write!(
+   508→                f,
+   509→                "sensor event too short: got {} bytes, need {}",
+   510→                got, SENSOR_EVENT_SIZE
+   511→            ),
+   512→            Self::BadIndex { got } => write!(
+   513→                f,
+   514→                "sensor event bad idx: got {}, need 0..{}",
+   515→                got, NUM_SENSORS
+   516→            ),
+   517→        }
+   518→    }
+   519→}
+   520→
+   521→impl std::error::Error for SensorEventError {}
+   522→
+   523→// ============================================================================
+   524→// SensorControl struct (12 bytes on the wire)
+   525→// ============================================================================
+   526→
+   527→/// A 12-byte control message sent by the guest to enable/disable a
+   528→/// sensor, query support, or set the sampling period.
+   529→///
+   530→/// Wire layout (little-endian):
+   531→/// ```text
+   532→///   off 0:  cmd  u32 LE — CTL_* constant
+   533→///   off 4:  idx  u32 LE — sensor index 0..11
+   534→///   off 8:  arg  u32 LE — for SET_DELAY: sampling period in ns
+   535→/// ```
+   536→///
+   537→/// `#[repr(C)]` (not packed) is sufficient here because all three
+   538→/// fields are `u32` — natural alignment gives no padding and the
+   539→/// in-memory size is already 12 bytes.
+   540→#[repr(C)]
+   541→#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   542→pub struct SensorControl {
+   543→    /// Offset 0. One of [`CTL_ENABLE`], [`CTL_DISABLE`],
+   544→    /// [`CTL_CHECK_SUPPORT`], [`CTL_SET_DELAY`].
+   545→    pub cmd: u32,
+   546→    /// Offset 4. Sensor index 0..11.
+   547→    pub idx: u32,
+   548→    /// Offset 8. For `SET_DELAY`: sampling period in ns. Ignored by
+   549→    /// other commands.
+   550→    pub arg: u32,
+   551→}
+   552→
+   553→const _: () = assert!(std::mem::size_of::<SensorControl>() == SENSOR_CONTROL_SIZE);
+   554→
+   555→impl SensorControl {
+   556→    /// Construct a control message.
+   557→    pub fn new(cmd: u32, idx: u32, arg: u32) -> Self {
+   558→        Self { cmd, idx, arg }
+   559→    }
+   560→
+   561→    /// Serialise to a 12-byte little-endian array.
+   562→    pub fn to_bytes(&self) -> [u8; SENSOR_CONTROL_SIZE] {
+   563→        let mut buf = [0u8; SENSOR_CONTROL_SIZE];
+   564→        buf[0..4].copy_from_slice(&self.cmd.to_le_bytes());
+   565→        buf[4..8].copy_from_slice(&self.idx.to_le_bytes());
+   566→        buf[8..12].copy_from_slice(&self.arg.to_le_bytes());
+   567→        buf
+   568→    }
+   569→
+   570→    /// Deserialise from a 12-byte (or longer) slice. Only the first
+   571→    /// 12 bytes are read; trailing bytes are ignored.
+   572→    pub fn from_bytes(buf: &[u8]) -> Result<Self, SensorControlError> {
+   573→        if buf.len() < SENSOR_CONTROL_SIZE {
+   574→            return Err(SensorControlError { got: buf.len() });
+   575→        }
+   576→        let cmd = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+   577→        let idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+   578→        let arg = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+   579→        Ok(Self { cmd, idx, arg })
+   580→    }
+   581→}
+   582→
+   583→/// Error returned by [`SensorControl::from_bytes`].
+   584→#[derive(Debug, Clone, PartialEq, Eq)]
+   585→pub struct SensorControlError {
+   586→    /// The buffer length we got (less than 12).
+   587→    pub got: usize,
+   588→}
+   589→
+   590→impl std::fmt::Display for SensorControlError {
+   591→    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   592→        write!(
+   593→            f,
+   594→            "sensor control too short: got {} bytes, need {}",
+   595→            self.got, SENSOR_CONTROL_SIZE
+   596→        )
+   597→    }
+   598→}
+   599→
+   600→impl std::error::Error for SensorControlError {}
+   601→
+   602→// ============================================================================
+   603→// SensorState bitflags (3-bit mask per sensor)
+   604→// ============================================================================
+   605→
+   606→/// Per-sensor state bitmask. Mirrors VM's `f9102WWWWWWWW` `int[12]`
+   607→/// array (see `download/AUDIO_SENSOR_HAL.md` §2.5). Each of the 12
+   608→/// sensors has its own `SensorState`.
+   609→///
+   610→///  | Bit | Mask | Constant    | Meaning                                              |
+   611→///  |----:|-----:|-------------|------------------------------------------------------|
+   612→///  |  0  |   1  | [`SUPPORTED`] | Host has this sensor (`getDefaultSensor()` ≠ null)  |
+   613→///  |  1  |   2  | [`ENABLED`]   | Guest requested enable                               |
+   614→///  |  2  |   4  | [`ACTIVE`]    | `SensorManager.registerListener` was called         |
+   615→///
+   616→/// This is a hand-rolled bitflags type (no `bitflags` crate — the
+   617→/// project is std + libc only). The API mirrors the `bitflags` crate's
+   618→/// API closely enough to be familiar.
+   619→#[repr(transparent)]
+   620→#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+   621→pub struct SensorState(pub u8);
+   622→
+   623→impl SensorState {
+   624→    /// Bit 0 (mask `0b001`): host has this sensor.
+   625→    pub const SUPPORTED: SensorState = SensorState(0b001);
+   626→    /// Bit 1 (mask `0b010`): guest requested enable.
+   627→    pub const ENABLED: SensorState = SensorState(0b010);
+   628→    /// Bit 2 (mask `0b100`): host actually registered a listener.
+   629→    pub const ACTIVE: SensorState = SensorState(0b100);
+   630→
+   631→    /// All bits set — useful for "any state" queries in tests.
+   632→    pub const ALL: SensorState = SensorState(0b111);
+   633→
+   634→    /// Empty state (no bits set).
+   635→    pub const fn empty() -> Self {
+   636→        Self(0)
+   637→    }
+   638→
+   639→    /// True if no bits are set.
+   640→    pub const fn is_empty(self) -> bool {
+   641→        self.0 == 0
+   642→    }
+   643→
+   644→    /// The raw `u8` bit pattern (only the low 3 bits are meaningful).
+   645→    pub const fn bits(self) -> u8 {
+   646→        self.0
+   647→    }
+   648→
+   649→    /// Construct from raw bits (masked to the low 3 bits).
+   650→    pub const fn from_bits(b: u8) -> Self {
+   651→        Self(b & 0b111)
+   652→    }
+   653→
+   654→    /// True if all bits in `other` are also set in `self`.
+   655→    pub const fn contains(self, other: Self) -> bool {
+   656→        (self.0 & other.0) == other.0
+   657→    }
+   658→
+   659→    /// Set the bits in `other`.
+   660→    pub fn insert(&mut self, other: Self) {
+   661→        self.0 |= other.0;
+   662→    }
+   663→
+   664→    /// Clear the bits in `other`.
+   665→    pub fn remove(&mut self, other: Self) {
+   666→        self.0 &= !other.0;
+   667→    }
+   668→
+   669→    /// Convenience: is [`SUPPORTED`](Self::SUPPORTED) set?
+   670→    pub const fn is_supported(self) -> bool {
+   671→        self.contains(Self::SUPPORTED)
+   672→    }
+   673→
+   674→    /// Convenience: is [`ENABLED`](Self::ENABLED) set?
+   675→    pub const fn is_enabled(self) -> bool {
+   676→        self.contains(Self::ENABLED)
+   677→    }
+   678→
+   679→    /// Convenience: is [`ACTIVE`](Self::ACTIVE) set?
+   680→    pub const fn is_active(self) -> bool {
+   681→        self.contains(Self::ACTIVE)
+   682→    }
+   683→}
+   684→
+   685→impl std::ops::BitOr for SensorState {
+   686→    type Output = Self;
+   687→    fn bitor(self, rhs: Self) -> Self {
+   688→        Self(self.0 | rhs.0)
+   689→    }
+   690→}
+   691→
+   692→impl std::ops::BitOrAssign for SensorState {
+   693→    fn bitor_assign(&mut self, rhs: Self) {
+   694→        self.0 |= rhs.0;
+   695→    }
+   696→}
+   697→
+   698→impl std::ops::BitAnd for SensorState {
+   699→    type Output = Self;
+   700→    fn bitand(self, rhs: Self) -> Self {
+   701→        Self(self.0 & rhs.0)
+   702→    }
+   703→}
+   704→
+   705→impl std::ops::BitAndAssign for SensorState {
+   706→    fn bitand_assign(&mut self, rhs: Self) {
+   707→        self.0 &= rhs.0;
+   708→    }
+   709→}
+   710→
+   711→impl std::ops::Not for SensorState {
+   712→    type Output = Self;
+   713→    fn not(self) -> Self {
+   714→        Self(!self.0 & 0b111)
+   715→    }
+   716→}
+   717→
+   718→// ============================================================================
+   719→// Per-connection state (shared between control worker + pump sub-thread)
+   720→// ============================================================================
+   721→
+   722→/// Inner mutable state for a single guest connection. Protected by a
+   723→/// `Mutex` inside [`SensorConnState`].
+   724→#[derive(Debug)]
+   725→struct ConnStateInner {
+   726→    /// Per-sensor ENABLED bit (mirrors bit 1 of VM's state mask).
+   727→    /// The pump thread iterates this list to decide which sensors to
+   728→    /// poll. SUPPORTED (bit 0) is queried on-demand via JNI and
+   729→    /// cached in `supported`; ACTIVE (bit 2) is implicitly true
+   730→    /// whenever `enabled[i]` is true and the pump is running.
+   731→    enabled: [bool; NUM_SENSORS],
+   732→    /// Per-sensor sampling period in nanoseconds (set by SET_DELAY).
+   733→    /// 0 means "use the default" (clamped to [`MIN_POLL_NS`] in the
+   734→    /// pump loop).
+   735→    delays_ns: [u64; NUM_SENSORS],
+   736→    /// Per-sensor SUPPORTED cache. Populated lazily by
+   737→    /// [`SensorConnState::check_support`] — the first CHECK_SUPPORT
+   738→    /// for an index calls the JNI stub, subsequent queries return
+   739→    /// the cached value. (Matches VM's `CheckSensorsSupport` which
+   740→    /// also reads a pre-populated state array.)
+   741→    supported: [bool; NUM_SENSORS],
+   742→}
+   743→
+   744→impl ConnStateInner {
+   745→    fn new() -> Self {
+   746→        Self {
+   747→            enabled: [false; NUM_SENSORS],
+   748→            delays_ns: [0u64; NUM_SENSORS],
+   749→            supported: [false; NUM_SENSORS],
+   750→        }
+   751→    }
+   752→}
+   753→
+   754→/// Per-connection state shared between the control worker thread and
+   755→/// the pump sub-thread. Created in [`handle_connection`], dropped
+   756→/// when the control worker exits (after joining the pump sub-thread).
+   757→///
+   758→/// The `Mutex<ConnStateInner>` protects the `enabled`/`delays_ns`/
+   759→/// `supported` arrays; the `AtomicBool` shutdown flag is read by the
+   760→/// pump thread on every iteration to know when to exit.
+   761→struct SensorConnState {
+   762→    state: Mutex<ConnStateInner>,
+   763→    shutdown: AtomicBool,
+   764→}
+   765→
+   766→impl SensorConnState {
+   767→    fn new() -> Self {
+   768→        Self {
+   769→            state: Mutex::new(ConnStateInner::new()),
+   770→            shutdown: AtomicBool::new(false),
+   771→        }
+   772→    }
+   773→
+   774→    /// Mark `idx` as ENABLED. Called from the control worker after
+   775→    /// `jni_enable_sensor` returns success.
+   776→    fn enable(&self, idx: usize) {
+   777→        self.state.lock().unwrap().enabled[idx] = true;
+   778→    }
+   779→
+   780→    /// Mark `idx` as not ENABLED. Called from the control worker on
+   781→    /// DISABLE.
+   782→    fn disable(&self, idx: usize) {
+   783→        self.state.lock().unwrap().enabled[idx] = false;
+   784→    }
+   785→
+   786→    /// Set the sampling period for `idx`. Called from the control
+   787→    /// worker on SET_DELAY.
+   788→    fn set_delay(&self, idx: usize, delay_ns: u64) {
+   789→        self.state.lock().unwrap().delays_ns[idx] = delay_ns;
+   790→    }
+   791→
+   792→    /// Query whether `idx` is supported by the host. The first call
+   793→    /// for a given `idx` invokes the JNI stub and caches the result;
+   794→    /// subsequent calls return the cached value. (VM's
+   795→    /// `CheckSensorsSupport` reads a pre-populated state array that
+   796→    /// `HALManager.startHALMgr` fills at boot — twoyi's lazy approach
+   797→    /// gives the same observable behaviour with one fewer JNI call
+   798→    /// per sensor that the guest never actually queries.)
+   799→    fn check_support(&self, idx: usize) -> bool {
+   800→        let mut s = self.state.lock().unwrap();
+   801→        // Note: this calls jni_check_sensor_support *while holding the
+   802→        // mutex*. In the skeleton the stub is a no-op (returns false
+   803→        // instantly), so this is fine. In the real impl, the JNI
+   804→        // up-call might block on a `SensorManager.getDefaultSensor()`
+   805→        // call — at that point we'd want to release the mutex around
+   806→        // the JNI call, cache the result, then re-acquire the mutex.
+   807→        // For the skeleton this is a non-issue.
+   808→        if !s.supported[idx] && jni_check_sensor_support(std::ptr::null_mut(), idx as u32) {
+   809→            s.supported[idx] = true;
+   810→        }
+   811→        s.supported[idx]
+   812→    }
+   813→
+   814→    /// Snapshot the enabled-sensor list as `(idx, delay_ns)` pairs.
+   815→    /// Called by the pump thread on every iteration. Cheap (12-element
+   816→    /// array scan + a small Vec allocation).
+   817→    fn snapshot(&self) -> Vec<(u32, u64)> {
+   818→        let s = self.state.lock().unwrap();
+   819→        let mut out = Vec::with_capacity(NUM_SENSORS);
+   820→        for i in 0..NUM_SENSORS {
+   821→            if s.enabled[i] {
+   822→                out.push((i as u32, s.delays_ns[i]));
+   823→            }
+   824→        }
+   825→        out
+   826→    }
+   827→
+   828→    /// Ask the pump thread to exit. Called by the control worker when
+   829→    /// the guest disconnects.
+   830→    fn signal_shutdown(&self) {
+   831→        self.shutdown.store(true, Ordering::Release);
+   832→    }
+   833→
+   834→    /// True if shutdown has been requested.
+   835→    fn is_shutdown(&self) -> bool {
+   836→        self.shutdown.load(Ordering::Acquire)
+   837→    }
+   838→}
+   839→
+   840→// ============================================================================
+   841→// create_sensor_device
+   842→// ============================================================================
+   843→
+   844→/// Create the virtual `/dev/sensors` Unix socket inside `rootfs`.
+   845→///
+   846→/// Mirrors Virtual Master's pattern (see AUDIO_SENSOR_HAL.md §2.2):
+   847→/// the guest's `sensorservice` opens `/dev/sensors`, `connect()`s,
+   848→/// and the host's sensor pump (this module's [`SensorDevice::spawn`])
+   849→/// is on the other end of the socket.
+   850→///
+   851→/// This is the sensor-specific equivalent of
+   852→/// `audio::create_audio_device` / `devices::create_touch_device`,
+   853→/// returning a [`SensorDevice`] that owns the listener directly
+   854→/// (rather than a generic `DeviceSocket`), because the sensor pump
+   855→/// needs its own accept thread + worker pool + per-connection
+   856→/// pump sub-thread and doesn't fit the simple "echo a byte and
+   857→/// close" pattern the other MVP devices use.
+   858→///
+   859→/// # Errors
+   860→///
+   861→/// Returns an error if directory creation or `UnixListener::bind`
+   862→/// fails. Stale socket files from a previous run are best-effort
+   863→/// removed before bind (errors are logged but not propagated).
+   864→pub fn create_sensor_device(rootfs: &str) -> std::io::Result<SensorDevice> {
+   865→    let path = format!("{}/dev/sensors", rootfs);
+   866→
+   867→    // Make sure {rootfs}/dev exists.
+   868→    if let Some(parent) = Path::new(&path).parent() {
+   869→        fs::create_dir_all(parent)?;
+   870→        #[cfg(unix)]
+   871→        {
+   872→            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o755));
+   873→        }
+   874→    }
+   875→
+   876→    // Remove stale socket file from a previous run. If the path is a
+   877→    // non-socket file we still try to remove it — `bind()` would fail
+   878→    // with EADDRINUSE otherwise.
+   879→    match fs::remove_file(&path) {
+   880→        Ok(()) => info!("[KR64][sensor] removed stale socket: {}", path),
+   881→        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+   882→        Err(e) => warning!("[KR64][sensor] could not remove {}: {}", path, e),
+   883→    }
+   884→
+   885→    // Bind. This creates the socket file as a side effect.
+   886→    let listener = UnixListener::bind(&path)?;
+   887→
+   888→    // chmod 0666 so the guest (which may run as a different uid
+   889→    // inside the chroot) can connect.
+   890→    #[cfg(unix)]
+   891→    {
+   892→        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o666));
+   893→    }
+   894→
+   895→    info!(
+   896→        "[KR64][sensor] bound unix socket: {} (fd={})",
+   897→        path,
+   898→        listener.as_raw_fd()
+   899→    );
+   900→
+   901→    Ok(SensorDevice {
+   902→        listener: Some(listener),
+   903→        path,
+   904→        shutdown: Arc::new(AtomicBool::new(false)),
+   905→    })
+   906→}
+   907→
+   908→// ============================================================================
+   909→// SensorDevice — owns the listener, spawns accept + pump threads
+   910→// ============================================================================
+   911→
+   912→/// A bound `/dev/sensors` Unix socket, ready to accept guest connections.
+   913→///
+   914→/// Created by [`create_sensor_device`]. Call [`SensorDevice::spawn`]
+   915→/// to start the accept thread + worker pool (consuming `self`); the
+   916→/// returned [`SensorDeviceHandle`] owns the running threads and will
+   917→/// shut them down on drop.
+   918→///
+   919→/// If `spawn` is not called, dropping the `SensorDevice` closes the
+   920→/// listener and unlinks the socket file.
+   921→pub struct SensorDevice {
+   922→    /// The listener itself. `Option<UnixListener>` so `spawn` can
+   923→    /// take it out (moving it into the accept thread) without
+   924→    /// disturbing the `path` field (needed for the `Drop` impl that
+   925→    /// unlinks the socket file).
+   926→    listener: Option<UnixListener>,
+   927→    /// The filesystem path the socket is bound to.
+   928→    path: String,
+   929→    /// Shutdown flag shared with the accept thread + the handle.
+   930→    shutdown: Arc<AtomicBool>,
+   931→}
+   932→
+   933→impl SensorDevice {
+   934→    /// The filesystem path the socket is bound to.
+   935→    pub fn path(&self) -> &str {
+   936→        &self.path
+   937→    }
+   938→
+   939→    /// The raw file descriptor of the listener, or -1 if the listener
+   940→    /// has been taken (i.e. `spawn` was called).
+   941→    pub fn raw_fd(&self) -> RawFd {
+   942→        match self.listener.as_ref() {
+   943→            Some(l) => l.as_raw_fd(),
+   944→            None => -1,
+   945→        }
+   946→    }
+   947→
+   948→    /// Spawn the accept thread + worker pool, consuming self.
+   949→    ///
+   950→    /// Returns a [`SensorDeviceHandle`] that holds the shutdown flag
+   951→    /// and the accept-thread `JoinHandle`. When the handle is dropped,
+   952→    /// the shutdown flag is set and the accept thread is joined.
+   953→    pub fn spawn(mut self) -> std::io::Result<SensorDeviceHandle> {
+   954→        let listener = self
+   955→            .listener
+   956→            .take()
+   957→            .expect("SensorDevice::spawn: listener already taken");
+   958→
+   959→        // Make the listening socket non-blocking so the accept thread
+   960→        // can poll the shutdown flag between accept attempts (mirrors
+   961→        // audio.rs / binder.rs).
+   962→        let fd = listener.as_raw_fd();
+   963→        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+   964→
+   965→        let shutdown_for_thread = Arc::clone(&self.shutdown);
+   966→        let shutdown_for_handle = Arc::clone(&self.shutdown);
+   967→        let path = self.path.clone();
+   968→
+   969→        let accept_thread = thread::Builder::new()
+   970→            .name("kr64-sensor-accept".to_string())
+   971→            .spawn(move || {
+   972→                // The pool lives inside the accept thread so its Drop
+   973→                // (which joins workers) runs when the accept thread
+   974→                // exits. Each worker, in turn, joins its own pump
+   975→                // sub-thread before returning, so the whole tree of
+   976→                // threads collapses cleanly on shutdown.
+   977→                let pool = ThreadPool::new(SENSOR_THREAD_POOL_SIZE);
+   978→                info!(
+   979→                    "[KR64][sensor] accept loop started (pool_size={})",
+   980→                    SENSOR_THREAD_POOL_SIZE
+   981→                );
+   982→
+   983→                while !shutdown_for_thread.load(Ordering::Acquire) {
+   984→                    match listener.accept() {
+   985→                        Ok((stream, _addr)) => {
+   986→                            info!("[KR64][sensor] client connected");
+   987→                            pool.execute(move || {
+   988→                                if let Err(e) = handle_connection(stream) {
+   989→                                    warning!("[KR64][sensor] connection handler ended: {}", e);
+   990→                                }
+   991→                            });
+   992→                        }
+   993→                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+   994→                            std::thread::sleep(std::time::Duration::from_millis(25));
+   995→                        }
+   996→                        Err(e) => {
+   997→                            warning!("[KR64][sensor] accept error: {}", e);
+   998→                            std::thread::sleep(std::time::Duration::from_millis(50));
+   999→                        }
+  1000→                    }
+  1001→                }
+  1002→                info!("[KR64][sensor] accept loop exiting");
+  1003→                // pool drops here → workers receive Terminate and join.
+  1004→                // Each worker that's mid-connection will have its
+  1005→                // read_exact() return EOF (the guest is gone) or
+  1006→                // continue normally until the guest disconnects.
+  1007→            })?;
+  1008→
+  1009→        Ok(SensorDeviceHandle {
+  1010→            shutdown: shutdown_for_handle,
+  1011→            accept_thread: Some(accept_thread),
+  1012→            path,
+  1013→        })
+  1014→    }
+  1015→}
+  1016→
+  1017→impl Drop for SensorDevice {
+  1018→    fn drop(&mut self) {
+  1019→        // If the user dropped without calling spawn(), we still own
+  1020→        // the listener — close it and unlink the socket file. If
+  1021→        // spawn() was called, the listener was moved into the accept
+  1022→        // thread and self.listener is None — in that case the
+  1023→        // SensorDeviceHandle owns the unlink responsibility.
+  1024→        if self.listener.take().is_some() {
+  1025→            let _ = fs::remove_file(&self.path);
+  1026→        }
+  1027→    }
+  1028→}
+  1029→
+  1030→/// Handle to a running sensor device. Dropping this sets the shutdown
+  1031→/// flag and joins the accept thread.
+  1032→///
+  1033→/// Created by [`SensorDevice::spawn`]. The accept thread + worker
+  1034→/// pool keep running until either the handle is dropped or
+  1035→/// [`SensorDeviceHandle::shutdown`] is called.
+  1036→pub struct SensorDeviceHandle {
+  1037→    shutdown: Arc<AtomicBool>,
+  1038→    accept_thread: Option<JoinHandle<()>>,
+  1039→    path: String,
+  1040→}
+  1041→
+  1042→impl SensorDeviceHandle {
+  1043→    /// Ask the accept thread to shut down. (Does not join — that
+  1044→    /// happens on drop.)
+  1045→    pub fn shutdown(&self) {
+  1046→        self.shutdown.store(true, Ordering::Release);
+  1047→    }
+  1048→
+  1049→    /// The socket path the device is listening on.
+  1050→    pub fn path(&self) -> &str {
+  1051→        &self.path
+  1052→    }
+  1053→}
+  1054→
+  1055→impl Drop for SensorDeviceHandle {
+  1056→    fn drop(&mut self) {
+  1057→        self.shutdown.store(true, Ordering::Release);
+  1058→        if let Some(t) = self.accept_thread.take() {
+  1059→            let _ = t.join();
+  1060→        }
+  1061→        // Best-effort unlink the socket file so a re-run of the daemon
+  1062→        // doesn't fail with EADDRINUSE.
+  1063→        let _ = fs::remove_file(&self.path);
+  1064→    }
+  1065→}
+  1066→
+  1067→// ============================================================================
+  1068→// Per-connection handler — dispatched to a worker thread by the accept loop.
+  1069→// ============================================================================
+  1070→
+  1071→/// Handle one guest connection: spawn the pump sub-thread, run the
+  1072→/// control loop in this worker thread, then join the pump on exit.
+  1073→///
+  1074→/// The connection stays open until the guest disconnects (control
+  1075→/// read returns EOF), at which point we signal the pump sub-thread
+  1076→/// to exit and join it before returning.
+  1077→fn handle_connection(stream: UnixStream) -> std::io::Result<()> {
+  1078→    // 1. Clone the stream so the pump sub-thread can write events
+  1079→    //    while the control worker reads requests. Both clones refer
+  1080→    //    to the same underlying socket — writes from either are
+  1081→    //    visible to the guest in order, but if both write concurrently
+  1082→    //    the bytes can interleave. For the skeleton this is a
+  1083→    //    non-issue (the pump's JNI stub returns None, so no events
+  1084→    //    are written). For the real impl, wrap writes in a mutex.
+  1085→    let mut ev_stream = stream.try_clone()?;
+  1086→    let conn = Arc::new(SensorConnState::new());
+  1087→    let conn_for_pump = Arc::clone(&conn);
+  1088→
+  1089→    // 2. Spawn the pump sub-thread.
+  1090→    let pump_thread = thread::Builder::new()
+  1091→        .name("kr64-sensor-pump".to_string())
+  1092→        .spawn(move || {
+  1093→            pump_events(&mut ev_stream, conn_for_pump);
+  1094→        })?;
+  1095→
+  1096→    // 3. Run the control loop in this worker thread. Returns when
+  1097→    //    the guest disconnects (EOF) or a write fails.
+  1098→    let mut ctl_stream = stream;
+  1099→    let result = handle_control(&mut ctl_stream, &conn);
+  1100→
+  1101→    // 4. Signal the pump to exit + join it. The pump might be mid-
+  1102→    //    sleep (up to MAX_POLL_NS = 1 s); joining blocks until it
+  1103→    //    wakes up and notices the shutdown flag.
+  1104→    conn.signal_shutdown();
+  1105→    let _ = pump_thread.join();
+  1106→
+  1107→    if let Err(e) = result {
+  1108→        warning!("[KR64][sensor] control loop ended: {}", e);
+  1109→    }
+  1110→    info!("[KR64][sensor] connection closed (pump joined)");
+  1111→    Ok(())
+  1112→}
+  1113→
+  1114→/// Read control requests from the guest and dispatch them. Runs in
+  1115→/// the worker thread; returns when the guest closes the socket (EOF),
+  1116→/// a read fails, or a CHECK_SUPPORT reply write fails.
+  1117→fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::Result<()> {
+  1118→    let mut buf = [0u8; SENSOR_CONTROL_SIZE];
+  1119→    loop {
+  1120→        if conn.is_shutdown() {
+  1121→            break;
+  1122→        }
+  1123→        if let Err(e) = read_exact(stream, &mut buf) {
+  1124→            // EOF or read error — guest disconnected. This is the
+  1125→            // normal exit path.
+  1126→            return Err(e);
+  1127→        }
+  1128→
+  1129→        let cmd = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+  1130→        let idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+  1131→        let arg = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+  1132→
+  1133→        if (idx as usize) >= NUM_SENSORS {
+  1134→            warning!(
+  1135→                "[KR64][sensor] bad idx={} (cmd={}) — out of range 0..{}",
+  1136→                idx, cmd, NUM_SENSORS
+  1137→            );
+  1138→            continue;
+  1139→        }
+  1140→        let idxu = idx as usize;
+  1141→
+  1142→        match cmd {
+  1143→            CTL_CHECK_SUPPORT => {
+  1144→                // JNI up-call: HALManager.CheckSensorsSupport(idx).
+  1145→                // Cached in conn state — first call for an idx
+  1146→                // populates the cache, subsequent calls return it.
+  1147→                let supported = conn.check_support(idxu);
+  1148→                let reply: u32 = if supported { 1 } else { 0 };
+  1149→                if let Err(e) = stream.write_all(&reply.to_le_bytes()) {
+  1150→                    warning!("[KR64][sensor] check_support reply write failed: {}", e);
+  1151→                    return Err(e);
+  1152→                }
+  1153→                info!(
+  1154→                    "[KR64][sensor] CHECK_SUPPORT idx={} → {}",
+  1155→                    idxu, supported
+  1156→                );
+  1157→            }
+  1158→            CTL_ENABLE => {
+  1159→                // JNI up-call: HALManager.EnableSensors(idx). Returns
+  1160→                // true if the host sensor was actually registered.
+  1161→                let ok = jni_enable_sensor(std::ptr::null_mut(), idx);
+  1162→                if ok {
+  1163→                    conn.enable(idxu);
+  1164→                }
+  1165→                info!(
+  1166→                    "[KR64][sensor] ENABLE idx={} ok={} (stub=false in skeleton)",
+  1167→                    idxu, ok
+  1168→                );
+  1169→            }
+  1170→            CTL_DISABLE => {
+  1171→                // JNI up-call: HALManager.DisableSensors(idx).
+  1172→                jni_disable_sensor(std::ptr::null_mut(), idx);
+  1173→                conn.disable(idxu);
+  1174→                info!("[KR64][sensor] DISABLE idx={}", idxu);
+  1175→            }
+  1176→            CTL_SET_DELAY => {
+  1177→                // JNI up-call: HALManager.SetDelay(idx, delayNs).
+  1178→                let delay_ns = arg as u64;
+  1179→                jni_set_sensor_delay(std::ptr::null_mut(), idx, delay_ns);
+  1180→                conn.set_delay(idxu, delay_ns);
+  1181→                info!(
+  1182→                    "[KR64][sensor] SET_DELAY idx={} delay_ns={}",
+  1183→                    idxu, delay_ns
+  1184→                );
+  1185→            }
+  1186→            _ => {
+  1187→                warning!(
+  1188→                    "[KR64][sensor] unknown ctl cmd={} idx={} arg={}",
+  1189→                    cmd, idxu, arg
+  1190→                );
+  1191→            }
+  1192→        }
+  1193→    }
+  1194→    Ok(())
+  1195→}
+  1196→
+  1197→/// Pump sensor events to the guest. Runs in a sub-thread spawned by
+  1198→/// [`handle_connection`]. Returns when the connection's shutdown flag
+  1199→/// is set (by the control worker on guest disconnect) or a write to
+  1200→/// the socket fails.
+  1201→///
+  1202→/// Loop:
+  1203→/// 1. Snapshot the enabled-sensor list from the shared state.
+  1204→/// 2. If empty, sleep for [`SENSOR_IDLE_POLL_MS`] and continue.
+  1205→/// 3. For each enabled sensor, call [`jni_read_sensor_event`]. If it
+  1206→///    returns `Some(ev)`, serialise the 24-byte event and write it
+  1207→///    to the socket.
+  1208→/// 4. Sleep for the shortest delay among enabled sensors (clamped to
+  1209→///    [`MIN_POLL_NS`]..[`MAX_POLL_NS`]) and repeat.
+  1210→///
+  1211→/// In the skeleton the JNI stub always returns `None`, so no events
+  1212→/// are written and the loop just sleeps — but the structure is
+  1213→/// correct for the real impl.
+  1214→fn pump_events(stream: &mut UnixStream, conn: Arc<SensorConnState>) {
+  1215→    info!("[KR64][sensor][pump] started");
+  1216→    while !conn.is_shutdown() {
+  1217→        let snapshot = conn.snapshot();
+  1218→        if snapshot.is_empty() {
+  1219→            // No sensors enabled — sleep idle and re-check.
+  1220→            thread::sleep(Duration::from_millis(SENSOR_IDLE_POLL_MS));
+  1221→            continue;
+  1222→        }
+  1223→
+  1224→        // Poll each enabled sensor + track the shortest delay for
+  1225→        // the next iteration's sleep.
+  1226→        let mut min_delay_ns = u64::MAX;
+  1227→        for (idx, delay_ns) in &snapshot {
+  1228→            if let Some(ev) = jni_read_sensor_event(std::ptr::null_mut(), *idx) {
+  1229→                let bytes = ev.to_bytes();
+  1230→                if let Err(e) = stream.write_all(&bytes) {
+  1231→                    warning!("[KR64][sensor][pump] write error: {}", e);
+  1232→                    return;
+  1233→                }
+  1234→            }
+  1235→            min_delay_ns = min_delay_ns.min(*delay_ns);
+  1236→        }
+  1237→
+  1238→        // Sleep until the next sample is due. Clamp to a sane range
+  1239→        // — a SET_DELAY 0 request shouldn't cause a busy-loop, and a
+  1240→        // SET_DELAY u32::MAX request shouldn't make us unresponsive.
+  1241→        let sleep_ns = min_delay_ns.clamp(MIN_POLL_NS, MAX_POLL_NS);
+  1242→        thread::sleep(Duration::from_nanos(sleep_ns));
+  1243→    }
+  1244→    info!("[KR64][sensor][pump] exiting");
+  1245→}
+  1246→
+  1247→// ============================================================================
+  1248→// JNI up-call stubs.
+  1249→//
+  1250→// These mirror VM's `HALManager.CheckSensorsSupport` / `EnableSensors` /
+  1251→// `DisableSensors` / `SetDelay` private methods and the
+  1252→// `nativeSensorChanged` down-call (see AUDIO_SENSOR_HAL.md §2.4–§2.5).
+  1253→// Each one, in the real implementation, would:
+  1254→//   1. Attach the current thread to the JVM (cached in a thread-local
+  1255→//      so the first call on each worker thread pays the attach cost
+  1256→//      and subsequent calls are free).
+  1257→//   2. Find the HALManager class + method by signature.
+  1258→//   3. Call the method, marshal args/returns.
+  1259→//   4. Return the Java bool / void / SensorEvent.
+  1260→//
+  1261→// For the skeleton these are no-ops returning false/None/() — they
+  1262→// let the control + pump loops compile and exercise the protocol,
+  1263→// but no real sensor data flows. The real implementation will
+  1264→// replace these five functions (likely behind a trait object so the
+  1265→// Java side can be wired in without touching the pump code).
+  1266→// ============================================================================
+  1267→
+  1268→/// Opaque handle to the Java `HALManager` instance. In the real
+  1269→/// implementation this would be a `jni::sys::jobject` (global ref).
+  1270→/// For the skeleton it's a `*mut c_void` so we can pass it around
+  1271→/// without pulling in the `jni` crate. The stubs never actually use
+  1272→/// it, so it's always null in the skeleton.
+  1273→pub type JniObject = *mut std::ffi::c_void;
+  1274→
+  1275→/// `HALManager.CheckSensorsSupport(int idx)` → returns true if the
+  1276→/// host has sensor `idx`. Stubbed: returns `false` — no JNI in
+  1277→/// skeleton, so the guest sees "no sensors available".
+  1278→///
+  1279→/// Real implementation: attach current thread to JVM, find HALManager
+  1280→/// class, call `CheckSensorsSupport(I)Z`, return the jboolean as bool.
+  1281→fn jni_check_sensor_support(_ptr: JniObject, _idx: u32) -> bool {
+  1282→    // Skeleton: always returns false. This means CHECK_SUPPORT replies
+  1283→    // 0 to every query, which the guest's sensor HAL should treat as
+  1284→    // "this sensor doesn't exist" — `SensorManager.getDefaultSensor()`
+  1285→    // returns null, and the guest falls back to no-sensor mode.
+  1286→    false
+  1287→}
+  1288→
+  1289→/// `HALManager.EnableSensors(int idx)` → returns true if the host
+  1290→/// `SensorManager.registerListener` succeeded. Stubbed: returns
+  1291→/// `false` — no JNI in skeleton, so ENABLE is a no-op and the
+  1292→/// per-connection state's `enabled[]` array stays all-false.
+  1293→fn jni_enable_sensor(_ptr: JniObject, _idx: u32) -> bool {
+  1294→    false
+  1295→}
+  1296→
+  1297→/// `HALManager.DisableSensors(int idx)` → unregisters the host
+  1298→/// listener. Stubbed: no-op.
+  1299→fn jni_disable_sensor(_ptr: JniObject, _idx: u32) {}
+  1300→
+  1301→/// `HALManager.SetDelay(int idx, int delayNs)` → sets the sampling
+  1302→/// period. Stubbed: no-op.
+  1303→///
+  1304→/// Note: VM's `SetDelay` has a quirk where it zeroes both the
+  1305→/// sampling period AND the max-latency arrays, then uses `1` (us) if
+  1306→/// `0` (see AUDIO_SENSOR_HAL.md §2.5). Twoyi treats this as a normal
+  1307→/// set-with-floor — the pump clamps to [`MIN_POLL_NS`] = 1 ms.
+  1308→fn jni_set_sensor_delay(_ptr: JniObject, _idx: u32, _delay_ns: u64) {}
+  1309→
+  1310→/// Read the next pending `SensorEvent` for sensor `idx`. In the real
+  1311→/// implementation this drains a per-idx `mpsc::Receiver` filled by
+  1312→/// the `nativeSensorChanged` JNI down-call (Java → Rust). Stubbed:
+  1313→/// returns `None` — no events are ever produced.
+  1314→///
+  1315→/// Real implementation: the `nativeSensorChanged` JNI entry point
+  1316→/// would be a `#[no_mangle] pub extern "system" fn` that pushes
+  1317→/// a `SensorEvent` into a per-idx `mpsc::Sender` stored in a global
+  1318→/// registry. This function would `recv_timeout(0)` from the matching
+  1319→/// receiver and return `Some(ev)` if a value was available, `None`
+  1320→/// otherwise.
+  1321→fn jni_read_sensor_event(_ptr: JniObject, _idx: u32) -> Option<SensorEvent> {
+  1322→    None
+  1323→}
+  1324→
+  1325→// ============================================================================
+  1326→// Minimal thread pool — fixed-size, MPMC via std::sync::mpsc.
+  1327→//
+  1328→// Same pattern as `audio.rs::ThreadPool` and `binder.rs::ThreadPool`.
+  1329→// Kept private to each module so they're self-contained (a future
+  1330→// refactor could lift this to a shared `thread_pool.rs`).
+  1331→// ============================================================================
+  1332→
+  1333→type Job = Box<dyn FnOnce() + Send + 'static>;
+  1334→
+  1335→enum Message {
+  1336→    Job(Job),
+  1337→    Terminate,
+  1338→}
+  1339→
+  1340→struct Worker {
+  1341→    thread: Option<JoinHandle<()>>,
+  1342→}
+  1343→
+  1344→impl Worker {
+  1345→    fn new(receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Self {
+  1346→        let thread = thread::Builder::new()
+  1347→            .name("kr64-sensor-worker".to_string())
+  1348→            .spawn(move || loop {
+  1349→                let msg = receiver.lock().unwrap().recv();
+  1350→                match msg {
+  1351→                    Ok(Message::Job(job)) => job(),
+  1352→                    Ok(Message::Terminate) | Err(_) => break,
+  1353→                }
+  1354→            })
+  1355→            .expect("spawn kr64 sensor worker");
+  1356→        Worker { thread: Some(thread) }
+  1357→    }
+  1358→}
+  1359→
+  1360→/// A fixed-size thread pool. Used by [`SensorDevice`] to handle
+  1361→/// multiple concurrent guest connections.
+  1362→pub struct ThreadPool {
+  1363→    workers: Vec<Worker>,
+  1364→    sender: Option<mpsc::Sender<Message>>,
+  1365→}
+  1366→
+  1367→impl ThreadPool {
+  1368→    /// Create a pool with `size` worker threads. Panics if `size == 0`.
+  1369→    pub fn new(size: usize) -> Self {
+  1370→        assert!(size > 0, "ThreadPool::new: size must be > 0");
+  1371→        let (sender, receiver) = mpsc::channel();
+  1372→        let receiver = Arc::new(Mutex::new(receiver));
+  1373→        let mut workers = Vec::with_capacity(size);
+  1374→        for _ in 0..size {
+  1375→            workers.push(Worker::new(Arc::clone(&receiver)));
+  1376→        }
+  1377→        ThreadPool {
+  1378→            workers,
+  1379→            sender: Some(sender),
+  1380→        }
+  1381→    }
+  1382→
+  1383→    /// Submit a job to the pool. If all workers are busy, the job is
+  1384→    /// queued until one becomes free.
+  1385→    pub fn execute<F>(&self, f: F)
+  1386→    where
+  1387→        F: FnOnce() + Send + 'static,
+  1388→    {
+  1389→        if let Some(s) = &self.sender {
+  1390→            if s.send(Message::Job(Box::new(f))).is_err() {
+  1391→                warning!("[KR64][sensor] thread pool: sender closed, job dropped");
+  1392→            }
+  1393→        }
+  1394→    }
+  1395→}
+  1396→
+  1397→impl Drop for ThreadPool {
+  1398→    fn drop(&mut self) {
+  1399→        // Send Terminate to each worker so their recv() returns and
+  1400→        // they exit cleanly.
+  1401→        if let Some(s) = self.sender.take() {
+  1402→            for _ in &self.workers {
+  1403→                let _ = s.send(Message::Terminate);
+  1404→            }
+  1405→        }
+  1406→        // Join each worker so we don't leak threads.
+  1407→        for w in &mut self.workers {
+  1408→            if let Some(t) = w.thread.take() {
+  1409→                let _ = t.join();
+  1410→            }
+  1411→        }
+  1412→    }
+  1413→}
+  1414→
+  1415→// ============================================================================
+  1416→// I/O helpers.
+  1417→// ============================================================================
+  1418→
+  1419→/// Read exactly `buf.len()` bytes from `s`, blocking until all bytes
+  1420→/// are available or the peer closes (returns `UnexpectedEof`).
+  1421→fn read_exact(s: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<()> {
+  1422→    let mut filled = 0;
+  1423→    while filled < buf.len() {
+  1424→        let n = s.read(&mut buf[filled..])?;
+  1425→        if n == 0 {
+  1426→            return Err(std::io::ErrorKind::UnexpectedEof.into());
+  1427→        }
+  1428→        filled += n;
+  1429→    }
+  1430→    Ok(())
+  1431→}
+  1432→
+  1433→// ============================================================================
+  1434→// Tests — pure-Rust, no Android/JNI deps, so they run on the host too.
+  1435→// (cargo test --lib)
+  1436→// ============================================================================
+  1437→#[cfg(test)]
+  1438→mod tests {
+  1439→    use super::*;
+  1440→    use std::env;
+  1441→    use std::os::unix::net::UnixStream;
+  1442→    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+  1443→    use std::time::Duration;
+  1444→
+  1445→    static COUNTER: AtomicU64 = AtomicU64::new(0);
+  1446→
+  1447→    /// Each test gets a UNIQUE tmpdir so parallel tests don't collide
+  1448→    /// on the same socket path (which would cause EADDRINUSE on bind).
+  1449→    /// Mirrors the pattern in audio.rs / binder.rs test modules.
+  1450→    fn tmpdir() -> String {
+  1451→        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+  1452→        let mut p = env::temp_dir();
+  1453→        p.push(format!("kr64-sensor-test-{}-{}", std::process::id(), n));
+  1454→        fs::create_dir_all(&p).unwrap();
+  1455→        p.to_string_lossy().to_string()
+  1456→    }
+  1457→
+  1458→    // -------- SensorEvent struct layout --------------------------------
+  1459→
+  1460→    #[test]
+  1461→    fn sensor_event_size_is_24_bytes() {
+  1462→        // Compile-time assertion exists at the top of the file
+  1463→        // (`const _: () = assert!(size_of::<SensorEvent>() == 24);`),
+  1464→        // but assert again at runtime for clarity in test output.
+  1465→        assert_eq!(std::mem::size_of::<SensorEvent>(), SENSOR_EVENT_SIZE);
+  1466→    }
+  1467→
+  1468→    // -------- SensorEvent serialization roundtrips ---------------------
+  1469→
+  1470→    #[test]
+  1471→    fn sensor_event_roundtrip_basic() {
+  1472→        let ev = SensorEvent::new(0, 1_000_000, 1.0, 2.0, 3.0);
+  1473→        let bytes = ev.to_bytes();
+  1474→        assert_eq!(bytes.len(), SENSOR_EVENT_SIZE);
+  1475→
+  1476→        let ev2 = SensorEvent::from_bytes(&bytes).expect("from_bytes");
+  1477→        assert_eq!(ev, ev2);
+  1478→    }
+  1479→
+  1480→    #[test]
+  1481→    fn sensor_event_roundtrip_max_idx() {
+  1482→        // idx 11 is the last valid sensor (GYRO_UNCAL).
+  1483→        let ev = SensorEvent::new(11, u64::MAX, f32::INFINITY, f32::NEG_INFINITY, 0.0);
+  1484→        let bytes = ev.to_bytes();
+  1485→        let ev2 = SensorEvent::from_bytes(&bytes).expect("from_bytes");
+  1486→        assert_eq!(ev, ev2);
+  1487→    }
+  1488→
+  1489→    #[test]
+  1490→    fn sensor_event_roundtrip_zero() {
+  1491→        let ev = SensorEvent::zero();
+  1492→        let bytes = ev.to_bytes();
+  1493→        let ev2 = SensorEvent::from_bytes(&bytes).expect("from_bytes");
+  1494→        assert_eq!(ev, ev2);
+  1495→    }
+  1496→
+  1497→    #[test]
+  1498→    fn sensor_event_roundtrip_negative_floats() {
+  1499→        // Accel values can be negative (e.g. -9.81 for gravity).
+  1500→        let ev = SensorEvent::new(0, 123_456, -9.81, 0.0, 0.0);
+  1501→        let bytes = ev.to_bytes();
+  1502→        let ev2 = SensorEvent::from_bytes(&bytes).expect("from_bytes");
+  1503→        assert_eq!(ev, ev2);
+  1504→    }
+  1505→
+  1506→    #[test]
+  1507→    fn sensor_event_from_bytes_ignores_trailing_bytes() {
+  1508→        // The caller may pass a buffer that's longer than 24 bytes
+  1509→        // (e.g. multiple events concatenated). Only the first 24
+  1510→        // bytes should be consumed.
+  1511→        let ev = SensorEvent::new(3, 999, 1.5, 2.5, 3.5);
+  1512→        let mut buf = ev.to_bytes().to_vec();
+  1513→        buf.extend_from_slice(&[0xAA; 32]); // fake next event
+  1514→        let ev2 = SensorEvent::from_bytes(&buf).expect("from_bytes");
+  1515→        assert_eq!(ev, ev2);
+  1516→    }
+  1517→
+  1518→    // -------- SensorEvent validation -----------------------------------
+  1519→
+  1520→    #[test]
+  1521→    fn sensor_event_from_bytes_rejects_short_buffer() {
+  1522→        let short = [0u8; 16];
+  1523→        let r = SensorEvent::from_bytes(&short);
+  1524→        assert_eq!(r, Err(SensorEventError::TooShort { got: 16 }));
+  1525→    }
+  1526→
+  1527→    #[test]
+  1528→    fn sensor_event_from_bytes_rejects_bad_idx() {
+  1529→        let mut ev = SensorEvent::new(0, 0, 0.0, 0.0, 0.0);
+  1530→        ev.idx = NUM_SENSORS as u32; // 12 — out of range
+  1531→        let bytes = ev.to_bytes();
+  1532→        let r = SensorEvent::from_bytes(&bytes);
+  1533→        assert_eq!(r, Err(SensorEventError::BadIndex { got: 12 }));
+  1534→    }
+  1535→
+  1536→    #[test]
+  1537→    fn sensor_event_from_bytes_rejects_huge_idx() {
+  1538→        let mut ev = SensorEvent::new(0, 0, 0.0, 0.0, 0.0);
+  1539→        ev.idx = u32::MAX;
+  1540→        let bytes = ev.to_bytes();
+  1541→        let r = SensorEvent::from_bytes(&bytes);
+  1542→        assert_eq!(r, Err(SensorEventError::BadIndex { got: u32::MAX }));
+  1543→    }
+  1544→
+  1545→    #[test]
+  1546→    fn sensor_event_is_valid_checks_idx_range() {
+  1547→        let mut ev = SensorEvent::new(0, 0, 0.0, 0.0, 0.0);
+  1548→        assert!(ev.is_valid());
+  1549→
+  1550→        ev.idx = 11;
+  1551→        assert!(ev.is_valid());
+  1552→
+  1553→        ev.idx = 12;
+  1554→        assert!(!ev.is_valid());
+  1555→
+  1556→        ev.idx = u32::MAX;
+  1557→        assert!(!ev.is_valid());
+  1558→    }
+  1559→
+  1560→    #[test]
+  1561→    fn sensor_event_error_display_is_informative() {
+  1562→        let e = SensorEventError::TooShort { got: 4 };
+  1563→        assert!(e.to_string().contains("4"));
+  1564→        assert!(e.to_string().contains("24"));
+  1565→
+  1566→        let e = SensorEventError::BadIndex { got: 99 };
+  1567→        assert!(e.to_string().contains("99"));
+  1568→        assert!(e.to_string().contains("0..12"));
+  1569→    }
+  1570→
+  1571→    // -------- SensorType enum + mapping --------------------------------
+  1572→
+  1573→    #[test]
+  1574→    fn sensor_type_repr_matches_android_constants() {
+  1575→        // Values must match android.hardware.Sensor.TYPE_* exactly.
+  1576→        assert_eq!(SensorType::Accelerometer as u32, 1);
+  1577→        assert_eq!(SensorType::MagneticField as u32, 2);
+  1578→        assert_eq!(SensorType::Orientation as u32, 3);
+  1579→        assert_eq!(SensorType::GyroscopeUncalibrated as u32, 4);
+  1580→        assert_eq!(SensorType::Proximity as u32, 5);
+  1581→        assert_eq!(SensorType::Gyroscope as u32, 6);
+  1582→        assert_eq!(SensorType::Temperature as u32, 7);
+  1583→        assert_eq!(SensorType::Light as u32, 8);
+  1584→        assert_eq!(SensorType::Pressure as u32, 9);
+  1585→        assert_eq!(SensorType::RelativeHumidity as u32, 12);
+  1586→        assert_eq!(SensorType::StepDetector as u32, 18);
+  1587→        assert_eq!(SensorType::Gravity as u32, 19);
+  1588→    }
+  1589→
+  1590→    #[test]
+  1591→    fn sensor_type_from_type_value_roundtrip() {
+  1592→        for v in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 12, 18, 19] {
+  1593→            let t = SensorType::from_type_value(v).expect("known type");
+  1594→            assert_eq!(t.type_value(), v);
+  1595→        }
+  1596→    }
+  1597→
+  1598→    #[test]
+  1599→    fn sensor_type_from_type_value_rejects_unknown() {
+  1600→        assert!(SensorType::from_type_value(0).is_none());
+  1601→        assert!(SensorType::from_type_value(10).is_none());
+  1602→        assert!(SensorType::from_type_value(11).is_none());
+  1603→        assert!(SensorType::from_type_value(13).is_none());
+  1604→        assert!(SensorType::from_type_value(17).is_none());
+  1605→        assert!(SensorType::from_type_value(20).is_none());
+  1606→        assert!(SensorType::from_type_value(u32::MAX).is_none());
+  1607→    }
+  1608→
+  1609→    #[test]
+  1610→    fn sensor_type_map_has_twelve_entries() {
+  1611→        assert_eq!(SENSOR_TYPE_MAP.len(), NUM_SENSORS);
+  1612→    }
+  1613→
+  1614→    #[test]
+  1615→    fn index_to_type_matches_vm_mapping() {
+  1616→        // Verbatim from SensorService.java's static {} block
+  1617→        // (see AUDIO_SENSOR_HAL.md §2.1).
+  1618→        assert_eq!(index_to_type(0), Some(SensorType::Accelerometer));
+  1619→        assert_eq!(index_to_type(1), Some(SensorType::MagneticField));
+  1620→        assert_eq!(index_to_type(2), Some(SensorType::Orientation));
+  1621→        assert_eq!(index_to_type(3), Some(SensorType::Temperature));
+  1622→        assert_eq!(index_to_type(4), Some(SensorType::Light));
+  1623→        assert_eq!(index_to_type(5), Some(SensorType::Proximity));
+  1624→        assert_eq!(index_to_type(6), Some(SensorType::Gyroscope));
+  1625→        assert_eq!(index_to_type(7), Some(SensorType::RelativeHumidity));
+  1626→        assert_eq!(index_to_type(8), Some(SensorType::Pressure));
+  1627→        assert_eq!(index_to_type(9), Some(SensorType::Gravity));
+  1628→        assert_eq!(index_to_type(10), Some(SensorType::StepDetector));
+  1629→        assert_eq!(index_to_type(11), Some(SensorType::GyroscopeUncalibrated));
+  1630→    }
+  1631→
+  1632→    #[test]
+  1633→    fn index_to_type_rejects_out_of_range() {
+  1634→        assert_eq!(index_to_type(12), None);
+  1635→        assert_eq!(index_to_type(100), None);
+  1636→        assert_eq!(index_to_type(u32::MAX), None);
+  1637→    }
+  1638→
+  1639→    #[test]
+  1640→    fn type_to_index_is_inverse_of_index_to_type() {
+  1641→        for i in 0..NUM_SENSORS as u32 {
+  1642→            let t = index_to_type(i).expect("in-range idx");
+  1643→            assert_eq!(type_to_index(t), Some(i));
+  1644→        }
+  1645→    }
+  1646→
+  1647→    #[test]
+  1648→    fn type_to_index_returns_none_for_non_virtualised_types() {
+  1649→        // These Sensor.TYPE_* values aren't in the 12 VM virtualises.
+  1650→        // We can only construct SensorType variants that exist, so
+  1651→        // we test via from_type_value first.
+  1652→        // All 12 variants are virtualised, so this is more of a sanity
+  1653→        // check that the reverse-map covers all variants.
+  1654→        for t in [
+  1655→            SensorType::Accelerometer,
+  1656→            SensorType::MagneticField,
+  1657→            SensorType::Orientation,
+  1658→            SensorType::GyroscopeUncalibrated,
+  1659→            SensorType::Proximity,
+  1660→            SensorType::Gyroscope,
+  1661→            SensorType::Temperature,
+  1662→            SensorType::Light,
+  1663→            SensorType::Pressure,
+  1664→            SensorType::RelativeHumidity,
+  1665→            SensorType::StepDetector,
+  1666→            SensorType::Gravity,
+  1667→        ] {
+  1668→            assert!(type_to_index(t).is_some(), "no index for {:?}", t);
+  1669→        }
+  1670→    }
+  1671→
+  1672→    // -------- SensorState bitflags -------------------------------------
+  1673→
+  1674→    #[test]
+  1675→    fn sensor_state_bit_values_match_vm() {
+  1676→        // Verbatim from HALManager.java (see AUDIO_SENSOR_HAL.md §2.5).
+  1677→        assert_eq!(SensorState::SUPPORTED.bits(), 0b001);
+  1678→        assert_eq!(SensorState::ENABLED.bits(), 0b010);
+  1679→        assert_eq!(SensorState::ACTIVE.bits(), 0b100);
+  1680→    }
+  1681→
+  1682→    #[test]
+  1683→    fn sensor_state_empty_is_zero() {
+  1684→        let s = SensorState::empty();
+  1685→        assert!(s.is_empty());
+  1686→        assert_eq!(s.bits(), 0);
+  1687→        assert!(!s.is_supported());
+  1688→        assert!(!s.is_enabled());
+  1689→        assert!(!s.is_active());
+  1690→    }
+  1691→
+  1692→    #[test]
+  1693→    fn sensor_state_from_bits_masks_to_low_three() {
+  1694→        // High bits should be stripped.
+  1695→        let s = SensorState::from_bits(0b11111001);
+  1696→        assert_eq!(s.bits(), 0b001);
+  1697→        assert!(s.is_supported());
+  1698→        assert!(!s.is_enabled());
+  1699→        assert!(!s.is_active());
+  1700→    }
+  1701→
+  1702→    #[test]
+  1703→    fn sensor_state_contains() {
+  1704→        let s = SensorState::SUPPORTED | SensorState::ENABLED;
+  1705→        assert!(s.contains(SensorState::SUPPORTED));
+  1706→        assert!(s.contains(SensorState::ENABLED));
+  1707→        assert!(!s.contains(SensorState::ACTIVE));
+  1708→    }
+  1709→
+  1710→    #[test]
+  1711→    fn sensor_state_insert_and_remove() {
+  1712→        let mut s = SensorState::empty();
+  1713→        s.insert(SensorState::SUPPORTED);
+  1714→        assert!(s.is_supported());
+  1715→        assert!(!s.is_enabled());
+  1716→
+  1717→        s.insert(SensorState::ENABLED);
+  1718→        assert!(s.is_supported());
+  1719→        assert!(s.is_enabled());
+  1720→        assert!(!s.is_active());
+  1721→
+  1722→        s.insert(SensorState::ACTIVE);
+  1723→        assert_eq!(s.bits(), 0b111);
+  1724→
+  1725→        s.remove(SensorState::ENABLED);
+  1726→        assert!(s.is_supported());
+  1727→        assert!(!s.is_enabled());
+  1728→        assert!(s.is_active());
+  1729→        assert_eq!(s.bits(), 0b101);
+  1730→    }
+  1731→
+  1732→    #[test]
+  1733→    fn sensor_state_bitor_assign() {
+  1734→        let mut s = SensorState::SUPPORTED;
+  1735→        s |= SensorState::ENABLED;
+  1736→        s |= SensorState::ACTIVE;
+  1737→        assert_eq!(s.bits(), 0b111);
+  1738→    }
+  1739→
+  1740→    #[test]
+  1741→    fn sensor_state_bitor_combines_bits() {
+  1742→        let s = SensorState::SUPPORTED | SensorState::ACTIVE;
+  1743→        assert_eq!(s.bits(), 0b101);
+  1744→        assert!(s.is_supported());
+  1745→        assert!(!s.is_enabled());
+  1746→        assert!(s.is_active());
+  1747→    }
+  1748→
+  1749→    #[test]
+  1750→    fn sensor_state_bitand() {
+  1751→        let s = SensorState::ALL & SensorState::SUPPORTED;
+  1752→        assert_eq!(s.bits(), 0b001);
+  1753→    }
+  1754→
+  1755→    #[test]
+  1756→    fn sensor_state_not() {
+  1757→        let s = !SensorState::SUPPORTED;
+  1758→        // Only the low 3 bits matter; bit 0 is cleared, bits 1+2 set.
+  1759→        assert_eq!(s.bits(), 0b110);
+  1760→        assert!(!s.is_supported());
+  1761→        assert!(s.is_enabled());
+  1762→        assert!(s.is_active());
+  1763→    }
+  1764→
+  1765→    #[test]
+  1766→    fn sensor_state_all_constant() {
+  1767→        assert_eq!(SensorState::ALL.bits(), 0b111);
+  1768→        assert!(SensorState::ALL.is_supported());
+  1769→        assert!(SensorState::ALL.is_enabled());
+  1770→        assert!(SensorState::ALL.is_active());
+  1771→    }
+  1772→
+  1773→    #[test]
+  1774→    fn sensor_state_default_is_empty() {
+  1775→        let s: SensorState = Default::default();
+  1776→        assert!(s.is_empty());
+  1777→    }
+  1778→
+  1779→    // -------- SensorControl struct -------------------------------------
+  1780→
+  1781→    #[test]
+  1782→    fn sensor_control_size_is_12_bytes() {
+  1783→        assert_eq!(std::mem::size_of::<SensorControl>(), SENSOR_CONTROL_SIZE);
+  1784→    }
+  1785→
+  1786→    #[test]
+  1787→    fn sensor_control_roundtrip() {
+  1788→        let c = SensorControl::new(CTL_ENABLE, 6, 1_000_000);
+  1789→        let bytes = c.to_bytes();
+  1790→        assert_eq!(bytes.len(), SENSOR_CONTROL_SIZE);
+  1791→        let c2 = SensorControl::from_bytes(&bytes).expect("from_bytes");
+  1792→        assert_eq!(c, c2);
+  1793→    }
+  1794→
+  1795→    #[test]
+  1796→    fn sensor_control_from_bytes_rejects_short_buffer() {
+  1797→        let short = [0u8; 8];
+  1798→        let r = SensorControl::from_bytes(&short);
+  1799→        assert!(r.is_err());
+  1800→        assert_eq!(r.unwrap_err().got, 8);
+  1801→    }
+  1802→
+  1803→    #[test]
+  1804→    fn sensor_control_from_bytes_ignores_trailing() {
+  1805→        let c = SensorControl::new(CTL_CHECK_SUPPORT, 0, 0);
+  1806→        let mut buf = c.to_bytes().to_vec();
+  1807→        buf.extend_from_slice(&[0xFF; 16]);
+  1808→        let c2 = SensorControl::from_bytes(&buf).expect("from_bytes");
+  1809→        assert_eq!(c, c2);
+  1810→    }
+  1811→
+  1812→    // -------- create_sensor_device -------------------------------------
+  1813→
+  1814→    #[test]
+  1815→    fn create_sensor_device_creates_socket() {
+  1816→        let rootfs = tmpdir();
+  1817→        let dev = create_sensor_device(&rootfs).expect("create_sensor_device");
+  1818→
+  1819→        assert!(Path::new(&dev.path).exists(), "socket file should exist");
+  1820→        assert!(dev.path.ends_with("/dev/sensors"));
+  1821→        assert!(dev.raw_fd() >= 0);
+  1822→
+  1823→        // drop should unlink the socket file.
+  1824→        let path = dev.path.clone();
+  1825→        drop(dev);
+  1826→        assert!(!Path::new(&path).exists(), "socket file should be unlinked on drop");
+  1827→
+  1828→        let _ = fs::remove_dir_all(&rootfs);
+  1829→    }
+  1830→
+  1831→    #[test]
+  1832→    fn create_sensor_device_creates_dev_dir_if_missing() {
+  1833→        let rootfs = tmpdir();
+  1834→        // {rootfs}/dev doesn't exist yet — create_sensor_device must
+  1835→        // make it.
+  1836→        assert!(!Path::new(&format!("{}/dev", rootfs)).exists());
+  1837→        let dev = create_sensor_device(&rootfs).expect("create_sensor_device");
+  1838→        assert!(Path::new(&format!("{}/dev", rootfs)).exists());
+  1839→        assert!(Path::new(&dev.path).exists());
+  1840→        drop(dev);
+  1841→        let _ = fs::remove_dir_all(&rootfs);
+  1842→    }
+  1843→
+  1844→    #[test]
+  1845→    fn create_sensor_device_replaces_stale_socket() {
+  1846→        let rootfs = tmpdir();
+  1847→        // First bind.
+  1848→        let dev1 = create_sensor_device(&rootfs).expect("first create");
+  1849→        let path = dev1.path.clone();
+  1850→        drop(dev1);
+  1851→        // path is now unlinked by Drop. But simulate a stale socket
+  1852→        // by creating a regular file at the same path.
+  1853→        fs::write(&path, b"stale").unwrap();
+  1854→        assert!(Path::new(&path).exists());
+  1855→
+  1856→        // Second bind should succeed (the stale file is removed first).
+  1857→        let dev2 = create_sensor_device(&rootfs).expect("second create over stale");
+  1858→        assert!(Path::new(&path).exists());
+  1859→        drop(dev2);
+  1860→        let _ = fs::remove_dir_all(&rootfs);
+  1861→    }
+  1862→
+  1863→    // -------- SensorDevice::spawn + connection handling ---------------
+  1864→
+  1865→    /// Helper: read exactly N bytes from a UnixStream in a test.
+  1866→    fn read_exact_test(s: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<()> {
+  1867→        use std::io::Read;
+  1868→        s.read_exact(buf)
+  1869→    }
+  1870→
+  1871→    #[test]
+  1872→    fn sensor_device_spawn_accepts_connection_and_handles_check_support() {
+  1873→        let rootfs = tmpdir();
+  1874→        let dev = create_sensor_device(&rootfs).expect("create");
+  1875→        let path = dev.path().to_string();
+  1876→        let handle = dev.spawn().expect("spawn");
+  1877→
+  1878→        // Give the accept thread a moment to start.
+  1879→        std::thread::sleep(Duration::from_millis(50));
+  1880→
+  1881→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1882→
+  1883→        // Send CHECK_SUPPORT for idx 0 (accel).
+  1884→        let ctl = SensorControl::new(CTL_CHECK_SUPPORT, 0, 0);
+  1885→        stream.write_all(&ctl.to_bytes()).expect("write ctl");
+  1886→
+  1887→        // Read 4-byte reply. The stubbed jni_check_sensor_support
+  1888→        // returns false, so the reply should be 0.
+  1889→        let mut reply = [0u8; 4];
+  1890→        read_exact_test(&mut stream, &mut reply).expect("read reply");
+  1891→        let supported = u32::from_le_bytes(reply);
+  1892→        assert_eq!(supported, 0, "stubbed CHECK_SUPPORT should reply 0");
+  1893→
+  1894→        // Try another idx to make sure the control loop continues.
+  1895→        let ctl2 = SensorControl::new(CTL_CHECK_SUPPORT, 6, 0);
+  1896→        stream.write_all(&ctl2.to_bytes()).expect("write ctl 2");
+  1897→        let mut reply2 = [0u8; 4];
+  1898→        read_exact_test(&mut stream, &mut reply2).expect("read reply 2");
+  1899→        assert_eq!(u32::from_le_bytes(reply2), 0);
+  1900→
+  1901→        drop(stream);
+  1902→        drop(handle);
+  1903→        assert!(!Path::new(&path).exists(), "socket unlinked on handle drop");
+  1904→        let _ = fs::remove_dir_all(&rootfs);
+  1905→    }
+  1906→
+  1907→    #[test]
+  1908→    fn sensor_device_spawn_handles_enable_disable_set_delay() {
+  1909→        let rootfs = tmpdir();
+  1910→        let dev = create_sensor_device(&rootfs).expect("create");
+  1911→        let path = dev.path().to_string();
+  1912→        let handle = dev.spawn().expect("spawn");
+  1913→
+  1914→        std::thread::sleep(Duration::from_millis(50));
+  1915→
+  1916→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1917→
+  1918→        // ENABLE idx 0 — stub returns false, but the control loop
+  1919→        // should still acknowledge and continue.
+  1920→        stream
+  1921→            .write_all(&SensorControl::new(CTL_ENABLE, 0, 0).to_bytes())
+  1922→            .expect("write enable");
+  1923→
+  1924→        // SET_DELAY idx 0, 60 Hz = ~16.67 ms = 16_666_667 ns.
+  1925→        stream
+  1926→            .write_all(&SensorControl::new(CTL_SET_DELAY, 0, 16_666_667).to_bytes())
+  1927→            .expect("write set_delay");
+  1928→
+  1929→        // DISABLE idx 0.
+  1930→        stream
+  1931→            .write_all(&SensorControl::new(CTL_DISABLE, 0, 0).to_bytes())
+  1932→            .expect("write disable");
+  1933→
+  1934→        // Give the worker a moment to process all three.
+  1935→        std::thread::sleep(Duration::from_millis(100));
+  1936→
+  1937→        // The connection should still be alive — verify by sending
+  1938→        // a CHECK_SUPPORT and reading a reply.
+  1939→        stream
+  1940→            .write_all(&SensorControl::new(CTL_CHECK_SUPPORT, 1, 0).to_bytes())
+  1941→            .expect("write check_support");
+  1942→        let mut reply = [0u8; 4];
+  1943→        read_exact_test(&mut stream, &mut reply).expect("read reply");
+  1944→        assert_eq!(u32::from_le_bytes(reply), 0);
+  1945→
+  1946→        drop(stream);
+  1947→        drop(handle);
+  1948→        let _ = fs::remove_dir_all(&rootfs);
+  1949→    }
+  1950→
+  1951→    #[test]
+  1952→    fn sensor_device_spawn_handles_unknown_command() {
+  1953→        let rootfs = tmpdir();
+  1954→        let dev = create_sensor_device(&rootfs).expect("create");
+  1955→        let path = dev.path().to_string();
+  1956→        let handle = dev.spawn().expect("spawn");
+  1957→
+  1958→        std::thread::sleep(Duration::from_millis(50));
+  1959→
+  1960→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1961→
+  1962→        // Send a control message with an unknown cmd. The worker
+  1963→        // should log a warning and continue.
+  1964→        stream
+  1965→            .write_all(&SensorControl::new(99, 0, 0).to_bytes())
+  1966→            .expect("write unknown");
+  1967→
+  1968→        std::thread::sleep(Duration::from_millis(50));
+  1969→
+  1970→        // Verify the connection is still alive.
+  1971→        stream
+  1972→            .write_all(&SensorControl::new(CTL_CHECK_SUPPORT, 0, 0).to_bytes())
+  1973→            .expect("write check_support");
+  1974→        let mut reply = [0u8; 4];
+  1975→        read_exact_test(&mut stream, &mut reply).expect("read reply");
+  1976→        assert_eq!(u32::from_le_bytes(reply), 0);
+  1977→
+  1978→        drop(stream);
+  1979→        drop(handle);
+  1980→        let _ = fs::remove_dir_all(&rootfs);
+  1981→    }
+  1982→
+  1983→    #[test]
+  1984→    fn sensor_device_spawn_handles_bad_idx() {
+  1985→        let rootfs = tmpdir();
+  1986→        let dev = create_sensor_device(&rootfs).expect("create");
+  1987→        let path = dev.path().to_string();
+  1988→        let handle = dev.spawn().expect("spawn");
+  1989→
+  1990→        std::thread::sleep(Duration::from_millis(50));
+  1991→
+  1992→        let mut stream = UnixStream::connect(&path).expect("connect");
+  1993→
+  1994→        // CHECK_SUPPORT with an out-of-range idx. The worker should
+  1995→        // log a warning and continue. No reply is sent for bad idx
+  1996→        // (we `continue` before the reply write).
+  1997→        stream
+  1998→            .write_all(&SensorControl::new(CTL_CHECK_SUPPORT, 99, 0).to_bytes())
+  1999→            .expect("write bad idx");
+  2000→
+
+[showing lines 1-2000 of 2295; use offset=2001 with limit to continue reading]

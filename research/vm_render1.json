@@ -1,0 +1,92 @@
+[
+  {
+    "url": "https://groups.google.com/g/android-platform/c/QX4SiTYsIq4",
+    "name": "Frame buffer , Hardware overlay, rendering",
+    "snippet": "I am trying to capture the frame from framebuffer device. /dev/graphics/fb0 in a rooted device. It works well to some extent. But when i try to play a video ... Read more\nFigure above may help you to understand how overlay rendering work and how overlay and frame buffer composition work.",
+    "host_name": "groups.google.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://play.google.com/store/apps/details?id=com.vmos.virtual&hl=en_US",
+    "name": "VMOS - Android virtual machine - Apps on Google Play",
+    "snippet": "Jul 3, 2026 — VMOS runs the guest Android entirely on your phone using our Ylinker virtualization engine. There is no remote server and no cloud streaming. Read more\nRating 3.2 (114) · Free · Android Jul 3, 2026 · VMOS lets you run a complete Android system as a regular app on your phone. No root, no rebooting, no separate device.",
+    "host_name": "play.google.com",
+    "rank": 1,
+    "date": "Jul 3, 2026",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=KeRNRURnz0g",
+    "name": "How to Setup An Android Virtual Machine - VMOS PRO Setup Tutorial",
+    "snippet": "May 26, 2021 · Join this channel to get access to perks: https://www.youtube.com/channel/UCDfnWOUgKfV1ltUlLryRygQ/join In this video we will be exploring ...\nIn this video we will be exploring how to install two versions of android OS on one android phone. Inveriably, installing an Android Virtual ...",
+    "host_name": "www.youtube.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=BUPPyR6VasI",
+    "name": "Android Frame Buffer and Screen Shots Tutorial - YouTube",
+    "snippet": "Jul 16, 2014 · Android Frame Buffer and Screen Shots Tutorial. @DigitalMetal208 likes13K views12 years ago more. Subscribe. Comments. 19. Comment.",
+    "host_name": "www.youtube.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.reddit.com/r/PokemonGoSpoofing/comments/deq6fy/tutorial_spoofing_on_all_unrooted_android_devices",
+    "name": "[Tutorial] Spoofing on All Unrooted Android Devices, Using VMOS",
+    "snippet": "Oct 8, 2019 · VMOS is an App, but is basically a rooted emulator installed on your phone. It runs a custom ROM based on 5.1 and is rooted out of the box!\nVMOS is an App, but is basically a rooted emulator installed on your phone. It runs a custom ROM based on 5.1 and is rooted out of the box! Read more",
+    "host_name": "www.reddit.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://developer.android.com/topic/performance/vitals/render",
+    "name": "Slow rendering | App quality - Android Developers",
+    "snippet": "This document explains UI rendering performance, defining jank as skipped frames due to slow rendering and frozen frames as extreme delays.",
+    "host_name": "developer.android.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/12210564/when-frame-buffer-in-used-on-android-scene-does-not-render",
+    "name": "When frame buffer in used on android, scene does not render",
+    "snippet": "Aug 31, 2012 · By allowing the images of a renderbuffer to be attached to a framebuffer, OpenGL ES provides a mechanism to support off-screen rendering.",
+    "host_name": "stackoverflow.com",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.vmoscloud.com/help/how-to-use-the-camera-on-vmos-cloud.html",
+    "name": "How to Use the Camera on VMOS Cloud?",
+    "snippet": "May 7, 2025 · This guide will show the most used scenarios to ask the camera permission on an android cloud phone, and navigate users on how to open the camera function on ...\nMay 7, 2025 — This guide will show the most used scenarios to ask the camera permission on an android cloud phone, and navigate users on how to open the camera function on ... Read more",
+    "host_name": "www.vmoscloud.com",
+    "rank": 7,
+    "date": "May 7, 2025",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.youtube.com/watch?v=n_UUsPVeQ5c",
+    "name": "How to Run Android Virtually on Any Device! VMOS Cloud - YouTube",
+    "snippet": "Aug 1, 2025 · Share your videos with friends, family, and the world.",
+    "host_name": "www.youtube.com",
+    "rank": 8,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://blog.en.uptodown.com/vmos-virtualize-android",
+    "name": "How to virtualize Android on your own smartphone - Uptodown Blog",
+    "snippet": "Sep 20, 2019 · VMOS is a free app that lets you run a virtual Android 5.1.1 directly on your own smartphone. The possibilities are huge.",
+    "host_name": "blog.en.uptodown.com",
+    "rank": 9,
+    "date": "",
+    "favicon": ""
+  }
+]

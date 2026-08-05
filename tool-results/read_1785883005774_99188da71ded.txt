@@ -1,0 +1,425 @@
+     1→     1→package com.android.vmapp;
+     2→     2→
+     3→     3→import ad.WoWo;
+     4→     4→import android.app.ActivityManager;
+     5→     5→import android.app.Application;
+     6→     6→import android.content.ClipboardManager;
+     7→     7→import android.content.Context;
+     8→     8→import android.content.Intent;
+     9→     9→import android.content.IntentFilter;
+    10→    10→import android.content.SharedPreferences;
+    11→    11→import android.net.ConnectivityManager;
+    12→    12→import android.net.NetworkRequest;
+    13→    13→import android.os.Build;
+    14→    14→import android.os.Handler;
+    15→    15→import android.os.Looper;
+    16→    16→import android.text.TextUtils;
+    17→    17→import android.util.Base64;
+    18→    18→import android.util.Log;
+    19→    19→import android.util.SparseArray;
+    20→    20→import androidx.appcompat.app.AbstractC0813WWoWWo;
+    21→    21→import androidx.lifecycle.AbstractC1099WoWo;
+    22→    22→import androidx.lifecycle.C1089WWoWWo;
+    23→    23→import c0.C1458WWWW;
+    24→    24→import com.android.vmapp.billing.C1603WWWWWWWW;
+    25→    25→import com.android.vmapp.billing.C1612WWoWWo;
+    26→    26→import com.android.vmapp.vm.VMExtension;
+    27→    27→import com.android.vmcore.KLog;
+    28→    28→import com.android.vmcore.StringFog;
+    29→    29→import com.android.vmcore.VMConfig;
+    30→    30→import com.android.vmcore.VMInstance;
+    31→    31→import com.android.vmcore.VMManager;
+    32→    32→import com.android.vmcore.event.VMCreationEvent;
+    33→    33→import com.android.vmcore.event.VMDeletionEvent;
+    34→    34→import com.google.android.gms.internal.ads.m7;
+    35→    35→import com.google.android.gms.internal.ads.x21;
+    36→    36→import com.google.android.gms.internal.consent_sdk.AbstractC1812WWWW;
+    37→    37→import com.google.android.gms.internal.consent_sdk.c0;
+    38→    38→import com.google.android.gms.internal.measurement.p1;
+    39→    39→import com.google.firebase.Firebase;
+    40→    40→import com.google.firebase.remoteconfig.FirebaseRemoteConfig;
+    41→    41→import com.google.firebase.remoteconfig.RemoteConfigKt;
+    42→    42→import dalvik.system.DexFile;
+    43→    43→import ed.AbstractC2403WWWWoWWWWo;
+    44→    44→import ed.C2427WWWWWWWW;
+    45→    45→import ed.WW;
+    46→    46→import eh.C2467WWWWWWWW;
+    47→    47→import eh.InterfaceC2472WWWWWWWW;
+    48→    48→import f2.C2489WWWWWWWW;
+    49→    49→import f2.C2494WWWoWWWo;
+    50→    50→import i6.C2899WWWWWWWW;
+    51→    51→import j3.C3160WWWWWWWW;
+    52→    52→import j3.C3164WWWWWWWW;
+    53→    53→import j3.SharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW;
+    54→    54→import j3.WWWW;
+    55→    55→import j3.WWWoWWWo;
+    56→    56→import j3.WWoWWo;
+    57→    57→import java.io.File;
+    58→    58→import java.io.FileOutputStream;
+    59→    59→import java.lang.reflect.Method;
+    60→    60→import java.util.Locale;
+    61→    61→import java.util.Map;
+    62→    62→import k3.C3219WWWWWWWW;
+    63→    63→import k3.C3222WWWWWWWW;
+    64→    64→import k3.C3226WWWWWWWW;
+    65→    65→import k3.C3231WWoWWo;
+    66→    66→import k3.C3233WWoWWo;
+    67→    67→import k3.o;
+    68→    68→import kotlin.jvm.internal.AbstractC3339WWWWWWWW;
+    69→    69→import l3.C3380WWWWWWWW;
+    70→    70→import l3.C3396WWWWWWWW;
+    71→    71→import l3.C3398WWWWWWWW;
+    72→    72→import lc.AbstractC3453WWWWWWWW;
+    73→    73→import ld.C3455WWWWWWWW;
+    74→    74→import ld.ExecutorC3454WWWWWWWW;
+    75→    75→import n2.C3534WWWWWWWW;
+    76→    76→import n6.C3577WWWWWWWW;
+    77→    77→import o2.C3625WWWWWWWW;
+    78→    78→import org.apache.commons.compress.archivers.tar.TarConstants;
+    79→    79→import org.apache.commons.compress.harmony.unpack200.bytecode.ConstantPoolEntry;
+    80→    80→import org.greenrobot.eventbus.ThreadMode;
+    81→    81→import p020WWWWWWWW.AbstractC0211WWWWWWWW;
+    82→    82→import q3.WWWWoWWWWo;
+    83→    83→import r3.C3960WWoWWo;
+    84→    84→import s2.C4086WWWWWWWW;
+    85→    85→import t4.ComponentCallbacksC4221WWWWWWWW;
+    86→    86→import u6.r;
+    87→    87→import wd.WWWWWWWW;
+    88→    88→/* loaded from: classes.dex */
+    89→    89→public class VMApp extends Application {
+    90→    90→
+    91→    91→    /* renamed from: WWWWWກWWWWWȝກ  reason: contains not printable characters */
+    92→    92→    public static VMApp f8424WWWWWWWWWW;
+    93→    93→
+    94→    94→    /* renamed from: WWWWoඤWWWWoెඤ  reason: contains not printable characters */
+    95→    95→    public final SparseArray f8425WWWWoWWWWo = new SparseArray();
+    96→    96→
+    97→    97→    /* JADX WARN: Code restructure failed: missing block: B:44:0x00b1, code lost:
+    98→    98→        if (r2.exists() == false) goto L48;
+    99→    99→     */
+   100→   100→    @Override // android.content.ContextWrapper
+   101→   101→    /*
+   102→   102→        Code decompiled incorrectly, please refer to instructions dump.
+   103→   103→    */
+   104→   104→    public final void attachBaseContext(Context context) {
+   105→   105→        File file;
+   106→   106→        Method method;
+   107→   107→        super.attachBaseContext(context);
+   108→   108→        if (Build.VERSION.SDK_INT >= 28) {
+   109→   109→            String[] strArr = {"L"};
+   110→   110→            Object obj = WWWWWWWW.f35180WWWWWWWW;
+   111→   111→            if (obj != null && (method = WWWWWWWW.f35179WWWWoWWWWo) != null) {
+   112→   112→                try {
+   113→   113→                    method.invoke(obj, strArr);
+   114→   114→                } catch (Throwable unused) {
+   115→   115→                }
+   116→   116→            }
+   117→   117→            byte[] decode = Base64.decode("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TGFuZHJvaWQvdXRpbC9Mb2c7ABFMamF2YS9sYW5nL0NsYXNzOwAUTGphdmEvbGFuZy9DbGFzczwqPjsAEkxqYXZhL2xhbmcvT2JqZWN0OwASTGphdmEvbGFuZy9TdHJpbmc7ABJMamF2YS9sYW5nL1N5c3RlbTsAFUxqYXZhL2xhbmcvVGhyb3dhYmxlOwAaTGphdmEvbGFuZy9yZWZsZWN0L01ldGhvZDsAJkxtZS93ZWlzaHUvZnJlZXJlZmxlY3Rpb24vQnVpbGRDb25maWc7ACVMbWUvd2Vpc2h1L3JlZmxlY3Rpb24vQm9vdHN0cmFwQ2xhc3M7ACFMbWUvd2Vpc2h1L3JlZmxlY3Rpb24vUmVmbGVjdGlvbjsAClJlZmxlY3Rpb24AD1JlZmxlY3Rpb24uamF2YQAHU0RLX0lOVAADVEFHAAFWAAxWRVJTSU9OX0NPREUADFZFUlNJT05fTkFNRQACVkwAAVoAAlpMABJbTGphdmEvbGFuZy9DbGFzczsAE1tMamF2YS9sYW5nL09iamVjdDsAE1tMamF2YS9sYW5nL1N0cmluZzsAB2NvbnRleHQAF2RhbHZpay5zeXN0ZW0uVk1SdW50aW1lAAFlAAZleGVtcHQACWV4ZW1wdEFsbAAHZm9yTmFtZQAPZnJlZS1yZWZsZWN0aW9uABJnZXRBcHBsaWNhdGlvbkluZm8AEWdldERlY2xhcmVkTWV0aG9kAApnZXRSdW50aW1lAAZpbnZva2UAC2xvYWRMaWJyYXJ5ABhtZS53ZWlzaHUuZnJlZXJlZmxlY3Rpb24ABm1ldGhvZAAHbWV0aG9kcwAZcmVmbGVjdCBib290c3RyYXAgZmFpbGVkOgAHcmVsZWFzZQAKc1ZtUnVudGltZQAWc2V0SGlkZGVuQXBpRXhlbXB0aW9ucwAQdGFyZ2V0U2RrVmVyc2lvbgAEdGhpcwAGdW5zZWFsAAx1bnNlYWxOYXRpdmUADnZtUnVudGltZUNsYXNzAAYABw4AFgAHDmr/AwEyCwEVEAMCNQvwBAREBhcBEg8DAzYLARsPqQUCBQMFBBkeAwAvCgAOAAcOACwBOgcOADYBOwcsnRriAQEDAC8KHgBIAAcOAA0ABw4AEwEtBx1yGWtaAAYXOBc8HxcABAEXAQEXBgEXHwYAAQACGQEZARkBGQEZARkGgYAEiAcDAAUACBoBCgEKB4iABKAHAYGABLQJAQnMCQGJAfQJAQnMCgEAAwALGgyBgAT4CgEJkAsBigIAAAAADgAAAAAAAAABAAAAAAAAAAEAAABEAAAAcAAAAAIAAAATAAAAgAEAAAMAAAALAAAAzAEAAAQAAAAMAAAAUAIAAAUAAAAPAAAAsAIAAAYAAAADAAAAKAMAAAEgAAAIAAAAiAMAAAEQAAAHAAAA3AUAAAIgAABEAAAAFgYAAAMgAAAIAAAAAwoAAAUgAAADAAAAZgoAAAAgAAADAAAAeAoAAAAQAAABAAAAyAoAAA==", 2);
+   118→   118→            if (context != null) {
+   119→   119→                file = context.getCodeCacheDir();
+   120→   120→            } else {
+   121→   121→                String property = System.getProperty("java.io.tmpdir");
+   122→   122→                if (!TextUtils.isEmpty(property)) {
+   123→   123→                    File file2 = new File(property);
+   124→   124→                    if (file2.exists()) {
+   125→   125→                        file = file2;
+   126→   126→                    }
+   127→   127→                }
+   128→   128→                file = null;
+   129→   129→            }
+   130→   130→            if (file != null) {
+   131→   131→                File file3 = new File(file, System.currentTimeMillis() + ".dex");
+   132→   132→                try {
+   133→   133→                    FileOutputStream fileOutputStream = new FileOutputStream(file3);
+   134→   134→                    fileOutputStream.write(decode);
+   135→   135→                    fileOutputStream.close();
+   136→   136→                    try {
+   137→   137→                        file3.setReadOnly();
+   138→   138→                    } catch (Throwable unused2) {
+   139→   139→                    }
+   140→   140→                    ((Boolean) new DexFile(file3).loadClass("me.weishu.reflection.BootstrapClass", null).getDeclaredMethod("exemptAll", null).invoke(null, null)).booleanValue();
+   141→   141→                } catch (Throwable th2) {
+   142→   142→                    try {
+   143→   143→                        th2.printStackTrace();
+   144→   144→                    } finally {
+   145→   145→                        if (file3.exists()) {
+   146→   146→                            file3.delete();
+   147→   147→                        }
+   148→   148→                    }
+   149→   149→                }
+   150→   150→            }
+   151→   151→        }
+   152→   152→        f8424WWWWWWWWWW = this;
+   153→   153→    }
+   154→   154→
+   155→   155→    /* JADX WARN: Multi-variable type inference failed */
+   156→   156→    /* JADX WARN: Type inference failed for: r1v16, types: [androidx.lifecycle.WWoᆑWWoӁᆑ, androidx.lifecycle.WoოWo੍ო] */
+   157→   157→    /* JADX WARN: Type inference failed for: r1v33, types: [o2.WoڄWoᄴڄ, java.lang.Object] */
+   158→   158→    /* JADX WARN: Type inference failed for: r7v14, types: [tc.WWWWެWWWWܕެ, lc.WWWWӈWWWWीӈ] */
+   159→   159→    /* JADX WARN: Type inference failed for: r9v2, types: [java.util.Map, java.lang.Object] */
+   160→   160→    /* JADX WARN: Type inference failed for: r9v4, types: [java.lang.Object, com.google.firebase.remoteconfig.ConfigUpdateListener] */
+   161→   161→    @Override // android.app.Application
+   162→   162→    public final void onCreate() {
+   163→   163→        C3577WWWWWWWW c3577wwwwwwww;
+   164→   164→        Intent intent;
+   165→   165→        int i10;
+   166→   166→        Context context;
+   167→   167→        Context context2;
+   168→   168→        super.onCreate();
+   169→   169→        if (WWWWoWWWWo.f32526WWWWWWWW == null) {
+   170→   170→            if (Build.VERSION.SDK_INT >= 24) {
+   171→   171→                context2 = createDeviceProtectedStorageContext();
+   172→   172→            } else {
+   173→   173→                context2 = this;
+   174→   174→            }
+   175→   175→            WWWWoWWWWo.f32526WWWWWWWW = new q3.WWWWWWWW(context2, 0).getSharedPreferences(WWWWoWWWWo.f32522WWWWWWWW, 0);
+   176→   176→        }
+   177→   177→        Locale m16514WWWWoWWWWo = WWWWoWWWWo.m16514WWWWoWWWWo();
+   178→   178→        Locale locale = WWWoWWWo.f28919WWWWoWWWWo;
+   179→   179→        AbstractC1812WWWW.m10962WoWo(m16514WWWWoWWWWo);
+   180→   180→        AbstractC0813WWoWWo.m2406WWWWWWWW(WWWWoWWWWo.m16516WWWWWWWW());
+   181→   181→        String m16522WWoWWo = WWWWoWWWWo.m16522WWoWWo();
+   182→   182→        String str = WWWW.f28925WWWWoWWWWo;
+   183→   183→        p1.m11587WWWWWWWW(m16522WWoWWo);
+   184→   184→        C3396WWWWWWWW.f30437WWWWWWWW.getClass();
+   185→   185→        FirebaseRemoteConfig remoteConfig = RemoteConfigKt.getRemoteConfig(Firebase.INSTANCE);
+   186→   186→        remoteConfig.setDefaultsAsync((Map<String, Object>) C3396WWWWWWWW.f30434WWWWWWWWWW);
+   187→   187→        remoteConfig.fetchAndActivate().mo16241WWWWWWWW(new C2899WWWWWWWW(5, new WoWo(12)));
+   188→   188→        remoteConfig.addOnConfigUpdateListener(new Object());
+   189→   189→        C2494WWWoWWWo c2494WWWoWWWo = new C2494WWWoWWWo();
+   190→   190→        C3164WWWWWWWW.f28918WWWWWWWW.getClass();
+   191→   191→        c2494WWWoWWWo.f26918WWWWWWWW = x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{92, -120, -67, -106, -65, -58, Byte.MIN_VALUE, 61, TarConstants.LF_GNUTYPE_LONGLINK, -110, -69, -121, -72}, new byte[]{42, -31, -49, -30, -54, -89, -20, 80});
+   192→   192→        c2494WWWoWWWo.f26917WWWWoWWWWo = x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{115, 63, -117, 27, -112, 32, 82, TarConstants.LF_BLK, 121, 40, -96, 95, -98, TarConstants.LF_CONTIG, 67, TarConstants.LF_CHR, 85, 37, -22, TarConstants.LF_PAX_EXTENDED_HEADER_UC, -66, 44, 95, 25, 118, 2, -93, 86, -54, 61, 67, 102}, new byte[]{26, TarConstants.LF_PAX_GLOBAL_EXTENDED_HEADER, -45, 111, -6, 100, 19, 82});
+   193→   193→        m7.f15885WWWW = new m7(this, new C2489WWWWWWWW(c2494WWWoWWWo.f26918WWWWWWWW, c2494WWWoWWWo.f26917WWWWoWWWWo, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-54, 35, 63, -43, TarConstants.LF_FIFO, -26, -2, 109, -35, 57, 57, -60, TarConstants.LF_LINK}, new byte[]{-68, 74, TarConstants.LF_MULTIVOLUME, -95, 67, -121, -110, 0})));
+   194→   194→        if (C1603WWWWWWWW.f8434WWWoWWWo == null) {
+   195→   195→            C1603WWWWWWWW c1603wwwwwwww = new C1603WWWWWWWW(this);
+   196→   196→            C1603WWWWWWWW.f8434WWWoWWWo = c1603wwwwwwww;
+   197→   197→            c1603wwwwwwww.m4896WWWWoWWWWo();
+   198→   198→            C1603WWWWWWWW c1603wwwwwwww2 = C1603WWWWWWWW.f8434WWWoWWWo;
+   199→   199→            c1603wwwwwwww2.getClass();
+   200→   200→            try {
+   201→   201→                ((ConnectivityManager) c1603wwwwwwww2.f8438WWWWoWWWWo.getSystemService(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-2, -46, 1, -122, TarConstants.LF_FIFO, -81, -126, 111, -21, -44, 27, -111}, new byte[]{-99, -67, 111, -24, TarConstants.LF_GNUTYPE_SPARSE, -52, -10, 6}))).registerNetworkCallback(new NetworkRequest.Builder().build(), new com.android.vmapp.billing.WWWoWWWo(0, c1603wwwwwwww2));
+   202→   202→            } catch (Exception e10) {
+   203→   203→                e10.printStackTrace();
+   204→   204→            }
+   205→   205→        }
+   206→   206→        C1612WWoWWo.f8473WWWWoWWWWo.getClass();
+   207→   207→        byte[] bArr = {73, 4, -86, -20, -31, ConstantPoolEntry.CP_InterfaceMethodref, -111, -119};
+   208→   208→        C3164WWWWWWWW.f28918WWWWWWWW.getClass();
+   209→   209→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{40, 116, -38}, bArr);
+   210→   210→        C1612WWoWWo.f8482WWWW = this;
+   211→   211→        C3960WWoWWo.f32923WWWWWWWW.getClass();
+   212→   212→        AbstractC2403WWWWoWWWWo.m13803WWWWWWWW(C3960WWoWWo.f32924WWWWWWWW, null, new AbstractC3453WWWWWWWW(2, null), 3);
+   213→   213→        C3396WWWWWWWW c3396wwwwwwww = C3396WWWWWWWW.f30437WWWWWWWW;
+   214→   214→        C1458WWWW c1458wwww = new C1458WWWW(24);
+   215→   215→        c3396wwwwwwww.getClass();
+   216→   216→        C3396WWWWWWWW.m15737WWWWWWWW(c1458wwww);
+   217→   217→        if (C3380WWWWWWWW.f30346WWWWWWWW == null) {
+   218→   218→            C3380WWWWWWWW c3380wwwwwwww = new C3380WWWWWWWW(this);
+   219→   219→            C3380WWWWWWWW.f30346WWWWWWWW = c3380wwwwwwww;
+   220→   220→            try {
+   221→   221→                IntentFilter intentFilter = new IntentFilter(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-16, -33, 17, 28, 81, TarConstants.LF_CHR, -43, 116, -8, -33, 1, ConstantPoolEntry.CP_InterfaceMethodref, 80, 46, -97, 59, -14, -59, 28, 1, 80, 116, -31, 27, -46, -6, TarConstants.LF_BLK, 41, 123, 5, -29, 31, -36, -2, 35, 43, 122}, new byte[]{-111, -79, 117, 110, 62, 90, -79, 90}));
+   222→   222→                intentFilter.addAction(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{ConstantPoolEntry.CP_NameAndType, -21, 109, 33, 41, TarConstants.LF_DIR, -60, 30, 4, -21, 125, TarConstants.LF_FIFO, 40, 40, -114, 81, 14, -15, 96, 60, 40, 114, -16, 113, 46, -50, 72, 20, 3, 3, -31, 116, 41, -64, TarConstants.LF_MULTIVOLUME}, new byte[]{109, -123, 9, TarConstants.LF_GNUTYPE_SPARSE, 70, 92, -96, TarConstants.LF_NORMAL}));
+   223→   223→                intentFilter.addAction(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{62, -115, -42, 23, -17, -53, 60, 97, TarConstants.LF_FIFO, -115, -58, 0, -18, -42, 118, 46, 60, -105, -37, 10, -18, -116, 8, 14, 28, -88, -13, 34, -59, -3, 10, 10, 15, -81, -13, 38, -59, -26}, new byte[]{95, -29, -78, 101, Byte.MIN_VALUE, -94, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 79}));
+   224→   224→                intentFilter.addDataScheme(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-22, -49, -106, -45, 89, 99, 40}, new byte[]{-102, -82, -11, -72, 56, 4, TarConstants.LF_MULTIVOLUME, 24}));
+   225→   225→                c3380wwwwwwww.f30349WWWWWWWW.registerReceiver(c3380wwwwwwww.f30353WWWWWWWW, intentFilter);
+   226→   226→            } catch (Throwable th2) {
+   227→   227→                th2.printStackTrace();
+   228→   228→            }
+   229→   229→        }
+   230→   230→        C3219WWWWWWWW.f29158WWWWWWWW.getClass();
+   231→   231→        C3164WWWWWWWW.f28918WWWWWWWW.getClass();
+   232→   232→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{123, -87, -62}, new byte[]{26, -39, -78, 112, 106, 41, 86, -36});
+   233→   233→        StringBuilder sb2 = new StringBuilder();
+   234→   234→        sb2.append(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{35, 97, 126, TarConstants.LF_DIR, 80, -17, -109, 26, ConstantPoolEntry.CP_InterfaceMethodref, 108, TarConstants.LF_PAX_EXTENDED_HEADER_LC, 62, 89, -86, -14, TarConstants.LF_CHR, 23, 46, 66, 22, 119, -86, -27, TarConstants.LF_SYMLINK, 22, 125, TarConstants.LF_PAX_EXTENDED_HEADER_LC, 61, 82, -80, -109}, new byte[]{100, 14, 17, 82, 60, -118, -77, 87}));
+   235→   235→        r.m17495WWWWWWWW();
+   236→   236→        String[] split = TextUtils.split("24.8.0", "\\.");
+   237→   237→        if (split.length != 3) {
+   238→   238→            c3577wwwwwwww = new C3577WWWWWWWW(0, 0, 0);
+   239→   239→        } else {
+   240→   240→            try {
+   241→   241→                c3577wwwwwwww = new C3577WWWWWWWW(Integer.parseInt(split[0]), Integer.parseInt(split[1]), Integer.parseInt(split[2]));
+   242→   242→            } catch (NumberFormatException unused) {
+   243→   243→                c3577wwwwwwww = new C3577WWWWWWWW(0, 0, 0);
+   244→   244→            }
+   245→   245→        }
+   246→   246→        sb2.append(c3577wwwwwwww);
+   247→   247→        Log.d(C3219WWWWWWWW.f29157WWWWoWWWWo, sb2.toString());
+   248→   248→        C3219WWWWWWWW.f29161WWWoWWWo = this;
+   249→   249→        c0 mo10850WWWWoWWWWo = com.google.android.gms.internal.consent_sdk.WWWWWWWW.m10849WWWWWWWW(this).mo10850WWWWoWWWWo();
+   250→   250→        C3164WWWWWWWW.f28918WWWWWWWW.getClass();
+   251→   251→        AbstractC3339WWWWWWWW.m15429WWWWWWWW(mo10850WWWWoWWWWo, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{57, -55, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 121, -99, -39, 106, -51, TarConstants.LF_NORMAL, -40, 101, 84, -108, -40, 107, -59, 63, -40, 69, 85, -100, -97, TarConstants.LF_CONTIG, -122, 112, -123}, new byte[]{94, -84, 44, 58, -14, -73, 25, -88}));
+   252→   252→        C3219WWWWWWWW.f29159WWWWWWWW = mo10850WWWWoWWWWo;
+   253→   253→        C3222WWWWWWWW c3222wwwwwwww = C3222WWWWWWWW.f29195WWWWoWWWWo;
+   254→   254→        c3222wwwwwwww.getClass();
+   255→   255→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-53, 96, -41}, new byte[]{-86, 16, -89, -99, -89, -83, 17, -78});
+   256→   256→        Log.d(C3222WWWWWWWW.f29194WWWWWWWWWW, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-18, -71, 47, -7, 124}, new byte[]{-121, -41, 70, -115, 82, 7, 26, 99}));
+   257→   257→        registerActivityLifecycleCallbacks(c3222wwwwwwww);
+   258→   258→        C1089WWoWWo.f5668WW.f5675WWoWWo.mo3500WWWWWWWW(c3222wwwwwwww);
+   259→   259→        C3233WWoWWo.f29240WWWWWWWW.getClass();
+   260→   260→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{125, 21, 38}, new byte[]{28, 101, 86, 116, -35, 109, 30, 112});
+   261→   261→        Log.d(C3233WWoWWo.f29239WWWWoWWWWo, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{6, TarConstants.LF_CONTIG, -22, -14, 81}, new byte[]{111, 89, -125, -122, Byte.MAX_VALUE, ConstantPoolEntry.CP_InterfaceMethodref, -86, -8}));
+   262→   262→        Application.ActivityLifecycleCallbacks activityLifecycleCallbacks = o.f29253WWWWoWWWWo;
+   263→   263→        activityLifecycleCallbacks.getClass();
+   264→   264→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-8, 37, -47}, new byte[]{-103, 85, -95, -13, 31, 18, -99, -27});
+   265→   265→        Log.d(o.f29252WWWWWWWWWW, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-53, -54, -86, 125, 33}, new byte[]{-94, -92, -61, 9, 15, -73, 9, -102}));
+   266→   266→        registerActivityLifecycleCallbacks(activityLifecycleCallbacks);
+   267→   267→        C3231WWoWWo.f29228WWWWWWWW.getClass();
+   268→   268→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{121, -75, -58}, new byte[]{24, -59, -74, -55, 111, -71, -27, 18});
+   269→   269→        Log.d(C3231WWoWWo.f29227WWWWoWWWWo, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-113, -93, 20, -112, 89}, new byte[]{-26, -51, 125, -28, 119, 94, TarConstants.LF_BLK, -54}));
+   270→   270→        Application.ActivityLifecycleCallbacks activityLifecycleCallbacks2 = C3226WWWWWWWW.f29210WWWWoWWWWo;
+   271→   271→        activityLifecycleCallbacks2.getClass();
+   272→   272→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{113, -39, -36}, new byte[]{16, -87, -84, 112, -6, -36, -52, -46});
+   273→   273→        Log.d(C3226WWWWWWWW.f29209WWWWWWWWWW, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{80, -120, -67, -63, TarConstants.LF_CONTIG}, new byte[]{57, -26, -44, -75, 25, 14, -59, 61}));
+   274→   274→        registerActivityLifecycleCallbacks(activityLifecycleCallbacks2);
+   275→   275→        String str2 = VMManager.f8949WWWoWWWo;
+   276→   276→        synchronized (VMManager.class) {
+   277→   277→            if (VMManager.f8948WWWWWWWW == null) {
+   278→   278→                String str3 = VMManager.f8949WWWoWWWo;
+   279→   279→                byte[] bArr2 = {-97, TarConstants.LF_CONTIG, TarConstants.LF_MULTIVOLUME, -80, -120, -36, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 106, -85, 63, 71, -80, -110, -26, TarConstants.LF_PAX_EXTENDED_HEADER_UC, 112, -87, 126, 79, -80, -98, -13, 25, 116, -67};
+   280→   280→                byte[] bArr3 = {-60, 94, 35, -39, -4, -127, TarConstants.LF_PAX_EXTENDED_HEADER_LC, 6};
+   281→   281→                StringFog.f8859WWWWWWWW.getClass();
+   282→   282→                Log.i(str3, x5.WWWWWWWW.m17835WWWWWWWW(bArr2, bArr3));
+   283→   283→                System.loadLibrary(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-26, -127}, new byte[]{-112, -20, -8, 31, -8, ConstantPoolEntry.CP_NameAndType, 66, -22}));
+   284→   284→                VMManager.f8948WWWWWWWW = new VMManager(this);
+   285→   285→            } else {
+   286→   286→                byte[] bArr4 = {-106, 89, -122, 82, 30, 118, 47, -100, -78, TarConstants.LF_BLK, -86, 95, 2, 114, 41, -99, -71, TarConstants.LF_BLK, -94, 93, 25, 99, 33, -104, -84, 125, -79, 86, 20};
+   287→   287→                byte[] bArr5 = {-64, 20, -53, TarConstants.LF_CHR, 112, 23, 72, -7};
+   288→   288→                StringFog.f8859WWWWWWWW.getClass();
+   289→   289→                throw new RuntimeException(x5.WWWWWWWW.m17835WWWWWWWW(bArr4, bArr5));
+   290→   290→            }
+   291→   291→        }
+   292→   292→        for (VMInstance vMInstance : VMManager.m5102WWWWWWWW().m5108WWoWWo()) {
+   293→   293→            this.f8425WWWWoWWWWo.put(vMInstance.f8937WWWoWWWo.f8866WWWWWWWW, new VMExtension(this, vMInstance));
+   294→   294→        }
+   295→   295→        if (!t8.WWWWWWWW.m17201WWWWWWWW(this).m4644WWWWoWWWWo() && (i10 = Build.VERSION.SDK_INT) >= 31) {
+   296→   296→            C4086WWWWWWWW.f33575WWWWWWWW = this;
+   297→   297→            if (s2.WWWWWWWW.f33572WWWWoWWWWo == null) {
+   298→   298→                if (i10 >= 24) {
+   299→   299→                    context = createDeviceProtectedStorageContext();
+   300→   300→                } else {
+   301→   301→                    context = this;
+   302→   302→                }
+   303→   303→                s2.WWWWWWWW.f33572WWWWoWWWWo = new q3.WWWWWWWW(context, 1).getSharedPreferences(s2.WWWWWWWW.f33573WWWWWWWW, 0);
+   304→   304→            }
+   305→   305→            if (o2.WoWo.f31584WWWWWWWW == null) {
+   306→   306→                ?? obj = new Object();
+   307→   307→                try {
+   308→   308→                    obj.f31591WWWoWWWo = this;
+   309→   309→                    obj.f31594WW = new Handler(Looper.getMainLooper());
+   310→   310→                    obj.f31586WWWWWWWWWW = false;
+   311→   311→                    obj.f31587WWWWoWWWWo = false;
+   312→   312→                    x21 x21Var = new x21(s2.WWWWWWWW.f33572WWWWoWWWWo);
+   313→   313→                    byte[] bArr6 = {-14, 73, 39, -40, -8, 89, 73, 95, -27, TarConstants.LF_GNUTYPE_SPARSE, 33, -55, -1};
+   314→   314→                    byte[] bArr7 = {-124, 32, 85, -84, -115, 56, 37, TarConstants.LF_SYMLINK};
+   315→   315→                    C3534WWWWWWWW.f31122WWWWWWWW.getClass();
+   316→   316→                    obj.f31595WoWo = new C3625WWWWWWWW(x21Var, x5.WWWWWWWW.m17835WWWWWWWW(bArr6, bArr7));
+   317→   317→                } catch (Throwable th3) {
+   318→   318→                    th3.printStackTrace();
+   319→   319→                }
+   320→   320→                o2.WoWo.f31584WWWWWWWW = obj;
+   321→   321→            }
+   322→   322→        }
+   323→   323→        ComponentCallbacksC4221WWWWWWWW componentCallbacksC4221WWWWWWWW = ComponentCallbacksC4221WWWWWWWW.f34042WWWWoWWWWo;
+   324→   324→        componentCallbacksC4221WWWWWWWW.getClass();
+   325→   325→        C3164WWWWWWWW.f28918WWWWWWWW.getClass();
+   326→   326→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{91, 2, 4}, new byte[]{58, 114, 116, 28, 102, -53, -84, -32});
+   327→   327→        C1089WWoWWo.f5668WW.f5675WWoWWo.mo3500WWWWWWWW(componentCallbacksC4221WWWWWWWW);
+   328→   328→        ComponentCallbacksC4221WWWWWWWW.f34043WWWWWWWW = this;
+   329→   329→        if (!ComponentCallbacksC4221WWWWWWWW.f34046WWoWWo) {
+   330→   330→            try {
+   331→   331→                AbstractC0211WWWWWWWW.m830WWWWWWWW(this, ComponentCallbacksC4221WWWWWWWW.f34045WWWWWWWW, new IntentFilter(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-38, 56, 110, -39, -17, 109, -50, -125, -46, 56, 126, -50, -18, 112, -124, -52, -40, 34, 99, -60, -18, 42, -23, -31, -12, 5, 79, -12, -45, 93, -7, -7, -2, 27, 85, -17, -55, 69, -26, -30, -4, 5}, new byte[]{-69, 86, 10, -85, Byte.MIN_VALUE, 4, -86, -83})), 4);
+   332→   332→                ComponentCallbacksC4221WWWWWWWW.f34046WWoWWo = true;
+   333→   333→            } catch (Throwable th4) {
+   334→   334→                th4.printStackTrace();
+   335→   335→            }
+   336→   336→        }
+   337→   337→        registerComponentCallbacks(componentCallbacksC4221WWWWWWWW);
+   338→   338→        ComponentCallbacksC4221WWWWWWWW.f34047WWWW = new AbstractC1099WoWo(ComponentCallbacksC4221WWWWWWWW.m17174WWWoWWWo());
+   339→   339→        registerActivityLifecycleCallbacks(new C3160WWWWWWWW(1));
+   340→   340→        SharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW sharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW = SharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW.f28903WWWWoWWWWo;
+   341→   341→        sharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW.getClass();
+   342→   342→        byte[] bArr8 = {-10, -35, -35, TarConstants.LF_LINK, -39, -88, -108, 38};
+   343→   343→        x5.WWWWWWWW wwwwwwww = C3164WWWWWWWW.f28918WWWWWWWW;
+   344→   344→        wwwwwwww.getClass();
+   345→   345→        x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-105, -83, -83}, bArr8);
+   346→   346→        SharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW.f28905WWWWWWWW = this;
+   347→   347→        C1089WWoWWo.f5668WW.f5675WWoWWo.mo3500WWWWWWWW(sharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW);
+   348→   348→        VMApp vMApp = SharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW.f28905WWWWWWWW;
+   349→   349→        if (vMApp != null) {
+   350→   350→            vMApp.registerActivityLifecycleCallbacks(new C3160WWWWWWWW(0));
+   351→   351→            SharedPreferences sharedPreferences = WWWWoWWWWo.f32526WWWWWWWW;
+   352→   352→            C2427WWWWWWWW c2427wwwwwwww = C2427WWWWWWWW.f26690WWWWoWWWWo;
+   353→   353→            C3455WWWWWWWW c3455wwwwwwww = WW.f26728WWWWWWWW;
+   354→   354→            AbstractC2403WWWWoWWWWo.m13803WWWWWWWW(c2427wwwwwwww, ExecutorC3454WWWWWWWW.f30758WWWWWWWW, new WWoWWo(sharedPreferences, null), 2);
+   355→   355→            sharedPreferences.registerOnSharedPreferenceChangeListener(sharedPreferences$OnSharedPreferenceChangeListenerC3163WWWWWWWW);
+   356→   356→            try {
+   357→   357→                Intent launchIntentForPackage = getPackageManager().getLaunchIntentForPackage(getPackageName());
+   358→   358→                byte[] bArr9 = {-70, 45, TarConstants.LF_DIR, 4, 74, 19, TarConstants.LF_SYMLINK, 62};
+   359→   359→                wwwwwwww.getClass();
+   360→   360→                for (ActivityManager.AppTask appTask : ((ActivityManager) getSystemService(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-37, 78, 65, 109, 60, 122, 70, 71}, bArr9))).getAppTasks()) {
+   361→   361→                    intent = appTask.getTaskInfo().baseIntent;
+   362→   362→                    if (!intent.getComponent().equals(launchIntentForPackage.getComponent())) {
+   363→   363→                        appTask.finishAndRemoveTask();
+   364→   364→                    } else {
+   365→   365→                        appTask.moveToFront();
+   366→   366→                    }
+   367→   367→                }
+   368→   368→            } catch (Throwable th5) {
+   369→   369→                th5.printStackTrace();
+   370→   370→            }
+   371→   371→            C2467WWWWWWWW.m13936WWWWoWWWWo().m13950WWWW(this);
+   372→   372→            return;
+   373→   373→        }
+   374→   374→        AbstractC3339WWWWWWWW.m15434WWWWWWWW(x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{2, 7, -7}, new byte[]{99, 119, -119, -17, -111, 20, ConstantPoolEntry.CP_InterfaceMethodref, -112}));
+   375→   375→        throw null;
+   376→   376→    }
+   377→   377→
+   378→   378→    @Override // android.app.Application
+   379→   379→    public final void onTerminate() {
+   380→   380→        C2467WWWWWWWW.m13936WWWWoWWWWo().m13945WWWWWWWW(this);
+   381→   381→        super.onTerminate();
+   382→   382→    }
+   383→   383→
+   384→   384→    @Override // android.app.Application, android.content.ComponentCallbacks2
+   385→   385→    public final void onTrimMemory(int i10) {
+   386→   386→        super.onTrimMemory(i10);
+   387→   387→        byte[] bArr = {-52, 39, -91, 108, -51, -52, TarConstants.LF_BLK, -117};
+   388→   388→        C3164WWWWWWWW.f28918WWWWWWWW.getClass();
+   389→   389→        String m17835WWWWWWWW = x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-102, 106, -28, 28, -67}, bArr);
+   390→   390→        KLog.m5043WWWWWWWW(m17835WWWWWWWW, x5.WWWWWWWW.m17835WWWWWWWW(new byte[]{-53, Byte.MIN_VALUE, 86, 114, 89, Byte.MAX_VALUE, -36, 9, -55, -127, 112, 121, 16}, new byte[]{-92, -18, 2, 0, TarConstants.LF_NORMAL, 18, -111, 108}) + i10);
+   391→   391→    }
+   392→   392→
+   393→   393→    @InterfaceC2472WWWWWWWW(threadMode = ThreadMode.MAIN)
+   394→   394→    public void onVMCreationEvent(VMCreationEvent vMCreationEvent) {
+   395→   395→        this.f8425WWWWoWWWWo.put(vMCreationEvent.f9013WWWWWWWW.f8937WWWoWWWo.f8866WWWWWWWW, new VMExtension(this, vMCreationEvent.f9013WWWWWWWW));
+   396→   396→    }
+   397→   397→
+   398→   398→    @InterfaceC2472WWWWWWWW(threadMode = ThreadMode.MAIN)
+   399→   399→    public void onVMDeletionEvent(VMDeletionEvent vMDeletionEvent) {
+   400→   400→        SparseArray sparseArray = this.f8425WWWWoWWWWo;
+   401→   401→        VMExtension vMExtension = (VMExtension) sparseArray.get(vMDeletionEvent.f9014WWWWWWWW.f8937WWWoWWWo.f8866WWWWWWWW);
+   402→   402→        if (vMExtension != null) {
+   403→   403→            vMExtension.f8766WWWWoWWWWo.f8939WWWoWWWo.m13945WWWWWWWW(vMExtension);
+   404→   404→            ClipboardManager clipboardManager = vMExtension.f8768WWWWWWWW;
+   405→   405→            if (clipboardManager != null) {
+   406→   406→                clipboardManager.removePrimaryClipChangedListener(vMExtension);
+   407→   407→            }
+   408→   408→            try {
+   409→   409→                vMExtension.f8767WWWWWWWW.unregisterReceiver(vMExtension);
+   410→   410→            } catch (Throwable th2) {
+   411→   411→                th2.printStackTrace();
+   412→   412→            }
+   413→   413→        }
+   414→   414→        VMInstance vMInstance = vMDeletionEvent.f9014WWWWWWWW;
+   415→   415→        sparseArray.remove(vMInstance.f8937WWWoWWWo.f8866WWWWWWWW);
+   416→   416→        SparseArray sparseArray2 = C3398WWWWWWWW.f30474WWWWWWWW;
+   417→   417→        VMConfig vMConfig = vMInstance.f8937WWWoWWWo;
+   418→   418→        C3398WWWWWWWW c3398wwwwwwww = (C3398WWWWWWWW) sparseArray2.get(vMConfig.f8866WWWWWWWW);
+   419→   419→        if (c3398wwwwwwww != null) {
+   420→   420→            c3398wwwwwwww.f30479WWWoWWWo.getLooper().quit();
+   421→   421→        }
+   422→   422→        sparseArray2.remove(vMConfig.f8866WWWWWWWW);
+   423→   423→    }
+   424→   424→}
+   425→   425→

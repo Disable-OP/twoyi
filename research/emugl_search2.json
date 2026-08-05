@@ -1,0 +1,74 @@
+[
+  {
+    "url": "https://github.com/flyskywhy/android-sdk/blob/master/tools/lib/libOpenglRender.so",
+    "name": "android-sdk/tools/lib/libOpenglRender.so at master",
+    "snippet": "Android SDK with branch linux and windows (>500MB) - libOpenglRender.so at master. Search code, repositories, users, issues, pull requests... libOpenglRender. ...",
+    "host_name": "github.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://android.googlesource.com/platform/sdk/+/7a712acc02282985dcd32feb81284e1f2b19ec7e/emulator/opengl/host/libs/libOpenglRender/render_api.cpp",
+    "name": "emulator/opengl/host/libs/libOpenglRender/render_api.cpp",
+    "snippet": "The Android Open Source Project * run the renderer as a thread … render to a window created by another process. int destroyOpenGLSubwindow(void) by sending the ...\nandroid / platform / sdk / 7a712acc02282985dcd32feb81284e1f2b19ec7e /. / emulator / opengl / host / libs / libOpenglRender /render_api.cpp blob: 00dcd75629dcee856ba33ecffd2957bd10719490 [file] [log] [blame]",
+    "host_name": "android.googlesource.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/memononen/nanovg/issues/458",
+    "name": "android example? · Issue #458 · memononen/nanovg",
+    "snippet": "The easiest will be to use the samples from the NDK that show how to use OpenGL, and then replace the GL code with NanoVG.",
+    "host_name": "github.com",
+    "rank": 2,
+    "date": "Feb 18, 2018",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/30859323/android-studio-error-emulator-opengies",
+    "name": "Android Studio Error Emulator OpengIES",
+    "snippet": "-Disable OpenGLES emulation support by renaming \\tools\\lib\\libOpenglRender.dll to libOpenglRender.dll.disabled. -Reduce the amount of memory ...",
+    "host_name": "stackoverflow.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/google-ar/arcore-android-sdk/issues/1011",
+    "name": "crashes and OpenGL errors · Issue #1011 · google-ar/",
+    "snippet": "SPECIFIC ISSUE ENCOUNTERED On emulator, having an AugmentedImageDatabase in an ARCore session crashes the app and logs a specific OpenGL ...",
+    "host_name": "github.com",
+    "rank": 4,
+    "date": "Mar 2, 2020",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/google/angle",
+    "name": "google/angle: A conformant OpenGL ES implementation",
+    "snippet": "The goal of ANGLE is to allow users of multiple operating systems to seamlessly run WebGL and other OpenGL ES content by translating OpenGL ES API calls.",
+    "host_name": "github.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/DiligentGraphics/DiligentEngine/issues/251",
+    "name": "Tutorial19Application_RenderPa",
+    "snippet": "Tutorial19Application_RenderPass crash on android. Loaded GraphicsEngineOpenGL library. What device/Android version was that? it can work on MI ...",
+    "host_name": "github.com",
+    "rank": 6,
+    "date": "May 5, 2023",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/google/filament/issues/9457",
+    "name": "How to build an Android library with OpenGL ES support?",
+    "snippet": "Could you clarify whether building with an OpenGL ES backend on Android is supported, and if so, how to enable or build it?",
+    "host_name": "github.com",
+    "rank": 7,
+    "date": "Nov 25, 2025",
+    "favicon": ""
+  }
+]
