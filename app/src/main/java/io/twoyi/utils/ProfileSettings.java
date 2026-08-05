@@ -171,7 +171,7 @@ public class ProfileSettings {
      * The user can still override this via the settings UI.
      */
     public static boolean useNewRenderer(Context context) {
-        boolean defaultVal = !"arm64-v8a".equals(android.os.Build.SUPPORTED_ABIS[0]);
+        boolean defaultVal = false;
         return getBoolean(context, USE_NEW_RENDERER, defaultVal);
     }
 

@@ -148,18 +148,6 @@ pub fn init_renderer(
 
     let mut renderer_type = *RENDERER_TYPE.lock().unwrap();
 
-    // On non-aarch64 targets, the legacy libOpenglRender.so blob is not
-    // available (it's a closed-source arm64-only binary). The
-    // renderer_bindings module provides panic stubs on these targets,
-    // so we MUST fall back to the new open-source Rust renderer to
-    // avoid a SIGABRT on every surfaceChanged/surfaceCreated call.
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        if renderer_type == RendererType::Old {
-            info!("[CORE] Legacy renderer not available on this architecture; falling back to new renderer");
-            renderer_type = RendererType::New;
-        }
-    }
 
     info!("[CORE] Using renderer: {:?}", renderer_type);
     info!("[CORE] ========================================");
@@ -243,7 +231,8 @@ pub fn init_renderer(
         let errors = outputs.try_clone().unwrap();
         let _ = Command::new("./init")
             .current_dir(working_dir)
-            .env("TYLOADER", loader_path)
+            .env("TYLOADER", &loader_path)
+            .env("TWOYI_ROOTFS", &working_dir)
             .stdout(Stdio::from(outputs))
             .stderr(Stdio::from(errors))
             .spawn();
@@ -253,15 +242,7 @@ pub fn init_renderer(
 /// Returns the renderer type to use, falling back to New on non-aarch64
 /// where the legacy libOpenglRender.so blob is not available.
 fn effective_renderer_type() -> RendererType {
-    let rt = *RENDERER_TYPE.lock().unwrap();
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        if rt == RendererType::Old {
-            log::info!("[CORE] Legacy renderer not available on this architecture; using new renderer");
-            return RendererType::New;
-        }
-    }
-    rt
+    *RENDERER_TYPE.lock().unwrap()
 }
 
 /// Reset window parameters
