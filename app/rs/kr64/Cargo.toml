@@ -1,0 +1,39 @@
+# Copyright Disclaimer: AI-Generated Content
+# This file was created by GitHub Copilot, an AI coding assistant.
+# AI-generated content is not subject to copyright protection and is provided
+# without any warranty, express or implied, including warranties of merchantability,
+# fitness for a particular purpose, or non-ignfringement.
+# Use at your own risk.
+
+[package]
+name = "kr64"
+version = "0.1.0"
+edition = "2021"
+description = "Twoyi kernel-replacement daemon — materialises the per-VM virtual /dev tree, installs a seccomp filter, emulates /proc, and exec's the guest init"
+license = "MPL-2.0"
+
+# Build as BOTH a cdylib (libkr64.so — for direct execution via the PIE hack
+# and for dlopen by the Java side if ever needed) AND a regular binary (kr64
+# — for direct invocation during development / unit tests).
+#
+# The cdylib uses the same PIE trick as the parent twoyi crate (see
+# app/rs/src/interp.c and app/rs/.cargo/config.toml): the .interp section
+# forces the dynamic linker to load it, and the `-Wl,-e,kr64_main` linker
+# flag sets `kr64_main` as the entry point. This produces a libkr64.so that
+# is BOTH dlopen-able AND directly executable (`./libkr64.so arg1 arg2`).
+#
+# The `bin` target is a thin wrapper around the same `run()` entry point
+# and is what gets executed when invoked as `kr64 arg1 arg2` from a shell.
+[lib]
+name = "kr64"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "kr64"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2.112"
+
+[build-dependencies]
+cc = "1.0"

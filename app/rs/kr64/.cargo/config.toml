@@ -1,0 +1,56 @@
+# Copyright Disclaimer: AI-Generated Content
+# This file was created by GitHub Copilot, an AI coding assistant.
+# AI-generated content is not subject to copyright protection and is provided
+# without any warranty, express or implied, including warranties of
+# merchantability, fitness for a particular purpose, or non-infringement.
+# Use at your own risk.
+
+# PIE / linker configuration for the kr64 crate.
+#
+# These flags are emitted for the cdylib target only (libkr64.so) so that
+# the resulting shared object is ALSO directly executable via the PIE hack:
+#
+#     ./libkr64.so --vmid 0 --rootfs /data/.../fs ...
+#
+# This mirrors the configuration in app/rs/.cargo/config.toml used by the
+# parent twoyi crate. We keep a separate copy here so the kr64 crate can
+# be built standalone (e.g. `cargo build` from app/rs/kr64/) without
+# inheriting the workspace config.
+#
+# The `bin` target (`kr64`) doesn't need any of these flags — Rust
+# already produces a PIE for `bin` targets on Android targets by default.
+#
+# Both aarch64-linux-android and x86_64-linux-android use /system/bin/linker64
+# as the dynamic linker (32-bit ABIs would use /system/bin/linker instead).
+
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "link-arg=-Wl,-e,kr64_main",
+    "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
+    "-C", "link-arg=-Wl,--enable-new-dtags",
+    "-C", "link-arg=-pie",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-Wl,--undefined=interp",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+    "-C", "link-arg=-Wl,-e,kr64_main",
+    "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
+    "-C", "link-arg=-Wl,--enable-new-dtags",
+    "-C", "link-arg=-pie",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-Wl,--undefined=interp",
+]
+
+# Also support building for the host (linux x86_64 / aarch64) for syntax
+# checking via `cargo check`. On the host we don't need the PIE hack — we
+# just want the code to compile so we can verify it parses. The build.rs
+# still emits the cdylib link args, but those are no-ops on the host
+# because the linker ignores unknown flags when linking a `bin` target
+# (and `cargo check` doesn't link at all).
+#
+# We don't set any rustflags for host targets — defaults are fine for
+# `cargo check`.
