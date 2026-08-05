@@ -157,10 +157,19 @@ pub fn init_renderer(
         info!("[CORE] Log path: {}", log_path);
         let outputs = File::create(log_path).unwrap();
         let errors = outputs.try_clone().unwrap();
-        let _ = Command::new("./init")
+        let init_path = format!("{}/init", working_dir);
+        let loader64_path = format!("{}/loader64", get_data_dir());
+        let lib_path = format!(
+            "{}/system/lib64:{}/system/lib64/bootstrap:{}/apex/com.android.runtime/lib64",
+            working_dir, working_dir, working_dir
+        );
+        info!("[CORE] Launching via loader: {}", loader64_path);
+        let _ = Command::new(&loader64_path)
+            .arg(&init_path)
             .current_dir(&working_dir)
             .env("TYLOADER", &loader_path)
             .env("TWOYI_ROOTFS", &working_dir)
+            .env("LD_LIBRARY_PATH", &lib_path)
             .stdout(Stdio::from(outputs))
             .stderr(Stdio::from(errors))
             .spawn();
