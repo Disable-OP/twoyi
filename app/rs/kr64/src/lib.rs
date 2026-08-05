@@ -38,6 +38,9 @@
 //!
 //! * [`devices`]    — virtual `/dev` device creation (qemu_pipe,
 //!                    touch, key, event, gb, gb2).
+//! * [`binder`]     — per-VM `/vm{id}/dev/binder` Unix socket + binder
+//!                    transaction proxy (skeleton; see
+//!                    `download/BINDER_SKELETON.md`).
 //! * [`seccomp`]    — BPF seccomp filter + SIGSYS handler.
 //! * [`proc_emu`]   — synthesised `/proc` tree (version, cpuinfo,
 //!                    meminfo, cmdline, self/, sys/).
@@ -53,6 +56,7 @@
 //! lazy statics use `std::sync::OnceLock` (stabilised in Rust 1.70).
 
 pub mod devices;
+pub mod binder;
 pub mod seccomp;
 pub mod proc_emu;
 pub mod mount_mgr;
@@ -330,6 +334,34 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     if let Err(e) = devices::create_busybox_marker(&cfg.rootfs) {
         warning!("[KR64] failed to create .busybox marker: {}", e);
     }
+
+    // ---------------------------------------------------------------
+    // Step 2.5: create the per-VM binder device + spawn the binder
+    // proxy. See `download/BINDER_SKELETON.md` and
+    // `app/rs/kr64/src/binder.rs` for the full story. The short
+    // version: this creates `{rootfs}/vm{id}/dev/binder` as a Unix
+    // socket + a `{rootfs}/dev/binder` symlink, and spawns an
+    // accept-thread + worker-pool that dispatches BINDER_* ioctls
+    // from the guest. The handle is held for the lifetime of `run()`
+    // so the proxy is shut down when the guest exits.
+    // ---------------------------------------------------------------
+    let _binder_handle = match binder::create_binder_device(&cfg.rootfs, cfg.vmid)
+        .and_then(|path| binder::BinderProxy::new(cfg.vmid, &path))
+        .and_then(|proxy| proxy.spawn())
+    {
+        Ok(h) => {
+            info!("[KR64] binder proxy listening at {} (vm{})", h.path(), cfg.vmid);
+            Some(h)
+        }
+        Err(e) => {
+            // Non-fatal: the guest can still boot against the host's
+            // /dev/binder if it's bind-mounted in (the current twoyi
+            // approach). The binder proxy is only needed for full
+            // service-manager virtualisation.
+            warning!("[KR64] failed to start binder proxy: {} — falling back to host binder", e);
+            None
+        }
+    };
 
     // ---------------------------------------------------------------
     // Step 3: populate /proc.
