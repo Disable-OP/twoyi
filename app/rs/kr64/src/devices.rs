@@ -78,6 +78,12 @@ pub struct DeviceSocket {
     /// The filesystem path the socket is bound to (so we can unlink it
     /// on drop, and so the caller can pass the path to `connect()`).
     pub path: String,
+    /// Whether to unlink the socket file on Drop. Set to false when
+    /// `take_listener()` is called, so the worker thread (which now
+    /// owns the listener) is responsible for cleanup — NOT the
+    /// `DeviceSocket` shell that gets dropped immediately after
+    /// `spawn_accept_thread` returns.
+    should_unlink: bool,
 }
 
 impl DeviceSocket {
@@ -90,7 +96,14 @@ impl DeviceSocket {
 
     /// Take ownership of the underlying listener (for moving into a
     /// thread that owns the accept loop, e.g.).
+    ///
+    /// **Important:** This also disables the `Drop` impl's `unlink`
+    /// so the socket file stays alive while the worker thread holds
+    /// the listener. Without this, the `DeviceSocket` shell is dropped
+    /// immediately after `take_listener()` returns, unlinking the socket
+    /// file before the guest can `connect()` to it.
     pub fn take_listener(&mut self) -> Option<UnixListener> {
+        self.should_unlink = false; // Worker thread now owns the path
         self.listener.take()
     }
 
@@ -110,7 +123,13 @@ impl Drop for DeviceSocket {
         // Drop. We additionally unlink the socket file so a re-run of
         // the daemon doesn't fail with "address already in use".
         // Errors here are non-fatal (the file may already be gone).
-        let _ = fs::remove_file(&self.path);
+        //
+        // Only unlink if we still own the path (i.e. `take_listener`
+        // was NOT called). If the listener was taken by a worker
+        // thread, that thread is responsible for unlinking.
+        if self.should_unlink {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -175,7 +194,7 @@ fn bind_unix_socket(path: &str) -> std::io::Result<UnixListener> {
 pub fn create_qemu_pipe(rootfs: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/qemu_pipe", rootfs);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path })
+    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
 }
 
 /// Create `{rootfs}/dev/input/touch` — the multi-touch input device.
@@ -193,7 +212,7 @@ pub fn create_qemu_pipe(rootfs: &str) -> std::io::Result<DeviceSocket> {
 pub fn create_touch_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/input/touch", rootfs);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path })
+    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
 }
 
 /// Create `{rootfs}/dev/input/key0` — the virtual key device.
@@ -206,7 +225,7 @@ pub fn create_touch_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
 pub fn create_key_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/input/key0", rootfs);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path })
+    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
 }
 
 /// Create `{data_dir}/dev/event` — the event IPC socket.
@@ -230,7 +249,7 @@ pub fn create_key_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
 pub fn create_event_socket(data_dir: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/event", data_dir);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path })
+    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
 }
 
 /// Create `{rootfs}/dev/gb` and `{rootfs}/dev/gb2` — the graphics
@@ -263,8 +282,8 @@ pub fn create_graphics_buffer_devices(rootfs: &str) -> std::io::Result<GraphicsB
     let gb2_listener = bind_unix_socket(&gb2_path)?;
 
     Ok(GraphicsBufferDevices {
-        gb:  DeviceSocket { listener: Some(gb_listener),  path: gb_path  },
-        gb2: DeviceSocket { listener: Some(gb2_listener), path: gb2_path },
+        gb:  DeviceSocket { listener: Some(gb_listener),  path: gb_path,  should_unlink: true },
+        gb2: DeviceSocket { listener: Some(gb2_listener), path: gb2_path, should_unlink: true },
     })
 }
 

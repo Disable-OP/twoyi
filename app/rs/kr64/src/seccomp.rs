@@ -366,8 +366,13 @@ fn killed_syscalls() -> HashSet<i32> {
     add_nr!(s, SYS_init_module);
     add_nr!(s, SYS_finit_module);
     add_nr!(s, SYS_delete_module);
-    add_nr!(s, SYS_iopl);
-    add_nr!(s, SYS_ioperm);
+    // SYS_iopl and SYS_ioperm are x86/x86_64-only syscalls.
+    // They don't exist on aarch64 (asm-generic syscall table).
+    #[cfg(target_arch = "x86_64")]
+    {
+        add_nr!(s, SYS_iopl);
+        add_nr!(s, SYS_ioperm);
+    }
     add_nr!(s, SYS_kcmp);
     add_nr!(s, SYS_ptrace);
     add_nr!(s, SYS_pivot_root);

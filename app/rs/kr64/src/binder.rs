@@ -410,21 +410,27 @@ pub const BC_FREE_BUFFER: u32 = _IOW(BINDER_IOC_TYPE, 10, 8);
 
 /// `BC_TRANSACTION_SG` — scatter-gather variant of `BC_TRANSACTION`.
 /// Payload is `binder_transaction_data_sg` = `binder_transaction_data`
-/// + `binder_size_t buffers_size`.
+/// (64 bytes) + `binder_size_t buffers_size` (8 bytes) = 72 bytes total.
+///
+/// The kernel defines this as `_IOW('b', 11, struct binder_transaction_data_sg)`
+/// where `binder_transaction_data_sg` is 72 bytes. Using 64 (just the base
+/// struct) produces the wrong ioctl number and the guest's `libbinder.so`
+/// (which uses the kernel literal) won't match — silently dropping ALL
+/// scatter-gather transactions.
 pub const BC_TRANSACTION_SG: u32 = _IOW(
     BINDER_IOC_TYPE,
     11,
-    // We declare this as the base binder_transaction_data size; the
-    // extra 8-byte `buffers_size` field is read separately in the
-    // dispatcher.
-    std::mem::size_of::<BinderTransactionData>() as u32,
+    // 72 = size_of::<BinderTransactionData>() + size_of::<u64>()
+    // (binder_transaction_data + buffers_size)
+    (std::mem::size_of::<BinderTransactionData>() + 8) as u32,
 );
 
 /// `BC_REPLY_SG` — scatter-gather variant of `BC_REPLY`.
+/// Same 72-byte payload as `BC_TRANSACTION_SG`.
 pub const BC_REPLY_SG: u32 = _IOW(
     BINDER_IOC_TYPE,
     12,
-    std::mem::size_of::<BinderTransactionData>() as u32,
+    (std::mem::size_of::<BinderTransactionData>() + 8) as u32,
 );
 
 /// `BC_ENTER_LOOPER` — declare this thread a binder looper (it'll call
@@ -1484,8 +1490,17 @@ fn servicemanager_proxy(
             TransactionResult::Failed
         }
         SVC_MGR_ADD_SERVICE => {
-            info!("[KR64][binder][svc] SVC_MGR_ADD_SERVICE accepted (skeleton: not recorded)");
-            TransactionResult::Noop
+            // SVC_MGR_ADD_SERVICE is a synchronous transaction — the guest's
+            // IServiceManager::addService calls waitForResponse, which loops
+            // on BINDER_WRITE_READ until it sees BR_REPLY.
+            //
+            // Returning Noop causes a livelock: the guest receives BR_NOOP
+            // and busy-spins forever. Instead, return a Reply with status 0
+            // (success) so the guest proceeds.
+            info!("[KR64][binder][svc] SVC_MGR_ADD_SERVICE accepted (skeleton: not recorded, returning success)");
+            // The reply parcel for IServiceManager is a single i32 status (0 = OK)
+            let status_reply: [u8; 4] = 0i32.to_ne_bytes();
+            TransactionResult::Reply(status_reply.to_vec())
         }
         SVC_MGR_LIST_SERVICES => {
             info!("[KR64][binder][svc] SVC_MGR_LIST_SERVICES — returning empty (skeleton)");
@@ -1628,6 +1643,16 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
     stream.read_exact(&mut hdr)?;
     let cmd = u32::from_ne_bytes(hdr[0..4].try_into().unwrap());
     let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
+    // Cap payload size to prevent DoS — a malicious guest could send
+    // arg_len = u32::MAX (4 GiB) to OOM the daemon. 1 MiB is more than
+    // enough for any legitimate binder transaction.
+    const MAX_PAYLOAD: usize = 1 << 20; // 1 MiB
+    if arg_len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("read_frame: payload too large ({} > {})", arg_len, MAX_PAYLOAD),
+        ));
+    }
     let mut payload = vec![0u8; arg_len];
     stream.read_exact(&mut payload)?;
     Ok(Frame { cmd, payload })
