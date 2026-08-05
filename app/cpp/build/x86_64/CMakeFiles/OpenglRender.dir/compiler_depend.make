@@ -40,16 +40,17 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/stdio.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/sys/types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/types.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/types.h \
+  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/int-ll64.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/bitsperlong.h \
+  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/bitsperlong.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/bitsperlong.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/posix_types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/stddef.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/compiler_types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/compiler.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/posix_types.h \
+  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/posix_types.h \
+  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/posix_types_64.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/posix_types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/pthread_types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/seek_constants.h \
@@ -80,14 +81,12 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/time_types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/sys/select.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/signal.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/sigcontext.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/sve_context.h \
+  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/sigcontext.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/signal_types.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/signal.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/signal.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/signal.h \
+  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/signal.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/signal-defs.h \
-  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/siginfo.h \
+  /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/siginfo.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/siginfo.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/sys/ucontext.h \
   /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/sys/user.h \
@@ -96,13 +95,13 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/siginfo.h:
 
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/siginfo.h:
+
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/signal-defs.h:
 
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/signal.h:
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/signal.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/signal.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/signal_types.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/signal.h:
 
@@ -111,8 +110,6 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/sys/time.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/sched.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/signal.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/timespec.h:
 
@@ -126,15 +123,13 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/fortify/strings.h:
 
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/sve_context.h:
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/strcasecmp.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/stdint.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/page_size.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/__stddef_max_align_t.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/stdint.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/__stddef_size_t.h:
 
@@ -174,11 +169,11 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/get_device_api_level_inlines.h:
 
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/posix_types_64.h:
+
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/__stdarg___gnuc_va_list.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/__stddef_offsetof.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/types.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/sys/ucontext.h:
 
@@ -188,25 +183,23 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/bitsperlong.h:
 
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/sigcontext.h:
+
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/sched.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/__stddef_wchar_t.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/bitsperlong.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/__stdarg_va_arg.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/malloc.h:
 
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/stdint.h:
+
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/types.h:
+
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/time_types.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/include/__stdarg___va_copy.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/compiler_types.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/posix_types.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/siginfo.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/c++/v1/stddef.h:
 
@@ -234,8 +227,6 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/stddef.h:
 
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android/asm/sigcontext.h:
-
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/c++/v1/stdio.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/stdio.h:
@@ -254,11 +245,19 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/int-ll64.h:
 
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/compiler_types.h:
+
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/bitsperlong.h:
+
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/linux/posix_types.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/strings.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/fortify/stdlib.h:
+
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/signal_types.h:
+
+/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android/asm/posix_types.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/asm-generic/posix_types.h:
 
@@ -273,5 +272,3 @@ CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o: /workspaces/twoyi/app/cpp/emugl/two
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/dlfcn.h:
 
 /workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/android/legacy_stdlib_inlines.h:
-
-/workspaces/twoyi/.android-ndk/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/bits/strcasecmp.h:

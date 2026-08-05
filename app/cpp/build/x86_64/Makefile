@@ -60,7 +60,7 @@ EQUALS = =
 CMAKE_SOURCE_DIR = /workspaces/twoyi/app/cpp/emugl
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /workspaces/twoyi/app/cpp/build/arm64-v8a
+CMAKE_BINARY_DIR = /workspaces/twoyi/app/cpp/build/x86_64
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /workspaces/twoyi/app/cpp/build/arm64-v8a/CMakeFiles /workspaces/twoyi/app/cpp/build/arm64-v8a//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /workspaces/twoyi/app/cpp/build/x86_64/CMakeFiles /workspaces/twoyi/app/cpp/build/x86_64//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /workspaces/twoyi/app/cpp/build/arm64-v8a/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /workspaces/twoyi/app/cpp/build/x86_64/CMakeFiles 0
 .PHONY : all
 
 # The main clean target

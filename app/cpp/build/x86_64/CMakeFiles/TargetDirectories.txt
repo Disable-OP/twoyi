@@ -1,0 +1,3 @@
+/workspaces/twoyi/app/cpp/build/x86_64/CMakeFiles/OpenglRender.dir
+/workspaces/twoyi/app/cpp/build/x86_64/CMakeFiles/edit_cache.dir
+/workspaces/twoyi/app/cpp/build/x86_64/CMakeFiles/rebuild_cache.dir
