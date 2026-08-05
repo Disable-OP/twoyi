@@ -27,7 +27,10 @@ static osUtils::dynLibrary *s_gles_lib = NULL;
 // any thread has been created - hence it should NOT be thread safe.
 //
 
-#define DEFAULT_GLES_CM_LIB EMUGL_LIBNAME("GLES_CM_translator")
+// On Android the renderer dlopens the system GLESv1 implementation
+// directly (libGLESv1_CM.so) rather than the desktop-GL translator
+// library that the standalone AOSP emulator build uses.
+#define DEFAULT_GLES_CM_LIB "libGLESv1_CM.so"
 
 bool init_gl_dispatch()
 {

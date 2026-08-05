@@ -20,7 +20,10 @@
 
 EGLDispatch s_egl;
 
-#define DEFAULT_EGL_LIB EMUGL_LIBNAME("EGL_translator")
+// On Android the renderer dlopens the system EGL implementation directly
+// (libEGL.so in /system/lib<abi>/) rather than the desktop-GL translator
+// library that the standalone AOSP emulator build uses.
+#define DEFAULT_EGL_LIB "libEGL.so"
 
 bool init_egl_dispatch()
 {

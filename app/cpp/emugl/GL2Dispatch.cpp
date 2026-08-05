@@ -24,7 +24,10 @@ int                   s_gl2_enabled;
 
 static osUtils::dynLibrary *s_gles2_lib = NULL;
 
-#define DEFAULT_GLES_V2_LIB EMUGL_LIBNAME("GLES_V2_translator")
+// On Android the renderer dlopens the system GLESv2 implementation
+// directly (libGLESv2.so) rather than the desktop-GL translator
+// library that the standalone AOSP emulator build uses.
+#define DEFAULT_GLES_V2_LIB "libGLESv2.so"
 
 //
 // This function is called only once during initialiation before

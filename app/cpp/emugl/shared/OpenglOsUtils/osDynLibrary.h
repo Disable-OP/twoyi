@@ -59,12 +59,16 @@ private:
 #  define DLL_EXTENSION  ".so"
 #endif
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) && !defined(ANDROID)
 #  define EMUGL_LIBNAME(name) "lib64" name DLL_EXTENSION
-#elif defined(__i386__)
+#elif defined(__i386__) && !defined(ANDROID)
 #  define EMUGL_LIBNAME(name) "lib" name DLL_EXTENSION
 #else
-/* This header is included by target w/o using EMUGL_LIBNAME().  Don't #error, leave it undefined */
+// Android (all ABIs: arm, arm64, x86, x86_64) and any other target.
+// Android does not use the lib64/ prefix convention; all shared
+// libraries live in /system/lib<abi>/ with the plain "lib<name>.so"
+// basename, so the bitness suffix would be wrong here.
+#  define EMUGL_LIBNAME(name) "lib" name DLL_EXTENSION
 #endif
 
 
