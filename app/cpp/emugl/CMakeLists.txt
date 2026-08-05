@@ -8,18 +8,17 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ---------------------------------------------------------------------------
 # Source files.
 #
+# twoyi_api.cpp implements the six C-ABI entry points the Rust side
+# (renderer_bindings.rs) links against, with a REAL EGL pipeline:
+#   - eglGetDisplay / eglInitialize / eglChooseConfig / eglCreateContext
+#   - eglCreateWindowSurface with the ANativeWindow passed in
+#   - A render thread that does glClearColor / glClear / eglSwapBuffers
+#     at the requested frame rate.
 # The full AOSP emugl renderer (FrameBuffer / RenderServer / GL decoders)
-# depends on emugen-generated sources, the desktop-GL translator libraries
-# and platform-private headers (cutils/*, utils/*) that are not shipped in
-# the NDK.  Those sources are kept in the tree for reference but are not
-# compiled — they do not build as-is (single-quoted includes, commented-out
-# function signatures, undefined macros, missing emugen output).
-#
-# libOpenglRender.so therefore exports only the six C-ABI entry points that
-# the Rust side (renderer_bindings.rs) links against.  Each entry point is
-# implemented in twoyi_api.cpp as a logging stub that maintains window /
-# surface state so a future iteration can wire them into a real EGL loop
-# without changing the ABI.
+# is kept in the tree for reference but is not compiled — it depends on
+# emugen-generated sources, the desktop-GL translator libraries and
+# platform-private headers (cutils/*, utils/*) that are not shipped in
+# the NDK.
 # ---------------------------------------------------------------------------
 set(EMUGL_SOURCES
     twoyi_api.cpp
@@ -38,10 +37,16 @@ include_directories(
 # Build the shared library
 add_library(OpenglRender SHARED ${EMUGL_SOURCES})
 
-# Link against system libraries.  `log` is needed for __android_log_print;
-# `dl` is needed for the dlopen_ex / dlsym_ex wrappers; `android` is needed
-# for the ANativeWindow types referenced indirectly.
+# Link against system libraries:
+#   EGL    — eglGetDisplay, eglInitialize, eglCreateContext, ...
+#   GLESv2 — glClearColor, glClear (GLES2 rendering context)
+#   android — ANativeWindow type (referenced by EGL's eglplatform.h)
+#   log    — __android_log_print
+#   dl     — dlopen_ex / dlsym_ex / dlclose_ex / dlerror_ex wrappers
 target_link_libraries(OpenglRender
+    EGL
+    GLESv2
+    android
     log
     dl
 )
