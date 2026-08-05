@@ -44,6 +44,9 @@
 //! * [`audio`]      — virtual `/dev/audio` Unix socket + bidirectional
 //!                    PCM pump (playback + capture skeleton; see
 //!                    `download/AUDIO_SENSOR_HAL.md`).
+//! * [`sensors`]    — virtual `/dev/sensors` Unix socket + multiplexed
+//!                    12-sensor HAL (accel/mag/gyro/... skeleton; see
+//!                    `download/AUDIO_SENSOR_HAL.md`).
 //! * [`seccomp`]    — BPF seccomp filter + SIGSYS handler.
 //! * [`proc_emu`]   — synthesised `/proc` tree (version, cpuinfo,
 //!                    meminfo, cmdline, self/, sys/).
@@ -61,6 +64,7 @@
 pub mod devices;
 pub mod binder;
 pub mod audio;
+pub mod sensors;
 pub mod seccomp;
 pub mod proc_emu;
 pub mod mount_mgr;
@@ -393,6 +397,37 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // null output. Sound is the user's primary use case
             // though, so this warning is worth surfacing.
             warning!("[KR64] failed to start audio device: {} — guest will have no sound", e);
+            None
+        }
+    };
+
+    // ---------------------------------------------------------------
+    // Step 2.7: create the sensor device + spawn the accept/pump
+    // thread. See `download/AUDIO_SENSOR_HAL.md` and
+    // `app/rs/kr64/src/sensors.rs` for the full story. The short
+    // version: this creates `{rootfs}/dev/sensors` as a Unix socket
+    // and spawns an accept-thread + worker-pool that reads 12-byte
+    // control requests (ENABLE/DISABLE/CHECK_SUPPORT/SET_DELAY) and
+    // pushes 24-byte SensorEvent records to the guest when sensors
+    // are enabled. The actual SensorManager integration is stubbed
+    // (no JNI yet) — the control loop replies false to every
+    // CHECK_SUPPORT and the pump never produces events. This is the
+    // deliberate "skeleton" boundary, mirroring audio.rs.
+    // ---------------------------------------------------------------
+    let _sensor_handle = match sensors::create_sensor_device(&cfg.rootfs)
+        .and_then(|dev| dev.spawn())
+    {
+        Ok(h) => {
+            info!("[KR64] sensor device listening at {}", h.path());
+            Some(h)
+        }
+        Err(e) => {
+            // Non-fatal: the guest can still boot without sensors —
+            // the guest's sensor HAL will see "no sensors available"
+            // and `SensorManager.getDefaultSensor()` will return null.
+            // Apps that hard-require a sensor (e.g. compass apps)
+            // will crash, but the boot proceeds.
+            warning!("[KR64] failed to start sensor device: {} — guest will have no sensors", e);
             None
         }
     };
