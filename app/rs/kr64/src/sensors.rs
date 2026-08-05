@@ -411,7 +411,6 @@ pub fn type_to_index(sensor_type: SensorType) -> Option<u32> {
 /// padding (and so we never take a reference to a mis-aligned field
 /// — which `#[repr(packed)]` would make unsafe).
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SensorEvent {
     /// Offset 0. Sensor index 0..11 (matches the guest's enumeration).
     pub idx: u32,
@@ -425,6 +424,12 @@ pub struct SensorEvent {
     /// Offset 20. Z-axis value. Unused slots are 0.
     pub z: f32,
 }
+
+// Note: #[derive(Debug, Clone, Copy, PartialEq)] removed because deriving
+// these traits on a #[repr(packed)] struct with misaligned fields (ts at
+// offset 4) is undefined behavior — the derived impls take &self.ts which
+// is a reference to a misaligned u64. Use to_bytes()/from_bytes() for
+// serialization instead.
 
 // Compile-time assertion: the packed struct must be exactly 24 bytes.
 const _: () = assert!(std::mem::size_of::<SensorEvent>() == SENSOR_EVENT_SIZE);

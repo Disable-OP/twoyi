@@ -306,10 +306,20 @@ fn write_proc_cmdline(proc_dir: &str) -> std::io::Result<()> {
         "androidboot.baseband=unknown ",
         "androidboot.kerneltype=twoyi ",
         "androidboot.bootreason=kernel-replacement ",
+        // CPU ABI info — required by Zygote to decide which zygote to start.
+        // Without these, Zygote cannot boot.
+        "androidboot.product.cpu.abi=arm64-v8a ",
+        "androidboot.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi ",
+        "androidboot.product.cpu.abilist64=arm64-v8a ",
+        "androidboot.product.cpu.abilist32=armeabi-v7a,armeabi ",
+        // Additional boot params Android expects
+        "androidboot.veritymode=enforcing ",
+        "androidboot.fstab_suffix=default ",
+        "androidboot.zygote=zygote64_32 ",
         "kpti=off ",
         "ssbd=force-off ",
         "rcu_nocbs=0-7 ",
-        "rw ",
+        "rw",
         "\n",
     );
     write_file(proc_dir, "cmdline", content)
@@ -364,12 +374,15 @@ fn write_proc_self(proc_dir: &str) -> std::io::Result<()> {
     fs::create_dir_all(&self_dir)?;
 
     // /proc/self/exe → /system/bin/init (the guest's init binary).
+    // /proc/self/cwd → / (init's working directory is /, not the binary path)
     #[cfg(unix)]
     {
         use std::os::unix::fs::symlink;
         let _ = symlink("/system/bin/init", format!("{}/exe", self_dir));
-        let _ = symlink("/system/bin/init", format!("{}/cwd",  self_dir));
-        let _ = symlink(format!("/proc/{}", pid), format!("{}/..", self_dir));
+        let _ = symlink("/", format!("{}/cwd",  self_dir));
+        // Note: /proc/self/.. is a reserved directory entry — symlink() would
+        // fail with EEXIST. The kernel resolves ".." via the actual parent
+        // directory, so this is unnecessary. Removed.
     }
 
     // /proc/self/status — minimal content.
@@ -399,7 +412,21 @@ fn write_proc_self(proc_dir: &str) -> std::io::Result<()> {
          VmLib:\t    4000 kB\n\
          VmPTE:\t       64 kB\n\
          VmSwap:\t        0 kB\n\
-         Threads:\t1\n",
+         Threads:\t1\n\
+         SigQ:\t0/256\n\
+         SigPnd:\t0000000000000000\n\
+         ShdPnd:\t0000000000000000\n\
+         SigBlk:\t0000000000000000\n\
+         SigIgn:\t0000000000000000\n\
+         SigCgt:\t0000000180000000\n\
+         CapInh:\t0000000000000000\n\
+         CapPrm:\t000001ffffffffff\n\
+         CapEff:\t000001ffffffffff\n\
+         CapBnd:\t000001ffffffffff\n\
+         CapAmb:\t0000000000000000\n\
+         Seccomp:\t0\n\
+         Cpus_allowed:\tff\n\
+         Cpus_allowed_list:\t0-7\n",
         pid, pid,
     ).as_bytes())?;
 
