@@ -1,0 +1,74 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Runs the kr64 crate's unit tests on the host (linux/x86_64) so that
+# regressions in the kernel-replacement daemon skeleton are caught
+# before they land on `main`. The crate is host-testable because its
+# only dependency is `libc` and its `build.rs` (which compiles
+# `interp.c`) works on any platform with a C compiler.
+---
+name: kr64 unit tests
+
+on:
+  push:
+    branches:
+      - 'improvements/**'
+  pull_request:
+  # Allow manual runs for debugging without opening a PR.
+  workflow_dispatch:
+
+# Cancel any superseded run on the same ref.
+concurrency:
+  group: kr64-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: cargo test (kr64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust stable
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          # Run on the host (linux/x86_64); no Android targets needed.
+          cache: true
+          # Make CI failures easier to read.
+          args: --component rustfmt --component clippy
+
+      - name: Cache cargo registry & kr64 target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rs/kr64/target
+          key: ${{ runner.os }}-kr64-cargo-${{ hashFiles('app/rs/kr64/Cargo.toml', 'app/rs/kr64/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-kr64-cargo-
+
+      - name: Run kr64 unit tests
+        # `--no-fail-fast` so we see *every* failing test, not just the first.
+        # `tee` mirrors the output to the GHA log *and* to a file we upload
+        # as the test-results artifact. The default GHA bash shell already
+        # has `set -eo pipefail`, so a non-zero `cargo test` exit code
+        # propagates through the pipe and fails the step.
+        shell: bash
+        run: cd app/rs/kr64 && cargo test --no-fail-fast 2>&1 | tee cargo-test.log
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kr64-test-results
+          path: |
+            app/rs/kr64/cargo-test.log
+            app/rs/kr64/target/debug/.fingerprint/
+            app/rs/kr64/target/debug/kr64*
+          if-no-files-found: warn
+          retention-days: 14
