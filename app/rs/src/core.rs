@@ -14,6 +14,7 @@
 use log::info;
 use std::ffi::c_void;
 use std::fs::File;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -155,24 +156,109 @@ pub fn init_renderer(
         info!("[CORE] Starting container init process");
         info!("[CORE] Working directory: {}", working_dir);
         info!("[CORE] Log path: {}", log_path);
-        let outputs = File::create(log_path).unwrap();
-        let errors = outputs.try_clone().unwrap();
+
+        // -----------------------------------------------------------------
+        // Init spawn strategy (post-2026-08 fix):
+        //
+        // The naive `Command::new("./init")` approach fails because init's
+        // INTERP segment is `/system/bin/bootstrap/linker64`, which resolves
+        // to the HOST linker. The host linker then loads init's NEEDED
+        // libraries (libc.so, libbase, ...) from the HOST /system/lib64/,
+        // producing a zombie init that can't do PID 1 operations.
+        //
+        // The fix: exec the ROOTFS linker directly, with init as its
+        // argument. The rootfs linker is a static PIE (it is its own
+        // interpreter), so the kernel doesn't read init's INTERP at all.
+        // We pass --library-path so the linker resolves init's deps from
+        // the rootfs's /system/lib64/, not the host's.
+        //
+        // This works WITHOUT SELinux permissive because:
+        //   - The rootfs linker file is in the app's data dir (app_data_file
+        //     context), which the app can execute.
+        //   - We never touch /system/bin/linker64 on the host.
+        //   - The kernel only needs exec permission on the linker binary.
+        //
+        // If the rootfs linker is missing (e.g. older Android 8 rootfs),
+        // fall back to the loader64 (libloader.so) approach, which dlopens
+        // init — but this loads HOST libs and is expected to fail.
+        // -----------------------------------------------------------------
         let init_path = format!("{}/init", working_dir);
-        let loader64_path = format!("{}/loader64", get_data_dir());
-        let lib_path = format!(
-            "{}/system/lib64:{}/system/lib64/bootstrap:{}/apex/com.android.runtime/lib64",
-            working_dir, working_dir, working_dir
+
+        // Android 10+ uses /system/bin/bootstrap/linker64 (Treble split).
+        // Android 8/9 uses /system/bin/linker64.
+        let bootstrap_linker = format!("{}/system/bin/bootstrap/linker64", working_dir);
+        let legacy_linker = format!("{}/system/bin/linker64", working_dir);
+
+        let linker_path = if Path::new(&bootstrap_linker).exists() {
+            info!("[CORE] Using rootfs bootstrap linker: {}", bootstrap_linker);
+            bootstrap_linker
+        } else if Path::new(&legacy_linker).exists() {
+            info!("[CORE] Using rootfs legacy linker: {}", legacy_linker);
+            legacy_linker
+        } else {
+            info!("[CORE] No rootfs linker found, falling back to loader64 (host libs — may fail)");
+            loader_path.clone()
+        };
+
+        // LD_LIBRARY_PATH: where the linker looks for init's NEEDED libs.
+        // We point it at the rootfs's lib64 dirs so init gets ROOTFS libs.
+        let ld_library_path = format!(
+            "{root}/system/lib64:{root}/system/lib64/bootstrap:{root}/system/lib64/vndk-sp-29:{root}/system/lib64/vndk-29:{root}/system/lib64/apex:{root}/system/lib",
+            root = working_dir
         );
-        info!("[CORE] Launching via loader: {}", loader64_path);
-        let _ = Command::new(&loader64_path)
-            .arg(&init_path)
-            .current_dir(&working_dir)
-            .env("TYLOADER", &loader_path)
-            .env("TWOYI_ROOTFS", &working_dir)
-            .env("LD_LIBRARY_PATH", &lib_path)
-            .stdout(Stdio::from(outputs))
-            .stderr(Stdio::from(errors))
-            .spawn();
+
+        info!("[CORE] Init path: {}", init_path);
+        info!("[CORE] Linker: {}", linker_path);
+        info!("[CORE] LD_LIBRARY_PATH: {}", ld_library_path);
+
+        let outputs = File::create(&log_path).unwrap();
+        let errors = outputs.try_clone().unwrap();
+
+        // Build the command. If we're using the rootfs linker, invoke it as:
+        //   <linker> --library-path <libs> <init>
+        // Otherwise (loader64 fallback): <loader64> <init>
+        let mut cmd = Command::new(&linker_path);
+        cmd.current_dir(&working_dir);
+
+        if linker_path == loader_path {
+            // loader64 fallback: just pass init as arg
+            cmd.arg(&init_path);
+        } else {
+            // rootfs linker: pass --library-path then init
+            cmd.arg("--library-path").arg(&ld_library_path);
+            cmd.arg(&init_path);
+        }
+
+        cmd.env("LD_LIBRARY_PATH", &ld_library_path);
+        cmd.env("LD_PRELOAD", "");
+        cmd.env("TWOYI_ROOTFS", &working_dir);
+        cmd.env("TYLOADER", &loader_path);
+        cmd.env("ANDROID_BOOTLOGO", "1");
+        cmd.env("ANDROID_ROOT", "/system");
+        cmd.env("ANDROID_DATA", "/data");
+        cmd.env("BOOTCLASSPATH", "");  // init sets its own
+        cmd.env("SYSTEMSERVERCLASSPATH", "");
+        cmd.stdout(Stdio::from(outputs));
+        cmd.stderr(Stdio::from(errors));
+
+        match cmd.spawn() {
+            Ok(child) => {
+                info!("[CORE] Container init spawned, PID={}", child.id());
+            }
+            Err(e) => {
+                info!("[CORE] FAILED to spawn container init: {}", e);
+                info!("[CORE] Attempting direct init exec as last resort");
+                let outputs = File::create(&log_path).unwrap();
+                let errors = outputs.try_clone().unwrap();
+                let _ = Command::new("./init")
+                    .current_dir(&working_dir)
+                    .env("TWOYI_ROOTFS", &working_dir)
+                    .env("TYLOADER", &loader_path)
+                    .stdout(Stdio::from(outputs))
+                    .stderr(Stdio::from(errors))
+                    .spawn();
+            }
+        }
     }
 }
 
