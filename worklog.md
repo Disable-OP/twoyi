@@ -4145,3 +4145,90 @@ Stage Summary:
   when codespace billing is resolved
 - Key finding: -no-window emulator mode doesn't trigger SurfaceView callbacks,
   need a real display (Xvfb+VNC or real monitor) for full boot test
+
+---
+Task ID: SESSION-CONTINUE-1
+Agent: Super Z (main)
+Task: Continue improving twoyi — fix bugs, build APK, test emulator
+
+Work Log:
+- Installed Rust toolchain, Android NDK 25, Android SDK, JDK 17, cmake, ninja
+- Downloaded AOSP API 27 x86_64 system image (no Google APIs)
+- Discovered API 27 lacks vendor.img → SELinux policy compilation fails
+- Downloaded API 28 default x86_64 system image (includes vendor.img!)
+- Created fake_statvfs.so LD_PRELOAD library to bypass emulator disk space check
+- Created patch_ramdisk.py to patch API 27 ramdisk (not needed for API 28)
+- EMULATOR BREAKTHROUGH: Android 9 (API 28) boots in 75-153 seconds with TCG!
+  * No KVM needed — pure software CPU emulation
+  * SwiftShader software GPU rendering
+  * fake_statvfs bypasses disk space check
+  * -selinux permissive mode
+  * Boot completed: sys.boot_completed=1 confirmed
+  * ADB connects successfully
+  * Only limitation: 3.9GB RAM causes OOM during APK install
+
+- Spawned 16 sub-agents for code review across entire codebase
+- Sub-agents found 250+ bugs across:
+  * core.rs (26 bugs) — JNI safety, init spawn, ANativeWindow lifetime
+  * lib.rs (15 bugs) — extern C, unwrap across FFI, null checks
+  * input.rs (5 critical bugs) — multitouch broken, busy-loop
+  * renderer_bindings.rs (12 bugs) — return values ignored, UAF
+  * devices.rs (34 bugs) — CRITICAL: Drop unlinks sockets before guest connects
+  * seccomp.rs (22 bugs) — BPF arch check truncation, aarch64 compile failure
+  * binder.rs (40 bugs) — wrong ioctl constants, livelock, DoS, UAF
+  * proc_emu.rs (33 bugs) — missing cmdline fields, missing /proc/self/status fields
+  * audio.rs + sensors.rs (15 bugs) — shutdown deadlock, packed struct UB
+  * battery.rs (10 bugs) — wrong sysfs file names, wrong voltage unit
+  * mount_mgr.rs (15 bugs) — pivot_root always fails, mounts leak to host
+  * emugl C++ (20 bugs) — compile error, no QEMU pipe protocol, UAF
+  * Java code (41 bugs) — lifecycle, memory leaks, ANR, security
+  * Build config (30 issues) — keystore in repo, no ProGuard, outdated deps
+
+- Fixed ~50 critical and high-priority bugs:
+  * JNI: removed all unwrap() across FFI boundary, added extern "C"
+  * JNI: fixed ANativeWindow use-after-free (acquire before passing to thread)
+  * JNI: fixed memory leak in reset_window/remove_window
+  * Init: fixed ANDROID_ROOT/ANDROID_DATA pointing to host filesystem
+  * Init: used env_remove instead of env("") for LD_PRELOAD etc.
+  * kr64 devices.rs: fixed CRITICAL Drop/take_listener socket unlink bug
+  * kr64 seccomp.rs: fixed aarch64 compile failure (SYS_iopl/SYS_ioperm)
+  * kr64 binder.rs: fixed BC_TRANSACTION_SG/BC_REPLY_SG wrong ioctl constants
+  * kr64 binder.rs: fixed SVC_MGR_ADD_SERVICE livelock (return Reply not Noop)
+  * kr64 binder.rs: fixed read_frame DoS (capped payload at 1 MiB)
+  * kr64 proc_emu.rs: added missing androidboot.cpu.abilist to cmdline
+  * kr64 proc_emu.rs: added CapEff/Seccomp to /proc/self/status
+  * kr64 proc_emu.rs: fixed /proc/self/cwd pointing to binary not /
+  * kr64 sensors.rs: removed #[derive] on #[repr(packed)] (UB)
+  * kr64 battery.rs: fixed sysfs file names (voltage→voltage_now, temp)
+  * kr64 mount_mgr.rs: added self-bind before pivot_root
+  * emugl String8.h: fixed empty char literal '' (compile error)
+  * emugl KeyedVector.h: fixed valueFor throwing instead of returning default
+  * input.rs: fixed multitouch ABS axis bitmask (was completely broken)
+  * input.rs: fixed ABS_MT_SLOT min/max inverted
+  * input.rs: fixed writer thread busy-loop (100% CPU after reconnect)
+  * loader: fixed argv not NULL-terminated (POSIX requirement)
+  * loader: fixed CString::new().unwrap() panic across FFI
+  * Java: fixed super.onCreate() called late (UB)
+  * Java: fixed finish() from background thread
+  * Java: added onDestroy() to remove SurfaceHolder callback
+  * Java: fixed TwoyiSocketServer memory leak (ApplicationContext)
+  * Java: fixed TwoyiSocketServer race condition (synchronized getInstance)
+  * Java: fixed unbounded thread pool (DoS vector)
+  * Java: fixed EOF crash in handleSocket0
+  * Java: fixed FD leak in handleSocket0 (close in finally)
+  * Java: fixed isAndroid12() backwards logic
+  * AndroidManifest: added android:exported to all activities (API 31+)
+  * AndroidManifest: set allowBackup=false
+  * AndroidManifest: added screenSize to configChanges
+  * ProGuard: added comprehensive JNI keep rules
+
+- Built 5 signed APKs with progressive fixes
+- Built libtwoyi.so for both ABIs (arm64-v8a + x86_64) with all fixes
+- All changes pushed to GitHub Disable-OP/twoyi improvements/initial-cleanup
+
+Stage Summary:
+- 12 commits pushed to improvements/initial-cleanup
+- ~50 bugs fixed (critical + high priority)
+- 250+ bugs documented for future work
+- Emulator configuration discovered and documented
+- APK ready for testing on real device or 8GB+ machine
