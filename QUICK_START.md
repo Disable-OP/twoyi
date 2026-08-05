@@ -1,70 +1,146 @@
-# Quick Start: Testing the Fix
+# Quick Start — Twoyi for New Contributors
 
-## What Was Fixed
+> **Goal:** get you from `git clone` to a working build and a picked task in
+> **5 minutes**. Twoyi is a rootless Android-on-Android container — it boots
+> a second Android userland inside one normal app process, with no root and
+> no kernel module. Active development happens on the `improvements/initial-cleanup`
+> branch of [`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi).
+>
+> If you want the *why* before the *how*, read
+> [`download/TECHNICAL_BRIEFING.md`](TECHNICAL_BRIEFING.md) (~15 min read).
 
-The segmentation fault when invoking `libtwoyi.so` via `linker64` has been fixed by setting the ELF entry point to the `main` function.
+---
 
-## How to Test (Local Build Verification)
-
-```bash
-# 1. Build the library (if not already built)
-cd app/rs
-sh build_rs.sh --release
-cd ../..
-
-# 2. Run the test script
-./test_libtwoyi.sh
-```
-
-Expected output:
-```
-✓ Library exists
-✓ Entry point is set (0x3a3a8)
-✓ Entry point matches 'main' function address
-✓ JNI_OnLoad symbol found
-✓ All twoyi_* functions exported
-All tests passed! ✓
-```
-
-## How to Test (On Android Device)
+## 1. Clone + Build (3 commands)
 
 ```bash
-# 1. Build the library (if not already done)
-cd app/rs && sh build_rs.sh --release && cd ../..
-
-# 2. Push files to device
-adb push app/src/main/jniLibs/arm64-v8a/libtwoyi.so /data/local/tmp/
-adb push app/src/main/jniLibs/arm64-v8a/libloader.so /data/local/tmp/
-
-# 3. Test the exact command from the problem statement
-adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=. /system/bin/linker64 ./libtwoyi.so --loader ./libloader.so --help"
+git clone https://github.com/Disable-OP/twoyi.git && cd twoyi
+git checkout improvements/initial-cleanup
+./gradlew assembleRelease -Pabis=arm64-v8a
 ```
 
-**Expected:** Help message should display without segmentation fault.
+The signed APK lands at `app/build/outputs/apk/release/`. For a fat APK that
+also works in x86_64 emulators and redroid, swap the last line for
+`./gradlew assembleRelease -Pabis=all`.
 
-## What Changed
+> **Fastest path:** skip the local install — open the repo in a GitHub
+> Codespace (pick `standardLinux32gb`). The devcontainer pre-installs JDK 17,
+> Rust + both Android targets, NDK r27c, the SDK, and QEMU/KVM. Then just
+> run the `./gradlew` line above.
 
-### Files Modified
-- `app/rs/.cargo/config.toml` - New: Rust linker configuration
-- `app/rs/build_rs.sh` - Modified: Sets RUSTFLAGS to configure entry point
-- `app/rs/build.rs` - Modified: Updated comments
-- `SHELL_EXECUTION.md` - Modified: Updated documentation
+**Prerequisites (local only):** JDK 17 · Android NDK r27c · Rust stable with
+`aarch64-linux-android` and `x86_64-linux-android` targets · `cargo-xdk`.
 
-### Files Added
-- `test_libtwoyi.sh` - Test script to validate library structure
-- `TESTING_DIRECT_INVOCATION.md` - Complete testing guide
-- `JNI_VERIFICATION.md` - JNI compatibility explanation
-- `FIX_SUMMARY.md` - Detailed fix summary
-- `QUICK_START.md` - This file
+---
 
-## Next Steps
+## 2. Run Tests (2 commands)
 
-1. **Verify Local Build**: Run `./test_libtwoyi.sh` to ensure the library was built correctly
-2. **Test on Device**: Follow the Android device testing steps above
-3. **Verify JNI Mode**: Build and test the APK to ensure app functionality is not affected
+```bash
+cd app/rs/kr64 && cargo test        # Rust unit tests — 38 tests on Linux host
+./gradlew test                      # Java unit tests
+```
 
-## For More Information
+Instrumented tests on a device/emulator: `./gradlew connectedAndroidTest`.
+End-to-end smoke test in the codespace: `.devcontainer/scripts/test-twoyi.sh`.
 
-- See `FIX_SUMMARY.md` for complete technical details
-- See `TESTING_DIRECT_INVOCATION.md` for comprehensive testing instructions
-- See `JNI_VERIFICATION.md` to understand JNI compatibility
+---
+
+## 3. Start Coding — where to look first
+
+Twoyi is three layers. Read these files **in this order** to get oriented:
+
+| Read this | To understand |
+|---|---|
+| [`ARCHITECTURE.md`](../ARCHITECTURE.md) | The 3-layer design, the PIE `.interp` hack, the boot flow. Read this first. |
+| `app/rs/src/core.rs` | The guest spawn: forks `./init` from the rootfs inside a data-dir chroot. |
+| `app/rs/kr64/src/lib.rs` (lines 39–80, 556–565) | The kernel-replacement daemon: 6 virtual devices, seccomp BPF, `/proc` emulator, mount namespace. |
+| `app/rs/src/renderer_bindings.rs` | The 6-symbol FFI contract between the Rust side and `libOpenglRender.so`. |
+| `app/rs/src/renderer_new/pipe.rs` | How the host opens `/dev/qemu_pipe` and decodes the GL stream. |
+| `app/src/main/java/io/twoyi/Render2Activity.java` | The Java UI host (SurfaceView + JNI entry points). |
+| `app/src/main/java/io/twoyi/utils/RomManager.java` | How the rootfs asset is extracted at first boot. |
+
+**Module map** (what each Rust crate is for):
+
+- `app/rs/` — the main `libtwoyi.so` cdylib (also a PIE binary). Boot loader
+  + input sockets + renderer pipe client.
+- `app/rs/kr64/` — the kernel-replacement daemon. Modules:
+  `devices.rs` (virtual `/dev` tree), `binder.rs` (binder proxy),
+  `seccomp.rs` (BPF filter + SIGSYS handler), `proc_emu.rs` (`/proc` synthesiser),
+  `mount_mgr.rs` (bind-mount + tmpfs), `audio.rs` / `battery.rs` / `sensors.rs`
+  (HAL shims). ~9,500 LOC, 144 tests.
+- `app/rs/loader/` — open-source replacement for the legacy `libloader.so` blob.
+- `app/rs/openglrenderer/` — Rust scaffolding around the AOSP-built
+  `libOpenglRender.so` (which is built from AOSP emugl source, not in this repo).
+
+**Java side** (`app/src/main/java/io/twoyi/`): `Render2Activity` (UI + JNI),
+`RomManager` (rootfs extract), `TwoyiStatusManager` (boot state),
+`TwoyiSocketServer` (IPC to guest), `Renderer.java` (JNI declarations).
+
+---
+
+## 4. Pick a Task
+
+The full plan, with file paths, acceptance criteria, and effort estimates,
+is in **[`DEVELOPMENT_ROADMAP.md`](DEVELOPMENT_ROADMAP.md)**. It breaks the
+work into 5 phases (Stabilization → Open-Source Completion → GSI Boot MVP →
+Feature Parity → Advanced). The "good first issues" list is in §10.2.
+
+**Three good first issues** (each is effort **S** — ≤1 week, no architectural
+discussion needed, complete design doc already exists):
+
+1. **Drop-in test the AOSP renderer on a real arm64 device**
+   (Phase 1 task 1.1, ~1 day). Copy
+   `download/aosp-built/libOpenglRender_aosp_arm64.so` to
+   `app/src/main/jniLibs/arm64-v8a/libOpenglRender.so`, rebuild, install on
+   a phone, verify guest GL renders. Highest-leverage verification in the
+   project. Requires a physical arm64 device.
+
+2. **Wire `kr64` into the boot flow**
+   (Phase 1 task 1.4, ~2 days). Add `kr64` as a workspace member of
+   `app/rs/Cargo.toml`, extend `app/rs/build_rs.sh`, add the spawn call in
+   `app/rs/src/core.rs`. Goal: see `[KR64 INFO] created device /dev/qemu_pipe`
+   in logcat on redroid x86_64. Great for learning the kr64 codebase.
+
+3. **Extend `kr64` device tree to 20+ devices**
+   (Phase 3 task 3.1, ~3 days total, ~30 min per device). The skeleton
+   creates 6 devices; VM creates 20+. Each new device is ~20 lines following
+   the existing `bind_unix_socket` helper in `app/rs/kr64/src/devices.rs`.
+   See `download/VM_KR64_ANALYSIS.md` §6 for the full inventory.
+
+For anything bigger than a typo, **open an issue first** so we can confirm
+scope. Branch from `improvements/initial-cleanup`, use Conventional Commits
+(`feat:`, `fix:`, `docs:` …), and open a PR against the same branch.
+
+---
+
+## 5. Get Help
+
+**Documentation (read in this order):**
+
+1. [`README.md`](../README.md) — project overview, build/test instructions, roadmap summary.
+2. [`ARCHITECTURE.md`](../ARCHITECTURE.md) — 3-layer architecture, PIE hack, boot flow.
+3. [`CONTRIBUTING.md`](../CONTRIBUTING.md) — dev environment, code style, PR process.
+4. [`download/DEVELOPMENT_ROADMAP.md`](DEVELOPMENT_ROADMAP.md) — what to work on next, with file paths.
+5. [`download/TECHNICAL_BRIEFING.md`](TECHNICAL_BRIEFING.md) — 15-minute architectural briefing.
+6. [`download/PROJECT_SUMMARY.md`](PROJECT_SUMMARY.md) — definitive state-of-the-project write-up (~970 lines).
+7. [`download/GSI_BOOT_PLAN.md`](GSI_BOOT_PLAN.md) — file-level plan for the headline GSI boot goal.
+8. [`download/TWOYI_HONEST_STATUS.md`](TWOYI_HONEST_STATUS.md) — verified vs. theoretical status
+   (this project has a documented history of overclaims — read this before
+   trusting any "it works" claim).
+
+**Ask questions:**
+
+- 💬 **[GitHub Discussions](https://github.com/Disable-OP/twoyi/discussions)** — general questions, design ideas.
+- 🐛 **[GitHub Issues](https://github.com/Disable-OP/twoyi/issues)** — bugs, feature requests, claiming a roadmap item.
+- 🔒 **Security-sensitive** — see `SECURITY.md` or email the maintainer directly.
+- 📝 **PR review** — one approval for normal changes, two for architectural
+  changes (new Rust crate, AIDL surface, JNI boundary, `kr64/src/seccomp.rs`,
+  `app/rs/src/interp.c`).
+
+**Conventions:** be **honest** in PRs about what you tested — say "inferred
+from symbol matching" rather than "verified working" unless you actually ran
+it. Rust crates: `cargo fmt` + `cargo clippy --all-targets -- -D warnings`
+before committing; the `kr64` crate is `libc`-only. Java: AOSP style, 4-space
+indent, 100-col limit. Shell scripts must be POSIX `sh`-compatible (CI runs `dash`).
+
+Welcome aboard — and thanks for helping make Twoyi better!
