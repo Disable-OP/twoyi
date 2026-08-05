@@ -1,40 +1,29 @@
-#ifndef _TWOYI_UTILS_REF_BASE_H
-#define _TWOYI_UTILS_REF_BASE_H
-/*
- * Compatibility shim for <utils/RefBase.h>. The emugl sources use
- * RefBase's incStrong / decStrong methods, but they don't actually
- * rely on the weak-reference machinery. We provide the minimum API
- * surface: a RefBase class with incStrong()/decStrong() that drive an
- * atomic refcount, and a virtual destructor that frees the object
- * when the count drops to zero.
- */
+#pragma once
 #include <atomic>
-#include <cstddef>
-
 namespace android {
-
 class RefBase {
 public:
-    RefBase() : mRefCount(0) {}
+    RefBase() : mRefCnt(0) {}
     virtual ~RefBase() {}
-
-    void incStrong(const void * /*id*/) const {
-        mRefCount.fetch_add(1, std::memory_order_relaxed);
-    }
-    void decStrong(const void * /*id*/) const {
-        if (mRefCount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            delete this;
-        }
-    }
-
-    int32_t getStrongCount() const {
-        return mRefCount.load(std::memory_order_relaxed);
-    }
-
+    void incStrong(const void* id) const { mRefCnt.fetch_add(1, std::memory_order_relaxed); }
+    void decStrong(const void* id) const { if (mRefCnt.fetch_sub(1, std::memory_order_acq_rel) == 1) delete this; }
 private:
-    mutable std::atomic<int32_t> mRefCount;
+    mutable std::atomic<int> mRefCnt;
 };
-
-}  // namespace android
-
-#endif /* _TWOYI_UTILS_REF_BASE_H */
+template <typename T>
+class sp {
+public:
+    sp() : mPtr(nullptr) {}
+    sp(T* p) : mPtr(p) { if (p) p->incStrong(nullptr); }
+    sp(const sp& other) : mPtr(other.mPtr) { if (mPtr) mPtr->incStrong(nullptr); }
+    ~sp() { if (mPtr) mPtr->decStrong(nullptr); }
+    sp& operator=(T* p) { if (p) p->incStrong(nullptr); if (mPtr) mPtr->decStrong(nullptr); mPtr = p; return *this; }
+    sp& operator=(const sp& other) { if (other.mPtr) other.mPtr->incStrong(nullptr); if (mPtr) mPtr->decStrong(nullptr); mPtr = other.mPtr; return *this; }
+    T& operator*() const { return *mPtr; }
+    T* operator->() const { return mPtr; }
+    T* get() const { return mPtr; }
+    operator bool() const { return mPtr != nullptr; }
+private:
+    T* mPtr;
+};
+}

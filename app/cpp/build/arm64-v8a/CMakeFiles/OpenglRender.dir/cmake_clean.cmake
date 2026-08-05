@@ -1,0 +1,41 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/OpenglRender.dir/ColorBuffer.cpp.o"
+  "CMakeFiles/OpenglRender.dir/ColorBuffer.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/EGLDispatch.cpp.o"
+  "CMakeFiles/OpenglRender.dir/EGLDispatch.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/FBConfig.cpp.o"
+  "CMakeFiles/OpenglRender.dir/FBConfig.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/FrameBuffer.cpp.o"
+  "CMakeFiles/OpenglRender.dir/FrameBuffer.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/GL2Dispatch.cpp.o"
+  "CMakeFiles/OpenglRender.dir/GL2Dispatch.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/GLDispatch.cpp.o"
+  "CMakeFiles/OpenglRender.dir/GLDispatch.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/NativeLinuxSubWindow.cpp.o"
+  "CMakeFiles/OpenglRender.dir/NativeLinuxSubWindow.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/ReadBuffer.cpp.o"
+  "CMakeFiles/OpenglRender.dir/ReadBuffer.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/RenderContext.cpp.o"
+  "CMakeFiles/OpenglRender.dir/RenderContext.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/RenderControl.cpp.o"
+  "CMakeFiles/OpenglRender.dir/RenderControl.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/RenderServer.cpp.o"
+  "CMakeFiles/OpenglRender.dir/RenderServer.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/RenderThread.cpp.o"
+  "CMakeFiles/OpenglRender.dir/RenderThread.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/ThreadInfo.cpp.o"
+  "CMakeFiles/OpenglRender.dir/ThreadInfo.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/WindowSurface.cpp.o"
+  "CMakeFiles/OpenglRender.dir/WindowSurface.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/render_api.cpp.o"
+  "CMakeFiles/OpenglRender.dir/render_api.cpp.o.d"
+  "CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o"
+  "CMakeFiles/OpenglRender.dir/twoyi_api.cpp.o.d"
+  "lib'OpenglRender'.pdb"
+  "lib'OpenglRender'.so"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/OpenglRender.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

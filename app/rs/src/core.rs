@@ -8,7 +8,6 @@
 //! exactly one renderer backend: the AOSP emugl `libOpenglRender.so`
 //! built from source under `app/cpp/emugl`. The legacy closed-source
 //! blobs (`libOpenglRender.so`, `libloader.so`, `libadb.so`) and the
-//! AI-generated Rust renderer (`renderer_new` / `openglrenderer` crate)
 //! have all been removed — every native library shipped in the APK is
 //! now built from open source code.
 

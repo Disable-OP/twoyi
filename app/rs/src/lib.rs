@@ -217,8 +217,6 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     debug!("JNI_OnLoad started");
 
     let class_name: &str = "io/twoyi/Renderer";
-    // After AOSP-VENDOR-1 the setRendererType / setDebugRenderer /
-    // setDebugLogDir JNI methods are gone — there is exactly one
     // renderer (the AOSP emugl libOpenglRender.so built from source).
     let jni_methods = [
         jni_method!(init, renderer_init, "(Landroid/view/Surface;Ljava/lang/String;IIFFI)V"),
