@@ -258,9 +258,14 @@ fn generate_touch_device(width: i32, height: i32) -> device_info {
 
     info.prop_bitmask[0] = INPUT_PROP_BUTTONPAD as u8;
 
-    info.abs_bitmask[ABS_RZ as usize] = 0x80;
-    info.abs_bitmask[ABS_THROTTLE as usize] = 0x60;
-    info.abs_bitmask[ABS_RUDDER as usize] = 0x2;
+    // Set multitouch ABS axis bits using proper bitmap indexing
+    // (byte = axis/8, bit = axis%8) — same pattern as set_key_bit
+    set_key_bit(&mut info.abs_bitmask, ABS_MT_SLOT as usize);
+    set_key_bit(&mut info.abs_bitmask, ABS_MT_POSITION_X as usize);
+    set_key_bit(&mut info.abs_bitmask, ABS_MT_POSITION_Y as usize);
+    set_key_bit(&mut info.abs_bitmask, ABS_MT_PRESSURE as usize);
+    set_key_bit(&mut info.abs_bitmask, ABS_MT_TRACKING_ID as usize);
+    set_key_bit(&mut info.abs_bitmask, ABS_MT_TOUCH_MAJOR as usize);
 
     info.abs_min[ABS_MT_POSITION_X as usize] = 0;
     info.abs_max[ABS_MT_POSITION_X as usize] = width as u32;
@@ -271,7 +276,10 @@ fn generate_touch_device(width: i32, height: i32) -> device_info {
     info.abs_min[ABS_MT_TOUCH_MAJOR as usize] = 0;
     info.abs_min[ABS_MT_TOUCH_MINOR as usize] = 15;
 
-    info.abs_min[ABS_MT_SLOT as usize] = 4;
+    // Fixed: min/max were inverted (min=4, max=0). This rejected all slots.
+    // Now: min=0, max=MAX_POINTERS-1 (supports slots 0..4 for 5 fingers)
+    info.abs_min[ABS_MT_SLOT as usize] = 0;
+    info.abs_max[ABS_MT_SLOT as usize] = (MAX_POINTERS as u32) - 1;
     info.abs_min[ABS_MT_PRESSURE as usize] = 0;
     info.abs_max[ABS_MT_PRESSURE as usize] = 80;
 
@@ -294,10 +302,17 @@ fn touch_server(width: i32, height: i32) {
                 *INPUT_SENDER.lock().unwrap() = Some(tx);
 
                 thread::spawn(move || loop {
-                    let ret = rx.recv();
-                    if let Ok(ev) = ret {
-                        let data = unsafe { any_as_u8_slice(&ev) };
-                        let _ = stream.write_all(data);
+                    match rx.recv() {
+                        Ok(ev) => {
+                            let data = unsafe { any_as_u8_slice(&ev) };
+                            if stream.write_all(data).is_err() {
+                                break; // write failed — client disconnected
+                            }
+                        }
+                        Err(_) => {
+                            // Channel disconnected — new client took over
+                            break;
+                        }
                     }
                 });
             }
@@ -424,10 +439,17 @@ fn key_server() {
                 *KEY_SENDER.lock().unwrap() = Some(tx);
 
                 thread::spawn(move || loop {
-                    let ret = rx.recv();
-                    if let Ok(ev) = ret {
-                        let data = unsafe { any_as_u8_slice(&ev) };
-                        let _ = stream.write_all(data);
+                    match rx.recv() {
+                        Ok(ev) => {
+                            let data = unsafe { any_as_u8_slice(&ev) };
+                            if stream.write_all(data).is_err() {
+                                break; // write failed — client disconnected
+                            }
+                        }
+                        Err(_) => {
+                            // Channel disconnected — new client took over
+                            break;
+                        }
                     }
                 });
             }

@@ -176,15 +176,18 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             let lib_argc = (args.len() - 1) as c_int;
             
             // Create CStrings that will live for the duration of the call
+            // Fixed: use ok() instead of unwrap() to avoid panic across FFI
             let lib_args: Vec<CString> = args.iter()
                 .skip(1)
-                .map(|s| CString::new(s.as_str()).unwrap())
+                .filter_map(|s| CString::new(s.as_str()).ok())
                 .collect();
-            
+
             // Create pointers from the CStrings
-            let lib_argv: Vec<*const c_char> = lib_args.iter()
+            // Fixed: add trailing NULL pointer (POSIX requires argv[argc] == NULL)
+            let mut lib_argv: Vec<*const c_char> = lib_args.iter()
                 .map(|s| s.as_ptr())
                 .collect();
+            lib_argv.push(std::ptr::null()); // POSIX argv terminator
             
             let result = main_func(lib_argc, lib_argv.as_ptr());
             let _ = writeln!(io::stderr(), "[LOADER] Library main() returned: {}", result);
