@@ -41,7 +41,7 @@ macro_rules! jni_method {
 }
 
 #[no_mangle]
-pub fn renderer_init(
+pub extern "C" fn renderer_init(
     env: JNIEnv,
     _clz: jclass,
     surface: jobject,
@@ -72,8 +72,20 @@ pub fn renderer_init(
     let virtual_width = width;
     let virtual_height = height;
 
-    let loader_path: String = env.get_string(loader.into()).unwrap().into();
+    let loader_path: String = match env.get_string(loader.into()) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("Failed to get loader path string: {}", e);
+            return;
+        }
+    };
     let window_ptr = window.ptr().as_ptr() as *mut c_void;
+
+    // Acquire an extra reference to the ANativeWindow so it stays alive
+    // after this function returns and the NativeWindow wrapper is dropped.
+    // The renderer thread will use this pointer. Without this, the window
+    // is freed when the NativeWindow drops, causing a use-after-free.
+    unsafe { ndk_sys::ANativeWindow_acquire(window_ptr as *mut ndk_sys::ANativeWindow); }
 
     core::init_renderer(
         window_ptr,
@@ -93,18 +105,24 @@ pub fn renderer_init(
 /// resolve correctly — especially in work profiles where the data
 /// dir is /data/user/<uid>/io.twoyi instead of /data/data/io.twoyi.
 #[no_mangle]
-pub fn set_data_dir(
+pub extern "C" fn set_data_dir(
     env: JNIEnv,
     _clz: jclass,
     data_dir: jstring,
 ) {
-    let dir: String = env.get_string(data_dir.into()).unwrap().into();
+    let dir: String = match env.get_string(data_dir.into()) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            error!("Failed to get data_dir string: {}", e);
+            return;
+        }
+    };
     debug!("set_data_dir: {}", dir);
     core::set_data_dir(dir);
 }
 
 #[no_mangle]
-pub fn renderer_reset_window(
+pub extern "C" fn renderer_reset_window(
     env: JNIEnv,
     _clz: jclass,
     surface: jobject,
@@ -118,38 +136,66 @@ pub fn renderer_reset_window(
     debug!("reset_window: surface={}x{}, framebuffer={}x{}", _width, _height, _fb_width, _fb_height);
     unsafe {
         let window = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface);
+        if window.is_null() {
+            error!("ANativeWindow_fromSurface returned null in renderer_reset_window");
+            return;
+        }
         core::reset_window(window as *mut c_void, _top, _left, _width, _height, _fb_width, _fb_height);
+        // Release the reference acquired by ANativeWindow_fromSurface
+        ndk_sys::ANativeWindow_release(window);
     }
 }
 
 #[no_mangle]
-pub fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
+pub extern "C" fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
     debug!("renderer_remove_window");
 
     unsafe {
         let window = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface);
+        if window.is_null() {
+            error!("ANativeWindow_fromSurface returned null in renderer_remove_window");
+            return;
+        }
         core::remove_window(window as *mut c_void);
+        // Release the reference acquired by ANativeWindow_fromSurface
+        ndk_sys::ANativeWindow_release(window);
     }
 }
 
 #[no_mangle]
-pub fn handle_touch(env: JNIEnv, _clz: jclass, event: jobject) {
+pub extern "C" fn handle_touch(env: JNIEnv, _clz: jclass, event: jobject) {
     // TODO: cache the field id.
-    let ptr = env.get_field(event, "mNativePtr", "J").unwrap();
+    let ptr = match env.get_field(event, "mNativePtr", "J") {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to get mNativePtr field: {}", e);
+            return;
+        }
+    };
 
     if let JValue::Long(p) = ptr {
+        if p == 0 {
+            error!("MotionEvent mNativePtr is null");
+            return;
+        }
         let ev = unsafe {
-            let nonptr =
-            std::ptr::NonNull::new(std::mem::transmute::<i64, *mut ndk_sys::AInputEvent>(p))
-                .unwrap();
+            let nonptr = match std::ptr::NonNull::new(p as *mut ndk_sys::AInputEvent) {
+                Some(n) => n,
+                None => {
+                    error!("Failed to create NonNull from MotionEvent ptr");
+                    return;
+                }
+            };
             ndk::event::MotionEvent::from_ptr(nonptr)
         };
         input::handle_touch(ev)
+    } else {
+        error!("mNativePtr field was not a Long");
     }
 }
 
 #[no_mangle]
-pub fn send_key_code(_env: JNIEnv, _clz: jclass, keycode: jint) {
+pub extern "C" fn send_key_code(_env: JNIEnv, _clz: jclass, keycode: jint) {
     debug!("send key code!");
     input::send_key_code(keycode);
 }

@@ -139,7 +139,7 @@ pub fn init_renderer(
             let window = window_addr as *mut c_void;
             info!("[CORE] Renderer thread started, window: {:?}", window);
             info!("[CORE] Starting AOSP libOpenglRender.so");
-            unsafe {
+            let result = unsafe {
                 renderer_bindings::startOpenGLRenderer(
                     window,
                     virtual_width,
@@ -147,7 +147,14 @@ pub fn init_renderer(
                     xdpi,
                     ydpi,
                     fps,
-                );
+                )
+            };
+            if result != 0 {
+                log::error!("[CORE] startOpenGLRenderer returned {} (non-zero = failure)", result);
+                // Reset RENDERER_STARTED so a future init_renderer call can retry
+                RENDERER_STARTED.store(false, Ordering::Release);
+            } else {
+                info!("[CORE] Renderer started successfully");
             }
         });
 
@@ -211,8 +218,21 @@ pub fn init_renderer(
         info!("[CORE] Linker: {}", linker_path);
         info!("[CORE] LD_LIBRARY_PATH: {}", ld_library_path);
 
-        let outputs = File::create(&log_path).unwrap();
-        let errors = outputs.try_clone().unwrap();
+        // Create log file without panicking across JNI boundary
+        let outputs = match File::create(&log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("[CORE] Failed to create log file {}: {}", log_path, e);
+                return;
+            }
+        };
+        let errors = match outputs.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("[CORE] Failed to clone log file handle: {}", e);
+                return;
+            }
+        };
 
         // Build the command. If we're using the rootfs linker, invoke it as:
         //   <linker> --library-path <libs> <init>
@@ -230,14 +250,16 @@ pub fn init_renderer(
         }
 
         cmd.env("LD_LIBRARY_PATH", &ld_library_path);
-        cmd.env("LD_PRELOAD", "");
+        cmd.env_remove("LD_PRELOAD");
         cmd.env("TWOYI_ROOTFS", &working_dir);
         cmd.env("TYLOADER", &loader_path);
         cmd.env("ANDROID_BOOTLOGO", "1");
-        cmd.env("ANDROID_ROOT", "/system");
-        cmd.env("ANDROID_DATA", "/data");
-        cmd.env("BOOTCLASSPATH", "");  // init sets its own
-        cmd.env("SYSTEMSERVERCLASSPATH", "");
+        // Point ANDROID_ROOT/ANDROID_DATA at the rootfs, not the host filesystem
+        cmd.env("ANDROID_ROOT", format!("{}/system", working_dir));
+        cmd.env("ANDROID_DATA", format!("{}/data", working_dir));
+        // Remove these so init/zygote computes them from the rootfs config
+        cmd.env_remove("BOOTCLASSPATH");
+        cmd.env_remove("SYSTEMSERVERCLASSPATH");
         cmd.stdout(Stdio::from(outputs));
         cmd.stderr(Stdio::from(errors));
 
@@ -246,17 +268,13 @@ pub fn init_renderer(
                 info!("[CORE] Container init spawned, PID={}", child.id());
             }
             Err(e) => {
-                info!("[CORE] FAILED to spawn container init: {}", e);
-                info!("[CORE] Attempting direct init exec as last resort");
-                let outputs = File::create(&log_path).unwrap();
-                let errors = outputs.try_clone().unwrap();
-                let _ = Command::new("./init")
-                    .current_dir(&working_dir)
-                    .env("TWOYI_ROOTFS", &working_dir)
-                    .env("TYLOADER", &loader_path)
-                    .stdout(Stdio::from(outputs))
-                    .stderr(Stdio::from(errors))
-                    .spawn();
+                log::error!("[CORE] FAILED to spawn container init: {}", e);
+                log::error!("[CORE]   linker_path: {} (exists: {})",
+                    linker_path, Path::new(&linker_path).exists());
+                log::error!("[CORE]   init_path: {} (exists: {})",
+                    init_path, Path::new(&init_path).exists());
+                log::error!("[CORE]   working_dir: {} (exists: {})",
+                    working_dir, Path::new(&working_dir).exists());
             }
         }
     }
