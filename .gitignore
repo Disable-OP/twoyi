@@ -15,3 +15,9 @@
 local.properties
 dl.sh
 *.class
+
+# task AOSP-VENDOR-1 — vendored AOSP emugl build artifacts
+app/cpp/emugl/build-*/
+# NDK / SDK installs (codespace-local)
+.android-ndk/
+.android-sdk/

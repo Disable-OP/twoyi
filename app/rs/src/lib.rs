@@ -14,7 +14,6 @@ use android_logger::Config;
 
 mod input;
 mod renderer_bindings;
-mod renderer_new;
 mod core;
 
 // Reference the interp symbol from C to force it to be linked
@@ -68,7 +67,7 @@ pub fn renderer_init(
 
     let surface_width = window.width();
     let surface_height = window.height();
-    
+
     // Use the virtual display dimensions passed from Java
     let virtual_width = width;
     let virtual_height = height;
@@ -87,37 +86,6 @@ pub fn renderer_init(
         ydpi as i32,
         fps as i32,
     );
-}
-
-#[no_mangle]
-pub fn set_renderer_type(
-    _env: JNIEnv,
-    _clz: jclass,
-    use_new_renderer: jint,
-) {
-    debug!("set_renderer_type: {}", use_new_renderer);
-    core::set_renderer_type(use_new_renderer != 0);
-}
-
-#[no_mangle]
-pub fn set_debug_renderer(
-    _env: JNIEnv,
-    _clz: jclass,
-    debug_enabled: jint,
-) {
-    debug!("set_debug_renderer: {}", debug_enabled);
-    core::set_debug_renderer(debug_enabled != 0);
-}
-
-#[no_mangle]
-pub fn set_debug_log_dir(
-    env: JNIEnv,
-    _clz: jclass,
-    log_dir: jstring,
-) {
-    let log_dir_path: String = env.get_string(log_dir.into()).unwrap().into();
-    debug!("set_debug_log_dir: {}", log_dir_path);
-    core::set_debug_log_dir(log_dir_path);
 }
 
 /// Set the app's data directory. This MUST be called before init()
@@ -196,7 +164,7 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
             return JNI_ERR;
         }
     };
-    
+
     let jni_version = env.get_version().unwrap();
     let version: jint = jni_version.into();
 
@@ -249,6 +217,9 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     debug!("JNI_OnLoad started");
 
     let class_name: &str = "io/twoyi/Renderer";
+    // After AOSP-VENDOR-1 the setRendererType / setDebugRenderer /
+    // setDebugLogDir JNI methods are gone — there is exactly one
+    // renderer (the AOSP emugl libOpenglRender.so built from source).
     let jni_methods = [
         jni_method!(init, renderer_init, "(Landroid/view/Surface;Ljava/lang/String;IIFFI)V"),
         jni_method!(
@@ -263,9 +234,6 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
         ),
         jni_method!(handleTouch, handle_touch, "(Landroid/view/MotionEvent;)V"),
         jni_method!(sendKeycode, send_key_code, "(I)V"),
-        jni_method!(setRendererType, set_renderer_type, "(I)V"),
-        jni_method!(setDebugRenderer, set_debug_renderer, "(I)V"),
-        jni_method!(setDebugLogDir, set_debug_log_dir, "(Ljava/lang/String;)V"),
         jni_method!(setDataDir, set_data_dir, "(Ljava/lang/String;)V"),
     ];
 
@@ -308,12 +276,12 @@ pub extern "C" fn twoyi_send_keycode(keycode: i32) {
 pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
     use std::io::{self, Write};
     use std::ffi::CStr;
-    
+
     let _ = writeln!(io::stdout(), "Twoyi Renderer - Standalone Mode");
-    
+
     // Parse arguments from argc/argv
     let mut args: Vec<String> = Vec::new();
-    
+
     if argc > 0 && !argv.is_null() {
         unsafe {
             for i in 0..argc as isize {
@@ -327,7 +295,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
             }
         }
     }
-    
+
     let _ = writeln!(io::stdout(), "argc: {}", argc);
     if !args.is_empty() {
         let _ = writeln!(io::stdout(), "Arguments:");
@@ -335,7 +303,7 @@ pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
             let _ = writeln!(io::stdout(), "  [{}]: {}", i, arg);
         }
     }
-    
+
     let _ = writeln!(io::stdout(), "\nUsage: ./libtwoyi.so [OPTIONS]");
     let _ = writeln!(io::stdout(), "Options:");
     let _ = writeln!(io::stdout(), "  --help                Show this help message");
@@ -345,12 +313,12 @@ pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
     let _ = writeln!(io::stdout(), "  --start-input         Start input system only");
     let _ = writeln!(io::stdout(), "\nNote: This library is primarily designed to be loaded by the Twoyi app.");
     let _ = writeln!(io::stdout(), "For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")");
-    
+
     // Parse arguments
     let mut width = 720;
     let mut height = 1280;
     let mut start_input = false;
-    
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -381,17 +349,17 @@ pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
         }
         i += 1;
     }
-    
+
     if start_input {
         let _ = writeln!(io::stdout(), "\nStarting input system with dimensions: {}x{}", width, height);
         twoyi_start_input_system(width, height);
         let _ = writeln!(io::stdout(), "Input system started. Press Ctrl+C to exit.");
-        
+
         // Keep the program running
         loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
-    
+
     0
 }

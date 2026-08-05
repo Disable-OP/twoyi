@@ -100,26 +100,6 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             Renderer.setDataDir(dataDir);
             Log.i(TAG, "Data directory: " + dataDir);
 
-            // Set renderer type before initializing
-            boolean useNewRenderer = ProfileSettings.useNewRenderer(getApplicationContext());
-            Renderer.setRendererType(useNewRenderer ? 1 : 0);
-            Log.i(TAG, "Using " + (useNewRenderer ? "new" : "old") + " renderer");
-            
-            // Set debug renderer mode and log directory
-            boolean debugRenderer = ProfileSettings.isDebugRendererEnabled(getApplicationContext());
-            if (debugRenderer) {
-                // Set log directory BEFORE enabling debug mode
-                File debugLogDir = new File(getFilesDir(), "twoyi_renderer_debug");
-                Renderer.setDebugLogDir(debugLogDir.getAbsolutePath());
-                Log.i(TAG, "Debug renderer log directory: " + debugLogDir.getAbsolutePath());
-                
-                // Now enable debug mode
-                Renderer.setDebugRenderer(1);
-                Log.i(TAG, "Debug renderer: enabled");
-            } else {
-                Renderer.setDebugRenderer(0);
-                Log.i(TAG, "Debug renderer: disabled");
-            }
             
             // Calculate proper DPI based on physical screen and virtual display scaling
             WindowManager windowManager = getWindowManager();

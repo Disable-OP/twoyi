@@ -23,6 +23,9 @@
 # =============================================================================
 set -e
 
+# Ensure cargo / cargo-xdk are on PATH (Gradle exec does not source ~/.bashrc)
+export PATH="$HOME/.cargo/bin:$PATH"
+
 # Default ABIs if none are specified on the command line
 DEFAULT_ABIS="arm64-v8a"
 ALL_ABIS="arm64-v8a x86_64"

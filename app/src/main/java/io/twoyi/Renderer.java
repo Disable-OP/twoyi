@@ -4,18 +4,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-/*
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- */
-
-/*
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- */
-
 package io.twoyi;
 
 import android.view.MotionEvent;
@@ -40,24 +28,6 @@ public class Renderer {
     public static native void handleTouch(MotionEvent event);
 
     public static native void sendKeycode(int keycode);
-    
-    /**
-     * Set the renderer type to use
-     * @param useNewRenderer true to use new open-source renderer, false for old renderer
-     */
-    public static native void setRendererType(int useNewRenderer);
-
-    /**
-     * Set debug renderer mode
-     * @param debugEnabled true to enable debug logging, false to disable
-     */
-    public static native void setDebugRenderer(int debugEnabled);
-    
-    /**
-     * Set debug renderer log directory
-     * @param logDir absolute path to the directory where debug logs should be written
-     */
-    public static native void setDebugLogDir(String logDir);
 
     /**
      * Set the app's data directory. Must be called before init() so that

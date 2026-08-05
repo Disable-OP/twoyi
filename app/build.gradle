@@ -27,20 +27,13 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            // arm64-v8a  — real Android devices (the only ABI the legacy
-            //               closed-source libOpenglRender.so / libloader.so
-            //               blobs ship for, and the only ABI the upstream
-            //               rootfs is built for).
-            // x86_64      — emulators and redroid containers. The open-source
-            //               Rust renderer and loader support x86_64, so a
-            //               developer running tests in a cloud container
-            //               (e.g. GitHub Codespaces + redroid) can install
-            //               the same APK without rebuilding.
-            //
-            // The legacy blobs are only present in jniLibs/arm64-v8a/, so
-            // an x86_64-only install will fall back to the open-source
-            // lib*_new.so variants automatically (see RomManager.LOADER_FILE
-            // and core::RendererType).
+            // Both ABIs are now 100% open source (task AOSP-VENDOR-1):
+            //   arm64-v8a  — real Android devices
+            //   x86_64     — emulators / redroid containers (CI testing)
+            // Every native library shipped in the APK is built from source:
+            //   libOpenglRender.so  — app/cpp/emugl  (AOSP emugl, CMake)
+            //   libloader.so        — app/rs/loader  (Rust, open source)
+            //   libtwoyi.so         — app/rs         (Rust, open source)
             abiFilters "arm64-v8a", "x86_64"
         }
         archivesBaseName = "twoyi_${versionName}"
@@ -74,12 +67,50 @@ android {
     }
 }
 
+// ============================================================================
+// Native build tasks (task AOSP-VENDOR-1 — 100% open source)
+// ============================================================================
+//
+// Build order:  cmakeBuild  ->  cargoBuild  ->  javaPreCompile
+//
+//   cmakeBuild  : builds libOpenglRender.so from the vendored AOSP emugl
+//                 source under app/cpp/emugl/ (CMake + NDK toolchain).
+//   cargoBuild  : builds libtwoyi.so (the JNI renderer glue) from
+//                 app/rs/. Its build.rs links against libOpenglRender.so,
+//                 so it MUST run after cmakeBuild.
+//
+// Both tasks accept -Pabis=arm64-v8a,x86_64 (or -Pabis=all) to restrict
+// which ABIs are built. The default is "all".
+
+task cmakeBuild {
+    doLast {
+        exec {
+            def abis = project.hasProperty('abis') ? project.getProperty('abis').split(',') : ['all']
+            workingDir new File(project.projectDir, "cpp")
+            commandLine "bash", "build.sh", *abis
+            ignoreExitValue = false
+        }
+    }
+}
+
+task loaderBuild {
+    doLast {
+        exec {
+            def abis = project.hasProperty('abis') ? project.getProperty('abis').split(',') : ['all']
+            workingDir new File(project.projectDir, "rs/loader")
+            commandLine "bash", "build.sh", *abis
+            ignoreExitValue = false
+        }
+    }
+}
+
 task cargoBuild {
+    dependsOn 'cmakeBuild'
     doLast {
         exec {
             // Build libtwoyi.so for both arm64-v8a and x86_64.
-            // arm64-v8a  → real devices
-            // x86_64     → emulators / redroid containers (CI testing)
+            // arm64-v8a  -> real devices
+            // x86_64     -> emulators / redroid containers (CI testing)
             //
             // The "all" arg tells build_rs.sh to build every supported ABI.
             // Override by setting project property -Pabis=arm64-v8a if you
@@ -95,6 +126,7 @@ task cargoBuild {
 tasks.whenTaskAdded { task ->
     if ((task.name == 'javaPreCompileDebug' || task.name == 'javaPreCompileRelease')) {
         task.dependsOn 'cargoBuild'
+        task.dependsOn 'loaderBuild'
     }
 }
 

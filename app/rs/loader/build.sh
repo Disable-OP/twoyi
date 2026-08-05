@@ -6,6 +6,10 @@
 # build.sh — build libloader.so (open-source replacement for the legacy
 # closed-source libloader.so) for one or more Android ABIs.
 #
+# After task AOSP-VENDOR-1 the legacy libloader.so blob has been
+# removed and the output of this build is shipped *as* libloader.so
+# (no more libloader_new.so).
+#
 # Usage:
 #   ./build.sh                       # default: arm64-v8a only
 #   ./build.sh arm64-v8a x86_64
@@ -15,6 +19,9 @@
 # Supported ABIs:  arm64-v8a, x86_64
 
 set -e
+
+# Ensure cargo / cargo-xdk are on PATH (Gradle exec does not source ~/.bashrc)
+export PATH="$HOME/.cargo/bin:$PATH"
 
 ALL_ABIS="arm64-v8a x86_64"
 
@@ -59,17 +66,13 @@ for ABI in $ABIS; do
 
     SRC="target/$RUST_TARGET/release/libloader.so"
     DST_DIR="../../src/main/jniLibs/$ABI"
-    DST="$DST_DIR/libloader_new.so"
+    DST="$DST_DIR/libloader.so"
 
     mkdir -p "$DST_DIR"
     cp -v "$SRC" "$DST"
     chmod +x "$DST"
 
-    echo "  → $DST"
-    echo ""
-    echo "Library size comparison ($ABI):"
-    echo "  Legacy: $(ls -lh "$DST_DIR/libloader.so" 2>/dev/null | awk '{print $5}' || echo 'N/A')"
-    echo "  New:    $(ls -lh "$DST" 2>/dev/null | awk '{print $5}' || echo 'N/A')"
+    echo "  -> $DST"
 
     if command -v readelf >/dev/null 2>&1; then
         echo ""
