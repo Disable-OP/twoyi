@@ -5,17 +5,45 @@
 # For more details, see
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# Preserve line numbers for debugging stack traces
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# === JNI native methods ===
+# Keep all classes with native methods — the native side looks up
+# method names by reflection via JNIEnv.GetMethodID / GetFieldID.
+-keepclasseswithmembernames class * {
+    native <methods>;
+}
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# Keep the Renderer class — it's called from JNI
+-keep class io.twoyi.Renderer { *; }
+-keep class io.twoyi.Renderer$* { *; }
+
+# === Reflection ===
+# FreeReflection library uses hidden API reflection
+-keep class com.jaredzrr.navigationbarhide.** { *; }
+
+# libsu shell utilities
+-keep class com.topjohnwu.superuser.** { *; }
+
+# === Glide ===
+-keep public class * implements com.bumptech.glide.module.GlideModule
+-keep class * extends com.bumptech.glide.module.AppGlideModule { <init>(...); }
+-keep class com.bumptech.glide.load.data.ParcelFileDescriptorRewinder$InternalRewinder { *** rewind(); }
+
+# === DocumentsProvider ===
+-keep class io.twoyi.provider.TwoyiDocumentsProvider { *; }
+
+# === JDeferred ===
+-keep class org.jdeferred.** { *; }
+-keepclassmembers class org.jdeferred.** { *; }
+
+# === Material Dialogs ===
+-keep class com.afollestad.materialdialogs.** { *; }
+
+# === Keep enum values ===
+-keepclassmembers enum * {
+    public static **[] values();
+    public static ** valueOf(java.lang.String);
+}
