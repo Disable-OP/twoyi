@@ -41,6 +41,9 @@
 //! * [`binder`]     — per-VM `/vm{id}/dev/binder` Unix socket + binder
 //!                    transaction proxy (skeleton; see
 //!                    `download/BINDER_SKELETON.md`).
+//! * [`audio`]      — virtual `/dev/audio` Unix socket + bidirectional
+//!                    PCM pump (playback + capture skeleton; see
+//!                    `download/AUDIO_SENSOR_HAL.md`).
 //! * [`seccomp`]    — BPF seccomp filter + SIGSYS handler.
 //! * [`proc_emu`]   — synthesised `/proc` tree (version, cpuinfo,
 //!                    meminfo, cmdline, self/, sys/).
@@ -57,6 +60,7 @@
 
 pub mod devices;
 pub mod binder;
+pub mod audio;
 pub mod seccomp;
 pub mod proc_emu;
 pub mod mount_mgr;
@@ -359,6 +363,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // approach). The binder proxy is only needed for full
             // service-manager virtualisation.
             warning!("[KR64] failed to start binder proxy: {} — falling back to host binder", e);
+            None
+        }
+    };
+
+    // ---------------------------------------------------------------
+    // Step 2.6: create the audio device + spawn the accept/pump
+    // thread. See `download/AUDIO_SENSOR_HAL.md` and
+    // `app/rs/kr64/src/audio.rs` for the full story. The short
+    // version: this creates `{rootfs}/dev/audio` as a Unix socket
+    // and spawns an accept-thread + worker-pool that reads a
+    // 16-byte header per connection and pumps raw PCM in both
+    // directions. The actual AudioTrack/AudioRecord integration is
+    // stubbed (no JNI yet) — the pump compiles and exercises the
+    // protocol but produces no sound until the Java side is wired
+    // up in a follow-up task.
+    // ---------------------------------------------------------------
+    let _audio_handle = match audio::create_audio_device(&cfg.rootfs)
+        .and_then(|dev| dev.spawn())
+    {
+        Ok(h) => {
+            info!("[KR64] audio device listening at {}", h.path());
+            Some(h)
+        }
+        Err(e) => {
+            // Non-fatal: the guest can still boot without sound —
+            // AudioFlinger's connect() to /dev/audio will fail and
+            // the guest's audio HAL will fall back to silence / a
+            // null output. Sound is the user's primary use case
+            // though, so this warning is worth surfacing.
+            warning!("[KR64] failed to start audio device: {} — guest will have no sound", e);
             None
         }
     };
