@@ -54,16 +54,24 @@ public class TwoyiSocketServer {
 
     private static final String JUMP_HOST_SETTINGS= "SETTINGS";
 
-    private static ExecutorService EXECUTOR = Executors.newCachedThreadPool();
+    // Fixed: use fixed thread pool with daemon threads to prevent
+    // unbounded thread growth and JVM shutdown issues
+    private static ExecutorService EXECUTOR = Executors.newFixedThreadPool(4, r -> {
+        Thread t = new Thread(r, "TwoyiSocket-Worker");
+        t.setDaemon(true);
+        return t;
+    });
 
     private final AtomicBoolean mStarted = new AtomicBoolean(false);
     private final Context mContext;
 
     private TwoyiSocketServer(Context context) {
-        mContext = context;
+        // Fixed: use ApplicationContext to prevent Activity memory leak
+        mContext = context.getApplicationContext();
     }
 
-    public static TwoyiSocketServer getInstance(Context context) {
+    // Fixed: synchronize getInstance to prevent race condition
+    public static synchronized TwoyiSocketServer getInstance(Context context) {
         if (INSTANCE == null) {
             INSTANCE = new TwoyiSocketServer(context);
         }
@@ -159,10 +167,19 @@ public class TwoyiSocketServer {
             while (!currentThread.isInterrupted()) {
                 byte[] data = new byte[1024];
                 int read = inputStream.read(data);
+                // Fixed: check for EOF (read returns -1) to prevent
+                // StringIndexOutOfBoundsException from new String(data, 0, -1, ...)
+                if (read <= 0) break;
                 handleData(new String(data, 0, read, StandardCharsets.US_ASCII));
             }
 
         } catch (IOException ignored) {
+        } finally {
+            // Fixed: close the socket to prevent FD leak
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 

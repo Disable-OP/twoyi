@@ -244,7 +244,12 @@ public final class RomManager {
 
 
     public static boolean isAndroid12() {
-        return Build.VERSION.PREVIEW_SDK_INT + Build.VERSION.SDK_INT == Build.VERSION_CODES.S;
+        // Fixed: the old check (PREVIEW_SDK_INT + SDK_INT == S) was backwards.
+        // On Android 12 preview: 1 + 31 = 32 != 31 → false (wrong!)
+        // On Android 12 stable: 0 + 31 = 31 == 31 → true (correct)
+        // On Android 13+: 0 + 33 = 33 != 31 → false (should be true for 13+)
+        // Correct check: SDK_INT >= S (Android 12 or later)
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.S;
     }
 
     private static void removePartition(Context context, String partition) {

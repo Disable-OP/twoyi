@@ -140,6 +140,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState); // MUST be first — Android requires it
+
         boolean started = TwoyiStatusManager.getInstance().isStarted();
         Log.i(TAG, "onCreate: " + savedInstanceState + " isStarted: " + started);
 
@@ -154,8 +156,6 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         TwoyiStatusManager.getInstance().reset();
 
         NavUtils.hideNavigation(getWindow());
-
-        super.onCreate(savedInstanceState);
 
         // Load virtual display settings from profile
         mVirtualDisplayWidth = ProfileSettings.getDisplayWidth(this);
@@ -183,6 +183,16 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         mSurfaceView.setOnTouchListener(this);
 
+    }
+
+    @Override
+    protected void onDestroy() {
+        // Remove the SurfaceHolder callback to prevent surfaceCreated/Changed/Destroyed
+        // from firing on a destroyed Activity with a stale Surface pointer.
+        if (mSurfaceView != null && mSurfaceCallback != null) {
+            mSurfaceView.getHolder().removeCallback(mSurfaceCallback);
+        }
+        super.onDestroy();
     }
 
     @Override
@@ -334,8 +344,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                     // waiting for track
                     SystemClock.sleep(3000);
 
-                    finish();
-                    System.exit(0);
+                    // finish() must be called on the main thread
+                    runOnUiThread(() -> {
+                        finish();
+                        System.exit(0);
+                    });
                     return;
                 }
             }
