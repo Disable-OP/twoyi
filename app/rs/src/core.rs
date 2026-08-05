@@ -146,7 +146,7 @@ pub fn init_renderer(
     info!("[CORE] Surface: {}x{}, Virtual: {}x{}, FPS: {}", 
           surface_width, surface_height, virtual_width, virtual_height, fps);
 
-    let mut renderer_type = *RENDERER_TYPE.lock().unwrap();
+    let renderer_type = *RENDERER_TYPE.lock().unwrap();
 
 
     info!("[CORE] Using renderer: {:?}", renderer_type);
@@ -230,7 +230,7 @@ pub fn init_renderer(
         let outputs = File::create(log_path).unwrap();
         let errors = outputs.try_clone().unwrap();
         let _ = Command::new("./init")
-            .current_dir(working_dir)
+            .current_dir(&working_dir)
             .env("TYLOADER", &loader_path)
             .env("TWOYI_ROOTFS", &working_dir)
             .stdout(Stdio::from(outputs))
