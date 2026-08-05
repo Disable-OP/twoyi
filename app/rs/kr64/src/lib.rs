@@ -47,6 +47,9 @@
 //! * [`sensors`]    — virtual `/dev/sensors` Unix socket + multiplexed
 //!                    12-sensor HAL (accel/mag/gyro/... skeleton; see
 //!                    `download/AUDIO_SENSOR_HAL.md`).
+//! * [`battery`]    — virtual `/sys/class/power_supply/battery` file tree
+//!                    + 30 s refresh thread (file-based, no socket; see
+//!                    `download/BATTERY_IMPL.md`).
 //! * [`seccomp`]    — BPF seccomp filter + SIGSYS handler.
 //! * [`proc_emu`]   — synthesised `/proc` tree (version, cpuinfo,
 //!                    meminfo, cmdline, self/, sys/).
@@ -65,6 +68,7 @@ pub mod devices;
 pub mod binder;
 pub mod audio;
 pub mod sensors;
+pub mod battery;
 pub mod seccomp;
 pub mod proc_emu;
 pub mod mount_mgr;
@@ -428,6 +432,33 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // Apps that hard-require a sensor (e.g. compass apps)
             // will crash, but the boot proceeds.
             warning!("[KR64] failed to start sensor device: {} — guest will have no sensors", e);
+            None
+        }
+    };
+
+    // ---------------------------------------------------------------
+    // Step 2.8: materialise the virtual battery sysfs tree + spawn
+    // the 30 s refresh thread. See `download/BATTERY_IMPL.md` and
+    // `app/rs/kr64/src/battery.rs` for the full story. The short
+    // version: this creates `{rootfs}/sys/class/power_supply/battery/`
+    // with seven files (capacity, status, charging, voltage,
+    // temperature, technology, health) populated from the (stubbed)
+    // JNI up-calls, then spawns a `kr64-battery-refresh` thread that
+    // re-writes them every 30 s. Failure is non-fatal — the guest
+    // can still boot without a battery sysfs (its `BatteryService`
+    // will just report "unknown" / fall back to defaults), but every
+    // real device has a battery so we warn loudly.
+    // ---------------------------------------------------------------
+    let _battery_handle = match battery::BatteryDevice::new(&cfg.rootfs)
+        .and_then(|dev| dev.spawn())
+    {
+        Ok(h) => {
+            info!("[KR64] battery sysfs materialised at {}/sys/class/power_supply/battery",
+                  cfg.rootfs);
+            Some(h)
+        }
+        Err(e) => {
+            warning!("[KR64] failed to start battery HAL: {} — guest will see no battery", e);
             None
         }
     };
