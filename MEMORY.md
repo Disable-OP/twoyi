@@ -221,27 +221,43 @@ app/src/main/
 ## 5. Current State (as of this session)
 
 ### What works
-- ✅ KVM in codespace (AMD EPYC, EastUs)
-- ✅ APK builds and signs for arm64-v8a + x86_64
+- ✅ KVM in codespace (AMD EPYC, EastUs) — until billing issue
+- ✅ APK builds and signs for arm64-v8a + x86_64 (284MB, v2 signed)
 - ✅ All closed-source blobs removed — 100% open source
 - ✅ AOSP emugl renderer built from source for both ABIs
 - ✅ kr64 daemon: 9,581 lines, 144 tests, 8 modules
 - ✅ Work profile support (no hardcoded /data/data paths)
-- ✅ x86_64 rootfs init executes (via host loader, broken)
-- ✅ QEMU pipe connects on x86_64 (emulator's pipe)
+- ✅ **libtwoyi.so rebuilt with rootfs linker fix** (both ABIs, pushed to GitHub)
+- ✅ x86_64 rootfs extracted from emulator (554MB, all system + vendor)
+- ✅ x86_64 rootfs linker confirmed as **static-pie** (approach validated!)
+- ✅ rootfs pushed to emulator's /data/data/io.twoyi/profiles/default/rootfs/
 
-### What doesn't work
-- ❌ Init loads HOST libraries (becomes zombie)
-- ❌ Init doesn't reach second stage
-- ❌ SurfaceFlinger doesn't start
-- ❌ No container boot
-- ❌ kr64 daemon not actually wired into the boot flow yet
+### What doesn't work yet
+- ❌ SurfaceCreated callback doesn't fire in -no-window emulator mode
+  (SurfaceView needs a compositor; -no-window has none)
+- ❌ Init boot NOT YET TESTED end-to-end (blocked by codespace billing)
+- ❌ kr64 daemon not wired into the boot flow yet
+- ❌ Codespace billing issue (HTTP 402) — can't restart for testing
 
-### What we're fixing this session
-1. Rewrite `core.rs::init_renderer` to exec the **rootfs linker** directly
-2. Set proper `LD_LIBRARY_PATH` pointing to rootfs libs
-3. Document the non-permissive-kernel considerations
-4. Build and push
+### What was accomplished this session
+1. ✅ Rewrote `core.rs::init_renderer` to exec rootfs linker directly
+2. ✅ Set LD_LIBRARY_PATH to rootfs lib64 dirs (no host lib contamination)
+3. ✅ Documented non-permissive-kernel considerations
+4. ✅ Built libtwoyi.so for both ABIs in codespace
+5. ✅ Built full signed APK (284MB)
+6. ✅ Extracted and pushed x86_64 rootfs to emulator
+7. ✅ Confirmed rootfs linker is static-pie (our approach is correct)
+8. ❌ Final boot test blocked by codespace billing issue
+
+### Key finding about -no-window mode
+The Android emulator with `-no-window` does NOT create a Surface for
+SurfaceView, so `surfaceCreated()` never fires, so `Renderer.init()`
+is never called, so init is never spawned. To test twoyi in the emulator,
+you need EITHER:
+- A real display (Xvfb + VNC, or a real monitor)
+- OR modify Render2Activity to call `Renderer.init()` from `onCreate()`
+  instead of `surfaceCreated()` (hack for headless testing)
+- OR test on a real arm64 device (the intended use case)
 
 ---
 
