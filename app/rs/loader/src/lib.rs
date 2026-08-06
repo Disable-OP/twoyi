@@ -10,7 +10,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Open-source Dynamic Library Loader
-//! 
+//!
 //! This library provides a simple dynamic library loader that can load and execute
 //! shared libraries. It's designed as a replacement for the legacy proprietary
 //! libloader.so, which is used to bootstrap the Android container environment.
@@ -48,7 +48,7 @@ extern "C" {
 }
 
 /// Load a shared library and return its handle
-/// 
+///
 /// # Safety
 /// This function uses FFI to call dlopen
 pub unsafe fn load_library(path: &str, flags: c_int) -> Result<*mut c_void, String> {
@@ -56,9 +56,9 @@ pub unsafe fn load_library(path: &str, flags: c_int) -> Result<*mut c_void, Stri
         Ok(s) => s,
         Err(_) => return Err("Invalid path string".to_string()),
     };
-    
+
     let handle = dlopen(path_cstr.as_ptr(), flags);
-    
+
     if handle.is_null() {
         let err_ptr = dlerror();
         let err_msg = if !err_ptr.is_null() {
@@ -68,12 +68,12 @@ pub unsafe fn load_library(path: &str, flags: c_int) -> Result<*mut c_void, Stri
         };
         return Err(format!("Failed to load library {}: {}", path, err_msg));
     }
-    
+
     Ok(handle)
 }
 
 /// Find a symbol in a loaded library
-/// 
+///
 /// # Safety
 /// This function uses FFI to call dlsym
 pub unsafe fn find_symbol(handle: *mut c_void, symbol: &str) -> Result<*mut c_void, String> {
@@ -81,24 +81,24 @@ pub unsafe fn find_symbol(handle: *mut c_void, symbol: &str) -> Result<*mut c_vo
         Ok(s) => s,
         Err(_) => return Err("Invalid symbol string".to_string()),
     };
-    
+
     // Clear any previous error
     dlerror();
-    
+
     let sym_ptr = dlsym(handle, symbol_cstr.as_ptr());
-    
+
     // Check if dlsym failed
     let err_ptr = dlerror();
     if !err_ptr.is_null() {
         let err_msg = CStr::from_ptr(err_ptr).to_string_lossy().into_owned();
         return Err(format!("Failed to find symbol {}: {}", symbol, err_msg));
     }
-    
+
     Ok(sym_ptr)
 }
 
 /// Close a loaded library
-/// 
+///
 /// # Safety
 /// This function uses FFI to call dlclose
 pub unsafe fn close_library(handle: *mut c_void) -> Result<(), String> {
@@ -111,12 +111,12 @@ pub unsafe fn close_library(handle: *mut c_void) -> Result<(), String> {
         };
         return Err(format!("Failed to close library: {}", err_msg));
     }
-    
+
     Ok(())
 }
 
 /// Main entry point when executed as a standalone executable
-/// 
+///
 /// This allows the loader to be executed directly (as loader64) to load
 /// and bootstrap libraries.
 ///
@@ -128,10 +128,10 @@ pub unsafe fn close_library(handle: *mut c_void) -> Result<(), String> {
 pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     use std::env;
     use std::io::{self, Write};
-    
+
     // Parse command line arguments
     let mut args: Vec<String> = Vec::new();
-    
+
     if argc > 0 && !argv.is_null() {
         unsafe {
             for i in 0..argc as isize {
@@ -144,11 +144,14 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
             }
         }
     }
-    
+
     // Print basic info
-    let _ = writeln!(io::stderr(), "[LOADER] Open-source dynamic library loader v1.0.0");
+    let _ = writeln!(
+        io::stderr(),
+        "[LOADER] Open-source dynamic library loader v1.0.0"
+    );
     let _ = writeln!(io::stderr(), "[LOADER] Arguments: {:?}", args);
-    
+
     // Check for library to load from arguments or environment
     let library_path = if args.len() > 1 {
         // First argument (after program name) is the library to load
@@ -156,48 +159,56 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
     } else if let Ok(env_lib) = env::var("LD_PRELOAD") {
         env_lib
     } else {
-        let _ = writeln!(io::stderr(), "[LOADER] Usage: {} <library.so> [args...]", 
-                        args.first().unwrap_or(&"loader".to_string()));
-        let _ = writeln!(io::stderr(), "[LOADER] Or set LD_PRELOAD environment variable");
+        let _ = writeln!(
+            io::stderr(),
+            "[LOADER] Usage: {} <library.so> [args...]",
+            args.first().unwrap_or(&"loader".to_string())
+        );
+        let _ = writeln!(
+            io::stderr(),
+            "[LOADER] Or set LD_PRELOAD environment variable"
+        );
         return 1;
     };
-    
+
     let _ = writeln!(io::stderr(), "[LOADER] Loading library: {}", library_path);
-    
+
     // Load the library
     unsafe {
         let handle = match load_library(&library_path, RTLD_NOW | RTLD_GLOBAL) {
             Ok(h) => {
                 let _ = writeln!(io::stderr(), "[LOADER] Library loaded successfully");
                 h
-            },
+            }
             Err(e) => {
                 let _ = writeln!(io::stderr(), "[LOADER] Error: {}", e);
                 return 1;
             }
         };
-        
+
         // Try to find and execute a main function in the loaded library
         if let Ok(main_fn) = find_symbol(handle, "main") {
-            let _ = writeln!(io::stderr(), "[LOADER] Found main() in library, executing...");
-            
+            let _ = writeln!(
+                io::stderr(),
+                "[LOADER] Found main() in library, executing..."
+            );
+
             // Cast to function pointer and call
             type MainFn = extern "C" fn(c_int, *const *const c_char) -> c_int;
             let main_func: MainFn = std::mem::transmute(main_fn);
-            
+
             // Create CStrings that will live for the duration of the call
             // Fixed: use ok() instead of unwrap() to avoid panic across FFI
             // (CString::new() fails if `s` contains an interior NUL byte.)
-            let lib_args: Vec<CString> = args.iter()
+            let lib_args: Vec<CString> = args
+                .iter()
                 .skip(1)
                 .filter_map(|s| CString::new(s.as_str()).ok())
                 .collect();
 
             // Create pointers from the CStrings
             // Fixed: add trailing NULL pointer (POSIX requires argv[argc] == NULL)
-            let mut lib_argv: Vec<*const c_char> = lib_args.iter()
-                .map(|s| s.as_ptr())
-                .collect();
+            let mut lib_argv: Vec<*const c_char> = lib_args.iter().map(|s| s.as_ptr()).collect();
             lib_argv.push(std::ptr::null()); // POSIX argv terminator
 
             // Fixed: derive argc from the *actual* lib_argv length, NOT from
@@ -209,20 +220,23 @@ pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int 
             // past the end of lib_argv (POSIX argv[argc] is NULL, but argv
             // slots past that are uninitialized heap).
             let lib_argc = lib_args.len() as c_int;
-            
+
             let result = main_func(lib_argc, lib_argv.as_ptr());
             let _ = writeln!(io::stderr(), "[LOADER] Library main() returned: {}", result);
-            
+
             // Clean up
             if let Err(e) = close_library(handle) {
                 let _ = writeln!(io::stderr(), "[LOADER] Warning: {}", e);
             }
-            
+
             result
         } else {
             let _ = writeln!(io::stderr(), "[LOADER] No main() function found in library");
-            let _ = writeln!(io::stderr(), "[LOADER] Library loaded and symbols available");
-            
+            let _ = writeln!(
+                io::stderr(),
+                "[LOADER] Library loaded and symbols available"
+            );
+
             // Keep the library loaded - don't close it
             // This allows the process to use the library's symbols
             0
@@ -247,13 +261,13 @@ pub unsafe extern "C" fn loader_load(path: *const c_char) -> *mut c_void {
     if path.is_null() {
         return ptr::null_mut();
     }
-    
+
     unsafe {
         let path_str = match CStr::from_ptr(path).to_str() {
             Ok(s) => s,
             Err(_) => return ptr::null_mut(),
         };
-        
+
         match load_library(path_str, RTLD_NOW | RTLD_GLOBAL) {
             Ok(handle) => handle,
             Err(_) => ptr::null_mut(),
@@ -273,13 +287,13 @@ pub unsafe extern "C" fn loader_symbol(handle: *mut c_void, symbol: *const c_cha
     if handle.is_null() || symbol.is_null() {
         return ptr::null_mut();
     }
-    
+
     unsafe {
         let symbol_str = match CStr::from_ptr(symbol).to_str() {
             Ok(s) => s,
             Err(_) => return ptr::null_mut(),
         };
-        
+
         match find_symbol(handle, symbol_str) {
             Ok(ptr) => ptr,
             Err(_) => ptr::null_mut(),
@@ -298,7 +312,7 @@ pub unsafe extern "C" fn loader_close(handle: *mut c_void) -> c_int {
     if handle.is_null() {
         return -1;
     }
-    
+
     unsafe {
         match close_library(handle) {
             Ok(_) => 0,
