@@ -40,10 +40,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
-import java.util.List;
 
 import io.twoyi.R;
-import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.ProfileSettings;
