@@ -57,13 +57,24 @@ public class TwoyiMessenger {
         }
 
         try {
-            this.socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET);
-            this.socket.connect(new LocalSocketAddress(SOCK_NAME));
+            LocalSocket socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET);
+            socket.connect(new LocalSocketAddress(SOCK_NAME));
+            // Only assign to this.socket AFTER successful connect
+            this.socket = socket;
             InputStream is = this.socket.getInputStream();
             OutputStream os = this.socket.getOutputStream();
             this.mWriter = new OutputStreamWriter(os);
         } catch (IOException e) {
             e.printStackTrace();
+            // Fixed: clean up the socket on failure so connect() can be retried.
+            // Previously, this.socket was assigned before connect(), so a
+            // failed connect left a non-null but unusable socket, and the
+            // guard at the top prevented all future reconnection attempts.
+            if (this.socket != null) {
+                try { this.socket.close(); } catch (IOException ignored) {}
+                this.socket = null;
+            }
+            this.mWriter = null;
         }
         return this;
     }

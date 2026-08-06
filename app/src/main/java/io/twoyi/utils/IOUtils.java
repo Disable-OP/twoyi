@@ -49,6 +49,10 @@ public class IOUtils {
         boolean success = true;
         if (dir.isDirectory()) {
             String[] children = dir.list();
+            // Fixed: dir.list() can return null (TOCTOU or I/O error)
+            if (children == null) {
+                return dir.delete();
+            }
             for (String file : children) {
                 boolean ret = deleteDir(new File(dir, file));
                 if (!ret) {
@@ -158,9 +162,11 @@ public class IOUtils {
     }
 
     public static boolean deleteDirectory(File directory) {
-        try {
-            Files.walk(directory.toPath())
-                    .sorted(Comparator.reverseOrder())
+        // Fixed: Files.walk() returns a Stream that holds open directory
+        // descriptors. Must use try-with-resources to close them, otherwise
+        // FDs leak and can exhaust the per-process FD limit.
+        try (java.util.stream.Stream<Path> walk = Files.walk(directory.toPath())) {
+            walk.sorted(Comparator.reverseOrder())
                     .map(Path::toFile)
                     .forEach(File::delete);
             return true;
