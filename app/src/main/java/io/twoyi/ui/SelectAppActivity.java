@@ -630,8 +630,8 @@ public class SelectAppActivity extends AppCompatActivity {
             holder.icon.setColorFilter(colorFilter);
 
             int[][] states = {{android.R.attr.state_checked}, {}};
-            int[] colors = {ContextCompat.getColor(this, R.color.colorPrimary),
-                    ContextCompat.getColor(this, android.R.color.tab_indicator_text)};
+            int[] colors = {ContextCompat.getColor(SelectAppActivity.this, R.color.colorPrimary),
+                    ContextCompat.getColor(SelectAppActivity.this, android.R.color.tab_indicator_text)};
             CompoundButtonCompat.setButtonTintList(holder.checkBox, new ColorStateList(states, colors));
 
             GlideModule.loadApplicationIcon(getApplicationContext(), item.applicationInfo, holder.icon);
