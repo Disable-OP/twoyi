@@ -120,8 +120,16 @@ public class ACache {
 		} finally {
 			if (out != null) {
 				try {
-					out.flush();
-					out.close();
+					try {
+						out.flush();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
+					try {
+						out.close();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
 				} catch (IOException e) {
 					e.printStackTrace();
 				}
@@ -299,8 +307,16 @@ public class ACache {
 		} finally {
 			if (out != null) {
 				try {
-					out.flush();
-					out.close();
+					try {
+						out.flush();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
+					try {
+						out.close();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
 				} catch (IOException e) {
 					e.printStackTrace();
 				}
