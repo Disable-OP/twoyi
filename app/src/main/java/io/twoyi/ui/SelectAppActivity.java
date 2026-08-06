@@ -373,6 +373,19 @@ public class SelectAppActivity extends AppCompatActivity {
             File tmpFile = new File(getCacheDir(), now + ".apk");
             Log.i(TAG, "copyFilesFromUri temp file: " + tmpFile);
             try (InputStream inputStream = contentResolver.openInputStream(uri); OutputStream os = new FileOutputStream(tmpFile)) {
+                // Fixed: openInputStream can return null if the provider revokes
+                // the URI grant between picker return and our read (matches the
+                // fix already applied in Render2Activity / SettingsActivity /
+                // ProfileManagerActivity). Without this guard the next line
+                // would throw NullPointerException, which is NOT caught by the
+                // IOException handler below — it would propagate up through
+                // copyFilesFromUri, abort the whole copy loop, and surface as
+                // an opaque "install failed: null" toast. Throwing IOException
+                // here lets the existing catch log it via LogEvents.trackError
+                // and skip just this one URI.
+                if (inputStream == null) {
+                    throw new IOException("ContentResolver returned null stream for " + uri);
+                }
                 byte[] buffer = new byte[1024];
                 int count;
                 while ((count = inputStream.read(buffer)) > 0) {

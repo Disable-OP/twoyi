@@ -47,6 +47,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import io.twoyi.R;
 import io.twoyi.utils.IOUtils;
@@ -431,6 +432,15 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 ContentResolver contentResolver = getContentResolver();
                 try (InputStream inputStream = contentResolver.openInputStream(uri);
                      OutputStream os = new FileOutputStream(tempFile)) {
+                    // Fixed: openInputStream can return null if the provider
+                    // revokes the URI grant between picker return and our read
+                    // (matches the fix already applied in Render2Activity /
+                    // SettingsActivity). Without this guard the next line
+                    // would NPE inside the try-with-resources and propagate
+                    // as an opaque failure to jdeferred's .fail() handler.
+                    if (inputStream == null) {
+                        throw new IOException("ContentResolver returned null stream for " + uri);
+                    }
                     byte[] buffer = new byte[8192];
                     int count;
                     while ((count = inputStream.read(buffer)) > 0) {
@@ -452,7 +462,17 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     "-C", tempExtractPath
                 );
                 Process process = pb.start();
-                int exitCode = process.waitFor();
+                // Fixed: waitFor() without a timeout can block forever on a
+                // corrupt archive or a stalled FUSE mount. Cap at 120 s —
+                // matches the limit used by Render2Activity and SettingsActivity
+                // for the same `tar -xf` invocation on rootfs tarballs.
+                int exitCode;
+                if (!process.waitFor(120, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    throw new IOException("tar extraction timed out after 120 s");
+                } else {
+                    exitCode = process.exitValue();
+                }
 
                 if (exitCode != 0) {
                     throw new IOException("tar extract failed with exit code: " + exitCode);
