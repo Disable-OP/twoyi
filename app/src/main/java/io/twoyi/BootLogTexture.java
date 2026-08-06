@@ -179,7 +179,11 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
     @Override
     public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surface) {
         mRendering.set(false);
-        return false;
+        // Fixed: was returning false, which tells the framework NOT to release
+        // the SurfaceTexture. Since we never manually release it, the native
+        // texture and its buffers leak on every surface destroy (rotation,
+        // backgrounding, etc.). Returning true lets the framework release it.
+        return true;
     }
 
     @Override
