@@ -58,3 +58,9 @@ app/src/main/jniLibs/*/libtwoyi.so
 # IDE
 .kotlin/
 .vscode/
+
+# Local emulator/test artifacts (never commit)
+.avd-*.img
+.avd-*.qcow2
+tool-results/
+twoyi-local
