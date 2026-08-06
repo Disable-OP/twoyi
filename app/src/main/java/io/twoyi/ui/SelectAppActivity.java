@@ -284,21 +284,23 @@ public class SelectAppActivity extends AppCompatActivity {
         }
 
         List<AppItem> newApps = new ArrayList<>();
-        Set<CharSequence> pkgs = new HashSet<>();
-        for (AppItem mAllApp : mAllApps) {
-            pkgs.add(mAllApp.pkg);
-        }
+
+        // Hoist query.toLowerCase() out of the loop: it doesn't depend on
+        // the iterated appItem, so recomputing it per iteration is wasted
+        // work (O(n) extra String allocations).
+        String queryLower = query.toLowerCase(Locale.US);
 
         for (AppItem appItem : mAllApps) {
             String name = appItem.name.toString().toLowerCase(Locale.US);
             String pkg = appItem.pkg.toString().toLowerCase(Locale.US);
-            String queryLower = query.toLowerCase(Locale.US);
             if (name.contains(queryLower) || pkg.contains(queryLower)) {
                 newApps.add(appItem);
             }
-            if (appItem.selected && !pkgs.contains(appItem.pkg)) {
-                newApps.add(appItem);
-            }
+            // Note: the prior `pkgs` set + `if (appItem.selected &&
+            // !pkgs.contains(appItem.pkg))` block was dead code — pkgs was
+            // built from the same mAllApps list iterated here, so
+            // pkgs.contains(appItem.pkg) was always true and the branch
+            // never fired. Removed.
         }
         mDisplayItems.clear();
         mDisplayItems.addAll(newApps);
