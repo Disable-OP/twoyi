@@ -107,8 +107,18 @@ public class TwoyiStatusManager {
         // Previously, two concurrent calls could both observe the same
         // mShown value and both launch the same activity, then both
         // flip the state, leaving it inverted from reality.
+        //
+        // Also fixed: capture mShown into a local once and flip it via
+        // compareAndSet on the SAME value, rather than re-reading
+        // mShown.get() at the end. The original two-step read
+        // (if (mShown.get()) ... mShown.set(!mShown.get())) is a TOCTOU
+        // race: another thread calling updateVisibility() between the
+        // two reads could change mShown, and we'd then write back the
+        // INVERTED value of what we just observed, losing the visibility
+        // update from updateVisibility().
+        boolean currentlyShown = mShown.get();
         Intent intent;
-        if (mShown.get()) {
+        if (currentlyShown) {
             intent = new Intent(Intent.ACTION_MAIN);
             intent.addCategory(Intent.CATEGORY_HOME);
         } else {
@@ -117,6 +127,9 @@ public class TwoyiStatusManager {
         intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
 
         context.startActivity(intent);
-        mShown.set(!mShown.get());
+        // Atomically flip the bit IF no other thread changed it under us.
+        // If updateVisibility() raced in between, the CAS fails harmlessly
+        // and the new visibility state wins through.
+        mShown.compareAndSet(currentlyShown, !currentlyShown);
     }
 }

@@ -124,6 +124,16 @@ public class TwoyiSocketServer {
             socket.bind(new LocalSocketAddress(SOCK_NAME, LocalSocketAddress.Namespace.ABSTRACT));
             LocalServerSocket localServerSocket = new LocalServerSocket(socket.getFileDescriptor());
 
+            // Fixed: mark the server as started BEFORE entering the accept
+            // loop. The catch block below sets mStarted=false on bind
+            // failure so that start() can be re-invoked; without re-setting
+            // it to true here, a successful retry (start0(attempt+1)) would
+            // leave mStarted=false even though the server is now listening.
+            // That in turn would let a subsequent start() call spawn ANOTHER
+            // start0(0), which would fail to bind (EADDRINUSE) and trigger
+            // yet another retry — a slow thundering-herd leak.
+            mStarted.set(true);
+
             Thread currentThread = Thread.currentThread();
             while (!currentThread.isInterrupted()) {
                 LocalSocket localSocket = localServerSocket.accept();
@@ -133,11 +143,13 @@ public class TwoyiSocketServer {
             Log.e(TAG, "start socket failed (attempt " + (attempt + 1) + "/" + MAX_START_RETRIES + ")", e);
 
             IOUtils.closeSilently(socket);
-            mStarted.set(false);
-
+            // Only clear mStarted if we're giving up — otherwise the
+            // in-flight retry (scheduled below) owns the lifecycle and
+            // will re-set mStarted=true on its own success.
             if (attempt + 1 >= MAX_START_RETRIES) {
                 Log.e(TAG, "giving up after " + MAX_START_RETRIES + " failed bind attempts; "
                         + "the guest will not be able to send control messages to the host.");
+                mStarted.set(false);
                 return;
             }
 
