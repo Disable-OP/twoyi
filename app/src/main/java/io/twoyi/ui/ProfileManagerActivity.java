@@ -247,17 +247,48 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
                 
-                // Read any error output
-                java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(process.getInputStream()));
+                // Fixed: drain tar's merged stdout/stderr in a daemon thread.
+                // The previous code called readLine() synchronously before
+                // waitFor(), so a hung tar (stalled FUSE mount, huge rootfs)
+                // would block on readLine() forever and the (missing) waitFor
+                // timeout would never engage. Draining in the background also
+                // prevents a large burst of tar warnings from filling the
+                // 64 KB pipe buffer and deadlocking the process.
                 StringBuilder output = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                    Log.d("ProfileManager", "tar output: " + line);
+                Thread drainThread = new Thread(() -> {
+                    try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(process.getInputStream()))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            output.append(line).append("\n");
+                            Log.d("ProfileManager", "tar output: " + line);
+                        }
+                    } catch (IOException ignored) {
+                    }
+                }, "tar-export-drain");
+                drainThread.setDaemon(true);
+                drainThread.start();
+
+                // Fixed: waitFor() without a timeout can block forever if tar
+                // hangs on a stalled FUSE mount or a huge rootfs. Cap at 120 s
+                // — matches the limit used by Render2Activity / SettingsActivity
+                // and by the import path (performProfileImport) in this file.
+                int exitCode;
+                if (!process.waitFor(120, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    drainThread.interrupt();
+                    throw new IOException("tar create timed out after 120 s");
+                } else {
+                    exitCode = process.exitValue();
                 }
-                
-                int exitCode = process.waitFor();
+                // Give the drain thread a brief moment to finish capturing
+                // final output so the error message below includes tar
+                // diagnostics. Daemon thread, so a missed join is harmless.
+                try {
+                    drainThread.join(2_000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
                 
                 if (exitCode != 0) {
                     Log.e("ProfileManager", "tar create failed. Output: " + output.toString());
