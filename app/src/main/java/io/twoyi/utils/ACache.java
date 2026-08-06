@@ -662,13 +662,42 @@ public class ACache {
 		}
 
 		private boolean remove(String key) {
-			File image = get(key);
-			return image.delete();
+			File file = newFile(key);
+			// Fixed: original code called get(key) here, which:
+			//   (1) re-touched the file's lastModified timestamp (even when
+			//       the file didn't exist, which silently set a stale entry),
+			//   (2) added a fresh entry to lastUsageDates for a file we are
+			//       about to delete -- polluting the LRU map with a phantom
+			//       entry that subsequent removeNext() would try to delete
+			//       again (File.delete() on a non-existent path returns false
+			//       and skips the lastUsageDates.remove), leaving the phantom
+			//       entry permanently in the map, AND
+			//   (3) never decremented cacheSize or cacheCount, so every
+			//       manual removal permanently shrank the effective cache
+			//       capacity -- eventually triggering premature eviction of
+			//       unrelated entries on subsequent put() calls.
+			//
+			// Instead: remove the lastUsageDates entry first (under the
+			// map's own lock) and decrement the counters so the cache state
+			// stays consistent with what's actually on disk.
+			Long wasUsage = lastUsageDates.remove(file);
+			if (wasUsage != null) {
+				cacheCount.addAndGet(-1);
+				cacheSize.addAndGet(-calculateSize(file));
+			}
+			return file.delete();
 		}
 
 		private void clear() {
 			lastUsageDates.clear();
 			cacheSize.set(0);
+			// Fixed: cacheCount was not reset, so after clear() the counter
+			// still reflected the pre-clear entry count. The next put() would
+			// compare curCacheCount+1 > countLimit against a stale value and,
+			// when countLimit was anything other than Integer.MAX_VALUE,
+			// would start evicting freshly-added entries immediately --
+			// making the cache effectively unusable after a single clear().
+			cacheCount.set(0);
 			File[] files = cacheDir.listFiles();
 			if (files != null) {
 				for (File f : files) {
@@ -683,32 +712,54 @@ public class ACache {
 		 * @return
 		 */
 		private long removeNext() {
-			if (lastUsageDates.isEmpty()) {
-				return 0;
-			}
-
-			Long oldestUsage = null;
-			File mostLongUsedFile = null;
-			Set<Entry<File, Long>> entries = lastUsageDates.entrySet();
+			File mostLongUsedFile;
+			// Fixed: the original code had two concurrency bugs:
+			//   (1) lastUsageDates.isEmpty() was checked OUTSIDE the
+			//       synchronized block. If another thread called clear()
+			//       or removeNext() between the isEmpty() check and the
+			//       synchronized iteration, the for-loop body never ran,
+			//       mostLongUsedFile stayed null, and the subsequent
+			//       calculateSize(null) -> null.length() threw an NPE that
+			//       propagated up through put() and crashed the calling
+			//       thread (typically the Glide fetcher thread that loads
+			//       app icons via CacheManager.getLabel).
+			//   (2) lastUsageDates.entrySet() was fetched before the
+			//       synchronized block, then iterated inside it. For
+			//       Collections.synchronizedMap, the documented pattern is
+			//       to synchronize on the map AND iterate inside the same
+			//       block; fetching the entrySet outside the lock can
+			//       return a stale view.
+			//
+			// Both fixed by moving isEmpty()/entrySet()/iteration all
+			// inside the synchronized block and returning early if the map
+			// is (or became) empty.
 			synchronized (lastUsageDates) {
-				for (Entry<File, Long> entry : entries) {
-					if (mostLongUsedFile == null) {
+				if (lastUsageDates.isEmpty()) {
+					return 0;
+				}
+
+				long oldestUsage = Long.MAX_VALUE;
+				mostLongUsedFile = null;
+				for (Entry<File, Long> entry : lastUsageDates.entrySet()) {
+					long lastValueUsage = entry.getValue();
+					if (lastValueUsage < oldestUsage) {
+						oldestUsage = lastValueUsage;
 						mostLongUsedFile = entry.getKey();
-						oldestUsage = entry.getValue();
-					} else {
-						Long lastValueUsage = entry.getValue();
-						if (lastValueUsage < oldestUsage) {
-							oldestUsage = lastValueUsage;
-							mostLongUsedFile = entry.getKey();
-						}
 					}
 				}
+
+				if (mostLongUsedFile == null) {
+					return 0;
+				}
+
+				// Remove the LRU entry from the map while still holding the
+				// lock, so a concurrent put() cannot resurrect it between
+				// the iteration and the delete().
+				lastUsageDates.remove(mostLongUsedFile);
 			}
 
 			long fileSize = calculateSize(mostLongUsedFile);
-			if (mostLongUsedFile.delete()) {
-				lastUsageDates.remove(mostLongUsedFile);
-			}
+			mostLongUsedFile.delete();
 			return fileSize;
 		}
 
