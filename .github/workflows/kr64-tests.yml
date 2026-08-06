@@ -8,8 +8,12 @@
 # are all caught before they land on `main`. The crate is host-testable
 # because its only dependency is `libc` and its `build.rs` (which compiles
 # `interp.c`) works on any platform with a C compiler.
+#
+# The toolchain (channel + `rustfmt`/`clippy` components + Android targets)
+# is pinned in `rust-toolchain.toml` at the repo root, so the CI toolchain
+# matches every developer's local toolchain byte-for-byte.
 ---
-name: kr64 unit tests
+name: kr64 lint + test
 
 on:
   push:
@@ -37,6 +41,9 @@ jobs:
       - name: Set up Rust stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          # The toolchain (channel, components, targets) is pinned in
+          # `rust-toolchain.toml` at the repo root; this `toolchain: stable`
+          # is just a fallback for forks that haven't pulled the file yet.
           toolchain: stable
           # Run on the host (linux/x86_64); no Android targets needed.
           cache: true

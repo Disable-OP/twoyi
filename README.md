@@ -165,7 +165,7 @@ and renders GLES commands received over the QEMU pipe into the host
 | JDK | 17 | Temurin or OpenJDK. |
 | Android SDK | API 31, build-tools 30.0.3 | `compileSdkVersion 31`, `targetSdk 28`. |
 | Android NDK | **r27c** | Matches CI. Newer may also work. |
-| Rust | stable | With `aarch64-linux-android` and `x86_64-linux-android` targets. |
+| Rust | stable | Pinned via [`rust-toolchain.toml`](rust-toolchain.toml) — `rustup` auto-installs the right channel, `rustfmt` + `clippy` components, and both Android targets on first `cargo` invocation. No manual `rustup target add` needed. |
 | `cargo-xdk` | latest | `cargo install cargo-xdk`. Wraps `cargo build` for Android ABIs. |
 | Android Studio | any recent | Optional — Gradle from the CLI works fine. |
 
