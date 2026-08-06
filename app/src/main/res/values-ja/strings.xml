@@ -22,7 +22,6 @@
     <string name="about_author">作者: weishu (お問い合わせ)</string>
     <string name="about_page_website">公式ウェブサイト</string>
     <string name="privacy">プライバシー</string>
-    <string name="about_feedback_qq_title">QQグループ (クリックで参加)</string>
     <string name="about_author_zhihu">Zhihu(weishu)</string>
     <string name="about_author_coolapk">Coolapk(weishu)</string>
     <string name="about_author_email">メールでのお問い合わせ</string>
@@ -35,15 +34,12 @@
     <string name="donate_others">他の方法</string>
     <string name="donate_choose_title">寄付の方法を選択</string>
     <string name="prompt_alipay_not_found">Alipayが見つかりません。</string>
-    <string name="donate_confirm">寄付</string>
     <string name="donate_never_show">再度表示しない</string>
-    <string name="app_guide_title">重要なお知らせ</string>
     <string name="about_feedback_title">TwoYiのフィードバック</string>
     <string name="feedback_confirm">問題が発生した場合はまずFAQを読んでください！もし機能の要望があれば私に連絡してください。</string>
     <string name="feedback_ok">フィードバックする</string>
     <string name="read_faq_text">FAQを読む</string>
     <string name="menu_not_show_system">システムアプリを表示しない</string>
-    <string name="menu_not_show_added">追加されたアプリを表示しない</string>
     <string name="select_app_button">アプリをインポート</string>
     <string name="create_app_no_apps">追加するアプリがない場合には、twoyiに必要な権限を許可してください。</string>
     <string name="create_app_all_apps_added">全てのアプリが追加されました :)</string>
@@ -56,7 +52,6 @@
     <string name="unsupported_for_32bit_app">32 bit アプリはサポートされていません :(</string>
     <string name="please_install_one_by_one">アプリを1つずつインストールしてください！</string>
     <string name="install_success">インストールが成功しました！</string>
-    <string name="install_failed">インストールに失敗しました: %1$s</string>
     <string name="title_settings">設定</string>
     <string name="settings_key_about">このアプリについて</string>
     <string name="settings_key_import_app">アプリをインポート</string>
@@ -68,7 +63,6 @@
     <string name="tips_for_android12">Android 12 をお使いの場合、twoyiの使用方法についてガイドに従ってください。</string>
     <string name="settings_key_sendlog">ログを送信</string>
     <string name="settings_sendlog_summary">例外ログを開発者に共有</string>
-    <string name="sdcard_of_twoyi">twoyiのSDカード</string>
     <string name="confirm_for_android12" >チュートリアルに沿ってセットアップしたことを確認してください！！！そうでなければ、システムが起動しない可能性があります。</string>
     <string name="i_confirm_it">確認する</string>
     <string name="menu_not_show_32bit">32bit アプリを表示しない</string>
@@ -77,8 +71,6 @@
     <string name="settings_category_other">その他</string>
     <string name="settings_key_factory_reset">ファクトリーリセット</string>
     <string name="settings_factory_reset_summary">rootfsをクリア (次回ROMを再インポートする必要があります)</string>
-    <string name="settings_key_wipe_all_data">全データの削除</string>
-    <string name="settings_wipe_all_data_summary">twoyiの全データが削除されます</string>
     <string name="factory_reset_confirm_message">ファクトリーリセットはrootfsを完全に削除します。次回起動時にROMファイルを再インポートする必要があります。続行しますか？</string>
     <string name="settings_key_manage_files">ファイルマネージャー</string>
     <string name="settings_export_summary">ファイルをtwoyiから(インポート/エクスポート)</string>
@@ -97,10 +89,6 @@
     <string name="settings_display_change_reboot">ディスプレイ設定は再起動後に有効になります</string>
     <string name="settings_key_select_rom">ROM選択</string>
     <string name="settings_select_rom_summary">現在のプロファイルにROMファイルをインポート</string>
-    <string name="settings_key_import_rootfs">Rootfsインポート</string>
-    <string name="settings_import_rootfs_summary">.tar ファイルから rootfs をインポート</string>
-    <string name="settings_key_export_rootfs">Rootfsエクスポート</string>
-    <string name="settings_export_rootfs_summary">rootfs を .tar ファイルにエクスポート</string>
     <string name="settings_key_profile_manager">プロファイルマネージャー</string>
     <string name="settings_profile_manager_summary">異なるプロファイルを管理</string>
     <string name="profile_manager_title">プロファイルマネージャー</string>
@@ -109,61 +97,13 @@
     <string name="profile_rename">プロファイルの名前を変更</string>
     <string name="profile_copy">プロファイルをコピー</string>
     <string name="profile_export">プロファイルをエクスポート</string>
-    <string name="profile_import">プロファイルをインポート</string>
     <string name="profile_delete">プロファイルを削除</string>
     <string name="profile_name_hint">プロファイル名</string>
     <string name="profile_active">アクティブ</string>
     <string name="profile_switch_confirm">プロファイル %1$s に切り替えますか？（再起動が必要）</string>
-    <string name="profile_rename_confirm">プロファイルを %1$s に名前変更しますか？</string>
-    <string name="profile_copy_hint">新しいプロファイル名</string>
     <string name="profile_delete_confirm">プロファイル %1$s を削除しますか？</string>
-    <string name="profile_switch_failed">プロファイルの切り替えに失敗しました</string>
-    <string name="profile_renamed_to">プロファイルを %1$s に名前変更しました</string>
-    <string name="profile_rename_failed">プロファイルの名前変更に失敗しました</string>
-    <string name="profile_copied_to">プロファイルを %1$s にコピーしました</string>
-    <string name="profile_copy_failed">プロファイルのコピーに失敗しました</string>
-    <string name="profile_copy_error">エラー: %1$s</string>
-    <string name="profile_deleted">プロファイル %1$s を削除しました</string>
-    <string name="profile_delete_failed">プロファイルの削除に失敗しました</string>
-    <string name="profile_picker_error">エラー</string>
-    <string name="profile_created">プロファイル %1$s を作成しました</string>
-    <string name="profile_create_failed">プロファイルの作成に失敗しました</string>
-    <string name="profile_export_success">プロファイルのエクスポートに成功しました</string>
-    <string name="profile_export_failed">プロファイルのエクスポートに失敗しました: %1$s</string>
-    <string name="profile_import_success">プロファイルのインポートに成功しました</string>
-    <string name="profile_import_failed">プロファイルのインポートに失敗しました: %1$s</string>
-    <string name="profile_from_scratch">新規作成</string>
-    <string name="profile_from_import">インポートから</string>
-    <string name="settings_key_use_new_renderer">新しいレンダラーを使用</string>
-    <string name="settings_use_new_renderer_summary">オープンソースのRustレンダラーを使用（実験的、再起動が必要）</string>
-    <string name="settings_debug_renderer_title">デバッグレンダラー</string>
-    <string name="settings_debug_renderer_summary">すべてのレンダラーデータをログファイルに出力（注意: 大量のログが生成されます、デフォルトOFF）</string>
-    <string name="export_rootfs_success">Rootfsのエクスポートに成功しました</string>
-    <string name="export_rootfs_failed">rootfsのエクスポートに失敗しました: %1$s</string>
-    <string name="import_rootfs_success">Rootfsのインポートに成功しました。再起動してください。</string>
-    <string name="import_rootfs_failed">rootfsのインポートに失敗しました: %1$s</string>
     <string name="no_rootfs_title">ROMがインストールされていません</string>
     <string name="no_rootfs_message">続行するにはrootfsをインポートしてください</string>
-    <string name="no_rootfs_guide">ROMがインストールされていません。設定 → 詳細設定 → Rootfsインポートに移動し、rootfs.tarファイルを選択して開始してください。</string>
     <string name="no_rootfs_select_rom">ROMがインストールされていません。rootfs.tarファイルを選択してインポートし、システムを起動してください。</string>
     <string name="select_rom_file">ROMファイルを選択</string>
-    <string name="go_to_settings">設定へ</string>
-    <string name="item_app_icon_desc">アプリアイコン</string>
-
-    <!-- Round 32: generic error / status messages (i18n extraction) -->
-    <string name="error_generic">エラー</string>
-    <string name="error_sharing_log">ログの共有中にエラーが発生しました</string>
-    <string name="error_selecting_file">ファイルの選択中にエラーが発生しました</string>
-    <string name="wechat_not_installed">WeChatはインストールされていません。</string>
-
-    <!-- Round 32: settings validation errors -->
-    <string name="settings_invalid_number">無効な数値です</string>
-    <string name="settings_width_range_error">幅は %1$d から %2$d の間でなければなりません</string>
-    <string name="settings_height_range_error">高さは %1$d から %2$d の間でなければなりません</string>
-    <string name="settings_dpi_range_error">DPIは %1$d から %2$d の間でなければなりません</string>
-
-    <!-- Round 32: ROM import status messages -->
-    <string name="rom_imported_successfully">ROMのインポートに成功しました。再起動してください。</string>
-    <string name="rom_import_failed">ROMのインポートに失敗しました</string>
-    <string name="rom_import_error">ROMのインポート中にエラーが発生しました：%1$s</string>
 </resources>
