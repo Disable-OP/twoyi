@@ -25,9 +25,17 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
-/// RTLD flags for dlopen
+/// RTLD flags for dlopen.
+///
+/// `RTLD_NOW` and `RTLD_GLOBAL` are the flags actually used by this
+/// crate's call sites. `RTLD_LAZY` and `RTLD_LOCAL` are exposed for
+/// completeness so callers passing a custom `flags` argument to
+/// [`load_library`] can compose them — they mirror the `<dlfcn.h>`
+/// constants on Android/Linux.
+#[allow(dead_code)]
 const RTLD_LAZY: c_int = 0x00001;
 const RTLD_NOW: c_int = 0x00002;
+#[allow(dead_code)]
 const RTLD_LOCAL: c_int = 0x00000;
 const RTLD_GLOBAL: c_int = 0x00100;
 
