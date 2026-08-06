@@ -1,6 +1,6 @@
 # MEMORY.md — Twoyi Fork Project State
 
-> **Last updated:** 2026-08-06 (final cleanup pass — production-ready)
+> **Last updated:** 2026-08-06 (continued-improvements session on top of final cleanup pass)
 > **Project:** Disable-OP/twoyi (fork of cyanmint/twoyi, originally twoyi/twoyi)
 > **Branch:** `improvements/initial-cleanup` (active development branch)
 > **Goal:** Boot Android 11 GSI rootfs in a rootless Android-in-Android container,
@@ -279,6 +279,54 @@ app/src/main/
 6. ✅ Extracted and pushed x86_64 rootfs to emulator
 7. ✅ Confirmed rootfs linker is static-pie (our approach is correct)
 8. ❌ Final boot test blocked by codespace billing issue
+
+### What was accomplished in the continued-improvements session (2026-08-06)
+1. ✅ **Refactored `TwoyiSocketServer.handleSocket0`**: the EOS bug was
+   already fixed in commit `fa54fa6`, but the cleanup path used a
+   hand-rolled `try { socket.close(); } catch(...)`. Switched to
+   `IOUtils.closeSilently(socket)` for consistency with `start0()`'s
+   finally block (single idiom across the file, fewer lines, less
+   chance of future copy-paste divergence). Kept the defensive
+   `read <= 0` break.
+2. ✅ **Fixed `RenderServer.cpp` NULL-deref + use-after-free** (in the
+   reference AOSP emugl source under `libOpenglRender/`, currently not
+   compiled but kept for the future full-AOSP-stack path): when
+   `RenderThread::create` returned NULL, the next `if (!rt->start())`
+   would dereference NULL. Also, when `start()` failed, the deleted
+   `rt` was still inserted into the `threads` set → use-after-free in
+   the cleanup loop. Both branches now `continue` to skip the rest of
+   the loop iteration.
+3. ✅ **Fixed `ColorBuffer.cpp` GPU-resource leak** (same reference
+   code path): `m_blitTex` and `m_blitEGLImage` were allocated in
+   `create()` but never released in the destructor (the original AOSP
+   bug). The destructor now also `glDeleteTextures(m_blitTex)` and
+   `eglDestroyImageKHR(m_blitEGLImage)`. The constructor initializer
+   list now zeroes both fields (they were previously uninitialised
+   memory). Added defensive null-checks for `FrameBuffer::getFB()`
+   and `bind_locked()`.
+4. ✅ **Verified kr64 test suite**: **144/144 pass** (`cargo test
+   --release` from a fresh `rustup`-installed stable toolchain — the
+   145th test mentioned in the stats above is feature-gated and not
+   run by default). Verified C++ syntax of the RenderServer.cpp and
+   ColorBuffer.cpp changes with `g++ -std=c++14 -fsyntax-only`
+   against stubbed Android headers (both pass with zero
+   warnings/errors).
+5. ✅ **Confirmed prior security hardening already in place**:
+   `AndroidManifest.xml` already had `allowBackup="false"` (added in
+   commit `685a10e`), all activities already had explicit
+   `android:exported` attributes, and `proguard-rules.pro` already
+   had comprehensive JNI keep rules. No new manifest changes needed.
+
+### Note on `build.gradle` jcenter() removal
+The root `build.gradle` still has `jcenter()` in both `buildscript.repositories`
+and `allprojects.repositories`. JCenter has been read-only since Feb 2022 and
+many artifacts have been removed. Removing it would be a clear improvement,
+BUT several legacy deps (`com.afollestad.material-dialogs:core:0.9.6.0`,
+`com.cleveroad:androidmanimation:0.9.1`, `com.github.clans:fab:1.6.4`) may
+only be resolvable through jcenter's mirrors. Without an Android SDK + NDK
+in this environment to actually run `./gradlew assembleRelease`, removing
+jcenter() is too risky — left as a TODO for the next session with a real
+build environment.
 
 ### Key finding about -no-window mode
 The Android emulator with `-no-window` does NOT create a Surface for

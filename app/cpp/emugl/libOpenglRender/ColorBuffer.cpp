@@ -111,7 +111,9 @@ ColorBuffer *ColorBuffer::create(int p_width, int p_height,
 
 ColorBuffer::ColorBuffer() :
     m_tex(0),
+    m_blitTex(0),
     m_eglImage(NULL),
+    m_blitEGLImage(NULL),
     m_fbo(0),
     m_internalFormat(0),
     m_warYInvertBug(false)
@@ -133,10 +135,24 @@ ColorBuffer::ColorBuffer() :
 ColorBuffer::~ColorBuffer()
 {
     FrameBuffer *fb = FrameBuffer::getFB();
-    fb->bind_locked();
+    if (!fb) {
+        // FrameBuffer already torn down — nothing we can safely free.
+        return;
+    }
+    if (!fb->bind_locked()) {
+        return;
+    }
     s_gl.glDeleteTextures(1, &m_tex);
+    // m_blitTex was leaked by the original AOSP code — it is allocated
+    // in create() and used by blitFromCurrentReadBuffer(), but never
+    // released. Free it here to avoid a GPU memory leak per ColorBuffer.
+    s_gl.glDeleteTextures(1, &m_blitTex);
     if (m_eglImage) {
         s_egl.eglDestroyImageKHR(fb->getDisplay(), m_eglImage);
+    }
+    // m_blitEGLImage was also leaked — paired with m_blitTex above.
+    if (m_blitEGLImage) {
+        s_egl.eglDestroyImageKHR(fb->getDisplay(), m_blitEGLImage);
     }
     if (m_fbo) {
         s_gl.glDeleteFramebuffersOES(1, &m_fbo);

@@ -187,11 +187,10 @@ public class TwoyiSocketServer {
 
         } catch (IOException ignored) {
         } finally {
-            // Fixed: close the socket to prevent FD leak
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-            }
+            // Close the accepted socket to prevent FD leak. Uses
+            // IOUtils.closeSilently for consistency with start0()'s
+            // finally block (single idiom across the file).
+            IOUtils.closeSilently(socket);
         }
     }
 
