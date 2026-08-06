@@ -31,6 +31,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Cancel any superseded run on the same ref. The APK build is expensive
+    # (~15 min: cargo-xdk install + 2 Rust ABIs + Gradle assembleRelease),
+    # so a rapid series of pushes to the same branch would otherwise queue
+    # up many redundant builds. Mirrors the concurrency block in
+    # kr64-tests.yml. PR runs are grouped separately from branch runs so a
+    # push to a branch with an open PR doesn't cancel the PR's own build.
+    concurrency:
+      group: build-apk-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name != 'pull_request' }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
