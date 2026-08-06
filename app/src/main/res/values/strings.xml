@@ -140,4 +140,5 @@
     <string name="no_rootfs_select_rom">No ROM is installed. Please select a rootfs.tar file to import and start the system.</string>
     <string name="select_rom_file">Select ROM File</string>
     <string name="go_to_settings">Go to Settings</string>
+    <string name="item_app_icon_desc">App icon</string>
 </resources>

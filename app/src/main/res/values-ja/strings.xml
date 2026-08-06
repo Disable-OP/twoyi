@@ -137,4 +137,5 @@
     <string name="no_rootfs_select_rom">ROMがインストールされていません。rootfs.tarファイルを選択してインポートし、システムを起動してください。</string>
     <string name="select_rom_file">ROMファイルを選択</string>
     <string name="go_to_settings">設定へ</string>
+    <string name="item_app_icon_desc">アプリアイコン</string>
 </resources>
