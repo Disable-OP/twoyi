@@ -440,30 +440,82 @@ public class SelectAppActivity extends AppCompatActivity {
 
             List<AppItem> appItems = new ArrayList<>();
             int mask = ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP;
-            PackageInfo sys = packageManager.getPackageInfo(
-                    "android", PackageManager.GET_SIGNATURES);
-
-            boolean directlyAdd = true;
 
             boolean noSystemApps = AppKV.getBooleanConfig(getApplicationContext(), AppKV.ADD_APP_NOT_SHOW_SYSTEM, true);
             boolean no32BitApps = AppKV.getBooleanConfig(getApplicationContext(), AppKV.ADD_APP_NOT_SHOW_32BIT, true);
 
+            // Only fetch the "android" package's signatures if we'll actually
+            // use them for the per-app signature comparison below. The
+            // signature check is only consulted when noSystemApps=true AND
+            // the user didn't specify a package set (otherwise the system
+            // flag is informational only and we keep the app regardless).
+            // Skipping this getPackageInfo(GET_SIGNATURES) IPC saves one
+            // binder round-trip per app-list load in the common case.
+            boolean needSignatureCheck = noSystemApps && !specified;
+            PackageInfo sys = null;
+            if (needSignatureCheck) {
+                try {
+                    sys = packageManager.getPackageInfo(
+                            "android", PackageManager.GET_SIGNATURES);
+                } catch (PackageManager.NameNotFoundException e) {
+                    // "android" package should always exist on a real
+                    // Android system; if it's missing we just can't do
+                    // signature-based system-app detection and fall back
+                    // to the FLAG_SYSTEM check only.
+                    sys = null;
+                }
+            }
+
+            int appTotal = apps.size();
+            int processed = 0;
+            int lastReported = 0;
             for (ApplicationInfo app : apps) {
-                // 自己忽略
-                runOnUiThread(() -> progressDialog.incrementProgress(1));
+                processed++;
+
+                // Batch progress updates: post at most every 10 apps (plus
+                // a final flush when the loop ends). The original code
+                // posted one Runnable per app via runOnUiThread(), which on
+                // a phone with 150 apps flooded the UI thread's Handler
+                // with 150 wakeups + message dispatches just to advance a
+                // progress bar — visible as jank on the filter toggle.
+                if (processed == appTotal || processed - lastReported >= 10) {
+                    final int inc = processed - lastReported;
+                    runOnUiThread(() -> progressDialog.incrementProgress(inc));
+                    lastReported = processed;
+                }
 
                 if (TextUtils.equals(getPackageName(), app.packageName)) {
                     continue;
                 }
 
                 // 检查系统应用
-                boolean isSystemApp = (app.flags & mask) != 0 || isSystemApp(packageManager, app.packageName, sys);
+                //
+                // isSystemApp(packageManager, packageName, sys) calls
+                // packageManager.getPackageInfo(packageName, GET_SIGNATURES),
+                // which is a binder IPC to PackageManagerService (~1-5 ms
+                // each). The original code did this for EVERY non-system-
+                // flag app — N apps = N IPCs, which dominated loadAsync()
+                // wall time on devices with many user-installed apps.
+                //
+                // The result is only consumed to skip the app when
+                // noSystemApps=true && !specified. Skip the IPC otherwise:
+                // when noSystemApps=false the app is kept regardless, and
+                // when specified=true the user's package set takes priority
+                // over the system filter.
+                boolean hasSystemFlag = (app.flags & mask) != 0;
+                boolean isSystemApp;
+                if (hasSystemFlag) {
+                    isSystemApp = true;
+                } else if (needSignatureCheck && sys != null) {
+                    isSystemApp = isSystemApp(packageManager, app.packageName, sys);
+                } else {
+                    isSystemApp = false;
+                }
                 if (isSystemApp) {
                     // 如果是系统应用
-                    if (!directlyAdd) {
-                        // 非 magisk 模式直接跳过，因为不可能支持
-                        continue;
-                    }
+                    // Note: the original code also checked `!directlyAdd`
+                    // here, but directlyAdd was hardcoded to `true` and
+                    // never reassigned — dead code removed.
                     if (noSystemApps && !specified) {
                         // magisk 模式如果设置了 "不显示系统" 也忽略
                         // 如果是从别的地方跳转过来的，那么忽略
