@@ -172,11 +172,9 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
             type MainFn = extern "C" fn(c_int, *const *const c_char) -> c_int;
             let main_func: MainFn = std::mem::transmute(main_fn);
             
-            // Pass remaining arguments to the library's main
-            let lib_argc = (args.len() - 1) as c_int;
-            
             // Create CStrings that will live for the duration of the call
             // Fixed: use ok() instead of unwrap() to avoid panic across FFI
+            // (CString::new() fails if `s` contains an interior NUL byte.)
             let lib_args: Vec<CString> = args.iter()
                 .skip(1)
                 .filter_map(|s| CString::new(s.as_str()).ok())
@@ -188,6 +186,16 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
                 .map(|s| s.as_ptr())
                 .collect();
             lib_argv.push(std::ptr::null()); // POSIX argv terminator
+
+            // Fixed: derive argc from the *actual* lib_argv length, NOT from
+            // `args.len() - 1`. The filter_map() above silently drops any
+            // argument whose Rust String contained an interior NUL byte
+            // (CString::new returns Err in that case). With the old code the
+            // called library would be told it had MORE argv entries than
+            // actually exist, causing an out-of-bounds read when it iterated
+            // past the end of lib_argv (POSIX argv[argc] is NULL, but argv
+            // slots past that are uninitialized heap).
+            let lib_argc = lib_args.len() as c_int;
             
             let result = main_func(lib_argc, lib_argv.as_ptr());
             let _ = writeln!(io::stderr(), "[LOADER] Library main() returned: {}", result);
