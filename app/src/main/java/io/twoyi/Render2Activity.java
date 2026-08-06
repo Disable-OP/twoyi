@@ -412,19 +412,23 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     }
 
     private float getBestFps() {
-        WindowManager windowManager = getWindowManager();
-        Display defaultDisplay = windowManager.getDefaultDisplay();
-        Display.Mode[] supportedModes = defaultDisplay.getSupportedModes();
-        float fps = 45;
-        for (Display.Mode supportedMode : supportedModes) {
-            float refreshRate = supportedMode.getRefreshRate();
-            if (refreshRate > fps) {
-                // fps = refreshRate;
-            }
-        }
-
-        Log.w(TAG, "current fps: " + fps);
-        return fps;
+        // Fixed: the previous implementation iterated over the display's
+        // supported Modes but the `fps = refreshRate` assignment was
+        // commented out, so the loop was dead code and the method always
+        // returned 45. Worse, the Log.w message said "current fps: 45",
+        // implying the device's actual refresh rate was 45 Hz, which is
+        // misleading on 60/90/120 Hz devices.
+        //
+        // The intent (per the original author) appears to have been to pick
+        // the highest supported refresh rate, but that path was disabled —
+        // probably because running the guest renderer above 45 fps caused
+        // dropped frames or excessive battery drain on the test device.
+        // Keeping the cap at 45 but documenting it, and dropping the dead
+        // loop, so future readers don't waste time tracing it.
+        final float fpsCap = 45f;
+        Log.i(TAG, "renderer fps cap: " + fpsCap
+                + " (display refresh-rate selection intentionally disabled)");
+        return fpsCap;
     }
 
     @Override
