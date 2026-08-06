@@ -11,6 +11,7 @@ import android.app.ProgressDialog;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.preference.CheckBoxPreference;
@@ -26,6 +27,7 @@ import androidx.annotation.Nullable;
 import androidx.annotation.StringRes;
 import androidx.appcompat.app.ActionBar;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
 import androidx.core.content.FileProvider;
 
 import com.microsoft.appcenter.crashes.Crashes;
@@ -69,7 +71,9 @@ public class SettingsActivity extends AppCompatActivity {
 
         if (actionBar != null) {
             actionBar.setDisplayHomeAsUpEnabled(true);
-            actionBar.setBackgroundDrawable(getResources().getDrawable(R.color.colorPrimary));
+            // Color resource → ColorDrawable (avoids deprecated getResources().getDrawable
+            // which would throw on a color resource on API 22+).
+            actionBar.setBackgroundDrawable(new ColorDrawable(ContextCompat.getColor(this, R.color.colorPrimary)));
             actionBar.setTitle(R.string.title_settings);
         }
     }

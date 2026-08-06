@@ -35,8 +35,9 @@
 //!  offset  size  field         description
 //!  ------  ----  -----------   ------------------------------------------
 //!   0       4    magic         Little-endian u32, must be
-//!                               [`AUDIO_HEADER_MAGIC`] = 0x4F444D41
-//!                               (documented in AUDIO_SENSOR_HAL.md §3.1).
+//!                               [`AUDIO_HEADER_MAGIC`] = 0x4F445541
+//!                               (ASCII `'AUDO'` in little-endian byte
+//!                               order; documented in AUDIO_SENSOR_HAL.md §3.1).
 //!   4       1    direction     1 = PLAYBACK, 2 = CAPTURE
 //!                               (see [`AUDIO_DIR_PLAYBACK`] /
 //!                                [`AUDIO_DIR_CAPTURE`]).
@@ -194,9 +195,11 @@ use crate::{error, info, warning};
 
 /// Magic value at offset 0 of the audio header. Documented in
 /// `download/AUDIO_SENSOR_HAL.md` §3.1. Both sides (guest audio HAL +
-/// host pump) must agree on this value — what matters is the numeric
-/// constant, not the ASCII interpretation.
-pub const AUDIO_HEADER_MAGIC: u32 = 0x4F444D41;
+/// host pump) must agree on this value. The numeric value is the
+/// little-endian encoding of the ASCII mnemonic `'AUDO'`
+/// (`u32::from_le_bytes(*b"AUDO") == 0x4F445541`), so a guest HAL
+/// that builds the constant from the string `'AUDO'` will match.
+pub const AUDIO_HEADER_MAGIC: u32 = 0x4F445541;
 
 /// Total size of the audio header on the wire (and of the
 /// [`AudioHeader`] struct via `#[repr(C)]`).
@@ -1138,7 +1141,7 @@ mod tests {
 
         let e = AudioHeaderError::BadMagic { got: 0xDEADBEEF };
         assert!(e.to_string().contains("0xDEADBEEF"));
-        assert!(e.to_string().contains("0x4F444D41"));
+        assert!(e.to_string().contains("0x4F445541"));
 
         let e = AudioHeaderError::BadDirection { got: 99 };
         assert!(e.to_string().contains("99"));

@@ -41,6 +41,7 @@ import androidx.annotation.Nullable;
 import androidx.appcompat.app.ActionBar;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.SearchView;
+import androidx.core.content.ContextCompat;
 import androidx.core.widget.CompoundButtonCompat;
 
 import com.afollestad.materialdialogs.MaterialDialog;
@@ -629,8 +630,8 @@ public class SelectAppActivity extends AppCompatActivity {
             holder.icon.setColorFilter(colorFilter);
 
             int[][] states = {{android.R.attr.state_checked}, {}};
-            int[] colors = {getResources().getColor(R.color.colorPrimary),
-                    getResources().getColor(android.R.color.tab_indicator_text)};
+            int[] colors = {ContextCompat.getColor(this, R.color.colorPrimary),
+                    ContextCompat.getColor(this, android.R.color.tab_indicator_text)};
             CompoundButtonCompat.setButtonTintList(holder.checkBox, new ColorStateList(states, colors));
 
             GlideModule.loadApplicationIcon(getApplicationContext(), item.applicationInfo, holder.icon);
