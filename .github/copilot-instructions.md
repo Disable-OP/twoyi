@@ -40,4 +40,4 @@ Do NOT add this disclaimer to:
 ### Target SDK
 - This project targets SDK 28 intentionally to allow execution in `/data/user/0/`
 - Do not update targetSdk beyond 28 without explicit approval
-- compileSdk can be updated for build-time API access (currently set to 35)
+- compileSdk can be updated for build-time API access (currently set to 31)

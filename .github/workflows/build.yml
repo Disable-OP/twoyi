@@ -72,7 +72,11 @@ jobs:
             ~/.cargo/git
             app/rs/target
             app/rs/loader/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('app/rs/**/Cargo.lock', 'app/rs/**/Cargo.toml') }}
+          # Only hash the Cargo manifests of crates this workflow actually
+          # builds (twoyi + loader). The kr64 crate is covered by its own
+          # workflow (kr64-tests.yml) and its own cache, so changes to
+          # app/rs/kr64/Cargo.toml must NOT invalidate the APK build cache.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Cache cargo-xdk
