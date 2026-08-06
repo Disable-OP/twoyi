@@ -54,6 +54,12 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
 
     private final AtomicBoolean mRendering = new AtomicBoolean(false);
 
+    // LimitedQueue is backed by java.util.concurrent.ConcurrentLinkedQueue, so
+    // mutations and iterations are lock-free and thread-safe. The render loop
+    // reads from this queue without holding any monitor — the previous
+    // "synchronized (mLogMessages)" block on the read path is gone, which
+    // removes contention between the logcat pump thread (writer) and the
+    // render loop (reader) at 60 fps.
     private final LimitedQueue<String> mLogMessages = new LimitedQueue<>(160);
     private final LinkedList<String> mSnapShot = new LinkedList<>();
 
@@ -157,9 +163,10 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
                     if (TextUtils.isEmpty(s)) {
                         return;
                     }
-                    synchronized (mLogMessages) {
-                        mLogMessages.add(s);
-                    }
+                    // LimitedQueue is backed by ConcurrentLinkedQueue, so the
+                    // bounded add is already lock-free and thread-safe — no
+                    // monitor needed on the writer side either.
+                    mLogMessages.add(s);
                     // Mark the snapshot as dirty so the render loop knows it
                     // needs to rebuild mSnapShot from mLogMessages on the next
                     // frame. Without this flag, render() would copy up to 160
@@ -227,10 +234,12 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
             // even when the logcat stream was idle.
             if (mSnapshotDirty) {
                 mSnapShot.clear();
-                // TODO: lock free
-                synchronized (mLogMessages) {
-                    mSnapShot.addAll(mLogMessages);
-                }
+                // Lock-free snapshot: LimitedQueue is a ConcurrentLinkedQueue
+                // whose iterator is weakly consistent and never throws
+                // ConcurrentModificationException. addAll() walks that
+                // iterator without holding any monitor, so the logcat writer
+                // thread is never blocked by the render loop.
+                mSnapShot.addAll(mLogMessages);
                 mSnapshotDirty = false;
             }
 

@@ -591,11 +591,24 @@ public class SelectAppActivity extends AppCompatActivity {
     private class ListAppAdapter extends BaseAdapter implements View.OnClickListener {
 
         ColorMatrixColorFilter colorFilter;
+        ColorStateList mCheckBoxTint;
 
         ListAppAdapter() {
             ColorMatrix matrix = new ColorMatrix();
             matrix.setSaturation(0);
             colorFilter = new ColorMatrixColorFilter(matrix);
+
+            // Cache the checkbox tint ColorStateList once instead of
+            // allocating a fresh one (plus two ContextCompat.getColor()
+            // lookups) on every getView() call. getView runs for every
+            // visible row on every scroll/notifyDataSetChanged pass, so this
+            // avoids O(visible_rows) allocations per UI refresh.
+            int[][] states = {{android.R.attr.state_checked}, {}};
+            int[] colors = {
+                    ContextCompat.getColor(SelectAppActivity.this, R.color.colorPrimary),
+                    ContextCompat.getColor(SelectAppActivity.this, android.R.color.tab_indicator_text),
+            };
+            mCheckBoxTint = new ColorStateList(states, colors);
         }
 
         @Override
@@ -629,10 +642,7 @@ public class SelectAppActivity extends AppCompatActivity {
 
             holder.icon.setColorFilter(colorFilter);
 
-            int[][] states = {{android.R.attr.state_checked}, {}};
-            int[] colors = {ContextCompat.getColor(SelectAppActivity.this, R.color.colorPrimary),
-                    ContextCompat.getColor(SelectAppActivity.this, android.R.color.tab_indicator_text)};
-            CompoundButtonCompat.setButtonTintList(holder.checkBox, new ColorStateList(states, colors));
+            CompoundButtonCompat.setButtonTintList(holder.checkBox, mCheckBoxTint);
 
             GlideModule.loadApplicationIcon(getApplicationContext(), item.applicationInfo, holder.icon);
             holder.label.setText(item.name);
