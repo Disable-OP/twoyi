@@ -359,10 +359,15 @@ fn write_proc_mounts(proc_dir: &str) -> std::io::Result<()> {
     write_file(proc_dir, "mounts", content)?;
 
     // /proc/self/mounts — same content as /proc/mounts.
+    // Use write_file (not fs::File::create) so the file gets the same
+    // 0o444 mode + idempotency-chmod-to-writable-on-re-run treatment
+    // as every other /proc file. Without this, the second populate_proc
+    // call dies with EACCES here: write_file() above chmods the symlink
+    // TARGET (which is /proc/self/mounts) to 0o444, then this raw
+    // File::create can't open it.
     let self_dir = format!("{}/self", proc_dir);
     fs::create_dir_all(&self_dir)?;
-    let mut f = fs::File::create(format!("{}/mounts", self_dir))?;
-    f.write_all(content.as_bytes())?;
+    write_file(&self_dir, "mounts", content)?;
 
     // /proc/mounts → symlink to /proc/self/mounts (kernel convention).
     let _ = fs::remove_file(format!("{}/mounts", proc_dir));
@@ -479,6 +484,18 @@ fn write_proc_sys(proc_dir: &str) -> std::io::Result<()> {
 /// (read-only — these are kernel-synthesised files).
 fn write_file(dir: &str, name: &str, content: &str) -> std::io::Result<()> {
     let path = format!("{}/{}", dir, name);
+
+    // Idempotency: a previous write_file() leaves the file at mode 0o444
+    // (read-only). Re-opening with O_WRONLY (what fs::File::create does)
+    // returns EACCES on a read-only file even if you own it. Restore the
+    // writable mode first — ignore errors (file may not exist yet on the
+    // first run, in which case set_permissions returns ENOENT).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+    }
+
     let mut f = fs::File::create(&path)?;
     f.write_all(content.as_bytes())?;
     #[cfg(unix)]
