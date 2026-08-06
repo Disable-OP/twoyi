@@ -342,6 +342,13 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                     // (~30 s).  60 s comfortably covers both in sequence.
                     success = TwoyiStatusManager.getInstance().waitBoot(60, TimeUnit.SECONDS);
                 } catch (Throwable ignored) {
+                    // waitBoot() can throw InterruptedException / BrokenBarrierException
+                    // (e.g. the boot-latch was reset() by a re-launched activity, or the
+                    // worker thread was interrupted during shutdown). Swallowing these
+                    // silently made the boot-failure path fire with no diagnostic in
+                    // logcat — track the exception so crash reporters and developers
+                    // have a clue when `success == false` leads to trackBootFailure().
+                    Log.e(TAG, "waitBoot interrupted — treating as boot failure", ignored);
                 }
 
                 if (!success) {
