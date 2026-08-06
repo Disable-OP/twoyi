@@ -152,9 +152,13 @@ Verify:
 - **JNI**: declare `native` methods on `Renderer.java` (or a sibling class)
   with the `extern "C"` counterpart in Rust. Use `Renderer.setDataDir()`,
   `Renderer.init()`, etc. as templates — keep the Java side thin.
-- **Reflection**: we depend on `com.github.tiann:FreeReflection` to bypass
-  hidden-API restrictions on Android 9+. Don't add raw `dalvik.system.*`
-  reflection without checking the FreeReflection exemption list first.
+- **Reflection**: the codebase uses standard `java.lang.reflect` to call
+  a handful of hidden platform APIs (e.g. `android.os.FileUtils.setPermissions`,
+  `ApplicationInfo.primaryCpuAbi`). This works because `targetSdkVersion`
+  is pinned to 28, so Android's hidden-API blocklist is not enforced.
+  If you raise `targetSdkVersion` ≥ 28 you will need to either drop the
+  reflective calls or reintroduce a hidden-API bypass (e.g.
+  [FreeReflection](https://github.com/tiann/FreeReflection)).
 - **No new dependencies** without an issue discussion — the dependency list
   in `app/build.gradle` is intentionally short.
 

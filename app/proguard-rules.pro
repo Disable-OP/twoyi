@@ -20,10 +20,6 @@
 -keep class io.twoyi.Renderer { *; }
 -keep class io.twoyi.Renderer$* { *; }
 
-# === Reflection ===
-# FreeReflection library uses hidden API reflection
--keep class com.jaredzrr.navigationbarhide.** { *; }
-
 # libsu shell utilities
 -keep class com.topjohnwu.superuser.** { *; }
 
