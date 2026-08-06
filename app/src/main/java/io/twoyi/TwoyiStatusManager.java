@@ -75,11 +75,15 @@ public class TwoyiStatusManager {
         }
     }
 
-    public void switchOs(Context context) {
+    public synchronized void switchOs(Context context) {
         if (!mStarted.get()) {
             return;
         }
 
+        // Fixed: use synchronized to make the check-then-act atomic.
+        // Previously, two concurrent calls could both observe the same
+        // mShown value and both launch the same activity, then both
+        // flip the state, leaving it inverted from reality.
         Intent intent;
         if (mShown.get()) {
             intent = new Intent(Intent.ACTION_MAIN);
