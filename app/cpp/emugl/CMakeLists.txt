@@ -54,5 +54,11 @@ target_link_libraries(OpenglRender
 # Set output name to libOpenglRender.so
 set_target_properties(OpenglRender PROPERTIES OUTPUT_NAME "OpenglRender")
 
-# Make all symbols visible so the Rust FFI can dlsym them.
-set_target_properties(OpenglRender PROPERTIES CXX_VISIBILITY_PRESET default)
+# Hide all symbols by default — only the 6 required FFI entry points
+# (marked with TWOYI_EXPORT or extern "C" __attribute__((visibility("default"))))
+# will be exported. This reduces the ABI surface and enables better
+# dead-code elimination via --gc-sections.
+set_target_properties(OpenglRender PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
