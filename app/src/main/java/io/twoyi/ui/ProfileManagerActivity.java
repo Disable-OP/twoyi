@@ -13,6 +13,7 @@
 
 package io.twoyi.ui;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.ProgressDialog;
 import android.content.ContentResolver;
@@ -534,6 +535,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
     /**
      * Import SharedPreferences from XML file
      */
+    @SuppressLint("ApplySharedPref")
     private void importPreferencesFromXml(File xmlFile, SharedPreferences prefs) throws IOException {
         String xmlContent = IOUtils.readContent(xmlFile);
         if (xmlContent == null || xmlContent.isEmpty()) {

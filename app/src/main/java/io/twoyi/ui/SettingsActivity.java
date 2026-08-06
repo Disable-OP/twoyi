@@ -14,6 +14,8 @@ import android.content.Intent;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.preference.CheckBoxPreference;
 import android.preference.Preference;
 import android.preference.PreferenceFragment;
@@ -332,7 +334,9 @@ public class SettingsActivity extends AppCompatActivity {
                     // startActivity must be called on the UI thread.
                     // runOnUiThread handles both Activity and Fragment contexts
                     // gracefully (we already null-checked getActivity above).
-                    context.getMainExecutor().execute(() -> {
+                    // Use Handler instead of Context#getMainExecutor (API 28+)
+                    // since minSdkVersion is 27.
+                    new Handler(Looper.getMainLooper()).post(() -> {
                         UIHelper.dismiss(progressDialog);
                         try {
                             context.startActivity(Intent.createChooser(shareIntent,
