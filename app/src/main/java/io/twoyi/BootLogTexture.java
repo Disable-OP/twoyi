@@ -209,6 +209,13 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
         Canvas canvas = null;
         try {
             canvas = lockCanvas();
+            // Fixed: lockCanvas() returns null when the SurfaceTexture is not
+            // yet available or has been destroyed (e.g. during a configuration
+            // change or backgrounding). Dereferencing the canvas below would
+            // NPE and crash the boot-log render loop.
+            if (canvas == null) {
+                return;
+            }
 
             // clear canvas
             canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);

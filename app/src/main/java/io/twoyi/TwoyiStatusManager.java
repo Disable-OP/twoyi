@@ -50,7 +50,15 @@ public class TwoyiStatusManager {
     public void markStarted() {
         if (mStarted.compareAndSet(false, true)) {
             try {
-                mBootLatch.await();
+                // Fixed: previously this called await() with no timeout. The UI
+                // side (Render2Activity.showBootingProcedure) calls waitBoot()
+                // with a 60 s timeout, so if it times out and reset() is later
+                // invoked (e.g. the activity is re-launched), a late
+                // BOOT_COMPLETED message would block the socket-server worker
+                // thread forever waiting for a UI party that may never arrive.
+                // Bounding the wait keeps the backend responsive on slow/failed
+                // boots. 60 s mirrors the UI's wait window.
+                mBootLatch.await(60, TimeUnit.SECONDS);
             } catch (BrokenBarrierException e) {
                 // Barrier was reset() (e.g. UI re-launched) — expected during
                 // a re-boot, not an error worth tracking.
@@ -62,6 +70,11 @@ public class TwoyiStatusManager {
                 // can suppress shutdown hooks and other interrupt-driven
                 // cancellation in callers up the stack.
                 Thread.currentThread().interrupt();
+                LogEvents.trackError(e);
+            } catch (TimeoutException e) {
+                // UI never showed up to rendezvous (activity destroyed before
+                // reaching waitBoot, or a reset() race). The guest has still
+                // booted, so we just track and move on rather than blocking.
                 LogEvents.trackError(e);
             }
         }
