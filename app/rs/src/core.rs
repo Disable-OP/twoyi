@@ -86,6 +86,7 @@ pub fn get_opengles_paths() -> Vec<String> {
 ///
 /// On subsequent calls (e.g. when the Surface is recreated) the
 /// renderer thread is *not* restarted — only the subwindow is reset.
+#[allow(clippy::too_many_arguments)]
 pub fn init_renderer(
     window: *mut c_void,
     loader_path: String,

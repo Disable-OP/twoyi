@@ -119,8 +119,13 @@ pub unsafe fn close_library(handle: *mut c_void) -> Result<(), String> {
 /// 
 /// This allows the loader to be executed directly (as loader64) to load
 /// and bootstrap libraries.
+///
+/// # Safety
+/// `argv` must point to a valid C-style argv array of at least `argc`
+/// non-null `*const c_char` entries (POSIX requires `argv[argc] == NULL`).
+/// Calling with an invalid `argv`/`argc` pair is undefined behavior.
 #[no_mangle]
-pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
+pub unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
     use std::env;
     use std::io::{self, Write};
     
@@ -152,7 +157,7 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
         env_lib
     } else {
         let _ = writeln!(io::stderr(), "[LOADER] Usage: {} <library.so> [args...]", 
-                        args.get(0).unwrap_or(&"loader".to_string()));
+                        args.first().unwrap_or(&"loader".to_string()));
         let _ = writeln!(io::stderr(), "[LOADER] Or set LD_PRELOAD environment variable");
         return 1;
     };
@@ -213,14 +218,14 @@ pub extern "C" fn main(argc: c_int, argv: *const *const c_char) -> c_int {
                 let _ = writeln!(io::stderr(), "[LOADER] Warning: {}", e);
             }
             
-            return result;
+            result
         } else {
             let _ = writeln!(io::stderr(), "[LOADER] No main() function found in library");
             let _ = writeln!(io::stderr(), "[LOADER] Library loaded and symbols available");
             
             // Keep the library loaded - don't close it
             // This allows the process to use the library's symbols
-            return 0;
+            0
         }
     }
 }
@@ -232,8 +237,13 @@ pub extern "C" fn loader_init() {
 }
 
 /// Load a library by path (C API)
+///
+/// # Safety
+/// `path` must be a valid pointer to a NUL-terminated UTF-8 C string
+/// that remains valid for the duration of this call. Passing a dangling
+/// or non-UTF-8 pointer is undefined behavior.
 #[no_mangle]
-pub extern "C" fn loader_load(path: *const c_char) -> *mut c_void {
+pub unsafe extern "C" fn loader_load(path: *const c_char) -> *mut c_void {
     if path.is_null() {
         return ptr::null_mut();
     }
@@ -252,8 +262,14 @@ pub extern "C" fn loader_load(path: *const c_char) -> *mut c_void {
 }
 
 /// Find a symbol in a library (C API)
+///
+/// # Safety
+/// `handle` must be a pointer previously returned by [`loader_load`] (and
+/// not yet closed via [`loader_close`]). `symbol` must be a valid pointer
+/// to a NUL-terminated UTF-8 C string. Passing invalid pointers is
+/// undefined behavior.
 #[no_mangle]
-pub extern "C" fn loader_symbol(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+pub unsafe extern "C" fn loader_symbol(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
     if handle.is_null() || symbol.is_null() {
         return ptr::null_mut();
     }
@@ -272,8 +288,13 @@ pub extern "C" fn loader_symbol(handle: *mut c_void, symbol: *const c_char) -> *
 }
 
 /// Close a library (C API)
+///
+/// # Safety
+/// `handle` must be a pointer previously returned by [`loader_load`] and
+/// must not have been closed already. Double-closing or passing an
+/// arbitrary pointer is undefined behavior.
 #[no_mangle]
-pub extern "C" fn loader_close(handle: *mut c_void) -> c_int {
+pub unsafe extern "C" fn loader_close(handle: *mut c_void) -> c_int {
     if handle.is_null() {
         return -1;
     }
