@@ -59,7 +59,7 @@ public class TwoyiApplication extends Application {
         }
     }
 
-    static int statusBarHeight = -1;
+    static volatile int statusBarHeight = -1;
 
     public static int getStatusBarHeight(Context context) {
         if (statusBarHeight != -1) {
@@ -72,16 +72,25 @@ public class TwoyiApplication extends Application {
         }
 
         if (statusBarHeight < 0) {
-            int result = 0;
+            // Fixed: original code unconditionally ran `statusBarHeight = result`
+            // in a finally block, where `result` defaulted to 0. If reflection
+            // threw (which it does on every Android release where
+            // com.android.internal.R$dimen no longer has the field, or where
+            // Class.newInstance() is blocked), the finally overwrote
+            // statusBarHeight to 0 — which then defeated the 25dp fallback
+            // below (`if (statusBarHeight < 0)` was false). The net effect was
+            // that on devices where the resource lookup failed, the status bar
+            // height was reported as 0px, breaking layout insets.
             try {
                 Class<?> clazz = Class.forName("com.android.internal.R$dimen");
-                Object obj = clazz.newInstance();
+                // Fixed: Class.newInstance() is deprecated since Java 9 and
+                // throws if the constructor is inaccessible; the modern
+                // equivalent propagates the underlying InvocationTargetException.
+                Object obj = clazz.getDeclaredConstructor().newInstance();
                 Field field = clazz.getField("status_bar_height");
                 int resourceId = Integer.parseInt(field.get(obj).toString());
-                result = context.getResources().getDimensionPixelSize(resourceId);
-            } catch (Exception e) {
-            } finally {
-                statusBarHeight = result;
+                statusBarHeight = context.getResources().getDimensionPixelSize(resourceId);
+            } catch (Throwable ignored) {
             }
         }
 
