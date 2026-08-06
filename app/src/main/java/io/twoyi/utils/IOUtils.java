@@ -95,7 +95,14 @@ public class IOUtils {
                     break;
                 buffer.limit(buffer.position());
                 buffer.position(0);
-                oChannel.write(buffer);
+                // Fixed: FileChannel.write(ByteBuffer) is allowed to return
+                // fewer bytes than buffer.remaining() (the contract mirrors
+                // WritableByteChannel). The original code dropped the unwritten
+                // tail, silently corrupting the target file. Drain the buffer
+                // fully before reading the next chunk.
+                while (buffer.hasRemaining()) {
+                    oChannel.write(buffer);
+                }
             }
         } finally {
             closeSilently(inputStream);
@@ -162,6 +169,13 @@ public class IOUtils {
     }
 
     public static boolean deleteDirectory(File directory) {
+        // Fixed: callers (e.g. RomManager.removePartition via IOUtils.deleteDirectory,
+        // and Render2Activity.importRomAndStart) can pass null when a profile
+        // rootfs dir doesn't exist yet. The original code NPE'd on
+        // `directory.toPath()`.
+        if (directory == null) {
+            return false;
+        }
         // Fixed: Files.walk() returns a Stream that holds open directory
         // descriptors. Must use try-with-resources to close them, otherwise
         // FDs leak and can exhaust the per-process FD limit.
