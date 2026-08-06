@@ -117,6 +117,17 @@
     <string name="profile_rename_confirm">將配置文件重新命名為 %1$s？</string>
     <string name="profile_copy_hint">新配置檔案名稱</string>
     <string name="profile_delete_confirm">刪除配置文件 %1$s？</string>
+    <string name="profile_switch_failed">切換配置文件失敗</string>
+    <string name="profile_renamed_to">配置文件已重新命名為：%1$s</string>
+    <string name="profile_rename_failed">重新命名配置文件失敗</string>
+    <string name="profile_copied_to">配置文件已複製為：%1$s</string>
+    <string name="profile_copy_failed">複製配置文件失敗</string>
+    <string name="profile_copy_error">錯誤：%1$s</string>
+    <string name="profile_deleted">配置文件已刪除：%1$s</string>
+    <string name="profile_delete_failed">刪除配置文件失敗</string>
+    <string name="profile_picker_error">錯誤</string>
+    <string name="profile_created">配置文件已建立：%1$s</string>
+    <string name="profile_create_failed">建立配置文件失敗</string>
     <string name="profile_export_success">配置檔案匯出成功</string>
     <string name="profile_export_failed">匯出配置檔案失敗: %1$s</string>
     <string name="profile_import_success">配置檔案匯入成功</string>

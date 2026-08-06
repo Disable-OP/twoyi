@@ -132,7 +132,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 if (ProfileManager.switchProfile(this, profileName)) {
                     RomManager.reboot(this);
                 } else {
-                    Toast.makeText(this, "Failed to switch profile", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, getString(R.string.profile_switch_failed), Toast.LENGTH_SHORT).show();
                 }
             })
             .setNegativeButton(android.R.string.cancel, null)
@@ -151,13 +151,13 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 String newName = input.getText().toString().trim();
                 if (!newName.isEmpty() && !newName.equals(oldName)) {
                     if (ProfileManager.renameProfile(this, oldName, newName)) {
-                        Toast.makeText(this, "Profile renamed to: " + newName, Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, getString(R.string.profile_renamed_to, newName), Toast.LENGTH_SHORT).show();
                         refreshProfiles();
                         if (oldName.equals(ProfileManager.getActiveProfile(this))) {
                             RomManager.reboot(this);
                         }
                     } else {
-                        Toast.makeText(this, "Failed to rename profile", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, getString(R.string.profile_rename_failed), Toast.LENGTH_SHORT).show();
                     }
                 }
             })
@@ -185,14 +185,14 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     }).done(success -> {
                         UIHelper.dismiss(progressDialog);
                         if (success) {
-                            Toast.makeText(this, "Profile copied to: " + targetName, Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.profile_copied_to, targetName), Toast.LENGTH_SHORT).show();
                             refreshProfiles();
                         } else {
-                            Toast.makeText(this, "Failed to copy profile", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.profile_copy_failed), Toast.LENGTH_SHORT).show();
                         }
                     }).fail(result -> runOnUiThread(() -> {
                         UIHelper.dismiss(progressDialog);
-                        Toast.makeText(this, "Error: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, getString(R.string.profile_copy_error, result.getMessage()), Toast.LENGTH_SHORT).show();
                     }));
                 }
             })
@@ -344,10 +344,10 @@ public class ProfileManagerActivity extends AppCompatActivity {
             .setMessage(getString(R.string.profile_delete_confirm, profileName))
             .setPositiveButton(android.R.string.ok, (d, w) -> {
                 if (ProfileManager.deleteProfile(this, profileName)) {
-                    Toast.makeText(this, "Profile deleted: " + profileName, Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, getString(R.string.profile_deleted, profileName), Toast.LENGTH_SHORT).show();
                     refreshProfiles();
                 } else {
-                    Toast.makeText(this, "Failed to delete profile", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, getString(R.string.profile_delete_failed), Toast.LENGTH_SHORT).show();
                 }
             })
             .setNegativeButton(android.R.string.cancel, null)
@@ -373,7 +373,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
                         try {
                             startActivityForResult(intent, REQUEST_IMPORT_PROFILE);
                         } catch (Throwable ignored) {
-                            Toast.makeText(this, "Error", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.profile_picker_error), Toast.LENGTH_SHORT).show();
                         }
                     } else {
                         createEmptyProfile(profileName);
@@ -386,10 +386,10 @@ public class ProfileManagerActivity extends AppCompatActivity {
 
     private void createEmptyProfile(String profileName) {
         if (ProfileManager.createProfile(this, profileName)) {
-            Toast.makeText(this, "Profile created: " + profileName, Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.profile_created, profileName), Toast.LENGTH_SHORT).show();
             refreshProfiles();
         } else {
-            Toast.makeText(this, "Failed to create profile", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.profile_create_failed), Toast.LENGTH_SHORT).show();
         }
     }
 

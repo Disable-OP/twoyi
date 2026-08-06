@@ -117,6 +117,17 @@
     <string name="profile_rename_confirm">プロファイルを %1$s に名前変更しますか？</string>
     <string name="profile_copy_hint">新しいプロファイル名</string>
     <string name="profile_delete_confirm">プロファイル %1$s を削除しますか？</string>
+    <string name="profile_switch_failed">プロファイルの切り替えに失敗しました</string>
+    <string name="profile_renamed_to">プロファイルを %1$s に名前変更しました</string>
+    <string name="profile_rename_failed">プロファイルの名前変更に失敗しました</string>
+    <string name="profile_copied_to">プロファイルを %1$s にコピーしました</string>
+    <string name="profile_copy_failed">プロファイルのコピーに失敗しました</string>
+    <string name="profile_copy_error">エラー: %1$s</string>
+    <string name="profile_deleted">プロファイル %1$s を削除しました</string>
+    <string name="profile_delete_failed">プロファイルの削除に失敗しました</string>
+    <string name="profile_picker_error">エラー</string>
+    <string name="profile_created">プロファイル %1$s を作成しました</string>
+    <string name="profile_create_failed">プロファイルの作成に失敗しました</string>
     <string name="profile_export_success">プロファイルのエクスポートに成功しました</string>
     <string name="profile_export_failed">プロファイルのエクスポートに失敗しました: %1$s</string>
     <string name="profile_import_success">プロファイルのインポートに成功しました</string>
