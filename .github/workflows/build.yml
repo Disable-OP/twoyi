@@ -53,6 +53,11 @@ jobs:
           cache: 'gradle'
 
       - name: Setup Rust
+        # The toolchain (channel, components, targets) is pinned in
+        # `rust-toolchain.toml` at the repo root; this action reads it
+        # automatically. The explicit `toolchain`/`target` below is a
+        # belt-and-braces fallback for forks that haven't pulled the
+        # toolchain file yet.
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -67,7 +72,6 @@ jobs:
             ~/.cargo/git
             app/rs/target
             app/rs/loader/target
-            app/rs/openglrenderer/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('app/rs/**/Cargo.lock', 'app/rs/**/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
@@ -97,7 +101,6 @@ jobs:
           chmod +x gradlew
           chmod +x app/rs/build_rs.sh
           chmod +x app/rs/loader/build.sh || true
-          chmod +x app/rs/openglrenderer/build.sh || true
 
       - name: Optionally fetch the real rootfs
         if: ${{ github.event.inputs.include_rootfs == 'true' }}

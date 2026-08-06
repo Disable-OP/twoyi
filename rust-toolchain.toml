@@ -1,0 +1,24 @@
+# Reproducible Rust toolchain pin for the twoyi project.
+#
+# This file is read by rustup (and by `actions-rust-lang/setup-rust-toolchain`
+# in CI) on any `cargo` invocation, so the same toolchain, components, and
+# Android cross-compilation targets are used by every developer, the
+# devcontainer, and GitHub Actions — eliminating "works on my machine" drift
+# between local builds and CI.
+#
+# Keep the `channel` on `stable` to ride the latest MSRV-compatible release.
+# Pin to a specific version (e.g. `channel = "1.82.0"`) only if a regression
+# forces us to; CI catches that via the build.yml workflow.
+#
+# The Android targets mirror `abiFilters` in app/build.gradle
+# (`arm64-v8a` + `x86_64`) so a fresh checkout is ready to
+# `./gradlew assembleRelease -Pabis=all` without an extra `rustup target add`.
+#
+# `rustfmt` and `clippy` are pre-installed so `cargo fmt --check` and
+# `cargo clippy --all-targets -- -D warnings` work without a separate
+# `rustup component add` step. See CONTRIBUTING.md §3 for the lint policy.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-linux-android", "x86_64-linux-android"]
+profile = "minimal"

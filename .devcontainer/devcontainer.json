@@ -57,7 +57,7 @@
         "rust-analyzer.linkedProjects": [
           "app/rs/Cargo.toml",
           "app/rs/loader/Cargo.toml",
-          "app/rs/openglrenderer/Cargo.toml"
+          "app/rs/kr64/Cargo.toml"
         ],
         "files.watcherExclude": {
           "**/target/**": true,

@@ -4463,3 +4463,55 @@ None of these block the production-ready sign-off.
 - Verified: all four `strings.xml` files + `pref_settings.xml` parse
   cleanly (Python ElementTree). `cargo clippy --lib` on both `kr64`
   and `loader` crates → 0 warnings (unchanged — no Rust source touched).
+
+## Round 22 — reproducible Rust toolchain + CI/doc cleanup (2026-08-06)
+
+- chore: added `rust-toolchain.toml` at the repo root. Pins the Rust
+  toolchain to `stable` with `rustfmt`, `clippy`, and both Android
+  cross-compilation targets (`aarch64-linux-android`,
+  `x86_64-linux-android`) pre-installed via the `minimal` profile. This
+  eliminates "works on my machine" toolchain drift between local
+  builds, the devcontainer, and GitHub Actions — a fresh `git clone`
+  is ready to `./gradlew assembleRelease -Pabis=all` without any
+  manual `rustup target add` or `rustup component add` steps. Both CI
+  workflows (`build.yml` + `kr64-tests.yml`) read the toolchain from
+  this file automatically via `actions-rust-lang/setup-rust-toolchain`.
+
+- ci: documented the new toolchain pin in `build.yml` and
+  `kr64-tests.yml` with comments explaining that the explicit
+  `toolchain: stable` is now a belt-and-braces fallback for forks
+  that haven't pulled `rust-toolchain.toml` yet. Renamed the
+  `kr64-tests.yml` workflow from "kr64 unit tests" to "kr64 lint +
+  test" to match the actual job contents (fmt + clippy + test).
+
+- fix(ci): removed stale `app/rs/openglrenderer/` references from
+  `.github/workflows/build.yml` (cache path + chmod call) and
+  `.devcontainer/devcontainer.json` (rust-analyzer `linkedProjects`).
+  The `openglrenderer` crate was planned but never materialised —
+  the directory does not exist on disk, so the references were dead
+  code that silently did nothing on each CI run and produced a
+  rust-analyzer warning in the codespace. Replaced the devcontainer
+  `linkedProjects` entry with the real `app/rs/kr64/Cargo.toml`.
+
+- docs: updated `CONTRIBUTING.md` §2 (Local setup), §3 (Code style —
+  Rust), §5 (PR checklist + CI requirements) to reflect:
+    * `rust-toolchain.toml` is the source of truth for the Rust
+      toolchain — no manual `rustup` calls needed.
+    * `cargo fmt --check` and `cargo clippy --all-targets
+      -D warnings` are now actual CI gates on the `kr64` crate
+      (previously CONTRIBUTING.md said "CI does not yet enforce
+      this"), enforced by the `kr64-tests.yml` workflow.
+    * Removed the stale `app/rs/openglrenderer/` mention from the
+      Rust code-style section header.
+
+- docs: updated `README.md` §Building → Prerequisites table to point
+  at `rust-toolchain.toml` for the Rust toolchain, replacing the
+  vague "With `aarch64-linux-android` and `x86_64-linux-android`
+  targets" note that implied contributors had to install the targets
+  themselves.
+
+- Verified: `python3 -c "import yaml; yaml.safe_load(...)"` on both
+  workflow files; `python3 -c "import tomllib; tomllib.load(...)"`
+  on `rust-toolchain.toml`. No Rust source files were touched, so
+  the 145/145 kr64 test pass rate and 0 clippy warning state are
+  unchanged.

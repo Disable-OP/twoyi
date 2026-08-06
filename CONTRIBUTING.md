@@ -84,8 +84,8 @@ Install manually:
 | JDK | 17 | Temurin or OpenJDK. |
 | Android SDK | API 31, build-tools 30.0.3 | `sdkmanager "platform-tools" "platforms;android-31" "build-tools;30.0.3"`. |
 | Android NDK | r27c | Matches CI exactly. |
-| Rust | stable | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh`. |
-| Rust targets | `aarch64-linux-android`, `x86_64-linux-android` | `rustup target add …`. |
+| Rust | stable | Pinned via `rust-toolchain.toml` at the repo root — no manual `rustup target add` needed. |
+| Rust targets | `aarch64-linux-android`, `x86_64-linux-android` | Auto-installed by `rust-toolchain.toml`. |
 | `cargo-xdk` | latest | `cargo install cargo-xdk`. |
 | (optional) Android Studio | recent | For the visual layout editor. |
 
@@ -116,12 +116,22 @@ Verify:
 
 ## 3. Code style
 
-### Rust (`app/rs/`, `app/rs/loader/`, `app/rs/openglrenderer/`, `app/rs/kr64/`)
+### Rust (`app/rs/`, `app/rs/loader/`, `app/rs/kr64/`)
 
-- **Format** with the default `rustfmt` configuration. Run `cargo fmt` before
-  committing. Do not introduce `#![rustfmt::skip]` without justification.
-- **Lint** with `cargo clippy --all-targets -- -D warnings`. CI does not yet
-  enforce this, but reviewers will ask you to fix anything `clippy` flags.
+- **Toolchain**: pinned via [`rust-toolchain.toml`](rust-toolchain.toml)
+  at the repo root — `stable` channel, with `rustfmt`, `clippy`, and both
+  Android targets (`aarch64-linux-android`, `x86_64-linux-android`)
+  pre-installed. A fresh `git clone` is ready to
+  `./gradlew assembleRelease -Pabis=all` without any manual `rustup` calls.
+- **Format** with the default `rustfmt` configuration. Run `cargo fmt`
+  before committing. Do not introduce `#![rustfmt::skip]` without
+  justification. CI runs `cargo fmt --check` on the `kr64` crate (see
+  `.github/workflows/kr64-tests.yml`) and will fail the build on any
+  reformatting diff.
+- **Lint** with `cargo clippy --all-targets -- -D warnings`. CI enforces
+  this on the `kr64` crate (see `.github/workflows/kr64-tests.yml`); the
+  other crates (which depend on the Android NDK) are not yet covered by
+  CI but reviewers will still ask you to fix anything `clippy` flags.
 - **Edition**: 2021. Don't bump it unilaterally across crates.
 - **Dependencies**: prefer `std` + `libc` only where possible. The `kr64`
   crate is intentionally `libc`-only (no `log`, no `once_cell`, no `nix`) so
@@ -233,8 +243,8 @@ working" unless you actually ran it.
 ### Before you open the PR
 
 - [ ] Branch is based on `improvements/initial-cleanup` (not `main`).
-- [ ] `cargo fmt` and `cargo clippy --all-targets -- -D warnings` are clean
-      for any Rust crate you touched.
+- [ ] `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
+      are clean for any Rust crate you touched (CI enforces this on `kr64`).
 - [ ] `cargo test` passes in every crate you touched.
 - [ ] `./gradlew assembleRelease -Pabis=all` succeeds.
 - [ ] Commit messages follow Conventional Commits.
@@ -287,10 +297,17 @@ Reviewers will look for:
 
 ### CI requirements
 
-The `.github/workflows/build.yml` workflow runs on every push to
-`improvements/**` and every PR against `main` / `develop`. It builds the APK
-with `assembleRelease -Pabis=all`. **Your PR must produce a green build on
-CI** before it can be merged.
+The repo ships two GitHub Actions workflows (see `.github/workflows/`):
+
+- **`build.yml`** — builds the APK with `assembleRelease -Pabis=all` on every
+  push to `improvements/**` and every PR against `main` / `develop`.
+- **`kr64-tests.yml`** — runs `cargo fmt --check`, `cargo clippy --all-targets
+  -- -D warnings`, and `cargo test` on the `kr64` crate, on the same triggers.
+
+Both workflows read the pinned Rust toolchain from `rust-toolchain.toml` at
+the repo root, so the local toolchain and the CI toolchain are guaranteed to
+be identical. **Your PR must produce a green build on both workflows** before
+it can be merged.
 
 If CI fails for a reason unrelated to your change (e.g. an upstream SDK
 outage), call it out in the PR description.
