@@ -120,6 +120,9 @@
     <string name="profile_delete">Delete Profile</string>
     <string name="profile_name_hint">Profile name</string>
     <string name="profile_active">Active</string>
+    <string name="profile_active_format" translatable="false">%1$s (%2$s)</string>
+    <string name="profile_child_indent" translatable="false">  %1$s</string>
+    <string name="profile_copy_default_name" translatable="false">%1$s_copy</string>
     <string name="profile_switch_confirm">Switch to profile %1$s? (Requires reboot)</string>
     <string name="profile_rename_confirm">Rename profile to %1$s?</string>
     <string name="profile_copy_hint">New profile name</string>

@@ -168,7 +168,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
     private void showCopyDialog(String sourceName) {
         android.widget.EditText input = new android.widget.EditText(this);
         input.setHint(R.string.profile_copy_hint);
-        input.setText(sourceName + "_copy");
+        input.setText(getString(R.string.profile_copy_default_name, sourceName));
 
         UIHelper.getDialogBuilder(this)
             .setTitle(R.string.profile_copy)
@@ -735,7 +735,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
             String profile = mProfiles.get(groupPosition);
             
             if (profile.equals(mActiveProfile) && !profile.equals(mNewProfilePlaceholder)) {
-                textView.setText(profile + " (" + getString(R.string.profile_active) + ")");
+                textView.setText(getString(R.string.profile_active_format, profile, getString(R.string.profile_active)));
             } else {
                 textView.setText(profile);
             }
@@ -750,7 +750,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
             }
             
             TextView textView = convertView.findViewById(android.R.id.text1);
-            textView.setText("  " + getChild(groupPosition, childPosition));
+            textView.setText(getString(R.string.profile_child_indent, getChild(groupPosition, childPosition)));
             
             return convertView;
         }
