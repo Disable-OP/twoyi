@@ -1783,8 +1783,13 @@ mod tests {
         assert_eq!(BC_ACQUIRE_DONE, 0x40106206, "BC_ACQUIRE_DONE");
         assert_eq!(BC_INCREFS_DONE, 0x40106208, "BC_INCREFS_DONE");
         assert_eq!(BC_FREE_BUFFER, 0x4008620a, "BC_FREE_BUFFER");
-        assert_eq!(BC_TRANSACTION_SG, 0x4040620b, "BC_TRANSACTION_SG");
-        assert_eq!(BC_REPLY_SG, 0x4040620c, "BC_REPLY_SG");
+        // BC_TRANSACTION_SG / BC_REPLY_SG use struct binder_transaction_data_sg
+        // (64-byte binder_transaction_data + 8-byte buffers_size = 72 bytes),
+        // so the _IOW size field is 0x48, not 0x40. The struct size MUST
+        // match the kernel's or the guest's libbinder.so (which uses the
+        // kernel literal) silently drops every scatter-gather transaction.
+        assert_eq!(BC_TRANSACTION_SG, 0x4048620b, "BC_TRANSACTION_SG");
+        assert_eq!(BC_REPLY_SG, 0x4048620c, "BC_REPLY_SG");
         assert_eq!(BC_ENTER_LOOPER, 0x0000620d, "BC_ENTER_LOOPER");
         assert_eq!(BC_REGISTER_LOOPER, 0x0000620e, "BC_REGISTER_LOOPER");
         assert_eq!(BC_EXIT_LOOPER, 0x0000620f, "BC_EXIT_LOOPER");
