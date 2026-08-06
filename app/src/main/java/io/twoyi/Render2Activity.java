@@ -86,6 +86,14 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private int mSurfaceOffsetX;
     private int mSurfaceOffsetY;
 
+    /**
+     * Cached Matrix that maps SurfaceView-local touch coordinates to virtual
+     * display coordinates. Pre-computed once in {@link #setupSurfaceViewLayout()}
+     * so the per-event touch path doesn't allocate a new Matrix on every
+     * MotionEvent (which can fire 100+ times/sec during a drag).
+     */
+    private final android.graphics.Matrix mTouchMatrix = new android.graphics.Matrix();
+
     private final AtomicBoolean mIsExtracting = new AtomicBoolean(false);
 
     private final SurfaceHolder.Callback mSurfaceCallback = new SurfaceHolder.Callback() {
@@ -245,6 +253,18 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         // Set black background on root to provide letterboxing/pillarboxing
         mRootView.setBackgroundColor(0xFF000000);
 
+        // Pre-compute the touch coordinate transform matrix (SurfaceView-local
+        // → virtual display). The matrix never changes between surface layout
+        // changes, so caching it avoids allocating a Matrix on every touch event.
+        // (mSurfaceWidth/Height are guaranteed > 0 here because setupSurfaceViewLayout
+        // always assigns positive values from the screen metrics.)
+        if (mSurfaceWidth > 0 && mSurfaceHeight > 0) {
+            float scaleX = (float) mVirtualDisplayWidth / (float) mSurfaceWidth;
+            float scaleY = (float) mVirtualDisplayHeight / (float) mSurfaceHeight;
+            mTouchMatrix.reset();
+            mTouchMatrix.postScale(scaleX, scaleY);
+        }
+
         Log.i(TAG, "Virtual display: " + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight +
                 ", Screen: " + screenWidth + "x" + screenHeight +
                 ", Surface: " + mSurfaceWidth + "x" + mSurfaceHeight +
@@ -375,23 +395,15 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     @Override
     public boolean onTouch(View v, MotionEvent event) {
-        // Transform touch coordinates from surface space to virtual display space
+        // Transform touch coordinates from surface space to virtual display space.
         // Note: event coordinates are already relative to the SurfaceView (not screen)
-        // since the touch listener is attached to mSurfaceView
+        // since the touch listener is attached to mSurfaceView.
+        //
+        // Performance: MotionEvent.obtain() is a pooled allocation (cheap), but we
+        // avoid allocating a new Matrix per event by reusing the pre-computed
+        // mTouchMatrix that's refreshed in setupSurfaceViewLayout().
         MotionEvent transformedEvent = MotionEvent.obtain(event);
-        
-        // Calculate the transformation matrix
-        android.graphics.Matrix matrix = new android.graphics.Matrix();
-        
-        // Scale from surface dimensions to virtual display dimensions
-        // No translation needed since coordinates are already relative to SurfaceView
-        float scaleX = (float) mVirtualDisplayWidth / mSurfaceWidth;
-        float scaleY = (float) mVirtualDisplayHeight / mSurfaceHeight;
-        matrix.postScale(scaleX, scaleY);
-        
-        // Transform the event
-        transformedEvent.transform(matrix);
-        
+        transformedEvent.transform(mTouchMatrix);
         Renderer.handleTouch(transformedEvent);
         transformedEvent.recycle();
         return true;

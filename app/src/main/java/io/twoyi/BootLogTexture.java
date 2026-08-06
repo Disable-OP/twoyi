@@ -57,6 +57,14 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
     private final LimitedQueue<String> mLogMessages = new LimitedQueue<>(160);
     private final LinkedList<String> mSnapShot = new LinkedList<>();
 
+    /**
+     * Set by the logcat callback when a new line arrives, cleared by the
+     * render loop after the snapshot is refreshed. Avoids copying the full
+     * 160-message buffer every frame (60 fps × 160 strings = ~10k copies/sec)
+     * when nothing has changed.
+     */
+    private volatile boolean mSnapshotDirty = false;
+
     private final SparseArray<Paint> mPaints = new SparseArray<>();
     private final Paint mDefaultPaint = new Paint();
 
@@ -152,6 +160,12 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
                     synchronized (mLogMessages) {
                         mLogMessages.add(s);
                     }
+                    // Mark the snapshot as dirty so the render loop knows it
+                    // needs to rebuild mSnapShot from mLogMessages on the next
+                    // frame. Without this flag, render() would copy up to 160
+                    // strings into mSnapShot every 16 ms even when no new
+                    // logcat output had arrived.
+                    mSnapshotDirty = true;
                 }
             };
 
@@ -199,11 +213,18 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
             // clear canvas
             canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
 
-            mSnapShot.clear();
-
-            // TODO: lock free
-            synchronized (mLogMessages) {
-                mSnapShot.addAll(mLogMessages);
+            // Only rebuild the snapshot when new logcat lines have arrived
+            // since the last frame. The previous implementation did
+            // mSnapShot.clear() + addAll(mLogMessages) every frame (60 fps),
+            // which copied up to 160 String references 60 times per second
+            // even when the logcat stream was idle.
+            if (mSnapshotDirty) {
+                mSnapShot.clear();
+                // TODO: lock free
+                synchronized (mLogMessages) {
+                    mSnapShot.addAll(mLogMessages);
+                }
+                mSnapshotDirty = false;
             }
 
             int count = 0;

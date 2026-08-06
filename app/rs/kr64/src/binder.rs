@@ -1295,9 +1295,6 @@ fn handle_write_read(
             BC_TRANSACTION | BC_TRANSACTION_SG => {
                 let result = handle_transaction(cmd_payload, vm_id, host_fd, handles);
                 match result {
-                    TransactionResult::Noop => {
-                        // No reply yet — the guest will keep looping.
-                    }
                     TransactionResult::Failed => {
                         push_br_failed_reply(&mut read_buf);
                     }
@@ -1377,9 +1374,13 @@ fn handle_write_read(
 // ============================================================================
 
 /// Result of handling a `BC_TRANSACTION`.
+///
+/// Note: a previous `Noop` variant (meaning "no reply pushed") was removed —
+/// returning `Noop` caused the guest to busy-spin on `BR_NOOP` forever
+/// (see the comment on `servicemanager_proxy`'s `SVC_MGR_ADD_SERVICE` arm).
+/// Every handler MUST push either a `BR_REPLY` or `BR_FAILED_REPLY` so the
+/// guest's `BINDER_WRITE_READ` loop terminates.
 enum TransactionResult {
-    /// No reply pushed (transaction accepted, async, or one-way).
-    Noop,
     /// Push a `BR_FAILED_REPLY` into the read buffer.
     Failed,
     /// Push a `BR_REPLY` with the given reply data bytes.
@@ -1472,9 +1473,9 @@ fn handle_transaction(
 ///
 /// * `SVC_MGR_GET_SERVICE` / `SVC_MGR_CHECK_SERVICE` → `Failed` (the
 ///   guest will see `BR_FAILED_REPLY` and retry, eventually giving up).
-/// * `SVC_MGR_ADD_SERVICE` → `Noop` (we accept the registration but
+/// * `SVC_MGR_ADD_SERVICE` → `Reply(0)` (we accept the registration but
 ///   don't record anything; in a real impl we'd store the name + handle
-///   in the [`HandleTable`]).
+///   in the [`HandleTable`]). Returning `Noop` would livelock the guest.
 /// * `SVC_MGR_LIST_SERVICES` → `Failed` (no services to enumerate).
 /// * anything else → `Failed`.
 fn servicemanager_proxy(
