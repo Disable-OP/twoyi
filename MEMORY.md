@@ -1,6 +1,6 @@
 # MEMORY.md — Twoyi Fork Project State
 
-> **Last updated:** 2026-08-06 (round 19 — final comprehensive check + clippy safety pass)
+> **Last updated:** 2026-08-06 (round 20 — printStackTrace → Log.e sweep + APK rebuild)
 > **Project:** Disable-OP/twoyi (fork of cyanmint/twoyi, originally twoyi/twoyi)
 > **Branch:** `improvements/initial-cleanup` (active development branch)
 > **Goal:** Boot Android 11 GSI rootfs in a rootless Android-in-Android container,
@@ -10,19 +10,44 @@
 
 | Metric                          | Value                                                  |
 | ------------------------------- | ------------------------------------------------------ |
-| Total commits pushed            | **62** on `improvements/initial-cleanup` (355 total)   |
-| Total bugs / improvements fixed | **~130** (critical + high + medium + low)              |
+| Total commits pushed            | **63** on `improvements/initial-cleanup` (356 total)   |
+| Total bugs / improvements fixed | **~155** (critical + high + medium + low)              |
 | Total sub-agents spawned        | **45+** (each filing a triaged bug list)               |
-| Files improved                  | **35+** (Rust + Java + C++ + XML + ProGuard + scripts) |
+| Files improved                  | **40+** (Rust + Java + C++ + XML + ProGuard + scripts) |
 | Emulator                        | Android 9 (API 28) boots with TCG (no KVM)             |
-| Latest APK                      | `twoyi_3.5.5-08061234-release.apk` (9.2 MB, v2 signed) |
+| Latest APK                      | `twoyi_3.5.5-08061416-release.apk` (9.2 MB, v2 signed) |
 | kr64 test suite                 | **145/145 passing** (0 failed, 0 ignored)              |
 | `cargo build --lib` warnings    | **0** (clean build)                                    |
 | `cargo clippy --lib`            | **0 errors**, 27 cosmetic warnings (doc indentation)  |
 | Build targets                   | arm64-v8a + x86_64 (both compile)                      |
 | Codebase state                  | **Production-ready**                                   |
 
-### Round 19 — final comprehensive check (this commit)
+### Round 20 — printStackTrace → Log.e sweep + APK rebuild (this commit)
+
+1. **APK rebuild with network security config** — produced
+   `download/twoyi_3.5.5-08061416-release.apk` (9.2 MB, v2-signed) from
+   the post-round-19 source tree. Verified the compiled APK contains
+   `android:networkSecurityConfig=@0x7f130001` via
+   `aapt dump xmltree <apk> AndroidManifest.xml`.
+
+2. **`e.printStackTrace()` → `Log.e(TAG, msg, e)` sweep** — 23 calls
+   across 4 host-app Java files (`ACache.java`, `UIHelper.java`,
+   `IOUtils.java`, `AboutActivity.java`). Each file now declares a
+   `private static final String TAG` and imports `android.util.Log`.
+   On Android release builds, `printStackTrace()` writes to `System.err`
+   which is redirected to `/dev/null`, so failures were silently
+   invisible. `Log.e()` routes them to logcat with attribution, so they
+   appear in bugreports and are captured by the AppCenter crash
+   reporter. (TwoyiMessenger.java was already fixed in round 19.)
+
+3. **`SECURITY.md` §7 — Network security configuration** — documented
+   the new `network_security_config.xml` policy (cleartext forbidden by
+   default; loopback exceptions for ADB on `localhost`/`127.0.0.1` and
+   the emulator alias `10.0.2.2`), including the rationale (targetSdk=28
+   would otherwise permit cleartext by default) and the DNS-rebinding
+   mitigation (Android matches the resolved IP, not the hostname).
+
+### Round 19 — final comprehensive check (previous commit)
 1. **`kr64_main` safety** — the cdylib entry point
    (`pub extern "C" fn kr64_main(argc, argv)`) dereferences the caller-supplied
    `argv` raw pointer but was not marked `unsafe`, triggering clippy's

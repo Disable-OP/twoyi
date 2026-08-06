@@ -12,6 +12,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.Gravity;
 import android.view.MenuItem;
 import android.view.View;
@@ -42,6 +43,7 @@ import mehdi.sakout.aboutpage.Element;
  * @date 2018/9/14.
  */
 public class AboutActivity extends AppCompatActivity {
+    private static final String TAG = "AboutActivity";
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -253,7 +255,7 @@ public class AboutActivity extends AppCompatActivity {
             try {
                 licensesDialog.show();
             } catch (Throwable ignored) {
-                ignored.printStackTrace();
+                Log.e(TAG, "Failed to show licenses dialog", ignored);
             }
 
         });
