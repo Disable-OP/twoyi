@@ -233,6 +233,20 @@ keytool -genkeypair -v -keystore app/twoyi-release.keystore \
   -alias twoyi-release -keyalg RSA -keysize 2048 -validity 10000
 ```
 
+### Build-time configuration via `gradle.properties`
+
+The AppCenter analytics key is injected at build time through a
+`BuildConfig.APPCENTER_API_KEY` field (no secrets live in the Java source).
+Forks can override it without patching code:
+
+```bash
+# ~/.gradle/gradle.properties  (or CI secret)
+APPCENTER_API_KEY=your-own-appcenter-app-secret
+```
+
+If unset, the build falls back to the upstream twoyi key, which is fine for
+local development but should be replaced before publishing a fork.
+
 ---
 
 ## Testing

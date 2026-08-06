@@ -137,4 +137,5 @@
     <string name="no_rootfs_select_rom">未安裝 ROM。請選擇一個 rootfs.tar 文件匯入並啟動系統。</string>
     <string name="select_rom_file">選擇 ROM 文件</string>
     <string name="go_to_settings">前往設定</string>
+    <string name="item_app_icon_desc">應用圖標</string>
 </resources>

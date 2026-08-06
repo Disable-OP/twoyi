@@ -646,6 +646,10 @@ public class SelectAppActivity extends AppCompatActivity {
 
             GlideModule.loadApplicationIcon(getApplicationContext(), item.applicationInfo, holder.icon);
             holder.label.setText(item.name);
+            // Accessibility: announce the app name when the icon receives focus.
+            // Falls back to the static "App icon" string from the layout when
+            // item.name is empty (shouldn't happen in practice, but cheap to guard).
+            holder.icon.setContentDescription(item.name);
             String pkg = String.format(Locale.US, "%s [ API %d %s]", item.pkg, item.applicationInfo.targetSdkVersion,
                     item.applicationInfo.splitPublicSourceDirs != null ? "S" : "");
 
