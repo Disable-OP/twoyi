@@ -2,13 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use jni::objects::JValue;
-use jni::sys::{jclass, jfloat, jint, jobject, JNI_ERR, jstring};
+use jni::objects::{JFieldID, JValue};
+use jni::signature::{JavaType, Primitive};
+use jni::sys::{jclass, jfieldID, jfloat, jint, jobject, JNI_ERR, jstring};
 use jni::JNIEnv;
 use jni::{JavaVM, NativeMethod};
 use log::{debug, error, info, Level};
 use ndk_sys;
 use std::ffi::c_void;
+use std::sync::OnceLock;
 
 use android_logger::Config;
 
@@ -162,10 +164,76 @@ pub extern "C" fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: job
     }
 }
 
+/// Cached JNI field ID for `android.view.MotionEvent.mNativePtr`.
+///
+/// `handle_touch` is invoked on every touch event (60–120 Hz). Looking up the
+/// field by name (`env.get_field(event, "mNativePtr", "J")`) on every call
+/// performs a string-based `GetFieldID` resolution (plus a `GetObjectClass`)
+/// each time, which is wasteful. JNI field IDs are JVM-global handles that
+/// remain valid for the lifetime of the JVM (the defining class cannot be
+/// unloaded while any instance is reachable), so the ID can safely be looked
+/// up once and reused for the rest of the process.
+///
+/// `jfieldID` is a raw pointer and therefore not `Send`/`Sync` by default,
+/// which would prevent storing it in a `static`. The newtype below asserts the
+/// safety of sharing it across threads: the field ID is immutable after the
+/// one-time lookup and never dereferenced on the Rust side.
+#[derive(Clone, Copy)]
+struct MotionEventNativePtrField(jfieldID);
+unsafe impl Send for MotionEventNativePtrField {}
+unsafe impl Sync for MotionEventNativePtrField {}
+
+static MOTION_EVENT_NATIVE_PTR_FIELD: OnceLock<MotionEventNativePtrField> = OnceLock::new();
+
 #[no_mangle]
 pub extern "C" fn handle_touch(env: JNIEnv, _clz: jclass, event: jobject) {
-    // TODO: cache the field id.
-    let ptr = match env.get_field(event, "mNativePtr", "J") {
+    // Resolve the field ID once and cache it; subsequent calls skip the
+    // string-based `GetFieldID` lookup entirely.
+    let field_id = match MOTION_EVENT_NATIVE_PTR_FIELD.get() {
+        Some(&id) => id,
+        None => {
+            let class = match env.get_object_class(event) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to get MotionEvent class: {}", e);
+                    return;
+                }
+            };
+            let id = match env.get_field_id(class, "mNativePtr", "J") {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Failed to get mNativePtr field ID: {}", e);
+                    // A failed GetFieldID raises a pending Java exception
+                    // (NoSuchFieldError). Clear it so later calls can retry.
+                    if env.exception_check().unwrap_or(false) {
+                        let _ = env.exception_describe();
+                        let _ = env.exception_clear();
+                    }
+                    return;
+                }
+            };
+            let raw = MotionEventNativePtrField(id.into_inner());
+            // Note: the `class` local reference above is freed automatically
+            // when this native method returns to Java (JNI local refs are
+            // per-call), so no manual cleanup is needed.
+            let _ = MOTION_EVENT_NATIVE_PTR_FIELD.set(raw);
+            // .get() again to hand back the stored copy (the `set` call above
+            // may have lost the race with another thread and stored a
+            // different — but equivalent — ID).
+            match MOTION_EVENT_NATIVE_PTR_FIELD.get() {
+                Some(&id) => id,
+                None => return,
+            }
+        }
+    };
+
+    // Use the cached field ID. `JFieldID::from(jfieldID)` is free (it just
+    // reattaches a lifetime); no JVM work happens here.
+    let ptr = match env.get_field_unchecked(
+        event,
+        JFieldID::from(field_id.0),
+        JavaType::Primitive(Primitive::Long),
+    ) {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to get mNativePtr field: {}", e);
