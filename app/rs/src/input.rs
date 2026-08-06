@@ -72,22 +72,52 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 /// accepts both `&mut [u8; N]` and `&mut [i8; N]` without `unsafe`.
 /// The `unsafe` block is bounded and the operation is sound: we never
 /// read past `len` bytes, and `len` is clamped to `COUNT`.
+///
+/// Robustness notes:
+///   - If `data` contains an interior NUL byte, the string is truncated
+///     at that byte rather than panicking. The data dir path is supplied
+///     by the Java side via JNI (`set_data_dir`); an interior NUL would
+///     be malformed but shouldn't kill the input thread (and thus the
+///     entire guest's touch/key input).
+///   - If the string (after truncation) is longer than `COUNT - 1` bytes,
+///     we copy at most `COUNT - 1` bytes and write a NUL at position
+///     `COUNT - 1`. The previous implementation set `len = COUNT` in the
+///     overflow case, which copied COUNT bytes of string data WITHOUT a
+///     NUL terminator — the C consumer (`EventHub::parseDeviceName` etc.)
+///     would then read past the array into adjacent struct fields looking
+///     for a terminator. In practice the paths are well under 80 bytes,
+///     but the fix protects against future longer paths.
 fn copy_to_cstr<T, const COUNT: usize>(data: &str, arr: &mut [T; COUNT]) {
-    let cstr = std::ffi::CString::new(data).expect("create cstring failed");
-    let bytes = cstr.as_bytes_with_nul();
-    let mut len = bytes.len();
-    if len >= COUNT {
-        len = COUNT;
-    }
+    // The device_info fields are zero-initialized by the caller
+    // (mem::zeroed() / MaybeUninit::zeroed()), so the trailing bytes
+    // are already 0 — we only need to overwrite the prefix we copy.
+    let bytes = data.as_bytes();
+    // Truncate at the first interior NUL byte, if any, so the rest of
+    // the string (after the NUL) isn't copied. Without this, a malformed
+    // path like "/data/\0/etc" would leak "/etc" into the array past
+    // the implicit NUL terminator.
+    let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    // Reserve one byte for the NUL terminator.
+    let max_len = if COUNT == 0 { 0 } else { COUNT - 1 };
+    let len = nul_pos.min(max_len);
+
     // Cast the [T; COUNT] array to a [u8; COUNT] pointer for the copy.
     // This is sound because:
     //   - On aarch64-linux-android, c_char == i8, and [i8; N] has the same
     //     memory layout as [u8; N] (both are 1-byte elements, N elements).
     //   - On targets where c_char == u8, this is a no-op cast.
-    //   - We only write `len` <= COUNT bytes, so we never overflow.
+    //   - We only write `len` < COUNT bytes, so we never overflow.
     unsafe {
         let ptr = arr.as_mut_ptr() as *mut u8;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
+        if len > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
+        }
+        // Explicit NUL terminator at position `len`. The caller already
+        // zeroed the array, but writing it here makes the invariant
+        // explicit and protects against future callers that forget.
+        if len < COUNT {
+            *ptr.add(len) = 0;
+        }
     }
 }
 
