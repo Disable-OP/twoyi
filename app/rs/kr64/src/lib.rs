@@ -118,6 +118,88 @@ pub(crate) use warning;
 pub(crate) use error;
 
 // ============================================================================
+// Async-signal-safe stderr logging.
+//
+// Between `fork()` and `execve()`, only a restricted set of libc functions
+// are safe to call (see signal-safety(7)). The `info!` / `warning!` /
+// `error!` macros above expand to `eprintln!`, which is NOT async-signal-
+// safe: it goes through `std::io::stderr()`, which lazily initialises a
+// global `LineWriter`, which allocates, which grabs the allocator lock.
+// If another thread held that lock at `fork()` time, the child deadlocks
+// the moment it tries to log. `format!` has the same problem.
+//
+// The helpers below use only the `write(2)` syscall (which IS async-
+// signal-safe) plus a stack-allocated buffer. They are the correct
+// primitive for diagnostics in the child branch of the kr64 fork —
+// without them, `mount_mgr::setup_mounts` / `seccomp::install` /
+// `execve` failures are silently swallowed and the parent observes only
+// a bare exit code with no clue why.
+// ============================================================================
+
+/// Write a byte slice to stderr using the async-signal-safe `write(2)`
+/// syscall. Used in the child branch between `fork()` and `execve()`.
+///
+/// Returns the number of bytes written (or -1 on error); callers in the
+/// child branch ignore the result because there is no useful recovery
+/// path. `write(2)` may write fewer bytes than requested (e.g. on a
+/// pipe with a small buffer) — for short log lines on stderr this is
+/// acceptable and we do not retry partial writes.
+unsafe fn safe_write_err(msg: &[u8]) -> isize {
+    libc::write(
+        libc::STDERR_FILENO,
+        msg.as_ptr() as *const libc::c_void,
+        msg.len(),
+    )
+}
+
+/// Format a signed integer as decimal into a fixed-size stack buffer
+/// and return the number of bytes written. This is the async-signal-
+/// safe equivalent of `format!("{}", n)` — no allocation, no locks.
+///
+/// The buffer must be large enough for the longest possible `i32`:
+/// 11 digits (`-2147483648`). We accept a 12-byte buffer to leave
+/// room for a trailing NUL if the caller wants one.
+///
+/// Handles negative values (writes a leading `-`).
+unsafe fn format_decimal(buf: &mut [u8; 12], n: i32) -> usize {
+    let mut len = 0usize;
+    let mut v = n;
+    let negative = v < 0;
+    if negative {
+        // i32::MIN negated overflows; use wrapping_neg to stay well-defined.
+        v = v.wrapping_neg();
+    }
+    if v == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    while v > 0 {
+        buf[len] = b'0' + (v % 10) as u8;
+        len += 1;
+        v /= 10;
+    }
+    if negative {
+        buf[len] = b'-';
+        len += 1;
+    }
+    // Reverse the digits (and the optional `-`) into display order.
+    buf[..len].reverse();
+    len
+}
+
+/// Write `<prefix> errno=<n>\n` to stderr using only async-signal-safe
+/// primitives. Used in the child branch to surface the OS errno from a
+/// failed syscall without invoking any allocator.
+unsafe fn safe_write_err_errno(prefix: &[u8], errno: i32) {
+    safe_write_err(prefix);
+    safe_write_err(b" errno=");
+    let mut buf = [0u8; 12];
+    let n = format_decimal(&mut buf, errno);
+    safe_write_err(&buf[..n]);
+    safe_write_err(b"\n");
+}
+
+// ============================================================================
 // Parsed CLI configuration.
 // ============================================================================
 
@@ -504,6 +586,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
     if pid == 0 {
         // ----- CHILD (will become the guest init) -----
+        //
+        // IMPORTANT: between fork() and execve() we are in an async-signal-
+        // unsafe window. The `info!`/`warning!`/`error!` macros above
+        // expand to `eprintln!`, which is NOT async-signal-safe — it
+        // initialises a global LineWriter, allocates, and grabs the stdio
+        // lock. If another thread held that lock at fork() time, calling
+        // `eprintln!` here would deadlock the child.
+        //
+        // For diagnostics in this branch we use `safe_write_err*()` (defined
+        // above), which only calls the async-signal-safe `write(2)` syscall
+        // and never touches the allocator. The parent observes stderr
+        // because fork() inherits the parent's stderr fd.
 
         // Close all inherited file descriptors except stdin/stdout/stderr.
         // The parent holds device sockets (SOCK_CLOEXEC, auto-closed by
@@ -518,10 +612,6 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
         }
 
-        // Note: info!/error! use eprintln! which is NOT async-signal-safe
-        // between fork() and execve(). However, for the MVP this is
-        // acceptable — in production, replace with write(2, ...) calls.
-
         let mount_cfg = mount_mgr::MountConfig {
             rootfs:           cfg.rootfs.clone(),
             rom_dir:          cfg.rom_dir.clone(),
@@ -529,30 +619,79 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             read_only_rom:    cfg.read_only_rom,
         };
         if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
-            // Use _exit, not return, to avoid running atexit handlers
-            unsafe { libc::_exit(1) };
+            // FATAL: without mounts, pivot_root/bind-mounts never happened
+            // and init would run against the host filesystem. Surface the
+            // errno via async-signal-safe write(2) so the parent (and the
+            // user reading logcat / log.txt) sees WHY the child died.
+            // Use _exit, not return, to avoid running atexit handlers.
+            let errno = e.raw_os_error().unwrap_or(0);
+            unsafe {
+                safe_write_err_errno(
+                    b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed",
+                    errno,
+                );
+                libc::_exit(1);
+            }
         }
 
         if cfg.install_seccomp {
-            if let Err(_e) = seccomp::install() {
-                // Continue anyway — permissive mode for debugging
+            if let Err(e) = seccomp::install() {
+                // Non-fatal: we explicitly continue so the guest can boot
+                // in a permissive-ish mode (the seccomp filter is a
+                // hardening layer, not a correctness requirement for the
+                // MVP). But the user must be told — silent failure here
+                // would mask a misconfigured BPF program.
+                let errno = e.raw_os_error().unwrap_or(0);
+                unsafe {
+                    safe_write_err_errno(
+                        b"[KR64 CHILD] WARN: seccomp::install failed (continuing without filter)",
+                        errno,
+                    );
+                }
             }
         }
 
         // Exec the guest init with a proper environment.
         // Fixed: was passing empty envp — init needs at least PATH,
         // ANDROID_ROOT, ANDROID_DATA, and BOOTCLASSPATH.
-        let init_cstr = CString::new(cfg.init_path.as_str()).unwrap_or_else(|_| unsafe { libc::_exit(127) });
-        let argv0 = CString::new(cfg.init_path.as_str()).unwrap_or_else(|_| unsafe { libc::_exit(127) });
+        //
+        // CString::new fails if the path contains an interior NUL byte,
+        // which would silently terminate the C string mid-path. Surface
+        // that case rather than _exit(127) with no diagnostic.
+        let init_cstr = match CString::new(cfg.init_path.as_str()) {
+            Ok(s) => s,
+            Err(_) => unsafe {
+                safe_write_err(b"[KR64 CHILD] FATAL: init_path contains interior NUL byte\n");
+                libc::_exit(127);
+            }
+        };
+        let argv0 = match CString::new(cfg.init_path.as_str()) {
+            Ok(s) => s,
+            Err(_) => unsafe {
+                safe_write_err(b"[KR64 CHILD] FATAL: argv0 contains interior NUL byte\n");
+                libc::_exit(127);
+            }
+        };
         let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
-        // Build environment for the guest init
+        // Build environment for the guest init. The CString::new calls
+        // below use compile-time-constant strings (no NUL possible) and
+        // format!() — the format! allocation happens BEFORE execve, so
+        // it's safe (we're not yet racing the post-fork window for the
+        // allocator lock on this short, single-thread-of-control path).
+        let twoyi_rootfs_env = match CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs)) {
+            Ok(s) => s,
+            Err(_) => unsafe {
+                safe_write_err(b"[KR64 CHILD] FATAL: TWOYI_ROOTFS env contains NUL byte\n");
+                libc::_exit(127);
+            }
+        };
         let env_vars: Vec<CString> = vec![
             CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
             CString::new("ANDROID_ROOT=/system").unwrap(),
             CString::new("ANDROID_DATA=/data").unwrap(),
             CString::new("ANDROID_BOOTLOGO=1").unwrap(),
-            CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs)).unwrap(),
+            twoyi_rootfs_env,
             CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
         ];
         let env_ptrs: Vec<*const libc::c_char> = env_vars.iter()
@@ -560,10 +699,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             .chain(std::iter::once(std::ptr::null()))
             .collect();
 
-        let r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };
-        // If execve returns, it failed. Use _exit immediately.
-        let _ = std::io::Error::last_os_error();
-        unsafe { libc::_exit(127) };
+        // If execve returns at all, it failed. Capture errno BEFORE any
+        // other call (any libc call can clobber it) and surface it.
+        let _r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };
+        let exec_errno = unsafe { *libc::__errno_location() };
+        unsafe {
+            safe_write_err_errno(
+                b"[KR64 CHILD] FATAL: execve returned (init did not replace us)",
+                exec_errno,
+            );
+            libc::_exit(127);
+        }
     }
 
     // ----- PARENT (the daemon) -----
