@@ -702,7 +702,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // If execve returns at all, it failed. Capture errno BEFORE any
         // other call (any libc call can clobber it) and surface it.
         let _r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };
-        let exec_errno = unsafe { *libc::__errno_location() };
+        let exec_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         unsafe {
             safe_write_err_errno(
                 b"[KR64 CHILD] FATAL: execve returned (init did not replace us)",

@@ -94,7 +94,7 @@
 //!   exact matches of the kernel `<uapi/linux/android/binder.h>` and
 //!   AOSP `frameworks/native/libs/binder/IServiceManager.cpp`.
 
-use libc::{c_ulong, c_void};
+use libc::c_void;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -1595,12 +1595,17 @@ fn forward_transaction_to_host(
         read_buffer: read_buf.as_mut_ptr() as u64,
     };
 
-    // Issue the ioctl. libc::ioctl's third arg is c_ulong on Linux;
-    // the kernel reads/writes through the raw pointer.
+    // Issue the ioctl. The `request` argument type differs between
+    // libc flavours: bionic (Android) declares `ioctl(fd, int request, ...)`
+    // while glibc declares `ioctl(fd, unsigned long request, ...)`. Casting
+    // with `as _` lets the compiler pick the right width per target so the
+    // same source compiles for aarch64-linux-android, x86_64-linux-android,
+    // and the host (glibc) `cargo check`. The kernel reads/writes through
+    // the raw third pointer.
     let rc = unsafe {
         libc::ioctl(
             fd,
-            BINDER_WRITE_READ as c_ulong,
+            BINDER_WRITE_READ as _,
             &mut bwr as *mut BinderWriteRead as *mut c_void,
         )
     };
