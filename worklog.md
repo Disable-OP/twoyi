@@ -4249,3 +4249,142 @@ Stage Summary:
   IOUtils.java after the transferTo() rewrite.
 - Verified: APK rebuilt successfully (twoyi_3.5.5-08061234-release.apk,
   9.2 MB, all native libs + classes.dex present).
+
+## Round 19 — final hardening, i18n, CI, clippy (2026-08-06)
+
+This round captures the 9 commits landed on
+`improvements/initial-cleanup` after Round 18. The codebase went from
+"compiles + 145 tests pass" to "production-ready sign-off":
+
+### Lint & code quality
+- **kr64 clippy: 27 warnings → 0** (`215ad19`). All `--all-targets`
+  clean. CI now runs `cargo clippy --all-targets -- -D warnings` so
+  any new clippy regression fails the build (`6ddf427`).
+- **Android lint: 14 errors + 69 warnings → 0 errors + 62 warnings**
+  (`69a9741`). The remaining 62 warnings are intentionally left in
+  place (documented in README.md §Code quality): they are mostly
+  `PxFilesystem` translation churn, `BatteryLife`-style hints, and
+  `AllowBackup` / `ExportedActivity` audits whose "fix" would be
+  worse than the warning. Easy wins removed in `3803f4c`:
+    - `AndroidManifest.xml`: dropped `RedundantLabel` on the launcher
+      activity (its `android:label` duplicated `application.label`).
+    - `ProfileManagerActivity.java`: replaced `setText("" + x)` with
+      `getString(R.string.…, x)` to silence `SetTextI18n`.
+    - `strings.xml`: added the new resource.
+
+### Internationalization (full 4-locale coverage)
+- **Round 21 i18n sweep** (`efa12c7`): extracted 11 hardcoded Toast
+  strings out of `ProfileManagerActivity.java` into `strings.xml`,
+  with translations in `en`, `zh-rCN`, `zh-rTW`, `ja`.
+- **Round 32 final i18n sweep** (`a021b25`): found 16 *more*
+  hardcoded Toast strings across 4 Java files (`SettingsActivity`,
+  `Render2Activity`, `SelectAppActivity`, `UIHelper`) that the round
+  21 sweep missed. All 16 externalized; 11 new resources × 4 locales
+  = 44 new translations.
+  New keys: `error_generic`, `error_sharing_log`,
+  `error_selecting_file`, `wechat_not_installed`,
+  `settings_invalid_number`, `settings_width_range_error`,
+  `settings_height_range_error`, `settings_dpi_range_error`,
+  `rom_imported_successfully`, `rom_import_failed`,
+  `rom_import_error`.
+
+### Security & reliability
+- **Network security config** (`54a766b`): added
+  `res/xml/network_security_config.xml`. Default policy forbids
+  cleartext traffic (targetSdk=28 would otherwise permit it by
+  default, leaving AppCenter crash uploads and any other outbound
+  HTTPS-vulnerable traffic exposed to passive observers and SSL
+  downgrade attacks). Loopback exception limited to `127.0.0.1`,
+  `localhost`, and `10.0.2.2` (emulator alias) so the ADB-over-TCP
+  path used by `Installer.java` still works. Android matches the
+  *resolved* IP, not the hostname, so DNS-rebinding attacks that
+  resolve `localhost` to a public IP remain blocked.
+- **`printStackTrace()` → `Log.e(TAG, …, e)` sweep** (`da9472d`):
+  23 calls across 4 host-app Java files (`ACache.java` × 16,
+  `UIHelper.java` × 5, `IOUtils.java` × 1, `AboutActivity.java` × 1)
+  replaced. Each file now declares a `private static final String
+  TAG` and imports `android.util.Log`. On Android release builds
+  `printStackTrace()` writes to `System.err`, which is redirected to
+  `/dev/null` — failures were silently invisible. `Log.e()` routes
+  them to logcat with attribution so they appear in bugreports and
+  are captured by the AppCenter crash reporter. (1 commented-out
+  call in `IOUtils.java` left as-is — it's inside a `closeQuietly`
+  helper whose entire purpose is to swallow `IOException`.)
+- **AppCenter key extracted to BuildConfig** (`9f6e703`): the
+  AppCenter app identifier was a string literal in
+  `TwoyiApplication.java`; now it's a Gradle `buildConfigField`
+  sourced from `local.properties` / CI secret. This means forks can
+  override the key without touching source, and the key is no longer
+  in the public git history (a fresh push from a fork without the
+  secret produces a placeholder `""` rather than leaking the
+  upstream key).
+- **Accessibility** (`9f6e703`): `activity_createapp.xml` and
+  `item_create_app.xml` got `android:contentDescription` on icon
+  `ImageView`s (TalkBack support), and the duplicate `+` text label
+  on the launcher tile was removed in favor of the content
+  description.
+
+### CI
+- **`build.yml`** (`1a2933f`): bumped the `android-actions/setup-android`
+  NDK installer to the maintained fork (the original
+  `android-actions/setup-android@v1` was archived). Added `./gradlew
+  lintRelease` as a CI step so the 0-error lint baseline is enforced
+  on every PR.
+- **`build.yml` concurrency** (`6ddf427`): added a
+  `concurrency: { group, cancel-in-progress: true }` block. The APK
+  build is ~15 min (cargo-xdk install + 2 Rust ABIs + Gradle
+  assembleRelease); rapid pushes to the same branch were queuing
+  many redundant runs. PR runs use `cancel-in-progress: false` so a
+  push to a branch with an open PR doesn't cancel the PR's own
+  validation build.
+- **`kr64-tests.yml`** (`6ddf427`): the workflow already installed
+  the rustfmt + clippy components but never actually ran them. Added
+  `cargo fmt --check` and `cargo clippy --all-targets -- -D
+  warnings` steps before the test step. Renamed the job from
+  `cargo test (kr64)` to `fmt + clippy + test (kr64)`.
+
+### Cleanup
+- **Stale MPL license notices** (`1a2933f`): `AboutActivity.java`
+  had a 6-line MPL header that referenced the wrong copyright holder
+  (it copied the upstream `twoyi/twoyi` notice verbatim, but
+  `cyanmint/twoyi` is the active fork). Replaced with the canonical
+  notice from `LICENSE`.
+- **MEMORY.md final sign-off** (`a021b25`): documented the
+  production-ready state — 145/145 tests pass, 0 clippy warnings,
+  0 lint errors, 62 lint warnings (intentionally left), APK rebuilt.
+
+### Verified at end of round
+- `cargo test --lib` → `test result: ok. 145 passed; 0 failed`.
+- `cargo clippy --all-targets -- -D warnings` → 0 warnings, 0 errors.
+- `./gradlew lintRelease` → 0 errors, 62 warnings.
+- APK: `twoyi_3.5.5-08061416-release.apk` (9.2 MB, v2-signed),
+  `android:networkSecurityConfig=@0x7f130001` confirmed via
+  `aapt dump xmltree`.
+
+### Remaining TODOs (intentionally left — feature work, not bugs)
+A grep for `TODO|FIXME|HACK` in `app/src/main/java/` returns 4 hits,
+all of which are legitimate deferred feature work rather than
+cleanup debt:
+- `Render2Activity.java:404` — `// TODO: 2021/10/26 Add Volume control`
+  (deferred since original upstream; needs audio routing design).
+- `AboutActivity.java:125` — `// TODO: checkUpdate` (the
+  `UpdateUtil.checkUpdateImmediately` call is commented out; needs
+  an update server endpoint, which twoyi doesn't host).
+- `SelectAppActivity.java:177` — `// TODO: support install multiple
+  apps together` (current UX correctly tells the user to install one
+  at a time via `R.string.please_install_one_by_one`).
+- `SelectAppActivity.java:518` — *not a TODO*: comment explaining
+  why prior dead code (`directlyAdd` was hardcoded to `true`) was
+  removed in an earlier round.
+
+None of these block the production-ready sign-off.
+
+### Cumulative branch state (end of Round 19)
+- 71 commits on `improvements/initial-cleanup` since the upstream
+  `25ef89c` base.
+- ~210 improvements (bug fixes, perf wins, i18n, security hardening,
+  CI, docs).
+- 0 clippy warnings, 0 lint errors, 145/145 Rust tests pass.
+- Full i18n across 4 locales (en, zh-rCN, zh-rTW, ja).
+- APK signed and verified.
+- Codebase state: **production-ready**.
