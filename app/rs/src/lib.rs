@@ -8,7 +8,6 @@ use jni::sys::{jclass, jfieldID, jfloat, jint, jobject, JNI_ERR, jstring};
 use jni::JNIEnv;
 use jni::{JavaVM, NativeMethod};
 use log::{debug, error, info, Level};
-use ndk_sys;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -26,7 +25,7 @@ extern "C" {
 
 // Force the interp symbol to be included by referencing it
 #[used]
-static INTERP_REF: &'static [u8; 0] = unsafe { &INTERP };
+static INTERP_REF: &[u8; 0] = unsafe { &INTERP };
 
 /// ## Examples
 /// ```
@@ -43,7 +42,12 @@ macro_rules! jni_method {
 }
 
 #[no_mangle]
-pub extern "C" fn renderer_init(
+/// # Safety
+/// JNI entry point invoked by the JVM. The caller (the JVM) must supply a
+/// valid `JNIEnv`, a `surface` referring to a live `android.view.Surface`,
+/// and a `loader` `jstring`. Calling from any other context is undefined
+/// behavior.
+pub unsafe extern "C" fn renderer_init(
     env: JNIEnv,
     _clz: jclass,
     surface: jobject,
@@ -98,7 +102,7 @@ pub extern "C" fn renderer_init(
         virtual_height,
         xdpi as i32,
         ydpi as i32,
-        fps as i32,
+        fps,
     );
 }
 
@@ -124,7 +128,11 @@ pub extern "C" fn set_data_dir(
 }
 
 #[no_mangle]
-pub extern "C" fn renderer_reset_window(
+/// # Safety
+/// JNI entry point invoked by the JVM. `surface` must refer to a live
+/// `android.view.Surface` and `env` must be a valid `JNIEnv`. Calling
+/// from any other context is undefined behavior.
+pub unsafe extern "C" fn renderer_reset_window(
     env: JNIEnv,
     _clz: jclass,
     surface: jobject,
@@ -149,7 +157,11 @@ pub extern "C" fn renderer_reset_window(
 }
 
 #[no_mangle]
-pub extern "C" fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
+/// # Safety
+/// JNI entry point invoked by the JVM. `surface` must refer to a live
+/// `android.view.Surface` and `env` must be a valid `JNIEnv`. Calling
+/// from any other context is undefined behavior.
+pub unsafe extern "C" fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
     debug!("renderer_remove_window");
 
     unsafe {
@@ -309,7 +321,7 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
     };
     debug!("clazz: {:#?}", clazz);
 
-    let result = env.register_native_methods(clazz, &methods);
+    let result = env.register_native_methods(clazz, methods);
 
     if result.is_ok() {
         info!("register_natives : succeed - registered {} methods", methods.len());
@@ -329,7 +341,7 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
 #[allow(non_snake_case)]
 unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     // Initialize logger - if this fails, continue anyway
-    let _ = android_logger::init_once(
+    android_logger::init_once(
         Config::default()
             .with_min_level(Level::Info)
             .with_tag("CLIENT_EGL"),
@@ -391,8 +403,13 @@ pub extern "C" fn twoyi_send_keycode(keycode: i32) {
 }
 
 // Main function for standalone execution when invoked directly or via linker64
+///
+/// # Safety
+/// `argv` must point to a C-style argv array of at least `argc` non-null
+/// `*const c_char` entries (POSIX requires `argv[argc] == NULL`). Calling
+/// with an invalid `argv`/`argc` pair is undefined behavior.
 #[no_mangle]
-pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
     use std::io::{self, Write};
     use std::ffi::CStr;
 

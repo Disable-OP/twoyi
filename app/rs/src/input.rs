@@ -18,11 +18,11 @@ use log::info;
 
 const FF_MAX: u16 = 0x7f;
 
-const TOUCH_DEVICE_NAME: &'static str = "vtouch";
-const TOUCH_DEVICE_UNIQUE_ID: &'static str = "<vtouch 0>";
+const TOUCH_DEVICE_NAME: &str = "vtouch";
+const TOUCH_DEVICE_UNIQUE_ID: &str = "<vtouch 0>";
 
-const KEY_DEVICE_NAME: &'static str = "vkey";
-const KEY_DEVICE_UNIQUE_ID: &'static str = "<keyboard 0>";
+const KEY_DEVICE_NAME: &str = "vkey";
+const KEY_DEVICE_UNIQUE_ID: &str = "<keyboard 0>";
 
 /// Touch device socket path — now dynamic via core::get_touch_path().
 /// In a work profile, the data dir is /data/user/<uid>/io.twoyi instead
@@ -389,19 +389,14 @@ fn touch_server(width: i32, height: i32) {
                 let (tx, rx) = channel::<input_event>();
                 *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
-                thread::spawn(move || loop {
-                    match rx.recv() {
-                        Ok(ev) => {
-                            let data = unsafe { any_as_u8_slice(&ev) };
-                            if stream.write_all(data).is_err() {
-                                break; // write failed — client disconnected
-                            }
-                        }
-                        Err(_) => {
-                            // Channel disconnected — new client took over
-                            break;
+                thread::spawn(move || {
+                    while let Ok(ev) = rx.recv() {
+                        let data = unsafe { any_as_u8_slice(&ev) };
+                        if stream.write_all(data).is_err() {
+                            return; // write failed — client disconnected
                         }
                     }
+                    // Channel disconnected — new client took over
                 });
             }
             Err(_) => {
@@ -546,19 +541,14 @@ fn key_server() {
                 let (tx, rx) = channel::<input_event>();
                 *KEY_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
-                thread::spawn(move || loop {
-                    match rx.recv() {
-                        Ok(ev) => {
-                            let data = unsafe { any_as_u8_slice(&ev) };
-                            if stream.write_all(data).is_err() {
-                                break; // write failed — client disconnected
-                            }
-                        }
-                        Err(_) => {
-                            // Channel disconnected — new client took over
-                            break;
+                thread::spawn(move || {
+                    while let Ok(ev) = rx.recv() {
+                        let data = unsafe { any_as_u8_slice(&ev) };
+                        if stream.write_all(data).is_err() {
+                            return; // write failed — client disconnected
                         }
                     }
+                    // Channel disconnected — new client took over
                 });
             }
             Err(_) => {
