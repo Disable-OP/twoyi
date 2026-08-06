@@ -275,7 +275,7 @@ fn write_proc_meminfo(proc_dir: &str, mem_mb: u64) -> std::io::Result<()> {
         cached_mb * 1024 / 2,
         cached_mb * 1024 / 2,
         cached_mb * 1024 / 2,
-        cached_mb * 1024 / 4,   // SUnreclaim
+        cached_mb * 1024 / 4,  // SUnreclaim
         mem_mb * 1024,         // CommitLimit
         avail_mb * 1024,       // Committed_AS
         536_870_912,           // VmallocTotal (512 GB)
@@ -395,7 +395,7 @@ fn write_proc_self(proc_dir: &str) -> std::io::Result<()> {
     {
         use std::os::unix::fs::symlink;
         let _ = symlink("/system/bin/init", format!("{}/exe", self_dir));
-        let _ = symlink("/", format!("{}/cwd",  self_dir));
+        let _ = symlink("/", format!("{}/cwd", self_dir));
         // Note: /proc/self/.. is a reserved directory entry — symlink() would
         // fail with EEXIST. The kernel resolves ".." via the actual parent
         // directory, so this is unnecessary. Removed.
@@ -403,8 +403,9 @@ fn write_proc_self(proc_dir: &str) -> std::io::Result<()> {
 
     // /proc/self/status — minimal content.
     let mut f = fs::File::create(format!("{}/status", self_dir))?;
-    f.write_all(format!(
-        "Name:\tinit\n\
+    f.write_all(
+        format!(
+            "Name:\tinit\n\
          Umask:\t0022\n\
          State:\tS (sleeping)\n\
          Tgid:\t{}\n\
@@ -443,8 +444,10 @@ fn write_proc_self(proc_dir: &str) -> std::io::Result<()> {
          Seccomp:\t0\n\
          Cpus_allowed:\tff\n\
          Cpus_allowed_list:\t0-7\n",
-        pid, pid,
-    ).as_bytes())?;
+            pid, pid,
+        )
+        .as_bytes(),
+    )?;
 
     Ok(())
 }
@@ -464,18 +467,22 @@ fn write_proc_sys(proc_dir: &str) -> std::io::Result<()> {
 
     write_file(&kernel_dir, "kptr_restrict", "1\n")?;
     write_file(&kernel_dir, "dmesg_restrict", "1\n")?;
-    write_file(&kernel_dir, "ngroups_max",   "65536\n")?;
-    write_file(&kernel_dir, "hostname",      "twoyi\n")?;
-    write_file(&kernel_dir, "domainname",    "localdomain\n")?;
-    write_file(&kernel_dir, "osrelease",     "4.14.190-g45619c7d3dc8-ab7891234\n")?;
-    write_file(&kernel_dir, "ostype",        "Linux\n")?;
+    write_file(&kernel_dir, "ngroups_max", "65536\n")?;
+    write_file(&kernel_dir, "hostname", "twoyi\n")?;
+    write_file(&kernel_dir, "domainname", "localdomain\n")?;
+    write_file(
+        &kernel_dir,
+        "osrelease",
+        "4.14.190-g45619c7d3dc8-ab7891234\n",
+    )?;
+    write_file(&kernel_dir, "ostype", "Linux\n")?;
 
-    write_file(&vm_dir, "mmap_rnd_bits",        "16\n")?;
+    write_file(&vm_dir, "mmap_rnd_bits", "16\n")?;
     write_file(&vm_dir, "mmap_rnd_compat_bits", "16\n")?;
-    write_file(&vm_dir, "overcommit_memory",    "1\n")?;
-    write_file(&vm_dir, "overcommit_ratio",     "50\n")?;
-    write_file(&vm_dir, "swappiness",           "60\n")?;
-    write_file(&vm_dir, "max_map_count",        "65536\n")?;
+    write_file(&vm_dir, "overcommit_memory", "1\n")?;
+    write_file(&vm_dir, "overcommit_ratio", "50\n")?;
+    write_file(&vm_dir, "swappiness", "60\n")?;
+    write_file(&vm_dir, "max_map_count", "65536\n")?;
 
     Ok(())
 }
@@ -504,7 +511,11 @@ fn write_file(dir: &str, name: &str, content: &str) -> std::io::Result<()> {
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o444));
     }
     // Sanity: make sure the file exists.
-    debug_assert!(Path::new(&path).exists(), "proc_emu: failed to create {}", path);
+    debug_assert!(
+        Path::new(&path).exists(),
+        "proc_emu: failed to create {}",
+        path
+    );
     Ok(())
 }
 
@@ -526,8 +537,12 @@ mod tests {
     fn tmpdir() -> String {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
-        p.push(format!("kr64-proc-test-{}-{}-{}", std::process::id(), n,
-                       std::thread::current().name().unwrap_or("?").len()));
+        p.push(format!(
+            "kr64-proc-test-{}-{}-{}",
+            std::process::id(),
+            n,
+            std::thread::current().name().unwrap_or("?").len()
+        ));
         std::fs::create_dir_all(&p).unwrap();
         p.to_string_lossy().to_string()
     }

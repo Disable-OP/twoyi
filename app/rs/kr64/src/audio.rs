@@ -330,7 +330,11 @@ impl AudioHeader {
     /// Construct a header with the given direction and the
     /// VM-hard-coded sample rate / channel count for that direction.
     pub fn new(direction: AudioDirection) -> Self {
-        Self::with_format(direction, direction.default_sample_rate(), direction.default_channels())
+        Self::with_format(
+            direction,
+            direction.default_sample_rate(),
+            direction.default_channels(),
+        )
     }
 
     /// Construct a header with an explicit sample rate / channel
@@ -391,7 +395,12 @@ impl AudioHeader {
             return Err(AudioHeaderError::BadDirection { got: direction });
         }
 
-        Ok(Self { magic, direction, sample_rate, channels })
+        Ok(Self {
+            magic,
+            direction,
+            sample_rate,
+            channels,
+        })
     }
 }
 
@@ -683,7 +692,10 @@ fn handle_connection(mut stream: UnixStream) -> std::io::Result<()> {
         Ok(h) => h,
         Err(e) => {
             warning!("[KR64][audio] rejecting connection: bad header: {}", e);
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            ));
         }
     };
 
@@ -746,7 +758,10 @@ fn handle_playback(stream: &mut UnixStream, header: AudioHeader) -> std::io::Res
         // JNI up-call: AudioService.writeAudioData(track, buf, 0, n)
         let written = jni_write_audio_data(track, &buf[..n]);
         if written <= 0 {
-            warning!("[KR64][audio][playback] writeAudioData returned {}", written);
+            warning!(
+                "[KR64][audio][playback] writeAudioData returned {}",
+                written
+            );
             break;
         }
     }
@@ -908,7 +923,9 @@ impl Worker {
                 }
             })
             .expect("spawn kr64 audio worker");
-        Worker { thread: Some(thread) }
+        Worker {
+            thread: Some(thread),
+        }
     }
 }
 
@@ -1196,7 +1213,10 @@ mod tests {
         // drop should unlink the socket file (DeviceSocket::Drop).
         let path = dev.path.clone();
         drop(dev);
-        assert!(!Path::new(&path).exists(), "socket file should be unlinked on drop");
+        assert!(
+            !Path::new(&path).exists(),
+            "socket file should be unlinked on drop"
+        );
 
         let _ = fs::remove_dir_all(&rootfs);
     }

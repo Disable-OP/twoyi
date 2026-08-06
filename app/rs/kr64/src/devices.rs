@@ -58,8 +58,8 @@
 //! be added incrementally in follow-up tasks.
 
 use std::fs;
-use std::os::unix::net::UnixListener;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 
 // Crate-local logging macros (defined in lib.rs) — no external `log` crate.
@@ -176,7 +176,11 @@ fn bind_unix_socket(path: &str) -> std::io::Result<UnixListener> {
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o666));
     }
 
-    info!("[KR64][devices] bound unix socket: {} (fd={})", path, listener.as_raw_fd());
+    info!(
+        "[KR64][devices] bound unix socket: {} (fd={})",
+        path,
+        listener.as_raw_fd()
+    );
     Ok(listener)
 }
 
@@ -194,7 +198,11 @@ fn bind_unix_socket(path: &str) -> std::io::Result<UnixListener> {
 pub fn create_qemu_pipe(rootfs: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/qemu_pipe", rootfs);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
+    Ok(DeviceSocket {
+        listener: Some(listener),
+        path,
+        should_unlink: true,
+    })
 }
 
 /// Create `{rootfs}/dev/input/touch` — the multi-touch input device.
@@ -212,7 +220,11 @@ pub fn create_qemu_pipe(rootfs: &str) -> std::io::Result<DeviceSocket> {
 pub fn create_touch_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/input/touch", rootfs);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
+    Ok(DeviceSocket {
+        listener: Some(listener),
+        path,
+        should_unlink: true,
+    })
 }
 
 /// Create `{rootfs}/dev/input/key0` — the virtual key device.
@@ -225,7 +237,11 @@ pub fn create_touch_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
 pub fn create_key_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/input/key0", rootfs);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
+    Ok(DeviceSocket {
+        listener: Some(listener),
+        path,
+        should_unlink: true,
+    })
 }
 
 /// Create `{data_dir}/dev/event` — the event IPC socket.
@@ -249,7 +265,11 @@ pub fn create_key_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
 pub fn create_event_socket(data_dir: &str) -> std::io::Result<DeviceSocket> {
     let path = format!("{}/dev/event", data_dir);
     let listener = bind_unix_socket(&path)?;
-    Ok(DeviceSocket { listener: Some(listener), path, should_unlink: true })
+    Ok(DeviceSocket {
+        listener: Some(listener),
+        path,
+        should_unlink: true,
+    })
 }
 
 /// Create `{rootfs}/dev/gb` and `{rootfs}/dev/gb2` — the graphics
@@ -270,20 +290,28 @@ pub fn create_event_socket(data_dir: &str) -> std::io::Result<DeviceSocket> {
 /// Returns both sockets in a struct so the caller can dispatch on
 /// `accept()` events from either.
 pub struct GraphicsBufferDevices {
-    pub gb:  DeviceSocket,
+    pub gb: DeviceSocket,
     pub gb2: DeviceSocket,
 }
 
 pub fn create_graphics_buffer_devices(rootfs: &str) -> std::io::Result<GraphicsBufferDevices> {
-    let gb_path  = format!("{}/dev/gb",  rootfs);
+    let gb_path = format!("{}/dev/gb", rootfs);
     let gb2_path = format!("{}/dev/gb2", rootfs);
 
-    let gb_listener  = bind_unix_socket(&gb_path)?;
+    let gb_listener = bind_unix_socket(&gb_path)?;
     let gb2_listener = bind_unix_socket(&gb2_path)?;
 
     Ok(GraphicsBufferDevices {
-        gb:  DeviceSocket { listener: Some(gb_listener),  path: gb_path,  should_unlink: true },
-        gb2: DeviceSocket { listener: Some(gb2_listener), path: gb2_path, should_unlink: true },
+        gb: DeviceSocket {
+            listener: Some(gb_listener),
+            path: gb_path,
+            should_unlink: true,
+        },
+        gb2: DeviceSocket {
+            listener: Some(gb2_listener),
+            path: gb2_path,
+            should_unlink: true,
+        },
     })
 }
 
@@ -294,17 +322,20 @@ pub fn create_graphics_buffer_devices(rootfs: &str) -> std::io::Result<GraphicsB
 /// one thread per listener to `accept()` and dispatch.
 pub struct DeviceSet {
     pub qemu_pipe: DeviceSocket,
-    pub touch:     DeviceSocket,
-    pub key:       DeviceSocket,
-    pub event:     DeviceSocket,
-    pub gb:        GraphicsBufferDevices,
+    pub touch: DeviceSocket,
+    pub key: DeviceSocket,
+    pub event: DeviceSocket,
+    pub gb: GraphicsBufferDevices,
 }
 
 pub fn create_all_devices(rootfs: &str, data_dir: &str) -> std::io::Result<DeviceSet> {
-    info!("[KR64][devices] creating virtual /dev tree under {}/dev", rootfs);
+    info!(
+        "[KR64][devices] creating virtual /dev tree under {}/dev",
+        rootfs
+    );
 
     // Make sure /dev and /dev/input exist before any create_* call.
-    let dev_dir       = format!("{}/dev",       rootfs);
+    let dev_dir = format!("{}/dev", rootfs);
     let dev_input_dir = format!("{}/dev/input", rootfs);
     fs::create_dir_all(&dev_dir)?;
     fs::create_dir_all(&dev_input_dir)?;
@@ -313,25 +344,55 @@ pub fn create_all_devices(rootfs: &str, data_dir: &str) -> std::io::Result<Devic
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&dev_dir,       fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&dev_dir, fs::Permissions::from_mode(0o755));
         let _ = fs::set_permissions(&dev_input_dir, fs::Permissions::from_mode(0o755));
     }
 
     let qemu_pipe = create_qemu_pipe(rootfs)?;
-    let touch     = create_touch_device(rootfs)?;
-    let key       = create_key_device(rootfs)?;
-    let event     = create_event_socket(data_dir)?;
-    let gb        = create_graphics_buffer_devices(rootfs)?;
+    let touch = create_touch_device(rootfs)?;
+    let key = create_key_device(rootfs)?;
+    let event = create_event_socket(data_dir)?;
+    let gb = create_graphics_buffer_devices(rootfs)?;
 
     info!("[KR64][devices] all MVP devices created:");
-    info!("[KR64][devices]   qemu_pipe = {} (fd={})", qemu_pipe.path, qemu_pipe.raw_fd());
-    info!("[KR64][devices]   touch     = {} (fd={})", touch.path,     touch.raw_fd());
-    info!("[KR64][devices]   key       = {} (fd={})", key.path,       key.raw_fd());
-    info!("[KR64][devices]   event     = {} (fd={})", event.path,     event.raw_fd());
-    info!("[KR64][devices]   gb        = {} (fd={})", gb.gb.path,     gb.gb.raw_fd());
-    info!("[KR64][devices]   gb2       = {} (fd={})", gb.gb2.path,    gb.gb2.raw_fd());
+    info!(
+        "[KR64][devices]   qemu_pipe = {} (fd={})",
+        qemu_pipe.path,
+        qemu_pipe.raw_fd()
+    );
+    info!(
+        "[KR64][devices]   touch     = {} (fd={})",
+        touch.path,
+        touch.raw_fd()
+    );
+    info!(
+        "[KR64][devices]   key       = {} (fd={})",
+        key.path,
+        key.raw_fd()
+    );
+    info!(
+        "[KR64][devices]   event     = {} (fd={})",
+        event.path,
+        event.raw_fd()
+    );
+    info!(
+        "[KR64][devices]   gb        = {} (fd={})",
+        gb.gb.path,
+        gb.gb.raw_fd()
+    );
+    info!(
+        "[KR64][devices]   gb2       = {} (fd={})",
+        gb.gb2.path,
+        gb.gb2.raw_fd()
+    );
 
-    Ok(DeviceSet { qemu_pipe, touch, key, event, gb })
+    Ok(DeviceSet {
+        qemu_pipe,
+        touch,
+        key,
+        event,
+        gb,
+    })
 }
 
 /// Create a marker file (used for `/dev/.coldboot_done`, `/dev/.busybox`,
