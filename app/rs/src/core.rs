@@ -131,6 +131,15 @@ pub fn init_renderer(
         // First time initialization
         input::start_input_system(virtual_width, virtual_height);
 
+        // Diagnostic: log the OpenGL ES pipe paths the renderer will
+        // open inside libOpenglRender.so. This is the only call site
+        // for get_opengles_paths() — without it, the helper is dead
+        // code and rustc emits a `dead_code` warning on every build.
+        // Surfacing the paths up front also makes it obvious from the
+        // logs whether the rootfs layout is what we expect.
+        let opengles_paths = get_opengles_paths();
+        info!("[CORE] Renderer will open OpenGL ES pipes: {:?}", opengles_paths);
+
         // Convert raw pointer to usize for safe transfer between threads
         let window_addr = window as usize;
 
