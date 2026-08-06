@@ -450,18 +450,23 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         UIHelper.defer().when(() -> {
             String activeProfile = ProfileManager.getActiveProfile(this);
             File profileRootfsDir = ProfileManager.getProfileRootfsDir(this, activeProfile);
-            
+
             // Clear existing rootfs
             if (profileRootfsDir.exists()) {
                 io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
             }
             profileRootfsDir.mkdirs();
-            
+
             File tempFile = new File(getCacheDir(), "rootfs_import.tar");
 
             ContentResolver contentResolver = getContentResolver();
             try (InputStream inputStream = contentResolver.openInputStream(uri);
                  OutputStream os = new FileOutputStream(tempFile)) {
+                // Fixed: openInputStream can return null if the provider
+                // revokes the grant between picker return and our read.
+                if (inputStream == null) {
+                    throw new IOException("ContentResolver returned null stream for " + uri);
+                }
                 byte[] buffer = new byte[8192];
                 int count;
                 while ((count = inputStream.read(buffer)) > 0) {
@@ -471,26 +476,35 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
             String tempFilePath = tempFile.getAbsolutePath();
             String rootfsPath = profileRootfsDir.getAbsolutePath();
-            
+
             if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
                 rootfsPath.contains(";") || rootfsPath.contains("&")) {
                 throw new SecurityException("Invalid path detected");
             }
-            
+
             // Extract tar to rootfs directory
             ProcessBuilder pb = new ProcessBuilder(
                 "tar", "-xf", tempFilePath,
                 "-C", rootfsPath
             );
             Process process = pb.start();
-            int exitCode = process.waitFor();
-            
+            // Fixed: waitFor() without a timeout can hang forever on a
+            // corrupt archive. Cap at 120 s; 500 MB rootfs tar extracts in
+            // ~30 s on most devices.
+            int exitCode;
+            if (!process.waitFor(120, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                throw new IOException("tar extraction timed out after 120 s");
+            } else {
+                exitCode = process.exitValue();
+            }
+
             tempFile.delete();
-            
+
             if (exitCode == 0) {
                 RomManager.initRootfs(this);
             }
-            
+
             return exitCode == 0;
         }).done(result -> {
             UIHelper.dismiss(dialog);

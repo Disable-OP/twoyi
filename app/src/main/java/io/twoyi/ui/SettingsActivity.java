@@ -296,22 +296,48 @@ public class SettingsActivity extends AppCompatActivity {
             });
 
             sendLog.setOnPreferenceClickListener(preference -> {
-                Context context = getActivity();
-                byte[] bugreport = LogEvents.getBugreport(context);
-                File tmpLog = new File(context.getCacheDir(), "bugreport.zip");
-                try {
-                    Files.write(tmpLog.toPath(), bugreport);
-                } catch (IOException e) {
-                    Crashes.trackError(e);
+                final Context context = getActivity();
+                if (context == null) {
+                    return true;
                 }
-                Uri uri = FileProvider.getUriForFile(context, "io.twoyi.fileprovider", tmpLog);
+                // Fixed: getBugreport() does heavy I/O (logcat -d, ps -ef, file
+                // reads, zip compression) and was running on the UI thread,
+                // causing an ANR when the user taps "Send log". Push it to the
+                // GLOBAL_EXECUTOR background pool, then hop back to the UI
+                // thread for the share-sheet startActivity call.
+                final ProgressDialog progressDialog = UIHelper.getProgressDialog(context);
+                progressDialog.setMessage(getString(R.string.settings_key_sendlog));
+                progressDialog.setCancelable(false);
+                progressDialog.show();
 
-                Intent shareIntent = new Intent(Intent.ACTION_SEND);
-                shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
-                shareIntent.setDataAndType(uri, "application/zip");
-                shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                UIHelper.GLOBAL_EXECUTOR.execute(() -> {
+                    final byte[] bugreport = LogEvents.getBugreport(context);
+                    final File tmpLog = new File(context.getCacheDir(), "bugreport.zip");
+                    try {
+                        Files.write(tmpLog.toPath(), bugreport);
+                    } catch (IOException e) {
+                        Crashes.trackError(e);
+                    }
+                    final Uri uri = FileProvider.getUriForFile(context, "io.twoyi.fileprovider", tmpLog);
 
-                context.startActivity(Intent.createChooser(shareIntent, getString(R.string.settings_key_sendlog)));
+                    final Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                    shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
+                    shareIntent.setDataAndType(uri, "application/zip");
+                    shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+                    // startActivity must be called on the UI thread.
+                    // runOnUiThread handles both Activity and Fragment contexts
+                    // gracefully (we already null-checked getActivity above).
+                    context.getMainExecutor().execute(() -> {
+                        UIHelper.dismiss(progressDialog);
+                        try {
+                            context.startActivity(Intent.createChooser(shareIntent,
+                                    getString(R.string.settings_key_sendlog)));
+                        } catch (Throwable ignored) {
+                            Toast.makeText(context, "Error sharing log", Toast.LENGTH_SHORT).show();
+                        }
+                    });
+                });
 
                 return true;
             });
@@ -344,18 +370,24 @@ public class SettingsActivity extends AppCompatActivity {
             UIHelper.defer().when(() -> {
                 String activeProfile = ProfileManager.getActiveProfile(activity);
                 File profileRootfsDir = ProfileManager.getProfileRootfsDir(activity, activeProfile);
-                
+
                 // Clear existing rootfs
                 if (profileRootfsDir.exists()) {
                     io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
                 }
                 profileRootfsDir.mkdirs();
-                
+
                 File tempFile = new File(activity.getCacheDir(), "rootfs_import.tar");
 
                 ContentResolver contentResolver = activity.getContentResolver();
                 try (InputStream inputStream = contentResolver.openInputStream(uri);
                      OutputStream os = new FileOutputStream(tempFile)) {
+                    // Fixed: openInputStream can return null if the provider
+                    // revokes the grant between picker return and our read.
+                    // The original code NPE'd inside the try-with-resources.
+                    if (inputStream == null) {
+                        throw new IOException("ContentResolver returned null stream for " + uri);
+                    }
                     byte[] buffer = new byte[8192];
                     int count;
                     while ((count = inputStream.read(buffer)) > 0) {
@@ -365,26 +397,36 @@ public class SettingsActivity extends AppCompatActivity {
 
                 String tempFilePath = tempFile.getAbsolutePath();
                 String rootfsPath = profileRootfsDir.getAbsolutePath();
-                
+
                 if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
                     rootfsPath.contains(";") || rootfsPath.contains("&")) {
                     throw new SecurityException("Invalid path detected");
                 }
-                
+
                 // Extract tar to rootfs directory
                 ProcessBuilder pb = new ProcessBuilder(
                     "tar", "-xf", tempFilePath,
                     "-C", rootfsPath
                 );
                 Process process = pb.start();
-                int exitCode = process.waitFor();
-                
+                // Fixed: waitFor() without a timeout can block forever if tar
+                // hangs on a corrupt archive or a stalled FUSE mount. Cap at
+                // 120 s — a 500 MB rootfs tar extracts in ~30 s on most
+                // devices, so 120 s is generous.
+                int exitCode;
+                if (!process.waitFor(120, java.util.concurrent.TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    throw new IOException("tar extraction timed out after 120 s");
+                } else {
+                    exitCode = process.exitValue();
+                }
+
                 tempFile.delete();
-                
+
                 if (exitCode == 0) {
                     RomManager.initRootfs(activity);
                 }
-                
+
                 return exitCode == 0;
             }).done(result -> {
                 UIHelper.dismiss(dialog);
