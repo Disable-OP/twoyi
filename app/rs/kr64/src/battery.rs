@@ -148,22 +148,22 @@ pub const JNI_STATUS_NOT_CHARGING: u8 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryStatus {
     /// Plugged in and actively charging.
-    Charging      = JNI_STATUS_CHARGING,
+    Charging = JNI_STATUS_CHARGING,
     /// On battery power, level dropping.
-    Discharging   = JNI_STATUS_DISCHARGING,
+    Discharging = JNI_STATUS_DISCHARGING,
     /// Plugged in, battery at 100%.
-    Full          = JNI_STATUS_FULL,
+    Full = JNI_STATUS_FULL,
     /// Plugged in but not charging (e.g. too hot, or charger undervolted).
-    NotCharging   = JNI_STATUS_NOT_CHARGING,
+    NotCharging = JNI_STATUS_NOT_CHARGING,
 }
 
 impl BatteryStatus {
     /// Parse a raw JNI status byte. Returns `None` for unknown values.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            JNI_STATUS_CHARGING    => Some(Self::Charging),
+            JNI_STATUS_CHARGING => Some(Self::Charging),
             JNI_STATUS_DISCHARGING => Some(Self::Discharging),
-            JNI_STATUS_FULL        => Some(Self::Full),
+            JNI_STATUS_FULL => Some(Self::Full),
             JNI_STATUS_NOT_CHARGING => Some(Self::NotCharging),
             _ => None,
         }
@@ -173,11 +173,11 @@ impl BatteryStatus {
     /// verbatim to the `status` file).
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Charging     => "Charging",
-            Self::Discharging  => "Discharging",
-            Self::Full         => "Full",
+            Self::Charging => "Charging",
+            Self::Discharging => "Discharging",
+            Self::Full => "Full",
             // The Linux ABI uses the two-word form "Not charging".
-            Self::NotCharging  => "Not charging",
+            Self::NotCharging => "Not charging",
         }
     }
 
@@ -334,14 +334,20 @@ impl BatteryDevice {
     /// `InvalidData` if the file contains an unknown string).
     pub fn read_status(&self) -> std::io::Result<BatteryStatus> {
         let s = self.read_file_trimmed("status")?;
-        [BatteryStatus::Charging, BatteryStatus::Discharging,
-         BatteryStatus::Full, BatteryStatus::NotCharging]
-            .into_iter()
-            .find(|st| st.as_str() == s)
-            .ok_or_else(|| std::io::Error::new(
+        [
+            BatteryStatus::Charging,
+            BatteryStatus::Discharging,
+            BatteryStatus::Full,
+            BatteryStatus::NotCharging,
+        ]
+        .into_iter()
+        .find(|st| st.as_str() == s)
+        .ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("unknown status string: {}", s),
-            ))
+            )
+        })
     }
 
     /// Read the `voltage` file back as a `u32` (mV).
@@ -384,7 +390,8 @@ impl BatteryDevice {
             .spawn(move || {
                 info!(
                     "[KR64][battery] refresh thread started (interval={}s, dir={})",
-                    BATTERY_REFRESH_INTERVAL_SECS, dir.display(),
+                    BATTERY_REFRESH_INTERVAL_SECS,
+                    dir.display(),
                 );
                 // Initial refresh was already done by `new()`, so we
                 // sleep first then refresh on each tick.
@@ -445,8 +452,8 @@ fn write_file_at(dir: &Path, name: &str, value: &str) -> std::io::Result<()> {
 /// next tick will retry the failed file).
 fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     let level = jni_get_battery_level();
-    let status = BatteryStatus::from_u8(jni_get_battery_status())
-        .unwrap_or(BatteryStatus::Discharging);
+    let status =
+        BatteryStatus::from_u8(jni_get_battery_status()).unwrap_or(BatteryStatus::Discharging);
     let voltage = jni_get_battery_voltage();
     let temp = jni_get_battery_temperature();
 
@@ -454,17 +461,19 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     macro_rules! try_write {
         ($name:expr, $val:expr) => {
             if let Err(e) = write_file_at(dir, $name, $val) {
-                if first_err.is_none() { first_err = Some(e); }
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         };
     }
-    try_write!("capacity",    &level.min(100).to_string());
-    try_write!("status",      status.as_str());
-    try_write!("charging",    if status.is_charging() { "1" } else { "0" });
-    try_write!("voltage_now",     &voltage.to_string());
+    try_write!("capacity", &level.min(100).to_string());
+    try_write!("status", status.as_str());
+    try_write!("charging", if status.is_charging() { "1" } else { "0" });
+    try_write!("voltage_now", &voltage.to_string());
     try_write!("temp", &temp.to_string());
-    try_write!("technology",  DEFAULT_TECHNOLOGY);
-    try_write!("health",      DEFAULT_HEALTH);
+    try_write!("technology", DEFAULT_TECHNOLOGY);
+    try_write!("health", DEFAULT_HEALTH);
 
     match first_err {
         Some(e) => Err(e),
@@ -580,22 +589,34 @@ mod tests {
 
     #[test]
     fn battery_status_from_u8_roundtrip() {
-        assert_eq!(BatteryStatus::from_u8(JNI_STATUS_CHARGING),    Some(BatteryStatus::Charging));
-        assert_eq!(BatteryStatus::from_u8(JNI_STATUS_DISCHARGING), Some(BatteryStatus::Discharging));
-        assert_eq!(BatteryStatus::from_u8(JNI_STATUS_FULL),        Some(BatteryStatus::Full));
-        assert_eq!(BatteryStatus::from_u8(JNI_STATUS_NOT_CHARGING),Some(BatteryStatus::NotCharging));
-        assert_eq!(BatteryStatus::from_u8(0),  None);
-        assert_eq!(BatteryStatus::from_u8(5),  None);
-        assert_eq!(BatteryStatus::from_u8(255),None);
+        assert_eq!(
+            BatteryStatus::from_u8(JNI_STATUS_CHARGING),
+            Some(BatteryStatus::Charging)
+        );
+        assert_eq!(
+            BatteryStatus::from_u8(JNI_STATUS_DISCHARGING),
+            Some(BatteryStatus::Discharging)
+        );
+        assert_eq!(
+            BatteryStatus::from_u8(JNI_STATUS_FULL),
+            Some(BatteryStatus::Full)
+        );
+        assert_eq!(
+            BatteryStatus::from_u8(JNI_STATUS_NOT_CHARGING),
+            Some(BatteryStatus::NotCharging)
+        );
+        assert_eq!(BatteryStatus::from_u8(0), None);
+        assert_eq!(BatteryStatus::from_u8(5), None);
+        assert_eq!(BatteryStatus::from_u8(255), None);
     }
 
     #[test]
     fn battery_status_repr_matches_jni_byte() {
         // `#[repr(u8)]` makes `as u8` give the exact JNI byte.
-        assert_eq!(BatteryStatus::Charging     as u8, JNI_STATUS_CHARGING);
-        assert_eq!(BatteryStatus::Discharging  as u8, JNI_STATUS_DISCHARGING);
-        assert_eq!(BatteryStatus::Full         as u8, JNI_STATUS_FULL);
-        assert_eq!(BatteryStatus::NotCharging  as u8, JNI_STATUS_NOT_CHARGING);
+        assert_eq!(BatteryStatus::Charging as u8, JNI_STATUS_CHARGING);
+        assert_eq!(BatteryStatus::Discharging as u8, JNI_STATUS_DISCHARGING);
+        assert_eq!(BatteryStatus::Full as u8, JNI_STATUS_FULL);
+        assert_eq!(BatteryStatus::NotCharging as u8, JNI_STATUS_NOT_CHARGING);
     }
 
     #[test]
@@ -603,15 +624,15 @@ mod tests {
         // The four Linux `power_supply` ABI strings, exactly as the
         // guest's health HAL will compare them. "Not charging" is
         // intentionally two words.
-        assert_eq!(BatteryStatus::Charging.as_str(),     "Charging");
-        assert_eq!(BatteryStatus::Discharging.as_str(),  "Discharging");
-        assert_eq!(BatteryStatus::Full.as_str(),         "Full");
-        assert_eq!(BatteryStatus::NotCharging.as_str(),  "Not charging");
+        assert_eq!(BatteryStatus::Charging.as_str(), "Charging");
+        assert_eq!(BatteryStatus::Discharging.as_str(), "Discharging");
+        assert_eq!(BatteryStatus::Full.as_str(), "Full");
+        assert_eq!(BatteryStatus::NotCharging.as_str(), "Not charging");
     }
 
     #[test]
     fn battery_status_is_charging_only_for_charging() {
-        assert!( BatteryStatus::Charging.is_charging());
+        assert!(BatteryStatus::Charging.is_charging());
         assert!(!BatteryStatus::Discharging.is_charging());
         assert!(!BatteryStatus::Full.is_charging());
         assert!(!BatteryStatus::NotCharging.is_charging());
@@ -628,8 +649,15 @@ mod tests {
         assert!(dev.dir().exists(), "battery dir should exist");
 
         // All seven files must exist with non-empty content.
-        for name in ["capacity", "status", "charging", "voltage_now",
-                     "temp", "technology", "health"] {
+        for name in [
+            "capacity",
+            "status",
+            "charging",
+            "voltage_now",
+            "temp",
+            "technology",
+            "health",
+        ] {
             let p = dev.dir().join(name);
             assert!(p.exists(), "file {} should exist", name);
             let content = fs::read_to_string(&p).unwrap();
@@ -674,13 +702,31 @@ mod tests {
         let rootfs = tmpdir();
         let dev = BatteryDevice::new(&rootfs).expect("new");
 
-        assert_eq!(read_raw(&dev.file("capacity")),    format!("{}\n", DEFAULT_CAPACITY));
-        assert_eq!(read_raw(&dev.file("voltage_now")),     format!("{}\n", DEFAULT_VOLTAGE_MV));
-        assert_eq!(read_raw(&dev.file("temp")), format!("{}\n", DEFAULT_TEMP_DECIC));
-        assert_eq!(read_raw(&dev.file("status")),      format!("{}\n", BatteryStatus::Discharging.as_str()));
-        assert_eq!(read_raw(&dev.file("charging")),    "0\n");
-        assert_eq!(read_raw(&dev.file("technology")),  format!("{}\n", DEFAULT_TECHNOLOGY));
-        assert_eq!(read_raw(&dev.file("health")),      format!("{}\n", DEFAULT_HEALTH));
+        assert_eq!(
+            read_raw(&dev.file("capacity")),
+            format!("{}\n", DEFAULT_CAPACITY)
+        );
+        assert_eq!(
+            read_raw(&dev.file("voltage_now")),
+            format!("{}\n", DEFAULT_VOLTAGE_MV)
+        );
+        assert_eq!(
+            read_raw(&dev.file("temp")),
+            format!("{}\n", DEFAULT_TEMP_DECIC)
+        );
+        assert_eq!(
+            read_raw(&dev.file("status")),
+            format!("{}\n", BatteryStatus::Discharging.as_str())
+        );
+        assert_eq!(read_raw(&dev.file("charging")), "0\n");
+        assert_eq!(
+            read_raw(&dev.file("technology")),
+            format!("{}\n", DEFAULT_TECHNOLOGY)
+        );
+        assert_eq!(
+            read_raw(&dev.file("health")),
+            format!("{}\n", DEFAULT_HEALTH)
+        );
 
         let _ = fs::remove_dir_all(&rootfs);
     }
@@ -712,8 +758,12 @@ mod tests {
     fn update_status_writes_each_variant() {
         let rootfs = tmpdir();
         let dev = BatteryDevice::new(&rootfs).unwrap();
-        for st in [BatteryStatus::Charging, BatteryStatus::Discharging,
-                   BatteryStatus::Full, BatteryStatus::NotCharging] {
+        for st in [
+            BatteryStatus::Charging,
+            BatteryStatus::Discharging,
+            BatteryStatus::Full,
+            BatteryStatus::NotCharging,
+        ] {
             dev.update_status(st).unwrap();
             assert_eq!(dev.read_status().unwrap(), st);
             assert_eq!(read_raw(&dev.file("status")), format!("{}\n", st.as_str()));
@@ -731,10 +781,18 @@ mod tests {
         dev.update_charging(BatteryStatus::Charging).unwrap();
         assert_eq!(read_raw(&dev.file("charging")), "1\n");
 
-        for st in [BatteryStatus::Discharging, BatteryStatus::Full, BatteryStatus::NotCharging] {
+        for st in [
+            BatteryStatus::Discharging,
+            BatteryStatus::Full,
+            BatteryStatus::NotCharging,
+        ] {
             dev.update_charging(st).unwrap();
-            assert_eq!(read_raw(&dev.file("charging")), "0\n",
-                "charging should be 0 for {:?}", st);
+            assert_eq!(
+                read_raw(&dev.file("charging")),
+                "0\n",
+                "charging should be 0 for {:?}",
+                st
+            );
         }
         let _ = fs::remove_dir_all(&rootfs);
     }
@@ -757,7 +815,7 @@ mod tests {
         dev.update_technology("Li-poly").unwrap();
         dev.update_health("Overheat").unwrap();
         assert_eq!(read_raw(&dev.file("technology")), "Li-poly\n");
-        assert_eq!(read_raw(&dev.file("health")),     "Overheat\n");
+        assert_eq!(read_raw(&dev.file("health")), "Overheat\n");
         let _ = fs::remove_dir_all(&rootfs);
     }
 
@@ -794,13 +852,19 @@ mod tests {
 
         dev.refresh().unwrap();
 
-        assert_eq!(dev.read_capacity().unwrap(),    DEFAULT_CAPACITY);
-        assert_eq!(dev.read_voltage().unwrap(),     DEFAULT_VOLTAGE_MV);
+        assert_eq!(dev.read_capacity().unwrap(), DEFAULT_CAPACITY);
+        assert_eq!(dev.read_voltage().unwrap(), DEFAULT_VOLTAGE_MV);
         assert_eq!(dev.read_temperature().unwrap(), DEFAULT_TEMP_DECIC);
-        assert_eq!(dev.read_status().unwrap(),      BatteryStatus::Discharging);
-        assert_eq!(read_raw(&dev.file("charging")),   "0\n");
-        assert_eq!(read_raw(&dev.file("technology")), format!("{}\n", DEFAULT_TECHNOLOGY));
-        assert_eq!(read_raw(&dev.file("health")),     format!("{}\n", DEFAULT_HEALTH));
+        assert_eq!(dev.read_status().unwrap(), BatteryStatus::Discharging);
+        assert_eq!(read_raw(&dev.file("charging")), "0\n");
+        assert_eq!(
+            read_raw(&dev.file("technology")),
+            format!("{}\n", DEFAULT_TECHNOLOGY)
+        );
+        assert_eq!(
+            read_raw(&dev.file("health")),
+            format!("{}\n", DEFAULT_HEALTH)
+        );
         let _ = fs::remove_dir_all(&rootfs);
     }
 
@@ -836,10 +900,14 @@ mod tests {
         let handle = dev.spawn().expect("spawn");
         std::thread::sleep(Duration::from_millis(50));
         // Files must still be readable while the thread is running.
-        assert_eq!(fs::read_to_string(dir.join("capacity")).unwrap().trim(),
-                   DEFAULT_CAPACITY.to_string());
-        assert_eq!(fs::read_to_string(dir.join("status")).unwrap().trim(),
-                   BatteryStatus::Discharging.as_str());
+        assert_eq!(
+            fs::read_to_string(dir.join("capacity")).unwrap().trim(),
+            DEFAULT_CAPACITY.to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("status")).unwrap().trim(),
+            BatteryStatus::Discharging.as_str()
+        );
         drop(handle);
         let _ = fs::remove_dir_all(&rootfs);
     }
@@ -848,9 +916,9 @@ mod tests {
 
     #[test]
     fn jni_stubs_return_documented_defaults() {
-        assert_eq!(jni_get_battery_level(),       DEFAULT_CAPACITY);
-        assert_eq!(jni_get_battery_status(),      JNI_STATUS_DISCHARGING);
-        assert_eq!(jni_get_battery_voltage(),     DEFAULT_VOLTAGE_MV);
+        assert_eq!(jni_get_battery_level(), DEFAULT_CAPACITY);
+        assert_eq!(jni_get_battery_status(), JNI_STATUS_DISCHARGING);
+        assert_eq!(jni_get_battery_voltage(), DEFAULT_VOLTAGE_MV);
         assert_eq!(jni_get_battery_temperature(), DEFAULT_TEMP_DECIC);
     }
 }

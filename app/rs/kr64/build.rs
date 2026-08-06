@@ -30,9 +30,7 @@ fn main() {
     // the linker will pull the `.interp` section out of. The
     // `--undefined=interp` link flag below forces the section to be
     // retained in the final binary (otherwise the linker may GC it).
-    cc::Build::new()
-        .file("interp.c")
-        .compile("interp");
+    cc::Build::new().file("interp.c").compile("interp");
 
     // PIE flags for the cdylib. See app/rs/.cargo/config.toml for the
     // canonical version (these flags are duplicated here so the kr64

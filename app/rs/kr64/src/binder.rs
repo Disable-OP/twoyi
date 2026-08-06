@@ -184,12 +184,12 @@ const BINDER_IOC_TYPE: u32 = b'b' as u32;
 #[derive(Clone, Copy, Default)]
 #[allow(dead_code)]
 pub struct BinderWriteRead {
-    pub write_size:      u64, // binder_size_t
-    pub write_consumed:  u64, // binder_size_t
-    pub write_buffer:    u64, // binder_uintptr_t (user pointer)
-    pub read_size:       u64, // binder_size_t
-    pub read_consumed:   u64, // binder_size_t
-    pub read_buffer:     u64, // binder_uintptr_t (user pointer)
+    pub write_size: u64,     // binder_size_t
+    pub write_consumed: u64, // binder_size_t
+    pub write_buffer: u64,   // binder_uintptr_t (user pointer)
+    pub read_size: u64,      // binder_size_t
+    pub read_consumed: u64,  // binder_size_t
+    pub read_buffer: u64,    // binder_uintptr_t (user pointer)
 }
 
 /// `struct binder_ptr_cookie` — payload of `BC_ACQUIRE_DONE`,
@@ -198,7 +198,7 @@ pub struct BinderWriteRead {
 #[derive(Clone, Copy, Default)]
 #[allow(dead_code)]
 pub struct BinderPtrCookie {
-    pub ptr:    u64,
+    pub ptr: u64,
     pub cookie: u64,
 }
 
@@ -209,7 +209,7 @@ pub struct BinderPtrCookie {
 #[allow(dead_code)]
 pub struct BinderHandleCookie {
     pub handle: u32,
-    pub pad:    u32,
+    pub pad: u32,
     pub cookie: u64,
 }
 
@@ -220,8 +220,8 @@ pub struct BinderHandleCookie {
 #[allow(dead_code)]
 pub struct BinderPriDesc {
     pub priority: u32,
-    pub desc:     u32,
-    pub pad:      u32,
+    pub desc: u32,
+    pub pad: u32,
 }
 
 /// `struct binder_pri_cookie` — payload of `BR_ATTEMPT_ACQUIRE`,
@@ -231,9 +231,9 @@ pub struct BinderPriDesc {
 #[allow(dead_code)]
 pub struct BinderPriCookie {
     pub priority: u32,
-    pub desc:     u32,
-    pub pad:      u32,
-    pub cookie:   u64,
+    pub desc: u32,
+    pub pad: u32,
+    pub cookie: u64,
 }
 
 /// `struct binder_transaction_data` — payload of `BC_TRANSACTION`,
@@ -253,16 +253,16 @@ pub struct BinderPriCookie {
 #[allow(dead_code)]
 pub struct BinderTransactionData {
     pub target_handle: u32, // [ 0.. 4] — when target is a remote handle
-    pub target_pad:    u32, // [ 4.. 8] — padding (or low 4 bytes of ptr)
+    pub target_pad: u32,    // [ 4.. 8] — padding (or low 4 bytes of ptr)
     pub target_cookie: u64, // [ 8..16] — cookie (or high 4 bytes of ptr)
-    pub code:          u32, // [16..20] — transaction code (method id)
-    pub flags:         u32, // [20..24] — TF_* flags
-    pub sender_pid:    i32, // [24..28] — pid_t (signed)
-    pub sender_euid:   u32, // [28..32] — uid_t (unsigned)
-    pub data_size:     u64, // [32..40] — size of data buffer
-    pub offsets_size:  u64, // [40..48] — size of offsets array
-    pub data_ptr:      u64, // [48..56] — user pointer to data buffer
-    pub offsets_ptr:   u64, // [56..64] — user pointer to offsets array
+    pub code: u32,          // [16..20] — transaction code (method id)
+    pub flags: u32,         // [20..24] — TF_* flags
+    pub sender_pid: i32,    // [24..28] — pid_t (signed)
+    pub sender_euid: u32,   // [28..32] — uid_t (unsigned)
+    pub data_size: u64,     // [32..40] — size of data buffer
+    pub offsets_size: u64,  // [40..48] — size of offsets array
+    pub data_ptr: u64,      // [48..56] — user pointer to data buffer
+    pub offsets_ptr: u64,   // [56..64] — user pointer to offsets array
 }
 
 /// `struct binder_flat_binder_object` — the structured object that
@@ -274,7 +274,7 @@ pub struct BinderTransactionData {
 #[allow(dead_code)]
 pub struct FlatBinderObject {
     pub r#type: u32, // BINDER_TYPE_{BINDER,WEAK_BINDER,HANDLE,…}
-    pub flags:  u32,
+    pub flags: u32,
     pub binder: u64, // union: handle (u32) or ptr (binder_uintptr_t)
     pub cookie: u64,
 }
@@ -324,15 +324,21 @@ pub const BINDER_VERSION: u32 = _IOWR(BINDER_IOC_TYPE, 9, 4);
 
 /// `BINDER_GET_NODE_DEBUG_INFO` — for debuggerd / dumpstate.
 #[allow(dead_code)]
-pub const BINDER_GET_NODE_DEBUG_INFO: u32 =
-    _IOWR(BINDER_IOC_TYPE, 11, std::mem::size_of::<FlatBinderObject>() as u32);
+pub const BINDER_GET_NODE_DEBUG_INFO: u32 = _IOWR(
+    BINDER_IOC_TYPE,
+    11,
+    std::mem::size_of::<FlatBinderObject>() as u32,
+);
 
 /// `BINDER_SET_CONTEXT_MGR_EXT` — modern form of SET_CONTEXT_MGR, takes
 /// a `flat_binder_object` to specify the priority and policy of the
 /// manager.
 #[allow(dead_code)]
-pub const BINDER_SET_CONTEXT_MGR_EXT: u32 =
-    _IOW(BINDER_IOC_TYPE, 13, std::mem::size_of::<FlatBinderObject>() as u32);
+pub const BINDER_SET_CONTEXT_MGR_EXT: u32 = _IOW(
+    BINDER_IOC_TYPE,
+    13,
+    std::mem::size_of::<FlatBinderObject>() as u32,
+);
 
 // ============================================================================
 // BC_* — binder commands (written by userspace into the write_buffer of
@@ -593,19 +599,19 @@ pub const SVC_MGR_HANDLE: u32 = 0;
 // ============================================================================
 
 #[allow(dead_code)]
-pub const BINDER_TYPE_BINDER:       u32 = 1; // strong local binder
+pub const BINDER_TYPE_BINDER: u32 = 1; // strong local binder
 #[allow(dead_code)]
-pub const BINDER_TYPE_WEAK_BINDER:  u32 = 2; // weak local binder
+pub const BINDER_TYPE_WEAK_BINDER: u32 = 2; // weak local binder
 #[allow(dead_code)]
-pub const BINDER_TYPE_HANDLE:       u32 = 3; // strong remote ref
+pub const BINDER_TYPE_HANDLE: u32 = 3; // strong remote ref
 #[allow(dead_code)]
-pub const BINDER_TYPE_WEAK_HANDLE:  u32 = 4; // weak remote ref
+pub const BINDER_TYPE_WEAK_HANDLE: u32 = 4; // weak remote ref
 #[allow(dead_code)]
-pub const BINDER_TYPE_FD:           u32 = 5; // file descriptor
+pub const BINDER_TYPE_FD: u32 = 5; // file descriptor
 #[allow(dead_code)]
-pub const BINDER_TYPE_FDA:          u32 = 6; // FD array
+pub const BINDER_TYPE_FDA: u32 = 6; // FD array
 #[allow(dead_code)]
-pub const BINDER_TYPE_PTR:          u32 = 7; // scatter-gather pointer
+pub const BINDER_TYPE_PTR: u32 = 7; // scatter-gather pointer
 
 // ============================================================================
 // Transaction flags (binder_transaction_data.flags).
@@ -913,9 +919,7 @@ impl BinderProxy {
 
         info!(
             "[KR64][binder][vm{}] proxy bound to {} (fd={}, non-blocking)",
-            vm_id,
-            socket_path,
-            fd
+            vm_id, socket_path, fd
         );
 
         Ok(BinderProxy {
@@ -967,12 +971,12 @@ impl BinderProxy {
                             let host_fd = Arc::clone(&host_fd);
                             let handles = Arc::clone(&handles);
                             pool.execute(move || {
-                                if let Err(e) =
-                                    handle_connection(stream, vm_id, &host_fd, &handles)
+                                if let Err(e) = handle_connection(stream, vm_id, &host_fd, &handles)
                                 {
                                     warning!(
                                         "[KR64][binder][vm{}] connection handler ended: {}",
-                                        vm_id, e
+                                        vm_id,
+                                        e
                                     );
                                 }
                             });
@@ -1439,7 +1443,8 @@ fn handle_transaction(
         Err(e) => {
             warning!(
                 "[KR64][binder][vm{}] forward_transaction_to_host failed: {}",
-                vm_id, e
+                vm_id,
+                e
             );
             TransactionResult::Failed
         }
@@ -1554,9 +1559,9 @@ fn forward_transaction_to_host(
     host_fd: &Arc<Mutex<Option<RawFd>>>,
 ) -> io::Result<Vec<u8>> {
     // Lazily open /dev/binder on the host.
-    let mut guard = host_fd.lock().map_err(|e| {
-        io::Error::other(format!("host_binder_fd mutex poisoned: {}", e))
-    })?;
+    let mut guard = host_fd
+        .lock()
+        .map_err(|e| io::Error::other(format!("host_binder_fd mutex poisoned: {}", e)))?;
     if guard.is_none() {
         match open_host_binder() {
             Ok(fd) => *guard = Some(fd),
@@ -1653,7 +1658,10 @@ fn read_frame(stream: &mut UnixStream) -> io::Result<Frame> {
     if arg_len > MAX_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("read_frame: payload too large ({} > {})", arg_len, MAX_PAYLOAD),
+            format!(
+                "read_frame: payload too large ({} > {})",
+                arg_len, MAX_PAYLOAD
+            ),
         ));
     }
     let mut payload = vec![0u8; arg_len];
@@ -1915,7 +1923,9 @@ mod tests {
         assert_eq!(arg_len, 4, "BINDER_VERSION returns a u32");
 
         let mut payload = vec![0u8; arg_len];
-        stream.read_exact(&mut payload).expect("read response payload");
+        stream
+            .read_exact(&mut payload)
+            .expect("read response payload");
         let version = u32::from_ne_bytes(payload[0..4].try_into().unwrap());
         assert_eq!(
             version, BINDER_CURRENT_PROTOCOL_VERSION,
@@ -1943,7 +1953,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&0u32.to_ne_bytes()); // write_size
         payload.extend_from_slice(&64u32.to_ne_bytes()); // read_capacity
-        // (no write_buffer bytes)
+                                                         // (no write_buffer bytes)
 
         let mut req = Vec::new();
         req.extend_from_slice(&BINDER_WRITE_READ.to_ne_bytes());
@@ -1957,12 +1967,18 @@ mod tests {
         let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
         let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
         assert_eq!(ret, 0);
-        assert!(arg_len >= 4, "BINDER_WRITE_READ response should have a read_size header");
+        assert!(
+            arg_len >= 4,
+            "BINDER_WRITE_READ response should have a read_size header"
+        );
 
         let mut resp = vec![0u8; arg_len];
         stream.read_exact(&mut resp).expect("read response payload");
         let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
-        assert_eq!(read_size, 4, "idle BINDER_WRITE_READ should return exactly one BR_NOOP");
+        assert_eq!(
+            read_size, 4,
+            "idle BINDER_WRITE_READ should return exactly one BR_NOOP"
+        );
 
         let br_cmd = u32::from_ne_bytes(resp[4..8].try_into().unwrap());
         assert_eq!(br_cmd, BR_NOOP, "expected BR_NOOP");

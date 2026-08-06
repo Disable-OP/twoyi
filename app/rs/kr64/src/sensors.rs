@@ -1204,7 +1204,9 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
         if (idx as usize) >= NUM_SENSORS {
             warning!(
                 "[KR64][sensor] bad idx={} (cmd={}) — out of range 0..{}",
-                idx, cmd, NUM_SENSORS
+                idx,
+                cmd,
+                NUM_SENSORS
             );
             continue;
         }
@@ -1221,10 +1223,7 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
                     warning!("[KR64][sensor] check_support reply write failed: {}", e);
                     return Err(e);
                 }
-                info!(
-                    "[KR64][sensor] CHECK_SUPPORT idx={} → {}",
-                    idxu, supported
-                );
+                info!("[KR64][sensor] CHECK_SUPPORT idx={} → {}", idxu, supported);
             }
             CTL_ENABLE => {
                 // JNI up-call: HALManager.EnableSensors(idx). Returns
@@ -1257,7 +1256,9 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
             _ => {
                 warning!(
                     "[KR64][sensor] unknown ctl cmd={} idx={} arg={}",
-                    cmd, idxu, arg
+                    cmd,
+                    idxu,
+                    arg
                 );
             }
         }
@@ -1424,7 +1425,9 @@ impl Worker {
                 }
             })
             .expect("spawn kr64 sensor worker");
-        Worker { thread: Some(thread) }
+        Worker {
+            thread: Some(thread),
+        }
     }
 }
 
@@ -1894,7 +1897,10 @@ mod tests {
         // drop should unlink the socket file.
         let path = dev.path.clone();
         drop(dev);
-        assert!(!Path::new(&path).exists(), "socket file should be unlinked on drop");
+        assert!(
+            !Path::new(&path).exists(),
+            "socket file should be unlinked on drop"
+        );
 
         let _ = fs::remove_dir_all(&rootfs);
     }
@@ -2208,7 +2214,10 @@ mod tests {
     fn conn_state_starts_empty() {
         let conn = SensorConnState::new();
         let snap = conn.snapshot();
-        assert!(snap.is_empty(), "fresh state should have no enabled sensors");
+        assert!(
+            snap.is_empty(),
+            "fresh state should have no enabled sensors"
+        );
         assert!(!conn.is_shutdown());
     }
 
