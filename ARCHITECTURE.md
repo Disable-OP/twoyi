@@ -5,14 +5,24 @@
 > archived `twoyi/twoyi` project) as it stands **plus the improvements in
 > this branch** (`improvements/initial-cleanup`).
 >
-> **Date of analysis:** 2026-08-05 (last revised 2026-08-05)
+> **Date of analysis:** 2026-08-05 (last revised 2026-08-06)
 > **Base commit:** `25ef89c` ("rom manifest", 2026-05-09, upstream)
-> **Branch tip:** `570e95e` ("feat(kr64): kernel replacement daemon skeleton")
-> on `improvements/initial-cleanup`. Adds: x86_64 ABI, AOSP-source
-> `libOpenglRender.so`, Rust `libloader.so`, dynamic data dir (work-profile
-> support), x86_64 SIGABRT fix, `kr64` kernel-replacement skeleton, CI,
-> devcontainer, input handling, and APK signing. See §9–§10 for the
-> reverse-engineering and roadmap sections added in this revision.
+> **Branch tip:** `a021b25` ("docs: final comprehensive MEMORY.md update + any
+> remaining fixes") on `improvements/initial-cleanup`. Adds: x86_64 ABI,
+> AOSP-source `libOpenglRender.so`, Rust `libloader.so`, dynamic data dir
+> (work-profile support), x86_64 SIGABRT fix, `kr64` kernel-replacement
+> skeleton, CI, devcontainer, input handling, and APK signing. See §9–§10
+> for the reverse-engineering and roadmap sections added in this revision.
+>
+> **Post-architecture cleanup rounds (2026-08-06):** subsequent commits
+> (`69a9741` → `a021b25`) did not change the *architecture* but did add
+> production-readiness hardening: `res/xml/network_security_config.xml`
+> (cleartext forbidden by default, loopback exception for ADB), full
+> 4-locale i18n (en/zh-rCN/zh-rTW/ja), 0 clippy warnings / 0 lint errors
+> / 145-145 Rust tests passing, `printStackTrace()` → `Log.e()` sweep,
+> AppCenter key extracted to `BuildConfig`, and CI gating on
+> `cargo clippy -- -D warnings` + `./gradlew lintRelease`. See
+> `worklog.md` §Round 19 for the full rundown.
 
 ---
 
