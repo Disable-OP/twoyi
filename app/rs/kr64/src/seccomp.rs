@@ -189,10 +189,22 @@ fn allowed_syscalls() -> HashSet<i32> {
         SYS_read, SYS_write, SYS_readv, SYS_writev,
         SYS_pread64, SYS_pwrite64,
         SYS_openat, SYS_close, SYS_dup, SYS_dup3, SYS_fcntl, SYS_lseek,
-        SYS_newfstatat, SYS_readlinkat,
-        SYS_ftruncate, SYS_getcwd,
+        SYS_readlinkat,
+        SYS_getcwd,
     ] {
         add_nr!(s, nr);
+    }
+    // SYS_newfstatat (x86_64's "stat relative to dirfd") and SYS_ftruncate
+    // are NOT exposed by the libc crate for android-aarch64 — the crate
+    // simply omits those `SYS_*` constants for the bionic aarch64 target.
+    // (The underlying syscalls DO exist on aarch64 — newfstatat=79,
+    // ftruncate=46 — but referencing them needs raw numbers; tracked as a
+    // follow-up for full aarch64 stat-syscall support.) Gate x86_64-only
+    // so the crate compiles for aarch64-linux-android.
+    #[cfg(target_arch = "x86_64")]
+    {
+        add_nr!(s, SYS_newfstatat);
+        add_nr!(s, SYS_ftruncate);
     }
 
     // --- file I/O (x86_64-only: open, access, dup2, stat, lstat, fstat,
@@ -208,15 +220,9 @@ fn allowed_syscalls() -> HashSet<i32> {
     ] {
         add_nr!(s, nr);
     }
-
-    // --- aarch64-only variants (already covered by *at, but listed for
-    //     completeness — these are present on aarch64 and not x86_64).
-    #[cfg(target_arch = "aarch64")]
-    for &nr in &[
-        SYS_fstat, SYS_fstatat, // fstat exists on aarch64 (not x86_64's "newfstatat")
-    ] {
-        add_nr!(s, nr);
-    }
+    // (The previous aarch64-only block referencing SYS_fstat / SYS_fstatat
+    // has been removed — neither constant is defined by the libc crate for
+    // android-aarch64, and SYS_fstatat is not defined on any target.)
 
     // --- memory ---
     for &nr in &[
@@ -244,13 +250,22 @@ fn allowed_syscalls() -> HashSet<i32> {
         SYS_accept4, SYS_getsockname, SYS_getpeername,
         SYS_sendto, SYS_recvfrom, SYS_sendmsg, SYS_recvmsg,
         SYS_shutdown, SYS_setsockopt, SYS_getsockopt,
-        SYS_pipe, SYS_pipe2,
-        SYS_pselect6, SYS_poll, SYS_ppoll,
-        SYS_epoll_create1, SYS_epoll_ctl, SYS_epoll_wait,
+        SYS_pipe2,
+        SYS_pselect6, SYS_ppoll,
+        SYS_epoll_create1, SYS_epoll_ctl,
         SYS_eventfd2, SYS_timerfd_create, SYS_timerfd_settime,
         SYS_inotify_init1, SYS_inotify_add_watch, SYS_inotify_rm_watch,
     ] {
         add_nr!(s, nr);
+    }
+    // SYS_poll and SYS_epoll_wait are x86_64-only — aarch64's asm-generic
+    // syscall table replaced them with ppoll (already allowed above) and
+    // epoll_pwait respectively. (Adding SYS_epoll_pwait for aarch64 would
+    // keep the guest's epoll-wait working; left as a follow-up.)
+    #[cfg(target_arch = "x86_64")]
+    {
+        add_nr!(s, SYS_poll);
+        add_nr!(s, SYS_epoll_wait);
     }
 
     // aarch64-only legacy socket syscalls (recv / send). On the unified
@@ -280,11 +295,15 @@ fn allowed_syscalls() -> HashSet<i32> {
         SYS_getrlimit, SYS_setrlimit, SYS_prlimit64,
         SYS_getrandom,
         SYS_clock_gettime, SYS_clock_getres, SYS_clock_settime,
-        SYS_gettimeofday, SYS_time,
+        SYS_gettimeofday,
         SYS_nanosleep,
     ] {
         add_nr!(s, nr);
     }
+    // SYS_time is x86_64-only — removed from the asm-generic syscall table
+    // used by aarch64 (callers use gettimeofday, already allowed above).
+    #[cfg(target_arch = "x86_64")]
+    add_nr!(s, SYS_time);
 
     // fork / vfork — present on x86_64, removed on aarch64.
     #[cfg(target_arch = "x86_64")]
@@ -305,7 +324,7 @@ fn allowed_syscalls() -> HashSet<i32> {
     // follows the kernel's `__NR_*` naming.
     for &nr in &[
         SYS_getdents64,
-        SYS_fadvise64, SYS_fallocate,
+        SYS_fallocate,
         SYS_flock, SYS_sync, SYS_fsync, SYS_fdatasync,
         SYS_renameat, SYS_renameat2, SYS_linkat, SYS_symlinkat,
         SYS_unlinkat, SYS_mkdirat,
@@ -315,6 +334,11 @@ fn allowed_syscalls() -> HashSet<i32> {
     ] {
         add_nr!(s, nr);
     }
+    // SYS_fadvise64 is not exposed by the libc crate for android-aarch64
+    // (the syscall exists as __NR_fadvise64=223 on aarch64, but the crate
+    // omits the constant). Gate x86_64-only to keep the crate compiling.
+    #[cfg(target_arch = "x86_64")]
+    add_nr!(s, SYS_fadvise64);
     // readahead exists on both.
     add_nr!(s, SYS_readahead);
 
@@ -362,6 +386,9 @@ fn killed_syscalls() -> HashSet<i32> {
     use libc::*;
     let mut s: HashSet<i32> = HashSet::new();
     add_nr!(s, SYS_kexec_load);
+    // SYS_kexec_file_load is not exposed by the libc crate for
+    // android-aarch64 (only for x86_64 / glibc-aarch64). Gate x86_64-only.
+    #[cfg(target_arch = "x86_64")]
     add_nr!(s, SYS_kexec_file_load);
     add_nr!(s, SYS_init_module);
     add_nr!(s, SYS_finit_module);
