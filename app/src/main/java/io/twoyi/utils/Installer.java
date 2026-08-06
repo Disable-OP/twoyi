@@ -122,41 +122,54 @@ public class Installer {
         Shell installShell = ShellUtil.newSh();
 
         installShell.newJob().add(envCmd).add(installCommand).to(new ArrayList<>(), new ArrayList<>()).submit(out1 -> {
-            Log.w(TAG, "install result: " + out1.isSuccess());
+            try {
+                Log.w(TAG, "install result: " + out1.isSuccess());
 
-            if (callback == null) {
-                return;
-            }
-
-            // adb install prints "Success" or "Failure [reason]" to stdout; the exit
-            // code mirrors that, but check stdout explicitly as an additional guard.
-            String installOutMsg = Arrays.toString(out1.getOut().toArray(new String[0]));
-            String installErrMsg = Arrays.toString(out1.getErr().toArray(new String[0]));
-            Log.w(TAG, "out: " + installOutMsg + " err: " + installErrMsg);
-
-            boolean successInStdout = false;
-            boolean failureInStdout = false;
-            for (String line : out1.getOut()) {
-                if (line.trim().equals("Success")) {
-                    successInStdout = true;
-                    break;
-                } else if (line.startsWith("Failure [")) {
-                    failureInStdout = true;
-                    break;
+                if (callback == null) {
+                    return;
                 }
-            }
 
-            boolean success = (out1.isSuccess() && !failureInStdout) || successInStdout;
+                // adb install prints "Success" or "Failure [reason]" to stdout; the exit
+                // code mirrors that, but check stdout explicitly as an additional guard.
+                String installOutMsg = Arrays.toString(out1.getOut().toArray(new String[0]));
+                String installErrMsg = Arrays.toString(out1.getErr().toArray(new String[0]));
+                Log.w(TAG, "out: " + installOutMsg + " err: " + installErrMsg);
 
-            if (success) {
-                callback.onSuccess(files);
-            } else {
-                // Include both stdout and stderr: stdout carries "Failure [INSTALL_FAILED_*]"
-                // while stderr carries connection / push errors.
-                String msg = installOutMsg + installErrMsg;
-                Log.w(TAG, "msg: " + msg);
+                boolean successInStdout = false;
+                boolean failureInStdout = false;
+                for (String line : out1.getOut()) {
+                    if (line.trim().equals("Success")) {
+                        successInStdout = true;
+                        break;
+                    } else if (line.startsWith("Failure [")) {
+                        failureInStdout = true;
+                        break;
+                    }
+                }
 
-                callback.onFail(files, msg);
+                boolean success = (out1.isSuccess() && !failureInStdout) || successInStdout;
+
+                if (success) {
+                    callback.onSuccess(files);
+                } else {
+                    // Include both stdout and stderr: stdout carries "Failure [INSTALL_FAILED_*]"
+                    // while stderr carries connection / push errors.
+                    String msg = installOutMsg + installErrMsg;
+                    Log.w(TAG, "msg: " + msg);
+
+                    callback.onFail(files, msg);
+                }
+            } finally {
+                // Release the install shell now that the install job AND this
+                // callback have finished. Without this, every install attempt
+                // leaks one Shell (and its underlying adb/su process). We use
+                // waitAndClose (not close) so any still-pending job output is
+                // drained first; by the time the callback fires the job is
+                // already complete, so this returns immediately.
+                try {
+                    installShell.waitAndClose(1, TimeUnit.SECONDS);
+                } catch (Throwable ignored) {
+                }
             }
         });
     }

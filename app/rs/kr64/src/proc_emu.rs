@@ -66,6 +66,17 @@ pub fn populate_proc(rootfs: &str, cpu_count: u32, mem_mb: u64) -> std::io::Resu
     let proc_dir = format!("{}/proc", rootfs);
     fs::create_dir_all(&proc_dir)?;
 
+    // Idempotency: a previous populate_proc() call leaves /proc at mode
+    // 0o555 (read-only — see the chmod at the end of this function). On
+    // re-run that would make every write_file() below fail with EACCES
+    // (you can't create/replace files in a read-only directory). Restore
+    // the writable mode up-front so re-runs behave like first runs.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&proc_dir, fs::Permissions::from_mode(0o755));
+    }
+
     // NOTE: the chmod to 0o555 (read-only) MUST happen AFTER all the
     // files are written, otherwise the write_file() calls below fail
     // with EACCES (you can't create files in a read-only directory).
@@ -556,6 +567,22 @@ mod tests {
         let c = std::fs::read_to_string(format!("{}/proc/cpuinfo", rootfs)).unwrap();
         let count = c.matches("processor\t:").count();
         assert_eq!(count, 8);
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: populate_proc() ends by chmod-ing /proc to 0o555
+    /// (read-only). A second call must restore 0o755 up-front, otherwise
+    /// every write_file() inside it fails with EACCES.
+    #[test]
+    fn populate_proc_is_idempotent() {
+        let rootfs = tmpdir();
+        populate_proc(&rootfs, 2, 1024).expect("first populate_proc");
+        // Second run on the same rootfs must not fail.
+        populate_proc(&rootfs, 4, 2048).expect("second populate_proc");
+
+        // And the content must reflect the second run (cpu_count=4).
+        let c = std::fs::read_to_string(format!("{}/proc/cpuinfo", rootfs)).unwrap();
+        assert_eq!(c.matches("processor\t:").count(), 4);
         let _ = std::fs::remove_dir_all(&rootfs);
     }
 }
