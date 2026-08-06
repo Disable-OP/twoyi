@@ -51,16 +51,18 @@ public class TwoyiMessenger {
         this.mLock = new ReentrantReadWriteLock();
     }
 
-    public TwoyiMessenger connect() {
+    public synchronized TwoyiMessenger connect() {
         if (this.socket != null) {
             return this;
         }
 
+        LocalSocket socket = null;
         try {
-            LocalSocket socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET);
+            socket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET);
             socket.connect(new LocalSocketAddress(SOCK_NAME));
             // Only assign to this.socket AFTER successful connect
             this.socket = socket;
+            socket = null; // ownership transferred
             InputStream is = this.socket.getInputStream();
             OutputStream os = this.socket.getOutputStream();
             this.mWriter = new OutputStreamWriter(os);
@@ -70,6 +72,13 @@ public class TwoyiMessenger {
             // Previously, this.socket was assigned before connect(), so a
             // failed connect left a non-null but unusable socket, and the
             // guard at the top prevented all future reconnection attempts.
+            //
+            // Also: the original code only closed this.socket, but if connect()
+            // threw before the assignment, the local `socket` variable still
+            // held an open FD that was leaked. Close the local copy too.
+            if (socket != null) {
+                try { socket.close(); } catch (IOException ignored) {}
+            }
             if (this.socket != null) {
                 try { this.socket.close(); } catch (IOException ignored) {}
                 this.socket = null;
@@ -108,10 +117,19 @@ public class TwoyiMessenger {
             }
         }
 
+        // Fixed: connect() may have failed (mWriter still null). The original
+        // code unconditionally called mWriter.write(msg) here, which NPE'd.
+        // The NPE was swallowed by `catch (Throwable ignored)` so messages
+        // were silently dropped without any log. Bail out explicitly instead.
+        OutputStreamWriter writer = this.mWriter;
+        if (writer == null) {
+            return;
+        }
+
         try {
             this.mLock.writeLock().lock();
-            this.mWriter.write(msg);
-            this.mWriter.flush();
+            writer.write(msg);
+            writer.flush();
         } catch (Throwable ignored) {
         } finally {
             this.mLock.writeLock().unlock();
