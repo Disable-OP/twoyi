@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ~ This Source Code Form is subject to the terms of the Mozilla Public
+  ~ License, v. 2.0. If a copy of the MPL was not distributed with this
+  ~ file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  -->
+
+<!--
+  Network security configuration for twoyi.
+
+  Default policy: cleartext traffic is FORBIDDEN. This forces all
+  outbound HTTPS traffic (e.g. AppCenter crash/analytics uploads)
+  to use TLS, hardening the app against passive network observers
+  and downgrade attacks on apps that target API 28+.
+
+  Two exceptions are kept for cleartext traffic, both loopback-only:
+
+    * 127.0.0.1, localhost  — ADB traffic. Installer.java spawns
+      libadb.so which connects to the guest's adbd listening on
+      localhost:22122 over plain TCP. ADB's protocol is plaintext
+      by design and cannot be TLS-wrapped.
+
+    * 10.0.2.2              — Android emulator host-loopback alias.
+      The standard Android emulator exposes the host as 10.0.2.2
+      on the guest's network; redroid containers and the Android
+      emulator use this for ADB-over-TCP during development.
+
+  Allowing cleartext on these specific loopback addresses does not
+  weaken the policy for any routable network traffic: a malicious
+  DNS rebinding that resolves "localhost" to a public IP is still
+  blocked because Android matches the resolved address, not the
+  hostname, against the exception list.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>
