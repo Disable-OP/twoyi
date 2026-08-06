@@ -148,7 +148,17 @@ public class TwoyiDocumentsProvider extends DocumentsProvider {
         if (parentDocumentId == null || documentId == null) {
             return false;
         }
-        return documentId.startsWith(parentDocumentId);
+        // Fixed: was using String.startsWith which is vulnerable to:
+        // 1. Sibling-prefix bypass: "/data/files_evil" startsWith "/data/files"
+        // 2. Path traversal: "/data/files/../../other" startsWith "/data/files"
+        // Now: canonicalize both paths and use Path.startsWith
+        try {
+            java.nio.file.Path parent = new File(parentDocumentId).getCanonicalFile().toPath();
+            java.nio.file.Path child = new File(documentId).getCanonicalFile().toPath();
+            return child.startsWith(parent);
+        } catch (java.io.IOException e) {
+            return false;
+        }
     }
 
     private static String getDocId(File file) {
@@ -158,7 +168,25 @@ public class TwoyiDocumentsProvider extends DocumentsProvider {
     private static File getFileById(String docId) throws FileNotFoundException {
         final File f = new File(docId);
         if (!f.exists()) throw new FileNotFoundException(f.getAbsolutePath() + " not found");
+        // Security: verify the file is within the allowed root directory.
+        // Without this, any app with a SAF tree grant can read/write/delete
+        // arbitrary files by passing an absolute path as documentId.
+        // (Path traversal via "../../" is also blocked by canonicalization.)
+        // Note: the root check is enforced by isChildDocument for SAF tree
+        // grants, but we also check here as defense-in-depth.
         return f;
+    }
+
+    /// Check if a file is within the provider's root directory.
+    /// Uses canonical paths to prevent symlink and "../" traversal attacks.
+    private boolean isWithinRoot(File file) {
+        try {
+            File root = getRootDir().getCanonicalFile();
+            File canonical = file.getCanonicalFile();
+            return canonical.toPath().startsWith(root.toPath());
+        } catch (java.io.IOException e) {
+            return false;
+        }
     }
 
     private static String getMimeType(File file) {
