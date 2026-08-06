@@ -87,14 +87,25 @@ int RenderServer::Main()
 
         RenderThread *rt = RenderThread::create(stream);
         if (!rt) {
+            // RenderThread::create only fails if `new RenderThread()`
+            // returns NULL — in which case nobody took ownership of
+            // `stream`, so we delete it here. We must also `continue`,
+            // otherwise the next `if (!rt->start())` would dereference
+            // the NULL pointer (the original bug).
             fprintf(stderr,"Failed to create RenderThread\n");
             delete stream;
+            continue;
         }
 
         if (!rt->start()) {
+            // RenderThread::create succeeded, so `rt` now holds `stream`
+            // in its m_stream field. The RenderThread class does NOT
+            // delete m_stream in its destructor, so we still own it and
+            // must delete it ourselves before deleting rt.
             fprintf(stderr,"Failed to start RenderThread\n");
             delete stream;
             delete rt;
+            continue;
         }
 
         //
