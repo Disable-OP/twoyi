@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ~ This Source Code Form is subject to the terms of the Mozilla Public
+  ~ License, v. 2.0. If a copy of the MPL was not distributed with this
+  ~ file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  -->
+
+<!--
+  Data extraction rules for Android 12+ (API 31+).
+
+  Referenced from AndroidManifest.xml via android:dataExtractionRules.
+
+  twoyi ships an entire Android image (rootfs + system + userdata) inside
+  its private data dir, plus any user-installed APKs and per-profile
+  state. A device-to-device migration or a cloud backup that pulled this
+  tree to another phone would (a) leak every file the user installed
+  inside the VM, and (b) almost certainly fail to boot on the target
+  because the native libraries are ABI-specific and the data layout is
+  tied to the source install path. We therefore opt out of *both* the
+  cloud-backup path and the device-transfer path.
+
+  allowBackup="false" in the manifest already disables Auto Backup on
+  Android 6–11; this file covers the Android 12+ migration flow, which
+  has its own separate flag and would otherwise still run.
+
+  The include-then-exclude pattern on domain="root" is the documented
+  way to express "exclude everything" — Android requires at least one
+  <include> rule per domain before <exclude> is meaningful, and an
+  empty <cloud-backup/> / <device-transfer/> element is treated as
+  "no rules" rather than "exclude everything".
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="root" />
+        <exclude domain="root" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="root" />
+        <exclude domain="root" />
+    </device-transfer>
+</data-extraction-rules>
