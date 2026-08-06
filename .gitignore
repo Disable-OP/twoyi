@@ -22,9 +22,19 @@ app/cpp/emugl/build/
 # NDK / SDK installs (codespace-local)
 .android-ndk/
 .android-sdk/
+# Match both real directories and codespace-provided symlinks
+# (e.g. `.cmake -> /tmp/my-project/.cmake`). The trailing-slash
+# form only matches directories, so symlinks were slipping through
+# and showing up as untracked in `git status`.
+.cmake
 .cmake/
+.ninja
 .ninja/
+.jdk17
 .jdk17/
+
+# Codespace-local skill registry (not part of twoyi)
+skills/
 
 # Rust build artifacts
 app/rs/target/

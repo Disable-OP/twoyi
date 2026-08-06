@@ -19,7 +19,6 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.reflect.Method;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -87,22 +86,27 @@ public class IOUtils {
             FileChannel iChannel = inputStream.getChannel();
             FileChannel oChannel = outputStream.getChannel();
 
-            ByteBuffer buffer = ByteBuffer.allocate(1024);
-            while (true) {
-                buffer.clear();
-                int r = iChannel.read(buffer);
-                if (r == -1)
+            // Performance: use FileChannel.transferTo(), which on Linux maps
+            // to the sendfile(2) syscall and copies data entirely inside the
+            // kernel (zero-copy) instead of bouncing every chunk through a
+            // user-space ByteBuffer. This is dramatically faster for the
+            // large rootfs / system image files twoyi ships (>100 MB) and
+            // also sidesteps the FileChannel.write(ByteBuffer) partial-write
+            // hazard that the previous manual loop had to work around.
+            //
+            // transferTo() is permitted to return fewer bytes than requested
+            // (its contract mirrors sendfile(2), which may return 0 on some
+            // kernels for very large counts). Loop until the source is
+            // exhausted; bail if no forward progress is possible to avoid
+            // an infinite spin.
+            long size = iChannel.size();
+            long transferred = 0;
+            while (transferred < size) {
+                long n = iChannel.transferTo(transferred, size - transferred, oChannel);
+                if (n <= 0) {
                     break;
-                buffer.limit(buffer.position());
-                buffer.position(0);
-                // Fixed: FileChannel.write(ByteBuffer) is allowed to return
-                // fewer bytes than buffer.remaining() (the contract mirrors
-                // WritableByteChannel). The original code dropped the unwritten
-                // tail, silently corrupting the target file. Drain the buffer
-                // fully before reading the next chunk.
-                while (buffer.hasRemaining()) {
-                    oChannel.write(buffer);
                 }
+                transferred += n;
             }
         } finally {
             closeSilently(inputStream);

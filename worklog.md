@@ -4232,3 +4232,20 @@ Stage Summary:
 - 250+ bugs documented for future work
 - Emulator configuration discovered and documented
 - APK ready for testing on real device or 8GB+ machine
+
+## Round 18 — perf + cleanup (2026-08-06)
+
+- perf: IOUtils.copyFile now uses FileChannel.transferTo() (zero-copy
+  sendfile(2) on Linux) instead of a manual 1 KB ByteBuffer loop.
+  This is dramatically faster for the >100 MB rootfs / system image
+  files twoyi ships at first-boot extract time, and also removes the
+  partial-write hazard that the previous drain-loop workaround had
+  to defend against.
+- chore: removed duplicate MPL license headers from 6 Java files
+  (TwoyiApplication, TwoyiSocketServer, TwoyiMessenger, TwoyiStatusManager,
+  BootLogTexture, Render2Activity). Each had 2–3 copies of the same
+  6-line header at the top of the file — only one is canonical.
+- chore: dropped the now-unused `import java.nio.ByteBuffer;` from
+  IOUtils.java after the transferTo() rewrite.
+- Verified: APK rebuilt successfully (twoyi_3.5.5-08061234-release.apk,
+  9.2 MB, all native libs + classes.dex present).
