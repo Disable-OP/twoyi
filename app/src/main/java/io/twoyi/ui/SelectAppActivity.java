@@ -113,7 +113,7 @@ public class SelectAppActivity extends AppCompatActivity {
             try {
                 startActivityForResult(intent, REQUEST_GET_FILE);
             } catch (Throwable ignored) {
-                Toast.makeText(getApplicationContext(), "Error", Toast.LENGTH_SHORT).show();
+                Toast.makeText(getApplicationContext(), getString(R.string.error_generic), Toast.LENGTH_SHORT).show();
             }
         });
 

@@ -282,7 +282,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                         try {
                             startActivityForResult(intent, REQUEST_SELECT_ROM);
                         } catch (Throwable ignored) {
-                            Toast.makeText(this, "Error selecting file", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.error_selecting_file), Toast.LENGTH_SHORT).show();
                             finish();
                         }
                     })
@@ -517,11 +517,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                 // ROM imported successfully, restart to boot
                 RomManager.reboot(this);
             } else {
-                Toast.makeText(this, "Failed to import ROM", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, getString(R.string.rom_import_failed), Toast.LENGTH_SHORT).show();
                 finish();
             }
         }).fail(result -> runOnUiThread(() -> {
-            Toast.makeText(this, "Error importing ROM: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.rom_import_error, result.getMessage()), Toast.LENGTH_SHORT).show();
             dialog.dismiss();
             finish();
         }));

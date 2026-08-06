@@ -149,4 +149,21 @@
     <string name="select_rom_file">选择 ROM 文件</string>
     <string name="go_to_settings">前往设置</string>
     <string name="item_app_icon_desc">应用图标</string>
+
+    <!-- Round 32: generic error / status messages (i18n extraction) -->
+    <string name="error_generic">错误</string>
+    <string name="error_sharing_log">分享日志时出错</string>
+    <string name="error_selecting_file">选择文件时出错</string>
+    <string name="wechat_not_installed">未安装微信。</string>
+
+    <!-- Round 32: settings validation errors -->
+    <string name="settings_invalid_number">无效的数字</string>
+    <string name="settings_width_range_error">宽度必须在 %1$d 和 %2$d 之间</string>
+    <string name="settings_height_range_error">高度必须在 %1$d 和 %2$d 之间</string>
+    <string name="settings_dpi_range_error">DPI 必须在 %1$d 和 %2$d 之间</string>
+
+    <!-- Round 32: ROM import status messages -->
+    <string name="rom_imported_successfully">ROM 导入成功，请重启。</string>
+    <string name="rom_import_failed">ROM 导入失败</string>
+    <string name="rom_import_error">导入 ROM 出错：%1$s</string>
 </resources>
