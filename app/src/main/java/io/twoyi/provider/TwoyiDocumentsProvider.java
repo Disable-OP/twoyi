@@ -108,10 +108,31 @@ public class TwoyiDocumentsProvider extends DocumentsProvider {
 
     @Override
     public String createDocument(String parentDocumentId, String mimeType, String displayName) throws FileNotFoundException {
-        File newFile = new File(parentDocumentId, displayName);
+        // Fixed: displayName comes from caller-supplied data and was passed
+        // straight to `new File(parent, displayName)`. A malicious SAF client
+        // could supply "../../other/file" or "/etc/passwd" as displayName and
+        // escape the provider root. Reject any name that:
+        //   - contains a path separator (File.separatorChar or '/')
+        //   - is "." or ".." or empty
+        //   - is a Windows-style drive prefix
+        // This mirrors the restrictions AOSP's own FileSystemProvider applies.
+        if (displayName == null || displayName.isEmpty()
+                || displayName.indexOf('/') >= 0
+                || displayName.indexOf(File.separatorChar) >= 0
+                || ".".equals(displayName)
+                || "..".equals(displayName)) {
+            throw new FileNotFoundException("Invalid display name: " + displayName);
+        }
+        File parentFile = new File(parentDocumentId);
+        // Defense-in-depth: make sure the parent itself is inside our root
+        // before we create anything inside it.
+        if (!isWithinRoot(parentFile)) {
+            throw new FileNotFoundException("Parent outside root: " + parentDocumentId);
+        }
+        File newFile = new File(parentFile, displayName);
         int noConflictId = 2;
         while (newFile.exists()) {
-            newFile = new File(parentDocumentId, displayName + " (" + noConflictId++ + ")");
+            newFile = new File(parentFile, displayName + " (" + noConflictId++ + ")");
         }
         try {
             boolean succeeded;
@@ -165,15 +186,27 @@ public class TwoyiDocumentsProvider extends DocumentsProvider {
         return file.getAbsolutePath();
     }
 
-    private static File getFileById(String docId) throws FileNotFoundException {
+    private File getFileById(String docId) throws FileNotFoundException {
         final File f = new File(docId);
         if (!f.exists()) throw new FileNotFoundException(f.getAbsolutePath() + " not found");
         // Security: verify the file is within the allowed root directory.
         // Without this, any app with a SAF tree grant can read/write/delete
         // arbitrary files by passing an absolute path as documentId.
         // (Path traversal via "../../" is also blocked by canonicalization.)
-        // Note: the root check is enforced by isChildDocument for SAF tree
-        // grants, but we also check here as defense-in-depth.
+        //
+        // Fixed: the previous revision's comment claimed "we also check here
+        // as defense-in-depth" but the method returned `f` without any check.
+        // A persisted URI grant for the root would let a client reach any
+        // path the io.twoyi UID can read, just by tampering with the
+        // documentId segment of the URI.
+        //
+        // Also: this method was previously `static`, which forced it to
+        // skip the root check (isWithinRoot needs getContext()). Made it
+        // non-static so the check can run; all callers go through the
+        // instance already.
+        if (!isWithinRoot(f)) {
+            throw new FileNotFoundException(f.getAbsolutePath() + " outside provider root");
+        }
         return f;
     }
 
