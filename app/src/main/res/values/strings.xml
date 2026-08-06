@@ -48,6 +48,7 @@
     <string name="select_app_app_not_found">Can not found the specified package.</string>
     <string name="select_app_tips">Please select app you want to create</string>
     <string name="create_app_activity">Import App</string>
+    <string name="item_app_icon_desc">App icon</string>
     <string name="check_file_invlid_apk">Can not parse the APK file!</string>
     <string name="check_file_create_self_tip">Boy, your idea is promising :)</string>
     <string name="import_app_from_file">Import app from APK</string>

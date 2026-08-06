@@ -46,6 +46,7 @@
     <string name="select_app_app_not_found">指定されたパッケージが見つかりません。</string>
     <string name="select_app_tips">作成するアプリを選択してください</string>
     <string name="create_app_activity">アプリをインポート</string>
+    <string name="item_app_icon_desc">アプリアイコン</string>
     <string name="check_file_invlid_apk">APKファイルを解析できません</string>
     <string name="check_file_create_self_tip">あなたのアイデアは有望です :)</string>
     <string name="import_app_from_file">アプリをAPKからインポート</string>

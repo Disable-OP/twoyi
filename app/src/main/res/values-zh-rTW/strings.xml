@@ -46,6 +46,7 @@
     <string name="select_app_app_not_found">未找到指定的應用，無法添加！</string>
     <string name="select_app_tips">請選擇要建立的應用</string>
     <string name="create_app_activity">匯入應用</string>
+    <string name="item_app_icon_desc">應用圖示</string>
     <string name="check_file_invlid_apk">安裝包解析錯誤！</string>
     <string name="check_file_create_self_tip">小伙子，你這個想法很有前途 :)</string>
     <string name="import_app_from_file">從APK文件匯入</string>
