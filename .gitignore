@@ -18,6 +18,43 @@ dl.sh
 
 # task AOSP-VENDOR-1 — vendored AOSP emugl build artifacts
 app/cpp/emugl/build-*/
+app/cpp/emugl/build/
 # NDK / SDK installs (codespace-local)
 .android-ndk/
 .android-sdk/
+.cmake/
+.ninja/
+.jdk17/
+
+# Rust build artifacts
+app/rs/target/
+app/rs/kr64/target/
+app/rs/loader/target/
+
+# Signing material (should never be committed)
+*.jks
+*.keystore
+*.p12
+keystore.properties
+google-services.json
+
+# Secrets / env files
+*.env
+secrets.properties
+
+# Build outputs
+*.apk
+*.aab
+*.aar
+app/build/
+app/src/main/jniLibs/*/libtwoyi.so
+
+# Large binaries
+*.tar.gz
+*.7z
+*.log
+*.hprof
+
+# IDE
+.kotlin/
+.vscode/
