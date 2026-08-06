@@ -464,3 +464,53 @@ emulator -avd twoyi28 \
 - `scripts/quick_install.sh` / `quick_install2.sh` — automated boot + install
 - `scripts/build_libtwoyi.sh` — cross-compile for both ABIs
 - `scripts/syntax_check.py` — Rust syntax validation
+
+## 13. Session Progress (2026-08-06 00:24 UTC)
+
+### Commits Pushed: 18
+### Bugs Found: 300+ (across 22 sub-agent code reviews)
+### Bugs Fixed: ~65 (critical + high + medium priority)
+
+### Files Improved (21 files):
+- app/rs/src/core.rs — init spawn, JNI safety, ANDROID_ROOT/DATA fix
+- app/rs/src/lib.rs — extern C, ANativeWindow acquire/release, null checks
+- app/rs/src/input.rs — multitouch ABS bitmask, SLOT min/max, busy-loop fix
+- app/rs/kr64/src/devices.rs — CRITICAL: Drop/take_listener socket unlink fix
+- app/rs/kr64/src/seccomp.rs — aarch64 compile fix (SYS_iopl/SYS_ioperm)
+- app/rs/kr64/src/binder.rs — BC_TRANSACTION_SG constants, livelock, DoS cap
+- app/rs/kr64/src/proc_emu.rs — cmdline abilist, status CapEff/Seccomp, cwd fix
+- app/rs/kr64/src/sensors.rs — removed #[derive] on #[repr(packed)] (UB)
+- app/rs/kr64/src/battery.rs — sysfs ABI names (voltage_now, temp)
+- app/rs/kr64/src/mount_mgr.rs — self-bind before pivot_root
+- app/rs/kr64/src/lib.rs — fork+exec security (close fd, env vars, _exit)
+- app/rs/loader/src/lib.rs — argv NULL-termination, CString panic fix
+- app/cpp/emugl/compat/utils/String8.h — empty char literal compile error
+- app/cpp/emugl/compat/utils/KeyedVector.h — valueFor crash fix
+- app/cpp/emugl/CMakeLists.txt — symbol visibility hidden
+- app/src/main/java/io/twoyi/Render2Activity.java — lifecycle, onDestroy
+- app/src/main/java/io/twoyi/TwoyiSocketServer.java — leaks, security, DoS
+- app/src/main/java/io/twoyi/TwoyiStatusManager.java — switchOs race fix
+- app/src/main/java/io/twoyi/utils/RomManager.java — isAndroid12 fix
+- app/src/main/java/io/twoyi/utils/UIHelper.java — isVM64 endsWith→equals, paste null
+- app/src/main/AndroidManifest.xml — exported attrs, allowBackup, configChanges
+- app/src/main/res/layout/ac_render.xml — layout conflict, keepScreenOn
+- app/src/main/res/values-night/themes.xml — colorOnPrimary accessibility
+- app/proguard-rules.pro — JNI keep rules, line numbers
+
+### Emulator Status
+- Android 9 (API 28) boots in 75-153 seconds with TCG (no KVM)
+- ADB connects, sys.boot_completed=1 confirmed
+- Only limitation: 3.9GB RAM causes OOM during APK install
+- On 8GB+ RAM machine: full testing would work
+
+### APK Builds
+- 7 signed APKs built with progressive fixes
+- Latest: twoyi_3.5.5-08060017-release.apk (8.8MB)
+- Location: /home/z/my-project/download/
+
+### Test Coverage Analysis
+- kr64 daemon: 144 meaningful tests (good quality)
+- Java app: 0 tests (only placeholder)
+- twoyi renderer crate: 0 tests
+- loader crate: 0 tests
+- All recently fixed bugs lack regression tests
