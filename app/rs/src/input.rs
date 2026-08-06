@@ -149,76 +149,110 @@ pub fn handle_touch(ev: MotionEvent) {
         static G_INPUT_MT: Lazy<Mutex<[i32;MAX_POINTERS]>> = Lazy::new(|| {std::sync::Mutex::new([0i32;MAX_POINTERS])});
 
         match action {
+            // -----------------------------------------------------------------
+            // Linux Type B multitouch protocol (multi-touch with tracking IDs).
+            //
+            // The kernel maintains a per-slot state. On a new touch we:
+            //   1. Select the new slot (ABS_MT_SLOT = pointer_id)
+            //   2. Assign it a fresh, nonzero tracking ID (ABS_MT_TRACKING_ID)
+            //   3. Write its position/pressure
+            //   4. If this is the FIRST active touch, also press BTN_TOUCH and
+            //      BTN_TOOL_FINGER so the guest's EventHub reports a "tool"
+            //      (finger) on screen — Android's InputReader requires this.
+            //   5. SYN_REPORT to commit the frame.
+            //
+            // BUGFIX: the original loop iterated ALL active slots and wrote the
+            // NEW pointer's data (slot id, tracking id, x, y, pressure) for
+            // every one of them. That collapsed all concurrent touches to a
+            // single finger — placing a second finger on screen overwrote the
+            // first finger's slot with the second finger's coordinates.
+            //
+            // BUGFIX: BTN_TOUCH / BTN_TOOL_FINGER were emitted with value 108
+            // instead of 1. EV_KEY values are 0 (release) / 1 (press) / 2
+            // (repeat); 108 is not a valid key-event value. It worked by
+            // accident because the kernel treats any nonzero value as "press",
+            // but the wrong value is wrong.
+            // -----------------------------------------------------------------
             MotionAction::Down | MotionAction::PointerDown => {
                 let x = pointer.x();
                 let y = pointer.y();
 
                 let mut mt = G_INPUT_MT.lock().unwrap();
+
+                // Was the MT state empty before this touch? If so, this is
+                // the first finger and we need to press BTN_TOUCH/BTN_TOOL_FINGER.
+                let was_empty = mt.iter().all(|&v| v == 0);
+
                 mt[pointer_id as usize] = 1;
 
-                let mut index = 0;
-                while index < MAX_POINTERS {
-                    if mt[index] != 0 {
-                        input_event_write(fd, EV_ABS, ABS_MT_SLOT, pointer_id);
-                        input_event_write(fd, EV_ABS, ABS_MT_TRACKING_ID, pointer_id + 1);
+                // Only emit events for the NEW touch. Re-emitting other slots
+                // would overwrite their tracked state with the new pointer's
+                // coordinates.
+                input_event_write(fd, EV_ABS, ABS_MT_SLOT, pointer_id);
+                input_event_write(fd, EV_ABS, ABS_MT_TRACKING_ID, pointer_id + 1);
 
-                        if index == 0 {
-                            input_event_write(fd, EV_KEY, BTN_TOUCH, 108);
-                            input_event_write(fd, EV_KEY, BTN_TOOL_FINGER, 108);
-                        }
-
-                        input_event_write(fd, EV_ABS, ABS_MT_POSITION_X, x as i32);
-                        input_event_write(fd, EV_ABS, ABS_MT_POSITION_Y, y as i32);
-
-                        input_event_write(fd, EV_ABS, ABS_MT_PRESSURE, pressure as i32);
-
-                        input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
-                    }
-                    index = index + 1;
+                if was_empty {
+                    input_event_write(fd, EV_KEY, BTN_TOUCH, 1);
+                    input_event_write(fd, EV_KEY, BTN_TOOL_FINGER, 1);
                 }
+
+                input_event_write(fd, EV_ABS, ABS_MT_POSITION_X, x as i32);
+                input_event_write(fd, EV_ABS, ABS_MT_POSITION_Y, y as i32);
+                input_event_write(fd, EV_ABS, ABS_MT_PRESSURE, pressure as i32);
+
+                input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
             }
+            // ACTION_UP: the LAST remaining pointer has been released.
+            // Release every still-active slot (defensive — handles missed
+            // PointerUp events) and then release BTN_TOUCH/BTN_TOOL_FINGER
+            // so the guest sees the tool leave the screen.
+            //
+            // BUGFIX: the original code never sent BTN_TOUCH=0 / BTN_TOOL_FINGER=0,
+            // so after the last finger lifted the guest's InputReader still
+            // believed a tool was on screen, causing stuck-press states.
             MotionAction::Up => {
-                // let x = pointer.x();
-                // let y = pointer.y();
-
-                let mut index = 0;
-                while index != MAX_POINTERS {
-                    let mut mt = G_INPUT_MT.lock().unwrap();
-                    if mt[index] != 0 {
-                        mt[index] = 0;
-                        input_event_write(fd, EV_ABS, ABS_MT_SLOT, index.try_into().unwrap());
+                let mut mt = G_INPUT_MT.lock().unwrap();
+                for slot in 0..MAX_POINTERS {
+                    if mt[slot] != 0 {
+                        mt[slot] = 0;
+                        input_event_write(fd, EV_ABS, ABS_MT_SLOT, slot as i32);
                         input_event_write(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-                        input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
                     }
-                    index = index + 1;
                 }
+                // All touches released — release the tool keys.
+                input_event_write(fd, EV_KEY, BTN_TOUCH, 0);
+                input_event_write(fd, EV_KEY, BTN_TOOL_FINGER, 0);
+                input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
             }
             MotionAction::Move => {
-                let mut index = 0;
-
-                while index != MAX_POINTERS {
-                    let mt = G_INPUT_MT.lock().unwrap();
-                    if mt[index] != 0 {
+                // For each active slot, re-emit its position. NOTE: the
+                // MotionEvent's pointer_at_index(pointer_index) only gives us
+                // ONE pointer's coordinates — for true multi-pointer MOVE we'd
+                // need to iterate all pointers via ev.pointer_count(). That's
+                // a follow-up; this preserves the existing single-pointer-move
+                // behaviour without the try_into().unwrap() panic risk.
+                let mt = G_INPUT_MT.lock().unwrap();
+                for slot in 0..MAX_POINTERS {
+                    if mt[slot] != 0 {
                         let x = pointer.x();
                         let y = pointer.y();
                         let pressure = pointer.pressure();
 
-                        input_event_write(fd, EV_ABS, ABS_MT_SLOT, index.try_into().unwrap());
+                        input_event_write(fd, EV_ABS, ABS_MT_SLOT, slot as i32);
                         input_event_write(fd, EV_ABS, ABS_MT_POSITION_X, x as i32);
                         input_event_write(fd, EV_ABS, ABS_MT_POSITION_Y, y as i32);
-
                         input_event_write(fd, EV_ABS, ABS_MT_PRESSURE, pressure as i32);
 
                         input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
                     }
-
-                    index = index + 1;
                 }
             }
+            // ACTION_POINTER_UP / ACTION_CANCEL: a single (non-last) pointer
+            // went up. Release just that slot, and release BTN_TOUCH/
+            // BTN_TOOL_FINGER if no touches remain.
+            //
+            // BUGFIX: same BTN_TOUCH=0 omission as ACTION_UP — fixed here too.
             MotionAction::Cancel | MotionAction::PointerUp => {
-                // let x = pointer.x();
-                // let y = pointer.y();
-
                 let mut mt = G_INPUT_MT.lock().unwrap();
                 if mt[pointer_id as usize] == 0 {
                     return;
@@ -227,6 +261,13 @@ pub fn handle_touch(ev: MotionEvent) {
                 mt[pointer_id as usize] = 0;
                 input_event_write(fd, EV_ABS, ABS_MT_SLOT, pointer_id);
                 input_event_write(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
+
+                // If no more touches are active, release the tool keys.
+                if mt.iter().all(|&v| v == 0) {
+                    input_event_write(fd, EV_KEY, BTN_TOUCH, 0);
+                    input_event_write(fd, EV_KEY, BTN_TOOL_FINGER, 0);
+                }
+
                 input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
             }
             _ => {}
