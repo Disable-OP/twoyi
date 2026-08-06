@@ -122,8 +122,10 @@ public class IOUtils {
         }
         try {
             closeable.close();
-        } catch (IOException e) {
-            // e.printStackTrace();
+        } catch (IOException ignored) {
+            // Intentionally silent: this is a best-effort close during
+            // cleanup; callers don't want to see close-time I/O errors
+            // masking the primary exception (if any).
         }
     }
 
