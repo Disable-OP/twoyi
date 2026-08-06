@@ -141,7 +141,7 @@ public class FakeUtils {
 
     /* renamed from: WWWȏWWWoನ̑  reason: contains not printable characters */
     public static String m5255WWWoWWWo(String str) {
-        String upperCase = str.substring(0, 8).toUpperCase();
+        String upperCase = str.substring(0, 8).toUpperCase(Locale.US);
         StringBuilder sb2 = new StringBuilder();
         pr0.m9002WWWWWWWW(StringFog.f8859WWWWWWWW, new byte[]{91, -127}, new byte[]{99, -79, -38, 17, 19, -27, -41, 98}, sb2);
         sb2.append(upperCase.substring(0, 6));

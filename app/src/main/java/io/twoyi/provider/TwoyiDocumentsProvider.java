@@ -20,6 +20,7 @@ import androidx.annotation.Nullable;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.util.Locale;
 
 import io.twoyi.R;
 
@@ -229,7 +230,7 @@ public class TwoyiDocumentsProvider extends DocumentsProvider {
             final String name = file.getName();
             final int lastDot = name.lastIndexOf('.');
             if (lastDot >= 0) {
-                final String extension = name.substring(lastDot + 1).toLowerCase();
+                final String extension = name.substring(lastDot + 1).toLowerCase(Locale.US);
                 final String mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension);
                 if (mime != null) return mime;
             }

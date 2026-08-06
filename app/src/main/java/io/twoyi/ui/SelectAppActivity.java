@@ -290,9 +290,9 @@ public class SelectAppActivity extends AppCompatActivity {
         }
 
         for (AppItem appItem : mAllApps) {
-            String name = appItem.name.toString().toLowerCase();
-            String pkg = appItem.pkg.toString().toLowerCase();
-            String queryLower = query.toLowerCase();
+            String name = appItem.name.toString().toLowerCase(Locale.US);
+            String pkg = appItem.pkg.toString().toLowerCase(Locale.US);
+            String queryLower = query.toLowerCase(Locale.US);
             if (name.contains(queryLower) || pkg.contains(queryLower)) {
                 newApps.add(appItem);
             }
