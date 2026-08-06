@@ -7,6 +7,7 @@
 package io.twoyi.utils;
 
 import android.text.TextUtils;
+import android.util.Log;
 
 import androidx.annotation.Keep;
 
@@ -31,6 +32,7 @@ import java.util.List;
  */
 @Keep
 public class IOUtils {
+    private static final String TAG = "IOUtils";
 
     public static void ensureCreated(File file) {
         if (!file.exists()) {
@@ -132,7 +134,7 @@ public class IOUtils {
             setPermissions.setAccessible(true);
             setPermissions.invoke(null, path, mode, uid, gid);
         } catch (Throwable e) {
-            e.printStackTrace();
+            Log.e(TAG, "IOUtils failure", e);
         }
     }
 

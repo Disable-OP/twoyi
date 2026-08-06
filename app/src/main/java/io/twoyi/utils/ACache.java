@@ -12,6 +12,7 @@ import android.graphics.Canvas;
 import android.graphics.PixelFormat;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
+import android.util.Log;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -42,6 +43,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * @author Michael Yang（www.yangfuhai.com） update at 2013.08.07
  */
 public class ACache {
+    private static final String TAG = "ACache";
 	public static final int TIME_HOUR = 60 * 60;
 	public static final int TIME_DAY = TIME_HOUR * 24;
 	private static final int MAX_SIZE = 1000 * 1000 * 50; // 50 mb
@@ -116,18 +118,18 @@ public class ACache {
 			out = new BufferedWriter(new FileWriter(file), 1024);
 			out.write(value);
 		} catch (IOException e) {
-			e.printStackTrace();
+			Log.e(TAG, "ACache I/O failure", e);
 		} finally {
 			if (out != null) {
 				try {
 					out.flush();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 				try {
 					out.close();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 			}
 			mCache.put(file);
@@ -174,14 +176,14 @@ public class ACache {
 				return null;
 			}
 		} catch (IOException e) {
-			e.printStackTrace();
+			Log.e(TAG, "ACache I/O failure", e);
 			return null;
 		} finally {
 			if (in != null) {
 				try {
 					in.close();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 			}
 			if (removeFile)
@@ -230,7 +232,7 @@ public class ACache {
 			JSONObject obj = new JSONObject(JSONString);
 			return obj;
 		} catch (Exception e) {
-			e.printStackTrace();
+			Log.e(TAG, "ACache I/O failure", e);
 			return null;
 		}
 	}
@@ -276,7 +278,7 @@ public class ACache {
 			JSONArray obj = new JSONArray(JSONString);
 			return obj;
 		} catch (Exception e) {
-			e.printStackTrace();
+			Log.e(TAG, "ACache I/O failure", e);
 			return null;
 		}
 	}
@@ -299,18 +301,18 @@ public class ACache {
 			out = new FileOutputStream(file);
 			out.write(value);
 		} catch (Exception e) {
-			e.printStackTrace();
+			Log.e(TAG, "ACache I/O failure", e);
 		} finally {
 			if (out != null) {
 				try {
 					out.flush();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 				try {
 					out.close();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 			}
 			mCache.put(file);
@@ -357,14 +359,14 @@ public class ACache {
 				return null;
 			}
 		} catch (Exception e) {
-			e.printStackTrace();
+			Log.e(TAG, "ACache I/O failure", e);
 			return null;
 		} finally {
 			if (RAFile != null) {
 				try {
 					RAFile.close();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 			}
 			if (removeFile)
@@ -411,7 +413,7 @@ public class ACache {
 				put(key, data);
 			}
 		} catch (Exception e) {
-			e.printStackTrace();
+			Log.e(TAG, "ACache I/O failure", e);
 		} finally {
 			// Fixed: if new ObjectOutputStream(baos) threw, oos is null and the
 			// original `oos.close()` NPE'd here, masking the real exception.
@@ -446,20 +448,20 @@ public class ACache {
 				Object reObject = ois.readObject();
 				return reObject;
 			} catch (Exception e) {
-				e.printStackTrace();
+				Log.e(TAG, "ACache I/O failure", e);
 				return null;
 			} finally {
 				try {
 					if (bais != null)
 						bais.close();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 				try {
 					if (ois != null)
 						ois.close();
 				} catch (IOException e) {
-					e.printStackTrace();
+					Log.e(TAG, "ACache I/O failure", e);
 				}
 			}
 		}

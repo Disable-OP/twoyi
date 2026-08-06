@@ -152,3 +152,35 @@ namespace**.
 - Never run Twoyi inside a work profile that holds sensitive host data,
   and do not grant the host app broad storage or accessibility
   permissions it does not strictly need.
+
+---
+
+## 7. Network security configuration — cleartext forbidden by default
+
+The AndroidManifest references
+[`res/xml/network_security_config.xml`](app/src/main/res/xml/network_security_config.xml),
+which sets the app's default network policy to
+`cleartextTrafficPermitted="false"`. With `targetSdk=28`, Android would
+otherwise permit cleartext (HTTP) traffic by default — leaving AppCenter
+analytics/crash uploads, license metadata fetches, and any future
+network call exposed to passive observers on hostile Wi-Fi and to
+active SSL-strip / TLS-downgrade attacks.
+
+The policy has three loopback-only exceptions that preserve existing
+functionality without weakening the default for routable traffic:
+
+- `localhost`, `127.0.0.1` — `Installer.java` spawns `libadb.so`, which
+  connects to the guest's `adbd` on `localhost:22122`. ADB's wire
+  protocol is plaintext by design and cannot be TLS-wrapped.
+- `10.0.2.2` — the Android emulator's host-loopback alias, used by
+  redroid containers and the emulator itself for ADB-over-TCP during
+  development.
+
+Android matches the **resolved IP address** against the exception list,
+not the hostname, so a malicious DNS rebinding that resolves `localhost`
+to a public IP remains blocked. The exceptions do not weaken the
+default for any routable network traffic.
+
+Verification: `aapt dump xmltree <apk> AndroidManifest.xml` shows
+`A: android:networkSecurityConfig(0x01010527)=@0x7f130001`, confirming
+the policy is compiled into every release APK.
