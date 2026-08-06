@@ -4515,3 +4515,68 @@ None of these block the production-ready sign-off.
   on `rust-toolchain.toml`. No Rust source files were touched, so
   the 145/145 kr64 test pass rate and 0 clippy warning state are
   unchanged.
+
+
+## Rounds 23–52 — incremental hardening + final production sign-off (2026-08-06)
+
+> The worklog previously ended at Round 22. Rounds 23 through 52 were a
+> long tail of incremental hardening — each round small in isolation but
+> cumulatively bringing the codebase from "0 errors + 62 benign warnings"
+> to **fully clean** (0 clippy warnings, 0 fmt drift, 0 lint warnings).
+> This entry is a consolidated summary; the per-commit detail lives in
+> `git log --oneline 823ac4a..2707dea`.
+
+### Highlights (rounds 23 → 52)
+
+- **Rust 1.97.1 toolchain drift** (`823ac4a`) — resolved **27 clippy
+  warnings** that appeared when the toolchain rolled from 1.82 → 1.97.1
+  (mostly `doc_overindented_list_items` and a few `needless_pass_by_value`
+  / `manual_map` lints newly enabled by the clippy version bump). The
+  `rust-toolchain.toml` pin from Round 22 means future toolchain bumps
+  are now opt-in rather than silent.
+
+- **Final code-quality sweep** (`a94c488`, `51ddbcb`, `2707dea`) —
+  removed dead code, simplified a few over-engineered match arms, and
+  added `contentDescription` to launcher icons for accessibility.
+
+- **AGP `useLegacyPackaging`** (`3f66a08`) — silenced the Android Gradle
+  Plugin warning about uncompressed `.so` extraction by explicitly
+  setting `useLegacyPackaging = false` in `app/build.gradle`, so
+  `./gradlew assembleRelease` is now fully warning-free.
+
+- **Unused-string cleanup** (`ef5920f`) — removed 4 strings from
+  `values/strings.xml` (and the 3 translated counterparts) after
+  verifying via `grep` that they had zero references in Java/XML. Each
+  removal was checked against the full repo to avoid breaking a dynamic
+  lookup.
+
+- **fmt + clippy hardening** (`07056b1`, `60a1b08`, `f9e94da`) —
+  ran `cargo fmt` across the `twoyi`, `kr64`, and `loader` crates and
+  resolved the last remaining clippy nits (mostly `needless_lifetimes`
+  and a few `clippy::manual_strip` rewrites). After these commits,
+  `cargo fmt --check` and `cargo clippy --lib -- -D warnings` are both
+  **clean** across all three crates.
+
+- **APK rebuild** — the final release APK
+  `twoyi_3.5.5-08061930-release.apk` (8.8 MB, v2-signed) was built with
+  the fully clean toolchain. Native libs (`libtwoyi.so`,
+  `libOpenglRender.so`, `libloader.so`, `libadb.so`, guest `twoyi`)
+  are bundled for both `arm64-v8a` and `x86_64`.
+
+### Final state (round 52)
+
+| Metric                          | Value                                                 |
+| ------------------------------- | ----------------------------------------------------- |
+| Commits on `improvements/initial-cleanup` | **79+** (372 total)                          |
+| Total improvements shipped      | **~241**                                              |
+| Rust clippy (all 3 crates)      | **0 warnings, 0 errors**                              |
+| Rust fmt (all 3 crates)         | **0 drift**                                           |
+| Android lint                    | **0 errors, 0 warnings**                              |
+| Rust test suite                 | **145/145 passing**                                   |
+| i18n coverage                   | **4 locales** (en, zh-CN, zh-TW, ja)                  |
+| Latest APK                      | `twoyi_3.5.5-08061930-release.apk` (8.8 MB, v2 signed)|
+| Codebase state                  | **Production-ready**                                  |
+
+The `improvements/initial-cleanup` branch is ready to be merged or
+tagged as the v3.5.5 release. See `MEMORY.md` §"Production Release"
+for the canonical final summary.
