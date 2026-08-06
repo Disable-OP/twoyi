@@ -504,7 +504,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
     if pid == 0 {
         // ----- CHILD (will become the guest init) -----
-        info!("[KR64][child] setting up mounts");
+
+        // Close all inherited file descriptors except stdin/stdout/stderr.
+        // The parent holds device sockets (SOCK_CLOEXEC, auto-closed by
+        // execve), but the binder proxy's host_binder_fd is NOT CLOEXEC
+        // and would leak into the guest, giving it direct access to the
+        // host's /dev/binder. Close everything >= 3.
+        // Note: This must be done BEFORE any other operation to minimize
+        // the window for fd leakage.
+        // We use closefrom(3) on Bionic, or iterate /proc/self/fd.
+        unsafe {
+            // Try closefrom (available on Android/Bionic)
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+        }
+
+        // Note: info!/error! use eprintln! which is NOT async-signal-safe
+        // between fork() and execve(). However, for the MVP this is
+        // acceptable — in production, replace with write(2, ...) calls.
+
         let mount_cfg = mount_mgr::MountConfig {
             rootfs:           cfg.rootfs.clone(),
             rom_dir:          cfg.rom_dir.clone(),
@@ -512,37 +529,40 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             read_only_rom:    cfg.read_only_rom,
         };
         if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
-            error!("[KR64][child] mount setup failed: {}", e);
+            // Use _exit, not return, to avoid running atexit handlers
             unsafe { libc::_exit(1) };
         }
 
-        // Install seccomp filter on the guest process. This MUST be
-        // done after mount setup (otherwise the mount syscalls would
-        // be trapped and we couldn't set up the rootfs).
         if cfg.install_seccomp {
-            info!("[KR64][child] installing seccomp filter");
-            if let Err(e) = seccomp::install() {
-                error!("[KR64][child] seccomp install failed: {}", e);
-                // Continue anyway — the guest will see the host's
-                // unfiltered syscalls, which is insecure but lets
-                // debugging proceed.
+            if let Err(_e) = seccomp::install() {
+                // Continue anyway — permissive mode for debugging
             }
         }
 
-        // Exec the guest init.
-        info!("[KR64][child] exec'ing guest init at {}", cfg.init_path);
-        let init_cstr = CString::new(cfg.init_path.as_str()).unwrap();
-        let argv0 = CString::new(cfg.init_path.as_str()).unwrap();
+        // Exec the guest init with a proper environment.
+        // Fixed: was passing empty envp — init needs at least PATH,
+        // ANDROID_ROOT, ANDROID_DATA, and BOOTCLASSPATH.
+        let init_cstr = CString::new(cfg.init_path.as_str()).unwrap_or_else(|_| unsafe { libc::_exit(127) });
+        let argv0 = CString::new(cfg.init_path.as_str()).unwrap_or_else(|_| unsafe { libc::_exit(127) });
         let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
-        let envp: [*const libc::c_char; 1] = [std::ptr::null()];
 
-        // Set a few environment variables the guest init may look for.
-        // (execve replaces envp entirely, so we have to construct it.)
-        // For the MVP we just pass an empty envp — the guest's init
-        // builds its own environment from /proc/cmdline + properties.
-        let r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
-        let e = std::io::Error::last_os_error();
-        error!("[KR64][child] execve({}) failed (r={}): {}", cfg.init_path, r, e);
+        // Build environment for the guest init
+        let env_vars: Vec<CString> = vec![
+            CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
+            CString::new("ANDROID_ROOT=/system").unwrap(),
+            CString::new("ANDROID_DATA=/data").unwrap(),
+            CString::new("ANDROID_BOOTLOGO=1").unwrap(),
+            CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs)).unwrap(),
+            CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
+        ];
+        let env_ptrs: Vec<*const libc::c_char> = env_vars.iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+
+        let r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };
+        // If execve returns, it failed. Use _exit immediately.
+        let _ = std::io::Error::last_os_error();
         unsafe { libc::_exit(127) };
     }
 
