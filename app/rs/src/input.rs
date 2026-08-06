@@ -93,6 +93,14 @@ fn copy_to_cstr<T, const COUNT: usize>(data: &str, arr: &mut [T; COUNT]) {
 
 const MAX_POINTERS: usize = 5;
 
+// Input channel state. These Mutexes are accessed from the JNI touch/key
+// callbacks (handle_touch, send_key_code) AND from the server threads
+// (touch_server, key_server). We deliberately recover from poison
+// (`.lock().unwrap_or_else(|e| e.into_inner())`) at every call site: a
+// panic in one callback must NOT permanently disable input for the rest
+// of the session. The alternative — letting PoisonError propagate —
+// would mean a single panic kills all subsequent touch/key events,
+// bricking the guest's UI with no recovery short of an app restart.
 static INPUT_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| { Mutex::new(None)});
 static KEY_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| { Mutex::new(None)});
 
@@ -128,7 +136,7 @@ pub fn input_event_write(
 }
 
 pub fn handle_touch(ev: MotionEvent) {
-    let opt = INPUT_SENDER.lock().unwrap();
+    let opt = INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref fd) = *opt {
 
         let action = ev.action();
@@ -177,12 +185,11 @@ pub fn handle_touch(ev: MotionEvent) {
                 let x = pointer.x();
                 let y = pointer.y();
 
-                let mut mt = G_INPUT_MT.lock().unwrap();
+                let mut mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
 
                 // Was the MT state empty before this touch? If so, this is
                 // the first finger and we need to press BTN_TOUCH/BTN_TOOL_FINGER.
                 let was_empty = mt.iter().all(|&v| v == 0);
-
                 mt[pointer_id as usize] = 1;
 
                 // Only emit events for the NEW touch. Re-emitting other slots
@@ -211,7 +218,7 @@ pub fn handle_touch(ev: MotionEvent) {
             // so after the last finger lifted the guest's InputReader still
             // believed a tool was on screen, causing stuck-press states.
             MotionAction::Up => {
-                let mut mt = G_INPUT_MT.lock().unwrap();
+                let mut mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
                 for slot in 0..MAX_POINTERS {
                     if mt[slot] != 0 {
                         mt[slot] = 0;
@@ -231,7 +238,7 @@ pub fn handle_touch(ev: MotionEvent) {
                 // need to iterate all pointers via ev.pointer_count(). That's
                 // a follow-up; this preserves the existing single-pointer-move
                 // behaviour without the try_into().unwrap() panic risk.
-                let mt = G_INPUT_MT.lock().unwrap();
+                let mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
                 for slot in 0..MAX_POINTERS {
                     if mt[slot] != 0 {
                         let x = pointer.x();
@@ -253,7 +260,7 @@ pub fn handle_touch(ev: MotionEvent) {
             //
             // BUGFIX: same BTN_TOUCH=0 omission as ACTION_UP — fixed here too.
             MotionAction::Cancel | MotionAction::PointerUp => {
-                let mut mt = G_INPUT_MT.lock().unwrap();
+                let mut mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
                 if mt[pointer_id as usize] == 0 {
                     return;
                 }
@@ -337,8 +344,33 @@ fn generate_touch_device(width: i32, height: i32) -> device_info {
 fn touch_server(width: i32, height: i32) {
     let device = generate_touch_device(width, height);
     let touch = touch_path();
+
+    // Make sure the parent directory exists — the rootfs/dev/input/
+    // path may not exist yet on a fresh install, and UnixListener::bind
+    // fails with ENOENT if it doesn't.
+    if let Some(parent) = std::path::Path::new(&touch).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Remove stale socket file from a previous run.
     let _ = std::fs::remove_file(&touch);
-    let listener = unix_socket::UnixListener::bind(&touch).unwrap();
+
+    // Fixed: .unwrap() here would panic the input thread, killing the
+    // touch input system silently. The guest's EventHub would then see
+    // "touch device not available" with no diagnostic on the host side.
+    // Log the error and exit the thread gracefully instead.
+    let listener = match unix_socket::UnixListener::bind(&touch) {
+        Ok(l) => {
+            info!("[INPUT] touch server listening at {}", touch);
+            l
+        }
+        Err(e) => {
+            log::error!("[INPUT] failed to bind touch socket at {}: {} — \
+                touch input will be unavailable. Check permissions and path length.", touch, e);
+            return;
+        }
+    };
+
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -347,7 +379,7 @@ fn touch_server(width: i32, height: i32) {
                 let _ = stream.write_all(unsafe { any_as_u8_slice(&device) });
 
                 let (tx, rx) = channel::<input_event>();
-                *INPUT_SENDER.lock().unwrap() = Some(tx);
+                *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
                 thread::spawn(move || loop {
                     match rx.recv() {
@@ -461,7 +493,7 @@ pub fn send_key_code(keycode: i32) {
         }
     };
 
-    if let Some(ref tx) = *KEY_SENDER.lock().unwrap() {
+    if let Some(ref tx) = *KEY_SENDER.lock().unwrap_or_else(|e| e.into_inner()) {
         // Standard press → sync → release sequence. The guest's EventHub
         // reads this as a single key event from the virtual `vkey` device.
         input_event_write(tx, EV_KEY, linux_keycode, 1);
@@ -474,8 +506,28 @@ pub fn send_key_code(keycode: i32) {
 fn key_server() {
     let device = generate_key_device();
     let key = key_path();
+
+    // Make sure the parent directory exists (mirrors touch_server).
+    if let Some(parent) = std::path::Path::new(&key).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
     let _ = std::fs::remove_file(&key);
-    let listener = unix_socket::UnixListener::bind(&key).unwrap();
+
+    // Fixed: same panic-on-bind-failure issue as touch_server — see
+    // the comment there for rationale.
+    let listener = match unix_socket::UnixListener::bind(&key) {
+        Ok(l) => {
+            info!("[INPUT] key server listening at {}", key);
+            l
+        }
+        Err(e) => {
+            log::error!("[INPUT] failed to bind key socket at {}: {} — \
+                key input will be unavailable. Check permissions and path length.", key, e);
+            return;
+        }
+    };
+
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
@@ -484,7 +536,7 @@ fn key_server() {
                 let _ = stream.write_all(unsafe { any_as_u8_slice(&device) });
 
                 let (tx, rx) = channel::<input_event>();
-                *KEY_SENDER.lock().unwrap() = Some(tx);
+                *KEY_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
                 thread::spawn(move || loop {
                     match rx.recv() {
