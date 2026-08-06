@@ -84,7 +84,10 @@ jobs:
 
       - name: Setup Android NDK
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        # nttld/setup-ndk@v2 supersedes the old android-actions/setup-ndk
+        # line; v2 is the actively maintained major and supports newer NDK
+        # releases (r27c+) and the `ndk-path` output used below.
+        uses: nttld/setup-ndk@v2
         with:
           ndk-version: r27c
           add-to-path: false
@@ -114,6 +117,21 @@ jobs:
           if [ -z "$ABIS" ]; then ABIS="all"; fi
           echo "abis=$ABIS" >> "$GITHUB_OUTPUT"
           echo "Building ABIs: $ABIS"
+
+      - name: Run Android Lint
+        # Run lint BEFORE assembleRelease so lint errors fail the build before
+        # we spend ~10 min packaging the APK. AGP's default `lint` task
+        # analyzes every variant; default lintOptions (abortOnError=true)
+        # turns error-severity issues into a non-zero exit code. Warnings do
+        # not fail the build — there are ~62 known warnings, all benign
+        # (SetTextI18n, DiscouragedPrivateApi for hidden-API reflection, etc.).
+        # The task transitively depends on javaPreCompileRelease, which in
+        # turn triggers the cargoBuild/cmakeBuild/loaderBuild tasks wired in
+        # app/build.gradle — so this also serves as a native-compile smoke
+        # test for the chosen ABIs before assembleRelease runs.
+        run: ./gradlew lint -Pabis=${{ steps.abis.outputs.abis }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
 
       - name: Build with Gradle
         run: ./gradlew assembleRelease -Pabis=${{ steps.abis.outputs.abis }}
