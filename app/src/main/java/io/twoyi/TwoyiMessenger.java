@@ -131,6 +131,23 @@ public class TwoyiMessenger {
             writer.write(msg);
             writer.flush();
         } catch (Throwable ignored) {
+            // Fixed: a broken pipe (e.g. the guest crashed or rebooted)
+            // leaves mWriter pointing at a dead socket. Without resetting
+            // the connection state here, every subsequent send() would
+            // skip connect() (because mWriter != null) and silently drop
+            // the message via the same catch. This made host<->guest
+            // control messages (BOOT_COMPLETED, SWITCH_HOST, SETTINGS)
+            // disappear forever after the first post-disconnect send,
+            // leaving the host UI stuck on "booting..." even after the
+            // guest had fully booted. Close + null out the socket so the
+            // next send() retries connect().
+            synchronized (this) {
+                if (this.socket != null) {
+                    try { this.socket.close(); } catch (IOException ignored2) {}
+                    this.socket = null;
+                }
+                this.mWriter = null;
+            }
         } finally {
             this.mLock.writeLock().unlock();
         }
