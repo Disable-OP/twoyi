@@ -726,7 +726,7 @@ fn handle_playback(stream: &mut UnixStream, header: AudioHeader) -> std::io::Res
     //    capped to AUDIO_PUMP_BUF_SIZE so a misbehaving Java side
     //    can't make us allocate a huge buffer per connection.
     let buf_size = if min_buf > 0 {
-        (min_buf as usize).min(AUDIO_PUMP_BUF_SIZE).max(256)
+        (min_buf as usize).clamp(256, AUDIO_PUMP_BUF_SIZE)
     } else {
         AUDIO_PUMP_BUF_SIZE
     };
@@ -777,7 +777,7 @@ fn handle_capture(stream: &mut UnixStream, header: AudioHeader) -> std::io::Resu
     }
 
     let buf_size = if min_buf > 0 {
-        (min_buf as usize).min(AUDIO_PUMP_BUF_SIZE).max(256)
+        (min_buf as usize).clamp(256, AUDIO_PUMP_BUF_SIZE)
     } else {
         AUDIO_PUMP_BUF_SIZE
     };

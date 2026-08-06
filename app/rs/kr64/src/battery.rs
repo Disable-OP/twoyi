@@ -372,7 +372,7 @@ impl BatteryDevice {
     /// Spawn the periodic refresh thread, consuming `self`.
     ///
     /// Returns a [`BatteryDeviceHandle`] that holds the shutdown flag
-    /// + the refresh thread's `JoinHandle`. When the handle is
+    /// and the refresh thread's `JoinHandle`. When the handle is
     /// dropped, the shutdown flag is set and the thread is joined.
     pub fn spawn(self) -> std::io::Result<BatteryDeviceHandle> {
         let dir = self.dir.clone();

@@ -438,17 +438,12 @@ pub struct SensorEvent {
 // `#[repr(packed)]` struct.
 
 impl Clone for SensorEvent {
+    // For a `Copy` type, the canonical `clone` impl is just `*self` (a
+    // bit-for-bit copy). On `#[repr(packed)]` this is still sound: taking
+    // `&Self` (the whole struct) is always aligned — only borrows of
+    // individual misaligned fields are UB, and `*self` doesn't create any.
     fn clone(&self) -> Self {
-        // `self.field` is a place expression; `addr_of!` takes a `*const`
-        // to it without creating a reference, and `read_unaligned` copies
-        // the (possibly misaligned) bytes into an aligned local.
-        Self {
-            idx: unsafe { std::ptr::addr_of!(self.idx).read_unaligned() },
-            ts: unsafe { std::ptr::addr_of!(self.ts).read_unaligned() },
-            x: unsafe { std::ptr::addr_of!(self.x).read_unaligned() },
-            y: unsafe { std::ptr::addr_of!(self.y).read_unaligned() },
-            z: unsafe { std::ptr::addr_of!(self.z).read_unaligned() },
-        }
+        *self
     }
 }
 
@@ -1198,11 +1193,9 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
         if conn.is_shutdown() {
             break;
         }
-        if let Err(e) = read_exact(stream, &mut buf) {
-            // EOF or read error — guest disconnected. This is the
-            // normal exit path.
-            return Err(e);
-        }
+        // EOF or read error — guest disconnected. This is the
+        // normal exit path.
+        read_exact(stream, &mut buf)?;
 
         let cmd = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());

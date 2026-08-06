@@ -36,25 +36,25 @@
 //!
 //! # Module layout
 //!
-//! * [`devices`]    — virtual `/dev` device creation (qemu_pipe,
-//!                    touch, key, event, gb, gb2).
-//! * [`binder`]     — per-VM `/vm{id}/dev/binder` Unix socket + binder
-//!                    transaction proxy (skeleton; see
-//!                    `download/BINDER_SKELETON.md`).
-//! * [`audio`]      — virtual `/dev/audio` Unix socket + bidirectional
-//!                    PCM pump (playback + capture skeleton; see
-//!                    `download/AUDIO_SENSOR_HAL.md`).
-//! * [`sensors`]    — virtual `/dev/sensors` Unix socket + multiplexed
-//!                    12-sensor HAL (accel/mag/gyro/... skeleton; see
-//!                    `download/AUDIO_SENSOR_HAL.md`).
-//! * [`battery`]    — virtual `/sys/class/power_supply/battery` file tree
-//!                    + 30 s refresh thread (file-based, no socket; see
-//!                    `download/BATTERY_IMPL.md`).
-//! * [`seccomp`]    — BPF seccomp filter + SIGSYS handler.
-//! * [`proc_emu`]   — synthesised `/proc` tree (version, cpuinfo,
-//!                    meminfo, cmdline, self/, sys/).
-//! * [`mount_mgr`]  — `unshare(CLONE_NEWNS)` + `pivot_root` + tmpfs
-//!                    mounts for /dev, /proc, /sys, /system, /vendor.
+//! * [`devices`]   — virtual `/dev` device creation (qemu_pipe,
+//!   touch, key, event, gb, gb2).
+//! * [`binder`]    — per-VM `/vm{id}/dev/binder` Unix socket + binder
+//!   transaction proxy (skeleton; see
+//!   `download/BINDER_SKELETON.md`).
+//! * [`audio`]     — virtual `/dev/audio` Unix socket + bidirectional
+//!   PCM pump (playback + capture skeleton; see
+//!   `download/AUDIO_SENSOR_HAL.md`).
+//! * [`sensors`]   — virtual `/dev/sensors` Unix socket + multiplexed
+//!   12-sensor HAL (accel/mag/gyro/... skeleton; see
+//!   `download/AUDIO_SENSOR_HAL.md`).
+//! * [`battery`]   — virtual `/sys/class/power_supply/battery` file tree
+//!   and 30 s refresh thread (file-based, no socket; see
+//!   `download/BATTERY_IMPL.md`).
+//! * [`seccomp`]   — BPF seccomp filter + SIGSYS handler.
+//! * [`proc_emu`]  — synthesised `/proc` tree (version, cpuinfo,
+//!   meminfo, cmdline, self/, sys/).
+//! * [`mount_mgr`] — `unshare(CLONE_NEWNS)` + `pivot_root` + tmpfs
+//!   mounts for /dev, /proc, /sys, /system, /vendor.
 //!
 //! # Dependencies
 //!

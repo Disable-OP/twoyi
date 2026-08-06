@@ -583,7 +583,7 @@ pub fn install() -> std::io::Result<()> {
         libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER as c_int,
-            SECCOMP_FILTER_FLAG_TSYNC as u32,
+            SECCOMP_FILTER_FLAG_TSYNC,
             &fprog as *const Fprog,
         )
     };
@@ -666,10 +666,10 @@ struct SigsysSiginfo {
 ///   2. Looks the syscall up in the trapped/killed sets.
 ///   3. If killed: log and call `_exit(1)` (no return).
 ///   4. If trapped: emulate the syscall by:
-///        a. Setting the return value register to 0 (success) — or
-///           `-ENOSYS` if we don't have a real emulation yet.
-///        b. Advancing the program counter past the syscall instruction
-///           so the kernel doesn't retry it.
+///      a. Setting the return value register to 0 (success) — or
+///      `-ENOSYS` if we don't have a real emulation yet.
+///      b. Advancing the program counter past the syscall instruction
+///      so the kernel doesn't retry it.
 ///   5. Returns; the kernel restores the (modified) context and
 ///      continues execution at the new PC.
 ///
