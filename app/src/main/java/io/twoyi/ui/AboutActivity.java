@@ -28,7 +28,6 @@ import de.psdev.licensesdialog.LicensesDialog;
 import de.psdev.licensesdialog.licenses.ApacheSoftwareLicense20;
 import de.psdev.licensesdialog.licenses.BSD2ClauseLicense;
 import de.psdev.licensesdialog.licenses.GnuGeneralPublicLicense20;
-import de.psdev.licensesdialog.licenses.GnuLesserGeneralPublicLicense3;
 import de.psdev.licensesdialog.licenses.MITLicense;
 import de.psdev.licensesdialog.model.Notice;
 import de.psdev.licensesdialog.model.Notices;
@@ -225,9 +224,12 @@ public class AboutActivity extends AppCompatActivity {
     Element getLicenseElement() {
         Element license = new Element();
         license.setTitle(getResources().getString(R.string.notices_title));
+        // NOTE: stale notices for AndroidP7Zip (com.github.hzy3774:AndroidP7zip) and
+        // Once (com.github.jonfinerty:Once) were removed in round 28 — neither
+        // library is present in app/build.gradle dependencies anymore, and the
+        // project now extracts rootfs archives via system `tar -xf` through
+        // libsu (see SettingsActivity / ProfileManagerActivity) rather than p7zip.
         Notices notices = new Notices();
-        notices.addNotice(new Notice("AndroidP7Zip", "https://github.com/hzy3774/AndroidP7zip",
-                "7-Zip Copyright (C) 1999-2020 Igor Pavlov.",new GnuLesserGeneralPublicLicense3()));
         notices.addNotice(new Notice("termux-adb-fastboot", "https://github.com/rendiix/termux-adb-fastboot",
                 "Copyright (c) 2022 rendiix", new ApacheSoftwareLicense20()));
         notices.addNotice(new Notice("libsu", "https://github.com/topjohnwu/libsu", "topjohnwu", new ApacheSoftwareLicense20()));
@@ -244,8 +246,6 @@ public class AboutActivity extends AppCompatActivity {
                 "Copyright 2016 Fung Go (fython)", new ApacheSoftwareLicense20()));
         notices.addNotice(new Notice("Glide", "https://github.com/bumptech/glide",
                 "Copyright 2014 Google, Inc.", new BSD2ClauseLicense()));
-        notices.addNotice(new Notice("Once", "https://github.com/jonfinerty/Once",
-                "Copyright 2018 Jon Finerty", new ApacheSoftwareLicense20()));
 
         license.setOnClickListener(v -> {
             LicensesDialog licensesDialog = new LicensesDialog.Builder(AboutActivity.this)
