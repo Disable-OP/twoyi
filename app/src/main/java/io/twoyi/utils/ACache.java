@@ -34,6 +34,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -45,7 +46,10 @@ public class ACache {
 	public static final int TIME_DAY = TIME_HOUR * 24;
 	private static final int MAX_SIZE = 1000 * 1000 * 50; // 50 mb
 	private static final int MAX_COUNT = Integer.MAX_VALUE; // 不限制存放数据的数量
-	private static Map<String, ACache> mInstanceMap = new HashMap<String, ACache>();
+	// Fixed: HashMap under concurrent access can deadlock (rehash infinite loop
+	// on Android). ACache.get() is called from multiple threads (UI + Glide
+	// fetchers), so use ConcurrentHashMap.
+	private static final Map<String, ACache> mInstanceMap = new ConcurrentHashMap<>();
 	private ACacheManager mCache;
 
 	public static ACache get(Context ctx) {
@@ -67,10 +71,17 @@ public class ACache {
 	}
 
 	public static ACache get(File cacheDir, long max_zise, int max_count) {
-		ACache manager = mInstanceMap.get(cacheDir.getAbsoluteFile() + myPid());
+		// Fixed: original code mixed getAbsoluteFile() (a File) and
+		// getAbsolutePath() (a String) as keys — both happened to toString()
+		// to the same value, but the inconsistency was fragile. Also, the
+		// check-then-act was racy: two threads could both see null and both
+		// construct+insert, stomping the loser. putIfAbsent avoids that.
+		String key = cacheDir.getAbsolutePath() + myPid();
+		ACache manager = mInstanceMap.get(key);
 		if (manager == null) {
-			manager = new ACache(cacheDir, max_zise, max_count);
-			mInstanceMap.put(cacheDir.getAbsolutePath() + myPid(), manager);
+			ACache newManager = new ACache(cacheDir, max_zise, max_count);
+			ACache prev = mInstanceMap.putIfAbsent(key, newManager);
+			return prev != null ? prev : newManager;
 		}
 		return manager;
 	}
@@ -327,7 +338,10 @@ public class ACache {
 				return null;
 			RAFile = new RandomAccessFile(file, "r");
 			byte[] byteArray = new byte[(int) RAFile.length()];
-			RAFile.read(byteArray);
+			// Fixed: RandomAccessFile.read(byte[]) may return fewer bytes than
+			// requested (it's not contractually required to fill the buffer),
+			// leaving trailing bytes uninitialized and corrupting the payload.
+			RAFile.readFully(byteArray);
 			if (!Utils.isDue(byteArray)) {
 				return Utils.clearDateInfo(byteArray);
 			} else {
@@ -391,9 +405,18 @@ public class ACache {
 		} catch (Exception e) {
 			e.printStackTrace();
 		} finally {
-			try {
-				oos.close();
-			} catch (IOException e) {
+			// Fixed: if new ObjectOutputStream(baos) threw, oos is null and the
+			// original `oos.close()` NPE'd here, masking the real exception.
+			if (oos != null) {
+				try {
+					oos.close();
+				} catch (IOException e) {
+				}
+			} else if (baos != null) {
+				try {
+					baos.close();
+				} catch (IOException ignored) {
+				}
 			}
 		}
 	}
@@ -472,10 +495,13 @@ public class ACache {
 	 * @return bitmap 数据
 	 */
 	public Bitmap getAsBitmap(String key) {
-		if (getAsBinary(key) == null) {
+		// Fixed: original called getAsBinary() twice, reading the cache file
+		// twice and doubling I/O for large bitmaps.
+		byte[] data = getAsBinary(key);
+		if (data == null) {
 			return null;
 		}
-		return Utils.Bytes2Bimap(getAsBinary(key));
+		return Utils.Bytes2Bimap(data);
 	}
 
 	// =======================================
@@ -514,10 +540,12 @@ public class ACache {
 	 * @return Drawable 数据
 	 */
 	public Drawable getAsDrawable(String key) {
-		if (getAsBinary(key) == null) {
+		// Fixed: original called getAsBinary() twice.
+		byte[] data = getAsBinary(key);
+		if (data == null) {
 			return null;
 		}
-		return Utils.bitmap2Drawable(Utils.Bytes2Bimap(getAsBinary(key)));
+		return Utils.bitmap2Drawable(Utils.Bytes2Bimap(data));
 	}
 
 	/**
@@ -817,7 +845,9 @@ public class ACache {
 		 * byte[] → Bitmap
 		 */
 		private static Bitmap Bytes2Bimap(byte[] b) {
-			if (b.length == 0) {
+			// Fixed: original `b.length == 0` check NPE'd when b was null
+			// (callers pass through from getAsBinary which can return null).
+			if (b == null || b.length == 0) {
 				return null;
 			}
 			return BitmapFactory.decodeByteArray(b, 0, b.length);
@@ -833,6 +863,13 @@ public class ACache {
 			// 取 drawable 的长宽
 			int w = drawable.getIntrinsicWidth();
 			int h = drawable.getIntrinsicHeight();
+			// Fixed: Color drawables and VectorDrawables without intrinsic size
+			// report w=0/h=0; createBitmap() throws IllegalArgumentException
+			// ("width and height must be > 0") in that case. Fall back to 1x1.
+			if (w <= 0 || h <= 0) {
+				w = 1;
+				h = 1;
+			}
 			// 取 drawable 的颜色格式
 			Bitmap.Config config = drawable.getOpacity() != PixelFormat.OPAQUE ? Bitmap.Config.ARGB_8888
 					: Bitmap.Config.RGB_565;
