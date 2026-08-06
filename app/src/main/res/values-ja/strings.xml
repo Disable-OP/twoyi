@@ -149,4 +149,21 @@
     <string name="select_rom_file">ROMファイルを選択</string>
     <string name="go_to_settings">設定へ</string>
     <string name="item_app_icon_desc">アプリアイコン</string>
+
+    <!-- Round 32: generic error / status messages (i18n extraction) -->
+    <string name="error_generic">エラー</string>
+    <string name="error_sharing_log">ログの共有中にエラーが発生しました</string>
+    <string name="error_selecting_file">ファイルの選択中にエラーが発生しました</string>
+    <string name="wechat_not_installed">WeChatはインストールされていません。</string>
+
+    <!-- Round 32: settings validation errors -->
+    <string name="settings_invalid_number">無効な数値です</string>
+    <string name="settings_width_range_error">幅は %1$d から %2$d の間でなければなりません</string>
+    <string name="settings_height_range_error">高さは %1$d から %2$d の間でなければなりません</string>
+    <string name="settings_dpi_range_error">DPIは %1$d から %2$d の間でなければなりません</string>
+
+    <!-- Round 32: ROM import status messages -->
+    <string name="rom_imported_successfully">ROMのインポートに成功しました。再起動してください。</string>
+    <string name="rom_import_failed">ROMのインポートに失敗しました</string>
+    <string name="rom_import_error">ROMのインポート中にエラーが発生しました：%1$s</string>
 </resources>

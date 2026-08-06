@@ -155,4 +155,21 @@
     <string name="select_rom_file">Select ROM File</string>
     <string name="go_to_settings">Go to Settings</string>
     <string name="item_app_icon_desc">App icon</string>
+
+    <!-- Round 32: generic error / status messages (i18n extraction) -->
+    <string name="error_generic">Error</string>
+    <string name="error_sharing_log">Error sharing log</string>
+    <string name="error_selecting_file">Error selecting file</string>
+    <string name="wechat_not_installed">WeChat is not installed.</string>
+
+    <!-- Round 32: settings validation errors -->
+    <string name="settings_invalid_number">Invalid number</string>
+    <string name="settings_width_range_error">Width must be between %1$d and %2$d</string>
+    <string name="settings_height_range_error">Height must be between %1$d and %2$d</string>
+    <string name="settings_dpi_range_error">DPI must be between %1$d and %2$d</string>
+
+    <!-- Round 32: ROM import status messages -->
+    <string name="rom_imported_successfully">ROM imported successfully. Please reboot.</string>
+    <string name="rom_import_failed">Failed to import ROM</string>
+    <string name="rom_import_error">Error importing ROM: %1$s</string>
 </resources>

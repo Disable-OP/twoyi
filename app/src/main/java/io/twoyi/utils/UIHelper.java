@@ -96,7 +96,7 @@ public class UIHelper {
             context.startActivity(intent);
             Toast.makeText(context, R.string.wechat_public_account_tips, Toast.LENGTH_LONG).show();
         } catch (Throwable e) {
-            Toast.makeText(context, "WeChat is not installed.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(context, R.string.wechat_not_installed, Toast.LENGTH_SHORT).show();
         }
     }
 
