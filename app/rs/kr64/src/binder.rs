@@ -1213,7 +1213,7 @@ fn dispatch_request(
                 req.payload.len()
             );
             Resp {
-                ret: -(libc::EINVAL as i32),
+                ret: -(libc::EINVAL),
                 payload: Vec::new(),
             }
         }
@@ -1251,7 +1251,7 @@ fn handle_write_read(
     // Parse the wire header.
     if payload.len() < 8 {
         return Resp {
-            ret: -(libc::EINVAL as i32),
+            ret: -(libc::EINVAL),
             payload: Vec::new(),
         };
     }
@@ -1265,7 +1265,7 @@ fn handle_write_read(
             payload.len() - 8
         );
         return Resp {
-            ret: -(libc::EINVAL as i32),
+            ret: -(libc::EINVAL),
             payload: Vec::new(),
         };
     }
@@ -1555,19 +1555,16 @@ fn forward_transaction_to_host(
 ) -> io::Result<Vec<u8>> {
     // Lazily open /dev/binder on the host.
     let mut guard = host_fd.lock().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("host_binder_fd mutex poisoned: {}", e),
-        )
+        io::Error::other(format!("host_binder_fd mutex poisoned: {}", e))
     })?;
     if guard.is_none() {
         match open_host_binder() {
             Ok(fd) => *guard = Some(fd),
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("could not open host /dev/binder: {}", e),
-                ));
+                return Err(io::Error::other(format!(
+                    "could not open host /dev/binder: {}",
+                    e
+                )));
             }
         }
     }

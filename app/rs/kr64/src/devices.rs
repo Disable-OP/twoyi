@@ -344,7 +344,7 @@ pub fn create_all_devices(rootfs: &str, data_dir: &str) -> std::io::Result<Devic
 pub fn create_marker_file(rootfs: &str, name: &str) -> std::io::Result<()> {
     let path = format!("{}/dev/{}", rootfs, name);
     ensure_parent_dir(&path)?;
-    fs::write(&path, &[0u8; 8])?;
+    fs::write(&path, [0u8; 8])?;
     info!("[KR64][devices] wrote marker file: {}", path);
     Ok(())
 }
