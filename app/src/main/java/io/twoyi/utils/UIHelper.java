@@ -41,6 +41,7 @@ import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -394,7 +395,7 @@ public class UIHelper {
                 return true;
             }
 
-            return Arrays.asList("arm64-v8a", "x86_64").contains(primaryCpuAbi.toLowerCase());
+            return Arrays.asList("arm64-v8a", "x86_64").contains(primaryCpuAbi.toLowerCase(Locale.ROOT));
         } catch (Throwable e) {
             return isApk64(info.sourceDir);
         }

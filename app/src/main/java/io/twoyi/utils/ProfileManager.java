@@ -21,10 +21,10 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Manages different profiles with separate rootfs and settings.
@@ -36,6 +36,38 @@ public class ProfileManager {
     private static final String PROFILES_DIR = "profiles";
     private static final String DEFAULT_PROFILE = "default";
     private static final String ACTIVE_PROFILE_KEY = "active_profile";
+
+    /**
+     * Validate a profile name to prevent path traversal.
+     *
+     * <p>Profile names are used directly as path segments under
+     * {@code <dataDir>/profiles/<name>}, so a name containing "/" or ".."
+     * would let a caller escape the profiles directory (e.g. "../../etc"
+     * resolves to {@code <dataDir>/etc}). Reject any name that:
+     * <ul>
+     *   <li>is null, empty, or all-whitespace</li>
+     *   <li>contains a path separator ('/' or File.separatorChar)</li>
+     *   <li>equals "." or ".."</li>
+     *   <li>contains a NUL byte (defence against C-string truncation in
+     *       any downstream native code that receives the name)</li>
+     * </ul>
+     * The default profile name is always considered valid.
+     */
+    private static boolean isValidProfileName(String name) {
+        if (name == null || name.trim().isEmpty()) {
+            return false;
+        }
+        if (name.indexOf('/') >= 0 || name.indexOf(File.separatorChar) >= 0) {
+            return false;
+        }
+        if (".".equals(name) || "..".equals(name)) {
+            return false;
+        }
+        if (name.indexOf('\0') >= 0) {
+            return false;
+        }
+        return true;
+    }
 
     /**
      * Get the profiles directory
@@ -109,7 +141,11 @@ public class ProfileManager {
      * Create a new profile
      */
     public static boolean createProfile(Context context, String profileName) {
-        if (profileName == null || profileName.trim().isEmpty()) {
+        // Fixed: was only checking trim().isEmpty(), which let names like
+        // "../../etc" or "a/b" escape the profiles directory via path
+        // traversal. Now uses the shared validator.
+        if (!isValidProfileName(profileName)) {
+            Log.w(TAG, "Invalid profile name: " + profileName);
             return false;
         }
 
@@ -131,8 +167,11 @@ public class ProfileManager {
             return false;
         }
 
-        if (newName == null || newName.trim().isEmpty()) {
-            Log.w(TAG, "New profile name is empty");
+        // Fixed: validate newName against path traversal (same as createProfile).
+        // oldName is also validated defensively, in case the caller tampered
+        // with SharedPreferences.
+        if (!isValidProfileName(newName) || !isValidProfileName(oldName)) {
+            Log.w(TAG, "Invalid profile name: old=" + oldName + " new=" + newName);
             return false;
         }
 
@@ -154,23 +193,30 @@ public class ProfileManager {
             return false;
         }
 
-        // Copy settings to new profile name and delete old
+        // Copy settings to new profile name and delete old.
+        // Fixed: original code called .commit() once per key, which is a
+        // synchronous disk write per SharedPreferences entry. Batch them
+        // into a single edit() so we only fsync once.
         SharedPreferences oldPrefs = context.getSharedPreferences(
                 "profile_settings_" + oldName, Context.MODE_PRIVATE);
         SharedPreferences newPrefs = context.getSharedPreferences(
                 "profile_settings_" + newName, Context.MODE_PRIVATE);
-        
-        newPrefs.edit().clear().commit();
-        for (String key : oldPrefs.getAll().keySet()) {
-            Object value = oldPrefs.getAll().get(key);
+
+        SharedPreferences.Editor newEditor = newPrefs.edit().clear();
+        // Note: getAll() returns a snapshot; safe to iterate after we've
+        // started the new editor.
+        for (Map.Entry<String, ?> entry : oldPrefs.getAll().entrySet()) {
+            String key = entry.getKey();
+            Object value = entry.getValue();
             if (value instanceof Boolean) {
-                newPrefs.edit().putBoolean(key, (Boolean) value).commit();
+                newEditor.putBoolean(key, (Boolean) value);
             } else if (value instanceof String) {
-                newPrefs.edit().putString(key, (String) value).commit();
+                newEditor.putString(key, (String) value);
             } else if (value instanceof Integer) {
-                newPrefs.edit().putInt(key, (Integer) value).commit();
+                newEditor.putInt(key, (Integer) value);
             }
         }
+        newEditor.commit();
         oldPrefs.edit().clear().commit();
 
         // Update active profile if it was the renamed one
@@ -186,8 +232,9 @@ public class ProfileManager {
      * Copy a profile - copies files manually then creates tar
      */
     public static boolean copyProfile(Context context, String sourceName, String targetName) {
-        if (targetName == null || targetName.trim().isEmpty()) {
-            Log.w(TAG, "Target profile name is empty");
+        // Fixed: validate both names against path traversal (same as createProfile).
+        if (!isValidProfileName(sourceName) || !isValidProfileName(targetName)) {
+            Log.w(TAG, "Invalid profile name: source=" + sourceName + " target=" + targetName);
             return false;
         }
 
@@ -206,7 +253,7 @@ public class ProfileManager {
         try {
             // Create target directory
             targetDir.mkdirs();
-            
+
             // Copy directory contents manually (preserving symlinks, skipping sockets)
             Log.d(TAG, "Copying profile from " + sourceDir + " to " + targetDir);
             copyDirectoryPreservingSymlinks(sourceDir, targetDir);
@@ -216,18 +263,21 @@ public class ProfileManager {
                     "profile_settings_" + sourceName, Context.MODE_PRIVATE);
             SharedPreferences targetPrefs = context.getSharedPreferences(
                     "profile_settings_" + targetName, Context.MODE_PRIVATE);
-            
-            targetPrefs.edit().clear().commit();
-            for (String key : sourcePrefs.getAll().keySet()) {
-                Object value = sourcePrefs.getAll().get(key);
+
+            // Fixed: batch into one edit() to avoid one fsync per key.
+            SharedPreferences.Editor targetEditor = targetPrefs.edit().clear();
+            for (Map.Entry<String, ?> entry : sourcePrefs.getAll().entrySet()) {
+                String key = entry.getKey();
+                Object value = entry.getValue();
                 if (value instanceof Boolean) {
-                    targetPrefs.edit().putBoolean(key, (Boolean) value).commit();
+                    targetEditor.putBoolean(key, (Boolean) value);
                 } else if (value instanceof String) {
-                    targetPrefs.edit().putString(key, (String) value).commit();
+                    targetEditor.putString(key, (String) value);
                 } else if (value instanceof Integer) {
-                    targetPrefs.edit().putInt(key, (Integer) value).commit();
+                    targetEditor.putInt(key, (Integer) value);
                 }
             }
+            targetEditor.commit();
 
             Log.d(TAG, "Profile copied successfully");
             return true;
@@ -330,6 +380,13 @@ public class ProfileManager {
             return false;
         }
 
+        // Fixed: validate to prevent deleting arbitrary directories via path
+        // traversal in the profile name.
+        if (!isValidProfileName(profileName)) {
+            Log.w(TAG, "Invalid profile name: " + profileName);
+            return false;
+        }
+
         if (profileName.equals(getActiveProfile(context))) {
             Log.w(TAG, "Cannot delete active profile");
             return false;
@@ -350,6 +407,11 @@ public class ProfileManager {
      * Switch to a different profile by updating the symlink
      */
     public static boolean switchProfile(Context context, String profileName) {
+        // Fixed: validate to prevent path traversal via a tampered profile name.
+        if (!isValidProfileName(profileName)) {
+            Log.w(TAG, "Invalid profile name: " + profileName);
+            return false;
+        }
         if (!getProfiles(context).contains(profileName)) {
             Log.w(TAG, "Profile does not exist: " + profileName);
             return false;
