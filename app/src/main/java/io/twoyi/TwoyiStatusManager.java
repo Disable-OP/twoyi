@@ -51,7 +51,17 @@ public class TwoyiStatusManager {
         if (mStarted.compareAndSet(false, true)) {
             try {
                 mBootLatch.await();
-            } catch (BrokenBarrierException | InterruptedException e) {
+            } catch (BrokenBarrierException e) {
+                // Barrier was reset() (e.g. UI re-launched) — expected during
+                // a re-boot, not an error worth tracking.
+                LogEvents.trackError(e);
+            } catch (InterruptedException e) {
+                // Fixed: catching InterruptedException clears the thread's
+                // interrupt flag. If we don't restore it, the executor worker
+                // that called us keeps running as if nothing happened, which
+                // can suppress shutdown hooks and other interrupt-driven
+                // cancellation in callers up the stack.
+                Thread.currentThread().interrupt();
                 LogEvents.trackError(e);
             }
         }
