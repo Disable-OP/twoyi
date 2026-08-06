@@ -127,6 +127,17 @@
     <string name="profile_rename_confirm">Rename profile to %1$s?</string>
     <string name="profile_copy_hint">New profile name</string>
     <string name="profile_delete_confirm">Delete profile %1$s?</string>
+    <string name="profile_switch_failed">Failed to switch profile</string>
+    <string name="profile_renamed_to">Profile renamed to: %1$s</string>
+    <string name="profile_rename_failed">Failed to rename profile</string>
+    <string name="profile_copied_to">Profile copied to: %1$s</string>
+    <string name="profile_copy_failed">Failed to copy profile</string>
+    <string name="profile_copy_error">Error: %1$s</string>
+    <string name="profile_deleted">Profile deleted: %1$s</string>
+    <string name="profile_delete_failed">Failed to delete profile</string>
+    <string name="profile_picker_error">Error</string>
+    <string name="profile_created">Profile created: %1$s</string>
+    <string name="profile_create_failed">Failed to create profile</string>
     <string name="profile_export_success">Profile exported successfully</string>
     <string name="profile_export_failed">Failed to export profile: %1$s</string>
     <string name="profile_import_success">Profile imported successfully</string>
