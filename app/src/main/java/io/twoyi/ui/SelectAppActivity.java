@@ -174,7 +174,7 @@ public class SelectAppActivity extends AppCompatActivity {
 
         if (pkgs.size() != 1) {
 
-            // TODO: support install mutilpe apps together
+            // TODO: support install multiple apps together
             Toast.makeText(getApplicationContext(), R.string.please_install_one_by_one, Toast.LENGTH_SHORT).show();
             return;
         }

@@ -87,6 +87,10 @@
     <string name="settings_key_display_dpi">显示 DPI</string>
     <string name="settings_display_dpi_summary">虚拟显示 DPI（默认：160）</string>
     <string name="settings_display_change_reboot">显示设置将在重启后生效</string>
+    <string name="settings_use_new_renderer_title">使用新渲染器</string>
+    <string name="settings_use_new_renderer_summary">使用开源 Rust 渲染器（实验性，需要重启）</string>
+    <string name="settings_debug_renderer_title">调试渲染器</string>
+    <string name="settings_debug_renderer_summary">将所有渲染器数据转储到日志文件（警告：会产生大量日志，默认关闭）</string>
     <string name="settings_key_select_rom">选择 ROM</string>
     <string name="settings_select_rom_summary">为当前配置文件导入 ROM 文件</string>
     <string name="settings_key_profile_manager">配置文件管理器</string>

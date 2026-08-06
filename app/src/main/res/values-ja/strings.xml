@@ -87,6 +87,10 @@
     <string name="settings_key_display_dpi">ディスプレイ DPI</string>
     <string name="settings_display_dpi_summary">仮想ディスプレイの DPI（デフォルト：160）</string>
     <string name="settings_display_change_reboot">ディスプレイ設定は再起動後に有効になります</string>
+    <string name="settings_use_new_renderer_title">新しいレンダラーを使用</string>
+    <string name="settings_use_new_renderer_summary">オープンソースの Rust レンダラーを使用（実験的、再起動が必要）</string>
+    <string name="settings_debug_renderer_title">デバッグレンダラー</string>
+    <string name="settings_debug_renderer_summary">すべてのレンダラーデータをログファイルにダンプ（警告：大量のログが生成されます、デフォルト OFF）</string>
     <string name="settings_key_select_rom">ROM選択</string>
     <string name="settings_select_rom_summary">現在のプロファイルにROMファイルをインポート</string>
     <string name="settings_key_profile_manager">プロファイルマネージャー</string>

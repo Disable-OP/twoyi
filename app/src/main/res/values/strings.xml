@@ -89,7 +89,8 @@
     <string name="settings_key_display_dpi">Display DPI</string>
     <string name="settings_display_dpi_summary">Virtual display DPI (default: 160)</string>
     <string name="settings_display_change_reboot">Display settings will take effect after reboot</string>
-    <string name="settings_key_use_new_renderer">Use New Renderer</string>
+    <string name="settings_key_use_new_renderer" translatable="false">use_new_renderer</string>
+    <string name="settings_use_new_renderer_title">Use New Renderer</string>
     <string name="settings_use_new_renderer_summary">Use open-source Rust renderer (experimental, requires reboot)</string>
     <string name="settings_key_debug_renderer" translatable="false">debug_renderer</string>
     <string name="settings_debug_renderer_title">Debug Renderer</string>

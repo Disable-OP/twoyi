@@ -4414,3 +4414,52 @@ None of these block the production-ready sign-off.
   data_extraction_rules) parse cleanly (Python ElementTree). No Java or
   Rust source changes, so the 145/145 cargo test suite and the
   0-clippy-warning / 0-lint-error status are unchanged.
+
+## Round 21 — preference key + i18n gap fix (2026-08-06)
+
+- fix: split `settings_key_use_new_renderer` into a non-translatable
+  SharedPreferences key (`use_new_renderer`, matching the
+  `ProfileSettings.USE_NEW_RENDERER` constant) and a separate
+  translatable title (`settings_use_new_renderer_title`). Previously
+  the same string resource (`"Use New Renderer"`) was used as BOTH
+  the `android:key` and `android:title` of the CheckBoxPreference in
+  `pref_settings.xml`. This had two real consequences:
+
+  1. **Key mismatch.** The CheckBoxPreference persisted its checkbox
+     state under the literal key `"Use New Renderer"`, but
+     `ProfileSettings.useNewRenderer()` reads from `"use_new_renderer"`
+     (the Java constant). The two only stayed in sync because the
+     preference's `OnPreferenceChangeListener` also calls
+     `ProfileSettings.setUseNewRenderer()`, which writes a second copy
+     to the correct key. The result was a redundant SharedPreferences
+     entry plus a fragile coupling — if the listener were ever changed
+     to return `false` (rejecting the change), the CheckBoxPreference
+     and `ProfileSettings` would silently disagree.
+
+  2. **Latent translation bug.** Because `settings_key_use_new_renderer`
+     was *not* marked `translatable="false"`, a translator translating
+     it would have changed the SharedPreferences key for that locale.
+     A user toggling the preference in one locale and then switching
+     languages would find their setting "lost" (the key under which it
+     was stored no longer exists in the new locale). This is the
+     classic "don't put user-facing text in a key" anti-pattern.
+
+  The fix mirrors the existing pattern used for `debug_renderer` (which
+  was already correctly split into `settings_key_debug_renderer` +
+  `settings_debug_renderer_title`). No user-visible behaviour change;
+  existing users' settings are preserved because the listener had
+  already been writing to the correct `"use_new_renderer"` key.
+
+- fix: typo in `SelectAppActivity.java` TODO comment — "mutilpe" →
+  "multiple". Aligns the source comment with the (already-correct)
+  worklog entry that documents this deferred feature request.
+
+- i18n: added missing translations for `settings_use_new_renderer_title`,
+  `settings_use_new_renderer_summary`, `settings_debug_renderer_title`,
+  and `settings_debug_renderer_summary` in zh-rCN, zh-rTW, and ja.
+  These four user-facing strings were previously English-only (the
+  `*_key_*` variants are intentionally `translatable="false"`).
+
+- Verified: all four `strings.xml` files + `pref_settings.xml` parse
+  cleanly (Python ElementTree). `cargo clippy --lib` on both `kr64`
+  and `loader` crates → 0 warnings (unchanged — no Rust source touched).
