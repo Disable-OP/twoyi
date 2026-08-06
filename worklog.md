@@ -4388,3 +4388,29 @@ None of these block the production-ready sign-off.
 - Full i18n across 4 locales (en, zh-rCN, zh-rTW, ja).
 - APK signed and verified.
 - Codebase state: **production-ready**.
+
+## Round 20 — Android 12+ data extraction rules (2026-08-06)
+
+- fix: added `res/xml/data_extraction_rules.xml` and referenced it from
+  the `<application>` tag via `android:dataExtractionRules`. Covers the
+  Android 12+ (API 31+) device-to-device migration flow, which has its
+  own flag separate from `allowBackup` and would otherwise still run
+  even with `allowBackup="false"`. Without this file, a migration would
+  attempt to copy twoyi's multi-GB rootfs/system/userdata tree
+  (per-profile state + any APKs the user installed inside the VM) to a
+  new phone — leaking user data and almost certainly failing to boot on
+  the target because the native libs are ABI-specific and the data
+  layout is tied to the source install path. The rules exclude the
+  entire `root` domain from both `cloud-backup` and `device-transfer`
+  using the include-then-exclude pattern Android requires.
+
+- fix: set `android:fullBackupContent="false"` on `<application>`. This
+  is the boolean form (Android 6–11 legacy backup) of the same opt-out;
+  `allowBackup="false"` already disables Auto Backup, but declaring
+  both attributes is explicit and future-proofs against any change in
+  the platform's precedence rules.
+
+- Verified: all three XML files (manifest + network_security_config +
+  data_extraction_rules) parse cleanly (Python ElementTree). No Java or
+  Rust source changes, so the 145/145 cargo test suite and the
+  0-clippy-warning / 0-lint-error status are unchanged.
