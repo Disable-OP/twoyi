@@ -56,7 +56,7 @@
 
 use libc::{c_int, c_void, sigaction, siginfo_t, sigset_t, ucontext_t};
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 // Crate-local logging macros (defined in lib.rs) — no external `log` crate.
 use crate::{error, info, warning};
@@ -473,16 +473,29 @@ pub fn build_filter() -> Vec<SockFilter> {
 // Install the filter + SIGSYS handler.
 // ============================================================================
 
-/// Global mutable state used by the SIGSYS handler. Protected by a
-/// Mutex because the handler may run on any thread.
+/// Snapshotted syscall classification tables, read by the SIGSYS handler.
 ///
-/// The handler reads `trapped_syscalls` and `killed_syscalls` to decide
-/// what to do with the trapped syscall. We snapshot them at install
-/// time into static `OnceLock`s to avoid allocating in the handler
-/// (and to avoid the `once_cell` dependency — `OnceLock` is in `std`
-/// since Rust 1.70).
-static TRAPPED_SET: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
-static KILLED_SET: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+/// These are populated by [`install()`] BEFORE the handler is installed,
+/// and are immutable afterwards. Reading an already-initialised
+/// `OnceLock` (via `get()` or `get_or_init`'s fast path) is a single
+/// atomic load — fully async-signal-safe — and `HashSet::contains` is a
+/// read-only traversal, also signal-safe.
+///
+/// **Why no `Mutex`?** The previous version wrapped these in
+/// `Mutex<HashSet<i32>>` and called `.lock()` from `classify()`, which
+/// runs inside the SIGSYS handler. `Mutex::lock` is NOT async-signal-safe
+/// (it performs a futex syscall and can deadlock if the thread already
+/// holds the lock). Combined with `SA_NODEFER` (set so a recursive trap
+/// in the handler is visible rather than silently dropped), a nested
+/// SIGSYS would deadlock on the mutex, hanging the guest permanently.
+/// Dropping the `Mutex` makes the handler lock-free and reentrant-safe.
+///
+/// The `get_or_init` fallback in `classify()` only ever runs its closure
+/// in unit tests (where `classify()` is called without `install()`); in
+/// production `install()` populates the sets first, so the closure is
+/// never executed from a signal context.
+static TRAPPED_SET: OnceLock<HashSet<i32>> = OnceLock::new();
+static KILLED_SET: OnceLock<HashSet<i32>> = OnceLock::new();
 
 /// Install the seccomp filter on the calling thread (and all threads
 /// in the calling process, via `SECCOMP_FILTER_FLAG_TSYNC`).
@@ -493,6 +506,17 @@ static KILLED_SET: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
 /// Returns `Ok(())` on success, or `Err(errno)` on failure.
 pub fn install() -> std::io::Result<()> {
     info!("[KR64][seccomp] installing seccomp filter");
+
+    // 0. Snapshot the trapped/killed syscall sets into the static
+    //    OnceLocks BEFORE installing the SIGSYS handler. The handler
+    //    reads these via `get()` (a lock-free atomic load) — see the
+    //    comment on `TRAPPED_SET`/`KILLED_SET` for why this must happen
+    //    before `sigaction(SIGSYS, …)` and must not involve a `Mutex`.
+    //    `set()` returns Err if already set (e.g. a prior `install()`
+    //    call, or a unit test that touched `classify()`); that's fine,
+    //    we just keep the existing snapshot.
+    let _ = KILLED_SET.set(killed_syscalls());
+    let _ = TRAPPED_SET.set(trapped_syscalls());
 
     // 1. PR_SET_NO_NEW_PRIVS — required before seccomp(2) without
     //    CAP_SYS_ADMIN. Has to be set on every thread; we use the
@@ -689,24 +713,30 @@ enum Action {
 ///   - trapped set → Action::Emulate { retval: 0 } (or syscall-specific)
 ///   - anything else → Action::Passthrough (shouldn't happen)
 fn classify(syscall_nr: i32) -> Action {
-    // `get_or_init` snapshots the syscall sets on first use. This is
-    // safe to call from the SIGSYS handler because OnceLock's init path
-    // is race-free (the OS guarantees atomic initialisation).
-    let killed = KILLED_SET.get_or_init(|| Mutex::new(killed_syscalls()));
-    if let Ok(killed) = killed.lock() {
-        if killed.contains(&syscall_nr) {
-            return Action::Kill;
-        }
+    // Read the snapshotted syscall sets. In production `install()` has
+    // already populated both OnceLocks before the SIGSYS handler was
+    // installed, so `get_or_init` takes the fast path (a single atomic
+    // load) and never runs its closure. The closure only runs in unit
+    // tests that call `classify()` directly without `install()`.
+    //
+    // This is async-signal-safe because:
+    //   - `OnceLock::get_or_init` on an already-initialised lock is just
+    //     an atomic load (no syscall, no allocation).
+    //   - `HashSet::contains` is a read-only hash lookup.
+    // The previous version wrapped the sets in `Mutex` and called
+    // `.lock()` here, which is NOT async-signal-safe and could deadlock
+    // under `SA_NODEFER` if a SIGSYS nested.
+    let killed = KILLED_SET.get_or_init(killed_syscalls);
+    if killed.contains(&syscall_nr) {
+        return Action::Kill;
     }
-    let trapped = TRAPPED_SET.get_or_init(|| Mutex::new(trapped_syscalls()));
-    if let Ok(trapped) = trapped.lock() {
-        if trapped.contains(&syscall_nr) {
-            // Per-syscall emulation. For now everything trapped is
-            // emulated as success (retval = 0) — the production
-            // version will dispatch to per-syscall handlers in
-            // mount_mgr / netlink / etc.
-            return Action::Emulate { retval: emulate_syscall(syscall_nr) };
-        }
+    let trapped = TRAPPED_SET.get_or_init(trapped_syscalls);
+    if trapped.contains(&syscall_nr) {
+        // Per-syscall emulation. For now everything trapped is
+        // emulated as success (retval = 0) — the production
+        // version will dispatch to per-syscall handlers in
+        // mount_mgr / netlink / etc.
+        return Action::Emulate { retval: emulate_syscall(syscall_nr) };
     }
     Action::Passthrough
 }
