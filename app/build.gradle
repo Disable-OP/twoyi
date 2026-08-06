@@ -69,6 +69,19 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
+    // extractNativeLibs="true" is set in AndroidManifest.xml, so we must
+    // opt into the legacy packaging behavior explicitly. Without this,
+    // AGP 7.x emits a build warning on every assembleRelease invocation:
+    //   "PackagingOptions.jniLibs.useLegacyPackaging should be set to true
+    //    because android:extractNativeLibs is set to "true" in AndroidManifest.xml."
+    // Setting it here also future-proofs the build against AGP 8.x where
+    // the default flips to false (which would silently break native lib
+    // loading at runtime on the legacy extractNativeLibs=true path).
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
