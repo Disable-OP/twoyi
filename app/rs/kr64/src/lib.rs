@@ -295,8 +295,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--help" | "-h" => {
-                return Err(format!(
-                    "twoyi kr64 — kernel-replacement daemon\n\
+                return Err("twoyi kr64 — kernel-replacement daemon\n\
                      \n\
                      Usage: kr64 [OPTIONS]\n\
                      \n\
@@ -317,7 +316,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                        --no-namespaces           Disable unshare + pivot_root; chroot only\n\
                        --rw-rom                  Mount /system etc. read-write (for dev)\n\
                        --no-seccomp              Skip seccomp filter installation\n"
-                ));
+                    .to_string());
             }
             "--rootfs" => {
                 cfg.rootfs = iter.next().ok_or("--rootfs requires a path".to_string())?;
@@ -828,8 +827,20 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
 /// runs `.init_array`, and jumps to `kr64_main` (because we set
 /// `-Wl,-e,kr64_main`). The args come from the kernel's stack as
 /// `argc` + `argv[]`, just like a regular C `main`.
+///
+/// Marked `unsafe` because the function dereferences the caller-supplied
+/// `argv` pointer; the caller (kernel / dynamic linker) is implicitly
+/// unsafe C code, and marking the Rust entry point `unsafe` correctly
+/// reflects this to Rust callers.
+///
+/// # Safety
+///
+/// Caller must guarantee that, when `argc > 0` and `argv` is non-null,
+/// `argv` points to a buffer of at least `argc` valid `char *` pointers
+/// (NUL-terminated C strings or NULL). This is the standard C `main`
+/// contract.
 #[no_mangle]
-pub extern "C" fn kr64_main(argc: libc::c_int, argv: *const *const libc::c_char) -> libc::c_int {
+pub unsafe extern "C" fn kr64_main(argc: libc::c_int, argv: *const *const libc::c_char) -> libc::c_int {
     // Convert C argv → Rust Vec<String>.
     let args: Vec<String> = if argc <= 0 || argv.is_null() {
         Vec::new()
@@ -856,7 +867,7 @@ extern "C" {
 }
 
 #[used]
-static INTERP_REF: &'static [u8; 0] = unsafe { &INTERP };
+static INTERP_REF: &[u8; 0] = unsafe { &INTERP };
 
 // ============================================================================
 // Tests — exercise arg parsing and config defaults.

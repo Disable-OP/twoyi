@@ -1,6 +1,6 @@
 # MEMORY.md — Twoyi Fork Project State
 
-> **Last updated:** 2026-08-06 (continued-improvements session on top of final cleanup pass)
+> **Last updated:** 2026-08-06 (round 19 — final comprehensive check + clippy safety pass)
 > **Project:** Disable-OP/twoyi (fork of cyanmint/twoyi, originally twoyi/twoyi)
 > **Branch:** `improvements/initial-cleanup` (active development branch)
 > **Goal:** Boot Android 11 GSI rootfs in a rootless Android-in-Android container,
@@ -10,16 +10,37 @@
 
 | Metric                          | Value                                                  |
 | ------------------------------- | ------------------------------------------------------ |
-| Total commits pushed            | **40+** on `improvements/initial-cleanup`              |
-| Total bugs fixed                | **~113** (critical + high + medium + low)              |
+| Total commits pushed            | **62** on `improvements/initial-cleanup` (355 total)   |
+| Total bugs / improvements fixed | **~130** (critical + high + medium + low)              |
 | Total sub-agents spawned        | **45+** (each filing a triaged bug list)               |
 | Files improved                  | **35+** (Rust + Java + C++ + XML + ProGuard + scripts) |
 | Emulator                        | Android 9 (API 28) boots with TCG (no KVM)             |
-| Latest APK                       | `twoyi_3.5.5-08060617-release.apk` (8.8 MB, v2 signed) |
-| kr64 test suite                 | **145/145 passing** (was 144/144; added 1 regression)  |
+| Latest APK                      | `twoyi_3.5.5-08061234-release.apk` (9.2 MB, v2 signed) |
+| kr64 test suite                 | **145/145 passing** (0 failed, 0 ignored)              |
+| `cargo build --lib` warnings    | **0** (clean build)                                    |
+| `cargo clippy --lib`            | **0 errors**, 27 cosmetic warnings (doc indentation)  |
+| Build targets                   | arm64-v8a + x86_64 (both compile)                      |
 | Codebase state                  | **Production-ready**                                   |
 
-### Final cleanup pass (this commit)
+### Round 19 — final comprehensive check (this commit)
+1. **`kr64_main` safety** — the cdylib entry point
+   (`pub extern "C" fn kr64_main(argc, argv)`) dereferences the caller-supplied
+   `argv` raw pointer but was not marked `unsafe`, triggering clippy's
+   `not_unsafe_ptr_arg_deref` **error** (denied lint). Fixed by marking the
+   function `pub unsafe extern "C"` and adding a `# Safety` doc section
+   describing the standard C `main` contract callers must uphold.
+2. **Useless `format!`** — the `--help` handler wrapped a string literal in
+   `format!(...)` with no arguments; replaced with `.to_string()`
+   (clippy::useless_format).
+3. **Redundant `'static`** — `INTERP_REF: &'static [u8; 0]` had a redundant
+   explicit `'static` lifetime (statics are `'static` by default); simplified
+   to `&[u8; 0]` (clippy::redundant_static_lifetimes).
+
+All three fixes verified: `cargo build --lib` → **0 warnings**;
+`cargo test --lib` → **145 passed; 0 failed**; `cargo clippy --lib` →
+**0 errors** (was 1 error + 29 warnings → now 0 errors + 27 warnings).
+
+### Final cleanup pass (previous commit)
 1. **`binder.rs` test** — `bc_br_constants_match_kernel_values` was asserting
    `BC_TRANSACTION_SG == 0x4040620b` (size=64), but the production constant
    uses `sizeof(binder_transaction_data_sg) == 72` (size=72 → `0x4048620b`)
