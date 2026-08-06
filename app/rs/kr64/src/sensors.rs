@@ -430,6 +430,79 @@ pub struct SensorEvent {
 // offset 4) is undefined behavior — the derived impls take &self.ts which
 // is a reference to a misaligned u64. Use to_bytes()/from_bytes() for
 // serialization instead.
+//
+// The trait impls below are hand-written to read each field through
+// `std::ptr::addr_of!(...).read_unaligned()`, which never materialises a
+// misaligned reference (it does a byte-wise copy into a local, aligned
+// temporary). This is the only sound way to implement these traits for a
+// `#[repr(packed)]` struct.
+
+impl Clone for SensorEvent {
+    fn clone(&self) -> Self {
+        // `self.field` is a place expression; `addr_of!` takes a `*const`
+        // to it without creating a reference, and `read_unaligned` copies
+        // the (possibly misaligned) bytes into an aligned local.
+        Self {
+            idx: unsafe { std::ptr::addr_of!(self.idx).read_unaligned() },
+            ts: unsafe { std::ptr::addr_of!(self.ts).read_unaligned() },
+            x: unsafe { std::ptr::addr_of!(self.x).read_unaligned() },
+            y: unsafe { std::ptr::addr_of!(self.y).read_unaligned() },
+            z: unsafe { std::ptr::addr_of!(self.z).read_unaligned() },
+        }
+    }
+}
+
+// Copy is sound: SensorEvent is 24 bytes of plain Copy types (u32/u64/f32)
+// and contains no heap pointers or destructors. A bit-for-bit copy is a
+// valid duplicate.
+impl Copy for SensorEvent {}
+
+impl PartialEq for SensorEvent {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare field-by-field via aligned temporaries. We deliberately
+        // avoid `self.field == other.field` because, for packed structs,
+        // even an implicit borrow during method dispatch can be unsound —
+        // going through `addr_of!` makes the (unaligned) read explicit.
+        let (s_idx, s_ts, s_x, s_y, s_z) = unsafe {
+            (
+                std::ptr::addr_of!(self.idx).read_unaligned(),
+                std::ptr::addr_of!(self.ts).read_unaligned(),
+                std::ptr::addr_of!(self.x).read_unaligned(),
+                std::ptr::addr_of!(self.y).read_unaligned(),
+                std::ptr::addr_of!(self.z).read_unaligned(),
+            )
+        };
+        let (o_idx, o_ts, o_x, o_y, o_z) = unsafe {
+            (
+                std::ptr::addr_of!(other.idx).read_unaligned(),
+                std::ptr::addr_of!(other.ts).read_unaligned(),
+                std::ptr::addr_of!(other.x).read_unaligned(),
+                std::ptr::addr_of!(other.y).read_unaligned(),
+                std::ptr::addr_of!(other.z).read_unaligned(),
+            )
+        };
+        s_idx == o_idx && s_ts == o_ts && s_x == o_x && s_y == o_y && s_z == o_z
+    }
+}
+
+impl std::fmt::Debug for SensorEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Read each field into an aligned local first, then debug-format
+        // the locals (formatting would otherwise need `&self.field`).
+        let idx = unsafe { std::ptr::addr_of!(self.idx).read_unaligned() };
+        let ts = unsafe { std::ptr::addr_of!(self.ts).read_unaligned() };
+        let x = unsafe { std::ptr::addr_of!(self.x).read_unaligned() };
+        let y = unsafe { std::ptr::addr_of!(self.y).read_unaligned() };
+        let z = unsafe { std::ptr::addr_of!(self.z).read_unaligned() };
+        f.debug_struct("SensorEvent")
+            .field("idx", &idx)
+            .field("ts", &ts)
+            .field("x", &x)
+            .field("y", &y)
+            .field("z", &z)
+            .finish()
+    }
+}
 
 // Compile-time assertion: the packed struct must be exactly 24 bytes.
 const _: () = assert!(std::mem::size_of::<SensorEvent>() == SENSOR_EVENT_SIZE);
