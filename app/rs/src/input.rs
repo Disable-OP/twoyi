@@ -137,6 +137,13 @@ pub fn handle_touch(ev: MotionEvent) {
         let pointer_id = pointer.pointer_id();
         let pressure = pointer.pressure();
 
+        // Bounds check: pointer_id must be < MAX_POINTERS to use as array index.
+        // Without this, a malformed MotionEvent with pointer_id >= 5 panics,
+        // which poisons the mutex and kills ALL subsequent touch input.
+        if (pointer_id as usize) >= MAX_POINTERS {
+            return;
+        }
+
         // info!("action: {:#?}, pointer_index: {}", action, pointer_index);
 
         static G_INPUT_MT: Lazy<Mutex<[i32;MAX_POINTERS]>> = Lazy::new(|| {std::sync::Mutex::new([0i32;MAX_POINTERS])});

@@ -211,7 +211,14 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
         }
     };
 
-    let jni_version = env.get_version().unwrap();
+    // Fixed: unwrap() across FFI boundary can panic — UB during library load
+    let jni_version = match env.get_version() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[KR64] Failed to get JNI version: {:?}", e);
+            return JNI_ERR;
+        }
+    };
     let version: jint = jni_version.into();
 
     debug!("JNI Version : {:#?} ", jni_version);
