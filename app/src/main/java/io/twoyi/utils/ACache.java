@@ -163,11 +163,28 @@ public class ACache {
 		BufferedReader in = null;
 		try {
 			in = new BufferedReader(new FileReader(file));
-			String readString = "";
+			// Fixed: use StringBuilder instead of `String +=` for O(n)
+			// concatenation. The previous loop was O(n²) — every iteration
+			// allocated a fresh String and copied the entire accumulated
+			// content, which on a multi-MiB cache file (e.g. a large JSON
+			// payload) meant hundreds of MiB of memcpy work plus heavy GC
+			// pressure on every read.
+			//
+			// Fixed: readLine() strips line terminators, so multi-line
+			// values were silently corrupted (every newline dropped) on
+			// read — put("k","a\nb") round-tripped as "ab". Insert
+			// '\n' BETWEEN lines (no trailing '\n') so single-line values
+			// — the common case for app labels and one-line JSON — are
+			// returned unchanged, while multi-line values survive.
+			StringBuilder sb = new StringBuilder();
 			String currentLine;
 			while ((currentLine = in.readLine()) != null) {
-				readString += currentLine;
+				if (sb.length() > 0) {
+					sb.append('\n');
+				}
+				sb.append(currentLine);
 			}
+			String readString = sb.toString();
 			if (!Utils.isDue(readString)) {
 				return Utils.clearDateInfo(readString);
 			} else {
