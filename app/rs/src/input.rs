@@ -232,26 +232,34 @@ pub fn handle_touch(ev: MotionEvent) {
                 input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
             }
             MotionAction::Move => {
-                // For each active slot, re-emit its position. NOTE: the
-                // MotionEvent's pointer_at_index(pointer_index) only gives us
-                // ONE pointer's coordinates — for true multi-pointer MOVE we'd
-                // need to iterate all pointers via ev.pointer_count(). That's
-                // a follow-up; this preserves the existing single-pointer-move
-                // behaviour without the try_into().unwrap() panic risk.
+                // Iterate every pointer in this MotionEvent and re-emit its
+                // position for its assigned slot. The previous implementation
+                // iterated all active MT slots but wrote the SAME pointer's
+                // coordinates (from `ev.pointer_at_index(pointer_index)`) to
+                // every slot. That collapsed multi-touch moves to a single-
+                // finger move: when finger 2 moved, finger 1's slot was also
+                // overwritten with finger 2's coords, breaking pinch-zoom,
+                // two-finger drag, and any gesture that relies on independent
+                // per-finger positions.
+                //
+                // The fix uses `ev.pointer_count()` + `ev.pointer_at_index(i)`
+                // to get each pointer's OWN coordinates, and writes them only
+                // to that pointer's slot (skipping pointers that aren't in
+                // our active MT state — e.g. a pointer that went up but whose
+                // PointerUp event we haven't processed yet).
                 let mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
-                for slot in 0..MAX_POINTERS {
-                    if mt[slot] != 0 {
-                        let x = pointer.x();
-                        let y = pointer.y();
-                        let pressure = pointer.pressure();
-
-                        input_event_write(fd, EV_ABS, ABS_MT_SLOT, slot as i32);
-                        input_event_write(fd, EV_ABS, ABS_MT_POSITION_X, x as i32);
-                        input_event_write(fd, EV_ABS, ABS_MT_POSITION_Y, y as i32);
-                        input_event_write(fd, EV_ABS, ABS_MT_PRESSURE, pressure as i32);
-
-                        input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
+                for i in 0..ev.pointer_count() {
+                    let p = ev.pointer_at_index(i);
+                    let pid = p.pointer_id();
+                    if (pid as usize) >= MAX_POINTERS || mt[pid as usize] == 0 {
+                        continue;
                     }
+                    input_event_write(fd, EV_ABS, ABS_MT_SLOT, pid);
+                    input_event_write(fd, EV_ABS, ABS_MT_POSITION_X, p.x() as i32);
+                    input_event_write(fd, EV_ABS, ABS_MT_POSITION_Y, p.y() as i32);
+                    input_event_write(fd, EV_ABS, ABS_MT_PRESSURE, p.pressure() as i32);
+
+                    input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
                 }
             }
             // ACTION_POINTER_UP / ACTION_CANCEL: a single (non-last) pointer

@@ -543,12 +543,18 @@ public class SelectAppActivity extends AppCompatActivity {
                 appItems.add(appItem);
             }
 
+            // Fixed: this lambda runs on a background thread (AndroidDeferredManager
+            // executes `when()` callables off the UI thread). Mutating a View
+            // from a background thread crashes Android with
+            // "Only the original thread that created a view hierarchy can touch
+            // its views" or causes silent UI corruption. Wrap the setText()
+            // calls in runOnUiThread() to dispatch them to the UI thread.
             if (apps.size() == 0) {
                 // 压根没有应用列表，那么说明没有权限
-                mEmptyView.setText(R.string.create_app_no_apps);
+                runOnUiThread(() -> mEmptyView.setText(R.string.create_app_no_apps));
             } else if (appItems.size() == 0) {
                 // 所有APP都被添加完毕了
-                mEmptyView.setText(R.string.create_app_all_apps_added);
+                runOnUiThread(() -> mEmptyView.setText(R.string.create_app_all_apps_added));
             }
             return appItems;
 
