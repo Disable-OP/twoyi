@@ -115,6 +115,21 @@ public final class RomManager {
 
         createLoaderSymlink(context);
 
+        // VM-inspired: symlink every host-shipped native lib the guest
+        // needs into the guest rootfs so the guest linker can dlopen()
+        // them by canonical name. Each call is idempotent and never
+        // clobbers a pre-existing real file (see ensureLibSymlink).
+        // Failures are non-fatal: a missing symlink means the guest
+        // can't load that specific lib, but boot continues.
+        File rootfsLib64 = new File(getRootfsDir(context), "system/lib64");
+        for (String lib : new String[]{"libkr64.so", "libOpenglRender.so"}) {
+            try {
+                ensureLibSymlink(context, lib, new File(rootfsLib64, lib));
+            } catch (IOException e) {
+                Log.w(TAG, "ensureLibSymlink failed for " + lib + ": " + e.getMessage());
+            }
+        }
+
         saveLastKmsg(context);
     }
 
@@ -127,6 +142,91 @@ public final class RomManager {
         } catch (IOException e) {
             throw new RuntimeException("symlink loader failed.", e);
         }
+    }
+
+    /**
+     * Ensure a native library from the host app's {@code nativeLibraryDir}
+     * is reachable at a given guest-visible path via a symlink.
+     *
+     * <p>This is the VM-inspired generalisation of {@link #createLoaderSymlink}:
+     * VM symlinks every host-shipped native lib the guest needs (loader,
+     * kr64, openglrenderer, ...) into the guest rootfs so the guest's
+     * linker can {@code dlopen()} them by their canonical names. The
+     * loader symlink alone isn't enough once the kr64 daemon and the
+     * AOSP emugl renderer are involved — both ship as native libs in
+     * the APK and need to be reachable from the guest.
+     *
+     * <p>This method:
+     * <ol>
+     *   <li>Resolves {@code libName} against the app's
+     *       {@code nativeLibraryDir} (e.g. {@code libloader.so} →
+     *       {@code /data/app/.../lib/arm64/libloader.so}).</li>
+     *   <li>If the target symlink already exists and points at the
+     *       right file, this is a no-op (idempotent — safe to call on
+     *       every boot).</li>
+     *   <li>If the symlink exists but is stale (points elsewhere, or
+     *       the target is gone), it is replaced.</li>
+     *   <li>If the path exists as a regular file/dir (not a symlink),
+     *       it is <b>left alone</b> — the rootfs may ship a real file
+     *       there and we must not clobber it.</li>
+     *   <li>Parent directories of the symlink are created on demand.</li>
+     * </ol>
+     *
+     * @param context  the application context (used to locate
+     *                 {@code nativeLibraryDir}).
+     * @param libName  the library file name as it appears in
+     *                 {@code nativeLibraryDir} (e.g. {@code "libloader.so"}).
+     * @param linkPath the absolute guest-visible path where the symlink
+     *                 should appear (e.g.
+     *                 {@code new File(getRootfsDir(context), "system/lib64/libkr64.so")}).
+     * @return the canonical path of the resolved host library (the
+     *         symlink target), for logging / diagnostics.
+     * @throws IOException if the symlink cannot be created or the
+     *         source library does not exist.
+     */
+    private static String ensureLibSymlink(Context context, String libName, File linkPath)
+            throws IOException {
+        ApplicationInfo appInfo = context.getApplicationInfo();
+        File sourceLib = new File(appInfo.nativeLibraryDir, libName);
+        String sourcePath = sourceLib.getAbsolutePath();
+
+        if (!sourceLib.exists()) {
+            throw new IOException("source library not found: " + sourcePath);
+        }
+
+        Path link = linkPath.toPath();
+
+        // Idempotency: if the symlink already points at the right file,
+        // there's nothing to do. Files.isSymbolicLink returns false for
+        // regular files/dirs, so a pre-existing real file at linkPath
+        // is left alone (the rootfs ships its own copy — don't clobber).
+        if (Files.isSymbolicLink(link)) {
+            Path currentTarget = Files.readSymbolicLink(link);
+            if (currentTarget.toString().equals(sourcePath)) {
+                // Already correctly linked — nothing to do.
+                return sourcePath;
+            }
+            // Stale symlink (points elsewhere) — replace it.
+            Files.deleteIfExists(link);
+        } else if (Files.exists(link)) {
+            // A real file or directory already lives at linkPath. The
+            // rootfs intentionally ships this — leave it alone. This is
+            // the "don't clobber a real blob" branch.
+            Log.i(TAG, "ensureLibSymlink: keeping existing non-symlink at " + linkPath);
+            return sourcePath;
+        }
+
+        // Make sure the parent dir exists (e.g. rootfs/system/lib64/).
+        File parent = linkPath.getParentFile();
+        if (parent != null && !parent.exists()) {
+            // noinspection ResultOfMethodCallIgnored — best-effort mkdir
+            parent.mkdirs();
+        }
+
+        Files.createSymbolicLink(link, Paths.get(sourcePath));
+        Log.i(TAG, "ensureLibSymlink: " + libName + " -> " + linkPath
+                + " (target " + sourcePath + ")");
+        return sourcePath;
     }
 
     private static void killOrphanProcess() {
