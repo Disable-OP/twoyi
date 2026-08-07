@@ -472,7 +472,10 @@ pub fn clear_zombie_processes() {
             } else {
                 status
             };
-            info!("[KR64][zombie] reaped leftover child pid={} status={}", pid, code);
+            info!(
+                "[KR64][zombie] reaped leftover child pid={} status={}",
+                pid, code
+            );
             continue;
         }
         if pid == 0 {
@@ -494,7 +497,10 @@ pub fn clear_zombie_processes() {
         break;
     }
     if reaped > 0 {
-        info!("[KR64][zombie] reaped {} leftover zombie process(es)", reaped);
+        info!(
+            "[KR64][zombie] reaped {} leftover zombie process(es)",
+            reaped
+        );
     }
 }
 
@@ -1187,15 +1193,21 @@ mod tests {
     #[test]
     fn config_default_socks5_is_none() {
         let cfg = Config::default();
-        assert!(cfg.socks5_proxy.is_none(), "socks5_proxy should default to None");
+        assert!(
+            cfg.socks5_proxy.is_none(),
+            "socks5_proxy should default to None"
+        );
     }
 
     #[test]
     fn parse_args_socks5_sets_field() {
         let cfg = parse_args(args(&[
-            "--rootfs", "/r",
-            "--data-dir", "/d",
-            "--socks5", "127.0.0.1:1080",
+            "--rootfs",
+            "/r",
+            "--data-dir",
+            "/d",
+            "--socks5",
+            "127.0.0.1:1080",
         ]))
         .unwrap();
         assert_eq!(cfg.socks5_proxy.as_deref(), Some("127.0.0.1:1080"));
@@ -1204,9 +1216,12 @@ mod tests {
     #[test]
     fn parse_args_socks5_rejects_missing_colon() {
         let r = parse_args(args(&[
-            "--rootfs", "/r",
-            "--data-dir", "/d",
-            "--socks5", "no-colon-here",
+            "--rootfs",
+            "/r",
+            "--data-dir",
+            "/d",
+            "--socks5",
+            "no-colon-here",
         ]));
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("--socks5"));
