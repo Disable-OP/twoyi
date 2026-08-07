@@ -416,11 +416,18 @@ fn write_proc_self(proc_dir: &str) -> std::io::Result<()> {
         // directory, so this is unnecessary. Removed.
     }
 
-    // /proc/self/status — minimal content.
-    let mut f = fs::File::create(format!("{}/status", self_dir))?;
-    f.write_all(
-        format!(
-            "Name:\tinit\n\
+    // /proc/self/status — minimal content. Use `write_file` (NOT
+    // `fs::File::create` + `write_all`) so the file gets the same
+    // 0o444 read-only mode + idempotency-chmod-to-writable-on-re-run
+    // treatment as every other `/proc` file. Without this, the file
+    // was created at the default 0o644 (writable by owner), which:
+    //   (a) is inconsistent with the kernel convention (`/proc` files
+    //       are mode 0444 — the kernel synthesises them read-only), and
+    //   (b) would let a misbehaving guest process `open()` it for
+    //       writing and corrupt the synthesised status, which other
+    //       guest processes reading `/proc/self/status` would then see.
+    let status_content = format!(
+        "Name:\tinit\n\
          Umask:\t0022\n\
          State:\tS (sleeping)\n\
          Tgid:\t{}\n\
@@ -459,10 +466,9 @@ fn write_proc_self(proc_dir: &str) -> std::io::Result<()> {
          Seccomp:\t0\n\
          Cpus_allowed:\tff\n\
          Cpus_allowed_list:\t0-7\n",
-            pid, pid,
-        )
-        .as_bytes(),
-    )?;
+        pid, pid,
+    );
+    write_file(&self_dir, "status", &status_content)?;
 
     Ok(())
 }
@@ -754,6 +760,85 @@ mod tests {
             Path::new(&prop_path).exists(),
             "populate_proc should also write ro.vm.prop"
         );
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `/proc/self/status` must be created with mode
+    /// 0o444 (read-only), matching the kernel convention and every
+    /// other synthesised `/proc` file. Before the fix, `write_proc_self`
+    /// used `fs::File::create` directly, which left the file at the
+    /// default 0o644 (owner-writable) — inconsistent with the rest of
+    /// `/proc` and a potential corruption vector if a guest process
+    /// opened it for writing.
+    #[test]
+    fn proc_self_status_is_read_only_mode_0444() {
+        let rootfs = tmpdir();
+        populate_proc(&rootfs, 1, 1024).expect("populate_proc");
+
+        let status_path = format!("{}/proc/self/status", rootfs);
+        assert!(
+            Path::new(&status_path).exists(),
+            "/proc/self/status should exist"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&status_path).unwrap();
+            let mode = meta.permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o444,
+                "/proc/self/status should be mode 0o444 (read-only), got 0o{:o}",
+                mode
+            );
+        }
+
+        // Also verify the content is non-empty and starts with "Name:".
+        let content = std::fs::read_to_string(&status_path).unwrap();
+        assert!(
+            content.starts_with("Name:\t"),
+            "/proc/self/status should start with Name:"
+        );
+        assert!(content.contains("VmRSS:\t    4000 kB"));
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `/proc/self/status` must survive a re-run of
+    /// `populate_proc` (idempotency). The `write_file` helper chmods
+    /// the file to 0o644 before re-opening it for writing, then back
+    /// to 0o444 — the previous `fs::File::create` approach didn't do
+    /// this, but since the file was 0o644 it happened to work. This
+    /// test guards the `write_file`-based path against future regressions.
+    #[test]
+    fn proc_self_status_survives_rerun() {
+        let rootfs = tmpdir();
+        populate_proc(&rootfs, 1, 1024).expect("first populate_proc");
+        // The file is now mode 0o444 (read-only). A second run must
+        // restore the writable mode, overwrite the content, and set
+        // it back to 0o444 — without panicking or returning Err.
+        populate_proc(&rootfs, 2, 2048).expect("second populate_proc");
+
+        let status_path = format!("{}/proc/self/status", rootfs);
+        let content = std::fs::read_to_string(&status_path).unwrap();
+        assert!(content.starts_with("Name:\tinit\n"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&status_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o444,
+                "/proc/self/status should still be 0o444 after re-run, got 0o{:o}",
+                mode
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&rootfs);
     }
 }

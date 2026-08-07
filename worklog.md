@@ -4685,3 +4685,84 @@ review of `SensorConnState::check_support`:
 | Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
 | Rust clippy (`loader`)            | **0 warnings, 0 errors**                                 |
 | Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |
+
+
+## Round 66 — proc_emu `/proc/self/status` mode + doc sync (this commit)
+
+A real consistency bug was found in the kr64 proc_emu module by code
+review of `write_proc_self`:
+
+* **`kr64/src/proc_emu.rs` — `/proc/self/status` was created at mode
+  0o644, not 0o444.** Every other synthesised `/proc` file goes through
+  the module-local `write_file()` helper, which (a) chmods the file to
+  0o644 up-front (idempotency — a previous run leaves it at 0o444 and
+  `fs::File::create` would EACCES), (b) writes the content, (c) chmods
+  it to 0o444 (read-only, matching the kernel's `/proc` convention),
+  and (d) `debug_assert!`s the file exists. `write_proc_self` bypassed
+  all of this and used `fs::File::create` + `f.write_all` directly,
+  leaving `/proc/self/status` at the default 0o644 (owner-writable).
+
+  The inconsistency has two consequences:
+  1. A guest process that `open("/proc/self/status", O_WRONLY)` succeeds
+     (the owner-write bit is set), letting the guest corrupt the
+     synthesised status that other guest processes then read. Real
+     `/proc/self/status` is kernel-synthesised and read-only; the
+     guest's `init` and `dumpsys` tooling assume the file can't be
+     corrupted from userspace.
+  2. Idempotency of `populate_proc()` worked *by accident* — because
+     the file was 0o644 (writable), the `fs::File::create` on a re-run
+     could open it for writing without the 0o644-restore step that
+     `write_file()` does for the 0o444 files. So the bug was masked by
+     the bug.
+
+  The fix routes `/proc/self/status` through `write_file()`, giving it
+  the same 0o444 mode + idempotency + existence assert as every other
+  `/proc` file. The `format!(...)` block is hoisted into a local
+  `status_content` variable so it can be passed by reference to
+  `write_file()`, which takes `&str`.
+
+  Two new regression tests guard the fix:
+  * `proc_self_status_is_read_only_mode_0444` — asserts the file's
+    `permissions().mode() & 0o777 == 0o444` after `populate_proc`,
+    plus verifies the content starts with `Name:\t` and contains
+    `VmRSS:\t    4000 kB` (sanity check that the `format!` with the
+    `pid` substitution still works through `write_file`).
+  * `proc_self_status_survives_rerun` — calls `populate_proc` twice
+    on the same rootfs and asserts the second call doesn't panic /
+    return Err, and that the file is still 0o444 + readable after
+    the re-run. Guards the `write_file`-based path against future
+    regressions (e.g. if someone reverts to `fs::File::create`).
+
+  Suite is now **165/165 passing** (was 163/163; +2 new tests);
+  clippy + fmt still clean on `kr64` and `loader`.
+
+* **Doc sync — README.md + MEMORY.md.** The headline test count was
+  stale at 145 (the round-52 baseline) — the actual count is 165
+  after the rounds-53–66 test additions. README.md's code-quality
+  table also still claimed "62 lint warnings" (the pre-round-52
+  state); MEMORY.md correctly recorded them as resolved in round 52.
+  Both docs now agree: 165/165 tests, 0 lint warnings, 0 clippy
+  warnings, 0 fmt drift. Updated:
+  - README.md `### Build the kr64 kernel-replacement daemon` block:
+    26 → 165 tests.
+  - README.md `### Rust unit tests` block: 145 → 165 tests.
+  - README.md `### Code quality` table: 145/145 → 165/165; 62
+    warnings → 0 warnings; the multi-paragraph "remaining 62 lint
+    warnings" explainer replaced with a one-paragraph "resolved in
+    rounds-23–52" note.
+  - MEMORY.md header: "round 52" → "round 66"; "52 rounds" →
+    "66 rounds"; "~241 improvements" → "~245"; "79+ commits" →
+    "90+ commits".
+  - MEMORY.md headline metrics + quality-gates table: 145/145 →
+    165/165 everywhere.
+  - MEMORY.md "Round 66" section added above the "Round 52" section
+    documenting this commit's two changes.
+
+### Round 66 — verification
+
+| Gate                              | Result                                                   |
+| --------------------------------- | -------------------------------------------------------- |
+| Rust unit tests (`kr64`)          | **165/165 pass** (was 163/163; +2 new tests)             |
+| Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
+| Rust clippy (`loader`)            | **0 warnings, 0 errors**                                 |
+| Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |

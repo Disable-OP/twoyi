@@ -204,7 +204,7 @@ sh build_rs.sh --release arm64-v8a x86_64
 
 ```bash
 cd app/rs/kr64
-cargo test                  # 26 unit tests, runs on Linux host
+cargo test                  # 165 unit tests, runs on Linux host
 cargo build --release       # host binary for development
 # For Android:
 cargo build --target aarch64-linux-android --release
@@ -295,7 +295,7 @@ adb shell am start -n io.twoyi/.ui.SettingsActivity
 ### Rust unit tests
 
 ```bash
-cd app/rs/kr64 && cargo test           # 145 tests
+cd app/rs/kr64 && cargo test           # 165 tests
 cd app/rs      && cargo build          # smoke-build the host crate
 ```
 
@@ -306,32 +306,18 @@ The `improvements/initial-cleanup` branch keeps three quality gates green:
 | Gate | Command | Result |
 |---|---|---|
 | Rust clippy (all crates) | `cd app/rs && cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warnings, 0 errors |
-| Rust unit tests | `cd app/rs/kr64 && cargo test` | ✅ 145 / 145 passing |
-| Android Lint (release) | `./gradlew lintRelease -x cmakeBuild -x loaderBuild -x cargoBuild` | ✅ 0 errors, 62 warnings (all pre-existing / non-actionable) |
+| Rust unit tests | `cd app/rs/kr64 && cargo test` | ✅ 165 / 165 passing |
+| Android Lint (release) | `./gradlew lintRelease -x cmakeBuild -x loaderBuild -x cargoBuild` | ✅ 0 errors, 0 warnings |
 
 ```bash
 # Reproduce clippy locally (must use the Android NDK target):
 cd app/rs && ~/.cargo/bin/cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The remaining 62 lint warnings fall into well-understood buckets that are
-intentionally left in place:
-
-- **`IconLauncherShape`** (6) — the inherited launcher PNG assets are not
-  re-cut for Material's adaptive-icon spec.
-- **`PrivateResource`** (5) — `ac_render.xml` references `com.cleveroad`
-  library-private colours; `UIHelper` uses a Material private overlay style.
-- **`UnusedResources`** (≈20) — historical strings/colours retained for
-  compatibility with potential consumers of the resource IDs.
-- **`LockedOrientationActivity`** (4) — the app is intentionally
-  portrait-only on phone form factors.
-- **`SetTextI18n` / `MergeRootFrame` / `UselessParent` / `Overdraw`** —
-  pre-existing layout patterns; refactoring would risk visual regressions
-  without functional benefit.
-- **`PrivateApi` / `DiscouragedPrivateApi` / `PackageManagerGetSignatures`**
-  — intentional reflective access to hidden Android APIs (status-bar
-  dimming, file permissions) and signature probing used to detect the
-  `android` package identity.
+All previously-known lint warnings (62 benign warnings across `IconLauncherShape`,
+`PrivateResource`, `UnusedResources`, `LockedOrientationActivity`, `SetTextI18n`,
+`PrivateApi`, etc.) were resolved in the rounds-23–52 quality sweep. The CI gate
+now treats **any** lint warning as build-breaking.
 
 > ℹ️ **Honest status of x86_64 boot.** The x86_64 build no longer SIGABRT-crashes
 > and the new Rust renderer initializes (`GL context created successfully`), but
