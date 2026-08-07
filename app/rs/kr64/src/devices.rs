@@ -423,6 +423,114 @@ pub fn create_busybox_marker(rootfs: &str) -> std::io::Result<()> {
     create_marker_file(rootfs, ".busybox")
 }
 
+/// Create the Magisk marker files in the guest rootfs.
+///
+/// This mirrors what VM does to make Magisk-aware apps (and Magisk itself,
+/// if installed inside the guest) detect a "Magisk-compatible" environment.
+/// Magisk uses a small set of marker files under `/dev` and `/sbin` to
+/// signal its presence and to coordinate with its own daemon:
+///
+///   * `/dev/.magisk`              — main presence marker (unified build)
+///   * `/dev/.magisk_unmount`      — signals "unmount modules" mode
+///   * `/dev/.magisk.block`        — used by MagiskHide / DenyList probe
+///   * `/sbin/.magisk/config`      — Magisk config dir marker (legacy path)
+///
+/// For twoyi we don't actually run a Magisk daemon — these markers exist
+/// purely so guest apps that probe for Magisk (e.g. banking apps, SafetyNet
+/// helpers, root checkers) see a consistent "rooted VM" environment and
+/// don't crash on missing paths. The guest's own Magisk (if the user
+/// installed it inside the VM) overlays these with real content via its
+/// boot script.
+///
+/// Each marker is a tiny text file (not the 8-byte binary zero blob used by
+/// `create_marker_file`) because Magisk itself writes short ASCII strings
+/// into them (e.g. the Magisk version code). We follow that convention.
+pub fn create_magisk_marker(rootfs: &str) -> std::io::Result<()> {
+    // /dev/.magisk — main presence marker. Content is the Magisk version
+    // code (we pretend to be Magisk 26.1 = version code 26100, the last
+    // stable release before the Magisk/DenyList split). Apps that read
+    // this file compare it against their minimum-supported version.
+    let dev_magisk = format!("{}/dev/.magisk", rootfs);
+    ensure_parent_dir(&dev_magisk)?;
+    fs::write(&dev_magisk, "26100\n")?;
+    info!("[KR64][devices] wrote Magisk presence marker: {}", dev_magisk);
+
+    // /dev/.magisk_unmount — empty marker (existence == "unmount mode on").
+    // We create it empty so MagiskHide-style apps see the flag is set
+    // without twoyi actually performing any unmount.
+    let dev_unmount = format!("{}/dev/.magisk_unmount", rootfs);
+    fs::write(&dev_unmount, "")?;
+    info!("[KR64][devices] wrote Magisk unmount marker: {}", dev_unmount);
+
+    // /dev/.magisk.block — used by the Magisk daemon to coordinate boot.
+    // Empty file; the guest's magiskd (if present) overwrites it.
+    let dev_block = format!("{}/dev/.magisk.block", rootfs);
+    fs::write(&dev_block, "")?;
+    info!("[KR64][devices] wrote Magisk block marker: {}", dev_block);
+
+    // /sbin/.magisk/ — the legacy Magisk working directory. Modern Magisk
+    // uses /debug/.magisk on Android 11+, but the /sbin path is still
+    // probed by older modules. We create the dir + a stub config so
+    // `ls /sbin/.magisk` doesn't ENOENT.
+    let sbin_magisk = format!("{}/sbin/.magisk", rootfs);
+    fs::create_dir_all(&sbin_magisk)?;
+    let sbin_config = format!("{}/config", sbin_magisk);
+    fs::write(
+        &sbin_config,
+        "KEEPVERITY=false\nKEEPFORCEENCRYPT=false\nPATCHVBMETAFLAG=false\nRECOVERYMODE=false\n",
+    )?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&sbin_magisk, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&dev_magisk, fs::Permissions::from_mode(0o644));
+        let _ = fs::set_permissions(&dev_unmount, fs::Permissions::from_mode(0o644));
+        let _ = fs::set_permissions(&dev_block, fs::Permissions::from_mode(0o644));
+    }
+
+    info!("[KR64][devices] Magisk marker tree materialised under {}/dev/.magisk*", rootfs);
+    Ok(())
+}
+
+/// Create `{rootfs}/dev/dm-user` — the userspace device-mapper control
+/// socket for Android 12+.
+///
+/// Android 12 (API 31) introduced `/dev/dm-user` as part of the
+/// userspace device-mapper (`dm-user`) infrastructure used by
+/// `virtual_ab` / `snapshotctl` for OTA snapshot merges and by
+/// `userdata` checkpointing. The guest's `vold` and `init` open this
+/// device during early boot to set up the dm-user target; if the node
+/// is missing, vold logs `Failed to open /dev/dm-user` and falls back
+/// to a degraded mode (no checkpoint, no snapshot merge), which on
+/// some GSIs causes a boot-loop because `init` waits on a property
+/// that vold never sets.
+///
+/// We can't `mknod()` a real char device (no CAP_MKNOD in the app
+/// sandbox), so — like the other devices in this module — we bind a
+/// Unix-domain socket to the path. The guest's `open("/dev/dm-user")`
+/// succeeds, and the kr64 daemon's accept thread (see `lib.rs`)
+/// handles the ioctl-style messages vold sends. For the MVP the
+/// handler just accepts and closes; the production version will
+/// implement the dm-user message protocol (DM_USER_MSG_MAP /
+/// DM_USER_MSG_DONE).
+///
+/// See `VM_KR64_ANALYSIS.md` §4.2 (Android 12 device inventory) and
+/// `GSI_BOOT_PLAN.md` §3.3 for why this node is required for A12 GSIs.
+pub fn create_dm_user_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
+    let path = format!("{}/dev/dm-user", rootfs);
+    let listener = bind_unix_socket(&path)?;
+    info!(
+        "[KR64][devices] created /dev/dm-user socket for Android 12+ dm-user target (path={})",
+        path
+    );
+    Ok(DeviceSocket {
+        listener: Some(listener),
+        path,
+        should_unlink: true,
+    })
+}
+
 // ============================================================================
 // Tests — pure-Rust, no Android deps, so they run on the host too.
 // (cargo test --lib)
@@ -480,6 +588,31 @@ mod tests {
         create_busybox_marker(&rootfs).expect("busybox");
         assert!(Path::new(&format!("{}/dev/.coldboot_done", rootfs)).exists());
         assert!(Path::new(&format!("{}/dev/.busybox", rootfs)).exists());
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn magisk_markers_are_created() {
+        let rootfs = tmpdir();
+        create_magisk_marker(&rootfs).expect("magisk");
+        assert!(Path::new(&format!("{}/dev/.magisk", rootfs)).exists());
+        assert!(Path::new(&format!("{}/dev/.magisk_unmount", rootfs)).exists());
+        assert!(Path::new(&format!("{}/dev/.magisk.block", rootfs)).exists());
+        assert!(Path::new(&format!("{}/sbin/.magisk/config", rootfs)).exists());
+        // The presence marker should contain a version code.
+        let v = fs::read_to_string(format!("{}/dev/.magisk", rootfs)).unwrap();
+        assert!(v.trim().parse::<u32>().is_ok(), "magisk marker should be numeric");
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn dm_user_device_is_created() {
+        let rootfs = tmpdir();
+        let dev = create_dm_user_device(&rootfs).expect("dm-user");
+        assert!(Path::new(&dev.path).exists(), "dm-user socket should exist");
+        assert!(dev.raw_fd() >= 0);
+        drop(dev);
+        assert!(!Path::new(&format!("{}/dev/dm-user", rootfs)).exists());
         let _ = fs::remove_dir_all(&rootfs);
     }
 }

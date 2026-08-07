@@ -67,6 +67,7 @@
 pub mod audio;
 pub mod battery;
 pub mod binder;
+pub mod compat_paths;
 pub mod devices;
 pub mod mount_mgr;
 pub mod proc_emu;
@@ -250,6 +251,25 @@ pub struct Config {
     /// Kernel log level (0=quiet, 3=verbose). Mirrors the `log_level`
     /// argv position in VM's `libkr64.so`.
     pub log_level: u32,
+    /// Optional SOCKS5 proxy the guest's networking should tunnel
+    /// through. Mirrors VM's `vmnet` SOCKS5 proxy feature: when set,
+    /// the kr64 daemon opens a listening socket inside the guest's
+    /// network namespace and forwards every accepted TCP connection
+    /// to the configured SOCKS5 upstream, so the guest's apps see a
+    /// "normal" network while all traffic actually egresses through
+    /// the host's proxy.
+    ///
+    /// `None` = proxy disabled (direct connect). When `Some`, the
+    /// string is `host:port` (e.g. `"127.0.0.1:1080"`). Username /
+    /// password auth is not yet supported — the stub only implements
+    /// the no-auth SOCKS5 method (0x00).
+    ///
+    /// This is a STUB: the field is parsed and stored but the actual
+    /// proxy listener is not yet spawned. The forwarding thread will
+    /// be added in a follow-up task (see `download/NETWORK_PROXY.md`,
+    /// not yet written). The field exists now so that callers can
+    /// configure it and so the daemon logs the configured value.
+    pub socks5_proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -267,6 +287,7 @@ impl Default for Config {
             read_only_rom: true,
             install_seccomp: true,
             log_level: 3,
+            socks5_proxy: None,
         }
     }
 }
@@ -315,7 +336,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                      Behaviour toggles:\n\
                        --no-namespaces           Disable unshare + pivot_root; chroot only\n\
                        --rw-rom                  Mount /system etc. read-write (for dev)\n\
-                       --no-seccomp              Skip seccomp filter installation\n"
+                       --no-seccomp              Skip seccomp filter installation\n\
+                     \n\
+                     Networking:\n\
+                       --socks5 <host:port>     Tunnel guest TCP through a SOCKS5 proxy (stub)\n"
                     .to_string());
             }
             "--rootfs" => {
@@ -370,6 +394,26 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             "--no-namespaces" => cfg.use_namespaces = false,
             "--rw-rom" => cfg.read_only_rom = false,
             "--no-seccomp" => cfg.install_seccomp = false,
+            "--socks5" => {
+                // SOCKS5 proxy stub: store the host:port string. The
+                // actual forwarding thread is not yet wired up — see
+                // the `socks5_proxy` field doc on `Config` for status.
+                let val = iter
+                    .next()
+                    .ok_or("--socks5 requires a host:port argument".to_string())?;
+                if val.is_empty() {
+                    return Err("--socks5 argument must not be empty".to_string());
+                }
+                // Minimal validation: must contain exactly one ':'.
+                let colon_count = val.matches(':').count();
+                if colon_count != 1 {
+                    return Err(format!(
+                        "--socks5 expects host:port (got '{}', expected exactly one ':')",
+                        val
+                    ));
+                }
+                cfg.socks5_proxy = Some(val);
+            }
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
@@ -384,6 +428,74 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
     }
 
     Ok(cfg)
+}
+
+// ============================================================================
+// Zombie reaping — VM-inspired cleanup.
+// ============================================================================
+
+/// Reap any leftover zombie children before forking the new guest.
+///
+/// This mirrors VM's `ProcessKiller` / `ZombieReaper` (see
+/// `VM_KR64_ANALYSIS.md` §2.10) which runs at daemon startup to clean
+/// up processes left behind by a previous VM run that crashed or was
+/// killed with SIGKILL. Without this, those zombies stay reaped by no
+/// one (their parent is gone) and accumulate as `<defunct>` entries in
+/// `/proc`, which on long-running hosts can exhaust the PID table.
+///
+/// We call `waitpid(-1, WNOHANG)` in a loop until it returns 0 (no
+/// more children to reap) or -1 with ECHILD (no children at all).
+/// Both terminating conditions are benign. EINTR is retried (it can
+/// happen if a signal arrives mid-syscall — we have no handlers yet,
+/// but this is the correct defensive pattern).
+///
+/// # Safety
+///
+/// `waitpid` is a POSIX syscall; calling it is safe. The `WNOHANG`
+/// flag makes it non-blocking, so this function never sleeps. It only
+/// reaps children that have ALREADY exited — it does not kill or
+/// signal any running process. The "kill orphan processes" step (which
+/// DOES send SIGKILL to leftover guest PIDs) is handled separately on
+/// the Java side in `RomManager.killOrphanProcess()` — this Rust
+/// function is purely the reap-after-the-fact step.
+pub fn clear_zombie_processes() {
+    let mut reaped = 0u32;
+    loop {
+        let mut status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid > 0 {
+            reaped += 1;
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else if libc::WIFSIGNALED(status) {
+                -(libc::WTERMSIG(status))
+            } else {
+                status
+            };
+            info!("[KR64][zombie] reaped leftover child pid={} status={}", pid, code);
+            continue;
+        }
+        if pid == 0 {
+            // No more children waiting to be reaped.
+            break;
+        }
+        // pid == -1: error. ECHILD means "no children" (benign — first
+        // run). EINTR means "interrupted by signal" — retry. Anything
+        // else is unexpected; log and stop to avoid an infinite loop.
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        if e.raw_os_error() == Some(libc::ECHILD) {
+            // No children at all — first run, nothing to reap.
+            break;
+        }
+        warning!("[KR64][zombie] waitpid failed: {} — stopping reap loop", e);
+        break;
+    }
+    if reaped > 0 {
+        info!("[KR64][zombie] reaped {} leftover zombie process(es)", reaped);
+    }
 }
 
 // ============================================================================
@@ -427,6 +539,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     info!("[KR64] starting daemon with config: {:?}", cfg);
 
     // ---------------------------------------------------------------
+    // Step 1.5: reap leftover zombie children from a previous run.
+    //
+    // VM does this at daemon startup (see `VM_KR64_ANALYSIS.md` §2.10)
+    // to clean up after a crashed/killed previous VM. We do the same so
+    // a rapid restart of the guest doesn't accumulate `<defunct>` PIDs.
+    // This is purely defensive — if there are no children, waitpid
+    // returns ECHILD immediately and we move on.
+    // ---------------------------------------------------------------
+    clear_zombie_processes();
+
+    // Log the SOCKS5 proxy configuration if set (stub: the actual
+    // forwarding thread is not yet spawned — see `Config::socks5_proxy`).
+    if let Some(ref upstream) = cfg.socks5_proxy {
+        info!(
+            "[KR64] SOCKS5 proxy configured: {} (stub — forwarding thread not yet started)",
+            upstream
+        );
+    } else {
+        info!("[KR64] SOCKS5 proxy: not configured (direct connect)");
+    }
+
+    // ---------------------------------------------------------------
     // Step 2: create virtual /dev devices.
     // ---------------------------------------------------------------
     let device_set = match devices::create_all_devices(&cfg.rootfs, &cfg.data_dir) {
@@ -443,6 +577,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
     if let Err(e) = devices::create_busybox_marker(&cfg.rootfs) {
         warning!("[KR64] failed to create .busybox marker: {}", e);
+    }
+    // Magisk presence markers — make Magisk-aware apps detect a
+    // consistent "rooted VM" environment. Non-fatal: the guest boots
+    // fine without these, but banking/root-checker apps may misbehave.
+    if let Err(e) = devices::create_magisk_marker(&cfg.rootfs) {
+        warning!("[KR64] failed to create Magisk markers: {}", e);
+    }
+    // /dev/dm-user — required by Android 12+ GSIs for userspace
+    // device-mapper (snapshot merges / userdata checkpointing). We
+    // create a socket (can't mknod a real char device) and spawn an
+    // accept thread so the guest's open() succeeds. Non-fatal on
+    // Android 11 and below (the node is simply never opened).
+    match devices::create_dm_user_device(&cfg.rootfs) {
+        Ok(dev) => {
+            // Hand off to an accept thread so the listener stays alive.
+            // The thread takes ownership; we don't store the handle.
+            spawn_accept_thread(dev, "dm-user");
+        }
+        Err(e) => {
+            warning!(
+                "[KR64] failed to create /dev/dm-user: {} — Android 12+ GSIs may boot-loop",
+                e
+            );
+        }
     }
 
     // ---------------------------------------------------------------
@@ -585,6 +743,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     let mem_mb = 4096u64;
     if let Err(e) = proc_emu::populate_proc(&cfg.rootfs, cpu_count, mem_mb) {
         warning!("[KR64] failed to populate /proc: {}", e);
+    }
+
+    // ---------------------------------------------------------------
+    // Step 3.5: materialise Samsung GameSDK compatibility paths.
+    //
+    // Games that probe for Samsung's GameDriver / GameSDK crash on
+    // the missing paths (ENOENT on stat / dlopen without null-check).
+    // We create stub dirs + files so the probes succeed; games then
+    // fall back to the default driver via their own error handling.
+    // Non-fatal: missing compat paths only affect Samsung-aware games.
+    // ---------------------------------------------------------------
+    if let Err(e) = compat_paths::create_samsung_gamesdk_compat_paths(&cfg.rootfs) {
+        warning!(
+            "[KR64] failed to materialise Samsung GameSDK compat paths: {} — some games may crash",
+            e
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1008,5 +1182,59 @@ mod tests {
     fn config_default_init_path_is_system_bin_init() {
         let cfg = Config::default();
         assert_eq!(cfg.init_path, "/system/bin/init");
+    }
+
+    #[test]
+    fn config_default_socks5_is_none() {
+        let cfg = Config::default();
+        assert!(cfg.socks5_proxy.is_none(), "socks5_proxy should default to None");
+    }
+
+    #[test]
+    fn parse_args_socks5_sets_field() {
+        let cfg = parse_args(args(&[
+            "--rootfs", "/r",
+            "--data-dir", "/d",
+            "--socks5", "127.0.0.1:1080",
+        ]))
+        .unwrap();
+        assert_eq!(cfg.socks5_proxy.as_deref(), Some("127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn parse_args_socks5_rejects_missing_colon() {
+        let r = parse_args(args(&[
+            "--rootfs", "/r",
+            "--data-dir", "/d",
+            "--socks5", "no-colon-here",
+        ]));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("--socks5"));
+    }
+
+    #[test]
+    fn parse_args_socks5_rejects_missing_value() {
+        let r = parse_args(args(&["--rootfs", "/r", "--data-dir", "/d", "--socks5"]));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn parse_args_help_mentions_socks5() {
+        let r = parse_args(args(&["--help"]));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("--socks5"));
+    }
+
+    /// `clear_zombie_processes` must be safe to call when there are no
+    /// children (the common case at startup). It should not panic and
+    /// should return promptly.
+    #[test]
+    fn clear_zombie_processes_is_safe_with_no_children() {
+        // We can't easily create real zombie children in a unit test
+        // (forking + exiting would race with the test runner), but we
+        // CAN verify the function handles ECHILD gracefully — which is
+        // the "no children" condition. This is a smoke test.
+        clear_zombie_processes();
+        // If we get here without panicking, the test passes.
     }
 }

@@ -269,7 +269,25 @@ pub fn init_renderer(
         }
 
         cmd.env("LD_LIBRARY_PATH", &ld_library_path);
+        // VM-inspired TYLD_PRELOAD trick (mirrors VM's VM_LD_PRELOAD → LD_PRELOAD
+        // remapping). The host Android linker ignores or strips LD_PRELOAD in
+        // certain sandboxed contexts (notably when the loader detects a
+        // non-system exec target), and on some SELinux policies the env var
+        // is filtered before the guest linker ever sees it.
+        //
+        // To get a preload library into the guest's init reliably, we use a
+        // *renamed* env var — TYLD_PRELOAD — which the host linker does NOT
+        // look at, so it passes through unmodified. The twoyi loader
+        // (TYLOADER = libloader.so) intercepts the exec, reads TYLD_PRELOAD,
+        // and re-exports it as LD_PRELOAD for the actual guest init binary.
+        // This is the exact pattern VM uses with VM_LD_PRELOAD → LD_PRELOAD.
+        //
+        // For now we set it to empty and explicitly clear any host-side
+        // LD_PRELOAD so no host preload leaks into the guest. When a guest
+        // preload library is needed (e.g. for shadowhook bootstrap), set
+        // TYLD_PRELOAD to the guest-visible path of that .so here.
         cmd.env_remove("LD_PRELOAD");
+        cmd.env("TYLD_PRELOAD", "");
         cmd.env("TWOYI_ROOTFS", &working_dir);
         cmd.env("TYLOADER", &loader_path);
         cmd.env("ANDROID_BOOTLOGO", "1");
