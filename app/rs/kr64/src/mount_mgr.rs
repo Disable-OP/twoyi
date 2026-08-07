@@ -462,19 +462,16 @@ pub fn list_mounts() -> Vec<MountSpec> {
         for line in content.lines() {
             // mountinfo format (man 5 proc):
             //   mount_id parent_id major:minor root mountpoint options ...
+            //   ... optional_fields - fstype source super_options
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() < 6 {
                 continue;
             }
             // The fstype/source are in the optional fields after "-".
+            // Scan forwards for the separator, then read the two fields
+            // that follow it (fstype, source).
             let mut fstype = String::new();
             let mut source = String::new();
-            for w in fields.iter().rev() {
-                if *w == "-" {
-                    break;
-                }
-            }
-            // Simplified parse — we don't need full accuracy for logs.
             for (i, w) in fields.iter().enumerate() {
                 if *w == "-" && i + 2 < fields.len() {
                     fstype = fields[i + 1].to_string();

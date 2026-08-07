@@ -643,19 +643,16 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// Each test gets a UNIQUE tmpdir (counter + pid + thread id) so
-    /// parallel tests don't collide on the same path. Without this,
-    /// `populate_proc`'s `chmod 0o555` on the proc dir would make the
-    /// dir read-only for the next test that tries to write into it.
+    /// Each test gets a UNIQUE tmpdir (counter + pid) so parallel tests
+    /// don't collide on the same path. Without this, `populate_proc`'s
+    /// `chmod 0o555` on the proc dir would make the dir read-only for
+    /// the next test that tries to write into it. The monotonic counter
+    /// alone guarantees uniqueness within a single test process (it's
+    /// the same pattern used by `battery.rs` / `sensors.rs` / `binder.rs`).
     fn tmpdir() -> String {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut p = std::env::temp_dir();
-        p.push(format!(
-            "kr64-proc-test-{}-{}-{}",
-            std::process::id(),
-            n,
-            std::thread::current().name().unwrap_or("?").len()
-        ));
+        p.push(format!("kr64-proc-test-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&p).unwrap();
         p.to_string_lossy().to_string()
     }
