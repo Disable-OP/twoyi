@@ -355,10 +355,10 @@ The legacy closed-source `libOpenglRender.so` is a 1,059,128-byte (1.06 MB) arm6
 | 3 | `GLDispatch.cpp` | `libGLES_CM_translator.so` → `libGLESv1_CM.so` |
 | 4 | `GL2Dispatch.cpp` | `libGLES_V2_translator.so` → `libGLESv2.so` |
 | 5 | `UnixStream.cpp` | Rewrote `make_unix_path()` to produce `$TWOYI_ROOTFS/opengles{,2,3}` (default `/data/data/io.twoyi/rootfs/opengles`) |
-| 6 | `NativeLinuxSubWindow.cpp` → `NativeAndroidSubWindow.cpp` | `createSubWindow` just returns the `ANativeWindow` as-is (no X11) |
-| 7 | `twoyi_api.cpp` (new) | Implements `startOpenGLRenderer`, `setNativeWindow`, `resetSubWindow`, `removeSubWindow`, `dlopen_ex`, `dlsym_ex`, `dlclose_ex`, `dlerror_ex` |
-| 8 | `render_api.cpp` | Removed `static` from `s_renderThread` so `twoyi_api.cpp` can `extern` it |
-| 9 | `CMakeLists.txt` (new) | Builds 33 source files (libOpenglRender + OpenglCodecCommon + OpenglOsUtils + GLESv1_dec + GLESv2_dec + generated decoders + compat.cpp + twoyi_api.cpp) into `libOpenglRender.so`. Links `libEGL`, `libGLESv1_CM`, `libGLESv2`, `liblog`, `libdl`, `libm`, `libc`. Stripped with `llvm-strip -x`. |
+| 6 | `NativeLinuxSubWindow.cpp` (and `NativeMacSubWindow.m` / `NativeWindowsSubWindow.cpp`) | Not in `CMakeLists.txt`'s `EMUGL_SOURCES` (platform-specific X11 / Win32 / Carbon code; not applicable on Android). Kept in the tree as part of the reference AOSP source. |
+| 7 | `twoyi_api.cpp` (new) | Implements `startOpenGLRenderer`, `setNativeWindow`, `resetSubWindow`, `removeSubWindow`, `destroyOpenGLSubwindow`, `repaintOpenGLDisplay`, `dlopen_ex`, `dlsym_ex`, `dlclose_ex`, `dlerror_ex`. **This is the only file actually compiled into the shipping `libOpenglRender.so`** — it talks to the system EGL / GLESv2 directly (`eglGetDisplay` / `eglInitialize` / `eglChooseConfig` / `eglCreateContext` / `eglCreateWindowSurface` / `eglSwapBuffers`) and runs a background render thread that owns the EGL context for its entire lifetime. The original "compose the AOSP `FrameBuffer` / `RenderServer` API" approach (rows 1–6, 8) is preserved in the tree as reference source. |
+| 8 | `render_api.cpp` | Removed `static` from `s_renderThread` so the now-deleted reference `twoyi/twoyi_api.cpp` could `extern` it. Not required by the active build. |
+| 9 | `CMakeLists.txt` (new) | Builds **only `twoyi_api.cpp`** into `libOpenglRender.so`. Links `libEGL`, `libGLESv2`, `libandroid`, `liblog`, `libdl`. Stripped with `llvm-strip -x`. (The 33-source-file build described in earlier revisions of this document was the abandoned "full AOSP pipeline" approach.) |
 
 **Compile flags:** `-DANDROID -DHAVE_ANDROID_OS=1 -DWITH_GLES2 -include assert.h -O2 -fno-rtti -std=c++11`. No `-fvisibility=hidden` (legacy blob doesn't hide symbols). `c++_static` STL.
 

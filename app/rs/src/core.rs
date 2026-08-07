@@ -45,7 +45,10 @@ pub fn set_data_dir(dir: String) {
 /// `set_data_dir` was never called (backwards compatibility with
 /// older Java code that doesn't call `setDataDir`).
 pub fn get_data_dir() -> &'static str {
-    DATA_DIR.get().map(|s| s.as_str()).unwrap_or("/data/data/io.twoyi")
+    DATA_DIR
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("/data/data/io.twoyi")
 }
 
 /// Get the rootfs directory path.
@@ -86,6 +89,7 @@ pub fn get_opengles_paths() -> Vec<String> {
 ///
 /// On subsequent calls (e.g. when the Surface is recreated) the
 /// renderer thread is *not* restarted — only the subwindow is reset.
+#[allow(clippy::too_many_arguments)]
 pub fn init_renderer(
     window: *mut c_void,
     loader_path: String,
@@ -138,7 +142,10 @@ pub fn init_renderer(
         // Surfacing the paths up front also makes it obvious from the
         // logs whether the rootfs layout is what we expect.
         let opengles_paths = get_opengles_paths();
-        info!("[CORE] Renderer will open OpenGL ES pipes: {:?}", opengles_paths);
+        info!(
+            "[CORE] Renderer will open OpenGL ES pipes: {:?}",
+            opengles_paths
+        );
 
         // Convert raw pointer to usize for safe transfer between threads
         let window_addr = window as usize;
@@ -159,7 +166,10 @@ pub fn init_renderer(
                 )
             };
             if result != 0 {
-                log::error!("[CORE] startOpenGLRenderer returned {} (non-zero = failure)", result);
+                log::error!(
+                    "[CORE] startOpenGLRenderer returned {} (non-zero = failure)",
+                    result
+                );
                 // Reset RENDERER_STARTED so a future init_renderer call can retry
                 RENDERER_STARTED.store(false, Ordering::Release);
             } else {
@@ -278,12 +288,21 @@ pub fn init_renderer(
             }
             Err(e) => {
                 log::error!("[CORE] FAILED to spawn container init: {}", e);
-                log::error!("[CORE]   linker_path: {} (exists: {})",
-                    linker_path, Path::new(&linker_path).exists());
-                log::error!("[CORE]   init_path: {} (exists: {})",
-                    init_path, Path::new(&init_path).exists());
-                log::error!("[CORE]   working_dir: {} (exists: {})",
-                    working_dir, Path::new(&working_dir).exists());
+                log::error!(
+                    "[CORE]   linker_path: {} (exists: {})",
+                    linker_path,
+                    Path::new(&linker_path).exists()
+                );
+                log::error!(
+                    "[CORE]   init_path: {} (exists: {})",
+                    init_path,
+                    Path::new(&init_path).exists()
+                );
+                log::error!(
+                    "[CORE]   working_dir: {} (exists: {})",
+                    working_dir,
+                    Path::new(&working_dir).exists()
+                );
             }
         }
     }
@@ -301,15 +320,7 @@ pub fn reset_window(
 ) {
     unsafe {
         renderer_bindings::resetSubWindow(
-            window,
-            left,
-            top,
-            width,
-            height,
-            fb_width,
-            fb_height,
-            1.0,
-            0.0,
+            window, left, top, width, height, fb_width, fb_height, 1.0, 0.0,
         );
     }
 }

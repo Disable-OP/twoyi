@@ -13,6 +13,7 @@
 
 package io.twoyi.ui;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.ProgressDialog;
 import android.content.ContentResolver;
@@ -46,6 +47,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import io.twoyi.R;
 import io.twoyi.utils.IOUtils;
@@ -131,7 +133,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 if (ProfileManager.switchProfile(this, profileName)) {
                     RomManager.reboot(this);
                 } else {
-                    Toast.makeText(this, "Failed to switch profile", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, getString(R.string.profile_switch_failed), Toast.LENGTH_SHORT).show();
                 }
             })
             .setNegativeButton(android.R.string.cancel, null)
@@ -150,13 +152,13 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 String newName = input.getText().toString().trim();
                 if (!newName.isEmpty() && !newName.equals(oldName)) {
                     if (ProfileManager.renameProfile(this, oldName, newName)) {
-                        Toast.makeText(this, "Profile renamed to: " + newName, Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, getString(R.string.profile_renamed_to, newName), Toast.LENGTH_SHORT).show();
                         refreshProfiles();
                         if (oldName.equals(ProfileManager.getActiveProfile(this))) {
                             RomManager.reboot(this);
                         }
                     } else {
-                        Toast.makeText(this, "Failed to rename profile", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, getString(R.string.profile_rename_failed), Toast.LENGTH_SHORT).show();
                     }
                 }
             })
@@ -167,7 +169,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
     private void showCopyDialog(String sourceName) {
         android.widget.EditText input = new android.widget.EditText(this);
         input.setHint(R.string.profile_copy_hint);
-        input.setText(sourceName + "_copy");
+        input.setText(getString(R.string.profile_copy_default_name, sourceName));
 
         UIHelper.getDialogBuilder(this)
             .setTitle(R.string.profile_copy)
@@ -184,14 +186,14 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     }).done(success -> {
                         UIHelper.dismiss(progressDialog);
                         if (success) {
-                            Toast.makeText(this, "Profile copied to: " + targetName, Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.profile_copied_to, targetName), Toast.LENGTH_SHORT).show();
                             refreshProfiles();
                         } else {
-                            Toast.makeText(this, "Failed to copy profile", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.profile_copy_failed), Toast.LENGTH_SHORT).show();
                         }
                     }).fail(result -> runOnUiThread(() -> {
                         UIHelper.dismiss(progressDialog);
-                        Toast.makeText(this, "Error: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+                        Toast.makeText(this, getString(R.string.profile_copy_error, result.getMessage()), Toast.LENGTH_SHORT).show();
                     }));
                 }
             })
@@ -245,17 +247,48 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
                 
-                // Read any error output
-                java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(process.getInputStream()));
+                // Fixed: drain tar's merged stdout/stderr in a daemon thread.
+                // The previous code called readLine() synchronously before
+                // waitFor(), so a hung tar (stalled FUSE mount, huge rootfs)
+                // would block on readLine() forever and the (missing) waitFor
+                // timeout would never engage. Draining in the background also
+                // prevents a large burst of tar warnings from filling the
+                // 64 KB pipe buffer and deadlocking the process.
                 StringBuilder output = new StringBuilder();
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                    Log.d("ProfileManager", "tar output: " + line);
+                Thread drainThread = new Thread(() -> {
+                    try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(process.getInputStream()))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            output.append(line).append("\n");
+                            Log.d("ProfileManager", "tar output: " + line);
+                        }
+                    } catch (IOException ignored) {
+                    }
+                }, "tar-export-drain");
+                drainThread.setDaemon(true);
+                drainThread.start();
+
+                // Fixed: waitFor() without a timeout can block forever if tar
+                // hangs on a stalled FUSE mount or a huge rootfs. Cap at 120 s
+                // — matches the limit used by Render2Activity / SettingsActivity
+                // and by the import path (performProfileImport) in this file.
+                int exitCode;
+                if (!process.waitFor(120, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    drainThread.interrupt();
+                    throw new IOException("tar create timed out after 120 s");
+                } else {
+                    exitCode = process.exitValue();
                 }
-                
-                int exitCode = process.waitFor();
+                // Give the drain thread a brief moment to finish capturing
+                // final output so the error message below includes tar
+                // diagnostics. Daemon thread, so a missed join is harmless.
+                try {
+                    drainThread.join(2_000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
                 
                 if (exitCode != 0) {
                     Log.e("ProfileManager", "tar create failed. Output: " + output.toString());
@@ -343,10 +376,10 @@ public class ProfileManagerActivity extends AppCompatActivity {
             .setMessage(getString(R.string.profile_delete_confirm, profileName))
             .setPositiveButton(android.R.string.ok, (d, w) -> {
                 if (ProfileManager.deleteProfile(this, profileName)) {
-                    Toast.makeText(this, "Profile deleted: " + profileName, Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, getString(R.string.profile_deleted, profileName), Toast.LENGTH_SHORT).show();
                     refreshProfiles();
                 } else {
-                    Toast.makeText(this, "Failed to delete profile", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, getString(R.string.profile_delete_failed), Toast.LENGTH_SHORT).show();
                 }
             })
             .setNegativeButton(android.R.string.cancel, null)
@@ -372,7 +405,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
                         try {
                             startActivityForResult(intent, REQUEST_IMPORT_PROFILE);
                         } catch (Throwable ignored) {
-                            Toast.makeText(this, "Error", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.profile_picker_error), Toast.LENGTH_SHORT).show();
                         }
                     } else {
                         createEmptyProfile(profileName);
@@ -385,10 +418,10 @@ public class ProfileManagerActivity extends AppCompatActivity {
 
     private void createEmptyProfile(String profileName) {
         if (ProfileManager.createProfile(this, profileName)) {
-            Toast.makeText(this, "Profile created: " + profileName, Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.profile_created, profileName), Toast.LENGTH_SHORT).show();
             refreshProfiles();
         } else {
-            Toast.makeText(this, "Failed to create profile", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.profile_create_failed), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -430,6 +463,15 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 ContentResolver contentResolver = getContentResolver();
                 try (InputStream inputStream = contentResolver.openInputStream(uri);
                      OutputStream os = new FileOutputStream(tempFile)) {
+                    // Fixed: openInputStream can return null if the provider
+                    // revokes the URI grant between picker return and our read
+                    // (matches the fix already applied in Render2Activity /
+                    // SettingsActivity). Without this guard the next line
+                    // would NPE inside the try-with-resources and propagate
+                    // as an opaque failure to jdeferred's .fail() handler.
+                    if (inputStream == null) {
+                        throw new IOException("ContentResolver returned null stream for " + uri);
+                    }
                     byte[] buffer = new byte[8192];
                     int count;
                     while ((count = inputStream.read(buffer)) > 0) {
@@ -451,7 +493,17 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     "-C", tempExtractPath
                 );
                 Process process = pb.start();
-                int exitCode = process.waitFor();
+                // Fixed: waitFor() without a timeout can block forever on a
+                // corrupt archive or a stalled FUSE mount. Cap at 120 s —
+                // matches the limit used by Render2Activity and SettingsActivity
+                // for the same `tar -xf` invocation on rootfs tarballs.
+                int exitCode;
+                if (!process.waitFor(120, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    throw new IOException("tar extraction timed out after 120 s");
+                } else {
+                    exitCode = process.exitValue();
+                }
 
                 if (exitCode != 0) {
                     throw new IOException("tar extract failed with exit code: " + exitCode);
@@ -534,6 +586,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
     /**
      * Import SharedPreferences from XML file
      */
+    @SuppressLint("ApplySharedPref")
     private void importPreferencesFromXml(File xmlFile, SharedPreferences prefs) throws IOException {
         String xmlContent = IOUtils.readContent(xmlFile);
         if (xmlContent == null || xmlContent.isEmpty()) {
@@ -733,7 +786,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
             String profile = mProfiles.get(groupPosition);
             
             if (profile.equals(mActiveProfile) && !profile.equals(mNewProfilePlaceholder)) {
-                textView.setText(profile + " (" + getString(R.string.profile_active) + ")");
+                textView.setText(getString(R.string.profile_active_format, profile, getString(R.string.profile_active)));
             } else {
                 textView.setText(profile);
             }
@@ -748,7 +801,7 @@ public class ProfileManagerActivity extends AppCompatActivity {
             }
             
             TextView textView = convertView.findViewById(android.R.id.text1);
-            textView.setText("  " + getChild(groupPosition, childPosition));
+            textView.setText(getString(R.string.profile_child_indent, getChild(groupPosition, childPosition)));
             
             return convertView;
         }

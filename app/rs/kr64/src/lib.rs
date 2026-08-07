@@ -36,25 +36,25 @@
 //!
 //! # Module layout
 //!
-//! * [`devices`]    — virtual `/dev` device creation (qemu_pipe,
-//!                    touch, key, event, gb, gb2).
-//! * [`binder`]     — per-VM `/vm{id}/dev/binder` Unix socket + binder
-//!                    transaction proxy (skeleton; see
-//!                    `download/BINDER_SKELETON.md`).
-//! * [`audio`]      — virtual `/dev/audio` Unix socket + bidirectional
-//!                    PCM pump (playback + capture skeleton; see
-//!                    `download/AUDIO_SENSOR_HAL.md`).
-//! * [`sensors`]    — virtual `/dev/sensors` Unix socket + multiplexed
-//!                    12-sensor HAL (accel/mag/gyro/... skeleton; see
-//!                    `download/AUDIO_SENSOR_HAL.md`).
-//! * [`battery`]    — virtual `/sys/class/power_supply/battery` file tree
-//!                    + 30 s refresh thread (file-based, no socket; see
-//!                    `download/BATTERY_IMPL.md`).
-//! * [`seccomp`]    — BPF seccomp filter + SIGSYS handler.
-//! * [`proc_emu`]   — synthesised `/proc` tree (version, cpuinfo,
-//!                    meminfo, cmdline, self/, sys/).
-//! * [`mount_mgr`]  — `unshare(CLONE_NEWNS)` + `pivot_root` + tmpfs
-//!                    mounts for /dev, /proc, /sys, /system, /vendor.
+//! * [`devices`]   — virtual `/dev` device creation (qemu_pipe,
+//!   touch, key, event, gb, gb2).
+//! * [`binder`]    — per-VM `/vm{id}/dev/binder` Unix socket + binder
+//!   transaction proxy (skeleton; see
+//!   `download/BINDER_SKELETON.md`).
+//! * [`audio`]     — virtual `/dev/audio` Unix socket + bidirectional
+//!   PCM pump (playback + capture skeleton; see
+//!   `download/AUDIO_SENSOR_HAL.md`).
+//! * [`sensors`]   — virtual `/dev/sensors` Unix socket + multiplexed
+//!   12-sensor HAL (accel/mag/gyro/... skeleton; see
+//!   `download/AUDIO_SENSOR_HAL.md`).
+//! * [`battery`]   — virtual `/sys/class/power_supply/battery` file tree
+//!   and 30 s refresh thread (file-based, no socket; see
+//!   `download/BATTERY_IMPL.md`).
+//! * [`seccomp`]   — BPF seccomp filter + SIGSYS handler.
+//! * [`proc_emu`]  — synthesised `/proc` tree (version, cpuinfo,
+//!   meminfo, cmdline, self/, sys/).
+//! * [`mount_mgr`] — `unshare(CLONE_NEWNS)` + `pivot_root` + tmpfs
+//!   mounts for /dev, /proc, /sys, /system, /vendor.
 //!
 //! # Dependencies
 //!
@@ -64,14 +64,14 @@
 //! `error!` macros defined below (which expand to `eprintln!`), and
 //! lazy statics use `std::sync::OnceLock` (stabilised in Rust 1.70).
 
-pub mod devices;
-pub mod binder;
 pub mod audio;
-pub mod sensors;
 pub mod battery;
-pub mod seccomp;
-pub mod proc_emu;
+pub mod binder;
+pub mod devices;
 pub mod mount_mgr;
+pub mod proc_emu;
+pub mod seccomp;
+pub mod sensors;
 
 use std::ffi::CString;
 use std::os::unix::io::AsRawFd;
@@ -113,9 +113,9 @@ macro_rules! error {
 }
 
 // Make the macros available to other modules in this crate.
+pub(crate) use error;
 pub(crate) use info;
 pub(crate) use warning;
-pub(crate) use error;
 
 // ============================================================================
 // Async-signal-safe stderr logging.
@@ -255,18 +255,18 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            vmid:             0,
-            data_dir:         String::new(),
-            rootfs:           String::new(),
-            rom_dir:          None,
-            init_path:        "/system/bin/init".to_string(),
-            width:            720,
-            height:           1280,
-            dpi:              320,
-            use_namespaces:   true,
-            read_only_rom:    true,
-            install_seccomp:  true,
-            log_level:        3,
+            vmid: 0,
+            data_dir: String::new(),
+            rootfs: String::new(),
+            rom_dir: None,
+            init_path: "/system/bin/init".to_string(),
+            width: 720,
+            height: 1280,
+            dpi: 320,
+            use_namespaces: true,
+            read_only_rom: true,
+            install_seccomp: true,
+            log_level: 3,
         }
     }
 }
@@ -322,7 +322,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                 cfg.rootfs = iter.next().ok_or("--rootfs requires a path".to_string())?;
             }
             "--data-dir" => {
-                cfg.data_dir = iter.next().ok_or("--data-dir requires a path".to_string())?;
+                cfg.data_dir = iter
+                    .next()
+                    .ok_or("--data-dir requires a path".to_string())?;
             }
             "--rom-dir" => {
                 cfg.rom_dir = Some(iter.next().ok_or("--rom-dir requires a path".to_string())?);
@@ -331,28 +333,43 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                 cfg.init_path = iter.next().ok_or("--init requires a path".to_string())?;
             }
             "--vmid" => {
-                cfg.vmid = iter.next().ok_or("--vmid requires a value".to_string())?
-                    .parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                cfg.vmid = iter
+                    .next()
+                    .ok_or("--vmid requires a value".to_string())?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
             }
             "--width" => {
-                cfg.width = iter.next().ok_or("--width requires a value".to_string())?
-                    .parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                cfg.width = iter
+                    .next()
+                    .ok_or("--width requires a value".to_string())?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
             }
             "--height" => {
-                cfg.height = iter.next().ok_or("--height requires a value".to_string())?
-                    .parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                cfg.height = iter
+                    .next()
+                    .ok_or("--height requires a value".to_string())?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
             }
             "--dpi" => {
-                cfg.dpi = iter.next().ok_or("--dpi requires a value".to_string())?
-                    .parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                cfg.dpi = iter
+                    .next()
+                    .ok_or("--dpi requires a value".to_string())?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
             }
             "--log-level" => {
-                cfg.log_level = iter.next().ok_or("--log-level requires a value".to_string())?
-                    .parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+                cfg.log_level = iter
+                    .next()
+                    .ok_or("--log-level requires a value".to_string())?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?;
             }
             "--no-namespaces" => cfg.use_namespaces = false,
-            "--rw-rom"        => cfg.read_only_rom = false,
-            "--no-seccomp"    => cfg.install_seccomp = false,
+            "--rw-rom" => cfg.read_only_rom = false,
+            "--no-seccomp" => cfg.install_seccomp = false,
             other => {
                 return Err(format!("unknown argument: {}", other));
             }
@@ -443,7 +460,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         .and_then(|proxy| proxy.spawn())
     {
         Ok(h) => {
-            info!("[KR64] binder proxy listening at {} (vm{})", h.path(), cfg.vmid);
+            info!(
+                "[KR64] binder proxy listening at {} (vm{})",
+                h.path(),
+                cfg.vmid
+            );
             Some(h)
         }
         Err(e) => {
@@ -451,7 +472,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // /dev/binder if it's bind-mounted in (the current twoyi
             // approach). The binder proxy is only needed for full
             // service-manager virtualisation.
-            warning!("[KR64] failed to start binder proxy: {} — falling back to host binder", e);
+            warning!(
+                "[KR64] failed to start binder proxy: {} — falling back to host binder",
+                e
+            );
             None
         }
     };
@@ -468,9 +492,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // protocol but produces no sound until the Java side is wired
     // up in a follow-up task.
     // ---------------------------------------------------------------
-    let _audio_handle = match audio::create_audio_device(&cfg.rootfs)
-        .and_then(|dev| dev.spawn())
-    {
+    let _audio_handle = match audio::create_audio_device(&cfg.rootfs).and_then(|dev| dev.spawn()) {
         Ok(h) => {
             info!("[KR64] audio device listening at {}", h.path());
             Some(h)
@@ -481,7 +503,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // the guest's audio HAL will fall back to silence / a
             // null output. Sound is the user's primary use case
             // though, so this warning is worth surfacing.
-            warning!("[KR64] failed to start audio device: {} — guest will have no sound", e);
+            warning!(
+                "[KR64] failed to start audio device: {} — guest will have no sound",
+                e
+            );
             None
         }
     };
@@ -499,23 +524,25 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // CHECK_SUPPORT and the pump never produces events. This is the
     // deliberate "skeleton" boundary, mirroring audio.rs.
     // ---------------------------------------------------------------
-    let _sensor_handle = match sensors::create_sensor_device(&cfg.rootfs)
-        .and_then(|dev| dev.spawn())
-    {
-        Ok(h) => {
-            info!("[KR64] sensor device listening at {}", h.path());
-            Some(h)
-        }
-        Err(e) => {
-            // Non-fatal: the guest can still boot without sensors —
-            // the guest's sensor HAL will see "no sensors available"
-            // and `SensorManager.getDefaultSensor()` will return null.
-            // Apps that hard-require a sensor (e.g. compass apps)
-            // will crash, but the boot proceeds.
-            warning!("[KR64] failed to start sensor device: {} — guest will have no sensors", e);
-            None
-        }
-    };
+    let _sensor_handle =
+        match sensors::create_sensor_device(&cfg.rootfs).and_then(|dev| dev.spawn()) {
+            Ok(h) => {
+                info!("[KR64] sensor device listening at {}", h.path());
+                Some(h)
+            }
+            Err(e) => {
+                // Non-fatal: the guest can still boot without sensors —
+                // the guest's sensor HAL will see "no sensors available"
+                // and `SensorManager.getDefaultSensor()` will return null.
+                // Apps that hard-require a sensor (e.g. compass apps)
+                // will crash, but the boot proceeds.
+                warning!(
+                    "[KR64] failed to start sensor device: {} — guest will have no sensors",
+                    e
+                );
+                None
+            }
+        };
 
     // ---------------------------------------------------------------
     // Step 2.8: materialise the virtual battery sysfs tree + spawn
@@ -530,16 +557,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // will just report "unknown" / fall back to defaults), but every
     // real device has a battery so we warn loudly.
     // ---------------------------------------------------------------
-    let _battery_handle = match battery::BatteryDevice::new(&cfg.rootfs)
-        .and_then(|dev| dev.spawn())
+    let _battery_handle = match battery::BatteryDevice::new(&cfg.rootfs).and_then(|dev| dev.spawn())
     {
         Ok(h) => {
-            info!("[KR64] battery sysfs materialised at {}/sys/class/power_supply/battery",
-                  cfg.rootfs);
+            info!(
+                "[KR64] battery sysfs materialised at {}/sys/class/power_supply/battery",
+                cfg.rootfs
+            );
             Some(h)
         }
         Err(e) => {
-            warning!("[KR64] failed to start battery HAL: {} — guest will see no battery", e);
+            warning!(
+                "[KR64] failed to start battery HAL: {} — guest will see no battery",
+                e
+            );
             None
         }
     };
@@ -612,10 +643,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
 
         let mount_cfg = mount_mgr::MountConfig {
-            rootfs:           cfg.rootfs.clone(),
-            rom_dir:          cfg.rom_dir.clone(),
-            use_namespaces:   cfg.use_namespaces,
-            read_only_rom:    cfg.read_only_rom,
+            rootfs: cfg.rootfs.clone(),
+            rom_dir: cfg.rom_dir.clone(),
+            use_namespaces: cfg.use_namespaces,
+            read_only_rom: cfg.read_only_rom,
         };
         if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
             // FATAL: without mounts, pivot_root/bind-mounts never happened
@@ -625,10 +656,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // Use _exit, not return, to avoid running atexit handlers.
             let errno = e.raw_os_error().unwrap_or(0);
             unsafe {
-                safe_write_err_errno(
-                    b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed",
-                    errno,
-                );
+                safe_write_err_errno(b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed", errno);
                 libc::_exit(1);
             }
         }
@@ -662,14 +690,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             Err(_) => unsafe {
                 safe_write_err(b"[KR64 CHILD] FATAL: init_path contains interior NUL byte\n");
                 libc::_exit(127);
-            }
+            },
         };
         let argv0 = match CString::new(cfg.init_path.as_str()) {
             Ok(s) => s,
             Err(_) => unsafe {
                 safe_write_err(b"[KR64 CHILD] FATAL: argv0 contains interior NUL byte\n");
                 libc::_exit(127);
-            }
+            },
         };
         let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
@@ -683,7 +711,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             Err(_) => unsafe {
                 safe_write_err(b"[KR64 CHILD] FATAL: TWOYI_ROOTFS env contains NUL byte\n");
                 libc::_exit(127);
-            }
+            },
         };
         let env_vars: Vec<CString> = vec![
             CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
@@ -693,7 +721,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             twoyi_rootfs_env,
             CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
         ];
-        let env_ptrs: Vec<*const libc::c_char> = env_vars.iter()
+        let env_ptrs: Vec<*const libc::c_char> = env_vars
+            .iter()
             .map(|s| s.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
@@ -724,11 +753,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //   event     → TwoyiSocketServer (event IPC)
     //   gb/gb2    → openglrenderer::gralloc
     spawn_accept_thread(device_set.qemu_pipe, "qemu_pipe");
-    spawn_accept_thread(device_set.touch,     "touch");
-    spawn_accept_thread(device_set.key,       "key");
-    spawn_accept_thread(device_set.event,     "event");
-    spawn_accept_thread(device_set.gb.gb,     "gb");
-    spawn_accept_thread(device_set.gb.gb2,    "gb2");
+    spawn_accept_thread(device_set.touch, "touch");
+    spawn_accept_thread(device_set.key, "key");
+    spawn_accept_thread(device_set.event, "event");
+    spawn_accept_thread(device_set.gb.gb, "gb");
+    spawn_accept_thread(device_set.gb.gb2, "gb2");
 
     // ---------------------------------------------------------------
     // Step 6: wait for the guest to exit.
@@ -758,7 +787,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         return 128 + sig;
     }
 
-    warning!("[KR64][parent] guest waitpid returned unexpected status {}", status);
+    warning!(
+        "[KR64][parent] guest waitpid returned unexpected status {}",
+        status
+    );
     1
 }
 
@@ -772,7 +804,10 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
     let listener = match dev.take_listener() {
         Some(l) => l,
         None => {
-            warning!("[KR64] cannot spawn accept thread for {}: listener already taken", name);
+            warning!(
+                "[KR64] cannot spawn accept thread for {}: listener already taken",
+                name
+            );
             return;
         }
     };
@@ -840,7 +875,10 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
 /// (NUL-terminated C strings or NULL). This is the standard C `main`
 /// contract.
 #[no_mangle]
-pub unsafe extern "C" fn kr64_main(argc: libc::c_int, argv: *const *const libc::c_char) -> libc::c_int {
+pub unsafe extern "C" fn kr64_main(
+    argc: libc::c_int,
+    argv: *const *const libc::c_char,
+) -> libc::c_int {
     // Convert C argv → Rust Vec<String>.
     let args: Vec<String> = if argc <= 0 || argv.is_null() {
         Vec::new()
@@ -848,8 +886,11 @@ pub unsafe extern "C" fn kr64_main(argc: libc::c_int, argv: *const *const libc::
         (0..argc as isize)
             .map(|i| unsafe {
                 let p = *argv.offset(i);
-                if p.is_null() { String::new() }
-                else { std::ffi::CStr::from_ptr(p).to_string_lossy().to_string() }
+                if p.is_null() {
+                    String::new()
+                } else {
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().to_string()
+                }
             })
             .collect()
     };
@@ -899,19 +940,29 @@ mod tests {
     #[test]
     fn parse_args_full() {
         let cfg = parse_args(args(&[
-            "--rootfs", "/r",
-            "--data-dir", "/d",
-            "--rom-dir", "/rom",
-            "--init", "/sbin/init",
-            "--vmid", "3",
-            "--width", "1080",
-            "--height", "1920",
-            "--dpi", "480",
-            "--log-level", "1",
+            "--rootfs",
+            "/r",
+            "--data-dir",
+            "/d",
+            "--rom-dir",
+            "/rom",
+            "--init",
+            "/sbin/init",
+            "--vmid",
+            "3",
+            "--width",
+            "1080",
+            "--height",
+            "1920",
+            "--dpi",
+            "480",
+            "--log-level",
+            "1",
             "--no-namespaces",
             "--rw-rom",
             "--no-seccomp",
-        ])).unwrap();
+        ]))
+        .unwrap();
         assert_eq!(cfg.rom_dir.as_deref(), Some("/rom"));
         assert_eq!(cfg.init_path, "/sbin/init");
         assert_eq!(cfg.vmid, 3);

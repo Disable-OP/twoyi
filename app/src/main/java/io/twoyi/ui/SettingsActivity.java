@@ -14,6 +14,8 @@ import android.content.Intent;
 import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.preference.CheckBoxPreference;
 import android.preference.Preference;
 import android.preference.PreferenceFragment;
@@ -38,10 +40,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
-import java.util.List;
 
 import io.twoyi.R;
-import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.ProfileSettings;
@@ -154,11 +154,11 @@ public class SettingsActivity extends AppCompatActivity {
                         Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
-                        Toast.makeText(getActivity(), "Width must be between " + MIN_VALUE + " and " + MAX_DISPLAY_DIMENSION, Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), getString(R.string.settings_width_range_error, MIN_VALUE, MAX_DISPLAY_DIMENSION), Toast.LENGTH_SHORT).show();
                         return false;
                     }
                 } catch (NumberFormatException e) {
-                    Toast.makeText(getActivity(), "Invalid number", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(getActivity(), getString(R.string.settings_invalid_number), Toast.LENGTH_SHORT).show();
                     return false;
                 }
             });
@@ -174,11 +174,11 @@ public class SettingsActivity extends AppCompatActivity {
                         Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
-                        Toast.makeText(getActivity(), "Height must be between " + MIN_VALUE + " and " + MAX_DISPLAY_DIMENSION, Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), getString(R.string.settings_height_range_error, MIN_VALUE, MAX_DISPLAY_DIMENSION), Toast.LENGTH_SHORT).show();
                         return false;
                     }
                 } catch (NumberFormatException e) {
-                    Toast.makeText(getActivity(), "Invalid number", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(getActivity(), getString(R.string.settings_invalid_number), Toast.LENGTH_SHORT).show();
                     return false;
                 }
             });
@@ -194,11 +194,11 @@ public class SettingsActivity extends AppCompatActivity {
                         Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
-                        Toast.makeText(getActivity(), "DPI must be between " + MIN_VALUE + " and " + MAX_DPI, Toast.LENGTH_SHORT).show();
+                        Toast.makeText(getActivity(), getString(R.string.settings_dpi_range_error, MIN_VALUE, MAX_DPI), Toast.LENGTH_SHORT).show();
                         return false;
                     }
                 } catch (NumberFormatException e) {
-                    Toast.makeText(getActivity(), "Invalid number", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(getActivity(), getString(R.string.settings_invalid_number), Toast.LENGTH_SHORT).show();
                     return false;
                 }
             });
@@ -264,7 +264,7 @@ public class SettingsActivity extends AppCompatActivity {
                 try {
                     startActivityForResult(intent, REQUEST_SELECT_ROM);
                 } catch (Throwable ignored) {
-                    Toast.makeText(getContext(), "Error", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(getContext(), getString(R.string.error_generic), Toast.LENGTH_SHORT).show();
                 }
                 return true;
             });
@@ -332,13 +332,15 @@ public class SettingsActivity extends AppCompatActivity {
                     // startActivity must be called on the UI thread.
                     // runOnUiThread handles both Activity and Fragment contexts
                     // gracefully (we already null-checked getActivity above).
-                    context.getMainExecutor().execute(() -> {
+                    // Use Handler instead of Context#getMainExecutor (API 28+)
+                    // since minSdkVersion is 27.
+                    new Handler(Looper.getMainLooper()).post(() -> {
                         UIHelper.dismiss(progressDialog);
                         try {
                             context.startActivity(Intent.createChooser(shareIntent,
                                     getString(R.string.settings_key_sendlog)));
                         } catch (Throwable ignored) {
-                            Toast.makeText(context, "Error sharing log", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(context, getString(R.string.error_sharing_log), Toast.LENGTH_SHORT).show();
                         }
                     });
                 });
@@ -435,12 +437,12 @@ public class SettingsActivity extends AppCompatActivity {
             }).done(result -> {
                 UIHelper.dismiss(dialog);
                 if (result) {
-                    Toast.makeText(activity, "ROM imported successfully. Please reboot.", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(activity, getString(R.string.rom_imported_successfully), Toast.LENGTH_SHORT).show();
                 } else {
-                    Toast.makeText(activity, "Failed to import ROM", Toast.LENGTH_SHORT).show();
+                    Toast.makeText(activity, getString(R.string.rom_import_failed), Toast.LENGTH_SHORT).show();
                 }
             }).fail(result -> activity.runOnUiThread(() -> {
-                Toast.makeText(activity, "Error importing ROM: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+                Toast.makeText(activity, getString(R.string.rom_import_error, result.getMessage()), Toast.LENGTH_SHORT).show();
                 dialog.dismiss();
             }));
         }

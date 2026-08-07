@@ -74,3 +74,19 @@ app/src/main/jniLibs/*/libtwoyi.so
 .avd-*.qcow2
 tool-results/
 twoyi-local
+
+# Codespace-local user binaries (pip install --user, etc.)
+.local/
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+
+# Windows / macOS clutter
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

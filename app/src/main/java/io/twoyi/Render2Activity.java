@@ -40,7 +40,6 @@ import java.io.OutputStream;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import io.twoyi.utils.AppKV;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.NavUtils;
 import io.twoyi.utils.ProfileManager;
@@ -282,7 +281,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                         try {
                             startActivityForResult(intent, REQUEST_SELECT_ROM);
                         } catch (Throwable ignored) {
-                            Toast.makeText(this, "Error selecting file", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(this, getString(R.string.error_selecting_file), Toast.LENGTH_SHORT).show();
                             finish();
                         }
                     })
@@ -343,6 +342,13 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                     // (~30 s).  60 s comfortably covers both in sequence.
                     success = TwoyiStatusManager.getInstance().waitBoot(60, TimeUnit.SECONDS);
                 } catch (Throwable ignored) {
+                    // waitBoot() can throw InterruptedException / BrokenBarrierException
+                    // (e.g. the boot-latch was reset() by a re-launched activity, or the
+                    // worker thread was interrupted during shutdown). Swallowing these
+                    // silently made the boot-failure path fire with no diagnostic in
+                    // logcat — track the exception so crash reporters and developers
+                    // have a clue when `success == false` leads to trackBootFailure().
+                    Log.e(TAG, "waitBoot interrupted — treating as boot failure", ignored);
                 }
 
                 if (!success) {
@@ -517,11 +523,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                 // ROM imported successfully, restart to boot
                 RomManager.reboot(this);
             } else {
-                Toast.makeText(this, "Failed to import ROM", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, getString(R.string.rom_import_failed), Toast.LENGTH_SHORT).show();
                 finish();
             }
         }).fail(result -> runOnUiThread(() -> {
-            Toast.makeText(this, "Error importing ROM: " + result.getMessage(), Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, getString(R.string.rom_import_error, result.getMessage()), Toast.LENGTH_SHORT).show();
             dialog.dismiss();
             finish();
         }));

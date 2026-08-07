@@ -215,7 +215,19 @@ public final class RomManager {
 
     public static void reboot(Context context) {
         Intent intent = context.getPackageManager().getLaunchIntentForPackage(context.getPackageName());
-        context.getApplicationContext().startActivity(intent);
+        // Fixed: getLaunchIntentForPackage returns null if the package is
+        // disabled, suspended, or absent (e.g. on some OEM ROMs that strip
+        // the launcher activity during backup/restore). The previous code
+        // unconditionally called startActivity(intent) which would NPE —
+        // and since shutdown() follows immediately, the NPE prevented the
+        // clean exit/restart path from running, leaving the app stuck.
+        // Fall back to System.exit(0) so the system restarts us cleanly
+        // via the manifest launch mode, matching shutdown()'s contract.
+        if (intent != null) {
+            context.getApplicationContext().startActivity(intent);
+        } else {
+            Log.w(TAG, "reboot: getLaunchIntentForPackage returned null — exiting without restart intent");
+        }
 
         shutdown(context);
     }
@@ -431,8 +443,15 @@ public final class RomManager {
                 return null;
             }
             try (InputStream in = zf.getInputStream(entry)) {
-                ByteArrayOutputStream baos =
-                        new ByteArrayOutputStream((int) entry.getSize());
+                // Fixed: ZipEntry.getSize() may return -1 if the central
+                // directory entry lacks a size field (e.g. for streaming-mode
+                // ZIPs written by some tools). ByteArrayOutputStream(int)
+                // throws IllegalArgumentException on a negative size, which
+                // would turn a recoverable "skip the patch" path into an
+                // uncaught crash on every boot. Clamp to 0 like
+                // replaceClassesDexInJar does (which uses Math.max(getSize,0)).
+                int initialSize = (int) Math.max(entry.getSize(), 0);
+                ByteArrayOutputStream baos = new ByteArrayOutputStream(initialSize);
                 byte[] buf = new byte[8192];
                 int n;
                 while ((n = in.read(buf)) >= 0) baos.write(buf, 0, n);

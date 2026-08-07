@@ -438,17 +438,12 @@ pub struct SensorEvent {
 // `#[repr(packed)]` struct.
 
 impl Clone for SensorEvent {
+    // For a `Copy` type, the canonical `clone` impl is just `*self` (a
+    // bit-for-bit copy). On `#[repr(packed)]` this is still sound: taking
+    // `&Self` (the whole struct) is always aligned — only borrows of
+    // individual misaligned fields are UB, and `*self` doesn't create any.
     fn clone(&self) -> Self {
-        // `self.field` is a place expression; `addr_of!` takes a `*const`
-        // to it without creating a reference, and `read_unaligned` copies
-        // the (possibly misaligned) bytes into an aligned local.
-        Self {
-            idx: unsafe { std::ptr::addr_of!(self.idx).read_unaligned() },
-            ts: unsafe { std::ptr::addr_of!(self.ts).read_unaligned() },
-            x: unsafe { std::ptr::addr_of!(self.x).read_unaligned() },
-            y: unsafe { std::ptr::addr_of!(self.y).read_unaligned() },
-            z: unsafe { std::ptr::addr_of!(self.z).read_unaligned() },
-        }
+        *self
     }
 }
 
@@ -1198,11 +1193,9 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
         if conn.is_shutdown() {
             break;
         }
-        if let Err(e) = read_exact(stream, &mut buf) {
-            // EOF or read error — guest disconnected. This is the
-            // normal exit path.
-            return Err(e);
-        }
+        // EOF or read error — guest disconnected. This is the
+        // normal exit path.
+        read_exact(stream, &mut buf)?;
 
         let cmd = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         let idx = u32::from_le_bytes(buf[4..8].try_into().unwrap());
@@ -1211,7 +1204,9 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
         if (idx as usize) >= NUM_SENSORS {
             warning!(
                 "[KR64][sensor] bad idx={} (cmd={}) — out of range 0..{}",
-                idx, cmd, NUM_SENSORS
+                idx,
+                cmd,
+                NUM_SENSORS
             );
             continue;
         }
@@ -1228,10 +1223,7 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
                     warning!("[KR64][sensor] check_support reply write failed: {}", e);
                     return Err(e);
                 }
-                info!(
-                    "[KR64][sensor] CHECK_SUPPORT idx={} → {}",
-                    idxu, supported
-                );
+                info!("[KR64][sensor] CHECK_SUPPORT idx={} → {}", idxu, supported);
             }
             CTL_ENABLE => {
                 // JNI up-call: HALManager.EnableSensors(idx). Returns
@@ -1264,7 +1256,9 @@ fn handle_control(stream: &mut UnixStream, conn: &SensorConnState) -> std::io::R
             _ => {
                 warning!(
                     "[KR64][sensor] unknown ctl cmd={} idx={} arg={}",
-                    cmd, idxu, arg
+                    cmd,
+                    idxu,
+                    arg
                 );
             }
         }
@@ -1431,7 +1425,9 @@ impl Worker {
                 }
             })
             .expect("spawn kr64 sensor worker");
-        Worker { thread: Some(thread) }
+        Worker {
+            thread: Some(thread),
+        }
     }
 }
 
@@ -1901,7 +1897,10 @@ mod tests {
         // drop should unlink the socket file.
         let path = dev.path.clone();
         drop(dev);
-        assert!(!Path::new(&path).exists(), "socket file should be unlinked on drop");
+        assert!(
+            !Path::new(&path).exists(),
+            "socket file should be unlinked on drop"
+        );
 
         let _ = fs::remove_dir_all(&rootfs);
     }
@@ -2215,7 +2214,10 @@ mod tests {
     fn conn_state_starts_empty() {
         let conn = SensorConnState::new();
         let snap = conn.snapshot();
-        assert!(snap.is_empty(), "fresh state should have no enabled sensors");
+        assert!(
+            snap.is_empty(),
+            "fresh state should have no enabled sensors"
+        );
         assert!(!conn.is_shutdown());
     }
 

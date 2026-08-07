@@ -40,7 +40,7 @@ public class TwoyiApplication extends Application {
     public void onCreate() {
         super.onCreate();
 
-        AppCenter.start(this, "6223c2b1-30ab-4293-8456-ac575420774e",
+        AppCenter.start(this, BuildConfig.APPCENTER_API_KEY,
                 Analytics.class, Crashes.class);
         if (BuildConfig.DEBUG) {
             AppCenter.setEnabled(false);

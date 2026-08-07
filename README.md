@@ -76,7 +76,7 @@ improvements over the archived upstream:
 | **Input handling** | `send_key_code()` now honours its keycode argument (was hardcoded to `KEY_BACK`) and advertises all supported keys; added `android_keycode_to_linux()` mapping for HOME/BACK/VOLUME_*/POWER/MENU/SEARCH/APP_SWITCH. | `7dc6093` |
 | **Signed release APKs** | Self-signed RSA-2048 test keystore wired into Gradle so CI and codespace builds produce installable APKs. | `ff1cc37` |
 
-The full 207-commit history is preserved:
+The full commit history is preserved (386 commits at last count):
 
 ```bash
 cd /home/z/my-project && git log --oneline improvements/initial-cleanup
@@ -165,7 +165,7 @@ and renders GLES commands received over the QEMU pipe into the host
 | JDK | 17 | Temurin or OpenJDK. |
 | Android SDK | API 31, build-tools 30.0.3 | `compileSdkVersion 31`, `targetSdk 28`. |
 | Android NDK | **r27c** | Matches CI. Newer may also work. |
-| Rust | stable | With `aarch64-linux-android` and `x86_64-linux-android` targets. |
+| Rust | stable | Pinned via [`rust-toolchain.toml`](rust-toolchain.toml) — `rustup` auto-installs the right channel, `rustfmt` + `clippy` components, and both Android targets on first `cargo` invocation. No manual `rustup target add` needed. |
 | `cargo-xdk` | latest | `cargo install cargo-xdk`. Wraps `cargo build` for Android ABIs. |
 | Android Studio | any recent | Optional — Gradle from the CLI works fine. |
 
@@ -233,6 +233,20 @@ keytool -genkeypair -v -keystore app/twoyi-release.keystore \
   -alias twoyi-release -keyalg RSA -keysize 2048 -validity 10000
 ```
 
+### Build-time configuration via `gradle.properties`
+
+The AppCenter analytics key is injected at build time through a
+`BuildConfig.APPCENTER_API_KEY` field (no secrets live in the Java source).
+Forks can override it without patching code:
+
+```bash
+# ~/.gradle/gradle.properties  (or CI secret)
+APPCENTER_API_KEY=your-own-appcenter-app-secret
+```
+
+If unset, the build falls back to the upstream twoyi key, which is fine for
+local development but should be replaced before publishing a fork.
+
 ---
 
 ## Testing
@@ -281,9 +295,43 @@ adb shell am start -n io.twoyi/.ui.SettingsActivity
 ### Rust unit tests
 
 ```bash
-cd app/rs/kr64 && cargo test           # 26 tests
+cd app/rs/kr64 && cargo test           # 145 tests
 cd app/rs      && cargo build          # smoke-build the host crate
 ```
+
+### Code quality
+
+The `improvements/initial-cleanup` branch keeps three quality gates green:
+
+| Gate | Command | Result |
+|---|---|---|
+| Rust clippy (all crates) | `cd app/rs && cargo clippy --workspace --all-targets -- -D warnings` | ✅ 0 warnings, 0 errors |
+| Rust unit tests | `cd app/rs/kr64 && cargo test` | ✅ 145 / 145 passing |
+| Android Lint (release) | `./gradlew lintRelease -x cmakeBuild -x loaderBuild -x cargoBuild` | ✅ 0 errors, 62 warnings (all pre-existing / non-actionable) |
+
+```bash
+# Reproduce clippy locally (must use the Android NDK target):
+cd app/rs && ~/.cargo/bin/cargo clippy --workspace --all-targets -- -D warnings
+```
+
+The remaining 62 lint warnings fall into well-understood buckets that are
+intentionally left in place:
+
+- **`IconLauncherShape`** (6) — the inherited launcher PNG assets are not
+  re-cut for Material's adaptive-icon spec.
+- **`PrivateResource`** (5) — `ac_render.xml` references `com.cleveroad`
+  library-private colours; `UIHelper` uses a Material private overlay style.
+- **`UnusedResources`** (≈20) — historical strings/colours retained for
+  compatibility with potential consumers of the resource IDs.
+- **`LockedOrientationActivity`** (4) — the app is intentionally
+  portrait-only on phone form factors.
+- **`SetTextI18n` / `MergeRootFrame` / `UselessParent` / `Overdraw`** —
+  pre-existing layout patterns; refactoring would risk visual regressions
+  without functional benefit.
+- **`PrivateApi` / `DiscouragedPrivateApi` / `PackageManagerGetSignatures`**
+  — intentional reflective access to hidden Android APIs (status-bar
+  dimming, file permissions) and signature probing used to detect the
+  `android` package identity.
 
 > ℹ️ **Honest status of x86_64 boot.** The x86_64 build no longer SIGABRT-crashes
 > and the new Rust renderer initializes (`GL context created successfully`), but

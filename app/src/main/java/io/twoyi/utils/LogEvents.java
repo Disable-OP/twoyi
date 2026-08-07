@@ -238,12 +238,19 @@ public class LogEvents {
 
         for (ReportItem item : reportItems) {
             try {
+                // Read the file BEFORE adding the ZIP entry. The previous
+                // ordering (putNextEntry → readAllBytes → closeEntry) left
+                // an empty entry in the archive whenever readAllBytes
+                // threw (e.g. file missing, permission denied, I/O error):
+                // putNextEntry had already opened the entry, the catch
+                // skipped closeEntry, and the next iteration's putNextEntry
+                // would auto-close the orphaned entry with zero bytes.
+                // Some ZIP consumers reject archives with empty entries,
+                // which would defeat the whole bug-report purpose.
+                byte[] bytes = Files.readAllBytes(item.file.toPath());
                 ZipEntry ze = new ZipEntry(item.entry);
                 zout.putNextEntry(ze);
-
-                byte[] bytes = Files.readAllBytes(item.file.toPath());
                 zout.write(bytes, 0, bytes.length);
-
                 zout.closeEntry();
             } catch (IOException ignored) {
             }
