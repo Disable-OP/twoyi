@@ -432,11 +432,20 @@ public final class RomManager {
             prop.load(in);
 
             RomInfo info = new RomInfo();
-            info.author = prop.getProperty("author");
-            info.code = Long.parseLong(prop.getProperty("code"));
-            info.version = prop.getProperty("version");
+            // Use the two-arg getProperty(key, default) so a missing
+            // optional field preserves the DEFAULT_INFO initialiser
+            // instead of being silently overwritten with null. The
+            // previous one-arg getProperty("author") would set info.author
+            // to null if the rom.ini lacked the "author" key, defeating
+            // the field's DEFAULT_INFO initialiser and causing
+            // NPE-risking downstream consumers (e.g. crash reports that
+            // toString() the RomInfo, or trackBootFailure which puts
+            // info.author into a Map) to see "null" instead of "unknown".
+            info.author = prop.getProperty("author", DEFAULT_INFO);
+            info.code = Long.parseLong(prop.getProperty("code", "0"));
+            info.version = prop.getProperty("version", DEFAULT_INFO);
             info.desc = prop.getProperty("desc", DEFAULT_INFO);
-            info.md5 = prop.getProperty("md5");
+            info.md5 = prop.getProperty("md5", "");
             return info;
         } catch (Throwable e) {
             Log.e(TAG, "read rom info err", e);
