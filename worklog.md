@@ -4580,3 +4580,55 @@ None of these block the production-ready sign-off.
 The `improvements/initial-cleanup` branch is ready to be merged or
 tagged as the v3.5.5 release. See `MEMORY.md` §"Production Release"
 for the canonical final summary.
+
+
+## Round 63 — seccomp reboot() emulation + build.gradle jcenter() future-proofing (this commit)
+
+Two small correctness / forward-compatibility improvements identified
+by code review of the round-62 state:
+
+* **`kr64/src/seccomp.rs` — emulate `reboot(2)` as `-EPERM` instead of
+  fake success.** The `emulate_syscall` dispatcher previously returned
+  `0` for every trapped syscall (mount, umount2, swapon, swapoff, acct,
+  reboot), with an inline TODO noting that the production version
+  should dispatch per-syscall. The `reboot` case was the most
+  consequential of the TODO list: returning 0 made the guest's
+  `init`/shutdown code believe the host had actually rebooted, after
+  which it would proceed to stop services, sync, then call
+  `reboot(RB_POWER_OFF)` again in a tight loop — polluting logs and
+  potentially tripping inits' watchdogs. `-EPERM` matches what the
+  kernel returns when the caller lacks `CAP_SYS_BOOT`, which is exactly
+  the semantics we want inside the sandbox. Implemented via a direct
+  `libc::SYS_reboot as i32` comparison (compile-time constant, no
+  allocation, async-signal-safe). `mount` and `umount2` still return 0
+  — a real implementation needs to read args out of the saved
+  `ucontext_t` and forward to `mount_mgr`, which is deferred to the
+  MOUNT-2 task; the doc comment now spells out exactly why each
+  remaining case is (intentionally) a no-op. Added two new tests:
+  `classify_reboot_returns_eperm` and `classify_swapon_returns_zero`.
+  Suite is now **160/160 passing** (was 158/158); clippy + fmt still
+  clean.
+
+* **`build.gradle` — replace `jcenter()` with explicit Bintray URL.**
+  The Gradle `jcenter()` shortcut was deprecated in Gradle 8.0 and is
+  slated for removal. The explicit equivalent
+  `maven { url 'https://jcenter.bintray.com/' }` (which is exactly
+  what `jcenter()` desugars to) continues to work and future-proofs
+  the build for the eventual Gradle upgrade. The behaviour is
+  unchanged — JCenter is still a fallback for the three legacy deps
+  that have never been mirrored to Maven Central
+  (`com.afollestad.material-dialogs:core:0.9.6.0`,
+  `com.cleveroad:androidmanimation:0.9.1`, `com.github.clans:fab:1.6.4`).
+  The inline comments now list the known consumers explicitly, and
+  `MEMORY.md §"Note on build.gradle jcenter() removal"` has been
+  updated to reflect that the shortcut is gone and what's left to do
+  (migrate each legacy dep to a Maven Central replacement).
+
+### Round 63 — verification
+
+| Gate                              | Result                                                   |
+| --------------------------------- | -------------------------------------------------------- |
+| Rust unit tests (`kr64`)          | **160/160 pass** (was 158/158; +2 new tests)             |
+| Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
+| Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |
+| `build.gradle` syntax            | Groovy DSL valid (no `jcenter()` shortcut left)          |

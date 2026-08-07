@@ -534,15 +534,28 @@ app/src/main/
    had comprehensive JNI keep rules. No new manifest changes needed.
 
 ### Note on `build.gradle` jcenter() removal
-The root `build.gradle` still has `jcenter()` in both `buildscript.repositories`
-and `allprojects.repositories`. JCenter has been read-only since Feb 2022 and
-many artifacts have been removed. Removing it would be a clear improvement,
-BUT several legacy deps (`com.afollestad.material-dialogs:core:0.9.6.0`,
-`com.cleveroad:androidmanimation:0.9.1`, `com.github.clans:fab:1.6.4`) may
-only be resolvable through jcenter's mirrors. Without an Android SDK + NDK
-in this environment to actually run `./gradlew assembleRelease`, removing
-jcenter() is too risky — left as a TODO for the next session with a real
-build environment.
+The root `build.gradle` no longer uses the Gradle `jcenter()` shortcut —
+as of round 63 it was replaced with the explicit equivalent
+`maven { url 'https://jcenter.bintray.com/' }` in both
+`buildscript.repositories` and `allprojects.repositories`. This is a
+forward-compatibility fix: the `jcenter()` shortcut was deprecated in
+Gradle 8.0 and will eventually be removed, while the explicit-maven
+form continues to work. The change is behaviour-preserving — Gradle's
+own `jcenter()` implementation just calls `maven { url ... }` under
+the hood.
+
+JCenter itself has been read-only since Feb 2022 (no new publishes, but
+existing artifacts are still served). Removing the entry entirely would
+break resolution of three legacy deps that have never been mirrored to
+Maven Central:
+  * `com.afollestad.material-dialogs:core:0.9.6.0`   (pre-3.x line)
+  * `com.cleveroad:androidmanimation:0.9.1`
+  * `com.github.clans:fab:1.6.4`
+Migrating each to a Maven Central replacement (newer material-dialogs
+3.x, a different FAB lib, etc.) is tracked as a separate follow-up —
+the inline comment in `build.gradle` lists the known consumers so the
+next session can verify with `./gradlew assembleRelease` once an
+Android SDK is available.
 
 ### Key finding about -no-window mode
 The Android emulator with `-no-window` does NOT create a Surface for

@@ -9,8 +9,19 @@ buildscript {
     repositories {
         google()
         mavenCentral()
-        // JCenter is deprecated but still needed for some plugins
-        jcenter()
+        // JCenter (https://jcenter.bintray.com/) has been read-only since
+        // Feb 2022 — no new artifacts can be published, but the mirror
+        // continues to serve the existing catalog. We spell out the URL
+        // explicitly because the Gradle `jcenter()` shortcut was
+        // deprecated in Gradle 8.0 (and will eventually be removed), so
+        // the explicit-maven form is more future-proof. The AGP 7.1.1
+        // classpath is itself hosted on google() / mavenCentral(), so
+        // this entry only matters if a future plugin upgrade pulls a
+        // transitive dep that still lives only on JCenter. See
+        // MEMORY.md §"Note on build.gradle jcenter() removal" for the
+        // analysis of why removing it outright is risky without a full
+        // resolution test against the legacy app-level deps.
+        maven { url 'https://jcenter.bintray.com/' }
     }
     dependencies {
         classpath 'com.android.tools.build:gradle:7.1.1'
@@ -25,8 +36,18 @@ allprojects {
         google()
         mavenCentral()
         maven { url 'https://jitpack.io' }
-        // JCenter is deprecated but still needed for some legacy dependencies
-        jcenter()
+        // JCenter fallback for legacy deps that were never mirrored to
+        // Maven Central. The known consumers are:
+        //   * com.afollestad.material-dialogs:core:0.9.6.0   (pre-3.x line)
+        //   * com.cleveroad:androidmanimation:0.9.1
+        //   * com.github.clans:fab:1.6.4
+        // Newer versions of all three (or drop-in replacements) exist on
+        // Maven Central — migrating them is tracked as a follow-up. Until
+        // then, removing this entry would break `./gradlew
+        // assembleRelease` with "Could not resolve …". We use the
+        // explicit URL form because the Gradle `jcenter()` shortcut was
+        // deprecated in Gradle 8.0.
+        maven { url 'https://jcenter.bintray.com/' }
     }
 }
 
