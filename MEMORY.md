@@ -1,16 +1,16 @@
 # MEMORY.md — Twoyi Fork Project State
 
-> **Last updated:** 2026-08-06 (round 52 — final production release, comprehensive wrap-up)
+> **Last updated:** 2026-08-07 (round 66 — continued improvements)
 > **Project:** Disable-OP/twoyi (fork of cyanmint/twoyi, originally twoyi/twoyi)
 > **Branch:** `improvements/initial-cleanup` (active development branch)
 > **Goal:** Boot Android 11 GSI rootfs in a rootless Android-in-Android container,
 > without root, without KVM, without SELinux permissive mode.
 
-## Production Release — Final Comprehensive Statistics (after 52 rounds)
+## Production Release — Final Comprehensive Statistics (after 66 rounds)
 
 > This section is the canonical final summary. All earlier per-round tables
 > below (section 0 onward) are preserved for historical context only.
-> **52 rounds of improvements** have been completed; the codebase is
+> **66 rounds of improvements** have been completed; the codebase is
 > production-ready and all quality gates are green.
 
 ### Headline metrics
@@ -22,7 +22,7 @@
 | Rust crates (clippy clean)      | **3/3** — `twoyi`, `kr64`, `loader` — **0 clippy warnings** |
 | Rust fmt status                 | **0 fmt drift** — `cargo fmt --check` clean on all 3 crates |
 | Lint status                     | **0 errors, 0 warnings** (all 62 prior benign warnings resolved) |
-| Rust test suite                 | **145/145 passing** (0 failed, 0 ignored)              |
+| Rust test suite                 | **165/165 passing** (0 failed, 0 ignored)              |
 | i18n coverage                   | **4 locales** — en, zh-CN (rCN), zh-TW (rTW), ja       |
 | Build targets                   | arm64-v8a + x86_64 (both compile)                      |
 | Emulator                        | Android 9 (API 28) boots with TCG (**no KVM needed**)  |
@@ -78,7 +78,7 @@
 
 | Gate                              | Tool / Command                                  | Result                          |
 | --------------------------------- | ----------------------------------------------- | ------------------------------- |
-| Rust unit tests                   | `cargo test --lib` (kr64, twoyi, loader)        | **145/145 pass**                |
+| Rust unit tests                   | `cargo test --lib` (kr64, twoyi, loader)        | **165/165 pass**                |
 | Rust clippy (all 3 crates)        | `cargo clippy --lib -- -D warnings` (errors)    | **0 errors, 0 warnings**        |
 | Rust fmt (all 3 crates)           | `cargo fmt --check`                             | **0 drift**                     |
 | Rust build warnings               | `cargo build --lib`                             | **0 warnings**                  |
@@ -88,11 +88,34 @@
 
 ### Status verdict
 
-**Production-ready.** After **52 rounds of improvements** (~241 individual
-changes shipped across 79+ commits), all quality gates are green, all 4
+**Production-ready.** After **66 rounds of improvements** (~245 individual
+changes shipped across 90+ commits), all quality gates are green, all 4
 locales translated, security config and CI gating in place, APK signed and
 reproducibly buildable. The `improvements/initial-cleanup` branch is ready
 to be merged or tagged as the v3.5.5 release.
+
+### Round 66 — proc_emu `/proc/self/status` mode + doc sync (this commit)
+
+- **`kr64/src/proc_emu.rs` — `/proc/self/status` now uses `write_file()`**
+  instead of `fs::File::create` + `write_all`. The previous code left the
+  file at the default 0o644 (owner-writable), inconsistent with the kernel
+  convention (`/proc` files are mode 0444 — synthesised read-only) and
+  with every other `/proc` file the same module writes (all of which go
+  through `write_file()` and end up at 0o444). The fix routes
+  `/proc/self/status` through `write_file()` too, which also buys the
+  idempotency-chmod-to-writable-on-re-run treatment and the
+  `debug_assert!(exists)` sanity check for free. Two new regression tests
+  guard the mode (`proc_self_status_is_read_only_mode_0444`) and the
+  re-run path (`proc_self_status_survives_rerun`). Suite is now
+  **165/165 passing** (was 163/163; +2 new tests); clippy + fmt still
+  clean on `kr64` and `loader`.
+
+- **Doc sync — README.md + MEMORY.md.** The headline test count was
+  stale at 145 (the round-52 baseline) — the actual count is 165 after
+  the rounds-53–66 test additions. README.md's code-quality table also
+  still claimed "62 lint warnings" (the pre-round-52 state); MEMORY.md
+  correctly recorded them as resolved in round 52. Both docs now agree:
+  165/165 tests, 0 lint warnings, 0 clippy warnings, 0 fmt drift.
 
 ### Round 52 — final comprehensive update (this commit)
 
@@ -127,7 +150,7 @@ to be merged or tagged as the v3.5.5 release.
 | Files improved                  | **40+** (Rust + Java + C++ + XML + ProGuard + scripts) |
 | Emulator                        | Android 9 (API 28) boots with TCG (no KVM)             |
 | Latest APK                      | `twoyi_3.5.5-08061416-release.apk` (9.2 MB, v2 signed) |
-| kr64 test suite                 | **145/145 passing** (0 failed, 0 ignored)              |
+| kr64 test suite                 | **165/165 passing** (0 failed, 0 ignored)              |
 | `cargo build --lib` warnings    | **0** (clean build)                                    |
 | `cargo clippy --lib`            | **0 warnings, 0 errors** (all 27 prior warnings fixed) |
 | Android lint                    | **0 errors, 0 warnings** (CI-gated)                    |
@@ -185,7 +208,7 @@ in **en**, **zh-rCN**, **zh-rTW**, and **ja**.
 
 **Verification:**
 - `cargo build --lib` → **0 warnings** (verified in round 19, unchanged)
-- `cargo test --lib` → **145/145 passed; 0 failed** (verified in round 19)
+- `cargo test --lib` → **165/165 passed; 0 failed** (verified in round 66)
 - `cargo clippy --lib` → **0 warnings, 0 errors** (all 27 fixed in round 18)
 - Android lint → **0 errors, 0 warnings** (CI-gated since round 22)
 - All 4 locales' `strings.xml` files validate as well-formed XML
@@ -831,7 +854,7 @@ emulator -avd twoyi28 \
 - **45+ sub-agents spawned** for code review (each filing a triaged bug list)
 - **Emulator boots Android 9 (API 28)** with TCG software emulation (no KVM needed)
 - **APK built and signed 11+ times** (latest ~8.8 MB, v2 signed, both ABIs)
-- **All kr64 unit tests pass on host** — `cargo test --lib` → **145/145 OK**
+- **All kr64 unit tests pass on host** — `cargo test --lib` → **165/165 OK**
   (60 sensors + audio + binder + proc_emu + seccomp + mount_mgr + lib). The
   earlier host-build failure (SensorEvent `PartialEq`/`Debug` removed for
   UB safety) was resolved in commit `9513323` by hand-writing those trait
