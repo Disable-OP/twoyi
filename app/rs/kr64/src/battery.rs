@@ -298,10 +298,19 @@ impl BatteryDevice {
         self.write_file("charging", if status.is_charging() { "1" } else { "0" })
     }
 
-    /// Update the `voltage` file (millivolts, matching the unit
-    /// returned by `jni_get_battery_voltage`).
+    /// Update the `voltage_now` file. `mv` is in **millivolts** (the unit
+    /// `jni_get_battery_voltage` and Android's `BatteryManager.EXTRA_VOLTAGE`
+    /// use); the Linux `power_supply` ABI expects `voltage_now` in
+    /// **microvolts** (uV), so we multiply by 1 000 before writing.
+    /// Without this conversion, the guest's health HAL would read
+    /// `4_200` (uV) and surface it as `4.2 mV` to apps — six orders of
+    /// magnitude below the correct `4.2 V` full-charge voltage.
     pub fn update_voltage(&self, mv: u32) -> std::io::Result<()> {
-        self.write_file("voltage_now", &mv.to_string())
+        // Saturate at u32::MAX so a wildly wrong JNI up-call (e.g. a
+        // host `BatteryManager` that returned INT_MAX) doesn't overflow
+        // and produce a wrapped-around garbage value in the sysfs file.
+        let uv = mv.saturating_mul(1_000);
+        self.write_file("voltage_now", &uv.to_string())
     }
 
     /// Update the `temperature` file (1/10 °C, matching the unit
@@ -350,11 +359,17 @@ impl BatteryDevice {
         })
     }
 
-    /// Read the `voltage` file back as a `u32` (mV).
+    /// Read the `voltage_now` file back as a `u32` in **millivolts** (the
+    /// unit the public API uses — matches what was passed to
+    /// [`update_voltage`](Self::update_voltage)). Internally the file is
+    /// stored in microvolts (the Linux `power_supply` ABI convention), so
+    /// we divide by 1 000 on the way out.
     pub fn read_voltage(&self) -> std::io::Result<u32> {
-        self.read_file_trimmed("voltage_now")?
-            .parse::<u32>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let uv: u32 = self
+            .read_file_trimmed("voltage_now")?
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(uv / 1_000)
     }
 
     /// Read the `temperature` file back as a `u32` (1/10 °C).
@@ -470,7 +485,10 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     try_write!("capacity", &level.min(100).to_string());
     try_write!("status", status.as_str());
     try_write!("charging", if status.is_charging() { "1" } else { "0" });
-    try_write!("voltage_now", &voltage.to_string());
+    // `voltage_now` is in microvolts (uV) per the Linux `power_supply` ABI;
+    // `voltage` (from `jni_get_battery_voltage`) is in millivolts (mV).
+    // Convert mV → uV so the guest's health HAL reads the right value.
+    try_write!("voltage_now", &(voltage.saturating_mul(1_000)).to_string());
     try_write!("temp", &temp.to_string());
     try_write!("technology", DEFAULT_TECHNOLOGY);
     try_write!("health", DEFAULT_HEALTH);
@@ -706,9 +724,12 @@ mod tests {
             read_raw(&dev.file("capacity")),
             format!("{}\n", DEFAULT_CAPACITY)
         );
+        // voltage_now is stored in microvolts (uV) per the Linux
+        // power_supply ABI; DEFAULT_VOLTAGE_MV is in millivolts (mV), so
+        // the on-disk value is `DEFAULT_VOLTAGE_MV * 1000`.
         assert_eq!(
             read_raw(&dev.file("voltage_now")),
-            format!("{}\n", DEFAULT_VOLTAGE_MV)
+            format!("{}\n", DEFAULT_VOLTAGE_MV * 1_000)
         );
         assert_eq!(
             read_raw(&dev.file("temp")),
@@ -805,6 +826,24 @@ mod tests {
         dev.update_temperature(315).unwrap(); // 31.5 °C
         assert_eq!(dev.read_voltage().unwrap(), 4_350);
         assert_eq!(dev.read_temperature().unwrap(), 315);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn voltage_now_is_written_in_microvolts() {
+        // The Linux `power_supply` ABI documents `voltage_now` in
+        // microvolts (uV); the guest's health HAL divides by 1 000 to
+        // recover millivolts (mV) for `BatteryManager.EXTRA_VOLTAGE`.
+        // Writing mV directly would make the guest report 4.2 mV instead
+        // of 4.2 V — six orders of magnitude off. Verify the on-disk
+        // value is mV * 1_000 so the guest reads the right voltage.
+        let rootfs = tmpdir();
+        let dev = BatteryDevice::new(&rootfs).unwrap();
+        dev.update_voltage(4_350).unwrap();
+        // 4 350 mV * 1 000 = 4 350 000 uV on disk.
+        assert_eq!(read_raw(&dev.file("voltage_now")), "4350000\n");
+        // And the read-back path divides by 1 000 to recover mV.
+        assert_eq!(dev.read_voltage().unwrap(), 4_350);
         let _ = fs::remove_dir_all(&rootfs);
     }
 
