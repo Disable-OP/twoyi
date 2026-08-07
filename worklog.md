@@ -4632,3 +4632,56 @@ by code review of the round-62 state:
 | Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
 | Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |
 | `build.gradle` syntax            | Groovy DSL valid (no `jcenter()` shortcut left)          |
+
+
+## Round 65 — sensor CHECK_SUPPORT cache bug fix (this commit)
+
+A real correctness bug was found in the kr64 sensor HAL by code
+review of `SensorConnState::check_support`:
+
+* **`kr64/src/sensors.rs` — `check_support` cache only stored `true`
+  outcomes.** `ConnStateInner.supported` was `[bool; NUM_SENSORS]`
+  initialised to `false`, and `check_support` populated the slot
+  *only* when the JNI up-call returned `true`. With that layout,
+  a `false` answer was indistinguishable from "not yet queried", so
+  every subsequent `CHECK_SUPPORT` for an *unsupported* sensor would
+  re-enter the JVM and re-call `SensorManager.getDefaultSensor()`
+  — a ~ms-scale operation that the guest's `sensorservice` can
+  legitimately issue dozens of times per second while enumerating
+  devices. The original doc comment ("the first call for an index
+  calls the JNI stub, subsequent queries return the cached value")
+  was only true when the first call returned `true`.
+
+  The fix changes the field to `[Option<bool>; NUM_SENSORS]` with
+  `[None; NUM_SENSORS]` as the initial value (`None` = "not yet
+  queried", `Some(b)` = "JNI returned b"). `check_support` now
+  fast-paths on `Some(cached)`, and on a miss calls the JNI up-call
+  *once* and stores `Some(result)` — caching **both** `true` and
+  `false` outcomes. The skeleton's `jni_check_sensor_support` stub
+  still returns `false`, so observable behaviour is unchanged today,
+  but the moment a real JNI up-call lands it will only be invoked
+  once per sensor per connection (matching VM's
+  `CheckSensorsSupport`, which reads a pre-populated state array
+  that `HALManager.startHALMgr` fills at boot).
+
+  Two new regression tests guard the fix:
+  * `conn_state_check_support_caches_false_outcome` — peeks at the
+    internal cache after a single `check_support(0)` call and asserts
+    the slot is `Some(false)` (NOT `None`, which would mean "didn't
+    cache" — the original bug).
+  * `conn_state_check_support_caches_each_idx_independently` —
+    verifies that querying idx 0 doesn't populate idx 1..11's cache
+    slots, guarding against any future off-by-one or shared-slot
+    regression.
+
+  Suite is now **163/163 passing** (was 161/161); clippy + fmt still
+  clean on `kr64` and `loader`.
+
+### Round 65 — verification
+
+| Gate                              | Result                                                   |
+| --------------------------------- | -------------------------------------------------------- |
+| Rust unit tests (`kr64`)          | **163/163 pass** (was 161/161; +2 new tests)             |
+| Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
+| Rust clippy (`loader`)            | **0 warnings, 0 errors**                                 |
+| Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |

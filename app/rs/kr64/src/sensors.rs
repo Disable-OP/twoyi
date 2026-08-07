@@ -807,11 +807,19 @@ struct ConnStateInner {
     /// pump loop).
     delays_ns: [u64; NUM_SENSORS],
     /// Per-sensor SUPPORTED cache. Populated lazily by
-    /// [`SensorConnState::check_support`] — the first CHECK_SUPPORT
-    /// for an index calls the JNI stub, subsequent queries return
-    /// the cached value. (Matches VM's `CheckSensorsSupport` which
-    /// also reads a pre-populated state array.)
-    supported: [bool; NUM_SENSORS],
+    /// [`SensorConnState::check_support`]: `None` means "not yet
+    /// queried", `Some(b)` means "the JNI up-call already returned
+    /// `b` for this sensor". Storing both outcomes (not just `true`,
+    /// as the original `[bool; NUM_SENSORS]` layout did) ensures a
+    /// `false` answer is also cached — otherwise every subsequent
+    /// `CHECK_SUPPORT` for an *unsupported* sensor would re-enter the
+    /// JVM and re-call `SensorManager.getDefaultSensor()`, a
+    /// ~ms-scale operation that the guest's `sensorservice` can
+    /// legitimately issue dozens of times per second while enumerating
+    /// devices. (Matches VM's `CheckSensorsSupport`, which reads a
+    /// pre-populated state array that `HALManager.startHALMgr` fills
+    /// at boot.)
+    supported: [Option<bool>; NUM_SENSORS],
 }
 
 impl ConnStateInner {
@@ -819,7 +827,7 @@ impl ConnStateInner {
         Self {
             enabled: [false; NUM_SENSORS],
             delays_ns: [0u64; NUM_SENSORS],
-            supported: [false; NUM_SENSORS],
+            supported: [None; NUM_SENSORS],
         }
     }
 }
@@ -864,24 +872,29 @@ impl SensorConnState {
 
     /// Query whether `idx` is supported by the host. The first call
     /// for a given `idx` invokes the JNI stub and caches the result;
-    /// subsequent calls return the cached value. (VM's
-    /// `CheckSensorsSupport` reads a pre-populated state array that
-    /// `HALManager.startHALMgr` fills at boot — twoyi's lazy approach
-    /// gives the same observable behaviour with one fewer JNI call
-    /// per sensor that the guest never actually queries.)
+    /// subsequent calls return the cached value — *including* the
+    /// `false` case. (VM's `CheckSensorsSupport` reads a pre-populated
+    /// state array that `HALManager.startHALMgr` fills at boot — twoyi's
+    /// lazy approach gives the same observable behaviour with one fewer
+    /// JNI call per sensor that the guest never actually queries.)
     fn check_support(&self, idx: usize) -> bool {
         let mut s = self.state.lock().unwrap();
-        // Note: this calls jni_check_sensor_support *while holding the
-        // mutex*. In the skeleton the stub is a no-op (returns false
-        // instantly), so this is fine. In the real impl, the JNI
-        // up-call might block on a `SensorManager.getDefaultSensor()`
-        // call — at that point we'd want to release the mutex around
-        // the JNI call, cache the result, then re-acquire the mutex.
-        // For the skeleton this is a non-issue.
-        if !s.supported[idx] && jni_check_sensor_support(std::ptr::null_mut(), idx as u32) {
-            s.supported[idx] = true;
+        // Fast path: the cache already holds an answer for this idx.
+        // We must NOT call the JNI up-call while holding the mutex if
+        // we can avoid it — in the real impl the up-call may block on
+        // `SensorManager.getDefaultSensor()` (a few ms). The skeleton
+        // stub returns instantly so this is a non-issue today, but the
+        // pattern below (check cache, then call JNI only on a miss,
+        // then store *both* outcomes) is the one the real impl will
+        // want once the JVM up-call is wired in.
+        if let Some(cached) = s.supported[idx] {
+            return cached;
         }
-        s.supported[idx]
+        let supported = jni_check_sensor_support(std::ptr::null_mut(), idx as u32);
+        // Cache BOTH true and false — see the field doc for why
+        // caching only `true` (the original behaviour) was a bug.
+        s.supported[idx] = Some(supported);
+        supported
     }
 
     /// Snapshot the enabled-sensor list as `(idx, delay_ns)` pairs.
@@ -2260,6 +2273,79 @@ mod tests {
         let conn = SensorConnState::new();
         assert!(!conn.check_support(0));
         assert!(!conn.check_support(0)); // second call uses cache
+    }
+
+    #[test]
+    fn conn_state_check_support_caches_false_outcome() {
+        // Regression test for the cache bug where `supported` was a
+        // `[bool; NUM_SENSORS]` initialised to `false`. With that
+        // layout, a `false` JNI answer could not be distinguished from
+        // "not yet queried" — so the second CHECK_SUPPORT for an
+        // *unsupported* sensor would re-enter the JVM and re-call
+        // `SensorManager.getDefaultSensor()` every time. The fix
+        // changes the field to `[Option<bool>; NUM_SENSORS]`; this
+        // test verifies the fix by peeking at the internal cache
+        // after a single check_support() call.
+        let conn = SensorConnState::new();
+
+        // Before any query: cache is None (not yet queried).
+        assert_eq!(
+            conn.state.lock().unwrap().supported[0],
+            None,
+            "supported[0] should be None before any CHECK_SUPPORT"
+        );
+
+        // First query populates the cache.
+        let result = conn.check_support(0);
+        assert_eq!(
+            conn.state.lock().unwrap().supported[0],
+            Some(result),
+            "supported[0] should be Some(<first-call result>) after one CHECK_SUPPORT"
+        );
+
+        // The stub returns false, so the cached value must be Some(false)
+        // — NOT None (which would mean "didn't cache") and NOT Some(true)
+        // (which would mean "cached the wrong value").
+        assert_eq!(
+            conn.state.lock().unwrap().supported[0],
+            Some(false),
+            "supported[0] should be Some(false) since the stub always returns false"
+        );
+
+        // A second call must return the cached false (no behaviour change
+        // for the caller, but the cache is now populated, so a real impl
+        // would skip the JNI up-call).
+        assert!(!conn.check_support(0));
+        assert_eq!(
+            conn.state.lock().unwrap().supported[0],
+            Some(false),
+            "second call must not have changed the cached value"
+        );
+    }
+
+    #[test]
+    fn conn_state_check_support_caches_each_idx_independently() {
+        // Each of the 12 sensor indices must have its own cache slot.
+        // A query for idx 0 must NOT populate idx 6's cache (and vice
+        // versa). This guards against an off-by-one or a shared-slot
+        // regression in the cache layout.
+        let conn = SensorConnState::new();
+        // All 12 slots start as None.
+        for i in 0..NUM_SENSORS {
+            assert_eq!(conn.state.lock().unwrap().supported[i], None);
+        }
+        // Query idx 0 only.
+        conn.check_support(0);
+        // Slot 0 is now populated; slots 1..11 must still be None.
+        assert_eq!(conn.state.lock().unwrap().supported[0], Some(false));
+        for i in 1..NUM_SENSORS {
+            assert_eq!(
+                conn.state.lock().unwrap().supported[i],
+                None,
+                "idx {} should still be None (only idx 0 was queried)",
+                i
+            );
+        }
     }
 
     #[test]
