@@ -73,32 +73,32 @@ use crate::{error, info, warning};
 // ============================================================================
 
 // Linux mount(2) flags.
-const MS_RDONLY:      c_ulong = 1;
-const MS_NOSUID:      c_ulong = 2;
-const MS_NODEV:       c_ulong = 4;
-const MS_NOEXEC:      c_ulong = 8;
+const MS_RDONLY: c_ulong = 1;
+const MS_NOSUID: c_ulong = 2;
+const MS_NODEV: c_ulong = 4;
+const MS_NOEXEC: c_ulong = 8;
 const MS_SYNCHRONOUS: c_ulong = 16;
-const MS_REMOUNT:     c_ulong = 32;
-const MS_MANDLOCK:    c_ulong = 64;
-const MS_DIRSYNC:     c_ulong = 128;
-const MS_NOATIME:     c_ulong = 1024;
-const MS_NODIRATIME:  c_ulong = 2048;
-const MS_BIND:        c_ulong = 4096;
-const MS_MOVE:        c_ulong = 8192;
-const MS_REC:         c_ulong = 16384;
-const MS_SILENT:      c_ulong = 32768;
-const MS_POSIXACL:    c_ulong = 1 << 16;
-const MS_UNBINDABLE:  c_ulong = 1 << 17;
-const MS_PRIVATE:     c_ulong = 1 << 18;
-const MS_SLAVE:       c_ulong = 1 << 19;
-const MS_SHARED:      c_ulong = 1 << 20;
-const MS_RELATIME:    c_ulong = 1 << 21;
+const MS_REMOUNT: c_ulong = 32;
+const MS_MANDLOCK: c_ulong = 64;
+const MS_DIRSYNC: c_ulong = 128;
+const MS_NOATIME: c_ulong = 1024;
+const MS_NODIRATIME: c_ulong = 2048;
+const MS_BIND: c_ulong = 4096;
+const MS_MOVE: c_ulong = 8192;
+const MS_REC: c_ulong = 16384;
+const MS_SILENT: c_ulong = 32768;
+const MS_POSIXACL: c_ulong = 1 << 16;
+const MS_UNBINDABLE: c_ulong = 1 << 17;
+const MS_PRIVATE: c_ulong = 1 << 18;
+const MS_SLAVE: c_ulong = 1 << 19;
+const MS_SHARED: c_ulong = 1 << 20;
+const MS_RELATIME: c_ulong = 1 << 21;
 const MS_STRICTATIME: c_ulong = 1 << 24;
 
 // umount2(2) flags.
-const MNT_FORCE:    c_int = 1;
-const MNT_DETACH:   c_int = 2;
-const MNT_EXPIRE:   c_int = 4;
+const MNT_FORCE: c_int = 1;
+const MNT_DETACH: c_int = 2;
+const MNT_EXPIRE: c_int = 4;
 
 // clone(2) / unshare(2) flags.
 const CLONE_NEWNS: c_int = 0x0002_0000;
@@ -120,13 +120,25 @@ fn check(r: c_int) -> IoResult<()> {
 }
 
 /// `mount(source, target, fstype, flags, data)` — thin libc wrapper.
-fn mount(source: &str, target: &str, fstype: &str, flags: c_ulong, data: Option<&str>) -> IoResult<()> {
-    let c_source  = CString::new(source).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let c_target  = CString::new(target).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let c_fstype  = CString::new(fstype).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+fn mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: c_ulong,
+    data: Option<&str>,
+) -> IoResult<()> {
+    let c_source = CString::new(source)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_target = CString::new(target)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_fstype = CString::new(fstype)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let c_data = match data {
-        Some(d) => Some(CString::new(d).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?),
-        None    => None,
+        Some(d) => Some(
+            CString::new(d)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
+        ),
+        None => None,
     };
     let r = unsafe {
         libc::mount(
@@ -134,7 +146,10 @@ fn mount(source: &str, target: &str, fstype: &str, flags: c_ulong, data: Option<
             c_target.as_ptr(),
             c_fstype.as_ptr(),
             flags,
-            c_data.as_ref().map(|c| c.as_ptr() as *const c_void).unwrap_or(std::ptr::null()),
+            c_data
+                .as_ref()
+                .map(|c| c.as_ptr() as *const c_void)
+                .unwrap_or(std::ptr::null()),
         )
     };
     check(r)
@@ -142,7 +157,8 @@ fn mount(source: &str, target: &str, fstype: &str, flags: c_ulong, data: Option<
 
 /// `umount2(target, flags)` — thin libc wrapper.
 fn umount2(target: &str, flags: c_int) -> IoResult<()> {
-    let c_target = CString::new(target).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_target = CString::new(target)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let r = unsafe { libc::umount2(c_target.as_ptr(), flags) };
     check(r)
 }
@@ -156,13 +172,13 @@ fn unshare(flags: c_int) -> IoResult<()> {
 /// `pivot_root(new_root, put_old)` — syscall wrapper (libc doesn't
 /// always wrap this).
 fn pivot_root(new_root: &str, put_old: &str) -> IoResult<()> {
-    let c_new_root = CString::new(new_root).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let c_put_old  = CString::new(put_old).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_new_root = CString::new(new_root)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_put_old = CString::new(put_old)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // SYS_pivot_root = 41 on x86_64, 41 on aarch64 (same!).
     let nr: c_long = libc::SYS_pivot_root as c_long;
-    let r = unsafe {
-        libc::syscall(nr, c_new_root.as_ptr(), c_put_old.as_ptr())
-    };
+    let r = unsafe { libc::syscall(nr, c_new_root.as_ptr(), c_put_old.as_ptr()) };
     if r == -1 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -172,7 +188,8 @@ fn pivot_root(new_root: &str, put_old: &str) -> IoResult<()> {
 
 /// `chroot(path)` — thin libc wrapper.
 fn chroot(path: &str) -> IoResult<()> {
-    let c_path = CString::new(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_path =
+        CString::new(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let r = unsafe { libc::chroot(c_path.as_ptr()) };
     check(r)
 }
@@ -192,9 +209,9 @@ pub struct MountSpec {
     /// Filesystem type (`bind`, `tmpfs`, `proc`, `sysfs`, `ext4`, …).
     pub fstype: String,
     /// Mount flags (bitmask of `MS_*`).
-    pub flags:  c_ulong,
+    pub flags: c_ulong,
     /// Optional mount data (e.g. `"mode=755,gid=1000"` for tmpfs).
-    pub data:   Option<String>,
+    pub data: Option<String>,
 }
 
 /// Configuration for `setup_mounts`.
@@ -218,10 +235,10 @@ pub struct MountConfig {
 impl Default for MountConfig {
     fn default() -> Self {
         MountConfig {
-            rootfs:           String::new(),
-            rom_dir:          None,
-            use_namespaces:   true,
-            read_only_rom:    true,
+            rootfs: String::new(),
+            rom_dir: None,
+            use_namespaces: true,
+            read_only_rom: true,
         }
     }
 }
@@ -247,8 +264,10 @@ impl Default for MountConfig {
 /// `CAP_SYS_ADMIN` but gives weaker isolation). This lets the daemon
 /// at least make progress in development / testing contexts.
 pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
-    info!("[KR64][mount_mgr] setting up mounts for rootfs={:?} rom_dir={:?} namespaces={}",
-          cfg.rootfs, cfg.rom_dir, cfg.use_namespaces);
+    info!(
+        "[KR64][mount_mgr] setting up mounts for rootfs={:?} rom_dir={:?} namespaces={}",
+        cfg.rootfs, cfg.rom_dir, cfg.use_namespaces
+    );
 
     // Step 1: unshare(CLONE_NEWNS).
     let have_ns = if cfg.use_namespaces {
@@ -258,8 +277,11 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
                 true
             }
             Err(e) => {
-                warning!("[KR64][mount_mgr] unshare(CLONE_NEWNS) failed ({}); \
-                       falling back to chroot only — isolation will be weaker", e);
+                warning!(
+                    "[KR64][mount_mgr] unshare(CLONE_NEWNS) failed ({}); \
+                       falling back to chroot only — isolation will be weaker",
+                    e
+                );
                 false
             }
         }
@@ -271,7 +293,10 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     if have_ns {
         match mount("", "/", "", MS_REC | MS_PRIVATE, None) {
             Ok(()) => info!("[KR64][mount_mgr] marked / as MS_REC|MS_PRIVATE"),
-            Err(e) => warning!("[KR64][mount_mgr] mount('/', '/', '', MS_REC|MS_PRIVATE) failed: {}", e),
+            Err(e) => warning!(
+                "[KR64][mount_mgr] mount('/', '/', '', MS_REC|MS_PRIVATE) failed: {}",
+                e
+            ),
         }
     }
 
@@ -279,7 +304,9 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     if let Some(rom_dir) = &cfg.rom_dir {
         if rom_dir != &cfg.rootfs {
             let mut flags = MS_BIND | MS_REC;
-            if cfg.read_only_rom { flags |= MS_RDONLY; }
+            if cfg.read_only_rom {
+                flags |= MS_RDONLY;
+            }
             for part in &["system", "vendor", "product", "system_ext"] {
                 let src = format!("{}/{}", rom_dir, part);
                 let dst = format!("{}/{}", cfg.rootfs, part);
@@ -288,7 +315,12 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
                     let _ = std::fs::create_dir_all(&dst);
                     match mount(&src, &dst, "", flags, None) {
                         Ok(()) => info!("[KR64][mount_mgr] bind-mounted {} → {}", src, dst),
-                        Err(e) => warning!("[KR64][mount_mgr] bind mount {} → {} failed: {}", src, dst, e),
+                        Err(e) => warning!(
+                            "[KR64][mount_mgr] bind mount {} → {} failed: {}",
+                            src,
+                            dst,
+                            e
+                        ),
                     }
                     // Remount read-only (bind mounts inherit the source's
                     // flags, so we need an explicit remount to enforce RO).
@@ -296,7 +328,10 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
                         let _ = mount("", &dst, "", MS_REMOUNT | MS_RDONLY | MS_BIND, None);
                     }
                 } else {
-                    warning!("[KR64][mount_mgr] ROM partition {} does not exist; skipping", src);
+                    warning!(
+                        "[KR64][mount_mgr] ROM partition {} does not exist; skipping",
+                        src
+                    );
                 }
             }
         }
@@ -305,20 +340,40 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     // Step 4: mount tmpfs on /dev, /proc, /sys, /tmp, /apex, /mnt.
     let tmpfs_mounts: &[(&str, &str, c_ulong, &str)] = &[
         // (path-in-rootfs, fstype, flags, data)
-        ("/dev",   "tmpfs", MS_NOSUID | MS_NOEXEC,                "mode=755"),
+        ("/dev", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755"),
         // /proc is populated by proc_emu::populate_proc() — we just
         // mount a tmpfs here as a placeholder so the dir exists. The
         // production version will mount a real procfs OR run our
         // /dev/vmproc-based emulator.
-        ("/proc",  "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV,      "mode=555"),
-        ("/sys",   "tmpfs", MS_NOSUID | MS_NOEXEC | MS_NODEV,      "mode=555"),
-        ("/tmp",   "tmpfs", MS_NOSUID | MS_NODEV,                  "mode=1777"),
+        (
+            "/proc",
+            "tmpfs",
+            MS_NOSUID | MS_NOEXEC | MS_NODEV,
+            "mode=555",
+        ),
+        (
+            "/sys",
+            "tmpfs",
+            MS_NOSUID | MS_NOEXEC | MS_NODEV,
+            "mode=555",
+        ),
+        ("/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777"),
         // /apex is where apexd loop-mounts APEX payloads. We pre-extract
         // them for the MVP (see GSI_BOOT_PLAN.md §2.6), so this is a
         // tmpfs placeholder.
-        ("/apex",  "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,      "mode=755"),
+        (
+            "/apex",
+            "tmpfs",
+            MS_NOSUID | MS_NODEV | MS_NOEXEC,
+            "mode=755",
+        ),
         // /mnt is where the guest's vold mounts external storage.
-        ("/mnt",   "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,      "mode=755,gid=1000"),
+        (
+            "/mnt",
+            "tmpfs",
+            MS_NOSUID | MS_NODEV | MS_NOEXEC,
+            "mode=755,gid=1000",
+        ),
     ];
     for (path, fstype, flags, data) in tmpfs_mounts {
         let abs = format!("{}{}", cfg.rootfs, path);
@@ -326,7 +381,12 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
         let _ = std::fs::create_dir_all(&abs);
         match mount("none", &abs, fstype, *flags, Some(data)) {
             Ok(()) => info!("[KR64][mount_mgr] mounted {} on {}", fstype, abs),
-            Err(e) => warning!("[KR64][mount_mgr] mount {} on {} failed: {}", fstype, abs, e),
+            Err(e) => warning!(
+                "[KR64][mount_mgr] mount {} on {} failed: {}",
+                fstype,
+                abs,
+                e
+            ),
         }
     }
 
@@ -336,18 +396,30 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
         // rootfs to itself to make it a mount point (standard idiom used
         // by runc, util-linux, and all container runtimes).
         match mount(&cfg.rootfs, &cfg.rootfs, "", MS_BIND | MS_REC, None) {
-            Ok(()) => info!("[KR64][mount_mgr] self-bind mount on {} succeeded", cfg.rootfs),
+            Ok(()) => info!(
+                "[KR64][mount_mgr] self-bind mount on {} succeeded",
+                cfg.rootfs
+            ),
             Err(e) => {
-                warning!("[KR64][mount_mgr] self-bind mount failed: {} — pivot_root will likely fail", e);
+                warning!(
+                    "[KR64][mount_mgr] self-bind mount failed: {} — pivot_root will likely fail",
+                    e
+                );
             }
         }
 
         let old_root = format!("{}/old_root", cfg.rootfs);
         let _ = std::fs::create_dir_all(&old_root);
         match pivot_root(&cfg.rootfs, &old_root) {
-            Ok(()) => info!("[KR64][mount_mgr] pivot_root({}, {}) succeeded", cfg.rootfs, old_root),
+            Ok(()) => info!(
+                "[KR64][mount_mgr] pivot_root({}, {}) succeeded",
+                cfg.rootfs, old_root
+            ),
             Err(e) => {
-                error!("[KR64][mount_mgr] pivot_root failed: {} — falling back to chroot", e);
+                error!(
+                    "[KR64][mount_mgr] pivot_root failed: {} — falling back to chroot",
+                    e
+                );
                 chroot(&cfg.rootfs)?;
             }
         }
@@ -356,14 +428,19 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
         // After pivot_root we're chrooted into the new root, so
         // /old_root is the path to the old root.
         match umount2("/old_root", MNT_DETACH) {
-            Ok(()) => info!("[KR64][mount_mgr] detached old root via umount2(/old_root, MNT_DETACH)"),
+            Ok(()) => {
+                info!("[KR64][mount_mgr] detached old root via umount2(/old_root, MNT_DETACH)")
+            }
             Err(e) => warning!("[KR64][mount_mgr] umount2(/old_root) failed: {}", e),
         }
         let _ = std::fs::remove_dir("/old_root");
     } else {
         // Fallback: just chroot.
         chroot(&cfg.rootfs)?;
-        info!("[KR64][mount_mgr] chroot({}) succeeded (no namespace isolation)", cfg.rootfs);
+        info!(
+            "[KR64][mount_mgr] chroot({}) succeeded (no namespace isolation)",
+            cfg.rootfs
+        );
     }
 
     // Step 7: chdir("/") — set the working directory.
@@ -386,12 +463,16 @@ pub fn list_mounts() -> Vec<MountSpec> {
             // mountinfo format (man 5 proc):
             //   mount_id parent_id major:minor root mountpoint options ...
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 6 { continue; }
+            if fields.len() < 6 {
+                continue;
+            }
             // The fstype/source are in the optional fields after "-".
             let mut fstype = String::new();
             let mut source = String::new();
             for w in fields.iter().rev() {
-                if *w == "-" { break; }
+                if *w == "-" {
+                    break;
+                }
             }
             // Simplified parse — we don't need full accuracy for logs.
             for (i, w) in fields.iter().enumerate() {
@@ -405,8 +486,8 @@ pub fn list_mounts() -> Vec<MountSpec> {
                 source,
                 target: fields[4].to_string(),
                 fstype,
-                flags:  0,
-                data:   None,
+                flags: 0,
+                data: None,
             });
         }
     }
@@ -429,8 +510,8 @@ mod tests {
             source: "tmpfs".to_string(),
             target: "/tmp".to_string(),
             fstype: "tmpfs".to_string(),
-            flags:  MS_NOSUID,
-            data:   Some("mode=1777".to_string()),
+            flags: MS_NOSUID,
+            data: Some("mode=1777".to_string()),
         };
         assert_eq!(m.fstype, "tmpfs");
         assert_eq!(m.flags & MS_NOSUID, MS_NOSUID);

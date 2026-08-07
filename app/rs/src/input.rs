@@ -5,24 +5,24 @@
 use libc::*;
 use libc::{c_char, c_int};
 use ndk::event::{MotionAction, MotionEvent};
+use std::io::Write;
 use std::mem;
 use std::thread;
-use std::{io::Write};
 use uinput_sys::*;
 
-use std::sync::mpsc::{ channel, Sender};
-use std::sync::Mutex;
 use once_cell::sync::Lazy;
+use std::sync::mpsc::{channel, Sender};
+use std::sync::Mutex;
 
 use log::info;
 
 const FF_MAX: u16 = 0x7f;
 
-const TOUCH_DEVICE_NAME: &'static str = "vtouch";
-const TOUCH_DEVICE_UNIQUE_ID: &'static str = "<vtouch 0>";
+const TOUCH_DEVICE_NAME: &str = "vtouch";
+const TOUCH_DEVICE_UNIQUE_ID: &str = "<vtouch 0>";
 
-const KEY_DEVICE_NAME: &'static str = "vkey";
-const KEY_DEVICE_UNIQUE_ID: &'static str = "<keyboard 0>";
+const KEY_DEVICE_NAME: &str = "vkey";
+const KEY_DEVICE_UNIQUE_ID: &str = "<keyboard 0>";
 
 /// Touch device socket path — now dynamic via core::get_touch_path().
 /// In a work profile, the data dir is /data/user/<uid>/io.twoyi instead
@@ -72,22 +72,52 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 /// accepts both `&mut [u8; N]` and `&mut [i8; N]` without `unsafe`.
 /// The `unsafe` block is bounded and the operation is sound: we never
 /// read past `len` bytes, and `len` is clamped to `COUNT`.
+///
+/// Robustness notes:
+///   - If `data` contains an interior NUL byte, the string is truncated
+///     at that byte rather than panicking. The data dir path is supplied
+///     by the Java side via JNI (`set_data_dir`); an interior NUL would
+///     be malformed but shouldn't kill the input thread (and thus the
+///     entire guest's touch/key input).
+///   - If the string (after truncation) is longer than `COUNT - 1` bytes,
+///     we copy at most `COUNT - 1` bytes and write a NUL at position
+///     `COUNT - 1`. The previous implementation set `len = COUNT` in the
+///     overflow case, which copied COUNT bytes of string data WITHOUT a
+///     NUL terminator — the C consumer (`EventHub::parseDeviceName` etc.)
+///     would then read past the array into adjacent struct fields looking
+///     for a terminator. In practice the paths are well under 80 bytes,
+///     but the fix protects against future longer paths.
 fn copy_to_cstr<T, const COUNT: usize>(data: &str, arr: &mut [T; COUNT]) {
-    let cstr = std::ffi::CString::new(data).expect("create cstring failed");
-    let bytes = cstr.as_bytes_with_nul();
-    let mut len = bytes.len();
-    if len >= COUNT {
-        len = COUNT;
-    }
+    // The device_info fields are zero-initialized by the caller
+    // (mem::zeroed() / MaybeUninit::zeroed()), so the trailing bytes
+    // are already 0 — we only need to overwrite the prefix we copy.
+    let bytes = data.as_bytes();
+    // Truncate at the first interior NUL byte, if any, so the rest of
+    // the string (after the NUL) isn't copied. Without this, a malformed
+    // path like "/data/\0/etc" would leak "/etc" into the array past
+    // the implicit NUL terminator.
+    let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    // Reserve one byte for the NUL terminator.
+    let max_len = if COUNT == 0 { 0 } else { COUNT - 1 };
+    let len = nul_pos.min(max_len);
+
     // Cast the [T; COUNT] array to a [u8; COUNT] pointer for the copy.
     // This is sound because:
     //   - On aarch64-linux-android, c_char == i8, and [i8; N] has the same
     //     memory layout as [u8; N] (both are 1-byte elements, N elements).
     //   - On targets where c_char == u8, this is a no-op cast.
-    //   - We only write `len` <= COUNT bytes, so we never overflow.
+    //   - We only write `len` < COUNT bytes, so we never overflow.
     unsafe {
         let ptr = arr.as_mut_ptr() as *mut u8;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
+        if len > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
+        }
+        // Explicit NUL terminator at position `len`. The caller already
+        // zeroed the array, but writing it here makes the invariant
+        // explicit and protects against future callers that forget.
+        if len < COUNT {
+            *ptr.add(len) = 0;
+        }
     }
 }
 
@@ -101,8 +131,8 @@ const MAX_POINTERS: usize = 5;
 // of the session. The alternative — letting PoisonError propagate —
 // would mean a single panic kills all subsequent touch/key events,
 // bricking the guest's UI with no recovery short of an app restart.
-static INPUT_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| { Mutex::new(None)});
-static KEY_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| { Mutex::new(None)});
+static INPUT_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| Mutex::new(None));
+static KEY_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn start_input_system(width: i32, height: i32) {
     thread::spawn(move || {
@@ -119,11 +149,14 @@ pub fn input_event_write(
     code: i32,
     val: i32,
 ) {
-    let mut tp = libc::timespec { tv_sec:0, tv_nsec: 0 };
+    let mut tp = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     let _ = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut tp) };
     let tv = timeval {
         tv_sec: tp.tv_sec,
-        tv_usec: tp.tv_nsec / 1000
+        tv_usec: tp.tv_nsec / 1000,
     };
 
     let ev = input_event {
@@ -138,7 +171,6 @@ pub fn input_event_write(
 pub fn handle_touch(ev: MotionEvent) {
     let opt = INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref fd) = *opt {
-
         let action = ev.action();
         let pointer_index = ev.pointer_index();
         let pointer = ev.pointer_at_index(pointer_index);
@@ -154,7 +186,8 @@ pub fn handle_touch(ev: MotionEvent) {
 
         // info!("action: {:#?}, pointer_index: {}", action, pointer_index);
 
-        static G_INPUT_MT: Lazy<Mutex<[i32;MAX_POINTERS]>> = Lazy::new(|| {std::sync::Mutex::new([0i32;MAX_POINTERS])});
+        static G_INPUT_MT: Lazy<Mutex<[i32; MAX_POINTERS]>> =
+            Lazy::new(|| std::sync::Mutex::new([0i32; MAX_POINTERS]));
 
         match action {
             // -----------------------------------------------------------------
@@ -373,8 +406,12 @@ fn touch_server(width: i32, height: i32) {
             l
         }
         Err(e) => {
-            log::error!("[INPUT] failed to bind touch socket at {}: {} — \
-                touch input will be unavailable. Check permissions and path length.", touch, e);
+            log::error!(
+                "[INPUT] failed to bind touch socket at {}: {} — \
+                touch input will be unavailable. Check permissions and path length.",
+                touch,
+                e
+            );
             return;
         }
     };
@@ -389,19 +426,14 @@ fn touch_server(width: i32, height: i32) {
                 let (tx, rx) = channel::<input_event>();
                 *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
-                thread::spawn(move || loop {
-                    match rx.recv() {
-                        Ok(ev) => {
-                            let data = unsafe { any_as_u8_slice(&ev) };
-                            if stream.write_all(data).is_err() {
-                                break; // write failed — client disconnected
-                            }
-                        }
-                        Err(_) => {
-                            // Channel disconnected — new client took over
-                            break;
+                thread::spawn(move || {
+                    while let Ok(ev) = rx.recv() {
+                        let data = unsafe { any_as_u8_slice(&ev) };
+                        if stream.write_all(data).is_err() {
+                            return; // write failed — client disconnected
                         }
                     }
+                    // Channel disconnected — new client took over
                 });
             }
             Err(_) => {
@@ -420,7 +452,7 @@ fn touch_server(width: i32, height: i32) {
 /// the virtual keyboard can emit.
 fn set_key_bit(bitmask: &mut [u8], keycode: usize) {
     let byte = keycode / 8;
-    let bit  = keycode % 8;
+    let bit = keycode % 8;
     if byte < bitmask.len() {
         bitmask[byte] |= 1 << bit;
     }
@@ -442,16 +474,16 @@ fn generate_key_device() -> device_info {
     // KEY_HOMEPAGE, and KEY_MENU — which meant KEYCODE_HOME silently
     // fell back through Android's compatibility shim.
     for &keycode in &[
-        KEY_HOME,         // 102  — KEYCODE_HOME
-        KEY_BACK,         // 158  — KEYCODE_BACK
-        KEY_END,          // 107  — KEYCODE_ENDCALL
-        KEY_VOLUMEUP,     // 115  — KEYCODE_VOLUME_UP
-        KEY_VOLUMEDOWN,   // 114  — KEYCODE_VOLUME_DOWN
-        KEY_POWER,        // 116  — KEYCODE_POWER
-        KEY_MENU,         // 139  — KEYCODE_MENU
-        KEY_SEARCH,       // 217  — KEYCODE_SEARCH
-        KEY_APPSELECT,    // 0x244 — KEYCODE_APP_SWITCH (recents)
-        KEY_HOMEPAGE,     // 172  — KEYCODE_HOME alternate
+        KEY_HOME,       // 102  — KEYCODE_HOME
+        KEY_BACK,       // 158  — KEYCODE_BACK
+        KEY_END,        // 107  — KEYCODE_ENDCALL
+        KEY_VOLUMEUP,   // 115  — KEYCODE_VOLUME_UP
+        KEY_VOLUMEDOWN, // 114  — KEYCODE_VOLUME_DOWN
+        KEY_POWER,      // 116  — KEYCODE_POWER
+        KEY_MENU,       // 139  — KEYCODE_MENU
+        KEY_SEARCH,     // 217  — KEYCODE_SEARCH
+        KEY_APPSELECT,  // 0x244 — KEYCODE_APP_SWITCH (recents)
+        KEY_HOMEPAGE,   // 172  — KEYCODE_HOME alternate
     ] {
         set_key_bit(&mut info.key_bitmask, keycode as usize);
     }
@@ -478,25 +510,28 @@ fn android_keycode_to_linux(keycode: i32) -> Option<i32> {
     // KEY_CALL is intentionally omitted because the uinput-sys crate
     // (tiann/rust-uinput-sys) doesn't export it.
     match keycode {
-        3   => Some(KEY_HOME),         // KEYCODE_HOME         → KEY_HOME (102)
-        4   => Some(KEY_BACK),         // KEYCODE_BACK         → KEY_BACK (158)
-        6   => Some(KEY_END),          // KEYCODE_ENDCALL      → KEY_END (107)
-        24  => Some(KEY_VOLUMEUP),     // KEYCODE_VOLUME_UP    → KEY_VOLUMEUP (115)
-        25  => Some(KEY_VOLUMEDOWN),   // KEYCODE_VOLUME_DOWN  → KEY_VOLUMEDOWN (114)
-        26  => Some(KEY_POWER),        // KEYCODE_POWER        → KEY_POWER (116)
-        82  => Some(KEY_MENU),         // KEYCODE_MENU         → KEY_MENU (139)
-        84  => Some(KEY_SEARCH),       // KEYCODE_SEARCH       → KEY_SEARCH (217)
-        187 => Some(KEY_APPSELECT),    // KEYCODE_APP_SWITCH   → KEY_APPSELECT (recents, 0x244)
-        220 => Some(KEY_HOMEPAGE),     // KEYCODE_HOME (alt)   → KEY_HOMEPAGE (172)
-        _   => None,                   // Unknown / unsupported keycode
+        3 => Some(KEY_HOME),        // KEYCODE_HOME         → KEY_HOME (102)
+        4 => Some(KEY_BACK),        // KEYCODE_BACK         → KEY_BACK (158)
+        6 => Some(KEY_END),         // KEYCODE_ENDCALL      → KEY_END (107)
+        24 => Some(KEY_VOLUMEUP),   // KEYCODE_VOLUME_UP    → KEY_VOLUMEUP (115)
+        25 => Some(KEY_VOLUMEDOWN), // KEYCODE_VOLUME_DOWN  → KEY_VOLUMEDOWN (114)
+        26 => Some(KEY_POWER),      // KEYCODE_POWER        → KEY_POWER (116)
+        82 => Some(KEY_MENU),       // KEYCODE_MENU         → KEY_MENU (139)
+        84 => Some(KEY_SEARCH),     // KEYCODE_SEARCH       → KEY_SEARCH (217)
+        187 => Some(KEY_APPSELECT), // KEYCODE_APP_SWITCH   → KEY_APPSELECT (recents, 0x244)
+        220 => Some(KEY_HOMEPAGE),  // KEYCODE_HOME (alt)   → KEY_HOMEPAGE (172)
+        _ => None,                  // Unknown / unsupported keycode
     }
 }
 
 pub fn send_key_code(keycode: i32) {
     let linux_keycode = match android_keycode_to_linux(keycode) {
         Some(k) => k,
-        None    => {
-            info!("send_key_code: unmapped Android keycode {}, ignoring", keycode);
+        None => {
+            info!(
+                "send_key_code: unmapped Android keycode {}, ignoring",
+                keycode
+            );
             return;
         }
     };
@@ -530,8 +565,12 @@ fn key_server() {
             l
         }
         Err(e) => {
-            log::error!("[INPUT] failed to bind key socket at {}: {} — \
-                key input will be unavailable. Check permissions and path length.", key, e);
+            log::error!(
+                "[INPUT] failed to bind key socket at {}: {} — \
+                key input will be unavailable. Check permissions and path length.",
+                key,
+                e
+            );
             return;
         }
     };
@@ -546,19 +585,14 @@ fn key_server() {
                 let (tx, rx) = channel::<input_event>();
                 *KEY_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
-                thread::spawn(move || loop {
-                    match rx.recv() {
-                        Ok(ev) => {
-                            let data = unsafe { any_as_u8_slice(&ev) };
-                            if stream.write_all(data).is_err() {
-                                break; // write failed — client disconnected
-                            }
-                        }
-                        Err(_) => {
-                            // Channel disconnected — new client took over
-                            break;
+                thread::spawn(move || {
+                    while let Ok(ev) = rx.recv() {
+                        let data = unsafe { any_as_u8_slice(&ev) };
+                        if stream.write_all(data).is_err() {
+                            return; // write failed — client disconnected
                         }
                     }
+                    // Channel disconnected — new client took over
                 });
             }
             Err(_) => {

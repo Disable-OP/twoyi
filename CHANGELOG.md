@@ -18,7 +18,7 @@ required NDK r22 or older) with a modernised build toolchain (NDK r27c /
 Rust stable), an open-source OpenGL renderer, a kernel-replacement daemon
 skeleton, work-profile support, and a functioning CI/devcontainer story.
 
-15 commits since `main`:
+30 commits since `main` (15 in the initial batch listed below; 15 more in follow-on rounds — see `worklog.md` and `MEMORY.md` for the full per-commit log):
 
 ```
 ce29754 docs: update ARCHITECTURE.md with all new findings (664→1324 lines)

@@ -9,6 +9,7 @@ package io.twoyi;
 import android.net.LocalSocket;
 import android.net.LocalSocketAddress;
 import android.os.Looper;
+import android.util.Log;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -55,7 +56,12 @@ public class TwoyiMessenger {
             OutputStream os = this.socket.getOutputStream();
             this.mWriter = new OutputStreamWriter(os);
         } catch (IOException e) {
-            e.printStackTrace();
+            // Fixed: use Log.e with TAG instead of e.printStackTrace() so the
+            // failure is attributable in logcat and captured by crash reporters.
+            // printStackTrace() writes to System.err (stderr), which on Android is
+            // redirected to /dev/null outside of debug builds — the failure was
+            // silently invisible unless a developer was actively tracing.
+            Log.e(TAG, "connect() failed for socket " + SOCK_NAME, e);
             // Fixed: clean up the socket on failure so connect() can be retried.
             // Previously, this.socket was assigned before connect(), so a
             // failed connect left a non-null but unusable socket, and the

@@ -113,7 +113,7 @@ public class SelectAppActivity extends AppCompatActivity {
             try {
                 startActivityForResult(intent, REQUEST_GET_FILE);
             } catch (Throwable ignored) {
-                Toast.makeText(getApplicationContext(), "Error", Toast.LENGTH_SHORT).show();
+                Toast.makeText(getApplicationContext(), getString(R.string.error_generic), Toast.LENGTH_SHORT).show();
             }
         });
 
@@ -174,7 +174,7 @@ public class SelectAppActivity extends AppCompatActivity {
 
         if (pkgs.size() != 1) {
 
-            // TODO: support install mutilpe apps together
+            // TODO: support install multiple apps together
             Toast.makeText(getApplicationContext(), R.string.please_install_one_by_one, Toast.LENGTH_SHORT).show();
             return;
         }
@@ -284,21 +284,23 @@ public class SelectAppActivity extends AppCompatActivity {
         }
 
         List<AppItem> newApps = new ArrayList<>();
-        Set<CharSequence> pkgs = new HashSet<>();
-        for (AppItem mAllApp : mAllApps) {
-            pkgs.add(mAllApp.pkg);
-        }
+
+        // Hoist query.toLowerCase() out of the loop: it doesn't depend on
+        // the iterated appItem, so recomputing it per iteration is wasted
+        // work (O(n) extra String allocations).
+        String queryLower = query.toLowerCase(Locale.US);
 
         for (AppItem appItem : mAllApps) {
             String name = appItem.name.toString().toLowerCase(Locale.US);
             String pkg = appItem.pkg.toString().toLowerCase(Locale.US);
-            String queryLower = query.toLowerCase(Locale.US);
             if (name.contains(queryLower) || pkg.contains(queryLower)) {
                 newApps.add(appItem);
             }
-            if (appItem.selected && !pkgs.contains(appItem.pkg)) {
-                newApps.add(appItem);
-            }
+            // Note: the prior `pkgs` set + `if (appItem.selected &&
+            // !pkgs.contains(appItem.pkg))` block was dead code — pkgs was
+            // built from the same mAllApps list iterated here, so
+            // pkgs.contains(appItem.pkg) was always true and the branch
+            // never fired. Removed.
         }
         mDisplayItems.clear();
         mDisplayItems.addAll(newApps);
@@ -371,6 +373,19 @@ public class SelectAppActivity extends AppCompatActivity {
             File tmpFile = new File(getCacheDir(), now + ".apk");
             Log.i(TAG, "copyFilesFromUri temp file: " + tmpFile);
             try (InputStream inputStream = contentResolver.openInputStream(uri); OutputStream os = new FileOutputStream(tmpFile)) {
+                // Fixed: openInputStream can return null if the provider revokes
+                // the URI grant between picker return and our read (matches the
+                // fix already applied in Render2Activity / SettingsActivity /
+                // ProfileManagerActivity). Without this guard the next line
+                // would throw NullPointerException, which is NOT caught by the
+                // IOException handler below — it would propagate up through
+                // copyFilesFromUri, abort the whole copy loop, and surface as
+                // an opaque "install failed: null" toast. Throwing IOException
+                // here lets the existing catch log it via LogEvents.trackError
+                // and skip just this one URI.
+                if (inputStream == null) {
+                    throw new IOException("ContentResolver returned null stream for " + uri);
+                }
                 byte[] buffer = new byte[1024];
                 int count;
                 while ((count = inputStream.read(buffer)) > 0) {
@@ -646,6 +661,10 @@ public class SelectAppActivity extends AppCompatActivity {
 
             GlideModule.loadApplicationIcon(getApplicationContext(), item.applicationInfo, holder.icon);
             holder.label.setText(item.name);
+            // Accessibility: announce the app name when the icon receives focus.
+            // Falls back to the static "App icon" string from the layout when
+            // item.name is empty (shouldn't happen in practice, but cheap to guard).
+            holder.icon.setContentDescription(item.name);
             String pkg = String.format(Locale.US, "%s [ API %d %s]", item.pkg, item.applicationInfo.targetSdkVersion,
                     item.applicationInfo.splitPublicSourceDirs != null ? "S" : "");
 

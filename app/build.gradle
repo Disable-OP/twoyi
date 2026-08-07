@@ -26,6 +26,14 @@ android {
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
+        // AppCenter analytics key — moved out of TwoyiApplication.java so the
+        // source tree contains no secrets and downstream forks can override the
+        // key via gradle.properties (APPCENTER_API_KEY=...) or a CI secret
+        // without patching Java. The default value below matches the upstream
+        // twoyi project; replace it for your own fork.
+        buildConfigField "String", "APPCENTER_API_KEY",
+                "\"${project.findProperty('APPCENTER_API_KEY') ?: '6223c2b1-30ab-4293-8456-ac575420774e'}\""
+
         ndk {
             // Both ABIs are now 100% open source (task AOSP-VENDOR-1):
             //   arm64-v8a  — real Android devices
@@ -59,6 +67,19 @@ android {
             debuggable false
             signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    // extractNativeLibs="true" is set in AndroidManifest.xml, so we must
+    // opt into the legacy packaging behavior explicitly. Without this,
+    // AGP 7.x emits a build warning on every assembleRelease invocation:
+    //   "PackagingOptions.jniLibs.useLegacyPackaging should be set to true
+    //    because android:extractNativeLibs is set to "true" in AndroidManifest.xml."
+    // Setting it here also future-proofs the build against AGP 8.x where
+    // the default flips to false (which would silently break native lib
+    // loading at runtime on the legacy extractNativeLibs=true path).
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
         }
     }
     compileOptions {

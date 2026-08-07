@@ -48,6 +48,7 @@
     <string name="select_app_app_not_found">Can not found the specified package.</string>
     <string name="select_app_tips">Please select app you want to create</string>
     <string name="create_app_activity">Import App</string>
+    <string name="item_app_icon_desc">App icon</string>
     <string name="check_file_invlid_apk">Can not parse the APK file!</string>
     <string name="check_file_create_self_tip">Boy, your idea is promising :)</string>
     <string name="import_app_from_file">Import app from APK</string>
@@ -89,9 +90,10 @@
     <string name="settings_key_display_dpi">Display DPI</string>
     <string name="settings_display_dpi_summary">Virtual display DPI (default: 160)</string>
     <string name="settings_display_change_reboot">Display settings will take effect after reboot</string>
-    <string name="settings_key_use_new_renderer">Use New Renderer</string>
+    <string name="settings_key_use_new_renderer" translatable="false">use_new_renderer</string>
+    <string name="settings_use_new_renderer_title">Use New Renderer</string>
     <string name="settings_use_new_renderer_summary">Use open-source Rust renderer (experimental, requires reboot)</string>
-    <string name="settings_key_debug_renderer">debug_renderer</string>
+    <string name="settings_key_debug_renderer" translatable="false">debug_renderer</string>
     <string name="settings_debug_renderer_title">Debug Renderer</string>
     <string name="settings_debug_renderer_summary">Dump all renderer data to log files (WARNING: produces huge logs, default OFF)</string>
     <string name="settings_key_select_rom">Select ROM</string>
@@ -107,6 +109,9 @@
     <string name="profile_delete">Delete Profile</string>
     <string name="profile_name_hint">Profile name</string>
     <string name="profile_active">Active</string>
+    <string name="profile_active_format" translatable="false">%1$s (%2$s)</string>
+    <string name="profile_child_indent" translatable="false">  %1$s</string>
+    <string name="profile_copy_default_name" translatable="false">%1$s_copy</string>
     <string name="profile_switch_confirm">Switch to profile %1$s? (Requires reboot)</string>
     <string name="profile_copy_hint">New profile name</string>
     <string name="profile_delete_confirm">Delete profile %1$s?</string>

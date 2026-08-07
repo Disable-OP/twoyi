@@ -4,19 +4,18 @@
 
 use jni::objects::{JFieldID, JValue};
 use jni::signature::{JavaType, Primitive};
-use jni::sys::{jclass, jfieldID, jfloat, jint, jobject, JNI_ERR, jstring};
+use jni::sys::{jclass, jfieldID, jfloat, jint, jobject, jstring, JNI_ERR};
 use jni::JNIEnv;
 use jni::{JavaVM, NativeMethod};
 use log::{debug, error, info, Level};
-use ndk_sys;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use android_logger::Config;
 
+mod core;
 mod input;
 mod renderer_bindings;
-mod core;
 
 // Reference the interp symbol from C to force it to be linked
 extern "C" {
@@ -26,7 +25,7 @@ extern "C" {
 
 // Force the interp symbol to be included by referencing it
 #[used]
-static INTERP_REF: &'static [u8; 0] = unsafe { &INTERP };
+static INTERP_REF: &[u8; 0] = unsafe { &INTERP };
 
 /// ## Examples
 /// ```
@@ -43,7 +42,12 @@ macro_rules! jni_method {
 }
 
 #[no_mangle]
-pub extern "C" fn renderer_init(
+/// # Safety
+/// JNI entry point invoked by the JVM. The caller (the JVM) must supply a
+/// valid `JNIEnv`, a `surface` referring to a live `android.view.Surface`,
+/// and a `loader` `jstring`. Calling from any other context is undefined
+/// behavior.
+pub unsafe extern "C" fn renderer_init(
     env: JNIEnv,
     _clz: jclass,
     surface: jobject,
@@ -87,7 +91,9 @@ pub extern "C" fn renderer_init(
     // after this function returns and the NativeWindow wrapper is dropped.
     // The renderer thread will use this pointer. Without this, the window
     // is freed when the NativeWindow drops, causing a use-after-free.
-    unsafe { ndk_sys::ANativeWindow_acquire(window_ptr as *mut ndk_sys::ANativeWindow); }
+    unsafe {
+        ndk_sys::ANativeWindow_acquire(window_ptr as *mut ndk_sys::ANativeWindow);
+    }
 
     core::init_renderer(
         window_ptr,
@@ -98,7 +104,7 @@ pub extern "C" fn renderer_init(
         virtual_height,
         xdpi as i32,
         ydpi as i32,
-        fps as i32,
+        fps,
     );
 }
 
@@ -107,11 +113,7 @@ pub extern "C" fn renderer_init(
 /// resolve correctly — especially in work profiles where the data
 /// dir is /data/user/<uid>/io.twoyi instead of /data/data/io.twoyi.
 #[no_mangle]
-pub extern "C" fn set_data_dir(
-    env: JNIEnv,
-    _clz: jclass,
-    data_dir: jstring,
-) {
+pub extern "C" fn set_data_dir(env: JNIEnv, _clz: jclass, data_dir: jstring) {
     let dir: String = match env.get_string(data_dir.into()) {
         Ok(s) => s.into(),
         Err(e) => {
@@ -124,7 +126,11 @@ pub extern "C" fn set_data_dir(
 }
 
 #[no_mangle]
-pub extern "C" fn renderer_reset_window(
+/// # Safety
+/// JNI entry point invoked by the JVM. `surface` must refer to a live
+/// `android.view.Surface` and `env` must be a valid `JNIEnv`. Calling
+/// from any other context is undefined behavior.
+pub unsafe extern "C" fn renderer_reset_window(
     env: JNIEnv,
     _clz: jclass,
     surface: jobject,
@@ -135,21 +141,36 @@ pub extern "C" fn renderer_reset_window(
     _fb_width: jint,
     _fb_height: jint,
 ) {
-    debug!("reset_window: surface={}x{}, framebuffer={}x{}", _width, _height, _fb_width, _fb_height);
+    debug!(
+        "reset_window: surface={}x{}, framebuffer={}x{}",
+        _width, _height, _fb_width, _fb_height
+    );
     unsafe {
         let window = ndk_sys::ANativeWindow_fromSurface(env.get_native_interface(), surface);
         if window.is_null() {
             error!("ANativeWindow_fromSurface returned null in renderer_reset_window");
             return;
         }
-        core::reset_window(window as *mut c_void, _top, _left, _width, _height, _fb_width, _fb_height);
+        core::reset_window(
+            window as *mut c_void,
+            _top,
+            _left,
+            _width,
+            _height,
+            _fb_width,
+            _fb_height,
+        );
         // Release the reference acquired by ANativeWindow_fromSurface
         ndk_sys::ANativeWindow_release(window);
     }
 }
 
 #[no_mangle]
-pub extern "C" fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
+/// # Safety
+/// JNI entry point invoked by the JVM. `surface` must refer to a live
+/// `android.view.Surface` and `env` must be a valid `JNIEnv`. Calling
+/// from any other context is undefined behavior.
+pub unsafe extern "C" fn renderer_remove_window(env: JNIEnv, _clz: jclass, surface: jobject) {
     debug!("renderer_remove_window");
 
     unsafe {
@@ -290,13 +311,17 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
     let version: jint = jni_version.into();
 
     debug!("JNI Version : {:#?} ", jni_version);
-    debug!("Registering {} methods for class: {}", methods.len(), class_name);
+    debug!(
+        "Registering {} methods for class: {}",
+        methods.len(),
+        class_name
+    );
 
     let clazz = match env.find_class(class_name) {
         Ok(clazz) => {
             debug!("Found class: {}", class_name);
             clazz
-        },
+        }
         Err(e) => {
             error!("java class not found : {:?}", e);
             // Check for pending exception and clear it
@@ -309,10 +334,13 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
     };
     debug!("clazz: {:#?}", clazz);
 
-    let result = env.register_native_methods(clazz, &methods);
+    let result = env.register_native_methods(clazz, methods);
 
     if result.is_ok() {
-        info!("register_natives : succeed - registered {} methods", methods.len());
+        info!(
+            "register_natives : succeed - registered {} methods",
+            methods.len()
+        );
         version
     } else {
         error!("register_natives : failed {:?}", result);
@@ -329,7 +357,7 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
 #[allow(non_snake_case)]
 unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     // Initialize logger - if this fails, continue anyway
-    let _ = android_logger::init_once(
+    android_logger::init_once(
         Config::default()
             .with_min_level(Level::Info)
             .with_tag("CLIENT_EGL"),
@@ -340,7 +368,11 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     let class_name: &str = "io/twoyi/Renderer";
     // renderer (the AOSP emugl libOpenglRender.so built from source).
     let jni_methods = [
-        jni_method!(init, renderer_init, "(Landroid/view/Surface;Ljava/lang/String;IIFFI)V"),
+        jni_method!(
+            init,
+            renderer_init,
+            "(Landroid/view/Surface;Ljava/lang/String;IIFFI)V"
+        ),
         jni_method!(
             resetWindow,
             renderer_reset_window,
@@ -376,12 +408,24 @@ pub extern "C" fn twoyi_print_help() {
     use std::io::{self, Write};
     let _ = writeln!(io::stdout(), "Twoyi Native Library - v0.1.0");
     let _ = writeln!(io::stdout(), "\nExported Functions:");
-    let _ = writeln!(io::stdout(), "  twoyi_start_input_system(width, height) - Start input system");
+    let _ = writeln!(
+        io::stdout(),
+        "  twoyi_start_input_system(width, height) - Start input system"
+    );
     let _ = writeln!(io::stdout(), "  twoyi_print_help() - Show this help");
-    let _ = writeln!(io::stdout(), "  twoyi_send_keycode(keycode) - Send a keycode event");
+    let _ = writeln!(
+        io::stdout(),
+        "  twoyi_send_keycode(keycode) - Send a keycode event"
+    );
     let _ = writeln!(io::stdout(), "\nUsage from shell:");
-    let _ = writeln!(io::stdout(), "  This library can be loaded via System.loadLibrary(\"twoyi\") in Android apps");
-    let _ = writeln!(io::stdout(), "  Or called from shell using the twoyi wrapper script");
+    let _ = writeln!(
+        io::stdout(),
+        "  This library can be loaded via System.loadLibrary(\"twoyi\") in Android apps"
+    );
+    let _ = writeln!(
+        io::stdout(),
+        "  Or called from shell using the twoyi wrapper script"
+    );
 }
 
 /// Send a keycode - exposed for shell access
@@ -391,10 +435,15 @@ pub extern "C" fn twoyi_send_keycode(keycode: i32) {
 }
 
 // Main function for standalone execution when invoked directly or via linker64
+///
+/// # Safety
+/// `argv` must point to a C-style argv array of at least `argc` non-null
+/// `*const c_char` entries (POSIX requires `argv[argc] == NULL`). Calling
+/// with an invalid `argv`/`argc` pair is undefined behavior.
 #[no_mangle]
-pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
-    use std::io::{self, Write};
+pub unsafe extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
     use std::ffi::CStr;
+    use std::io::{self, Write};
 
     let _ = writeln!(io::stdout(), "Twoyi Renderer - Standalone Mode");
 
@@ -425,13 +474,31 @@ pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
 
     let _ = writeln!(io::stdout(), "\nUsage: ./libtwoyi.so [OPTIONS]");
     let _ = writeln!(io::stdout(), "Options:");
-    let _ = writeln!(io::stdout(), "  --help                Show this help message");
-    let _ = writeln!(io::stdout(), "  --width <width>       Set virtual display width (default: 720)");
-    let _ = writeln!(io::stdout(), "  --height <height>     Set virtual display height (default: 1280)");
+    let _ = writeln!(
+        io::stdout(),
+        "  --help                Show this help message"
+    );
+    let _ = writeln!(
+        io::stdout(),
+        "  --width <width>       Set virtual display width (default: 720)"
+    );
+    let _ = writeln!(
+        io::stdout(),
+        "  --height <height>     Set virtual display height (default: 1280)"
+    );
     let _ = writeln!(io::stdout(), "  --loader <path>       Set loader path");
-    let _ = writeln!(io::stdout(), "  --start-input         Start input system only");
-    let _ = writeln!(io::stdout(), "\nNote: This library is primarily designed to be loaded by the Twoyi app.");
-    let _ = writeln!(io::stdout(), "For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")");
+    let _ = writeln!(
+        io::stdout(),
+        "  --start-input         Start input system only"
+    );
+    let _ = writeln!(
+        io::stdout(),
+        "\nNote: This library is primarily designed to be loaded by the Twoyi app."
+    );
+    let _ = writeln!(
+        io::stdout(),
+        "For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")"
+    );
 
     // Parse arguments
     let mut width = 720;
@@ -470,7 +537,12 @@ pub extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i32 {
     }
 
     if start_input {
-        let _ = writeln!(io::stdout(), "\nStarting input system with dimensions: {}x{}", width, height);
+        let _ = writeln!(
+            io::stdout(),
+            "\nStarting input system with dimensions: {}x{}",
+            width,
+            height
+        );
         twoyi_start_input_system(width, height);
         let _ = writeln!(io::stdout(), "Input system started. Press Ctrl+C to exit.");
 

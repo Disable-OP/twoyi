@@ -13,6 +13,7 @@
 
 package io.twoyi.utils;
 
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.util.Log;
@@ -161,6 +162,7 @@ public class ProfileManager {
     /**
      * Rename a profile
      */
+    @SuppressLint("ApplySharedPref")
     public static boolean renameProfile(Context context, String oldName, String newName) {
         if (DEFAULT_PROFILE.equals(oldName)) {
             Log.w(TAG, "Cannot rename default profile");
@@ -231,6 +233,7 @@ public class ProfileManager {
     /**
      * Copy a profile - copies files manually then creates tar
      */
+    @SuppressLint("ApplySharedPref")
     public static boolean copyProfile(Context context, String sourceName, String targetName) {
         // Fixed: validate both names against path traversal (same as createProfile).
         if (!isValidProfileName(sourceName) || !isValidProfileName(targetName)) {

@@ -5,14 +5,24 @@
 > archived `twoyi/twoyi` project) as it stands **plus the improvements in
 > this branch** (`improvements/initial-cleanup`).
 >
-> **Date of analysis:** 2026-08-05 (last revised 2026-08-05)
+> **Date of analysis:** 2026-08-05 (last revised 2026-08-06)
 > **Base commit:** `25ef89c` ("rom manifest", 2026-05-09, upstream)
-> **Branch tip:** `570e95e` ("feat(kr64): kernel replacement daemon skeleton")
-> on `improvements/initial-cleanup`. Adds: x86_64 ABI, AOSP-source
-> `libOpenglRender.so`, Rust `libloader.so`, dynamic data dir (work-profile
-> support), x86_64 SIGABRT fix, `kr64` kernel-replacement skeleton, CI,
-> devcontainer, input handling, and APK signing. See §9–§10 for the
-> reverse-engineering and roadmap sections added in this revision.
+> **Branch tip:** `a021b25` ("docs: final comprehensive MEMORY.md update + any
+> remaining fixes") on `improvements/initial-cleanup`. Adds: x86_64 ABI,
+> AOSP-source `libOpenglRender.so`, Rust `libloader.so`, dynamic data dir
+> (work-profile support), x86_64 SIGABRT fix, `kr64` kernel-replacement
+> skeleton, CI, devcontainer, input handling, and APK signing. See §9–§10
+> for the reverse-engineering and roadmap sections added in this revision.
+>
+> **Post-architecture cleanup rounds (2026-08-06):** subsequent commits
+> (`69a9741` → `a021b25`) did not change the *architecture* but did add
+> production-readiness hardening: `res/xml/network_security_config.xml`
+> (cleartext forbidden by default, loopback exception for ADB), full
+> 4-locale i18n (en/zh-rCN/zh-rTW/ja), 0 clippy warnings / 0 lint errors
+> / 145-145 Rust tests passing, `printStackTrace()` → `Log.e()` sweep,
+> AppCenter key extracted to `BuildConfig`, and CI gating on
+> `cargo clippy -- -D warnings` + `./gradlew lintRelease`. See
+> `worklog.md` §Round 19 for the full rundown.
 
 ---
 
@@ -518,17 +528,19 @@ dynamically instead of bundling desktop-GL translator libraries.
 | 3 | `GLDispatch.cpp` | `libGLES_CM_translator.so` → `libGLESv1_CM.so` |
 | 4 | `GL2Dispatch.cpp` | `libGLES_V2_translator.so` → `libGLESv2.so` |
 | 5 | `UnixStream.cpp` | Rewrote `make_unix_path()` to produce `$TWOYI_ROOTFS/opengles{,2,3}` (defaults to `/data/data/io.twoyi/rootfs/opengles`) |
-| 6 | `NativeLinuxSubWindow.cpp` → `NativeAndroidSubWindow.cpp` | `createSubWindow` just returns the `ANativeWindow` as-is (no X11) |
-| 7 | `twoyi_api.cpp` (**new**) | Implements the six twoyi-required entry points (`startOpenGLRenderer`, `setNativeWindow`, `resetSubWindow`, `removeSubWindow`, `destroyOpenGLSubwindow`, `repaintOpenGLDisplay`) plus the four `dl*_ex` wrappers, by calling into the existing AOSP `FrameBuffer` / `RenderServer` API |
-| 8 | `render_api.cpp` | Removed `static` from `s_renderThread` so `twoyi_api.cpp` can `extern` it |
-| 9 | `CMakeLists.txt` (**new**) | Builds 33 source files into `libOpenglRender.so`. Links `libEGL`, `libGLESv1_CM`, `libGLESv2`, `liblog`, `libdl`, `libm`, `libc` |
+| 6 | `NativeLinuxSubWindow.cpp` (and `NativeMacSubWindow.m` / `NativeWindowsSubWindow.cpp`) | Not in `CMakeLists.txt`'s `EMUGL_SOURCES` (platform-specific X11 / Win32 / Carbon code; not applicable on Android). Kept in the tree as part of the reference AOSP source. |
+| 7 | `twoyi_api.cpp` (**new**) | Implements the six twoyi-required entry points (`startOpenGLRenderer`, `setNativeWindow`, `resetSubWindow`, `removeSubWindow`, `destroyOpenGLSubwindow`, `repaintOpenGLDisplay`) plus the four `dl*_ex` wrappers. **This is the only file actually compiled into the shipping `libOpenglRender.so`** (see `CMakeLists.txt`); it talks to the system EGL / GLESv2 directly (`eglGetDisplay` / `eglInitialize` / `eglChooseConfig` / `eglCreateContext` / `eglCreateWindowSurface` / `eglSwapBuffers`) and runs a background render thread that owns the EGL context for its entire lifetime. The original "compose the AOSP `FrameBuffer` / `RenderServer` API" approach (rows 1–6, 8) is preserved in the tree as reference source for a possible future re-enablement of the full AOSP emugl pipeline. |
+| 8 | `render_api.cpp` | Removed `static` from `s_renderThread` so the now-deleted reference `twoyi/twoyi_api.cpp` could `extern` it. Not required by the active build; the patch is preserved on the reference source in `libOpenglRender/render_api.cpp` for historical consistency. |
+| 9 | `CMakeLists.txt` (**new**) | Builds **only `twoyi_api.cpp`** into `libOpenglRender.so`. Links `libEGL`, `libGLESv2`, `libandroid`, `liblog`, `libdl`. (The 33-source-file build described in earlier revisions of this document was the abandoned "full AOSP pipeline" approach.) |
 
-**Function renaming.** AOSP's `initOpenGLRenderer` is renamed to
+**Function renaming.** The twoyi-required entry-point names —
 `startOpenGLRenderer` with the twoyi-specific signature
-`(win, w, h, xdpi, ydpi, fps)`. AOSP's `createOpenGLSubwindow` is
-renamed to `resetSubWindow`. Two new entry points (`setNativeWindow`,
-`removeSubWindow`) are added to match what `renderer_bindings.rs`
-declares as `extern "C"`.
+`(win, w, h, xdpi, ydpi, fps)`, `setNativeWindow`, `resetSubWindow`,
+`removeSubWindow`, `destroyOpenGLSubwindow`, `repaintOpenGLDisplay` —
+are exported by `twoyi_api.cpp` to match what `renderer_bindings.rs`
+declares as `extern "C"`. (The original AOSP names `initOpenGLRenderer`
+and `createOpenGLSubwindow` are not used by the active build; they
+were the names the abandoned "compose the AOSP API" approach renamed.)
 
 #### 5.4.3 The ported legacy pieces (commit `eb13449`)
 

@@ -46,6 +46,7 @@
     <string name="select_app_app_not_found">未找到指定的应用，无法添加！</string>
     <string name="select_app_tips">请选择要创建的应用</string>
     <string name="create_app_activity">导入应用</string>
+    <string name="item_app_icon_desc">应用图标</string>
     <string name="check_file_invlid_apk">安装包解析错误！</string>
     <string name="check_file_create_self_tip">小伙子，你这个想法很有前途 :)</string>
     <string name="import_app_from_file">从APK文件导入</string>
@@ -87,6 +88,10 @@
     <string name="settings_key_display_dpi">显示 DPI</string>
     <string name="settings_display_dpi_summary">虚拟显示 DPI（默认：160）</string>
     <string name="settings_display_change_reboot">显示设置将在重启后生效</string>
+    <string name="settings_use_new_renderer_title">使用新渲染器</string>
+    <string name="settings_use_new_renderer_summary">使用开源 Rust 渲染器（实验性，需要重启）</string>
+    <string name="settings_debug_renderer_title">调试渲染器</string>
+    <string name="settings_debug_renderer_summary">将所有渲染器数据转储到日志文件（警告：会产生大量日志，默认关闭）</string>
     <string name="settings_key_select_rom">选择 ROM</string>
     <string name="settings_select_rom_summary">为当前配置文件导入 ROM 文件</string>
     <string name="settings_key_profile_manager">配置文件管理器</string>

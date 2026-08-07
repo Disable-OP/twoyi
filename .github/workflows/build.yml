@@ -31,6 +31,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Cancel any superseded run on the same ref. The APK build is expensive
+    # (~15 min: cargo-xdk install + 2 Rust ABIs + Gradle assembleRelease),
+    # so a rapid series of pushes to the same branch would otherwise queue
+    # up many redundant builds. Mirrors the concurrency block in
+    # kr64-tests.yml. PR runs are grouped separately from branch runs so a
+    # push to a branch with an open PR doesn't cancel the PR's own build.
+    concurrency:
+      group: build-apk-${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name != 'pull_request' }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -43,6 +53,11 @@ jobs:
           cache: 'gradle'
 
       - name: Setup Rust
+        # The toolchain (channel, components, targets) is pinned in
+        # `rust-toolchain.toml` at the repo root; this action reads it
+        # automatically. The explicit `toolchain`/`target` below is a
+        # belt-and-braces fallback for forks that haven't pulled the
+        # toolchain file yet.
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -57,8 +72,11 @@ jobs:
             ~/.cargo/git
             app/rs/target
             app/rs/loader/target
-            app/rs/openglrenderer/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('app/rs/**/Cargo.lock', 'app/rs/**/Cargo.toml') }}
+          # Only hash the Cargo manifests of crates this workflow actually
+          # builds (twoyi + loader). The kr64 crate is covered by its own
+          # workflow (kr64-tests.yml) and its own cache, so changes to
+          # app/rs/kr64/Cargo.toml must NOT invalidate the APK build cache.
+          key: ${{ runner.os }}-cargo-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Cache cargo-xdk
@@ -74,7 +92,10 @@ jobs:
 
       - name: Setup Android NDK
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        # nttld/setup-ndk@v2 supersedes the old android-actions/setup-ndk
+        # line; v2 is the actively maintained major and supports newer NDK
+        # releases (r27c+) and the `ndk-path` output used below.
+        uses: nttld/setup-ndk@v2
         with:
           ndk-version: r27c
           add-to-path: false
@@ -84,7 +105,6 @@ jobs:
           chmod +x gradlew
           chmod +x app/rs/build_rs.sh
           chmod +x app/rs/loader/build.sh || true
-          chmod +x app/rs/openglrenderer/build.sh || true
 
       - name: Optionally fetch the real rootfs
         if: ${{ github.event.inputs.include_rootfs == 'true' }}
@@ -104,6 +124,21 @@ jobs:
           if [ -z "$ABIS" ]; then ABIS="all"; fi
           echo "abis=$ABIS" >> "$GITHUB_OUTPUT"
           echo "Building ABIs: $ABIS"
+
+      - name: Run Android Lint
+        # Run lint BEFORE assembleRelease so lint errors fail the build before
+        # we spend ~10 min packaging the APK. AGP's default `lint` task
+        # analyzes every variant; default lintOptions (abortOnError=true)
+        # turns error-severity issues into a non-zero exit code. Warnings do
+        # not fail the build — there are ~62 known warnings, all benign
+        # (SetTextI18n, DiscouragedPrivateApi for hidden-API reflection, etc.).
+        # The task transitively depends on javaPreCompileRelease, which in
+        # turn triggers the cargoBuild/cmakeBuild/loaderBuild tasks wired in
+        # app/build.gradle — so this also serves as a native-compile smoke
+        # test for the chosen ABIs before assembleRelease runs.
+        run: ./gradlew lint -Pabis=${{ steps.abis.outputs.abis }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
 
       - name: Build with Gradle
         run: ./gradlew assembleRelease -Pabis=${{ steps.abis.outputs.abis }}

@@ -24,6 +24,7 @@ import android.os.Build;
 import android.os.Process;
 import android.os.SystemClock;
 import android.text.TextUtils;
+import android.util.Log;
 import android.util.TypedValue;
 import android.webkit.WebView;
 import android.widget.Toast;
@@ -56,6 +57,7 @@ import moe.feng.alipay.zerosdk.AlipayZeroSdk;
  * @date 2018/7/21.
  */
 public class UIHelper {
+    private static final String TAG = "UIHelper";
     private static final AndroidDeferredManager gDM = new AndroidDeferredManager();
 
     public static ExecutorService GLOBAL_EXECUTOR = Executors.newCachedThreadPool();
@@ -72,7 +74,7 @@ public class UIHelper {
         try {
             dialog.dismiss();
         } catch (Throwable ignored) {
-            ignored.printStackTrace();
+            Log.e(TAG, "Ignored throwable", ignored);
         }
     }
 
@@ -94,7 +96,7 @@ public class UIHelper {
             context.startActivity(intent);
             Toast.makeText(context, R.string.wechat_public_account_tips, Toast.LENGTH_LONG).show();
         } catch (Throwable e) {
-            Toast.makeText(context, "WeChat is not installed.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(context, R.string.wechat_not_installed, Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -106,7 +108,7 @@ public class UIHelper {
         try {
             dialog.show();
         } catch (Throwable ignored) {
-            ignored.printStackTrace();
+            Log.e(TAG, "Ignored throwable", ignored);
         }
     }
 
@@ -169,7 +171,7 @@ public class UIHelper {
                             t1.setData(Uri.parse("https://paypal.me/virtualxposed"));
                             activity.startActivity(t1);
                         } catch (Throwable ignored) {
-                            ignored.printStackTrace();
+                            Log.e(TAG, "Ignored throwable", ignored);
                         }
                     } else if (which1 == 2) {
                         try {
@@ -206,7 +208,7 @@ public class UIHelper {
             intent.setData(Uri.parse("https://twoyi.app/guide"));
             context.startActivity(intent);
         } catch (Throwable ignored) {
-            ignored.printStackTrace();
+            Log.e(TAG, "Ignored throwable", ignored);
         }
     }
 
@@ -371,7 +373,7 @@ public class UIHelper {
             }
             return supportedABIs;
         } catch (Exception e) {
-            e.printStackTrace();
+            Log.e(TAG, "UIHelper failure", e);
         }
 
         return null;

@@ -2,13 +2,18 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #
-# Runs the kr64 crate's unit tests on the host (linux/x86_64) so that
-# regressions in the kernel-replacement daemon skeleton are caught
-# before they land on `main`. The crate is host-testable because its
-# only dependency is `libc` and its `build.rs` (which compiles
+# Runs `cargo fmt --check`, `cargo clippy -D warnings`, and the kr64 crate's
+# unit tests on the host (linux/x86_64) so that formatting drift, clippy
+# regressions, and test failures in the kernel-replacement daemon skeleton
+# are all caught before they land on `main`. The crate is host-testable
+# because its only dependency is `libc` and its `build.rs` (which compiles
 # `interp.c`) works on any platform with a C compiler.
+#
+# The toolchain (channel + `rustfmt`/`clippy` components + Android targets)
+# is pinned in `rust-toolchain.toml` at the repo root, so the CI toolchain
+# matches every developer's local toolchain byte-for-byte.
 ---
-name: kr64 unit tests
+name: kr64 lint + test
 
 on:
   push:
@@ -25,7 +30,7 @@ concurrency:
 
 jobs:
   test:
-    name: cargo test (kr64)
+    name: fmt + clippy + test (kr64)
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -36,6 +41,9 @@ jobs:
       - name: Set up Rust stable
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
+          # The toolchain (channel, components, targets) is pinned in
+          # `rust-toolchain.toml` at the repo root; this `toolchain: stable`
+          # is just a fallback for forks that haven't pulled the file yet.
           toolchain: stable
           # Run on the host (linux/x86_64); no Android targets needed.
           cache: true
@@ -51,6 +59,22 @@ jobs:
             app/rs/kr64/target
           key: ${{ runner.os }}-kr64-cargo-${{ hashFiles('app/rs/kr64/Cargo.toml', 'app/rs/kr64/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-kr64-cargo-
+
+      - name: Verify formatting (rustfmt)
+        # Fails the build if any file isn't `rustfmt`-clean. The setup step
+        # above already installed the rustfmt component, so this is free.
+        # `--check` writes nothing on success and a unified diff on failure.
+        shell: bash
+        run: cd app/rs/kr64 && cargo fmt --check
+
+      - name: Lint with clippy
+        # Gate CI on the "0 clippy warnings" state that was painstakingly
+        # reached in rounds 13–18. `-D warnings` turns every clippy warning
+        # into a hard error so regressions can't sneak in through a PR.
+        # `--all-targets` covers tests/benches/build-scripts too, not just
+        # the lib/bin.
+        shell: bash
+        run: cd app/rs/kr64 && cargo clippy --all-targets -- -D warnings
 
       - name: Run kr64 unit tests
         # `--no-fail-fast` so we see *every* failing test, not just the first.

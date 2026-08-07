@@ -67,12 +67,12 @@ use crate::{error, info, warning};
 // ============================================================================
 
 // BPF instruction classes (low 3 bits of `code`).
-const BPF_LD:  u16 = 0x00;
+const BPF_LD: u16 = 0x00;
 const BPF_JMP: u16 = 0x05;
 const BPF_RET: u16 = 0x06;
 
 // BPF size modifiers (next 2 bits).
-const BPF_W:   u16 = 0x00;
+const BPF_W: u16 = 0x00;
 
 // BPF mode modifiers for BPF_LD (high 3 bits).
 const BPF_ABS: u16 = 0x20;
@@ -81,21 +81,21 @@ const BPF_ABS: u16 = 0x20;
 const BPF_JEQ: u16 = 0x10;
 
 // BPF source operand (high 1 bit).
-const BPF_K:   u16 = 0x00;
+const BPF_K: u16 = 0x00;
 
 // Seccomp return values (top 16 bits of the return word).
 #[allow(dead_code)]
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 #[allow(dead_code)]
-const SECCOMP_RET_KILL_THREAD:  u32 = 0x0000_0000;
-const SECCOMP_RET_TRAP:         u32 = 0x0003_0000;
+const SECCOMP_RET_KILL_THREAD: u32 = 0x0000_0000;
+const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
 #[allow(dead_code)]
-const SECCOMP_RET_ERRNO:        u32 = 0x0005_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 #[allow(dead_code)]
-const SECCOMP_RET_TRACE:        u32 = 0x7ff0_0000;
+const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
 #[allow(dead_code)]
-const SECCOMP_RET_LOG:          u32 = 0x7ffc_0000;
-const SECCOMP_RET_ALLOW:        u32 = 0x7fff_0000;
+const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
 // prctl(2) operations used by seccomp.
 const PR_SET_NO_NEW_PRIVS: c_int = 38;
@@ -114,8 +114,8 @@ const AUDIT_ARCH_EXPECTED: u32 = 0xC000_00B7; // EM_AARCH64 | __AUDIT_ARCH_64BIT
 const AUDIT_ARCH_EXPECTED: u32 = 0xC000_003E; // EM_X86_64  | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE
 
 // struct seccomp_data field offsets (see <linux/seccomp.h>).
-const OFF_NR:   u32 = 0;  // int   nr
-const OFF_ARCH: u32 = 4;  // __u32 arch
+const OFF_NR: u32 = 0; // int   nr
+const OFF_ARCH: u32 = 4; // __u32 arch
 
 // ============================================================================
 // BPF instruction builder — thin wrapper around `sock_filter`.
@@ -127,26 +127,41 @@ const OFF_ARCH: u32 = 4;  // __u32 arch
 #[derive(Clone, Copy, Debug)]
 pub struct SockFilter {
     pub code: u16,
-    pub jt:   u8,
-    pub jf:   u8,
-    pub k:    u32,
+    pub jt: u8,
+    pub jf: u8,
+    pub k: u32,
 }
 
 /// Build a `BPF_LD | BPF_W | BPF_ABS` instruction — load a 32-bit word
 /// from offset `k` of `struct seccomp_data` into the accumulator.
 const fn bpf_ld_abs(k: u32) -> SockFilter {
-    SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k }
+    SockFilter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 
 /// Build a `BPF_JMP | BPF_JEQ | BPF_K` instruction — if accumulator
 /// equals `k`, jump `jt` instructions forward, else jump `jf`.
 const fn bpf_jeq(k: u32, jt: u8, jf: u8) -> SockFilter {
-    SockFilter { code: BPF_JMP | BPF_JEQ | BPF_K, jt, jf, k }
+    SockFilter {
+        code: BPF_JMP | BPF_JEQ | BPF_K,
+        jt,
+        jf,
+        k,
+    }
 }
 
 /// Build a `BPF_RET | BPF_K` instruction — return `k` from the filter.
 const fn bpf_ret(k: u32) -> SockFilter {
-    SockFilter { code: BPF_RET | BPF_K, jt: 0, jf: 0, k }
+    SockFilter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k,
+    }
 }
 
 // ============================================================================
@@ -186,9 +201,18 @@ fn allowed_syscalls() -> HashSet<i32> {
 
     // --- file I/O (present on both aarch64 and x86_64) ---
     for &nr in &[
-        SYS_read, SYS_write, SYS_readv, SYS_writev,
-        SYS_pread64, SYS_pwrite64,
-        SYS_openat, SYS_close, SYS_dup, SYS_dup3, SYS_fcntl, SYS_lseek,
+        SYS_read,
+        SYS_write,
+        SYS_readv,
+        SYS_writev,
+        SYS_pread64,
+        SYS_pwrite64,
+        SYS_openat,
+        SYS_close,
+        SYS_dup,
+        SYS_dup3,
+        SYS_fcntl,
+        SYS_lseek,
         SYS_readlinkat,
         SYS_getcwd,
     ] {
@@ -212,11 +236,23 @@ fn allowed_syscalls() -> HashSet<i32> {
     //     On aarch64 these are replaced by the *at variants.
     #[cfg(target_arch = "x86_64")]
     for &nr in &[
-        SYS_open, SYS_access, SYS_dup2,
-        SYS_stat, SYS_fstat, SYS_lstat,
-        SYS_chmod, SYS_fchmod, SYS_lchown, SYS_chown, SYS_fchown,
-        SYS_chroot, SYS_unlink, SYS_rmdir, SYS_mkdir,
-        SYS_readlink, SYS_truncate,
+        SYS_open,
+        SYS_access,
+        SYS_dup2,
+        SYS_stat,
+        SYS_fstat,
+        SYS_lstat,
+        SYS_chmod,
+        SYS_fchmod,
+        SYS_lchown,
+        SYS_chown,
+        SYS_fchown,
+        SYS_chroot,
+        SYS_unlink,
+        SYS_rmdir,
+        SYS_mkdir,
+        SYS_readlink,
+        SYS_truncate,
     ] {
         add_nr!(s, nr);
     }
@@ -226,8 +262,13 @@ fn allowed_syscalls() -> HashSet<i32> {
 
     // --- memory ---
     for &nr in &[
-        SYS_mmap, SYS_munmap, SYS_mprotect, SYS_mremap, SYS_msync,
-        SYS_madvise, SYS_brk,
+        SYS_mmap,
+        SYS_munmap,
+        SYS_mprotect,
+        SYS_mremap,
+        SYS_msync,
+        SYS_madvise,
+        SYS_brk,
     ] {
         add_nr!(s, nr);
     }
@@ -237,24 +278,48 @@ fn allowed_syscalls() -> HashSet<i32> {
 
     // --- signals ---
     for &nr in &[
-        SYS_rt_sigaction, SYS_rt_sigprocmask, SYS_rt_sigpending,
-        SYS_rt_sigtimedwait, SYS_rt_sigreturn, SYS_sigaltstack,
-        SYS_rt_sigsuspend, SYS_kill, SYS_tgkill, SYS_tkill,
+        SYS_rt_sigaction,
+        SYS_rt_sigprocmask,
+        SYS_rt_sigpending,
+        SYS_rt_sigtimedwait,
+        SYS_rt_sigreturn,
+        SYS_sigaltstack,
+        SYS_rt_sigsuspend,
+        SYS_kill,
+        SYS_tgkill,
+        SYS_tkill,
     ] {
         add_nr!(s, nr);
     }
 
     // --- sockets / IPC (present on both) ---
     for &nr in &[
-        SYS_socket, SYS_socketpair, SYS_connect, SYS_bind, SYS_listen,
-        SYS_accept4, SYS_getsockname, SYS_getpeername,
-        SYS_sendto, SYS_recvfrom, SYS_sendmsg, SYS_recvmsg,
-        SYS_shutdown, SYS_setsockopt, SYS_getsockopt,
+        SYS_socket,
+        SYS_socketpair,
+        SYS_connect,
+        SYS_bind,
+        SYS_listen,
+        SYS_accept4,
+        SYS_getsockname,
+        SYS_getpeername,
+        SYS_sendto,
+        SYS_recvfrom,
+        SYS_sendmsg,
+        SYS_recvmsg,
+        SYS_shutdown,
+        SYS_setsockopt,
+        SYS_getsockopt,
         SYS_pipe2,
-        SYS_pselect6, SYS_ppoll,
-        SYS_epoll_create1, SYS_epoll_ctl,
-        SYS_eventfd2, SYS_timerfd_create, SYS_timerfd_settime,
-        SYS_inotify_init1, SYS_inotify_add_watch, SYS_inotify_rm_watch,
+        SYS_pselect6,
+        SYS_ppoll,
+        SYS_epoll_create1,
+        SYS_epoll_ctl,
+        SYS_eventfd2,
+        SYS_timerfd_create,
+        SYS_timerfd_settime,
+        SYS_inotify_init1,
+        SYS_inotify_add_watch,
+        SYS_inotify_rm_watch,
     ] {
         add_nr!(s, nr);
     }
@@ -283,18 +348,37 @@ fn allowed_syscalls() -> HashSet<i32> {
 
     // --- process / thread ---
     for &nr in &[
-        SYS_clone, SYS_execve, SYS_execveat,
-        SYS_exit, SYS_exit_group,
-        SYS_wait4, SYS_waitid,
-        SYS_set_tid_address, SYS_setpgid, SYS_setsid,
-        SYS_getpgid, SYS_getpid, SYS_getppid,
-        SYS_gettid, SYS_getuid, SYS_geteuid, SYS_getgid, SYS_getegid,
-        SYS_getresuid, SYS_getresgid,
-        SYS_prctl,  // NOT filtered — guest can set its own name, etc.
-        SYS_uname, SYS_sethostname, SYS_setdomainname,
-        SYS_getrlimit, SYS_setrlimit, SYS_prlimit64,
+        SYS_clone,
+        SYS_execve,
+        SYS_execveat,
+        SYS_exit,
+        SYS_exit_group,
+        SYS_wait4,
+        SYS_waitid,
+        SYS_set_tid_address,
+        SYS_setpgid,
+        SYS_setsid,
+        SYS_getpgid,
+        SYS_getpid,
+        SYS_getppid,
+        SYS_gettid,
+        SYS_getuid,
+        SYS_geteuid,
+        SYS_getgid,
+        SYS_getegid,
+        SYS_getresuid,
+        SYS_getresgid,
+        SYS_prctl, // NOT filtered — guest can set its own name, etc.
+        SYS_uname,
+        SYS_sethostname,
+        SYS_setdomainname,
+        SYS_getrlimit,
+        SYS_setrlimit,
+        SYS_prlimit64,
         SYS_getrandom,
-        SYS_clock_gettime, SYS_clock_getres, SYS_clock_settime,
+        SYS_clock_gettime,
+        SYS_clock_getres,
+        SYS_clock_settime,
         SYS_gettimeofday,
         SYS_nanosleep,
     ] {
@@ -313,8 +397,14 @@ fn allowed_syscalls() -> HashSet<i32> {
 
     // setuid / setgid — present on x86_64, removed on aarch64.
     #[cfg(target_arch = "x86_64")]
-    for &nr in &[SYS_setuid, SYS_setgid, SYS_setreuid, SYS_setregid,
-                 SYS_settimeofday, SYS_getpgrp] {
+    for &nr in &[
+        SYS_setuid,
+        SYS_setgid,
+        SYS_setreuid,
+        SYS_setregid,
+        SYS_settimeofday,
+        SYS_getpgrp,
+    ] {
         add_nr!(s, nr);
     }
 
@@ -325,12 +415,23 @@ fn allowed_syscalls() -> HashSet<i32> {
     for &nr in &[
         SYS_getdents64,
         SYS_fallocate,
-        SYS_flock, SYS_sync, SYS_fsync, SYS_fdatasync,
-        SYS_renameat, SYS_renameat2, SYS_linkat, SYS_symlinkat,
-        SYS_unlinkat, SYS_mkdirat,
-        SYS_fchmod, SYS_fchmodat, SYS_fchown, SYS_fchownat,
+        SYS_flock,
+        SYS_sync,
+        SYS_fsync,
+        SYS_fdatasync,
+        SYS_renameat,
+        SYS_renameat2,
+        SYS_linkat,
+        SYS_symlinkat,
+        SYS_unlinkat,
+        SYS_mkdirat,
+        SYS_fchmod,
+        SYS_fchmodat,
+        SYS_fchown,
+        SYS_fchownat,
         SYS_umask,
-        SYS_chdir, SYS_fchdir,
+        SYS_chdir,
+        SYS_fchdir,
     ] {
         add_nr!(s, nr);
     }
@@ -436,7 +537,7 @@ fn killed_syscalls() -> HashSet<i32> {
 pub fn build_filter() -> Vec<SockFilter> {
     let allowed = allowed_syscalls();
     let trapped = trapped_syscalls();
-    let killed  = killed_syscalls();
+    let killed = killed_syscalls();
 
     let mut prog: Vec<SockFilter> = Vec::new();
 
@@ -451,18 +552,22 @@ pub fn build_filter() -> Vec<SockFilter> {
     prog.push(bpf_ld_abs(OFF_NR));
 
     // (4) Allowed syscalls: jeq + ret ALLOW.
-    let mut sorted_allowed: Vec<i32> = allowed.iter().copied()
+    let mut sorted_allowed: Vec<i32> = allowed
+        .iter()
+        .copied()
         .filter(|nr| !trapped.contains(nr) && !killed.contains(nr))
         .collect();
     sorted_allowed.sort_unstable();
     sorted_allowed.dedup();
     for nr in sorted_allowed {
-        prog.push(bpf_jeq(nr as u32, 0, 1));  // match: fall to next; else skip 1
+        prog.push(bpf_jeq(nr as u32, 0, 1)); // match: fall to next; else skip 1
         prog.push(bpf_ret(SECCOMP_RET_ALLOW));
     }
 
     // (5) Trapped syscalls: jeq + ret TRAP.
-    let mut sorted_trapped: Vec<i32> = trapped.iter().copied()
+    let mut sorted_trapped: Vec<i32> = trapped
+        .iter()
+        .copied()
         .filter(|nr| !killed.contains(nr))
         .collect();
     sorted_trapped.sort_unstable();
@@ -492,7 +597,10 @@ pub fn build_filter() -> Vec<SockFilter> {
     let jf_offset = (kill_idx - arch_jeq_idx - 1) as u8;
     prog[arch_jeq_idx].jf = jf_offset;
 
-    info!("[KR64][seccomp] BPF filter built: {} instructions", prog.len());
+    info!(
+        "[KR64][seccomp] BPF filter built: {} instructions",
+        prog.len()
+    );
     prog
 }
 
@@ -569,11 +677,11 @@ pub fn install() -> std::io::Result<()> {
     //    `seccomp(2)` on every target.
     #[repr(C)]
     struct Fprog {
-        len:    u16,
+        len: u16,
         filter: *const SockFilter,
     }
     let fprog = Fprog {
-        len:    prog.len() as u16,
+        len: prog.len() as u16,
         filter: prog.as_ptr(),
     };
 
@@ -583,7 +691,7 @@ pub fn install() -> std::io::Result<()> {
         libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER as c_int,
-            SECCOMP_FILTER_FLAG_TSYNC as u32,
+            SECCOMP_FILTER_FLAG_TSYNC,
             &fprog as *const Fprog,
         )
     };
@@ -593,7 +701,10 @@ pub fn install() -> std::io::Result<()> {
         return Err(e);
     }
 
-    info!("[KR64][seccomp] seccomp filter installed ({} insns, TSYNC)", prog.len());
+    info!(
+        "[KR64][seccomp] seccomp filter installed ({} insns, TSYNC)",
+        prog.len()
+    );
     Ok(())
 }
 
@@ -619,8 +730,10 @@ fn install_sigsys_handler() -> std::io::Result<()> {
         error!("[KR64][seccomp] sigaction(SIGSYS) failed: {}", e);
         return Err(e);
     }
-    info!("[KR64][seccomp] SIGSYS handler installed at {:p}",
-          sigsys_handler as *const c_void);
+    info!(
+        "[KR64][seccomp] SIGSYS handler installed at {:p}",
+        sigsys_handler as *const c_void
+    );
     Ok(())
 }
 
@@ -641,21 +754,21 @@ fn install_sigsys_handler() -> std::io::Result<()> {
 /// collapses but is harmless).
 #[repr(C)]
 struct SigsysSiginfo {
-    si_signo:     i32,
+    si_signo: i32,
     /// For seccomp traps this holds the seccomp return value
     /// (e.g. `SECCOMP_RET_TRAP`).
-    si_errno:     i32,
+    si_errno: i32,
     /// `SYS_SECCOMP` (= 1).
-    si_code:      i32,
+    si_code: i32,
     /// Alignment padding so `si_call_addr` is 8-byte aligned.
-    _pad:         i32,
+    _pad: i32,
     /// Address of the syscall instruction that was trapped.
     si_call_addr: *mut c_void,
     /// The trapped syscall number (what we care about).
-    si_syscall:   i32,
+    si_syscall: i32,
     /// The audit architecture of the trapped syscall
     /// (e.g. `AUDIT_ARCH_AARCH64`).
-    si_arch:      u32,
+    si_arch: u32,
 }
 
 /// SIGSYS handler — called by the kernel when a `SECCOMP_RET_TRAP` is
@@ -666,10 +779,10 @@ struct SigsysSiginfo {
 ///   2. Looks the syscall up in the trapped/killed sets.
 ///   3. If killed: log and call `_exit(1)` (no return).
 ///   4. If trapped: emulate the syscall by:
-///        a. Setting the return value register to 0 (success) — or
-///           `-ENOSYS` if we don't have a real emulation yet.
-///        b. Advancing the program counter past the syscall instruction
-///           so the kernel doesn't retry it.
+///      a. Setting the return value register to 0 (success) — or
+///      `-ENOSYS` if we don't have a real emulation yet.
+///      b. Advancing the program counter past the syscall instruction
+///      so the kernel doesn't retry it.
 ///   5. Returns; the kernel restores the (modified) context and
 ///      continues execution at the new PC.
 ///
@@ -710,7 +823,8 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, ctx: *mut c_void
             // Emulate: set return value, advance PC past syscall instr.
             warning!(
                 "[KR64][seccomp] BLOCKED.SYSCALL.FAILED: trapped syscall {} → emulated (retval={})",
-                syscall_nr, retval
+                syscall_nr,
+                retval
             );
             set_return_value(uc, retval);
             advance_pc(uc);
@@ -763,7 +877,9 @@ fn classify(syscall_nr: i32) -> Action {
         // emulated as success (retval = 0) — the production
         // version will dispatch to per-syscall handlers in
         // mount_mgr / netlink / etc.
-        return Action::Emulate { retval: emulate_syscall(syscall_nr) };
+        return Action::Emulate {
+            retval: emulate_syscall(syscall_nr),
+        };
     }
     Action::Passthrough
 }
@@ -841,25 +957,25 @@ mod tests {
     #[test]
     fn allowed_set_contains_read_write() {
         let allowed = allowed_syscalls();
-        assert!(allowed.contains(&(libc::SYS_read  as i32)));
+        assert!(allowed.contains(&(libc::SYS_read as i32)));
         assert!(allowed.contains(&(libc::SYS_write as i32)));
         assert!(allowed.contains(&(libc::SYS_openat as i32)));
         assert!(allowed.contains(&(libc::SYS_close as i32)));
-        assert!(allowed.contains(&(libc::SYS_mmap  as i32)));
+        assert!(allowed.contains(&(libc::SYS_mmap as i32)));
         assert!(allowed.contains(&(libc::SYS_ioctl as i32)));
     }
 
     #[test]
     fn trapped_set_contains_mount_umount() {
         let trapped = trapped_syscalls();
-        assert!(trapped.contains(&(libc::SYS_mount   as i32)));
+        assert!(trapped.contains(&(libc::SYS_mount as i32)));
         assert!(trapped.contains(&(libc::SYS_umount2 as i32)));
     }
 
     #[test]
     fn killed_set_contains_ptrace_kexec() {
         let killed = killed_syscalls();
-        assert!(killed.contains(&(libc::SYS_ptrace     as i32)));
+        assert!(killed.contains(&(libc::SYS_ptrace as i32)));
         assert!(killed.contains(&(libc::SYS_kexec_load as i32)));
     }
 
