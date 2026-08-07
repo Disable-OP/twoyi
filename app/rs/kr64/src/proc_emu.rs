@@ -99,7 +99,10 @@ pub fn populate_proc(rootfs: &str, cpu_count: u32, mem_mb: u64) -> std::io::Resu
         // Non-fatal: a missing ro.vm.* prop file doesn't block boot —
         // guest apps that read these just see "undefined" and fall back
         // to defaults. Log so the operator knows why the props are absent.
-        info!("[KR64][proc_emu] warning: failed to write ro.vm.* props: {}", e);
+        info!(
+            "[KR64][proc_emu] warning: failed to write ro.vm.* props: {}",
+            e
+        );
     }
 
     // Now that all files are in place, mark /proc read-only (matching

@@ -453,14 +453,20 @@ pub fn create_magisk_marker(rootfs: &str) -> std::io::Result<()> {
     let dev_magisk = format!("{}/dev/.magisk", rootfs);
     ensure_parent_dir(&dev_magisk)?;
     fs::write(&dev_magisk, "26100\n")?;
-    info!("[KR64][devices] wrote Magisk presence marker: {}", dev_magisk);
+    info!(
+        "[KR64][devices] wrote Magisk presence marker: {}",
+        dev_magisk
+    );
 
     // /dev/.magisk_unmount — empty marker (existence == "unmount mode on").
     // We create it empty so MagiskHide-style apps see the flag is set
     // without twoyi actually performing any unmount.
     let dev_unmount = format!("{}/dev/.magisk_unmount", rootfs);
     fs::write(&dev_unmount, "")?;
-    info!("[KR64][devices] wrote Magisk unmount marker: {}", dev_unmount);
+    info!(
+        "[KR64][devices] wrote Magisk unmount marker: {}",
+        dev_unmount
+    );
 
     // /dev/.magisk.block — used by the Magisk daemon to coordinate boot.
     // Empty file; the guest's magiskd (if present) overwrites it.
@@ -489,7 +495,10 @@ pub fn create_magisk_marker(rootfs: &str) -> std::io::Result<()> {
         let _ = fs::set_permissions(&dev_block, fs::Permissions::from_mode(0o644));
     }
 
-    info!("[KR64][devices] Magisk marker tree materialised under {}/dev/.magisk*", rootfs);
+    info!(
+        "[KR64][devices] Magisk marker tree materialised under {}/dev/.magisk*",
+        rootfs
+    );
     Ok(())
 }
 
@@ -601,7 +610,10 @@ mod tests {
         assert!(Path::new(&format!("{}/sbin/.magisk/config", rootfs)).exists());
         // The presence marker should contain a version code.
         let v = fs::read_to_string(format!("{}/dev/.magisk", rootfs)).unwrap();
-        assert!(v.trim().parse::<u32>().is_ok(), "magisk marker should be numeric");
+        assert!(
+            v.trim().parse::<u32>().is_ok(),
+            "magisk marker should be numeric"
+        );
         let _ = fs::remove_dir_all(&rootfs);
     }
 

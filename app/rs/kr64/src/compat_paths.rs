@@ -244,7 +244,11 @@ mod tests {
         assert!(Path::new(&format!("{}/system/etc/gameopt", rootfs)).is_dir());
 
         // Files
-        assert!(Path::new(&format!("{}/system/etc/game_driver/game_driver.json", rootfs)).exists());
+        assert!(Path::new(&format!(
+            "{}/system/etc/game_driver/game_driver.json",
+            rootfs
+        ))
+        .exists());
         assert!(Path::new(&format!("{}/system/lib64/libGameDriver.sys.so", rootfs)).exists());
         assert!(Path::new(&format!("{}/system/lib64/libGameSDK.sys.so", rootfs)).exists());
         assert!(Path::new(&format!("{}/vendor/lib64/egl/libGLESGameDriver.so", rootfs)).exists());
@@ -258,9 +262,11 @@ mod tests {
     fn game_driver_json_is_valid_json() {
         let rootfs = tmpdir();
         create_samsung_gamesdk_compat_paths(&rootfs).unwrap();
-        let content =
-            fs::read_to_string(format!("{}/system/etc/game_driver/game_driver.json", rootfs))
-                .unwrap();
+        let content = fs::read_to_string(format!(
+            "{}/system/etc/game_driver/game_driver.json",
+            rootfs
+        ))
+        .unwrap();
         // Minimal JSON sanity: starts with {, ends with }, and has the
         // expected keys. (We don't pull in serde just for this test.)
         assert!(content.trim_start().starts_with('{'));
