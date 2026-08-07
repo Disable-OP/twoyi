@@ -886,16 +886,42 @@ fn classify(syscall_nr: i32) -> Action {
 
 /// Per-syscall emulation — return a fake return value.
 ///
-/// For the MVP, every trapped syscall returns 0 (success). The
-/// production version will:
-///   - `mount`   → call `mount_mgr::handle_mount(args…)`, return its result
-///   - `umount2` → call `mount_mgr::handle_umount(args…)`, return its result
-///   - `swapon`  → return 0 (no-op)
-///   - `swapoff` → return 0 (no-op)
-///   - `acct`    → return 0 (no-op)
-///   - `reboot`  → return -EPERM (we don't reboot the host!)
-fn emulate_syscall(_syscall_nr: i32) -> i64 {
-    // TODO: dispatch to per-syscall handlers (mount_mgr, etc.).
+/// The dispatch below implements the documented intent of the original
+/// `TODO: dispatch to per-syscall handlers` block. The cases that don't
+/// need to inspect the syscall arguments (which would require reading
+/// the saved register context — arch-specific and unsafe in the
+/// SIGSYS handler) are implemented now:
+///   - `swapon` / `swapoff` / `acct` → return 0 (no-op success — the
+///     guest believes the operation worked, but the host is untouched).
+///   - `reboot` → return `-EPERM` so the guest's `init/shutdown` code
+///     sees a clean "permission denied" instead of a fake success.
+///     Returning 0 here (the previous behaviour) made the guest think
+///     the reboot succeeded, after which it would proceed to stop
+///     services, sync, and finally call `reboot(RB_POWER_OFF)` again
+///     — a confusing no-op loop that polluted logs and could trip
+///     watchdogs. `-EPERM` matches what the kernel would return if
+///     the caller lacked `CAP_SYS_BOOT`, which is exactly the
+///     semantics we want inside the sandbox.
+///
+/// `mount` and `umount2` still return 0 — a real implementation needs
+/// to read `args[0..4]` out of the saved `ucontext_t`, decode the
+/// `char *` pointers in the guest's address space, and forward to
+/// `mount_mgr::handle_mount` / `handle_umount`. That work is deferred
+/// to the `MOUNT-2` task; for now the guest's `mount(2)` calls
+/// silently succeed without affecting the host mount table, which
+/// is the same effective behaviour as VM's skeleton.
+fn emulate_syscall(syscall_nr: i32) -> i64 {
+    // `libc::SYS_reboot` is a compile-time `c_long` constant that
+    // resolves to the correct syscall number per target (aarch64 = 142,
+    // x86_64 = 169), so the comparison is a single integer compare —
+    // no allocation, no locking, safe to call from the async-signal
+    // SIGSYS handler.
+    if syscall_nr == libc::SYS_reboot as i32 {
+        // EPERM = 1 on Linux; syscalls return -errno on failure.
+        return -(libc::EPERM as i64);
+    }
+    // swapon, swapoff, acct, mount, umount2 — fake success.
+    // See method doc for why each case is (intentionally) a no-op.
     0
 }
 
@@ -982,6 +1008,38 @@ mod tests {
     #[test]
     fn classify_mount_is_emulated() {
         let action = classify(libc::SYS_mount as i32);
+        match action {
+            Action::Emulate { retval } => assert_eq!(retval, 0),
+            other => panic!("expected Emulate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_reboot_returns_eperm() {
+        // reboot(2) is trapped (not killed) so the guest's `init`
+        // shutdown path can complete cleanly — but the emulated return
+        // value must be -EPERM, NOT 0, otherwise the guest thinks the
+        // host actually rebooted and starts its shutdown sequence
+        // (stopping services, syncing, then calling reboot() again in
+        // a loop). -EPERM matches the kernel's behaviour when the
+        // caller lacks CAP_SYS_BOOT.
+        let action = classify(libc::SYS_reboot as i32);
+        match action {
+            Action::Emulate { retval } => {
+                assert_eq!(retval, -(libc::EPERM as i64));
+            }
+            other => panic!("expected Emulate, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_swapon_returns_zero() {
+        // swapon(2) is trapped and emulated as a no-op success — the
+        // guest believes it added swap, but the host's swap is
+        // untouched. Other no-op-emulated syscalls (swapoff, acct,
+        // umount2) share the same retval; we only assert swapon here
+        // to keep the test suite focused.
+        let action = classify(libc::SYS_swapon as i32);
         match action {
             Action::Emulate { retval } => assert_eq!(retval, 0),
             other => panic!("expected Emulate, got {:?}", other),
