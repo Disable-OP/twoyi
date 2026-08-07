@@ -3,7 +3,7 @@
 // AI-generated content is not subject to copyright protection and is provided
 // without any warranty, express or implied, including warranties of
 // merchantability, fitness for a particular purpose, or non-infringement.
-// Use of your own risk.
+// Use at your own risk.
 
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -41,8 +41,8 @@
 //!  | `capacity`     | ASCII `0`..`100`               | `jni_get_battery_level`|
 //!  | `status`       | `Charging`/`Discharging`/...   | `jni_get_battery_status`|
 //!  | `charging`     | `0` or `1`                     | derived from status     |
-//!  | `voltage`      | ASCII mV (e.g. `4200`)         | `jni_get_battery_voltage`|
-//!  | `temperature`  | ASCII 1/10 °C (e.g. `280`)     | `jni_get_battery_temperature`|
+//!  | `voltage_now`  | ASCII uV (e.g. `4200000`)      | `jni_get_battery_voltage` (mV → uV) |
+//!  | `temp`         | ASCII 1/10 °C (e.g. `280`)     | `jni_get_battery_temperature`|
 //!  | `technology`   | `Li-ion` (constant for now)    | hard-coded              |
 //!  | `health`       | `Good`/`Dead`/`Overheat`/...   | hard-coded              |
 //!

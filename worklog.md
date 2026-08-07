@@ -4766,3 +4766,82 @@ review of `write_proc_self`:
 | Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
 | Rust clippy (`loader`)            | **0 warnings, 0 errors**                                 |
 | Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |
+
+## Round 67 — battery.rs header typo + sysfs filename doc fix (this commit)
+
+Code review of `kr64/src/battery.rs` (the file-based battery HAL)
+surfaced two documentation defects that were inconsistent with the
+actual on-disk behaviour — both in the module-level rustdoc, not in
+the runtime path, so neither affected the running system. Still,
+anyone wiring up the Java-side `BatteryService` against the doc would
+have written code that opens the wrong filenames, so they were worth
+fixing:
+
+* **Header license typo — `// Use of your own risk.` → `// Use at your
+  own risk.`** Every other file in the kr64 crate (and the parent
+  twoyi / loader crates, and the .toml / .c / .sh siblings) carries
+  the standard `// Use at your own risk.` footer under the
+  copyright-disclaimer block. `battery.rs` was the lone file with the
+  typo `Use of your own risk.` — clearly a transcription slip when the
+  file was first created. Trivial, but it stood out when grepping for
+  the disclaimer boilerplate, and it made `battery.rs` look like it
+  had diverged from the project's standard header template (which is
+  exactly the kind of thing a contributor will "fix" by overwriting
+  the whole header). Restored the canonical wording so all 20 source
+  files agree verbatim.
+
+* **Sysfs filename doc table mismatch — `voltage` → `voltage_now`,
+  `temperature` → `temp`.** The "Files we materialise" doc table at
+  the top of `battery.rs` listed the seven sysfs files as
+  `capacity / status / charging / voltage / temperature / technology /
+  health`. The actual filenames the code writes (verified against the
+  Linux `power_supply` ABI and against `BatteryDevice::update_*` /
+  `refresh_dir` / the on-disk assertions in
+  `new_creates_dir_and_all_seven_files` and
+  `new_writes_default_values_with_trailing_newline`) are
+  `capacity / status / charging / voltage_now / temp / technology /
+  health`. So two of the seven rows in the doc table were wrong:
+
+  * **`voltage` → `voltage_now`** — the Linux `power_supply` ABI
+    (Documentation/ABI/testing/sysfs-class-power) documents the
+    voltage attribute as `voltage_now`, NOT `voltage`. The runtime
+    code has always used the correct name (`write_file("voltage_now",
+    ...)` in `BatteryDevice::update_voltage` and `refresh_dir`, with
+    the mV→uV conversion documented at the call site). Only the doc
+    table was wrong. Also fixed the unit description: the doc said
+    "ASCII mV (e.g. `4200`)" but the file is actually written in
+    microvolts (e.g. `4200000`), since the Linux ABI expects uV and
+    `update_voltage` multiplies mV by 1 000 before writing — the
+    doc said mV, the code wrote uV, and the test
+    `voltage_now_is_written_in_microvolts` asserted uV. Now the doc
+    matches all three.
+
+  * **`temperature` → `temp`** — same issue, opposite direction. The
+    Linux ABI uses the short name `temp` for the battery temperature
+    file (1/10 °C), NOT `temperature`. The code writes
+    `write_file("temp", ...)`, the test
+    `new_writes_default_values_with_trailing_newline` reads
+    `dev.file("temp")`, and the doc table said `temperature`. Fixed.
+
+  Both rows now also note the mV→uV conversion in the `Source`
+  column ("`jni_get_battery_voltage` (mV → uV)") so the doc explains
+  why the file's stored unit differs from the JNI up-call's unit.
+
+  No code changes (the runtime path was already correct), no test
+  changes (the tests already asserted the correct filenames —
+  `new_creates_dir_and_all_seven_files` enumerates the actual seven
+  names including `voltage_now` and `temp`, so the doc bug was
+  invisible from the test side). Pure doc fix.
+
+Suite is unchanged at **165/165 passing** (no new tests, no test
+changes — these are pure-comment fixes); clippy + fmt still clean on
+`kr64` and `loader`.
+
+### Round 67 — verification
+
+| Gate                              | Result                                                   |
+| --------------------------------- | -------------------------------------------------------- |
+| Rust unit tests (`kr64`)          | **165/165 pass** (unchanged from round 66)               |
+| Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
+| Rust clippy (`loader`)            | **0 warnings, 0 errors**                                 |
+| Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |
