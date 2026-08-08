@@ -434,6 +434,7 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
     };
 
     // chmod 0666 so the guest (which may run as a different uid in the chroot) can connect
+    use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&pipe_path, std::fs::Permissions::from_mode(0o666));
 
     let mut session_id: u64 = 0;
