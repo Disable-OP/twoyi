@@ -124,4 +124,26 @@
     <string name="no_rootfs_message">Please import a rootfs to continue</string>
     <string name="no_rootfs_select_rom">No ROM is installed. Please select a rootfs.tar file to import and start the system.</string>
     <string name="select_rom_file">Select ROM File</string>
+    <string name="error_generic">Error</string>
+    <string name="error_selecting_file">Error selecting file</string>
+    <string name="error_sharing_log">Error sharing log</string>
+    <string name="wechat_not_installed">WeChat is not installed.</string>
+    <string name="settings_invalid_number">Invalid number</string>
+    <string name="settings_width_range_error">Width must be between %1$d and %2$d</string>
+    <string name="settings_height_range_error">Height must be between %1$d and %2$d</string>
+    <string name="settings_dpi_range_error">DPI must be between %1$d and %2$d</string>
+    <string name="rom_imported_successfully">ROM imported successfully</string>
+    <string name="rom_import_failed">Failed to import ROM</string>
+    <string name="rom_import_error">Error importing ROM: %1$s</string>
+    <string name="profile_switch_failed">Failed to switch profile</string>
+    <string name="profile_renamed_to">Profile renamed to %1$s</string>
+    <string name="profile_rename_failed">Failed to rename profile</string>
+    <string name="profile_copied_to">Profile copied to %1$s</string>
+    <string name="profile_copy_failed">Failed to copy profile</string>
+    <string name="profile_copy_error">Error copying profile: %1$s</string>
+    <string name="profile_deleted">Profile %1$s deleted</string>
+    <string name="profile_delete_failed">Failed to delete profile</string>
+    <string name="profile_picker_error">Error picking profile</string>
+    <string name="profile_created">Profile %1$s created</string>
+    <string name="profile_create_failed">Failed to create profile</string>
 </resources>
