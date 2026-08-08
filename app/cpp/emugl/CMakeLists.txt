@@ -59,8 +59,12 @@ set(EMUGL_SOURCES
     # native subwindow (Android — ANativeWindow passthrough)
     NativeLinuxSubWindow.cpp
     # codec common (socket streams, GL state, shared groups)
+    # NOTE: UnixStream.cpp is the PATCHED version from OpenglCodecCommon/
+    # (not shared/OpenglCodecCommon/) — it builds the pipe path as
+    # $TWOYI_ROOTFS/opengles{,2,3} instead of /tmp/android-$USER/qemu-gles-$port.
+    # The shared/ version is the original AOSP code kept for reference.
     shared/OpenglCodecCommon/SocketStream.cpp
-    shared/OpenglCodecCommon/UnixStream.cpp
+    OpenglCodecCommon/UnixStream.cpp
     shared/OpenglCodecCommon/TcpStream.cpp
     shared/OpenglCodecCommon/glUtils.cpp
     shared/OpenglCodecCommon/GLClientState.cpp
