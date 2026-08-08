@@ -128,11 +128,18 @@ target_link_libraries(OpenglRender
 # Set output name to libOpenglRender.so
 set_target_properties(OpenglRender PROPERTIES OUTPUT_NAME "OpenglRender")
 
-# Hide all symbols by default — only the required FFI entry points
-# (marked with TWOYI_EXPORT or extern "C" __attribute__((visibility("default"))))
-# will be exported. This reduces the ABI surface and enables better
-# dead-code elimination via --gc-sections.
+# Export ALL symbols by default. The Rust crate libtwoyi.so links against
+# libOpenglRender.so via #[link(name = "OpenglRender")] and dlopen-resolves
+# the FFI entry points (startOpenGLRenderer, setNativeWindow, resetSubWindow,
+# removeSubWindow, destroyOpenGLSubwindow, repaintOpenGLDisplay) at load
+# time. If these symbols are hidden, System.loadLibrary("twoyi") fails with
+# "dlopen failed: cannot locate symbol removeSubWindow".
+#
+# The old CXX_VISIBILITY_PRESET=hidden setting was intended to reduce the
+# ABI surface, but it broke the Rust→C++ FFI linkage. Reverting to default
+# visibility (all extern "C" symbols exported) fixes the link and costs
+# only ~20 KB of extra symbol table.
 set_target_properties(OpenglRender PROPERTIES
-    CXX_VISIBILITY_PRESET hidden
-    VISIBILITY_INLINES_HIDDEN ON
+    CXX_VISIBILITY_PRESET default
+    VISIBILITY_INLINES_HIDDEN OFF
 )
