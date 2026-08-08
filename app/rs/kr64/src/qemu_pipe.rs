@@ -166,7 +166,7 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
 
     // Step 2: open the matching renderer socket under the same rootfs.
     let renderer_path = format!("{}/{}", rootfs, channel);
-    let renderer = UnixStream::connect(&renderer_path).map_err(|e| {
+    let mut renderer = UnixStream::connect(&renderer_path).map_err(|e| {
         error!(
             "[KR64][qemu_pipe] session {} connect to {} failed: {}",
             sid, renderer_path, e
@@ -185,17 +185,21 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
 
     // We need two clones of each stream: one for reading, one for writing.
     // UnixStream::try_clone() duplicates the fd.
-    let guest_for_write = guest.try_clone()?;
-    let renderer_for_read = renderer.try_clone()?;
+    let mut guest_for_write = guest.try_clone()?;
+    let mut renderer_for_read = renderer.try_clone()?;
 
+    // Clone both Arcs BEFORE the first move closure captures them.
+    // The first closure moves g2r_done; the second moves r2g_done.
+    // Each closure also needs a clone of the OTHER Arc to check when
+    // the opposite direction has closed.
     let r2g_done_for_g2r = r2g_done.clone();
+    let g2r_done_for_r2g = g2r_done.clone();
     let g2r_thread = std::thread::Builder::new()
         .name(format!("kr64-pipe-g2r-{}", sid))
         .spawn(move || {
             pump(&mut guest, &mut renderer, &g2r_done, &r2g_done_for_g2r);
         })?;
 
-    let g2r_done_for_r2g = g2r_done.clone();
     let r2g_thread = std::thread::Builder::new()
         .name(format!("kr64-pipe-r2g-{}", sid))
         .spawn(move || {
