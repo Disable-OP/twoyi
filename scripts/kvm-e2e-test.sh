@@ -344,6 +344,21 @@ echo "  → extract into $TWOYI_PROFILE"
          cp $TWOYI_PROFILE/system/bin/init $TWOYI_PROFILE/init; \
      fi" 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" || true
 
+# Fix permissions: the rootfs was extracted as root (via adb root), so
+# all files/dirs are owned by root. The twoyi app runs as u0_a167 and
+# can't create symlinks (ensureLibSymlink for libkr64.so, libOpenglRender.so)
+# or write to rootfs/system/lib64/. Chown the entire rootfs to the app's uid.
+# On Android, the app uid is determined at install time; we look it up
+# via `pm list packages -U io.twoyi` and extract the uid.
+APP_UID=$("$ADB_BIN" -s emulator-5554 shell "pm list packages -U io.twoyi" 2>/dev/null | sed 's/.*uid://' | tr -d '\r\n ')
+if [ -n "$APP_UID" ]; then
+    echo "  → chown rootfs to app uid $APP_UID"
+    "$ADB_BIN" -s emulator-5554 shell "chown -R $APP_UID:$APP_UID $TWOYI_PROFILE" 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" || true
+    "$ADB_BIN" -s emulator-5554 shell "chmod -R 0755 $TWOYI_PROFILE" 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" || true
+else
+    echo "  ⚠ could not determine app uid — skipping chown (ensureLibSymlink may fail)"
+fi
+
 # SELinux permissive for first-boot debugging (X86_64_BREAKTHROUGH.md §5)
 "$ADB_BIN" -s emulator-5554 shell setenforce 0 2>/dev/null || true
 
