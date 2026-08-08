@@ -94,6 +94,8 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/libOpenglRender
     ${CMAKE_CURRENT_SOURCE_DIR}/shared/OpenglOsUtils
     ${CMAKE_CURRENT_SOURCE_DIR}/shared/OpenglCodecCommon
+    ${CMAKE_CURRENT_SOURCE_DIR}/GLESv1_dec
+    ${CMAKE_CURRENT_SOURCE_DIR}/GLESv2_dec
     ${CMAKE_CURRENT_SOURCE_DIR}/generated/gl_dec
     ${CMAKE_CURRENT_SOURCE_DIR}/generated/gl2_dec
     ${CMAKE_CURRENT_SOURCE_DIR}/generated/renderControl_dec

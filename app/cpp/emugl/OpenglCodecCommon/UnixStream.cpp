@@ -10,7 +10,7 @@
  * The rest of the file is byte-for-byte identical to the AOSP original.
  */
 #include "UnixStream.h"
-#include "cutils/sockets.h>
+#include "cutils/sockets.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

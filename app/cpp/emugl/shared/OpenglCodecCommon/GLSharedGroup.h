@@ -30,10 +30,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "ErrorLog.h"
-#include "utils/KeyedVector.h>
-#include "utils/List.h>
-#include "utils/String8.h>
-#include "utils/threads.h>
+#include "utils/KeyedVector.h"
+#include "utils/List.h"
+#include "utils/String8.h"
+#include "utils/threads.h"
 #include "FixedBuffer.h"
 #include "SmartPtr.h"
 
