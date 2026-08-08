@@ -354,6 +354,7 @@ jobs:
             /tmp/ci-artifacts/logcat.txt
             /tmp/ci-artifacts/logcat-*.txt
             /tmp/ci-artifacts/twoyi-log.txt
+            /tmp/ci-artifacts/kr64-prelaunch.log
             /tmp/ci-artifacts/boot-verdict.txt
             /tmp/ci-artifacts/emulator-stdout.log
             /tmp/ci-artifacts/emulator-stderr.log
