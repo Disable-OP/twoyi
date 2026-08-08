@@ -205,14 +205,62 @@ jobs:
           echo "✓ SDK + emulator + system image installed"
 
       - name: Create x86_64 AVD with KVM + swiftshader GPU
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
         run: |
+          set -ex
           export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          echo "no" | avdmanager create avd \
+
+          # Make sure the AVD directory exists — avdmanager won't create
+          # ~/.android/avd/ itself in some SDK versions, which causes the
+          # subsequent config.ini append to fail with "No such file or
+          # directory".
+          mkdir -p ~/.android/avd
+
+          # Find the avdmanager binary. The cmdline-tools install step
+          # above puts it at cmdline-tools/latest/bin/avdmanager, but the
+          # pre-installed GitHub runner SDK might also have one at
+          # cmdline-tools/<version>/bin/avdmanager. Prefer the latest.
+          AVDMGR="$(command -v avdmanager 2>/dev/null || true)"
+          if [ -z "$AVDMGR" ] || [ ! -x "$AVDMGR" ]; then
+            # Walk cmdline-tools/* to find avdmanager
+            for d in "$ANDROID_HOME"/cmdline-tools/*/; do
+              if [ -x "${d}bin/avdmanager" ]; then
+                AVDMGR="${d}bin/avdmanager"
+                break
+              fi
+            done
+          fi
+          if [ -z "$AVDMGR" ] || [ ! -x "$AVDMGR" ]; then
+            echo "✗ avdmanager not found"
+            ls -la "$ANDROID_HOME/cmdline-tools/" 2>&1 || true
+            exit 1
+          fi
+          echo "avdmanager: $AVDMGR"
+
+          # Create the AVD. We use `printf "no\n"` to answer "no" to the
+          # "Do you wish to create a custom hardware profile?" prompt.
+          # We omit -d (device) because the pixel_5 device profile isn't
+          # always available; avdmanager will use a generic profile by
+          # default, which is fine for our headless testing.
+          printf "no\n" | "$AVDMGR" create avd \
               -n twoyi_test \
               -k "system-images;android-30;google_apis;x86_64" \
-              -d pixel_5 \
               --force
+
+          # Verify the AVD was actually created.
+          AVD_CONFIG=~/.android/avd/twoyi_test.avd/config.ini
+          if [ ! -f "$AVD_CONFIG" ]; then
+            echo "✗ AVD config.ini not found at $AVD_CONFIG"
+            echo "  avdmanager output above. Listing ~/.android/avd/:"
+            ls -laR ~/.android/avd/ 2>&1 || true
+            exit 1
+          fi
+          echo "✓ AVD created at $AVD_CONFIG"
+
           # AVD config tweaks:
           #  - hw.keyboard=yes      : allow `adb shell input text` to work
           #  - hw.gpu.enabled=yes   : enable GPU emulation (required for
@@ -224,7 +272,6 @@ jobs:
           #  - hw.ramSize=2048      : 2 GB is enough for Android 11
           #                          system-image boot + twoyi
           #  - disk.dataPartition.size=4096 : room for the rootfs extract
-          AVD_CONFIG=~/.android/avd/twoyi_test.avd/config.ini
           {
               echo "hw.keyboard=yes"
               echo "hw.gpu.enabled=yes"
