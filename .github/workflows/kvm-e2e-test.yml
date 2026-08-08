@@ -241,15 +241,20 @@ jobs:
           fi
           echo "avdmanager: $AVDMGR"
 
-          # Create the AVD. We use `printf "no\n"` to answer "no" to the
-          # "Do you wish to create a custom hardware profile?" prompt.
+          # Create the AVD. avdmanager prompts "Do you wish to create a
+          # custom hardware profile? [no]" — the default is 'no' (shown in
+          # brackets). Redirecting /dev/null to stdin sends EOF, which
+          # makes avdmanager accept the default and proceed. (Piping
+          # "no\n" doesn't always work — avdmanager's stdin reading is
+          # finicky in non-interactive mode.)
           # We omit -d (device) because the pixel_5 device profile isn't
           # always available; avdmanager will use a generic profile by
           # default, which is fine for our headless testing.
-          printf "no\n" | "$AVDMGR" create avd \
+          "$AVDMGR" create avd \
               -n twoyi_test \
               -k "system-images;android-30;google_apis;x86_64" \
-              --force
+              --force \
+              < /dev/null
 
           # Verify the AVD was actually created.
           AVD_CONFIG=~/.android/avd/twoyi_test.avd/config.ini
