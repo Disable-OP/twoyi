@@ -27,16 +27,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Build with RENDER_API_USE_THREAD so initOpenGLRenderer runs the
 # RenderServer in-process (no separate emulator_renderer process).
-# NOTE: WITH_GLES2 is intentionally NOT defined. When enabled, it
-# causes FrameBuffer::initialize to call getGLES2ExtensionString()
-# which dlopens libGLESv2.so and calls s_gl2.glGetString — but on the
-# Android emulator, the dlopened libGLESv2.so doesn't match the
-# emulator's EGL implementation, causing crashes or bad function
-# pointers. The renderer works fine with GLESv1 only (the guest's
-# GLESv2 commands are still decoded by gl2_dec.cpp — the WITH_GLES2
-# flag only controls the host-side GLESv2 dispatch table for the
-# FrameBuffer's own EGL context, not the guest command decoding).
-add_compile_definitions(RENDER_API_USE_THREAD)
+# Build with WITH_GLES2 so the GLESv2 dispatch tables and s_gl2
+# are visible. ColorBuffer.cpp and RenderThread.cpp reference s_gl2
+# unconditionally.
+add_compile_definitions(RENDER_API_USE_THREAD WITH_GLES2)
 
 # Source files — use the libOpenglRender/ subdir (which has bug fixes
 # over the top-level copies: RenderServer NULL-deref fix, ColorBuffer
