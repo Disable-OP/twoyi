@@ -129,7 +129,9 @@ echo "── Step 1/6: start emulator ──"
 # -read-only                     : the SDK system image is read-only; we
 #                                 extract rootfs to the data partition
 # -partition-size 4096           : 4 GB data partition (room for rootfs)
-# -ports 5554                    : telnet/console on 5554, adb on 5555
+# -ports 5554,5555               : console on 5554, adb on 5555
+#                                 (must specify BOTH ports, else emulator
+#                                  dies with "Failed to parse option: |5554|")
 "$EMULATOR_BIN" -avd "$AVD_NAME" \
     -no-window \
     -no-audio \
@@ -138,7 +140,7 @@ echo "── Step 1/6: start emulator ──"
     -gpu swiftshader_indirect \
     -partition-size 4096 \
     -read-only \
-    -ports 5554 \
+    -ports 5554,5555 \
     -qemu -enable-kvm \
     > "$ARTIFACT_DIR/emulator-stdout.log" \
     2> "$ARTIFACT_DIR/emulator-stderr.log" &
