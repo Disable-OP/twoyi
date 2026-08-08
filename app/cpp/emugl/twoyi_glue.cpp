@@ -44,6 +44,13 @@
 // must be at file scope OUTSIDE any extern "C" block.
 extern EGLDispatch s_egl;
 
+// s_renderThread is the global RenderServer pointer defined in
+// render_api.cpp. createOpenGLSubwindow() and destroyOpenGLSubwindow()
+// check this pointer — if it's NULL, they return false without doing
+// anything. We MUST set this global when we create the RenderServer,
+// otherwise all subwindow operations fail.
+extern RenderServer* s_renderThread;
+
 // ---------------------------------------------------------------------------
 // startOpenGLRenderer — called from core.rs::init_renderer.
 //
@@ -135,8 +142,8 @@ extern "C" int startOpenGLRenderer(void* win, int width, int height,
     LOGI("FrameBuffer::initialize: OK");
 
     LOGI("Calling RenderServer::create(port=0)");
-    RenderServer* renderServer = RenderServer::create(0);
-    if (!renderServer) {
+    s_renderThread = RenderServer::create(0);
+    if (!s_renderThread) {
         LOGE("RenderServer::create failed — Unix socket bind failed");
         LOGE("  Check: does %s/opengles path work?", rootfs_env ?: "/data/data/io.twoyi/rootfs");
         // Try to create the directory in case it doesn't exist
@@ -147,7 +154,7 @@ extern "C" int startOpenGLRenderer(void* win, int width, int height,
         return -1;
     }
     LOGI("RenderServer::create: OK");
-    renderServer->start();
+    s_renderThread->start();
     LOGI("RenderServer started — listening on $TWOYI_ROOTFS/opengles");
 
     // 4. createOpenGLSubwindow — bind the ANativeWindow so EGL can
