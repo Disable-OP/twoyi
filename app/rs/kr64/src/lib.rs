@@ -785,6 +785,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //   parent: accept loop on device sockets
 
     // ---------------------------------------------------------------
+    // Step 4.5: create a PID namespace so the guest init becomes PID 1.
+    //
+    // Android's init binary requires getpid() == 1 — if it's not PID 1,
+    // SecondStageMain exits with code 31 immediately. Without a PID
+    // namespace, our forked child would have some arbitrary PID and
+    // init would refuse to boot.
+    //
+    // unshare(CLONE_NEWPID) creates a new PID namespace. The calling
+    // process stays in the old namespace, but its next fork() produces
+    // a child that is PID 1 in the new namespace. That child can then
+    // exec init, and init's getpid() check passes.
+    //
+    // Requires CAP_SYS_ADMIN (or root). When kr64 is run via `su -c`
+    // (as core.rs does on rooted devices), we have root and this works.
+    // When running as a regular untrusted_app, unshare fails and we
+    // fall through — init will exit 31, but at least we get diagnostic
+    // output.
+    // ---------------------------------------------------------------
+    match unsafe { libc::unshare(libc::CLONE_NEWPID) } {
+        0 => info!("[KR64] unshare(CLONE_NEWPID) succeeded — child will be PID 1"),
+        _ => {
+            let e = std::io::Error::last_os_error();
+            warning!(
+                "[KR64] unshare(CLONE_NEWPID) failed: {} — init will not be PID 1 (will exit 31)",
+                e
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Step 5: fork + exec the guest.
     // ---------------------------------------------------------------
     info!("[KR64] forking guest process");
@@ -815,12 +845,21 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // execve), but the binder proxy's host_binder_fd is NOT CLOEXEC
         // and would leak into the guest, giving it direct access to the
         // host's /dev/binder. Close everything >= 3.
-        // Note: This must be done BEFORE any other operation to minimize
-        // the window for fd leakage.
-        // We use closefrom(3) on Bionic, or iterate /proc/self/fd.
-        unsafe {
-            // Try closefrom (available on Android/Bionic)
-            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+        //
+        // IMPORTANT (2026-08-09): We previously used close_range (syscall
+        // 436) here, but the Android zygote's seccomp filter blocks it
+        // (SIGSYS / SYS_SECCOMP kill). close_range was added in Linux 5.9
+        // and Android 11's seccomp policy doesn't whitelist it for
+        // untrusted_app. We now iterate fd numbers 3..1024 and close each
+        // one — close() (syscall 3) IS whitelisted. This is O(1024) but
+        // only runs once at guest startup.
+        //
+        // When kr64 runs as root (via `su -c`), the zygote's seccomp
+        // filter is not inherited, so close_range would work — but we
+        // keep the portable loop to avoid the seccomp trap on non-root
+        // runs and because the cost is negligible.
+        for fd in 3..1024i32 {
+            unsafe { libc::close(fd); }
         }
 
         let mount_cfg = mount_mgr::MountConfig {
