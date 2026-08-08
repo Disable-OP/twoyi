@@ -205,6 +205,30 @@ pub fn init_renderer(
         info!("[CORE] Log path: {}", log_path);
 
         // -----------------------------------------------------------------
+        // Create /dev/qemu_pipe socket + GL proxy BEFORE spawning init.
+        //
+        // The renderer's RenderServer is listening on $TWOYI_ROOTFS/opengles.
+        // The guest's SurfaceFlinger opens /dev/qemu_pipe and writes
+        // "pipe:opengles" to request a GL connection. We need a proxy
+        // that:
+        //   1. Listens on {rootfs}/dev/qemu_pipe
+        //   2. Reads the "pipe:opengles" handshake from the guest
+        //   3. Connects to {rootfs}/opengles (the renderer)
+        //   4. Pumps bytes bidirectionally
+        //
+        // Without this proxy, the guest can't send GL commands to the
+        // renderer and the screen stays black.
+        // -----------------------------------------------------------------
+        let rootfs_for_pipe = working_dir.clone();
+        std::thread::Builder::new()
+            .name("twoyi-qemu-pipe-setup".into())
+            .spawn(move || {
+                spawn_qemu_pipe_proxy(&rootfs_for_pipe);
+            })
+            .ok();
+        info!("[CORE] qemu_pipe proxy thread spawned");
+
+        // -----------------------------------------------------------------
         // Init spawn strategy (post-2026-08 fix):
         //
         // The naive `Command::new("./init")` approach fails because init's
@@ -369,4 +393,187 @@ pub fn remove_window(window: *mut c_void) {
     unsafe {
         renderer_bindings::removeSubWindow(window);
     }
+}
+
+// ---------------------------------------------------------------------------
+// qemu_pipe GL proxy — creates /dev/qemu_pipe in the guest rootfs and
+// forwards guest GL connections to the renderer's /opengles socket.
+// ---------------------------------------------------------------------------
+
+/// Create /dev/qemu_pipe and run a proxy that forwards guest connections
+/// to the renderer's RenderServer listening on {rootfs}/opengles.
+///
+/// The AOSP qemu_pipe protocol:
+///   1. Guest opens /dev/qemu_pipe
+///   2. Guest writes "pipe:opengles" (the channel name)
+///   3. Host reads the channel name, connects to {rootfs}/opengles
+///   4. Bytes flow bidirectionally (guest GL commands → renderer)
+fn spawn_qemu_pipe_proxy(rootfs: &str) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    let pipe_path = format!("{}/dev/qemu_pipe", rootfs);
+    let dev_dir = format!("{}/dev", rootfs);
+
+    // Ensure /dev exists
+    let _ = std::fs::create_dir_all(&dev_dir);
+
+    // Remove stale socket
+    let _ = std::fs::remove_file(&pipe_path);
+
+    // Bind the listener
+    let listener = match UnixListener::bind(&pipe_path) {
+        Ok(l) => {
+            info!("[CORE] qemu_pipe proxy listening at {}", pipe_path);
+            l
+        }
+        Err(e) => {
+            log::error!("[CORE] Failed to bind qemu_pipe at {}: {}", pipe_path, e);
+            return;
+        }
+    };
+
+    // chmod 0666 so the guest (which may run as a different uid in the chroot) can connect
+    let _ = std::fs::set_permissions(&pipe_path, std::fs::Permissions::from_mode(0o666));
+
+    let mut session_id: u64 = 0;
+    loop {
+        match listener.accept() {
+            Ok((mut guest, _addr)) => {
+                let sid = session_id;
+                session_id += 1;
+                info!("[CORE] qemu_pipe: guest connected (session={})", sid);
+
+                // Read the "pipe:<channel>" handshake
+                let channel = match read_channel_name(&mut guest) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::warn!("[CORE] qemu_pipe: session {} handshake failed: {}", sid, e);
+                        continue;
+                    }
+                };
+                info!("[CORE] qemu_pipe: session {} channel = {}", sid, channel);
+
+                if channel != "opengles" && channel != "opengles2" && channel != "opengles3" {
+                    log::warn!("[CORE] qemu_pipe: session {} unknown channel '{}'", sid, channel);
+                    continue;
+                }
+
+                // Connect to the renderer
+                let renderer_path = format!("{}/{}", rootfs, channel);
+                let renderer = match UnixStream::connect(&renderer_path) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::error!("[CORE] qemu_pipe: session {} connect to {} failed: {}", sid, renderer_path, e);
+                        continue;
+                    }
+                };
+                info!("[CORE] qemu_pipe: session {} connected to {}", sid, renderer_path);
+
+                // Spawn two pump threads
+                let mut guest_w = match guest.try_clone() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        log::error!("[CORE] qemu_pipe: session {} guest clone failed: {}", sid, e);
+                        continue;
+                    }
+                };
+                let mut renderer_r = match renderer.try_clone() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log::error!("[CORE] qemu_pipe: session {} renderer clone failed: {}", sid, e);
+                        continue;
+                    }
+                };
+
+                let mut guest_r = guest;
+                let mut renderer_w = renderer;
+
+                let sid_g2r = sid;
+                std::thread::Builder::new()
+                    .name(format!("pipe-g2r-{}", sid_g2r))
+                    .spawn(move || {
+                        let mut buf = [0u8; 16 * 1024];
+                        loop {
+                            match guest_r.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if renderer_w.write_all(&buf[..n]).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let _ = renderer_w.shutdown(std::net::Shutdown::Both);
+                    })
+                    .ok();
+
+                let sid_r2g = sid;
+                std::thread::Builder::new()
+                    .name(format!("pipe-r2g-{}", sid_r2g))
+                    .spawn(move || {
+                        let mut buf = [0u8; 16 * 1024];
+                        loop {
+                            match renderer_r.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if guest_w.write_all(&buf[..n]).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let _ = guest_w.shutdown(std::net::Shutdown::Both);
+                    })
+                    .ok();
+            }
+            Err(e) => {
+                log::warn!("[CORE] qemu_pipe: accept error: {}", e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// Read the "pipe:<channel>" handshake from the guest.
+fn read_channel_name(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 256];
+    let mut total = 0;
+    while total < buf.len() {
+        let n = stream.read(&mut buf[total..])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "guest closed before sending channel name",
+            ));
+        }
+        total += n;
+        if let Some(name) = parse_channel_name(&buf[..total]) {
+            return Ok(name.to_string());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "channel name too long",
+    ))
+}
+
+/// Parse the "pipe:<channel>" handshake — stops at NUL or non-printable.
+fn parse_channel_name(buf: &[u8]) -> Option<&str> {
+    let prefix = b"pipe:";
+    if !buf.starts_with(prefix) {
+        return None;
+    }
+    let name_bytes = &buf[prefix.len()..];
+    let end = name_bytes
+        .iter()
+        .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b))
+        .unwrap_or(name_bytes.len());
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&name_bytes[..end]).ok()
 }
