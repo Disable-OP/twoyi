@@ -229,58 +229,39 @@ pub fn init_renderer(
         info!("[CORE] qemu_pipe proxy thread spawned");
 
         // -----------------------------------------------------------------
-        // Init spawn strategy (post-2026-08 fix):
+        // Init spawn strategy (post-2026-08-09 fix):
         //
-        // The naive `Command::new("./init")` approach fails because init's
-        // INTERP segment is `/system/bin/bootstrap/linker64`, which resolves
-        // to the HOST linker. The host linker then loads init's NEEDED
-        // libraries (libc.so, libbase, ...) from the HOST /system/lib64/,
-        // producing a zombie init that can't do PID 1 operations.
+        // Android's init binary requires PID 1 status and a properly set up
+        // environment (property service, /dev/__properties__, seccomp, etc.)
+        // If we exec init directly, it exits with code 31 because it's not
+        // PID 1 and can't set up the property service.
         //
-        // The fix: exec the ROOTFS linker directly, with init as its
-        // argument. The rootfs linker is a static PIE (it is its own
-        // interpreter), so the kernel doesn't read init's INTERP at all.
-        // We pass --library-path so the linker resolves init's deps from
-        // the rootfs's /system/lib64/, not the host's.
+        // The fix: exec libkr64.so (the kr64 daemon) instead. The kr64
+        // daemon sets up the virtual /dev tree, creates /dev/__properties__,
+        // installs a seccomp filter, and then execs init in a child process
+        // where init believes it's PID 1. The kr64 daemon acts as a
+        // "kernel replacement" that provides the environment init expects.
         //
-        // This works WITHOUT SELinux permissive because:
-        //   - The rootfs linker file is in the app's data dir (app_data_file
-        //     context), which the app can execute.
-        //   - We never touch /system/bin/linker64 on the host.
-        //   - The kernel only needs exec permission on the linker binary.
+        // libkr64.so is a PIE cdylib — it can be exec'd directly because
+        // its ELF entry point is set to kr64_main via the -Wl,-e linker
+        // flag. The kernel loads it via the dynamic linker and jumps to
+        // kr64_main, which parses args and calls run().
         //
-        // If the rootfs linker is missing (e.g. older Android 8 rootfs),
-        // fall back to the loader64 (libloader.so) approach, which dlopens
-        // init — but this loads HOST libs and is expected to fail.
+        // If libkr64.so doesn't exist (e.g. not yet built), fall back to
+        // the rootfs linker + init approach (which will fail with exit 31
+        // but at least we'll see the error).
         // -----------------------------------------------------------------
         let init_path = format!("{}/init", working_dir);
 
-        // Android 10+ uses /system/bin/bootstrap/linker64 (Treble split).
-        // Android 8/9 uses /system/bin/linker64.
-        let bootstrap_linker = format!("{}/system/bin/bootstrap/linker64", working_dir);
-        let legacy_linker = format!("{}/system/bin/linker64", working_dir);
+        // libkr64.so is in the app's nativeLibraryDir (symlinked into rootfs
+        // by RomManager.ensureLibSymlink). The loader_path passed from Java
+        // is the path to libloader.so in the same dir.
+        let kr64_path = loader_path.replace("libloader.so", "libkr64.so");
 
-        let linker_path = if Path::new(&bootstrap_linker).exists() {
-            info!("[CORE] Using rootfs bootstrap linker: {}", bootstrap_linker);
-            bootstrap_linker
-        } else if Path::new(&legacy_linker).exists() {
-            info!("[CORE] Using rootfs legacy linker: {}", legacy_linker);
-            legacy_linker
-        } else {
-            info!("[CORE] No rootfs linker found, falling back to loader64 (host libs — may fail)");
-            loader_path.clone()
-        };
-
-        // LD_LIBRARY_PATH: where the linker looks for init's NEEDED libs.
-        // We point it at the rootfs's lib64 dirs so init gets ROOTFS libs.
         let ld_library_path = format!(
             "{root}/system/lib64:{root}/system/lib64/bootstrap:{root}/system/lib64/vndk-sp-29:{root}/system/lib64/vndk-29:{root}/system/lib64/apex:{root}/system/lib",
             root = working_dir
         );
-
-        info!("[CORE] Init path: {}", init_path);
-        info!("[CORE] Linker: {}", linker_path);
-        info!("[CORE] LD_LIBRARY_PATH: {}", ld_library_path);
 
         // Create log file without panicking across JNI boundary
         let outputs = match File::create(&log_path) {
@@ -298,56 +279,43 @@ pub fn init_renderer(
             }
         };
 
-        // Build the command. If we're using the rootfs linker, invoke it as:
-        //   <linker> <init>
-        // The Android runtime linker (linker64) does NOT accept --library-path
-        // as a CLI flag (that's a GNU ld flag, not an Android linker flag).
-        // When the linker is exec'd directly, it treats the first arg as the
-        // program to load and remaining args as that program's argv.
-        // Library search paths are configured via LD_LIBRARY_PATH env var
-        // (set below), not via --library-path.
-        //
-        // Previous code passed "--library-path <libs>" which caused:
-        //   F/linker: error: expected absolute path: "--library-path"
-        // because the linker tried to load "--library-path" as a program.
-        let mut cmd = Command::new(&linker_path);
-        cmd.current_dir(&working_dir);
-
-        if linker_path == loader_path {
-            // loader64 fallback: just pass init as arg
-            cmd.arg(&init_path);
+        let mut cmd;
+        if Path::new(&kr64_path).exists() {
+            // Use the kr64 daemon — it sets up /dev, properties, seccomp,
+            // then execs init in a child where init thinks it's PID 1.
+            info!("[CORE] Using kr64 daemon: {}", kr64_path);
+            cmd = Command::new(&kr64_path);
+            cmd.current_dir(&working_dir);
+            cmd.arg("--rootfs").arg(&working_dir);
+            cmd.arg("--data-dir").arg(get_data_dir());
+            cmd.arg("--vmid").arg("0");
         } else {
-            // rootfs linker: just pass init as the program to load
+            // Fallback: exec rootfs linker + init directly.
+            // This will fail with exit 31 (init not PID 1) but at least
+            // we get diagnostic output.
+            info!("[CORE] libkr64.so not found, falling back to direct init (will fail with exit 31)");
+            let bootstrap_linker = format!("{}/system/bin/bootstrap/linker64", working_dir);
+            let legacy_linker = format!("{}/system/bin/linker64", working_dir);
+            let linker_path = if Path::new(&bootstrap_linker).exists() {
+                bootstrap_linker
+            } else {
+                legacy_linker
+            };
+            info!("[CORE] Using rootfs linker: {}", linker_path);
+            info!("[CORE] Init path: {}", init_path);
+            cmd = Command::new(&linker_path);
+            cmd.current_dir(&working_dir);
             cmd.arg(&init_path);
         }
 
         cmd.env("LD_LIBRARY_PATH", &ld_library_path);
-        // VM-inspired TYLD_PRELOAD trick (mirrors VM's VM_LD_PRELOAD → LD_PRELOAD
-        // remapping). The host Android linker ignores or strips LD_PRELOAD in
-        // certain sandboxed contexts (notably when the loader detects a
-        // non-system exec target), and on some SELinux policies the env var
-        // is filtered before the guest linker ever sees it.
-        //
-        // To get a preload library into the guest's init reliably, we use a
-        // *renamed* env var — TYLD_PRELOAD — which the host linker does NOT
-        // look at, so it passes through unmodified. The twoyi loader
-        // (TYLOADER = libloader.so) intercepts the exec, reads TYLD_PRELOAD,
-        // and re-exports it as LD_PRELOAD for the actual guest init binary.
-        // This is the exact pattern VM uses with VM_LD_PRELOAD → LD_PRELOAD.
-        //
-        // For now we set it to empty and explicitly clear any host-side
-        // LD_PRELOAD so no host preload leaks into the guest. When a guest
-        // preload library is needed (e.g. for shadowhook bootstrap), set
-        // TYLD_PRELOAD to the guest-visible path of that .so here.
         cmd.env_remove("LD_PRELOAD");
         cmd.env("TYLD_PRELOAD", "");
         cmd.env("TWOYI_ROOTFS", &working_dir);
         cmd.env("TYLOADER", &loader_path);
         cmd.env("ANDROID_BOOTLOGO", "1");
-        // Point ANDROID_ROOT/ANDROID_DATA at the rootfs, not the host filesystem
         cmd.env("ANDROID_ROOT", format!("{}/system", working_dir));
         cmd.env("ANDROID_DATA", format!("{}/data", working_dir));
-        // Remove these so init/zygote computes them from the rootfs config
         cmd.env_remove("BOOTCLASSPATH");
         cmd.env_remove("SYSTEMSERVERCLASSPATH");
         cmd.stdout(Stdio::from(outputs));
