@@ -133,4 +133,10 @@
     <string name="profile_picker_error">プロファイルの選択中にエラーが発生しました</string>
     <string name="profile_created">プロファイル %1$s を作成しました</string>
     <string name="profile_create_failed">プロファイルの作成に失敗しました</string>
+    <string name="profile_copy_hint">新しいプロファイル名</string>
+    <string name="profile_export_failed">プロファイルのエクスポートに失敗しました: %1$s</string>
+    <string name="profile_import_success">プロファイルのインポートに成功しました</string>
+    <string name="profile_import_failed">プロファイルのインポートに失敗しました: %1$s</string>
+    <string name="profile_from_scratch">新規作成</string>
+    <string name="profile_from_import">インポートから</string>
 </resources>

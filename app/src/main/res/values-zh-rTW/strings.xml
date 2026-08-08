@@ -133,4 +133,10 @@
     <string name="profile_picker_error">選擇設定檔出錯</string>
     <string name="profile_created">設定檔 %1$s 已建立</string>
     <string name="profile_create_failed">建立設定檔失敗</string>
+    <string name="profile_copy_hint">新設定檔名稱</string>
+    <string name="profile_export_failed">匯出設定檔失敗：%1$s</string>
+    <string name="profile_import_success">設定檔匯入成功</string>
+    <string name="profile_import_failed">匯入設定檔失敗：%1$s</string>
+    <string name="profile_from_scratch">從零開始</string>
+    <string name="profile_from_import">從匯入</string>
 </resources>

@@ -133,4 +133,10 @@
     <string name="profile_picker_error">选择配置文件出错</string>
     <string name="profile_created">配置文件 %1$s 已创建</string>
     <string name="profile_create_failed">创建配置文件失败</string>
+    <string name="profile_copy_hint">新配置文件名</string>
+    <string name="profile_export_failed">导出配置文件失败：%1$s</string>
+    <string name="profile_import_success">配置文件导入成功</string>
+    <string name="profile_import_failed">导入配置文件失败：%1$s</string>
+    <string name="profile_from_scratch">从零开始</string>
+    <string name="profile_from_import">从导入</string>
 </resources>
