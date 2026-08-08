@@ -370,7 +370,7 @@ echo "── Step 5/6: launch twoyi + capture ──"
 LOGCAT_PID=$!
 echo "  logcat capture started (PID $LOGCAT_PID → $ARTIFACT_DIR/logcat.txt)"
 
-echo "  → launching io.twoyi/.ui.SettingsActivity"
+echo "  → launching io.twoyi/.ui.SettingsActivity (to trigger rootfs detection)"
 "$ADB_BIN" -s emulator-5554 shell am start -n io.twoyi/.ui.SettingsActivity
 sleep 3
 
@@ -380,11 +380,33 @@ sleep 3
     > "$ARTIFACT_DIR/screenshot-00_settings.png"
 echo "  ✓ screenshot-00_settings.png"
 
-# Tap "Launch Container". Coordinates are heuristic; see note in
-# .devcontainer/scripts/test-twoyi.sh — adjust if the VLM analysis
-# of the settings screenshot says otherwise.
-echo "  → tap 'Launch Container' (heuristic coords 540, 700)"
-"$ADB_BIN" -s emulator-5554 shell input tap 540 700
+# Launch the container DIRECTLY via Render2Activity instead of tapping
+# the settings preference. Tapping at fixed coordinates is fragile
+# (different screen densities, layout changes). Render2Activity is the
+# activity that SettingsActivity's "Launch Container" preference starts,
+# so launching it directly is equivalent and 100% reliable.
+echo "  → launching io.twoyi/.Render2Activity (direct container launch)"
+"$ADB_BIN" -s emulator-5554 shell am start -n io.twoyi/.Render2Activity
+sleep 2
+
+# Verify Render2Activity is in the foreground. If it crashed back to
+# settings or the home screen, log it but continue (screenshots will
+# show what happened).
+CURRENT_FOCUS=$("$ADB_BIN" -s emulator-5554 shell dumpsys activity activities 2>/dev/null \
+    | grep -E 'mResumedActivity|topResumedActivity' | head -1 || true)
+echo "  current focus: $CURRENT_FOCUS"
+if echo "$CURRENT_FOCUS" | grep -q "Render2Activity"; then
+    echo "  ✓ Render2Activity is foreground"
+elif echo "$CURRENT_FOCUS" | grep -q "SettingsActivity"; then
+    echo "  ⚠ Render2Activity fell back to SettingsActivity (crash?)"
+    # Fallback: try the tap approach in case Render2Activity needs the
+    # preference click path to set up state first.
+    echo "  → fallback: tap 'Launch Container' (heuristic coords 540, 700)"
+    "$ADB_BIN" -s emulator-5554 shell input tap 540 700
+    sleep 2
+else
+    echo "  ⚠ unexpected focus — container may have crashed"
+fi
 
 # Screenshot sequence: 5s, 15s, 30s, 60s (or however long boot_wait is)
 # after the tap. We use a cumulative sleep so the intervals are

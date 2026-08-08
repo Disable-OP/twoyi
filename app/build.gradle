@@ -125,6 +125,17 @@ task loaderBuild {
     }
 }
 
+task kr64Build {
+    doLast {
+        exec {
+            def abis = project.hasProperty('abis') ? project.getProperty('abis').split(',') : ['all']
+            workingDir new File(project.projectDir, "rs/kr64")
+            commandLine "bash", "build.sh", *abis
+            ignoreExitValue = false
+        }
+    }
+}
+
 task cargoBuild {
     dependsOn 'cmakeBuild'
     doLast {
@@ -148,6 +159,7 @@ tasks.whenTaskAdded { task ->
     if ((task.name == 'javaPreCompileDebug' || task.name == 'javaPreCompileRelease')) {
         task.dependsOn 'cargoBuild'
         task.dependsOn 'loaderBuild'
+        task.dependsOn 'kr64Build'
     }
 }
 
