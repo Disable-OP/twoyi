@@ -58,11 +58,23 @@ jobs:
         # automatically. The explicit `toolchain`/`target` below is a
         # belt-and-braces fallback for forks that haven't pulled the
         # toolchain file yet.
+        #
+        # `cache: false` disables the Swatinem/rust-cache integration
+        # that setup-rust-toolchain@v1 calls by default. rust-cache
+        # runs `cargo metadata` from the repo root, which fails with
+        # exit code 101 ("could not find Cargo.toml") because this
+        # repo's Cargo workspace lives at app/rs/, not at the root.
+        # The failure is non-fatal (the Setup Rust step still
+        # succeeds) but prints a noisy stack trace in the log. The
+        # explicit Cache cargo registry step below uses actions/cache@v4
+        # with a path/key that covers app/rs/target and the cargo
+        # registry, so caching still works correctly without rust-cache.
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
           # Both Android targets — matches abiFilters in app/build.gradle
           target: aarch64-linux-android,x86_64-linux-android
+          cache: false
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -136,8 +148,13 @@ jobs:
         # we spend ~10 min packaging the APK. AGP's default `lint` task
         # analyzes every variant; default lintOptions (abortOnError=true)
         # turns error-severity issues into a non-zero exit code. Warnings do
-        # not fail the build — there are ~62 known warnings, all benign
-        # (SetTextI18n, DiscouragedPrivateApi for hidden-API reflection, etc.).
+        # not fail the build. All previously-known 62 lint warnings
+        # (SetTextI18n, DiscouragedPrivateApi, LockedOrientationActivity,
+        # PrivateResource, UnusedResources, IconLauncherShape, etc.) were
+        # resolved across rounds 23-52; the gate now treats any warning as
+        # build-breaking. MissingTranslation errors are also fatal —
+        # scripts/find_missing_translations.py can be run locally to catch
+        # those before pushing.
         # The task transitively depends on javaPreCompileRelease, which in
         # turn triggers the cargoBuild/cmakeBuild/loaderBuild tasks wired in
         # app/build.gradle — so this also serves as a native-compile smoke
