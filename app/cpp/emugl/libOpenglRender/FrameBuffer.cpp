@@ -163,7 +163,7 @@ bool FrameBuffer::initialize(int width, int height, OnPostFn onPost, void* onPos
         // libGLESv2_emulation.so via the EGL loader, not a directly
         // dlopenable libGLESv2.so). Calling getGLES2ExtensionString
         // with a NULL s_gl2.glGetString would crash.
-        extern bool s_gl2_enabled;
+        extern int s_gl2_enabled;
         extern GL2Dispatch s_gl2;
         if (!s_gl2_enabled || !s_gl2.glGetString) {
             ERR("GLES2 dispatch table not loaded — skipping GLES2 extension query\n");
