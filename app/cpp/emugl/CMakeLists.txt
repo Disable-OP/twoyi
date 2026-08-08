@@ -27,10 +27,16 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Build with RENDER_API_USE_THREAD so initOpenGLRenderer runs the
 # RenderServer in-process (no separate emulator_renderer process).
-# Build with WITH_GLES2 so the GLESv2 dispatch tables (init_gl2_dispatch,
-# gl2_dispatch_get_proc_func, s_gl2) are visible — they're guarded by
-# #ifdef WITH_GLES2 in GL2Dispatch.h and GL2Dispatch.cpp.
-add_compile_definitions(RENDER_API_USE_THREAD WITH_GLES2)
+# NOTE: WITH_GLES2 is intentionally NOT defined. When enabled, it
+# causes FrameBuffer::initialize to call getGLES2ExtensionString()
+# which dlopens libGLESv2.so and calls s_gl2.glGetString — but on the
+# Android emulator, the dlopened libGLESv2.so doesn't match the
+# emulator's EGL implementation, causing crashes or bad function
+# pointers. The renderer works fine with GLESv1 only (the guest's
+# GLESv2 commands are still decoded by gl2_dec.cpp — the WITH_GLES2
+# flag only controls the host-side GLESv2 dispatch table for the
+# FrameBuffer's own EGL context, not the guest command decoding).
+add_compile_definitions(RENDER_API_USE_THREAD)
 
 # Source files — use the libOpenglRender/ subdir (which has bug fixes
 # over the top-level copies: RenderServer NULL-deref fix, ColorBuffer
@@ -56,6 +62,7 @@ set(EMUGL_SOURCES
     libOpenglRender/EGLDispatch.cpp
     libOpenglRender/GLDispatch.cpp
     libOpenglRender/GL2Dispatch.cpp
+    libOpenglRender/GL2DispatchStub.cpp
     # native subwindow (Android — ANativeWindow passthrough)
     NativeLinuxSubWindow.cpp
     # codec common (socket streams, GL state, shared groups)
