@@ -465,6 +465,19 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "── Step 6/6: verdict ──"
 
+# Pull the twoyi log file (kr64's stderr/stdout is redirected here by
+# core.rs). This is CRITICAL for debugging — without it, we can't see
+# kr64's [KR64 INFO] / [KR64 ERROR] messages, only the tombstones.
+"$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
+sleep 1
+"$ADB_BIN" -s emulator-5554 wait-for-device
+"$ADB_BIN" -s emulator-5554 pull /data/data/io.twoyi/log.txt "$ARTIFACT_DIR/twoyi-log.txt" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/twoyi-log.txt" ]; then
+    echo "  ✓ pulled twoyi-log.txt ($(stat -c%s "$ARTIFACT_DIR/twoyi-log.txt") bytes)"
+else
+    echo "  ⚠ could not pull /data/data/io.twoyi/log.txt (file may not exist yet)"
+fi
+
 # Save a filtered logcat for quick scanning — the full logcat can be
 # 100k+ lines on a booted emulator.
 grep -E 'KR64 INFO|KR64 WARN|KR64 ERROR|CORE|NEW_RENDERER|CLIENT_EGL|SOCKET_MONITOR|BOOT_COMPLETED|TWOYI_RENDERER|emugl' \
