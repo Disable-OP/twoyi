@@ -110,14 +110,16 @@ add_library(OpenglRender SHARED ${EMUGL_SOURCES})
 # Link against system libraries:
 #   EGL    — eglGetDisplay, eglInitialize, eglCreateContext, ...
 #   GLESv2 — glClearColor, glClear, glTexImage2D, ...
-#   GLESv1 — OpenGL ES 1.1 commands (gl_dec.cpp references these)
 #   android — ANativeWindow type (referenced by EGL's eglplatform.h)
 #   log    — __android_log_print
-#   dl     — dlopen / dlsym (EGLDispatch dlopens libEGL.so)
+#   dl     — dlopen / dlsym (EGLDispatch/GLDispatch dlopen libEGL.so,
+#            libGLESv2.so, libGLESv1_CM.so at runtime — no link-time
+#            dependency on GLESv1 because the NDK doesn't ship a
+#            separate libGLESv1.so; the GLESv1 dispatch table is
+#            populated by dlopening libGLESv1_CM.so.)
 target_link_libraries(OpenglRender
     EGL
     GLESv2
-    GLESv1
     android
     log
     dl
