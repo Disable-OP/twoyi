@@ -90,6 +90,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/compat
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/libOpenglRender
     ${CMAKE_CURRENT_SOURCE_DIR}/libOpenglRender
     ${CMAKE_CURRENT_SOURCE_DIR}/shared/OpenglOsUtils
     ${CMAKE_CURRENT_SOURCE_DIR}/shared/OpenglCodecCommon

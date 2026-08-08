@@ -25,6 +25,7 @@
 // RenderThread + FrameBuffer + GL decoders) executes guest GL commands.
 
 #include "libOpenglRender/render_api.h"
+#include "FrameBuffer.h"
 
 #include <android/log.h>
 
