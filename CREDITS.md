@@ -25,7 +25,8 @@ died with the original repository.
 ### Current fork
 
 **[Disable-OP](https://github.com/Disable-OP)** — the fork where active
-improvements are being made (branch `improvements/initial-cleanup`). See the
+improvements are being made (branch `main` — the historical
+`improvements/initial-cleanup` branch has been merged in and deleted). See the
 [contributors graph](https://github.com/Disable-OP/twoyi/graphs/contributors)
 for the up-to-date human contributor list.
 

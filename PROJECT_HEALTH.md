@@ -1,29 +1,50 @@
 # Project Health — twoyi fork
 
 > **Task ID:** KEEP-WORKING-11 · **Author:** general-purpose sub-agent
-> **Date:** 2026-08-05 ~06:50 UTC
-> **Branch:** `improvements/initial-cleanup` (HEAD `ca33d02`, 37 commits past fork point)
+> **Date:** 2026-08-05 ~06:50 UTC · **Last refreshed:** 2026-08-08 (round 68)
+> **Branch:** `main` (the ONLY branch — `improvements/initial-cleanup` was
+> merged in and deleted from origin on 2026-08-08; HEAD on round 68 refresh
+> is `99c940e`, ~84 commits past the cyanmint fork point)
 > **Sources:** `VERIFICATION.md`, `CHANGELOG.md`, `DEVELOPMENT_ROADMAP.md`, `TWOYI_HONEST_STATUS.md`,
 > `CONTRIBUTOR_LADDER.md`, `.github/workflows/*.yml`, `app/rs/kr64/src/`.
 
 An honest assessment across five dimensions. The project is in **early-stage but
-well-disciplined** shape: code compiles, CI is green, docs are abundant, but the
-end-to-end product (a booting guest container) is not yet demonstrable.
+well-disciplined** shape: code compiles, **CI is now actually green** (round 68
+fixed 4 stacked bugs that had broken every CI run since round 60), docs are
+abundant, but the end-to-end product (a booting guest container) is not yet
+demonstrable.
+
+> **Round 68 update:** the previous version of this doc (and of `MEMORY.md`,
+> `README.md`, `FINAL_STATUS.md`, etc.) claimed "CI status: GREEN" from
+> rounds 60–67. That was **only true for the local cargo/gradle invocations**
+> — the actual GitHub Actions runs had been failing on every push since
+> round 60 due to 4 stacked bugs (`nttld/setup-ndk@v2` never existed,
+> 64 stale CMake artifacts in `app/cpp/build/`, 22 missing string
+> resources, 6 missing translations). All 4 are now fixed in commits
+> `f166b20`/`cd6d0d8`/`7fbf3ad`/`9e3a1fb`/`99c940e`; CI is verified
+> green on the latest commits on `main`.
 
 ## 1. Code health — 🟡 Mixed
 
-- **CI status: GREEN.** Both `build.yml` (assembleRelease for arm64-v8a + x86_64)
-  and `kr64-tests.yml` (`cargo test --no-fail-fast`) pass on HEAD `ca33d02`
-  (verified 06:18 UTC, see `VERIFICATION.md`).
+- **CI status: GREEN (verified in round 68).** Both `build.yml`
+  (assembleRelease for arm64-v8a + x86_64 + Android lint) and
+  `kr64-tests.yml` (165 `cargo` tests + `cargo fmt --check` +
+  `cargo clippy -- -D warnings`) pass on `main` HEAD `99c940e`.
+  ⚠️ **Caveat:** CI was actually **broken on every push from rounds 60
+  through 67** (8+ consecutive red runs). The previous versions of this
+  doc claimed "CI status: GREEN" from round 60 onward, but that claim
+  was only ever true for the local cargo/gradle invocations — CI never
+  got far enough to invoke any of them. The 4 stacked root causes were
+  fixed in round 68 (see `MEMORY.md` §Round 68). Both workflows are now
+  genuinely green on `main`.
 - **Test coverage: thin but real.** `kr64` has 9,581 LOC across 10 files with
-  144 `#[test]` functions; ~38 are host-runnable and pass. **No Java unit tests
+  165 `#[test]` functions; all pass on host and in CI. **No Java unit tests
   beyond the Gradle template `ExampleUnitTest`**, and **no instrumented tests
   beyond `ExampleInstrumentedTest`**. Coverage of the actual JNI surface
   (`libtwoyi.so` ↔ `Renderer.java`) is zero.
-- **Build quality: clean enough.** `kr64` compiles with zero warnings; the
-  main `libtwoyi.so` crate has 5 lingering Rust warnings (`unnecessary unsafe`
-  in `core.rs`, unused `-pie`). `clippy -D warnings` is enforced in
-  `CONTRIBUTING.md` but not yet in CI.
+- **Build quality: clean.** `kr64` compiles with zero warnings; `twoyi`
+  and `loader` are also clippy-clean. `clippy -D warnings` is enforced in
+  `CONTRIBUTING.md` and gated in `kr64-tests.yml`.
 - **Multi-ABI: works.** Both `arm64-v8a` and `x86_64` produce APKs; x86_64
   defaults to the new Rust renderer (defence-in-depth via
   `effective_renderer_type()`).
@@ -72,9 +93,11 @@ end-to-end product (a booting guest container) is not yet demonstrable.
 - **x86_64 rootfs not built.** Container cannot boot on x86_64 emulator
   (arch mismatch with arm64 rootfs); only real arm64 hardware can fully
   smoke-test today.
-- **Branch hygiene:** `main` is 47 commits ahead of `origin/main` and is *not*
-  the dev branch — all work lives on `improvements/initial-cleanup`. Should be
-  reconciled or deleted before any release tag.
+- **Branch hygiene:** ✅ RESOLVED in round 68. `main` IS the dev branch and
+  the only branch on origin — `improvements/initial-cleanup` was merged in
+  and deleted on 2026-08-08. (Previously: `main` was 47 commits ahead of
+  `origin/main` and was *not* the dev branch — all work lived on
+  `improvements/initial-cleanup`.) No reconciliation debt remains.
 - **Test keystore committed** (`app/twoyi-release.keystore`) — intentional for
   CI usability; production distributors MUST replace (documented inline in
   `app/build.gradle`).
@@ -85,7 +108,7 @@ end-to-end product (a booting guest container) is not yet demonstrable.
 |---|---|---|---|
 | Container never boots (kr64 stubs, no x86_64 rootfs) | **High today** | Critical | Roadmap Phase 3 (weeks 5–12) is the entire boot path; gated by GsiExtractor → kr64 spawn. |
 | Single maintainer disappears | Medium | Critical | `CONTRIBUTOR_LADDER.md` defines succession; needs a second Maintainer. |
-| Sub-agent-authored code has subtle bugs | Medium | High | CI green + 144 kr64 tests + honesty policy reduce but don't eliminate; needs human review pass. |
+| Sub-agent-authored code has subtle bugs | Medium | High | CI green (round 68) + 165 kr64 tests + honesty policy reduce but don't eliminate; needs human review pass. |
 | Test keystore leaks into production build | Low | High | Documented inline; add a Gradle `checkReleaseBuilds` gate (not present). |
 | Renderer regression on arm64 (only verified symbol exports, not boot) | Medium | High | Roadmap task 1.1: drop-in test on real arm64 device. |
 | Documentation rot (46+ `.md` files) | Medium | Medium | Roadmap §0 says roadmap is "living"; no automated doc-freshness check exists. |

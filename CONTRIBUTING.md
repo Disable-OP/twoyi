@@ -4,9 +4,10 @@ Thanks for your interest in improving Twoyi! This document covers everything
 you need to get a build going, write code that fits in, and land it upstream.
 
 > **Project status.** This is an **active fork** of the archived
-> `twoyi/twoyi` project, maintained on the `improvements/initial-cleanup`
-> branch of [`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi). Read
-> [`README.md`](README.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md) first if
+> `twoyi/twoyi` project, maintained on the `main` branch of
+> [`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi) (the historical
+> `improvements/initial-cleanup` branch has been merged in and deleted).
+> Read [`README.md`](README.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md) first if
 > you haven't already.
 
 ---
@@ -22,10 +23,10 @@ The standard GitHub flow:
    cd twoyi
    git remote add upstream https://github.com/Disable-OP/twoyi.git
    git fetch upstream
-   git checkout -b my-feature improvements/initial-cleanup
+   git checkout -b my-feature main
    ```
-3. **Branch** from `improvements/initial-cleanup` (the active development
-   branch). Use a descriptive branch name:
+3. **Branch** from `main` (the active development branch — the only branch
+   on origin). Use a descriptive branch name:
    - `feat/kr64-binder-proxy`
    - `fix/renderer-reset-window-race`
    - `docs/readme-arm64-build`
@@ -34,7 +35,7 @@ The standard GitHub flow:
    `build:`, `chore:`. Scope is encouraged, e.g. `feat(kr64): …`,
    `fix(renderer): …`, `ci(build): …`.
 5. **Push** to your fork and open a pull request against
-   `Disable-OP/twoyi:improvements/initial-cleanup`.
+   `Disable-OP/twoyi:main`.
 6. **Address review feedback** by pushing additional commits to the same
    branch (do **not** squash unless asked — reviewers want to see the
    iteration history).
@@ -55,7 +56,7 @@ one up, comment on the relevant issue (or open one) so we don't double up.
 The repo ships a full devcontainer (`.devcontainer/`). Create a codespace:
 
 1. Click the green **Code** button on the repo → **Codespaces** tab →
-   **Create codespace on improvements/initial-cleanup**.
+   **Create codespace on `main`**.
 2. Pick the **`standardLinux32gb`** machine (4 cores / 16 GB / 32 GB disk).
    You need this size for the Android SDK + NDK + Rust toolchain.
 3. The `postCreateCommand` (`.devcontainer/scripts/setup.sh`) installs:
@@ -242,7 +243,7 @@ working" unless you actually ran it.
 
 ### Before you open the PR
 
-- [ ] Branch is based on `improvements/initial-cleanup` (not `main`).
+- [ ] Branch is based on `main` (the only branch on origin).
 - [ ] `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
       are clean for any Rust crate you touched (CI enforces this on `kr64`).
 - [ ] `cargo test` passes in every crate you touched.

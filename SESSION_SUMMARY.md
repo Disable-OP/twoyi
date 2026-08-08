@@ -6,6 +6,14 @@
 > **Branch:** `improvements/initial-cleanup` (now at `2e7632d`, **29 commits since `main`**)
 > **Codespace:** `twoyi-dev-3-jr47xg6xvx7ghq6p` (EastUs, AMD EPYC 7763, KVM working)
 > **Tests:** 144 passing, 0 failing, 0 warnings
+>
+> **Update (round 68, 2026-08-08):** this is a historical session summary
+> preserved as-is. Since then, (1) `improvements/initial-cleanup` was merged
+> into `main` and deleted from origin — `main` is now the only branch; (2)
+> the test count has grown to 165 (was 144); (3) CI was broken from rounds
+> 60–67 due to 4 stacked bugs (NDK action, CMake cache, missing strings,
+> missing translations) — all 4 are now fixed and both workflows are
+> genuinely green on `main` HEAD `99c940e`. See `MEMORY.md` §Round 68.
 
 ---
 

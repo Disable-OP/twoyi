@@ -1,6 +1,14 @@
 # FINAL STATUS — 06:16 UTC, 2026-08-05
 
 > Read this first. Coffee's on you.
+>
+> **Update (round 68, 2026-08-08):** this document was written on
+> 2026-08-05 and is preserved as-is. Since then, (a) `improvements/initial-cleanup`
+> has been merged into `main` and deleted from origin — `main` is now
+> the only branch; and (b) the CI status was actually broken from rounds
+> 60–67 (the "CI green" claim below was only ever true for local cargo/
+> gradle invocations, never for the GitHub Actions runs). Both issues
+> are now resolved — see `MEMORY.md` §Round 68 for the full history.
 
 ---
 
@@ -81,8 +89,13 @@ context created" into "the container renders."
 
 ## State of the tree
 
-- Branch: `main` (the `improvements/initial-cleanup` branch has been merged)
+- Branch: `main` (the ONLY branch — `improvements/initial-cleanup` was
+  merged in and deleted from origin on 2026-08-08)
 - Working tree: clean
+- CI (round 68, verified on `99c940e`): both `build.yml` and
+  `kr64-tests.yml` **GREEN** (this is the first fully green Build APK
+  run since round 59 — rounds 60–67 were all red due to 4 stacked bugs
+  that have now been fixed; see `MEMORY.md` §Round 68)
 - Signed release APK: `download/twoyi_3.5.5-08041908-release-unsigned.apk`
 - Bash tool still alive; ready for the next task
 

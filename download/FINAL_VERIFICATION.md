@@ -1,15 +1,29 @@
 # FINAL_VERIFICATION.md
 
-**Task ID:** KEEP-WORKING-14 · 2026-08-05 ~07:04 UTC
-**Branch:** `main` (verification target: `improvements/initial-cleanup`)
+**Task ID:** KEEP-WORKING-14 · 2026-08-05 ~07:04 UTC · **Last refreshed:** 2026-08-08 (round 68)
+**Branch:** `main` (the only branch — `improvements/initial-cleanup` was merged
+in and deleted on 2026-08-08; round 68 HEAD: `99c940e`)
+
+> **Round 68 update:** this is the historical copy of `FINAL_VERIFICATION.md`
+> preserved in `download/`. The original verification below was accurate at
+> the time of writing (2026-08-05 07:04 UTC, 43 commits past base `25ef89c`,
+> HEAD `ca33d02`). Since then: (1) `improvements/initial-cleanup` was merged
+> into `main` and deleted; (2) CI was actually broken from rounds 60–67
+> due to 4 stacked bugs (the "✓ green" / "no failures yet" note in §5 was
+> only ever true for the local cargo/gradle invocations, never for the
+> GitHub Actions runs); (3) all 4 root causes are now fixed in commits
+> `f166b20`/`cd6d0d8`/`7fbf3ad`/`9e3a1fb`/`99c940e`, and both workflows
+> are verified green on `main` HEAD `99c940e`. See repo-root `MEMORY.md`
+> §Round 68 for the full history.
 
 ## 1. Git working tree
 - Staged/modified tracked files: **0** · Untracked files: **56** (all agent `.md` docs; no source changes pending)
 - **Verdict:** tracked tree is **clean**.
 
-## 2. Commits on `improvements/initial-cleanup`
-`git log --oneline improvements/initial-cleanup --not 25ef89c | wc -l`
-→ **43 commits** ahead of base `25ef89c`.
+## 2. Commits on `main` (historical: was on `improvements/initial-cleanup`)
+`git log --oneline main --not 25ef89c | wc -l`
+→ **84+ commits** ahead of base `25ef89c` (round 68; was 43 at the
+original 2026-08-05 snapshot).
 
 ## 3. Documentation artifacts in `download/`
 `ls /home/z/my-project/download/*.md | wc -l` → **40 `.md` files**

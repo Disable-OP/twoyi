@@ -297,4 +297,4 @@ See `GSI_BOOT_PLAN.md` §5.7 for the file layout
 
 ---
 
-*If a test stops working, open a PR against `improvements/initial-cleanup` and update the command + file:line ref.*
+*If a test stops working, open a PR against `main` and update the command + file:line ref.*

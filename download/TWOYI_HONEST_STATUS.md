@@ -47,7 +47,9 @@ Two layers:
    `RendererType::New` on non-aarch64 targets even if Java requests Old.
    Defense-in-depth: the Rust side never calls the panic stubs on x86_64.
 
-Commit: `7664c66` on `improvements/initial-cleanup`
+Commit: `7664c66` on `improvements/initial-cleanup` (historical — this branch
+has since been merged into `main` and deleted on 2026-08-08; the commit
+is reachable on `main` as `7664c66`)
 
 ---
 

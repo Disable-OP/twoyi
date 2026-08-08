@@ -1,24 +1,30 @@
 # MEMORY.md — Twoyi Fork Project State
 
-> **Last updated:** 2026-08-07 (round 67 — continued improvements)
+> **Last updated:** 2026-08-08 (round 68 — CI fix + doc refresh)
 > **Project:** Disable-OP/twoyi (fork of cyanmint/twoyi, originally twoyi/twoyi)
-> **Branch:** `improvements/initial-cleanup` (active development branch)
+> **Branch:** `main` (the ONLY branch — `improvements/initial-cleanup` was
+> merged in and deleted from origin on 2026-08-08)
 > **Goal:** Boot Android 11 GSI rootfs in a rootless Android-in-Android container,
 > without root, without KVM, without SELinux permissive mode.
 
-## Production Release — Final Comprehensive Statistics (after 67 rounds)
+## Production Release — Final Comprehensive Statistics (after 68 rounds)
 
 > This section is the canonical final summary. All earlier per-round tables
 > below (section 0 onward) are preserved for historical context only.
-> **67 rounds of improvements** have been completed; the codebase is
-> production-ready and all quality gates are green.
+> **68 rounds of improvements** have been completed; the codebase is
+> production-ready. **CI is now ACTUALLY green on `main`** — see the Round 68
+> section below; rounds 60–67 had been red on every push because 4 stacked CI
+> bugs masked each other (the previous "all quality gates green" claim was
+> only ever true for the local cargo test / clippy / lint invocations, never
+> for the actual GitHub Actions runs).
 
 ### Headline metrics
 
 | Metric                          | Value                                                  |
 | ------------------------------- | ------------------------------------------------------ |
-| Commits on `improvements/initial-cleanup` | **79+** (372 total across all branches)      |
-| Total improvements shipped      | **~241** (bug fixes, perf wins, i18n, security hardening, CI, docs) |
+| Active branch                   | **`main`** (only branch — `improvements/initial-cleanup` deleted 2026-08-08) |
+| Commits on `main`               | **84+** beyond the cyanmint fork point (394+ total)    |
+| Total improvements shipped      | **~245** (bug fixes, perf wins, i18n, security hardening, CI, docs) |
 | Rust crates (clippy clean)      | **3/3** — `twoyi`, `kr64`, `loader` — **0 clippy warnings** |
 | Rust fmt status                 | **0 fmt drift** — `cargo fmt --check` clean on all 3 crates |
 | Lint status                     | **0 errors, 0 warnings** (all 62 prior benign warnings resolved) |
@@ -27,6 +33,7 @@
 | Build targets                   | arm64-v8a + x86_64 (both compile)                      |
 | Emulator                        | Android 9 (API 28) boots with TCG (**no KVM needed**)  |
 | Latest APK                      | `twoyi_3.5.5-08061930-release.apk` (8.8 MB, v2 signed) |
+| CI status (GitHub Actions)      | **GREEN** — both `build.yml` and `kr64-tests.yml` pass on `99c940e` (round 68) |
 | Codebase state                  | **Production-ready**                                   |
 
 ### Shipped improvements (categories)
@@ -88,11 +95,102 @@
 
 ### Status verdict
 
-**Production-ready.** After **66 rounds of improvements** (~245 individual
-changes shipped across 90+ commits), all quality gates are green, all 4
-locales translated, security config and CI gating in place, APK signed and
-reproducibly buildable. The `improvements/initial-cleanup` branch is ready
-to be merged or tagged as the v3.5.5 release.
+**Production-ready.** After **68 rounds of improvements** (~245 individual
+changes shipped across 90+ commits), all local quality gates are green,
+all 4 locales translated, security config and CI gating in place, APK
+signed and reproducibly buildable. The `main` branch is the only branch
+(`improvements/initial-cleanup` was merged in and deleted on 2026-08-08)
+and is ready to be tagged as the v3.5.5 release.
+
+> **Round 68 caveat:** the previous rounds (60–67) all claimed "CI green"
+> in their commit messages, but CI had actually been broken on every push
+> since round 60 due to 4 stacked bugs that masked each other. Round 68
+> fixed all 4 (see section below). CI is now ACTUALLY green on both
+> `build.yml` and `kr64-tests.yml`.
+
+### Round 68 — CI unblock: 4 stacked bugs fixed, branch consolidated (this commit)
+
+Round 67 (and rounds 60–66 before it) shipped commits with messages like
+"all quality gates green" and "production-ready", but the GitHub Actions
+runs were failing on every push. The CI badge in README was red for 8+
+consecutive runs. The 4 root causes were stacked: each one masked the next,
+and the local cargo/gradle invocations that the docs cited as evidence were
+all green — but CI never got far enough to invoke them. This round fixes
+all 4 and refreshes the docs to match the actual state.
+
+**Root causes fixed (in order of discovery):**
+
+1. **`nttld/setup-ndk@v2` → `@v1`** (commit `f166b20`).
+   The `build.yml` workflow referenced `nttld/setup-ndk@v2`, a tag that
+   **does not exist** on that action's repo (latest tag is `v1.6.0`).
+   Every `Build APK` run since round 60 died at the very first step
+   ("Set up job") with `Unable to resolve action 'nttld/setup-ndk@v2'`.
+   Fixed to `@v1`. Same commit also added `main` to the `kr64-tests.yml`
+   `push.branches` trigger — that workflow had been scoped to
+   `improvements/**` only, so once the branch was deleted the kr64
+   fmt+clippy+165-test gate stopped running entirely.
+
+2. **64 stale CMake artifacts untracked** (commit `cd6d0d8`).
+   `app/cpp/build/` had been committed from a codespace, with absolute
+   paths baked into `CMakeCache.txt` pointing at `/workspaces/twoyi/...`.
+   Every CI runner clones to `/home/runner/work/twoyi/twoyi/...`, so CMake
+   refused to reuse the cache and the `cmakeBuild` task died. Untracked
+   all 64 files (`git rm -r --cached`), added `app/cpp/build/` to
+   `.gitignore`, and hardened `app/cpp/build.sh` to `rm -rf` the build
+   dir before reconfiguring.
+
+3. **22 missing string resources added** (commit `7fbf3ad`).
+   Java code references 22 `R.string.*` resources (`error_generic`,
+   `profile_switch_failed`, `rom_import_failed`, `profile_copy_hint`, etc.)
+   that were **never** in `strings.xml` despite MEMORY.md round 32
+   claiming they were added. The 11 `profile_*` strings appear to have
+   been added by the profile-manager feature commit without updating
+   `strings.xml`. Added all 22 strings × 4 locales (en, zh-CN, zh-TW, ja)
+   = **88 entries** via an idempotent Python script
+   (`scripts/add_missing_strings.py`). After this, `compileDebugJavaWithJavac`
+   passes.
+
+4. **6 missing translations added** (commit `9e3a1fb`).
+   With Java compiling, the build moved further and failed at `lintDebug`
+   with 6 `MissingTranslation` errors. Root cause: 6 pre-existing English
+   strings (`profile_copy_hint`, `profile_export_failed`,
+   `profile_import_success`, `profile_import_failed`,
+   `profile_from_scratch`, `profile_from_import`) had **never** been
+   translated into zh-CN/zh-TW/ja — a pre-existing issue masked by all
+   the earlier failures. Added 6 × 3 = **18 entries**.
+
+5. **CI cleanup** (commit `99c940e`).
+   - Silenced noisy `cargo metadata` errors in `build.yml` (added
+     `cache: false` to `setup-rust-toolchain` — the Swatinem/rust-cache
+     integration was failing because there's no `Cargo.toml` at the repo
+     root, only at `app/rs/`).
+   - Replaced the stale "62 known warnings" comment with accurate text
+     reflecting the round-23–52 cleanup.
+
+**Verification (CI, not local):**
+- `Build APK` workflow: **PASS** on commits `9e3a1fb` and `99c940e`
+  (first fully green Build APK run since round 59 — rounds 60–67 all
+  failed).
+- `kr64 lint+test` workflow: **PASS** on `9e3a1fb` and `99c940e`.
+- kr64 tests: **165/165 passing** (CI-verified, not just locally).
+- clippy: **0 warnings, 0 errors** (CI-verified).
+- fmt: **0 drift** (CI-verified).
+- Android lint: **0 errors, 0 warnings** (CI-verified).
+
+**Branch consolidation:**
+- `improvements/initial-cleanup` was deleted from origin on 2026-08-08.
+- `main` is now the ONLY branch. All historical improvements branches
+  have been merged into `main`.
+- All docs in this commit are refreshed to remove `improvements/initial-cleanup`
+  references — `main` is the single source of truth.
+
+**Note on the local-vs-CI gap:** the per-round sections below (rounds 60–67)
+all say "all quality gates green" and list `cargo test` / `cargo clippy` /
+`./gradlew lint` as evidence. Those local invocations WERE green — but
+they only prove the source compiles and tests pass on a host build.
+CI was running NONE of them because it was failing at earlier steps
+(NDK setup, CMake cache, Java compile, lint). The local-vs-CI gap is now
+closed: CI runs the full pipeline end-to-end.
 
 ### Round 66 — proc_emu `/proc/self/status` mode + doc sync (this commit)
 
