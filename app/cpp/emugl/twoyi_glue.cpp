@@ -39,6 +39,11 @@
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// s_egl is the EGL dispatch table defined in EGLDispatch.cpp.
+// It's a C++ global (not extern "C"), so the extern declaration
+// must be at file scope OUTSIDE any extern "C" block.
+extern EGLDispatch s_egl;
+
 // ---------------------------------------------------------------------------
 // startOpenGLRenderer — called from core.rs::init_renderer.
 //
@@ -97,7 +102,6 @@ extern "C" int startOpenGLRenderer(void* win, int width, int height,
     // swallows the error and just returns false.
     //
     // First, test the EGL dispatch table directly to pinpoint failures.
-    extern EGLDispatch s_egl;
     LOGI("s_egl.eglGetDisplay=%p s_egl.eglInitialize=%p s_egl.eglChooseConfig=%p",
          (void*)s_egl.eglGetDisplay, (void*)s_egl.eglInitialize,
          (void*)s_egl.eglChooseConfig);
