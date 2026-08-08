@@ -4,7 +4,9 @@
 > **Author:** general-purpose sub-agent
 > **Date:** 2026-08-05
 > **Codespace:** `twoyi-dev-3-jr47xg6xvx7ghq6p`
-> **Branch:** `improvements/initial-cleanup`
+> **Branch:** `main` (the only branch — `improvements/initial-cleanup` was
+> merged in and deleted on 2026-08-08; for current state see repo-root
+> `MEMORY.md` §Round 68)
 > **Inputs:** `default.xml` (AOSP manifest, pins `android-8.1.0_r81`), `TWOYI_HONEST_STATUS.md`, `DEVELOPMENT_ROADMAP.md` §3.2, `AOSP_BUILD_RESULTS.md` (pipe-path patch precedent), `RomManager.java` (rootfs on-disk layout).
 > **Goal:** Make it possible to produce a bootable **x86_64** `rootfs.tar.gz` for twoyi, so end-to-end testing in the Android emulator / redroid x86_64 / codespace is unblocked. This is the single biggest blocker for x86_64 testing today (Roadmap item #2).
 
@@ -143,7 +145,7 @@ AOSP tree. Either clone it:
 ```bash
 git clone https://github.com/Disable-OP/twoyi.git /path/to/twoyi
 cd /path/to/twoyi
-git checkout improvements/initial-cleanup
+git checkout main   # the only branch (round 68)
 ```
 
 Or just keep using the local checkout at `/home/z/my-project/`.

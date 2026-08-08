@@ -30,7 +30,7 @@ original 2026-08-05 snapshot).
 (incl. `RELENG.md`, `DOCUMENTATION_INDEX.md`, `FINAL_STATUS.md`, `VERIFICATION.md`).
 
 ## 4. kr64 Rust source line count
-`find app/rs/kr64/src -name '*.rs' | xargs wc -l` → **9,581 LOC across 10 files**:
+`find app/rs/kr64/src -name '*.rs' | xargs wc -l` → **9,581 LOC across 10 files** (historical — 2026-08-05 snapshot; now ~11,554 LOC across 11 `.rs` files as of round 68, 2026-08-08):
 sensors.rs 2294, binder.rs 1959, audio.rs 1423, battery.rs 856, seccomp.rs 831,
 lib.rs 784, proc_emu.rs 534, mount_mgr.rs 457, devices.rs 405, main.rs 38.
 
@@ -49,9 +49,9 @@ run had not finished at snapshot time — no failures observed.
 | Check                  | Result            |
 |------------------------|-------------------|
 | Working tree (tracked) | clean             |
-| Commits since base     | 43                |
+| Commits since base     | 43 (historical; 414 on `main` as of round 68) |
 | Download docs          | 40                |
-| kr64 Rust LOC          | 9,581             |
+| kr64 Rust LOC          | 9,581 (historical; ~11,554 as of round 68) |
 | CI kr64 tests          | ✓ green           |
 | CI Build APK           | running, no fails |
 

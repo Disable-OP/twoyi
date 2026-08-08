@@ -68,7 +68,7 @@ Twoyi is three layers. Read these files **in this order** to get oriented:
   `devices.rs` (virtual `/dev` tree), `binder.rs` (binder proxy),
   `seccomp.rs` (BPF filter + SIGSYS handler), `proc_emu.rs` (`/proc` synthesiser),
   `mount_mgr.rs` (bind-mount + tmpfs), `audio.rs` / `battery.rs` / `sensors.rs`
-  (HAL shims). ~9,500 LOC, 165 tests.
+  (HAL shims). ~11,554 LOC across 11 `.rs` files, 165 tests.
 - `app/rs/loader/` — open-source replacement for the legacy `libloader.so` blob.
 - `app/rs/openglrenderer/` — Rust scaffolding around the AOSP-built
   `libOpenglRender.so` (which is built from AOSP emugl source, not in this repo).

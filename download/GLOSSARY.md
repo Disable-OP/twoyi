@@ -59,7 +59,7 @@
 
 ## K
 
-**kr64** — "kernel-replacement, 64-bit". twoyi's Rust daemon (`app/rs/kr64/`, ~9.6 kLOC, 144 tests) that materialises the virtual `/dev` tree, installs seccomp, emulates `/proc`. Analogue of VM's `libkr64.so`.
+**kr64** — "kernel-replacement, 64-bit". twoyi's Rust daemon (`app/rs/kr64/`, ~11.6 kLOC across 11 `.rs` files, 165 tests) that materialises the virtual `/dev` tree, installs seccomp, emulates `/proc`. Analogue of VM's `libkr64.so`.
 
 **KVM** — Kernel Virtual Machine (hardware-assisted virtualisation). twoyi does **not** use KVM — it shares the host kernel directly.
 

@@ -7,7 +7,7 @@
 > snapshot; this branch has since been merged into `main` and deleted (2026-08-08).
 > For current state, see `MEMORY.md` §Round 68.
 > **Codespace:** `twoyi-dev-3-jr47k6xvx7ghq6p` (EastUs, AMD EPYC 7763, KVM working)
-> **Scope:** Read all 13 analysis files in `/home/z/my-project/download/`, the full worklog (`worklog.md`, 879 lines), and the entire historical `improvements/initial-cleanup` git history (207 commits, now merged into `main`). This document is the definitive state-of-the-project write-up — every claim is traceable to a specific artifact, file, or commit.
+> **Scope:** Read all 13 analysis files in `/home/z/my-project/download/`, the full worklog (`worklog.md`, 879 lines at the time of writing — now ~4,847 lines as of 2026-08-08, round 68), and the entire historical `improvements/initial-cleanup` git history (207 commits, now merged into `main`). This document is the definitive state-of-the-project write-up — every claim is traceable to a specific artifact, file, or commit.
 
 ---
 
@@ -902,7 +902,7 @@ Ordered by dependency and impact. Each item references the relevant analysis sec
 
 | File | Purpose |
 |---|---|
-| `worklog.md` | 879-line worklog of all sub-agent tasks (VM-ROM-1, VM-JAVA-1, VM-DISASM-1, VM-KR64-1, AOSP-BUILD-1, GSI-BOOT-1, FUNC-COMPARE-1, PORT-1) |
+| `worklog.md` | 879-line worklog at the time of writing (now ~4,847 lines as of 2026-08-08) of all sub-agent tasks (VM-ROM-1, VM-JAVA-1, VM-DISASM-1, VM-KR64-1, AOSP-BUILD-1, GSI-BOOT-1, FUNC-COMPARE-1, PORT-1) |
 | `ARCHITECTURE.md` | 664-line deep code-level architecture write-up of twoyi's 3-layer architecture |
 | `PIE_IMPLEMENTATION.md` | Documents the PIE pattern in `app/rs/src/interp.c` (needed for `libkr64.so` equivalent) |
 | `REDROID_TESTING.md` | Documents the ARM64/x86_64 mismatch |
@@ -967,4 +967,4 @@ To avoid overclaiming (per the user's instruction), here is the explicit split:
 
 ---
 
-*This document was produced by reading all 13 analysis files in `/home/z/my-project/download/`, the full 879-line `worklog.md`, and the entire 207-commit git history of the `improvements/initial-cleanup` branch. Every factual claim is traceable to a specific artifact, file, commit, or analysis report. Theoretical claims are explicitly flagged in Appendix A.*
+*This document was produced by reading all 13 analysis files in `/home/z/my-project/download/`, the full 879-line `worklog.md` (at the time of writing — now ~4,847 lines as of 2026-08-08), and the entire 207-commit git history of the `improvements/initial-cleanup` branch (now merged into `main`). Every factual claim is traceable to a specific artifact, file, commit, or analysis report. Theoretical claims are explicitly flagged in Appendix A.*

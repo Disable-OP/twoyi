@@ -37,7 +37,7 @@ demonstrable.
   got far enough to invoke any of them. The 4 stacked root causes were
   fixed in round 68 (see repo-root `MEMORY.md` §Round 68). Both
   workflows are now genuinely green on `main`.
-- **Test coverage: thin but real.** `kr64` has 9,581 LOC across 10 files with
+- **Test coverage: thin but real.** `kr64` has ~11,554 LOC across 11 files with
   165 `#[test]` functions; all pass on host and in CI. **No Java unit tests
   beyond the Gradle template `ExampleUnitTest`**, and **no instrumented tests
   beyond `ExampleInstrumentedTest`**. Coverage of the actual JNI surface

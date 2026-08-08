@@ -3,11 +3,12 @@
 This guide walks users of the original **[`twoyi/twoyi`](https://github.com/twoyi/twoyi)**
 repository (archived April 2023 with the maintainer's note *"the project has
 been discontinued"*) through migrating to the actively maintained fork at
-**[`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi)** (branch
-`improvements/initial-cleanup`).
+**[`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi)** (branch `main` —
+the only branch; the historical `improvements/initial-cleanup` branch has
+been merged in and deleted).
 
 The fork preserves the original project's design and history (all 207
-upstream commits are intact) and adds 15+ new commits on top that
+upstream commits are intact) and adds 80+ new commits on top that
 modernise the toolchain, replace closed-source blobs with open-source
 rebuilds, and lay the groundwork for Virtual-Master-parity features.
 
@@ -67,11 +68,12 @@ machine size.
 ```bash
 git clone https://github.com/Disable-OP/twoyi.git
 cd twoyi
-git checkout improvements/initial-cleanup   # active dev branch
+git checkout main   # the only branch (round 68: improvements/initial-cleanup merged in and deleted)
 ```
 
-> The `main` branch tracks upstream and is not where the new work lives.
-> All improvements are on `improvements/initial-cleanup` until merged.
+> Round 68 note: `main` is now both the dev branch AND the release branch.
+The historical `improvements/initial-cleanup` branch has been merged in
+and deleted from origin.
 
 ### 3.2 Build the APK
 
@@ -237,11 +239,11 @@ into `signingConfigs.release`. Consequences:
 The original twoyi had no CI. The fork ships:
 
 - **`.github/workflows/build.yml`** — matrix workflow that builds
-  `arm64-v8a` and `x86_64` APKs on every push to `improvements/**` and
+  `arm64-v8a` and `x86_64` APKs on every push to `main` and
   on PRs. Has `workflow_dispatch` inputs for ABI selection and
   `include_rootfs`.
 - **`.github/workflows/kr64-tests.yml`** — runs `cargo test` in
-  `app/rs/kr64/` on every push to `improvements/**`. Uploads the test
+  `app/rs/kr64/` on every push to `main`. Uploads the test
   log and binaries as a 14-day-retention artifact.
 
 If you fork the repo, both workflows run automatically on your fork.
@@ -354,14 +356,14 @@ design and the remaining work items.
 | `INSTALL_PARSE_FAILED_NO_CERTIFICATES` | You're trying to install an unsigned APK from a non-fork build. | Use `./gradlew assembleRelease` — the test keystore is wired in. |
 | `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | The fork's APK is signed with a different key than the original twoyi you have installed. | `adb uninstall io.twoyi` first (after backing up your rootfs — see §3.4). |
 | `INSTALL_FAILED_VERIFICATION_FAILURE` | Play Protect blocking the test-signed APK. | Disable Play Protect for the install, or replace the keystore with your own. |
-| App crashes immediately on x86_64 with `SIGABRT` in `surfaceChanged`. | You're running an old build of the fork before commit `7664c66`. | Rebuild from `improvements/initial-cleanup` — the new renderer is now the default on x86_64. |
+| App crashes immediately on x86_64 with `SIGABRT` in `surfaceChanged`. | You're running an old build of the fork before commit `7664c66`. | Rebuild from `main` — the new renderer is now the default on x86_64. |
 | Boot stalls at *"Failed to write to pipe: Invalid argument (os error 22)"*. | The bundled rootfs is arm64-only; on x86_64 the guest `init` is an aarch64 ELF and can't execute. | Build or vendor an x86_64 rootfs — see [`X86_64_ROOTFS_BUILD_GUIDE.md`](X86_64_ROOTFS_BUILD_GUIDE.md). On arm64 this error means the rootfs is missing — see §3.4. |
 | `adb shell am start -n io.twoyi/.ui.SettingsActivity` does nothing. | The activity moved or the APK didn't install. | `adb shell pm list packages \| grep twoyi` to confirm; if absent, `adb install -r` again. |
 | Work-profile install: app says "ROM not found" after importing. | The `TWOYI_ROOTFS` env var or `setDataDir` JNI wasn't called. | Make sure you're on a build from `9c4b907` or later. `Render2Activity` calls `Renderer.setDataDir(getDataDir())` before `Renderer.init()`. |
 | `cargo xdk` fails with `linker not found`. | NDK r27c not on PATH, or `cargo-xdk` not installed. | `cargo install cargo-xdk`; ensure `$ANDROID_NDK_HOME` points at r27c; `rustup target add aarch64-linux-android x86_64-linux-android`. |
 | Build error: `libOpenglRender.so is incompatible with elf_x86_64`. | Stale `app/src/main/jniLibs/arm64-v8a/libOpenglRender.so` left over from an arm64-only build. | `rm -rf app/src/main/jniLibs/` and rebuild with `-Pabis=all` (commit `2085938` fixes this in CI). |
 | `build_rs.sh: Syntax error: "(" unexpected`. | You're running an old checkout where the build scripts used bash arrays but were invoked with `sh`. | Pull `d2cfb8d` or later — scripts are now POSIX-sh compatible. |
-| `reference to submit is ambiguous` (JDK 17 compile error). | Old checkout before `719a0db`. | Pull latest `improvements/initial-cleanup`. |
+| `reference to submit is ambiguous` (JDK 17 compile error). | Old checkout before `719a0db`. | Pull latest `main`. |
 | Original twoyi ran fine; fork's arm64 build also runs fine but rootfs is empty. | The fork doesn't bundle the rootfs in the APK by default — only a placeholder. | Drop a real `rootfs.tar.gz` into `app/src/main/assets/` before building, or use the in-app Import ROM flow (§3.4). |
 | `adb -s localhost:22122` timeout after boot. | Guest `adbd` not running, or the rootfs doesn't include the twoyi `init` wrapper that starts `adbd`. | Confirm `init` is at the rootfs root (not `/system/bin/init`); see [`X86_64_ROOTFS_BUILD_GUIDE.md`](X86_64_ROOTFS_BUILD_GUIDE.md) §3.8.1. |
 

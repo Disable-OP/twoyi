@@ -1,7 +1,7 @@
 # Architecture Decision Records (ADRs)
 
 > Project: **twoyi** — rootless Android-on-Android container (`io.twoyi`)
-> Fork: `cyanmint/twoyi` branch `improvements/initial-cleanup`
+> Fork: `Disable-OP/twoyi` branch `main` (was `cyanmint/twoyi` branch `improvements/initial-cleanup`, consolidated 2026-08-08)
 > Format: **Status**, **Context**, **Decision**, **Consequences**.
 > Author: general-purpose sub-agent (Task KEEP-WORKING-8) · 2026-08-05
 
@@ -285,7 +285,7 @@ out-of-scope alternative in `GSI_BOOT_PLAN.md` §5.5. Commit `570e95e`
   kernel — no kernel image to ship, no per-SoC kernel build matrix.
 - **−** The `kr64` daemon must reimplement kernel behaviour (mount
   trapping, `/proc` synthesis, device-tree materialisation) in
-  userspace. This is the bulk of the 9,581-LOC Rust skeleton and the
+  userspace. This is the bulk of the ~11,554-LOC Rust skeleton and the
   8–12 week MVP estimate.
 - **−** **Binder virtualisation is the hardest piece** and is not yet
   started. Without it the guest's `servicemanager` cannot register
