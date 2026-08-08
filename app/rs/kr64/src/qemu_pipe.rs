@@ -84,10 +84,7 @@ pub fn spawn_qemu_pipe_proxy(
                     Ok((guest_stream, _addr)) => {
                         let sid = next_session_id;
                         next_session_id += 1;
-                        info!(
-                            "[KR64][qemu_pipe] guest connected (session={})",
-                            sid
-                        );
+                        info!("[KR64][qemu_pipe] guest connected (session={})", sid);
                         let rootfs_clone = rootfs.clone();
                         std::thread::Builder::new()
                             .name(format!("kr64-pipe-handshake-{}", sid))
@@ -95,11 +92,7 @@ pub fn spawn_qemu_pipe_proxy(
                                 if let Err(e) =
                                     handle_session(guest_stream, &rootfs_clone, sid)
                                 {
-                                    warning!(
-                                        "[KR64][qemu_pipe] session {} ended: {}",
-                                        sid,
-                                        e
-                                    );
+                                    warning!("[KR64][qemu_pipe] session {} ended: {}", sid, e);
                                 }
                             })
                             .ok();
@@ -158,11 +151,7 @@ impl Drop for QemuPipeProxyHandle {
 /// Per-connection handler. Reads the channel name, opens the
 /// matching renderer socket, and pumps bytes both directions until
 /// either side closes.
-fn handle_session(
-    mut guest: UnixStream,
-    rootfs: &str,
-    sid: u64,
-) -> std::io::Result<()> {
+fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Result<()> {
     // Step 1: read the "pipe:<channel>" handshake.
     let channel = read_channel_name(&mut guest)?;
     info!(
@@ -174,7 +163,8 @@ fn handle_session(
         // Unknown channel — close. (Future: route "audio", "camera", etc.)
         warning!(
             "[KR64][qemu_pipe] session {} unknown channel '{}', closing",
-            sid, channel
+            sid,
+            channel
         );
         return Ok(());
     }
@@ -549,7 +539,8 @@ mod tests {
         // Use a temporary Unix socket pair via socketpair()
         use std::os::unix::io::FromRawFd;
         let mut fds = [0i32; 2];
-        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        let ret =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(ret, 0, "socketpair failed");
         // SAFETY: fds are valid and owned by us
         let a = unsafe { UnixStream::from_raw_fd(fds[0]) };
