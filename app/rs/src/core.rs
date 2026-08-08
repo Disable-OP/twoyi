@@ -328,9 +328,9 @@ pub fn init_renderer(
             Err(e) => {
                 log::error!("[CORE] FAILED to spawn container init: {}", e);
                 log::error!(
-                    "[CORE]   linker_path: {} (exists: {})",
-                    linker_path,
-                    Path::new(&linker_path).exists()
+                    "[CORE]   kr64_path: {} (exists: {})",
+                    kr64_path,
+                    Path::new(&kr64_path).exists()
                 );
                 log::error!(
                     "[CORE]   init_path: {} (exists: {})",
