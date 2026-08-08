@@ -9,13 +9,7 @@ package io.twoyi;
 import android.content.Context;
 import android.content.Intent;
 
-import java.util.concurrent.BrokenBarrierException;
-import java.util.concurrent.CyclicBarrier;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-
-import io.twoyi.utils.LogEvents;
 
 /**
  * @author weishu
@@ -31,8 +25,18 @@ public class TwoyiStatusManager {
     private final AtomicBoolean mStarted = new AtomicBoolean(false);
     private final AtomicBoolean mShown = new AtomicBoolean(false);
 
-    private final CyclicBarrier mBootLatch = new CyclicBarrier(2);
-
+    /**
+     * Returns {@code true} if the guest has signalled
+     * {@code BOOT_COMPLETED} for the current boot cycle.
+     *
+     * <p>Set by {@link #markStarted()}, which is invoked by
+     * {@link BootCompletionServer#markCompleted()} — i.e. the boot latch
+     * itself now lives in {@link BootCompletionServer} (ported from
+     * cyanmint/Nogitsune's {@code BootStatus.kt}). This class retains
+     * only the {@code mStarted}/{@code mShown} flags that
+     * {@link #switchOs(Context)} needs to decide whether to bring the
+     * guest UI forward.
+     */
     public static TwoyiStatusManager getInstance() {
         return INSTANCE;
     }
@@ -41,55 +45,41 @@ public class TwoyiStatusManager {
         mShown.set(visible);
     }
 
+    /**
+     * Marks the guest as started. Called by
+     * {@link BootCompletionServer#markCompleted()} after the guest sends
+     * {@code BOOT_COMPLETED}.
+     *
+     * <p>This method used to also await a {@link java.util.concurrent.CyclicBarrier}
+     * to rendezvous with the UI thread waiting in {@code waitBoot()}.
+     * That barrier has been moved to {@link BootCompletionServer} so the
+     * boot-completion state and the boot latch live together in one
+     * focused class (mirroring Nogitsune's {@code BootStatus.kt}). This
+     * method is now a plain setter — the rendezvous happens in
+     * {@link BootCompletionServer#markCompleted()}.
+     *
+     * <p>Idempotent: setting {@code true} on an already-{@code true}
+     * flag is a no-op.
+     */
     public void markStarted() {
-        if (mStarted.compareAndSet(false, true)) {
-            try {
-                // Fixed: previously this called await() with no timeout. The UI
-                // side (Render2Activity.showBootingProcedure) calls waitBoot()
-                // with a 60 s timeout, so if it times out and reset() is later
-                // invoked (e.g. the activity is re-launched), a late
-                // BOOT_COMPLETED message would block the socket-server worker
-                // thread forever waiting for a UI party that may never arrive.
-                // Bounding the wait keeps the backend responsive on slow/failed
-                // boots. 60 s mirrors the UI's wait window.
-                mBootLatch.await(60, TimeUnit.SECONDS);
-            } catch (BrokenBarrierException e) {
-                // Barrier was reset() (e.g. UI re-launched) — expected during
-                // a re-boot, not an error worth tracking.
-                LogEvents.trackError(e);
-            } catch (InterruptedException e) {
-                // Fixed: catching InterruptedException clears the thread's
-                // interrupt flag. If we don't restore it, the executor worker
-                // that called us keeps running as if nothing happened, which
-                // can suppress shutdown hooks and other interrupt-driven
-                // cancellation in callers up the stack.
-                Thread.currentThread().interrupt();
-                LogEvents.trackError(e);
-            } catch (TimeoutException e) {
-                // UI never showed up to rendezvous (activity destroyed before
-                // reaching waitBoot, or a reset() race). The guest has still
-                // booted, so we just track and move on rather than blocking.
-                LogEvents.trackError(e);
-            }
-        }
+        mStarted.set(true);
     }
 
     public boolean isStarted() {
         return mStarted.get();
     }
 
+    /**
+     * Resets the {@code mStarted} flag for a new boot cycle.
+     *
+     * <p>Note: the boot latch (formerly here) now lives in
+     * {@link BootCompletionServer#reset()} — callers that want a full
+     * reset (e.g. {@link Render2Activity#onCreate(android.os.Bundle)})
+     * must call both {@link BootCompletionServer#reset()} and this
+     * method.
+     */
     public void reset() {
         mStarted.set(false);
-        mBootLatch.reset();
-    }
-
-    public boolean waitBoot(long timeout, TimeUnit unit) throws InterruptedException, BrokenBarrierException {
-        try {
-            mBootLatch.await(timeout, unit);
-            return true;
-        } catch (TimeoutException e) {
-            return false;
-        }
     }
 
     public synchronized void switchOs(Context context) {

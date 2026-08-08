@@ -148,7 +148,13 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             return;
         }
 
-        // reset state
+        // reset state — both the legacy mStarted flag (for switchOs) and
+        // the new BootCompletionServer boot latch (ported from
+        // cyanmint/Nogitsune's BootStatus.kt). The boot latch was
+        // previously inside TwoyiStatusManager; it now lives in
+        // BootCompletionServer so the boot-completion state and the
+        // BOOT_COMPLETED socket listener are co-located.
+        BootCompletionServer.getInstance().reset();
         TwoyiStatusManager.getInstance().reset();
 
         NavUtils.hideNavigation(getWindow());
@@ -301,7 +307,21 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         // fully cleared before Renderer.init() starts the container.  The existing code
         // already runs shell commands on the main thread inside attachBaseContext, so the
         // brief blocking (~100 ms worst-case for rm -rf) is acceptable.
+        //
+        // Delegates to DalvikCacheManager (ported from cyanmint/Nogitsune's
+        // BootHelper.kt::clearDalvikCacheIfNeeded). RomManager keeps a thin
+        // wrapper for backwards-compat with any external callers.
         RomManager.clearDalvikCacheIfNeeded(this);
+
+        // Start the dedicated boot-completion socket server BEFORE the
+        // container launches, so it's ready to accept the guest's
+        // BOOT_COMPLETED signal the moment the guest sends it. The
+        // legacy TwoyiSocketServer on TWOYI_SOCK is also still running
+        // and will delegate BOOT_COMPLETED to BootCompletionServer —
+        // both paths funnel through BootCompletionServer.markCompleted()
+        // (idempotent via AtomicBoolean compare-and-set).
+        BootCompletionServer.getInstance().start();
+
         mRootView.addView(mSurfaceView, 0);
         showBootingProcedure();
     }
@@ -340,15 +360,22 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                     // reboot the guest ART often needs one Zygote restart to regenerate a
                     // stale dalvik-cache (~14 s), followed by a full system_server boot
                     // (~30 s).  60 s comfortably covers both in sequence.
-                    success = TwoyiStatusManager.getInstance().waitBoot(60, TimeUnit.SECONDS);
+                    //
+                    // The wait now goes through BootCompletionServer (ported from
+                    // cyanmint/Nogitsune's BootStatus.kt), which owns the boot latch.
+                    // TwoyiStatusManager.markStarted() is still called (by
+                    // BootCompletionServer.markCompleted()) so switchOs() works.
+                    success = BootCompletionServer.getInstance().waitBoot(60, TimeUnit.SECONDS);
                 } catch (Throwable ignored) {
-                    // waitBoot() can throw InterruptedException / BrokenBarrierException
-                    // (e.g. the boot-latch was reset() by a re-launched activity, or the
-                    // worker thread was interrupted during shutdown). Swallowing these
-                    // silently made the boot-failure path fire with no diagnostic in
-                    // logcat — track the exception so crash reporters and developers
-                    // have a clue when `success == false` leads to trackBootFailure().
-                    Log.e(TAG, "waitBoot interrupted — treating as boot failure", ignored);
+                    // BootCompletionServer.waitBoot() catches InterruptedException /
+                    // BrokenBarrierException internally and returns false, so this
+                    // catch is a defensive guard against any other unexpected
+                    // Throwable (e.g. IllegalMonitorStateException from a future
+                    // refactor). Swallowing these silently made the boot-failure
+                    // path fire with no diagnostic in logcat — track the exception
+                    // so crash reporters and developers have a clue when
+                    // `success == false` leads to trackBootFailure().
+                    Log.e(TAG, "waitBoot threw — treating as boot failure", ignored);
                 }
 
                 if (!success) {

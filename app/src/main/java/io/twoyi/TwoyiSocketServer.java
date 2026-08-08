@@ -187,8 +187,12 @@ public class TwoyiSocketServer {
             // switch host system
             TwoyiStatusManager.getInstance().switchOs(mContext);
         } else if (msg.startsWith(BOOT_COMPLETED)) {
-            // machine started
-            TwoyiStatusManager.getInstance().markStarted();
+            // machine started — delegate to BootCompletionServer, which
+            // owns the boot latch (ported from cyanmint/Nogitsune's
+            // BootStatus.kt + NogitsuneSocketServer.kt pattern).
+            // BootCompletionServer.markCompleted() will in turn call
+            // TwoyiStatusManager.markStarted() so switchOs() still works.
+            BootCompletionServer.getInstance().markCompleted();
         } else if (msg.startsWith(JUMP_HOST_SETTINGS)) {
             // UIHelper.startActivity(mContext, AboutActivity.class);
             UIHelper.startActivity(mContext, SettingsActivity.class);
