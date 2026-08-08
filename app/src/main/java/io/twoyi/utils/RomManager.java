@@ -379,8 +379,6 @@ public final class RomManager {
         removePartition(context, "vendor");
     }
 
-    private static final String PREF_HOST_FINGERPRINT = "host_build_fingerprint";
-
     /**
      * Clears the guest Android's dalvik-cache only when the host build fingerprint
      * has changed since the last successful clear (i.e. after a host OTA update).
@@ -393,26 +391,14 @@ public final class RomManager {
      * once per process lifetime.  This method is called synchronously on the UI thread
      * in bootSystem() before addView(mSurfaceView), so the cache is guaranteed to be
      * fully cleared before Renderer.init() starts the container.
+     *
+     * <p>The implementation now lives in {@link DalvikCacheManager} (ported from
+     * cyanmint/Nogitsune's {@code BootHelper.kt::clearDalvikCacheIfNeeded}).
+     * This method is kept as a thin delegating wrapper so existing callers
+     * (Render2Activity, future external code) don't need to change.
      */
     public static void clearDalvikCacheIfNeeded(Context context) {
-        String currentFingerprint = Build.FINGERPRINT;
-        String lastFingerprint = AppKV.getStringConfig(context, PREF_HOST_FINGERPRINT, "");
-        if (!currentFingerprint.equals(lastFingerprint)) {
-            Log.i(TAG, "Host fingerprint changed (" + lastFingerprint + " → " + currentFingerprint + "), clearing dalvik-cache");
-            clearDalvikCache(context);
-            AppKV.setStringConfig(context, PREF_HOST_FINGERPRINT, currentFingerprint);
-        } else {
-            Log.i(TAG, "Host fingerprint unchanged, skipping dalvik-cache clear");
-        }
-    }
-
-    private static void clearDalvikCache(Context context) {
-        String path = new File(getRootfsDir(context), "data/dalvik-cache").getAbsolutePath();
-        Shell.Result result = ShellUtil.newSh().newJob().add("rm -rf '" + path + "'").exec();
-        if (!result.isSuccess()) {
-            Log.w(TAG, "rm -rf dalvik-cache failed: " + Arrays.toString(result.getErr().toArray(new String[0])));
-        }
-        Log.i(TAG, "dalvik-cache cleared: " + path);
+        DalvikCacheManager.checkAndInvalidate(context, getRootfsDir(context));
     }
 
     private static void ensureDataLocalTmp(Context context) {
