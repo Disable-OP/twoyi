@@ -14,7 +14,7 @@
 * limitations under the License.
 */
 #include "TcpStream.h"
-#include "cutils/sockets.h>
+#include "cutils/sockets.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>

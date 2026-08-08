@@ -29,7 +29,7 @@ RenderThreadInfo *getRenderThreadInfo()
 
 #else
 
-#include "cutils/threads.h>
+#include "cutils/threads.h"
 static thread_store_t s_tls = THREAD_STORE_INITIALIZER;
 
 static void tlsDestruct(void *ptr)

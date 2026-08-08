@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "glUtils.h"
-#include "cutils/log.h>
+#include "cutils/log.h"
 
 #ifndef MAX
 #define MAX(a, b) ((a) < (b) ? (b) : (a))

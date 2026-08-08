@@ -20,7 +20,7 @@
 #include "ColorBuffer.h"
 #include "RenderContext.h"
 #include "WindowSurface.h"
-#include "utils/threads.h>
+#include "utils/threads.h"
 #include <map>
 #include <EGL/egl.h>
 #include <stdint.h>
