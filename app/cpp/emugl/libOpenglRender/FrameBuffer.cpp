@@ -156,10 +156,24 @@ bool FrameBuffer::initialize(int width, int height, OnPostFn onPost, void* onPos
     const char *gl2Extensions = NULL;
 #ifdef WITH_GLES2
     if (fb->m_caps.hasGL2) {
-        gl2Extensions = getGLES2ExtensionString(fb->m_eglDisplay);
-        if (!gl2Extensions) {
-            // Could not create GLES2 context - drop GL2 capability
+        // twoyi patch: check that the GLES2 dispatch table is actually
+        // populated before calling getGLES2ExtensionString. The AOSP
+        // code assumes init_gl2_dispatch() succeeded, but on Android
+        // the dlopen of libGLESv2.so can fail (the emulator uses
+        // libGLESv2_emulation.so via the EGL loader, not a directly
+        // dlopenable libGLESv2.so). Calling getGLES2ExtensionString
+        // with a NULL s_gl2.glGetString would crash.
+        extern bool s_gl2_enabled;
+        extern GL2Dispatch s_gl2;
+        if (!s_gl2_enabled || !s_gl2.glGetString) {
+            ERR("GLES2 dispatch table not loaded — skipping GLES2 extension query\n");
             fb->m_caps.hasGL2 = false;
+        } else {
+            gl2Extensions = getGLES2ExtensionString(fb->m_eglDisplay);
+            if (!gl2Extensions) {
+                // Could not create GLES2 context - drop GL2 capability
+                fb->m_caps.hasGL2 = false;
+            }
         }
     }
 #endif
@@ -184,12 +198,14 @@ bool FrameBuffer::initialize(int width, int height, OnPostFn onPost, void* onPos
 #endif
 
     int n;
+    ERR("twoyi: FrameBuffer::initialize calling eglChooseConfig\n");
     if (!s_egl.eglChooseConfig(fb->m_eglDisplay, configAttribs,
                                &fb->m_eglConfig, 1, &n)) {
         ERR("Failed on eglChooseConfig\n");
         delete fb;
         return false;
     }
+    ERR("twoyi: eglChooseConfig OK, n=%d\n", n);
 
     GLint glContextAttribs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 1,
