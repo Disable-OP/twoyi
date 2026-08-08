@@ -26,9 +26,11 @@
 
 #include "libOpenglRender/render_api.h"
 #include "FrameBuffer.h"
+#include "RenderServer.h"
 
 #include <android/log.h>
 #include <stdlib.h>  // getenv
+#include <sys/stat.h>  // mkdir
 
 #define LOG_TAG "TWOYI_RENDERER"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -86,19 +88,35 @@ extern "C" int startOpenGLRenderer(void* win, int width, int height,
     LOGI("TWOYI_ROOTFS=%s", rootfs_env ? rootfs_env : "(not set)");
     if (!rootfs_env || !rootfs_env[0]) {
         LOGE("TWOYI_ROOTFS not set — UnixStream will use default /data/data/io.twoyi/rootfs");
-        // Not fatal — the default path might work if the app data dir
-        // matches. But on work profiles it would be wrong.
     }
-    if (!initOpenGLRenderer(width, height, /*portNum=*/0,
-                            /*onPost=*/NULL, /*onPostContext=*/NULL)) {
-        LOGE("initOpenGLRenderer failed — FrameBuffer::initialize or RenderServer::create returned false");
-        LOGE("  Possible causes:");
-        LOGE("    1. TWOYI_ROOTFS dir doesn't exist or isn't writable");
-        LOGE("    2. EGL init failed (no EGL display)");
-        LOGE("    3. Unix socket bind failed (path too long or no permission)");
+
+    // Call FrameBuffer::initialize and RenderServer::create directly
+    // so we can log exactly which step fails. initOpenGLRenderer()
+    // swallows the error and just returns false.
+    LOGI("Calling FrameBuffer::initialize(%d, %d, ...)", width, height);
+    bool fb_inited = FrameBuffer::initialize(width, height, NULL, NULL);
+    if (!fb_inited) {
+        LOGE("FrameBuffer::initialize failed — EGL init or config selection failed");
+        LOGE("  Check: is libEGL.so loadable? Does eglGetDisplay work?");
         return -1;
     }
-    LOGI("initOpenGLRenderer: OK (listening on $TWOYI_ROOTFS/opengles)");
+    LOGI("FrameBuffer::initialize: OK");
+
+    LOGI("Calling RenderServer::create(port=0)");
+    RenderServer* renderServer = RenderServer::create(0);
+    if (!renderServer) {
+        LOGE("RenderServer::create failed — Unix socket bind failed");
+        LOGE("  Check: does %s/opengles path work?", rootfs_env ?: "/data/data/io.twoyi/rootfs");
+        // Try to create the directory in case it doesn't exist
+        if (rootfs_env) {
+            mkdir(rootfs_env, 0755);
+            LOGI("  Ensured rootfs dir exists: %s", rootfs_env);
+        }
+        return -1;
+    }
+    LOGI("RenderServer::create: OK");
+    renderServer->start();
+    LOGI("RenderServer started — listening on $TWOYI_ROOTFS/opengles");
 
     // 4. createOpenGLSubwindow — bind the ANativeWindow so EGL can
     //    render onto it. If win is NULL, skip (the subwindow can be

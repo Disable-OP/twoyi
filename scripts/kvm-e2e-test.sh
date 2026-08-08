@@ -450,7 +450,7 @@ echo "── Step 6/6: verdict ──"
 
 # Save a filtered logcat for quick scanning — the full logcat can be
 # 100k+ lines on a booted emulator.
-grep -E 'KR64 INFO|KR64 WARN|KR64 ERROR|CORE|NEW_RENDERER|CLIENT_EGL|SOCKET_MONITOR|BOOT_COMPLETED' \
+grep -E 'KR64 INFO|KR64 WARN|KR64 ERROR|CORE|NEW_RENDERER|CLIENT_EGL|SOCKET_MONITOR|BOOT_COMPLETED|TWOYI_RENDERER|emugl' \
     "$ARTIFACT_DIR/logcat.txt" 2>/dev/null \
     > "$ARTIFACT_DIR/logcat-filtered.txt" || true
 
