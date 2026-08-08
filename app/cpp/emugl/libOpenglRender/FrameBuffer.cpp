@@ -164,7 +164,7 @@ bool FrameBuffer::initialize(int width, int height, OnPostFn onPost, void* onPos
         // dlopenable libGLESv2.so). Calling getGLES2ExtensionString
         // with a NULL s_gl2.glGetString would crash.
         extern int s_gl2_enabled;
-        extern GL2Dispatch s_gl2;
+        extern gl2_decoder_context_t s_gl2;
         if (!s_gl2_enabled || !s_gl2.glGetString) {
             ERR("GLES2 dispatch table not loaded — skipping GLES2 extension query\n");
             fb->m_caps.hasGL2 = false;
