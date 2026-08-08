@@ -859,7 +859,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // keep the portable loop to avoid the seccomp trap on non-root
         // runs and because the cost is negligible.
         for fd in 3..1024i32 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
 
         let mount_cfg = mount_mgr::MountConfig {
