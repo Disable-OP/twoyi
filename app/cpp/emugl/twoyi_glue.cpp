@@ -27,7 +27,9 @@
 #include "libOpenglRender/render_api.h"
 #include "FrameBuffer.h"
 #include "RenderServer.h"
+#include "EGLDispatch.h"
 
+#include <EGL/egl.h>
 #include <android/log.h>
 #include <stdlib.h>  // getenv
 #include <sys/stat.h>  // mkdir
@@ -93,6 +95,32 @@ extern "C" int startOpenGLRenderer(void* win, int width, int height,
     // Call FrameBuffer::initialize and RenderServer::create directly
     // so we can log exactly which step fails. initOpenGLRenderer()
     // swallows the error and just returns false.
+    //
+    // First, test the EGL dispatch table directly to pinpoint failures.
+    extern EGLDispatch s_egl;
+    LOGI("s_egl.eglGetDisplay=%p s_egl.eglInitialize=%p s_egl.eglChooseConfig=%p",
+         (void*)s_egl.eglGetDisplay, (void*)s_egl.eglInitialize,
+         (void*)s_egl.eglChooseConfig);
+    if (!s_egl.eglGetDisplay || !s_egl.eglInitialize || !s_egl.eglChooseConfig) {
+        LOGE("EGL dispatch table has NULL entries — init_egl_dispatch failed to load symbols");
+        return -1;
+    }
+
+    EGLDisplay dpy = s_egl.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    LOGI("eglGetDisplay(EGL_DEFAULT_DISPLAY) = %p", (void*)dpy);
+    if (dpy == EGL_NO_DISPLAY) {
+        LOGE("eglGetDisplay returned EGL_NO_DISPLAY — no EGL display available");
+        return -1;
+    }
+
+    EGLint major = 0, minor = 0;
+    EGLBoolean ok = s_egl.eglInitialize(dpy, &major, &minor);
+    LOGI("eglInitialize(%p) = %d, version=%d.%d", (void*)dpy, ok, major, minor);
+    if (!ok) {
+        LOGE("eglInitialize failed — cannot initialize EGL");
+        return -1;
+    }
+
     LOGI("Calling FrameBuffer::initialize(%d, %d, ...)", width, height);
     bool fb_inited = FrameBuffer::initialize(width, height, NULL, NULL);
     if (!fb_inited) {
