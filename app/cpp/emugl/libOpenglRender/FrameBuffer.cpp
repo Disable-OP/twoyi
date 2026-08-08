@@ -156,25 +156,17 @@ bool FrameBuffer::initialize(int width, int height, OnPostFn onPost, void* onPos
     const char *gl2Extensions = NULL;
 #ifdef WITH_GLES2
     if (fb->m_caps.hasGL2) {
-        // twoyi patch: check that the GLES2 dispatch table is actually
-        // populated before calling getGLES2ExtensionString. The AOSP
-        // code assumes init_gl2_dispatch() succeeded, but on Android
-        // the dlopen of libGLESv2.so can fail (the emulator uses
-        // libGLESv2_emulation.so via the EGL loader, not a directly
-        // dlopenable libGLESv2.so). Calling getGLES2ExtensionString
-        // with a NULL s_gl2.glGetString would crash.
-        extern int s_gl2_enabled;
-        extern gl2_decoder_context_t s_gl2;
-        if (!s_gl2_enabled || !s_gl2.glGetString) {
-            ERR("GLES2 dispatch table not loaded — skipping GLES2 extension query\n");
-            fb->m_caps.hasGL2 = false;
-        } else {
-            gl2Extensions = getGLES2ExtensionString(fb->m_eglDisplay);
-            if (!gl2Extensions) {
-                // Could not create GLES2 context - drop GL2 capability
-                fb->m_caps.hasGL2 = false;
-            }
-        }
+        // twoyi patch: skip getGLES2ExtensionString entirely. On the
+        // Android emulator, this function dlopens libGLESv2.so and
+        // calls s_gl2.glGetString, but the dlopened libGLESv2.so
+        // doesn't match the emulator's EGL implementation, causing
+        // crashes or bad function pointers. The GLES2 extension
+        // string is only used for capability detection — setting
+        // hasGL2=false is safe (the renderer falls back to GLESv1
+        // for its own post-rendering context; guest GLESv2 commands
+        // are still decoded by gl2_dec.cpp).
+        ERR("twoyi: skipping getGLES2ExtensionString (emulator EGL mismatch)\n");
+        fb->m_caps.hasGL2 = false;
     }
 #endif
 
