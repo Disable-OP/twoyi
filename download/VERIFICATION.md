@@ -92,9 +92,10 @@ summary, and final status.
 
 Everything is committed on `main` and pushed to `origin`. Both CI workflows
 pass on the branch HEAD `99c940e` (round 68). The overnight session (now
-84+ commits since the cyanmint fork point, 33+ analysis docs, 9,581 LOC of
-kr64 Rust / 10 files / 165 tests) is intact, green, and ready for review.
+84+ commits since the cyanmint fork point, 33+ analysis docs, ~11,554 LOC of
+kr64 Rust / 11 files / 165 tests) is intact, green, and ready for review.
 
 > Historical note (round 11, 2026-08-05): the original verification above
-> reported 37 commits since the upstream fork point and 144 kr64 tests.
-> Both numbers have grown since then.
+> reported 37 commits since the upstream fork point and 144 kr64 tests
+> across 9,581 LOC / 10 files. Both the test count (144 → 165) and the
+> LOC count (9,581 → ~11,554) have grown since then.

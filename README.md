@@ -79,7 +79,7 @@ improvements over the archived upstream:
 | **Input handling** | `send_key_code()` now honours its keycode argument (was hardcoded to `KEY_BACK`) and advertises all supported keys; added `android_keycode_to_linux()` mapping for HOME/BACK/VOLUME_*/POWER/MENU/SEARCH/APP_SWITCH. | `7dc6093` |
 | **Signed release APKs** | Self-signed RSA-2048 test keystore wired into Gradle so CI and codespace builds produce installable APKs. | `ff1cc37` |
 
-The full commit history is preserved (386 commits at last count):
+The full commit history is preserved (414 commits at last count, 2026-08-08):
 
 ```bash
 git log --oneline main

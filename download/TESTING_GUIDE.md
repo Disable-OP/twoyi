@@ -18,7 +18,7 @@
 The kernel-replacement daemon (`app/rs/kr64/`) is the only Rust crate
 that is fully host-testable: its sole dependency is `libc`, and its
 `build.rs` (which compiles `interp.c`) works on any platform with a C
-compiler. **144 tests across 8 submodules plus the lib root** run on
+compiler. **165 tests across 8 submodules plus the lib root** run on
 plain Linux/x86_64 — no NDK, no device.
 
 ```bash
@@ -43,7 +43,7 @@ cargo test -- --nocapture     # show eprintln! from passing tests
 | `seccomp.rs` | 7 | BPF builds without panic, `allowed`/`trapped`/`killed` syscall sets, `classify` returns `Emulate{retval:0}`/`Kill`/`Passthrough` correctly |
 | `proc_emu.rs` | 5 | `populate_proc` creates all files, `/proc/version`/`cmdline`/`meminfo`/`cpuinfo` content |
 | `mount_mgr.rs` | 4 | `MountSpec::default`, `unshare(CLONE_NEWUSER)` works, `list_mounts`, `pivot_root` wrapper |
-| **Total** | **144** | |
+| **Total** | **165** | |
 
 Tests use a per-process `AtomicU64`-indexed tmpdir helper (e.g.
 `devices.rs:360-366`) so they run in parallel without colliding.
@@ -297,4 +297,4 @@ See `GSI_BOOT_PLAN.md` §5.7 for the file layout
 
 ---
 
-*If a test stops working, open a PR against `improvements/initial-cleanup` and update the command + file:line ref.*
+*If a test stops working, open a PR against `main` and update the command + file:line ref.*

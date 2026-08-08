@@ -18,7 +18,7 @@
 The kernel-replacement daemon (`app/rs/kr64/`) is the only Rust crate
 that is fully host-testable: its sole dependency is `libc`, and its
 `build.rs` (which compiles `interp.c`) works on any platform with a C
-compiler. **144 tests across 8 submodules plus the lib root** run on
+compiler. **165 tests across 8 submodules plus the lib root** run on
 plain Linux/x86_64 — no NDK, no device.
 
 ```bash
@@ -34,16 +34,17 @@ cargo test -- --nocapture     # show eprintln! from passing tests
 
 | Module | # | What it covers |
 |---|---:|---|
-| `lib.rs` | 7 | `Config::default`, `parse_args` (minimal/full/missing `--rootfs`/missing `--data-dir`/unknown/`--help`) |
-| `devices.rs` | 3 | `create_qemu_pipe` socket + FD, `create_all_devices` creates all 6 sockets, marker files |
+| `lib.rs` | 13 | `Config::default`, `parse_args` (minimal/full/missing `--rootfs`/missing `--data-dir`/unknown/`--help`) + extra config / arg coverage added in rounds 53–66 |
+| `devices.rs` | 5 | `create_qemu_pipe` socket + FD, `create_all_devices` creates all 6 sockets, marker files, drop / take-listener socket unlink |
 | `binder.rs` | 12 | ioctl/`BC_*`/`BR_*` constants match kernel, struct sizes (`binder_write_read`=48 B, `binder_transaction_data`=64 B, `flat_binder_object`=24 B), `HandleTable`, per-VM binder device, `BINDER_VERSION` roundtrip, `BINDER_WRITE_READ`→`BR_NOOP`, `ThreadPool` |
 | `audio.rs` | 27 | `AudioHeader` 16-byte layout + magic/direction, playback/capture roundtrips, `create_audio_device` socket + stale replacement, spawn accepts/rejects, `Handle::shutdown` joins, `ThreadPool`, `read_exact` EOF |
-| `sensors.rs` | 60 | `SensorEvent` 24-byte + 12-sensor index/type mapping matching VM wire format, `SensorState` bitflags, `SensorControl` 12-byte, spawn + per-cmd dispatch, multi-connection, `ConnState` cache, `ThreadPool` |
-| `battery.rs` | 19 | `BatteryStatus` roundtrip + Linux ABI bytes, `BatteryDevice::new` creates 7 files in nested `/sys/class/power_supply/battery/`, idempotency, `update_*` clamps, `refresh` from JNI stubs, `spawn` background refresh |
-| `seccomp.rs` | 7 | BPF builds without panic, `allowed`/`trapped`/`killed` syscall sets, `classify` returns `Emulate{retval:0}`/`Kill`/`Passthrough` correctly |
-| `proc_emu.rs` | 5 | `populate_proc` creates all files, `/proc/version`/`cmdline`/`meminfo`/`cpuinfo` content |
+| `sensors.rs` | 62 | `SensorEvent` 24-byte + 12-sensor index/type mapping matching VM wire format, `SensorState` bitflags, `SensorControl` 12-byte, spawn + per-cmd dispatch, multi-connection, `ConnState` cache, `ThreadPool` |
+| `battery.rs` | 20 | `BatteryStatus` roundtrip + Linux ABI bytes, `BatteryDevice::new` creates 7 files in nested `/sys/class/power_supply/battery/`, idempotency, `update_*` clamps, `refresh` from JNI stubs, `spawn` background refresh |
+| `seccomp.rs` | 9 | BPF builds without panic, `allowed`/`trapped`/`killed` syscall sets, `classify` returns `Emulate{retval:0}`/`Kill`/`Passthrough` correctly |
+| `proc_emu.rs` | 10 | `populate_proc` creates all files, `/proc/version`/`cmdline`/`meminfo`/`cpuinfo`/`self/status`/`self/mounts` content + idempotency (mode 0444, re-run safety) |
 | `mount_mgr.rs` | 4 | `MountSpec::default`, `unshare(CLONE_NEWUSER)` works, `list_mounts`, `pivot_root` wrapper |
-| **Total** | **144** | |
+| `compat_paths.rs` | 3 | Samsung GameSDK compatibility paths (added round 67) |
+| **Total** | **165** | |
 
 Tests use a per-process `AtomicU64`-indexed tmpdir helper (e.g.
 `devices.rs:360-366`) so they run in parallel without colliding.

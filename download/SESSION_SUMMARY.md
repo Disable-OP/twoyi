@@ -317,10 +317,10 @@ cargo test --lib
 ### Build the APK
 
 ```bash
-cd /home/z/my-project
+cd $REPO_ROOT   # in the codespace, this was `/home/z/my-project`
 source ~/.cargo/env
-export ANDROID_HOME=/workspaces/twoyi/.android-sdk
-export ANDROID_NDK_HOME=/workspaces/twoyi/.android-ndk
+export ANDROID_HOME=$REPO_ROOT/.android-sdk
+export ANDROID_NDK_HOME=$REPO_ROOT/.android-ndk
 ./gradlew assembleRelease -Pabis=all
 # Output: app/build/outputs/apk/release/twoyi_3.5.5-XXXXXXXX-release.apk (~270 MiB)
 ```

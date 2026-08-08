@@ -19,7 +19,7 @@
 In one session we reverse-engineered Virtual Master's APK (recovered the
 AES-128 key `%z89aviCM0KkbEs9`, decrypted its 4 bundled plugins,
 identified the GSI), ported AOSP's `libOpenglRender` to arm64 + x86_64,
-built `kr64` — a 9.5K-LOC Rust crate emulating the kernel / binder / HAL
+built `kr64` — an ~11.6K-LOC Rust crate emulating the kernel / binder / HAL
 surface a 64-bit Android guest expects — wired up two CI workflows
 (both green where finished), and produced a release APK. The honest-status
 doc explicitly retracts an earlier "it boots" overclaim. Current state:

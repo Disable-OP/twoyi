@@ -5,6 +5,17 @@
 > Nothing has booted a guest container end-to-end yet. That's the next
 > thing. Coffee's on you.
 
+> **Update (round 68, 2026-08-08):** the original handoff above was
+> written when `improvements/initial-cleanup` was still the dev branch.
+> That branch has since been merged into `main` and deleted from origin.
+> `main` is now the ONLY branch (see repo-root `MEMORY.md` §Round 68 for
+> the full history). CI was actually broken from rounds 60–67 due to 4
+> stacked bugs (NDK action, CMake cache, missing strings, missing
+> translations); all 4 are now fixed and both workflows are genuinely
+> green on `main` HEAD `99c940e`. The "43 commits ahead of base" count
+> below is the historical 2026-08-05 snapshot; `main` is now ~414
+> commits past the cyanmint fork point.
+
 ## 1. What was done
 
 In one session we reverse-engineered Virtual Master's APK (recovered the

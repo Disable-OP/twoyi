@@ -1,7 +1,8 @@
 # RELENG — Release Engineering
 
 How twoyi releases are versioned, built, signed, published, and rolled back.
-Active dev branch: `improvements/initial-cleanup`; mirror: `Disable-OP/twoyi`.
+Active dev branch: `main` (the only branch — `improvements/initial-cleanup`
+was merged in and deleted on 2026-08-08); mirror: `Disable-OP/twoyi`.
 
 ## 1. Version numbering
 
@@ -110,7 +111,7 @@ If a published release is broken (bootloop, crash on launch, etc.):
 1. **Unset "latest"** on the bad release's GitHub page (stops the API and any in-app
    updater from advertising it), then **re-point "latest"** to the previous known-good
    release. Do not delete the bad release — keep it for forensics, mark its title `[RETRACTED]`.
-2. **Push a revert** commit on `improvements/initial-cleanup` for the offending
+2. **Push a revert** commit on `main` for the offending
    change(s); let CI rebuild.
 3. **Cut a hotfix** following §2–§4 with a fresh `MMddHHmm` timestamp and a
    bumped `versionCode` so users on the bad build can upgrade over it.

@@ -11,8 +11,8 @@ unlocked bootloader, and no host modifications.
   (`%z89aviCM0KkbEs9`), decrypted all 4 bundled plugins, identified the GSI.
 - **Open-sourced the native side** — rebuilt AOSP's `libOpenglRender` from
   source for **arm64-v8a + x86_64**, replacing 3 closed-source `.so` blobs.
-- **Built `kr64`** — a 9,581-LOC Rust crate emulating the kernel / binder /
-  HAL surface a 64-bit Android guest expects; 8 modules, **154 tests passing**.
+- **Built `kr64`** — a ~11,554-LOC Rust crate emulating the kernel / binder /
+  HAL surface a 64-bit Android guest expects; 8 modules, **165 tests passing**.
 - **Wired up CI** — 2 GitHub Actions workflows, both green; ~20 commits
   overnight (235 total on `main`).
 - **Shipped a signed release APK** + ~32 analysis docs (~15,900 lines).
@@ -31,7 +31,8 @@ reached the rendering stage on x86_64**. From `logcat`: `init` **executed**
 | ✅ Works | ❌ Doesn't work (yet) |
 |---|---|
 | Builds for arm64 + x86_64 | End-to-end rendering |
-| 154 unit tests, 0 failing; CI green | Pipe write fails: `EINVAL` (os error 22) |
+| 154 unit tests, 0 failing; CI green (historical — see Round 68 update above) | Pipe write fails: `EINVAL` (os error 22) |
+| Updated: 165 tests as of round 68 | — |
 | x86_64 rootfs: `init` runs | Guest SurfaceFlinger can't draw a frame |
 | QEMU pipe connects, GL ctx created | — |
 

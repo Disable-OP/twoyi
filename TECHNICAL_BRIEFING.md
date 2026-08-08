@@ -74,7 +74,7 @@ app/rs/
     └── interp.c               # custom PT_INTERP (sets the dynamic linker)
 ```
 
-**Total kr64:** 9,581 lines, 144 unit tests, 8 feature modules.
+**Total kr64:** ~11,554 lines, 165 unit tests, 8 feature modules (across 11 `.rs` files).
 
 **Key files to read first:**
 - `app/rs/src/core.rs` — boot sequence (this is where `init` gets spawned).
@@ -226,7 +226,7 @@ What it took:
   — `ANativeWindow` is the `EGLNativeWindow`, returned as-is.
 - Added `twoyi_api.cpp` — the 6 C-ABI entry points + 4 `dl*_ex` wrappers.
 
-### 3.2 The kr64 daemon (Rust, 9,581 lines, 144 tests)
+### 3.2 The kr64 daemon (Rust, ~11,554 lines, 165 tests)
 
 Mirrors VM's `libkr64.so` design in safe Rust. Modules:
 - `devices.rs` (405 lines) — `mknodat`/`bind` for 7 device sockets
@@ -433,7 +433,7 @@ WHAT WORKS
   ✅ QEMU pipe connects (wrong pipe, but the code path works)
   ✅ GL context created
   ✅ AOSP libOpenglRender.so built for arm64 + x86_64 (open source)
-  ✅ kr64 daemon: 9,581 lines, 144 tests, 8 modules
+  ✅ kr64 daemon: ~11,554 lines, 165 tests, 8 modules
   ✅ HAL shims: audio + battery + sensors
   ✅ App stays alive on x86_64 boot (no crash)
 

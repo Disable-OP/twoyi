@@ -12,7 +12,11 @@
 > This section is the canonical final summary. All earlier per-round tables
 > below (section 0 onward) are preserved for historical context only.
 > **68 rounds of improvements** have been completed; the codebase is
-> production-ready. **CI is now ACTUALLY green on `main`** — see the Round 68
+> **build-ready** (CI green, 0 warnings, 0 fmt drift, 165/165 kr64 tests).
+> ⚠️ **The twoyi container has NEVER booted end-to-end** — the
+> `qemu_pipe` accept thread is still the MVP single-byte-echo stub; see
+> [`HONEST_STATUS_CORRECTED.md`](HONEST_STATUS_CORRECTED.md) for the canonical
+> status retraction. **CI is now ACTUALLY green on `main`** — see the Round 68
 > section below; rounds 60–67 had been red on every push because 4 stacked CI
 > bugs masked each other (the previous "all quality gates green" claim was
 > only ever true for the local cargo test / clippy / lint invocations, never
@@ -34,7 +38,7 @@
 | Emulator                        | Android 9 (API 28) boots with TCG (**no KVM needed**)  |
 | Latest APK                      | `twoyi_3.5.5-08061930-release.apk` (8.8 MB, v2 signed) |
 | CI status (GitHub Actions)      | **GREEN** — both `build.yml` and `kr64-tests.yml` pass on `99c940e` (round 68) |
-| Codebase state                  | **Production-ready**                                   |
+| Codebase state                  | **Build-ready** — CI green, 0 warnings, 0 fmt drift, 165/165 kr64 tests. ⚠️ Container has NOT yet booted end-to-end (see [`HONEST_STATUS_CORRECTED.md`](HONEST_STATUS_CORRECTED.md)) |
 
 ### Shipped improvements (categories)
 
@@ -81,7 +85,7 @@
 - `scripts/fake_statvfs.so` — prebuilt `LD_PRELOAD` shim for headless
   emulator disk-bypass testing.
 
-### Quality gates (all green)
+### Quality gates (all green — verified 2026-08-08 commit `99c940e`)
 
 | Gate                              | Tool / Command                                  | Result                          |
 | --------------------------------- | ----------------------------------------------- | ------------------------------- |
@@ -91,16 +95,20 @@
 | Rust build warnings               | `cargo build --lib`                             | **0 warnings**                  |
 | Lint (Java + XML + resources)     | `./gradlew lint`                                | **0 errors, 0 warnings**        |
 | APK signing                       | `apksigner verify --verbose`                    | **v2 scheme verified**          |
-| Emulator boot                     | TCG-only, no KVM                                | **Android 9 boots end-to-end**  |
+| Emulator boot (NOT twoyi container) | TCG-only, no KVM                             | **Android 9 (API 28) AVD boots end-to-end** — twoyi's own container has NOT yet booted end-to-end; the `qemu_pipe` accept thread is still the MVP stub |
 
 ### Status verdict
 
-**Production-ready.** After **68 rounds of improvements** (~245 individual
-changes shipped across 90+ commits), all local quality gates are green,
-all 4 locales translated, security config and CI gating in place, APK
-signed and reproducibly buildable. The `main` branch is the only branch
-(`improvements/initial-cleanup` was merged in and deleted on 2026-08-08)
-and is ready to be tagged as the v3.5.5 release.
+**Build-ready.** After **68 rounds of improvements** (~245 individual
+changes shipped across 90+ commits), all build quality gates are green
+(verified 2026-08-08 commit `99c940e`), all 4 locales translated,
+security config and CI gating in place, APK signed and reproducibly
+buildable. ⚠️ **The twoyi container itself has NOT yet booted
+end-to-end** — the `qemu_pipe` GL dispatcher is still the MVP stub; see
+[`HONEST_STATUS_CORRECTED.md`](HONEST_STATUS_CORRECTED.md). The `main`
+branch is the only branch (`improvements/initial-cleanup` was merged in
+and deleted on 2026-08-08) and is ready to be tagged as a v3.5.5
+**release candidate**, not a "production-ready" release.
 
 > **Round 68 caveat:** the previous rounds (60–67) all claimed "CI green"
 > in their commit messages, but CI had actually been broken on every push
@@ -238,11 +246,11 @@ closed: CI runs the full pipeline end-to-end.
 > preserved for history. See the **Production Release** section above for
 > the final canonical numbers (round 52).
 
-## 0. Final Session Statistics (production-ready)
+## 0. Final Session Statistics (historical — round 32 era, build-clean sign-off)
 
 | Metric                          | Value                                                  |
 | ------------------------------- | ------------------------------------------------------ |
-| Total commits pushed            | **62+** on `improvements/initial-cleanup` (368 total)  |
+| Total commits pushed            | Historical: 62+ on `improvements/initial-cleanup` (368 total). Current: see Round 68 section above — 414 commits on `main` (verified 2026-08-08). |
 | Total bugs / improvements fixed | **~180** (critical + high + medium + low)              |
 | Total sub-agents spawned        | **45+** (each filing a triaged bug list)               |
 | Files improved                  | **40+** (Rust + Java + C++ + XML + ProGuard + scripts) |
@@ -256,7 +264,7 @@ closed: CI runs the full pipeline end-to-end.
 | Network security config         | ✓ `network_security_config.xml` (cleartext forbidden)  |
 | CI gating                       | ✓ clippy + lint both gate PRs                          |
 | Build targets                   | arm64-v8a + x86_64 (both compile)                      |
-| Codebase state                  | **Production-ready**                                   |
+| Codebase state (round 32 view)  | **Production-ready** *(historical round-32-era claim, later retracted by [`HONEST_STATUS_CORRECTED.md`](HONEST_STATUS_CORRECTED.md) — container has never booted end-to-end)* |
 
 ### Round 32 — final comprehensive review + remaining i18n cleanup (this commit)
 
@@ -311,7 +319,7 @@ in **en**, **zh-rCN**, **zh-rTW**, and **ja**.
 - Android lint → **0 errors, 0 warnings** (CI-gated since round 22)
 - All 4 locales' `strings.xml` files validate as well-formed XML
 
-**Codebase state:** production-ready, fully internationalized, CI-gated.
+**Codebase state (round 32 view):** production-ready *(historical — retracted; see [`HONEST_STATUS_CORRECTED.md`](HONEST_STATUS_CORRECTED.md))*, fully internationalized, CI-gated.
 
 ### Round 20 — printStackTrace → Log.e sweep + APK rebuild (this commit)
 
@@ -550,7 +558,7 @@ app/rs/
 │   ├── renderer_bindings.rs # FFI to libOpenglRender.so
 │   └── interp.c             # .interp segment for PIE hack
 ├── loader/                  # libloader.so (open-source dlopen wrapper)
-├── kr64/                    # Kernel replacement daemon (9,581 lines, 144 tests)
+├── kr64/                    # Kernel replacement daemon (~11,554 lines, 165 tests, 11 files)
 │   └── src/
 │       ├── lib.rs           # Main entry, config, fork+exec guest
 │       ├── devices.rs       # Virtual /dev devices (qemu_pipe, touch, key, ...)
@@ -593,7 +601,7 @@ app/src/main/
 - ✅ APK builds and signs for arm64-v8a + x86_64 (284MB, v2 signed)
 - ✅ All closed-source blobs removed — 100% open source
 - ✅ AOSP emugl renderer built from source for both ABIs
-- ✅ kr64 daemon: 9,581 lines, 144 tests, 8 modules
+- ✅ kr64 daemon: ~11,554 lines, 165 tests, 8 modules (across 11 .rs files)
 - ✅ Work profile support (no hardcoded /data/data paths)
 - ✅ **libtwoyi.so rebuilt with rootfs linker fix** (both ABIs, pushed to GitHub)
 - ✅ x86_64 rootfs extracted from emulator (554MB, all system + vendor)
@@ -1017,7 +1025,7 @@ emulator -avd twoyi28 \
 4. Test signed APK on a real arm64 device (codespace is x86_64, can't do arm64
    runtime testing).
 
-## 15. Final Cleanup Pass (2026-08-06 — production-ready sign-off)
+## 15. Final Cleanup Pass (2026-08-06 — build-clean sign-off; ⚠️ container boot NOT achieved)
 
 This commit closes out the cleanup work. Two latent test regressions (introduced
 by earlier "fix" commits that updated production code without updating the
@@ -1039,14 +1047,14 @@ corresponding regression tests) were the only remaining issues:
    re-run path is also safe).
 
 **Verification:** `cargo test --lib` → `test result: ok. 145 passed; 0 failed`.
-**Codebase state:** production-ready.
+**Codebase state (round 32 view):** production-ready *(historical — retracted by [`HONEST_STATUS_CORRECTED.md`](HONEST_STATUS_CORRECTED.md); container has never booted end-to-end)*.
 
 ## 16. Final Session State (2026-08-07 08:10 UTC)
 
 ### Branches Synchronized
-- **main**: 399 commits (merged from improvements/initial-cleanup + VM analysis + VM-inspired code)
-- **improvements/initial-cleanup**: 394 commits (fully merged into main)
-- Both branches pushed to origin
+- **main**: 414 commits as of 2026-08-08 (was 399 at the 2026-08-07 snapshot below; includes merged `improvements/initial-cleanup` + VM analysis + VM-inspired code + round 68 CI fixes)
+- **improvements/initial-cleanup** (deleted 2026-08-08): had 394 commits, all merged into `main`
+- Only `main` is pushed to origin (the historical branch was deleted)
 
 ### Virtual Master Reverse Engineering — COMPLETE
 - All native libraries analyzed (libvm.so, libkr64.so/11/12, libkrloader64)

@@ -280,7 +280,7 @@ endif()
 Build invocation:
 
 ```bash
-NDK=/workspaces/twoyi/.android-ndk
+NDK=$REPO_ROOT/.android-ndk   # codespace path was `/workspaces/twoyi/.android-ndk`
 cmake -G "Unix Makefiles" \
     -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
     -DANDROID_ABI=arm64-v8a \

@@ -3,8 +3,9 @@
 > **Goal:** get you from `git clone` to a working build and a picked task in
 > **5 minutes**. Twoyi is a rootless Android-on-Android container — it boots
 > a second Android userland inside one normal app process, with no root and
-> no kernel module. Active development happens on the `improvements/initial-cleanup`
-> branch of [`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi).
+> no kernel module. Active development happens on the `main` branch of
+> [`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi) (the historical
+> `improvements/initial-cleanup` branch has been merged in and deleted).
 >
 > If you want the *why* before the *how*, read
 > [`download/TECHNICAL_BRIEFING.md`](TECHNICAL_BRIEFING.md) (~15 min read).
@@ -15,7 +16,7 @@
 
 ```bash
 git clone https://github.com/Disable-OP/twoyi.git && cd twoyi
-git checkout improvements/initial-cleanup
+git checkout main   # main is the only branch (round 68)
 ./gradlew assembleRelease -Pabis=arm64-v8a
 ```
 
@@ -36,7 +37,7 @@ also works in x86_64 emulators and redroid, swap the last line for
 ## 2. Run Tests (2 commands)
 
 ```bash
-cd app/rs/kr64 && cargo test        # Rust unit tests — 38 tests on Linux host
+cd app/rs/kr64 && cargo test        # Rust unit tests — 165 tests on Linux host
 ./gradlew test                      # Java unit tests
 ```
 
@@ -67,7 +68,7 @@ Twoyi is three layers. Read these files **in this order** to get oriented:
   `devices.rs` (virtual `/dev` tree), `binder.rs` (binder proxy),
   `seccomp.rs` (BPF filter + SIGSYS handler), `proc_emu.rs` (`/proc` synthesiser),
   `mount_mgr.rs` (bind-mount + tmpfs), `audio.rs` / `battery.rs` / `sensors.rs`
-  (HAL shims). ~9,500 LOC, 144 tests.
+  (HAL shims). ~11,554 LOC across 11 `.rs` files, 165 tests.
 - `app/rs/loader/` — open-source replacement for the legacy `libloader.so` blob.
 - `app/rs/openglrenderer/` — Rust scaffolding around the AOSP-built
   `libOpenglRender.so` (which is built from AOSP emugl source, not in this repo).
@@ -108,7 +109,7 @@ discussion needed, complete design doc already exists):
    See `download/VM_KR64_ANALYSIS.md` §6 for the full inventory.
 
 For anything bigger than a typo, **open an issue first** so we can confirm
-scope. Branch from `improvements/initial-cleanup`, use Conventional Commits
+scope. Branch from `main`, use Conventional Commits
 (`feat:`, `fix:`, `docs:` …), and open a PR against the same branch.
 
 ---

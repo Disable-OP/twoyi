@@ -73,7 +73,7 @@ on top of upstream, including:
 - An **open-source `libOpenglRender.so`** rebuilt from AOSP `emugl` source
   (Apache-2.0), replacing the 1.06 MB closed-source arm64-only blob. Builds
   for both `arm64-v8a` and `x86_64`.
-- The **`kr64` kernel-replacement daemon** in Rust — 9,581 lines, 165 unit
+- The **`kr64` kernel-replacement daemon** in Rust — ~11,554 lines, 165 unit
   tests, 8 feature modules (binder, sensors, audio, battery, seccomp,
   `proc_emu`, `mount_mgr`, devices).
 - **Work profile support** — eight hardcoded `/data/data/io.twoyi` paths
@@ -129,7 +129,7 @@ filter (~60 syscalls allowed, ~15 blocked) with a `SIGSYS` handler, emulates a
 static `/proc`, sets up a mount namespace via `pivot_root` + tmpfs, and finally
 `exec`s the guest `init`.
 
-It is the centrepiece of the fork. Today it compiles, all 144 tests pass, and
+It is the centrepiece of the fork. Today it compiles, all 165 tests pass, and
 the design is complete — but its JNI surface is stubbed, the binder proxy is
 unreachable without a guest-side LD_PRELOAD shim, and `create_qemu_pipe()` is
 still a stub. Wiring kr64 into the actual boot flow is the single highest-

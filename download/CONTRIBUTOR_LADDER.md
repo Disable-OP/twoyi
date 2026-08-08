@@ -3,7 +3,8 @@
 > The four contributor roles in the twoyi project — what each can do, what's
 > expected, and how to advance. Pair with [`CONTRIBUTING.md`](../CONTRIBUTING.md)
 > (process) and the [Development Roadmap](DEVELOPMENT_ROADMAP.md) (what to work on).
-> Active branch: `improvements/initial-cleanup` on `Disable-OP/twoyi`.
+> Active branch: `main` on `Disable-OP/twoyi` (the only branch —
+> `improvements/initial-cleanup` was merged in and deleted on 2026-08-08).
 
 ## 1. New Contributor
 
@@ -15,14 +16,14 @@ Anyone who has forked the repo and is reading the docs — no PRs merged yet.
 the one thing we push back on in review.
 
 **Permissions** — Open issues and Discussions; open PRs from your fork against
-`improvements/initial-cleanup`; comment on issues and PRs; self-assign issues labelled `good first
+`main`; comment on issues and PRs; self-assign issues labelled `good first
 issue`.
 
 **Responsibilities** — Ask in Discussions before sinking time into code; follow the PR template
 (Conventional Commits, `cargo fmt` + `clippy -D warnings`, honest "What I tested / Not tested");
 pick a task from §5 or `DEVELOPMENT_ROADMAP.md` §10.2.
 
-**How to advance to Contributor** — Get **one** PR merged into `improvements/initial-cleanup`. Any
+**How to advance to Contributor** — Get **one** PR merged into `main`. Any
 size counts — typo, docs, or a `good first issue`.
 
 ## 2. Contributor
@@ -55,17 +56,17 @@ the AOSP-derived `libOpenglRender.so` rebuild); reviewed 3+ PRs to completion be
 understands `ARCHITECTURE_DECISIONS.md` (Rust+JNI over C++; container over KVM; PIE-as-cdylib; open-
 source everything; defer binder virtualisation).
 
-**Permissions** — Approve and merge PRs into `improvements/initial-cleanup` (squash small, merge-
+**Permissions** — Approve and merge PRs into `main` (squash small, merge-
 commit large per `CONTRIBUTING.md` §5). One approval suffices for non-architectural changes; **two**
 approvals required for: new Rust crate, new AIDL/JNI surface, anything in
 `app/rs/kr64/src/seccomp.rs` or `app/rs/src/interp.c`. Label/close issues, edit the roadmap, `force-
-with-lease` feature branches (never `improvements/initial-cleanup` or `main`), cut release-candidate
+with-lease` feature branches (never `main`), cut release-candidate
 builds.
 
 **Responsibilities** — Review PRs within 1 week of assignment; enforce the honesty policy in PR
 descriptions; don't merge your own PRs unless another Maintainer is unavailable >2 weeks and the
 change is urgent; mentor at least one Contributor or New Contributor (§6); keep
-`improvements/initial-cleanup` green — bisect and revert if a merge breaks CI and the author is
+`main` green — bisect and revert if a merge breaks CI and the author is
 unreachable; document architectural changes in `ARCHITECTURE_DECISIONS.md` as a new ADR.
 
 **How to advance to Lead Maintainer** — Sustained contribution over 6+ months (review load, releases

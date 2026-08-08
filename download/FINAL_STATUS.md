@@ -20,7 +20,7 @@ piece (twoyi's own `/dev/qemu_pipe`).**
 | Commits overnight | **20** (since 22:06 UTC on 2026-08-04) |
 | Total commits on `main` | 235 |
 | Analysis docs in `download/` | 32 files, ~15,900 lines |
-| `kr64` daemon | ~9,581 LOC, **154 tests** passing, 8 feature modules |
+| `kr64` daemon | ~11,554 LOC across 11 files, **165 tests** passing, 8 feature modules |
 | CI | 2 GitHub Actions workflows (`build.yml`, `kr64-tests.yml`) — all green |
 | Test status | 154 passing, 0 failing, 0 warnings |
 

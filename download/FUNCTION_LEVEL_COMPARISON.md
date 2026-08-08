@@ -4,7 +4,7 @@
 **Investigator:** general-purpose sub-agent
 **Codespace:** `twoyi-dev-3-jr47xg6xvx7ghq6p`
 **Binaries compared:**
-- **LEGACY** = `/workspaces/twoyi/app/src/main/jniLibs/arm64-v8a/libOpenglRender.so` (1,059,128 bytes, closed-source blob)
+- **LEGACY** = `$REPO_ROOT/app/src/main/jniLibs/arm64-v8a/libOpenglRender.so` (1,059,128 bytes, closed-source blob; in the codespace this was `/workspaces/twoyi/app/src/main/jniLibs/arm64-v8a/libOpenglRender.so`)
 - **AOSP-arm64** = `/tmp/libOpenglRender_aosp_arm64.so` (603,296 bytes, built in task AOSP-BUILD-1)
 - **AOSP-x86_64** = `/tmp/libOpenglRender_aosp_x86_64.so` (597,632 bytes)
 

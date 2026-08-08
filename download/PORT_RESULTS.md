@@ -395,9 +395,10 @@ drop-in replacement for the legacy blob**, with three caveats:
 ```bash
 # Copy the new build over the legacy blob
 cp /tmp/libOpenglRender_aosp_arm64.so \
-   /workspaces/twoyi/app/src/main/jniLibs/arm64-v8a/libOpenglRender.so
+   $REPO_ROOT/app/src/main/jniLibs/arm64-v8a/libOpenglRender.so
 cp /tmp/libOpenglRender_aosp_x86_64.so \
-   /workspaces/twoyi/app/src/main/jniLibs/x86_64/libOpenglRender.so
+   $REPO_ROOT/app/src/main/jniLibs/x86_64/libOpenglRender.so
+# (in the codespace, $REPO_ROOT was `/workspaces/twoyi` — adjust for your clone)
 
 # Build the APK and test that:
 # 1. Basic GL rendering still works (the 6 twoyi-required symbols).

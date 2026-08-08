@@ -21,7 +21,9 @@ answer. Close that one gap and the container goes end-to-end.
   exactly where I left off.
 - 40+ docs landed in `download/` overnight; `HANDOFF.md` and
   `ONE_PAGE_SUMMARY.md` are the quick maps. Branch
-  `improvements/initial-cleanup` has the dev work.
+  `improvements/initial-cleanup` has the dev work. **(Round 68 update: that
+  branch was merged into `main` and deleted on 2026-08-08 — `main` is now
+  the only branch; see repo-root `MEMORY.md` §Round 68.)**
 
 Thanks for trusting me with the night shift — the repo is healthier
 than you left it, the breakthrough is real, and the next step is small
