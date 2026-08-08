@@ -264,7 +264,7 @@ fn parse_channel_name(buf: &[u8]) -> Option<&str> {
     // the channel name in the same write).
     let end = name_bytes
         .iter()
-        .position(|&b| b == 0 || b < 0x20 || b > 0x7e)
+        .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b))
         .unwrap_or(name_bytes.len());
     if end == 0 {
         return None;
