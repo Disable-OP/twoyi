@@ -939,8 +939,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 return 1;
             }
         };
-        match qemu_pipe::spawn_qemu_pipe_proxy(listener, dev.path.clone(), cfg.rootfs.clone())
-        {
+        match qemu_pipe::spawn_qemu_pipe_proxy(listener, dev.path.clone(), cfg.rootfs.clone()) {
             Ok(h) => {
                 info!(
                     "[KR64] qemu_pipe proxy listening at {} (rootfs={})",

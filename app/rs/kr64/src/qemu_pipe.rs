@@ -89,9 +89,7 @@ pub fn spawn_qemu_pipe_proxy(
                         std::thread::Builder::new()
                             .name(format!("kr64-pipe-handshake-{}", sid))
                             .spawn(move || {
-                                if let Err(e) =
-                                    handle_session(guest_stream, &rootfs_clone, sid)
-                                {
+                                if let Err(e) = handle_session(guest_stream, &rootfs_clone, sid) {
                                     warning!("[KR64][qemu_pipe] session {} ended: {}", sid, e);
                                 }
                             })
@@ -154,10 +152,7 @@ impl Drop for QemuPipeProxyHandle {
 fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Result<()> {
     // Step 1: read the "pipe:<channel>" handshake.
     let channel = read_channel_name(&mut guest)?;
-    info!(
-        "[KR64][qemu_pipe] session {} channel = {}",
-        sid, channel
-    );
+    info!("[KR64][qemu_pipe] session {} channel = {}", sid, channel);
 
     if channel != "opengles" && channel != "opengles2" && channel != "opengles3" {
         // Unknown channel — close. (Future: route "audio", "camera", etc.)
