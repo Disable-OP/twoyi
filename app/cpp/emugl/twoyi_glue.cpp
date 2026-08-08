@@ -28,6 +28,7 @@
 #include "FrameBuffer.h"
 
 #include <android/log.h>
+#include <stdlib.h>  // getenv
 
 #define LOG_TAG "TWOYI_RENDERER"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -77,9 +78,24 @@ extern "C" int startOpenGLRenderer(void* win, int width, int height,
     // 3. initOpenGLRenderer — starts FrameBuffer + RenderServer.
     //    portNum=0 → RenderServer listens on $TWOYI_ROOTFS/opengles.
     //    (UnixStream.cpp uses port % 3 to pick opengles{,2,3}.)
+    //    The TWOYI_ROOTFS env var must be set before this call —
+    //    UnixStream::listen() calls getenv("TWOYI_ROOTFS") to build
+    //    the socket path. The Rust side sets it in core.rs before
+    //    calling startOpenGLRenderer.
+    const char* rootfs_env = getenv("TWOYI_ROOTFS");
+    LOGI("TWOYI_ROOTFS=%s", rootfs_env ? rootfs_env : "(not set)");
+    if (!rootfs_env || !rootfs_env[0]) {
+        LOGE("TWOYI_ROOTFS not set — UnixStream will use default /data/data/io.twoyi/rootfs");
+        // Not fatal — the default path might work if the app data dir
+        // matches. But on work profiles it would be wrong.
+    }
     if (!initOpenGLRenderer(width, height, /*portNum=*/0,
                             /*onPost=*/NULL, /*onPostContext=*/NULL)) {
-        LOGE("initOpenGLRenderer failed");
+        LOGE("initOpenGLRenderer failed — FrameBuffer::initialize or RenderServer::create returned false");
+        LOGE("  Possible causes:");
+        LOGE("    1. TWOYI_ROOTFS dir doesn't exist or isn't writable");
+        LOGE("    2. EGL init failed (no EGL display)");
+        LOGE("    3. Unix socket bind failed (path too long or no permission)");
         return -1;
     }
     LOGI("initOpenGLRenderer: OK (listening on $TWOYI_ROOTFS/opengles)");

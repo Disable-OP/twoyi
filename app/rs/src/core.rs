@@ -150,6 +150,27 @@ pub fn init_renderer(
         // Convert raw pointer to usize for safe transfer between threads
         let window_addr = window as usize;
 
+        // Set TWOYI_ROOTFS env var in the CURRENT process so that
+        // libOpenglRender.so's UnixStream::listen() can find the rootfs
+        // path to create the /opengles socket. This must happen BEFORE
+        // startOpenGLRenderer is called, because the renderer's
+        // RenderServer::create() calls UnixStream::listen() which calls
+        // getenv("TWOYI_ROOTFS") in the same process (not the child).
+        let working_dir_for_env = get_rootfs_dir();
+        unsafe {
+            let c_rootfs = std::ffi::CString::new(working_dir_for_env.as_str())
+                .expect("rootfs path has NUL byte");
+            libc::setenv(
+                b"TWOYI_ROOTFS\0".as_ptr() as *const libc::c_char,
+                c_rootfs.as_ptr(),
+                1,
+            );
+        }
+        info!(
+            "[CORE] Set TWOYI_ROOTFS={} in process env for renderer",
+            working_dir_for_env
+        );
+
         // Start the renderer in a separate thread
         thread::spawn(move || {
             let window = window_addr as *mut c_void;
