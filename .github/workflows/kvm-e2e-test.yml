@@ -243,15 +243,16 @@ jobs:
 
           # Create the AVD. avdmanager prompts "Do you wish to create a
           # custom hardware profile? [no]" — the default is 'no' (shown in
-          # brackets). We pipe "no\n" to answer 'no' explicitly.
-          # NOTE: < /dev/null (EOF) causes avdmanager's BufferedReader to
-          # throw (offset 0, count -1, length 256) and exit 1. Piping
-          # actual input works. "yes no" provides infinite "no" lines in
-          # case avdmanager asks multiple questions.
+          # brackets). We pipe a single empty line (just Enter) to accept
+          # the default.
+          # NOTE: 'yes no |' floods avdmanager with "no" lines before it
+          # even asks the question, causing "Error: no" and a spam of
+          # echoed lines. < /dev/null (EOF) causes a BufferedReader
+          # throw. A single echo (one newline = accept default) works.
           # We omit -d (device) because the pixel_5 device profile isn't
           # always available; avdmanager will use a generic profile by
           # default, which is fine for our headless testing.
-          yes no | "$AVDMGR" create avd \
+          echo "" | "$AVDMGR" create avd \
               -n twoyi_test \
               -k "system-images;android-30;google_apis;x86_64" \
               --force
