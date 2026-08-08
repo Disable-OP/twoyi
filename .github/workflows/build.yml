@@ -92,10 +92,16 @@ jobs:
 
       - name: Setup Android NDK
         id: setup-ndk
-        # nttld/setup-ndk@v2 supersedes the old android-actions/setup-ndk
-        # line; v2 is the actively maintained major and supports newer NDK
-        # releases (r27c+) and the `ndk-path` output used below.
-        uses: nttld/setup-ndk@v2
+        # nttld/setup-ndk is the actively-maintained fork of the old
+        # android-actions/setup-ndk action; it supports newer NDK releases
+        # (r27c+) and exposes the `ndk-path` output used below. As of
+        # 2026-08 the latest stable tag is v1.6.0 — there is NO `v2` tag
+        # (the comment that previously said so was wrong, and every CI
+        # run since round 60 was failing at "Set up job" with
+        # "Unable to resolve action `nttld/setup-ndk@v2`"). Pinning to
+        # the v1 major line tracks patch releases without breaking on a
+        # hypothetical future v2 that changes the input schema.
+        uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
           add-to-path: false
