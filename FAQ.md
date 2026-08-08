@@ -2,7 +2,7 @@
 
 > Answers to the most common questions from new contributors and users.
 > This document reflects the honest state of the project as of the
-> `improvements/initial-cleanup` branch. Twoyi has a documented history of
+> `main` branch (round 68, 2026-08-08). Twoyi has a documented history of
 > overclaims — when in doubt, trust [`TWOYI_HONEST_STATUS.md`](TWOYI_HONEST_STATUS.md)
 > over any "it works" claim, including ones here.
 
@@ -64,14 +64,16 @@ emulator's. This is the new top priority of the project.
 ## 4. How is this different from the original twoyi?
 
 The original `twoyi/twoyi` repo is archived and was last touched in 2022. This
-fork lives on the `improvements/initial-cleanup` branch of
-[`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi) and adds **34 commits**
+fork lives on the `main` branch of
+[`Disable-OP/twoyi`](https://github.com/Disable-OP/twoyi) (the historical
+`improvements/initial-cleanup` branch has been merged in and deleted) and
+adds **84+ commits**
 on top of upstream, including:
 
 - An **open-source `libOpenglRender.so`** rebuilt from AOSP `emugl` source
   (Apache-2.0), replacing the 1.06 MB closed-source arm64-only blob. Builds
   for both `arm64-v8a` and `x86_64`.
-- The **`kr64` kernel-replacement daemon** in Rust — 9,581 lines, 144 unit
+- The **`kr64` kernel-replacement daemon** in Rust — 9,581 lines, 165 unit
   tests, 8 feature modules (binder, sensors, audio, battery, seccomp,
   `proc_emu`, `mount_mgr`, devices).
 - **Work profile support** — eight hardcoded `/data/data/io.twoyi` paths
@@ -151,7 +153,7 @@ discussion needed):
 3. Extend the `kr64` device tree to 20+ devices (Phase 3 task 3.1, ~3 days,
    ~30 min per device).
 
-Branch from `improvements/initial-cleanup`, use Conventional Commits
+Branch from `main`, use Conventional Commits
 (`feat:`, `fix:`, `docs:` …), and open a PR against the same branch. **Open
 an issue first** for anything bigger than a typo.
 

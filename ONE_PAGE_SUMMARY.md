@@ -1,5 +1,16 @@
 # Twoyi — One-Page Summary
 
+> **Update (round 68, 2026-08-08):** this summary was written on
+> 2026-08-05 and is preserved as a historical record. Two things have
+> changed since: (1) `improvements/initial-cleanup` was merged into
+> `main` and deleted from origin — `main` is now the only branch; (2)
+> CI was actually broken from rounds 60–67 (the "CI green" claim below
+> was only ever true for local cargo/gradle invocations, never for the
+> GitHub Actions runs). Both are now resolved in round 68 — see
+> `MEMORY.md` §Round 68 for the full history. The next-step below
+> (implement twoyi's own `/dev/qemu_pipe`) is still the project's #1
+> functional blocker and has not been done yet.
+
 **Twoyi** (两仪) is a **rootless Android-on-Android container**: it boots a
 nearly complete second Android userland — `init`, `zygote`, `system_server`,
 SurfaceFlinger, ART, HALs — inside one normal app process, with no root, no

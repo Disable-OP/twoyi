@@ -1,7 +1,7 @@
 # Architecture Decision Records (ADRs)
 
 > Project: **twoyi** — rootless Android-on-Android container (`io.twoyi`)
-> Fork: `cyanmint/twoyi` branch `improvements/initial-cleanup`
+> Fork: `Disable-OP/twoyi` branch `main` (the historical `improvements/initial-cleanup` branch has been merged in and deleted)
 > Format: **Status**, **Context**, **Decision**, **Consequences**.
 > Author: general-purpose sub-agent (Task KEEP-WORKING-8) · 2026-08-05
 

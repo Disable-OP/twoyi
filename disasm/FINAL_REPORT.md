@@ -2,7 +2,9 @@
 
 > **Date:** 2026-08-05
 > **Codespace:** `twoyi-dev-3-jr47xg6xvx7ghq6p` (EastUs, AMD EPYC 7763, 4 cores / 16 GB / 32 GB)
-> **Branch:** `improvements/initial-cleanup` on `Disable-OP/twoyi`
+> **Branch:** `improvements/initial-cleanup` on `Disable-OP/twoyi` (historical —
+> this branch has since been merged into `main` and deleted; for current
+> state see `MEMORY.md` §Round 68)
 
 ---
 

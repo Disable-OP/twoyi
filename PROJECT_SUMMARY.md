@@ -3,9 +3,11 @@
 > **Task ID:** SUMMARY-1
 > **Author:** general-purpose sub-agent
 > **Date:** 2026-08-05
-> **Branch analyzed:** `improvements/initial-cleanup` (207 commits)
+> **Branch analyzed:** `improvements/initial-cleanup` (207 commits) — historical
+> snapshot; this branch has since been merged into `main` and deleted (2026-08-08).
+> For current state, see `MEMORY.md` §Round 68.
 > **Codespace:** `twoyi-dev-3-jr47k6xvx7ghq6p` (EastUs, AMD EPYC 7763, KVM working)
-> **Scope:** Read all 13 analysis files in `/home/z/my-project/download/`, the full worklog (`worklog.md`, 879 lines), and the entire `improvements/initial-cleanup` git history (207 commits). This document is the definitive state-of-the-project write-up — every claim is traceable to a specific artifact, file, or commit.
+> **Scope:** Read all 13 analysis files in `/home/z/my-project/download/`, the full worklog (`worklog.md`, 879 lines), and the entire historical `improvements/initial-cleanup` git history (207 commits, now merged into `main`). This document is the definitive state-of-the-project write-up — every claim is traceable to a specific artifact, file, or commit.
 
 ---
 
@@ -916,10 +918,10 @@ Ordered by dependency and impact. Each item references the relevant analysis sec
 
 ### 10.6 Git history
 
-The `improvements/initial-cleanup` branch contains 207 commits. The most significant 30+ commits are detailed in §2 above. The full history is preserved and accessible via:
+The historical `improvements/initial-cleanup` branch contained 207 commits (now merged into `main`). The most significant 30+ commits are detailed in §2 above. The full history is preserved and accessible via:
 
 ```bash
-cd /home/z/my-project && git log --oneline improvements/initial-cleanup
+cd /home/z/my-project && git log --oneline main
 ```
 
 ---

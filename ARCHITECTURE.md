@@ -1,14 +1,15 @@
 # Twoyi — Architecture & Source Map
 
 > **What this document is.** A deep, code-level architecture write-up of the
-> **`cyanmint/twoyi`** fork (the only currently-active continuation of the
-> archived `twoyi/twoyi` project) as it stands **plus the improvements in
-> this branch** (`improvements/initial-cleanup`).
+> **`Disable-OP/twoyi`** fork (the active continuation of the archived
+> `twoyi/twoyi` project, originally forked from `cyanmint/twoyi`) as it
+> stands **plus the improvements in this branch** (`main` — the historical
+> `improvements/initial-cleanup` branch has been merged in and deleted).
 >
-> **Date of analysis:** 2026-08-05 (last revised 2026-08-06)
+> **Date of analysis:** 2026-08-05 (last revised 2026-08-08 in round 68)
 > **Base commit:** `25ef89c` ("rom manifest", 2026-05-09, upstream)
-> **Branch tip:** `a021b25` ("docs: final comprehensive MEMORY.md update + any
-> remaining fixes") on `improvements/initial-cleanup`. Adds: x86_64 ABI,
+> **Branch tip:** `99c940e` ("chore(ci): silence cargo metadata noise, fix
+> stale '62 warnings' comment") on `main`. Adds: x86_64 ABI,
 > AOSP-source `libOpenglRender.so`, Rust `libloader.so`, dynamic data dir
 > (work-profile support), x86_64 SIGABRT fix, `kr64` kernel-replacement
 > skeleton, CI, devcontainer, input handling, and APK signing. See §9–§10
@@ -867,7 +868,7 @@ container, no KVM needed) instead.
 ## 8. Complete file map (this branch)
 
 ```
-cyanmint/twoyi (+ improvements/initial-cleanup branch)/
+cyanmint/twoyi (+ Disable-OP/twoyi `main` branch, historical improvements/initial-cleanup merged in)/
 ├── README.md / README_CN.md           Project overview (EN/CN)
 ├── LICENSE                            MPL-2.0
 ├── ARCHITECTURE.md                    ← NEW: this document

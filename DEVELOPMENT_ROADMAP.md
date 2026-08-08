@@ -4,7 +4,7 @@
 > **Author:** general-purpose sub-agent
 > **Date:** 2026-08-05
 > **Codespace:** `twoyi-dev-3-jr47xg6xvx7ghq6p`
-> **Branch:** `improvements/initial-cleanup` (207 commits, 15 since `main`)
+> **Branch:** `main` (the only branch — `improvements/initial-cleanup` was merged in and deleted on 2026-08-08; ~84 commits past the cyanmint fork point as of round 68)
 > **Scope:** Ties together every analysis document in `download/` and the full `worklog.md` (1701 lines) into a single actionable contributor-facing roadmap. Every claim below is traceable to a specific commit, file, or analysis report.
 > **Sources:** `PROJECT_SUMMARY.md`, `GSI_BOOT_PLAN.md`, `HAL_VIRTUALIZATION_ANALYSIS.md`, `KR64_SKELETON.md`, `BINDER_SKELETON.md`, `TWOYI_HONEST_STATUS.md`, `TWOYI_DISASSEMBLY_ANALYSIS.md`, `AOSP_BUILD_RESULTS.md`, `PORT_RESULTS.md`, `FUNCTION_LEVEL_COMPARISON.md`, `VM_JAVA_ANALYSIS.md`, `VM_KR64_ANALYSIS.md`, `VM_ROM_ANALYSIS.md`, `VM_DEEP_DISASSEMBLY.md`.
 
@@ -671,7 +671,7 @@ Open an issue to discuss approach before starting:
 
 - **[GitHub Discussions](https://github.com/Disable-OP/twoyi/discussions)** — general questions.
 - **[GitHub Issues](https://github.com/Disable-OP/twoyi/issues)** — bugs and feature requests.
-- **Pull requests** — against `Disable-OP/twoyi:improvements/initial-cleanup`. See `CONTRIBUTING.md` §5 for the PR process.
+- **Pull requests** — against `Disable-OP/twoyi:main`. See `CONTRIBUTING.md` §5 for the PR process.
 
 ---
 
@@ -764,6 +764,6 @@ What's left is the engineering: wiring the pieces together, implementing the GSI
 
 **The single highest-leverage action right now is Phase 1 task 1.1: drop-in test the AOSP renderer on a real arm64 device.** If that passes, the closed-source blob can be deleted, the legal posture of the project changes, and we have a verified foundation for Phase 3.
 
-If you want to contribute, start with the [good first issues](#102-good-first-issues-effort-s-no-architectural-discussion-required) in §10.2, read [`CONTRIBUTING.md`](../CONTRIBUTING.md), and open a pull request against `improvements/initial-cleanup`.
+If you want to contribute, start with the [good first issues](#102-good-first-issues-effort-s-no-architectural-discussion-required) in §10.2, read [`CONTRIBUTING.md`](../CONTRIBUTING.md), and open a pull request against `main`.
 
 — End of roadmap —

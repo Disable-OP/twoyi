@@ -1,7 +1,8 @@
 # Changelog
 
 All notable changes to the **twoyi fork** (active development on the
-`improvements/initial-cleanup` branch) are documented in this file.
+`main` branch — the historical `improvements/initial-cleanup` branch
+was merged in and deleted on 2026-08-08) are documented in this file.
 
 The format is based on [Keep a Changelog v1.1.0](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
