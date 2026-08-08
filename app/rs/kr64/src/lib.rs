@@ -935,17 +935,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let listener = match dev.take_listener() {
             Some(l) => l,
             None => {
-                error!(
-                    "[KR64] qemu_pipe listener already taken — cannot start proxy"
-                );
+                error!("[KR64] qemu_pipe listener already taken — cannot start proxy");
                 return 1;
             }
         };
-        match qemu_pipe::spawn_qemu_pipe_proxy(
-            listener,
-            dev.path.clone(),
-            cfg.rootfs.clone(),
-        ) {
+        match qemu_pipe::spawn_qemu_pipe_proxy(listener, dev.path.clone(), cfg.rootfs.clone())
+        {
             Ok(h) => {
                 info!(
                     "[KR64] qemu_pipe proxy listening at {} (rootfs={})",
