@@ -27,7 +27,10 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Build with RENDER_API_USE_THREAD so initOpenGLRenderer runs the
 # RenderServer in-process (no separate emulator_renderer process).
-add_compile_definitions(RENDER_API_USE_THREAD)
+# Build with WITH_GLES2 so the GLESv2 dispatch tables (init_gl2_dispatch,
+# gl2_dispatch_get_proc_func, s_gl2) are visible — they're guarded by
+# #ifdef WITH_GLES2 in GL2Dispatch.h and GL2Dispatch.cpp.
+add_compile_definitions(RENDER_API_USE_THREAD WITH_GLES2)
 
 # Source files — use the libOpenglRender/ subdir (which has bug fixes
 # over the top-level copies: RenderServer NULL-deref fix, ColorBuffer
