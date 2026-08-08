@@ -283,12 +283,44 @@ pub fn init_renderer(
         if Path::new(&kr64_path).exists() {
             // Use the kr64 daemon — it sets up /dev, properties, seccomp,
             // then execs init in a child where init thinks it's PID 1.
-            info!("[CORE] Using kr64 daemon: {}", kr64_path);
-            cmd = Command::new(&kr64_path);
+            //
+            // IMPORTANT (2026-08-09 overnight debug): kr64 MUST run as root
+            // because it needs to call unshare(CLONE_NEWPID), mount,
+            // pivot_root / chroot, and other syscalls that are blocked by
+            // the Android zygote's seccomp filter for untrusted_app.
+            // Running kr64 as the app user causes SIGSYS / SYS_SECCOMP
+            // crashes (seccomp prevents the syscall, kernel kills the
+            // process). Running via `su -c` gives us a root shell that
+            // does NOT inherit the zygote's seccomp filter, so kr64 can
+            // freely call mount/unshare/chroot/etc.
+            //
+            // The `su` binary on Android emulators (google_apis images)
+            // and rooted devices is at /system/bin/su and accepts
+            // `su -c <command>`. On non-rooted devices `su` is absent
+            // and the spawn will fail — logged below.
+            info!("[CORE] Using kr64 daemon (via su): {}", kr64_path);
+
+            // Build the command string for `su -c`. We use `exec env ...`
+            // so the su shell is replaced by kr64 (no extra process) and
+            // env vars are set explicitly (su doesn't inherit our env).
+            let android_root = format!("{}/system", working_dir);
+            let android_data = format!("{}/data", working_dir);
+            let su_cmd = format!(
+                "exec env LD_LIBRARY_PATH='{ld_library}' TWOYI_ROOTFS='{root}' TYLOADER='{loader}' \
+                 ANDROID_BOOTLOGO=1 ANDROID_ROOT='{aroot}' ANDROID_DATA='{adata}' \
+                 '{kr64}' --rootfs '{root}' --data-dir '{ddir}' --vmid 0",
+                ld_library = ld_library_path,
+                root = working_dir,
+                loader = loader_path,
+                aroot = android_root,
+                adata = android_data,
+                kr64 = kr64_path,
+                ddir = get_data_dir(),
+            );
+            cmd = Command::new("su");
             cmd.current_dir(&working_dir);
-            cmd.arg("--rootfs").arg(&working_dir);
-            cmd.arg("--data-dir").arg(get_data_dir());
-            cmd.arg("--vmid").arg("0");
+            cmd.arg("-c");
+            cmd.arg(&su_cmd);
         } else {
             // Fallback: exec rootfs linker + init directly.
             // This will fail with exit 31 (init not PID 1) but at least
@@ -308,6 +340,9 @@ pub fn init_renderer(
             cmd.arg(&init_path);
         }
 
+        // These env calls are no-ops when using `su -c` (the env is set
+        // inside the su_cmd string), but they don't hurt and keep the
+        // fallback path working.
         cmd.env("LD_LIBRARY_PATH", &ld_library_path);
         cmd.env_remove("LD_PRELOAD");
         cmd.env("TYLD_PRELOAD", "");
