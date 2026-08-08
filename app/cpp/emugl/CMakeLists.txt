@@ -70,6 +70,13 @@ set(EMUGL_SOURCES
     shared/OpenglOsUtils/osThreadUnix.cpp
     shared/OpenglOsUtils/osProcessUnix.cpp
     shared/OpenglOsUtils/osDynLibrary.cpp
+    # GLDecoder / GL2Decoder — the AOSP decoder wrapper classes that
+    # inherit from gl_decoder_context_t / gl2_decoder_context_t and
+    # provide initGL(), s_getProc(), and the static GL callback stubs.
+    # Without these, the linker fails with "undefined symbol:
+    # GLDecoder::GLDecoder()" etc.
+    GLESv1_dec/GLDecoder.cpp
+    GLESv2_dec/GL2Decoder.cpp
     # emugen-generated decoders (GLESv1, GLESv2, renderControl)
     generated/gl_dec/gl_dec.cpp
     generated/gl_dec/gl_server_context.cpp
