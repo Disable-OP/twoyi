@@ -19,6 +19,12 @@ dl.sh
 # task AOSP-VENDOR-1 — vendored AOSP emugl build artifacts
 app/cpp/emugl/build-*/
 app/cpp/emugl/build/
+# CMake build artifacts for libOpenglRender.so. These were accidentally
+# committed from a codespace (paths embedded in CMakeCache.txt pointed
+# at /workspaces/twoyi/...), which broke CI because the runner clones
+# to /home/runner/work/twoyi/twoyi/... and CMake refuses to reuse a
+# cache generated for a different source directory. Never commit these.
+app/cpp/build/
 # NDK / SDK installs (codespace-local)
 .android-ndk/
 .android-sdk/

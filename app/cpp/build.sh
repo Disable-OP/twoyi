@@ -16,7 +16,15 @@ for ABI in arm64-v8a x86_64; do
     echo '=========================================='
 
     BUILD_DIR=$SCRIPT_DIR/build/$ABI
-    mkdir -p $BUILD_DIR
+    # Wipe any stale CMake cache before reconfiguring. CMake embeds the
+    # absolute source path in CMakeCache.txt and refuses to proceed if
+    # the current source path doesn't match — which breaks builds when
+    # the source tree is moved (e.g. codespace -> CI runner, or just a
+    # fresh clone at a different path). Wiping here guarantees a clean
+    # reconfigure every run; the cost is ~5s of reconfigure time, which
+    # is negligible compared to the actual compile time.
+    rm -rf "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
 
     cmake -S $SCRIPT_DIR/emugl -B $BUILD_DIR \
         -DCMAKE_TOOLCHAIN_FILE=$NDK_BUILD_DIR/build/cmake/android.toolchain.cmake \

@@ -1,3 +1,0 @@
-/workspaces/twoyi/app/cpp/build/arm64-v8a/CMakeFiles/OpenglRender.dir
-/workspaces/twoyi/app/cpp/build/arm64-v8a/CMakeFiles/edit_cache.dir
-/workspaces/twoyi/app/cpp/build/arm64-v8a/CMakeFiles/rebuild_cache.dir
