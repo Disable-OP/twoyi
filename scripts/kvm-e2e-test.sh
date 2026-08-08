@@ -306,7 +306,9 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "── Step 4/6: install rootfs into twoyi data dir ──"
 TWOYI_DATA=/data/data/io.twoyi
-TWOYI_PROFILE="$TWOYI_DATA/profiles/default/rootfs"
+# RomManager.getRootfsDir() returns <dataDir>/rootfs (NOT profiles/default/rootfs).
+# The app looks for the rootfs at /data/data/io.twoyi/rootfs, so extract there.
+TWOYI_PROFILE="$TWOYI_DATA/rootfs"
 
 # Stop twoyi if it's running (it shouldn't be — fresh boot — but be safe)
 "$ADB_BIN" -s emulator-5554 shell am force-stop io.twoyi 2>/dev/null || true
