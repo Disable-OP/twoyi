@@ -16,8 +16,12 @@
 #ifndef _GLES2_DISPATCH_H
 #define _GLES2_DISPATCH_H
 
-#ifdef WITH_GLES2
-
+// twoyi patch: always include gl2_dec.h and declare the dispatch
+// functions, even when WITH_GLES2 is not defined. The original AOSP
+// code guards these behind #ifdef WITH_GLES2, but render_api.cpp and
+// RenderThread.cpp call init_gl2_dispatch() and
+// gl2_dispatch_get_proc_func() unconditionally. When WITH_GLES2 is
+// off, GL2DispatchStub.cpp provides no-op implementations.
 #include "gl2_dec.h"
 
 bool init_gl2_dispatch();
@@ -26,5 +30,10 @@ void *gl2_dispatch_get_proc_func(const char *name, void *userData);
 extern gl2_decoder_context_t s_gl2;
 extern int                   s_gl2_enabled;
 
+#ifdef WITH_GLES2
+// The real init_gl2_dispatch implementation (in GL2Dispatch.cpp) is
+// only compiled when WITH_GLES2 is defined. Otherwise
+// GL2DispatchStub.cpp provides the no-op stub.
 #endif
+
 #endif
