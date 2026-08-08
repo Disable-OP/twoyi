@@ -1,56 +1,32 @@
 # Copyright Disclaimer: AI-Generated Content
 # This file was created by GitHub Copilot, an AI coding assistant.
 # AI-generated content is not subject to copyright protection and is provided
-# without any warranty, express or implied, including warranties of
-# merchantability, fitness for a particular purpose, or non-infringement.
+# without any warranty, express or implied.
 # Use at your own risk.
 
-# PIE / linker configuration for the kr64 crate.
+# Cargo configuration for the kr64 crate.
 #
-# These flags are emitted for the cdylib target only (libkr64.so) so that
-# the resulting shared object is ALSO directly executable via the PIE hack:
+# IMPORTANT (2026-08-09 overnight debug): We previously set rustflags here
+# that applied to ALL targets (cdylib AND bin) including `-Wl,-e,kr64_main`.
+# That flag set the entry point to `kr64_main` (defined in lib.rs) for BOTH
+# the cdylib and the bin. For the cdylib this is the intended PIE hack, but
+# for the BIN target it OVERRODE the default `_start` from crt1.o, which
+# meant the C runtime (TLS, stdio, atexit, __libc_start_main) was never
+# initialized. When the resulting libkr64.so was exec'd directly, the very
+# first `eprintln!` call dereferenced uninitialized TLS / stdio state and
+# crashed with SIGSEGV at rip=0x7 (NULL function pointer).
 #
-#     ./libkr64.so --vmid 0 --rootfs /data/.../fs ...
+# The fix: ship the BIN target (which has a proper _start) as `libkr64.so`.
+# The bin target must NOT inherit the cdylib-only PIE hack flags, so we
+# removed all rustflags from this file. The cdylib's PIE flags are still
+# emitted by build.rs via `cargo:rustc-cdylib-link-arg=` (which applies to
+# the cdylib target ONLY), so the cdylib remains directly executable if
+# anyone ever builds it.
 #
-# This mirrors the configuration in app/rs/.cargo/config.toml used by the
-# parent twoyi crate. We keep a separate copy here so the kr64 crate can
-# be built standalone (e.g. `cargo build` from app/rs/kr64/) without
-# inheriting the workspace config.
+# The bin target on Android is built as a PIE by default and uses the
+# system linker64 as PT_INTERP — no special flags needed.
 #
-# The `bin` target (`kr64`) doesn't need any of these flags — Rust
-# already produces a PIE for `bin` targets on Android targets by default.
-#
-# Both aarch64-linux-android and x86_64-linux-android use /system/bin/linker64
-# as the dynamic linker (32-bit ABIs would use /system/bin/linker instead).
+# Both aarch64-linux-android and x86_64-linux-android work with defaults.
 
-[target.aarch64-linux-android]
-rustflags = [
-    "-C", "link-arg=-Wl,-e,kr64_main",
-    "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
-    "-C", "link-arg=-Wl,--enable-new-dtags",
-    "-C", "link-arg=-pie",
-    "-C", "relocation-model=pic",
-    "-C", "link-arg=-Wl,--undefined=interp",
-]
-
-[target.x86_64-linux-android]
-rustflags = [
-    "-C", "link-arg=-Wl,-e,kr64_main",
-    "-C", "link-arg=-Wl,--dynamic-linker=/system/bin/linker64",
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
-    "-C", "link-arg=-Wl,--enable-new-dtags",
-    "-C", "link-arg=-pie",
-    "-C", "relocation-model=pic",
-    "-C", "link-arg=-Wl,--undefined=interp",
-]
-
-# Also support building for the host (linux x86_64 / aarch64) for syntax
-# checking via `cargo check`. On the host we don't need the PIE hack — we
-# just want the code to compile so we can verify it parses. The build.rs
-# still emits the cdylib link args, but those are no-ops on the host
-# because the linker ignores unknown flags when linking a `bin` target
-# (and `cargo check` doesn't link at all).
-#
-# We don't set any rustflags for host targets — defaults are fine for
-# `cargo check`.
+# No rustflags — defaults are correct for the bin target on Android.
+# The cdylib (if built) gets its PIE hack flags from build.rs.
