@@ -462,14 +462,18 @@ echo "$LAUNCH_SCRIPT" > /tmp/twoyi-launch-kr64.sh
 sleep 1
 "$ADB_BIN" -s emulator-5554 wait-for-device
 
-# Create the log file (writable by root) so kr64's stdout/stderr goes there
-"$ADB_BIN" -s emulator-5554 shell "touch '$TWOYI_DATA/log.txt' && chmod 666 '$TWOYI_DATA/log.txt'" 2>/dev/null || true
+# Create the kr64 log file at /data/local/tmp/kr64.log (NOT /data/data/...
+# because the app's core.rs does File::create() on /data/data/io.twoyi/log.txt
+# which truncates the file and erases kr64's pre-launch output).
+KR64_LOG="/data/local/tmp/kr64.log"
+"$ADB_BIN" -s emulator-5554 shell "touch '$KR64_LOG' && chmod 666 '$KR64_LOG'" 2>/dev/null || true
 
 # Launch kr64 detached: setsid creates a new session, nohup ignores SIGHUP,
 # and </dev/null >log 2>&1 & backgrounds the process.
+# Output goes to /data/local/tmp/kr64.log (separate from the app's log.txt).
 "$ADB_BIN" -s emulator-5554 shell \
-    "setsid nohup sh /data/local/tmp/launch-kr64.sh < /dev/null > '$TWOYI_DATA/log.txt' 2>&1 &"
-echo "  ✓ kr64 pre-launch command sent"
+    "setsid nohup sh /data/local/tmp/launch-kr64.sh < /dev/null > '$KR64_LOG' 2>&1 &"
+echo "  ✓ kr64 pre-launch command sent (log → $KR64_LOG)"
 
 # Wait for kr64 to create /dev/qemu_pipe (indicates it started successfully)
 KR64_PIPE="$TWOYI_PROFILE/dev/qemu_pipe"
@@ -483,9 +487,40 @@ for i in $(seq 1 15); do
     sleep 1
 done
 if [ "$KR64_READY" = "0" ]; then
-    echo "  ⚠ kr64 did not create /dev/qemu_pipe after 15s — check twoyi-log.txt for errors"
-    # Pull the log so we can see what happened
-    "$ADB_BIN" -s emulator-5554 pull "$TWOYI_DATA/log.txt" "$ARTIFACT_DIR/twoyi-log.txt" 2>/dev/null || true
+    echo "  ⚠ kr64 did not create /dev/qemu_pipe after 15s — check kr64.log for errors"
+fi
+
+# Check if kr64 is still running (it should be — it forks init and waits)
+KR64_PID=$("$ADB_BIN" -s emulator-5554 shell "pidof libkr64.so" 2>/dev/null | tr -d '\r ' || true)
+if [ -n "$KR64_PID" ]; then
+    echo "  ✓ kr64 process alive (pid $KR64_PID)"
+else
+    echo "  ⚠ kr64 process not found — may have crashed or exited"
+fi
+
+# Check if init was spawned by kr64 (it should be PID 1 in the PID namespace,
+# but from the host's perspective it has a regular PID)
+INIT_PID=$("$ADB_BIN" -s emulator-5554 shell "pidof init" 2>/dev/null | tr -d '\r ' || true)
+if [ -n "$INIT_PID" ]; then
+    echo "  ✓ init process found (pid $INIT_PID)"
+else
+    echo "  ⚠ init process not found — kr64 may not have forked init yet"
+fi
+
+# Pull kr64's log NOW (before the app starts and potentially interferes)
+"$ADB_BIN" -s emulator-5554 pull "$KR64_LOG" "$ARTIFACT_DIR/kr64-prelaunch.log" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/kr64-prelaunch.log" ]; then
+    LOG_SIZE=$(stat -c%s "$ARTIFACT_DIR/kr64-prelaunch.log")
+    echo "  ✓ pulled kr64-prelaunch.log ($LOG_SIZE bytes)"
+    # Show first/last 20 lines for immediate visibility in the GHA log
+    if [ "$LOG_SIZE" -gt 0 ]; then
+        echo "  ── kr64 log (first 20 lines) ──"
+        head -20 "$ARTIFACT_DIR/kr64-prelaunch.log" | sed 's/^/    /'
+        echo "  ── kr64 log (last 20 lines) ──"
+        tail -20 "$ARTIFACT_DIR/kr64-prelaunch.log" | sed 's/^/    /'
+    fi
+else
+    echo "  ⚠ could not pull $KR64_LOG"
 fi
 
 # Give kr64 a moment to fork init before we start the renderer
@@ -565,6 +600,37 @@ echo "── Step 6/6: verdict ──"
 "$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
 sleep 1
 "$ADB_BIN" -s emulator-5554 wait-for-device
+
+# Pull the pre-launched kr64 log (final pull — may have more output than
+# the initial pull before the app started). Overwrites the earlier copy.
+"$ADB_BIN" -s emulator-5554 pull /data/local/tmp/kr64.log "$ARTIFACT_DIR/kr64-prelaunch.log" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/kr64-prelaunch.log" ]; then
+    LOG_SIZE=$(stat -c%s "$ARTIFACT_DIR/kr64-prelaunch.log")
+    echo "  ✓ pulled kr64-prelaunch.log (final, $LOG_SIZE bytes)"
+    if [ "$LOG_SIZE" -gt 0 ]; then
+        echo "  ── kr64 log (last 40 lines) ──"
+        tail -40 "$ARTIFACT_DIR/kr64-prelaunch.log" | sed 's/^/    /'
+    fi
+else
+    echo "  ⚠ could not pull /data/local/tmp/kr64.log"
+fi
+
+# Check if kr64 is still alive at the end
+KR64_PID_END=$("$ADB_BIN" -s emulator-5554 shell "pidof libkr64.so" 2>/dev/null | tr -d '\r ' || true)
+if [ -n "$KR64_PID_END" ]; then
+    echo "  ✓ kr64 process still alive at end (pid $KR64_PID_END)"
+else
+    echo "  ⚠ kr64 process not found at end — may have crashed or exited"
+fi
+
+# Check if init is still alive at the end
+INIT_PID_END=$("$ADB_BIN" -s emulator-5554 shell "pidof init" 2>/dev/null | tr -d '\r ' || true)
+if [ -n "$INIT_PID_END" ]; then
+    echo "  ✓ init process alive at end (pid $INIT_PID_END)"
+else
+    echo "  ⚠ init process not found at end — may have exited"
+fi
+
 "$ADB_BIN" -s emulator-5554 pull /data/data/io.twoyi/log.txt "$ARTIFACT_DIR/twoyi-log.txt" 2>/dev/null || true
 if [ -f "$ARTIFACT_DIR/twoyi-log.txt" ]; then
     echo "  ✓ pulled twoyi-log.txt ($(stat -c%s "$ARTIFACT_DIR/twoyi-log.txt") bytes)"
