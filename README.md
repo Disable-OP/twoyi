@@ -16,7 +16,7 @@
          src="https://img.shields.io/badge/Java-17-orange?logo=openjdk" />
     <a href="https://github.com/Disable-OP/twoyi/actions/workflows/build.yml">
       <img alt="GitHub Actions CI"
-           src="https://github.com/Disable-OP/twoyi/actions/workflows/build.yml/badge.svg?branch=improvements%2Finitial-cleanup" />
+           src="https://github.com/Disable-OP/twoyi/actions/workflows/build.yml/badge.svg?branch=main" />
     </a>
   </p>
 
@@ -60,7 +60,10 @@ and lack of any revenue, the project has been discontinued."* The fork carries
 the project forward and replaces several closed-source components with
 open-source rebuilds.
 
-Development happens on the **`improvements/initial-cleanup`** branch. Notable
+Development happens on the **`main`** branch (the historical
+`improvements/initial-cleanup` branch has been merged in and deleted —
+`main` is now the single source of truth, so sub-agents and contributors
+can't accidentally land work on the wrong branch). Notable
 improvements over the archived upstream:
 
 | Improvement | What it does | Headline commit |
@@ -79,7 +82,7 @@ improvements over the archived upstream:
 The full commit history is preserved (386 commits at last count):
 
 ```bash
-cd /home/z/my-project && git log --oneline improvements/initial-cleanup
+git log --oneline main
 ```
 
 ---
@@ -301,7 +304,7 @@ cd app/rs      && cargo build          # smoke-build the host crate
 
 ### Code quality
 
-The `improvements/initial-cleanup` branch keeps three quality gates green:
+The `main` branch keeps three quality gates green:
 
 | Gate | Command | Result |
 |---|---|---|

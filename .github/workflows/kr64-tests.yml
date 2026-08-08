@@ -18,6 +18,7 @@ name: kr64 lint + test
 on:
   push:
     branches:
+      - main
       - 'improvements/**'
   pull_request:
   # Allow manual runs for debugging without opening a PR.
