@@ -299,8 +299,17 @@ pub fn init_renderer(
         };
 
         // Build the command. If we're using the rootfs linker, invoke it as:
-        //   <linker> --library-path <libs> <init>
-        // Otherwise (loader64 fallback): <loader64> <init>
+        //   <linker> <init>
+        // The Android runtime linker (linker64) does NOT accept --library-path
+        // as a CLI flag (that's a GNU ld flag, not an Android linker flag).
+        // When the linker is exec'd directly, it treats the first arg as the
+        // program to load and remaining args as that program's argv.
+        // Library search paths are configured via LD_LIBRARY_PATH env var
+        // (set below), not via --library-path.
+        //
+        // Previous code passed "--library-path <libs>" which caused:
+        //   F/linker: error: expected absolute path: "--library-path"
+        // because the linker tried to load "--library-path" as a program.
         let mut cmd = Command::new(&linker_path);
         cmd.current_dir(&working_dir);
 
@@ -308,8 +317,7 @@ pub fn init_renderer(
             // loader64 fallback: just pass init as arg
             cmd.arg(&init_path);
         } else {
-            // rootfs linker: pass --library-path then init
-            cmd.arg("--library-path").arg(&ld_library_path);
+            // rootfs linker: just pass init as the program to load
             cmd.arg(&init_path);
         }
 
