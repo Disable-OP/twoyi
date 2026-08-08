@@ -71,6 +71,7 @@ pub mod compat_paths;
 pub mod devices;
 pub mod mount_mgr;
 pub mod proc_emu;
+pub mod qemu_pipe;
 pub mod seccomp;
 pub mod sensors;
 
@@ -923,16 +924,49 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ----- PARENT (the daemon) -----
     info!("[KR64][parent] guest pid = {}", pid);
 
-    // Spawn one accept thread per device socket. For the MVP each
-    // thread just accepts connections and immediately closes them
+    // qemu_pipe → real GL command proxy (Phase 1 of the dispatcher plan).
+    // The proxy accepts guest connections, reads the "pipe:opengles"
+    // channel-name handshake, connects to the renderer's Unix socket
+    // at {rootfs}/opengles, and pumps bytes bidirectionally. This
+    // replaces the old MVP stub that wrote a single 0 byte and closed.
+    // See download/QEMU_PIPE_DISPATCHER_PLAN.md for the full design.
+    let _qemu_pipe_proxy = {
+        let mut dev = device_set.qemu_pipe;
+        let listener = match dev.take_listener() {
+            Some(l) => l,
+            None => {
+                error!("[KR64] qemu_pipe listener already taken — cannot start proxy");
+                return 1;
+            }
+        };
+        match qemu_pipe::spawn_qemu_pipe_proxy(
+            listener,
+            dev.path.clone(),
+            cfg.rootfs.clone(),
+        ) {
+            Ok(h) => {
+                info!(
+                    "[KR64] qemu_pipe proxy listening at {} (rootfs={})",
+                    h.path(),
+                    cfg.rootfs
+                );
+                Some(h)
+            }
+            Err(e) => {
+                error!("[KR64] failed to start qemu_pipe proxy: {}", e);
+                None
+            }
+        }
+    };
+
+    // Spawn one accept thread per remaining device socket. For the MVP
+    // each thread just accepts connections and immediately closes them
     // (echoing a single byte so the guest sees SOME response). The
     // production version will dispatch to per-device handlers:
-    //   qemu_pipe → openglrenderer::pipe
     //   touch     → input::touch_server
     //   key       → input::key_server
     //   event     → TwoyiSocketServer (event IPC)
     //   gb/gb2    → openglrenderer::gralloc
-    spawn_accept_thread(device_set.qemu_pipe, "qemu_pipe");
     spawn_accept_thread(device_set.touch, "touch");
     spawn_accept_thread(device_set.key, "key");
     spawn_accept_thread(device_set.event, "event");
