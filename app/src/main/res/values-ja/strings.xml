@@ -111,4 +111,26 @@
     <string name="no_rootfs_message">続行するにはrootfsをインポートしてください</string>
     <string name="no_rootfs_select_rom">ROMがインストールされていません。rootfs.tarファイルを選択してインポートし、システムを起動してください。</string>
     <string name="select_rom_file">ROMファイルを選択</string>
+    <string name="error_generic">エラー</string>
+    <string name="error_selecting_file">ファイルの選択に失敗しました</string>
+    <string name="error_sharing_log">ログの共有に失敗しました</string>
+    <string name="wechat_not_installed">WeChatがインストールされていません。</string>
+    <string name="settings_invalid_number">無効な数値</string>
+    <string name="settings_width_range_error">幅は %1$d から %2$d の間でなければなりません</string>
+    <string name="settings_height_range_error">高さは %1$d から %2$d の間でなければなりません</string>
+    <string name="settings_dpi_range_error">DPIは %1$d から %2$d の間でなければなりません</string>
+    <string name="rom_imported_successfully">ROMのインポートに成功しました</string>
+    <string name="rom_import_failed">ROMのインポートに失敗しました</string>
+    <string name="rom_import_error">ROMのインポート中にエラーが発生しました: %1$s</string>
+    <string name="profile_switch_failed">プロファイルの切り替えに失敗しました</string>
+    <string name="profile_renamed_to">プロファイル名を %1$s に変更しました</string>
+    <string name="profile_rename_failed">プロファイル名の変更に失敗しました</string>
+    <string name="profile_copied_to">プロファイルを %1$s にコピーしました</string>
+    <string name="profile_copy_failed">プロファイルのコピーに失敗しました</string>
+    <string name="profile_copy_error">プロファイルのコピー中にエラーが発生しました: %1$s</string>
+    <string name="profile_deleted">プロファイル %1$s を削除しました</string>
+    <string name="profile_delete_failed">プロファイルの削除に失敗しました</string>
+    <string name="profile_picker_error">プロファイルの選択中にエラーが発生しました</string>
+    <string name="profile_created">プロファイル %1$s を作成しました</string>
+    <string name="profile_create_failed">プロファイルの作成に失敗しました</string>
 </resources>

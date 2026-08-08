@@ -111,4 +111,26 @@
     <string name="no_rootfs_message">请导入 rootfs 以继续</string>
     <string name="no_rootfs_select_rom">未安装 ROM。请选择一个 rootfs.tar 文件导入并启动系统。</string>
     <string name="select_rom_file">选择 ROM 文件</string>
+    <string name="error_generic">错误</string>
+    <string name="error_selecting_file">选择文件失败</string>
+    <string name="error_sharing_log">分享日志失败</string>
+    <string name="wechat_not_installed">微信未安装。</string>
+    <string name="settings_invalid_number">无效的数字</string>
+    <string name="settings_width_range_error">宽度必须在 %1$d 和 %2$d 之间</string>
+    <string name="settings_height_range_error">高度必须在 %1$d 和 %2$d 之间</string>
+    <string name="settings_dpi_range_error">DPI 必须在 %1$d 和 %2$d 之间</string>
+    <string name="rom_imported_successfully">ROM 导入成功</string>
+    <string name="rom_import_failed">ROM 导入失败</string>
+    <string name="rom_import_error">导入 ROM 出错：%1$s</string>
+    <string name="profile_switch_failed">切换配置文件失败</string>
+    <string name="profile_renamed_to">配置文件已重命名为 %1$s</string>
+    <string name="profile_rename_failed">重命名配置文件失败</string>
+    <string name="profile_copied_to">配置文件已复制为 %1$s</string>
+    <string name="profile_copy_failed">复制配置文件失败</string>
+    <string name="profile_copy_error">复制配置文件出错：%1$s</string>
+    <string name="profile_deleted">配置文件 %1$s 已删除</string>
+    <string name="profile_delete_failed">删除配置文件失败</string>
+    <string name="profile_picker_error">选择配置文件出错</string>
+    <string name="profile_created">配置文件 %1$s 已创建</string>
+    <string name="profile_create_failed">创建配置文件失败</string>
 </resources>

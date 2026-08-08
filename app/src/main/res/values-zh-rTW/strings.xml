@@ -111,4 +111,26 @@
     <string name="no_rootfs_message">請匯入 rootfs 以繼續</string>
     <string name="no_rootfs_select_rom">未安裝 ROM。請選擇一個 rootfs.tar 文件匯入並啟動系統。</string>
     <string name="select_rom_file">選擇 ROM 文件</string>
+    <string name="error_generic">錯誤</string>
+    <string name="error_selecting_file">選擇檔案失敗</string>
+    <string name="error_sharing_log">分享日誌失敗</string>
+    <string name="wechat_not_installed">微信未安裝。</string>
+    <string name="settings_invalid_number">無效的數字</string>
+    <string name="settings_width_range_error">寬度必須在 %1$d 和 %2$d 之間</string>
+    <string name="settings_height_range_error">高度必須在 %1$d 和 %2$d 之間</string>
+    <string name="settings_dpi_range_error">DPI 必須在 %1$d 和 %2$d 之間</string>
+    <string name="rom_imported_successfully">ROM 匯入成功</string>
+    <string name="rom_import_failed">ROM 匯入失敗</string>
+    <string name="rom_import_error">匯入 ROM 出錯：%1$s</string>
+    <string name="profile_switch_failed">切換設定檔失敗</string>
+    <string name="profile_renamed_to">設定檔已重新命名為 %1$s</string>
+    <string name="profile_rename_failed">重新命名設定檔失敗</string>
+    <string name="profile_copied_to">設定檔已複製為 %1$s</string>
+    <string name="profile_copy_failed">複製設定檔失敗</string>
+    <string name="profile_copy_error">複製設定檔出錯：%1$s</string>
+    <string name="profile_deleted">設定檔 %1$s 已刪除</string>
+    <string name="profile_delete_failed">刪除設定檔失敗</string>
+    <string name="profile_picker_error">選擇設定檔出錯</string>
+    <string name="profile_created">設定檔 %1$s 已建立</string>
+    <string name="profile_create_failed">建立設定檔失敗</string>
 </resources>
