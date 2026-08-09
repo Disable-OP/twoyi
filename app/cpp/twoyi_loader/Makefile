@@ -1,15 +1,19 @@
-# Makefile for twoyi_loader vertical slice test
+# Makefile for twoyi_loader
 #
-# Supports two modes:
-#   make            — x86_64 native build
-#   make arm64      — AArch64 cross-compile (run with qemu-aarch64)
-#   make test       — run x86_64 test
-#   make test-arm64 — run AArch64 test under QEMU
+# Builds:
+#   1. libtwoyi_loader.so — the custom ELF interpreter (PT_INTERP)
+#   2. test_twoyi — combined test binary (loader + test guest in one binary)
+#
+# Usage:
+#   make                    — build test binary (x86_64 native)
+#   make test               — run test binary
+#   make loader             — build libtwoyi_loader.so
+#   make TARGET=arm64       — cross-compile for arm64
+#   make test-arm64         — run arm64 test under QEMU
 
 UNAME_M := $(shell uname -m)
 
 ifeq ($(TARGET),arm64)
-    # AArch64 cross-compilation mode
     CC ?= aarch64-linux-gnu-gcc-14
     SYSROOT ?= /tmp/gcc-aarch64-extract/usr/aarch64-linux-gnu
     GCC_INCLUDE ?= /tmp/gcc-aarch64-extract/usr/lib/gcc-cross/aarch64-linux-gnu/14/include
@@ -19,8 +23,8 @@ ifeq ($(TARGET),arm64)
     EXTRA_LDFLAGS = -static -Wl,--no-dynamic-linker
     QEMU ?= /tmp/qemu-user-extract/usr/bin/qemu-aarch64
     TARGET_BIN = test_twoyi_arm64
+    LOADER_BIN = libtwoyi_loader_arm64.so
 else
-    # x86_64 native mode
     CC ?= gcc
     ifeq ($(UNAME_M),x86_64)
 	ARCH_START = arch/x86_64_start.S
@@ -30,36 +34,52 @@ else
     EXTRA_CFLAGS =
     EXTRA_LDFLAGS =
     TARGET_BIN = test_twoyi
+    LOADER_BIN = libtwoyi_loader.so
 endif
 
 CFLAGS = -Wall -Wextra -O2 -g -fno-stack-protector $(EXTRA_CFLAGS)
-CFLAGS += -Iinclude -Itests
+CFLAGS += -Iinclude -Isrc
 
-LOADER_OBJS = src/loader_main.o src/sigsys_handler.o src/seccomp_filter.o src/mount_table.o
-TEST_OBJS = tests/test_guest.o
+# All source files
+LOADER_SRCS = src/twoyi_loader.c
+LOADER_OBJS = $(LOADER_SRCS:.c=.o)
 ARCH_OBJS = $(ARCH_START:.S=.o)
-ALL_OBJS = $(LOADER_OBJS) $(TEST_OBJS) $(ARCH_OBJS)
 
-.PHONY: all clean test arm64 test-arm64
+# For the combined test, we also need loader_main.c (which calls main())
+# and the test guest
+COMBINED_SRCS = src/loader_main.c src/twoyi_loader.c
+TEST_SRCS = tests/test_guest.c
+COMBINED_OBJS = $(COMBINED_SRCS:.c=.o) $(TEST_SRCS:.c=.o) $(ARCH_OBJS)
+
+.PHONY: all clean test loader test-arm64
 
 all: $(TARGET_BIN)
 
-arm64:
-	$(MAKE) TARGET=arm64 $(TARGET_BIN)
-
-# Combined test binary.
-# For arm64: provide a stub _DYNAMIC to satisfy dl-reloc-static-pie.o
+# Combined test binary (loader + test guest)
+# For arm64: need arm64_stub.c for _DYNAMIC etc.
 ifeq ($(TARGET),arm64)
-$(TARGET_BIN): $(ALL_OBJS) arch/arm64_stub.o
-	$(CC) $(CFLAGS) -nostartfiles -no-pie $(EXTRA_LDFLAGS) -Wl,-e,_start -o $@ $(ALL_OBJS) arch/arm64_stub.o -lc -lgcc -lgcc_eh
+$(TARGET_BIN): $(COMBINED_OBJS) arch/arm64_stub.o
+	$(CC) $(CFLAGS) -nostartfiles -no-pie $(EXTRA_LDFLAGS) -Wl,-e,_start -o $@ \
+		$(COMBINED_OBJS) arch/arm64_stub.o -lc -lgcc -lgcc_eh -lpthread
 	@echo "Built $(TARGET_BIN)"
 	@file $@ | head -1
 else
-$(TARGET_BIN): $(ALL_OBJS)
-	$(CC) $(CFLAGS) -nostartfiles -no-pie $(EXTRA_LDFLAGS) -Wl,-e,_start -o $@ $(ALL_OBJS) -lc
+$(TARGET_BIN): $(COMBINED_OBJS)
+	$(CC) $(CFLAGS) -nostartfiles -no-pie $(EXTRA_LDFLAGS) -Wl,-e,_start -o $@ \
+		$(COMBINED_OBJS) -lc -lpthread
 	@echo "Built $(TARGET_BIN)"
 	@file $@ | head -1
 endif
+
+# Custom ELF interpreter (shared library, like a dynamic linker)
+# This is what gets installed as PT_INTERP for guest binaries
+loader: $(LOADER_BIN)
+
+$(LOADER_BIN): $(LOADER_OBJS)
+	$(CC) $(CFLAGS) -nostartfiles -shared -fPIC -Wl,-e,twoyi_loader_main -o $@ \
+		$(LOADER_OBJS) -lc -lpthread
+	@echo "Built $(LOADER_BIN)"
+	@file $@ | head -1
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -67,15 +87,13 @@ endif
 %.o: %.S
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Run x86_64 test natively
-test: test_twoyi
-	@echo "=== Running vertical slice test (x86_64 native) ==="
-	./test_twoyi
+test: $(TARGET_BIN)
+	@echo "=== Running vertical slice test ==="
+	./$(TARGET_BIN)
 
-# Run AArch64 test under QEMU
-test-arm64: test_twoyi_arm64
-	@echo "=== Running vertical slice test (AArch64 via QEMU) ==="
-	$(QEMU) ./test_twoyi_arm64
+test-arm64: $(TARGET_BIN)
+	@echo "=== Running arm64 test under QEMU ==="
+	$(QEMU) ./$(TARGET_BIN)
 
 clean:
-	rm -f $(ALL_OBJS) test_twoyi test_twoyi_arm64
+	rm -f $(LOADER_OBJS) $(COMBINED_OBJS) arch/arm64_stub.o $(TARGET_BIN) $(LOADER_BIN)
