@@ -24,6 +24,7 @@
 #include <sys/mount.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <signal.h>
 
 #include "sigsys_handler.h"
@@ -146,6 +147,42 @@ int main(void) {
         PASS();
     } else {
         FAIL("getpid returned %d", pid);
+    }
+
+    // ---- Test 6b: Non-trapped syscall (read/write) works ----
+    // Verify that the BPF filter allows non-trapped syscalls to pass through.
+    // read() and write() should work normally (not trigger SIGSYS).
+    TEST("6b. non-trapped syscalls (read/write) work");
+    {
+        int pipefd[2];
+        int pipe_ret = pipe(pipefd);
+        if (pipe_ret != 0) {
+            FAIL("pipe failed: %s", strerror(errno));
+        } else {
+            const char *msg = "hello";
+            ssize_t wret = write(pipefd[1], msg, 5);
+            char buf[16] = {0};
+            ssize_t rret = read(pipefd[0], buf, 5);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            if (wret == 5 && rret == 5 && memcmp(buf, "hello", 5) == 0) {
+                PASS();
+            } else {
+                FAIL("write=%zd read=%zd buf=%.*s", wret, rret, 5, buf);
+            }
+        }
+    }
+
+    // ---- Test 6c: Non-trapped syscall (stat) works ----
+    TEST("6c. non-trapped syscall (stat) works");
+    {
+        struct stat st;
+        int stat_ret = stat("/proc/self", &st);
+        if (stat_ret == 0 && S_ISDIR(st.st_mode)) {
+            PASS();
+        } else {
+            FAIL("stat returned %d errno=%d", stat_ret, errno);
+        }
     }
 
     // ---- Test 7: Child processes preserve virtualization ----
