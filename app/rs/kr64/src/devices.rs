@@ -282,7 +282,12 @@ pub fn create_key_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
 /// This mirrors VM's `VMEventManager.java` which runs a
 /// `LocalServerSocket("<vmDataDir>/dev/event")` in the host process.
 pub fn create_event_socket(data_dir: &str) -> std::io::Result<DeviceSocket> {
-    let path = format!("{}/dev/event", data_dir);
+    // Create the event socket under rootfs/dev/ instead of data_dir/dev/.
+    // The rootfs/dev/ directory is chowned to the app uid by the KVM test
+    // script, so the app can create/remove sockets there. The data_dir/dev/
+    // directory may be owned by root from a previous adb root extraction.
+    let rootfs = format!("{}/rootfs", data_dir);
+    let path = format!("{}/dev/event", rootfs);
     let listener = bind_unix_socket(&path)?;
     Ok(DeviceSocket {
         listener: Some(listener),
