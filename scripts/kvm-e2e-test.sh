@@ -503,7 +503,21 @@ fi
 "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so" 2>/dev/null || true
 
 # Verify libgetpid_hook.so exists in the rootfs
-"$ADB_BIN" -s emulator-5554 shell "test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'EXISTS' || echo 'MISSING'" 2>&1 | tail -3
+# Also check if system/lib64 is a symlink (which would cause the file to
+# be written to the wrong location)
+"$ADB_BIN" -s emulator-5554 shell "
+    echo '--- checking system/lib64 ---'
+    ls -la $TWOYI_PROFILE/system/ | head -5
+    echo '--- checking lib64 dir ---'
+    ls -la $TWOYI_PROFILE/system/lib64/ | head -5
+    echo '--- checking libgetpid_hook.so ---'
+    ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so 2>&1
+    echo '--- readlink check ---'
+    readlink -f $TWOYI_PROFILE/system/lib64 2>&1
+    readlink -f $TWOYI_PROFILE/system 2>&1
+    echo '--- file exists? ---'
+    test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'EXISTS' || echo 'MISSING'
+" 2>&1
 
 # Verify libgetpid_hook.so exists in the rootfs
 "$ADB_BIN" -s emulator-5554 shell "test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo '  ✓ libgetpid_hook.so exists in rootfs' || echo '  ⚠ libgetpid_hook.so MISSING from rootfs — init will fail to link'" 2>&1 | tail -1
