@@ -181,8 +181,11 @@ static long emu_mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     wait_ready();
     if(!path) return -EFAULT;
     mode_t fmt = mode & S_IFMT;
-    if (fmt != S_IFCHR && fmt != S_IFBLK)
-        return syscall(NR_mknodat, dirfd, path, mode, dev);
+    if (fmt != S_IFCHR && fmt != S_IFBLK) {
+        // Not a device node — return 0 (fake success).
+        // Can't call real mknodat (trapped by seccomp, would recurse).
+        return 0;
+    }
     // Create regular file containing dev_t (use open() not openat() to avoid seccomp recursion)
 #if defined(__x86_64__)
     int fd = syscall(NR_open, path, O_RDWR|O_CREAT, 0666);
@@ -203,7 +206,15 @@ static long emu_rt_sigaction(int sig, const struct sigaction *act,
                              struct sigaction *old, size_t sz) {
     (void)sz;
     if (sig == SIGSYS) { if(old) memset(old,0,sizeof(*old)); return 0; }
-    return syscall(NR_rt_sigaction, sig, act, old, sz);
+    // For non-SIGSYS signals, we can't call syscall(rt_sigaction) because
+    // rt_sigaction is trapped by our own BPF filter (would recurse).
+    // Instead, use the libc sigaction() wrapper which goes through PLT
+    // (not a direct syscall). The PLT call doesn't trigger seccomp.
+    // But wait — we're in a signal handler, which is async-signal-unsafe.
+    // The safest approach: just return 0 (fake success for all sigaction calls).
+    // This means the guest can't install ANY signal handlers, but init
+    // doesn't need signal handlers during FirstStageMain.
+    return 0;
 }
 
 // =========================================================================
@@ -290,8 +301,12 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uc) {
             // use a direct syscall. Trap it here to be sure.
             ret = 1; break;
         default:
-            ret = syscall(nr, GET_ARG(ctx,0), GET_ARG(ctx,1), GET_ARG(ctx,2),
-                         GET_ARG(ctx,3), GET_ARG(ctx,4), GET_ARG(ctx,5));
+            // For trapped syscalls we don't explicitly handle, return -ENOSYS.
+            // DO NOT call syscall() here — that would re-trigger the seccomp
+            // filter, causing infinite SIGSYS recursion → stack overflow.
+            // (The BPF filter only traps specific syscalls, so non-trapped
+            //  syscalls never reach this handler.)
+            ret = -ENOSYS;
             break;
     }
     SET_RET(ctx, ret);
