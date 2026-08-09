@@ -535,7 +535,10 @@ fi
 # the hook. Set TWOYI_SKIP_PRELOAD=1 in the CI env to test.
 SKIP_PRELOAD_ENV="${TWOYI_SKIP_PRELOAD:-}"
 INIT_PATH_OVERRIDE="${TWOYI_INIT_PATH:-}"
-if [ -n "$SKIP_PRELOAD_ENV" ]; then
+NO_NAMESPACES_ENV="${TWOYI_NO_NAMESPACES:-}"
+if [ -n "$NO_NAMESPACES_ENV" ]; then
+    echo "  → pre-launching kr64 as root (TWOYI_NO_NAMESPACES=1, no pivot_root/chroot)"
+elif [ -n "$SKIP_PRELOAD_ENV" ]; then
     echo "  → pre-launching kr64 as root (TWOYI_SKIP_PRELOAD=1, no LD_PRELOAD)"
 elif [ -n "$INIT_PATH_OVERRIDE" ]; then
     echo "  → pre-launching kr64 as root (TWOYI_INIT_PATH=$INIT_PATH_OVERRIDE)"
@@ -550,6 +553,7 @@ fi
         --data-dir /data/user/0/io.twoyi \
         --vmid 0 \
         --no-seccomp \
+        ${NO_NAMESPACES_ENV:+--no-namespaces} \
         ${INIT_PATH_OVERRIDE:+--init $INIT_PATH_OVERRIDE} \
         > /data/user/0/io.twoyi/kr64-stderr.log 2>&1 &
     echo \$! > /data/local/tmp/kr64.pid

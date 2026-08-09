@@ -60,6 +60,11 @@ name: KVM E2E Test
         description: 'Override the guest init binary path (e.g. /system/bin/sh for a simpler test)'
         required: false
         default: ''
+      no_namespaces:
+        description: 'Skip pivot_root/chroot (non-root mode — HOST linker loads the binary, closer to production)'
+        type: boolean
+        required: false
+        default: false
 
 # Cancel any superseded manual run on the same ref. Manual dispatches
 # are rare (you'd typically only run this when investigating a boot
@@ -332,6 +337,7 @@ jobs:
           ANDROID_HOME: /usr/local/lib/android/sdk
           TWOYI_SKIP_PRELOAD: ${{ github.event.inputs.skip_preload == 'true' && '1' || '' }}
           TWOYI_INIT_PATH: ${{ github.event.inputs.init_path || '' }}
+          TWOYI_NO_NAMESPACES: ${{ github.event.inputs.no_namespaces == 'true' && '1' || '' }}
 
       - name: Print boot verdict
         # The script writes a verdict file. We surface it in the GHA
