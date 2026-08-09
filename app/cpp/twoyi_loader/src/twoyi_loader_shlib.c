@@ -136,7 +136,7 @@ static void wait_ready(void) {
 // =========================================================================
 static long emu_mount(const char *src, const char *tgt, const char *fs,
                       unsigned long flags, const void *data) {
-    (void)data; wait_ready();
+    (void)data; // wait_ready() removed — runtime is always ready when handler runs
     if (!tgt) return -EFAULT;
     // Special paths
     if ((strncmp(tgt,"/dev",4)==0 && (tgt[4]==0||tgt[4]=='/')) ||
@@ -163,7 +163,7 @@ static long emu_mount(const char *src, const char *tgt, const char *fs,
 }
 
 static long emu_umount2(const char *tgt, int flags) {
-    (void)flags; wait_ready();
+    (void)flags; // wait_ready() removed — runtime is always ready when handler runs
     if(!tgt) return -EFAULT;
     pthread_mutex_lock(&g_mount_lock);
     for(int i=0;i<MAX_MOUNTS;i++) {
@@ -178,7 +178,7 @@ static long emu_umount2(const char *tgt, int flags) {
 // mknodat emulation (VM at 0x11d598: creates regular file with dev_t)
 // =========================================================================
 static long emu_mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
-    wait_ready();
+    // wait_ready() removed — runtime is always ready when handler runs
     if(!path) return -EFAULT;
     mode_t fmt = mode & S_IFMT;
     if (fmt != S_IFCHR && fmt != S_IFBLK) {
@@ -311,7 +311,7 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uc) {
             break;
         }
         case NR_umount2: ret = emu_umount2((const char*)GET_ARG(ctx,0), (int)GET_ARG(ctx,1)); break;
-        case NR_chroot: wait_ready(); ret = 0; break;
+        case NR_chroot: // wait_ready() removed — runtime is always ready when handler runs ret = 0; break;
         case NR_mknod: ret = emu_mknodat(AT_FDCWD, (const char*)GET_ARG(ctx,0), (mode_t)GET_ARG(ctx,1), (dev_t)GET_ARG(ctx,2)); break;
         case NR_mknodat: ret = emu_mknodat((int)GET_ARG(ctx,0), (const char*)GET_ARG(ctx,1), (mode_t)GET_ARG(ctx,2), (dev_t)GET_ARG(ctx,3)); break;
         case NR_rt_sigaction: ret = emu_rt_sigaction((int)GET_ARG(ctx,0), (const struct sigaction*)GET_ARG(ctx,1), (struct sigaction*)GET_ARG(ctx,2), (size_t)GET_ARG(ctx,3)); break;
