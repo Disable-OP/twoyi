@@ -281,50 +281,31 @@ pub fn init_renderer(
 
         let mut cmd;
         if Path::new(&kr64_path).exists() {
-            // Use the kr64 daemon via the rootfs linker.
+            // Use the kr64 binary (built as --bin kr64, a regular PIE
+            // executable with proper _start from crt1.o).
             //
-            // Directly exec'ing libkr64.so crashes with SIGSEGV (rip=0x7,
-            // null function pointer) because the cdylib's C runtime isn't
-            // properly initialized when exec'd directly — the .init_array
-            // / lang_start setup doesn't complete, leaving function pointers
-            // in the GOT as NULL.
+            // The kr64 bin target is a proper executable — no PIE hack,
+            // no custom entry point. It has PT_INTERP=/system/bin/linker64
+            // and the kernel loads it correctly.
             //
-            // Fix: use the rootfs linker to load libkr64.so, the same way
-            // we load init. The linker properly initializes the C runtime,
-            // runs .init_array, then calls the ELF entry point (kr64_main).
-            //   linker64 libkr64.so --rootfs ... --data-dir ... --vmid 0
+            // We exec it directly (no su, no rootfs linker wrapper).
+            // The kr64 daemon will:
+            //   1. Create virtual /dev tree
+            //   2. Set up /dev/__properties__
+            //   3. fork() a child where init thinks it's PID 1
+            //   4. exec init in the child
             //
-            // kr64 needs root for unshare/mount/chroot. We run it via
-            // `su -c` on rooted emulators. The su shell exec's the linker
-            // which loads libkr64.so and calls kr64_main.
-            let bootstrap_linker = format!("{}/system/bin/bootstrap/linker64", working_dir);
-            let legacy_linker = format!("{}/system/bin/linker64", working_dir);
-            let linker = if Path::new(&bootstrap_linker).exists() {
-                bootstrap_linker
-            } else {
-                legacy_linker
-            };
-            let android_root = format!("{}/system", working_dir);
-            let android_data = format!("{}/data", working_dir);
-            info!("[CORE] Using kr64 daemon via rootfs linker: {} {}", linker, kr64_path);
-
-            let su_cmd = format!(
-                "exec env LD_LIBRARY_PATH='{ld_library}' TWOYI_ROOTFS='{root}' TYLOADER='{loader}' \
-                 ANDROID_BOOTLOGO=1 ANDROID_ROOT='{aroot}' ANDROID_DATA='{adata}' \
-                 '{linker}' '{kr64}' --rootfs '{root}' --data-dir '{ddir}' --vmid 0",
-                ld_library = ld_library_path,
-                root = working_dir,
-                loader = loader_path,
-                aroot = android_root,
-                adata = android_data,
-                linker = linker,
-                kr64 = kr64_path,
-                ddir = get_data_dir(),
-            );
-            cmd = Command::new("su");
+            // Note: unshare/mount/chroot may fail without root, but kr64
+            // has fallbacks (chroot instead of pivot_root, skip seccomp).
+            // The key thing is that kr64 forks + execs init, and in the
+            // child process init gets PID 1 (or at least a PID that init
+            // doesn't reject).
+            info!("[CORE] Using kr64 binary: {}", kr64_path);
+            cmd = Command::new(&kr64_path);
             cmd.current_dir(&working_dir);
-            cmd.arg("-c");
-            cmd.arg(&su_cmd);
+            cmd.arg("--rootfs").arg(&working_dir);
+            cmd.arg("--data-dir").arg(get_data_dir());
+            cmd.arg("--vmid").arg("0");
         } else {
             // Fallback: exec rootfs linker + init directly.
             // This will fail with exit 31 (init not PID 1) but at least
