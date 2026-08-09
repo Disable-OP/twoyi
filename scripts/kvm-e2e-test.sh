@@ -389,13 +389,24 @@ echo "  ✓ rootfs installed"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 5: Launch twoyi + capture logcat + screenshots.
-# Coordinates for "Launch Container" tap come from
-# .devcontainer/scripts/test-twoyi.sh (heuristic; pixel_5 is 1080x1920).
-# The settings list starts ~y=400 and items are ~120px apart, so
-# y=700 is a reasonable guess for the first non-header preference.
+# Step 5: Pre-launch kr64 as ROOT + launch twoyi + capture logcat + screenshots.
+#
+# The app's own kr64 (launched by core.rs) CANNOT chroot() or mount() —
+# the zygote's seccomp filter blocks these syscalls and kills the process
+# with SIGSYS (signal 31). Only a ROOT-launched kr64 can do these ops.
+#
+# So we pre-launch kr64 as root via `adb shell` BEFORE starting the app.
+# The app's core.rs detects that /dev/qemu_pipe already exists and skips
+# its own kr64 launch + qemu_pipe proxy. The app's role is JUST to
+# provide the renderer (libOpenglRender.so) and the UI.
+#
+# The root kr64:
+#   1. Creates all /dev devices (qemu_pipe, touch, key, event, gb, etc.)
+#   2. unshare(CLONE_NEWNS) + mount tmpfs + pivot_root (or chroot fallback)
+#   3. unshare(CLONE_NEWPID) — makes init actually PID 1 (no LD_PRELOAD hack needed)
+#   4. fork() + exec init
 # ---------------------------------------------------------------------------
-echo "── Step 5/6: launch twoyi + capture ──"
+echo "── Step 5/6: pre-launch root kr64 + launch twoyi + capture ──"
 
 # Clear logcat so we only capture the container-launch session
 "$ADB_BIN" -s emulator-5554 logcat -c
@@ -407,6 +418,83 @@ echo "── Step 5/6: launch twoyi + capture ──"
 LOGCAT_PID=$!
 echo "  logcat capture started (PID $LOGCAT_PID → $ARTIFACT_DIR/logcat.txt)"
 
+# --- Extract libkr64.so + libgetpid_hook.so from the APK ---
+# The root kr64 needs to be at a path accessible to root. We extract it
+# from the APK and push it to /data/local/tmp/.
+# The script is run from the repo root, so the APK is at
+# app/build/outputs/apk/release/*.apk (relative to cwd).
+APK_PATH=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+if [ -z "$APK_PATH" ] && [ -n "${GITHUB_WORKSPACE:-}" ]; then
+    APK_PATH=$(ls "$GITHUB_WORKSPACE"/app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
+fi
+if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+    echo "  → extracting libkr64.so + libgetpid_hook.so from APK ($APK_PATH)"
+    EXTRACT_DIR=/tmp/apk-extract
+    rm -rf "$EXTRACT_DIR" && mkdir -p "$EXTRACT_DIR"
+    (cd "$EXTRACT_DIR" && unzip -o "$APK_PATH" "lib/x86_64/libkr64.so" "lib/x86_64/libgetpid_hook.so" 2>/dev/null) || true
+    if [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
+        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libkr64.so" /data/local/tmp/kr64
+        "$ADB_BIN" -s emulator-5554 shell chmod 755 /data/local/tmp/kr64
+        echo "  ✓ pushed kr64 to /data/local/tmp/kr64"
+    else
+        echo "  ⚠ libkr64.so not found in APK — will fall back to app's kr64"
+    fi
+    if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
+        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" /data/local/tmp/libgetpid_hook.so
+        echo "  ✓ pushed libgetpid_hook.so to /data/local/tmp/"
+    fi
+else
+    echo "  ⚠ APK not found — cannot extract libkr64.so"
+fi
+
+# --- Create symlinks in the rootfs for libgetpid_hook.so ---
+# kr64's LD_PRELOAD path is /system/lib64/libgetpid_hook.so (relative to chroot).
+# We need the file to be at {rootfs}/system/lib64/libgetpid_hook.so.
+# RomManager.ensureLibSymlink would create this, but the app hasn't started yet.
+"$ADB_BIN" -s emulator-5554 shell "
+    mkdir -p $TWOYI_PROFILE/system/lib64
+    if [ ! -e $TWOYI_PROFILE/system/lib64/libgetpid_hook.so ]; then
+        ln -sf /data/local/tmp/libgetpid_hook.so $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
+    fi
+    if [ ! -e $TWOYI_PROFILE/system/lib64/libkr64.so ]; then
+        ln -sf /data/local/tmp/kr64 $TWOYI_PROFILE/system/lib64/libkr64.so
+    fi
+" 2>/dev/null || true
+
+# --- Pre-launch kr64 as ROOT ---
+# Run kr64 with namespaces + seccomp enabled (root can do these).
+# Redirect stderr to a log file we can pull later.
+echo "  → pre-launching kr64 as root (with namespaces + seccomp)"
+"$ADB_BIN" -s emulator-5554 shell "
+    export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
+    /data/local/tmp/kr64 \
+        --rootfs $TWOYI_PROFILE \
+        --data-dir /data/user/0/io.twoyi \
+        --vmid 0 \
+        > /data/user/0/io.twoyi/kr64-stderr.log 2>&1 &
+    echo \$! > /data/local/tmp/kr64.pid
+    echo 'kr64 launched'
+" 2>&1 | tail -5
+
+# Wait for /dev/qemu_pipe to be created (kr64 is setting up)
+echo "  → waiting for kr64 to create /dev/qemu_pipe..."
+for i in $(seq 1 15); do
+    if "$ADB_BIN" -s emulator-5554 shell "test -S $TWOYI_PROFILE/dev/qemu_pipe" 2>/dev/null; then
+        echo "  ✓ /dev/qemu_pipe created (after ${i}s)"
+        break
+    fi
+    sleep 1
+done
+if ! "$ADB_BIN" -s emulator-5554 shell "test -S $TWOYI_PROFILE/dev/qemu_pipe" 2>/dev/null; then
+    echo "  ⚠ /dev/qemu_pipe not created after 15s — kr64 may have failed"
+    echo "  → pulling kr64-stderr.log for diagnosis"
+    "$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+    if [ -f "$ARTIFACT_DIR/kr64-stderr.log" ]; then
+        echo "  === kr64-stderr.log ==="
+        cat "$ARTIFACT_DIR/kr64-stderr.log"
+    fi
+fi
+
 echo "  → launching io.twoyi/.ui.SettingsActivity (to trigger rootfs detection)"
 "$ADB_BIN" -s emulator-5554 shell am start -n io.twoyi/.ui.SettingsActivity
 sleep 3
@@ -416,14 +504,6 @@ sleep 3
 "$ADB_BIN" -s emulator-5554 exec-out screencap -p \
     > "$ARTIFACT_DIR/screenshot-00_settings.png"
 echo "  ✓ screenshot-00_settings.png"
-
-# ---------------------------------------------------------------------------
-# SKIP pre-launch kr64 — let the app's own kr64 handle everything.
-# The app's kr64 runs with --no-namespaces --no-seccomp, and uses
-# LD_PRELOAD=libgetpid_hook.so to make init think it's PID 1.
-# The pre-launched kr64 was causing conflicts (duplicate /dev/qemu_pipe)
-# and interfering with the app's startup.
-# ---------------------------------------------------------------------------
 
 # Give SettingsActivity time to initialize before launching Render2Activity
 sleep 5
