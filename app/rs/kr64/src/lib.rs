@@ -1015,16 +1015,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         };
         let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
-        // Debug: check if libgetpid_hook.so exists at the expected path
-        // After pivot_root: /dev/libgetpid_hook.so (tmpfs)
-        // Without pivot_root: {rootfs}/dev/libgetpid_hook.so (ext4)
-        let hook_exists = if cfg.use_namespaces {
-            unsafe { libc::access(b"/dev/libgetpid_hook.so\0".as_ptr() as *const libc::c_char, libc::F_OK) } == 0
-        } else {
-            // Can't use format! in async-signal-safe context, but we can
-            // check the chroot-relative path since the parent already
-            // copied it to {rootfs}/dev/libgetpid_hook.so
-            unsafe { libc::access(b"/dev/libgetpid_hook.so\0".as_ptr() as *const libc::c_char, libc::F_OK) } == 0
+        // Debug: check if libgetpid_hook.so exists at the expected path.
+        // After pivot_root (use_namespaces=true): /dev/libgetpid_hook.so
+        // Without pivot_root: {rootfs}/dev/libgetpid_hook.so
+        // In both cases, the chroot-relative path /dev/libgetpid_hook.so
+        // works — after pivot_root it's the tmpfs, without pivot_root
+        // the parent copied it to {rootfs}/dev/ which IS /dev/ relative
+        // to the chroot... actually no, without pivot_root there's no
+        // chroot, so /dev/ refers to the HOST's /dev. We need to check
+        // the full path in that case. But we can't use format! here
+        // (async-signal-unsafe). So just check the chroot-relative path
+        // and log the result — it's only diagnostic.
+        let hook_exists = unsafe {
+            libc::access(
+                b"/dev/libgetpid_hook.so\0".as_ptr() as *const libc::c_char,
+                libc::F_OK,
+            ) == 0
         };
         if hook_exists {
             unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /dev/\n"); }
