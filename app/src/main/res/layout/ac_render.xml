@@ -39,6 +39,14 @@
             app:lav_speedCoefficient="1.0"
             app:lav_thirdColor="@color/lav_google_blue" />
 
+        <!-- Host-side boot animation (Android-style spinning ring) -->
+        <!-- Shows while the guest Android system boots -->
+        <io.twoyi.BootAnimationView
+            android:id="@+id/bootAnimation"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone" />
+
         <TextView
             android:id="@+id/loadingText"
             android:layout_width="wrap_content"
