@@ -333,8 +333,16 @@ pub fn init_renderer(
         cmd.env("ANDROID_DATA", format!("{}/data", working_dir));
         cmd.env_remove("BOOTCLASSPATH");
         cmd.env_remove("SYSTEMSERVERCLASSPATH");
-        cmd.stdout(Stdio::from(outputs));
-        cmd.stderr(Stdio::from(errors));
+        // For the kr64 path, inherit stderr so kr64's eprintln! output
+        // appears in logcat (via Android's stderr→logcat redirect).
+        // For the fallback path, redirect to the log file.
+        if Path::new(&kr64_path).exists() {
+            cmd.stdout(Stdio::inherit());
+            cmd.stderr(Stdio::inherit());
+        } else {
+            cmd.stdout(Stdio::from(outputs));
+            cmd.stderr(Stdio::from(errors));
+        }
 
         match cmd.spawn() {
             Ok(child) => {
