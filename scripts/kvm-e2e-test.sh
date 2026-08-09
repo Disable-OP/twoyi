@@ -428,10 +428,21 @@ if [ -z "$APK_PATH" ] && [ -n "${GITHUB_WORKSPACE:-}" ]; then
     APK_PATH=$(ls "$GITHUB_WORKSPACE"/app/build/outputs/apk/release/*.apk 2>/dev/null | head -1)
 fi
 if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
-    echo "  → extracting libkr64.so + libgetpid_hook.so from APK ($APK_PATH)"
+    # Convert to absolute path BEFORE any subshell cd — unzip runs inside
+    # a `(cd "$EXTRACT_DIR" && unzip ...)` subshell, and a relative
+    # APK_PATH would not resolve from /tmp/apk-extract/. This was the
+    # root cause of "unzip failed: 9" in every previous KVM run: the
+    # glob matched the APK (so APK_PATH was set), but the subshell's cd
+    # made the relative path unresolvable.
+    APK_ABS=$(readlink -f "$APK_PATH" 2>/dev/null || echo "$APK_PATH")
+    echo "  → extracting libkr64.so + libgetpid_hook.so from APK ($APK_ABS)"
     EXTRACT_DIR=/tmp/apk-extract
     rm -rf "$EXTRACT_DIR" && mkdir -p "$EXTRACT_DIR"
-    (cd "$EXTRACT_DIR" && unzip -o "$APK_PATH" "lib/x86_64/libkr64.so" "lib/x86_64/libgetpid_hook.so") || echo "  ⚠ unzip failed: $?"
+    # Use unzip -d to extract into EXTRACT_DIR without cd-ing (avoids
+    # the relative-path-after-cd bug entirely).
+    unzip -o "$APK_ABS" "lib/x86_64/libkr64.so" "lib/x86_64/libgetpid_hook.so" -d "$EXTRACT_DIR" || echo "  ⚠ unzip failed: $?"
+    echo "  → EXTRACT_DIR contents:"
+    ls -la "$EXTRACT_DIR/lib/x86_64/" 2>/dev/null || echo "    (lib/x86_64/ not found in extraction)"
     if [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
         "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libkr64.so" /data/local/tmp/kr64
         "$ADB_BIN" -s emulator-5554 shell chmod 755 /data/local/tmp/kr64
@@ -476,6 +487,8 @@ else
     echo "  ⚠ APK not found — cannot extract libkr64.so"
     echo "    CWD: $(pwd)"
     ls -la app/build/outputs/apk/release/ 2>/dev/null || echo "    APK dir does not exist"
+    EXTRACT_DIR=/tmp/apk-extract  # ensure variable is set for the push logic below
+    mkdir -p "$EXTRACT_DIR"
 fi
 
 # --- Push libgetpid_hook.so to ROOT of rootfs ---
@@ -486,8 +499,9 @@ if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
     echo "  ✓ pushed libgetpid_hook.so to root of rootfs (from EXTRACT_DIR)"
 elif [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
     # libgetpid_hook.so wasn't extracted, but libkr64.so was — try extracting
-    # libgetpid_hook.so separately
-    (cd "$EXTRACT_DIR" && unzip -o "$APK_PATH" "lib/x86_64/libgetpid_hook.so" 2>/dev/null) || true
+    # libgetpid_hook.so separately. Use absolute APK path + unzip -d (no cd).
+    APK_ABS2=$(readlink -f "$APK_PATH" 2>/dev/null || echo "$APK_PATH")
+    unzip -o "$APK_ABS2" "lib/x86_64/libgetpid_hook.so" -d "$EXTRACT_DIR" 2>/dev/null || true
     if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
         "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
         echo "  ✓ pushed libgetpid_hook.so to root of rootfs (extracted separately)"
