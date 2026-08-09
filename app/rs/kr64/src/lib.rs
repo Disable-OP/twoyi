@@ -951,9 +951,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             let alt_path = b"/system/lib64/libc.so\0";
             let alt_exists = unsafe { libc::access(alt_path.as_ptr() as *const libc::c_char, libc::F_OK) } == 0;
             if alt_exists {
-                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so exists — dir is accessible\n"); }
+                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so exists - dir is accessible\n"); }
             } else {
-                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so NOT found — dir may not exist\n"); }
+                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so NOT found - dir may not exist\n"); }
             }
         }
 
