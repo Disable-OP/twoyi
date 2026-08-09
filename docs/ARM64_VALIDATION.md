@@ -348,3 +348,107 @@ headers) but the seccomp path needs a different validation environment.
 | QEMU runs AArch64 binaries | `qemu-aarch64 /tmp/test_arm64` outputs PID | QEMU-VERIFIED |
 | QEMU does NOT support seccomp | `seccomp()` returns ENOSYS, `prctl(PR_SET_SECCOMP)` returns EINVAL | QEMU-VERIFIED |
 | seccomp/SIGSYS path works on AArch64 | NOT TESTABLE under QEMU | UNKNOWN |
+
+---
+
+## UPDATE: QEMU System-Mode Validation — SUCCESS
+
+### Switch from QEMU user-mode to QEMU system-mode
+
+After discovering that QEMU user-mode does NOT support seccomp (returns ENOSYS),
+I switched to QEMU system-mode (qemu-system-aarch64), which runs a real
+AArch64 Linux kernel and fully supports seccomp.
+
+### Environment
+
+- **QEMU:** qemu-system-aarch64 10.0.11 (Debian)
+- **Kernel:** Linux 6.12.94+deb13-arm64 (Debian netboot kernel)
+  - Source: http://deb.debian.org/debian/dists/trixie/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux
+  - Format: Linux kernel ARM64 boot executable Image (raw, not EFI)
+- **Machine:** qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512
+- **Console:** ttyAMA0 (PL011 UART)
+- **Init:** Our test binary as /init in a minimal initramfs (cpio)
+
+### Test Binary
+
+A self-contained AArch64 static binary that:
+1. Installs a SIGSYS handler (sigaction with SA_SIGINFO|SA_NODEFER)
+2. Installs a seccomp BPF filter that traps mount(40) and chroot(51)
+3. Calls mount() — verifies it's trapped and emulated
+4. Calls getpid() — verifies it passes through normally
+
+### Results (AArch64 QEMU system-mode)
+
+```
+=== AArch64 Seccomp Test ===
+OK: SIGSYS handler installed
+OK: SIGSYS unblocked
+OK: PR_SET_NO_NEW_PRIVS
+OK: seccomp filter installed
+Calling mount()...
+mount returned: 0x0000000000000000
+sigsys_fired: 0x0000000000000001
+sigsys_nr: 0x0000000000000028
+PASS: mount trapped and emulated
+getpid returned: 0x0000000000000001
+PASS: getpid not trapped
+=== DONE ===
+```
+
+### Analysis
+
+1. **seccomp filter installed successfully** — the `seccomp(SECCOMP_SET_MODE_FILTER)`
+   syscall works under QEMU system-mode (unlike QEMU user-mode which returns ENOSYS).
+
+2. **mount() was trapped** — `sigsys_fired: 1` proves the SIGSYS handler was invoked.
+
+3. **Syscall number correct** — `sigsys_nr: 0x28` = 40 decimal = `__NR_mount` on AArch64.
+   This matches the AOSP `bionic/libc/kernel/uapi/asm-generic/unistd.h` definition.
+   SOURCE-VERIFIED.
+
+4. **Return value emulated** — `mount returned: 0x0` proves the handler wrote 0
+   to `ucontext->uc_mcontext.regs[0]` (x0) and execution continued normally.
+
+5. **Non-trapped syscall works** — `getpid returned: 1` (init's PID) proves the
+   BPF filter allowed getpid to pass through to the kernel.
+
+### Classification
+
+| Claim | Evidence | Classification |
+|-------|----------|----------------|
+| seccomp works on AArch64 | seccomp() returned 0 | QEMU-VERIFIED |
+| SIGSYS handler fires on AArch64 | sigsys_fired=1 | QEMU-VERIFIED |
+| mount syscall number = 40 | sigsys_nr=0x28=40 | QEMU-VERIFIED + SOURCE-VERIFIED |
+| ucontext regs[0] = return value | mount returned 0 | QEMU-VERIFIED |
+| ucontext regs[8] = syscall nr | si_syscall=40 matches x8 | SOURCE-VERIFIED (headers) |
+| BPF filter allows non-trapped syscalls | getpid returned 1 | QEMU-VERIFIED |
+| AArch64 binary is valid ELF | file command confirms | SOURCE-VERIFIED |
+| AArch64 _start stub works | binary runs as init | QEMU-VERIFIED |
+
+### What This Proves
+
+- ✅ The seccomp/SIGSYS mechanism works on AArch64 Linux
+- ✅ The BPF filter correctly traps mount() and delivers SIGSYS
+- ✅ The SIGSYS handler correctly reads si_syscall and writes the return value
+- ✅ Non-trapped syscalls pass through normally
+- ✅ The AArch64 ucontext layout is correct (regs[0] for return value)
+
+### What This Does NOT Prove
+
+- ❌ Android bionic behavior (this is glibc, not bionic)
+- ❌ Android zygote seccomp policy (this is a raw kernel, no zygote)
+- ❌ Android SELinux (this kernel has AppArmor, not SELinux)
+- ❌ Android /proc, /dev, /sys semantics
+- ❌ Behavior on a physical arm64 Android device
+
+### Validation Hierarchy Updated
+
+```
+x86_64 native Linux           ✅ TEST-VERIFIED (12/12 tests pass)
+      ↓
+AArch64 QEMU system-mode      ✅ QEMU-VERIFIED (seccomp + SIGSYS work)
+      ↓
+AArch64 Android emulator      ❌ NOT YET VERIFIED
+      ↓
+physical Android arm64        ❌ NOT YET VERIFIED
+```
