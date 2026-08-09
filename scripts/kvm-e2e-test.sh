@@ -437,7 +437,27 @@ if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
         "$ADB_BIN" -s emulator-5554 shell chmod 755 /data/local/tmp/kr64
         echo "  ✓ pushed kr64 to /data/local/tmp/kr64"
     else
-        echo "  ⚠ libkr64.so not found in APK — will fall back to app's kr64"
+        echo "  ⚠ libkr64.so not found in APK extraction — trying installed APK"
+        # Try to copy from the installed APK's native lib dir
+        "$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
+        sleep 1
+        "$ADB_BIN" -s emulator-5554 wait-for-device 2>/dev/null || true
+        "$ADB_BIN" -s emulator-5554 shell "
+            APK_DIR=\$(dirname \$(pm path io.twoyi | head -1 | sed 's/package://'))
+            if [ -f \"\$APK_DIR/lib/x86_64/libkr64.so\" ]; then
+                cp \"\$APK_DIR/lib/x86_64/libkr64.so\" /data/local/tmp/kr64
+                chmod 755 /data/local/tmp/kr64
+                echo 'copied kr64 from installed APK'
+            else
+                echo 'kr64 not found in installed APK either'
+                # Last resort: use the symlink created by RomManager
+                if [ -e /data/user/0/io.twoyi/rootfs/system/lib64/libkr64.so ]; then
+                    cp -L /data/user/0/io.twoyi/rootfs/system/lib64/libkr64.so /data/local/tmp/kr64
+                    chmod 755 /data/local/tmp/kr64
+                    echo 'copied kr64 from rootfs symlink'
+                fi
+            fi
+        " 2>&1 | tail -5
     fi
     if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
         "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" /data/local/tmp/libgetpid_hook.so
