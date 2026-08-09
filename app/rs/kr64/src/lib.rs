@@ -929,7 +929,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // CString::new fails if the path contains an interior NUL byte,
         // which would silently terminate the C string mid-path. Surface
         // that case rather than _exit(127) with no diagnostic.
-        let init_cstr = match CString::new(cfg.init_path.as_str()) {
+        // When not using chroot/pivot_root, init_path is relative to the
+        // rootfs (e.g. /system/bin/init). We need to prepend the rootfs
+        // path to get the full absolute path. When chroot IS used, the
+        // init_path is already correct (it's relative to the new root).
+        let full_init_path = if cfg.use_namespaces {
+            cfg.init_path.clone()
+        } else {
+            format!("{}{}", cfg.rootfs, cfg.init_path)
+        };
+        let init_cstr = match CString::new(full_init_path.as_str()) {
             Ok(s) => s,
             Err(_) => unsafe {
                 safe_write_err(b"[KR64 CHILD] FATAL: init_path contains interior NUL byte\n");
