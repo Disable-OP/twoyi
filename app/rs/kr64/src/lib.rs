@@ -77,6 +77,7 @@ pub mod sensors;
 
 use std::ffi::CString;
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 
 // ============================================================================
 // Logging — minimal `eprintln!`-based macros. No external `log` crate.
