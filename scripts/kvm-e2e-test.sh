@@ -491,15 +491,16 @@ fi
 " 2>/dev/null || true
 
 # --- Pre-launch kr64 as ROOT ---
-# Run kr64 with namespaces + seccomp enabled (root can do these).
-# Redirect stderr to a log file we can pull later.
-echo "  → pre-launching kr64 as root (with namespaces + seccomp)"
+# Run kr64 with namespaces enabled (root can do unshare/pivot_root).
+# Skip seccomp — the filter's SIGSYS handler crashes init with SIGSEGV.
+echo "  → pre-launching kr64 as root (with namespaces, no seccomp)"
 "$ADB_BIN" -s emulator-5554 shell "
     export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
     /data/local/tmp/kr64 \
         --rootfs $TWOYI_PROFILE \
         --data-dir /data/user/0/io.twoyi \
         --vmid 0 \
+        --no-seccomp \
         > /data/user/0/io.twoyi/kr64-stderr.log 2>&1 &
     echo \$! > /data/local/tmp/kr64.pid
     echo 'kr64 launched'
