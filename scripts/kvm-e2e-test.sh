@@ -638,6 +638,16 @@ else
     echo "  ⚠ could not pull /data/data/io.twoyi/log.txt (file may not exist yet)"
 fi
 
+# Pull the kr64 daemon's stderr log (separate from the app's log.txt)
+"$ADB_BIN" -s emulator-5554 pull /data/data/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/kr64-stderr.log" ]; then
+    echo "  ✓ pulled kr64-stderr.log ($(stat -c%s "$ARTIFACT_DIR/kr64-stderr.log") bytes)"
+    echo "  === kr64-stderr.log ==="
+    cat "$ARTIFACT_DIR/kr64-stderr.log"
+else
+    echo "  ⚠ could not pull kr64-stderr.log (file may not exist)"
+fi
+
 # Save a filtered logcat for quick scanning — the full logcat can be
 # 100k+ lines on a booted emulator.
 grep -E 'KR64 INFO|KR64 WARN|KR64 ERROR|CORE|NEW_RENDERER|CLIENT_EGL|SOCKET_MONITOR|BOOT_COMPLETED|TWOYI_RENDERER|emugl' \
