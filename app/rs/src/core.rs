@@ -295,12 +295,13 @@ pub fn init_renderer(
             cmd.arg("--rootfs").arg(&working_dir);
             cmd.arg("--data-dir").arg(get_data_dir());
             cmd.arg("--vmid").arg("0");
-            // Pass --no-namespaces and --no-seccomp to skip the parts
-            // that need root (unshare, mount, pivot_root, seccomp).
-            // The guest will run in the same namespace as the app —
-            // not ideal for isolation, but sufficient for booting.
             cmd.arg("--no-namespaces");
             cmd.arg("--no-seccomp");
+            // Use the HOST system lib64 for kr64's own dependencies
+            // (libc.so, libdl.so, etc.) — NOT the rootfs's versions.
+            // The rootfs's libc.so may be incompatible with the host
+            // linker, causing the C runtime to crash before main().
+            cmd.env("LD_LIBRARY_PATH", "/system/lib64:/vendor/lib64");
         } else {
             // Fallback: exec rootfs linker + init directly.
             // This will fail with exit 31 (init not PID 1) but at least
@@ -321,9 +322,15 @@ pub fn init_renderer(
         }
 
         // These env calls are no-ops when using `su -c` (the env is set
-        // inside the su_cmd string), but they don't hurt and keep the
-        // fallback path working.
-        cmd.env("LD_LIBRARY_PATH", &ld_library_path);
+        // Set LD_LIBRARY_PATH. For the kr64 path, we already set it to
+        // the HOST system lib64 (kr64 needs host libs, not rootfs libs).
+        // For the fallback path, use the rootfs lib64 paths so init
+        // gets rootfs libs.
+        if !Path::new(&kr64_path).exists() {
+            // Fallback path — use rootfs libs for init
+            cmd.env("LD_LIBRARY_PATH", &ld_library_path);
+        }
+        // kr64 path already set LD_LIBRARY_PATH above
         cmd.env_remove("LD_PRELOAD");
         cmd.env("TYLD_PRELOAD", "");
         cmd.env("TWOYI_ROOTFS", &working_dir);
