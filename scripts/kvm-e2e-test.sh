@@ -630,14 +630,16 @@ else
 fi
 
 # Pull the kr64 daemon's stderr log (separate from the app's log.txt)
-"$ADB_BIN" -s emulator-5554 pull /data/data/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
-if [ -f "$ARTIFACT_DIR/kr64-stderr.log" ]; then
-    echo "  ✓ pulled kr64-stderr.log ($(stat -c%s "$ARTIFACT_DIR/kr64-stderr.log") bytes)"
-    echo "  === kr64-stderr.log ==="
-    cat "$ARTIFACT_DIR/kr64-stderr.log"
-else
-    echo "  ⚠ could not pull kr64-stderr.log (file may not exist)"
-fi
+# Try both the root kr64's log and the app's kr64 log
+"$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+"$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-app-stderr.log "$ARTIFACT_DIR/kr64-app-stderr.log" 2>/dev/null || true
+for logf in kr64-stderr.log kr64-app-stderr.log; do
+    if [ -f "$ARTIFACT_DIR/$logf" ]; then
+        echo "  ✓ pulled $logf ($(stat -c%s "$ARTIFACT_DIR/$logf") bytes)"
+        echo "  === $logf ==="
+        cat "$ARTIFACT_DIR/$logf"
+    fi
+done
 
 # Save a filtered logcat for quick scanning — the full logcat can be
 # 100k+ lines on a booted emulator.

@@ -385,7 +385,7 @@ pub fn init_renderer(
         // stderr to /dev/null, so Stdio::inherit() doesn't work.
         // For the fallback path, use the app's log file.
         if Path::new(&kr64_path).exists() {
-            let kr64_log = format!("{}/kr64-stderr.log", get_data_dir());
+            let kr64_log = format!("{}/kr64-app-stderr.log", get_data_dir());
             match File::create(&kr64_log) {
                 Ok(f) => {
                     let f2 = f.try_clone().unwrap_or_else(|_| f.try_clone().unwrap());
