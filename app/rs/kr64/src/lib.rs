@@ -909,7 +909,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
             // chdir to / after chroot
             unsafe {
-                libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+                libc::chdir(c"/".as_ptr());
             }
         }
 
