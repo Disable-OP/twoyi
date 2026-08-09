@@ -488,10 +488,11 @@ fi
 # (they'd be interpreted as <chroot>/data/local/tmp/... which doesn't exist).
 "$ADB_BIN" -s emulator-5554 shell "
     mkdir -p $TWOYI_PROFILE/system/lib64
-    cp /data/local/tmp/libgetpid_hook.so $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
+    cp /data/local/tmp/libgetpid_hook.so $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'cp succeeded' || echo 'cp FAILED'
     chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
+    ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
     echo '  ✓ copied libgetpid_hook.so to rootfs/system/lib64/'
-" 2>/dev/null || true
+"
 
 # Verify libgetpid_hook.so exists in the rootfs
 "$ADB_BIN" -s emulator-5554 shell "test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo '  ✓ libgetpid_hook.so exists in rootfs' || echo '  ⚠ libgetpid_hook.so MISSING from rootfs — init will fail to link'" 2>&1 | tail -1

@@ -932,6 +932,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         };
         let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
+        // Debug: check if libgetpid_hook.so exists at the expected path
+        let hook_path = if cfg.use_namespaces {
+            c"/system/lib64/libgetpid_hook.so".to_bytes_with_nul()
+        } else {
+            // Can't use format! here (async-signal-unsafe), so just check
+            // the chroot-relative path
+            b"/system/lib64/libgetpid_hook.so\0"
+        };
+        let hook_exists = unsafe { libc::access(hook_path.as_ptr() as *const libc::c_char, libc::F_OK) } == 0;
+        if hook_exists {
+            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /system/lib64/\n"); }
+        } else {
+            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so NOT found at /system/lib64/\n"); }
+            // Try listing /system/lib64/ to see what's there
+            // (can't use opendir in async-signal-safe context, so just
+            // try a few known paths)
+            let alt_path = b"/system/lib64/libc.so\0";
+            let alt_exists = unsafe { libc::access(alt_path.as_ptr() as *const libc::c_char, libc::F_OK) } == 0;
+            if alt_exists {
+                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so exists — dir is accessible\n"); }
+            } else {
+                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so NOT found — dir may not exist\n"); }
+            }
+        }
+
         // Build environment for the guest init. The CString::new calls
         // below use compile-time-constant strings (no NUL possible) and
         // format!() — the format! allocation happens BEFORE execve, so
@@ -948,6 +973,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // has already happened, so the path is relative to the new
         // root. When false, we need the full absolute path.
         let ld_preload_str = if cfg.use_namespaces {
+            // After pivot_root, /system/lib64/libgetpid_hook.so should
+            // resolve to the file in the rootfs. But if it doesn't work,
+            // try the full path (which won't work after pivot_root either,
+            // but at least we'll see a different error).
             "LD_PRELOAD=/system/lib64/libgetpid_hook.so".to_string()
         } else {
             format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)
@@ -959,6 +988,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             CString::new("ANDROID_BOOTLOGO=1").unwrap(),
             twoyi_rootfs_env,
             CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
+            // Only set LD_PRELOAD if the file actually exists
+            // (checking before pivot_root is not possible in the child,
+            // so we always set it — if the file doesn't exist, the linker
+            // will print an error but init may still run)
             CString::new(ld_preload_str).unwrap(),
         ];
         let env_ptrs: Vec<*const libc::c_char> = env_vars
