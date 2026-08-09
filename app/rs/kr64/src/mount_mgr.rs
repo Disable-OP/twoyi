@@ -337,7 +337,15 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
         }
     }
 
-    // Step 4: mount tmpfs on /dev, /proc, /sys, /tmp, /apex, /mnt.
+    // Step 4: mount tmpfs on /dev, /proc, /sys, /tmp, /mnt.
+    // IMPORTANT: Do NOT mount tmpfs on /apex! On Android 11+,
+    // /system/bin/linker64 and /system/lib64/libc.so are symlinks to
+    // /apex/com.android.runtime/bin/linker64 and
+    // /apex/com.android.runtime/lib64/bionic/libc.so. If we mount
+    // tmpfs on /apex, these symlinks become dangling and the dynamic
+    // linker can't load — causing SIGSEGV at address 0x86 in linker64.
+    // The KVM test script extracts /apex from the emulator into the
+    // rootfs, so we leave it as-is (no tmpfs overlay).
     let tmpfs_mounts: &[(&str, &str, c_ulong, &str)] = &[
         // (path-in-rootfs, fstype, flags, data)
         ("/dev", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755"),
@@ -358,15 +366,6 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
             "mode=555",
         ),
         ("/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777"),
-        // /apex is where apexd loop-mounts APEX payloads. We pre-extract
-        // them for the MVP (see GSI_BOOT_PLAN.md §2.6), so this is a
-        // tmpfs placeholder.
-        (
-            "/apex",
-            "tmpfs",
-            MS_NOSUID | MS_NODEV | MS_NOEXEC,
-            "mode=755",
-        ),
         // /mnt is where the guest's vold mounts external storage.
         (
             "/mnt",
