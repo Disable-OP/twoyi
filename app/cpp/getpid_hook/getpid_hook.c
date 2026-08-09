@@ -43,13 +43,9 @@
 // to SecondStageMain (property service, zygote spawn, etc.).
 
 #include <unistd.h>
-#include <sys/syscall.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <string.h>
 
 // =========================================================================
 // PID hooks — make init think it's PID 1
@@ -126,19 +122,15 @@ int pivot_root(const char *new_root, const char *put_old) {
 // kernel log.
 
 int mknod(const char *pathname, mode_t mode, dev_t dev) {
-    // If it's a regular file (not a device node), let the real mknod run.
-    if ((mode & S_IFMT) == 0) {
-        return syscall(SYS_mknod, pathname, mode, dev);
-    }
-    // For device nodes, return success without creating anything.
-    // The host already has /dev/null, /dev/random, etc.
+    // Init only calls mknod for device nodes (S_IFCHR | mode).
+    // The host already has /dev/null, /dev/random, /dev/urandom, /dev/ptmx,
+    // /dev/kmsg as real device nodes. So we just return success without
+    // creating anything. Init's subsequent open() calls will find the
+    // host's existing device nodes.
     return 0;
 }
 
 int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev) {
-    if ((mode & S_IFMT) == 0) {
-        return syscall(SYS_mknodat, dirfd, pathname, mode, dev);
-    }
     return 0;
 }
 
