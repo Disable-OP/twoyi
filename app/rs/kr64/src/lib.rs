@@ -1097,6 +1097,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // at {rootfs}/opengles, and pumps bytes bidirectionally. This
     // replaces the old MVP stub that wrote a single 0 byte and closed.
     // See download/QEMU_PIPE_DISPATCHER_PLAN.md for the full design.
+    //
+    // After pivot_root (use_namespaces=true), the rootfs IS the root "/",
+    // so the renderer socket at {rootfs}/opengles is now at /opengles.
+    // Pass "" as the rootfs prefix so the proxy constructs "/opengles".
+    // Without pivot_root, pass the full rootfs path.
+    let proxy_rootfs = if cfg.use_namespaces {
+        String::new()  // chroot-relative: format!("{}/{}", "", "opengles") = "/opengles"
+    } else {
+        cfg.rootfs.clone()
+    };
     let _qemu_pipe_proxy = {
         let mut dev = device_set.qemu_pipe;
         let listener = match dev.take_listener() {
@@ -1106,7 +1116,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 return 1;
             }
         };
-        match qemu_pipe::spawn_qemu_pipe_proxy(listener, dev.path.clone(), cfg.rootfs.clone()) {
+        match qemu_pipe::spawn_qemu_pipe_proxy(listener, dev.path.clone(), proxy_rootfs) {
             Ok(h) => {
                 info!(
                     "[KR64] qemu_pipe proxy listening at {} (rootfs={})",
