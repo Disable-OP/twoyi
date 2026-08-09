@@ -276,12 +276,19 @@ jobs:
           sdkmanager --update
 
           # Install the arm64 system image
+          # Note: 'emulator' package may not list on arm64 host, try with --include_obsolete
           sdkmanager \
               "platform-tools" \
               "platforms;android-30" \
               "build-tools;30.0.3" \
-              "emulator" \
-              "system-images;android-30;default;arm64-v8a"
+              "system-images;android-30;default;arm64-v8a" || true
+
+          # Install emulator separately (may need --include_obsolete)
+          sdkmanager --include_obsolete "emulator" || sdkmanager "emulator" || true
+
+          # Check what emulator packages are available
+          echo "=== Available emulator packages ==="
+          sdkmanager --list 2>/dev/null | grep -i "emulator" | head -10 || true
 
           echo "=== Verify system image installed ==="
           ls -la "$ANDROID_HOME/system-images/android-30/default/arm64-v8a/"
