@@ -864,51 +864,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        // Skip setup_mounts entirely when use_namespaces is false.
-        // When running as untrusted_app (non-root), the zygote's seccomp
-        // filter blocks mount() and kills the process with SIGSYS.
-        // Without root, we can't do pivot_root or mount operations anyway,
-        // so there's no point trying — just chroot into the rootfs and
-        // exec init directly.
-        // Skip setup_mounts when use_namespaces is TRUE — the parent
-        // already did unshare + pivot_root + mount tmpfs BEFORE forking.
-        // The child inherits the parent's mount namespace, so calling
-        // setup_mounts again would try to mount on already-mounted
-        // filesystems, which fails or crashes.
+        // NEVER call setup_mounts in the child. The parent already did
+        // unshare + pivot_root + mount tmpfs BEFORE forking. The child
+        // inherits the parent's mount namespace. Calling setup_mounts
+        // again would crash (mounting on already-mounted filesystems)
+        // or be blocked by seccomp (zygote filter blocks mount/chroot
+        // for untrusted_app).
         //
-        // When use_namespaces is FALSE (non-root), the child has no
-        // mount namespace and can't do mount operations anyway (seccomp
-        // blocks them), so also skip.
-        if false {  // Never call setup_mounts in the child
-            let mount_cfg = mount_mgr::MountConfig {
-                rootfs: cfg.rootfs.clone(),
-                rom_dir: cfg.rom_dir.clone(),
-                use_namespaces: cfg.use_namespaces,
-                read_only_rom: cfg.read_only_rom,
-            };
-            if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
-                let errno = e.raw_os_error().unwrap_or(0);
-                unsafe {
-                    safe_write_err_errno(
-                        b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed",
-                        errno,
-                    );
-                    libc::_exit(1);
-                }
+        // The child just needs to: close fds, (optionally) install
+        // seccomp, and execve init.
+        if cfg.use_namespaces {
+            unsafe {
+                safe_write_err(b"[KR64 CHILD] root mode: parent already did pivot_root, skipping mount setup\n");
             }
         } else {
-            // Non-root mode: skip BOTH mount AND chroot.
-            // The zygote's seccomp filter blocks mount() (syscall 165)
-            // AND chroot() (syscall 161) for untrusted_app.
-            // Calling either kills the process with SIGSYS (signal 31).
-            //
-            // Without root, we can't do any filesystem isolation.
-            // Just exec init directly with the rootfs as cwd.
-            // Init's INTERP points to the rootfs linker, so the kernel
-            // loads rootfs libs via LD_LIBRARY_PATH. Init runs in the
-            // host filesystem namespace but with TWOYI_ROOTFS pointing
-            // at the rootfs. The getpid_hook LD_PRELOAD makes init
-            // think it's PID 1.
             unsafe {
                 safe_write_err(b"[KR64 CHILD] non-root mode: skipping mount+chroot (seccomp blocks both)\n");
             }
