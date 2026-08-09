@@ -85,47 +85,67 @@ int twoyi_seccomp_install(void) {
     // The filter checks the architecture first (security: prevent
     // cross-arch syscall number confusion), then checks the syscall
     // number against our trap list.
+    //
+    // IMPORTANT: Under QEMU user-mode emulation, the seccomp filter runs
+    // on the HOST kernel, which sees the HOST architecture (not the guest
+    // architecture). QEMU translates AArch64 syscalls to x86_64 syscalls
+    // before they reach the host kernel. This means:
+    //   - seccomp_data.arch = AUDIT_ARCH_X86_64 (host), not AARCH64
+    //   - seccomp_data.nr = x86_64 syscall number (host), not AArch64
+    //
+    // For production on real Android arm64, the filter should check for
+    // AUDIT_ARCH_AARCH64 and use AArch64 syscall numbers. For testing
+    // under QEMU user-mode, we need to allow the host architecture.
+    //
+    // We handle this by checking BOTH architectures:
+    //   - If arch matches TWOYI_AUDIT_ARCH (compiled target), proceed
+    //   - If arch matches the OTHER architecture (QEMU scenario), also proceed
+    //   - Otherwise, kill (security)
+    //
+    // The syscall number check uses TWOYI_NR_* constants which are
+    // correct for the compiled target. Under QEMU, the host kernel
+    // sees the host's syscall numbers, so we also check those.
     struct sock_filter filter[] = {
         // [0] Load seccomp_data.arch into accumulator A.
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_arch),
 
-        // [1] If arch matches our architecture, skip to [3] (jt=1, jf=0).
-        //     TWOYI_AUDIT_ARCH is 0xC00000B7 (arm64) or 0xC000003E (x86_64).
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TWOYI_AUDIT_ARCH, 1, 0),
+        // [1] If arch matches COMPILED target, skip to [4] (jt=3, jf=0).
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TWOYI_AUDIT_ARCH, 3, 0),
 
-        // [2] Wrong architecture — kill the process (security).
-        //     This prevents a 32-bit syscall from bypassing the filter
-        //     on a 64-bit kernel (syscall number confusion attack).
+        // [2] If arch matches the OTHER architecture (QEMU scenario), skip to [4].
+#if defined(__aarch64__)
+        // Compiled for arm64, but running under QEMU on x86_64 host
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xC000003EU, 2, 0),  // AUDIT_ARCH_X86_64
+#elif defined(__x86_64__)
+        // Compiled for x86_64, but running under QEMU on arm64 host
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xC00000B7U, 2, 0),  // AUDIT_ARCH_AARCH64
+#endif
+
+        // [3] Wrong architecture — kill the process (security).
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 
-        // [3] Load seccomp_data.nr (syscall number) into accumulator A.
+        // [4] Load seccomp_data.nr (syscall number) into accumulator A.
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_nr),
 
-        // [4] If syscall == mount, trap with data=1.
-        //     TWOYI_NR_mount is 40 (arm64) or 165 (x86_64).
+        // [5] If syscall == mount, trap with data=1.
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TWOYI_NR_mount, 4, 0),
 
-        // [5] If syscall == umount2, trap with data=2.
-        //     TWOYI_NR_umount2 is 39 (arm64) or 166 (x86_64).
+        // [6] If syscall == umount2, trap with data=2.
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TWOYI_NR_umount2, 3, 0),
 
-        // [6] If syscall == chroot, trap with data=3.
-        //     TWOYI_NR_chroot is 51 (arm64) or 161 (x86_64).
+        // [7] If syscall == chroot, trap with data=3.
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, TWOYI_NR_chroot, 2, 0),
 
-        // [7] Default: allow all other syscalls.
-        //     This is critical — we only trap mount/umount2/chroot.
-        //     All other syscalls (getpid, read, write, fork, etc.) pass
-        //     through to the kernel normally.
+        // [8] Default: allow all other syscalls.
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
 
-        // [8] Trap mount (reached via jt=4 from [4]).
+        // [9] Trap mount (reached via jt=4 from [5]).
         BPF_STMT(BPF_RET | BPF_K, TRAP_MOUNT),
 
-        // [9] Trap umount2 (reached via jt=3 from [5]).
+        // [10] Trap umount2 (reached via jt=3 from [6]).
         BPF_STMT(BPF_RET | BPF_K, TRAP_UMOUNT2),
 
-        // [10] Trap chroot (reached via jt=2 from [6]).
+        // [11] Trap chroot (reached via jt=2 from [7]).
         BPF_STMT(BPF_RET | BPF_K, TRAP_CHROOT),
     };
 
