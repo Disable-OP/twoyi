@@ -1113,7 +1113,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             CString::new("ANDROID_DATA=/data").unwrap(),
             CString::new("ANDROID_BOOTLOGO=1").unwrap(),
             twoyi_rootfs_env,
-            CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
+            // On Android 11+, many libraries (libc.so, libbase.so, liblog.so,
+            // etc.) live in /apex/com.android.runtime/lib64/ and are only
+            // symlinked from /system/lib64/. Some libraries (like libbase.so)
+            // have NO symlink in /system/lib64/ and can only be found in the
+            // apex directory. Without these paths in LD_LIBRARY_PATH, the
+            // linker gets a NULL soinfo for the missing library and crashes
+            // with SIGSEGV at address 0x86 (offset 0xaf174 in linker64).
+            CString::new(
+                "LD_LIBRARY_PATH=\
+                /system/lib64:\
+                /system/lib64/bootstrap:\
+                /apex/com.android.runtime/lib64:\
+                /apex/com.android.runtime/lib64/bionic:\
+                /apex/com.android.runtime/lib64/bootstrap",
+            )
+            .unwrap(),
         ];
         if skip_preload {
             unsafe {
