@@ -1,0 +1,324 @@
+=== Syscall stub callers ===
+  0x0000ff38  sys_close(0x39)  called 0x  *** NEVER CALLED ***
+  0x0000ff50  sys_openat(0x38)  called 1x: ['0xadb0']
+  0x0000ff68  sys_rt_sigprocmask(0x87)  called 1x: ['0x3964']
+  0x0000ff80  sys_fcntl(0x19)  called 0x  *** NEVER CALLED ***
+  0x0000ff98  sys_fstat(0x50)  called 0x  *** NEVER CALLED ***
+  0x0000ffb0  sys_ftruncate(0x2e)  called 0x  *** NEVER CALLED ***
+  0x0000ffc8  sys_getuid(0xae)  called 0x  *** NEVER CALLED ***
+  0x0000ffe0  sys_mmap(0xde)  called 10x: ['0x46ec', '0x470c', '0x4ec8', '0x4fec', '0x5488', '0x7104', '0x8f68', '0x9220', '0xa9f0', '0xaf2c']
+  0x0000fff8  sys_mprotect(0xe2)  called 2x: ['0x32f4', '0x3334']
+  0x00010010  sys_munmap(0xd7)  called 10x: ['0x4f90', '0x5658', '0x75f8', '0x9448', '0x95e8', '0x9dd4', '0x9f3c', '0xa38c', '0xa894', '0xac3c']
+  0x00010028  sys_prctl(0xa7)  called 2x: ['0x3a28', '0x3c00']
+  0x00010040  sys_writev(0x42)  called 0x  *** NEVER CALLED ***
+  0x0001351c  sys_faccessat(0x30)  called 0x  *** NEVER CALLED ***
+  0x00013534  sys_fsetxattr(0x7)  called 0x  *** NEVER CALLED ***
+  0x0001354c  sys_accept4(0xf2)  called 0x  *** NEVER CALLED ***
+  0x00013564  sys_clock_gettime(0x71)  called 0x  *** NEVER CALLED ***
+  0x0001357c  sys_connect(0xcb)  called 0x  *** NEVER CALLED ***
+  0x00013594  sys_getpid(0xac)  called 0x  *** NEVER CALLED ***
+  0x000135ac  sys_gettimeofday(0xa9)  called 0x  *** NEVER CALLED ***
+  0x000135c4  sys_ppoll(0x49)  called 0x  *** NEVER CALLED ***
+  0x000135dc  sys_pselect6(0x48)  called 0x  *** NEVER CALLED ***
+  0x000135f4  sys_rt_sigaction(0x86)  called 0x  *** NEVER CALLED ***
+  0x0001360c  sys_socket(0xc6)  called 0x  *** NEVER CALLED ***
+  0x00013624  sys_exit_group(0x5e)  called 0x  *** NEVER CALLED ***
+  0x0001363c  sys_dup3(0x18)  called 0x  *** NEVER CALLED ***
+
+=== Context around lone SVC at 0xbd20 ===
+  0x0000bd00:  c0035fd6    ret      
+  0x0000bd04:  e80300aa    mov      x8, x0
+  0x0000bd08:  e00301aa    mov      x0, x1
+  0x0000bd0c:  e10302aa    mov      x1, x2
+  0x0000bd10:  e20303aa    mov      x2, x3
+  0x0000bd14:  e30304aa    mov      x3, x4
+  0x0000bd18:  e40305aa    mov      x4, x5
+  0x0000bd1c:  e50306aa    mov      x5, x6
+  0x0000bd20:  010000d4    svc      #0 << SVC >>
+  0x0000bd24:  1f0440b1    cmn      x0, #1, lsl #12
+  0x0000bd28:  009480da    cneg     x0, x0, hi
+  0x0000bd2c:  68ac0054    b.hi     #0xd2b8
+  0x0000bd30:  c0035fd6    ret      
+  0x0000bd34:  f44fbea9    stp      x20, x19, [sp, #-0x20]!
+  0x0000bd38:  fd7b01a9    stp      x29, x30, [sp, #0x10]
+  0x0000bd3c:  fd430091    add      x29, sp, #0x10
+  0x0000bd40:  7e100094    bl       #0xff38 -> 0xff38 (close)
+  0x0000bd44:  f303002a    mov      w19, w0
+  0x0000bd48:  7f060031    cmn      w19, #1
+  0x0000bd4c:  c1000054    b.ne     #0xbd64
+  0x0000bd50:  09000094    bl       #0xbd74 -> 0xbd74
+  0x0000bd54:  080040b9    ldr      w8, [x0]
+  0x0000bd58:  1f110071    cmp      w8, #4
+  0x0000bd5c:  41000054    b.ne     #0xbd64
+  0x0000bd60:  f3031f2a    mov      w19, wzr
+  0x0000bd64:  fd7b41a9    ldp      x29, x30, [sp, #0x10]
+  0x0000bd68:  e003132a    mov      w0, w19
+  0x0000bd6c:  f44fc2a8    ldp      x20, x19, [sp], #0x20
+  0x0000bd70:  c0035fd6    ret      
+  0x0000bd74:  48d03bd5    mrs      x8, tpidr_el0
+  0x0000bd78:  00410091    add      x0, x8, #0x10
+  0x0000bd7c:  c0035fd6    ret      
+
+=== Function that calls prctl (0x10028) - seccomp check ===
+
+--- prctl caller at 0x3a28 (func start ~0x338c) ---
+  0x0000338c:  sub      sp, sp, #0x1f0
+  0x00003390:  mov      x10, #0xc010
+  0x00003394:  movk     x10, #0x2eee, lsl #16
+  0x00003398:  movk     x10, #0x78, lsl #32
+  0x0000339c:  ldr      x8, [x10]
+  0x000033a0:  add      x9, sp, #0x28
+  0x000033a4:  str      x8, [sp, #0x50]
+  0x000033a8:  ldr      x19, [x10, #8]
+  0x000033ac:  str      x9, [sp, #0x58]
+  0x000033b0:  ldr      x8, [sp, #0x58]
+  0x000033b4:  ldr      x10, [sp, #0x50]
+  0x000033b8:  mov      w8, #0xc36a
+  0x000033bc:  mov      w9, #0xe5a6
+  0x000033c0:  movk     w8, #0x4d31, lsl #16
+  0x000033c4:  ldr      x11, [x10], #8
+  0x000033c8:  movk     w9, #0x3b1e, lsl #16
+  0x000033cc:  str      w11, [sp, #0x28]
+  0x000033d0:  lsl      x11, x11, #0x20
+  0x000033d4:  str      x10, [sp, #0x30]
+  0x000033d8:  add      x10, x10, x11, asr #29
+  0x000033dc:  add      x11, x10, #8
+  0x000033e0:  mov      w10, #0xf5ae
+  0x000033e4:  movk     w10, #0xbbd4, lsl #16
+  0x000033e8:  str      x11, [sp, #0x38]
+  0x000033ec:  b        #0x33f4
+  0x000033f0:  ldr      x11, [sp, #0x80]
+  0x000033f4:  mov      w13, #0xf5ae
+  0x000033f8:  add      x12, x11, #8
+  0x000033fc:  movk     w13, #0xbbd4, lsl #16
+  0x00003400:  b        #0x3414
+  0x00003404:  ldr      x13, [x11]
+  0x00003408:  str      x12, [sp, #0x80]
+  0x0000340c:  cmp      x13, #0
+  0x00003410:  csel     w13, w9, w8, eq
+  0x00003414:  cmp      w13, w8
+  0x00003418:  b.eq     #0x33f0
+  0x0000341c:  cmp      w13, w9
+  0x00003420:  b.eq     #0x3430
+  0x00003424:  cmp      w13, w10
+  0x00003428:  b.ne     #0x3414
+  0x0000342c:  b        #0x3404
+  0x00003430:  ldr      x8, [sp, #0x80]
+  0x00003434:  mov      w22, #0xb4b8
+  0x00003438:  add      x0, sp, #0x28
+  0x0000343c:  mov      w1, #0x1f
+  0x00003440:  movk     w22, #0x5a2, lsl #16
+  0x00003444:  str      x8, [sp, #0x40]
+  0x00003448:  bl       #0x3c8c -> 0x3c8c
+  0x0000344c:  add      x8, sp, #0x20
+  0x00003450:  str      x8, [sp, #0x60]
+  0x00003454:  ldr      x8, [sp, #0x60]
+  0x00003458:  ldr      x8, [sp, #0x50]
+  0x0000345c:  add      x9, sp, #0x18
+  0x00003460:  add      x10, sp, #0x10
+  0x00003464:  stp      x9, x10, [sp, #0x68]
+  0x00003468:  stp      xzr, x8, [sp, #0x18]
+  0x0000346c:  ldr      x8, [sp, #0x68]
+  0x00003470:  ldr      x8, [sp, #0x70]
+  0x00003474:  add      x1, sp, #0x20
+  0x00003478:  add      x2, sp, #0x18
+  0x0000347c:  add      x3, sp, #0x10
+  0x00003480:  str      xzr, [sp, #0x10]
+  0x00003484:  bl       #0x56d8 -> 0x56d8
+  0x00003488:  ldp      x1, x0, [sp, #0x10]
+  0x0000348c:  mov      x2, x19
+  0x00003490:  bl       #0x3190 -> 0x3190
+  0x00003494:  mov      w8, #0xc8ad
+  0x00003498:  movk     w8, #0xb817, lsl #16
+  0x0000349c:  mvn      w8, w8
+  0x000034a0:  mov      w19, #0x9ca6
+  0x000034a4:  mov      w23, #0xfe65
+  0x000034a8:  mov      w28, #0x4da8
+  0x000034ac:  mov      w24, #0x341c
+  0x000034b0:  str      w8, [sp, #0xc]
+  0x000034b4:  mov      w25, #0xd551
+  0x000034b8:  mov      w21, #0xcccb
+  0x000034bc:  mov      w27, #0x1479
+  0x000034c0:  mov      w20, #0xe0e0
+  0x000034c4:  mov      w26, #0xb567
+  0x000034c8:  mov      w8, #0x9ca6
+  0x000034cc:  movk     w19, #0x5562, lsl #16
+  0x000034d0:  movk     w23, #0x5d5b, lsl #16
+  0x000034d4:  movk     w28, #0x6351, lsl #16
+  0x000034d8:  movk     w24, #0xd4ed, lsl #16
+  0x000034dc:  movk     w25, #0x57f7, lsl #16
+  0x000034e0:  movk     w21, #0x42a4, lsl #16
+  0x000034e4:  movk     w27, #0xec2, lsl #16
+  0x000034e8:  movk     w20, #0x491a, lsl #16
+  0x000034ec:  movk     w26, #0xf213, lsl #16
+  0x000034f0:  movk     w8, #0x5562, lsl #16
+  0x000034f4:  str      w0, [sp, #0x7c]
+  0x000034f8:  b        #0x3508
+  0x000034fc:  ldr      w8, [sp, #0x7c]
+  0x00003500:  cmn      w8, #1
+  0x00003504:  csel     w8, w23, w22, eq
+  0x00003508:  and      w9, w8, #0x7fffffff
+  0x0000350c:  cmp      w9, w22
+  0x00003510:  b.eq     #0x3c4c
+  0x00003514:  cmp      w9, w23
+  0x00003518:  b.eq     #0x3528
+  0x0000351c:  cmp      w9, w19
+  0x00003520:  b.ne     #0x3508
+  0x00003524:  b        #0x34fc
+  0x00003528:  sub      x8, x29, #0x88
+  0x0000352c:  stur     x8, [x29, #-0x68]
+  0x00003530:  ldur     x8, [x29, #-0x68]
+  0x00003534:  ldur     x8, [x29, #-0x68]
+  0x00003538:  movi     v0.2d, #0000000000000000
+  0x0000353c:  mov      w9, #0x4da8
+  0x00003540:  mov      w10, #0xb567
+  0x00003544:  stp      q0, q0, [x8]
+  0x00003548:  adrp     x8, #0x2000
+  0x0000354c:  add      x8, x8, #0xce4
+  0x00003550:  stur     x8, [x29, #-0x80]
+  0x00003554:  mov      w8, #4
+  0x00003558:  stur     w8, [x29, #-0x88]
+  0x0000355c:  add      x8, sp, #0x80
+  0x00003560:  stur     x8, [x29, #-0x58]
+  0x00003564:  ldur     x8, [x29, #-0x58]
+  0x00003568:  ldur     x8, [x29, #-0x78]
+  0x0000356c:  movk     w9, #0x6351, lsl #16
+  0x00003570:  movk     w10, #0xf213, lsl #16
+  0x00003574:  b        #0x358c
+  0x00003578:  mov      w10, #1
+  0x0000357c:  sturb    w10, [x29, #-0x90]
+  0x00003580:  ldurb    w10, [x29, #-0x90]
+  0x00003584:  cmp      w10, #0
+  0x00003588:  csel     w10, w20, w9, ne
+
+--- prctl caller at 0x3c00 (func start ~0x338c) ---
+  0x0000338c:  sub      sp, sp, #0x1f0
+  0x00003390:  mov      x10, #0xc010
+  0x00003394:  movk     x10, #0x2eee, lsl #16
+  0x00003398:  movk     x10, #0x78, lsl #32
+  0x0000339c:  ldr      x8, [x10]
+  0x000033a0:  add      x9, sp, #0x28
+  0x000033a4:  str      x8, [sp, #0x50]
+  0x000033a8:  ldr      x19, [x10, #8]
+  0x000033ac:  str      x9, [sp, #0x58]
+  0x000033b0:  ldr      x8, [sp, #0x58]
+  0x000033b4:  ldr      x10, [sp, #0x50]
+  0x000033b8:  mov      w8, #0xc36a
+  0x000033bc:  mov      w9, #0xe5a6
+  0x000033c0:  movk     w8, #0x4d31, lsl #16
+  0x000033c4:  ldr      x11, [x10], #8
+  0x000033c8:  movk     w9, #0x3b1e, lsl #16
+  0x000033cc:  str      w11, [sp, #0x28]
+  0x000033d0:  lsl      x11, x11, #0x20
+  0x000033d4:  str      x10, [sp, #0x30]
+  0x000033d8:  add      x10, x10, x11, asr #29
+  0x000033dc:  add      x11, x10, #8
+  0x000033e0:  mov      w10, #0xf5ae
+  0x000033e4:  movk     w10, #0xbbd4, lsl #16
+  0x000033e8:  str      x11, [sp, #0x38]
+  0x000033ec:  b        #0x33f4
+  0x000033f0:  ldr      x11, [sp, #0x80]
+  0x000033f4:  mov      w13, #0xf5ae
+  0x000033f8:  add      x12, x11, #8
+  0x000033fc:  movk     w13, #0xbbd4, lsl #16
+  0x00003400:  b        #0x3414
+  0x00003404:  ldr      x13, [x11]
+  0x00003408:  str      x12, [sp, #0x80]
+  0x0000340c:  cmp      x13, #0
+  0x00003410:  csel     w13, w9, w8, eq
+  0x00003414:  cmp      w13, w8
+  0x00003418:  b.eq     #0x33f0
+  0x0000341c:  cmp      w13, w9
+  0x00003420:  b.eq     #0x3430
+  0x00003424:  cmp      w13, w10
+  0x00003428:  b.ne     #0x3414
+  0x0000342c:  b        #0x3404
+  0x00003430:  ldr      x8, [sp, #0x80]
+  0x00003434:  mov      w22, #0xb4b8
+  0x00003438:  add      x0, sp, #0x28
+  0x0000343c:  mov      w1, #0x1f
+  0x00003440:  movk     w22, #0x5a2, lsl #16
+  0x00003444:  str      x8, [sp, #0x40]
+  0x00003448:  bl       #0x3c8c -> 0x3c8c
+  0x0000344c:  add      x8, sp, #0x20
+  0x00003450:  str      x8, [sp, #0x60]
+  0x00003454:  ldr      x8, [sp, #0x60]
+  0x00003458:  ldr      x8, [sp, #0x50]
+  0x0000345c:  add      x9, sp, #0x18
+  0x00003460:  add      x10, sp, #0x10
+  0x00003464:  stp      x9, x10, [sp, #0x68]
+  0x00003468:  stp      xzr, x8, [sp, #0x18]
+  0x0000346c:  ldr      x8, [sp, #0x68]
+  0x00003470:  ldr      x8, [sp, #0x70]
+  0x00003474:  add      x1, sp, #0x20
+  0x00003478:  add      x2, sp, #0x18
+  0x0000347c:  add      x3, sp, #0x10
+  0x00003480:  str      xzr, [sp, #0x10]
+  0x00003484:  bl       #0x56d8 -> 0x56d8
+  0x00003488:  ldp      x1, x0, [sp, #0x10]
+  0x0000348c:  mov      x2, x19
+  0x00003490:  bl       #0x3190 -> 0x3190
+  0x00003494:  mov      w8, #0xc8ad
+  0x00003498:  movk     w8, #0xb817, lsl #16
+  0x0000349c:  mvn      w8, w8
+  0x000034a0:  mov      w19, #0x9ca6
+  0x000034a4:  mov      w23, #0xfe65
+  0x000034a8:  mov      w28, #0x4da8
+  0x000034ac:  mov      w24, #0x341c
+  0x000034b0:  str      w8, [sp, #0xc]
+  0x000034b4:  mov      w25, #0xd551
+  0x000034b8:  mov      w21, #0xcccb
+  0x000034bc:  mov      w27, #0x1479
+  0x000034c0:  mov      w20, #0xe0e0
+  0x000034c4:  mov      w26, #0xb567
+  0x000034c8:  mov      w8, #0x9ca6
+  0x000034cc:  movk     w19, #0x5562, lsl #16
+  0x000034d0:  movk     w23, #0x5d5b, lsl #16
+  0x000034d4:  movk     w28, #0x6351, lsl #16
+  0x000034d8:  movk     w24, #0xd4ed, lsl #16
+  0x000034dc:  movk     w25, #0x57f7, lsl #16
+  0x000034e0:  movk     w21, #0x42a4, lsl #16
+  0x000034e4:  movk     w27, #0xec2, lsl #16
+  0x000034e8:  movk     w20, #0x491a, lsl #16
+  0x000034ec:  movk     w26, #0xf213, lsl #16
+  0x000034f0:  movk     w8, #0x5562, lsl #16
+  0x000034f4:  str      w0, [sp, #0x7c]
+  0x000034f8:  b        #0x3508
+  0x000034fc:  ldr      w8, [sp, #0x7c]
+  0x00003500:  cmn      w8, #1
+  0x00003504:  csel     w8, w23, w22, eq
+  0x00003508:  and      w9, w8, #0x7fffffff
+  0x0000350c:  cmp      w9, w22
+  0x00003510:  b.eq     #0x3c4c
+  0x00003514:  cmp      w9, w23
+  0x00003518:  b.eq     #0x3528
+  0x0000351c:  cmp      w9, w19
+  0x00003520:  b.ne     #0x3508
+  0x00003524:  b        #0x34fc
+  0x00003528:  sub      x8, x29, #0x88
+  0x0000352c:  stur     x8, [x29, #-0x68]
+  0x00003530:  ldur     x8, [x29, #-0x68]
+  0x00003534:  ldur     x8, [x29, #-0x68]
+  0x00003538:  movi     v0.2d, #0000000000000000
+  0x0000353c:  mov      w9, #0x4da8
+  0x00003540:  mov      w10, #0xb567
+  0x00003544:  stp      q0, q0, [x8]
+  0x00003548:  adrp     x8, #0x2000
+  0x0000354c:  add      x8, x8, #0xce4
+  0x00003550:  stur     x8, [x29, #-0x80]
+  0x00003554:  mov      w8, #4
+  0x00003558:  stur     w8, [x29, #-0x88]
+  0x0000355c:  add      x8, sp, #0x80
+  0x00003560:  stur     x8, [x29, #-0x58]
+  0x00003564:  ldur     x8, [x29, #-0x58]
+  0x00003568:  ldur     x8, [x29, #-0x78]
+  0x0000356c:  movk     w9, #0x6351, lsl #16
+  0x00003570:  movk     w10, #0xf213, lsl #16
+  0x00003574:  b        #0x358c
+  0x00003578:  mov      w10, #1
+  0x0000357c:  sturb    w10, [x29, #-0x90]
+  0x00003580:  ldurb    w10, [x29, #-0x90]
+  0x00003584:  cmp      w10, #0
+  0x00003588:  csel     w10, w20, w9, ne
+
+=== Function that calls rt_sigaction (0x135f4) - SIGSYS check ===

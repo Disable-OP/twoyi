@@ -1,0 +1,274 @@
+=== Callers of key functions ===
+  0x000031a8  called 0x: []
+  0x00003384  called 0x: []
+  0x00003c70  called 0x: []
+  0x00004090  called 0x: []
+  0x00012490  called 0x: []
+  0x0001192c  called 3x: ['0xcf14', '0xdbb8', '0x16cd0']
+  0x00002d10  called 0x: []
+
+================================================================================
+rt_sigaction caller function (starts at 0x12490)
+================================================================================
+
+--- rt_sigaction_caller: 0x12490 - 0x12590 ---
+  0x00012490:  stp      x29, x30, [sp, #0x10]
+  0x00012494:  add      x29, sp, #0x10
+  0x00012498:  sub      sp, sp, #0x50
+  0x0001249c:  adrp     x20, #0x37000
+  0x000124a0:  ldr      x20, [x20, #0xf58]
+  0x000124a4:  mov      x19, x2
+  0x000124a8:  ldr      x20, [x20]
+  0x000124ac:  stur     x20, [x29, #-0x18]
+  0x000124b0:  cbz      x1, #0x124d4
+  0x000124b4:  ldr      w8, [x1]
+  0x000124b8:  str      x8, [sp, #0x30]
+  0x000124bc:  ldr      x8, [x1, #8]
+  0x000124c0:  str      x8, [sp, #0x28]
+  0x000124c4:  ldr      x8, [x1, #0x10]
+  0x000124c8:  str      x8, [sp, #0x40]
+  0x000124cc:  ldr      x8, [x1, #0x18]
+  0x000124d0:  str      x8, [sp, #0x38]
+  0x000124d4:  cmp      x1, #0
+  0x000124d8:  add      x8, sp, #0x28
+  0x000124dc:  csel     x1, x8, xzr, ne
+  0x000124e0:  cmp      x19, #0
+  0x000124e4:  add      x8, sp, #8
+  0x000124e8:  csel     x2, x8, xzr, ne
+  0x000124ec:  mov      w3, #8
+  0x000124f0:  bl       #0x135f4 -> rt_sigaction
+  0x000124f4:  cbz      x19, #0x12518
+  0x000124f8:  ldr      x8, [sp, #0x10]
+  0x000124fc:  str      w8, [x19]
+  0x00012500:  ldr      x8, [sp, #8]
+  0x00012504:  str      x8, [x19, #8]
+  0x00012508:  ldr      x8, [sp, #0x20]
+  0x0001250c:  str      x8, [x19, #0x10]
+  0x00012510:  ldr      x8, [sp, #0x18]
+  0x00012514:  str      x8, [x19, #0x18]
+  0x00012518:  ldur     x8, [x29, #-0x18]
+  0x0001251c:  sub      x8, x20, x8
+  0x00012520:  cbnz     x8, #0x12534
+  0x00012524:  sub      sp, x29, #0x10
+  0x00012528:  ldp      x29, x30, [sp, #0x10]
+  0x0001252c:  ldp      x20, x19, [sp], #0x20
+  0x00012530:  ret      
+  0x00012534:  bl       #0xff24 -> 0xff24
+  0x00012538:  subs     w9, w1, #1
+  0x0001253c:  cbz      x0, #0x12588
+  0x00012540:  b.lt     #0x12588
+  0x00012544:  cmp      w9, #0x40
+  0x00012548:  b.ge     #0x12588
+  0x0001254c:  mov      w8, wzr
+  0x00012550:  add      w10, w9, #0x3f
+  0x00012554:  cmp      w9, #0
+  0x00012558:  csel     w10, w10, w9, lt
+  0x0001255c:  and      w11, w10, #0xffffffc0
+  0x00012560:  asr      w10, w10, #6
+  0x00012564:  sbfiz    x10, x10, #3, #0x20
+  0x00012568:  ldr      x12, [x0, x10]
+  0x0001256c:  sub      w9, w9, w11
+  0x00012570:  mov      w11, #1
+  0x00012574:  lsl      x9, x11, x9
+  0x00012578:  bic      x9, x12, x9
+  0x0001257c:  str      x9, [x0, x10]
+  0x00012580:  mov      w0, w8
+  0x00012584:  ret      
+  0x00012588:  stp      x29, x30, [sp, #-0x10]!
+  0x0001258c:  mov      x29, sp
+
+================================================================================
+mprotect call sites within function 0x31a8
+================================================================================
+
+--- mprotect_call1_region: 0x32c0 - 0x3360 ---
+  0x000032c0:  csel     w8, w27, w24, eq
+  0x000032c4:  b        #0x3298
+  0x000032c8:  cmp      w8, w23
+  0x000032cc:  b.eq     #0x328c
+  0x000032d0:  cmp      w8, w24
+  0x000032d4:  b.eq     #0x3314
+  0x000032d8:  cmp      w8, w26
+  0x000032dc:  b.ne     #0x3298
+  0x000032e0:  mov      x0, sp
+  0x000032e4:  bl       #0xb454 -> 0xb454
+  0x000032e8:  ldr      x0, [sp, #0x50]
+  0x000032ec:  ldr      x1, [sp, #0x58]
+  0x000032f0:  mov      w2, #5
+  0x000032f4:  bl       #0xfff8 -> mprotect
+  0x000032f8:  ldr      x1, [sp, #0x30]
+  0x000032fc:  ldr      x0, [sp, #0x50]
+  0x00003300:  bl       #0x2a90c -> 0x2a90c
+  0x00003304:  mov      w8, #0xab26
+  0x00003308:  mov      w19, wzr
+  0x0000330c:  movk     w8, #0x4f20, lsl #16
+  0x00003310:  b        #0x3298
+  0x00003314:  ldr      x8, [sp, #0x30]
+  0x00003318:  mov      w2, #7
+  0x0000331c:  add      x8, x8, x25
+  0x00003320:  sub      x8, x8, x20
+  0x00003324:  sub      x8, x8, x25
+  0x00003328:  stp      x20, x8, [sp, #0x50]
+  0x0000332c:  ldr      x0, [sp, #0x50]
+  0x00003330:  ldr      x1, [sp, #0x58]
+  0x00003334:  bl       #0xfff8 -> mprotect
+  0x00003338:  cmn      w0, #1
+  0x0000333c:  csel     w8, w23, w26, eq
+  0x00003340:  b        #0x3298
+  0x00003344:  ldr      x8, [sp, #0x40]
+  0x00003348:  ldr      x8, [sp, #0x38]
+  0x0000334c:  mov      w0, w19
+  0x00003350:  ldp      x29, x30, [sp, #0xb0]
+  0x00003354:  ldp      x20, x19, [sp, #0xa0]
+  0x00003358:  ldp      x22, x21, [sp, #0x90]
+  0x0000335c:  ldp      x24, x23, [sp, #0x80]
+
+--- mprotect_call2_region: 0x3300 - 0x33a0 ---
+  0x00003300:  bl       #0x2a90c -> 0x2a90c
+  0x00003304:  mov      w8, #0xab26
+  0x00003308:  mov      w19, wzr
+  0x0000330c:  movk     w8, #0x4f20, lsl #16
+  0x00003310:  b        #0x3298
+  0x00003314:  ldr      x8, [sp, #0x30]
+  0x00003318:  mov      w2, #7
+  0x0000331c:  add      x8, x8, x25
+  0x00003320:  sub      x8, x8, x20
+  0x00003324:  sub      x8, x8, x25
+  0x00003328:  stp      x20, x8, [sp, #0x50]
+  0x0000332c:  ldr      x0, [sp, #0x50]
+  0x00003330:  ldr      x1, [sp, #0x58]
+  0x00003334:  bl       #0xfff8 -> mprotect
+  0x00003338:  cmn      w0, #1
+  0x0000333c:  csel     w8, w23, w26, eq
+  0x00003340:  b        #0x3298
+  0x00003344:  ldr      x8, [sp, #0x40]
+  0x00003348:  ldr      x8, [sp, #0x38]
+  0x0000334c:  mov      w0, w19
+  0x00003350:  ldp      x29, x30, [sp, #0xb0]
+  0x00003354:  ldp      x20, x19, [sp, #0xa0]
+  0x00003358:  ldp      x22, x21, [sp, #0x90]
+  0x0000335c:  ldp      x24, x23, [sp, #0x80]
+  0x00003360:  ldp      x26, x25, [sp, #0x70]
+  0x00003364:  ldp      x28, x27, [sp, #0x60]
+  0x00003368:  add      sp, sp, #0xc0
+  0x0000336c:  ret      
+  0x00003370:  stp      x28, x27, [sp, #-0x60]!
+  0x00003374:  stp      x26, x25, [sp, #0x10]
+  0x00003378:  stp      x24, x23, [sp, #0x20]
+  0x0000337c:  stp      x22, x21, [sp, #0x30]
+  0x00003380:  stp      x20, x19, [sp, #0x40]
+  0x00003384:  stp      x29, x30, [sp, #0x50]
+  0x00003388:  add      x29, sp, #0x50
+  0x0000338c:  sub      sp, sp, #0x1f0
+  0x00003390:  mov      x10, #0xc010
+  0x00003394:  movk     x10, #0x2eee, lsl #16
+  0x00003398:  movk     x10, #0x78, lsl #32
+  0x0000339c:  ldr      x8, [x10]
+
+================================================================================
+__libc_init function (starts at 0x4090)
+================================================================================
+
+--- __libc_init_prologue: 0x4090 - 0x4110 ---
+  0x00004090:  ldp      x29, x30, [sp, #0x80]
+  0x00004094:  ldp      x20, x19, [sp, #0x70]
+  0x00004098:  ldp      x22, x21, [sp, #0x60]
+  0x0000409c:  ldp      x24, x23, [sp, #0x50]
+  0x000040a0:  ldp      x26, x25, [sp, #0x40]
+  0x000040a4:  ldp      x28, x27, [sp, #0x30]
+  0x000040a8:  add      sp, sp, #0x90
+  0x000040ac:  ret      
+  0x000040b0:  sub      sp, sp, #0x130
+  0x000040b4:  stp      x28, x27, [sp, #0xd0]
+  0x000040b8:  stp      x26, x25, [sp, #0xe0]
+  0x000040bc:  stp      x24, x23, [sp, #0xf0]
+  0x000040c0:  stp      x22, x21, [sp, #0x100]
+  0x000040c4:  stp      x20, x19, [sp, #0x110]
+  0x000040c8:  stp      x29, x30, [sp, #0x120]
+  0x000040cc:  add      x29, sp, #0x120
+  0x000040d0:  mov      x19, x0
+  0x000040d4:  add      x8, sp, #0x18
+  0x000040d8:  mov      x10, x19
+  0x000040dc:  str      x8, [sp, #0x40]
+  0x000040e0:  ldr      x8, [sp, #0x40]
+  0x000040e4:  ldr      x11, [x10], #8
+  0x000040e8:  mov      w8, #0xc36a
+  0x000040ec:  mov      w9, #0xe5a6
+  0x000040f0:  movk     w8, #0x4d31, lsl #16
+  0x000040f4:  str      w11, [sp, #0x18]
+  0x000040f8:  lsl      x11, x11, #0x20
+  0x000040fc:  str      x10, [sp, #0x20]
+  0x00004100:  add      x10, x10, x11, asr #29
+  0x00004104:  add      x11, x10, #8
+  0x00004108:  mov      w10, #0xf5ae
+  0x0000410c:  movk     w9, #0x3b1e, lsl #16
+
+================================================================================
+exit_group caller function (0x1192c)
+================================================================================
+
+--- exit_group_caller: 0x1192c - 0x11a2c ---
+  0x0001192c:  stp      x29, x30, [sp, #-0x10]!
+  0x00011930:  mov      x29, sp
+  0x00011934:  sub      sp, sp, #0x30
+  0x00011938:  sub      x0, x29, #8
+  0x0001193c:  bl       #0x125e4 -> 0x125e4
+  0x00011940:  sub      x0, x29, #8
+  0x00011944:  mov      w1, #6
+  0x00011948:  bl       #0x12538 -> 0x12538
+  0x0001194c:  mov      w0, #2
+  0x00011950:  sub      x1, x29, #8
+  0x00011954:  mov      x2, xzr
+  0x00011958:  bl       #0x12620 -> 0x12620
+  0x0001195c:  mov      w0, #6
+  0x00011960:  bl       #0x1243c -> 0x1243c
+  0x00011964:  add      x9, sp, #8
+  0x00011968:  mov      w8, #0x10000000
+  0x0001196c:  add      x0, x9, #0x10
+  0x00011970:  str      xzr, [sp, #0x10]
+  0x00011974:  str      w8, [sp, #8]
+  0x00011978:  bl       #0x125ac -> 0x125ac
+  0x0001197c:  mov      w0, #6
+  0x00011980:  add      x1, sp, #8
+  0x00011984:  add      x2, sp, #8
+  0x00011988:  bl       #0x1248c -> 0x1248c
+  0x0001198c:  mov      w0, #2
+  0x00011990:  sub      x1, x29, #8
+  0x00011994:  mov      x2, xzr
+  0x00011998:  bl       #0x12620 -> 0x12620
+  0x0001199c:  mov      w0, #6
+  0x000119a0:  bl       #0x1243c -> 0x1243c
+  0x000119a4:  mov      w0, #1
+  0x000119a8:  bl       #0x13624 -> exit_group
+  0x000119ac:  mov      x8, x0
+  0x000119b0:  mov      w9, w1
+  0x000119b4:  mov      w0, #-0x64
+  0x000119b8:  mov      x1, x8
+  0x000119bc:  mov      w2, w9
+  0x000119c0:  mov      w3, wzr
+  0x000119c4:  b        #0x12004
+  0x000119c8:  stp      x29, x30, [sp, #-0x10]!
+  0x000119cc:  mov      x29, sp
+  0x000119d0:  mov      x8, x2
+  0x000119d4:  mov      w9, w1
+  0x000119d8:  mov      x10, x0
+  0x000119dc:  adrp     x0, #0x2b000
+  0x000119e0:  add      x0, x0, #0x87b
+  0x000119e4:  mov      x1, x10
+  0x000119e8:  mov      w2, w9
+  0x000119ec:  mov      x3, x8
+  0x000119f0:  bl       #0xceac -> 0xceac
+  0x000119f4:  stp      x29, x30, [sp, #-0x10]!
+  0x000119f8:  mov      x29, sp
+  0x000119fc:  mov      x8, x3
+  0x00011a00:  mov      x9, x2
+  0x00011a04:  mov      w10, w1
+  0x00011a08:  mov      x11, x0
+  0x00011a0c:  adrp     x0, #0x2b000
+  0x00011a10:  add      x0, x0, #0x898
+  0x00011a14:  mov      x1, x11
+  0x00011a18:  mov      w2, w10
+  0x00011a1c:  mov      x3, x9
+  0x00011a20:  mov      x4, x8
+  0x00011a24:  bl       #0xceac -> 0xceac
+  0x00011a28:  stp      x26, x25, [sp, #-0x50]!

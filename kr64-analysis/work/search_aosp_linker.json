@@ -1,0 +1,74 @@
+[
+  {
+    "url": "https://android.googlesource.com/platform/bionic/+/c50b6a2/linker/linker_main.cpp",
+    "name": "linker/linker_main.cpp - platform/bionic - Git at Google",
+    "snippet": "include < bionic /libc_init_common.h>. Initialize system properties. Register the debuggerd signal handler. be used to compute the load bias of an executable or ...",
+    "host_name": "android.googlesource.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/aosp-mirror/platform_bionic",
+    "name": "aosp-mirror/platform_bionic",
+    "snippet": "Nov 8, 2023 — bionic is Android's C library, math library, and dynamic linker . This document is a high-level overview of making changes to bionic itself. Read more",
+    "host_name": "github.com",
+    "rank": 1,
+    "date": "Nov 8, 2023",
+    "favicon": ""
+  },
+  {
+    "url": "https://cs.android.com/android/platform/superproject/+/master:bionic/linker/linker.cpp",
+    "name": "linker.cpp",
+    "snippet": "No information is available for this page. Learn why",
+    "host_name": "cs.android.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.five-embeddev.com/baremetal/startup_cxx",
+    "name": "Startup Code in C++",
+    "snippet": "The initial entry code needs to be in assembler, The enter() function must be placed in the location where code execution starts by specifying the linker ...",
+    "host_name": "www.five-embeddev.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://embeddedartistry.com/blog/2019/04/17/exploring-startup-implementations-newlib-arm",
+    "name": "Exploring Startup Implementations: Newlib (ARM)",
+    "snippet": "Apr 17, 2019 — Once the processor is initialized, we call the _start function to initialize the C runtime. Note that the nRF startup code allows you to define ...",
+    "host_name": "embeddedartistry.com",
+    "rank": 4,
+    "date": "Apr 17, 2019",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/78407961/compiling-without-a-standard-library-but-with-the-start-label-entry-point",
+    "name": "Compiling without a standard library but with the _start",
+    "snippet": "The problem is that by doing so, the program compiles without a _start label, causing the entry (defined in the ELF header) to point at the ... Read more",
+    "host_name": "stackoverflow.com",
+    "rank": 5,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.reddit.com/r/C_Programming/comments/15mjopz/does_libc_have_a_main_in_there_somewhere",
+    "name": "Does libc have a main() in there somewhere?",
+    "snippet": "I've noticed when I run /usr/lib/libc.so directly in bash, it will print some version and licensing info. At first I thought maybe there is some kernel ...",
+    "host_name": "www.reddit.com",
+    "rank": 6,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://news.ycombinator.com/item?id=39232590",
+    "name": "> When the program starts running, you might think it",
+    "snippet": "The symbol _start is a language-agnostic entry point for the binary that will in this case call main. _start is where .text begins and address __libc_start_ ...",
+    "host_name": "news.ycombinator.com",
+    "rank": 7,
+    "date": "",
+    "favicon": ""
+  }
+]

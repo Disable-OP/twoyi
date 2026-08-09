@@ -1,0 +1,344 @@
+Found 493 function-prologue candidates
+
+=== Function containing each address of interest ===
+  0x32f4 (mprotect call #1) is in function starting at 0x31a8
+  0x3334 (mprotect call #2) is in function starting at 0x31a8
+  0x3a28 (prctl call #1) is in function starting at 0x3384
+  0x3c00 (prctl call #2) is in function starting at 0x3384
+  0x3964 (rt_sigprocmask call) is in function starting at 0x3384
+  0x124f0 (rt_sigaction call) is in function starting at 0x12490
+  0x119a8 (exit_group call) is in function starting at 0x1192c
+  0x3c8c (getauxval-like?) is in function starting at 0x3c70
+  0x40b0 (__libc_init) is in function starting at 0x4090
+  0x2cd0 (_start) is in function starting at 0x2cb8
+
+Function containing prctl call (0x3a28): 0x3384 - 0x3c6c, size 0x8ec
+
+--- sigprocmask_caller_region: 0x3940 - 0x3a40 ---
+  0x00003940:  mov      w9, #0x40000000
+  0x00003944:  sub      x8, x29, #0x98
+  0x00003948:  stp      x9, x9, [x29, #-0x98]
+  0x0000394c:  str      x8, [sp, #0x80]
+  0x00003950:  ldr      x8, [sp, #0x80]
+  0x00003954:  mov      w0, #1
+  0x00003958:  sub      x1, x29, #0x98
+  0x0000395c:  mov      w3, #8
+  0x00003960:  mov      x2, xzr
+  0x00003964:  bl       #0xff68 -> rt_sigprocmask
+  0x00003968:  stur     w0, [x29, #-0x5c]
+  0x0000396c:  ldur     w8, [x29, #-0x5c]
+  0x00003970:  ldr      w9, [sp, #0xc]
+  0x00003974:  mov      w10, #0x20b7
+  0x00003978:  movk     w10, #0x688c, lsl #16
+  0x0000397c:  mov      w6, #0xbf9b
+  0x00003980:  orn      w8, w9, w8, asr #31
+  0x00003984:  mov      w9, #0xf135
+  0x00003988:  movk     w9, #0xf303, lsl #16
+  0x0000398c:  orn      w9, w9, w9
+  0x00003990:  bic      w8, w9, w8
+  0x00003994:  mov      w9, #0xe422
+  0x00003998:  movk     w9, #0x99d3, lsl #16
+  0x0000399c:  sub      w8, w8, w9
+  0x000039a0:  mov      w5, #0xe964
+  0x000039a4:  mov      w4, #0x24e
+  0x000039a8:  mov      w3, #0x341d
+  0x000039ac:  mov      w2, #0x540a
+  0x000039b0:  mov      w1, #0xc7b9
+  0x000039b4:  mov      w18, #0x7d20
+  0x000039b8:  mov      w17, #0x2ae7
+  0x000039bc:  mov      w16, #0x7d1f
+  0x000039c0:  mov      w14, #0x43fb
+  0x000039c4:  mov      w13, #0xdfd1
+  0x000039c8:  mov      w12, #0xb13f
+  0x000039cc:  mov      w0, #0x540b
+  0x000039d0:  add      w8, w8, w10
+  0x000039d4:  movk     w6, #0x58d3, lsl #16
+  0x000039d8:  movk     w5, #0x20a3, lsl #16
+  0x000039dc:  movk     w4, #0xf734, lsl #16
+  0x000039e0:  movk     w3, #0xd4ed, lsl #16
+  0x000039e4:  movk     w2, #0x22f3, lsl #16
+  0x000039e8:  movk     w1, #0xc71f, lsl #16
+  0x000039ec:  movk     w18, #0xab8a, lsl #16
+  0x000039f0:  movk     w17, #0xa828, lsl #16
+  0x000039f4:  movk     w16, #0xab8a, lsl #16
+  0x000039f8:  movk     w14, #0x827e, lsl #16
+  0x000039fc:  movk     w13, #0x8981, lsl #16
+  0x00003a00:  movk     w12, #0xaf47, lsl #16
+  0x00003a04:  movk     w0, #0x22f3, lsl #16
+  0x00003a08:  add      w9, w8, w9
+  0x00003a0c:  b        #0x368c
+  0x00003a10:  ldur     x8, [x29, #-0x68]
+  0x00003a14:  mov      w0, #0x26
+  0x00003a18:  mov      w1, #1
+  0x00003a1c:  mov      w2, wzr
+  0x00003a20:  mov      w3, wzr
+  0x00003a24:  mov      w4, wzr
+  0x00003a28:  bl       #0x10028 -> prctl
+  0x00003a2c:  mov      w8, #0x1479
+  0x00003a30:  stur     w0, [x29, #-0x58]
+  0x00003a34:  movk     w8, #0xec2, lsl #16
+  0x00003a38:  b        #0x3c0c
+  0x00003a3c:  mov      x8, #0x400000004
+
+--- prctl_call1_region: 0x3a00 - 0x3a80 ---
+  0x00003a00:  movk     w12, #0xaf47, lsl #16
+  0x00003a04:  movk     w0, #0x22f3, lsl #16
+  0x00003a08:  add      w9, w8, w9
+  0x00003a0c:  b        #0x368c
+  0x00003a10:  ldur     x8, [x29, #-0x68]
+  0x00003a14:  mov      w0, #0x26
+  0x00003a18:  mov      w1, #1
+  0x00003a1c:  mov      w2, wzr
+  0x00003a20:  mov      w3, wzr
+  0x00003a24:  mov      w4, wzr
+  0x00003a28:  bl       #0x10028 -> prctl
+  0x00003a2c:  mov      w8, #0x1479
+  0x00003a30:  stur     w0, [x29, #-0x58]
+  0x00003a34:  movk     w8, #0xec2, lsl #16
+  0x00003a38:  b        #0x3c0c
+  0x00003a3c:  mov      x8, #0x400000004
+  0x00003a40:  movk     x8, #0x20
+  0x00003a44:  str      x8, [sp, #0x80]
+  0x00003a48:  mov      x8, #-0x3ffffffffffe0001
+  0x00003a4c:  movk     x8, #0x15
+  0x00003a50:  mov      x11, #6
+  0x00003a54:  mov      x12, #0xc0000000c
+  0x00003a58:  mov      w13, #0x25
+  0x00003a5c:  mov      x10, #0xc010
+  0x00003a60:  movk     x8, #0xb7, lsl #32
+  0x00003a64:  movk     x11, #0x7fff, lsl #48
+  0x00003a68:  movk     x12, #0x20
+  0x00003a6c:  movk     w13, #3, lsl #16
+  0x00003a70:  movk     x10, #0x2eee, lsl #16
+  0x00003a74:  stp      x8, x11, [sp, #0x88]
+  0x00003a78:  str      x12, [sp, #0x98]
+  0x00003a7c:  str      w13, [sp, #0xa0]
+
+--- prctl_call2_region: 0x3bd0 - 0x3c50 ---
+  0x00003bd0:  lsr      x9, x8, #0x20
+  0x00003bd4:  str      w8, [sp, #0x18c]
+  0x00003bd8:  add      x8, sp, #0x80
+  0x00003bdc:  mov      w0, #0x16
+  0x00003be0:  sub      x2, x29, #0x88
+  0x00003be4:  sturh    w10, [x29, #-0x88]
+  0x00003be8:  str      w9, [sp, #0x174]
+  0x00003bec:  str      w17, [sp, #0x178]
+  0x00003bf0:  str      w9, [sp, #0x17c]
+  0x00003bf4:  str      x15, [sp, #0x180]
+  0x00003bf8:  str      w18, [sp, #0x188]
+  0x00003bfc:  stur     x8, [x29, #-0x80]
+  0x00003c00:  bl       #0x10028 -> prctl
+  0x00003c04:  mov      w8, #0xcccb
+  0x00003c08:  movk     w8, #0x42a4, lsl #16
+  0x00003c0c:  and      w9, w8, #0x7fffffff
+  0x00003c10:  cmp      w9, w25
+  0x00003c14:  b.eq     #0x3a3c
+  0x00003c18:  cmp      w9, w21
+  0x00003c1c:  b.eq     #0x3c40
+  0x00003c20:  cmp      w9, w27
+  0x00003c24:  b.ne     #0x3c0c
+  0x00003c28:  ldur     w8, [x29, #-0x58]
+  0x00003c2c:  cmp      w8, #0
+  0x00003c30:  mov      w8, #0xcccb
+  0x00003c34:  movk     w8, #0x42a4, lsl #16
+  0x00003c38:  csel     w8, w25, w8, eq
+  0x00003c3c:  b        #0x3c0c
+  0x00003c40:  mov      w8, #0xb4b8
+  0x00003c44:  movk     w8, #0x5a2, lsl #16
+  0x00003c48:  b        #0x3508
+  0x00003c4c:  ldr      x0, [sp, #0x20]
+
+Function containing mprotect call #1 (0x32f4): 0x31a8 - 0x334c, size 0x1a8
+
+--- mprotect_caller_func: 0x31a8 - 0x3350 ---
+  0x000031a8:  stp      x29, x30, [sp, #0xb0]
+  0x000031ac:  add      x29, sp, #0xb0
+  0x000031b0:  mov      x10, #0x3e68
+  0x000031b4:  mov      x20, x0
+  0x000031b8:  movk     x10, #0x7d2, lsl #16
+  0x000031bc:  neg      x8, x20
+  0x000031c0:  mov      w9, #0xfff
+  0x000031c4:  movk     x10, #0x9bbb, lsl #32
+  0x000031c8:  movk     x10, #0x5e56, lsl #48
+  0x000031cc:  sub      x8, x9, x8
+  0x000031d0:  sub      x8, x8, x10
+  0x000031d4:  add      x8, x8, x1
+  0x000031d8:  add      x8, x8, x10
+  0x000031dc:  add      x9, sp, #0x18
+  0x000031e0:  and      x8, x8, #0xfffffffffffff000
+  0x000031e4:  stp      x8, x9, [sp, #0x30]
+  0x000031e8:  mov      w11, #0xde
+  0x000031ec:  mov      x10, sp
+  0x000031f0:  ldr      x8, [sp, #0x38]
+  0x000031f4:  str      w11, [sp, #0x18]
+  0x000031f8:  mov      w8, #1
+  0x000031fc:  stp      xzr, x2, [sp, #0x20]
+  0x00003200:  mov      w11, #-1
+  0x00003204:  str      x10, [sp, #0x40]
+  0x00003208:  ldr      x10, [sp, #0x40]
+  0x0000320c:  strh     w8, [sp]
+  0x00003210:  str      x9, [sp, #8]
+  0x00003214:  str      w11, [sp, #0x10]
+  0x00003218:  ldr      x1, [sp, #0x30]
+  0x0000321c:  mov      x2, sp
+  0x00003220:  bl       #0xb5c8 -> 0xb5c8
+  0x00003224:  mov      x0, sp
+  0x00003228:  bl       #0xb178 -> 0xb178
+  0x0000322c:  mov      x25, #0xde35
+  0x00003230:  eor      x8, x20, #0xfff
+  0x00003234:  movk     x25, #0x6c21, lsl #16
+  0x00003238:  mov      w21, #0xdc9
+  0x0000323c:  mov      w22, #0xdc8
+  0x00003240:  mov      w23, #0xd5fa
+  0x00003244:  mov      w24, #0xcf4f
+  0x00003248:  movk     x25, #0x453e, lsl #32
+  0x0000324c:  mov      w26, #0xe140
+  0x00003250:  mov      w27, #0xb5a6
+  0x00003254:  mov      w28, #0xab26
+  0x00003258:  and      x20, x8, x20
+  0x0000325c:  mov      w8, #0xdc9
+  0x00003260:  movk     w21, #0x4428, lsl #16
+  0x00003264:  movk     w22, #0x4428, lsl #16
+  0x00003268:  movk     w23, #0xf8e1, lsl #16
+  0x0000326c:  movk     w24, #0x2d6, lsl #16
+  0x00003270:  movk     x25, #0xa97, lsl #48
+  0x00003274:  movk     w26, #0x3003, lsl #16
+  0x00003278:  movk     w27, #0x73b7, lsl #16
+  0x0000327c:  movk     w28, #0x4f20, lsl #16
+  0x00003280:  movk     w8, #0x4428, lsl #16
+  0x00003284:  str      w0, [sp, #0x4c]
+  0x00003288:  b        #0x3298
+  0x0000328c:  mov      w8, #0xab26
+  0x00003290:  movk     w8, #0x4f20, lsl #16
+  0x00003294:  mov      w19, #-1
+  0x00003298:  cmp      w8, w22
+  0x0000329c:  b.le     #0x32c8
+  0x000032a0:  cmp      w8, w27
+  0x000032a4:  b.eq     #0x328c
+  0x000032a8:  cmp      w8, w28
+  0x000032ac:  b.eq     #0x3344
+  0x000032b0:  cmp      w8, w21
+  0x000032b4:  b.ne     #0x3298
+  0x000032b8:  ldr      w8, [sp, #0x4c]
+  0x000032bc:  cmp      w8, #0
+  0x000032c0:  csel     w8, w27, w24, eq
+  0x000032c4:  b        #0x3298
+  0x000032c8:  cmp      w8, w23
+  0x000032cc:  b.eq     #0x328c
+  0x000032d0:  cmp      w8, w24
+  0x000032d4:  b.eq     #0x3314
+  0x000032d8:  cmp      w8, w26
+  0x000032dc:  b.ne     #0x3298
+  0x000032e0:  mov      x0, sp
+  0x000032e4:  bl       #0xb454 -> 0xb454
+  0x000032e8:  ldr      x0, [sp, #0x50]
+  0x000032ec:  ldr      x1, [sp, #0x58]
+  0x000032f0:  mov      w2, #5
+  0x000032f4:  bl       #0xfff8 -> mprotect
+  0x000032f8:  ldr      x1, [sp, #0x30]
+  0x000032fc:  ldr      x0, [sp, #0x50]
+  0x00003300:  bl       #0x2a90c -> 0x2a90c
+  0x00003304:  mov      w8, #0xab26
+  0x00003308:  mov      w19, wzr
+  0x0000330c:  movk     w8, #0x4f20, lsl #16
+  0x00003310:  b        #0x3298
+  0x00003314:  ldr      x8, [sp, #0x30]
+  0x00003318:  mov      w2, #7
+  0x0000331c:  add      x8, x8, x25
+  0x00003320:  sub      x8, x8, x20
+  0x00003324:  sub      x8, x8, x25
+  0x00003328:  stp      x20, x8, [sp, #0x50]
+  0x0000332c:  ldr      x0, [sp, #0x50]
+  0x00003330:  ldr      x1, [sp, #0x58]
+  0x00003334:  bl       #0xfff8 -> mprotect
+  0x00003338:  cmn      w0, #1
+  0x0000333c:  csel     w8, w23, w26, eq
+  0x00003340:  b        #0x3298
+  0x00003344:  ldr      x8, [sp, #0x40]
+  0x00003348:  ldr      x8, [sp, #0x38]
+  0x0000334c:  mov      w0, w19
+
+Function containing rt_sigaction call (0x124f0): 0x12490 - 0x12524, size 0x98
+
+--- rt_sigaction_caller_func: 0x12490 - 0x12528 ---
+  0x00012490:  stp      x29, x30, [sp, #0x10]
+  0x00012494:  add      x29, sp, #0x10
+  0x00012498:  sub      sp, sp, #0x50
+  0x0001249c:  adrp     x20, #0x37000
+  0x000124a0:  ldr      x20, [x20, #0xf58]
+  0x000124a4:  mov      x19, x2
+  0x000124a8:  ldr      x20, [x20]
+  0x000124ac:  stur     x20, [x29, #-0x18]
+  0x000124b0:  cbz      x1, #0x124d4
+  0x000124b4:  ldr      w8, [x1]
+  0x000124b8:  str      x8, [sp, #0x30]
+  0x000124bc:  ldr      x8, [x1, #8]
+  0x000124c0:  str      x8, [sp, #0x28]
+  0x000124c4:  ldr      x8, [x1, #0x10]
+  0x000124c8:  str      x8, [sp, #0x40]
+  0x000124cc:  ldr      x8, [x1, #0x18]
+  0x000124d0:  str      x8, [sp, #0x38]
+  0x000124d4:  cmp      x1, #0
+  0x000124d8:  add      x8, sp, #0x28
+  0x000124dc:  csel     x1, x8, xzr, ne
+  0x000124e0:  cmp      x19, #0
+  0x000124e4:  add      x8, sp, #8
+  0x000124e8:  csel     x2, x8, xzr, ne
+  0x000124ec:  mov      w3, #8
+  0x000124f0:  bl       #0x135f4 -> rt_sigaction
+  0x000124f4:  cbz      x19, #0x12518
+  0x000124f8:  ldr      x8, [sp, #0x10]
+  0x000124fc:  str      w8, [x19]
+  0x00012500:  ldr      x8, [sp, #8]
+  0x00012504:  str      x8, [x19, #8]
+  0x00012508:  ldr      x8, [sp, #0x20]
+  0x0001250c:  str      x8, [x19, #0x10]
+  0x00012510:  ldr      x8, [sp, #0x18]
+  0x00012514:  str      x8, [x19, #0x18]
+  0x00012518:  ldur     x8, [x29, #-0x18]
+  0x0001251c:  sub      x8, x20, x8
+  0x00012520:  cbnz     x8, #0x12534
+  0x00012524:  sub      sp, x29, #0x10
+
+Function containing exit_group call (0x119a8): 0x1192c - 0x119c4, size 0x9c
+
+--- exit_group_caller_func: 0x1192c - 0x119c8 ---
+  0x0001192c:  stp      x29, x30, [sp, #-0x10]!
+  0x00011930:  mov      x29, sp
+  0x00011934:  sub      sp, sp, #0x30
+  0x00011938:  sub      x0, x29, #8
+  0x0001193c:  bl       #0x125e4 -> 0x125e4
+  0x00011940:  sub      x0, x29, #8
+  0x00011944:  mov      w1, #6
+  0x00011948:  bl       #0x12538 -> 0x12538
+  0x0001194c:  mov      w0, #2
+  0x00011950:  sub      x1, x29, #8
+  0x00011954:  mov      x2, xzr
+  0x00011958:  bl       #0x12620 -> 0x12620
+  0x0001195c:  mov      w0, #6
+  0x00011960:  bl       #0x1243c -> 0x1243c
+  0x00011964:  add      x9, sp, #8
+  0x00011968:  mov      w8, #0x10000000
+  0x0001196c:  add      x0, x9, #0x10
+  0x00011970:  str      xzr, [sp, #0x10]
+  0x00011974:  str      w8, [sp, #8]
+  0x00011978:  bl       #0x125ac -> 0x125ac
+  0x0001197c:  mov      w0, #6
+  0x00011980:  add      x1, sp, #8
+  0x00011984:  add      x2, sp, #8
+  0x00011988:  bl       #0x1248c -> 0x1248c
+  0x0001198c:  mov      w0, #2
+  0x00011990:  sub      x1, x29, #8
+  0x00011994:  mov      x2, xzr
+  0x00011998:  bl       #0x12620 -> 0x12620
+  0x0001199c:  mov      w0, #6
+  0x000119a0:  bl       #0x1243c -> 0x1243c
+  0x000119a4:  mov      w0, #1
+  0x000119a8:  bl       #0x13624 -> exit_group
+  0x000119ac:  mov      x8, x0
+  0x000119b0:  mov      w9, w1
+  0x000119b4:  mov      w0, #-0x64
+  0x000119b8:  mov      x1, x8
+  0x000119bc:  mov      w2, w9
+  0x000119c0:  mov      w3, wzr
+  0x000119c4:  b        #0x12004
