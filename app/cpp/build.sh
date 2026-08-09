@@ -52,6 +52,25 @@ for ABI in arm64-v8a x86_64; do
         -DCMAKE_BUILD_TYPE=Release
     cmake --build $HOOK_BUILD_DIR -j$(nproc)
     cp -v $HOOK_BUILD_DIR/libgetpid_hook.so $JNILIBS_DIR/libgetpid_hook.so
+
+    # Build libtwoyi_loader_shlib.so (the seccomp/SIGSYS virtualization library)
+    # This is loaded via LD_PRELOAD to install seccomp + SIGSYS handler
+    # before the guest init's main() runs.
+    LOADER_BUILD_DIR=$SCRIPT_DIR/build/twoyi_loader/$ABI
+    rm -rf "$LOADER_BUILD_DIR"
+    mkdir -p "$LOADER_BUILD_DIR"
+    # Compile directly (not CMake — it's a single file)
+    $NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+        -target $ABI-linux-android24 \
+        --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+        -shared -fPIC -O2 -g \
+        -D_GNU_SOURCE \
+        -o $LOADER_BUILD_DIR/libtwoyi_loader_shlib.so \
+        $SCRIPT_DIR/twoyi_loader/src/twoyi_loader_shlib.c \
+        -lc -lpthread -ldl 2>&1 || echo "  ⚠ twoyi_loader_shlib build failed for $ABI"
+    if [ -f "$LOADER_BUILD_DIR/libtwoyi_loader_shlib.so" ]; then
+        cp -v $LOADER_BUILD_DIR/libtwoyi_loader_shlib.so $JNILIBS_DIR/libtwoyi_loader_shlib.so
+    fi
 done
 
 echo '=========================================='
