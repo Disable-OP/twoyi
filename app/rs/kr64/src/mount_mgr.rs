@@ -337,7 +337,7 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
         }
     }
 
-    // Step 4: mount tmpfs on /dev, /proc, /sys, /tmp, /mnt.
+    // Step 4: mount filesystems on /dev, /proc, /sys, /tmp, /mnt.
     // IMPORTANT: Do NOT mount tmpfs on /apex! On Android 11+,
     // /system/bin/linker64 and /system/lib64/libc.so are symlinks to
     // /apex/com.android.runtime/bin/linker64 and
@@ -346,24 +346,30 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     // linker can't load — causing SIGSEGV at address 0x86 in linker64.
     // The KVM test script extracts /apex from the emulator into the
     // rootfs, so we leave it as-is (no tmpfs overlay).
-    let tmpfs_mounts: &[(&str, &str, c_ulong, &str)] = &[
+    //
+    // CRITICAL: /proc must be a REAL procfs, NOT tmpfs! The bionic
+    // dynamic linker (linker64) reads /proc/self/maps and
+    // /proc/self/auxv during library loading. If /proc is an empty
+    // tmpfs, the linker can't find already-loaded libraries (like
+    // libc.so) -> NULL soinfo -> SIGSEGV at offset 0xaf174 in
+    // linker64 (write to address 0x86 = field at offset 0x86 from
+    // NULL soinfo pointer).
+    let fs_mounts: &[(&str, &str, c_ulong, &str)] = &[
         // (path-in-rootfs, fstype, flags, data)
         ("/dev", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755"),
-        // /proc is populated by proc_emu::populate_proc() — we just
-        // mount a tmpfs here as a placeholder so the dir exists. The
-        // production version will mount a real procfs OR run our
-        // /dev/vmproc-based emulator.
+        // Real procfs — the linker needs /proc/self/maps and /proc/self/auxv
         (
             "/proc",
-            "tmpfs",
+            "proc",
             MS_NOSUID | MS_NOEXEC | MS_NODEV,
-            "mode=555",
+            "",
         ),
+        // Real sysfs — some init code reads /sys/... paths
         (
             "/sys",
-            "tmpfs",
+            "sysfs",
             MS_NOSUID | MS_NOEXEC | MS_NODEV,
-            "mode=555",
+            "",
         ),
         ("/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777"),
         // /mnt is where the guest's vold mounts external storage.
@@ -374,7 +380,7 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
             "mode=755,gid=1000",
         ),
     ];
-    for (path, fstype, flags, data) in tmpfs_mounts {
+    for (path, fstype, flags, data) in fs_mounts {
         let abs = format!("{}{}", cfg.rootfs, path);
         // Make sure the mount point exists.
         let _ = std::fs::create_dir_all(&abs);
