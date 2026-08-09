@@ -975,6 +975,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 libc::_exit(127);
             },
         };
+        // LD_PRELOAD path: when use_namespaces is true, pivot_root
+        // has already happened, so the path is relative to the new
+        // root. When false, we need the full absolute path.
+        let ld_preload_str = if cfg.use_namespaces {
+            "LD_PRELOAD=/system/lib64/libgetpid_hook.so".to_string()
+        } else {
+            format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)
+        };
         let env_vars: Vec<CString> = vec![
             CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
             CString::new("ANDROID_ROOT=/system").unwrap(),
@@ -982,23 +990,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             CString::new("ANDROID_BOOTLOGO=1").unwrap(),
             twoyi_rootfs_env,
             CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
-            // LD_PRELOAD the getpid_hook library so init thinks it's PID 1.
-            // The hook overrides getpid() to return 1, bypassing init's
-            // PID 1 check without needing unshare(CLONE_NEWPID).
-            // The path is RELATIVE TO THE NEW ROOT (set by chroot/pivot_root
-            // above). RomManager.ensureLibSymlink creates the symlink at
-            // {rootfs}/system/lib64/libgetpid_hook.so, so after chroot
-            // the file is at /system/lib64/libgetpid_hook.so.
-            // LD_PRELOAD path: when use_namespaces is true, pivot_root
-            // has already happened, so the path is relative to the new
-            // root (/system/lib64/libgetpid_hook.so). When false, we
-            // need the full absolute path.
-            let ld_preload = if cfg.use_namespaces {
-                format!("LD_PRELOAD=/system/lib64/libgetpid_hook.so")
-            } else {
-                format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)
-            };
-            CString::new(ld_preload).unwrap(),
+            CString::new(ld_preload_str).unwrap(),
         ];
         let env_ptrs: Vec<*const libc::c_char> = env_vars
             .iter()
