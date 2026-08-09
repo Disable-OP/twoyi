@@ -1196,9 +1196,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // handler via .init_array constructor before init's main() runs.
         // The getpid hook makes init think it's PID 1.
         let ld_preload_str = if cfg.use_namespaces {
-            "LD_PRELOAD=/dev/libtwoyi_loader_shlib.so:/dev/libgetpid_hook.so".to_string()
+            // getpid_hook FIRST (so getpid() is hooked before seccomp installs)
+            // twoyi_loader SECOND (installs seccomp + SIGSYS + PLT hooks)
+            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string()
         } else {
-            format!("LD_PRELOAD={}/dev/libtwoyi_loader_shlib.so:{}/dev/libgetpid_hook.so",
+            format!("LD_PRELOAD={}/dev/libgetpid_hook.so:{}/dev/libtwoyi_loader_shlib.so",
                     cfg.rootfs, cfg.rootfs)
         };
         let mut env_vars: Vec<CString> = vec![
