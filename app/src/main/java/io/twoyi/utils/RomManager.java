@@ -122,7 +122,7 @@ public final class RomManager {
         // Failures are non-fatal: a missing symlink means the guest
         // can't load that specific lib, but boot continues.
         File rootfsLib64 = new File(getRootfsDir(context), "system/lib64");
-        for (String lib : new String[]{"libkr64.so", "libOpenglRender.so"}) {
+        for (String lib : new String[]{"libkr64.so", "libOpenglRender.so", "libgetpid_hook.so"}) {
             try {
                 ensureLibSymlink(context, lib, new File(rootfsLib64, lib));
             } catch (IOException e) {

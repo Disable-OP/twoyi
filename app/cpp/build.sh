@@ -39,6 +39,19 @@ for ABI in arm64-v8a x86_64; do
     JNILIBS_DIR=$SCRIPT_DIR/../src/main/jniLibs/$ABI
     mkdir -p $JNILIBS_DIR
     cp -v $BUILD_DIR/libOpenglRender.so $JNILIBS_DIR/libOpenglRender.so
+
+    # Build getpid_hook.so (LD_PRELOAD library that makes init think
+    # it's PID 1 by hooking getpid() to return 1)
+    HOOK_BUILD_DIR=$SCRIPT_DIR/build/getpid_hook/$ABI
+    rm -rf "$HOOK_BUILD_DIR"
+    mkdir -p "$HOOK_BUILD_DIR"
+    cmake -S $SCRIPT_DIR/getpid_hook -B $HOOK_BUILD_DIR \
+        -DCMAKE_TOOLCHAIN_FILE=$NDK_BUILD_DIR/build/cmake/android.toolchain.cmake \
+        -DANDROID_ABI=$ABI \
+        -DANDROID_PLATFORM=android-24 \
+        -DCMAKE_BUILD_TYPE=Release
+    cmake --build $HOOK_BUILD_DIR -j$(nproc)
+    cp -v $HOOK_BUILD_DIR/libgetpid_hook.so $JNILIBS_DIR/libgetpid_hook.so
 done
 
 echo '=========================================='

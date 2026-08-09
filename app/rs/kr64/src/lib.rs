@@ -950,6 +950,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             CString::new("ANDROID_BOOTLOGO=1").unwrap(),
             twoyi_rootfs_env,
             CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
+            // LD_PRELOAD the getpid_hook library so init thinks it's PID 1.
+            // The hook overrides getpid() to return 1, bypassing init's
+            // PID 1 check without needing unshare(CLONE_NEWPID).
+            // The path is resolved from the rootfs's system/lib64/ where
+            // RomManager.ensureLibSymlink creates it.
+            CString::new(format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)).unwrap(),
         ];
         let env_ptrs: Vec<*const libc::c_char> = env_vars
             .iter()
