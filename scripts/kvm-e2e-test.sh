@@ -313,6 +313,15 @@ TWOYI_PROFILE="$TWOYI_DATA/rootfs"
 # Stop twoyi if it's running (it shouldn't be — fresh boot — but be safe)
 "$ADB_BIN" -s emulator-5554 shell am force-stop io.twoyi 2>/dev/null || true
 
+# Clean up stale dev/event directory from previous runs (kr64 fails if
+# /data/data/io.twoyi/dev/event exists as a directory or stale socket)
+"$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
+sleep 1
+"$ADB_BIN" -s emulator-5554 wait-for-device 2>/dev/null || true
+"$ADB_BIN" -s emulator-5554 shell "rm -rf /data/data/io.twoyi/dev" 2>/dev/null || true
+"$ADB_BIN" -s emulator-5554 shell "rm -rf /data/user/0/io.twoyi/dev" 2>/dev/null || true
+echo "  ✓ cleaned up stale dev/ directory"
+
 # Push the tarball to a temp location, then extract it into twoyi's
 # data dir. We can't `adb push` directly to /data/data/io.twoyi/.../
 # because that dir is created on first launch; create it first.
