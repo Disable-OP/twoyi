@@ -864,22 +864,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        let mount_cfg = mount_mgr::MountConfig {
-            rootfs: cfg.rootfs.clone(),
-            rom_dir: cfg.rom_dir.clone(),
-            use_namespaces: cfg.use_namespaces,
-            read_only_rom: cfg.read_only_rom,
-        };
-        if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
-            // FATAL: without mounts, pivot_root/bind-mounts never happened
-            // and init would run against the host filesystem. Surface the
-            // errno via async-signal-safe write(2) so the parent (and the
-            // user reading logcat / log.txt) sees WHY the child died.
-            // Use _exit, not return, to avoid running atexit handlers.
-            let errno = e.raw_os_error().unwrap_or(0);
-            unsafe {
-                safe_write_err_errno(b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed", errno);
-                libc::_exit(1);
+        // Only call setup_mounts in the child if we DIDN'T already do it
+        // in the parent (i.e., if use_namespaces is false, the parent
+        // skipped pivot_root and the child needs to do mount setup).
+        // If use_namespaces is true, the parent already did pivot_root
+        // and mount setup BEFORE installing seccomp, so the child must
+        // NOT call mount() again (seccomp would kill it with SIGSYS).
+        if !cfg.use_namespaces {
+            let mount_cfg = mount_mgr::MountConfig {
+                rootfs: cfg.rootfs.clone(),
+                rom_dir: cfg.rom_dir.clone(),
+                use_namespaces: cfg.use_namespaces,
+                read_only_rom: cfg.read_only_rom,
+            };
+            if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
+                // FATAL: without mounts, pivot_root/bind-mounts never happened
+                // and init would run against the host filesystem. Surface the
+                // errno via async-signal-safe write(2) so the parent (and the
+                // user reading logcat / log.txt) sees WHY the child died.
+                // Use _exit, not return, to avoid running atexit handlers.
+                let errno = e.raw_os_error().unwrap_or(0);
+                unsafe {
+                    safe_write_err_errno(b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed", errno);
+                    libc::_exit(1);
+                }
             }
         }
 
