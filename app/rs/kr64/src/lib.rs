@@ -971,7 +971,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // above). RomManager.ensureLibSymlink creates the symlink at
             // {rootfs}/system/lib64/libgetpid_hook.so, so after chroot
             // the file is at /system/lib64/libgetpid_hook.so.
-            CString::new("LD_PRELOAD=/system/lib64/libgetpid_hook.so").unwrap(),
+            CString::new(format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)).unwrap(),
         ];
         let env_ptrs: Vec<*const libc::c_char> = env_vars
             .iter()
