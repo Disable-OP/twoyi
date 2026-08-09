@@ -280,6 +280,15 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uc) {
     if (!info || info->si_code != 1) return;
     long nr = info->si_syscall;
     g_sigsys_count++;
+
+    // Log every SIGSYS trap (async-signal-safe: write + snprintf are OK
+    // because we set SA_NODEFER and the handler is short)
+    {
+        char msg[128];
+        int len = snprintf(msg, sizeof(msg),
+            "[twoyi_loader] SIGSYS #%d: nr=%ld\n", g_sigsys_count, nr);
+        write(2, msg, len);
+    }
     long ret;
     switch (nr) {
         case NR_mount: {
@@ -302,10 +311,13 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uc) {
             ret = 1; break;
         default:
             // For trapped syscalls we don't explicitly handle, return -ENOSYS.
-            // DO NOT call syscall() here — that would re-trigger the seccomp
-            // filter, causing infinite SIGSYS recursion → stack overflow.
-            // (The BPF filter only traps specific syscalls, so non-trapped
-            //  syscalls never reach this handler.)
+            // Log the syscall number so we can identify what init needs.
+            {
+                char msg[64];
+                int len = snprintf(msg, sizeof(msg),
+                    "[twoyi_loader] SIGSYS: unhandled syscall %ld\n", nr);
+                write(2, msg, len);
+            }
             ret = -ENOSYS;
             break;
     }
