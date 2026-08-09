@@ -462,9 +462,20 @@ if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
     if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
         "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" /data/local/tmp/libgetpid_hook.so
         echo "  ✓ pushed libgetpid_hook.so to /data/local/tmp/"
+    else
+        echo "  ⚠ libgetpid_hook.so not found in APK extraction — trying installed APK"
+        "$ADB_BIN" -s emulator-5554 shell "
+            APK_DIR=\$(dirname \$(pm path io.twoyi | head -1 | sed 's/package://'))
+            if [ -f \"\$APK_DIR/lib/x86_64/libgetpid_hook.so\" ]; then
+                cp \"\$APK_DIR/lib/x86_64/libgetpid_hook.so\" /data/local/tmp/libgetpid_hook.so
+                echo 'copied libgetpid_hook from installed APK'
+            fi
+        " 2>&1 | tail -3
     fi
 else
     echo "  ⚠ APK not found — cannot extract libkr64.so"
+    echo "    CWD: $(pwd)"
+    ls -la app/build/outputs/apk/release/ 2>/dev/null || echo "    APK dir does not exist"
 fi
 
 # --- Create symlinks in the rootfs for libgetpid_hook.so ---
@@ -481,6 +492,9 @@ fi
     chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
     echo '  ✓ copied libgetpid_hook.so to rootfs/system/lib64/'
 " 2>/dev/null || true
+
+# Verify libgetpid_hook.so exists in the rootfs
+"$ADB_BIN" -s emulator-5554 shell "test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo '  ✓ libgetpid_hook.so exists in rootfs' || echo '  ⚠ libgetpid_hook.so MISSING from rootfs — init will fail to link'" 2>&1 | tail -1
 
 # Also create the libkr64.so symlink in the rootfs (RomManager does this
 # when the app starts, but we want it ready before the app launches).
