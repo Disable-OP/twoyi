@@ -870,7 +870,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Without root, we can't do pivot_root or mount operations anyway,
         // so there's no point trying — just chroot into the rootfs and
         // exec init directly.
-        if cfg.use_namespaces {
+        // Skip setup_mounts when use_namespaces is TRUE — the parent
+        // already did unshare + pivot_root + mount tmpfs BEFORE forking.
+        // The child inherits the parent's mount namespace, so calling
+        // setup_mounts again would try to mount on already-mounted
+        // filesystems, which fails or crashes.
+        //
+        // When use_namespaces is FALSE (non-root), the child has no
+        // mount namespace and can't do mount operations anyway (seccomp
+        // blocks them), so also skip.
+        if false {  // Never call setup_mounts in the child
             let mount_cfg = mount_mgr::MountConfig {
                 rootfs: cfg.rootfs.clone(),
                 rom_dir: cfg.rom_dir.clone(),
