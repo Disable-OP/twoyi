@@ -205,28 +205,55 @@ pub fn init_renderer(
         info!("[CORE] Log path: {}", log_path);
 
         // -----------------------------------------------------------------
-        // Create /dev/qemu_pipe socket + GL proxy BEFORE spawning init.
+        // Check if a root-launched kr64 has already set up the guest.
         //
-        // The renderer's RenderServer is listening on $TWOYI_ROOTFS/opengles.
-        // The guest's SurfaceFlinger opens /dev/qemu_pipe and writes
-        // "pipe:opengles" to request a GL connection. We need a proxy
-        // that:
-        //   1. Listens on {rootfs}/dev/qemu_pipe
-        //   2. Reads the "pipe:opengles" handshake from the guest
-        //   3. Connects to {rootfs}/opengles (the renderer)
-        //   4. Pumps bytes bidirectionally
+        // In the KVM test environment, the test script pre-launches kr64
+        // as root (via `adb shell`) BEFORE starting the app. The root
+        // kr64 can chroot() and unshare(CLONE_NEWPID) — operations the
+        // app's own kr64 can't do because the zygote's seccomp filter
+        // blocks them (SIGSYS / signal 31).
         //
-        // Without this proxy, the guest can't send GL commands to the
-        // renderer and the screen stays black.
+        // The root kr64 creates /dev/qemu_pipe (and all other /dev
+        // devices) in the rootfs. If we detect that /dev/qemu_pipe
+        // already exists, we skip:
+        //   1. Our own qemu_pipe proxy (would conflict with root kr64's)
+        //   2. Our own kr64 launch (root kr64 is already handling the guest)
+        //
+        // The app's role in this mode is JUST to provide the renderer
+        // (libOpenglRender.so) and the UI — the guest container is
+        // managed by the root kr64.
         // -----------------------------------------------------------------
-        let rootfs_for_pipe = working_dir.clone();
-        std::thread::Builder::new()
-            .name("twoyi-qemu-pipe-setup".into())
-            .spawn(move || {
-                spawn_qemu_pipe_proxy(&rootfs_for_pipe);
-            })
-            .ok();
-        info!("[CORE] qemu_pipe proxy thread spawned");
+        let qemu_pipe_path = format!("{}/dev/qemu_pipe", working_dir);
+        let root_kr64_running = Path::new(&qemu_pipe_path).exists();
+        if root_kr64_running {
+            info!("[CORE] /dev/qemu_pipe already exists — root kr64 is running");
+            info!("[CORE] Skipping app's kr64 launch + qemu_pipe proxy");
+            info!("[CORE] App will only provide the renderer (root kr64 handles the guest)");
+        } else {
+            // -----------------------------------------------------------------
+            // Create /dev/qemu_pipe socket + GL proxy BEFORE spawning init.
+            //
+            // The renderer's RenderServer is listening on $TWOYI_ROOTFS/opengles.
+            // The guest's SurfaceFlinger opens /dev/qemu_pipe and writes
+            // "pipe:opengles" to request a GL connection. We need a proxy
+            // that:
+            //   1. Listens on {rootfs}/dev/qemu_pipe
+            //   2. Reads the "pipe:opengles" handshake from the guest
+            //   3. Connects to {rootfs}/opengles (the renderer)
+            //   4. Pumps bytes bidirectionally
+            //
+            // Without this proxy, the guest can't send GL commands to the
+            // renderer and the screen stays black.
+            // -----------------------------------------------------------------
+            let rootfs_for_pipe = working_dir.clone();
+            std::thread::Builder::new()
+                .name("twoyi-qemu-pipe-setup".into())
+                .spawn(move || {
+                    spawn_qemu_pipe_proxy(&rootfs_for_pipe);
+                })
+                .ok();
+            info!("[CORE] qemu_pipe proxy thread spawned");
+        }
 
         // -----------------------------------------------------------------
         // Init spawn strategy (post-2026-08-09 fix):
@@ -250,7 +277,20 @@ pub fn init_renderer(
         // If libkr64.so doesn't exist (e.g. not yet built), fall back to
         // the rootfs linker + init approach (which will fail with exit 31
         // but at least we'll see the error).
+        //
+        // SKIP ENTIRELY if root kr64 is already running (detected above).
+        // The root kr64 handles chroot + PID namespace + exec init —
+        // things the app's kr64 can't do because the zygote's seccomp
+        // filter blocks chroot/mount/unshare with SIGSYS.
         // -----------------------------------------------------------------
+        if root_kr64_running {
+            info!("[CORE] Root kr64 is running — skipping app's kr64 launch entirely");
+            // The root kr64 is already handling the guest. We just need
+            // to make sure the renderer is started (done above) and the
+            // app's UI is shown. Nothing else to do here.
+            return;
+        }
+
         let init_path = format!("{}/init", working_dir);
 
         // libkr64.so is in the app's nativeLibraryDir (symlinked into rootfs
