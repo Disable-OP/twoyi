@@ -284,6 +284,11 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uc) {
         case NR_setuid: case NR_setgid: case NR_setgroups:
         case NR_setresuid: case NR_setresgid: case NR_unshare:
             ret = 0; break;
+        case NR_getpid:
+            // init requires getpid() == 1 (exit 31 otherwise)
+            // The LD_PRELOAD getpid_hook catches libc calls, but init might
+            // use a direct syscall. Trap it here to be sure.
+            ret = 1; break;
         default:
             ret = syscall(nr, GET_ARG(ctx,0), GET_ARG(ctx,1), GET_ARG(ctx,2),
                          GET_ARG(ctx,3), GET_ARG(ctx,4), GET_ARG(ctx,5));
@@ -303,27 +308,29 @@ static int install_seccomp(void) {
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, TWOYI_AUDIT_ARCH, 1, 0),
         BPF_STMT(BPF_RET|BPF_K, 0x80000000),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_mount, 10, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_umount2, 9, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_chroot, 8, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_mknod, 7, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_mknodat, 6, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_rt_sigaction, 5, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_setuid, 4, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_setgid, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_setgroups, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_unshare, 1, 0),
-        BPF_STMT(BPF_RET|BPF_K, 0x7fff0000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_mount, 11, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_umount2, 10, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_chroot, 9, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_mknod, 8, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_mknodat, 7, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_rt_sigaction, 6, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_setuid, 5, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_setgid, 4, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_setgroups, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_unshare, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_getpid, 1, 0),
+        BPF_STMT(BPF_RET|BPF_K, 0x7fff0000), // ALLOW
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: mount
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: umount2
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: chroot
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: mknod
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: mknodat
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: rt_sigaction
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: setuid
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: setgid
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: setgroups
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: unshare
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: getpid
     };
     struct sock_fprog prog = { .len = sizeof(filter)/sizeof(filter[0]), .filter = filter };
     if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) != 0)
