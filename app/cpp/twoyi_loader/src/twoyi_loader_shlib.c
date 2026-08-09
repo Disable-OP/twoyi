@@ -25,6 +25,9 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include <malloc.h>
+#include <unistd.h> // for environ on some systems
+extern char **environ;
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -105,6 +108,102 @@
 // Helper
 static void write_str(int fd, const char *s) {
     if (s) { size_t l=0; while(s[l])l++; write(fd,s,l); }
+}
+
+// =========================================================================
+// LD_PRELOAD path — stored at init time, re-set before each exec
+// ROOT CAUSE: Android init's FirstStageMain calls clearenv() which wipes
+// LD_PRELOAD, then execv() which resets signal handlers to SIG_DFL.
+// The seccomp filter survives execve, but the SIGSYS handler is gone.
+// Fix: hook execv/execve to re-set LD_PRELOAD before each exec, so the
+// .init_array constructor re-installs the handler in the new process.
+// =========================================================================
+static char g_preload_path[512] = {0};
+
+static void set_preload_path(void) {
+    const char *preload = getenv("LD_PRELOAD");
+    if (preload) {
+        // LD_PRELOAD may contain multiple paths separated by ':'
+        // We need to preserve ALL of them
+        strncpy(g_preload_path, preload, sizeof(g_preload_path) - 1);
+    }
+}
+
+static void restore_preload_env(void) {
+    if (g_preload_path[0]) {
+        setenv("LD_PRELOAD", g_preload_path, 1);
+    }
+}
+
+// Hook execv — re-set LD_PRELOAD before exec
+// This ensures the .init_array constructor runs in the new process
+static int (*real_execv)(const char *, char *const[]) = NULL;
+
+int execv(const char *path, char *const argv[]) {
+    if (!real_execv) real_execv = dlsym(RTLD_NEXT, "execv");
+    restore_preload_env();
+    write_str(2, "[twoyi_loader] execv: restored LD_PRELOAD\n");
+    if (!real_execv) return syscall(SYS_execve, path, argv, environ);
+    return real_execv(path, argv);
+}
+
+// Hook execve — re-set LD_PRELOAD before exec
+static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    if (!real_execve) real_execve = dlsym(RTLD_NEXT, "execve");
+    // For execve, we need to modify the envp array to include LD_PRELOAD
+    // But envp might not have LD_PRELOAD. We need to add it.
+    // Simplest approach: use setenv() to set it in the current env,
+    // then pass environ instead of envp.
+    // But execve uses the passed envp, not environ.
+    // So we need to build a new envp with LD_PRELOAD added.
+    restore_preload_env();
+
+    // Count existing envp entries
+    int env_count = 0;
+    if (envp) {
+        while (envp[env_count]) env_count++;
+    }
+
+    // Check if LD_PRELOAD is already in envp
+    int has_preload = 0;
+    for (int i = 0; i < env_count; i++) {
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
+            has_preload = 1;
+            break;
+        }
+    }
+
+    if (has_preload || !g_preload_path[0]) {
+        // Already has LD_PRELOAD or we don't have a path to set
+        if (!real_execve) return syscall(SYS_execve, path, argv, envp);
+        return real_execve(path, argv, envp);
+    }
+
+    // Build new envp with LD_PRELOAD added
+    char preload_env[600];
+    snprintf(preload_env, sizeof(preload_env), "LD_PRELOAD=%s", g_preload_path);
+
+    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 2));
+    if (!new_envp) {
+        // Can't allocate — fall back to environ
+        if (!real_execve) return syscall(SYS_execve, path, argv, environ);
+        return real_execve(path, argv, environ);
+    }
+
+    for (int i = 0; i < env_count; i++) {
+        new_envp[i] = (char *)envp[i];
+    }
+    new_envp[env_count] = preload_env;
+    new_envp[env_count + 1] = NULL;
+
+    write_str(2, "[twoyi_loader] execve: added LD_PRELOAD to envp\n");
+    int ret;
+    if (!real_execve) ret = syscall(SYS_execve, path, argv, new_envp);
+    else ret = real_execve(path, argv, new_envp);
+    free(new_envp);
+    return ret;
 }
 
 // =========================================================================
@@ -399,6 +498,10 @@ static void twoyi_init(void) {
     // Get rootfs path from env
     g_rootfs = getenv("TWOYI_ROOTFS");
     if (!g_rootfs) g_rootfs = "/data/data/io.twoyi/rootfs";
+
+    // Save LD_PRELOAD path so we can restore it before execv/execve
+    // (Android init's clearenv() wipes it, then execv() resets signal handlers)
+    set_preload_path();
 
     write_str(2, "[twoyi_loader] init: installing virtualization\n");
 
