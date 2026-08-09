@@ -51,6 +51,11 @@ name: KVM E2E Test
         description: 'Comma-separated ABIs to build the APK for (x86_64 is required for this test; arm64-v8a is ignored)'
         required: false
         default: 'x86_64'
+      skip_preload:
+        description: 'Skip LD_PRELOAD (getpid_hook) — diagnostic mode to check if init links without the hook (init will exit 31)'
+        type: boolean
+        required: false
+        default: false
 
 # Cancel any superseded manual run on the same ref. Manual dispatches
 # are rare (you'd typically only run this when investigating a boot
@@ -321,6 +326,7 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_HOME: /usr/local/lib/android/sdk
+          TWOYI_SKIP_PRELOAD: ${{ github.event.inputs.skip_preload == true && '1' || '' }}
 
       - name: Print boot verdict
         # The script writes a verdict file. We surface it in the GHA
