@@ -251,10 +251,11 @@ jobs:
       - name: Install cmdline-tools (sdkmanager not pre-installed on arm64)
         run: |
           set -e
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          # Use home directory since /usr/local/lib/android may not be writable
+          export ANDROID_HOME=$HOME/android-sdk
           mkdir -p "$ANDROID_HOME/cmdline-tools"
 
-          # Download cmdline-tools if not present
+          # Download cmdline-tools
           if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
             echo "Installing cmdline-tools..."
             cd /tmp
@@ -285,13 +286,16 @@ jobs:
           echo "=== Verify system image installed ==="
           ls -la "$ANDROID_HOME/system-images/android-30/default/arm64-v8a/"
 
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+
       - name: Create arm64 AVD
         env:
           ANDROID_AVD_HOME: /home/runner/.android/avd
         run: |
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=$HOME/android-sdk
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          mkdir -p /home/runner/.android/avd
+          mkdir -p $ANDROID_AVD_HOME
 
           echo "no" | avdmanager create avd \
               -n twoyi_arm64 \
@@ -316,7 +320,7 @@ jobs:
         env:
           ANDROID_AVD_HOME: /home/runner/.android/avd
         run: |
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=$HOME/android-sdk
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
           # Choose acceleration based on KVM availability
@@ -363,6 +367,8 @@ jobs:
       - name: Build and push test binary to Android
         run: |
           set -e
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
           cd app/cpp/twoyi_loader
 
           # Build a test binary that runs as shell user (not untrusted_app)
