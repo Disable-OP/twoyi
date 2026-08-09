@@ -1,0 +1,290 @@
+# AArch64 seccomp/SIGSYS validation via QEMU system-mode
+#
+# This workflow boots a real AArch64 Linux kernel under qemu-system-aarch64
+# (TCG software emulation) and runs our seccomp/SIGSYS test binary as init.
+#
+# The official Android emulator does NOT support arm64 on x86_64 hosts
+# (Google Issue Tracker #242699119), so we use upstream QEMU system-mode
+# with a Debian arm64 kernel instead.
+#
+# This validates:
+#   - seccomp BPF filter installs on AArch64
+#   - SIGSYS handler receives si_syscall correctly
+#   - ucontext->regs[0] (x0) sets the return value
+#   - Non-trapped syscalls pass through
+#
+# This does NOT validate:
+#   - Android bionic seccomp policy (this is glibc, not bionic)
+#   - Android zygote seccomp filter
+#   - Android SELinux
+#   - Physical arm64 device behavior
+
+name: AArch64 Seccomp Validation
+
+'on':
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'app/cpp/twoyi_loader/**'
+      - '.github/workflows/arm64-seccomp-test.yml'
+
+concurrency:
+  group: arm64-seccomp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64-seccomp-test:
+    name: AArch64 seccomp/SIGSYS via QEMU system-mode
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install QEMU system-mode and cross-compiler
+        run: |
+          set -e
+          # Download packages without root using apt-get download
+          mkdir -p /tmp/qemu-system /tmp/gcc-aarch64
+          cd /tmp
+
+          # QEMU system-mode and dependencies
+          apt-get download qemu-system-arm qemu-system-data ipxe-qemu \
+            qemu-efi-aarch64 libcapstone5 libpmem1 libfdt1 libibverbs1 \
+            libslirp0 libfuse3-4 libaio1t64 liburing2 librdmacm1t64 \
+            libvdeplug2t64 libndctl6 libdaxctl1 libnl-3-200 libnl-route-3-200 \
+            libkmod2 2>&1 | tail -5
+
+          for d in *.deb; do dpkg-deb -x "$d" qemu-system-extract/ 2>/dev/null || true; done
+
+          # Cross-compiler toolchain
+          apt-get download gcc-14-aarch64-linux-gnu cpp-14-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross libc6-arm64-cross gcc-14-cross-base \
+            libgcc-14-dev-arm64-cross 2>&1 | tail -5
+
+          for d in gcc-14-aarch64*.deb cpp-14-aarch64*.deb binutils-aarch64*.deb \
+                   libc6-dev-arm64*.deb linux-libc-dev-arm64*.deb libc6-arm64*.deb \
+                   gcc-14-cross-base*.deb libgcc-14-dev-arm64*.deb; do
+            dpkg-deb -x "$d" gcc-aarch64-extract/ 2>/dev/null || true
+          done
+
+          # cpio for initramfs
+          apt-get download cpio 2>&1 | tail -1
+          dpkg-deb -x cpio_*.deb /tmp/cpio-extract/ 2>/dev/null
+
+          echo "=== Verify installations ==="
+          export LD_LIBRARY_PATH="/tmp/qemu-system-extract/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+          /tmp/qemu-system-extract/usr/bin/qemu-system-aarch64 --version | head -1
+          /tmp/gcc-aarch64-extract/usr/bin/aarch64-linux-gnu-gcc-14 --version | head -1
+
+      - name: Download AArch64 Linux kernel
+        run: |
+          set -e
+          cd /tmp
+          # Debian netboot kernel — raw ARM64 Image (not EFI-wrapped)
+          curl -sL "http://deb.debian.org/debian/dists/trixie/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux" -o debian_arm64_kernel
+          file debian_arm64_kernel
+          ls -la debian_arm64_kernel
+
+      - name: Build AArch64 test binary
+        run: |
+          set -e
+          cd /home/z/my-project/repos/twoyi/app/cpp/twoyi_loader
+
+          export PATH="/tmp/gcc-aarch64-extract/usr/bin:$PATH"
+          export LD_LIBRARY_PATH="/tmp/gcc-aarch64-extract/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+          export SYSROOT="/tmp/gcc-aarch64-extract/usr/aarch64-linux-gnu"
+          export GCC_INCLUDE="/tmp/gcc-aarch64-extract/usr/lib/gcc-cross/aarch64-linux-gnu/14/include"
+
+          # Build the minimal test binary (self-contained, no loader_main)
+          cat > /tmp/test_arm64_init.c << 'TESTEOF'
+          #include <unistd.h>
+          #include <sys/syscall.h>
+          #include <errno.h>
+          #include <signal.h>
+          #include <linux/seccomp.h>
+          #include <linux/filter.h>
+          #include <sys/prctl.h>
+          #include <stdint.h>
+          #include <ucontext.h>
+          #include <fcntl.h>
+
+          static void write_str(int fd, const char *s) {
+              int len = 0; while (s[len]) len++;
+              syscall(SYS_write, fd, s, len);
+          }
+          static void write_hex(int fd, unsigned long val) {
+              char buf[20]; char *p = buf;
+              *p++ = '0'; *p++ = 'x';
+              for (int i = 60; i >= 0; i -= 4)
+                  *p++ = "0123456789abcdef"[(val >> i) & 0xf];
+              *p++ = '\n';
+              syscall(SYS_write, fd, buf, p - buf);
+          }
+
+          #define ARM64_NR_mount 40
+          #define ARM64_NR_getpid 172
+          #define ARM64_NR_chroot 51
+          #define ARM64_NR_sched_yield 124
+
+          static volatile int sigsys_fired = 0;
+          static volatile long sigsys_nr = -1;
+
+          static void sigsys_handler(int sig, siginfo_t *info, void *ctx) {
+              (void)sig;
+              ucontext_t *uc = (ucontext_t *)ctx;
+              if (info->si_code != 1) return;
+              sigsys_fired++;
+              sigsys_nr = info->si_syscall;
+              if (info->si_syscall == ARM64_NR_mount || info->si_syscall == ARM64_NR_chroot) {
+                  uc->uc_mcontext.regs[0] = 0;
+              } else {
+                  uc->uc_mcontext.regs[0] = -ENOSYS;
+              }
+          }
+
+          void _start(void) {
+              write_str(1, "=== AArch64 Seccomp Test ===\n");
+
+              struct sigaction sa = {0};
+              sa.sa_sigaction = sigsys_handler;
+              sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+              sigemptyset(&sa.sa_mask);
+              if (sigaction(SIGSYS, &sa, NULL) != 0) {
+                  write_str(1, "FAIL: sigaction failed\n");
+                  while(1) syscall(ARM64_NR_sched_yield);
+              }
+              write_str(1, "OK: SIGSYS handler installed\n");
+
+              sigset_t mask;
+              sigemptyset(&mask);
+              sigaddset(&mask, SIGSYS);
+              sigprocmask(SIG_UNBLOCK, &mask, NULL);
+
+              if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+                  write_str(1, "FAIL: prctl failed\n");
+                  while(1) syscall(ARM64_NR_sched_yield);
+              }
+              write_str(1, "OK: PR_SET_NO_NEW_PRIVS\n");
+
+              struct sock_filter filter[] = {
+                  {0x20, 0, 0, 4},
+                  {0x15, 1, 0, 0xC00000B7},
+                  {0x06, 0, 0, 0x80000000},
+                  {0x20, 0, 0, 0},
+                  {0x15, 3, 0, 40},
+                  {0x15, 2, 0, 51},
+                  {0x06, 0, 0, 0x7fff0000},
+                  {0x06, 0, 0, 0x00030000},
+                  {0x06, 0, 0, 0x00030000},
+              };
+              struct sock_fprog prog = {
+                  .len = sizeof(filter)/sizeof(filter[0]),
+                  .filter = filter,
+              };
+
+              long sec_ret = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+              if (sec_ret != 0) {
+                  write_str(1, "seccomp() failed, trying prctl... errno=");
+                  write_hex(1, errno);
+                  sec_ret = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
+                  if (sec_ret != 0) {
+                      write_str(1, "FAIL: prctl seccomp also failed\n");
+                      while(1) syscall(ARM64_NR_sched_yield);
+                  }
+              }
+              write_str(1, "OK: seccomp filter installed\n");
+
+              write_str(1, "Calling mount()...\n");
+              long mount_ret = syscall(ARM64_NR_mount, "tmpfs", "/test", "tmpfs", 0, NULL);
+              write_str(1, "mount returned: ");
+              write_hex(1, (unsigned long)mount_ret);
+              write_str(1, "sigsys_fired: ");
+              write_hex(1, (unsigned long)sigsys_fired);
+              write_str(1, "sigsys_nr: ");
+              write_hex(1, (unsigned long)sigsys_nr);
+
+              if (mount_ret == 0 && sigsys_fired > 0) {
+                  write_str(1, "PASS: mount trapped and emulated\n");
+              } else {
+                  write_str(1, "FAIL: mount not trapped\n");
+              }
+
+              long pid = syscall(ARM64_NR_getpid);
+              write_str(1, "getpid returned: ");
+              write_hex(1, (unsigned long)pid);
+              if (pid > 0) {
+                  write_str(1, "PASS: getpid not trapped\n");
+              } else {
+                  write_str(1, "FAIL: getpid failed\n");
+              }
+
+              write_str(1, "=== DONE ===\n");
+              while(1) syscall(ARM64_NR_sched_yield);
+          }
+          TESTEOF
+
+          # Stub symbols needed for static linking
+          cat > /tmp/arm64_stub.c << 'STUBEOF'
+          __attribute__((weak)) const char _DYNAMIC[] = {0};
+          __attribute__((weak)) void _dl_relocate_static_pie(void) {}
+          __attribute__((weak)) void _init(void) {}
+          __attribute__((weak)) void _fini(void) {}
+          STUBEOF
+
+          aarch64-linux-gnu-gcc-14 --sysroot=$SYSROOT -I$GCC_INCLUDE \
+            -fno-stack-protector -O0 -g -nostartfiles -static \
+            -Wl,--no-dynamic-linker -Wl,-e,_start \
+            -o /tmp/test_arm64_init /tmp/test_arm64_init.c /tmp/arm64_stub.c \
+            -lc -lgcc -lgcc_eh 2>&1
+
+          file /tmp/test_arm64_init
+
+      - name: Create initramfs and boot under QEMU
+        run: |
+          set -e
+          cd /tmp
+
+          # Create minimal initramfs with test binary as /init
+          mkdir -p initramfs
+          cp test_arm64_init initramfs/init
+          chmod +x initramfs/init
+          cd initramfs
+          find . | /tmp/cpio-extract/usr/bin/cpio -o -H newc 2>/dev/null > /tmp/initramfs.cpio
+          ls -la /tmp/initramfs.cpio
+
+          # Boot under QEMU system-mode
+          export LD_LIBRARY_PATH="/tmp/qemu-system-extract/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+          timeout 60 /tmp/qemu-system-extract/usr/bin/qemu-system-aarch64 \
+            -machine virt -cpu cortex-a57 -m 512 -nographic \
+            -kernel debian_arm64_kernel \
+            -initrd /tmp/initramfs.cpio \
+            -append "console=ttyAMA0 rdinit=/init" \
+            -net none -no-reboot \
+            > /tmp/qemu_output.log 2>&1 || true
+
+          echo "=== QEMU Output ==="
+          cat /tmp/qemu_output.log
+
+      - name: Check test results
+        run: |
+          cd /tmp
+          if grep -q "PASS: mount trapped and emulated" qemu_output.log && \
+             grep -q "PASS: getpid not trapped" qemu_output.log; then
+            echo "✓ ALL AArch64 TESTS PASSED"
+            exit 0
+          else
+            echo "✗ AArch64 TESTS FAILED"
+            exit 1
+          fi
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-seccomp-test-output
+          path: /tmp/qemu_output.log
+          retention-days: 7
