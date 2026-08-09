@@ -281,13 +281,27 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uc) {
     long nr = info->si_syscall;
     g_sigsys_count++;
 
-    // Log every SIGSYS trap (async-signal-safe: write + snprintf are OK
-    // because we set SA_NODEFER and the handler is short)
+    // Log: use ONLY async-signal-safe functions (write, not snprintf)
+    // Format: "[twoyi_loader] SIGSYS #N nr=M\n"
     {
-        char msg[128];
-        int len = snprintf(msg, sizeof(msg),
-            "[twoyi_loader] SIGSYS #%d: nr=%ld\n", g_sigsys_count, nr);
-        write(2, msg, len);
+        char msg[64];
+        char *p = msg;
+        const char *prefix = "[twoyi_loader] SIGSYS #";
+        while (*prefix) *p++ = *prefix++;
+        // Write count (decimal)
+        int c = g_sigsys_count;
+        char tmp[16]; int t = 0;
+        if (c == 0) tmp[t++] = '0';
+        while (c > 0) { tmp[t++] = '0' + (c % 10); c /= 10; }
+        while (t > 0) *p++ = tmp[--t];
+        *p++ = ' '; *p++ = 'n'; *p++ = 'r'; *p++ = '=';
+        // Write syscall number (decimal)
+        long n = nr;
+        if (n == 0) tmp[t++] = '0';
+        else { t = 0; while (n > 0) { tmp[t++] = '0' + (n % 10); n /= 10; } }
+        while (t > 0) *p++ = tmp[--t];
+        *p++ = '\n';
+        write(2, msg, p - msg);
     }
     long ret;
     switch (nr) {
