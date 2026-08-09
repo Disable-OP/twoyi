@@ -864,13 +864,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        // Only call setup_mounts in the child if we DIDN'T already do it
-        // in the parent (i.e., if use_namespaces is false, the parent
-        // skipped pivot_root and the child needs to do mount setup).
-        // If use_namespaces is true, the parent already did pivot_root
-        // and mount setup BEFORE installing seccomp, so the child must
-        // NOT call mount() again (seccomp would kill it with SIGSYS).
-        if !cfg.use_namespaces {
+        // Skip setup_mounts entirely when use_namespaces is false.
+        // When running as untrusted_app (non-root), the zygote's seccomp
+        // filter blocks mount() and kills the process with SIGSYS.
+        // Without root, we can't do pivot_root or mount operations anyway,
+        // so there's no point trying — just chroot into the rootfs and
+        // exec init directly.
+        if cfg.use_namespaces {
             let mount_cfg = mount_mgr::MountConfig {
                 rootfs: cfg.rootfs.clone(),
                 rom_dir: cfg.rom_dir.clone(),
@@ -878,17 +878,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 read_only_rom: cfg.read_only_rom,
             };
             if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
-                // FATAL: without mounts, pivot_root/bind-mounts never happened
-                // and init would run against the host filesystem. Surface the
-                // errno via async-signal-safe write(2) so the parent (and the
-                // user reading logcat / log.txt) sees WHY the child died.
-                // Use _exit, not return, to avoid running atexit handlers.
                 let errno = e.raw_os_error().unwrap_or(0);
                 unsafe {
                     safe_write_err_errno(b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed", errno);
                     libc::_exit(1);
                 }
             }
+        } else {
+            // Non-root mode: just chroot into the rootfs.
+            // chroot() is NOT blocked by the zygote's seccomp filter
+            // (it's allowed for untrusted_app on Android 11).
+            safe_write_err(b"[KR64 CHILD] non-root mode: skipping mount setup, using chroot\n");
+            let rootfs_cstr = match CString::new(cfg.rootfs.as_str()) {
+                Ok(s) => s,
+                Err(_) => unsafe { libc::_exit(127); }
+            };
+            if unsafe { libc::chroot(rootfs_cstr.as_ptr()) } != 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                safe_write_err_errno(b"[KR64 CHILD] FATAL: chroot failed", errno);
+                unsafe { libc::_exit(1); }
+            }
+            // chdir to / after chroot
+            unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char); }
         }
 
         if cfg.install_seccomp {
