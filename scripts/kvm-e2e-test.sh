@@ -451,11 +451,20 @@ fi
 # kr64's LD_PRELOAD path is /system/lib64/libgetpid_hook.so (relative to chroot).
 # We need the file to be at {rootfs}/system/lib64/libgetpid_hook.so.
 # RomManager.ensureLibSymlink would create this, but the app hasn't started yet.
+#
+# IMPORTANT: we COPY the file (not symlink) because after chroot, absolute
+# symlink targets like /data/local/tmp/libgetpid_hook.so would be unreachable
+# (they'd be interpreted as <chroot>/data/local/tmp/... which doesn't exist).
 "$ADB_BIN" -s emulator-5554 shell "
     mkdir -p $TWOYI_PROFILE/system/lib64
-    if [ ! -e $TWOYI_PROFILE/system/lib64/libgetpid_hook.so ]; then
-        ln -sf /data/local/tmp/libgetpid_hook.so $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
-    fi
+    cp /data/local/tmp/libgetpid_hook.so $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
+    chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
+    echo '  ✓ copied libgetpid_hook.so to rootfs/system/lib64/'
+" 2>/dev/null || true
+
+# Also create the libkr64.so symlink in the rootfs (RomManager does this
+# when the app starts, but we want it ready before the app launches).
+"$ADB_BIN" -s emulator-5554 shell "
     if [ ! -e $TWOYI_PROFILE/system/lib64/libkr64.so ]; then
         ln -sf /data/local/tmp/kr64 $TWOYI_PROFILE/system/lib64/libkr64.so
     fi
