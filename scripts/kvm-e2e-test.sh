@@ -246,7 +246,7 @@ case "$ROOTFS_SOURCE" in
         # with SIGSEGV at address 0x86 (NULL pointer dereference in
         # linker64's soinfo handling).
         "$ADB_BIN" -s emulator-5554 shell \
-            'cd / && tar cf /data/local/tmp/rootfs.tar system/ init* default.prop apex/' \
+            'cd / && tar cf /data/local/tmp/rootfs.tar system/ vendor/ init* default.prop apex/' \
             2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log"
         echo "  → pull /data/local/tmp/rootfs.tar"
         "$ADB_BIN" -s emulator-5554 pull /data/local/tmp/rootfs.tar "$ROOTFS_TAR"
