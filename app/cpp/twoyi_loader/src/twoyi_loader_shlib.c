@@ -523,6 +523,12 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
     init_real_funcs();
 
+    // Block fstab files → init skips first_stage_mount
+    if (path && strstr(path, "fstab.")) {
+        errno = ENOENT;
+        return -1;
+    }
+
     // Special handling for selinuxfs paths
     // Init opens /sys/fs/selinux/checkreqprot, /sys/fs/selinux/enforce, etc.
     // These need to exist as writable files.
@@ -550,6 +556,12 @@ int open(const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
     init_real_funcs();
+
+    // Block fstab files → init skips first_stage_mount
+    if (path && strstr(path, "fstab.")) {
+        errno = ENOENT;
+        return -1;
+    }
 
     // Log selinuxfs opens for debugging
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
@@ -603,10 +615,22 @@ int open(const char *path, int flags, ...) {
 }
 
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
-// Only intercept selinuxfs paths; pass through everything else
+// Only intercept selinuxfs paths and fstab files; pass through everything else
 int __open_2(const char *path, int flags) {
+    // SELinuxFS: intercept and auto-create
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return open(path, flags);  // our hook (translate + create)
+    }
+    // Fstab files: return ENOENT so init skips first_stage_mount
+    // (init checks fstab, if not found → "First stage mount skipped")
+    if (path && (strstr(path, "fstab.") || strstr(path, "/proc/device-tree"))) {
+        if (strstr(path, "fstab.")) {
+            write_str(2, "[twoyi_loader] blocking fstab open: ");
+            write_str(2, path);
+            write_str(2, "\n");
+        }
+        errno = ENOENT;
+        return -1;
     }
     // Pass through to real bionic __open_2 — do NOT translate
     static int (*real_open2)(const char *, int) = NULL;
@@ -623,6 +647,11 @@ int __open_2(const char *path, int flags) {
 int __openat_2(int dirfd, const char *path, int flags) {
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return openat(dirfd, path, flags);  // our hook
+    }
+    // Fstab files: return ENOENT
+    if (path && strstr(path, "fstab.")) {
+        errno = ENOENT;
+        return -1;
     }
     static int (*real_openat2)(int, const char *, int) = NULL;
     if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
