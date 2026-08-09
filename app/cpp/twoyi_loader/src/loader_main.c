@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 // Auxiliary vector types (from include/uapi/linux/auxvec.h).
 #define AT_NULL   0
@@ -112,8 +113,24 @@ uint64_t twoyi_loader_main(uint64_t *raw_stack) {
     write_str(2, "[twoyi_loader] SIGSYS handler installed\n");
 
     // Install the seccomp BPF filter.
-    if (twoyi_seccomp_install() != 0) {
-        write_str(2, "[twoyi_loader] FATAL: failed to install seccomp filter\n");
+    int sec_ret = twoyi_seccomp_install();
+    if (sec_ret != 0) {
+        // Log the error with the errno
+        int e = errno;
+        char buf[64];
+        const char hex[] = "0123456789abcdef";
+        char *p = buf;
+        const char *msg = "[twoyi_loader] FATAL: seccomp install failed errno=";
+        size_t mlen = 0;
+        while (msg[mlen]) mlen++;
+        write(2, msg, mlen);
+        *p++ = '0';
+        *p++ = 'x';
+        for (int i = 28; i >= 0; i -= 4) {
+            *p++ = hex[(e >> i) & 0xf];
+        }
+        *p++ = '\n';
+        write(2, buf, p - buf);
         _exit(1);
     }
     write_str(2, "[twoyi_loader] seccomp filter installed\n");
