@@ -63,6 +63,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private TextView mLoadingText;
     private View mLoadingLayout;
     private View mBootLogView;
+    private BootAnimationView mBootAnimationView;
 
     private int mVirtualDisplayWidth;
     private int mVirtualDisplayHeight;
@@ -177,9 +178,17 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         mLoadingView = findViewById(R.id.loading);
         mLoadingText = findViewById(R.id.loadingText);
         mBootLogView = findViewById(R.id.bootlog);
+        mBootAnimationView = findViewById(R.id.bootAnimation);
 
         mLoadingLayout.setVisibility(View.VISIBLE);
         mLoadingView.startAnimation();
+
+        // Show the Android-style boot animation (host-side fake bootanimation)
+        // This shows a spinning ring while the guest boots.
+        // The real guest bootanimation requires SurfaceFlinger + HWC + gralloc.
+        if (mBootAnimationView != null) {
+            mBootAnimationView.setVisibility(View.VISIBLE);
+        }
 
         UITips.checkForAndroid12(this, this::bootSystem);
 
@@ -398,6 +407,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             runOnUiThread(() -> {
                 mLoadingView.stopAnimation();
                 mLoadingLayout.setVisibility(View.GONE);
+                // Hide the boot animation when boot completes
+                if (mBootAnimationView != null) {
+                    mBootAnimationView.setBooted(true);
+                    mBootAnimationView.setVisibility(View.GONE);
+                }
             });
         }, "waiting-boot").start();
     }

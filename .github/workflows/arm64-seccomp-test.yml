@@ -284,17 +284,34 @@ jobs:
               "build-tools;30.0.3" \
               "system-images;android-30;default;arm64-v8a" || true
 
-          # Download emulator package manually (it's a generic zip, works on arm64)
+          # Download emulator package manually
+          # The emulator zip from the Android repository works on arm64 hosts
+          # (it's a 64-bit Linux binary + Qt + Python wrapper)
           echo "=== Downloading emulator package manually ==="
-          EMULATOR_URL="https://dl.google.com/android/repository/emulator-linux-11591348.zip"
-          curl -sL -o /tmp/emulator.zip "$EMULATOR_URL"
-          unzip -q -o /tmp/emulator.zip -d "$ANDROID_HOME/"
-          rm /tmp/emulator.zip
-          chmod +x "$ANDROID_HOME/emulator/emulator" 2>/dev/null || true
+          # Try multiple URLs — the repository structure changes over time
+          EMULATOR_URLS=(
+            "https://dl.google.com/android/repository/emulator-linux-13477706.zip"
+            "https://dl.google.com/android/repository/emulator-linux-13114558.zip"
+            "https://dl.google.com/android/repository/emulator-linux-11591348.zip"
+          )
+          for URL in "${EMULATOR_URLS[@]}"; do
+            echo "Trying: $URL"
+            if curl -sL --fail -o /tmp/emulator.zip "$URL"; then
+              echo "Downloaded from: $URL"
+              break
+            fi
+          done
 
-          echo "=== Verify emulator installed ==="
-          ls -la "$ANDROID_HOME/emulator/emulator" 2>/dev/null || echo "emulator binary not found"
-          "$ANDROID_HOME/emulator/emulator" -version 2>&1 | head -3 || true
+          if [ -f /tmp/emulator.zip ] && unzip -t /tmp/emulator.zip >/dev/null 2>&1; then
+            unzip -q -o /tmp/emulator.zip -d "$ANDROID_HOME/"
+            rm /tmp/emulator.zip
+            chmod +x "$ANDROID_HOME/emulator/emulator" 2>/dev/null || true
+            echo "=== Emulator installed ==="
+            "$ANDROID_HOME/emulator/emulator" -version 2>&1 | head -3 || true
+          else
+            echo "⚠ Could not download emulator package — skipping Android emulator test"
+            echo "SKIP_EMULATOR=true" >> $GITHUB_ENV
+          fi
 
           echo "=== Verify system image installed ==="
           ls -la "$ANDROID_HOME/system-images/android-30/default/arm64-v8a/"
