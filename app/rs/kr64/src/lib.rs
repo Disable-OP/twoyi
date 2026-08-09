@@ -817,6 +817,38 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ---------------------------------------------------------------
     // Step 5: fork + exec the guest.
     // ---------------------------------------------------------------
+
+    // Debug: check if libgetpid_hook.so exists in the new root
+    // (after pivot_root, before fork)
+    let hook_path = "/system/lib64/libgetpid_hook.so";
+    if Path::new(hook_path).exists() {
+        info!("[KR64] PARENT: libgetpid_hook.so EXISTS at {} (after pivot_root)", hook_path);
+        match std::fs::metadata(hook_path) {
+            Ok(m) => info!("[KR64] PARENT: file size = {} bytes, mode = {:o}", m.len(), {
+                use std::os::unix::fs::PermissionsExt;
+                m.permissions().mode()
+            }),
+            Err(e) => info!("[KR64] PARENT: metadata error: {}", e),
+        }
+    } else {
+        error!("[KR64] PARENT: libgetpid_hook.so does NOT exist at {} (after pivot_root)", hook_path);
+        // List /system/lib64/ to see what's there
+        if let Ok(entries) = std::fs::read_dir("/system/lib64") {
+            let mut count = 0;
+            for entry in entries {
+                if let Ok(e) = entry {
+                    if count < 10 {
+                        info!("[KR64] PARENT: /system/lib64/ contains: {:?}", e.file_name());
+                    }
+                    count += 1;
+                }
+            }
+            info!("[KR64] PARENT: /system/lib64/ has {} entries total", count);
+        } else {
+            error!("[KR64] PARENT: cannot read /system/lib64/ directory");
+        }
+    }
+
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
     if pid < 0 {
