@@ -56,6 +56,10 @@ name: KVM E2E Test
         type: boolean
         required: false
         default: false
+      init_path:
+        description: 'Override the guest init binary path (e.g. /system/bin/sh for a simpler test)'
+        required: false
+        default: ''
 
 # Cancel any superseded manual run on the same ref. Manual dispatches
 # are rare (you'd typically only run this when investigating a boot
@@ -327,6 +331,7 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_HOME: /usr/local/lib/android/sdk
           TWOYI_SKIP_PRELOAD: ${{ github.event.inputs.skip_preload == 'true' && '1' || '' }}
+          TWOYI_INIT_PATH: ${{ github.event.inputs.init_path || '' }}
 
       - name: Print boot verdict
         # The script writes a verdict file. We surface it in the GHA
