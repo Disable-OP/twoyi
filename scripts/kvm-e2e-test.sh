@@ -478,15 +478,26 @@ else
     ls -la app/build/outputs/apk/release/ 2>/dev/null || echo "    APK dir does not exist"
 fi
 
-# --- Push libgetpid_hook.so to ROOT of rootfs (not system/lib64/) ---
-# The rootfs's system/ directory comes from the emulator's /system partition.
-# Files pushed to system/lib64/ are NOT visible after pivot_root + bind mount
-# (the bind mount captures the original partition state, not newly added files).
-# Instead, push to the ROOT of the rootfs — this is on the data partition
-# and is always visible after pivot_root.
-# The kr64 parent will copy it from / to /dev/ (tmpfs) before fork.
-"$ADB_BIN" -s emulator-5554 push /data/local/tmp/libgetpid_hook.so "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
-echo "  ✓ pushed libgetpid_hook.so to root of rootfs"
+# --- Push libgetpid_hook.so to ROOT of rootfs ---
+# Use the file from the CI runner's EXTRACT_DIR (not from the device's
+# /data/local/tmp/, which may not have been populated).
+if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
+    "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
+    echo "  ✓ pushed libgetpid_hook.so to root of rootfs (from EXTRACT_DIR)"
+elif [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
+    # libgetpid_hook.so wasn't extracted, but libkr64.so was — try extracting
+    # libgetpid_hook.so separately
+    (cd "$EXTRACT_DIR" && unzip -o "$APK_PATH" "lib/x86_64/libgetpid_hook.so" 2>/dev/null) || true
+    if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
+        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
+        echo "  ✓ pushed libgetpid_hook.so to root of rootfs (extracted separately)"
+    else
+        echo "  ⚠ libgetpid_hook.so not found in APK extraction"
+    fi
+else
+    echo "  ⚠ EXTRACT_DIR not populated — trying device /data/local/tmp/"
+    "$ADB_BIN" -s emulator-5554 push /data/local/tmp/libgetpid_hook.so "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2 || echo "  ⚠ push from /data/local/tmp/ failed"
+fi
 "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libgetpid_hook.so && ls -la $TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
 
 # Also create the libkr64.so symlink in the rootfs (RomManager does this
