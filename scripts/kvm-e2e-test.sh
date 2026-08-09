@@ -478,49 +478,16 @@ else
     ls -la app/build/outputs/apk/release/ 2>/dev/null || echo "    APK dir does not exist"
 fi
 
-# --- Create symlinks in the rootfs for libgetpid_hook.so ---
-# kr64's LD_PRELOAD path is /system/lib64/libgetpid_hook.so (relative to chroot).
-# We need the file to be at {rootfs}/system/lib64/libgetpid_hook.so.
-# Use adb push directly to the rootfs path (more reliable than cp/cat on device)
-"$ADB_BIN" -s emulator-5554 shell "mkdir -p $TWOYI_PROFILE/system/lib64" 2>/dev/null
-if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
-    "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" "$TWOYI_PROFILE/system/lib64/libgetpid_hook.so" 2>&1 | tail -2
-    echo "  ✓ pushed libgetpid_hook.so directly to rootfs/system/lib64/"
-elif [ -f /data/local/tmp/libgetpid_hook.so ]; then
-    "$ADB_BIN" -s emulator-5554 push /data/local/tmp/libgetpid_hook.so "$TWOYI_PROFILE/system/lib64/libgetpid_hook.so" 2>&1 | tail -2
-    echo "  ✓ pushed libgetpid_hook.so from /data/local/tmp/"
-else
-    # Copy from installed APK on device
-    "$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
-    sleep 1
-    "$ADB_BIN" -s emulator-5554 wait-for-device 2>/dev/null || true
-    "$ADB_BIN" -s emulator-5554 shell "
-        APK_DIR=\$(dirname \$(pm path io.twoyi | head -1 | sed 's/package://'))
-        cat \$APK_DIR/lib/x86_64/libgetpid_hook.so > $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'copied from APK' || echo 'copy from APK FAILED'
-        ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
-    " 2>&1 | tail -3
-fi
-"$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so" 2>/dev/null || true
-
-# Verify libgetpid_hook.so exists in the rootfs
-# Also check if system/lib64 is a symlink (which would cause the file to
-# be written to the wrong location)
-"$ADB_BIN" -s emulator-5554 shell "
-    echo '--- checking system/lib64 ---'
-    ls -la $TWOYI_PROFILE/system/ | head -5
-    echo '--- checking lib64 dir ---'
-    ls -la $TWOYI_PROFILE/system/lib64/ | head -5
-    echo '--- checking libgetpid_hook.so ---'
-    ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so 2>&1
-    echo '--- readlink check ---'
-    readlink -f $TWOYI_PROFILE/system/lib64 2>&1
-    readlink -f $TWOYI_PROFILE/system 2>&1
-    echo '--- file exists? ---'
-    test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'EXISTS' || echo 'MISSING'
-" 2>&1
-
-# Verify libgetpid_hook.so exists in the rootfs
-"$ADB_BIN" -s emulator-5554 shell "test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo '  ✓ libgetpid_hook.so exists in rootfs' || echo '  ⚠ libgetpid_hook.so MISSING from rootfs — init will fail to link'" 2>&1 | tail -1
+# --- Push libgetpid_hook.so to ROOT of rootfs (not system/lib64/) ---
+# The rootfs's system/ directory comes from the emulator's /system partition.
+# Files pushed to system/lib64/ are NOT visible after pivot_root + bind mount
+# (the bind mount captures the original partition state, not newly added files).
+# Instead, push to the ROOT of the rootfs — this is on the data partition
+# and is always visible after pivot_root.
+# The kr64 parent will copy it from / to /dev/ (tmpfs) before fork.
+"$ADB_BIN" -s emulator-5554 push /data/local/tmp/libgetpid_hook.so "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
+echo "  ✓ pushed libgetpid_hook.so to root of rootfs"
+"$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libgetpid_hook.so && ls -la $TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
 
 # Also create the libkr64.so symlink in the rootfs (RomManager does this
 # when the app starts, but we want it ready before the app launches).
