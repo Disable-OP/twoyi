@@ -615,24 +615,31 @@ int open(const char *path, int flags, ...) {
 }
 
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
-// Only intercept selinuxfs paths and fstab files; pass through everything else
+// Translate rootfs paths, intercept selinuxfs, block fstab
 int __open_2(const char *path, int flags) {
     // SELinuxFS: intercept and auto-create
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return open(path, flags);  // our hook (translate + create)
     }
     // Fstab files: return ENOENT so init skips first_stage_mount
-    // (init checks fstab, if not found → "First stage mount skipped")
-    if (path && (strstr(path, "fstab.") || strstr(path, "/proc/device-tree"))) {
-        if (strstr(path, "fstab.")) {
-            write_str(2, "[twoyi_loader] blocking fstab open: ");
-            write_str(2, path);
-            write_str(2, "\n");
-        }
+    if (path && strstr(path, "fstab.")) {
         errno = ENOENT;
         return -1;
     }
-    // Pass through to real bionic __open_2 — do NOT translate
+    // For rootfs paths (/vendor, /system, /dev, /proc, /sys, /apex, /data):
+    // translate to {rootfs}/path
+    if (path && path[0] == '/' && g_rootfs) {
+        const char *translated = translate(path);
+        static int (*real_open2)(const char *, int) = NULL;
+        if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
+        if (real_open2) return real_open2(translated, flags);
+#if defined(__x86_64__)
+        return syscall(NR_open, translated, flags);
+#else
+        return syscall(NR_openat, AT_FDCWD, translated, flags);
+#endif
+    }
+    // Relative paths: pass through
     static int (*real_open2)(const char *, int) = NULL;
     if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
     if (real_open2) return real_open2(path, flags);
@@ -648,10 +655,17 @@ int __openat_2(int dirfd, const char *path, int flags) {
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return openat(dirfd, path, flags);  // our hook
     }
-    // Fstab files: return ENOENT
     if (path && strstr(path, "fstab.")) {
         errno = ENOENT;
         return -1;
+    }
+    // Translate rootfs paths
+    if (path && path[0] == '/' && g_rootfs) {
+        const char *translated = translate(path);
+        static int (*real_openat2)(int, const char *, int) = NULL;
+        if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
+        if (real_openat2) return real_openat2(dirfd, translated, flags);
+        return syscall(NR_openat, dirfd, translated, flags);
     }
     static int (*real_openat2)(int, const char *, int) = NULL;
     if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
