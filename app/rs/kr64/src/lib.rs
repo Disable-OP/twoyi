@@ -852,6 +852,63 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Step 5: fork + exec the guest.
     // ---------------------------------------------------------------
 
+    // Parent-side diagnostics: verify the actual files at the symlink
+    // targets exist and have non-zero size. access() follows symlinks
+    // and returns success if the file exists, but doesn't tell us if
+    // the file is a valid ELF binary. std::fs::metadata follows symlinks
+    // and returns the size, which we can check.
+    if cfg.use_namespaces {
+        // After pivot_root, paths are relative to the new root.
+        let paths_to_check = [
+            "/system/bin/linker64",
+            "/system/lib64/libc.so",
+            "/system/lib64/libm.so",
+            "/system/lib64/libdl.so",
+            "/apex/com.android.runtime/bin/linker64",
+            "/apex/com.android.runtime/lib64/bionic/libc.so",
+            cfg.init_path.as_str(),
+        ];
+        for path in &paths_to_check {
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    let ft = meta.file_type();
+                    let kind = if ft.is_symlink() { "symlink" }
+                        else if ft.is_file() { "file" }
+                        else if ft.is_dir() { "dir" }
+                        else { "other" };
+                    info!(
+                        "[KR64] PARENT: {} -> {} ({} bytes, {:?})",
+                        path, kind, meta.len(), meta.permissions()
+                    );
+                }
+                Err(e) => {
+                    error!("[KR64] PARENT: {} -> metadata failed: {}", path, e);
+                }
+            }
+        }
+        // Also check if /apex/com.android.runtime is a real directory
+        // with content (not empty)
+        match std::fs::read_dir("/apex/com.android.runtime") {
+            Ok(entries) => {
+                let count = entries.count();
+                info!("[KR64] PARENT: /apex/com.android.runtime has {} entries", count);
+            }
+            Err(e) => {
+                error!("[KR64] PARENT: /apex/com.android.runtime read_dir failed: {}", e);
+            }
+        }
+        // Check if /apex/com.android.runtime/lib64/bionic/ has libc.so
+        match std::fs::read_dir("/apex/com.android.runtime/lib64/bionic") {
+            Ok(entries) => {
+                let count = entries.count();
+                info!("[KR64] PARENT: /apex/com.android.runtime/lib64/bionic has {} entries", count);
+            }
+            Err(e) => {
+                error!("[KR64] PARENT: /apex/com.android.runtime/lib64/bionic read_dir failed: {}", e);
+            }
+        }
+    }
+
     // Copy libgetpid_hook.so to /dev/ (tmpfs) so the child can use
     // LD_PRELOAD=/dev/libgetpid_hook.so.
     //
