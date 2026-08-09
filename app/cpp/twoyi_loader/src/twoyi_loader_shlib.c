@@ -603,13 +603,31 @@ int open(const char *path, int flags, ...) {
 }
 
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
+// Only intercept selinuxfs paths; pass through everything else
 int __open_2(const char *path, int flags) {
-    return open(path, flags);
+    if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
+        return open(path, flags);  // our hook (translate + create)
+    }
+    // Pass through to real bionic __open_2 — do NOT translate
+    static int (*real_open2)(const char *, int) = NULL;
+    if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
+    if (real_open2) return real_open2(path, flags);
+#if defined(__x86_64__)
+    return syscall(NR_open, path, flags);
+#else
+    return syscall(NR_openat, AT_FDCWD, path, flags);
+#endif
 }
 
 // Hook __openat_2 (bionic's fortified openat)
 int __openat_2(int dirfd, const char *path, int flags) {
-    return openat(dirfd, path, flags);
+    if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
+        return openat(dirfd, path, flags);  // our hook
+    }
+    static int (*real_openat2)(int, const char *, int) = NULL;
+    if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
+    if (real_openat2) return real_openat2(dirfd, path, flags);
+    return syscall(NR_openat, dirfd, path, flags);
 }
 
 // =========================================================================
