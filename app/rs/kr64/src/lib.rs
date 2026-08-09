@@ -9,7 +9,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
 
-//! Twoyi kernel-replacement daemon — the Rust port of VM's `libkr64.so`.
+//! Twoyi kernel-replacement daemon -- the Rust port of VM's `libkr64.so`.
 //!
 //! See `VM_KR64_ANALYSIS.md` and `GSI_BOOT_PLAN.md` for the full
 //! background. The short version: twoyi needs a userspace daemon that
@@ -20,7 +20,7 @@
 //!
 //! # Build
 //!
-//! The crate builds as BOTH a cdylib (`libkr64.so` — directly
+//! The crate builds as BOTH a cdylib (`libkr64.so` -- directly
 //! executable via the PIE hack) AND a regular binary (`kr64`). See
 //! `Cargo.toml` and `build.rs` for details.
 //!
@@ -36,30 +36,30 @@
 //!
 //! # Module layout
 //!
-//! * [`devices`]   — virtual `/dev` device creation (qemu_pipe,
+//! * [`devices`]   -- virtual `/dev` device creation (qemu_pipe,
 //!   touch, key, event, gb, gb2).
-//! * [`binder`]    — per-VM `/vm{id}/dev/binder` Unix socket + binder
+//! * [`binder`]    -- per-VM `/vm{id}/dev/binder` Unix socket + binder
 //!   transaction proxy (skeleton; see
 //!   `download/BINDER_SKELETON.md`).
-//! * [`audio`]     — virtual `/dev/audio` Unix socket + bidirectional
+//! * [`audio`]     -- virtual `/dev/audio` Unix socket + bidirectional
 //!   PCM pump (playback + capture skeleton; see
 //!   `download/AUDIO_SENSOR_HAL.md`).
-//! * [`sensors`]   — virtual `/dev/sensors` Unix socket + multiplexed
+//! * [`sensors`]   -- virtual `/dev/sensors` Unix socket + multiplexed
 //!   12-sensor HAL (accel/mag/gyro/... skeleton; see
 //!   `download/AUDIO_SENSOR_HAL.md`).
-//! * [`battery`]   — virtual `/sys/class/power_supply/battery` file tree
+//! * [`battery`]   -- virtual `/sys/class/power_supply/battery` file tree
 //!   and 30 s refresh thread (file-based, no socket; see
 //!   `download/BATTERY_IMPL.md`).
-//! * [`seccomp`]   — BPF seccomp filter + SIGSYS handler.
-//! * [`proc_emu`]  — synthesised `/proc` tree (version, cpuinfo,
+//! * [`seccomp`]   -- BPF seccomp filter + SIGSYS handler.
+//! * [`proc_emu`]  -- synthesised `/proc` tree (version, cpuinfo,
 //!   meminfo, cmdline, self/, sys/).
-//! * [`mount_mgr`] — `unshare(CLONE_NEWNS)` + `pivot_root` + tmpfs
+//! * [`mount_mgr`] -- `unshare(CLONE_NEWNS)` + `pivot_root` + tmpfs
 //!   mounts for /dev, /proc, /sys, /system, /vendor.
 //!
 //! # Dependencies
 //!
 //! Per the task spec ("Use only std + libc, no external crates for
-//! now"), this crate depends on **only** `libc` — no `log`, no
+//! now"), this crate depends on **only** `libc` -- no `log`, no
 //! `once_cell`, no `nix`. Logging is done via the `info!` / `warning!` /
 //! `error!` macros defined below (which expand to `eprintln!`), and
 //! lazy statics use `std::sync::OnceLock` (stabilised in Rust 1.70).
@@ -80,7 +80,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 // ============================================================================
-// Logging — minimal `eprintln!`-based macros. No external `log` crate.
+// Logging -- minimal `eprintln!`-based macros. No external `log` crate.
 //
 // All log lines go to stderr in the format `[KR64 <LEVEL>] <msg>`.
 // This works both on-device (visible via `adb logcat *:S KR64:V` or
@@ -133,7 +133,7 @@ pub(crate) use warning;
 //
 // The helpers below use only the `write(2)` syscall (which IS async-
 // signal-safe) plus a stack-allocated buffer. They are the correct
-// primitive for diagnostics in the child branch of the kr64 fork —
+// primitive for diagnostics in the child branch of the kr64 fork --
 // without them, `mount_mgr::setup_mounts` / `seccomp::install` /
 // `execve` failures are silently swallowed and the parent observes only
 // a bare exit code with no clue why.
@@ -145,7 +145,7 @@ pub(crate) use warning;
 /// Returns the number of bytes written (or -1 on error); callers in the
 /// child branch ignore the result because there is no useful recovery
 /// path. `write(2)` may write fewer bytes than requested (e.g. on a
-/// pipe with a small buffer) — for short log lines on stderr this is
+/// pipe with a small buffer) -- for short log lines on stderr this is
 /// acceptable and we do not retry partial writes.
 unsafe fn safe_write_err(msg: &[u8]) -> isize {
     libc::write(
@@ -157,7 +157,7 @@ unsafe fn safe_write_err(msg: &[u8]) -> isize {
 
 /// Format a signed integer as decimal into a fixed-size stack buffer
 /// and return the number of bytes written. This is the async-signal-
-/// safe equivalent of `format!("{}", n)` — no allocation, no locks.
+/// safe equivalent of `format!("{}", n)` -- no allocation, no locks.
 ///
 /// The buffer must be large enough for the longest possible `i32`:
 /// 11 digits (`-2147483648`). We accept a 12-byte buffer to leave
@@ -209,7 +209,7 @@ unsafe fn safe_write_err_errno(prefix: &[u8], errno: i32) {
 /// Configuration parsed from argv / env.
 ///
 /// Mirrors the 7-arg `libkr64.so` invocation pattern documented in
-/// `VM_KR64_ANALYSIS.md` §2 (`vmid`, `data_dir`, `rom_dir`,
+/// `VM_KR64_ANALYSIS.md` S2 (`vmid`, `data_dir`, `rom_dir`,
 /// `kernel_path`, `config_path`, `log_level`, `socket_fd`). We use
 /// named flags instead of positional args for clarity, and add a few
 /// twoyi-specific knobs (display dimensions, seccomp toggle).
@@ -243,11 +243,11 @@ pub struct Config {
     /// `false` (or if unshare fails), fall back to `chroot`.
     pub use_namespaces: bool,
     /// If `true`, mount `/system` etc. read-only (Treble convention).
-    /// If `false`, mount them read-write (for development — lets you
+    /// If `false`, mount them read-write (for development -- lets you
     /// `adb push` test binaries into the running guest).
     pub read_only_rom: bool,
     /// If `true`, install the seccomp filter on the guest. If `false`,
-    /// skip it (for debugging — the guest will see the host's `/proc`
+    /// skip it (for debugging -- the guest will see the host's `/proc`
     /// etc. unfiltered).
     pub install_seccomp: bool,
     /// Kernel log level (0=quiet, 3=verbose). Mirrors the `log_level`
@@ -263,7 +263,7 @@ pub struct Config {
     ///
     /// `None` = proxy disabled (direct connect). When `Some`, the
     /// string is `host:port` (e.g. `"127.0.0.1:1080"`). Username /
-    /// password auth is not yet supported — the stub only implements
+    /// password auth is not yet supported -- the stub only implements
     /// the no-auth SOCKS5 method (0x00).
     ///
     /// This is a STUB: the field is parsed and stored but the actual
@@ -318,7 +318,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--help" | "-h" => {
-                return Err("twoyi kr64 — kernel-replacement daemon\n\
+                return Err("twoyi kr64 -- kernel-replacement daemon\n\
                      \n\
                      Usage: kr64 [OPTIONS]\n\
                      \n\
@@ -398,7 +398,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             "--no-seccomp" => cfg.install_seccomp = false,
             "--socks5" => {
                 // SOCKS5 proxy stub: store the host:port string. The
-                // actual forwarding thread is not yet wired up — see
+                // actual forwarding thread is not yet wired up -- see
                 // the `socks5_proxy` field doc on `Config` for status.
                 let val = iter
                     .next()
@@ -433,13 +433,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
 }
 
 // ============================================================================
-// Zombie reaping — VM-inspired cleanup.
+// Zombie reaping -- VM-inspired cleanup.
 // ============================================================================
 
 /// Reap any leftover zombie children before forking the new guest.
 ///
 /// This mirrors VM's `ProcessKiller` / `ZombieReaper` (see
-/// `VM_KR64_ANALYSIS.md` §2.10) which runs at daemon startup to clean
+/// `VM_KR64_ANALYSIS.md` S2.10) which runs at daemon startup to clean
 /// up processes left behind by a previous VM run that crashed or was
 /// killed with SIGKILL. Without this, those zombies stay reaped by no
 /// one (their parent is gone) and accumulate as `<defunct>` entries in
@@ -448,17 +448,17 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
 /// We call `waitpid(-1, WNOHANG)` in a loop until it returns 0 (no
 /// more children to reap) or -1 with ECHILD (no children at all).
 /// Both terminating conditions are benign. EINTR is retried (it can
-/// happen if a signal arrives mid-syscall — we have no handlers yet,
+/// happen if a signal arrives mid-syscall -- we have no handlers yet,
 /// but this is the correct defensive pattern).
 ///
 /// # Safety
 ///
 /// `waitpid` is a POSIX syscall; calling it is safe. The `WNOHANG`
 /// flag makes it non-blocking, so this function never sleeps. It only
-/// reaps children that have ALREADY exited — it does not kill or
+/// reaps children that have ALREADY exited -- it does not kill or
 /// signal any running process. The "kill orphan processes" step (which
 /// DOES send SIGKILL to leftover guest PIDs) is handled separately on
-/// the Java side in `RomManager.killOrphanProcess()` — this Rust
+/// the Java side in `RomManager.killOrphanProcess()` -- this Rust
 /// function is purely the reap-after-the-fact step.
 pub fn clear_zombie_processes() {
     let mut reaped = 0u32;
@@ -484,18 +484,18 @@ pub fn clear_zombie_processes() {
             // No more children waiting to be reaped.
             break;
         }
-        // pid == -1: error. ECHILD means "no children" (benign — first
-        // run). EINTR means "interrupted by signal" — retry. Anything
+        // pid == -1: error. ECHILD means "no children" (benign -- first
+        // run). EINTR means "interrupted by signal" -- retry. Anything
         // else is unexpected; log and stop to avoid an infinite loop.
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() == Some(libc::EINTR) {
             continue;
         }
         if e.raw_os_error() == Some(libc::ECHILD) {
-            // No children at all — first run, nothing to reap.
+            // No children at all -- first run, nothing to reap.
             break;
         }
-        warning!("[KR64][zombie] waitpid failed: {} — stopping reap loop", e);
+        warning!("[KR64][zombie] waitpid failed: {} -- stopping reap loop", e);
         break;
     }
     if reaped > 0 {
@@ -520,10 +520,10 @@ pub fn clear_zombie_processes() {
 ///   1. Parse args.
 ///   2. Create all virtual `/dev` devices (qemu_pipe, touch, key,
 ///      event, gb, gb2).
-///   3. Populate `/proc` (version, cpuinfo, meminfo, cmdline, …).
+///   3. Populate `/proc` (version, cpuinfo, meminfo, cmdline, ...).
 ///   4. Set up mount namespace (unshare + bind mounts + tmpfs mounts).
 ///   5. Fork:
-///      - Child: pivot_root → install seccomp → exec /system/bin/init.
+///      - Child: pivot_root -> install seccomp -> exec /system/bin/init.
 ///      - Parent: run the device-accept loop (spawns one thread per
 ///        device socket; for the MVP each thread just accepts and
 ///        echoes).
@@ -549,19 +549,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ---------------------------------------------------------------
     // Step 1.5: reap leftover zombie children from a previous run.
     //
-    // VM does this at daemon startup (see `VM_KR64_ANALYSIS.md` §2.10)
+    // VM does this at daemon startup (see `VM_KR64_ANALYSIS.md` S2.10)
     // to clean up after a crashed/killed previous VM. We do the same so
     // a rapid restart of the guest doesn't accumulate `<defunct>` PIDs.
-    // This is purely defensive — if there are no children, waitpid
+    // This is purely defensive -- if there are no children, waitpid
     // returns ECHILD immediately and we move on.
     // ---------------------------------------------------------------
     clear_zombie_processes();
 
     // Log the SOCKS5 proxy configuration if set (stub: the actual
-    // forwarding thread is not yet spawned — see `Config::socks5_proxy`).
+    // forwarding thread is not yet spawned -- see `Config::socks5_proxy`).
     if let Some(ref upstream) = cfg.socks5_proxy {
         info!(
-            "[KR64] SOCKS5 proxy configured: {} (stub — forwarding thread not yet started)",
+            "[KR64] SOCKS5 proxy configured: {} (stub -- forwarding thread not yet started)",
             upstream
         );
     } else {
@@ -586,13 +586,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     if let Err(e) = devices::create_busybox_marker(&cfg.rootfs) {
         warning!("[KR64] failed to create .busybox marker: {}", e);
     }
-    // Magisk presence markers — make Magisk-aware apps detect a
+    // Magisk presence markers -- make Magisk-aware apps detect a
     // consistent "rooted VM" environment. Non-fatal: the guest boots
     // fine without these, but banking/root-checker apps may misbehave.
     if let Err(e) = devices::create_magisk_marker(&cfg.rootfs) {
         warning!("[KR64] failed to create Magisk markers: {}", e);
     }
-    // /dev/dm-user — required by Android 12+ GSIs for userspace
+    // /dev/dm-user -- required by Android 12+ GSIs for userspace
     // device-mapper (snapshot merges / userdata checkpointing). We
     // create a socket (can't mknod a real char device) and spawn an
     // accept thread so the guest's open() succeeds. Non-fatal on
@@ -605,7 +605,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
         Err(e) => {
             warning!(
-                "[KR64] failed to create /dev/dm-user: {} — Android 12+ GSIs may boot-loop",
+                "[KR64] failed to create /dev/dm-user: {} -- Android 12+ GSIs may boot-loop",
                 e
             );
         }
@@ -639,7 +639,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // approach). The binder proxy is only needed for full
             // service-manager virtualisation.
             warning!(
-                "[KR64] failed to start binder proxy: {} — falling back to host binder",
+                "[KR64] failed to start binder proxy: {} -- falling back to host binder",
                 e
             );
             None
@@ -654,7 +654,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // and spawns an accept-thread + worker-pool that reads a
     // 16-byte header per connection and pumps raw PCM in both
     // directions. The actual AudioTrack/AudioRecord integration is
-    // stubbed (no JNI yet) — the pump compiles and exercises the
+    // stubbed (no JNI yet) -- the pump compiles and exercises the
     // protocol but produces no sound until the Java side is wired
     // up in a follow-up task.
     // ---------------------------------------------------------------
@@ -664,13 +664,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             Some(h)
         }
         Err(e) => {
-            // Non-fatal: the guest can still boot without sound —
+            // Non-fatal: the guest can still boot without sound --
             // AudioFlinger's connect() to /dev/audio will fail and
             // the guest's audio HAL will fall back to silence / a
             // null output. Sound is the user's primary use case
             // though, so this warning is worth surfacing.
             warning!(
-                "[KR64] failed to start audio device: {} — guest will have no sound",
+                "[KR64] failed to start audio device: {} -- guest will have no sound",
                 e
             );
             None
@@ -686,7 +686,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // control requests (ENABLE/DISABLE/CHECK_SUPPORT/SET_DELAY) and
     // pushes 24-byte SensorEvent records to the guest when sensors
     // are enabled. The actual SensorManager integration is stubbed
-    // (no JNI yet) — the control loop replies false to every
+    // (no JNI yet) -- the control loop replies false to every
     // CHECK_SUPPORT and the pump never produces events. This is the
     // deliberate "skeleton" boundary, mirroring audio.rs.
     // ---------------------------------------------------------------
@@ -697,13 +697,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 Some(h)
             }
             Err(e) => {
-                // Non-fatal: the guest can still boot without sensors —
+                // Non-fatal: the guest can still boot without sensors --
                 // the guest's sensor HAL will see "no sensors available"
                 // and `SensorManager.getDefaultSensor()` will return null.
                 // Apps that hard-require a sensor (e.g. compass apps)
                 // will crash, but the boot proceeds.
                 warning!(
-                    "[KR64] failed to start sensor device: {} — guest will have no sensors",
+                    "[KR64] failed to start sensor device: {} -- guest will have no sensors",
                     e
                 );
                 None
@@ -718,7 +718,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // with seven files (capacity, status, charging, voltage,
     // temperature, technology, health) populated from the (stubbed)
     // JNI up-calls, then spawns a `kr64-battery-refresh` thread that
-    // re-writes them every 30 s. Failure is non-fatal — the guest
+    // re-writes them every 30 s. Failure is non-fatal -- the guest
     // can still boot without a battery sysfs (its `BatteryService`
     // will just report "unknown" / fall back to defaults), but every
     // real device has a battery so we warn loudly.
@@ -734,7 +734,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
         Err(e) => {
             warning!(
-                "[KR64] failed to start battery HAL: {} — guest will see no battery",
+                "[KR64] failed to start battery HAL: {} -- guest will see no battery",
                 e
             );
             None
@@ -764,7 +764,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ---------------------------------------------------------------
     if let Err(e) = compat_paths::create_samsung_gamesdk_compat_paths(&cfg.rootfs) {
         warning!(
-            "[KR64] failed to materialise Samsung GameSDK compat paths: {} — some games may crash",
+            "[KR64] failed to materialise Samsung GameSDK compat paths: {} -- some games may crash",
             e
         );
     }
@@ -773,14 +773,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Step 4: set up mount namespace + bind mounts + tmpfs.
     // ---------------------------------------------------------------
     // The parent calls setup_mounts() BEFORE fork(). This does:
-    //   1. unshare(CLONE_NEWNS) — new mount namespace (root required)
+    //   1. unshare(CLONE_NEWNS) -- new mount namespace (root required)
     //   2. mount tmpfs on {rootfs}/dev, /proc, /sys, /tmp, /apex, /mnt
-    //   3. pivot_root(rootfs, rootfs/old_root) — make rootfs the new /
-    //   4. umount2(/old_root, MNT_DETACH) — drop host's /
+    //   3. pivot_root(rootfs, rootfs/old_root) -- make rootfs the new /
+    //   4. umount2(/old_root, MNT_DETACH) -- drop host's /
     //   5. chdir("/")
     //
     // After pivot_root, the parent's root IS the rootfs. The device
-    // socket fds (held by accept threads) are still valid — accept()
+    // socket fds (held by accept threads) are still valid -- accept()
     // works on fds, not paths. The host (outside the mount namespace)
     // still sees {rootfs}/dev/qemu_pipe on the original ext4 filesystem
     // and can connect to it. The tmpfs mount is only visible inside
@@ -788,9 +788,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //
     // The child (init) inherits the parent's mount namespace (with
     // pivot_root already done). This means:
-    //   - execve("/system/bin/init") resolves to {rootfs}/system/bin/init ✓
-    //   - LD_PRELOAD=/dev/libgetpid_hook.so resolves to the tmpfs ✓
-    //   - Init's own mount("tmpfs", "/dev", ...) stacks on top of ours ✓
+    //   - execve("/system/bin/init") resolves to {rootfs}/system/bin/init OK
+    //   - LD_PRELOAD=/dev/libgetpid_hook.so resolves to the tmpfs OK
+    //   - Init's own mount("tmpfs", "/dev", ...) stacks on top of ours OK
     //
     // If setup_mounts fails (e.g. not root), we fall through to fork
     // without pivot_root. The child will exec init with full rootfs
@@ -803,10 +803,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             read_only_rom: cfg.read_only_rom,
         };
         match mount_mgr::setup_mounts(&mount_cfg) {
-            Ok(()) => info!("[KR64] setup_mounts succeeded — pivot_root done"),
+            Ok(()) => info!("[KR64] setup_mounts succeeded -- pivot_root done"),
             Err(e) => {
                 error!(
-                    "[KR64] setup_mounts failed: {} — continuing without pivot_root (init may fail to find /system/bin/init)",
+                    "[KR64] setup_mounts failed: {} -- continuing without pivot_root (init may fail to find /system/bin/init)",
                     e
                 );
                 // Mark that we did NOT pivot_root, so the child uses
@@ -815,13 +815,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
     } else {
-        info!("[KR64] use_namespaces=false — skipping setup_mounts (chroot only)");
+        info!("[KR64] use_namespaces=false -- skipping setup_mounts (chroot only)");
     }
 
     // ---------------------------------------------------------------
     // Step 4.5: create a PID namespace so the guest init becomes PID 1.
     //
-    // Android's init binary requires getpid() == 1 — if it's not PID 1,
+    // Android's init binary requires getpid() == 1 -- if it's not PID 1,
     // SecondStageMain exits with code 31 immediately. Without a PID
     // namespace, our forked child would have some arbitrary PID and
     // init would refuse to boot.
@@ -834,15 +834,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Requires CAP_SYS_ADMIN (or root). When kr64 is run via `su -c`
     // (as core.rs does on rooted devices), we have root and this works.
     // When running as a regular untrusted_app, unshare fails and we
-    // fall through — init will exit 31, but at least we get diagnostic
+    // fall through -- init will exit 31, but at least we get diagnostic
     // output.
     // ---------------------------------------------------------------
     match unsafe { libc::unshare(libc::CLONE_NEWPID) } {
-        0 => info!("[KR64] unshare(CLONE_NEWPID) succeeded — child will be PID 1"),
+        0 => info!("[KR64] unshare(CLONE_NEWPID) succeeded -- child will be PID 1"),
         _ => {
             let e = std::io::Error::last_os_error();
             warning!(
-                "[KR64] unshare(CLONE_NEWPID) failed: {} — init will not be PID 1 (will exit 31)",
+                "[KR64] unshare(CLONE_NEWPID) failed: {} -- init will not be PID 1 (will exit 31)",
                 e
             );
         }
@@ -895,7 +895,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     } else {
         error!(
-            "[KR64] PARENT: libgetpid_hook.so not found at {} — LD_PRELOAD will fail",
+            "[KR64] PARENT: libgetpid_hook.so not found at {} -- LD_PRELOAD will fail",
             hook_src
         );
     }
@@ -913,7 +913,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         //
         // IMPORTANT: between fork() and execve() we are in an async-signal-
         // unsafe window. The `info!`/`warning!`/`error!` macros above
-        // expand to `eprintln!`, which is NOT async-signal-safe — it
+        // expand to `eprintln!`, which is NOT async-signal-safe -- it
         // initialises a global LineWriter, allocates, and grabs the stdio
         // lock. If another thread held that lock at fork() time, calling
         // `eprintln!` here would deadlock the child.
@@ -934,11 +934,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // (SIGSYS / SYS_SECCOMP kill). close_range was added in Linux 5.9
         // and Android 11's seccomp policy doesn't whitelist it for
         // untrusted_app. We now iterate fd numbers 3..1024 and close each
-        // one — close() (syscall 3) IS whitelisted. This is O(1024) but
+        // one -- close() (syscall 3) IS whitelisted. This is O(1024) but
         // only runs once at guest startup.
         //
         // When kr64 runs as root (via `su -c`), the zygote's seccomp
-        // filter is not inherited, so close_range would work — but we
+        // filter is not inherited, so close_range would work -- but we
         // keep the portable loop to avoid the seccomp trap on non-root
         // runs and because the cost is negligible.
         for fd in 3..1024i32 {
@@ -971,7 +971,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 // Non-fatal: we explicitly continue so the guest can boot
                 // in a permissive-ish mode (the seccomp filter is a
                 // hardening layer, not a correctness requirement for the
-                // MVP). But the user must be told — silent failure here
+                // MVP). But the user must be told -- silent failure here
                 // would mask a misconfigured BPF program.
                 let errno = e.raw_os_error().unwrap_or(0);
                 unsafe {
@@ -984,7 +984,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
 
         // Exec the guest init with a proper environment.
-        // Fixed: was passing empty envp — init needs at least PATH,
+        // Fixed: was passing empty envp -- init needs at least PATH,
         // ANDROID_ROOT, ANDROID_DATA, and BOOTCLASSPATH.
         //
         // CString::new fails if the path contains an interior NUL byte,
@@ -1003,12 +1003,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Pre-execve diagnostics: verify the init binary and linker exist.
         // The init binary's ELF INTERP field specifies the dynamic linker
         // path (usually /system/bin/linker64). If either file is missing,
-        execve fails with ENOENT. If the linker loads but crashes (e.g.
-        due to a bad LD_PRELOAD), we get SIGSEGV in linker64.
+        // execve fails with ENOENT. If the linker loads but crashes (e.g.
+        // due to a bad LD_PRELOAD), we get SIGSEGV in linker64.
         {
             // Use CString for the init path (need null-terminated C string
             // for access()). This allocates, but we're in a single-threaded
-            // path before execve — safe per the existing format!() usage.
+            // path before execve -- safe per the existing format!() usage.
             let init_c = CString::new(full_init_path.as_str()).unwrap_or_default();
             let init_exists = unsafe {
                 libc::access(init_c.as_ptr(), libc::F_OK) == 0
@@ -1063,13 +1063,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // After pivot_root (use_namespaces=true): /dev/libgetpid_hook.so
         // Without pivot_root: {rootfs}/dev/libgetpid_hook.so
         // In both cases, the chroot-relative path /dev/libgetpid_hook.so
-        // works — after pivot_root it's the tmpfs, without pivot_root
+        // works -- after pivot_root it's the tmpfs, without pivot_root
         // the parent copied it to {rootfs}/dev/ which IS /dev/ relative
         // to the chroot... actually no, without pivot_root there's no
         // chroot, so /dev/ refers to the HOST's /dev. We need to check
         // the full path in that case. But we can't use format! here
         // (async-signal-unsafe). So just check the chroot-relative path
-        // and log the result — it's only diagnostic.
+        // and log the result -- it's only diagnostic.
         let hook_exists = unsafe {
             libc::access(
                 b"/dev/libgetpid_hook.so\0".as_ptr() as *const libc::c_char,
@@ -1084,7 +1084,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
         // Build environment for the guest init. The CString::new calls
         // below use compile-time-constant strings (no NUL possible) and
-        // format!() — the format! allocation happens BEFORE execve, so
+        // format!() -- the format! allocation happens BEFORE execve, so
         // it's safe (we're not yet racing the post-fork window for the
         // allocator lock on this short, single-thread-of-control path).
         let twoyi_rootfs_env = match CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs)) {
@@ -1098,7 +1098,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // has already happened, so the path is relative to the new
         // root. When false, we need the full absolute path.
         // If TWOYI_SKIP_PRELOAD is set in the parent env, skip LD_PRELOAD
-        // entirely — this is a diagnostic mode to check if the init binary
+        // entirely -- this is a diagnostic mode to check if the init binary
         // can link WITHOUT the getpid hook (init will exit 31, but if it
         // exits 31 instead of SIGSEGV, we know the linker works).
         let skip_preload = std::env::var("TWOYI_SKIP_PRELOAD").is_ok();
@@ -1117,7 +1117,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         ];
         if skip_preload {
             unsafe {
-                safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set — skipping LD_PRELOAD (init will exit 31)\n");
+                safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set -- skipping LD_PRELOAD (init will exit 31)\n");
             }
         } else {
             env_vars.push(CString::new(ld_preload_str).unwrap());
@@ -1144,7 +1144,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ----- PARENT (the daemon) -----
     info!("[KR64][parent] guest pid = {}", pid);
 
-    // qemu_pipe → real GL command proxy (Phase 1 of the dispatcher plan).
+    // qemu_pipe -> real GL command proxy (Phase 1 of the dispatcher plan).
     // The proxy accepts guest connections, reads the "pipe:opengles"
     // channel-name handshake, connects to the renderer's Unix socket
     // at {rootfs}/opengles, and pumps bytes bidirectionally. This
@@ -1165,7 +1165,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let listener = match dev.take_listener() {
             Some(l) => l,
             None => {
-                error!("[KR64] qemu_pipe listener already taken — cannot start proxy");
+                error!("[KR64] qemu_pipe listener already taken -- cannot start proxy");
                 return 1;
             }
         };
@@ -1189,10 +1189,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // each thread just accepts connections and immediately closes them
     // (echoing a single byte so the guest sees SOME response). The
     // production version will dispatch to per-device handlers:
-    //   touch     → input::touch_server
-    //   key       → input::key_server
-    //   event     → TwoyiSocketServer (event IPC)
-    //   gb/gb2    → openglrenderer::gralloc
+    //   touch     -> input::touch_server
+    //   key       -> input::key_server
+    //   event     -> TwoyiSocketServer (event IPC)
+    //   gb/gb2    -> openglrenderer::gralloc
     spawn_accept_thread(device_set.touch, "touch");
     spawn_accept_thread(device_set.key, "key");
     spawn_accept_thread(device_set.event, "event");
@@ -1266,7 +1266,7 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
                         info!("[KR64][{}] client connected", name);
                         // Echo a single byte so the guest sees SOME response.
                         // (Many of the device protocols expect a handshake
-                        // byte — e.g. the touch device sends a device_info
+                        // byte -- e.g. the touch device sends a device_info
                         // struct on connect, which the guest reads before
                         // sending anything. The production version will
                         // dispatch to the right handler.)
@@ -1274,7 +1274,7 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
                         let _ = stream.write_all(&[0u8]);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No pending connection — sleep briefly to avoid
+                        // No pending connection -- sleep briefly to avoid
                         // spinning. (Real implementation would use epoll.)
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
@@ -1289,13 +1289,13 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
 }
 
 // ============================================================================
-// cdylib entry point — used when `libkr64.so` is exec'd directly via
+// cdylib entry point -- used when `libkr64.so` is exec'd directly via
 // the PIE hack. The ELF entry point is set to `kr64_main` via the
 // `-Wl,-e,kr64_main` link flag in build.rs / .cargo/config.toml.
 // ============================================================================
 
 /// Entry point for the cdylib (libkr64.so). Mirrors the C `main`
-/// signature `(argc, argv) → int` so the standard C runtime can call
+/// signature `(argc, argv) -> int` so the standard C runtime can call
 /// it.
 ///
 /// When the kernel exec's `libkr64.so`, the dynamic linker loads it,
@@ -1319,7 +1319,7 @@ pub unsafe extern "C" fn kr64_main(
     argc: libc::c_int,
     argv: *const *const libc::c_char,
 ) -> libc::c_int {
-    // Convert C argv → Rust Vec<String>.
+    // Convert C argv -> Rust Vec<String>.
     let args: Vec<String> = if argc <= 0 || argv.is_null() {
         Vec::new()
     } else {
@@ -1351,7 +1351,7 @@ extern "C" {
 static INTERP_REF: &[u8; 0] = unsafe { &INTERP };
 
 // ============================================================================
-// Tests — exercise arg parsing and config defaults.
+// Tests -- exercise arg parsing and config defaults.
 // ============================================================================
 
 #[cfg(test)]
@@ -1507,7 +1507,7 @@ mod tests {
     fn clear_zombie_processes_is_safe_with_no_children() {
         // We can't easily create real zombie children in a unit test
         // (forking + exiting would race with the test runner), but we
-        // CAN verify the function handles ECHILD gracefully — which is
+        // CAN verify the function handles ECHILD gracefully -- which is
         // the "no children" condition. This is a smoke test.
         clear_zombie_processes();
         // If we get here without panicking, the test passes.
