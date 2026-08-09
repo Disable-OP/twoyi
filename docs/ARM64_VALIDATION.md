@@ -452,3 +452,73 @@ AArch64 Android emulator      ❌ NOT YET VERIFIED
       ↓
 physical Android arm64        ❌ NOT YET VERIFIED
 ```
+
+---
+
+## UPDATE: Native ARM64 GitHub Actions Runner — SUCCESS
+
+### GitHub FREE ARM64 Runners
+
+GitHub now offers FREE ARM64 Linux runners:
+- Label: `ubuntu-24.04-arm`
+- Available for public repos (GA since Jan 16, 2025)
+- Available for private repos (since Jan 29, 2026)
+- 4 vCPUs, 16 GB RAM (public repos)
+- Source: https://github.blog/changelog/2025-01-16-linux-arm64-hosted-runners-now-available-for-free-in-public-repositories-public-preview
+
+### KVM Availability on ARM64 Runners
+
+KVM is NOT available on `ubuntu-24.04-arm`:
+- `/dev/kvm` does not exist
+- `modprobe kvm` fails
+- `modprobe kvm_arm64` fails
+- GitHub has not enabled nested virtualization on ARM64 runners yet
+- Open issue: https://github.com/actions/runner-images/issues/14062
+
+### Native ARM64 Seccomp Test — PASSES
+
+Workflow: `.github/workflows/arm64-seccomp-test.yml`
+Job: `Native ARM64 seccomp/SIGSYS test`
+Runner: `ubuntu-24.04-arm`
+Duration: ~8 seconds
+
+The seccomp test runs NATIVELY on real ARM64 hardware (no QEMU, no
+emulator). This is the fastest and most accurate ARM64 validation.
+
+Results (from CI run 31329013276):
+```
+✓ Native ARM64 seccomp/SIGSYS test in 8s
+```
+
+### Android ARM64 Emulator — NOT AVAILABLE
+
+The Android emulator binary cannot be downloaded on arm64 hosts:
+- `sdkmanager` does not list the `emulator` package for arm64
+- Direct download URLs from dl.google.com return 404
+- The emulator package appears to be x86_64-only on Linux
+
+The `continue-on-error: true` on this job means it doesn't block the
+workflow. The native seccomp test is the primary validation.
+
+### Updated Validation Hierarchy
+
+```
+x86_64 native Linux           ✅ TEST-VERIFIED (12/12 tests pass)
+AArch64 QEMU system-mode      ✅ QEMU-VERIFIED (seccomp + SIGSYS work)
+AArch64 native (GH runner)    ✅ CI-VERIFIED (native ARM64, real hardware)
+AArch64 Android emulator      ❌ NOT AVAILABLE (emulator binary not downloadable)
+physical Android arm64        ❌ NOT YET VERIFIED
+```
+
+### Classification
+
+| Claim | Evidence | Classification |
+|-------|----------|----------------|
+| seccomp works on ARM64 | Native CI test passes | CI-VERIFIED |
+| SIGSYS handler fires on ARM64 | sigsys_fired=1 in CI | CI-VERIFIED |
+| mount syscall number = 40 | sigsys_nr=0x28=40 | CI-VERIFIED |
+| ucontext regs[0] = return value | mount returned 0 | CI-VERIFIED |
+| Non-trapped syscalls pass through | getpid works | CI-VERIFIED |
+| ARM64 assembly compiles | CI builds successfully | CI-VERIFIED |
+| KVM available on GH arm64 | modprobe fails | CI-VERIFIED (not available) |
+| Android emulator on arm64 | Download fails | CI-VERIFIED (not available) |
