@@ -186,12 +186,13 @@ static long emu_mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     // Create regular file containing dev_t (use open() not openat() to avoid seccomp recursion)
 #if defined(__x86_64__)
     int fd = syscall(NR_open, path, O_RDWR|O_CREAT, 0666);
-#else
-    return 0; // arm64: TODO use internal flag
-#endif
     if(fd<0) return -errno;
     syscall(NR_write, fd, &dev, sizeof(dev_t));
     syscall(NR_close, fd);
+#else
+    // arm64: no open() syscall, return 0 for now (TODO: use internal flag)
+    (void)dev;
+#endif
     return 0;
 }
 
