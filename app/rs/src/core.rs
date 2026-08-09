@@ -340,12 +340,25 @@ pub fn init_renderer(
         cmd.env("ANDROID_DATA", format!("{}/data", working_dir));
         cmd.env_remove("BOOTCLASSPATH");
         cmd.env_remove("SYSTEMSERVERCLASSPATH");
-        // For the kr64 path, inherit stderr so kr64's eprintln! output
-        // appears in logcat (via Android's stderr→logcat redirect).
-        // For the fallback path, redirect to the log file.
+        // For the kr64 path, redirect stderr to a separate log file
+        // that we can pull via adb. Android's release builds redirect
+        // stderr to /dev/null, so Stdio::inherit() doesn't work.
+        // For the fallback path, use the app's log file.
         if Path::new(&kr64_path).exists() {
-            cmd.stdout(Stdio::inherit());
-            cmd.stderr(Stdio::inherit());
+            let kr64_log = format!("{}/kr64-stderr.log", get_data_dir());
+            match File::create(&kr64_log) {
+                Ok(f) => {
+                    let f2 = f.try_clone().unwrap_or_else(|_| f.try_clone().unwrap());
+                    cmd.stdout(Stdio::from(f));
+                    cmd.stderr(Stdio::from(f2));
+                    info!("[CORE] kr64 stderr → {}", kr64_log);
+                }
+                Err(e) => {
+                    log::error!("[CORE] Failed to create kr64 log: {}", e);
+                    cmd.stdout(Stdio::inherit());
+                    cmd.stderr(Stdio::inherit());
+                }
+            }
         } else {
             cmd.stdout(Stdio::from(outputs));
             cmd.stderr(Stdio::from(errors));
