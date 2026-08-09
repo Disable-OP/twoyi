@@ -41,3 +41,13 @@ Change TRAP to ERRNO(EPERM) for ALL trapped syscalls. If init survives longer, t
 
 **Also found:** Bionic's debuggerd_register_handlers installs a SIGSYS handler BEFORE constructors run (step 4, before step 8b). Our constructor overrides it. But if sigaction() is intercepted by ART's libsigchain, it might silently no-op. Fix: use raw syscall for rt_sigaction.
 
+
+### Experiment 2: Recursive mkdir fix — PARTIAL
+### Timestamp UTC: 2026-08-10 ~22:35
+
+**Change:** Added mkdir_p() recursive mkdir + open() hook auto-create for selinuxfs
+**Expected:** checkreqprot file created, init passes SELinux setup
+**Observed:** "selinuxfs virtual files created" logged, but init still gets ENOENT on checkreqprot
+**Conclusion:** Directory creation works, but file open still fails. The PLT hook for open() may not be intercepting init's open() call. Init might use a direct syscall or a different libc function.
+
+**Next experiment:** Add path logging to open()/openat() hooks to verify which paths init actually opens. Also check if init uses a different open variant (like __open_2 or openat).
