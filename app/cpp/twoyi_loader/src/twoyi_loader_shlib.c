@@ -442,14 +442,31 @@ static long emu_rt_sigaction(int sig, const struct sigaction *act,
 // Init needs /sys/fs/selinux/* files during SELinux setup.
 // We create virtual files in the rootfs's /sys/fs/selinux/ directory.
 // =========================================================================
+// Recursive mkdir (like mkdir -p)
+static int mkdir_p(const char *path, mode_t mode) {
+    char tmp[512];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    int len = strlen(tmp);
+    if (len > 0 && tmp[len - 1] == '/') tmp[len - 1] = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(tmp, mode);
+            *p = '/';
+        }
+    }
+    return mkdir(tmp, mode);
+}
+
 static void ensure_selinuxfs_files(void) {
     if (!g_rootfs) return;
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/sys/fs/selinux", g_rootfs);
-    mkdir(dir, 0755);
+    // Recursive mkdir — create /sys, /sys/fs, /sys/fs/selinux
+    mkdir_p(dir, 0755);
 
     // Create required selinuxfs control files
-    // Init opens these and writes to them during SELinux setup
     const char *files[] = {
         "checkreqprot",  // init writes "0" here (FATAL if missing)
         "enforce",       // init writes "0" or "1" here
@@ -460,10 +477,8 @@ static void ensure_selinuxfs_files(void) {
     for (int i = 0; files[i]; i++) {
         char path[600];
         snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
-        // Create the file if it doesn't exist
         int fd = syscall(NR_open, path, O_WRONLY | O_CREAT, 0666);
         if (fd >= 0) {
-            // Write default content
             if (strcmp(files[i], "checkreqprot") == 0) {
                 syscall(NR_write, fd, "0", 1);
             } else if (strcmp(files[i], "enforce") == 0) {
@@ -535,6 +550,28 @@ int open(const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
     init_real_funcs();
+
+    // Special handling for selinuxfs paths — same as openat()
+    if (path && strncmp(path, "/sys/fs/selinux/", 16) == 0) {
+        const char *translated = translate(path);
+#if defined(__x86_64__)
+        int fd = syscall(NR_open, translated, flags, mode);
+        if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
+            fd = syscall(NR_open, translated, flags | O_CREAT, 0666);
+        }
+        return fd;
+#else
+        if (real_openat) {
+            int fd = real_openat(AT_FDCWD, translated, flags, mode);
+            if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
+                fd = real_openat(AT_FDCWD, translated, flags | O_CREAT, 0666);
+            }
+            return fd;
+        }
+        return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
+#endif
+    }
+
     const char *translated = translate(path);
 #if defined(__x86_64__)
     return syscall(NR_open, translated, flags, mode);
