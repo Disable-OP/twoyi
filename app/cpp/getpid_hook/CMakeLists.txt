@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(getpid_hook)
 
-# Build a tiny LD_PRELOAD library that hooks getpid() to return 1.
-# This makes Android's init think it's PID 1, bypassing the exit 31
-# check without needing unshare(CLONE_NEWPID) (which fails on the
-# emulator even as root).
+# Build a comprehensive LD_PRELOAD library for rootless Android container
+# boot. Hooks getpid(), mount(), mknod(), chroot(), unshare(), etc. to
+# return fake success, allowing init to boot in the HOST filesystem
+# namespace without needing root privileges.
 #
 # IMPORTANT: Do NOT link against any shared libraries (no `log`, no
 # `c`). The hook only uses `syscall()` which is provided by the
@@ -16,3 +16,7 @@ project(getpid_hook)
 
 add_library(getpid_hook SHARED getpid_hook.c)
 # No target_link_libraries — the hook is self-contained.
+# Set visibility to default so all hooks are exported.
+set_target_properties(getpid_hook PROPERTIES
+    C_VISIBILITY_PRESET default
+)
