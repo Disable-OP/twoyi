@@ -222,10 +222,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Verify ARM64 architecture
+      - name: Verify ARM64 architecture and TRY KVM
         run: |
+          echo "=== Architecture ==="
           uname -m
-          ls -la /dev/kvm 2>/dev/null || echo "No /dev/kvm — will use TCG (slow)"
+          echo "=== /dev/kvm check ==="
+          ls -la /dev/kvm 2>/dev/null && echo "KVM EXISTS!" || echo "No /dev/kvm yet"
+          echo "=== Try modprobe kvm ==="
+          sudo modprobe kvm 2>/dev/null || echo "modprobe kvm failed"
+          sudo modprobe kvm_arm64 2>/dev/null || echo "modprobe kvm_arm64 failed"
+          ls -la /dev/kvm 2>/dev/null && echo "KVM NOW EXISTS!" || echo "Still no /dev/kvm"
+          # Check if we can access kvm
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm 2>/dev/null || true
+            echo "KVM IS AVAILABLE — will use -accel kvm"
+            echo "KVM_AVAILABLE=true" >> $GITHUB_ENV
+          else
+            echo "KVM NOT available — will use TCG (slow)"
+            echo "KVM_AVAILABLE=false" >> $GITHUB_ENV
+          fi
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -233,15 +248,33 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Android SDK + arm64 system image
+      - name: Install cmdline-tools (sdkmanager not pre-installed on arm64)
         run: |
           set -e
           export ANDROID_HOME=/usr/local/lib/android/sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+
+          # Download cmdline-tools if not present
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
+            echo "Installing cmdline-tools..."
+            cd /tmp
+            CMDLINE_TOOLS_URL='https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+            curl -sL -o cmdline-tools.zip "$CMDLINE_TOOLS_URL"
+            unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            rm cmdline-tools.zip
+          fi
+
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
-          # Install SDK components
+          echo "=== sdkmanager version ==="
+          sdkmanager --version
+
+          echo "=== Installing SDK components ==="
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager --update
+
+          # Install the arm64 system image
           sdkmanager \
               "platform-tools" \
               "platforms;android-30" \
@@ -279,18 +312,23 @@ jobs:
           echo "=== AVD config ==="
           cat "$AVD_CONFIG"
 
-      - name: Boot Android arm64 emulator (TCG)
+      - name: Boot Android arm64 emulator (KVM if available, else TCG)
         env:
           ANDROID_AVD_HOME: /home/runner/.android/avd
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
 
-          # Start emulator in background (TCG, no KVM)
-          # -no-window: headless
-          # -no-audio: disable audio
-          # -gpu swiftshader_indirect: software rendering
-          # -no-snapshot: don't use snapshot (clean boot)
+          # Choose acceleration based on KVM availability
+          if [ "$KVM_AVAILABLE" = "true" ]; then
+            ACCEL="-accel kvm"
+            echo "=== Using KVM acceleration ==="
+          else
+            ACCEL="-accel tcg"
+            echo "=== Using TCG software emulation (slow) ==="
+          fi
+
+          # Start emulator in background
           nohup emulator -avd twoyi_arm64 \
               -no-window \
               -no-audio \
@@ -298,16 +336,17 @@ jobs:
               -gpu swiftshader_indirect \
               -no-snapshot \
               -netfast \
+              $ACCEL \
               > /tmp/emulator.log 2>&1 &
 
           EMULATOR_PID=$!
           echo "Emulator PID: $EMULATOR_PID"
 
-          # Wait for boot (up to 20 minutes under TCG)
-          echo "Waiting for boot (up to 20 minutes)..."
+          # Wait for boot (up to 15 minutes)
+          echo "Waiting for boot (up to 15 minutes)..."
           adb wait-for-device
           echo "Device detected, waiting for boot_completed..."
-          timeout 1200 bash -c 'while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do sleep 5; echo "  still booting..."; done' || true
+          timeout 900 bash -c 'while [[ -z $(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r") ]]; do sleep 5; echo "  still booting..."; done' || true
 
           BOOT_STATUS=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")
           echo "Boot status: '$BOOT_STATUS'"
