@@ -418,133 +418,15 @@ sleep 3
 echo "  ✓ screenshot-00_settings.png"
 
 # ---------------------------------------------------------------------------
-# Pre-launch kr64 as root via adb shell.
-#
-# The twoyi app can't use `su` (the su binary on google_apis emulator
-# images is restricted to shell/root users — regular apps get EACCES).
-# But the test script has `adb root` access, so we can pre-launch kr64
-# as root directly. The app's own kr64 spawn (via su -c in core.rs)
-# will fail with EACCES, but that's non-fatal — the renderer still
-# starts, and the pre-launched kr64 handles the guest.
-#
-# The flow:
-#   1. SettingsActivity started above → RomManager.init created the
-#      libkr64.so symlink at rootfs/system/lib64/libkr64.so
-#   2. We pre-launch kr64 as root (via adb shell, which is root after
-#      `adb root`). kr64 creates /dev/qemu_pipe, forks init in a PID
-#      namespace, and execs the guest init binary.
-#   3. Render2Activity starts the renderer (creates /opengles socket).
-#   4. Guest init boots → SurfaceFlinger connects to /dev/qemu_pipe →
-#      kr64's proxy forwards to /opengles → renderer processes GL.
-#
-# We use `setsid` + `nohup` to fully detach the kr64 process from the
-# adb shell session so it survives after the shell exits.
+# SKIP pre-launch kr64 — let the app's own kr64 handle everything.
+# The app's kr64 runs with --no-namespaces --no-seccomp, and uses
+# LD_PRELOAD=libgetpid_hook.so to make init think it's PID 1.
+# The pre-launched kr64 was causing conflicts (duplicate /dev/qemu_pipe)
+# and interfering with the app's startup.
 # ---------------------------------------------------------------------------
-echo "  → pre-launching kr64 as root via adb shell"
 
-KR64_SYMLINK="$TWOYI_PROFILE/system/lib64/libkr64.so"
-
-# Wait for the symlink to exist (RomManager.init creates it on first launch)
-for i in $(seq 1 15); do
-    if "$ADB_BIN" -s emulator-5554 shell "test -e '$KR64_SYMLINK'" 2>/dev/null; then
-        echo "  ✓ libkr64.so symlink exists (after ${i}s)"
-        break
-    fi
-    if [ "$i" = "15" ]; then
-        echo "  ⚠ libkr64.so symlink not found after 15s — kr64 pre-launch will fail"
-    fi
-    sleep 1
-done
-
-# Build the LD_LIBRARY_PATH for kr64 (same as core.rs uses)
-KR64_LD_PATH="$TWOYI_PROFILE/system/lib64:$TWOYI_PROFILE/system/lib64/bootstrap:$TWOYI_PROFILE/system/lib64/vndk-sp-29:$TWOYI_PROFILE/system/lib64/vndk-29:$TWOYI_PROFILE/system/lib64/apex:$TWOYI_PROFILE/system/lib"
-
-# Write a launch script to the device (avoids quoting hell with nested env vars)
-LAUNCH_SCRIPT='#!/system/bin/sh
-export LD_LIBRARY_PATH='"$KR64_LD_PATH"'
-export TWOYI_ROOTFS='"$TWOYI_PROFILE"'
-export TYLOADER='"$TWOYI_PROFILE/system/lib64/libloader.so"'
-export ANDROID_BOOTLOGO=1
-export ANDROID_ROOT='"$TWOYI_PROFILE/system"'
-export ANDROID_DATA='"$TWOYI_PROFILE/data"'
-export PATH=/system/bin:/system/xbin:/vendor/bin
-cd "'"$TWOYI_PROFILE"'"
-exec "'"$KR64_SYMLINK"'" --rootfs "'"$TWOYI_PROFILE"'" --data-dir "'"$TWOYI_DATA"'" --vmid 0 --no-seccomp
-'
-
-# Push the launch script to /data/local/tmp (writable by root)
-echo "$LAUNCH_SCRIPT" > /tmp/twoyi-launch-kr64.sh
-"$ADB_BIN" -s emulator-5554 push /tmp/twoyi-launch-kr64.sh /data/local/tmp/launch-kr64.sh 2>/dev/null
-"$ADB_BIN" -s emulator-5554 shell chmod 755 /data/local/tmp/launch-kr64.sh
-
-# Ensure adb is root (re-run `adb root` in case it was reset)
-"$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
-sleep 1
-"$ADB_BIN" -s emulator-5554 wait-for-device
-
-# Create the kr64 log file at /data/local/tmp/kr64.log (NOT /data/data/...
-# because the app's core.rs does File::create() on /data/data/io.twoyi/log.txt
-# which truncates the file and erases kr64's pre-launch output).
-KR64_LOG="/data/local/tmp/kr64.log"
-"$ADB_BIN" -s emulator-5554 shell "touch '$KR64_LOG' && chmod 666 '$KR64_LOG'" 2>/dev/null || true
-
-# Launch kr64 detached: setsid creates a new session, nohup ignores SIGHUP,
-# and </dev/null >log 2>&1 & backgrounds the process.
-# Output goes to /data/local/tmp/kr64.log (separate from the app's log.txt).
-"$ADB_BIN" -s emulator-5554 shell \
-    "setsid nohup sh /data/local/tmp/launch-kr64.sh < /dev/null > '$KR64_LOG' 2>&1 &"
-echo "  ✓ kr64 pre-launch command sent (log → $KR64_LOG)"
-
-# Wait for kr64 to create /dev/qemu_pipe (indicates it started successfully)
-KR64_PIPE="$TWOYI_PROFILE/dev/qemu_pipe"
-KR64_READY=0
-for i in $(seq 1 15); do
-    if "$ADB_BIN" -s emulator-5554 shell "test -S '$KR64_PIPE'" 2>/dev/null; then
-        echo "  ✓ kr64 started — /dev/qemu_pipe socket exists (after ${i}s)"
-        KR64_READY=1
-        break
-    fi
-    sleep 1
-done
-if [ "$KR64_READY" = "0" ]; then
-    echo "  ⚠ kr64 did not create /dev/qemu_pipe after 15s — check kr64.log for errors"
-fi
-
-# Check if kr64 is still running (it should be — it forks init and waits)
-KR64_PID=$("$ADB_BIN" -s emulator-5554 shell "pidof libkr64.so" 2>/dev/null | tr -d '\r ' || true)
-if [ -n "$KR64_PID" ]; then
-    echo "  ✓ kr64 process alive (pid $KR64_PID)"
-else
-    echo "  ⚠ kr64 process not found — may have crashed or exited"
-fi
-
-# Check if init was spawned by kr64 (it should be PID 1 in the PID namespace,
-# but from the host's perspective it has a regular PID)
-INIT_PID=$("$ADB_BIN" -s emulator-5554 shell "pidof init" 2>/dev/null | tr -d '\r ' || true)
-if [ -n "$INIT_PID" ]; then
-    echo "  ✓ init process found (pid $INIT_PID)"
-else
-    echo "  ⚠ init process not found — kr64 may not have forked init yet"
-fi
-
-# Pull kr64's log NOW (before the app starts and potentially interferes)
-"$ADB_BIN" -s emulator-5554 pull "$KR64_LOG" "$ARTIFACT_DIR/kr64-prelaunch.log" 2>/dev/null || true
-if [ -f "$ARTIFACT_DIR/kr64-prelaunch.log" ]; then
-    LOG_SIZE=$(stat -c%s "$ARTIFACT_DIR/kr64-prelaunch.log")
-    echo "  ✓ pulled kr64-prelaunch.log ($LOG_SIZE bytes)"
-    # Show first/last 20 lines for immediate visibility in the GHA log
-    if [ "$LOG_SIZE" -gt 0 ]; then
-        echo "  ── kr64 log (first 20 lines) ──"
-        head -20 "$ARTIFACT_DIR/kr64-prelaunch.log" | sed 's/^/    /'
-        echo "  ── kr64 log (last 20 lines) ──"
-        tail -20 "$ARTIFACT_DIR/kr64-prelaunch.log" | sed 's/^/    /'
-    fi
-else
-    echo "  ⚠ could not pull $KR64_LOG"
-fi
-
-# Give kr64 a moment to fork init before we start the renderer
-sleep 2
+# Give SettingsActivity time to initialize before launching Render2Activity
+sleep 5
 
 # Launch the container DIRECTLY via Render2Activity instead of tapping
 # the settings preference. Tapping at fixed coordinates is fragile
