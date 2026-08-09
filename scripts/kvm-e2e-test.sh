@@ -238,12 +238,15 @@ case "$ROOTFS_SOURCE" in
         sleep 2  # adbd takes a moment to come back up as root
         "$ADB_BIN" -s emulator-5554 wait-for-device
 
-        echo "  → tar system/ init* default.prop from the booted emulator"
-        # `adb shell tar` writes to the device's /data/local/tmp; we then
-        # pull it. This is faster than `adb shell tar | tar xf -` over
-        # the adb pipe (which has high per-packet overhead).
+        echo "  → tar system/ init* default.prop apex/ from the booted emulator"
+        # IMPORTANT: We also tar apex/ because on Android 11+,
+        # /system/bin/linker64 and /system/lib64/libc.so are symlinks
+        # into /apex/com.android.runtime/. Without /apex in the rootfs,
+        # these symlinks are dangling and the dynamic linker crashes
+        # with SIGSEGV at address 0x86 (NULL pointer dereference in
+        # linker64's soinfo handling).
         "$ADB_BIN" -s emulator-5554 shell \
-            'cd / && tar cf /data/local/tmp/rootfs.tar system/ init* default.prop' \
+            'cd / && tar cf /data/local/tmp/rootfs.tar system/ init* default.prop apex/' \
             2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log"
         echo "  → pull /data/local/tmp/rootfs.tar"
         "$ADB_BIN" -s emulator-5554 pull /data/local/tmp/rootfs.tar "$ROOTFS_TAR"
