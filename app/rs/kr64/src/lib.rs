@@ -888,28 +888,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 }
             }
         } else {
-            // Non-root mode: just chroot into the rootfs.
-            // chroot() is NOT blocked by the zygote's seccomp filter
-            // (it's allowed for untrusted_app on Android 11).
+            // Non-root mode: skip BOTH mount AND chroot.
+            // The zygote's seccomp filter blocks mount() (syscall 165)
+            // AND chroot() (syscall 161) for untrusted_app.
+            // Calling either kills the process with SIGSYS (signal 31).
+            //
+            // Without root, we can't do any filesystem isolation.
+            // Just exec init directly with the rootfs as cwd.
+            // Init's INTERP points to the rootfs linker, so the kernel
+            // loads rootfs libs via LD_LIBRARY_PATH. Init runs in the
+            // host filesystem namespace but with TWOYI_ROOTFS pointing
+            // at the rootfs. The getpid_hook LD_PRELOAD makes init
+            // think it's PID 1.
             unsafe {
-                safe_write_err(b"[KR64 CHILD] non-root mode: skipping mount setup, using chroot\n");
-            }
-            let rootfs_cstr = match CString::new(cfg.rootfs.as_str()) {
-                Ok(s) => s,
-                Err(_) => unsafe {
-                    libc::_exit(127);
-                },
-            };
-            if unsafe { libc::chroot(rootfs_cstr.as_ptr()) } != 0 {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                unsafe {
-                    safe_write_err_errno(b"[KR64 CHILD] FATAL: chroot failed", errno);
-                    libc::_exit(1);
-                }
-            }
-            // chdir to / after chroot
-            unsafe {
-                libc::chdir(c"/".as_ptr());
+                safe_write_err(b"[KR64 CHILD] non-root mode: skipping mount+chroot (seccomp blocks both)\n");
             }
         }
 
