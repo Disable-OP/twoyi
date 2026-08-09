@@ -528,9 +528,20 @@ fi
 # --- Pre-launch kr64 as ROOT ---
 # Run kr64 with namespaces enabled (root can do unshare/pivot_root).
 # Skip seccomp — the filter's SIGSYS handler crashes init with SIGSEGV.
-echo "  → pre-launching kr64 as root (with namespaces, no seccomp)"
+#
+# TWOYI_SKIP_PRELOAD: when set, kr64 skips LD_PRELOAD (getpid_hook.so).
+# This is a diagnostic mode: init will exit 31 (getpid != 1), but if it
+# exits 31 instead of SIGSEGV, we know the linker can load init without
+# the hook. Set TWOYI_SKIP_PRELOAD=1 in the CI env to test.
+SKIP_PRELOAD_ENV="${TWOYI_SKIP_PRELOAD:-}"
+if [ -n "$SKIP_PRELOAD_ENV" ]; then
+    echo "  → pre-launching kr64 as root (TWOYI_SKIP_PRELOAD=1, no LD_PRELOAD)"
+else
+    echo "  → pre-launching kr64 as root (with namespaces, no seccomp)"
+fi
 "$ADB_BIN" -s emulator-5554 shell "
     export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
+    ${SKIP_PRELOAD_ENV:+export TWOYI_SKIP_PRELOAD=1}
     /data/local/tmp/kr64 \
         --rootfs $TWOYI_PROFILE \
         --data-dir /data/user/0/io.twoyi \
