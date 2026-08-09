@@ -957,6 +957,37 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         );
     }
 
+    // Copy libtwoyi_loader_shlib.so to /dev/ (same pattern as libgetpid_hook.so)
+    // This is the seccomp/SIGSYS virtualization library.
+    let (loader_src, loader_dst) = if cfg.use_namespaces {
+        ("/libtwoyi_loader_shlib.so".to_string(), "/dev/libtwoyi_loader_shlib.so".to_string())
+    } else {
+        (
+            format!("{}/libtwoyi_loader_shlib.so", cfg.rootfs),
+            format!("{}/dev/libtwoyi_loader_shlib.so", cfg.rootfs),
+        )
+    };
+    if Path::new(&loader_src).exists() {
+        if let Some(parent) = Path::new(&loader_dst).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::copy(&loader_src, &loader_dst) {
+            Ok(_) => {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &loader_dst,
+                    std::fs::Permissions::from_mode(0o644),
+                );
+                info!("[KR64] PARENT: copied libtwoyi_loader_shlib.so {} -> {}", loader_src, loader_dst);
+            }
+            Err(e) => {
+                error!("[KR64] PARENT: failed to copy libtwoyi_loader_shlib.so {} -> {}: {}", loader_src, loader_dst, e);
+            }
+        }
+    } else {
+        info!("[KR64] PARENT: libtwoyi_loader_shlib.so not found at {} -- seccomp virtualization disabled", loader_src);
+    }
+
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -1159,10 +1190,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // can link WITHOUT the getpid hook (init will exit 31, but if it
         // exits 31 instead of SIGSEGV, we know the linker works).
         let skip_preload = std::env::var("TWOYI_SKIP_PRELOAD").is_ok();
+        // LD_PRELOAD: load BOTH the seccomp/SIGSYS virtualization library
+        // (libtwoyi_loader_shlib.so) AND the getpid hook (libgetpid_hook.so).
+        // The virtualization library installs seccomp BPF filter + SIGSYS
+        // handler via .init_array constructor before init's main() runs.
+        // The getpid hook makes init think it's PID 1.
         let ld_preload_str = if cfg.use_namespaces {
-            "LD_PRELOAD=/dev/libgetpid_hook.so".to_string()
+            "LD_PRELOAD=/dev/libtwoyi_loader_shlib.so:/dev/libgetpid_hook.so".to_string()
         } else {
-            format!("LD_PRELOAD={}/dev/libgetpid_hook.so", cfg.rootfs)
+            format!("LD_PRELOAD={}/dev/libtwoyi_loader_shlib.so:{}/dev/libgetpid_hook.so",
+                    cfg.rootfs, cfg.rootfs)
         };
         let mut env_vars: Vec<CString> = vec![
             CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),

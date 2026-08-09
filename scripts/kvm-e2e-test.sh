@@ -517,6 +517,26 @@ else
 fi
 "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libgetpid_hook.so && ls -la $TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
 
+# --- Push libtwoyi_loader_shlib.so (seccomp/SIGSYS virtualization) ---
+# This is the REAL virtualization library. Loaded via LD_PRELOAD.
+if [ -f "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" ]; then
+    "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" "$TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1 | tail -2
+    "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1
+    echo "  ✓ pushed libtwoyi_loader_shlib.so to rootfs"
+elif [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
+    APK_ABS3=$(readlink -f "$APK_PATH" 2>/dev/null || echo "$APK_PATH")
+    unzip -o "$APK_ABS3" "lib/x86_64/libtwoyi_loader_shlib.so" -d "$EXTRACT_DIR" 2>/dev/null || true
+    if [ -f "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" ]; then
+        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" "$TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1 | tail -2
+        "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1
+        echo "  ✓ pushed libtwoyi_loader_shlib.so to rootfs (extracted separately)"
+    else
+        echo "  ⚠ libtwoyi_loader_shlib.so not found in APK — seccomp virtualization disabled"
+    fi
+else
+    echo "  ⚠ EXTRACT_DIR not populated — libtwoyi_loader_shlib.so not available"
+fi
+
 # Also create the libkr64.so symlink in the rootfs (RomManager does this
 # when the app starts, but we want it ready before the app launches).
 "$ADB_BIN" -s emulator-5554 shell "

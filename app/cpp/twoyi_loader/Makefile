@@ -97,3 +97,11 @@ test-arm64: $(TARGET_BIN)
 
 clean:
 	rm -f $(LOADER_OBJS) $(COMBINED_OBJS) arch/arm64_stub.o $(TARGET_BIN) $(LOADER_BIN)
+
+# Shared library (for LD_PRELOAD / DT_NEEDED)
+shlib: libtwoyi_loader_shlib.so
+
+libtwoyi_loader_shlib.so: src/twoyi_loader_shlib.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ src/twoyi_loader_shlib.c -lc -lpthread -ldl
+	@echo "Built $@"
+	@file $@ | head -1
