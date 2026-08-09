@@ -438,12 +438,49 @@ static long emu_rt_sigaction(int sig, const struct sigaction *act,
 }
 
 // =========================================================================
+// SELinuxFS virtualization
+// Init needs /sys/fs/selinux/* files during SELinux setup.
+// We create virtual files in the rootfs's /sys/fs/selinux/ directory.
+// =========================================================================
+static void ensure_selinuxfs_files(void) {
+    if (!g_rootfs) return;
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/sys/fs/selinux", g_rootfs);
+    mkdir(dir, 0755);
+
+    // Create required selinuxfs control files
+    // Init opens these and writes to them during SELinux setup
+    const char *files[] = {
+        "checkreqprot",  // init writes "0" here (FATAL if missing)
+        "enforce",       // init writes "0" or "1" here
+        "load",          // init writes policy here
+        "policyvers",    // init reads policy version
+        NULL
+    };
+    for (int i = 0; files[i]; i++) {
+        char path[600];
+        snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
+        // Create the file if it doesn't exist
+        int fd = syscall(NR_open, path, O_WRONLY | O_CREAT, 0666);
+        if (fd >= 0) {
+            // Write default content
+            if (strcmp(files[i], "checkreqprot") == 0) {
+                syscall(NR_write, fd, "0", 1);
+            } else if (strcmp(files[i], "enforce") == 0) {
+                syscall(NR_write, fd, "0", 1);
+            } else if (strcmp(files[i], "policyvers") == 0) {
+                syscall(NR_write, fd, "33", 2);
+            }
+            syscall(NR_close, fd);
+        }
+    }
+}
+
+// =========================================================================
 // openat PLT interposition (path translation)
 // VM uses shadowhook for openat; we use LD_PRELOAD PLT interposition.
-// This is NOT in the seccomp trap list — it's a libc wrapper hook.
 // =========================================================================
 
-// Real openat pointer (resolved via dlsym)
 static int (*real_openat)(int, const char *, int, ...) = NULL;
 
 static void init_real_funcs(void) {
@@ -470,6 +507,22 @@ int openat(int dirfd, const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
     init_real_funcs();
+
+    // Special handling for selinuxfs paths
+    // Init opens /sys/fs/selinux/checkreqprot, /sys/fs/selinux/enforce, etc.
+    // These need to exist as writable files.
+    if (path && strncmp(path, "/sys/fs/selinux/", 16) == 0) {
+        const char *translated = translate(path);
+        int fd = real_openat ? real_openat(dirfd, translated, flags, mode)
+                              : syscall(NR_openat, dirfd, translated, flags, mode);
+        if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
+            // File doesn't exist — create it
+            fd = real_openat ? real_openat(dirfd, translated, flags | O_CREAT, 0666)
+                              : syscall(NR_openat, dirfd, translated, flags | O_CREAT, 0666);
+        }
+        return fd;
+    }
+
     if (!real_openat) return syscall(NR_openat, dirfd, path, flags, mode);
     const char *translated = translate(path);
     return real_openat(dirfd, translated, flags, mode);
@@ -667,6 +720,11 @@ static void twoyi_init(void) {
     // The getpid_hook.so (also in LD_PRELOAD) handles getpid() → return 1.
 
     write_str(2, "[twoyi_loader] PLT hooks installed (mount, open, openat, execv, execve)\n");
+
+    // Create SELinuxFS virtual files (init needs /sys/fs/selinux/checkreqprot etc.)
+    ensure_selinuxfs_files();
+    write_str(2, "[twoyi_loader] selinuxfs virtual files created\n");
+
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
 
     g_runtime_ready = 1;
