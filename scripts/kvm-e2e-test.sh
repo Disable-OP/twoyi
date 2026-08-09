@@ -481,21 +481,29 @@ fi
 # --- Create symlinks in the rootfs for libgetpid_hook.so ---
 # kr64's LD_PRELOAD path is /system/lib64/libgetpid_hook.so (relative to chroot).
 # We need the file to be at {rootfs}/system/lib64/libgetpid_hook.so.
-# RomManager.ensureLibSymlink would create this, but the app hasn't started yet.
-#
-# IMPORTANT: we COPY the file (not symlink) because after chroot, absolute
-# symlink targets like /data/local/tmp/libgetpid_hook.so would be unreachable
-# (they'd be interpreted as <chroot>/data/local/tmp/... which doesn't exist).
-"$ADB_BIN" -s emulator-5554 shell "
-    mkdir -p $TWOYI_PROFILE/system/lib64
-    # Use cat instead of cp — cp may fail on read-only filesystems
-    cat /data/local/tmp/libgetpid_hook.so > $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'cat copy succeeded' || echo 'cat copy FAILED'
-    chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
-    ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
-    # Also check the file is a valid ELF
-    file $TWOYI_PROFILE/system/lib64/libgetpid_hook.so 2>/dev/null || true
-    echo '  ✓ copied libgetpid_hook.so to rootfs/system/lib64/'
-"
+# Use adb push directly to the rootfs path (more reliable than cp/cat on device)
+"$ADB_BIN" -s emulator-5554 shell "mkdir -p $TWOYI_PROFILE/system/lib64" 2>/dev/null
+if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
+    "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" "$TWOYI_PROFILE/system/lib64/libgetpid_hook.so" 2>&1 | tail -2
+    echo "  ✓ pushed libgetpid_hook.so directly to rootfs/system/lib64/"
+elif [ -f /data/local/tmp/libgetpid_hook.so ]; then
+    "$ADB_BIN" -s emulator-5554 push /data/local/tmp/libgetpid_hook.so "$TWOYI_PROFILE/system/lib64/libgetpid_hook.so" 2>&1 | tail -2
+    echo "  ✓ pushed libgetpid_hook.so from /data/local/tmp/"
+else
+    # Copy from installed APK on device
+    "$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
+    sleep 1
+    "$ADB_BIN" -s emulator-5554 wait-for-device 2>/dev/null || true
+    "$ADB_BIN" -s emulator-5554 shell "
+        APK_DIR=\$(dirname \$(pm path io.twoyi | head -1 | sed 's/package://'))
+        cat \$APK_DIR/lib/x86_64/libgetpid_hook.so > $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'copied from APK' || echo 'copy from APK FAILED'
+        ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
+    " 2>&1 | tail -3
+fi
+"$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so" 2>/dev/null || true
+
+# Verify libgetpid_hook.so exists in the rootfs
+"$ADB_BIN" -s emulator-5554 shell "test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'EXISTS' || echo 'MISSING'" 2>&1 | tail -3
 
 # Verify libgetpid_hook.so exists in the rootfs
 "$ADB_BIN" -s emulator-5554 shell "test -f $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo '  ✓ libgetpid_hook.so exists in rootfs' || echo '  ⚠ libgetpid_hook.so MISSING from rootfs — init will fail to link'" 2>&1 | tail -1
