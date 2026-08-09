@@ -551,9 +551,30 @@ int open(const char *path, int flags, ...) {
     }
     init_real_funcs();
 
+    // Log selinuxfs opens for debugging
+    if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg),
+            "[twoyi_loader] open(%s, flags=0x%x)\n", path, flags);
+        write(2, msg, len);
+    }
+
     // Special handling for selinuxfs paths — same as openat()
-    if (path && strncmp(path, "/sys/fs/selinux/", 16) == 0) {
+    if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         const char *translated = translate(path);
+        // Ensure the file exists — create it if missing
+        char real_path[600];
+        snprintf(real_path, sizeof(real_path), "%s/sys/fs/selinux", g_rootfs ? g_rootfs : "");
+        mkdir_p(real_path, 0755);
+
+        // Try to create the file if it doesn't exist
+        if (g_rootfs) {
+            char file_path[600];
+            snprintf(file_path, sizeof(file_path), "%s%s", g_rootfs, path);
+            int cfd = syscall(NR_open, file_path, O_WRONLY | O_CREAT, 0666);
+            if (cfd >= 0) syscall(NR_close, cfd);
+        }
+
 #if defined(__x86_64__)
         int fd = syscall(NR_open, translated, flags, mode);
         if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
@@ -579,6 +600,16 @@ int open(const char *path, int flags, ...) {
     if (real_openat) return real_openat(AT_FDCWD, translated, flags, mode);
     return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
+}
+
+// Hook __open_2 (bionic's fortified open — used by init's WriteFile)
+int __open_2(const char *path, int flags) {
+    return open(path, flags);
+}
+
+// Hook __openat_2 (bionic's fortified openat)
+int __openat_2(int dirfd, const char *path, int flags) {
+    return openat(dirfd, path, flags);
 }
 
 // =========================================================================
