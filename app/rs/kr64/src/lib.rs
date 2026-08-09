@@ -880,7 +880,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             if let Err(e) = mount_mgr::setup_mounts(&mount_cfg) {
                 let errno = e.raw_os_error().unwrap_or(0);
                 unsafe {
-                    safe_write_err_errno(b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed", errno);
+                    safe_write_err_errno(
+                        b"[KR64 CHILD] FATAL: mount_mgr::setup_mounts failed",
+                        errno,
+                    );
                     libc::_exit(1);
                 }
             }
@@ -888,18 +891,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // Non-root mode: just chroot into the rootfs.
             // chroot() is NOT blocked by the zygote's seccomp filter
             // (it's allowed for untrusted_app on Android 11).
-            safe_write_err(b"[KR64 CHILD] non-root mode: skipping mount setup, using chroot\n");
+            unsafe {
+                safe_write_err(
+                    b"[KR64 CHILD] non-root mode: skipping mount setup, using chroot\n",
+                );
+            }
             let rootfs_cstr = match CString::new(cfg.rootfs.as_str()) {
                 Ok(s) => s,
-                Err(_) => unsafe { libc::_exit(127); }
+                Err(_) => unsafe {
+                    libc::_exit(127);
+                },
             };
             if unsafe { libc::chroot(rootfs_cstr.as_ptr()) } != 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                safe_write_err_errno(b"[KR64 CHILD] FATAL: chroot failed", errno);
-                unsafe { libc::_exit(1); }
+                unsafe {
+                    safe_write_err_errno(b"[KR64 CHILD] FATAL: chroot failed", errno);
+                    libc::_exit(1);
+                }
             }
             // chdir to / after chroot
-            unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char); }
+            unsafe {
+                libc::chdir(b"/\0".as_ptr() as *const libc::c_char);
+            }
         }
 
         if cfg.install_seccomp {
@@ -966,7 +979,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // PID 1 check without needing unshare(CLONE_NEWPID).
             // The path is resolved from the rootfs's system/lib64/ where
             // RomManager.ensureLibSymlink creates it.
-            CString::new(format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)).unwrap(),
+            CString::new(format!(
+                "LD_PRELOAD={}/system/lib64/libgetpid_hook.so",
+                cfg.rootfs
+            ))
+            .unwrap(),
         ];
         let env_ptrs: Vec<*const libc::c_char> = env_vars
             .iter()
