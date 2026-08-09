@@ -161,7 +161,26 @@ fn bind_unix_socket(path: &str) -> std::io::Result<UnixListener> {
     match fs::remove_file(path) {
         Ok(()) => info!("[KR64][devices] removed stale socket: {}", path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warning!("[KR64][devices] could not remove {}: {}", path, e),
+        Err(e) => {
+            // If remove_file failed, the path might be a directory.
+            // Try removing it as a directory (empty only).
+            match fs::remove_dir(path) {
+                Ok(()) => {
+                    info!("[KR64][devices] removed stale dir: {}", path);
+                }
+                Err(_) => {
+                    // Last resort: chmod the path so we can remove it,
+                    // then try remove_file again.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o777));
+                        let _ = fs::remove_file(path);
+                    }
+                    warning!("[KR64][devices] could not remove {}: {}", path, e);
+                }
+            }
+        }
     }
 
     // Bind. This creates the socket file as a side effect.
