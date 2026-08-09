@@ -488,9 +488,12 @@ fi
 # (they'd be interpreted as <chroot>/data/local/tmp/... which doesn't exist).
 "$ADB_BIN" -s emulator-5554 shell "
     mkdir -p $TWOYI_PROFILE/system/lib64
-    cp /data/local/tmp/libgetpid_hook.so $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'cp succeeded' || echo 'cp FAILED'
+    # Use cat instead of cp — cp may fail on read-only filesystems
+    cat /data/local/tmp/libgetpid_hook.so > $TWOYI_PROFILE/system/lib64/libgetpid_hook.so && echo 'cat copy succeeded' || echo 'cat copy FAILED'
     chmod 644 $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
     ls -la $TWOYI_PROFILE/system/lib64/libgetpid_hook.so
+    # Also check the file is a valid ELF
+    file $TWOYI_PROFILE/system/lib64/libgetpid_hook.so 2>/dev/null || true
     echo '  ✓ copied libgetpid_hook.so to rootfs/system/lib64/'
 "
 
