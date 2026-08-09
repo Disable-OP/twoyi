@@ -314,13 +314,24 @@ TWOYI_PROFILE="$TWOYI_DATA/rootfs"
 "$ADB_BIN" -s emulator-5554 shell am force-stop io.twoyi 2>/dev/null || true
 
 # Clean up stale dev/event directory from previous runs (kr64 fails if
-# /data/data/io.twoyi/dev/event exists as a directory or stale socket)
+# /data/user/0/io.twoyi/dev/event exists as a directory or stale socket)
 "$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
-sleep 1
+sleep 2
 "$ADB_BIN" -s emulator-5554 wait-for-device 2>/dev/null || true
-"$ADB_BIN" -s emulator-5554 shell "rm -rf /data/data/io.twoyi/dev" 2>/dev/null || true
-"$ADB_BIN" -s emulator-5554 shell "rm -rf /data/user/0/io.twoyi/dev" 2>/dev/null || true
-echo "  ✓ cleaned up stale dev/ directory"
+# Use both paths — /data/user/0/io.twoyi is a symlink to /data/data/io.twoyi
+# but some operations don't follow symlinks
+"$ADB_BIN" -s emulator-5554 shell "rm -rf /data/user/0/io.twoyi/dev /data/data/io.twoyi/dev" 2>/dev/null || true
+# Also remove the kr64-stderr.log from previous runs
+"$ADB_BIN" -s emulator-5554 shell "rm -f /data/user/0/io.twoyi/kr64-stderr.log /data/data/io.twoyi/kr64-stderr.log" 2>/dev/null || true
+# Verify the cleanup worked
+DEV_EXISTS=$("$ADB_BIN" -s emulator-5554 shell "ls -la /data/user/0/io.twoyi/dev 2>&1" 2>/dev/null || true)
+if echo "$DEV_EXISTS" | grep -q "No such file"; then
+    echo "  ✓ cleaned up stale dev/ directory"
+else
+    echo "  ⚠ dev/ directory still exists: $DEV_EXISTS"
+    # Force remove with chmod
+    "$ADB_BIN" -s emulator-5554 shell "chmod -R 777 /data/user/0/io.twoyi/dev 2>/dev/null; rm -rf /data/user/0/io.twoyi/dev" 2>/dev/null || true
+fi
 
 # Push the tarball to a temp location, then extract it into twoyi's
 # data dir. We can't `adb push` directly to /data/data/io.twoyi/.../
