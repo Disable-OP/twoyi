@@ -469,7 +469,7 @@ export ANDROID_ROOT='"$TWOYI_PROFILE/system"'
 export ANDROID_DATA='"$TWOYI_PROFILE/data"'
 export PATH=/system/bin:/system/xbin:/vendor/bin
 cd "'"$TWOYI_PROFILE"'"
-exec "'"$KR64_SYMLINK"'" --rootfs "'"$TWOYI_PROFILE"'" --data-dir "'"$TWOYI_DATA"'" --vmid 0
+exec "'"$KR64_SYMLINK"'" --rootfs "'"$TWOYI_PROFILE"'" --data-dir "'"$TWOYI_DATA"'" --vmid 0 --no-seccomp
 '
 
 # Push the launch script to /data/local/tmp (writable by root)
