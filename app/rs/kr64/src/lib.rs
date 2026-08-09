@@ -530,7 +530,7 @@ pub fn clear_zombie_processes() {
 ///   6. Wait for the child (the guest init) to exit; propagate its
 ///      exit code.
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
-    let cfg = match parse_args(args) {
+    let mut cfg = match parse_args(args) {
         Ok(c) => c,
         Err(e) => {
             // If --help, print to stdout and exit 0; otherwise stderr
@@ -772,18 +772,51 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
     // ---------------------------------------------------------------
-    // NOTE: We do NOT do this yet — the mount setup has to happen
-    // inside the forked child, because once we pivot_root we lose
-    // access to the host's paths (and the parent needs to keep
-    // accepting connections on the device sockets it bound above).
+    // The parent calls setup_mounts() BEFORE fork(). This does:
+    //   1. unshare(CLONE_NEWNS) — new mount namespace (root required)
+    //   2. mount tmpfs on {rootfs}/dev, /proc, /sys, /tmp, /apex, /mnt
+    //   3. pivot_root(rootfs, rootfs/old_root) — make rootfs the new /
+    //   4. umount2(/old_root, MNT_DETACH) — drop host's /
+    //   5. chdir("/")
     //
-    // The flow is:
-    //   parent: bind device sockets (already done above)
-    //   parent: fork()
-    //     child: mount_mgr::setup_mounts(cfg)
-    //     child: seccomp::install()
-    //     child: execve(/system/bin/init)
-    //   parent: accept loop on device sockets
+    // After pivot_root, the parent's root IS the rootfs. The device
+    // socket fds (held by accept threads) are still valid — accept()
+    // works on fds, not paths. The host (outside the mount namespace)
+    // still sees {rootfs}/dev/qemu_pipe on the original ext4 filesystem
+    // and can connect to it. The tmpfs mount is only visible inside
+    // the parent's mount namespace.
+    //
+    // The child (init) inherits the parent's mount namespace (with
+    // pivot_root already done). This means:
+    //   - execve("/system/bin/init") resolves to {rootfs}/system/bin/init ✓
+    //   - LD_PRELOAD=/dev/libgetpid_hook.so resolves to the tmpfs ✓
+    //   - Init's own mount("tmpfs", "/dev", ...) stacks on top of ours ✓
+    //
+    // If setup_mounts fails (e.g. not root), we fall through to fork
+    // without pivot_root. The child will exec init with full rootfs
+    // paths prepended (see full_init_path below).
+    if cfg.use_namespaces {
+        let mount_cfg = mount_mgr::MountConfig {
+            rootfs: cfg.rootfs.clone(),
+            rom_dir: cfg.rom_dir.clone(),
+            use_namespaces: cfg.use_namespaces,
+            read_only_rom: cfg.read_only_rom,
+        };
+        match mount_mgr::setup_mounts(&mount_cfg) {
+            Ok(()) => info!("[KR64] setup_mounts succeeded — pivot_root done"),
+            Err(e) => {
+                error!(
+                    "[KR64] setup_mounts failed: {} — continuing without pivot_root (init may fail to find /system/bin/init)",
+                    e
+                );
+                // Mark that we did NOT pivot_root, so the child uses
+                // full rootfs-prefixed paths instead.
+                cfg.use_namespaces = false;
+            }
+        }
+    } else {
+        info!("[KR64] use_namespaces=false — skipping setup_mounts (chroot only)");
+    }
 
     // ---------------------------------------------------------------
     // Step 4.5: create a PID namespace so the guest init becomes PID 1.
@@ -819,28 +852,52 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Step 5: fork + exec the guest.
     // ---------------------------------------------------------------
 
-    // Copy libgetpid_hook.so from / (root of rootfs) to /dev/ (tmpfs)
-    // The KVM test script pushes it to the ROOT of the rootfs (not
-    // /system/lib64/) because the rootfs's system/ directory comes from
-    // the emulator's /system partition and files pushed there are not
-    // visible after pivot_root + bind mount.
-    // /dev/ is a tmpfs mounted by kr64 — always writable and visible.
-    if Path::new("/libgetpid_hook.so").exists() {
-        match std::fs::copy("/libgetpid_hook.so", "/dev/libgetpid_hook.so") {
+    // Copy libgetpid_hook.so to /dev/ (tmpfs) so the child can use
+    // LD_PRELOAD=/dev/libgetpid_hook.so.
+    //
+    // After pivot_root (use_namespaces still true):
+    //   /libgetpid_hook.so = {rootfs}/libgetpid_hook.so (on ext4)
+    //   /dev/ = tmpfs (writable, mounted by setup_mounts)
+    //
+    // Without pivot_root (setup_mounts failed, use_namespaces set false):
+    //   {rootfs}/libgetpid_hook.so (full path on ext4)
+    //   {rootfs}/dev/ (regular dir on ext4, writable)
+    let (hook_src, hook_dst) = if cfg.use_namespaces {
+        ("/libgetpid_hook.so".to_string(), "/dev/libgetpid_hook.so".to_string())
+    } else {
+        (
+            format!("{}/libgetpid_hook.so", cfg.rootfs),
+            format!("{}/dev/libgetpid_hook.so", cfg.rootfs),
+        )
+    };
+    if Path::new(&hook_src).exists() {
+        // Ensure the destination directory exists (setup_mounts may not
+        // have created /dev/ if it failed, or the rootfs/dev/ dir may
+        // not exist yet in non-namespace mode).
+        if let Some(parent) = Path::new(&hook_dst).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::copy(&hook_src, &hook_dst) {
             Ok(_) => {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(
-                    "/dev/libgetpid_hook.so",
+                    &hook_dst,
                     std::fs::Permissions::from_mode(0o644),
                 );
-                info!("[KR64] PARENT: copied libgetpid_hook.so from / to /dev/");
+                info!("[KR64] PARENT: copied libgetpid_hook.so {} -> {}", hook_src, hook_dst);
             }
             Err(e) => {
-                error!("[KR64] PARENT: failed to copy libgetpid_hook.so to /dev/: {}", e);
+                error!(
+                    "[KR64] PARENT: failed to copy libgetpid_hook.so {} -> {}: {}",
+                    hook_src, hook_dst, e
+                );
             }
         }
     } else {
-        error!("[KR64] PARENT: /libgetpid_hook.so not found in rootfs");
+        error!(
+            "[KR64] PARENT: libgetpid_hook.so not found at {} — LD_PRELOAD will fail",
+            hook_src
+        );
     }
 
     info!("[KR64] forking guest process");
@@ -959,28 +1016,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
         // Debug: check if libgetpid_hook.so exists at the expected path
-        let hook_path = if cfg.use_namespaces {
-            c"/system/lib64/libgetpid_hook.so".to_bytes_with_nul()
+        // After pivot_root: /dev/libgetpid_hook.so (tmpfs)
+        // Without pivot_root: {rootfs}/dev/libgetpid_hook.so (ext4)
+        let hook_exists = if cfg.use_namespaces {
+            unsafe { libc::access(b"/dev/libgetpid_hook.so\0".as_ptr() as *const libc::c_char, libc::F_OK) } == 0
         } else {
-            // Can't use format! here (async-signal-unsafe), so just check
-            // the chroot-relative path
-            b"/system/lib64/libgetpid_hook.so\0"
+            // Can't use format! in async-signal-safe context, but we can
+            // check the chroot-relative path since the parent already
+            // copied it to {rootfs}/dev/libgetpid_hook.so
+            unsafe { libc::access(b"/dev/libgetpid_hook.so\0".as_ptr() as *const libc::c_char, libc::F_OK) } == 0
         };
-        let hook_exists = unsafe { libc::access(hook_path.as_ptr() as *const libc::c_char, libc::F_OK) } == 0;
         if hook_exists {
-            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /system/lib64/\n"); }
+            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /dev/\n"); }
         } else {
-            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so NOT found at /system/lib64/\n"); }
-            // Try listing /system/lib64/ to see what's there
-            // (can't use opendir in async-signal-safe context, so just
-            // try a few known paths)
-            let alt_path = b"/system/lib64/libc.so\0";
-            let alt_exists = unsafe { libc::access(alt_path.as_ptr() as *const libc::c_char, libc::F_OK) } == 0;
-            if alt_exists {
-                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so exists - dir is accessible\n"); }
-            } else {
-                unsafe { safe_write_err(b"[KR64 CHILD] /system/lib64/libc.so NOT found - dir may not exist\n"); }
-            }
+            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so NOT found at /dev/\n"); }
         }
 
         // Build environment for the guest init. The CString::new calls
@@ -1003,7 +1052,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // The parent copied libgetpid_hook.so to /dev/ before fork.
             "LD_PRELOAD=/dev/libgetpid_hook.so".to_string()
         } else {
-            format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)
+            // No pivot_root — use the full rootfs path. The parent
+            // copied libgetpid_hook.so to {rootfs}/dev/libgetpid_hook.so.
+            format!("LD_PRELOAD={}/dev/libgetpid_hook.so", cfg.rootfs)
         };
         let env_vars: Vec<CString> = vec![
             CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
