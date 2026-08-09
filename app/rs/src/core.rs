@@ -281,39 +281,43 @@ pub fn init_renderer(
 
         let mut cmd;
         if Path::new(&kr64_path).exists() {
-            // Use the kr64 daemon — it sets up /dev, properties, seccomp,
-            // then execs init in a child where init thinks it's PID 1.
+            // Use the kr64 daemon via the rootfs linker.
             //
-            // IMPORTANT (2026-08-09 overnight debug): kr64 MUST run as root
-            // because it needs to call unshare(CLONE_NEWPID), mount,
-            // pivot_root / chroot, and other syscalls that are blocked by
-            // the Android zygote's seccomp filter for untrusted_app.
-            // Running kr64 as the app user causes SIGSYS / SYS_SECCOMP
-            // crashes (seccomp prevents the syscall, kernel kills the
-            // process). Running via `su -c` gives us a root shell that
-            // does NOT inherit the zygote's seccomp filter, so kr64 can
-            // freely call mount/unshare/chroot/etc.
+            // Directly exec'ing libkr64.so crashes with SIGSEGV (rip=0x7,
+            // null function pointer) because the cdylib's C runtime isn't
+            // properly initialized when exec'd directly — the .init_array
+            // / lang_start setup doesn't complete, leaving function pointers
+            // in the GOT as NULL.
             //
-            // The `su` binary on Android emulators (google_apis images)
-            // and rooted devices is at /system/bin/su and accepts
-            // `su -c <command>`. On non-rooted devices `su` is absent
-            // and the spawn will fail — logged below.
-            info!("[CORE] Using kr64 daemon (via su): {}", kr64_path);
-
-            // Build the command string for `su -c`. We use `exec env ...`
-            // so the su shell is replaced by kr64 (no extra process) and
-            // env vars are set explicitly (su doesn't inherit our env).
+            // Fix: use the rootfs linker to load libkr64.so, the same way
+            // we load init. The linker properly initializes the C runtime,
+            // runs .init_array, then calls the ELF entry point (kr64_main).
+            //   linker64 libkr64.so --rootfs ... --data-dir ... --vmid 0
+            //
+            // kr64 needs root for unshare/mount/chroot. We run it via
+            // `su -c` on rooted emulators. The su shell exec's the linker
+            // which loads libkr64.so and calls kr64_main.
+            let bootstrap_linker = format!("{}/system/bin/bootstrap/linker64", working_dir);
+            let legacy_linker = format!("{}/system/bin/linker64", working_dir);
+            let linker = if Path::new(&bootstrap_linker).exists() {
+                bootstrap_linker
+            } else {
+                legacy_linker
+            };
             let android_root = format!("{}/system", working_dir);
             let android_data = format!("{}/data", working_dir);
+            info!("[CORE] Using kr64 daemon via rootfs linker: {} {}", linker, kr64_path);
+
             let su_cmd = format!(
                 "exec env LD_LIBRARY_PATH='{ld_library}' TWOYI_ROOTFS='{root}' TYLOADER='{loader}' \
                  ANDROID_BOOTLOGO=1 ANDROID_ROOT='{aroot}' ANDROID_DATA='{adata}' \
-                 '{kr64}' --rootfs '{root}' --data-dir '{ddir}' --vmid 0",
+                 '{linker}' '{kr64}' --rootfs '{root}' --data-dir '{ddir}' --vmid 0",
                 ld_library = ld_library_path,
                 root = working_dir,
                 loader = loader_path,
                 aroot = android_root,
                 adata = android_data,
+                linker = linker,
                 kr64 = kr64_path,
                 ddir = get_data_dir(),
             );
