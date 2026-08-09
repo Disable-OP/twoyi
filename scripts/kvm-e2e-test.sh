@@ -431,7 +431,7 @@ if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
     echo "  → extracting libkr64.so + libgetpid_hook.so from APK ($APK_PATH)"
     EXTRACT_DIR=/tmp/apk-extract
     rm -rf "$EXTRACT_DIR" && mkdir -p "$EXTRACT_DIR"
-    (cd "$EXTRACT_DIR" && unzip -o "$APK_PATH" "lib/x86_64/libkr64.so" "lib/x86_64/libgetpid_hook.so" 2>/dev/null) || true
+    (cd "$EXTRACT_DIR" && unzip -o "$APK_PATH" "lib/x86_64/libkr64.so" "lib/x86_64/libgetpid_hook.so") || echo "  ⚠ unzip failed: $?"
     if [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
         "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libkr64.so" /data/local/tmp/kr64
         "$ADB_BIN" -s emulator-5554 shell chmod 755 /data/local/tmp/kr64
