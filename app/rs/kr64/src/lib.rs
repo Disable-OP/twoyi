@@ -892,9 +892,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // chroot() is NOT blocked by the zygote's seccomp filter
             // (it's allowed for untrusted_app on Android 11).
             unsafe {
-                safe_write_err(
-                    b"[KR64 CHILD] non-root mode: skipping mount setup, using chroot\n",
-                );
+                safe_write_err(b"[KR64 CHILD] non-root mode: skipping mount setup, using chroot\n");
             }
             let rootfs_cstr = match CString::new(cfg.rootfs.as_str()) {
                 Ok(s) => s,
@@ -977,13 +975,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // LD_PRELOAD the getpid_hook library so init thinks it's PID 1.
             // The hook overrides getpid() to return 1, bypassing init's
             // PID 1 check without needing unshare(CLONE_NEWPID).
-            // The path is resolved from the rootfs's system/lib64/ where
-            // RomManager.ensureLibSymlink creates it.
-            CString::new(format!(
-                "LD_PRELOAD={}/system/lib64/libgetpid_hook.so",
-                cfg.rootfs
-            ))
-            .unwrap(),
+            // The path is RELATIVE TO THE NEW ROOT (set by chroot/pivot_root
+            // above). RomManager.ensureLibSymlink creates the symlink at
+            // {rootfs}/system/lib64/libgetpid_hook.so, so after chroot
+            // the file is at /system/lib64/libgetpid_hook.so.
+            CString::new("LD_PRELOAD=/system/lib64/libgetpid_hook.so").unwrap(),
         ];
         let env_ptrs: Vec<*const libc::c_char> = env_vars
             .iter()
