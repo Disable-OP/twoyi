@@ -135,6 +135,30 @@ int mknodat(int dirfd, const char *pathname, mode_t mode, dev_t dev) {
 }
 
 // =========================================================================
+// mkdir/mkdirat hooks — return 0 even if directory already exists
+// =========================================================================
+// Init's FirstStageMain creates directories:
+//   mkdir("/dev/pts", 0755)
+//   mkdir("/dev/socket", 0755)
+//   mkdir("/mnt/vendor", 0755)
+//   mkdir("/mnt/product", 0755)
+//
+// In rootless mode, these directories already exist on the HOST. mkdir()
+// returns EEXIST, which init treats as an error and aborts. We hook
+// mkdir() to return 0 (success) regardless, so init continues.
+
+int mkdir(const char *pathname, mode_t mode) {
+    // In rootless mode, the host's directories already exist (EEXIST).
+    // Just return 0 so init continues. kr64 creates any rootfs-specific
+    // directories before forking.
+    return 0;
+}
+
+int mkdirat(int dirfd, const char *pathname, mode_t mode) {
+    return 0;
+}
+
+// =========================================================================
 // setgroups hook — fake success
 // =========================================================================
 // Init calls setgroups() to set supplementary groups. In rootless mode,
