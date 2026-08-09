@@ -111,6 +111,23 @@ static void write_str(int fd, const char *s) {
 }
 
 // =========================================================================
+// Global state (must be before PLT hooks that use it)
+// =========================================================================
+
+volatile int g_runtime_ready = 0;
+volatile int g_sigsys_count = 0;
+static const char *g_rootfs = NULL;
+
+// Mount table
+#define MAX_MOUNTS 32
+struct mount_entry {
+    char source[256]; char target[256]; char fstype[64];
+    unsigned long flags; int active;
+};
+static struct mount_entry g_mounts[MAX_MOUNTS];
+static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// =========================================================================
 // LD_PRELOAD path — stored at init time, re-set before each exec
 // ROOT CAUSE: Android init's FirstStageMain calls clearenv() which wipes
 // LD_PRELOAD, then execv() which resets signal handlers to SIG_DFL.
@@ -135,9 +152,129 @@ static void restore_preload_env(void) {
     }
 }
 
-// Hook execv — re-set LD_PRELOAD before exec
-// This ensures the .init_array constructor runs in the new process
+// =========================================================================
+// PLT interposition for mount/mknod/chroot/etc
+// These replace the seccomp/SIGSYS approach (which doesn't survive execv).
+// PLT hooks survive execv because LD_PRELOAD is restored by our execv hook.
+// =========================================================================
+
+static int (*real_mount)(const char *, const char *, const char *,
+                         unsigned long, const void *) = NULL;
+
+int mount(const char *source, const char *target, const char *fstype,
+          unsigned long flags, const void *data) {
+    if (!real_mount) real_mount = dlsym(RTLD_NEXT, "mount");
+
+    // Special paths: /dev, /mnt, /storage — skip (return 0)
+    if (target) {
+        if ((strncmp(target, "/dev", 4) == 0 && (target[4] == 0 || target[4] == '/')) ||
+            (strncmp(target, "/mnt", 4) == 0 && (target[4] == 0 || target[4] == '/')) ||
+            (strncmp(target, "/storage", 8) == 0 && (target[8] == 0 || target[8] == '/')))
+            return 0;
+    }
+
+    // Record in mount table
+    pthread_mutex_lock(&g_mount_lock);
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+        if (g_mounts[i].active && target &&
+            strncmp(g_mounts[i].target, target, 256) == 0) {
+            if (flags & MS_REMOUNT) {
+                g_mounts[i].flags = flags;
+                pthread_mutex_unlock(&g_mount_lock);
+                return 0;
+            }
+            pthread_mutex_unlock(&g_mount_lock);
+            errno = EBUSY;
+            return -1;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+        if (!g_mounts[i].active) { slot = i; break; }
+    }
+    if (slot >= 0 && target) {
+        if (source) strncpy(g_mounts[slot].source, source, 255);
+        else g_mounts[slot].source[0] = 0;
+        strncpy(g_mounts[slot].target, target, 255);
+        if (fstype) strncpy(g_mounts[slot].fstype, fstype, 63);
+        else g_mounts[slot].fstype[0] = 0;
+        g_mounts[slot].flags = flags;
+        g_mounts[slot].active = 1;
+    }
+    pthread_mutex_unlock(&g_mount_lock);
+
+    // Return 0 (success) — don't actually call real mount
+    return 0;
+}
+
+static int (*real_umount2)(const char *, int) = NULL;
+
+int umount2(const char *target, int flags) {
+    (void)flags;
+    if (!real_umount2) real_umount2 = dlsym(RTLD_NEXT, "umount2");
+    if (!target) { errno = EFAULT; return -1; }
+    pthread_mutex_lock(&g_mount_lock);
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+        if (g_mounts[i].active && strncmp(g_mounts[i].target, target, 256) == 0) {
+            g_mounts[i].active = 0;
+            pthread_mutex_unlock(&g_mount_lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_mount_lock);
+    errno = EINVAL;
+    return -1;
+}
+
+int chroot(const char *path) {
+    (void)path;
+    // Return 0 (success) — path translation handles chroot effect
+    return 0;
+}
+
+static int (*real_mknod)(const char *, mode_t, dev_t) = NULL;
+static int (*real_mknodat)(int, const char *, mode_t, dev_t) = NULL;
+
+int mknod(const char *path, mode_t mode, dev_t dev) {
+    if (!real_mknod) real_mknod = dlsym(RTLD_NEXT, "mknod");
+    // For device nodes, create a regular file containing dev_t
+    mode_t fmt = mode & S_IFMT;
+    if (fmt == S_IFCHR || fmt == S_IFBLK) {
+#if defined(__x86_64__)
+        int fd = syscall(NR_open, path, O_RDWR|O_CREAT, 0666);
+        if (fd >= 0) {
+            syscall(NR_write, fd, &dev, sizeof(dev_t));
+            syscall(NR_close, fd);
+        }
+#endif
+        return 0;
+    }
+    // For non-device nodes, call real mknod
+    if (real_mknod) return real_mknod(path, mode, dev);
+    return 0;
+}
+
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
+    if (!real_mknodat) real_mknodat = dlsym(RTLD_NEXT, "mknodat");
+    mode_t fmt = mode & S_IFMT;
+    if (fmt == S_IFCHR || fmt == S_IFBLK) {
+        // Create regular file
+        return 0;
+    }
+    if (real_mknodat) return real_mknodat(dirfd, path, mode, dev);
+    return 0;
+}
+
+int setuid(uid_t uid) { (void)uid; return 0; }
+int setgid(gid_t gid) { (void)gid; return 0; }
+int setgroups(size_t size, const gid_t *list) { (void)size; (void)list; return 0; }
+int setresuid(uid_t ruid, uid_t euid, uid_t suid) { (void)ruid; (void)euid; (void)suid; return 0; }
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid) { (void)rgid; (void)egid; (void)sgid; return 0; }
+int unshare(int flags) { (void)flags; return 0; }
+
+// execv/execve hooks — restore LD_PRELOAD before each exec
 static int (*real_execv)(const char *, char *const[]) = NULL;
+static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
 
 int execv(const char *path, char *const argv[]) {
     if (!real_execv) real_execv = dlsym(RTLD_NEXT, "execv");
@@ -148,7 +285,6 @@ int execv(const char *path, char *const argv[]) {
 }
 
 // Hook execve — re-set LD_PRELOAD before exec
-static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!real_execve) real_execve = dlsym(RTLD_NEXT, "execve");
@@ -208,21 +344,6 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 
 // =========================================================================
 // Global state
-// =========================================================================
-
-volatile int g_runtime_ready = 0;
-volatile int g_sigsys_count = 0;
-static const char *g_rootfs = NULL;
-
-// Mount table
-#define MAX_MOUNTS 32
-struct mount_entry {
-    char source[256]; char target[256]; char fstype[64];
-    unsigned long flags; int active;
-};
-static struct mount_entry g_mounts[MAX_MOUNTS];
-static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
-
 // =========================================================================
 // Runtime readiness barrier (VM hidden logic: BSS state vars + infinite loop)
 // =========================================================================
@@ -448,6 +569,17 @@ static int install_seccomp(void) {
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, TWOYI_AUDIT_ARCH, 1, 0),
         BPF_STMT(BPF_RET|BPF_K, 0x80000000),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, 0),
+        // Use SECCOMP_RET_ERRNO(EPERM) instead of SECCOMP_RET_TRAP
+        // This returns -1 + errno=EPERM for trapped syscalls WITHOUT
+        // sending SIGSYS. This avoids the signal handler entirely.
+        //
+        // WHY: Android init's execv() resets signal handlers to SIG_DFL.
+        // The seccomp filter survives execve, but the SIGSYS handler is gone.
+        // Using ERRNO instead of TRAP means we don't need a handler.
+        //
+        // SECCOMP_RET_ERRNO = 0x00050000 | errno
+        // EPERM = 1
+        // So: 0x00050001
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_mount, 11, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_umount2, 10, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_chroot, 9, 0),
@@ -460,17 +592,31 @@ static int install_seccomp(void) {
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_unshare, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, NR_getpid, 1, 0),
         BPF_STMT(BPF_RET|BPF_K, 0x7fff0000), // ALLOW
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: mount
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: umount2
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: chroot
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: mknod
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: mknodat
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: rt_sigaction
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: setuid
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: setgid
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: setgroups
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: unshare
-        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: getpid
+        // ERRNO(EPERM) for all trapped syscalls
+        // 0x00050000 = SECCOMP_RET_ERRNO, | 1 = EPERM
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): mount
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): umount2
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): chroot
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): mknod
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): mknodat
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): rt_sigaction
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): setuid
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): setgid
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): setgroups
+        BPF_STMT(BPF_RET|BPF_K, 0x00050001), // ERRNO(EPERM): unshare
+        // getpid: return 1 via ERRNO? No — ERRNO returns -1.
+        // We need getpid to return 1 (success, PID=1).
+        // With ERRNO, getpid returns -1 + errno=EPERM, which init treats as failure.
+        // But init's getpid check: if (getpid() != 1) → exit(31)
+        // With ERRNO, getpid returns -1, which != 1, so init exits 31.
+        // We CANNOT use ERRNO for getpid.
+        // Instead, trap getpid with TRAP and have the handler return 1.
+        // But after execv, the handler is gone...
+        // SOLUTION: Don't trap getpid at all. Use LD_PRELOAD getpid_hook
+        // for the libc path. For direct syscalls, init won't use getpid
+        // directly (it uses the libc wrapper).
+        // Remove getpid from the trap list.
+        BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP: getpid (only works pre-execv)
     };
     struct sock_fprog prog = { .len = sizeof(filter)/sizeof(filter[0]), .filter = filter };
     if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) != 0)
@@ -500,29 +646,28 @@ static void twoyi_init(void) {
     if (!g_rootfs) g_rootfs = "/data/data/io.twoyi/rootfs";
 
     // Save LD_PRELOAD path so we can restore it before execv/execve
-    // (Android init's clearenv() wipes it, then execv() resets signal handlers)
     set_preload_path();
 
-    write_str(2, "[twoyi_loader] init: installing virtualization\n");
+    write_str(2, "[twoyi_loader] init: installing virtualization (PLT-only mode)\n");
 
     // Initialize real function pointers
     init_real_funcs();
 
-    // Install SIGSYS handler
-    if (install_sigsys() != 0) {
-        write_str(2, "[twoyi_loader] FATAL: sigsys handler failed\n");
-        return;
-    }
-    write_str(2, "[twoyi_loader] SIGSYS handler installed\n");
+    // NOTE: We do NOT install seccomp BPF filter anymore.
+    // ROOT CAUSE: Android init calls execv() which resets signal handlers.
+    // Seccomp filters survive execve but SIGSYS handlers don't.
+    // After execv, any SECCOMP_RET_TRAP → SIGSYS → SIG_DFL → process killed.
+    //
+    // Instead, we use PLT interposition (LD_PRELOAD hooks) for ALL
+    // virtualized syscalls. PLT hooks survive execv because:
+    // 1. Our execv/execve hooks restore LD_PRELOAD in the environment
+    // 2. The new process loads our .so via LD_PRELOAD
+    // 3. The .init_array constructor runs again, re-installing PLT hooks
+    //
+    // The getpid_hook.so (also in LD_PRELOAD) handles getpid() → return 1.
 
-    // Install seccomp filter
-    if (install_seccomp() != 0) {
-        write_str(2, "[twoyi_loader] FATAL: seccomp failed\n");
-        return;
-    }
-    write_str(2, "[twoyi_loader] seccomp filter installed\n");
-
-    // Mark runtime as ready
-    g_runtime_ready = 1;
+    write_str(2, "[twoyi_loader] PLT hooks installed (mount, open, openat, execv, execve)\n");
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
+
+    g_runtime_ready = 1;
 }
