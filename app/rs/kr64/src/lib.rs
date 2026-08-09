@@ -999,6 +999,50 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         } else {
             format!("{}{}", cfg.rootfs, cfg.init_path)
         };
+
+        // Pre-execve diagnostics: verify the init binary and linker exist.
+        // The init binary's ELF INTERP field specifies the dynamic linker
+        // path (usually /system/bin/linker64). If either file is missing,
+        execve fails with ENOENT. If the linker loads but crashes (e.g.
+        due to a bad LD_PRELOAD), we get SIGSEGV in linker64.
+        {
+            // Use CString for the init path (need null-terminated C string
+            // for access()). This allocates, but we're in a single-threaded
+            // path before execve — safe per the existing format!() usage.
+            let init_c = CString::new(full_init_path.as_str()).unwrap_or_default();
+            let init_exists = unsafe {
+                libc::access(init_c.as_ptr(), libc::F_OK) == 0
+            };
+            if !init_exists {
+                unsafe {
+                    safe_write_err(b"[KR64 CHILD] FATAL: init binary not found at ");
+                    safe_write_err(full_init_path.as_bytes());
+                    safe_write_err(b"\n");
+                    libc::_exit(127);
+                }
+            }
+            // Check if the dynamic linker exists (needed by the ELF INTERP)
+            let linker_path = b"/system/bin/linker64\0";
+            let linker_exists = unsafe {
+                libc::access(linker_path.as_ptr() as *const libc::c_char, libc::F_OK) == 0
+            };
+            if linker_exists {
+                unsafe { safe_write_err(b"[KR64 CHILD] linker64 found at /system/bin/\n"); }
+            } else {
+                unsafe { safe_write_err(b"[KR64 CHILD] linker64 NOT found at /system/bin/\n"); }
+            }
+            // Check libc.so
+            let libc_path = b"/system/lib64/libc.so\0";
+            let libc_exists = unsafe {
+                libc::access(libc_path.as_ptr() as *const libc::c_char, libc::F_OK) == 0
+            };
+            if libc_exists {
+                unsafe { safe_write_err(b"[KR64 CHILD] libc.so found at /system/lib64/\n"); }
+            } else {
+                unsafe { safe_write_err(b"[KR64 CHILD] libc.so NOT found at /system/lib64/\n"); }
+            }
+        }
+
         let init_cstr = match CString::new(full_init_path.as_str()) {
             Ok(s) => s,
             Err(_) => unsafe {
@@ -1053,28 +1097,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // LD_PRELOAD path: when use_namespaces is true, pivot_root
         // has already happened, so the path is relative to the new
         // root. When false, we need the full absolute path.
+        // If TWOYI_SKIP_PRELOAD is set in the parent env, skip LD_PRELOAD
+        // entirely — this is a diagnostic mode to check if the init binary
+        // can link WITHOUT the getpid hook (init will exit 31, but if it
+        // exits 31 instead of SIGSEGV, we know the linker works).
+        let skip_preload = std::env::var("TWOYI_SKIP_PRELOAD").is_ok();
         let ld_preload_str = if cfg.use_namespaces {
-            // After pivot_root, /dev/ is a tmpfs mounted by kr64.
-            // The parent copied libgetpid_hook.so to /dev/ before fork.
             "LD_PRELOAD=/dev/libgetpid_hook.so".to_string()
         } else {
-            // No pivot_root — use the full rootfs path. The parent
-            // copied libgetpid_hook.so to {rootfs}/dev/libgetpid_hook.so.
             format!("LD_PRELOAD={}/dev/libgetpid_hook.so", cfg.rootfs)
         };
-        let env_vars: Vec<CString> = vec![
+        let mut env_vars: Vec<CString> = vec![
             CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
             CString::new("ANDROID_ROOT=/system").unwrap(),
             CString::new("ANDROID_DATA=/data").unwrap(),
             CString::new("ANDROID_BOOTLOGO=1").unwrap(),
             twoyi_rootfs_env,
             CString::new("LD_LIBRARY_PATH=/system/lib64:/system/lib64/bootstrap").unwrap(),
-            // Only set LD_PRELOAD if the file actually exists
-            // (checking before pivot_root is not possible in the child,
-            // so we always set it — if the file doesn't exist, the linker
-            // will print an error but init may still run)
-            CString::new(ld_preload_str).unwrap(),
         ];
+        if skip_preload {
+            unsafe {
+                safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set — skipping LD_PRELOAD (init will exit 31)\n");
+            }
+        } else {
+            env_vars.push(CString::new(ld_preload_str).unwrap());
+        }
         let env_ptrs: Vec<*const libc::c_char> = env_vars
             .iter()
             .map(|s| s.as_ptr())
