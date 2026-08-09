@@ -819,35 +819,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Step 5: fork + exec the guest.
     // ---------------------------------------------------------------
 
-    // Debug: check if libgetpid_hook.so exists in the new root
-    // (after pivot_root, before fork)
-    let hook_path = "/system/lib64/libgetpid_hook.so";
-    if Path::new(hook_path).exists() {
-        info!("[KR64] PARENT: libgetpid_hook.so EXISTS at {} (after pivot_root)", hook_path);
-        match std::fs::metadata(hook_path) {
-            Ok(m) => info!("[KR64] PARENT: file size = {} bytes, mode = {:o}", m.len(), {
+    // Copy libgetpid_hook.so from / (root of rootfs) to /dev/ (tmpfs)
+    // The KVM test script pushes it to the ROOT of the rootfs (not
+    // /system/lib64/) because the rootfs's system/ directory comes from
+    // the emulator's /system partition and files pushed there are not
+    // visible after pivot_root + bind mount.
+    // /dev/ is a tmpfs mounted by kr64 — always writable and visible.
+    if Path::new("/libgetpid_hook.so").exists() {
+        match std::fs::copy("/libgetpid_hook.so", "/dev/libgetpid_hook.so") {
+            Ok(_) => {
                 use std::os::unix::fs::PermissionsExt;
-                m.permissions().mode()
-            }),
-            Err(e) => info!("[KR64] PARENT: metadata error: {}", e),
+                let _ = std::fs::set_permissions(
+                    "/dev/libgetpid_hook.so",
+                    std::fs::Permissions::from_mode(0o644),
+                );
+                info!("[KR64] PARENT: copied libgetpid_hook.so from / to /dev/");
+            }
+            Err(e) => {
+                error!("[KR64] PARENT: failed to copy libgetpid_hook.so to /dev/: {}", e);
+            }
         }
     } else {
-        error!("[KR64] PARENT: libgetpid_hook.so does NOT exist at {} (after pivot_root)", hook_path);
-        // List /system/lib64/ to see what's there
-        if let Ok(entries) = std::fs::read_dir("/system/lib64") {
-            let mut count = 0;
-            for entry in entries {
-                if let Ok(e) = entry {
-                    if count < 10 {
-                        info!("[KR64] PARENT: /system/lib64/ contains: {:?}", e.file_name());
-                    }
-                    count += 1;
-                }
-            }
-            info!("[KR64] PARENT: /system/lib64/ has {} entries total", count);
-        } else {
-            error!("[KR64] PARENT: cannot read /system/lib64/ directory");
-        }
+        error!("[KR64] PARENT: /libgetpid_hook.so not found in rootfs");
     }
 
     info!("[KR64] forking guest process");
@@ -1006,11 +999,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // has already happened, so the path is relative to the new
         // root. When false, we need the full absolute path.
         let ld_preload_str = if cfg.use_namespaces {
-            // After pivot_root, /system/lib64/libgetpid_hook.so should
-            // resolve to the file in the rootfs. But if it doesn't work,
-            // try the full path (which won't work after pivot_root either,
-            // but at least we'll see a different error).
-            "LD_PRELOAD=/system/lib64/libgetpid_hook.so".to_string()
+            // After pivot_root, /dev/ is a tmpfs mounted by kr64.
+            // The parent copied libgetpid_hook.so to /dev/ before fork.
+            "LD_PRELOAD=/dev/libgetpid_hook.so".to_string()
         } else {
             format!("LD_PRELOAD={}/system/lib64/libgetpid_hook.so", cfg.rootfs)
         };
