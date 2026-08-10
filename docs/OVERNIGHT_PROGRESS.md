@@ -427,3 +427,38 @@ Boot verdict:
 - Investigate why coldboot_done is not firing
 - ueventd may need /sys/devices support or device enumeration
 - May need to fake the coldboot_done property
+
+### 🎉🎉🎉 THIRD PARTIAL SUCCESS: lmkd doesn't crash, init progresses! 🎉🎉🎉
+### Timestamp UTC: 2026-08-10 ~15:20
+
+**KVM run 31401623028 — THIRD PARTIAL SUCCESS! (17.5 min test)**
+
+Boot verdict:
+```
+◐ PARTIAL — twoyi process is alive but no GL context.
+  io.twoyi process: ALIVE (pid 6283)
+  tombstones during run: 0
+```
+
+**What worked (NEW since last partial success):**
+- android_get_control_socket hook: lmkd gets fake fd 3, doesn't exit
+- NO "critical process 'lmkd' exited 4 times" error!
+- NO InitFatalReboot!
+- Init progressed through ALL boot phases:
+  - early-init, init, late-init, early-fs, fs, post-fs, post-fs-data
+- Services started successfully:
+  - ueventd, apexd-bootstrap, boringssl self tests (all passed)
+  - logd, lmkd, servicemanager, hwservicemanager
+  - console, qemu-props, vold, wait_for_keymaster
+- Init reached "queue_property_triggers" and "late-init" actions
+
+**What's still missing:**
+- zygote service not started (zygote.rc parsed but service not launched)
+- surfaceflinger not started
+- No BOOT_COMPLETED
+- logd fails with "Permission denied" (updatable but not critical)
+
+**Next step:**
+- Investigate why zygote service isn't starting
+- May need to fix property triggers (zygote starts on property change)
+- Or fix logd permission issue
