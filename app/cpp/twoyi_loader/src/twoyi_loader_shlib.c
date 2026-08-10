@@ -39,6 +39,12 @@ static int should_translate(const char *path);
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+// Android system property constants (from sys/system_properties.h)
+// These are Android-specific and not available on the host build system.
+// We define them here so the loader compiles on the host.
+#define PROP_NAME_MAX   32
+#define PROP_VALUE_MAX  92
+typedef struct prop_info prop_info;
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -877,6 +883,46 @@ int __system_property_area_init(void) {
 // Hook __system_property_set — store in our in-memory table
 int __system_property_set(const char *key, const char *value) {
     return prop_set(key, value);
+}
+
+// Hook __system_property_add — init uses this to add properties during boot
+// Returns 0 on success, -1 on failure
+int __system_property_add(const char *name, unsigned int namelen,
+                          const char *value, unsigned int valuelen) {
+    (void)namelen; (void)valuelen;
+    return prop_set(name, value);
+}
+
+// Hook __system_property_update — update an existing property
+int __system_property_update(prop_info *pi, const char *value, unsigned int len) {
+    (void)len;
+    if (!pi) return -1;
+    // pi is a pointer to our prop_entry (from __system_property_find)
+    struct prop_entry *entry = (struct prop_entry *)pi;
+    if (entry->used) {
+        strncpy(entry->value, value, 127);
+        entry->value[127] = 0;
+        return 0;
+    }
+    return -1;
+}
+
+// Hook __system_property_read — read property value
+int __system_property_read(const prop_info *pi, char *name, char *value) {
+    if (!pi) return 0;
+    const struct prop_entry *entry = (const struct prop_entry *)pi;
+    if (entry->used) {
+        if (name) {
+            strncpy(name, entry->key, PROP_NAME_MAX - 1);
+            name[PROP_NAME_MAX - 1] = 0;
+        }
+        if (value) {
+            strncpy(value, entry->value, PROP_VALUE_MAX - 1);
+            value[PROP_VALUE_MAX - 1] = 0;
+        }
+        return strlen(entry->value);
+    }
+    return 0;
 }
 
 // Hook __system_property_get — read from our in-memory table
