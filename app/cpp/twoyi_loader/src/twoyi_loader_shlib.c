@@ -491,6 +491,19 @@ static void ensure_selinuxfs_files(void) {
     }
 }
 
+// Check if a path should be translated to rootfs
+static int should_translate(const char *path) {
+    if (!path || !g_rootfs || path[0] != '/') return 0;
+    if (strncmp(path, g_rootfs, strlen(g_rootfs)) == 0) return 0;
+    if (strncmp(path, "/system", 7) == 0) return 1;
+    if (strncmp(path, "/vendor", 7) == 0) return 1;
+    if (strncmp(path, "/apex", 5) == 0) return 1;
+    if (strncmp(path, "/data", 5) == 0) return 1;
+    if (strncmp(path, "/init", 5) == 0) return 1;
+    if (strncmp(path, "/default.prop", 13) == 0) return 1;
+    return 0;
+}
+
 // =========================================================================
 // openat PLT interposition (path translation)
 // VM uses shadowhook for openat; we use LD_PRELOAD PLT interposition.
@@ -504,13 +517,11 @@ static void init_real_funcs(void) {
     }
 }
 
-// Path translation: prepend rootfs prefix for absolute paths
+// Path translation: prepend rootfs prefix for rootfs paths only
 static char g_translated[512];
 static const char *translate(const char *path) {
     if (!path || !g_rootfs) return path;
-    if (path[0] != '/') return path; // relative
-    // Don't translate paths that are already under rootfs
-    if (strncmp(path, g_rootfs, strlen(g_rootfs)) == 0) return path;
+    if (!should_translate(path)) return path; // kernel paths pass through
     snprintf(g_translated, sizeof(g_translated), "%s%s", g_rootfs, path);
     return g_translated;
 }
@@ -614,8 +625,8 @@ int open(const char *path, int flags, ...) {
 #endif
 }
 
+
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
-// Translate rootfs paths, intercept selinuxfs, block fstab
 int __open_2(const char *path, int flags) {
     // SELinuxFS: intercept and auto-create
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
@@ -626,9 +637,8 @@ int __open_2(const char *path, int flags) {
         errno = ENOENT;
         return -1;
     }
-    // For rootfs paths (/vendor, /system, /dev, /proc, /sys, /apex, /data):
-    // translate to {rootfs}/path
-    if (path && path[0] == '/' && g_rootfs) {
+    // Translate only rootfs paths (system, vendor, apex, data, init)
+    if (should_translate(path)) {
         const char *translated = translate(path);
         static int (*real_open2)(const char *, int) = NULL;
         if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
@@ -639,7 +649,7 @@ int __open_2(const char *path, int flags) {
         return syscall(NR_openat, AT_FDCWD, translated, flags);
 #endif
     }
-    // Relative paths: pass through
+    // Pass through (kernel paths: /proc, /sys, /dev, relative paths)
     static int (*real_open2)(const char *, int) = NULL;
     if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
     if (real_open2) return real_open2(path, flags);
@@ -653,14 +663,13 @@ int __open_2(const char *path, int flags) {
 // Hook __openat_2 (bionic's fortified openat)
 int __openat_2(int dirfd, const char *path, int flags) {
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
-        return openat(dirfd, path, flags);  // our hook
+        return openat(dirfd, path, flags);
     }
     if (path && strstr(path, "fstab.")) {
         errno = ENOENT;
         return -1;
     }
-    // Translate rootfs paths
-    if (path && path[0] == '/' && g_rootfs) {
+    if (should_translate(path)) {
         const char *translated = translate(path);
         static int (*real_openat2)(int, const char *, int) = NULL;
         if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
