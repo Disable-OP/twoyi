@@ -150,6 +150,10 @@ volatile int g_runtime_ready = 0;
 volatile int g_sigsys_count = 0;
 static const char *g_rootfs = NULL;
 
+// Diagnostic flag: when set (by constructor(102) in vold), the open() hook
+// logs every path it sees. Used to trace why vold exits silently with status 1.
+volatile int g_trace_opens = 0;
+
 // Mount table
 #define MAX_MOUNTS 32
 struct mount_entry {
@@ -1790,6 +1794,17 @@ int open(const char *path, int flags, ...) {
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
+
+    // DIAGNOSTIC (vold silent exit): if tracing is enabled (only set in vold
+    // by constructor(102)), log every open() path + flags. Placed at the very
+    // top so we see all opens, even ones that fail.
+    if (g_trace_opens && path) {
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] TRACE open(%s, flags=0x%x)\n", path, flags);
+        write_str(2, msg);
+    }
+
     init_real_funcs();
 
     // Block fstab files for init only → first_stage_mount is skipped.
@@ -1856,6 +1871,44 @@ int open(const char *path, int flags, ...) {
     if (real_openat) return real_openat(AT_FDCWD, translated, flags, mode);
     return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
+}
+
+// =========================================================================
+// DIAGNOSTIC (vold silent exit): exit() / _exit() hooks
+// vold exits with status 1 within ~89ms, producing zero log output.
+// These hooks log the exit status when g_trace_opens is set (only in vold),
+// so we can see exactly when and how vold dies. Diagnostic only — the
+// hooks still actually terminate the process.
+// =========================================================================
+__attribute__((noreturn))
+void exit(int status) {
+    if (g_trace_opens) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] TRACE exit(%d) called\n", status);
+        write_str(2, msg);
+    }
+    static void (*real_exit)(int) __attribute__((noreturn)) = NULL;
+    if (!real_exit) real_exit = dlsym(RTLD_NEXT, "exit");
+    if (real_exit) real_exit(status);
+    // Fallback: should never happen (libc always provides exit), but make
+    // sure we still terminate the process rather than hanging.
+    syscall(SYS_exit_group, status);
+    while (1) { }
+}
+
+__attribute__((noreturn))
+void _exit(int status) {
+    if (g_trace_opens) {
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] TRACE _exit(%d) called\n", status);
+        write_str(2, msg);
+    }
+    // _exit is a raw syscall — can't call the real one via dlsym. Just go
+    // straight to exit_group so the process actually terminates.
+    syscall(SYS_exit_group, status);
+    while (1) { }
 }
 
 
@@ -2337,4 +2390,35 @@ static void twoyi_init(void) {
     // (we want the guest to actually boot, not fake it)
 
     g_runtime_ready = 1;
+}
+
+// =========================================================================
+// DIAGNOSTIC (vold silent exit): constructor(102)
+// Runs AFTER the main constructor(101) but BEFORE main(). Lets us detect
+// when vold's main() is about to start, and turn on open()/exit() tracing
+// so we can see exactly what vold does before it dies with status 1 within
+// ~89ms (zero log output otherwise). Diagnostic only — will be removed
+// after root cause is found.
+// =========================================================================
+__attribute__((constructor(102)))
+static void twoyi_post_init(void) {
+    // Check if we're vold by reading /proc/self/comm via raw syscalls
+    // (NR_openat works on both x86_64 and arm64; avoids recursing into
+    // our own open() PLT hook).
+    char comm[16] = {0};
+    int cfd = (int)syscall(NR_openat, AT_FDCWD, "/proc/self/comm", O_RDONLY, 0);
+    if (cfd >= 0) {
+        syscall(SYS_read, cfd, comm, sizeof(comm) - 1);
+        syscall(NR_close, cfd);
+    }
+    char *nl = strchr(comm, '\n');
+    if (nl) *nl = 0;
+
+    if (strcmp(comm, "vold") == 0) {
+        write_str(2, "[twoyi_loader] POST_INIT: vold detected - main() about to start\n");
+
+        // Turn on tracing for open() / exit() / _exit() hooks. Only set in
+        // vold so other processes aren't flooded with TRACE messages.
+        g_trace_opens = 1;
+    }
 }
