@@ -841,6 +841,54 @@ int __open_2(const char *path, int flags) {
 #endif
 }
 
+// Hook __open_real (bionic's internal open — all open variants call this)
+// This catches WriteStringToFile's open() which bypasses __open_2/__openat_2
+int __open_real(const char *pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+    }
+    // Translate /dev/__properties__ paths
+    if (pathname && strncmp(pathname, "/dev/__properties__", 19) == 0 && g_rootfs) {
+        char translated[600];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, pathname);
+        // Ensure parent dir exists
+        char dir[600];
+        strncpy(dir, translated, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = 0;
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = 0; mkdir_p(dir, 0777); }
+        static int (*real_open_real)(const char *, int, ...) = NULL;
+        if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
+        if (real_open_real) return real_open_real(translated, flags, mode);
+#if defined(__x86_64__)
+        return syscall(NR_open, translated, flags, mode);
+#else
+        return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
+#endif
+    }
+    // Also translate other rootfs paths
+    if (should_translate(pathname)) {
+        const char *translated = translate(pathname);
+        static int (*real_open_real)(const char *, int, ...) = NULL;
+        if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
+        if (real_open_real) return real_open_real(translated, flags, mode);
+#if defined(__x86_64__)
+        return syscall(NR_open, translated, flags, mode);
+#else
+        return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
+#endif
+    }
+    static int (*real_open_real)(const char *, int, ...) = NULL;
+    if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
+    if (real_open_real) return real_open_real(pathname, flags, mode);
+#if defined(__x86_64__)
+    return syscall(NR_open, pathname, flags, mode);
+#else
+    return syscall(NR_openat, AT_FDCWD, pathname, flags, mode);
+#endif
+}
+
 // Hook __openat_2 (bionic's fortified openat)
 int __openat_2(int dirfd, const char *path, int flags) {
     // Debug: log all /dev/__properties__ opens
