@@ -621,13 +621,54 @@ int setexeccon_raw(const char *context) {
 
 int security_compute_create(const char *scon, const char *tcon,
                             security_class_t tclass, char **newcon) {
-    (void)scon; (void)tcon; (void)tclass;
+    (void)scon; (void)tclass;
     if (newcon) {
-        // Return a different context than the source to indicate a transition
-        // Init checks if newcon != scon to decide if a domain transition exists.
-        // By returning "u:r:init:s0" (which differs from the actual source
-        // context the kernel would report), init thinks a transition exists.
-        *newcon = strdup(FAKE_CONTEXT);
+        // Return a context DIFFERENT from scon to indicate a domain transition.
+        // Init checks: if (newcon == mycon) → "no domain transition" → fail.
+        // So we must return something different from "u:r:init:s0".
+        //
+        // Strategy: derive a context from tcon (the file's context).
+        // tcon is like "u:object_r:apexd_exec:s0" — we convert it to
+        // "u:r:apexd:s0" (the process domain) by replacing "object_r:"
+        // with "r:" and removing the "_exec" suffix.
+        if (tcon) {
+            // tcon format: u:object_r:<type>:s0
+            // We want:    u:r:<domain>:s0
+            // where <domain> is <type> without "_exec" suffix
+            char result[256];
+            const char *p = tcon;
+            // Copy user (e.g., "u:")
+            int i = 0;
+            while (*p && *p != ':' && i < 200) result[i++] = *p++;
+            if (*p == ':') { result[i++] = ':'; p++; }
+            // Skip "object_r:" — replace with "r:"
+            if (strncmp(p, "object_r:", 9) == 0) {
+                result[i++] = 'r'; result[i++] = ':';
+                p += 9;
+            } else if (strncmp(p, "r:", 2) == 0) {
+                result[i++] = 'r'; result[i++] = ':';
+                p += 2;
+            }
+            // Copy type (e.g., "apexd_exec"), removing "_exec" suffix
+            char type_buf[128];
+            int ti = 0;
+            while (*p && *p != ':' && ti < 120) type_buf[ti++] = *p++;
+            type_buf[ti] = 0;
+            // Remove "_exec" suffix if present
+            int tlen = ti;
+            if (tlen >= 5 && strcmp(type_buf + tlen - 5, "_exec") == 0) {
+                type_buf[tlen - 5] = 0;
+            }
+            // Append type to result
+            for (int j = 0; type_buf[j] && i < 240; j++) result[i++] = type_buf[j];
+            // Copy remaining (e.g., ":s0")
+            while (*p && i < 250) result[i++] = *p++;
+            result[i] = 0;
+            *newcon = strdup(result);
+            if (*newcon) return 0;
+        }
+        // Fallback: return a generic context
+        *newcon = strdup("u:r:init:s0");
         if (*newcon) return 0;
         return -1;
     }
