@@ -610,6 +610,14 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
     init_real_funcs();
 
+    // Debug: log all /dev/__properties__ opens
+    if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg),
+            "[twoyi_loader] openat(%s, flags=0x%x)\n", path, flags);
+        write(2, msg, len);
+    }
+
     // Block fstab files → init skips first_stage_mount
     if (path && strstr(path, "fstab.")) {
         errno = ENOENT;
@@ -643,6 +651,14 @@ int open(const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
     init_real_funcs();
+
+    // Debug: log all /dev/__properties__ opens
+    if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg),
+            "[twoyi_loader] open(%s, flags=0x%x)\n", path, flags);
+        write(2, msg, len);
+    }
 
     // Block fstab files → init skips first_stage_mount
     if (path && strstr(path, "fstab.")) {
@@ -704,6 +720,13 @@ int open(const char *path, int flags, ...) {
 
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
 int __open_2(const char *path, int flags) {
+    // Debug: log all /dev/__properties__ opens
+    if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg),
+            "[twoyi_loader] __open_2(%s, flags=0x%x)\n", path, flags);
+        write(2, msg, len);
+    }
     // SELinuxFS: intercept and auto-create
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return open(path, flags);  // our hook (translate + create)
