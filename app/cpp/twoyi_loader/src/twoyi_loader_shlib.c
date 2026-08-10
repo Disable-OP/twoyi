@@ -1728,12 +1728,6 @@ int openat(int dirfd, const char *path, int flags, ...) {
         write(2, msg, len);
     }
 
-    // Block fstab files → init skips first_stage_mount
-    if (path && strstr(path, "fstab.")) {
-        errno = ENOENT;
-        return -1;
-    }
-
     // Special handling for selinuxfs paths
     // Init opens /sys/fs/selinux/checkreqprot, /sys/fs/selinux/enforce, etc.
     // These need to exist as writable files.
@@ -1768,12 +1762,6 @@ int open(const char *path, int flags, ...) {
         int len = snprintf(msg, sizeof(msg),
             "[twoyi_loader] open(%s, flags=0x%x)\n", path, flags);
         write(2, msg, len);
-    }
-
-    // Block fstab files → init skips first_stage_mount
-    if (path && strstr(path, "fstab.")) {
-        errno = ENOENT;
-        return -1;
     }
 
     // Log selinuxfs opens for debugging
@@ -1840,11 +1828,6 @@ int __open_2(const char *path, int flags) {
     // SELinuxFS: intercept and auto-create
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return open(path, flags);  // our hook (translate + create)
-    }
-    // Fstab files: return ENOENT so init skips first_stage_mount
-    if (path && strstr(path, "fstab.")) {
-        errno = ENOENT;
-        return -1;
     }
     // Translate only rootfs paths (system, vendor, apex, data, init)
     if (should_translate(path)) {
@@ -1928,10 +1911,6 @@ int __openat_2(int dirfd, const char *path, int flags) {
     }
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return openat(dirfd, path, flags);
-    }
-    if (path && strstr(path, "fstab.")) {
-        errno = ENOENT;
-        return -1;
     }
     if (should_translate(path)) {
         const char *translated = translate(path);
