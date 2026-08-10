@@ -1207,6 +1207,7 @@ static void log_exec_call(const char *variant, const char *path) {
 }
 
 // Helper: translate path for exec (prepend rootfs if needed)
+// For critical service binaries, try /dev/twoyi-bin/ first (tmpfs, executable)
 static const char *translate_exec_path(const char *path) {
     // Always log entry to verify this function is called
     {
@@ -1224,10 +1225,29 @@ static const char *translate_exec_path(const char *path) {
         write_str(2, msg);
         return path;
     }
+
+    // First, try /dev/twoyi-bin/<basename> (tmpfs, always executable)
+    // This is where kr64 copies critical service binaries.
+    const char *basename = strrchr(path, '/');
+    if (basename) {
+        basename++;  // skip the '/'
+        static char dev_bin_path[512];
+        snprintf(dev_bin_path, sizeof(dev_bin_path), "/dev/twoyi-bin/%s", basename);
+        struct stat st;
+        int rc = syscall(SYS_newfstatat, AT_FDCWD, dev_bin_path, &st, 0);
+        if (rc == 0 && (st.st_mode & 0111)) {
+            char msg[600];
+            snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: %s -> %s (dev/twoyi-bin, mode=0%o)\n",
+                path, dev_bin_path, st.st_mode & 0777);
+            write_str(2, msg);
+            return dev_bin_path;
+        }
+    }
+
+    // Fall back to rootfs path
     static char translated[512];
     snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
     // Verify the translated file exists using direct syscall (bypasses our hooks)
-    // Use SYS_newfstatat with AT_FDCWD to avoid path translation issues
     struct stat st;
     int rc = syscall(SYS_newfstatat, AT_FDCWD, translated, &st, 0);
     if (rc == 0) {

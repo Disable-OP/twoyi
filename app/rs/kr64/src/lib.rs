@@ -1019,6 +1019,85 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
+    // Copy critical service binaries to /dev/twoyi-bin/ (tmpfs, executable).
+    //
+    // ROOT CAUSE: The rootfs is at /data/data/io.twoyi/rootfs/, which is on
+    // the app's data partition. Even with chmod 0755, execve of binaries
+    // from this location fails with EACCES. This is likely because the
+    // data partition has noexec or there's a kernel-level restriction.
+    //
+    // FIX: Copy critical service binaries to /dev/twoyi-bin/ (tmpfs, which
+    // is always executable). Our exec hook (translate_exec_path) will
+    // redirect exec calls to /dev/twoyi-bin/<binary>.
+    //
+    // We copy the most critical services that init needs to boot:
+    // - logd, lmkd, servicemanager, hwservicemanager, vold
+    // - zygote64, zygote (for app startup)
+    // - surfaceflinger (for display)
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dev_bin_dir = "/dev/twoyi-bin";
+        let _ = std::fs::create_dir_all(dev_bin_dir);
+        let _ = std::fs::set_permissions(
+            dev_bin_dir,
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        let critical_binaries = [
+            "system/bin/logd",
+            "system/bin/lmkd",
+            "system/bin/servicemanager",
+            "system/bin/hwservicemanager",
+            "system/bin/vold",
+            "system/bin/app_process64",
+            "system/bin/app_process32",
+            "system/bin/surfaceflinger",
+            "system/bin/bootanimation",
+            "system/bin/linkerconfig",
+            "system/bin/ueventd",
+            "system/bin/init",
+            "system/bin/secilc",
+            "system/bin/boringssl_self_test32",
+            "system/bin/boringssl_self_test64",
+            "system/bin/netd",
+            "system/bin/installd",
+            "system/bin/keystore2",
+            "vendor/bin/boringssl_self_test32",
+            "vendor/bin/boringssl_self_test64",
+        ];
+
+        for binary in &critical_binaries {
+            let src = format!("{}/{}", cfg.rootfs, binary);
+            let binary_name = std::path::Path::new(binary)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            let dst = format!("{}/{}", dev_bin_dir, binary_name);
+
+            if Path::new(&src).exists() {
+                match std::fs::copy(&src, &dst) {
+                    Ok(_) => {
+                        let _ = std::fs::set_permissions(
+                            &dst,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                        // Try to chcon to system_file
+                        let _ = std::process::Command::new("chcon")
+                            .args(&["u:object_r:system_file:s0", &dst])
+                            .status();
+                    }
+                    Err(e) => {
+                        warning!(
+                            "[KR64] PARENT: failed to copy {} -> {}: {}",
+                            src, dst, e
+                        );
+                    }
+                }
+            }
+        }
+        info!("[KR64] PARENT: critical service binaries copied to /dev/twoyi-bin/");
+    }
+
     // Pre-create /dev/__properties__/property_info on the HOST and in the
     // rootfs BEFORE forking. This is a defensive measure: even if our
     // LD_PRELOAD loader fails to be re-loaded after init's execv chain
