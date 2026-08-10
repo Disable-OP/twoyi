@@ -237,10 +237,21 @@ int chroot(const char *path) {
 
 // Hook mkdir — redirect /dev/__properties__ to rootfs
 int mkdir(const char *path, mode_t mode) {
-    if (path && strcmp(path, "/dev/__properties__") == 0 && g_rootfs) {
+    // Redirect /dev/__properties__ and its subdirectories to rootfs
+    if (path && g_rootfs && (
+        strcmp(path, "/dev/__properties__") == 0 ||
+        strncmp(path, "/dev/__properties__/", 20) == 0
+    )) {
         char real_path[512];
-        snprintf(real_path, sizeof(real_path), "%s/dev/__properties__", g_rootfs);
+        snprintf(real_path, sizeof(real_path), "%s%s", g_rootfs, path);
         mkdir_p(real_path, mode);
+        // Also create on host as a symlink target (if it doesn't exist)
+        // This allows bionic's internal opens that bypass our hook to
+        // still find the directory
+        struct stat st;
+        if (lstat(path, &st) != 0) {
+            symlink(real_path, path);
+        }
         return 0;
     }
     // For other paths, call real mkdir
