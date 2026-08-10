@@ -1208,14 +1208,22 @@ static void log_exec_call(const char *variant, const char *path) {
 
 // Helper: translate path for exec (prepend rootfs if needed)
 static const char *translate_exec_path(const char *path) {
-    if (!path || !g_rootfs) {
+    // Always log entry to verify this function is called
+    {
         char msg[256];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: path=%s g_rootfs=%s\n",
+        snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path ENTER: path=%s g_rootfs=%s\n",
             path ? path : "(null)", g_rootfs ? g_rootfs : "(null)");
+        write_str(2, msg);
+    }
+    if (!path || !g_rootfs) {
+        return path;
+    }
+    if (!should_translate(path)) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: should_translate returned 0 for %s\n", path);
         write_str(2, msg);
         return path;
     }
-    if (!should_translate(path)) return path;
     static char translated[512];
     snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
     // Verify the translated file exists and is executable
