@@ -761,6 +761,13 @@ int __open_2(const char *path, int flags) {
 
 // Hook __openat_2 (bionic's fortified openat)
 int __openat_2(int dirfd, const char *path, int flags) {
+    // Debug: log all /dev/__properties__ opens
+    if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg),
+            "[twoyi_loader] __openat_2(%s, flags=0x%x)\n", path, flags);
+        write(2, msg, len);
+    }
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return openat(dirfd, path, flags);
     }
