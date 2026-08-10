@@ -367,6 +367,15 @@ echo "  → extract into $TWOYI_PROFILE"
          cp $TWOYI_PROFILE/system/bin/init $TWOYI_PROFILE/init; \
      fi" 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" || true
 
+# Ensure /system/bin/init exists in the rootfs.
+# On some emulator images, /system/bin/init is a symlink that doesn't
+# survive tar extraction. Create it as a copy of /init if missing.
+"$ADB_BIN" -s emulator-5554 shell \
+    "if [ ! -e $TWOYI_PROFILE/system/bin/init ]; then \
+         cp $TWOYI_PROFILE/init $TWOYI_PROFILE/system/bin/init; \
+     fi" 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" || true
+echo "  ✓ ensured /system/bin/init exists in rootfs"
+
 # Fix permissions: the rootfs was extracted as root (via adb root), so
 # all files/dirs are owned by root. The twoyi app runs as u0_a167 and
 # can't create symlinks (ensureLibSymlink for libkr64.so, libOpenglRender.so)
