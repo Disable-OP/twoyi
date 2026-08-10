@@ -1279,9 +1279,11 @@ int execv(const char *path, char *const argv[]) {
     }
     // Check if we should skip LD_PRELOAD for this binary (e.g., 32-bit)
     if (!should_set_preload_for_exec(path)) {
-        // Remove LD_PRELOAD from env so the 32-bit binary can link normally
+        // Remove LD_PRELOAD and LD_LIBRARY_PATH from env so the 32-bit binary
+        // can link normally (32-bit needs 32-bit libs, not our 64-bit paths)
         unsetenv_internal("LD_PRELOAD");
-        write_str(2, "[twoyi_loader] execv: skipped LD_PRELOAD for 32-bit binary\n");
+        unsetenv_internal("LD_LIBRARY_PATH");
+        write_str(2, "[twoyi_loader] execv: skipped LD_PRELOAD+LD_LIBRARY_PATH for 32-bit binary\n");
         if (!real_execv) return syscall(SYS_execve, exec_path, argv, environ);
         return real_execv(exec_path, argv);
     }
@@ -1305,7 +1307,8 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     }
     // Check if we should skip LD_PRELOAD for this binary (e.g., 32-bit)
     if (!should_set_preload_for_exec(path)) {
-        // Build new envp WITHOUT LD_PRELOAD
+        // Build new envp WITHOUT LD_PRELOAD and WITHOUT LD_LIBRARY_PATH
+        // (32-bit binaries need 32-bit libs, not our 64-bit LD_LIBRARY_PATH)
         int env_count = 0;
         if (envp) { while (envp[env_count]) env_count++; }
         char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 1));
@@ -1315,12 +1318,13 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         }
         int j = 0;
         for (int i = 0; i < env_count; i++) {
-            if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0) {
+            if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0 &&
+                strncmp(envp[i], "LD_LIBRARY_PATH=", 16) != 0) {
                 new_envp[j++] = (char *)envp[i];
             }
         }
         new_envp[j] = NULL;
-        write_str(2, "[twoyi_loader] execve: skipped LD_PRELOAD for 32-bit binary\n");
+        write_str(2, "[twoyi_loader] execve: skipped LD_PRELOAD+LD_LIBRARY_PATH for 32-bit binary\n");
         int ret;
         if (!real_execve) ret = syscall(SYS_execve, exec_path, argv, new_envp);
         else ret = real_execve(exec_path, argv, new_envp);
