@@ -503,6 +503,36 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
     return 0;
 }
 
+// Hook android_get_control_socket — return a fake fd.
+// lmkd and other services call this to get the socket fd that init
+// created for them via "socket" in the .rc file. The fd is normally
+// passed via ANDROID_SOCKET_<name> env var. If the env var is missing
+// (e.g., because our exec hooks stripped it), the function returns -1
+// and the service exits.
+//
+// Fix: return a fake fd (3) so the service thinks it has the socket.
+// The service will then bind/listen on this fd. Since the fd is not
+// a real socket, bind/listen will fail, but the service may continue
+// running (or at least not exit immediately).
+int android_get_control_socket(const char *name) {
+    (void)name;
+    // Check if the env var exists first
+    char env_name[128];
+    snprintf(env_name, sizeof(env_name), "ANDROID_SOCKET_%s", name);
+    const char *val = getenv(env_name);
+    if (val) {
+        // Env var exists — parse it as an fd
+        int fd = atoi(val);
+        if (fd >= 0) return fd;
+    }
+    // Env var missing — return a fake fd
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+        "[twoyi_loader] android_get_control_socket(%s) — env var missing, returning fake fd 3\n", name);
+    write_str(2, msg);
+    return 3;  // fake fd
+}
+
 // Hook signal() too (some code uses signal() instead of sigaction())
 typedef void (*sighandler_t)(int);
 sighandler_t signal(int signum, sighandler_t handler) {
