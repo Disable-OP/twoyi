@@ -279,6 +279,21 @@ long keyctl(int cmd, ...) {
     return 0;  // fake keyring ID
 }
 
+// Hook __system_property_area_init — PropertyInit() calls this to create
+// /dev/__properties__. In our container (no chroot), this would overwrite
+// the HOST's property area, causing SIGBUS/SIGSEGV in host processes.
+// Return 0 (fake success) without actually creating the property area.
+int __system_property_area_init(void) {
+    write_str(2, "[twoyi_loader] __system_property_area_init: faked\n");
+    return 0;
+}
+
+// Hook __system_property_set — don't actually set properties on the host
+int __system_property_set(const char *key, const char *value) {
+    (void)key; (void)value;
+    return 0;  // fake success
+}
+
 // execv/execve hooks — restore LD_PRELOAD before each exec
 static int (*real_execv)(const char *, char *const[]) = NULL;
 static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
