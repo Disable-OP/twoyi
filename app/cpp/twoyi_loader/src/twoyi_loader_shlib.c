@@ -37,6 +37,8 @@ static int should_translate(const char *path);
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -411,6 +413,129 @@ int setpgid(pid_t pid, pid_t pgid) { (void)pid; (void)pgid; return 0; }
 // init may call setsid() for some services. In our container, this might
 // fail. Return 1 (fake session ID) to avoid crashes.
 pid_t setsid(void) { return 1; }
+
+// Hook unlink/unlinkat — redirect /dev/socket/ paths to rootfs.
+// init calls unlink("/dev/socket/property_service") before bind(). Without
+// this hook, it would delete the HOST's property_service socket, breaking
+// the host's property service.
+int unlink(const char *path) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_unlink)(const char *) = NULL;
+        if (!real_unlink) real_unlink = dlsym(RTLD_NEXT, "unlink");
+        if (real_unlink) return real_unlink(translated);
+        return syscall(SYS_unlink, translated);
+    }
+    static int (*real_unlink)(const char *) = NULL;
+    if (!real_unlink) real_unlink = dlsym(RTLD_NEXT, "unlink");
+    if (real_unlink) return real_unlink(path);
+    return syscall(SYS_unlink, path);
+}
+
+int unlinkat(int dirfd, const char *path, int flags) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_unlinkat)(int, const char *, int) = NULL;
+        if (!real_unlinkat) real_unlinkat = dlsym(RTLD_NEXT, "unlinkat");
+        if (real_unlinkat) return real_unlinkat(dirfd, translated, flags);
+        return syscall(SYS_unlinkat, dirfd, translated, flags);
+    }
+    static int (*real_unlinkat)(int, const char *, int) = NULL;
+    if (!real_unlinkat) real_unlinkat = dlsym(RTLD_NEXT, "unlinkat");
+    if (real_unlinkat) return real_unlinkat(dirfd, path, flags);
+    return syscall(SYS_unlinkat, dirfd, path, flags);
+}
+
+// Hook bind — redirect AF_UNIX socket paths to rootfs.
+// init creates sockets at /dev/socket/property_service, /dev/socket/..., etc.
+// Without this hook, these sockets would be created on the HOST, conflicting
+// with host services. We translate the socket path to {rootfs}/dev/socket/...
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    static int (*real_bind)(int, const struct sockaddr *, socklen_t) = NULL;
+    if (!real_bind) real_bind = dlsym(RTLD_NEXT, "bind");
+
+    if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
+        struct sockaddr_un *un = (struct sockaddr_un *)addr;
+        if (un->sun_path[0] == '/' && should_translate(un->sun_path)) {
+            // Build translated path
+            char translated[600];
+            snprintf(translated, sizeof(translated), "%s%s", g_rootfs, un->sun_path);
+
+            // Ensure parent directory exists
+            char dir[600];
+            strncpy(dir, translated, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = 0;
+            char *slash = strrchr(dir, '/');
+            if (slash) { *slash = 0; mkdir_p(dir, 0777); }
+
+            // Create a copy of the sockaddr with the translated path
+            struct sockaddr_un new_addr;
+            memset(&new_addr, 0, sizeof(new_addr));
+            new_addr.sun_family = AF_UNIX;
+            strncpy(new_addr.sun_path, translated, sizeof(new_addr.sun_path) - 1);
+
+            char msg[256];
+            int len = snprintf(msg, sizeof(msg),
+                "[twoyi_loader] bind: translated %s -> %s\n", un->sun_path, translated);
+            write_str(2, msg);
+
+            if (real_bind) return real_bind(sockfd, (const struct sockaddr *)&new_addr, sizeof(new_addr));
+            return syscall(SYS_bind, sockfd, &new_addr, sizeof(new_addr));
+        }
+    }
+    if (real_bind) return real_bind(sockfd, addr, addrlen);
+    return syscall(SYS_bind, sockfd, addr, addrlen);
+}
+
+// Hook fchmodat — redirect paths to rootfs (matches bind translation)
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_fchmodat)(int, const char *, mode_t, int) = NULL;
+        if (!real_fchmodat) real_fchmodat = dlsym(RTLD_NEXT, "fchmodat");
+        if (real_fchmodat) return real_fchmodat(dirfd, translated, mode, flags);
+        return syscall(SYS_fchmodat, dirfd, translated, mode, flags);
+    }
+    static int (*real_fchmodat)(int, const char *, mode_t, int) = NULL;
+    if (!real_fchmodat) real_fchmodat = dlsym(RTLD_NEXT, "fchmodat");
+    if (real_fchmodat) return real_fchmodat(dirfd, path, mode, flags);
+    return syscall(SYS_fchmodat, dirfd, path, mode, flags);
+}
+
+// Hook chmod — redirect paths to rootfs
+int chmod(const char *path, mode_t mode) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_chmod)(const char *, mode_t) = NULL;
+        if (!real_chmod) real_chmod = dlsym(RTLD_NEXT, "chmod");
+        if (real_chmod) return real_chmod(translated, mode);
+        return syscall(SYS_chmod, translated, mode);
+    }
+    static int (*real_chmod)(const char *, mode_t) = NULL;
+    if (!real_chmod) real_chmod = dlsym(RTLD_NEXT, "chmod");
+    if (real_chmod) return real_chmod(path, mode);
+    return syscall(SYS_chmod, path, mode);
+}
+
+// Hook chown — redirect paths to rootfs
+int chown(const char *path, uid_t owner, gid_t group) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
+        if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
+        if (real_chown) return real_chown(translated, owner, group);
+        return syscall(SYS_chown, translated, owner, group);
+    }
+    static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
+    if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
+    if (real_chown) return real_chown(path, owner, group);
+    return syscall(SYS_chown, path, owner, group);
+}
 
 // Hook keyctl — init calls keyctl_get_keyring_ID(KEY_SPEC_SESSION_KEYRING, 1)
 // This might fail or cause issues in our container. Return 0 (fake success).

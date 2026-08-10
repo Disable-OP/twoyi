@@ -286,3 +286,23 @@ The guest init crashed with SIGSEGV.
 - Guest init's property service socket is in rootfs (isolated)
 - Host's system_server uses host's socket (unaffected)
 - Guest's zygote can start without crashing the host
+
+### Experiment: hook bind/unlink/fchmodat for socket path translation
+### Timestamp UTC: 2026-08-10 ~10:30
+
+**Diagnosis from KVM run 31378034876:**
+- /dev/socket/ translation in should_translate caused fchmodat to fail
+  because bind() (syscall) creates socket on HOST, but fchmodat (hooked)
+  looks in rootfs → ENOENT
+- init crashes: "start_property_service socket creation failed"
+
+**Fix: hook bind(), unlink(), fchmodat(), chmod(), chown():**
+- bind(): translate AF_UNIX socket paths to {rootfs}/... before bind
+  (creates socket in rootfs, not on host)
+- unlink(): translate paths to rootfs (don't delete host's sockets)
+- fchmodat(): translate paths to rootfs (matches bind translation)
+- chmod()/chown(): translate paths to rootfs
+
+This approach is cleaner than chroot — no need to mount /proc, /sys, /dev.
+Socket paths are translated by bind(), so init creates sockets in rootfs.
+Other operations (open, mkdir, etc.) continue to use should_translate.
