@@ -440,6 +440,27 @@ int setns(int fd, int nstype) {
     return 0;
 }
 
+// Hook abort — don't actually abort, just return.
+// init's LOG(FATAL) calls abort() which kills the process with signal 6.
+// For non-critical failures (like lmkd crashing), we want init to continue
+// rather than reboot. This hook makes abort() a no-op so init continues
+// after LOG(FATAL).
+//
+// NOTE: This is aggressive — it suppresses ALL aborts in the guest init.
+// But since our guest init is running in a container, many things that
+// would be FATAL on a real device are actually non-fatal here.
+void abort(void) {
+    write_str(2, "[twoyi_loader] abort() called — SUPPRESSED (returning instead of killing)\n");
+    // Don't actually abort — just return
+    // The caller will continue execution, which may produce weird behavior
+    // but at least init won't reboot
+}
+
+// Hook _exit and exit — don't actually exit for critical processes
+// This is too aggressive (would break normal service exits), so we only
+// intercept _exit for specific cases. For now, just let them through.
+// void _exit(int status) { ... }
+
 // Hook unlink/unlinkat — redirect /dev/socket/ paths to rootfs.
 // init calls unlink("/dev/socket/property_service") before bind(). Without
 // this hook, it would delete the HOST's property_service socket, breaking
