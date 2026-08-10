@@ -462,3 +462,33 @@ Boot verdict:
 - Investigate why zygote service isn't starting
 - May need to fix property triggers (zygote starts on property change)
 - Or fix logd permission issue
+
+### Experiment: /dev/twoyi-bin/ for executable binaries
+### Timestamp UTC: 2026-08-10 ~17:35
+
+**Diagnosis from KVM run 31413752207:**
+- /dev/twoyi-bin/ redirection WORKS! lmkd is exec'd from /dev/twoyi-bin/lmkd
+- lmkd exits with status 1 (not 127 like before) — binary IS running
+- BUT: our loader's .init_array doesn't run in lmkd (no install messages)
+- This means LD_PRELOAD is not being passed correctly to lmkd
+- lmkd crashes 4 times → InitFatalReboot
+
+**Root cause still under investigation:**
+- LD_PRELOAD is set in the execv hook (we see it in the log)
+- But the execve hook may not be passing it correctly to the new process
+- The `has_preload` check may find LD_PRELOAD in envp but with a different path
+
+**Progress summary (all achievements):**
+1. Guest init boots past FirstStageMain → selinux_setup → second_stage
+2. apexd-bootstrap succeeds
+3. boringssl self-tests pass (32-bit and 64-bit)
+4. Init starts services: ueventd, apexd, logd, lmkd, servicemanager, etc.
+5. Renderer starts successfully
+6. twoyi process stays ALIVE in multiple runs
+7. /dev/twoyi-bin/ provides executable binaries (bypasses data partition noexec)
+8. Path translation for /system works (boundary check fix for /sys vs /system)
+
+**Next steps:**
+- Fix LD_PRELOAD passing in execve hook (ensure LD_PRELOAD with /dev/ paths)
+- Or: make lmkd not critical by modifying its service definition
+- Or: make init not reboot on critical process failure (hook tgkill)
