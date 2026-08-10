@@ -1124,19 +1124,36 @@ static void twoyi_init(void) {
     // Eagerly create /dev/__properties__/ in the rootfs with property files
     // (init's WriteStringToFile bypasses PLT hooks, but our open/__open_2
     // hooks translate /dev/__properties__ → {rootfs}/dev/__properties__)
-    // Create property files in ROOTFS only (NOT on host — modifying host
-    // property files corrupts the host's property area and crashes the emulator)
+    // Create property files in ROOTFS AND on HOST
+    // WriteStringToFile uses a direct openat syscall that bypasses ALL PLT hooks.
+    // It opens /dev/__properties__/property_info on the HOST path.
+    // We need the file to exist on the HOST so the open succeeds.
+    // The HOST's /dev/__properties__/ directory already exists (created by host init).
+    // We just create the file (no chmod on the directory).
+    // The host's property service reads properties_serial, not property_info,
+    // so creating property_info should be safe.
     if (g_rootfs) {
         char prop_dir[512];
         snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
-        mkdir_p(prop_dir, 0777);  // 0777 so init can create files
-        // Pre-create property_info and properties_serial
+        mkdir_p(prop_dir, 0777);
+        // Pre-create in rootfs
         const char *files[] = {"property_info", "properties_serial", NULL};
         for (int i = 0; files[i]; i++) {
             char fpath[600];
             snprintf(fpath, sizeof(fpath), "%s/%s", prop_dir, files[i]);
             int fd = syscall(NR_open, fpath, O_WRONLY | O_CREAT, 0666);
             if (fd >= 0) syscall(NR_close, fd);
+        }
+        // Also create on HOST (WriteStringToFile bypasses PLT hooks)
+        struct stat st;
+        if (stat("/dev/__properties__", &st) == 0) {
+            // Only create property_info (NOT properties_serial — host uses that)
+            int fd = syscall(NR_open, "/dev/__properties__/property_info",
+                            O_WRONLY | O_CREAT, 0666);
+            if (fd >= 0) {
+                syscall(NR_close, fd);
+                write_str(2, "[twoyi_loader] created property_info on host\n");
+            }
         }
     }
 
