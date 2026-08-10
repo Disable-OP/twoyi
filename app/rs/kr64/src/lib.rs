@@ -1062,8 +1062,21 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "system/bin/netd",
             "system/bin/installd",
             "system/bin/keystore2",
+            "system/bin/wait_for_keymaster",
+            "system/bin/gatekeeperd",
+            "system/bin/recovery",
+            "system/bin/keystore",
             "vendor/bin/boringssl_self_test32",
             "vendor/bin/boringssl_self_test64",
+            "vendor/bin/hw/android.hardware.keymaster@4.1-service",
+            "vendor/bin/hw/android.hardware.gatekeeper@1.0-service",
+            "vendor/bin/hw/android.hardware.graphics.allocator@4.0-service",
+            "vendor/bin/hw/android.hardware.graphics.mapper@4.0-impl",
+            "vendor/bin/hw/android.hardware.graphics.composer@2.4-service",
+            "vendor/bin/hw/android.hardware.configstore@1.0-service",
+            "vendor/bin/hw/android.hardware.media.omx@1.0-service",
+            "vendor/bin/hw/android.hardware.audio@6.0-service",
+            "vendor/bin/hw/android.hardware.audio@6.0-service.rc",
         ];
 
         for binary in &critical_binaries {

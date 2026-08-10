@@ -541,3 +541,38 @@ Boot verdict:
 **Next step:**
 - Investigate why zygote service isn't starting
 - May need to fix property triggers (zygote starts on property change)
+
+### Experiment: unblock wait_for_keymaster + remove abort hooks
+### Timestamp UTC: 2026-08-10 ~19:10
+
+**Diagnosis from KVM run 31419383636 (FOURTH PARTIAL SUCCESS):**
+- Init is stuck at "fs" action waiting for wait_for_keymaster to exit
+- wait_for_keymaster is an exec_start (blocking) service
+- It blocks forever waiting for the keymaster HAL to register with hwservicemanager
+- Since we don't have a keymaster HAL, init never proceeds past "fs"
+- This is why zygote never starts — init never reaches "post-fs-data" or "boot"
+
+**Fix 1: Make wait_for_keymaster exit(0) immediately**
+- Added check in .init_array constructor: if process basename is
+  "wait_for_keymaster" or "wait_for_gatekeeper", exit(0) immediately
+- This is a virtualization technique: telling init the HAL is "ready"
+- NOT suppressing a crash — the service would otherwise hang forever
+
+**Fix 2: Remove abort/raise/kill/sigaction/signal suppression hooks**
+- Per overnight instructions: these were added to suppress InitFatalReboot
+  when lmkd crashed, but the real fix (android_get_control_socket) makes
+  them unnecessary
+- Removed all five hooks
+- If InitFatalReboot returns, the correct response is to fix the root cause
+
+**Fix 3: Add more binaries to /dev/twoyi-bin/ critical_binaries list**
+- Added wait_for_keymaster, gatekeeperd, keystore, and all HAL services
+  (keymaster, gatekeeper, graphics allocator/mapper/composer, configstore,
+  media.omx, audio) so they can be exec'd from tmpfs
+
+**Expected outcome:**
+- wait_for_keymaster exits 0 → init proceeds past "fs" action
+- Init reaches "post-fs-data" and "boot" triggers
+- Zygote service starts (triggered by "on boot" or property trigger)
+- If abort hooks were needed, InitFatalReboot will return and we'll know
+  the real cause

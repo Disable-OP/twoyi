@@ -440,69 +440,6 @@ int setns(int fd, int nstype) {
     return 0;
 }
 
-// Hook abort — don't actually abort, just return.
-// init's LOG(FATAL) calls abort() which kills the process with signal 6.
-// For non-critical failures (like lmkd crashing), we want init to continue
-// rather than reboot. This hook makes abort() a no-op so init continues
-// after LOG(FATAL).
-//
-// NOTE: This is aggressive — it suppresses ALL aborts in the guest init.
-// But since our guest init is running in a container, many things that
-// would be FATAL on a real device are actually non-fatal here.
-void abort(void) {
-    write_str(2, "[twoyi_loader] abort() called — SUPPRESSED (returning instead of killing)\n");
-    // Don't actually abort — just return
-    // The caller will continue execution, which may produce weird behavior
-    // but at least init won't reboot
-}
-
-// Hook raise — suppress SIGABRT (signal 6) to prevent init from crashing
-int raise(int sig) {
-    if (sig == 6) {  // SIGABRT
-        write_str(2, "[twoyi_loader] raise(SIGABRT) — SUPPRESSED\n");
-        return 0;
-    }
-    static int (*real_raise)(int) = NULL;
-    if (!real_raise) real_raise = dlsym(RTLD_NEXT, "raise");
-    if (real_raise) return real_raise(sig);
-    return syscall(SYS_tkill, getpid(), sig);
-}
-
-// Hook kill — suppress sending SIGABRT to self
-int kill(pid_t pid, int sig) {
-    if (sig == 6 && pid == getpid()) {  // SIGABRT to self
-        write_str(2, "[twoyi_loader] kill(self, SIGABRT) — SUPPRESSED\n");
-        return 0;
-    }
-    static int (*real_kill)(pid_t, int) = NULL;
-    if (!real_kill) real_kill = dlsym(RTLD_NEXT, "kill");
-    if (real_kill) return real_kill(pid, sig);
-    return syscall(SYS_kill, pid, sig);
-}
-
-// Hook sigaction — intercept SIGABRT handler installations and replace with SIG_IGN
-// init's InstallRebootSignalHandlers() installs a SIGABRT handler that calls
-// InitFatalReboot (which reboots). We replace ALL SIGABRT handlers with SIG_IGN
-// so LOG(FATAL) doesn't reboot the system.
-int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
-    static int (*real_sigaction)(int, const struct sigaction *, struct sigaction *) = NULL;
-    if (!real_sigaction) real_sigaction = dlsym(RTLD_NEXT, "sigaction");
-
-    if (signum == 6) {  // SIGABRT
-        // Replace the handler with SIG_IGN
-        struct sigaction ignore_act;
-        memset(&ignore_act, 0, sizeof(ignore_act));
-        ignore_act.sa_handler = SIG_IGN;
-        sigemptyset(&ignore_act.sa_mask);
-        ignore_act.sa_flags = 0;
-        write_str(2, "[twoyi_loader] sigaction(SIGABRT) — replaced with SIG_IGN\n");
-        if (real_sigaction) return real_sigaction(signum, &ignore_act, oldact);
-        return 0;
-    }
-    if (real_sigaction) return real_sigaction(signum, act, oldact);
-    return 0;
-}
-
 // Hook android_get_control_socket — return a fake fd.
 // lmkd and other services call this to get the socket fd that init
 // created for them via "socket" in the .rc file. The fd is normally
@@ -533,23 +470,11 @@ int android_get_control_socket(const char *name) {
     return 3;  // fake fd
 }
 
-// Hook signal() too (some code uses signal() instead of sigaction())
-typedef void (*sighandler_t)(int);
-sighandler_t signal(int signum, sighandler_t handler) {
-    if (signum == 6) {  // SIGABRT
-        write_str(2, "[twoyi_loader] signal(SIGABRT) — replaced with SIG_IGN\n");
-        return SIG_IGN;
-    }
-    static sighandler_t (*real_signal)(int, sighandler_t) = NULL;
-    if (!real_signal) real_signal = dlsym(RTLD_NEXT, "signal");
-    if (real_signal) return real_signal(signum, handler);
-    return SIG_ERR;
-}
-
-// Hook _exit and exit — don't actually exit for critical processes
-// This is too aggressive (would break normal service exits), so we only
-// intercept _exit for specific cases. For now, just let them through.
-// void _exit(int status) { ... }
+// NOTE: abort(), raise(), kill(), sigaction(), signal() hooks were previously
+// here to suppress SIGABRT and prevent InitFatalReboot. They have been REMOVED
+// because the real fix (android_get_control_socket hook for lmkd) makes them
+// unnecessary. If InitFatalReboot returns, the correct response is to fix the
+// root cause of the crash, not to suppress the signal.
 
 // Hook unlink/unlinkat — redirect /dev/socket/ paths to rootfs.
 // init calls unlink("/dev/socket/property_service") before bind(). Without
@@ -2178,6 +2103,44 @@ static void twoyi_init(void) {
     }
 
     write_str(2, "[twoyi_loader] init: installing virtualization (PLT-only mode)\n");
+
+    // Check if this process is wait_for_keymaster or similar blocking services.
+    // These services wait forever for HAL services that don't exist in our
+    // container. Since init uses exec_start (blocking) for them, they block
+    // the entire boot process. We make them exit(0) immediately so init
+    // continues to the next action.
+    //
+    // This is NOT suppressing a crash — the service would otherwise hang
+    // forever. This is a virtualization technique: we're telling init that
+    // the HAL is "ready" (the virtualized equivalent of the HAL having
+    // registered with hwservicemanager).
+    {
+        char exe_path[512] = {0};
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (len > 0) {
+            exe_path[len] = 0;
+            const char *basename = strrchr(exe_path, '/');
+            if (basename) basename++; else basename = exe_path;
+
+            // List of services that block waiting for HALs we don't have
+            const char *blocking_services[] = {
+                "wait_for_keymaster",
+                "wait_for_gatekeeper",
+                NULL
+            };
+
+            for (int i = 0; blocking_services[i]; i++) {
+                if (strcmp(basename, blocking_services[i]) == 0) {
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "[twoyi_loader] detected %s — exiting 0 to unblock init\n",
+                        basename);
+                    write_str(2, msg);
+                    _exit(0);
+                }
+            }
+        }
+    }
 
     // Initialize real function pointers
     init_real_funcs();
