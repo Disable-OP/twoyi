@@ -988,6 +988,119 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] PARENT: libtwoyi_loader_shlib.so not found at {} -- seccomp virtualization disabled", loader_src);
     }
 
+    // Pre-create /dev/__properties__/property_info on the HOST and in the
+    // rootfs BEFORE forking. This is a defensive measure: even if our
+    // LD_PRELOAD loader fails to be re-loaded after init's execv chain
+    // (init first_stage → init selinux_setup → init second_stage), the
+    // property_info file will still exist when second_stage init calls
+    // WriteStringToFile(kPropertyInfoPath).
+    //
+    // ROOT CAUSE this defends against:
+    //   - init first stage calls clearenv() (wipes LD_PRELOAD)
+    //   - our execv hook restores LD_PRELOAD before execv'ing to selinux_setup
+    //   - selinux_setup forks+execs secilc (loader is reloaded in secilc)
+    //   - secilc exits, selinux_setup continues
+    //   - selinux_setup execv's to second_stage init
+    //   - SOMETHING in this chain causes LD_PRELOAD to be missing in
+    //     second_stage init (likely an exec variant we don't hook, OR
+    //     bionic execv not going through PLT in some code path)
+    //   - second_stage init's WriteStringToFile fails with ENOENT because
+    //     the open() goes directly to the kernel and the file doesn't
+    //     exist (or the directory doesn't exist)
+    //
+    // By pre-creating the file in BOTH locations (host + rootfs), we
+    // ensure WriteStringToFile succeeds regardless of which path init
+    // actually opens.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Create the directory on the host (if it doesn't exist)
+        let host_prop_dir = "/dev/__properties__";
+        if !Path::new(host_prop_dir).exists() {
+            match std::fs::create_dir_all(host_prop_dir) {
+                Ok(_) => {
+                    let _ = std::fs::set_permissions(
+                        host_prop_dir,
+                        std::fs::Permissions::from_mode(0o711),
+                    );
+                    info!("[KR64] PARENT: created host {} (mode 0711)", host_prop_dir);
+                }
+                Err(e) => {
+                    error!("[KR64] PARENT: failed to create host {}: {}", host_prop_dir, e);
+                }
+            }
+        }
+        // Pre-create property_info on host (empty regular file, mode 0666)
+        let host_prop_info = format!("{}/property_info", host_prop_dir);
+        if !Path::new(&host_prop_info).exists() {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&host_prop_info)
+            {
+                Ok(_) => {
+                    let _ = std::fs::set_permissions(
+                        &host_prop_info,
+                        std::fs::Permissions::from_mode(0o666),
+                    );
+                    info!("[KR64] PARENT: pre-created host {} (mode 0666)", host_prop_info);
+                }
+                Err(e) => {
+                    error!("[KR64] PARENT: failed to pre-create host {}: {}", host_prop_info, e);
+                }
+            }
+        }
+        // Also pre-create properties_serial on host (host's property service
+        // needs this; don't truncate if it already exists)
+        let host_prop_serial = format!("{}/properties_serial", host_prop_dir);
+        if !Path::new(&host_prop_serial).exists() {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&host_prop_serial)
+            {
+                Ok(_) => {
+                    let _ = std::fs::set_permissions(
+                        &host_prop_serial,
+                        std::fs::Permissions::from_mode(0o666),
+                    );
+                    info!("[KR64] PARENT: pre-created host {}", host_prop_serial);
+                }
+                Err(e) => {
+                    error!("[KR64] PARENT: failed to pre-create host {}: {}", host_prop_serial, e);
+                }
+            }
+        }
+        // Pre-create the directory + files in the rootfs too
+        let rootfs_prop_dir = format!("{}/dev/__properties__", cfg.rootfs);
+        let _ = std::fs::create_dir_all(&rootfs_prop_dir);
+        let _ = std::fs::set_permissions(
+            &rootfs_prop_dir,
+            std::fs::Permissions::from_mode(0o777),
+        );
+        for fname in &["property_info", "properties_serial"] {
+            let path = format!("{}/{}", rootfs_prop_dir, fname);
+            if !Path::new(&path).exists() {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .open(&path)
+                {
+                    Ok(_) => {
+                        let _ = std::fs::set_permissions(
+                            &path,
+                            std::fs::Permissions::from_mode(0o666),
+                        );
+                        info!("[KR64] PARENT: pre-created rootfs {}", path);
+                    }
+                    Err(e) => {
+                        error!("[KR64] PARENT: failed to pre-create rootfs {}: {}", path, e);
+                    }
+                }
+            }
+        }
+        info!("[KR64] PARENT: property files pre-created on host + rootfs");
+    }
+
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
     if pid < 0 {
