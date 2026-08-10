@@ -745,6 +745,14 @@ for logf in kr64-stderr.log kr64-app-stderr.log; do
     fi
 done
 
+# Pull the twoyi-loader debug log (written by libtwoyi_loader_shlib.so)
+"$ADB_BIN" -s emulator-5554 pull /data/local/tmp/twoyi-loader.log "$ARTIFACT_DIR/twoyi-loader.log" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/twoyi-loader.log" ]; then
+    echo "  ✓ pulled twoyi-loader.log ($(stat -c%s "$ARTIFACT_DIR/twoyi-loader.log") bytes)"
+    echo "  === twoyi-loader.log ==="
+    cat "$ARTIFACT_DIR/twoyi-loader.log"
+fi
+
 # Save a filtered logcat for quick scanning — the full logcat can be
 # 100k+ lines on a booted emulator.
 grep -E 'KR64 INFO|KR64 WARN|KR64 ERROR|CORE|NEW_RENDERER|CLIENT_EGL|SOCKET_MONITOR|BOOT_COMPLETED|TWOYI_RENDERER|emugl' \
