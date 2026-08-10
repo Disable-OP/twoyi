@@ -32,6 +32,7 @@ extern char **environ;
 // Forward declarations
 static int mkdir_p(const char *path, mode_t mode);
 static int should_translate(const char *path);
+static void unsetenv_internal(const char *name);
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -241,6 +242,13 @@ int clearenv(void) {
 }
 
 // Hook unsetenv — prevent LD_PRELOAD from being unset
+// BUT: we need an internal version that CAN unset LD_PRELOAD for 32-bit binaries
+static void unsetenv_internal(const char *name) {
+    static int (*real_unsetenv)(const char *) = NULL;
+    if (!real_unsetenv) real_unsetenv = dlsym(RTLD_NEXT, "unsetenv");
+    if (real_unsetenv) real_unsetenv(name);
+}
+
 int unsetenv(const char *name) {
     if (name && (strcmp(name, "LD_PRELOAD") == 0 || strcmp(name, "TWOYI_ROOTFS") == 0)) {
         char msg[256];
@@ -994,6 +1002,50 @@ static int (*real_execvp)(const char *, char *const[]) = NULL;
 static int (*real_execvpe)(const char *, char *const[], char *const[]) = NULL;
 static int (*real_execveat)(int, const char *, char *const[], char *const[], int) = NULL;
 
+// Helper: read the ELF class of a binary (32-bit or 64-bit)
+// Returns 1 for 32-bit (ELFCLASS32), 2 for 64-bit (ELFCLASS64), 0 on error
+static int get_elf_class(const char *path) {
+    if (!path) return 0;
+    // Use direct syscall to avoid recursion with our open hooks
+    int fd = syscall(NR_open, path, O_RDONLY, 0);
+    if (fd < 0) {
+        // Try with rootfs prefix
+        if (g_rootfs && path[0] == '/') {
+            char translated[512];
+            snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+            fd = syscall(NR_open, translated, O_RDONLY, 0);
+        }
+        if (fd < 0) return 0;
+    }
+    char ehdr[64];
+    long n = syscall(SYS_read, fd, ehdr, sizeof(ehdr));
+    syscall(NR_close, fd);
+    if (n < 20) return 0;
+    // Check ELF magic
+    if (ehdr[0] != 0x7f || ehdr[1] != 'E' || ehdr[2] != 'L' || ehdr[3] != 'F')
+        return 0;
+    // EI_CLASS is at offset 4
+    return ehdr[4] == 1 ? 1 : (ehdr[4] == 2 ? 2 : 0);
+}
+
+// Helper: check if LD_PRELOAD should be set for this exec
+// Returns 1 if LD_PRELOAD should be set, 0 if it should be skipped
+static int should_set_preload_for_exec(const char *path) {
+    if (!g_preload_path[0]) return 0;
+    // Our libraries are 64-bit (ELFCLASS32).
+    // If the target binary is 32-bit, skip LD_PRELOAD to avoid:
+    //   CANNOT LINK EXECUTABLE: "/dev/libgetpid_hook.so" is 64-bit instead of 32-bit
+    int elf_class = get_elf_class(path);
+    if (elf_class == 1) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] %s is 32-bit — skipping LD_PRELOAD (our libs are 64-bit)\n", path);
+        write_str(2, msg);
+        return 0;
+    }
+    return 1;
+}
+
 // Diagnostic helper: log the exec call with path + LD_PRELOAD state
 static void log_exec_call(const char *variant, const char *path) {
     char msg[768];
@@ -1007,6 +1059,14 @@ static void log_exec_call(const char *variant, const char *path) {
 int execv(const char *path, char *const argv[]) {
     if (!real_execv) real_execv = dlsym(RTLD_NEXT, "execv");
     log_exec_call("execv", path);
+    // Check if we should skip LD_PRELOAD for this binary (e.g., 32-bit)
+    if (!should_set_preload_for_exec(path)) {
+        // Remove LD_PRELOAD from env so the 32-bit binary can link normally
+        unsetenv_internal("LD_PRELOAD");
+        write_str(2, "[twoyi_loader] execv: skipped LD_PRELOAD for 32-bit binary\n");
+        if (!real_execv) return syscall(SYS_execve, path, argv, environ);
+        return real_execv(path, argv);
+    }
     restore_preload_env();
     write_str(2, "[twoyi_loader] execv: restored LD_PRELOAD\n");
     if (!real_execv) return syscall(SYS_execve, path, argv, environ);
@@ -1018,6 +1078,30 @@ int execv(const char *path, char *const argv[]) {
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!real_execve) real_execve = dlsym(RTLD_NEXT, "execve");
     log_exec_call("execve", path);
+    // Check if we should skip LD_PRELOAD for this binary (e.g., 32-bit)
+    if (!should_set_preload_for_exec(path)) {
+        // Build new envp WITHOUT LD_PRELOAD
+        int env_count = 0;
+        if (envp) { while (envp[env_count]) env_count++; }
+        char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 1));
+        if (!new_envp) {
+            if (!real_execve) return syscall(SYS_execve, path, argv, envp);
+            return real_execve(path, argv, envp);
+        }
+        int j = 0;
+        for (int i = 0; i < env_count; i++) {
+            if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0) {
+                new_envp[j++] = (char *)envp[i];
+            }
+        }
+        new_envp[j] = NULL;
+        write_str(2, "[twoyi_loader] execve: skipped LD_PRELOAD for 32-bit binary\n");
+        int ret;
+        if (!real_execve) ret = syscall(SYS_execve, path, argv, new_envp);
+        else ret = real_execve(path, argv, new_envp);
+        free(new_envp);
+        return ret;
+    }
     // For execve, we need to modify the envp array to include LD_PRELOAD
     // But envp might not have LD_PRELOAD. We need to add it.
     // Simplest approach: use setenv() to set it in the current env,
