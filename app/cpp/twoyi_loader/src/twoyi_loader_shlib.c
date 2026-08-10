@@ -1226,9 +1226,11 @@ static const char *translate_exec_path(const char *path) {
     }
     static char translated[512];
     snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
-    // Verify the translated file exists and is executable
+    // Verify the translated file exists using direct syscall (bypasses our hooks)
+    // Use SYS_newfstatat with AT_FDCWD to avoid path translation issues
     struct stat st;
-    if (stat(translated, &st) == 0) {
+    int rc = syscall(SYS_newfstatat, AT_FDCWD, translated, &st, 0);
+    if (rc == 0) {
         char msg[600];
         snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: %s -> %s (exists, mode=0%o)\n",
             path, translated, st.st_mode & 0777);
@@ -1236,11 +1238,12 @@ static const char *translate_exec_path(const char *path) {
         return translated;
     } else {
         char msg[600];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: %s -> %s (MISSING! errno=%d)\n",
-            path, translated, errno);
+        snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: %s -> %s (MISSING! errno=%d: %s)\n",
+            path, translated, errno, strerror(errno));
         write_str(2, msg);
-        // Fall back to original path
-        return path;
+        // Even if stat fails, try the translated path anyway — the exec might
+        // succeed where stat failed (e.g., if stat is denied but exec is allowed)
+        return translated;
     }
 }
 
