@@ -51,3 +51,24 @@ Change TRAP to ERRNO(EPERM) for ALL trapped syscalls. If init survives longer, t
 **Conclusion:** Directory creation works, but file open still fails. The PLT hook for open() may not be intercepting init's open() call. Init might use a direct syscall or a different libc function.
 
 **Next experiment:** Add path logging to open()/openat() hooks to verify which paths init actually opens. Also check if init uses a different open variant (like __open_2 or openat).
+
+### MAJOR MILESTONE: init second stage started!
+### Timestamp UTC: 2026-08-10 ~01:15
+
+Boot frontier progression:
+1. ✅ init first stage started
+2. ✅ first_stage_mount skipped (fstab blocked)
+3. ✅ SELinux policy compiled (secilc)
+4. ✅ SELinux policy loaded
+5. ✅ file_contexts loaded
+6. ✅ restorecon succeeded (packages.list accessible)
+7. ✅ init second stage started! (FIRST TIME EVER!)
+8. ✅ SELinux enforcing=1 set
+9. ❌ SIGSEGV during early second-stage init (before zygote)
+
+Current blocker: guest init gets signal 11 (SIGSEGV) during early
+second-stage init. Need to investigate what second-stage init does
+that causes the crash.
+
+The io.twoyi host process is ALIVE (pid 6144) — the host app didn't crash.
+The guest init crashed with SIGSEGV.
