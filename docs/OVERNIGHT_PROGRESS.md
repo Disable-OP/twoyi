@@ -229,3 +229,32 @@ The guest init crashed with SIGSEGV.
 - SELinux stays permissive → vendor_init can load LD_PRELOAD libraries
 - Subcontexts start successfully
 - init progresses to zygote/bootanimation
+
+### Experiment: hook setpgid/setsid + translate all rootfs paths
+### Timestamp UTC: 2026-08-10 ~09:50
+
+**MAJOR DISCOVERY from KVM run 31375441676:**
+- Our loader IS loaded in second_stage init! (4th batch in twoyi-loader.log)
+- The SELinux permissive watchdog works (enforcing=0 overrides)
+- init progressed MUCH further: parsed .rc files, started services
+- NEW crash: setpgid fails for ueventd
+  ```
+  F/init: cannot set attribute for ueventd: setpgid failed: Operation not permitted
+  InitFatalReboot: signal 6
+  ```
+- Also: mkdir /linkerconfig fails (not translated to rootfs)
+
+**Fix:**
+1. Hook setpgid() — return 0 (fake success)
+   - init calls setpgid(0,0) when forking services, fails with EPERM
+   - In our PID namespace without proper session setup, this fails
+2. Hook setsid() — return 1 (fake session ID)
+3. Update should_translate() to translate ALL rootfs paths
+   - Added /linkerconfig, /acct, /config, /metadata, /mnt, /storage, etc.
+   - Default: translate any /path to rootfs (except /proc, /sys, /dev, /data)
+4. Update mkdir() hook to use should_translate for path redirection
+
+**Expected outcome:**
+- setpgid no longer crashes init
+- mkdir /linkerconfig creates {rootfs}/linkerconfig
+- init progresses to zygote/bootanimation
