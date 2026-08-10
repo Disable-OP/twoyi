@@ -28,6 +28,9 @@
 #include <malloc.h>
 #include <unistd.h> // for environ on some systems
 extern char **environ;
+
+// Forward declarations
+static int mkdir_p(const char *path, mode_t mode);
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
