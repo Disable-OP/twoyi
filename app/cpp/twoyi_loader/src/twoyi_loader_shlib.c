@@ -355,9 +355,21 @@ static int prop_get(const char *key, char *value) {
     return 0;
 }
 
-// Hook __system_property_area_init — return 0 (success) without creating area
+// Hook __system_property_area_init — create property_info file on HOST
+// and return 0 (success) without creating the real property area.
+// The in-memory property system handles all get/set operations.
 int __system_property_area_init(void) {
-    write_str(2, "[twoyi_loader] __system_property_area_init: faked (in-memory)\n");
+    // Create /dev/__properties__/property_info on the HOST so that
+    // WriteStringToFile (which uses direct openat syscall) can write to it.
+    // This is called from PropertyInit() BEFORE CreateSerializedPropertyInfo().
+    struct stat st;
+    if (stat("/dev/__properties__", &st) == 0) {
+        int fd = syscall(NR_open, "/dev/__properties__/property_info",
+                        O_WRONLY | O_CREAT, 0666);
+        if (fd >= 0) {
+            syscall(NR_close, fd);
+        }
+    }
     return 0;
 }
 
