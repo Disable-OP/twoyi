@@ -911,14 +911,19 @@ static int should_translate(const char *path) {
     // Host-only paths — do NOT translate (these are virtual or host-specific)
     if (strncmp(path, "/proc", 5) == 0) return 0;
     if (strncmp(path, "/sys", 4) == 0) return 0;
-    if (strncmp(path, "/dev/", 5) == 0 && strncmp(path, "/dev/__properties__", 19) != 0) return 0;
     if (strncmp(path, "/data", 5) == 0) return 0;  // host data
+    // /dev/ paths: translate socket, __properties__, and other guest paths
+    // but keep host device nodes (/dev/null, /dev/zero, /dev/qemu_pipe, etc.)
+    if (strncmp(path, "/dev/socket", 11) == 0) return 1;  // guest sockets
+    if (strncmp(path, "/dev/__properties__", 19) == 0) return 1;
+    if (strncmp(path, "/dev/__null__", 13) == 0) return 1;
+    // Other /dev/ paths (null, zero, random, qemu_pipe, binder, etc.) stay on host
+    if (strncmp(path, "/dev/", 5) == 0) return 0;
     if (strncmp(path, "/dev", 4) == 0 && (path[4] == 0)) return 0;  // /dev exactly
     // Guest rootfs paths — translate
     if (strncmp(path, "/system", 7) == 0) return 1;
     if (strncmp(path, "/vendor", 7) == 0) return 1;
     if (strncmp(path, "/apex", 5) == 0) return 1;
-    if (strncmp(path, "/dev/__properties__", 19) == 0) return 1;
     if (strncmp(path, "/init", 5) == 0) return 1;
     if (strncmp(path, "/default.prop", 13) == 0) return 1;
     // Init creates these directories during boot — translate to rootfs
@@ -941,7 +946,6 @@ static int should_translate(const char *path) {
     if (strncmp(path, "/system_ext", 11) == 0) return 1;
     // For any other path starting with /, translate it (safer to redirect
     // to rootfs than to write to the host filesystem)
-    // Exception: /dev exactly (already handled above)
     return 1;
 }
 

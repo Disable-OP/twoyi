@@ -258,3 +258,31 @@ The guest init crashed with SIGSEGV.
 - setpgid no longer crashes init
 - mkdir /linkerconfig creates {rootfs}/linkerconfig
 - init progresses to zygote/bootanimation
+
+### Experiment: translate /dev/socket/ to rootfs (prevent host corruption)
+### Timestamp UTC: 2026-08-10 ~10:10
+
+**MASSIVE PROGRESS from KVM run 31376773424:**
+- setpgid hook WORKED — init no longer crashes at setpgid
+- init progressed ALL THE WAY to starting zygote!
+- **Zygote started!** (system_server PID 496 running)
+- BUT: host's system_server crashed:
+  ```
+  E/Zygote: System zygote died with exception
+  java.lang.RuntimeException: failed to set system property
+  ```
+- ROOT CAUSE: our init created /dev/socket/property_service on the HOST,
+  conflicting with the host's property service socket
+- The host's system_server connected to our (broken) property service
+  instead of the host's, causing the crash
+
+**Fix:**
+- Add /dev/socket/ to should_translate() → translate to {rootfs}/dev/socket/
+- This separates guest sockets from host sockets
+- Guest init creates sockets in rootfs, host processes use host sockets
+- Also add /dev/__null__ to translate list
+
+**Expected outcome:**
+- Guest init's property service socket is in rootfs (isolated)
+- Host's system_server uses host's socket (unaffected)
+- Guest's zygote can start without crashing the host
