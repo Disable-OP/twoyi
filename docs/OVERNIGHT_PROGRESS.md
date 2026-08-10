@@ -164,3 +164,40 @@ The guest init crashed with SIGSEGV.
 - /dev/ libraries are accessible to vendor_init subcontexts
 - Subcontexts can link and load our hooks
 - init progresses past subcontext forking to zygote/bootanimation
+
+### Experiment: chcon libraries to system_file + android_log_write
+### Timestamp UTC: 2026-08-10 ~09:15
+
+**Diagnosis from KVM run 31372609944:**
+- MAJOR PROGRESS: clearenv hook works! TWOYI_ROOTFS is now preserved.
+- LD_PRELOAD files exist and are accessible: /dev/libgetpid_hook.so (9384 bytes), /dev/libtwoyi_loader_shlib.so (68008 bytes)
+- init second stage started, loaded .prop files, parsed .rc files
+- NEW failure: subcontexts can't load LD_PRELOAD libraries
+  ```
+  F/linker: CANNOT LINK EXECUTABLE "/system/bin/init":
+    unable to stat file for the library "/dev/libgetpid_hook.so": Permission denied
+  ```
+- ROOT CAUSE: SELinux enforcing! After init loads guest policy, enforcing=1.
+  ```
+  avc: denied { getattr } for path="/dev/libgetpid_hook.so"
+    scontext=u:r:vendor_init:s0 tcontext=u:object_r:device:s0 permissive=0
+  ```
+  Files in /dev/ are labeled as `device`, which vendor_init can't access.
+- Also: our loader is STILL not loaded in second_stage init
+  (no install messages between secilc and "init second stage started!")
+  But LD_PRELOAD IS set (preserved by clearenv hook)
+  → The linker should load our libraries, but .init_array doesn't run
+  → Need better diagnostics to figure out why
+
+**Fix:**
+1. chcon /dev/lib*.so to u:object_r:system_file:s0 in kr64
+   - system_file is accessible to vendor_init
+   - Done before forking init, while SELinux is still permissive
+2. Add __android_log_write to write_str (via dlsym)
+   - Messages go directly to logd socket, not via stderr
+   - Critical for processes where stderr is closed/redirected
+
+**Expected outcome:**
+- Subcontexts can load LD_PRELOAD libraries (system_file label)
+- Better diagnostics for the second_stage loader issue
+- If our loader IS loaded in second_stage, we'll see messages via logd
