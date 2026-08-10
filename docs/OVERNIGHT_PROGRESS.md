@@ -384,3 +384,46 @@ Boot verdict:
 - Properties like ro.zygote can't be set (Access denied)
 - This is because our in-memory property system doesn't support all operations
 - Need to implement __system_property_add properly
+
+### 🎉🎉🎉 SECOND PARTIAL SUCCESS: Guest init boots past boringssl! 🎉🎉🎉
+### Timestamp UTC: 2026-08-10 ~12:55
+
+**KVM run 31389191742 — SECOND PARTIAL SUCCESS!**
+
+Boot verdict:
+```
+◐ PARTIAL — twoyi process is alive but no GL context.
+  io.twoyi process: ALIVE (pid 6074)
+  tombstones during run: 0
+```
+
+**What worked (NEW since last partial success):**
+- 32-bit binary detection: boringssl_self_test32 runs WITHOUT LD_PRELOAD
+- boringssl_self_test32 PASSED (exited status 0)
+- boringssl_self_test64 PASSED (exited status 0)
+- boringssl_self_test32_vendor PASSED (exited status 0)
+- boringssl_self_test64_vendor PASSED (exited status 0)
+- NO boringssl-self-check-failed reboot!
+- Guest init progressed to "wait_for_coldboot_done" phase
+- Guest init is ALIVE and waiting for coldboot to complete
+
+**Services started by guest init:**
+- exec 1 (linkerconfig) — received signal 6 (non-critical, expected)
+- ueventd — started
+- apexd-bootstrap — succeeded (exited status 0)
+- boringssl_self_test32 — succeeded
+- boringssl_self_test64 — succeeded
+- boringssl_self_test32_vendor — succeeded
+- boringssl_self_test64_vendor — succeeded
+
+**What's still missing:**
+- Guest init is stuck at "wait_for_coldboot_done"
+  (ueventd's coldboot scan is waiting for something)
+- zygote not started yet (comes after coldboot_done)
+- surfaceflinger not started yet
+- No BOOT_COMPLETED
+
+**Next step:**
+- Investigate why coldboot_done is not firing
+- ueventd may need /sys/devices support or device enumeration
+- May need to fake the coldboot_done property
