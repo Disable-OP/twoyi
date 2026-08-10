@@ -1327,13 +1327,17 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         free(new_envp);
         return ret;
     }
-    // For execve, we need to modify the envp array to include LD_PRELOAD
-    // But envp might not have LD_PRELOAD. We need to add it.
-    // Simplest approach: use setenv() to set it in the current env,
-    // then pass environ instead of envp.
-    // But execve uses the passed envp, not environ.
-    // So we need to build a new envp with LD_PRELOAD added.
+    // Always build a new envp with the correct LD_PRELOAD.
+    // Even if LD_PRELOAD is already in envp, it might have the wrong path
+    // (e.g., {rootfs}/dev/ instead of /dev/). We always replace it with
+    // our known-good g_preload_path.
     restore_preload_env();
+
+    if (!g_preload_path[0]) {
+        // No preload path — use envp as-is
+        if (!real_execve) return syscall(SYS_execve, exec_path, argv, envp);
+        return real_execve(exec_path, argv, envp);
+    }
 
     // Count existing envp entries
     int env_count = 0;
@@ -1341,22 +1345,7 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         while (envp[env_count]) env_count++;
     }
 
-    // Check if LD_PRELOAD is already in envp
-    int has_preload = 0;
-    for (int i = 0; i < env_count; i++) {
-        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
-            has_preload = 1;
-            break;
-        }
-    }
-
-    if (has_preload || !g_preload_path[0]) {
-        // Already has LD_PRELOAD or we don't have a path to set
-        if (!real_execve) return syscall(SYS_execve, exec_path, argv, envp);
-        return real_execve(exec_path, argv, envp);
-    }
-
-    // Build new envp with LD_PRELOAD added
+    // Build new envp: copy all entries EXCEPT LD_PRELOAD, then add our LD_PRELOAD
     char preload_env[600];
     snprintf(preload_env, sizeof(preload_env), "LD_PRELOAD=%s", g_preload_path);
 
@@ -1367,13 +1356,16 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         return real_execve(exec_path, argv, environ);
     }
 
+    int j = 0;
     for (int i = 0; i < env_count; i++) {
-        new_envp[i] = (char *)envp[i];
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0) {
+            new_envp[j++] = (char *)envp[i];
+        }
     }
-    new_envp[env_count] = preload_env;
-    new_envp[env_count + 1] = NULL;
+    new_envp[j] = preload_env;
+    new_envp[j + 1] = NULL;
 
-    write_str(2, "[twoyi_loader] execve: added LD_PRELOAD to envp\n");
+    write_str(2, "[twoyi_loader] execve: replaced LD_PRELOAD in envp\n");
     int ret;
     if (!real_execve) ret = syscall(SYS_execve, exec_path, argv, new_envp);
     else ret = real_execve(exec_path, argv, new_envp);
