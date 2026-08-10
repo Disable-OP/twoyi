@@ -2031,7 +2031,10 @@ static void twoyi_init(void) {
     // but our in-memory property system is per-process, so init can't see
     // properties set by other processes. Pre-setting them in init's own
     // property table ensures init doesn't wait forever.
-    prop_set("ro.coldboot_done", "1");
+    // NOTE: ro.cold_boot_done (with underscore) is the correct name
+    // (from AOSP util.h: kColdBootDoneProp = "ro.cold_boot_done")
+    prop_set("ro.cold_boot_done", "true");  // unblocks wait_for_coldboot_done
+    prop_set("ro.coldboot_done", "true");   // alias just in case
     prop_set("ro.bootmode", "normal");
     prop_set("ro.boot.mode", "normal");
     prop_set("ro.boot.bootreason", "reboot");
@@ -2040,7 +2043,7 @@ static void twoyi_init(void) {
     prop_set("ro.boot.serialno", "EMULATOR37X1X11X0");
     prop_set("ro.boot.hardware", "ranchu");
     prop_set("ro.bootfrog", "0");
-    prop_set("ro.persistent_properties.ready", "1");
+    prop_set("ro.persistent_properties.ready", "true");
     prop_set("ro.actionable_compatible_property.enabled", "true");
     // ro.zygote is needed for init to parse init.zygote64_32.rc
     prop_set("ro.zygote", "zygote64_32");
