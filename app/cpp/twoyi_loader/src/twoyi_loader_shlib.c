@@ -456,6 +456,30 @@ void abort(void) {
     // but at least init won't reboot
 }
 
+// Hook raise — suppress SIGABRT (signal 6) to prevent init from crashing
+int raise(int sig) {
+    if (sig == 6) {  // SIGABRT
+        write_str(2, "[twoyi_loader] raise(SIGABRT) — SUPPRESSED\n");
+        return 0;
+    }
+    static int (*real_raise)(int) = NULL;
+    if (!real_raise) real_raise = dlsym(RTLD_NEXT, "raise");
+    if (real_raise) return real_raise(sig);
+    return syscall(SYS_tkill, getpid(), sig);
+}
+
+// Hook kill — suppress sending SIGABRT to self
+int kill(pid_t pid, int sig) {
+    if (sig == 6 && pid == getpid()) {  // SIGABRT to self
+        write_str(2, "[twoyi_loader] kill(self, SIGABRT) — SUPPRESSED\n");
+        return 0;
+    }
+    static int (*real_kill)(pid_t, int) = NULL;
+    if (!real_kill) real_kill = dlsym(RTLD_NEXT, "kill");
+    if (real_kill) return real_kill(pid, sig);
+    return syscall(SYS_kill, pid, sig);
+}
+
 // Hook _exit and exit — don't actually exit for critical processes
 // This is too aggressive (would break normal service exits), so we only
 // intercept _exit for specific cases. For now, just let them through.
