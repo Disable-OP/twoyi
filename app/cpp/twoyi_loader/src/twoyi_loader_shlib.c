@@ -1068,37 +1068,22 @@ static void twoyi_init(void) {
     ensure_selinuxfs_files();
     write_str(2, "[twoyi_loader] selinuxfs virtual files created\n");
 
-    // Eagerly create /dev/__properties__/ in the rootfs AND on the host
-    // (init's mkdir might not go through our hook, and WriteStringToFile
-    // uses a direct syscall that bypasses PLT hooks, hitting the HOST path)
+    // Eagerly create /dev/__properties__/ in the rootfs with property files
+    // (init's WriteStringToFile bypasses PLT hooks, but our open/__open_2
+    // hooks translate /dev/__properties__ → {rootfs}/dev/__properties__)
+    // Create property files in ROOTFS only (NOT on host — modifying host
+    // property files corrupts the host's property area and crashes the emulator)
     if (g_rootfs) {
         char prop_dir[512];
         snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
-        mkdir_p(prop_dir, 0771);
-    }
-    // Also create /dev/__properties__/property_info on the HOST
-    // WriteStringToFile opens /dev/__properties__/property_info directly
-    // (bypassing PLT hooks). The HOST's /dev/__properties__/ exists
-    // (created by host init), but property_info may not exist.
-    // Create it AND make the directory writable.
-    {
-        struct stat st;
-        if (stat("/dev/__properties__", &st) == 0) {
-            // Make directory world-writable (WriteStringToFile needs to create files)
-            chmod("/dev/__properties__", 0777);
-            // Create property_info as writable file
-            int fd = syscall(NR_open, "/dev/__properties__/property_info",
-                            O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            if (fd >= 0) {
-                syscall(NR_close, fd);
-            }
-            // Also create properties_serial
-            fd = syscall(NR_open, "/dev/__properties__/properties_serial",
-                        O_WRONLY | O_CREAT | O_TRUNC, 0666);
-            if (fd >= 0) {
-                syscall(NR_close, fd);
-            }
-            write_str(2, "[twoyi_loader] created property files on host\n");
+        mkdir_p(prop_dir, 0777);  // 0777 so init can create files
+        // Pre-create property_info and properties_serial
+        const char *files[] = {"property_info", "properties_serial", NULL};
+        for (int i = 0; files[i]; i++) {
+            char fpath[600];
+            snprintf(fpath, sizeof(fpath), "%s/%s", prop_dir, files[i]);
+            int fd = syscall(NR_open, fpath, O_WRONLY | O_CREAT, 0666);
+            if (fd >= 0) syscall(NR_close, fd);
         }
     }
 
