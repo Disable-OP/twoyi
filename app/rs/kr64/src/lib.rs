@@ -912,28 +912,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Copy libgetpid_hook.so to /dev/ (tmpfs) so the child can use
     // LD_PRELOAD=/dev/libgetpid_hook.so.
     //
-    // After pivot_root (use_namespaces still true):
-    //   /libgetpid_hook.so = {rootfs}/libgetpid_hook.so (on ext4)
-    //   /dev/ = tmpfs (writable, mounted by setup_mounts)
+    // IMPORTANT: Always copy to the HOST's /dev/ (tmpfs), NOT to
+    // {rootfs}/dev/ (app_data_file on ext4). This is critical because:
+    //   - Init second stage forks subcontexts running as u:r:vendor_init:s0
+    //   - vendor_init is DENIED search access to app_data_file directories
+    //     (per SELinux policy: avc denied { search } for name="io.twoyi"
+    //      tcontext=u:object_r:app_data_file:s0 permissive=0)
+    //   - If the libraries are in /data/data/io.twoyi/rootfs/dev/, the
+    //     subcontext's linker can't find them → "CANNOT LINK EXECUTABLE"
+    //   - /dev/ (tmpfs) is accessible to ALL domains (labeled tmpfs)
     //
-    // Without pivot_root (setup_mounts failed, use_namespaces set false):
-    //   {rootfs}/libgetpid_hook.so (full path on ext4)
-    //   {rootfs}/dev/ (regular dir on ext4, writable)
-    let (hook_src, hook_dst) = if cfg.use_namespaces {
-        ("/libgetpid_hook.so".to_string(), "/dev/libgetpid_hook.so".to_string())
-    } else {
-        (
-            format!("{}/libgetpid_hook.so", cfg.rootfs),
-            format!("{}/dev/libgetpid_hook.so", cfg.rootfs),
-        )
-    };
+    // After pivot_root (use_namespaces still true):
+    //   /libgetpid_hook.so = {rootfs}/libgetpid_hook.so (on ext4, source)
+    //   /dev/libgetpid_hook.so = tmpfs (destination, accessible to all)
+    //
+    // Without pivot_root (--no-namespaces):
+    //   {rootfs}/libgetpid_hook.so (source, on ext4)
+    //   /dev/libgetpid_hook.so (destination, on HOST's tmpfs — works because
+    //   kr64 runs as root and can write to /dev/)
+    let hook_src = format!("{}/libgetpid_hook.so", cfg.rootfs);
+    let hook_dst = "/dev/libgetpid_hook.so".to_string();
     if Path::new(&hook_src).exists() {
-        // Ensure the destination directory exists (setup_mounts may not
-        // have created /dev/ if it failed, or the rootfs/dev/ dir may
-        // not exist yet in non-namespace mode).
-        if let Some(parent) = Path::new(&hook_dst).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        // /dev/ always exists on the host, no need to create it
         match std::fs::copy(&hook_src, &hook_dst) {
             Ok(_) => {
                 use std::os::unix::fs::PermissionsExt;
@@ -959,18 +959,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
     // Copy libtwoyi_loader_shlib.so to /dev/ (same pattern as libgetpid_hook.so)
     // This is the seccomp/SIGSYS virtualization library.
-    let (loader_src, loader_dst) = if cfg.use_namespaces {
-        ("/libtwoyi_loader_shlib.so".to_string(), "/dev/libtwoyi_loader_shlib.so".to_string())
-    } else {
-        (
-            format!("{}/libtwoyi_loader_shlib.so", cfg.rootfs),
-            format!("{}/dev/libtwoyi_loader_shlib.so", cfg.rootfs),
-        )
-    };
+    // ALSO copied to /dev/ (tmpfs) for the same SELinux reason as above.
+    let loader_src = format!("{}/libtwoyi_loader_shlib.so", cfg.rootfs);
+    let loader_dst = "/dev/libtwoyi_loader_shlib.so".to_string();
     if Path::new(&loader_src).exists() {
-        if let Some(parent) = Path::new(&loader_dst).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         match std::fs::copy(&loader_src, &loader_dst) {
             Ok(_) => {
                 use std::os::unix::fs::PermissionsExt;
@@ -1295,9 +1287,21 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 libc::_exit(127);
             },
         };
-        // LD_PRELOAD path: when use_namespaces is true, pivot_root
-        // has already happened, so the path is relative to the new
-        // root. When false, we need the full absolute path.
+        // LD_PRELOAD path: ALWAYS use /dev/libgetpid_hook.so and
+        // /dev/libtwoyi_loader_shlib.so (not {rootfs}/dev/).
+        //
+        // WHY: Init second stage forks subcontexts running as
+        // u:r:vendor_init:s0. vendor_init is DENIED search access to
+        // app_data_file directories (per SELinux policy). If the libraries
+        // are at /data/data/io.twoyi/rootfs/dev/, the subcontext's linker
+        // can't find them. /dev/ (tmpfs) is accessible to ALL domains.
+        //
+        // When use_namespaces=true, pivot_root has happened, so /dev/
+        // refers to the new root's /dev/ (tmpfs mounted by setup_mounts).
+        // When use_namespaces=false, /dev/ refers to the HOST's /dev/
+        // (also tmpfs). In both cases, kr64 copies the libraries to /dev/
+        // before forking, so the paths resolve correctly.
+        //
         // If TWOYI_SKIP_PRELOAD is set in the parent env, skip LD_PRELOAD
         // entirely -- this is a diagnostic mode to check if the init binary
         // can link WITHOUT the getpid hook (init will exit 31, but if it
@@ -1308,14 +1312,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // The virtualization library installs seccomp BPF filter + SIGSYS
         // handler via .init_array constructor before init's main() runs.
         // The getpid hook makes init think it's PID 1.
-        let ld_preload_str = if cfg.use_namespaces {
-            // getpid_hook FIRST (so getpid() is hooked before seccomp installs)
-            // twoyi_loader SECOND (installs seccomp + SIGSYS + PLT hooks)
-            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string()
-        } else {
-            format!("LD_PRELOAD={}/dev/libgetpid_hook.so:{}/dev/libtwoyi_loader_shlib.so",
-                    cfg.rootfs, cfg.rootfs)
-        };
+        let ld_preload_str =
+            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string();
         let mut env_vars: Vec<CString> = vec![
             CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
             CString::new("ANDROID_ROOT=/system").unwrap(),
