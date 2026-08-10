@@ -939,6 +939,18 @@ static void twoyi_init(void) {
     ensure_selinuxfs_files();
     write_str(2, "[twoyi_loader] selinuxfs virtual files created\n");
 
+    // Eagerly create /dev/__properties__/ in the rootfs
+    // Init's PropertyInit() calls mkdir("/dev/__properties__") then
+    // writes property files there. We need the directory to exist
+    // BEFORE init tries to create it (in case our mkdir hook doesn't
+    // catch init's call).
+    if (g_rootfs) {
+        char prop_dir[512];
+        snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
+        mkdir_p(prop_dir, 0771);
+        write_str(2, "[twoyi_loader] created /dev/__properties__ in rootfs\n");
+    }
+
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
 
     g_runtime_ready = 1;
