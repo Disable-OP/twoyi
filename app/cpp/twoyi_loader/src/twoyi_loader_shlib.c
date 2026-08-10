@@ -279,59 +279,29 @@ long keyctl(int cmd, ...) {
     return 0;  // fake keyring ID
 }
 
-// Hook __system_property_area_init — PropertyInit() calls this to create
-// /dev/__properties__. In our container (no chroot), this would overwrite
-// the HOST's property area, causing SIGBUS/SIGSEGV in host processes.
-// Return 0 (fake success) without actually creating the property area.
+// Hook __system_property_area_init — redirect to a private property file
+// so init creates its own property area without corrupting the host's.
+static int (*real_property_area_init)(void) = NULL;
 int __system_property_area_init(void) {
-    write_str(2, "[twoyi_loader] __system_property_area_init: faked\n");
+    // Set a custom property file path via env var before calling real init
+    // This makes init create /dev/__properties__ in the rootfs instead of host
+    if (g_rootfs) {
+        char prop_path[512];
+        snprintf(prop_path, sizeof(prop_path), "%s/dev/__properties__", g_rootfs);
+        // Ensure the directory exists
+        char dev_dir[512];
+        snprintf(dev_dir, sizeof(dev_dir), "%s/dev", g_rootfs);
+        mkdir_p(dev_dir, 0755);
+        // Set the env var that bionic uses for the property file path
+        setenv("__property_file__", prop_path, 1);
+    }
+    if (!real_property_area_init) real_property_area_init = dlsym(RTLD_NEXT, "__system_property_area_init");
+    if (real_property_area_init) {
+        int ret = real_property_area_init();
+        write_str(2, "[twoyi_loader] __system_property_area_init: called real\n");
+        return ret;
+    }
     return 0;
-}
-
-// Hook __system_property_set — don't actually set properties on the host
-int __system_property_set(const char *key, const char *value) {
-    (void)key; (void)value;
-    return 0;  // fake success
-}
-
-// Hook __system_property_get — return empty string (property not found)
-// This prevents init from reading unmapped memory when it tries to
-// read back properties that were "set" by our faked __system_property_set
-int __system_property_get(const char *name, char *value) {
-    if (value) value[0] = '\0';
-    return 0;  // 0 = property not found
-}
-
-// Hook __system_property_find — return NULL (property not found)
-const void *__system_property_find(const char *name) {
-    (void)name;
-    return NULL;
-}
-
-// Hook __system_property_foreach — return 0 (no properties to iterate)
-int __system_property_foreach(void (*propfn)(const void *pi, void *cookie), void *cookie) {
-    (void)propfn; (void)cookie;
-    return 0;
-}
-
-// Hook __system_property_read_callback — return -1 (no property)
-void __system_property_read_callback(const void *pi,
-    void (*callback)(void *cookie, const char *name, const char *value, uint32_t serial),
-    void *cookie) {
-    (void)pi; (void)callback; (void)cookie;
-    // Do nothing — property doesn't exist
-}
-
-// Hook __system_property_serial — return 0
-uint32_t __system_property_serial(const void *pi) {
-    (void)pi;
-    return 0;
-}
-
-// Hook __system_property_wait_any — return immediately (no properties)
-const void *__system_property_wait_any(const void *pi) {
-    (void)pi;
-    return NULL;
 }
 
 // execv/execve hooks — restore LD_PRELOAD before each exec
