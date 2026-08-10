@@ -31,6 +31,7 @@ extern char **environ;
 
 // Forward declarations
 static int mkdir_p(const char *path, mode_t mode);
+static int should_translate(const char *path);
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -326,7 +327,8 @@ int chroot(const char *path) {
     return 0;
 }
 
-// Hook mkdir — redirect /dev/__properties__ to rootfs
+// Hook mkdir — redirect rootfs paths to {rootfs}/...
+// This catches init's mkdir calls for /linkerconfig, /acct, /config, etc.
 int mkdir(const char *path, mode_t mode) {
     // Redirect /dev/__properties__ and its subdirectories to rootfs
     if (path && g_rootfs && (
@@ -337,15 +339,21 @@ int mkdir(const char *path, mode_t mode) {
         snprintf(real_path, sizeof(real_path), "%s%s", g_rootfs, path);
         mkdir_p(real_path, mode);
         // Also create on host as a symlink target (if it doesn't exist)
-        // This allows bionic's internal opens that bypass our hook to
-        // still find the directory
         struct stat st;
         if (lstat(path, &st) != 0) {
             symlink(real_path, path);
         }
         return 0;
     }
-    // For other paths, call real mkdir
+    // Redirect other rootfs paths (linkerconfig, acct, config, etc.)
+    // to {rootfs}/... so init can create them
+    if (path && should_translate(path)) {
+        char real_path[512];
+        snprintf(real_path, sizeof(real_path), "%s%s", g_rootfs, path);
+        mkdir_p(real_path, mode);
+        return 0;
+    }
+    // For other paths (host paths like /dev, /proc, /sys, /data), call real mkdir
     static int (*real_mkdir)(const char *, mode_t) = NULL;
     if (!real_mkdir) real_mkdir = dlsym(RTLD_NEXT, "mkdir");
     if (real_mkdir) return real_mkdir(path, mode);
@@ -391,6 +399,18 @@ int setgroups(size_t size, const gid_t *list) { (void)size; (void)list; return 0
 int setresuid(uid_t ruid, uid_t euid, uid_t suid) { (void)ruid; (void)euid; (void)suid; return 0; }
 int setresgid(gid_t rgid, gid_t egid, gid_t sgid) { (void)rgid; (void)egid; (void)sgid; return 0; }
 int unshare(int flags) { (void)flags; return 0; }
+
+// Hook setpgid — fake success.
+// ROOT CAUSE: init calls setpgid(0, 0) when forking services (ueventd, etc.).
+// In our container (PID namespace without proper session setup), this fails
+// with EPERM, causing init to LOG(FATAL) and abort (signal 6).
+// Fix: return 0 (fake success) so init continues.
+int setpgid(pid_t pid, pid_t pgid) { (void)pid; (void)pgid; return 0; }
+
+// Hook setsid — fake success (return current PID as the new session ID).
+// init may call setsid() for some services. In our container, this might
+// fail. Return 1 (fake session ID) to avoid crashes.
+pid_t setsid(void) { return 1; }
 
 // Hook keyctl — init calls keyctl_get_keyring_ID(KEY_SPEC_SESSION_KEYRING, 1)
 // This might fail or cause issues in our container. Return 0 (fake success).
@@ -888,15 +908,41 @@ static void ensure_selinuxfs_files(void) {
 static int should_translate(const char *path) {
     if (!path || !g_rootfs || path[0] != '/') return 0;
     if (strncmp(path, g_rootfs, strlen(g_rootfs)) == 0) return 0;
+    // Host-only paths — do NOT translate (these are virtual or host-specific)
+    if (strncmp(path, "/proc", 5) == 0) return 0;
+    if (strncmp(path, "/sys", 4) == 0) return 0;
+    if (strncmp(path, "/dev/", 5) == 0 && strncmp(path, "/dev/__properties__", 19) != 0) return 0;
+    if (strncmp(path, "/data", 5) == 0) return 0;  // host data
+    if (strncmp(path, "/dev", 4) == 0 && (path[4] == 0)) return 0;  // /dev exactly
+    // Guest rootfs paths — translate
     if (strncmp(path, "/system", 7) == 0) return 1;
     if (strncmp(path, "/vendor", 7) == 0) return 1;
     if (strncmp(path, "/apex", 5) == 0) return 1;
-    // Translate /dev/__properties__ → rootfs (prevents host property corruption)
     if (strncmp(path, "/dev/__properties__", 19) == 0) return 1;
-    // Do NOT translate /data — it contains host packages.list, dalvik-cache, etc.
     if (strncmp(path, "/init", 5) == 0) return 1;
     if (strncmp(path, "/default.prop", 13) == 0) return 1;
-    return 0;
+    // Init creates these directories during boot — translate to rootfs
+    if (strncmp(path, "/linkerconfig", 13) == 0) return 1;
+    if (strncmp(path, "/acct", 5) == 0) return 1;
+    if (strncmp(path, "/config", 7) == 0) return 1;
+    if (strncmp(path, "/metadata", 9) == 0) return 1;
+    if (strncmp(path, "/mnt", 4) == 0) return 1;
+    if (strncmp(path, "/storage", 8) == 0) return 1;
+    if (strncmp(path, "/cache", 6) == 0) return 1;
+    if (strncmp(path, "/bin", 4) == 0) return 1;
+    if (strncmp(path, "/sbin", 5) == 0) return 1;
+    if (strncmp(path, "/lib", 4) == 0) return 1;
+    if (strncmp(path, "/etc", 4) == 0) return 1;
+    if (strncmp(path, "/root", 5) == 0) return 1;
+    if (strncmp(path, "/tmp", 4) == 0) return 1;
+    if (strncmp(path, "/var", 4) == 0) return 1;
+    if (strncmp(path, "/odm", 4) == 0) return 1;
+    if (strncmp(path, "/product", 8) == 0) return 1;
+    if (strncmp(path, "/system_ext", 11) == 0) return 1;
+    // For any other path starting with /, translate it (safer to redirect
+    // to rootfs than to write to the host filesystem)
+    // Exception: /dev exactly (already handled above)
+    return 1;
 }
 
 // =========================================================================
