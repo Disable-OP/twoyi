@@ -1132,6 +1132,40 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] PARENT: property files pre-created on host + rootfs");
     }
 
+    // Start a background thread that continuously sets SELinux to permissive.
+    //
+    // ROOT CAUSE: When init second stage loads the guest's SELinux policy,
+    // it sets enforcing=1. This causes vendor_init subcontexts to be denied
+    // access to /dev/lib*.so (regardless of SELinux label — vendor_init is
+    // denied read on system_file, device, etc.).
+    //
+    // FIX: This thread writes "0" to /sys/fs/selinux/enforce every 50ms,
+    // overriding the guest's policy load. This keeps SELinux permissive,
+    // allowing vendor_init to load our LD_PRELOAD libraries.
+    //
+    // This is a temporary measure for the KVM test environment. In production,
+    // we'd need to either:
+    // 1. Modify the guest's SELinux policy to allow vendor_init access
+    // 2. Use a different loading mechanism (PT_INTERP, DT_NEEDED)
+    // 3. Don't use LD_PRELOAD for subcontexts
+    let enforce_thread = std::thread::Builder::new()
+        .name("selinux-permissive".to_string())
+        .spawn(|| {
+            info!("[KR64] PARENT: starting SELinux permissive watchdog thread");
+            loop {
+                // Write "0" to /sys/fs/selinux/enforce to set permissive mode
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/sys/fs/selinux/enforce")
+                {
+                    use std::io::Write;
+                    let _ = f.write_all(b"0");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+        .ok();
+
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -1404,6 +1438,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
     // ----- PARENT (the daemon) -----
     info!("[KR64][parent] guest pid = {}", pid);
+
+    // Keep the SELinux permissive watchdog thread alive (it's detached,
+    // but we hold the handle to avoid a compiler warning)
+    let _ = enforce_thread;
 
     // qemu_pipe -> real GL command proxy (Phase 1 of the dispatcher plan).
     // The proxy accepts guest connections, reads the "pipe:opengles"

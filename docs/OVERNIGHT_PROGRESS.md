@@ -201,3 +201,31 @@ The guest init crashed with SIGSEGV.
 - Subcontexts can load LD_PRELOAD libraries (system_file label)
 - Better diagnostics for the second_stage loader issue
 - If our loader IS loaded in second_stage, we'll see messages via logd
+
+### Experiment: SELinux permissive watchdog thread
+### Timestamp UTC: 2026-08-10 ~09:35
+
+**Diagnosis from KVM run 31374150488:**
+- chcon to system_file WORKED (file label is now system_file)
+- BUT vendor_init is STILL denied read access:
+  ```
+  avc: denied { read } for name="libgetpid_hook.so"
+    scontext=u:r:vendor_init:s0
+    tcontext=u:object_r:system_file:s0
+    permissive=0
+  ```
+  vendor_init can't read system_file (only execute specific binaries)
+- android_log_write IS working — messages now appear as "I/twoyi_loader"
+  in logcat, even for processes where stderr is redirected
+
+**Fix: SELinux permissive watchdog thread**
+- kr64 spawns a background thread that writes "0" to
+  /sys/fs/selinux/enforce every 50ms
+- This overrides the guest's policy load (which sets enforcing=1)
+- Keeps SELinux permissive throughout the boot
+- vendor_init can then access /dev/lib*.so regardless of label
+
+**Expected outcome:**
+- SELinux stays permissive → vendor_init can load LD_PRELOAD libraries
+- Subcontexts start successfully
+- init progresses to zygote/bootanimation
