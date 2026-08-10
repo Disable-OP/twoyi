@@ -1056,25 +1056,30 @@ static void twoyi_init(void) {
     ensure_selinuxfs_files();
     write_str(2, "[twoyi_loader] selinuxfs virtual files created\n");
 
-    // Eagerly create /dev/__properties__/ in the rootfs
-    // (init's mkdir might not go through our hook)
+    // Eagerly create /dev/__properties__/ in the rootfs AND on the host
+    // (init's mkdir might not go through our hook, and WriteStringToFile
+    // uses a direct syscall that bypasses PLT hooks, hitting the HOST path)
     if (g_rootfs) {
         char prop_dir[512];
         snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
         mkdir_p(prop_dir, 0771);
-
-        // Pre-create property_info file so LoadDefaultPath succeeds
-        // CreateSerializedPropertyInfo writes to /dev/__properties__/property_info
-        // via WriteStringToFile which uses a direct openat syscall.
-        // If the file doesn't exist on the HOST path, WriteStringToFile fails.
-        // If it exists but is empty, LoadDefaultPath fails to parse it.
-        // Solution: create a minimal valid serialized property info file.
-        // The format is a PropertyInfoArea header + entries.
-        // For now, create an empty file — LoadDefaultPath may tolerate it.
-        char info_path[600];
-        snprintf(info_path, sizeof(info_path), "%s/dev/__properties__/property_info", g_rootfs);
-        int fd = syscall(NR_open, info_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (fd >= 0) syscall(NR_close, fd);
+    }
+    // Also create /dev/__properties__/property_info on the HOST
+    // WriteStringToFile opens /dev/__properties__/property_info directly
+    // (bypassing PLT hooks). The HOST's /dev/__properties__/ exists
+    // (created by host init), but property_info may not exist.
+    // Create it as a writable file so WriteStringToFile succeeds.
+    {
+        struct stat st;
+        if (stat("/dev/__properties__", &st) == 0) {
+            // /dev/__properties__ exists on host — create property_info
+            int fd = syscall(NR_open, "/dev/__properties__/property_info",
+                            O_WRONLY | O_CREAT, 0666);
+            if (fd >= 0) {
+                syscall(NR_close, fd);
+                write_str(2, "[twoyi_loader] created /dev/__properties__/property_info on host\n");
+            }
+        }
     }
 
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
