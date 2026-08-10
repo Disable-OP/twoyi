@@ -549,6 +549,185 @@ int chown(const char *path, uid_t owner, gid_t group) {
     return syscall(SYS_chown, path, owner, group);
 }
 
+// =========================================================================
+// SELinux context hooks
+// Init checks if it can transition from its current context (u:r:su:s0)
+// to a service's exec context (u:r:apexd_exec:s0, etc.). The guest's
+// SELinux policy doesn't have these transition rules for `su` domain,
+// so init fails to start services.
+//
+// Fix: hook the SELinux context functions to fake success:
+// - getcon(): return "u:r:init:s0" (so init thinks it's in init domain)
+// - setexeccon(): fake success (don't actually set context)
+// - security_compute_create(): return "u:r:init:s0" (allow transition)
+// - selinux_check_access(): return 0 (allow all)
+// =========================================================================
+
+// Fake SELinux context strings
+static const char *FAKE_CONTEXT = "u:r:init:s0";
+
+// Define security_class_t if not available (older systems)
+#ifndef security_class_t
+typedef unsigned short security_class_t;
+#endif
+
+int getcon(char **context) {
+    if (context) {
+        *context = strdup(FAKE_CONTEXT);
+        if (*context) return 0;
+        return -1;
+    }
+    return -1;
+}
+
+int getprevcon(char **context) {
+    if (context) {
+        *context = strdup(FAKE_CONTEXT);
+        if (*context) return 0;
+        return -1;
+    }
+    return -1;
+}
+
+int getpidcon(pid_t pid, char **context) {
+    (void)pid;
+    if (context) {
+        *context = strdup(FAKE_CONTEXT);
+        if (*context) return 0;
+        return -1;
+    }
+    return -1;
+}
+
+int getexeccon(char **context) {
+    if (context) {
+        *context = strdup(FAKE_CONTEXT);
+        if (*context) return 0;
+        return -1;
+    }
+    return -1;
+}
+
+int setexeccon(const char *context) {
+    (void)context;
+    // Fake success — don't actually set the exec context
+    return 0;
+}
+
+int setexeccon_raw(const char *context) {
+    (void)context;
+    return 0;
+}
+
+int security_compute_create(const char *scon, const char *tcon,
+                            security_class_t tclass, char **newcon) {
+    (void)scon; (void)tcon; (void)tclass;
+    if (newcon) {
+        *newcon = strdup(FAKE_CONTEXT);
+        if (*newcon) return 0;
+        return -1;
+    }
+    return -1;
+}
+
+int security_compute_create_raw(const char *scon, const char *tcon,
+                                security_class_t tclass, char **newcon) {
+    return security_compute_create(scon, tcon, tclass, newcon);
+}
+
+int selinux_check_access(const char *scon, const char *tcon,
+                         const char *class, const char *perm, void *aux) {
+    (void)scon; (void)tcon; (void)class; (void)perm; (void)aux;
+    return 0;  // allow all
+}
+
+int selinux_check_security_context(const char *con) {
+    (void)con;
+    return 0;  // all contexts are valid
+}
+
+int selinux_android_restorecon(const char *pathname, unsigned int flags) {
+    (void)pathname; (void)flags;
+    return 0;  // fake success
+}
+
+int selinux_android_restorecon_pkgdir(const char *pkgdir, const char *seinfo,
+                                       uid_t uid, unsigned int flags) {
+    (void)pkgdir; (void)seinfo; (void)uid; (void)flags;
+    return 0;
+}
+
+int selinux_android_setfilecon(const char *path, const char *seinfo,
+                                uid_t uid) {
+    (void)path; (void)seinfo; (void)uid;
+    return 0;
+}
+
+int selinux_android_context_type(const char *type) {
+    (void)type;
+    return 0;
+}
+
+// setfscreatecon — fake success
+int setfscreatecon(const char *context) {
+    (void)context;
+    return 0;
+}
+
+int setfscreatecon_raw(const char *context) {
+    (void)context;
+    return 0;
+}
+
+int getfscreatecon(char **context) {
+    if (context) {
+        *context = strdup(FAKE_CONTEXT);
+        if (*context) return 0;
+        return -1;
+    }
+    return -1;
+}
+
+// fsetfilecon — fake success
+int fsetfilecon(int fd, const char *context) {
+    (void)fd; (void)context;
+    return 0;
+}
+
+int setfilecon(const char *path, const char *context) {
+    (void)path; (void)context;
+    return 0;
+}
+
+// lsetfilecon — fake success
+int lsetfilecon(const char *path, const char *context) {
+    (void)path; (void)context;
+    return 0;
+}
+
+// freecon — no-op (we used strdup, but freecon is supposed to free)
+void freecon(char *context) {
+    // free(context);  // free what we strdup'd
+    // Actually, safer to no-op since some callers pass non-alloc'd contexts
+    (void)context;
+}
+
+// is_selinux_enabled — return 1 (enabled) so init's selinux code paths run
+int is_selinux_enabled(void) {
+    return 1;
+}
+
+// security_getenforce — return 0 (permissive) so init doesn't try to enforce
+int security_getenforce(void) {
+    return 0;  // permissive
+}
+
+// security_setenforce — fake success
+int security_setenforce(int value) {
+    (void)value;
+    return 0;
+}
+
 // Hook keyctl — init calls keyctl_get_keyring_ID(KEY_SPEC_SESSION_KEYRING, 1)
 // This might fail or cause issues in our container. Return 0 (fake success).
 long keyctl(int cmd, ...) {
