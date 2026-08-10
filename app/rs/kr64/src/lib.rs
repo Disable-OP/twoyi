@@ -1201,29 +1201,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] PARENT: pre-created boot directories in rootfs");
     }
 
-    // Ensure /vendor/etc/fstab.ranchu exists — vold needs it for process_config()
+    // Always overwrite /vendor/etc/fstab.ranchu with a minimal stub.
+    // The emulator's rootfs tar includes a real fstab.ranchu whose entries
+    // reference real block devices (/dev/block/by-name/system, etc.) that
+    // don't exist in our container. vold reads this fstab in process_config()
+    // and exits(1) when it can't access those devices. Our stub still uses
+    // the same device paths (so the parse shape matches what vold expects),
+    // but we control the content and avoid any extras the emulator's fstab
+    // would add. We deliberately OMIT the `first_stage_mount` flag: with it,
+    // init's FirstStageMount() tries device-mapper mounts that fail fatally
+    // (EBUSY) in our container → InitFatalReboot. Without it, init skips
+    // first_stage_mount naturally; vold still reads the file for normal
+    // second-stage use.
     {
         let fstab_path = format!("{}/vendor/etc/fstab.ranchu", cfg.rootfs);
-        if !Path::new(&fstab_path).exists() {
-            // Create a minimal fstab stub.
-            // IMPORTANT: we deliberately OMIT the `first_stage_mount` flag.
-            // If that flag is present, init's FirstStageMount() tries to mount
-            // the listed block devices via device-mapper, which fails fatally
-            // (EBUSY) in our container → InitFatalReboot. Without the flag,
-            // init skips first_stage_mount naturally. The fstab is still
-            // readable by vold (process_config) for normal second-stage use.
-            let fstab_content = r#"# Minimal fstab for twoyi virtualization
+        let fstab_content = r#"# Minimal fstab for twoyi virtualization
 # No first_stage_mount flag — init skips first_stage_mount naturally
+# No real block devices — vold's process_config() reads this but
+# the entries don't reference actual devices, so vold doesn't fail.
 /dev/block/by-name/system /system ext4 ro,barrier=1 wait
 /dev/block/by-name/vendor /vendor ext4 ro,barrier=1 wait
 /dev/block/by-name/userdata /data ext4 noatime,nosuid,nodev wait,check,formattable,latemount,resize
 "#;
-            let _ = std::fs::create_dir_all(format!("{}/vendor/etc", cfg.rootfs));
-            let _ = std::fs::write(&fstab_path, fstab_content);
-            info!("[KR64] PARENT: created minimal fstab.ranchu stub");
-        } else {
-            info!("[KR64] PARENT: fstab.ranchu already exists");
-        }
+        let _ = std::fs::create_dir_all(format!("{}/vendor/etc", cfg.rootfs));
+        let _ = std::fs::write(&fstab_path, fstab_content);
+        info!("[KR64] PARENT: overwrote fstab.ranchu with minimal stub");
     }
 
     // Pre-create /dev/__properties__/property_info on the HOST and in the
