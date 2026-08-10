@@ -85,3 +85,43 @@ The guest init crashed with SIGSEGV.
 3. The file is created but deleted before second-stage init runs
 
 **Next experiment:** Verify the constructor runs in second-stage init by checking twoyi-loader.log. Also check if /dev/__properties__ is a symlink on the emulator.
+
+### Experiment: Pre-create property_info in kr64 + hook ALL exec variants
+### Timestamp UTC: 2026-08-10 ~08:25
+
+**Diagnosis from latest KVM run (31368119366):**
+- Init lifecycle progression: first stage → selinux_setup → secilc → second_stage
+- Crash at "init second stage started!":
+  ```
+  android::WriteStringToFile open failed: No such file or directory
+  Unable to write serialized property infos to file: No such file or directory
+  Failed to load serialized property info file
+  InitFatalReboot: signal 6
+  ```
+- The loader IS loaded in: init first stage, init selinux_setup, secilc
+- The loader is NOT loaded in: init second_stage (no install messages)
+- This means LD_PRELOAD is missing in second_stage init
+- Our execv hook fires for: kr64→init, init→secilc
+- Our execv hook does NOT fire for: init selinux_setup → init second_stage
+- This means init uses an exec variant we don't hook (execve? execveat? direct syscall?)
+
+**Fix (defensive, multi-layered):**
+1. Pre-create /dev/__properties__/property_info on HOST in kr64 (before forking init)
+   - This ensures the file exists regardless of whether our loader is loaded
+2. Pre-create /dev/__properties__/properties_serial on HOST in kr64
+3. Pre-create {rootfs}/dev/__properties__/property_info + properties_serial in kr64
+4. Add hooks for ALL exec variants: execv, execve, execvp, execvpe, execveat
+5. Add diagnostics to execv/execve hooks (log path + g_preload_path)
+6. Add diagnostic in .init_array (log LD_PRELOAD + TWOYI_ROOTFS values)
+7. Upload twoyi-loader.log as artifact in KVM workflow
+
+**Expected outcome:**
+- WriteStringToFile succeeds because the file pre-exists on host
+- Even if our loader isn't loaded in second_stage init, the file is there
+- Diagnostics will tell us which exec variant init actually uses
+- If our exec hooks DO fire, LD_PRELOAD will be restored
+
+**Next experiment if this fails:**
+- Check twoyi-loader.log to see which exec variants were called
+- If no exec hook fired, init is using a direct syscall (need seccomp or other approach)
+- Consider pre-creating ALL property files (u:object_r:*:s0 contexts too)

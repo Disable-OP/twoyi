@@ -436,9 +436,23 @@ const void *__system_property_wait_any(const void *pi) {
 // execv/execve hooks — restore LD_PRELOAD before each exec
 static int (*real_execv)(const char *, char *const[]) = NULL;
 static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
+static int (*real_execvp)(const char *, char *const[]) = NULL;
+static int (*real_execvpe)(const char *, char *const[], char *const[]) = NULL;
+static int (*real_execveat)(int, const char *, char *const[], char *const[], int) = NULL;
+
+// Diagnostic helper: log the exec call with path + LD_PRELOAD state
+static void log_exec_call(const char *variant, const char *path) {
+    char msg[768];
+    int len = snprintf(msg, sizeof(msg),
+        "[twoyi_loader] %s called: path=%s preload_path=%s\n",
+        variant, path ? path : "(null)",
+        g_preload_path[0] ? g_preload_path : "(empty)");
+    write_str(2, msg);
+}
 
 int execv(const char *path, char *const argv[]) {
     if (!real_execv) real_execv = dlsym(RTLD_NEXT, "execv");
+    log_exec_call("execv", path);
     restore_preload_env();
     write_str(2, "[twoyi_loader] execv: restored LD_PRELOAD\n");
     if (!real_execv) return syscall(SYS_execve, path, argv, environ);
@@ -449,6 +463,7 @@ int execv(const char *path, char *const argv[]) {
 
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!real_execve) real_execve = dlsym(RTLD_NEXT, "execve");
+    log_exec_call("execve", path);
     // For execve, we need to modify the envp array to include LD_PRELOAD
     // But envp might not have LD_PRELOAD. We need to add it.
     // Simplest approach: use setenv() to set it in the current env,
@@ -499,6 +514,137 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     int ret;
     if (!real_execve) ret = syscall(SYS_execve, path, argv, new_envp);
     else ret = real_execve(path, argv, new_envp);
+    free(new_envp);
+    return ret;
+}
+
+// Hook execvp — same as execv but uses PATH
+int execvp(const char *path, char *const argv[]) {
+    if (!real_execvp) real_execvp = dlsym(RTLD_NEXT, "execvp");
+    log_exec_call("execvp", path);
+    restore_preload_env();
+    write_str(2, "[twoyi_loader] execvp: restored LD_PRELOAD\n");
+    if (!real_execvp) return syscall(SYS_execve, path, argv, environ);
+    return real_execvp(path, argv);
+}
+
+// Hook execvpe — same as execve but uses PATH
+int execvpe(const char *path, char *const argv[], char *const envp[]) {
+    if (!real_execvpe) real_execvpe = dlsym(RTLD_NEXT, "execvpe");
+    log_exec_call("execvpe", path);
+    // Same envp manipulation as execve
+    restore_preload_env();
+
+    int env_count = 0;
+    if (envp) {
+        while (envp[env_count]) env_count++;
+    }
+
+    int has_preload = 0;
+    for (int i = 0; i < env_count; i++) {
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
+            has_preload = 1;
+            break;
+        }
+    }
+
+    if (has_preload || !g_preload_path[0]) {
+        if (!real_execvpe) return syscall(SYS_execve, path, argv, envp);
+        return real_execvpe(path, argv, envp);
+    }
+
+    char preload_env[600];
+    snprintf(preload_env, sizeof(preload_env), "LD_PRELOAD=%s", g_preload_path);
+
+    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 2));
+    if (!new_envp) {
+        if (!real_execvpe) return syscall(SYS_execve, path, argv, environ);
+        return real_execvpe(path, argv, environ);
+    }
+
+    for (int i = 0; i < env_count; i++) {
+        new_envp[i] = (char *)envp[i];
+    }
+    new_envp[env_count] = preload_env;
+    new_envp[env_count + 1] = NULL;
+
+    write_str(2, "[twoyi_loader] execvpe: added LD_PRELOAD to envp\n");
+    int ret;
+    if (!real_execvpe) ret = syscall(SYS_execve, path, argv, new_envp);
+    else ret = real_execvpe(path, argv, new_envp);
+    free(new_envp);
+    return ret;
+}
+
+// Hook execveat — execve relative to a dirfd
+int execveat(int dirfd, const char *path, char *const argv[],
+             char *const envp[], int flags) {
+    if (!real_execveat) real_execveat = dlsym(RTLD_NEXT, "execveat");
+    log_exec_call("execveat", path);
+    restore_preload_env();
+
+    int env_count = 0;
+    if (envp) {
+        while (envp[env_count]) env_count++;
+    }
+
+    int has_preload = 0;
+    for (int i = 0; i < env_count; i++) {
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) == 0) {
+            has_preload = 1;
+            break;
+        }
+    }
+
+    if (has_preload || !g_preload_path[0]) {
+        // No LD_PRELOAD needed — call real execveat
+        if (!real_execveat) {
+            // Fall back to syscall
+#ifdef SYS_execveat
+            return syscall(SYS_execveat, dirfd, path, argv, envp, flags);
+#else
+            errno = ENOSYS;
+            return -1;
+#endif
+        }
+        return real_execveat(dirfd, path, argv, envp, flags);
+    }
+
+    // Build new envp with LD_PRELOAD added
+    char preload_env[600];
+    snprintf(preload_env, sizeof(preload_env), "LD_PRELOAD=%s", g_preload_path);
+
+    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 2));
+    if (!new_envp) {
+        if (!real_execveat) {
+#ifdef SYS_execveat
+            return syscall(SYS_execveat, dirfd, path, argv, environ, flags);
+#else
+            errno = ENOSYS;
+            return -1;
+#endif
+        }
+        return real_execveat(dirfd, path, argv, environ, flags);
+    }
+
+    for (int i = 0; i < env_count; i++) {
+        new_envp[i] = (char *)envp[i];
+    }
+    new_envp[env_count] = preload_env;
+    new_envp[env_count + 1] = NULL;
+
+    write_str(2, "[twoyi_loader] execveat: added LD_PRELOAD to envp\n");
+    int ret;
+    if (!real_execveat) {
+#ifdef SYS_execveat
+        ret = syscall(SYS_execveat, dirfd, path, argv, new_envp, flags);
+#else
+        errno = ENOSYS;
+        ret = -1;
+#endif
+    } else {
+        ret = real_execveat(dirfd, path, argv, new_envp, flags);
+    }
     free(new_envp);
     return ret;
 }
@@ -1088,6 +1234,21 @@ static void twoyi_init(void) {
 
     // Save LD_PRELOAD path so we can restore it before execv/execve
     set_preload_path();
+
+    // DIAGNOSTIC: log the LD_PRELOAD value and TWOYI_ROOTFS so we can
+    // verify the loader is being loaded with the right env in every
+    // process (init first stage, selinux_setup, secilc, second_stage).
+    {
+        char msg[1024];
+        const char *preload = getenv("LD_PRELOAD");
+        const char *rootfs = getenv("TWOYI_ROOTFS");
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] init: LD_PRELOAD=%s TWOYI_ROOTFS=%s g_rootfs=%s\n",
+            preload ? preload : "(null)",
+            rootfs ? rootfs : "(null)",
+            g_rootfs ? g_rootfs : "(null)");
+        write_str(2, msg);
+    }
 
     write_str(2, "[twoyi_loader] init: installing virtualization (PLT-only mode)\n");
 
