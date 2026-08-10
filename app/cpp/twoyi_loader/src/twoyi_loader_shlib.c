@@ -110,7 +110,9 @@ static int mkdir_p(const char *path, mode_t mode);
 
 // Helper: write to both stderr and a log file (for debugging when stderr is /dev/null)
 static void write_str(int fd, const char *s) {
-    if (s) { size_t l=0; while(s[l])l++; write(fd,s,l); }
+    if (!s) return;
+    size_t l = 0; while (s[l]) l++;
+    write(fd, s, l);
     // Also write to /data/local/tmp/twoyi-loader.log for debugging
     int logfd = syscall(NR_open, "/data/local/tmp/twoyi-loader.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (logfd >= 0) { syscall(NR_write, logfd, s, l); syscall(NR_close, logfd); }
