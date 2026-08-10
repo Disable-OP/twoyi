@@ -1357,10 +1357,10 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     // Set LD_LIBRARY_PATH to include rootfs library directories
     // This is needed because binaries in /dev/twoyi-bin/ need libraries
     // from {rootfs}/system/lib64/ and {rootfs}/apex/com.android.runtime/lib64/
-    char ld_library_path[1024];
+    char ld_library_path[2048];
     snprintf(ld_library_path, sizeof(ld_library_path),
-        "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/vendor/lib64",
-        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
+        "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/vendor/lib64:%s/apex/com.android.os.statsd/lib64:%s/system_ext/lib64:%s/product/lib64",
+        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
 
     char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3));
     if (!new_envp) {
