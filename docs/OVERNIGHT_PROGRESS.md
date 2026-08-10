@@ -343,3 +343,44 @@ guest init process, not the host's SELinux enforcement.
 
 **Note:** The SELinux permissive watchdog thread in kr64 is kept as a
 backup. With the new hooks, it may not be needed, but it doesn't hurt.
+
+### 🎉🎉🎉 BREAKTHROUGH: Guest init boots, twoyi process ALIVE! 🎉🎉🎉
+### Timestamp UTC: 2026-08-10 ~11:50
+
+**KVM run 31384413017 — FIRST PARTIAL SUCCESS!**
+
+Boot verdict:
+```
+◐ PARTIAL — twoyi process is alive but no GL context.
+  io.twoyi process: ALIVE (pid 6252)
+  tombstones during run: 0
+```
+
+**What worked:**
+- security_compute_create returns derived context (u:r:apexd:s0 from u:object_r:apexd_exec:s0)
+- init's domain transition check passes (newcon != mycon)
+- apexd-bootstrap SUCCEEDED: "Service 'apexd-bootstrap' (pid 6151) exited with status 0"
+- linkerconfig, ueventd, apexd all started
+- Guest init did NOT crash (no InitFatalReboot!)
+- Host emulator did NOT crash
+- twoyi app launched, renderer started:
+  ```
+  I/TWOYI_RENDERER: eglInitialize(0x1) = 1, version=1.4
+  I/TWOYI_RENDERER: FrameBuffer::initialize: OK
+  I/TWOYI_RENDERER: RenderServer started — listening on $TWOYI_ROOTFS/opengles
+  I/TWOYI_RENDERER: createOpenGLSubwindow: OK
+  I/CLIENT_EGL: [CORE] Renderer started successfully
+  ```
+
+**What's still missing:**
+- No BOOT_COMPLETED signal (guest didn't fully boot to home screen)
+- No GL context created (renderer is up but no guest connected to it)
+- Guest init may have stalled after starting early services
+- ro.zygote property couldn't be set (prop add failed)
+  → init.rc couldn't expand /system/etc/init/hw/init.${ro.zygote}.rc
+  → zygote service never started
+
+**Next step: Fix __system_property_add**
+- Properties like ro.zygote can't be set (Access denied)
+- This is because our in-memory property system doesn't support all operations
+- Need to implement __system_property_add properly
