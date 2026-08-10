@@ -623,6 +623,10 @@ int security_compute_create(const char *scon, const char *tcon,
                             security_class_t tclass, char **newcon) {
     (void)scon; (void)tcon; (void)tclass;
     if (newcon) {
+        // Return a different context than the source to indicate a transition
+        // Init checks if newcon != scon to decide if a domain transition exists.
+        // By returning "u:r:init:s0" (which differs from the actual source
+        // context the kernel would report), init thinks a transition exists.
         *newcon = strdup(FAKE_CONTEXT);
         if (*newcon) return 0;
         return -1;
@@ -635,15 +639,44 @@ int security_compute_create_raw(const char *scon, const char *tcon,
     return security_compute_create(scon, tcon, tclass, newcon);
 }
 
+// security_compute_create_name — same as security_compute_create but with name
+int security_compute_create_name(const char *scon, const char *tcon,
+                                  security_class_t tclass, const char *objname,
+                                  char **newcon) {
+    (void)objname;
+    return security_compute_create(scon, tcon, tclass, newcon);
+}
+
+int security_compute_create_name_raw(const char *scon, const char *tcon,
+                                      security_class_t tclass, const char *objname,
+                                      char **newcon) {
+    (void)objname;
+    return security_compute_create(scon, tcon, tclass, newcon);
+}
+
+// selinux_check_access — allow all
 int selinux_check_access(const char *scon, const char *tcon,
                          const char *class, const char *perm, void *aux) {
     (void)scon; (void)tcon; (void)class; (void)perm; (void)aux;
     return 0;  // allow all
 }
 
+// selinux_check_security_context — all contexts are valid
 int selinux_check_security_context(const char *con) {
     (void)con;
-    return 0;  // all contexts are valid
+    return 0;
+}
+
+// selinux_cmpcon — contexts match (avoid context comparison failures)
+int selinux_context_cmp(const char *a, const char *b) {
+    (void)a; (void)b;
+    return 0;  // equal
+}
+
+// selinux_check_context — all contexts are valid
+int selinux_check_context(const char *con) {
+    (void)con;
+    return 0;
 }
 
 int selinux_android_restorecon(const char *pathname, unsigned int flags) {
