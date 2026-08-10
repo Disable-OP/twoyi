@@ -911,15 +911,24 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uc) {
             // use a direct syscall. Trap it here to be sure.
             ret = 1; break;
         default:
-            // For trapped syscalls we don't explicitly handle, return -ENOSYS.
-            // Log the syscall number so we can identify what init needs.
-            {
-                char msg[64];
-                int len = snprintf(msg, sizeof(msg),
-                    "[twoyi_loader] SIGSYS: unhandled syscall %ld\n", nr);
-                write(2, msg, len);
+            // Handle openat (trapped by seccomp) — translate path
+            if (nr == NR_openat) {
+                int dirfd = (int)GET_ARG(ctx, 0);
+                const char *path = (const char *)GET_ARG(ctx, 1);
+                int flags = (int)GET_ARG(ctx, 2);
+                mode_t mode = (mode_t)GET_ARG(ctx, 3);
+                if (path && should_translate(path)) {
+                    const char *translated = translate(path);
+                    ret = syscall(NR_openat, dirfd, translated, flags, mode);
+                } else if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
+                    const char *translated = translate(path);
+                    ret = syscall(NR_openat, dirfd, translated, flags, mode);
+                } else {
+                    ret = syscall(NR_openat, dirfd, path, flags, mode);
+                }
+            } else {
+                ret = -ENOSYS;
             }
-            ret = -ENOSYS;
             break;
     }
     SET_RET(ctx, ret);
@@ -1033,7 +1042,34 @@ static void twoyi_init(void) {
     //
     // The getpid_hook.so (also in LD_PRELOAD) handles getpid() → return 1.
 
-    write_str(2, "[twoyi_loader] PLT hooks installed (mount, open, openat, execv, execve)\n");
+    // Install seccomp BPF filter to TRAP openat for path translation
+    // This catches direct syscalls that bypass PLT hooks (WriteStringToFile)
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0) {
+        struct sock_filter trap_filter[] = {
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, 4), // load arch
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, TWOYI_AUDIT_ARCH, 1, 0),
+            BPF_STMT(BPF_RET|BPF_K, 0x80000000), // KILL wrong arch
+            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, 0), // load nr
+#if defined(__x86_64__)
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 257, 0, 1), // openat
+#elif defined(__aarch64__)
+            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 56, 0, 1), // openat
+#endif
+            BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP
+            BPF_STMT(BPF_RET|BPF_K, 0x7fff0000), // ALLOW
+        };
+        struct sock_fprog prog = {
+            .len = sizeof(trap_filter)/sizeof(trap_filter[0]),
+            .filter = trap_filter,
+        };
+        if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) == 0) {
+            write_str(2, "[twoyi_loader] seccomp trap for openat installed\n");
+        } else {
+            write_str(2, "[twoyi_loader] seccomp trap failed (non-fatal)\n");
+        }
+    }
+
+    write_str(2, "[twoyi_loader] PLT hooks + seccomp installed\n");
 
     // Create SELinuxFS virtual files (init needs /sys/fs/selinux/checkreqprot etc.)
     ensure_selinuxfs_files();
