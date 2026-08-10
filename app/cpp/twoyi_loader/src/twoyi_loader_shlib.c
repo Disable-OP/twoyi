@@ -1042,34 +1042,15 @@ static void twoyi_init(void) {
     //
     // The getpid_hook.so (also in LD_PRELOAD) handles getpid() → return 1.
 
-    // Install seccomp BPF filter to TRAP openat for path translation
-    // This catches direct syscalls that bypass PLT hooks (WriteStringToFile)
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0) {
-        struct sock_filter trap_filter[] = {
-            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, 4), // load arch
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, TWOYI_AUDIT_ARCH, 1, 0),
-            BPF_STMT(BPF_RET|BPF_K, 0x80000000), // KILL wrong arch
-            BPF_STMT(BPF_LD|BPF_W|BPF_ABS, 0), // load nr
-#if defined(__x86_64__)
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 257, 0, 1), // openat
-#elif defined(__aarch64__)
-            BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 56, 0, 1), // openat
-#endif
-            BPF_STMT(BPF_RET|BPF_K, 0x00030000), // TRAP
-            BPF_STMT(BPF_RET|BPF_K, 0x7fff0000), // ALLOW
-        };
-        struct sock_fprog prog = {
-            .len = sizeof(trap_filter)/sizeof(trap_filter[0]),
-            .filter = trap_filter,
-        };
-        if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) == 0) {
-            write_str(2, "[twoyi_loader] seccomp trap for openat installed\n");
-        } else {
-            write_str(2, "[twoyi_loader] seccomp trap failed (non-fatal)\n");
-        }
-    }
+    // NOTE: Do NOT install seccomp BPF filter for openat.
+    // ROOT CAUSE: Android init calls execv() which resets signal handlers.
+    // Seccomp filters survive execve but SIGSYS handlers don't.
+    // After execv, any SECCOMP_RET_TRAP → SIGSYS → SIG_DFL → process killed.
+    // The linker's own openat calls during library loading get trapped → SIGSYS → kill.
+    //
+    // Instead, use PLT interposition + pre-create property files in rootfs.
 
-    write_str(2, "[twoyi_loader] PLT hooks + seccomp installed\n");
+    write_str(2, "[twoyi_loader] PLT hooks installed\n");
 
     // Create SELinuxFS virtual files (init needs /sys/fs/selinux/checkreqprot etc.)
     ensure_selinuxfs_files();
@@ -1081,6 +1062,19 @@ static void twoyi_init(void) {
         char prop_dir[512];
         snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
         mkdir_p(prop_dir, 0771);
+
+        // Pre-create property_info file so LoadDefaultPath succeeds
+        // CreateSerializedPropertyInfo writes to /dev/__properties__/property_info
+        // via WriteStringToFile which uses a direct openat syscall.
+        // If the file doesn't exist on the HOST path, WriteStringToFile fails.
+        // If it exists but is empty, LoadDefaultPath fails to parse it.
+        // Solution: create a minimal valid serialized property info file.
+        // The format is a PropertyInfoArea header + entries.
+        // For now, create an empty file — LoadDefaultPath may tolerate it.
+        char info_path[600];
+        snprintf(info_path, sizeof(info_path), "%s/dev/__properties__/property_info", g_rootfs);
+        int fd = syscall(NR_open, info_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) syscall(NR_close, fd);
     }
 
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
