@@ -463,12 +463,24 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             char translated[600];
             snprintf(translated, sizeof(translated), "%s%s", g_rootfs, un->sun_path);
 
-            // Ensure parent directory exists
+            // Ensure parent directory exists using DIRECT SYSCALLS
+            // (bypass our mkdir hook to avoid recursion/translation issues)
             char dir[600];
             strncpy(dir, translated, sizeof(dir) - 1);
             dir[sizeof(dir) - 1] = 0;
             char *slash = strrchr(dir, '/');
-            if (slash) { *slash = 0; mkdir_p(dir, 0777); }
+            if (slash) {
+                *slash = 0;
+                // Create directory chain using direct syscalls
+                for (char *p = dir + 1; *p; p++) {
+                    if (*p == '/') {
+                        *p = 0;
+                        syscall(SYS_mkdir, dir, 0777);
+                        *p = '/';
+                    }
+                }
+                syscall(SYS_mkdir, dir, 0777);
+            }
 
             // Create a copy of the sockaddr with the translated path
             struct sockaddr_un new_addr;
@@ -477,7 +489,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
             strncpy(new_addr.sun_path, translated, sizeof(new_addr.sun_path) - 1);
 
             char msg[256];
-            int len = snprintf(msg, sizeof(msg),
+            snprintf(msg, sizeof(msg),
                 "[twoyi_loader] bind: translated %s -> %s\n", un->sun_path, translated);
             write_str(2, msg);
 
