@@ -1644,9 +1644,12 @@ static int should_translate(const char *path) {
     if (!path || !g_rootfs || path[0] != '/') return 0;
     if (strncmp(path, g_rootfs, strlen(g_rootfs)) == 0) return 0;
     // Host-only paths — do NOT translate (these are virtual or host-specific)
-    if (strncmp(path, "/proc", 5) == 0) return 0;
-    if (strncmp(path, "/sys", 4) == 0) return 0;
-    if (strncmp(path, "/data", 5) == 0) return 0;  // host data
+    // IMPORTANT: Use boundary checks (path[N] == 0 || path[N] == '/') to avoid
+    // matching paths that just start with the same prefix.
+    // e.g., /sys must NOT match /system (which starts with /sys)
+    if (strncmp(path, "/proc", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
+    if (strncmp(path, "/sys", 4) == 0 && (path[4] == 0 || path[4] == '/')) return 0;
+    if (strncmp(path, "/data", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
     // /dev/ paths: translate socket, __properties__, and other guest paths
     // but keep host device nodes (/dev/null, /dev/zero, /dev/qemu_pipe, etc.)
     if (strncmp(path, "/dev/socket", 11) == 0) return 1;  // guest sockets
@@ -1656,24 +1659,24 @@ static int should_translate(const char *path) {
     if (strncmp(path, "/dev/", 5) == 0) return 0;
     if (strncmp(path, "/dev", 4) == 0 && (path[4] == 0)) return 0;  // /dev exactly
     // Guest rootfs paths — translate
-    if (strncmp(path, "/system", 7) == 0) return 1;
-    if (strncmp(path, "/vendor", 7) == 0) return 1;
-    if (strncmp(path, "/apex", 5) == 0) return 1;
-    if (strncmp(path, "/init", 5) == 0) return 1;
+    if (strncmp(path, "/system", 7) == 0 && (path[7] == 0 || path[7] == '/')) return 1;
+    if (strncmp(path, "/vendor", 7) == 0 && (path[7] == 0 || path[7] == '/')) return 1;
+    if (strncmp(path, "/apex", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 1;
+    if (strncmp(path, "/init", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 1;
     if (strncmp(path, "/default.prop", 13) == 0) return 1;
     // Init creates these directories during boot — translate to rootfs
     if (strncmp(path, "/linkerconfig", 13) == 0) return 1;
     if (strncmp(path, "/acct", 5) == 0) return 1;
     if (strncmp(path, "/config", 7) == 0) return 1;
     if (strncmp(path, "/metadata", 9) == 0) return 1;
-    if (strncmp(path, "/mnt", 4) == 0) return 1;
+    if (strncmp(path, "/mnt", 4) == 0 && (path[4] == 0 || path[4] == '/')) return 1;
     if (strncmp(path, "/storage", 8) == 0) return 1;
     if (strncmp(path, "/cache", 6) == 0) return 1;
     if (strncmp(path, "/bin", 4) == 0) return 1;
     if (strncmp(path, "/sbin", 5) == 0) return 1;
     if (strncmp(path, "/lib", 4) == 0) return 1;
     if (strncmp(path, "/etc", 4) == 0) return 1;
-    if (strncmp(path, "/root", 5) == 0) return 1;
+    if (strncmp(path, "/root", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 1;
     if (strncmp(path, "/tmp", 4) == 0) return 1;
     if (strncmp(path, "/var", 4) == 0) return 1;
     if (strncmp(path, "/odm", 4) == 0) return 1;
