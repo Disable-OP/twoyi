@@ -527,6 +527,30 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return syscall(SYS_bind, sockfd, addr, addrlen);
 }
 
+// Hook connect — redirect AF_UNIX socket paths to rootfs (matches bind)
+int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    static int (*real_connect)(int, const struct sockaddr *, socklen_t) = NULL;
+    if (!real_connect) real_connect = dlsym(RTLD_NEXT, "connect");
+
+    if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
+        struct sockaddr_un *un = (struct sockaddr_un *)addr;
+        if (un->sun_path[0] == '/' && should_translate(un->sun_path)) {
+            char translated[600];
+            snprintf(translated, sizeof(translated), "%s%s", g_rootfs, un->sun_path);
+
+            struct sockaddr_un new_addr;
+            memset(&new_addr, 0, sizeof(new_addr));
+            new_addr.sun_family = AF_UNIX;
+            strncpy(new_addr.sun_path, translated, sizeof(new_addr.sun_path) - 1);
+
+            if (real_connect) return real_connect(sockfd, (const struct sockaddr *)&new_addr, sizeof(new_addr));
+            return syscall(SYS_connect, sockfd, &new_addr, sizeof(new_addr));
+        }
+    }
+    if (real_connect) return real_connect(sockfd, addr, addrlen);
+    return syscall(SYS_connect, sockfd, addr, addrlen);
+}
+
 // Hook fchmodat — redirect paths to rootfs (matches bind translation)
 int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
     if (path && should_translate(path)) {
