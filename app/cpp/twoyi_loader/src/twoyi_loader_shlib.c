@@ -498,7 +498,8 @@ static int should_translate(const char *path) {
     if (strncmp(path, "/system", 7) == 0) return 1;
     if (strncmp(path, "/vendor", 7) == 0) return 1;
     if (strncmp(path, "/apex", 5) == 0) return 1;
-    if (strncmp(path, "/data", 5) == 0) return 1;
+    // Do NOT translate /data — it contains host packages.list, dalvik-cache, etc.
+    // that libselinux and init need to access on the HOST, not in rootfs.
     if (strncmp(path, "/init", 5) == 0) return 1;
     if (strncmp(path, "/default.prop", 13) == 0) return 1;
     return 0;
