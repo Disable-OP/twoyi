@@ -2011,5 +2011,26 @@ static void twoyi_init(void) {
 
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
 
+    // Pre-set critical properties that init waits for during boot.
+    // These properties are normally set by other processes (ueventd, etc.)
+    // but our in-memory property system is per-process, so init can't see
+    // properties set by other processes. Pre-setting them in init's own
+    // property table ensures init doesn't wait forever.
+    prop_set("ro.coldboot_done", "1");
+    prop_set("ro.bootmode", "normal");
+    prop_set("ro.boot.mode", "normal");
+    prop_set("ro.boot.bootreason", "reboot");
+    prop_set("ro.boot.bootdevice", "");
+    prop_set("ro.boot.bootloader", "unknown");
+    prop_set("ro.boot.serialno", "EMULATOR37X1X11X0");
+    prop_set("ro.boot.hardware", "ranchu");
+    prop_set("ro.bootfrog", "0");
+    prop_set("ro.persistent_properties.ready", "1");
+    prop_set("ro.actionable_compatible_property.enabled", "true");
+    // ro.zygote is needed for init to parse init.zygote64_32.rc
+    prop_set("ro.zygote", "zygote64_32");
+    // sys.boot_completed is the final goal — but don't set it yet
+    // (we want the guest to actually boot, not fake it)
+
     g_runtime_ready = 1;
 }
