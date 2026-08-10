@@ -420,6 +420,18 @@ int setpgid(pid_t pid, pid_t pgid) { (void)pid; (void)pgid; return 0; }
 // fail. Return 1 (fake session ID) to avoid crashes.
 pid_t setsid(void) { return 1; }
 
+// Hook setns — fake success for mount namespace switches.
+// init's SetupMountNamespaces calls setns() to switch to the bootstrap
+// mount namespace. In our container (no real mount namespaces), this fails.
+// Faking success lets init continue.
+int setns(int fd, int nstype) {
+    (void)fd; (void)nstype;
+    char msg[128];
+    snprintf(msg, sizeof(msg), "[twoyi_loader] setns: faking success (fd=%d nstype=%d)\n", fd, nstype);
+    write_str(2, msg);
+    return 0;
+}
+
 // Hook unlink/unlinkat — redirect /dev/socket/ paths to rootfs.
 // init calls unlink("/dev/socket/property_service") before bind(). Without
 // this hook, it would delete the HOST's property_service socket, breaking
