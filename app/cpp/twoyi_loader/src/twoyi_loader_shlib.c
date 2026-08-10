@@ -1080,17 +1080,25 @@ static void twoyi_init(void) {
     // WriteStringToFile opens /dev/__properties__/property_info directly
     // (bypassing PLT hooks). The HOST's /dev/__properties__/ exists
     // (created by host init), but property_info may not exist.
-    // Create it as a writable file so WriteStringToFile succeeds.
+    // Create it AND make the directory writable.
     {
         struct stat st;
         if (stat("/dev/__properties__", &st) == 0) {
-            // /dev/__properties__ exists on host — create property_info
+            // Make directory world-writable (WriteStringToFile needs to create files)
+            chmod("/dev/__properties__", 0777);
+            // Create property_info as writable file
             int fd = syscall(NR_open, "/dev/__properties__/property_info",
-                            O_WRONLY | O_CREAT, 0666);
+                            O_WRONLY | O_CREAT | O_TRUNC, 0666);
             if (fd >= 0) {
                 syscall(NR_close, fd);
-                write_str(2, "[twoyi_loader] created /dev/__properties__/property_info on host\n");
             }
+            // Also create properties_serial
+            fd = syscall(NR_open, "/dev/__properties__/properties_serial",
+                        O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd >= 0) {
+                syscall(NR_close, fd);
+            }
+            write_str(2, "[twoyi_loader] created property files on host\n");
         }
     }
 
