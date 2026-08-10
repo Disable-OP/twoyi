@@ -282,29 +282,14 @@ long keyctl(int cmd, ...) {
     return 0;  // fake keyring ID
 }
 
-// Hook __system_property_area_init — redirect to a private property file
-// so init creates its own property area without corrupting the host's.
-static int (*real_property_area_init)(void) = NULL;
+// Hook __system_property_area_init — return -1 (failure)
+// PropertyInit() calls this to create /dev/__properties__.
+// In our container (no chroot), calling the real function would
+// corrupt the HOST's property area. Return -1 to make init
+// LOG(FATAL) with a clear error message instead of SIGSEGV.
 int __system_property_area_init(void) {
-    // Set a custom property file path via env var before calling real init
-    // This makes init create /dev/__properties__ in the rootfs instead of host
-    if (g_rootfs) {
-        char prop_path[512];
-        snprintf(prop_path, sizeof(prop_path), "%s/dev/__properties__", g_rootfs);
-        // Ensure the directory exists
-        char dev_dir[512];
-        snprintf(dev_dir, sizeof(dev_dir), "%s/dev", g_rootfs);
-        mkdir_p(dev_dir, 0755);
-        // Set the env var that bionic uses for the property file path
-        setenv("__property_file__", prop_path, 1);
-    }
-    if (!real_property_area_init) real_property_area_init = dlsym(RTLD_NEXT, "__system_property_area_init");
-    if (real_property_area_init) {
-        int ret = real_property_area_init();
-        write_str(2, "[twoyi_loader] __system_property_area_init: called real\n");
-        return ret;
-    }
-    return 0;
+    write_str(2, "[twoyi_loader] __system_property_area_init: returning -1 (blocked)\n");
+    return -1;  // failure — init will LOG(FATAL)
 }
 
 // execv/execve hooks — restore LD_PRELOAD before each exec
