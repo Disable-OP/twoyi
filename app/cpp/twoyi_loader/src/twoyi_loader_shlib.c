@@ -1206,21 +1206,37 @@ static void log_exec_call(const char *variant, const char *path) {
     write_str(2, msg);
 }
 
+// Helper: translate path for exec (prepend rootfs if needed)
+static const char *translate_exec_path(const char *path) {
+    if (!path || !g_rootfs) return path;
+    if (!should_translate(path)) return path;
+    static char translated[512];
+    snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+    return translated;
+}
+
 int execv(const char *path, char *const argv[]) {
     if (!real_execv) real_execv = dlsym(RTLD_NEXT, "execv");
     log_exec_call("execv", path);
+    // Translate path to rootfs (e.g., /system/bin/logd -> {rootfs}/system/bin/logd)
+    const char *exec_path = translate_exec_path(path);
+    if (exec_path != path) {
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] execv: translated %s -> %s\n", path, exec_path);
+        write_str(2, msg);
+    }
     // Check if we should skip LD_PRELOAD for this binary (e.g., 32-bit)
     if (!should_set_preload_for_exec(path)) {
         // Remove LD_PRELOAD from env so the 32-bit binary can link normally
         unsetenv_internal("LD_PRELOAD");
         write_str(2, "[twoyi_loader] execv: skipped LD_PRELOAD for 32-bit binary\n");
-        if (!real_execv) return syscall(SYS_execve, path, argv, environ);
-        return real_execv(path, argv);
+        if (!real_execv) return syscall(SYS_execve, exec_path, argv, environ);
+        return real_execv(exec_path, argv);
     }
     restore_preload_env();
     write_str(2, "[twoyi_loader] execv: restored LD_PRELOAD\n");
-    if (!real_execv) return syscall(SYS_execve, path, argv, environ);
-    return real_execv(path, argv);
+    if (!real_execv) return syscall(SYS_execve, exec_path, argv, environ);
+    return real_execv(exec_path, argv);
 }
 
 // Hook execve — re-set LD_PRELOAD before exec
@@ -1228,6 +1244,13 @@ int execv(const char *path, char *const argv[]) {
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!real_execve) real_execve = dlsym(RTLD_NEXT, "execve");
     log_exec_call("execve", path);
+    // Translate path to rootfs (e.g., /system/bin/logd -> {rootfs}/system/bin/logd)
+    const char *exec_path = translate_exec_path(path);
+    if (exec_path != path) {
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] execve: translated %s -> %s\n", path, exec_path);
+        write_str(2, msg);
+    }
     // Check if we should skip LD_PRELOAD for this binary (e.g., 32-bit)
     if (!should_set_preload_for_exec(path)) {
         // Build new envp WITHOUT LD_PRELOAD
@@ -1235,8 +1258,8 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         if (envp) { while (envp[env_count]) env_count++; }
         char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 1));
         if (!new_envp) {
-            if (!real_execve) return syscall(SYS_execve, path, argv, envp);
-            return real_execve(path, argv, envp);
+            if (!real_execve) return syscall(SYS_execve, exec_path, argv, envp);
+            return real_execve(exec_path, argv, envp);
         }
         int j = 0;
         for (int i = 0; i < env_count; i++) {
@@ -1247,8 +1270,8 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         new_envp[j] = NULL;
         write_str(2, "[twoyi_loader] execve: skipped LD_PRELOAD for 32-bit binary\n");
         int ret;
-        if (!real_execve) ret = syscall(SYS_execve, path, argv, new_envp);
-        else ret = real_execve(path, argv, new_envp);
+        if (!real_execve) ret = syscall(SYS_execve, exec_path, argv, new_envp);
+        else ret = real_execve(exec_path, argv, new_envp);
         free(new_envp);
         return ret;
     }
@@ -1277,8 +1300,8 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 
     if (has_preload || !g_preload_path[0]) {
         // Already has LD_PRELOAD or we don't have a path to set
-        if (!real_execve) return syscall(SYS_execve, path, argv, envp);
-        return real_execve(path, argv, envp);
+        if (!real_execve) return syscall(SYS_execve, exec_path, argv, envp);
+        return real_execve(exec_path, argv, envp);
     }
 
     // Build new envp with LD_PRELOAD added
@@ -1288,8 +1311,8 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 2));
     if (!new_envp) {
         // Can't allocate — fall back to environ
-        if (!real_execve) return syscall(SYS_execve, path, argv, environ);
-        return real_execve(path, argv, environ);
+        if (!real_execve) return syscall(SYS_execve, exec_path, argv, environ);
+        return real_execve(exec_path, argv, environ);
     }
 
     for (int i = 0; i < env_count; i++) {
@@ -1300,8 +1323,8 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 
     write_str(2, "[twoyi_loader] execve: added LD_PRELOAD to envp\n");
     int ret;
-    if (!real_execve) ret = syscall(SYS_execve, path, argv, new_envp);
-    else ret = real_execve(path, argv, new_envp);
+    if (!real_execve) ret = syscall(SYS_execve, exec_path, argv, new_envp);
+    else ret = real_execve(exec_path, argv, new_envp);
     free(new_envp);
     return ret;
 }
@@ -1310,10 +1333,11 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 int execvp(const char *path, char *const argv[]) {
     if (!real_execvp) real_execvp = dlsym(RTLD_NEXT, "execvp");
     log_exec_call("execvp", path);
+    const char *exec_path = translate_exec_path(path);
     restore_preload_env();
     write_str(2, "[twoyi_loader] execvp: restored LD_PRELOAD\n");
-    if (!real_execvp) return syscall(SYS_execve, path, argv, environ);
-    return real_execvp(path, argv);
+    if (!real_execvp) return syscall(SYS_execve, exec_path, argv, environ);
+    return real_execvp(exec_path, argv);
 }
 
 // Hook execvpe — same as execve but uses PATH
