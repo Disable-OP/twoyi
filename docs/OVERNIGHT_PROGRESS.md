@@ -492,3 +492,52 @@ Boot verdict:
 - Fix LD_PRELOAD passing in execve hook (ensure LD_PRELOAD with /dev/ paths)
 - Or: make lmkd not critical by modifying its service definition
 - Or: make init not reboot on critical process failure (hook tgkill)
+
+### 🎉🎉🎉 FOURTH PARTIAL SUCCESS: lmkd survives, init boots! 🎉🎉🎉
+### Timestamp UTC: 2026-08-10 ~18:40
+
+**KVM run 31419383636 — FOURTH PARTIAL SUCCESS!**
+
+Boot verdict:
+```
+◐ PARTIAL — twoyi process is alive but no GL context.
+  io.twoyi process: ALIVE (pid 6212)
+  tombstones during run: 0
+```
+
+**What worked (NEW since last partial success):**
+- LD_LIBRARY_PATH includes all rootfs lib dirs (including statsd)
+- lmkd SURVIVES! No "critical process 'lmkd' exited 4 times" error!
+- NO InitFatalReboot!
+- NO reboot at all!
+- All boringssl self-tests pass
+- All services start: logd, lmkd, servicemanager, hwservicemanager, etc.
+- vold exits (updatable, not critical) — init continues
+- Guest init stays alive for the entire 120s boot wait
+
+**Key fixes that got us here:**
+1. should_translate boundary check (/sys vs /system)
+2. /dev/twoyi-bin/ for executable binaries (bypasses data partition noexec)
+3. LD_LIBRARY_PATH with all rootfs lib dirs
+4. Always replace LD_PRELOAD in execve (not just when missing)
+5. Remove LD_LIBRARY_PATH for 32-bit binaries
+6. android_get_control_socket hook (fake fd for lmkd)
+7. SELinux context hooks (getcon, setexeccon, security_compute_create)
+8. abort/raise/kill/sigaction hooks (suppress SIGABRT)
+9. bind/connect hooks (translate AF_UNIX socket paths)
+10. setpgid/setsid/setns hooks (fake success)
+11. __system_property_add/update/wait hooks
+12. Pre-set critical properties (ro.cold_boot_done, ro.zygote, etc.)
+13. clearenv/unsetenv hooks (preserve LD_PRELOAD)
+14. 32-bit binary detection (skip LD_PRELOAD)
+15. SELinux permissive watchdog thread in kr64
+
+**What's still missing:**
+- zygote service not started yet (needs property triggers)
+- surfaceflinger not started
+- No BOOT_COMPLETED
+- vold crashes (updatable, not critical)
+
+**Next step:**
+- Investigate why zygote service isn't starting
+- May need to fix property triggers (zygote starts on property change)
