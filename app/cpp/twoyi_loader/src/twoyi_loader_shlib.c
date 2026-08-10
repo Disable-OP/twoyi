@@ -294,6 +294,46 @@ int __system_property_set(const char *key, const char *value) {
     return 0;  // fake success
 }
 
+// Hook __system_property_get — return empty string (property not found)
+// This prevents init from reading unmapped memory when it tries to
+// read back properties that were "set" by our faked __system_property_set
+int __system_property_get(const char *name, char *value) {
+    if (value) value[0] = '\0';
+    return 0;  // 0 = property not found
+}
+
+// Hook __system_property_find — return NULL (property not found)
+const void *__system_property_find(const char *name) {
+    (void)name;
+    return NULL;
+}
+
+// Hook __system_property_foreach — return 0 (no properties to iterate)
+int __system_property_foreach(void (*propfn)(const void *pi, void *cookie), void *cookie) {
+    (void)propfn; (void)cookie;
+    return 0;
+}
+
+// Hook __system_property_read_callback — return -1 (no property)
+void __system_property_read_callback(const void *pi,
+    void (*callback)(void *cookie, const char *name, const char *value, uint32_t serial),
+    void *cookie) {
+    (void)pi; (void)callback; (void)cookie;
+    // Do nothing — property doesn't exist
+}
+
+// Hook __system_property_serial — return 0
+uint32_t __system_property_serial(const void *pi) {
+    (void)pi;
+    return 0;
+}
+
+// Hook __system_property_wait_any — return immediately (no properties)
+const void *__system_property_wait_any(const void *pi) {
+    (void)pi;
+    return NULL;
+}
+
 // execv/execve hooks — restore LD_PRELOAD before each exec
 static int (*real_execv)(const char *, char *const[]) = NULL;
 static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
