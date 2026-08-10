@@ -980,6 +980,45 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] PARENT: libtwoyi_loader_shlib.so not found at {} -- seccomp virtualization disabled", loader_src);
     }
 
+    // Change SELinux label of /dev/lib*.so to system_file so that
+    // vendor_init subcontexts can access them.
+    //
+    // ROOT CAUSE: When init second stage loads the guest's SELinux policy,
+    // SELinux switches to enforcing=1. vendor_init domain is denied
+    // getattr/read access to files labeled as `device` (which is the
+    // default label for files in /dev/ tmpfs). This causes:
+    //   F/linker: CANNOT LINK EXECUTABLE "/system/bin/init":
+    //     unable to stat file for the library "/dev/libgetpid_hook.so":
+    //     Permission denied
+    //
+    // FIX: chcon the libraries to u:object_r:system_file:s0, which
+    // vendor_init CAN access (it needs to read system_file for its
+    // own operation). We do this BEFORE forking init, while SELinux
+    // is still permissive (setenforce 0 was called by the test script).
+    //
+    // Note: chcon requires SELinux to be compiled in the kernel (it is
+    // on Android) and the process to have relabel permission (root has
+    // this in permissive mode).
+    for lib_path in &["/dev/libgetpid_hook.so", "/dev/libtwoyi_loader_shlib.so"] {
+        if Path::new(lib_path).exists() {
+            let result = std::process::Command::new("chcon")
+                .args(&["u:object_r:system_file:s0", lib_path])
+                .status();
+            match result {
+                Ok(status) if status.success() => {
+                    info!("[KR64] PARENT: chcon {} -> system_file OK", lib_path);
+                }
+                _ => {
+                    // chcon failed — try restorecon as fallback
+                    let _ = std::process::Command::new("restorecon")
+                        .args(&[lib_path])
+                        .status();
+                    warning!("[KR64] PARENT: chcon {} failed, tried restorecon", lib_path);
+                }
+            }
+        }
+    }
+
     // Pre-create /dev/__properties__/property_info on the HOST and in the
     // rootfs BEFORE forking. This is a defensive measure: even if our
     // LD_PRELOAD loader fails to be re-loaded after init's execv chain

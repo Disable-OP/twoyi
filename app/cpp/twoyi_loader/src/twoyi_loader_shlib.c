@@ -109,13 +109,27 @@ static int mkdir_p(const char *path, mode_t mode);
 #endif
 
 // Helper: write to both stderr and a log file (for debugging when stderr is /dev/null)
+// Also tries to write to logd via __android_log_print (if available via dlsym)
 static void write_str(int fd, const char *s) {
     if (!s) return;
     size_t l = 0; while (s[l]) l++;
-    write(fd, s, l);
+    // Write to stderr (goes to logd's stderr collector)
+    syscall(NR_write, fd, s, l);
     // Also write to /data/local/tmp/twoyi-loader.log for debugging
     int logfd = syscall(NR_open, "/data/local/tmp/twoyi-loader.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (logfd >= 0) { syscall(NR_write, logfd, s, l); syscall(NR_close, logfd); }
+    // Also try __android_log_write via dlsym (goes directly to logd socket)
+    // This is critical for processes where stderr is closed/redirected (e.g., after execv)
+    static int (*android_log_write_p)(int, const char *, const char *) = NULL;
+    static int android_log_checked = 0;
+    if (!android_log_checked) {
+        android_log_write_p = (int (*)(int, const char *, const char *))dlsym(RTLD_DEFAULT, "__android_log_write");
+        android_log_checked = 1;
+    }
+    if (android_log_write_p) {
+        // ANDROID_LOG_INFO = 4, tag = "twoyi_loader"
+        android_log_write_p(4, "twoyi_loader", s);
+    }
 }
 
 // =========================================================================
