@@ -235,6 +235,21 @@ int chroot(const char *path) {
     return 0;
 }
 
+// Hook mkdir — redirect /dev/__properties__ to rootfs
+int mkdir(const char *path, mode_t mode) {
+    if (path && strcmp(path, "/dev/__properties__") == 0 && g_rootfs) {
+        char real_path[512];
+        snprintf(real_path, sizeof(real_path), "%s/dev/__properties__", g_rootfs);
+        mkdir_p(real_path, mode);
+        return 0;
+    }
+    // For other paths, call real mkdir
+    static int (*real_mkdir)(const char *, mode_t) = NULL;
+    if (!real_mkdir) real_mkdir = dlsym(RTLD_NEXT, "mkdir");
+    if (real_mkdir) return real_mkdir(path, mode);
+    return syscall(SYS_mkdir, path, mode);
+}
+
 static int (*real_mknod)(const char *, mode_t, dev_t) = NULL;
 static int (*real_mknodat)(int, const char *, mode_t, dev_t) = NULL;
 
@@ -282,14 +297,42 @@ long keyctl(int cmd, ...) {
     return 0;  // fake keyring ID
 }
 
-// Hook __system_property_area_init — return -1 (failure)
-// PropertyInit() calls this to create /dev/__properties__.
-// In our container (no chroot), calling the real function would
-// corrupt the HOST's property area. Return -1 to make init
-// LOG(FATAL) with a clear error message instead of SIGSEGV.
+// Hook __system_property_area_init — create property area in rootfs
+// Bionic hardcodes /dev/__properties__/ but we need it in the rootfs.
+// We hook mkdir to redirect /dev/__properties__ → {rootfs}/dev/__properties__
+// and then call the real __system_property_area_init.
+// The real function creates files in /dev/__properties__/ which our
+// mkdir hook redirects to {rootfs}/dev/__properties__/.
+static int (*real_property_area_init)(void) = NULL;
 int __system_property_area_init(void) {
-    write_str(2, "[twoyi_loader] __system_property_area_init: returning -1 (blocked)\n");
-    return -1;  // failure — init will LOG(FATAL)
+    // Create the property directory in rootfs
+    if (g_rootfs) {
+        char prop_dir[512];
+        snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
+        mkdir_p(prop_dir, 0771);
+    }
+
+    // Create a symlink on the host: /dev/__properties__ → {rootfs}/dev/__properties__
+    // This way bionic's hardcoded path resolves to the rootfs directory
+    if (g_rootfs) {
+        char target[512];
+        snprintf(target, sizeof(target), "%s/dev/__properties__", g_rootfs);
+        // Remove existing symlink/dir if present (but don't remove host's real dir)
+        struct stat st;
+        if (lstat("/dev/__properties__", &st) != 0) {
+            // /dev/__properties__ doesn't exist on host — create symlink
+            symlink(target, "/dev/__properties__");
+            write_str(2, "[twoyi_loader] created symlink /dev/__properties__ -> rootfs\n");
+        }
+    }
+
+    if (!real_property_area_init) real_property_area_init = dlsym(RTLD_NEXT, "__system_property_area_init");
+    if (real_property_area_init) {
+        int ret = real_property_area_init();
+        write_str(2, "[twoyi_loader] __system_property_area_init: called real (ret=)\n");
+        return ret;
+    }
+    return 0;
 }
 
 // execv/execve hooks — restore LD_PRELOAD before each exec
