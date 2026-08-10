@@ -635,6 +635,54 @@ int chown(const char *path, uid_t owner, gid_t group) {
     return syscall(SYS_chown, path, owner, group);
 }
 
+// Hook lstat — translate paths to rootfs (init's make_dir uses lstat)
+int lstat(const char *path, struct stat *buf) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_lstat)(const char *, struct stat *) = NULL;
+        if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
+        if (real_lstat) return real_lstat(translated, buf);
+        return syscall(SYS_newfstatat, AT_FDCWD, translated, buf, AT_SYMLINK_NOFOLLOW);
+    }
+    static int (*real_lstat)(const char *, struct stat *) = NULL;
+    if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
+    if (real_lstat) return real_lstat(path, buf);
+    return syscall(SYS_newfstatat, AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
+}
+
+// Hook lchown — translate paths to rootfs
+int lchown(const char *path, uid_t owner, gid_t group) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_lchown)(const char *, uid_t, gid_t) = NULL;
+        if (!real_lchown) real_lchown = dlsym(RTLD_NEXT, "lchown");
+        if (real_lchown) return real_lchown(translated, owner, group);
+        return syscall(SYS_fchownat, AT_FDCWD, translated, owner, group, AT_SYMLINK_NOFOLLOW);
+    }
+    static int (*real_lchown)(const char *, uid_t, gid_t) = NULL;
+    if (!real_lchown) real_lchown = dlsym(RTLD_NEXT, "lchown");
+    if (real_lchown) return real_lchown(path, owner, group);
+    return syscall(SYS_fchownat, AT_FDCWD, path, owner, group, AT_SYMLINK_NOFOLLOW);
+}
+
+// Hook access — translate paths to rootfs
+int access(const char *path, int mode) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_access)(const char *, int) = NULL;
+        if (!real_access) real_access = dlsym(RTLD_NEXT, "access");
+        if (real_access) return real_access(translated, mode);
+        return syscall(SYS_faccessat, AT_FDCWD, translated, mode, 0);
+    }
+    static int (*real_access)(const char *, int) = NULL;
+    if (!real_access) real_access = dlsym(RTLD_NEXT, "access");
+    if (real_access) return real_access(path, mode);
+    return syscall(SYS_faccessat, AT_FDCWD, path, mode, 0);
+}
+
 // =========================================================================
 // SELinux context hooks
 // Init checks if it can transition from its current context (u:r:su:s0)

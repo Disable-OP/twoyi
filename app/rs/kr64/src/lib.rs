@@ -1158,6 +1158,68 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] PARENT: critical service binaries copied to /dev/twoyi-bin/");
     }
 
+    // Pre-create directories that init and services expect to exist.
+    // These are created in the rootfs so init's mkdir commands succeed.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in &[
+            "acct",
+            "acct/uid_0",
+            "acct/uid_1000",
+            "metadata",
+            "metadata/vold",
+            "metadata/bootstat",
+            "linkerconfig",
+            "linkerconfig/bootstrap",
+            "linkerconfig/default",
+            "mnt/secure",
+            "mnt/secure/staging",
+            "mnt/asec",
+            "mnt/obb",
+            "mnt/user",
+            "mnt/user/0",
+            "mnt/installer",
+            "mnt/androidwritable",
+            "mnt/pass_through",
+            "data_mirror",
+            "data_mirror/cur_profiles",
+            "data_mirror/data_de",
+            "data_mirror/data_ce",
+            "config",
+            "cache",
+            "dev/block",
+            "dev/block/by-name",
+            "dev/block/dm-5",
+        ] {
+            let path = format!("{}/{}", cfg.rootfs, dir);
+            let _ = std::fs::create_dir_all(&path);
+            let _ = std::fs::set_permissions(
+                &path,
+                std::fs::Permissions::from_mode(0o777),
+            );
+        }
+        info!("[KR64] PARENT: pre-created boot directories in rootfs");
+    }
+
+    // Ensure /vendor/etc/fstab.ranchu exists — vold needs it for process_config()
+    {
+        let fstab_path = format!("{}/vendor/etc/fstab.ranchu", cfg.rootfs);
+        if !Path::new(&fstab_path).exists() {
+            // Create a minimal fstab stub
+            let fstab_content = r#"# Minimal fstab for twoyi virtualization
+# devices
+/dev/block/by-name/system /system ext4 ro,barrier=1 wait,first_stage_mount
+/dev/block/by-name/vendor /vendor ext4 ro,barrier=1 wait,first_stage_mount
+/dev/block/by-name/userdata /data ext4 noatime,nosuid,nodev wait,check,formattable,latemount,resize
+"#;
+            let _ = std::fs::create_dir_all(format!("{}/vendor/etc", cfg.rootfs));
+            let _ = std::fs::write(&fstab_path, fstab_content);
+            info!("[KR64] PARENT: created minimal fstab.ranchu stub");
+        } else {
+            info!("[KR64] PARENT: fstab.ranchu already exists");
+        }
+    }
+
     // Pre-create /dev/__properties__/property_info on the HOST and in the
     // rootfs BEFORE forking. This is a defensive measure: even if our
     // LD_PRELOAD loader fails to be re-loaded after init's execv chain
