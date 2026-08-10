@@ -1066,6 +1066,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "system/bin/gatekeeperd",
             "system/bin/recovery",
             "system/bin/keystore",
+            "system/bin/vdc",
+            "system/bin/dumpstate",
+            "system/bin/idmap",
+            "system/bin/idmap2",
+            "system/bin/thermalserviced",
+            "system/bin/atrace",
+            "system/bin/traced",
+            "system/bin/traced_probes",
+            "system/bin/perfetto",
             "vendor/bin/boringssl_self_test32",
             "vendor/bin/boringssl_self_test64",
             "vendor/bin/hw/android.hardware.keymaster@4.1-service",
@@ -1076,7 +1085,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "vendor/bin/hw/android.hardware.configstore@1.0-service",
             "vendor/bin/hw/android.hardware.media.omx@1.0-service",
             "vendor/bin/hw/android.hardware.audio@6.0-service",
-            "vendor/bin/hw/android.hardware.audio@6.0-service.rc",
+            "vendor/bin/hw/android.hardware.atrace@1.0-service",
+            "system/bin/hw/android.system.suspend@1.0-service",
+            "system/bin/hw/android.hidl.allocator@1.0-service",
+            "system/bin/hwservicemanager",
+            "system/bin/vold",
+            "system/bin/cameraserver",
+            "system/bin/drmserver",
+            "system/bin/mediadrmserver",
+            "system/bin/mediaserver",
+            "system/bin/statsd",
+            "system/bin/system_server",
         ];
 
         for binary in &critical_binaries {
@@ -1104,6 +1123,34 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             "[KR64] PARENT: failed to copy {} -> {}: {}",
                             src, dst, e
                         );
+                    }
+                }
+            }
+        }
+
+        // Also systematically copy ALL binaries from hw/ directories.
+        // This ensures any HAL service can be exec'd without hitting
+        // the data partition's noexec restriction.
+        for hw_dir in &[
+            format!("{}/system/bin/hw", cfg.rootfs),
+            format!("{}/vendor/bin/hw", cfg.rootfs),
+        ] {
+            if let Ok(entries) = std::fs::read_dir(hw_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(file_type) = entry.file_type() {
+                        if file_type.is_file() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                let dst = format!("{}/{}", dev_bin_dir, name);
+                                let _ = std::fs::copy(entry.path(), &dst);
+                                let _ = std::fs::set_permissions(
+                                    &dst,
+                                    std::fs::Permissions::from_mode(0o755),
+                                );
+                                let _ = std::process::Command::new("chcon")
+                                    .args(&["u:object_r:system_file:s0", &dst])
+                                    .status();
+                            }
+                        }
                     }
                 }
             }
