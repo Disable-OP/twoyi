@@ -72,3 +72,16 @@ that causes the crash.
 
 The io.twoyi host process is ALIVE (pid 6144) — the host app didn't crash.
 The guest init crashed with SIGSEGV.
+
+### Experiment: property_info on HOST (no chmod) — PARTIAL
+### Timestamp UTC: 2026-08-10 ~08:10
+
+**Change:** Create /dev/__properties__/property_info on HOST (no chmod)
+**Expected:** WriteStringToFile's open() finds the file → succeeds
+**Observed:** "created property_info on host" appears in logs (constructor runs), but WriteStringToFile STILL fails with ENOENT
+**Conclusion:** The file is created by the constructor but WriteStringToFile can't find it. Possible causes:
+1. O_NOFOLLOW flag in WriteStringToFile — if /dev/__properties__ is a symlink, open fails
+2. The constructor runs in first-stage init but NOT in second-stage init (LD_PRELOAD not restored for second execv)
+3. The file is created but deleted before second-stage init runs
+
+**Next experiment:** Verify the constructor runs in second-stage init by checking twoyi-loader.log. Also check if /dev/__properties__ is a symlink on the emulator.
