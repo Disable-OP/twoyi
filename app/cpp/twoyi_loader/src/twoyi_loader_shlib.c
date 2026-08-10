@@ -1788,6 +1788,30 @@ int openat(int dirfd, const char *path, int flags, ...) {
     return real_openat(dirfd, translated, flags, mode);
 }
 
+// DIAGNOSTIC (vold silent exit): logs the return value (fd or errno) of an
+// open() call. Wraps every return path in the open() hook so we can see
+// whether each open succeeds or fails — in particular, whether the last
+// open before exit(1) (/vendor/etc/fstab.ranchu) returns a valid fd or an
+// error (ENOENT, EACCES, etc.).
+//
+// Only logs when g_trace_opens is set (vold only — see constructor(102)).
+// A __thread recursion guard prevents infinite loops in case strerror() or
+// any other library call used here internally triggers another open().
+static int trace_open_result(const char *path, int fd) {
+    if (!g_trace_opens || !path) return fd;
+    static __thread int in_trace = 0;
+    if (in_trace) return fd;
+    in_trace = 1;
+    int err = fd < 0 ? errno : 0;
+    char msg[600];
+    snprintf(msg, sizeof(msg),
+        "[twoyi_loader] TRACE open(%s) = %d (errno=%d: %s)\n",
+        path, fd, err, err ? strerror(err) : "OK");
+    write_str(2, msg);
+    in_trace = 0;
+    return fd;
+}
+
 // open PLT interposition (for code that uses open() instead of openat())
 int open(const char *path, int flags, ...) {
     mode_t mode = 0;
@@ -1797,11 +1821,14 @@ int open(const char *path, int flags, ...) {
 
     // DIAGNOSTIC (vold silent exit): if tracing is enabled (only set in vold
     // by constructor(102)), log every open() path + flags. Placed at the very
-    // top so we see all opens, even ones that fail.
+    // top so we see all opens, even ones that fail. The matching result line
+    // (with fd/errno) is emitted by trace_open_result() at every return path
+    // below — so the entry line shows what was requested, and the result line
+    // shows whether it succeeded.
     if (g_trace_opens && path) {
         char msg[512];
         snprintf(msg, sizeof(msg),
-            "[twoyi_loader] TRACE open(%s, flags=0x%x)\n", path, flags);
+            "[twoyi_loader] TRACE open(%s, flags=0x%x) ...\n", path, flags);
         write_str(2, msg);
     }
 
@@ -1811,7 +1838,7 @@ int open(const char *path, int flags, ...) {
     // vold (and other services) can still read the fstab.
     if (should_block_fstab(path)) {
         errno = ENOENT;
-        return -1;
+        return trace_open_result(path, -1);
     }
 
     // Debug: log all /dev/__properties__ opens
@@ -1851,25 +1878,25 @@ int open(const char *path, int flags, ...) {
         if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
             fd = syscall(NR_open, translated, flags | O_CREAT, 0666);
         }
-        return fd;
+        return trace_open_result(path, fd);
 #else
         if (real_openat) {
             int fd = real_openat(AT_FDCWD, translated, flags, mode);
             if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
                 fd = real_openat(AT_FDCWD, translated, flags | O_CREAT, 0666);
             }
-            return fd;
+            return trace_open_result(path, fd);
         }
-        return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
+        return trace_open_result(path, syscall(NR_openat, AT_FDCWD, translated, flags, mode));
 #endif
     }
 
     const char *translated = translate(path);
 #if defined(__x86_64__)
-    return syscall(NR_open, translated, flags, mode);
+    return trace_open_result(path, syscall(NR_open, translated, flags, mode));
 #else
-    if (real_openat) return real_openat(AT_FDCWD, translated, flags, mode);
-    return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
+    if (real_openat) return trace_open_result(path, real_openat(AT_FDCWD, translated, flags, mode));
+    return trace_open_result(path, syscall(NR_openat, AT_FDCWD, translated, flags, mode));
 #endif
 }
 
