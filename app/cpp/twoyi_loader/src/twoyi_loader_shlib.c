@@ -308,42 +308,112 @@ long keyctl(int cmd, ...) {
     return 0;  // fake keyring ID
 }
 
-// Hook __system_property_area_init — create property area in rootfs
-// Bionic hardcodes /dev/__properties__/ but we need it in the rootfs.
-// We hook mkdir to redirect /dev/__properties__ → {rootfs}/dev/__properties__
-// and then call the real __system_property_area_init.
-// The real function creates files in /dev/__properties__/ which our
-// mkdir hook redirects to {rootfs}/dev/__properties__/.
-static int (*real_property_area_init)(void) = NULL;
-int __system_property_area_init(void) {
-    // Create the property directory in rootfs
-    if (g_rootfs) {
-        char prop_dir[512];
-        snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
-        mkdir_p(prop_dir, 0771);
-    }
+// Minimal in-memory property system
+// We can't use the real bionic property area (it corrupts the host).
+// Instead, we fake all property functions with a simple key-value store.
+#define MAX_PROPS 256
+struct prop_entry {
+    char key[128];
+    char value[128];
+    int used;
+};
+static struct prop_entry g_props[MAX_PROPS];
 
-    // Create a symlink on the host: /dev/__properties__ → {rootfs}/dev/__properties__
-    // This way bionic's hardcoded path resolves to the rootfs directory
-    if (g_rootfs) {
-        char target[512];
-        snprintf(target, sizeof(target), "%s/dev/__properties__", g_rootfs);
-        // Remove existing symlink/dir if present (but don't remove host's real dir)
-        struct stat st;
-        if (lstat("/dev/__properties__", &st) != 0) {
-            // /dev/__properties__ doesn't exist on host — create symlink
-            symlink(target, "/dev/__properties__");
-            write_str(2, "[twoyi_loader] created symlink /dev/__properties__ -> rootfs\n");
+static int prop_set(const char *key, const char *value) {
+    if (!key || !value) return -1;
+    // Find existing
+    for (int i = 0; i < MAX_PROPS; i++) {
+        if (g_props[i].used && strcmp(g_props[i].key, key) == 0) {
+            strncpy(g_props[i].value, value, 127);
+            g_props[i].value[127] = 0;
+            return 0;
         }
     }
+    // Find free slot
+    for (int i = 0; i < MAX_PROPS; i++) {
+        if (!g_props[i].used) {
+            strncpy(g_props[i].key, key, 127);
+            g_props[i].key[127] = 0;
+            strncpy(g_props[i].value, value, 127);
+            g_props[i].value[127] = 0;
+            g_props[i].used = 1;
+            return 0;
+        }
+    }
+    return -1; // table full
+}
 
-    if (!real_property_area_init) real_property_area_init = dlsym(RTLD_NEXT, "__system_property_area_init");
-    if (real_property_area_init) {
-        int ret = real_property_area_init();
-        write_str(2, "[twoyi_loader] __system_property_area_init: called real (ret=)\n");
-        return ret;
+static int prop_get(const char *key, char *value) {
+    if (!key || !value) return 0;
+    for (int i = 0; i < MAX_PROPS; i++) {
+        if (g_props[i].used && strcmp(g_props[i].key, key) == 0) {
+            strncpy(value, g_props[i].value, 128);
+            return strlen(g_props[i].value);
+        }
+    }
+    value[0] = 0;
+    return 0;
+}
+
+// Hook __system_property_area_init — return 0 (success) without creating area
+int __system_property_area_init(void) {
+    write_str(2, "[twoyi_loader] __system_property_area_init: faked (in-memory)\n");
+    return 0;
+}
+
+// Hook __system_property_set — store in our in-memory table
+int __system_property_set(const char *key, const char *value) {
+    return prop_set(key, value);
+}
+
+// Hook __system_property_get — read from our in-memory table
+int __system_property_get(const char *name, char *value) {
+    return prop_get(name, value);
+}
+
+// Hook __system_property_find — return a fake pointer (non-NULL if found)
+// We use the prop_entry address as the "prop_info" pointer
+static char g_dummy_prop_info[1] = {0};
+const void *__system_property_find(const char *name) {
+    if (!name) return NULL;
+    for (int i = 0; i < MAX_PROPS; i++) {
+        if (g_props[i].used && strcmp(g_props[i].key, name) == 0) {
+            return &g_props[i]; // return pointer to entry as fake prop_info
+        }
+    }
+    return NULL;
+}
+
+// Hook __system_property_read_callback — call callback with our value
+void __system_property_read_callback(const void *pi,
+    void (*callback)(void *cookie, const char *name, const char *value, uint32_t serial),
+    void *cookie) {
+    if (!pi || !callback) return;
+    const struct prop_entry *entry = (const struct prop_entry *)pi;
+    callback(cookie, entry->key, entry->value, 0);
+}
+
+// Hook __system_property_serial — return 0
+uint32_t __system_property_serial(const void *pi) {
+    (void)pi;
+    return 0;
+}
+
+// Hook __system_property_foreach — iterate our table
+int __system_property_foreach(void (*propfn)(const void *pi, void *cookie), void *cookie) {
+    if (!propfn) return 0;
+    for (int i = 0; i < MAX_PROPS; i++) {
+        if (g_props[i].used) {
+            propfn(&g_props[i], cookie);
+        }
     }
     return 0;
+}
+
+// Hook __system_property_wait_any — return immediately
+const void *__system_property_wait_any(const void *pi) {
+    (void)pi;
+    return NULL;
 }
 
 // execv/execve hooks — restore LD_PRELOAD before each exec
@@ -970,15 +1040,11 @@ static void twoyi_init(void) {
     write_str(2, "[twoyi_loader] selinuxfs virtual files created\n");
 
     // Eagerly create /dev/__properties__/ in the rootfs
-    // Init's PropertyInit() calls mkdir("/dev/__properties__") then
-    // writes property files there. We need the directory to exist
-    // BEFORE init tries to create it (in case our mkdir hook doesn't
-    // catch init's call).
+    // (init's mkdir might not go through our hook)
     if (g_rootfs) {
         char prop_dir[512];
         snprintf(prop_dir, sizeof(prop_dir), "%s/dev/__properties__", g_rootfs);
         mkdir_p(prop_dir, 0771);
-        write_str(2, "[twoyi_loader] created /dev/__properties__ in rootfs\n");
     }
 
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
