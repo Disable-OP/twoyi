@@ -989,10 +989,25 @@ int __system_property_foreach(void (*propfn)(const void *pi, void *cookie), void
     return 0;
 }
 
-// Hook __system_property_wait_any — return immediately
+// Hook __system_property_wait_any — return immediately with a fake prop_info
+// This unblocks init's WaitForProperty loops (e.g., wait_for_coldboot_done)
 const void *__system_property_wait_any(const void *pi) {
     (void)pi;
-    return NULL;
+    // Return a non-NULL pointer to indicate "a property changed"
+    // This causes init's WaitForProperty to re-read the property and check
+    // if it matches the expected value.
+    return &g_props[0];
+}
+
+// Hook __system_property_wait — return 1 (property changed)
+int __system_property_wait(const void *pi) {
+    (void)pi;
+    return 1;
+}
+
+// Hook __system_property_poll — return immediately
+void __system_property_poll(void) {
+    // No-op — our properties don't have serials that change
 }
 
 // execv/execve hooks — restore LD_PRELOAD before each exec
