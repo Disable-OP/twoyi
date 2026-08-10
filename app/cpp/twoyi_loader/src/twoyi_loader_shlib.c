@@ -144,6 +144,7 @@ static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 // .init_array constructor re-installs the handler in the new process.
 // =========================================================================
 static char g_preload_path[512] = {0};
+static char g_rootfs_env[512] = {0};
 
 static void set_preload_path(void) {
     const char *preload = getenv("LD_PRELOAD");
@@ -152,12 +153,83 @@ static void set_preload_path(void) {
         // We need to preserve ALL of them
         strncpy(g_preload_path, preload, sizeof(g_preload_path) - 1);
     }
+    // Also save TWOYI_ROOTFS so we can restore it after clearenv
+    const char *rootfs = getenv("TWOYI_ROOTFS");
+    if (rootfs) {
+        strncpy(g_rootfs_env, rootfs, sizeof(g_rootfs_env) - 1);
+    }
 }
 
 static void restore_preload_env(void) {
     if (g_preload_path[0]) {
         setenv("LD_PRELOAD", g_preload_path, 1);
     }
+    if (g_rootfs_env[0]) {
+        setenv("TWOYI_ROOTFS", g_rootfs_env, 1);
+    }
+}
+
+// Hook clearenv — preserve LD_PRELOAD and TWOYI_ROOTFS across clearenv().
+// Android init's FirstStageMain calls clearenv() which wipes ALL env vars.
+// This means LD_PRELOAD is gone, and subsequent execv's don't load our loader.
+// Our execv hook restores LD_PRELOAD, but if init uses an exec variant we
+// don't hook (or a direct syscall), LD_PRELOAD stays missing.
+// By preserving LD_PRELOAD across clearenv, we ensure it's always in environ
+// when execv is called, regardless of which exec variant is used.
+int clearenv(void) {
+    // Save LD_PRELOAD and TWOYI_ROOTFS before clearing
+    char saved_preload[512] = {0};
+    char saved_rootfs[512] = {0};
+    const char *preload = getenv("LD_PRELOAD");
+    const char *rootfs = getenv("TWOYI_ROOTFS");
+    if (preload) strncpy(saved_preload, preload, sizeof(saved_preload) - 1);
+    if (rootfs) strncpy(saved_rootfs, rootfs, sizeof(saved_rootfs) - 1);
+    
+    // Call real clearenv
+    static int (*real_clearenv)(void) = NULL;
+    if (!real_clearenv) real_clearenv = dlsym(RTLD_NEXT, "clearenv");
+    int ret = 0;
+    if (real_clearenv) {
+        ret = real_clearenv();
+    } else {
+        // Fallback: set environ to NULL manually
+        extern char **environ;
+        environ = NULL;
+    }
+    
+    // Restore LD_PRELOAD and TWOYI_ROOTFS
+    if (saved_preload[0]) {
+        setenv("LD_PRELOAD", saved_preload, 1);
+    }
+    if (saved_rootfs[0]) {
+        setenv("TWOYI_ROOTFS", saved_rootfs, 1);
+    }
+    
+    // Update g_preload_path and g_rootfs_env in case they weren't set
+    if (!g_preload_path[0] && saved_preload[0]) {
+        strncpy(g_preload_path, saved_preload, sizeof(g_preload_path) - 1);
+    }
+    if (!g_rootfs_env[0] && saved_rootfs[0]) {
+        strncpy(g_rootfs_env, saved_rootfs, sizeof(g_rootfs_env) - 1);
+    }
+    
+    write_str(2, "[twoyi_loader] clearenv: preserved LD_PRELOAD + TWOYI_ROOTFS\n");
+    return ret;
+}
+
+// Hook unsetenv — prevent LD_PRELOAD from being unset
+int unsetenv(const char *name) {
+    if (name && (strcmp(name, "LD_PRELOAD") == 0 || strcmp(name, "TWOYI_ROOTFS") == 0)) {
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg),
+            "[twoyi_loader] unsetenv(%s) — BLOCKED to preserve loader\n", name);
+        write_str(2, msg);
+        return 0;
+    }
+    static int (*real_unsetenv)(const char *) = NULL;
+    if (!real_unsetenv) real_unsetenv = dlsym(RTLD_NEXT, "unsetenv");
+    if (real_unsetenv) return real_unsetenv(name);
+    return 0;
 }
 
 // =========================================================================
@@ -1248,6 +1320,29 @@ static void twoyi_init(void) {
             rootfs ? rootfs : "(null)",
             g_rootfs ? g_rootfs : "(null)");
         write_str(2, msg);
+        
+        // Also verify that the LD_PRELOAD files exist and are accessible
+        if (preload) {
+            char *preload_copy = strdup(preload);
+            if (preload_copy) {
+                char *tok = strtok(preload_copy, ":");
+                while (tok) {
+                    struct stat st;
+                    if (stat(tok, &st) == 0) {
+                        snprintf(msg, sizeof(msg),
+                            "[twoyi_loader] init: LD_PRELOAD file OK: %s (size=%ld mode=0%o)\n",
+                            tok, (long)st.st_size, st.st_mode & 0777);
+                    } else {
+                        snprintf(msg, sizeof(msg),
+                            "[twoyi_loader] init: LD_PRELOAD file MISSING: %s (errno=%d: %s)\n",
+                            tok, errno, strerror(errno));
+                    }
+                    write_str(2, msg);
+                    tok = strtok(NULL, ":");
+                }
+                free(preload_copy);
+            }
+        }
     }
 
     write_str(2, "[twoyi_loader] init: installing virtualization (PLT-only mode)\n");

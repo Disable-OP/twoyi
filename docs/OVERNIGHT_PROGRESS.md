@@ -125,3 +125,42 @@ The guest init crashed with SIGSEGV.
 - Check twoyi-loader.log to see which exec variants were called
 - If no exec hook fired, init is using a direct syscall (need seccomp or other approach)
 - Consider pre-creating ALL property files (u:object_r:*:s0 contexts too)
+
+### Experiment: clearenv hook + /dev/ libraries for SELinux access
+### Timestamp UTC: 2026-08-10 ~08:55
+
+**Diagnosis from KVM run 31371064247:**
+- MAJOR PROGRESS: init got past property_info! Pre-creating the file worked.
+- init second stage started, loaded .prop files
+- NEW failure: subcontexts can't link libgetpid_hook.so
+  ```
+  F/linker: CANNOT LINK EXECUTABLE "/system/bin/init":
+    library "/data/data/io.twoyi/rootfs/dev/libgetpid_hook.so" not found
+  ```
+- ROOT CAUSE: SELinux denial!
+  ```
+  avc: denied { search } for name="io.twoyi"
+    scontext=u:r:vendor_init:s0
+    tcontext=u:object_r:app_data_file:s0
+    permissive=0
+  ```
+  vendor_init domain is DENIED search access to app_data_file directories.
+  The libraries at /data/data/io.twoyi/rootfs/dev/ are inaccessible to
+  subcontexts (which run as vendor_init).
+
+**Fix (multi-layered):**
+1. Hook clearenv() — preserve LD_PRELOAD + TWOYI_ROOTFS across clearenv.
+   This ensures LD_PRELOAD is always in environ, even if init uses an
+   exec variant we don't hook (or a direct syscall).
+2. Hook unsetenv() — block unsetenv("LD_PRELOAD") and unsetenv("TWOYI_ROOTFS").
+3. Always copy libraries to /dev/ (tmpfs) instead of {rootfs}/dev/ (app_data_file).
+   /dev/ is accessible to ALL SELinux domains.
+4. Always use LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so
+   (not {rootfs}/dev/ paths).
+5. Add diagnostic in .init_array: verify LD_PRELOAD files exist and are accessible.
+
+**Expected outcome:**
+- clearenv hook ensures LD_PRELOAD survives init's clearenv() call
+- /dev/ libraries are accessible to vendor_init subcontexts
+- Subcontexts can link and load our hooks
+- init progresses past subcontext forking to zygote/bootanimation
