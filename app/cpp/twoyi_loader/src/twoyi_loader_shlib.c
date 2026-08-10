@@ -480,6 +480,42 @@ int kill(pid_t pid, int sig) {
     return syscall(SYS_kill, pid, sig);
 }
 
+// Hook sigaction — intercept SIGABRT handler installations and replace with SIG_IGN
+// init's InstallRebootSignalHandlers() installs a SIGABRT handler that calls
+// InitFatalReboot (which reboots). We replace ALL SIGABRT handlers with SIG_IGN
+// so LOG(FATAL) doesn't reboot the system.
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
+    static int (*real_sigaction)(int, const struct sigaction *, struct sigaction *) = NULL;
+    if (!real_sigaction) real_sigaction = dlsym(RTLD_NEXT, "sigaction");
+
+    if (signum == 6) {  // SIGABRT
+        // Replace the handler with SIG_IGN
+        struct sigaction ignore_act;
+        memset(&ignore_act, 0, sizeof(ignore_act));
+        ignore_act.sa_handler = SIG_IGN;
+        sigemptyset(&ignore_act.sa_mask);
+        ignore_act.sa_flags = 0;
+        write_str(2, "[twoyi_loader] sigaction(SIGABRT) — replaced with SIG_IGN\n");
+        if (real_sigaction) return real_sigaction(signum, &ignore_act, oldact);
+        return 0;
+    }
+    if (real_sigaction) return real_sigaction(signum, act, oldact);
+    return 0;
+}
+
+// Hook signal() too (some code uses signal() instead of sigaction())
+typedef void (*sighandler_t)(int);
+sighandler_t signal(int signum, sighandler_t handler) {
+    if (signum == 6) {  // SIGABRT
+        write_str(2, "[twoyi_loader] signal(SIGABRT) — replaced with SIG_IGN\n");
+        return SIG_IGN;
+    }
+    static sighandler_t (*real_signal)(int, sighandler_t) = NULL;
+    if (!real_signal) real_signal = dlsym(RTLD_NEXT, "signal");
+    if (real_signal) return real_signal(signum, handler);
+    return SIG_ERR;
+}
+
 // Hook _exit and exit — don't actually exit for critical processes
 // This is too aggressive (would break normal service exits), so we only
 // intercept _exit for specific cases. For now, just let them through.
@@ -2094,6 +2130,17 @@ static void twoyi_init(void) {
     }
 
     write_str(2, "[twoyi_loader] runtime ready — guest can boot\n");
+
+    // Install our own SIGABRT handler that ignores the signal.
+    // init's InstallRebootSignalHandlers() installs a SIGABRT handler that
+    // calls InitFatalReboot (which reboots the system). We override it with
+    // SIG_IGN so LOG(FATAL) doesn't reboot.
+    // This must happen AFTER init's signal handlers are installed, but since
+    // our .init_array runs BEFORE init's main(), init will OVERRIDE our
+    // handler. So we can't do it here.
+    //
+    // Instead, we hook sigaction() to intercept SIGABRT handler installations
+    // and replace them with SIG_IGN. See the sigaction hook below.
 
     // Pre-set critical properties that init waits for during boot.
     // These properties are normally set by other processes (ueventd, etc.)
