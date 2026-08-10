@@ -1345,11 +1345,20 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
         while (envp[env_count]) env_count++;
     }
 
-    // Build new envp: copy all entries EXCEPT LD_PRELOAD, then add our LD_PRELOAD
+    // Build new envp: copy all entries EXCEPT LD_PRELOAD and LD_LIBRARY_PATH,
+    // then add our LD_PRELOAD and LD_LIBRARY_PATH
     char preload_env[600];
     snprintf(preload_env, sizeof(preload_env), "LD_PRELOAD=%s", g_preload_path);
 
-    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 2));
+    // Set LD_LIBRARY_PATH to include rootfs library directories
+    // This is needed because binaries in /dev/twoyi-bin/ need libraries
+    // from {rootfs}/system/lib64/ and {rootfs}/apex/com.android.runtime/lib64/
+    char ld_library_path[1024];
+    snprintf(ld_library_path, sizeof(ld_library_path),
+        "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/vendor/lib64",
+        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
+
+    char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3));
     if (!new_envp) {
         // Can't allocate — fall back to environ
         if (!real_execve) return syscall(SYS_execve, exec_path, argv, environ);
@@ -1358,12 +1367,14 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 
     int j = 0;
     for (int i = 0; i < env_count; i++) {
-        if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0) {
+        if (strncmp(envp[i], "LD_PRELOAD=", 11) != 0 &&
+            strncmp(envp[i], "LD_LIBRARY_PATH=", 16) != 0) {
             new_envp[j++] = (char *)envp[i];
         }
     }
     new_envp[j] = preload_env;
-    new_envp[j + 1] = NULL;
+    new_envp[j + 1] = ld_library_path;
+    new_envp[j + 2] = NULL;
 
     write_str(2, "[twoyi_loader] execve: replaced LD_PRELOAD in envp\n");
     int ret;
