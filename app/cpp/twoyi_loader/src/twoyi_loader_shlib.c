@@ -1712,6 +1712,35 @@ static const char *translate(const char *path) {
     return g_translated;
 }
 
+// Returns 1 if the calling process is "init" (first_stage or second_stage).
+// We use raw syscalls (NR_openat + SYS_read + NR_close) to avoid recursing
+// into our own open()/openat() PLT hooks. NR_openat is defined for both
+// x86_64 and arm64 in this file (unlike NR_open which is x86_64-only).
+static int is_init_process(void) {
+    char comm[16] = {0};
+    int fd = (int)syscall(NR_openat, AT_FDCWD, "/proc/self/comm", O_RDONLY, 0);
+    if (fd < 0) return 0;
+    long n = syscall(SYS_read, fd, comm, sizeof(comm) - 1);
+    syscall(NR_close, fd);
+    if (n <= 0) return 0;
+    // Strip trailing newline
+    char *nl = strchr(comm, '\n');
+    if (nl) *nl = 0;
+    return (strcmp(comm, "init") == 0);
+}
+
+// Block fstab opens for init only.
+//   - first_stage init reading fstab → triggers FirstStageMount() which
+//     fatally fails (device-mapper EBUSY) → InitFatalReboot.
+//   - second_stage init reading fstab → mount_all fails, but init continues.
+//   - vold reading fstab → process_config() needs it; must be allowed.
+// Returns 1 if the caller should return -1 / errno=ENOENT.
+static int should_block_fstab(const char *path) {
+    if (!path) return 0;
+    if (!strstr(path, "fstab.")) return 0;
+    return is_init_process();
+}
+
 // openat PLT interposition
 int openat(int dirfd, const char *path, int flags, ...) {
     mode_t mode = 0;
@@ -1719,6 +1748,13 @@ int openat(int dirfd, const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
     init_real_funcs();
+
+    // Block fstab files for init only → first_stage_mount is skipped.
+    // vold (and other services) can still read the fstab.
+    if (should_block_fstab(path)) {
+        errno = ENOENT;
+        return -1;
+    }
 
     // Debug: log all /dev/__properties__ opens
     if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
@@ -1755,6 +1791,13 @@ int open(const char *path, int flags, ...) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
     init_real_funcs();
+
+    // Block fstab files for init only → first_stage_mount is skipped.
+    // vold (and other services) can still read the fstab.
+    if (should_block_fstab(path)) {
+        errno = ENOENT;
+        return -1;
+    }
 
     // Debug: log all /dev/__properties__ opens
     if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
@@ -1818,6 +1861,13 @@ int open(const char *path, int flags, ...) {
 
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
 int __open_2(const char *path, int flags) {
+    // Block fstab files for init only → first_stage_mount is skipped.
+    // vold (and other services) can still read the fstab.
+    if (should_block_fstab(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+
     // Debug: log all /dev/__properties__ opens
     if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
         char msg[256];
@@ -1859,6 +1909,13 @@ int __open_real(const char *pathname, int flags, ...) {
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
+    // Block fstab files for init only → first_stage_mount is skipped.
+    // vold (and other services) can still read the fstab.
+    if (should_block_fstab(pathname)) {
+        errno = ENOENT;
+        return -1;
+    }
+
     // Translate /dev/__properties__ paths
     if (pathname && strncmp(pathname, "/dev/__properties__", 19) == 0 && g_rootfs) {
         char translated[600];
@@ -1902,6 +1959,13 @@ int __open_real(const char *pathname, int flags, ...) {
 
 // Hook __openat_2 (bionic's fortified openat)
 int __openat_2(int dirfd, const char *path, int flags) {
+    // Block fstab files for init only → first_stage_mount is skipped.
+    // vold (and other services) can still read the fstab.
+    if (should_block_fstab(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+
     // Debug: log all /dev/__properties__ opens
     if (path && strncmp(path, "/dev/__properties__", 19) == 0) {
         char msg[256];

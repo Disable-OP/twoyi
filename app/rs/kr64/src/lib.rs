@@ -1205,11 +1205,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     {
         let fstab_path = format!("{}/vendor/etc/fstab.ranchu", cfg.rootfs);
         if !Path::new(&fstab_path).exists() {
-            // Create a minimal fstab stub
+            // Create a minimal fstab stub.
+            // IMPORTANT: we deliberately OMIT the `first_stage_mount` flag.
+            // If that flag is present, init's FirstStageMount() tries to mount
+            // the listed block devices via device-mapper, which fails fatally
+            // (EBUSY) in our container → InitFatalReboot. Without the flag,
+            // init skips first_stage_mount naturally. The fstab is still
+            // readable by vold (process_config) for normal second-stage use.
             let fstab_content = r#"# Minimal fstab for twoyi virtualization
-# devices
-/dev/block/by-name/system /system ext4 ro,barrier=1 wait,first_stage_mount
-/dev/block/by-name/vendor /vendor ext4 ro,barrier=1 wait,first_stage_mount
+# No first_stage_mount flag — init skips first_stage_mount naturally
+/dev/block/by-name/system /system ext4 ro,barrier=1 wait
+/dev/block/by-name/vendor /vendor ext4 ro,barrier=1 wait
 /dev/block/by-name/userdata /data ext4 noatime,nosuid,nodev wait,check,formattable,latemount,resize
 "#;
             let _ = std::fs::create_dir_all(format!("{}/vendor/etc", cfg.rootfs));
