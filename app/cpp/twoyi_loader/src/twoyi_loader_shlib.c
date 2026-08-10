@@ -272,6 +272,13 @@ int setresuid(uid_t ruid, uid_t euid, uid_t suid) { (void)ruid; (void)euid; (voi
 int setresgid(gid_t rgid, gid_t egid, gid_t sgid) { (void)rgid; (void)egid; (void)sgid; return 0; }
 int unshare(int flags) { (void)flags; return 0; }
 
+// Hook keyctl — init calls keyctl_get_keyring_ID(KEY_SPEC_SESSION_KEYRING, 1)
+// This might fail or cause issues in our container. Return 0 (fake success).
+long keyctl(int cmd, ...) {
+    (void)cmd;
+    return 0;  // fake keyring ID
+}
+
 // execv/execve hooks — restore LD_PRELOAD before each exec
 static int (*real_execv)(const char *, char *const[]) = NULL;
 static int (*real_execve)(const char *, char *const[], char *const[]) = NULL;
