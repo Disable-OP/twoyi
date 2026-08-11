@@ -1058,3 +1058,194 @@ Risk of removing these is LOW but non-zero:
 - No new hooks added. No existing hook behavior changed.
 - Did NOT trigger a KVM run (run 31497457100 is in progress).
 - Commit message + push to main completed: b069d5e.
+
+---
+
+## Timestamp UTC: 2026-08-11 (overnight Task ID 5)
+## Task: Fix BINDER_WRITE_READ to do real IPC for real binder fds
+
+### What was wrong
+The loader's `ioctl()` hook in `app/cpp/twoyi_loader/src/twoyi_loader_shlib.c`
+faked ALL binder ioctls regardless of whether the fd was a real binderfs
+device or a `/dev/null` fallback fd. Specifically, `BINDER_WRITE_READ`
+returned 0 without calling the real ioctl. This was harmless while only
+vold/servicemanager needed a valid fd (they don't transact during early
+boot), but becomes FATAL when system_server tries real binder IPC:
+- `ServiceManager.addService("activity", this)` -> `BC_TRANSACTION` ->
+  hook returns 0 with no data -> client's `bwr.write_consumed` stays 0 ->
+  `IPCThreadState::talkWithDriver` doesn't clear `mOut` -> infinite retry
+  loop OR silent "success" with no actual registration.
+- `ServiceManager.getService("package")` -> same fake success -> returns
+  null/garbage -> `NullPointerException` in system_server.
+
+### Root cause
+The hook could not distinguish:
+1. **Real binderfs fds** — opened successfully from `/dev/binderfs/*`
+   (the container has its own binderfs, mounted by kr64 with chmod 0666).
+   These support REAL binder IPC within the container's binder domain.
+2. **Fallback fds** — `/dev/null` fds returned by `binder_open_fallback()`
+   when the real open of a binder device failed (e.g., EACCES for a
+   process that ran before the kr64 chmod took effect). These CANNOT do
+   real binder IPC — the real ioctl would return ENOTTY on /dev/null.
+
+For both, the hook faked all binder ioctls. Case (1) is the bug: real
+binderfs fds should pass through to the real ioctl so real IPC happens.
+
+### What was changed (commit bca0e7b, +165/-40 lines in one file)
+
+**1. Binder fallback fd tracking bitmap** (new, ~50 lines, after g_mount_lock):
+- `g_binder_fallback_fds` — a 1024-bit bitmap (fds are low-numbered, < 1024)
+  protected by `g_binder_fd_lock` (pthread mutex).
+- `binder_fd_mark_fallback(fd)` — sets the bit for a fallback fd.
+- `binder_fd_is_fallback(fd)` — reads the bit (returns 0 for out-of-range).
+- `binder_fd_clear(fd)` — clears the bit.
+
+**2. `binder_open_fallback()` modified** — when it returns a /dev/null fd
+(`fb >= 0`), it now calls `binder_fd_mark_fallback(fb)` so the ioctl hook
+knows to fake binder ioctls for that fd. Real binderfs fds (the
+`real_fd >= 0` early-return path) are NOT marked, so the ioctl hook passes
+them through to the real ioctl. `binder_open_fallback` opens /dev/null
+with `O_CLOEXEC`, so fallback fds (and their tracking entries) do not
+survive execve.
+
+**3. `ioctl()` hook rewritten** — now decides fake-vs-real per fd:
+- Non-binder ioctls (`(req & 0xff00) != 0x6200`): pass through to
+  `real_ioctl` (unchanged behavior).
+- Binder ioctls on FALLBACK fds: fake `BINDER_VERSION` (-> 8),
+  `BINDER_SET_MAX_THREADS`, `BINDER_SET_CONTEXT_MGR`, `BINDER_WRITE_READ`
+  (unchanged behavior — the real ioctl would ENOTTY on /dev/null). Unknown
+  binder ioctls on fallback fds also fake success (defensive — /dev/null
+  can't do real ioctls anyway).
+- Binder ioctls on REAL binderfs fds (not in the fallback set): call the
+  REAL `ioctl(fd, request, argp)`. If it returns -1, log the errno and
+  return -1 (do NOT suppress real failures — we need to see them).
+
+**4. `close()` hook added** (new, ~14 lines, after mmap hook) — calls
+`binder_fd_clear(fd)` before calling `real_close(fd)`. This keeps the
+bitmap accurate: when a fallback fd is closed and its fd number is
+recycled for a different file, the new fd is NOT mistakenly treated as a
+binder fallback. Real binderfs fds are never in the set, so clearing is a
+no-op for them. All internal close calls in the loader use
+`syscall(NR_close, fd)` (direct syscall, no PLT recursion), so the hook
+does not interfere with the loader's own fd management.
+
+### Fd tracking data structure
+```
+#define TWOYI_MAX_FD 1024
+static unsigned char g_binder_fallback_fds[(TWOYI_MAX_FD + 7) / 8];  // 128 bytes
+static pthread_mutex_t g_binder_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+```
+- Bitmap (128 bytes), protected by a pthread mutex.
+- `fd >> 3` selects the byte, `fd & 7` selects the bit.
+- Out-of-range fds (fd < 0 or fd >= 1024) are treated as "not fallback"
+  (real ioctl path) — this is correct because binder fds are always
+  low-numbered.
+- Limitation: dup/dup2/dup3 of a fallback fd are not tracked. Binder fds
+  are not typically dup'd (ProcessState holds mDriverFD directly). If a
+  dup'd fallback fd receives a binder ioctl, it falls through to the real
+  ioctl which returns ENOTTY — logged, not suppressed.
+
+### Build verification
+- `gcc -fsyntax-only -I app/cpp/twoyi_loader/include
+  app/cpp/twoyi_loader/src/twoyi_loader_shlib.c` -> exit 0, no errors.
+- `gcc -shared -fPIC -o /tmp/test.so ... -ldl -lpthread
+  twoyi_loader_shlib.c` -> exit 0, valid .so produced (78608 bytes).
+- `make shlib` (app/cpp/twoyi_loader/Makefile target, uses the same
+  flags: `-shared -fPIC -lc -lpthread -ldl`) -> "Built
+  libtwoyi_loader_shlib.so", exit 0, valid 168136-byte .so.
+- `gcc -Wall -Wextra -fsyntax-only` -> only 5 pre-existing warnings
+  (unused variable/parameter in mount/seccomp code at lines 418, 439,
+  1714, 2090, 2115). No new warnings from this edit.
+
+### Risk analysis
+**Will this break vold/servicemanager (which currently work)?** NO:
+- vold and servicemanager open binder devices successfully (their opens
+  return real binderfs fds, fd >= 0). These fds are NOT in the fallback
+  set, so the ioctl hook now passes them through to the real ioctl.
+- Previously, their binder ioctls were faked (BINDER_VERSION -> 8,
+  BINDER_WRITE_READ -> 0). Now, the real ioctl runs.
+- For vold/servicemanager during early boot: they call BINDER_VERSION
+  (real ioctl returns the kernel's protocol version, which is >= 8 on
+  modern kernels — should be fine), BINDER_SET_MAX_THREADS (real ioctl
+  sets the max thread count — no-op effect), and BINDER_SET_CONTEXT_MGR
+  (servicemanager becomes the real context manager — this is the CORRECT
+  behavior, previously faked). They do NOT call BINDER_WRITE_READ during
+  early boot (no transactions yet), so the BINDER_WRITE_READ change has
+  no effect on them at this stage.
+- The kr64 chmod 0666 on binderfs devices (commit e56f391) ensures the
+  real ioctl has the permissions it needs. If the real ioctl fails for
+  any reason, the error is logged (not suppressed) so we can diagnose it.
+
+**Will this break HIDL HAL services (which use fallback fds)?** NO:
+- HIDL services that can't open the real binder device still get /dev/null
+  fallback fds via `binder_open_fallback()`. These fds ARE in the fallback
+  set, so the ioctl hook fakes binder ioctls for them (unchanged behavior).
+- They see fd >= 0 and a valid protocol version (8), then block in their
+  threadpool. Init treats them as "running" (not crashed). This is the
+  same behavior as before commit bca0e7b.
+
+**Confidence: HIGH for vold/servicemanager (they get real IPC, which is
+the correct behavior and should work since binderfs is a real kernel
+device with chmod 0666). MEDIUM-HIGH for system_server (real IPC unblocks
+ServiceManager.addService/getService, but system_server may hit other
+blockers like the graphics stack — see Task ID 3's analysis of blocker #2
+and #3).**
+
+### Constraint compliance
+- ONLY `app/cpp/twoyi_loader/src/twoyi_loader_shlib.c` was edited for the
+  code fix (Task ID 4 had already finished its edit of this file).
+- `binder_open_fallback` was NOT removed (still needed for processes that
+  can't open the real binder device).
+- Real ioctl errors are NOT suppressed (logged + returned as -1).
+- BINDER_VERSION fake value (8) for fallback fds is UNCHANGED.
+- Did NOT trigger a KVM run (run 31497457100 is in progress).
+- Build verified (syntax check + full .so link + Makefile target).
+
+### Next steps for the next sub-agent
+1. **Check KVM run 31497457100** (commit c047ac4, BEFORE this fix) — does
+   init progress past post-fs-data? Does zygote start? This run does NOT
+   have the real-binder-IPC fix, so if system_server starts and hangs/crashes
+   on binder IPC, that's the expected behavior this fix addresses.
+2. **Trigger a new KVM run on commit bca0e7b** (this fix) — then check:
+   - `grep -c "ioctl(fd=.*real, req=0x" twoyi-loader.log` — count of real
+     binder ioctl calls (should be > 0 if system_server or other processes
+     are doing real IPC). If 0, either no process reached the binder IPC
+     stage, or all binder fds are fallbacks (kr64 chmod didn't take effect).
+   - `grep "ioctl(fd=.*real, req=0x.*) -> -1" twoyi-loader.log | head -20`
+     — real binder ioctl FAILURES. If present, the errno tells us why
+     (e.g., EAGAIN = normal binder wait, ECONNREFUSED = servicemanager
+     died, EINVAL = bad argp, ENOTTY = fd is not actually a binder device).
+   - `grep -c "ioctl(fd=.*fallback, req=0x" twoyi-loader.log` — count of
+     faked binder ioctls on fallback fds. Should be low if kr64 chmod
+     worked; high if many processes still can't open the real binder device.
+   - `grep -c "binder_open_fallback" twoyi-loader.log` — count of fallback
+     fd creations. Ideally 0 (kr64 chmod fixed DAC); non-zero means some
+     processes still fall back.
+   - `grep -E "system_server|SystemServer" logcat.txt | head -50` —
+     system_server startup. If it starts and progresses past
+     SystemServer>com.android.server.SystemServer then binder IPC is working.
+   - `grep -E "ServiceManager|addService|getService" logcat.txt | head -30`
+     — binder service registration. Should now show real activity (not
+     silent as before).
+   - First system_server tombstone's abort message — if it's a
+     NullPointerException at ServiceManager.getService, the fix didn't
+     fully work (some fds are still being faked). If it's a different
+     error, that's the next blocker (likely graphics — Task ID 3's
+     blocker #2).
+3. **If real binder ioctls fail with ENOTTY** — the fd is not actually a
+   binder device. This would mean our fd tracking is wrong (a real binder
+   fd was mistakenly treated as real, but it's actually /dev/null because
+   the open failed silently). Investigate whether `binder_open_fallback`
+   is being called for all binder device opens and whether the fallback
+   fd is being marked correctly.
+4. **If real binder ioctls fail with EPERM/EACCES** — the kr64 chmod 0666
+   didn't take effect for this process (maybe it started before the chmod,
+   or SELinux denies it despite permissive mode). The fallback path should
+   catch these, but if the open SUCCEEDED (fd >= 0) and the ioctl FAILED,
+   that's a different issue — the device node exists and is openable but
+   ioctl is denied. Investigate the binderfs mount options and SELinux
+   policy for ioctl access.
+
+### Commit
+- bca0e7b "fix: real binder IPC for real binderfs fds, keep fake for
+  /dev/null fallbacks" — pushed to origin/main (c047ac4..bca0e7b).
