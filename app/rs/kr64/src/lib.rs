@@ -78,6 +78,7 @@ pub mod sensors;
 use std::ffi::CString;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // Logging -- minimal `eprintln!`-based macros. No external `log` crate.
@@ -200,6 +201,48 @@ unsafe fn safe_write_err_errno(prefix: &[u8], errno: i32) {
     let n = format_decimal(&mut buf, errno);
     safe_write_err(&buf[..n]);
     safe_write_err(b"\n");
+}
+
+// ============================================================================
+// Graceful shutdown via SIGTERM.
+//
+// The KVM E2E test script sends SIGTERM to kr64 after the boot wait
+// (the guest init runs indefinitely in TWRP mode). Without a handler,
+// the default SIGTERM action kills kr64 instantly while it is blocked
+// in `waitpid()` — so we never log whether the guest init crashed,
+// exited, or was still running. This handler sets a flag that the
+// waitpid loop checks, allowing kr64 to do a final non-blocking
+// `waitpid()`, log the guest's exit status, and kill the guest if it
+// is still alive before exiting cleanly.
+// ============================================================================
+
+/// Set to `true` by the SIGTERM handler. The waitpid loop polls this
+/// between `WNOHANG` checks and initiates graceful shutdown when set.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// SIGTERM signal handler. Only touches an `AtomicBool` (async-signal-
+/// safe via `SeqCst` ordering) — all real work (waitpid, logging) is
+/// done in the main thread after the handler returns.
+extern "C" fn sigterm_handler(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Install a SIGTERM handler that sets [`SHUTDOWN_REQUESTED`] instead
+/// of using the default (terminate) action. This must be called BEFORE
+/// the waitpid loop so the handler is in place when the script sends
+/// SIGTERM.
+fn install_sigterm_handler() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigterm_handler as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        sa.sa_flags = 0; // default: no SA_RESTART (we want EINTR)
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) == 0 {
+            info!("[KR64][parent] SIGTERM handler installed (graceful shutdown enabled)");
+        } else {
+            warning!("[KR64][parent] failed to install SIGTERM handler — script SIGTERM will kill us without logging guest status");
+        }
+    }
 }
 
 // ============================================================================
@@ -2736,22 +2779,108 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     spawn_accept_thread(device_set.gb.gb2, "gb2");
 
     // ---------------------------------------------------------------
-    // Step 6: wait for the guest to exit.
+    // Step 6: wait for the guest to exit (with graceful SIGTERM handling).
+    //
+    // We install a SIGTERM handler so the KVM test script can ask us to
+    // shut down cleanly after the boot wait. Without it, the default
+    // SIGTERM action kills us instantly while blocked in waitpid(), and
+    // we never log the guest init's fate (crash, exit, or still running).
+    //
+    // The loop uses WNOHANG + a short sleep so it can poll the
+    // SHUTDOWN_REQUESTED flag between checks. On SIGTERM:
+    //   1. Do a final non-blocking waitpid to see if the guest exited.
+    //   2. If it exited → log the status (exit code / signal).
+    //   3. If still running → SIGKILL the guest, reap it, log that we
+    //      killed it (the guest was alive at shutdown — not a crash).
     // ---------------------------------------------------------------
+    install_sigterm_handler();
+
     let mut status: libc::c_int = 0;
     loop {
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if waited == pid {
+            // Child exited on its own — fall through to status logging.
+            break;
+        }
         if waited == -1 {
             let e = std::io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
+                // Signal interrupted waitpid (WNOHANG rarely blocks, but
+                // be defensive). Fall through to the shutdown check.
+            } else {
+                error!("[KR64][parent] waitpid failed: {}", e);
+                return 1;
             }
-            error!("[KR64][parent] waitpid failed: {}", e);
-            return 1;
         }
-        break;
+        // waited == 0 (child still running) or EINTR — check for shutdown.
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            info!("[KR64][parent] SIGTERM received — initiating graceful shutdown");
+            // Final non-blocking waitpid: the guest may have exited
+            // between our last poll and the signal.
+            let w = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if w == pid {
+                // Log with "(after SIGTERM)" suffix to distinguish from
+                // a self-initiated exit during normal operation.
+                if libc::WIFEXITED(status) {
+                    let code = libc::WEXITSTATUS(status);
+                    info!(
+                        "[KR64][parent] guest exited with status {} (after SIGTERM)",
+                        code
+                    );
+                    return code;
+                }
+                if libc::WIFSIGNALED(status) {
+                    let sig = libc::WTERMSIG(status);
+                    warning!(
+                        "[KR64][parent] guest killed by signal {} (after SIGTERM)",
+                        sig
+                    );
+                    return 128 + sig;
+                }
+                warning!(
+                    "[KR64][parent] guest waitpid returned unexpected status {} (after SIGTERM)",
+                    status
+                );
+                return 1;
+            }
+            // Guest still running — kill it and reap. This is NOT a
+            // crash: the guest was alive when we were asked to shut down
+            // (typical for TWRP recovery which runs indefinitely).
+            warning!(
+                "[KR64][parent] guest (pid={}) still running — sending SIGKILL",
+                pid
+            );
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            // Blocking waitpid to reap the SIGKILLed child (no signal
+            // expected now, but use EINTR retry just in case).
+            loop {
+                let w = unsafe { libc::waitpid(pid, &mut status, 0) };
+                if w == pid {
+                    break;
+                }
+                if w == -1 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    // Child already reaped by something else — not fatal.
+                    warning!("[KR64][parent] waitpid after SIGKILL failed: {}", e);
+                    break;
+                }
+            }
+            warning!(
+                "[KR64][parent] guest killed by our SIGKILL (was still running at shutdown — not a crash)"
+            );
+            return 0;
+        }
+        // Child still running, no shutdown requested — sleep briefly.
+        // A signal during sleep returns early (EINTR), which is fine.
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
+    // Normal exit path: child exited on its own during the WNOHANG poll.
     if libc::WIFEXITED(status) {
         let code = libc::WEXITSTATUS(status);
         info!("[KR64][parent] guest exited with status {}", code);

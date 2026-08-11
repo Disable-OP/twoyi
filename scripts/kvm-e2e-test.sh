@@ -877,10 +877,59 @@ fi
 # to capture logs. In TWRP mode, kr64 + the guest init run indefinitely
 # (TWRP's recovery service never exits), which would cause the script
 # to hang forever waiting for kr64 to exit.
+#
+# We send SIGTERM (not SIGKILL) so kr64's SIGTERM handler can do a
+# graceful shutdown: it does a final waitpid on the guest init and logs
+# the exit status (crash, exit, or still-running-then-SIGKILLed). This
+# is critical — without it we can't tell whether init crashed, exited,
+# or was still running.
 if [ "$TWRP_MODE" = "1" ]; then
-    echo "  → TWRP mode: killing kr64 + guest init to continue log capture..."
-    timeout 5 "$ADB_BIN" -s emulator-5554 shell "kill \$(cat /data/local/tmp/kr64.pid 2>/dev/null) 2>/dev/null; pkill -f '/data/local/tmp/kr64' 2>/dev/null" 2>/dev/null || true
+    echo "  → TWRP mode: sending SIGTERM to kr64 (graceful shutdown)..."
+    # Send SIGTERM (default for `kill`) — kr64's handler logs the guest's
+    # exit status before dying. Wait up to 8s for kr64 to finish.
+    timeout 8 "$ADB_BIN" -s emulator-5554 shell "kill \$(cat /data/local/tmp/kr64.pid 2>/dev/null) 2>/dev/null" 2>/dev/null || true
     sleep 2
+    # If kr64 is still alive (handler stuck?), escalate to SIGKILL + pkill.
+    timeout 5 "$ADB_BIN" -s emulator-5554 shell "kill -9 \$(cat /data/local/tmp/kr64.pid 2>/dev/null) 2>/dev/null; pkill -9 -f '/data/local/tmp/kr64' 2>/dev/null" 2>/dev/null || true
+    sleep 1
+
+    # Capture kernel log (dmesg) — the guest shares the host emulator's
+    # kernel, so any segfault from TWRP init appears here. TWRP init also
+    # tries to log to /dev/kmsg (which may or may not exist in the guest's
+    # /dev); if it does, those messages appear in dmesg too.
+    echo "  → capturing dmesg (kernel log)..."
+    timeout 10 "$ADB_BIN" -s emulator-5554 shell dmesg > "$ARTIFACT_DIR/dmesg.log" 2>/dev/null || true
+    if [ -s "$ARTIFACT_DIR/dmesg.log" ]; then
+        echo "  ✓ dmesg.log: $(stat -c%s "$ARTIFACT_DIR/dmesg.log") bytes"
+        # Surface any segfault or init-related kernel messages for quick diagnosis.
+        echo "  → kernel messages mentioning init/segfault/twrp:"
+        grep -iE 'segfault|init\[|twrp|recovery' "$ARTIFACT_DIR/dmesg.log" 2>/dev/null | tail -20 || echo "    (none found)"
+    else
+        echo "  ⚠ dmesg.log empty or not captured"
+    fi
+
+    # Check if any TWRP processes are still alive after kr64 died.
+    # kr64's SIGKILL of the guest init (in the handler) should have killed
+    # it, but if init forked daemons (ueventd, partlink, recovery) they
+    # may survive as orphans reparented to the host's init.
+    echo "  → checking for surviving TWRP processes..."
+    timeout 5 "$ADB_BIN" -s emulator-5554 shell "ps -A 2>/dev/null" > "$ARTIFACT_DIR/twrp-ps.log" 2>/dev/null || true
+    if [ -s "$ARTIFACT_DIR/twrp-ps.log" ]; then
+        # Surface TWRP-related daemons (ueventd, partlink, recovery) and
+        # any "init" process that is NOT the host's PID 1.
+        SURVIVORS=$(grep -iE 'ueventd|partlink|recovery' "$ARTIFACT_DIR/twrp-ps.log" 2>/dev/null || true)
+        # Also check for non-PID-1 init processes (the TWRP guest init).
+        INIT_PROCS=$(awk '/[i]nit/ && $2 != 1' "$ARTIFACT_DIR/twrp-ps.log" 2>/dev/null || true)
+        if [ -n "$SURVIVORS" ] || [ -n "$INIT_PROCS" ]; then
+            echo "  ⚠ TWRP-related processes still alive after kr64 died:"
+            [ -n "$SURVIVORS" ] && echo "$SURVIVORS"
+            [ -n "$INIT_PROCS" ] && echo "$INIT_PROCS"
+        else
+            echo "  ✓ no TWRP daemons survived (init was killed or exited)"
+        fi
+    else
+        echo "  ⚠ could not capture ps output"
+    fi
 fi
 
 # Stop logcat
