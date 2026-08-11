@@ -52,6 +52,7 @@ typedef struct prop_info prop_info;
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
+#include <linux/fb.h>
 #include <ucontext.h>
 #include <pthread.h>
 
@@ -320,6 +321,164 @@ static void binder_fd_clear(int fd) {
     pthread_mutex_lock(&g_binder_fd_lock);
     g_binder_fallback_fds[fd >> 3] &= (unsigned char)~(1u << (fd & 7));
     pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
+// ---------------------------------------------------------------------------
+// Framebuffer fd tracking (for TWRP virtual fb0).
+//
+// In TWRP mode, kr64 creates /dev/graphics/fb0 and /dev/fb0 as REGULAR
+// files (3,686,400 bytes = 720x1280x4 RGBA8888) so open() and mmap()
+// succeed naturally. But FB ioctls (FBIOGET_VSCREENINFO etc.) on a
+// regular file return ENOTTY from the kernel, leaving the screeninfo
+// struct zeroed. libminuitwrp then dereferences the NULL fields and
+// segfaults at offset 0x57d7.
+//
+// FIX: when open/openat/__open_2/__openat_2 successfully opens an fb0
+// path, the returned fd is recorded here. The ioctl hook checks this
+// set to decide whether to fake FB ioctls. The close hook clears
+// entries when fds are closed.
+//
+// This tracking is HARMLESS in non-TWRP mode: /dev/graphics/fb0 is a
+// real device (or doesn't exist), so is_fb_path() returns false and no
+// fd is ever tracked. The ioctl hook's fb_fd_is_tracked() check is a
+// single bitmap lookup — negligible overhead.
+//
+// Limitation: dup/dup2/dup3 of an fb0 fd are not tracked. This is
+// acceptable — libminuitwrp doesn't dup the fb0 fd.
+// ---------------------------------------------------------------------------
+static unsigned char g_fb_fds[(TWOYI_MAX_FD + 7) / 8];
+static pthread_mutex_t g_fb_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void fb_fd_mark(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_fb_fd_lock);
+    g_fb_fds[fd >> 3] |= (unsigned char)(1u << (fd & 7));
+    pthread_mutex_unlock(&g_fb_fd_lock);
+}
+
+static int fb_fd_is_tracked(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return 0;
+    pthread_mutex_lock(&g_fb_fd_lock);
+    int r = (g_fb_fds[fd >> 3] >> (fd & 7)) & 1;
+    pthread_mutex_unlock(&g_fb_fd_lock);
+    return r;
+}
+
+static void fb_fd_clear(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_fb_fd_lock);
+    g_fb_fds[fd >> 3] &= (unsigned char)~(1u << (fd & 7));
+    pthread_mutex_unlock(&g_fb_fd_lock);
+}
+
+// Returns 1 if path is /dev/graphics/fb0 or /dev/fb0 (exact match).
+// These are the framebuffer device paths that libminuitwrp opens.
+static int is_fb_path(const char *path) {
+    if (!path) return 0;
+    if (strcmp(path, "/dev/graphics/fb0") == 0) return 1;
+    if (strcmp(path, "/dev/fb0") == 0) return 1;
+    return 0;
+}
+
+// Called from open/openat/__open_2/__openat_2/__open_real after a
+// successful open. If the path is an fb0 path, marks the fd for the
+// ioctl hook. Returns the fd unchanged (so it can be used inline as
+// `return track_fb_fd(path, fd);`).
+static int track_fb_fd(const char *path, int fd) {
+    if (fd >= 0 && is_fb_path(path)) {
+        fb_fd_mark(fd);
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] open(%s) -> fd=%d (tracking for FB ioctls)\n",
+            path, fd);
+        write_str(2, msg);
+    }
+    return fd;
+}
+
+// ---------------------------------------------------------------------------
+// Virtual screen configuration for TWRP framebuffer virtualization.
+//
+// 720x1280 @ 32bpp (RGBA8888). This matches the byt_t_crv2 (Minix Z64)
+// TWRP image's expected display resolution. libminuitwrp reads these
+// values from FBIOGET_VSCREENINFO and uses them to size its framebuffer.
+//
+// The framebuffer memory is 720*1280*4 = 3,686,400 bytes. kr64 pre-
+// creates /dev/graphics/fb0 as a regular file of exactly this size, so
+// mmap() on the fd works naturally (no mmap hook needed for the common
+// case).
+// ---------------------------------------------------------------------------
+#define TWOYI_FB_WIDTH          720
+#define TWOYI_FB_HEIGHT         1280
+#define TWOYI_FB_BPP            32
+#define TWOYI_FB_BYTES_PER_PIX  4
+#define TWOYI_FB_LINE_LENGTH    (TWOYI_FB_WIDTH * TWOYI_FB_BYTES_PER_PIX)  /* 2880 */
+#define TWOYI_FB_SMEM_LEN       (TWOYI_FB_WIDTH * TWOYI_FB_HEIGHT * TWOYI_FB_BYTES_PER_PIX)  /* 3686400 */
+
+// Fill struct fb_var_screeninfo with valid 720x1280@32bpp RGBA8888.
+// libminuitwrp reads xres, yres, bits_per_pixel, and the color channel
+// offsets/lengths to configure its software renderer.
+static void fill_vscreeninfo(struct fb_var_screeninfo *v) {
+    memset(v, 0, sizeof(*v));
+    v->xres = TWOYI_FB_WIDTH;
+    v->yres = TWOYI_FB_HEIGHT;
+    v->xres_virtual = TWOYI_FB_WIDTH;
+    v->yres_virtual = TWOYI_FB_HEIGHT;
+    v->xoffset = 0;
+    v->yoffset = 0;
+    v->bits_per_pixel = TWOYI_FB_BPP;
+    v->grayscale = 0;
+    // RGBA8888: red at bit 16, green at bit 8, blue at bit 0, alpha at bit 24
+    v->red.offset = 16;    v->red.length = 8;    v->red.msb_right = 0;
+    v->green.offset = 8;   v->green.length = 8;  v->green.msb_right = 0;
+    v->blue.offset = 0;    v->blue.length = 8;   v->blue.msb_right = 0;
+    v->transp.offset = 24; v->transp.length = 8; v->transp.msb_right = 0;
+    v->nonstd = 0;
+    v->activate = 0;  // FB_ACTIVATE_NOW
+    // Physical dimensions in mm (for DPI calculation). 720x1280 at
+    // ~250 DPI is ~73x130mm — round numbers close to a 5" phone.
+    v->height = 130;
+    v->width = 73;
+    v->accel_flags = 0;
+    // Pixclock in picoseconds. For 60Hz refresh of 720x1280:
+    //   pixclock = 1 / (60 * 720 * 1280) = ~18ns = ~18100ps
+    v->pixclock = 18100;
+    v->left_margin = 24;
+    v->right_margin = 24;
+    v->upper_margin = 4;
+    v->lower_margin = 4;
+    v->hsync_len = 24;
+    v->vsync_len = 4;
+    v->sync = 0;
+    v->vmode = 0;  // FB_VMODE_NONINTERLACED
+    v->rotate = 0;
+    v->colorspace = 0;  // FB_COLORSPACE_RGB
+}
+
+// Fill struct fb_fix_screeninfo with valid fixed framebuffer info.
+// libminuitwrp reads smem_len (for the mmap size) and line_length
+// (for the row stride).
+static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
+    memset(f, 0, sizeof(*f));
+    // id is a 16-byte char array (kernel: char id[16]).
+    strncpy(f->id, "twoyi_fb", sizeof(f->id) - 1);
+    // smem_start is an unsigned long — we set it to 0 (libminuitwrp
+    // doesn't dereference it; it only uses smem_len for the mmap size).
+    f->smem_start = 0;
+    f->smem_len = TWOYI_FB_SMEM_LEN;
+    f->type = 0;  // FB_TYPE_PACKED_PIXELS
+    f->type_aux = 0;
+    f->visual = 2;  // FB_VISUAL_TRUECOLOR
+    f->xpanstep = 0;
+    f->ypanstep = 0;
+    f->ywrapstep = 0;
+    f->line_length = TWOYI_FB_LINE_LENGTH;
+    f->mmio_start = 0;
+    f->mmio_len = 0;
+    f->accel = 0;
+    f->capabilities = 0;
+    f->reserved[0] = 0;
+    f->reserved[1] = 0;
 }
 
 // =========================================================================
@@ -903,6 +1062,69 @@ int ioctl(int fd, unsigned long request, ...) {
 
     unsigned req = (unsigned)request;
 
+    // -----------------------------------------------------------------------
+    // FB ioctl virtualization for TWRP: if this fd was opened on
+    // /dev/graphics/fb0 or /dev/fb0, intercept FB ioctls and return valid
+    // screen info. The kernel returns ENOTTY for FB ioctls on a regular
+    // file (which is what /dev/graphics/fb0 is in TWRP mode), leaving the
+    // screeninfo struct zeroed and causing a NULL deref segfault in
+    // libminuitwrp.so at offset 0x57d7.
+    //
+    // FB ioctl numbers (from linux/fb.h — raw numbers, no _IO encoding):
+    //   FBIOGET_VSCREENINFO  = 0x4600
+    //   FBIOPUT_VSCREENINFO  = 0x4601
+    //   FBIOGET_FSCREENINFO  = 0x4602
+    //   FBIOPUT_FSCREENINFO  = 0x4603
+    //   FBIOGETCMAP          = 0x4604
+    //   FBIOPUTCMAP          = 0x4605
+    //   FBIOPAN_DISPLAY      = 0x4606
+    //   FBIOBLANK            = 0x4611
+    //   FBIO_WAITFORVSYNC    = 0x40044620
+    //
+    // A tracked fb0 fd will never be a binder fallback fd (the open hook
+    // only tracks fb0 paths, not binder paths), so this check is mutually
+    // exclusive with the binder logic below.
+    // -----------------------------------------------------------------------
+    if (fb_fd_is_tracked(fd)) {
+        switch (req) {
+            case 0x4600u: {  // FBIOGET_VSCREENINFO
+                if (argp) fill_vscreeninfo((struct fb_var_screeninfo *)argp);
+                write_str(2, "[twoyi_loader] ioctl(FBIOGET_VSCREENINFO) -> 720x1280@32bpp\n");
+                return 0;
+            }
+            case 0x4601u: {  // FBIOPUT_VSCREENINFO — accept the mode change
+                write_str(2, "[twoyi_loader] ioctl(FBIOPUT_VSCREENINFO) -> success\n");
+                return 0;
+            }
+            case 0x4602u: {  // FBIOGET_FSCREENINFO
+                if (argp) fill_fscreeninfo((struct fb_fix_screeninfo *)argp);
+                write_str(2, "[twoyi_loader] ioctl(FBIOGET_FSCREENINFO) -> smem_len=3686400 line_length=2880\n");
+                return 0;
+            }
+            case 0x4603u: {  // FBIOPUT_FSCREENINFO — accept
+                return 0;
+            }
+            case 0x4606u: {  // FBIOPAN_DISPLAY — page flip, accept
+                return 0;
+            }
+            case 0x4611u: {  // FBIOBLANK — virtual display, blanking is a no-op
+                return 0;
+            }
+            case 0x40044620u: {  // FBIO_WAITFORVSYNC — no real vsync, return
+                return 0;
+            }
+            default: {
+                // Other FB ioctls (0x46xx range: FBIOGETCMAP, FBIOPUTCMAP,
+                // FBIO_CURSOR, etc.) — fake success. Non-FB ioctls on an
+                // fb0 fd (shouldn't happen) fall through to the real ioctl.
+                if ((req & 0xff00) == 0x4600) {
+                    return 0;
+                }
+                break;  // fall through to binder check / real ioctl
+            }
+        }
+    }
+
     // Quick filter: is this a binder ioctl? (magic 'b' = 0x62 in high byte)
     int is_binder_req = ((req & 0xff00) == 0x6200);
     if (!is_binder_req) {
@@ -1014,6 +1236,7 @@ int close(int fd) {
     static int (*real_close)(int) = NULL;
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     binder_fd_clear(fd);
+    fb_fd_clear(fd);
     if (real_close) return real_close(fd);
     return (int)syscall(NR_close, fd);
 }
@@ -2338,7 +2561,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
             int saved_errno = fd < 0 ? errno : 0;
             return binder_open_fallback(path, fd, saved_errno);
         }
-        return fd;
+        return track_fb_fd(path, fd);
     }
     const char *translated = translate(path);
     int fd = real_openat(dirfd, translated, flags, mode);
@@ -2347,7 +2570,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
         int saved_errno = fd < 0 ? errno : 0;
         return binder_open_fallback(path, fd, saved_errno);
     }
-    return fd;
+    return track_fb_fd(path, fd);
 }
 
 // open PLT interposition (for code that uses open() instead of openat())
@@ -2434,7 +2657,7 @@ int open(const char *path, int flags, ...) {
         int saved_errno = fd < 0 ? errno : 0;
         return binder_open_fallback(path, fd, saved_errno);
     }
-    return fd;
+    return track_fb_fd(path, fd);
 }
 
 // Hook fopen — translate paths to rootfs.
@@ -2610,12 +2833,14 @@ int __open_2(const char *path, int flags) {
     // Pass through (kernel paths: /proc, /sys, /dev, relative paths)
     static int (*real_open2)(const char *, int) = NULL;
     if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
-    if (real_open2) return real_open2(path, flags);
+    int fd;
+    if (real_open2) fd = real_open2(path, flags);
 #if defined(__x86_64__)
-    return twoyi_sys_open2(path, flags);
+    else fd = twoyi_sys_open2(path, flags);
 #else
-    return syscall(NR_openat, AT_FDCWD, path, flags);
+    else fd = (int)syscall(NR_openat, AT_FDCWD, path, flags);
 #endif
+    return track_fb_fd(path, fd);
 }
 
 // Hook __open_real (bionic's internal open — all open variants call this)
@@ -2668,16 +2893,18 @@ int __open_real(const char *pathname, int flags, ...) {
             int saved_errno = fd < 0 ? errno : 0;
             return binder_open_fallback(pathname, fd, saved_errno);
         }
-        return fd;
+        return track_fb_fd(pathname, fd);
     }
     static int (*real_open_real)(const char *, int, ...) = NULL;
     if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
-    if (real_open_real) return real_open_real(pathname, flags, mode);
+    int fd;
+    if (real_open_real) fd = real_open_real(pathname, flags, mode);
 #if defined(__x86_64__)
-    return twoyi_sys_open(pathname, flags, mode);
+    else fd = twoyi_sys_open(pathname, flags, mode);
 #else
-    return syscall(NR_openat, AT_FDCWD, pathname, flags, mode);
+    else fd = (int)syscall(NR_openat, AT_FDCWD, pathname, flags, mode);
 #endif
+    return track_fb_fd(pathname, fd);
 }
 
 // Hook __openat_2 (bionic's fortified openat)
@@ -2703,13 +2930,17 @@ int __openat_2(int dirfd, const char *path, int flags) {
         const char *translated = translate(path);
         static int (*real_openat2)(int, const char *, int) = NULL;
         if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
-        if (real_openat2) return real_openat2(dirfd, translated, flags);
-        return syscall(NR_openat, dirfd, translated, flags);
+        int fd;
+        if (real_openat2) fd = real_openat2(dirfd, translated, flags);
+        else fd = (int)syscall(NR_openat, dirfd, translated, flags);
+        return track_fb_fd(path, fd);
     }
     static int (*real_openat2)(int, const char *, int) = NULL;
     if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
-    if (real_openat2) return real_openat2(dirfd, path, flags);
-    return syscall(NR_openat, dirfd, path, flags);
+    int fd;
+    if (real_openat2) fd = real_openat2(dirfd, path, flags);
+    else fd = (int)syscall(NR_openat, dirfd, path, flags);
+    return track_fb_fd(path, fd);
 }
 
 // =========================================================================

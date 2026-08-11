@@ -67,7 +67,7 @@ name: KVM E2E Test
         required: false
         default: false
       twrp:
-        description: 'Boot TWRP recovery image instead of full Android rootfs (uses assets/twrp/*.img, launches kr64 with --boot-recovery). Skips LD_PRELOAD, /apex bind, binderfs, SELinux watchdog. The Android rootfs_source / skip_preload / init_path inputs are IGNORED when this is true.'
+        description: 'Boot TWRP recovery image instead of full Android rootfs (uses assets/twrp/*.img, launches kr64 with --boot-recovery). LD_PRELOADs libtwoyi_loader_shlib.so into the recovery process to intercept FB ioctls on /dev/graphics/fb0 (fixes libminuitwrp segfault). Skips libgetpid_hook, /apex bind, binderfs, SELinux watchdog. The Android rootfs_source / skip_preload / init_path inputs are IGNORED when this is true.'
         type: boolean
         required: false
         default: false
@@ -348,14 +348,14 @@ jobs:
           #   - extracts the TWRP ramdisk from assets/twrp/*.img (via
           #     scripts/extract-twrp-ramdisk.py) instead of the Android rootfs
           #   - skips the /init symlink dance (TWRP init is a real binary)
-          #   - skips the x86_64 libgetpid_hook.so + libtwoyi_loader_shlib.so
-          #     push (i386 recovery can't load x86_64 libs)
-          #   - pushes twrp_fb_hook.so (i686) instead — LD_PRELOAD for the
-          #     i386 recovery process to intercept FB ioctls on
-          #     /dev/graphics/fb0 and fix the libminuitwrp segfault
-          #   - launches kr64 with --boot-recovery (loads twrp_fb_hook.so,
-          #     skips /apex bind, binderfs, SELinux watchdog; auto-sets
-          #     init_path=/init)
+          #   - skips the x86_64 libgetpid_hook.so push (TWRP's init is
+          #     statically linked; recovery doesn't need PID 1 faking)
+          #   - pushes libtwoyi_loader_shlib.so (x86_64) — LD_PRELOAD for
+          #     the dynamically-linked recovery process to intercept FB
+          #     ioctls on /dev/graphics/fb0 and fix the libminuitwrp segfault
+          #   - launches kr64 with --boot-recovery (loads
+          #     libtwoyi_loader_shlib.so via LD_PRELOAD, skips /apex bind,
+          #     binderfs, SELinux watchdog; auto-sets init_path=/init)
           TWOYI_TWRP: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
 
       - name: Print boot verdict
