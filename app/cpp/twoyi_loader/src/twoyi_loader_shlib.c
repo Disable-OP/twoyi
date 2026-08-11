@@ -786,24 +786,10 @@ int lstat(const char *path, struct stat *buf) {
     if (path && should_translate(path)) {
         char translated[512];
         snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
-        // DEBUG: log every translated lstat so we can see why /acct/uid fails
-        char msg[600];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] lstat(%s) -> %s\n", path, translated);
-        write_str(2, msg);
         static int (*real_lstat)(const char *, struct stat *) = NULL;
         if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
-        int ret;
-        if (real_lstat) ret = real_lstat(translated, buf);
-        else ret = syscall(SYS_newfstatat, AT_FDCWD, translated, buf, AT_SYMLINK_NOFOLLOW);
-        if (ret < 0) {
-            int saved_errno = errno;
-            snprintf(msg, sizeof(msg),
-                     "[twoyi_loader] lstat(%s) = %d (errno=%d: %s)\n",
-                     translated, ret, saved_errno, strerror(saved_errno));
-            write_str(2, msg);
-            errno = saved_errno;
-        }
-        return ret;
+        if (real_lstat) return real_lstat(translated, buf);
+        return syscall(SYS_newfstatat, AT_FDCWD, translated, buf, AT_SYMLINK_NOFOLLOW);
     }
     static int (*real_lstat)(const char *, struct stat *) = NULL;
     if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
@@ -1215,15 +1201,7 @@ int __system_property_read(const prop_info *pi, char *name, char *value) {
 
 // Hook __system_property_get — read from our in-memory table
 int __system_property_get(const char *name, char *value) {
-    int ret = prop_get(name, value);
-    // Debug: log all property queries
-    if (name) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] prop_get(%s) = '%s' (ret=%d)\n",
-            name, ret > 0 ? value : "(empty)", ret);
-        write_str(2, msg);
-    }
-    return ret;
+    return prop_get(name, value);
 }
 
 // Hook __system_property_find — return a fake pointer (non-NULL if found)
@@ -1233,15 +1211,9 @@ const void *__system_property_find(const char *name) {
     if (!name) return NULL;
     for (int i = 0; i < MAX_PROPS; i++) {
         if (g_props[i].used && strcmp(g_props[i].key, name) == 0) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "[twoyi_loader] prop_find(%s) = FOUND\n", name);
-            write_str(2, msg);
             return &g_props[i]; // return pointer to entry as fake prop_info
         }
     }
-    char msg[256];
-    snprintf(msg, sizeof(msg), "[twoyi_loader] prop_find(%s) = NOT FOUND\n", name);
-    write_str(2, msg);
     return NULL;
 }
 
