@@ -807,6 +807,9 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 // BINDER_SET_MAX_THREADS = _IOW(0x62, 5, __u32) = 0x40046205
 // BINDER_SET_CONTEXT_MGR = _IOW(0x62, 7, __u32) = 0x40046207
 // BINDER_WRITE_READ = _IOWR(0x62, 1, ...) = 0xc0306201
+// Use the correct ioctl signature for the build host (glibc: unsigned long,
+// bionic: int). We use unsigned long to match glibc (the host build system),
+// and cast to unsigned for comparison so high-bit-set codes match on both.
 int ioctl(int fd, unsigned long request, ...) {
     static int (*real_ioctl)(int, unsigned long, ...) = NULL;
     if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
@@ -816,42 +819,32 @@ int ioctl(int fd, unsigned long request, ...) {
     void *argp = va_arg(ap, void *);
     va_end(ap);
     
+    unsigned req = (unsigned)request;
+    
     // BINDER_VERSION = 0xc004620d — returns protocol version
-    // The struct is { __s32 protocol_version } and we write the current version (8)
-    if (request == 0xc004620d) {
-        // Write the binder protocol version (8 = BINDER_CURRENT_PROTOCOL_VERSION)
+    if (req == 0xc004620du) {
         if (argp) {
-            *(int *)argp = 8;
+            *(int *)argp = 8;  // BINDER_CURRENT_PROTOCOL_VERSION
         }
         write_str(2, "[twoyi_loader] ioctl(BINDER_VERSION) -> faking version 8\n");
         return 0;
     }
     
-    // BINDER_SET_MAX_THREADS = 0x40046205 — just return success
-    if (request == 0x40046205) {
+    // BINDER_SET_MAX_THREADS = 0x40046205
+    if (req == 0x40046205u) {
         write_str(2, "[twoyi_loader] ioctl(BINDER_SET_MAX_THREADS) -> success\n");
         return 0;
     }
     
-    // BINDER_SET_CONTEXT_MGR = 0x40046207 — return success
-    // This is needed for servicemanager to become context manager
-    if (request == 0x40046207) {
+    // BINDER_SET_CONTEXT_MGR = 0x40046207
+    if (req == 0x40046207u) {
         write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR) -> success\n");
         return 0;
     }
     
     // BINDER_WRITE_READ = 0xc0306201 — return success with no data
-    // This is the main data transfer ioctl; faking it means binder IPC
-    // won't actually work, but it prevents crashes during startup.
-    if (request == 0xc0306201) {
-        // Return 0 (success) with no read or write
+    if (req == 0xc0306201u) {
         return 0;
-    }
-    
-    // SOL_NETLINK = 270, common optnames for netlink
-    // This was previously in setsockopt but ioctl is also used
-    if (request == 0x8004620d) {  // SIOCGSTAMP might conflict; check
-        // This is actually not a binder ioctl; pass through
     }
     
     if (real_ioctl) return real_ioctl(fd, request, argp);
