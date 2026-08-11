@@ -344,8 +344,15 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     // /apex/com.android.runtime/lib64/bionic/libc.so. If we mount
     // tmpfs on /apex, these symlinks become dangling and the dynamic
     // linker can't load — causing SIGSEGV at address 0x86 in linker64.
-    // The KVM test script extracts /apex from the emulator into the
-    // rootfs, so we leave it as-is (no tmpfs overlay).
+    //
+    // Instead, BIND-MOUNT the HOST's /apex/ into the rootfs's /apex/.
+    // This gives the rootfs access to the real APEX packages (libc.so,
+    // linker64, libbase.so, etc.) with no version mismatches. The
+    // symlinks in /system/lib64/ resolve correctly after pivot_root.
+    //
+    // This works on BOTH:
+    // - KVM test environment (host is Android emulator with /apex/)
+    // - Real devices (host is a real Android device with /apex/)
     //
     // CRITICAL: /proc must be a REAL procfs, NOT tmpfs! The bionic
     // dynamic linker (linker64) reads /proc/self/maps and
@@ -383,6 +390,30 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
                 e
             ),
         }
+    }
+
+    // Bind-mount the HOST's /apex/ into the rootfs's /apex/.
+    // This is CRITICAL for Android 11+ where libc.so, libdl.so,
+    // linker64, and many other essential libraries live ONLY in
+    // /apex/com.android.runtime/. Without this bind mount, /apex/ is
+    // empty after pivot_root, all symlinks into /apex/ break, and the
+    // linker crashes with SIGSEGV at 0x86 (NULL soinfo).
+    //
+    // We use MS_BIND | MS_REC to recursively bind-mount /apex/ and
+    // all its sub-mounts (each APEX package is a separate mount on
+    // Android).
+    let apex_dst = format!("{}/apex", cfg.rootfs);
+    let _ = std::fs::create_dir_all(&apex_dst);
+    match mount("/apex", &apex_dst, "", MS_BIND | MS_REC, None) {
+        Ok(()) => info!(
+            "[KR64][mount_mgr] bind-mounted /apex -> {} (APEX packages accessible)",
+            apex_dst
+        ),
+        Err(e) => warning!(
+            "[KR64][mount_mgr] bind-mount /apex -> {} failed: {} — linker may crash at 0x86 (NULL soinfo for missing libc.so)",
+            apex_dst,
+            e
+        ),
     }
 
     // Step 5: pivot_root (or chroot fallback).
