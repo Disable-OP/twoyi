@@ -2499,5 +2499,10 @@ static void twoyi_init(void) {
     // sys.boot_completed is the final goal — but don't set it yet
     // (we want the guest to actually boot, not fake it)
 
+    // vold exits(0) in our container, so it never sets this property.
+    // Init's post-fs-data action waits for it via wait_for_prop.
+    // Pre-set it so init can proceed past post-fs-data to zygote-start.
+    prop_set("vold.post_fs_data_done", "1");
+
     g_runtime_ready = 1;
 }
