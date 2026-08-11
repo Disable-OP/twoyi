@@ -67,7 +67,7 @@ name: KVM E2E Test
         required: false
         default: false
       twrp:
-        description: 'Boot TWRP recovery image instead of full Android rootfs (uses assets/twrp/*.img, launches kr64 with --boot-recovery). LD_PRELOADs libtwoyi_loader_shlib.so into the recovery process to intercept FB ioctls on /dev/graphics/fb0 (fixes libminuitwrp segfault). Skips libgetpid_hook, /apex bind, binderfs, SELinux watchdog. The Android rootfs_source / skip_preload / init_path inputs are IGNORED when this is true.'
+        description: 'Boot TWRP recovery image instead of full Android rootfs (uses assets/twrp/*.img, launches kr64 with --boot-recovery). LD_PRELOADs twrp_fb_hook.so (i686) into the i386 recovery process to intercept FB ioctls on /dev/graphics/fb0 (fixes libminuitwrp segfault). Skips libgetpid_hook, libtwoyi_loader_shlib (x86_64), /apex bind, binderfs, SELinux watchdog. The Android rootfs_source / skip_preload / init_path inputs are IGNORED when this is true.'
         type: boolean
         required: false
         default: false
@@ -350,12 +350,14 @@ jobs:
           #   - skips the /init symlink dance (TWRP init is a real binary)
           #   - skips the x86_64 libgetpid_hook.so push (TWRP's init is
           #     statically linked; recovery doesn't need PID 1 faking)
-          #   - pushes libtwoyi_loader_shlib.so (x86_64) — LD_PRELOAD for
-          #     the dynamically-linked recovery process to intercept FB
+          #   - skips the x86_64 libtwoyi_loader_shlib.so push (recovery is
+          #     i386; the 32-bit bionic linker cannot load a 64-bit library)
+          #   - pushes twrp_fb_hook.so (i686) — LD_PRELOAD for the
+          #     dynamically-linked i386 recovery process to intercept FB
           #     ioctls on /dev/graphics/fb0 and fix the libminuitwrp segfault
-          #   - launches kr64 with --boot-recovery (loads
-          #     libtwoyi_loader_shlib.so via LD_PRELOAD, skips /apex bind,
-          #     binderfs, SELinux watchdog; auto-sets init_path=/init)
+          #   - launches kr64 with --boot-recovery (loads twrp_fb_hook.so
+          #     via LD_PRELOAD, skips /apex bind, binderfs, SELinux watchdog;
+          #     auto-sets init_path=/init)
           TWOYI_TWRP: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
 
       - name: Print boot verdict
