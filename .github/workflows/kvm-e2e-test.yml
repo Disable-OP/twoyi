@@ -399,7 +399,10 @@ jobs:
             /tmp/ci-artifacts/tombstones/ \
             /tmp/ci-artifacts/dropbox/ \
             /tmp/ci-artifacts/anr/ \
-            /tmp/ci-artifacts/rootfs-extract.log
+            /tmp/ci-artifacts/rootfs-extract.log \
+            /tmp/ci-artifacts/twrp-init.log \
+            /tmp/ci-artifacts/dmesg.log \
+            /tmp/ci-artifacts/twrp-ps.log
 
       - name: Upload logs
         if: always()
