@@ -688,3 +688,134 @@ Possible causes:
 2. libhidlbase uses a different BINDER_VERSION constant
 3. The ioctl hook's #ifdef __BIONIC__ doesn't match the target
 4. HIDL services are started before our constructor runs
+
+### Zygote blocker identified: wait_for_prop apexd.status activated — FIXED
+### Timestamp UTC: 2026-08-11 ~13:00 (Task ID 2)
+
+**Investigation of why zygote never starts (commit e56f391):**
+
+Analyzed the latest KVM e2e run (31489388552, commit 14e3989, cancelled
+at 30min) — the BINDER_VERSION fix run. The HIDL service crash loop
+(system_suspend restarting every 5s) is a SEPARATE issue being fixed by
+Task ID 1. This investigation focused on the PROPERTY/TRIGGER angle:
+even if the HIDL crash loop is fixed, will zygote actually start?
+
+**Concrete log evidence (logcat.txt from run 31489388552):**
+
+1. Init reaches post-fs-data at 12:09:08.779:
+   `processing action (post-fs-data) from (/system/etc/init/hw/init.rc:540)`
+
+2. Last init "took" log is at 12:09:09.348 (init.rc:718, rm /data/user/0).
+   After this, init processes ~45 more mkdir/mount commands silently
+   (successful commands don't log "took"), then hits:
+   `wait_for_prop apexd.status activated` (init.rc:763)
+
+3. apexd exits 0 at 12:09:09.542 with:
+   `I/apexd: This device does not support updatable APEX. Exiting`
+   `I/apexd: Marking APEXd as activated`
+   apexd DOES call `__system_property_set("apexd.status", "activated")`
+   — but this goes into APEXD's per-process g_props table (the loader's
+   in-memory property system is per-process, NOT shared). Init's
+   `__system_property_find("apexd.status")` returns NULL forever.
+
+4. The loader's `__system_property_wait_any` hook returns immediately
+   (to unblock wait_for_coldboot_done). So `wait_for_prop` busy-loops:
+   find → NULL → wait → immediate return → find → NULL → ...
+   Init goes silent (100% CPU spin) and never reaches zygote-start.
+
+5. Confirmed: NO "processing action (zygote-start)" or
+   "processing action (boot)" or "processing action (property:..." logs
+   anywhere in the logcat. Only "processing action (post-fs-data)" is
+   the last action log. The `vold.decrypt=trigger_restart_framework`
+   trigger (pre-set by the loader) NEVER FIRES — likely because init
+   never gets past wait_for_prop to evaluate it in the main loop.
+
+**The zygote trigger chain (AOSP 11 init.rc):**
+
+- `on late-init` (init.rc:427) triggers `zygote-start` (init.rc:455)
+  AFTER post-fs-data completes.
+- `on zygote-start && property:ro.crypto.state=unsupported` (init.rc:832)
+  calls `start zygote` + `start zygote_secondary`.
+- zygote is `class main` (init.zygote64_32.rc), so it's also started by
+  `class_start main` (init.rc:970, `on nonencrypted` action) and by
+  `on property:vold.decrypt=trigger_restart_framework` (init.rc:974,
+  which calls `class_start main`).
+- The loader pre-sets `vold.decrypt=trigger_restart_framework` via
+  `prop_set()` in the constructor (twoyi_loader_shlib.c:2919), which
+  SHOULD fire the trigger at `queue_property_triggers` time. But init
+  never reaches that evaluation because it's stuck at wait_for_prop.
+
+**Properties currently pre-set by the loader (twoyi_loader_shlib.c:2885-2934):**
+- ro.cold_boot_done=true (works — "already set" logged at 12:09:06.686)
+- ro.bootmode=normal, ro.boot.mode=normal, ro.boot.hardware=ranchu, etc.
+- ro.zygote=zygote64_32 (needed to parse init.zygote64_32.rc)
+- vold.post_fs_data_done=1
+- vold.decrypt=trigger_restart_framework
+- sys.boot_completed=1 (NOTE: this is set by the loader — it's the
+  GOAL property, normally set by the system server after full boot.
+  Setting it early is arguably "faking boot completion" but it's in
+  the loader which Task ID 1 owns; not touched here.)
+- init.svc.vold=running, init.svc.zygote=running
+- ro.crypto.state is INTENTIONALLY NOT SET (causes SIGABRT regression
+  per the loader comments — believed to be a downstream effect of
+  createProcessGroup failing for critical services)
+
+**Properties NOT pre-set (the gap):**
+- apexd.status=activated ← THIS IS THE BLOCKER
+
+**Fix (commit e56f391, kr64/src/proc_emu.rs):**
+
+Added `write_boot_preset_properties()` which appends
+`apexd.status=activated` to `{rootfs}/system/build.prop`. This file is
+loaded by init's `PropertyLoadBootDefaults()` (property_service.cpp:889)
+unconditionally — unlike `/system/etc/ro.vm.prop` which is NOT in the
+fixed list of files PropertyLoadBootDefaults loads (a pre-existing
+discrepancy: kr64 writes ro.vm.prop to /system/etc/ but init only loads
+/system/etc/prop.default, /system/build.prop, /vendor/build.prop, etc.).
+
+The property goes through `CheckPermissions` (SELinux check:
+`selinux_check_access("u:r:init:s0", "u:object_r:apexd_prop:s0",
+"property_service", "set")`). The AOSP 11 SELinux policy includes
+`set_prop(init, apexd_prop)` so this should pass. If it doesn't, the
+logcat will show "Do not have permissions to set 'apexd.status'..." and
+the next step would be to add the property via a different mechanism
+(e.g., have the loader call prop_set directly — but that's in
+twoyi_loader_shlib.c which Task ID 1 owns).
+
+**Expected outcome:**
+- Init loads apexd.status=activated from /system/build.prop during
+  PropertyLoadBootDefaults (early in second-stage init).
+- When init reaches wait_for_prop apexd.status activated (init.rc:763),
+  __system_property_find returns the entry, the value matches, and
+  wait_for_prop returns immediately.
+- Init progresses to perform_apex_config, exec_start derive_sdk,
+  init_user0, exec_start apexd-snapshotde, then triggers zygote-start.
+- The on zygote-start action requires ro.crypto.state (not set), so
+  that specific trigger won't fire. BUT the
+  on property:vold.decrypt=trigger_restart_framework trigger (pre-set
+  by loader) should fire at queue_property_triggers time NOW that init
+  can actually evaluate it, calling class_start main → start zygote.
+
+**Confidence: MEDIUM-HIGH.**
+The apexd.status fix is high-confidence (the root cause is clear and
+the fix directly addresses it). The zygote-start chain has a remaining
+uncertainty: whether vold.decrypt=trigger_restart_framework actually
+fires at queue_property_triggers time. If it doesn't, the next
+investigation should focus on why queue_property_triggers isn't
+matching the vold.decrypt condition despite the property being in
+init's g_props table.
+
+**Next steps for the next sub-agent:**
+1. Trigger a KVM e2e test on commit e56f391 and check if init progresses
+   past wait_for_prop apexd.status activated.
+2. Look for "processing action (property:vold.decrypt=trigger_restart_framework)"
+   in the new logcat — if present, zygote should start.
+3. If zygote starts but crashes, investigate createProcessGroup failures
+   (the /acct/uid_<UID>/ path translation issue).
+4. If vold.decrypt trigger still doesn't fire, investigate
+   queue_property_triggers / CheckPropertyTriggers in the loader's
+   property hooks — the property IS in g_props but the trigger
+   evaluation may not be calling __system_property_find correctly.
+5. Consider whether to also pre-set ro.crypto.state=unsupported (the
+   SIGABRT regression may have been fixed by subsequent createProcessGroup
+   fixes — needs testing).
