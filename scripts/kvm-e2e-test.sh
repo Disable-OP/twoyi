@@ -675,18 +675,24 @@ fi
 "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libgetpid_hook.so && ls -la $TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
 fi  # end of TWRP_MODE libgetpid_hook push branch
 
-# --- Push libtwoyi_loader_shlib.so (seccomp/SIGSYS virtualization + FB ioctl hook) ---
+# --- Push libtwoyi_loader_shlib.so (seccomp/SIGSYS virtualization) ---
 # This is the REAL virtualization library. Loaded via LD_PRELOAD.
 #
-# In BOTH modes (TWRP and non-TWRP), we push this library to the rootfs.
-# In non-TWRP mode, it provides seccomp/SIGSYS virtualization + binder ioctl
-# hooks + path translation for the full Android boot.
-# In TWRP mode, the statically-linked init ignores LD_PRELOAD, but the
-# dynamically-linked `recovery` service loads it via
-# LD_PRELOAD=/dev/libtwoyi_loader_shlib.so (injected via init.rc `setenv`).
-# The loader's FB ioctl hook intercepts FBIOGET_VSCREENINFO on
-# /dev/graphics/fb0 and returns valid 720x1280@32bpp screen info, fixing
-# the libminuitwrp segfault at offset 0x57d7.
+# In NON-TWRP mode only: provides seccomp/SIGSYS virtualization + binder
+# ioctl hooks + path translation for the full Android boot. The guest
+# init's bionic linker loads it via LD_PRELOAD=/dev/libtwoyi_loader_shlib.so.
+#
+# TWRP MODE: skip this push. TWRP's recovery binary is i386 (32-bit x86)
+# and its 32-bit bionic linker CANNOT load the 64-bit libtwoyi_loader_shlib.so
+# ("CANNOT LINK EXECUTABLE: ... is 64-bit instead of 32-bit"). Instead, we
+# push the i686 twrp_fb_hook.so below, which is the architecturally correct
+# 32-bit hook library for the i386 recovery. Task ID 17 incorrectly pushed
+# the x86_64 libtwoyi_loader_shlib.so in TWRP mode and set LD_PRELOAD to
+# it; the linker aborted recovery on the arch mismatch, making recovery
+# invisible in `ps` (Task ID 18 / KVM run 31536016997).
+if [ "$TWRP_MODE" = "1" ]; then
+    echo "  → TWRP mode: skipping libtwoyi_loader_shlib.so push (recovery is i386; x86_64 loader cannot be loaded by the 32-bit bionic linker)"
+else
 if [ -f "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" ]; then
     "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" "$TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1 | tail -2
     "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1
@@ -704,17 +710,42 @@ elif [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
 else
     echo "  ⚠ EXTRACT_DIR not populated — libtwoyi_loader_shlib.so not available"
 fi
+fi  # end of TWRP_MODE libtwoyi_loader_shlib push branch
 
-# twrp_fb_hook.so (the previous i686 FB ioctl hook) is no longer used.
-# The FB ioctl hook now lives in the main libtwoyi_loader_shlib.so (built
-# for x86_64), which is pushed above and loaded via LD_PRELOAD in both
-# TWRP and non-TWRP modes. The separate i686 build was needed when we
-# thought the recovery binary was 32-bit, but the recovery binary is
-# dynamically linked with interpreter /sbin/linker and can load the
-# x86_64 loader.
+# --- Push twrp_fb_hook.so (TWRP mode only — i686 FB ioctl hook) ---
+# This is the i686 (32-bit x86) LD_PRELOAD library for TWRP framebuffer
+# virtualization. TWRP's recovery binary is i386 and loads libminuitwrp.so
+# which crashes at offset 0x57d7 (NULL deref after FBIOGET_VSCREENINFO
+# returns ENOTTY on the /dev/graphics/fb0 regular-file stub).
 #
-# (The twrp_fb_hook.c source file is kept in app/cpp/twoyi_loader/src/ for
-# reference, but it's no longer built or pushed.)
+# The i686 hook intercepts FB ioctls and returns valid 720x1280@32bpp
+# screen info, fixing the segfault. The .so is placed in jniLibs/x86_64/
+# (despite being i686) so the APK packaging includes it; PackageManager
+# doesn't validate per-file ELF architecture. The KVM test extracts it
+# via `unzip` and pushes it to the device rootfs where kr64 reads it.
+#
+# Task ID 18 (KVM run 31536016997): reverted from the x86_64
+# libtwoyi_loader_shlib.so (which the i386 recovery's 32-bit bionic linker
+# cannot load) back to the i686 twrp_fb_hook.so — the architecturally
+# correct choice for the i386 recovery binary.
+if [ "$TWRP_MODE" = "1" ]; then
+    if [ -f "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" ]; then
+        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" "$TWOYI_PROFILE/twrp_fb_hook.so" 2>&1 | tail -2
+        "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/twrp_fb_hook.so" 2>&1
+        echo "  ✓ pushed twrp_fb_hook.so to rootfs"
+    else
+        # Try extracting from the APK directly.
+        APK_ABS4=$(readlink -f "$APK_PATH" 2>/dev/null || echo "$APK_PATH")
+        unzip -o "$APK_ABS4" "lib/x86_64/twrp_fb_hook.so" -d "$EXTRACT_DIR" 2>/dev/null || true
+        if [ -f "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" ]; then
+            "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" "$TWOYI_PROFILE/twrp_fb_hook.so" 2>&1 | tail -2
+            "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/twrp_fb_hook.so" 2>&1
+            echo "  ✓ pushed twrp_fb_hook.so to rootfs (extracted separately)"
+        else
+            echo "  ⚠ twrp_fb_hook.so not found in APK — TWRP framebuffer virtualization disabled (recovery will crash in libminuitwrp.so)"
+        fi
+    fi
+fi
 
 # Also create the libkr64.so symlink in the rootfs (RomManager does this
 # when the app starts, but we want it ready before the app launches).
@@ -740,12 +771,18 @@ fi
 # Set TWOYI_LD_DEBUG=0 in the CI env to disable.
 #
 # TWRP MODE: pass --boot-recovery to kr64. This:
-#   - loads libtwoyi_loader_shlib.so (x86_64) and sets
-#     LD_PRELOAD=/dev/libtwoyi_loader_shlib.so (the statically-linked
-#     init ignores LD_PRELOAD, but the dynamically-linked recovery binary
-#     loads it → FB ioctls are intercepted → no libminuitwrp crash)
+#   - loads twrp_fb_hook.so (i686) and sets
+#     LD_PRELOAD=/dev/twrp_fb_hook.so (the statically-linked
+#     init ignores LD_PRELOAD, but the dynamically-linked i386 recovery
+#     binary loads it → FB ioctls are intercepted → no libminuitwrp crash).
+#     The i686 hook is required because the 32-bit bionic linker in TWRP's
+#     i386 recovery process CANNOT load the 64-bit libtwoyi_loader_shlib.so
+#     ("CANNOT LINK EXECUTABLE: ... is 64-bit instead of 32-bit"). See
+#     Task ID 18 / KVM run 31536016997 for the regression Task ID 17 caused.
 #   - skips the x86_64 libgetpid_hook.so (init is statically linked,
 #     doesn't need PID 1 faking; recovery doesn't need it either)
+#   - skips the x86_64 libtwoyi_loader_shlib.so (recovery is i386;
+#     the 32-bit bionic linker cannot load a 64-bit library)
 #   - skips /apex bind mount (TWRP doesn't use APEX packages)
 #   - skips binderfs mount (TWRP doesn't use binder)
 #   - skips SELinux permissive watchdog (TWRP handles SELinux in init.rc)
