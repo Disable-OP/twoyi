@@ -125,6 +125,20 @@ pub extern "C" fn set_data_dir(env: JNIEnv, _clz: jclass, data_dir: jstring) {
     core::set_data_dir(dir);
 }
 
+/// JNI entry point for `Renderer.setBootRecovery(boolean)`. Stores
+/// the flag in a static `AtomicBool` that `core::init_renderer` reads
+/// when constructing the kr64 command line. When true, the next
+/// `init_renderer` call passes `--boot-recovery` to kr64.
+///
+/// Must be called BEFORE `Renderer.init()`. The flag is reset to
+/// `false` on process restart (the static is initialized to false).
+#[no_mangle]
+pub extern "C" fn set_boot_recovery(_env: JNIEnv, _clz: jclass, enabled: jni::sys::jboolean) {
+    // jboolean is 0 for false, non-zero (typically 1) for true.
+    let flag = enabled != 0;
+    core::set_boot_recovery(flag);
+}
+
 #[no_mangle]
 /// # Safety
 /// JNI entry point invoked by the JVM. `surface` must refer to a live
@@ -386,6 +400,7 @@ unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
         jni_method!(handleTouch, handle_touch, "(Landroid/view/MotionEvent;)V"),
         jni_method!(sendKeycode, send_key_code, "(I)V"),
         jni_method!(setDataDir, set_data_dir, "(Ljava/lang/String;)V"),
+        jni_method!(setBootRecovery, set_boot_recovery, "(Z)V"),
     ];
 
     let result = register_natives(&jvm, class_name, jni_methods.as_ref());

@@ -32,6 +32,18 @@ public class ProfileSettings {
     public static final String DISPLAY_DPI = "display_dpi";
     public static final String USE_NEW_RENDERER = "use_new_renderer";
     public static final String DEBUG_RENDERER = "debug_renderer";
+    /**
+     * Boot to TWRP recovery instead of full Android. When true, the
+     * next container launch will pass --boot-recovery to kr64, which
+     * skips LD_PRELOAD (TWRP init is statically linked), the /apex
+     * bind mount, the binderfs mount, and the SELinux permissive
+     * watchdog — the TWRP init.rc handles all of those itself.
+     *
+     * Stored per-profile so the user can have one profile with a
+     * full-Android rootfs and another with a TWRP rootfs, switching
+     * between them via the Profile Manager.
+     */
+    public static final String BOOT_RECOVERY = "boot_recovery";
 
     /**
      * Get SharedPreferences for the active profile
@@ -194,5 +206,26 @@ public class ProfileSettings {
      */
     public static void setDebugRenderer(Context context, boolean enabled) {
         setBoolean(context, DEBUG_RENDERER, enabled);
+    }
+
+    /**
+     * Check if Boot Recovery (TWRP) mode should be enabled for the
+     * active profile (default: false).
+     *
+     * When true, the next container launch passes --boot-recovery to
+     * kr64, which boots a TWRP recovery image instead of full Android.
+     * The user is responsible for installing a TWRP rootfs (e.g.
+     * extracted from assets/twrp/twrp-*.img via scripts/extract-twrp-ramdisk.py)
+     * into the profile's rootfs directory before enabling this.
+     */
+    public static boolean isBootRecoveryEnabled(Context context) {
+        return getBoolean(context, BOOT_RECOVERY, false);
+    }
+
+    /**
+     * Set Boot Recovery (TWRP) mode for the active profile.
+     */
+    public static void setBootRecovery(Context context, boolean enabled) {
+        setBoolean(context, BOOT_RECOVERY, enabled);
     }
 }
