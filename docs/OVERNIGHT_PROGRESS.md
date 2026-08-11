@@ -2346,3 +2346,333 @@ grep "overwrote fstab.ranchu" kr64-stderr.log
    graphics stubs (Task 6, commit f11b46f), and banned-fake-boot
    removal (Task 4, commit b069d5e) are the next things to validate.
    The greps in those progress-log entries apply directly.
+
+---
+
+## Timestamp UTC: 2026-08-11 (overnight Task ID 11)
+## Task: Replace chcon/restorecon subprocess spawns with direct lsetxattr syscall
+
+### Context
+
+KVM run 31507752891 (commit b163020, Task ID 10's LD_LIBRARY_PATH
+expansion for chcon) was triggered to verify that adding /apex paths
+to the chcon subprocess's LD_LIBRARY_PATH would let chcon find
+libbase.so / libc++.so from `/apex/com.android.runtime/lib64/` and
+stop crashing with SIGSEGV at address 0x86 (NULL soinfo in linker64).
+
+**That workaround did NOT fix the crash.** Reason: adding `/apex/...`
+to `LD_LIBRARY_PATH` does not magically make `/apex/` non-empty. After
+`pivot_root`, `/apex/com.android.runtime/lib64/` is an empty directory
+(apexd hasn't mounted the APEX packages yet — that happens later in
+the guest init second stage). So the linker still can't find libbase.so
+/ libc++.so, still gets a NULL soinfo, still SIGSEGV at 0x86.
+
+This was confirmed by the task description: the chcon approach is
+*fundamentally broken* — it spawns a guest binary that depends on
+/apex/ libraries before apexd has mounted them. No amount of
+LD_LIBRARY_PATH tweaking will fix it.
+
+### What was changed (commit 9ad0964, +248/-58 in one file)
+
+**ONLY `app/rs/kr64/src/lib.rs` was edited** (per task constraint).
+
+**1. New `set_selinux_context(path, context) -> std::io::Result<()>`**
+   (defined right before `copy_hook_library_to_dev`):
+
+   - Wraps a single `libc::lsetxattr(path, "security.selinux",
+     context, context.len_with_nul, 0)` call.
+   - Uses `lsetxattr` (NOT `setxattr`) so SYMLINKS are labeled
+     directly — important for binderfs device symlinks
+     (`/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`).
+   - The context size includes the trailing NUL (matches libselinux's
+     `setfilecon()` which passes `strlen(con)+1` to `setxattr`). We
+     achieve this by using `CString::as_bytes_with_nul()` for the
+     value buffer.
+   - Returns `Ok(())` on success, `Err(io::Error::last_os_error())`
+     on failure (carries the errno via `raw_os_error()`).
+   - Returns `Err(InvalidInput)` if path or context contains an
+     interior NUL byte (caught at `CString::new`).
+   - ZERO subprocess spawn, ZERO dependency on /apex/ libraries.
+   - This is EXACTLY what `chcon` does internally:
+     `chcon` -> `setfilecon()` -> `setxattr("security.selinux", ...)`.
+     The only difference is we skip the libselinux wrapper and call
+     the syscall directly via libc.
+
+**2. Replaced ALL THREE `Command::new("chcon")` call sites** with
+   calls to `set_selinux_context`:
+
+   - **Site #1** (hook libraries): The loop over
+     `["/dev/libgetpid_hook.so", "/dev/libtwoyi_loader_shlib.so"]`.
+     Was: chcon + restorecon fallback with `CHCON_LD_LIBRARY_PATH`
+     env. Now: single `set_selinux_context(lib_path,
+     "u:object_r:system_file:s0")` call. Success logged at info level
+     (`lsetxattr ... OK (direct syscall, no chcon subprocess)`).
+     Failure logged at warning level with errno + a note that on KVM
+     permissive it's non-fatal but on real device it indicates missing
+     CAP_MAC_ADMIN or SELinux policy.
+     - The `CHCON_LD_LIBRARY_PATH` constant was REMOVED (no longer
+       needed — no subprocess to set env on).
+     - The restorecon fallback was REMOVED (restorecon reads
+       file_contexts and applies the matching label — we already know
+       the exact label, so the fallback is unnecessary).
+
+   - **Site #2** (critical_binaries copy): After each binary is copied
+     to `/dev/twoyi-bin/<name>`. Was: chcon subprocess spawn. Now:
+     `set_selinux_context(&dst, "u:object_r:system_file:s0")`.
+     Failure logged at warning level with errno.
+
+   - **Site #3** (hw/ binaries copy): After each hw/ binary is copied
+     to `/dev/twoyi-bin/<name>`. Was: chcon subprocess spawn. Now:
+     `set_selinux_context(&dst, "u:object_r:system_file:s0")`.
+     Failure logged at warning level with errno.
+
+**3. Added 5 new unit tests** for `set_selinux_context`:
+
+   - `set_selinux_context_rejects_nul_in_path`: verifies `InvalidInput`
+     error when path contains an interior NUL byte.
+   - `set_selinux_context_rejects_nul_in_context`: verifies
+     `InvalidInput` error when context contains an interior NUL byte.
+   - `set_selinux_context_returns_err_for_nonexistent_path`: verifies
+     an `Err` with a real OS errno is returned for a path that doesn't
+     exist (errno varies: ENOENT if SELinux is enabled, ENOTSUP/ENOSYS
+     if xattrs are disabled, etc. — test only checks `raw_os_error()`
+     is `Some`).
+   - `set_selinux_context_does_not_panic_on_dev_null`: verifies no
+     panic when called on `/dev/null` (skips gracefully if /dev/null
+     is missing in a sandboxed env). Result depends on kernel SELinux
+     config — all 4 outcomes (Ok, EPERM, ENOTSUP, ENOSYS) are valid.
+   - `set_selinux_context_does_not_panic_on_temp_file`: creates a
+     temp file, calls `set_selinux_context` on it, verifies no panic.
+     Catches regressions in the CString handling and the unsafe
+     lsetxattr call signature.
+
+### Why this works on real enforcing devices
+
+The task description specified the correct analysis:
+
+1. **kr64 runs as root.** The whole virtualization approach requires
+   root for the namespace operations (`unshare(CLONE_NEWNS)`,
+   `pivot_root`, `mount`). On a non-rooted device, kr64 can't run as
+   root at all, so the entire approach requires root or a custom
+   SELinux policy.
+
+2. **Root has `CAP_MAC_ADMIN`.** This is the capability required by
+   the kernel's SELinux LSM hook (`selinux_inode_setxattr`) to allow
+   setting the `security.selinux` extended attribute. Without
+   `CAP_MAC_ADMIN`, `lsetxattr` fails with `EPERM`.
+
+3. **The kernel enforces the label change.** With `CAP_MAC_ADMIN` +
+   the appropriate SELinux policy permission (`relabelfrom` on the
+   file's current label + `relabelto` on the new label), the kernel's
+   SELinux LSM hook updates the inode's security context. The new
+   label is then enforced for all subsequent access checks.
+
+4. **The previous chcon approach had the SAME permission requirement.**
+   chcon also calls `setxattr` via libselinux's `setfilecon()`, which
+   the kernel subjects to the same `CAP_MAC_ADMIN` + policy check.
+   So if chcon worked on a real device, `lsetxattr` will too — they
+   hit the exact same kernel code path.
+
+5. **The difference is the userspace dependency.** chcon is a guest
+   binary that depends on `/apex/com.android.runtime/lib64/`
+   libraries. `lsetxattr` is a direct syscall with ZERO userspace
+   dependencies. On a real device with apexd mounted, chcon WOULD
+   work — but in the kr64 setup sequence, apexd hasn't run yet, so
+   chcon crashes. `lsetxattr` works in BOTH environments.
+
+### Build verification
+
+All 4 verification commands pass cleanly:
+
+- `cargo check` — Finished, no errors, no warnings.
+- `cargo clippy --all-targets -- -D warnings` — Finished, exit 0, NO
+  warnings. (Had to fix one `clippy::doc_lazy_continuation` in the
+  `set_selinux_context_does_not_panic_on_dev_null` test doc comment:
+  added a blank `///` line between the bullet list and the following
+  paragraph.)
+- `cargo fmt` (auto-fixed 2 long lines: the `if let Err(e) = ...`
+  block and the `eprintln!` skip-message) then `cargo fmt --check` —
+  exit 0.
+- `cargo test` — **196 passed; 0 failed; 0 ignored** (was 191, +5
+  new tests for `set_selinux_context`).
+
+### Constraint compliance
+
+- **ONLY `app/rs/kr64/src/lib.rs` was edited.** No loader changes,
+  no other kr64 files touched.
+- **No chcon/restorecon subprocess spawns remain.** Verified via
+  `rg 'Command::new\("chcon"\)|Command::new\("restorecon"\)'` —
+  zero matches.
+- **The `CHCON_LD_LIBRARY_PATH` constant was REMOVED.** Verified via
+  `rg 'CHCON_LD_LIBRARY_PATH'` — zero matches.
+- **The SELinux relabeling is NOT skipped.** All 3 call sites still
+  perform the relabel — they just do it via syscall instead of
+  subprocess. The label `u:object_r:system_file:s0` is unchanged.
+- **No crash suppression, no faked results.** The syscall failure is
+  logged at warning level with the errno and a clear message
+  distinguishing KVM-permissive (non-fatal) from real-device (fatal
+  — indicates missing CAP_MAC_ADMIN or SELinux policy).
+- **No reliance on the permissive watchdog.** The function attempts
+  the relabel unconditionally. On a real device with root +
+  CAP_MAC_ADMIN, it succeeds. On KVM permissive, it may fail with
+  EPERM but the permissive watchdog allows access anyway (the warning
+  log explicitly notes this). On a real device WITHOUT root, it
+  fails — but kr64 can't run without root anyway (pivot_root etc.).
+- **No SELinux disabling.** The kernel's SELinux enforcement is
+  untouched. We just set file labels.
+
+### Confidence assessment
+
+**WILL this fix the 10 chcon/restorecon segfaults per KVM run?
+HIGH confidence.**
+
+Reasoning:
+1. The segfaults were caused by the guest chcon binary's linker
+   crashing because /apex/com.android.runtime/lib64/ is empty (apexd
+   hasn't mounted the APEX packages yet). DIRECT cause-effect.
+2. The fix removes ALL chcon/restorecon subprocess spawns. There is
+   literally no code path that can spawn chcon anymore. The
+   `lsetxattr` syscall has zero userspace dependencies — it goes
+   straight to the kernel.
+3. The syscall MAY fail (EPERM on KVM permissive without
+   CAP_MAC_ADMIN, ENOTSUP if xattrs are disabled), but it will NOT
+   segfault. A failed syscall returns -1 with errno set; kr64 logs
+   the warning and continues. The guest's access to the relabeled
+   files will then be governed by the permissive watchdog (KVM test
+   only) or by the kernel's SELinux enforcement (real device).
+
+**WILL this fix the guest init SIGSEGV? MEDIUM confidence.**
+
+Reasoning:
+1. The 10 chcon/restorecon segfaults were NOISE — they happened
+   during the parent's setup, not during init's execution. The
+   parent reaped them and continued. So they were NOT the direct
+   cause of init's SIGSEGV.
+2. HOWEVER, the failed relabeling meant the hook libraries stayed
+   labeled as `device` (the default for /dev/ tmpfs). When vendor_init
+   (running under the guest's enforcing SELinux policy) tried to
+   `stat`/`read` `/dev/libgetpid_hook.so`, it was DENIED access to
+   `device`-labeled files. This caused:
+   `F/linker: CANNOT LINK EXECUTABLE "/system/bin/init": unable to
+   stat file for the library "/dev/libgetpid_hook.so": Permission
+   denied`
+   This was the DIRECT cause of init's SIGSEGV (the linker couldn't
+   load the LD_PRELOAD library, so init ran without hooks, hit a
+   syscall that the hooks would have emulated, and crashed).
+3. The fix DOES relabel the hook libraries to `system_file` (when
+   the syscall succeeds). On a real device, this succeeds. On KVM
+   permissive, the syscall may fail with EPERM — but in that case,
+   the permissive watchdog allows vendor_init's access to the
+   `device`-labeled file anyway. So init SHOULD be able to load the
+   hook libraries in BOTH environments.
+
+**What COULD still go wrong:**
+- If `lsetxattr` fails with EPERM on KVM AND the permissive watchdog
+  is NOT active (e.g., if the watchdog was disabled, or if the
+  vendor_init domain is in enforcing mode for this specific access),
+  init will still crash with the linker error. The diagnostic logs
+  will show `lsetxattr ... FAILED: ... (errno=1)` for EPERM.
+- Even with hooks loaded, init may hit OTHER blockers (binder IPC
+  from Task 5, graphics from Task 6, banned-fake-boot removal from
+  Task 4). This fix unblocks the SELinux relabeling layer so the
+  next blocker becomes visible.
+- The critical_binaries and hw/ binaries relabeling failures are
+  less critical — those binaries are exec'd by init's children
+  (zygote, surfaceflinger, etc.) which may run under different
+  SELinux domains. But the same logic applies: on real devices the
+  relabel succeeds, on KVM permissive the watchdog covers it.
+
+### Greps for the next sub-agent analyzing KVM run 31509809060
+
+```bash
+# SUCCESS indicator #1: lsetxattr succeeded for both hook libraries.
+# Should see 2 lines (one per library). The log says "OK (direct
+# syscall, no chcon subprocess)".
+grep -E "PARENT: lsetxattr /dev/lib.*\.so -> u:object_r:system_file:s0 OK" kr64-stderr.log
+
+# SUCCESS indicator #2: lsetxattr was ATTEMPTED (may have failed with
+# EPERM on KVM permissive, which is non-fatal). If neither this nor
+# the OK line appears, the function wasn't called — check that the
+# hook library files exist at /dev/ before the relabel step.
+grep -E "PARENT: lsetxattr /dev/lib.*\.so -> u:object_r:system_file:s0" kr64-stderr.log
+
+# REGRESSION CHECK #1: NO chcon/restorecon segfaults. The previous
+# runs had 10 segfaults per run. This line MUST NOT appear.
+grep -E "chcon|restorecon" kr64-stderr.log | grep -i "segfault\|signal\|SIGSEGV"
+
+# REGRESSION CHECK #2: NO chcon/restorecon subprocess spawns at all.
+# The previous runs had lines like "chcon: executable missing" or
+# similar. These MUST NOT appear.
+grep -E "Command::new\(.chcon|Command::new\(.restorecon" kr64-stderr.log
+
+# REGRESSION CHECK #3: init should NOT crash with the linker error
+# about /dev/libgetpid_hook.so Permission denied (that was the
+# symptom of the failed relabel in previous runs).
+grep -E "CANNOT LINK EXECUTABLE.*libgetpid_hook|unable to stat file for the library.*libgetpid_hook" kr64-stderr.log logcat.txt
+
+# REGRESSION CHECK #4: the SIGSEGV at 0x86 in linker64 (the chcon
+# crash signature) MUST NOT appear.
+grep -E "SIGSEGV.*0x86|signal 11.*0x86|libbase\.so|libc\+\+\.so.*NULL soinfo" kr64-stderr.log logcat.txt
+
+# DIAGNOSTIC: if lsetxattr failed, the errno tells us why:
+# - errno=1 (EPERM): no CAP_MAC_ADMIN (expected on KVM permissive
+#   without root capabilities — non-fatal due to permissive watchdog)
+# - errno=95 (ENOTSUP/OPNOTSUPP): xattrs not supported on this
+#   filesystem (/dev tmpfs may not support security.* xattrs)
+# - errno=38 (ENOSYS): lsetxattr syscall not implemented (very
+#   unlikely on any Linux kernel built in the last decade)
+grep -E "PARENT: lsetxattr .* FAILED: .* \(errno=[0-9]+\)" kr64-stderr.log
+
+# If the fix works, init should progress further. Check for zygote /
+# surfaceflinger / system_server startup (the next blockers per
+# Tasks ID 3/5/6).
+grep -E "starting service 'zygote'|service zygote.*started" logcat.txt
+grep -E "starting service 'surfaceflinger'|service surfaceflinger.*started" logcat.txt
+grep -E "system_server|SystemServer" logcat.txt | head -20
+
+# If init still crashes, the FIRST tombstone's abort message + the
+# last few kr64-stderr.log lines before the crash are the key clue.
+grep -E "tombstone|SIGSEGV|SIGABRT|signal [0-9]+" logcat.txt | head -20
+```
+
+### Commit + KVM run
+
+- **Commit:** 9ad0964 "fix: SELinux relabeling via direct setxattr
+  syscall (no chcon subprocess)" — pushed to origin/main
+  (b163020..9ad0964).
+- **KVM run triggered:** 31509809060 (workflow `kvm-e2e-test.yml`,
+  ref main, started 2026-08-11T15:57:08Z). Status at trigger time:
+  in_progress. Head SHA: 9ad096445c3a8b7106cc1240984252fb821e3612.
+
+### Next steps for the next sub-agent
+
+1. **Wait for KVM run 31509809060 to complete** (previous runs took
+   ~9-10 minutes; allow up to 30).
+2. **Download the artifacts** and run the greps above. The PRIMARY
+   success signal is the `PARENT: lsetxattr /dev/lib*.so -> ... OK`
+   line (2 lines, one per hook library). The SECONDARY success signal
+   is the ABSENCE of chcon/restorecon segfaults (REGRESSION CHECK #1
+   and #2).
+3. **If lsetxattr succeeded** (OK lines present) AND init progresses
+   past the hook-loading stage: this fix was necessary AND sufficient
+   for the SELinux relabeling layer. The next blocker is likely
+   binder IPC (Task 5), graphics (Task 6), or a new issue revealed
+   by init progressing further.
+4. **If lsetxattr failed** (FAILED lines with errno): check the
+   errno. EPERM (errno=1) on KVM permissive is non-fatal — the
+   permissive watchdog covers it. ENOTSUP (errno=95) means /dev
+   tmpfs doesn't support security.* xattrs — would need a different
+   approach (e.g., relabel the parent /dev/ tmpfs mount with a
+   context= mount option, or use a different filesystem).
+5. **If init STILL crashes with the linker Permission denied error**
+   (REGRESSION CHECK #3): the relabel failed AND the permissive
+   watchdog didn't cover it. This would mean the watchdog is not
+   active for vendor_init's access to /dev/libgetpid_hook.so. The
+   next fix would need to either (a) make the watchdog cover this
+   access, (b) move the hook libraries to a different location with
+   a label vendor_init can access, or (c) find another way to make
+   the relabel succeed.
+6. **If init crashes with a DIFFERENT error**: this is PROGRESS. The
+   SELinux relabeling layer is no longer the blocker. Analyze the
+   new crash point — the first tombstone's abort message is the key
+   clue.
