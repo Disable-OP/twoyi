@@ -656,3 +656,35 @@ ioctl(BINDER_SET_MAX_THREADS) -> success
 
 **Still pending:** KVM test for commit 14e3989 is running (20+ minutes,
 longer than usual). Need to verify vold survives and init progresses.
+
+### BINDER_VERSION fix WORKS — vold survives! HIDL services still crash.
+### Timestamp UTC: 2026-08-11 ~12:35
+
+**KVM run 31489388552 (commit 14e3989, cancelled at 30min):**
+
+VOLD NO LONGER CRASHES! BINDER_VERSION ioctl is now intercepted:
+```
+ioctl(fd=5, req=0xc0046209) — binder ioctl
+ioctl(BINDER_VERSION) -> faking version 8    ← INTERCEPTED!
+ioctl(fd=5, req=0x40046205) — binder ioctl
+ioctl(BINDER_SET_MAX_THREADS) -> success
+```
+
+No "Service 'vold' exited" lines in logcat — vold stays running!
+
+BUT: Other HIDL services (system_suspend, etc.) still crash with
+"Binder driver could not be opened. Terminating." These services
+use libhidlbase's ProcessState::self() which also calls
+ioctl(fd, BINDER_VERSION). Our ioctl hook should intercept these
+too (LD_PRELOAD covers all shared libraries), but the aborts persist.
+
+Init still stops at post-fs-data — likely because the HIDL service
+crash loop prevents init from progressing.
+
+**Next step:** Investigate why HIDL services' ioctl(BINDER_VERSION)
+isn't being intercepted despite LD_PRELOAD covering all shared libs.
+Possible causes:
+1. libhidlbase calls ioctl() via syscall() directly (bypassing PLT)
+2. libhidlbase uses a different BINDER_VERSION constant
+3. The ioctl hook's #ifdef __BIONIC__ doesn't match the target
+4. HIDL services are started before our constructor runs
