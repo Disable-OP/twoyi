@@ -2510,5 +2510,11 @@ static void twoyi_init(void) {
     // Since vold exits(0), pre-set this so init triggers zygote startup.
     prop_set("vold.decrypt", "trigger_restart_framework");
 
+    // Init needs ro.crypto.state to determine the boot path.
+    // "encrypted" + vold.decrypt=trigger_restart_framework → class_start core → zygote
+    // (Previous attempt with "unsupported" caused SIGABRT — "encrypted" takes a different path)
+    prop_set("ro.crypto.state", "encrypted");
+    prop_set("ro.crypto.type", "block");
+
     g_runtime_ready = 1;
 }
