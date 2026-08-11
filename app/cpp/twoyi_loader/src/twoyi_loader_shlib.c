@@ -26,7 +26,6 @@
 #include <stdarg.h>
 #include <dlfcn.h>
 #include <malloc.h>
-#include <execinfo.h> // for backtrace / backtrace_symbols
 #include <unistd.h> // for environ on some systems
 extern char **environ;
 
@@ -259,10 +258,6 @@ static void write_str(int fd, const char *s) {
 volatile int g_runtime_ready = 0;
 volatile int g_sigsys_count = 0;
 static const char *g_rootfs = NULL;
-
-// Diagnostic flag: when set (by constructor(102) in vold), the open() hook
-// logs every path it sees. Used to trace why vold exits silently with status 1.
-volatile int g_trace_opens = 0;
 
 // Mount table
 #define MAX_MOUNTS 32
@@ -1898,48 +1893,11 @@ int openat(int dirfd, const char *path, int flags, ...) {
     return real_openat(dirfd, translated, flags, mode);
 }
 
-// DIAGNOSTIC (vold silent exit): logs the return value (fd or errno) of an
-// open() call. Wraps every return path in the open() hook so we can see
-// whether each open succeeds or fails — in particular, whether the last
-// open before exit(1) (/vendor/etc/fstab.ranchu) returns a valid fd or an
-// error (ENOENT, EACCES, etc.).
-//
-// Only logs when g_trace_opens is set (vold only — see constructor(102)).
-// A __thread recursion guard prevents infinite loops in case strerror() or
-// any other library call used here internally triggers another open().
-static int trace_open_result(const char *path, int fd) {
-    if (!g_trace_opens || !path) return fd;
-    static __thread int in_trace = 0;
-    if (in_trace) return fd;
-    in_trace = 1;
-    int err = fd < 0 ? errno : 0;
-    char msg[600];
-    snprintf(msg, sizeof(msg),
-        "[twoyi_loader] TRACE open(%s) = %d (errno=%d: %s)\n",
-        path, fd, err, err ? strerror(err) : "OK");
-    write_str(2, msg);
-    in_trace = 0;
-    return fd;
-}
-
 // open PLT interposition (for code that uses open() instead of openat())
 int open(const char *path, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
-    }
-
-    // DIAGNOSTIC (vold silent exit): if tracing is enabled (only set in vold
-    // by constructor(102)), log every open() path + flags. Placed at the very
-    // top so we see all opens, even ones that fail. The matching result line
-    // (with fd/errno) is emitted by trace_open_result() at every return path
-    // below — so the entry line shows what was requested, and the result line
-    // shows whether it succeeded.
-    if (g_trace_opens && path) {
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-            "[twoyi_loader] TRACE open(%s, flags=0x%x) ...\n", path, flags);
-        write_str(2, msg);
     }
 
     init_real_funcs();
@@ -1948,7 +1906,7 @@ int open(const char *path, int flags, ...) {
     // vold (and other services) can still read the fstab.
     if (should_block_fstab(path)) {
         errno = ENOENT;
-        return trace_open_result(path, -1);
+        return -1;
     }
 
     // Debug: log all /dev/__properties__ opens
@@ -1988,25 +1946,25 @@ int open(const char *path, int flags, ...) {
         if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
             fd = twoyi_sys_open(translated, flags | O_CREAT, 0666);
         }
-        return trace_open_result(path, fd);
+        return fd;
 #else
         if (real_openat) {
             int fd = real_openat(AT_FDCWD, translated, flags, mode);
             if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
                 fd = real_openat(AT_FDCWD, translated, flags | O_CREAT, 0666);
             }
-            return trace_open_result(path, fd);
+            return fd;
         }
-        return trace_open_result(path, syscall(NR_openat, AT_FDCWD, translated, flags, mode));
+        return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
     }
 
     const char *translated = translate(path);
 #if defined(__x86_64__)
-    return trace_open_result(path, twoyi_sys_open(translated, flags, mode));
+    return twoyi_sys_open(translated, flags, mode);
 #else
-    if (real_openat) return trace_open_result(path, real_openat(AT_FDCWD, translated, flags, mode));
-    return trace_open_result(path, syscall(NR_openat, AT_FDCWD, translated, flags, mode));
+    if (real_openat) return real_openat(AT_FDCWD, translated, flags, mode);
+    return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
 }
 
@@ -2060,137 +2018,6 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     if (real_freopen) return real_freopen(path, mode, stream);
     return NULL;
 }
-
-// =========================================================================
-// DIAGNOSTIC (vold silent exit): exit() / _exit() hooks
-// vold exits with status 1 within ~89ms, producing zero log output.
-// These hooks log the exit status when g_trace_opens is set (only in vold),
-// so we can see exactly when and how vold dies. Diagnostic only — the
-// hooks still actually terminate the process.
-// =========================================================================
-
-// Symbolicate a code address via dladdr() and write a one-line summary.
-// dladdr() has been in bionic since API 9 so we can call it directly
-// (no dlsym needed). On failure, just log the raw pointer.
-static void twoyi_log_addr(const char *tag, int idx, void *addr) {
-    Dl_info info;
-    char msg[512];
-    if (addr && dladdr(addr, &info) && info.dli_fname) {
-        const char *sym = info.dli_sname ? info.dli_sname : "?";
-        unsigned long off = info.dli_saddr
-            ? (unsigned long)((char *)addr - (char *)info.dli_saddr)
-            : 0UL;
-        snprintf(msg, sizeof(msg),
-            "[twoyi_loader] %s[%d]: %p %s(%s+0x%lx) [%s]\n",
-            tag, idx, addr,
-            sym, sym, off,
-            info.dli_fname);
-    } else {
-        snprintf(msg, sizeof(msg),
-            "[twoyi_loader] %s[%d]: %p (no symbol)\n",
-            tag, idx, addr);
-    }
-    write_str(2, msg);
-}
-
-// Common backtrace routine: try libc backtrace() first (if available via
-// dlsym — only API 28+), then fall back to __builtin_return_address for
-// the first 8 frames. Always logs at least one frame so we can identify
-// the immediate caller of exit() / _exit().
-static void twoyi_dump_backtrace(const char *tag) {
-    // First try libc's backtrace() / backtrace_symbols() (API 28+).
-    static int (*backtrace_p)(void **, int) = NULL;
-    static char **(*backtrace_symbols_p)(void *const *, int) = NULL;
-    static int backtrace_checked = 0;
-    static int backtrace_available = -1;
-    if (!backtrace_checked) {
-        backtrace_p = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
-        backtrace_symbols_p = (char **(*)(void *const *, int))dlsym(RTLD_DEFAULT, "backtrace_symbols");
-        backtrace_available = (backtrace_p && backtrace_symbols_p) ? 1 : 0;
-        backtrace_checked = 1;
-        char msg[160];
-        snprintf(msg, sizeof(msg),
-            "[twoyi_loader] %s: backtrace() via dlsym = %s\n",
-            tag, backtrace_available ? "available" : "UNAVAILABLE — falling back to __builtin_return_address");
-        write_str(2, msg);
-    }
-    if (backtrace_available == 1) {
-        void *bt[32];
-        int n = backtrace_p(bt, 32);
-        char **symbols = backtrace_symbols_p(bt, n);
-        if (symbols) {
-            for (int i = 0; i < n; i++) {
-                char bt_msg[512];
-                snprintf(bt_msg, sizeof(bt_msg),
-                    "[twoyi_loader] %s[%d]: %s\n", tag, i, symbols[i]);
-                write_str(2, bt_msg);
-            }
-            free(symbols);
-        }
-        // Also symbolicate via dladdr for richer info (file + offset).
-        for (int i = 0; i < n; i++) {
-            twoyi_log_addr(tag, i, bt[i]);
-        }
-        return;
-    }
-    // Fallback: walk the caller chain via __builtin_return_address.
-    // This requires frame pointers, so deeper frames may be NULL on -O2
-    // builds with -fomit-frame-pointer. The first frame (immediate caller)
-    // is always available.
-    void *frames[8] = {NULL};
-    frames[0] = __builtin_return_address(0);
-#if defined(__x86_64__)
-    frames[1] = __builtin_return_address(1);
-    frames[2] = __builtin_return_address(2);
-    frames[3] = __builtin_return_address(3);
-    frames[4] = __builtin_return_address(4);
-    frames[5] = __builtin_return_address(5);
-    frames[6] = __builtin_return_address(6);
-    frames[7] = __builtin_return_address(7);
-#elif defined(__aarch64__)
-    frames[1] = __builtin_return_address(1);
-    frames[2] = __builtin_return_address(2);
-    frames[3] = __builtin_return_address(3);
-#endif
-    for (int i = 0; i < 8; i++) {
-        if (!frames[i]) break;
-        twoyi_log_addr(tag, i, frames[i]);
-    }
-}
-
-__attribute__((noreturn))
-void exit(int status) {
-    if (g_trace_opens) {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-            "[twoyi_loader] TRACE exit(%d) called\n", status);
-        write_str(2, msg);
-        twoyi_dump_backtrace("BACKTRACE");
-    }
-    static void (*real_exit)(int) __attribute__((noreturn)) = NULL;
-    if (!real_exit) real_exit = dlsym(RTLD_NEXT, "exit");
-    if (real_exit) real_exit(status);
-    // Fallback: should never happen (libc always provides exit), but make
-    // sure we still terminate the process rather than hanging.
-    syscall(SYS_exit_group, status);
-    while (1) { }
-}
-
-__attribute__((noreturn))
-void _exit(int status) {
-    if (g_trace_opens) {
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-            "[twoyi_loader] TRACE _exit(%d) called\n", status);
-        write_str(2, msg);
-        twoyi_dump_backtrace("BACKTRACE");
-    }
-    // _exit is a raw syscall — can't call the real one via dlsym. Just go
-    // straight to exit_group so the process actually terminates.
-    syscall(SYS_exit_group, status);
-    while (1) { }
-}
-
 
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
 int __open_2(const char *path, int flags) {
@@ -2550,6 +2377,7 @@ static void twoyi_init(void) {
             const char *blocking_services[] = {
                 "wait_for_keymaster",
                 "wait_for_gatekeeper",
+                "vold",  // vold requires real block devices / device-mapper
                 NULL
             };
 
@@ -2670,35 +2498,4 @@ static void twoyi_init(void) {
     // (we want the guest to actually boot, not fake it)
 
     g_runtime_ready = 1;
-}
-
-// =========================================================================
-// DIAGNOSTIC (vold silent exit): constructor(102)
-// Runs AFTER the main constructor(101) but BEFORE main(). Lets us detect
-// when vold's main() is about to start, and turn on open()/exit() tracing
-// so we can see exactly what vold does before it dies with status 1 within
-// ~89ms (zero log output otherwise). Diagnostic only — will be removed
-// after root cause is found.
-// =========================================================================
-__attribute__((constructor(102)))
-static void twoyi_post_init(void) {
-    // Check if we're vold by reading /proc/self/comm via raw syscalls
-    // (NR_openat works on both x86_64 and arm64; avoids recursing into
-    // our own open() PLT hook).
-    char comm[16] = {0};
-    int cfd = (int)syscall(NR_openat, AT_FDCWD, "/proc/self/comm", O_RDONLY, 0);
-    if (cfd >= 0) {
-        syscall(SYS_read, cfd, comm, sizeof(comm) - 1);
-        syscall(NR_close, cfd);
-    }
-    char *nl = strchr(comm, '\n');
-    if (nl) *nl = 0;
-
-    if (strcmp(comm, "vold") == 0) {
-        write_str(2, "[twoyi_loader] POST_INIT: vold detected - main() about to start\n");
-
-        // Turn on tracing for open() / exit() / _exit() hooks. Only set in
-        // vold so other processes aren't flooded with TRACE messages.
-        g_trace_opens = 1;
-    }
 }
