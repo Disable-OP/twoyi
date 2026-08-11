@@ -454,13 +454,10 @@ int chroot(const char *path) {
 
 // Hook mkdir — redirect rootfs paths to {rootfs}/...
 // This catches init's mkdir calls for /linkerconfig, /acct, /config, etc.
+// NOTE: init mostly uses direct syscalls that bypass these hooks; we pre-create
+// all the directories it needs in twoyi_init() instead. These hooks remain to
+// catch any libc-routed mkdir calls from other processes.
 int mkdir(const char *path, mode_t mode) {
-    // DEBUG
-    if (path) {
-        char msg[600];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s, mode=0%o) called\n", path, mode);
-        write_str(2, msg);
-    }
     // Redirect /dev/__properties__ and its subdirectories to rootfs
     if (path && g_rootfs && (
         strcmp(path, "/dev/__properties__") == 0 ||
@@ -474,11 +471,7 @@ int mkdir(const char *path, mode_t mode) {
         if (lstat(path, &st) != 0) {
             symlink(real_path, path);
         }
-        int ret = 0;
-        char msg[600];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
-        write_str(2, msg);
-        return ret;
+        return 0;
     }
     // Redirect other rootfs paths (linkerconfig, acct, config, etc.)
     // to {rootfs}/... so init can create them
@@ -486,33 +479,21 @@ int mkdir(const char *path, mode_t mode) {
         char real_path[512];
         snprintf(real_path, sizeof(real_path), "%s%s", g_rootfs, path);
         mkdir_p(real_path, mode);
-        int ret = 0;
-        char msg[600];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
-        write_str(2, msg);
-        return ret;
+        return 0;
     }
     // For other paths (host paths like /dev, /proc, /sys, /data), call real mkdir
     static int (*real_mkdir)(const char *, mode_t) = NULL;
     if (!real_mkdir) real_mkdir = dlsym(RTLD_NEXT, "mkdir");
     if (real_mkdir) {
-        int ret = real_mkdir(path, mode);
-        const char *real_path = path;
-        char msg[600];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
-        write_str(2, msg);
-        return ret;
+        return real_mkdir(path, mode);
     }
-    int ret = twoyi_sys_mkdir(path, mode);
-    const char *real_path = path;
-    char msg[600];
-    snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
-    write_str(2, msg);
-    return ret;
+    return twoyi_sys_mkdir(path, mode);
 }
 
 // Hook mkdirat — bionic may inline mkdir() as mkdirat(AT_FDCWD, ...)
-// This catches the case where mkdir's PLT hook is bypassed
+// This catches the case where mkdir's PLT hook is bypassed.
+// NOTE: init mostly uses direct syscalls that bypass these hooks; we pre-create
+// all the directories it needs in twoyi_init() instead.
 int mkdirat(int dirfd, const char *path, mode_t mode) {
     if (path && should_translate(path)) {
         char translated[512];
@@ -536,11 +517,7 @@ int mkdirat(int dirfd, const char *path, mode_t mode) {
             syscall(SYS_mkdirat, AT_FDCWD, dir, 0777);
         }
 
-        int ret = syscall(SYS_mkdirat, AT_FDCWD, translated, mode);
-        char msg[600];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdirat(%s) -> %s = %d (errno=%d)\n", path, translated, ret, ret < 0 ? errno : 0);
-        write_str(2, msg);
-        return ret;
+        return syscall(SYS_mkdirat, AT_FDCWD, translated, mode);
     }
     return syscall(SYS_mkdirat, dirfd, path, mode);
 }
@@ -2498,6 +2475,47 @@ static void twoyi_init(void) {
     // Create SELinuxFS virtual files (init needs /sys/fs/selinux/checkreqprot etc.)
     ensure_selinuxfs_files();
     write_str(2, "[twoyi_loader] selinuxfs virtual files created\n");
+
+    // Pre-create directories that init's mkdir commands create.
+    // Init uses direct syscalls for mkdir/mkdirat, bypassing our PLT hooks.
+    // We must create these directories BEFORE init's main() runs.
+    if (g_rootfs) {
+        const char *dirs[] = {
+            "acct", "acct/uid", "acct/uid_0", "acct/uid_1000",
+            "mnt/secure", "mnt/secure/asec", "mnt/secure/staging",
+            "mnt/media_rw", "mnt/user", "mnt/user/0", "mnt/user/0/self",
+            "mnt/user/0/emulated", "mnt/pass_through", "mnt/pass_through/0",
+            "mnt/expand", "mnt/appfuse", "mnt/installer", "mnt/androidwritable",
+            "mnt/runtime", "mnt/runtime/default", "mnt/runtime/read",
+            "mnt/runtime/write", "mnt/runtime/full",
+            "cache", "cache/recovery", "cache/backup_stage", "cache/backup",
+            "cache/lost+found",
+            "metadata", "metadata/password_slots", "metadata/ota",
+            "metadata/ota/snapshots", "metadata/apex", "metadata/bootstat",
+            "metadata/vold", "metadata/gsi",
+            "linkerconfig", "linkerconfig/bootstrap", "linkerconfig/default",
+            "data_mirror", "data_mirror/cur_profiles", "data_mirror/data_de",
+            "data_mirror/data_de/null", "data_mirror/data_ce",
+            "data_mirror/data_ce/null", "data_mirror/data_ce/null/0",
+            "dev/socket", "dev/block", "dev/block/by-name",
+            "config",
+            NULL
+        };
+        for (int i = 0; dirs[i]; i++) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", g_rootfs, dirs[i]);
+            // Create directory chain using direct syscalls
+            for (char *p = path + 1; *p; p++) {
+                if (*p == '/') {
+                    *p = 0;
+                    syscall(SYS_mkdirat, AT_FDCWD, path, 0777);
+                    *p = '/';
+                }
+            }
+            syscall(SYS_mkdirat, AT_FDCWD, path, 0777);
+        }
+        write_str(2, "[twoyi_loader] pre-created init directories in rootfs\n");
+    }
 
     // Eagerly create /dev/__properties__/ in the rootfs with property files
     // (init's WriteStringToFile bypasses PLT hooks, but our open/__open_2
