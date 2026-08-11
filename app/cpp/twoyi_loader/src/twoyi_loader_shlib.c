@@ -26,6 +26,7 @@
 #include <stdarg.h>
 #include <dlfcn.h>
 #include <malloc.h>
+#include <execinfo.h> // for backtrace / backtrace_symbols
 #include <unistd.h> // for environ on some systems
 extern char **environ;
 
@@ -1965,6 +1966,21 @@ void exit(int status) {
         snprintf(msg, sizeof(msg),
             "[twoyi_loader] TRACE exit(%d) called\n", status);
         write_str(2, msg);
+
+        // Print backtrace to identify which function called exit().
+        // Diagnostic only — removed once root cause is found.
+        void *bt[32];
+        int n = backtrace(bt, 32);
+        char **symbols = backtrace_symbols(bt, n);
+        if (symbols) {
+            for (int i = 0; i < n; i++) {
+                char bt_msg[512];
+                snprintf(bt_msg, sizeof(bt_msg),
+                    "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
+                write_str(2, bt_msg);
+            }
+            free(symbols);
+        }
     }
     static void (*real_exit)(int) __attribute__((noreturn)) = NULL;
     if (!real_exit) real_exit = dlsym(RTLD_NEXT, "exit");
@@ -1982,6 +1998,21 @@ void _exit(int status) {
         snprintf(msg, sizeof(msg),
             "[twoyi_loader] TRACE _exit(%d) called\n", status);
         write_str(2, msg);
+
+        // Print backtrace to identify which function called _exit().
+        // Diagnostic only — removed once root cause is found.
+        void *bt[32];
+        int n = backtrace(bt, 32);
+        char **symbols = backtrace_symbols(bt, n);
+        if (symbols) {
+            for (int i = 0; i < n; i++) {
+                char bt_msg[512];
+                snprintf(bt_msg, sizeof(bt_msg),
+                    "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
+                write_str(2, bt_msg);
+            }
+            free(symbols);
+        }
     }
     // _exit is a raw syscall — can't call the real one via dlsym. Just go
     // straight to exit_group so the process actually terminates.
