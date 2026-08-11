@@ -812,6 +812,93 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
     }
 }
 
+/// Set the SELinux security context of a file using the `lsetxattr(2)`
+/// syscall directly.
+///
+/// This is exactly what the `chcon` command does internally
+/// (`setfilecon()` -> `setxattr("security.selinux", ...)`) but without
+/// spawning any subprocess. It is the ONLY safe way to relabel files
+/// from kr64 AFTER `pivot_root`, because:
+///
+///   * The GUEST's `chcon` binary is bind-mounted from the ROM and
+///     depends on libraries from `/apex/com.android.runtime/lib64/`
+///     (libbase.so, libc++.so). After `pivot_root`, `/apex` is EMPTY
+///     (apexd hasn't mounted the APEX packages yet), so the guest's
+///     chcon crashes with SIGSEGV at address 0x86 in linker64 (NULL
+///     soinfo for the missing library). See KVM runs 31505655579 +
+///     31507752891.
+///   * The HOST's `chcon` binary is unreachable after `pivot_root`
+///     (the old root was detached via `umount2(MNT_DETACH)`).
+///
+/// `lsetxattr` (not `setxattr`) is used so that SYMLINKS are labeled
+/// directly, not their targets — important for the binderfs device
+/// symlinks (`/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`).
+///
+/// # Arguments
+///
+/// * `path`    — file path (absolute, chroot-relative after pivot_root).
+/// * `context` — SELinux context string, e.g. `"u:object_r:system_file:s0"`.
+///   Must NOT contain a NUL byte (the function returns `InvalidInput`).
+///
+/// # Permissions
+///
+/// On a real Android device with an enforcing kernel, this requires:
+///   * `CAP_MAC_ADMIN` capability (root has it by default).
+///   * SELinux policy: `relabelfrom` on the file's CURRENT label +
+///     `relabelto` on the NEW label.
+///
+/// The kr64 process runs as root (required for `pivot_root` and the
+/// other namespace ops), so it has `CAP_MAC_ADMIN`. On a real device,
+/// the operation succeeds and the new label is enforced by the kernel.
+/// On the KVM test environment (permissive mode), the operation may
+/// fail with `EPERM`/`ENOTSUP` but access is allowed anyway via the
+/// permissive watchdog — callers should log the failure but not crash.
+///
+/// # Returns
+///
+/// `Ok(())` on success. `Err(io::Error)` on failure — the caller
+/// decides whether to log+continue or propagate. The `io::Error`
+/// carries the `errno` value via `raw_os_error()`.
+fn set_selinux_context(path: &str, context: &str) -> std::io::Result<()> {
+    // Construct the C strings. The attribute name is a static literal
+    // with no NULs, so CString::new is infallible — unwrap is safe.
+    let path_c = CString::new(path).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("path contains NUL byte: {}", e),
+        )
+    })?;
+    let attr_c = CString::new("security.selinux").unwrap();
+    // libselinux's setfilecon() passes strlen(con)+1 as the size —
+    // i.e. the context string INCLUDING its trailing NUL. We match
+    // that exactly by using as_bytes_with_nul().
+    let context_c = CString::new(context).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("context contains NUL byte: {}", e),
+        )
+    })?;
+    let context_bytes_with_nul = context_c.as_bytes_with_nul();
+
+    // Safety: path_c and attr_c are valid NUL-terminated C strings.
+    // context_bytes_with_nul points to a valid byte buffer of the
+    // given length. flags=0 means no XATTR_CREATE/XATTR_REPLACE.
+    let ret = unsafe {
+        libc::lsetxattr(
+            path_c.as_ptr(),
+            attr_c.as_ptr(),
+            context_bytes_with_nul.as_ptr() as *const libc::c_void,
+            context_bytes_with_nul.len(),
+            0,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Copies a hook library into `/dev/` (tmpfs) so the guest can use it.
 ///
 /// This is a convenience wrapper around [`find_and_read_hook_library`]
@@ -1362,57 +1449,56 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //     unable to stat file for the library "/dev/libgetpid_hook.so":
     //     Permission denied
     //
-    // FIX: chcon the libraries to u:object_r:system_file:s0, which
-    // vendor_init CAN access (it needs to read system_file for its
-    // own operation). We do this BEFORE forking init, while SELinux
-    // is still permissive (setenforce 0 was called by the test script).
+    // FIX: relabel the libraries to u:object_r:system_file:s0, which
+    // vendor_init CAN access (it needs to read system_file for its own
+    // operation). We do this BEFORE forking init.
     //
-    // Note: chcon requires SELinux to be compiled in the kernel (it is
-    // on Android) and the process to have relabel permission (root has
-    // this in permissive mode).
+    // CRITICAL (KVM runs 31505655579 + 31507752891): the previous
+    // implementation spawned the GUEST's `chcon` binary as a subprocess
+    // to do the relabeling. But after pivot_root, the guest's chcon
+    // binary is bind-mounted from the ROM and depends on libraries from
+    // `/apex/com.android.runtime/lib64/` (libbase.so, libc++.so). /apex
+    // is EMPTY at this point (apexd hasn't mounted the APEX packages
+    // yet). The linker resolves the missing library to a NULL soinfo
+    // and crashes with SIGSEGV at address 0x86. This produced 10
+    // chcon/restorecon segfaults per KVM run. Task ID 10's workaround
+    // (adding /apex paths to LD_LIBRARY_PATH) did NOT fix this — the
+    // paths were set but /apex is empty, so the libraries still don't
+    // exist.
     //
-    // CRITICAL (KVM run 31505655579): chcon/restorecon subprocesses were
-    // crashing with SIGSEGV at address 0x86 in linker64 (NULL soinfo).
-    // Root cause: after pivot_root, the chcon binary is the GUEST's chcon
-    // (bind-mounted from ROM), and it needs GUEST libraries. But the
-    // subprocess inherited kr64's LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
-    // (set by the test script), which is MISSING the /apex paths. On
-    // Android 11+, many libraries (libbase.so, libc++.so, etc.) live
-    // ONLY in /apex/com.android.runtime/lib64/. Without /apex in
-    // LD_LIBRARY_PATH, the linker gets a NULL soinfo for the missing
-    // library and crashes.
+    // NEW FIX (Task ID 11): do the SELinux relabel DIRECTLY from kr64
+    // via the `lsetxattr(2)` syscall on the `security.selinux` extended
+    // attribute. This is EXACTLY what `chcon` does internally
+    // (`setfilecon()` -> `setxattr("security.selinux", ...)`) but with
+    // ZERO subprocess and ZERO dependency on /apex/ libraries.
+    // `lsetxattr` (not `setxattr`) is used so symlinks are labeled
+    // directly (not their targets) — important for the binderfs device
+    // symlinks.
     //
-    // FIX: Set LD_LIBRARY_PATH to include /apex paths (matching what
-    // init gets). Also clear LD_PRELOAD and TWOYI_ROOTFS defensively —
-    // these are HOST-side subprocesses that should NOT load the guest
-    // hooks or use the guest rootfs path.
-    const CHCON_LD_LIBRARY_PATH: &str = "/system/lib64\
-        :/system/lib64/bootstrap\
-        :/apex/com.android.runtime/lib64\
-        :/apex/com.android.runtime/lib64/bionic\
-        :/apex/com.android.runtime/lib64/bootstrap\
-        :/vendor/lib64";
+    // On a real device with an enforcing kernel: kr64 runs as root
+    // which has CAP_MAC_ADMIN, so the operation succeeds and the label
+    // change is enforced by the kernel. On the KVM test environment
+    // (permissive mode), the operation may fail with EPERM/ENOTSUP but
+    // access is allowed anyway via the permissive watchdog.
     for lib_path in &["/dev/libgetpid_hook.so", "/dev/libtwoyi_loader_shlib.so"] {
         if Path::new(lib_path).exists() {
-            let result = std::process::Command::new("chcon")
-                .args(["u:object_r:system_file:s0", lib_path])
-                .env_remove("LD_PRELOAD")
-                .env_remove("TWOYI_ROOTFS")
-                .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
-                .status();
-            match result {
-                Ok(status) if status.success() => {
-                    info!("[KR64] PARENT: chcon {} -> system_file OK", lib_path);
+            match set_selinux_context(lib_path, "u:object_r:system_file:s0") {
+                Ok(()) => {
+                    info!(
+                        "[KR64] PARENT: lsetxattr {} -> u:object_r:system_file:s0 OK (direct syscall, no chcon subprocess)",
+                        lib_path
+                    );
                 }
-                _ => {
-                    // chcon failed — try restorecon as fallback
-                    let _ = std::process::Command::new("restorecon")
-                        .args([lib_path])
-                        .env_remove("LD_PRELOAD")
-                        .env_remove("TWOYI_ROOTFS")
-                        .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
-                        .status();
-                    warning!("[KR64] PARENT: chcon {} failed, tried restorecon", lib_path);
+                Err(e) => {
+                    // Don't crash — the permissive watchdog (KVM test
+                    // only) will allow access anyway. On a real device
+                    // with root + CAP_MAC_ADMIN this should succeed.
+                    warning!(
+                        "[KR64] PARENT: lsetxattr {} -> u:object_r:system_file:s0 FAILED: {} (errno={}). On KVM permissive this is non-fatal; on real device this indicates missing CAP_MAC_ADMIN or SELinux policy.",
+                        lib_path,
+                        e,
+                        e.raw_os_error().unwrap_or(0)
+                    );
                 }
             }
         }
@@ -1507,13 +1593,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     Ok(_) => {
                         let _ =
                             std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
-                        // Try to chcon to system_file
-                        let _ = std::process::Command::new("chcon")
-                            .args(["u:object_r:system_file:s0", &dst])
-                            .env_remove("LD_PRELOAD")
-                            .env_remove("TWOYI_ROOTFS")
-                            .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
-                            .status();
+                        // Relabel to system_file via direct lsetxattr
+                        // syscall (no chcon subprocess — see the
+                        // comment on the hook-library relabel above
+                        // for why subprocesses crash after pivot_root).
+                        if let Err(e) = set_selinux_context(&dst, "u:object_r:system_file:s0") {
+                            warning!(
+                                "[KR64] PARENT: lsetxattr {} -> system_file FAILED: {} (errno={})",
+                                dst,
+                                e,
+                                e.raw_os_error().unwrap_or(0)
+                            );
+                        }
                     }
                     Err(e) => {
                         warning!("[KR64] PARENT: failed to copy {} -> {}: {}", src, dst, e);
@@ -1540,12 +1631,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     &dst,
                                     std::fs::Permissions::from_mode(0o755),
                                 );
-                                let _ = std::process::Command::new("chcon")
-                                    .args(["u:object_r:system_file:s0", &dst])
-                                    .env_remove("LD_PRELOAD")
-                                    .env_remove("TWOYI_ROOTFS")
-                                    .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
-                                    .status();
+                                if let Err(e) =
+                                    set_selinux_context(&dst, "u:object_r:system_file:s0")
+                                {
+                                    warning!(
+                                        "[KR64] PARENT: lsetxattr {} -> system_file FAILED: {} (errno={})",
+                                        dst,
+                                        e,
+                                        e.raw_os_error().unwrap_or(0)
+                                    );
+                                }
                             }
                         }
                     }
@@ -2866,5 +2961,100 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ========================================================================
+    // Tests for set_selinux_context (direct lsetxattr syscall).
+    // ========================================================================
+
+    /// `set_selinux_context` must reject a path containing a NUL byte
+    /// with `InvalidInput` — CString::new fails on interior NULs, and we
+    /// surface that as a clear io::Error rather than panicking.
+    #[test]
+    fn set_selinux_context_rejects_nul_in_path() {
+        let err = set_selinux_context("bad\0path", "u:object_r:system_file:s0")
+            .expect_err("NUL in path must error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "expected InvalidInput, got {:?}",
+            err
+        );
+    }
+
+    /// `set_selinux_context` must reject a context containing a NUL byte
+    /// with `InvalidInput` — same reason as above.
+    #[test]
+    fn set_selinux_context_rejects_nul_in_context() {
+        let err = set_selinux_context("/dev/null", "u:object_r:\0system_file:s0")
+            .expect_err("NUL in context must error");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "expected InvalidInput, got {:?}",
+            err
+        );
+    }
+
+    /// `set_selinux_context` must return `Err` (any errno) for a path
+    /// that does not exist. lsetxattr fails with ENOENT in this case
+    /// (or ENOTSUP if xattrs/SELinux are compiled out). Either way, the
+    /// function must NOT return Ok and must NOT panic.
+    #[test]
+    fn set_selinux_context_returns_err_for_nonexistent_path() {
+        let err = set_selinux_context(
+            "/nonexistent-twoyi-setfilecon-target-xyz",
+            "u:object_r:system_file:s0",
+        )
+        .expect_err("nonexistent path must error");
+        // Don't assert the specific errno — it varies by kernel config
+        // (ENOENT if the path is the failure, ENOTSUP/ENOSYS if xattrs
+        // are disabled, EPERM if SELinux denies). Just verify an errno
+        // is present (i.e. it's a real OS error, not a logic bug).
+        assert!(
+            err.raw_os_error().is_some(),
+            "expected an OS errno, got non-OS error: {:?}",
+            err
+        );
+    }
+
+    /// `set_selinux_context` must NOT panic when called on a real file
+    /// (`/dev/null`). The result depends on the kernel's SELinux/xattr
+    /// configuration:
+    ///   - SELinux enforcing + CAP_MAC_ADMIN: Ok (label changed)
+    ///   - SELinux permissive + CAP_MAC_ADMIN: Ok
+    ///   - SELinux disabled / no xattr support: Err(ENOTSUP/ENOSYS)
+    ///   - No CAP_MAC_ADMIN: Err(EPERM)
+    ///
+    /// All four are valid outcomes — the test only verifies no panic.
+    /// We use /dev/null because it always exists on a devcontainer.
+    #[test]
+    fn set_selinux_context_does_not_panic_on_dev_null() {
+        // /dev/null may not exist in some sandboxed test envs; skip
+        // gracefully rather than fail.
+        if !Path::new("/dev/null").exists() {
+            eprintln!(
+                "set_selinux_context_does_not_panic_on_dev_null: /dev/null missing, skipping"
+            );
+            return;
+        }
+        let _ = set_selinux_context("/dev/null", "u:object_r:system_file:s0");
+        // No assertion on the result — see comment above.
+    }
+
+    /// `set_selinux_context` on a freshly-created temp file must not
+    /// panic. On a real device it would succeed (root + CAP_MAC_ADMIN);
+    /// on the devcontainer it likely returns ENOTSUP/EPERM. Either way
+    /// is fine. This test catches regressions in the CString handling
+    /// and the unsafe lsetxattr call signature.
+    #[test]
+    fn set_selinux_context_does_not_panic_on_temp_file() {
+        let tmp = std::env::temp_dir().join("twoyi-setfilecon-test-file");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"x").unwrap();
+        let path_str = tmp.to_string_lossy().into_owned();
+        let _ = set_selinux_context(&path_str, "u:object_r:system_file:s0");
+        // Cleanup.
+        let _ = std::fs::remove_file(&tmp);
     }
 }
