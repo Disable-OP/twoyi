@@ -198,6 +198,14 @@ if [ -z "$APK" ]; then
 fi
 echo "  APK: $APK ($(stat -c%s "$APK") bytes)"
 
+# Clear app data BEFORE install to force a fresh rootfs extraction.
+# This is CRITICAL: previous runs may have modified the rootfs (e.g.,
+# the bionic library copy replaced /system/lib64/ symlinks with real
+# files from the host). Without pm clear, the stale rootfs persists
+# and causes version mismatch crashes (linker SIGSEGV at 0x86).
+echo "  Clearing app data (force fresh rootfs extraction)..."
+"$ADB_BIN" -s emulator-5554 shell pm clear io.twoyi 2>/dev/null || true
+
 # -r : reinstall, keeping data
 # -t : allow test packages (twoyi isn't debuggable by default, but -t
 #      lets us install over a debug-signed variant if needed)
