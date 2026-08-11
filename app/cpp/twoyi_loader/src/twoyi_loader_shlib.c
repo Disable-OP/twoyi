@@ -690,6 +690,44 @@ int __android_log_write(int prio, const char *tag, const char *text) {
     return 0;
 }
 
+// =========================================================================
+// Hook sendto — capture logd messages and mirror to stderr
+//
+// vold's LogdLogger sends messages directly to /dev/socket/logdw via
+// sendto(), bypassing our __android_log_write hooks above. This hook
+// intercepts sendto() to the logd socket and mirrors the message to
+// stderr so we can see the actual error message that causes vold to
+// exit(1).
+//
+// We still forward to the real sendto() so logd (if running) also gets
+// the message — we only add a side-channel mirror.
+// =========================================================================
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+               const struct sockaddr *dest_addr, socklen_t addrlen) {
+    static ssize_t (*real_sendto)(int, const void *, size_t, int,
+                                  const struct sockaddr *, socklen_t) = NULL;
+    if (!real_sendto) real_sendto = dlsym(RTLD_NEXT, "sendto");
+
+    // Check if this is a send to the logd socket
+    if (dest_addr && dest_addr->sa_family == AF_UNIX && buf && len > 0) {
+        struct sockaddr_un *un = (struct sockaddr_un *)dest_addr;
+        if (strstr(un->sun_path, "logdw") || strstr(un->sun_path, "logd")) {
+            // Mirror to stderr
+            static __thread int in_sendto_hook = 0;
+            if (!in_sendto_hook) {
+                in_sendto_hook = 1;
+                // Write raw payload to stderr
+                syscall(SYS_write, 2, buf, len);
+                syscall(SYS_write, 2, "\n", 1);
+                in_sendto_hook = 0;
+            }
+        }
+    }
+
+    if (real_sendto) return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+    return syscall(SYS_sendto, sockfd, buf, len, flags, dest_addr, addrlen);
+}
+
 // NOTE: abort(), raise(), kill(), sigaction(), signal() hooks were previously
 // here to suppress SIGABRT and prevent InitFatalReboot. They have been REMOVED
 // because the real fix (android_get_control_socket hook for lmkd) makes them
