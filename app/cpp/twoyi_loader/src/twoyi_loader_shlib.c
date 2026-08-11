@@ -712,18 +712,32 @@ int __android_log_write(int prio, const char *tag, const char *text) {
 // the message — we only add a side-channel mirror.
 // =========================================================================
 
-// Hook socket — intercept AF_NETLINK and replace with AF_UNIX
+// Helper: check if current process is vold (by reading /proc/self/comm)
+static int is_vold_process(void) {
+    char comm[16] = {0};
+    int fd = (int)syscall(NR_openat, AT_FDCWD, "/proc/self/comm", O_RDONLY, 0);
+    if (fd < 0) return 0;
+    long n = syscall(SYS_read, fd, comm, sizeof(comm) - 1);
+    syscall(NR_close, fd);
+    if (n <= 0) return 0;
+    char *nl = strchr(comm, '\n');
+    if (nl) *nl = 0;
+    return (strcmp(comm, "vold") == 0);
+}
+
+// Hook socket — intercept AF_NETLINK ONLY for vold, replace with AF_UNIX
+// init/ueventd also use AF_NETLINK and MUST NOT be intercepted.
 int socket(int domain, int type, int protocol) {
     static int (*real_socket)(int, int, int) = NULL;
     if (!real_socket) real_socket = dlsym(RTLD_NEXT, "socket");
     
-    if (domain == AF_NETLINK) {
-        // Replace AF_NETLINK with AF_UNIX — vold's NetlinkManager
-        // calls socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT)
-        // which fails in our container. AF_UNIX always succeeds.
+    if (domain == AF_NETLINK && is_vold_process()) {
+        // vold's NetlinkManager calls socket(AF_NETLINK, SOCK_RAW,
+        // NETLINK_KOBJECT_UEVENT) which fails in our container.
+        // Replace with AF_UNIX (always succeeds).
         char msg[256];
         snprintf(msg, sizeof(msg),
-            "[twoyi_loader] socket(AF_NETLINK, %d, %d) -> replacing with AF_UNIX\n",
+            "[twoyi_loader] socket(AF_NETLINK, %d, %d) -> replacing with AF_UNIX (vold)\n",
             type, protocol);
         write_str(2, msg);
         domain = AF_UNIX;
@@ -734,14 +748,14 @@ int socket(int domain, int type, int protocol) {
     return syscall(SYS_socket, domain, type, protocol);
 }
 
-// Hook bind — for AF_NETLINK binds, convert to AF_UNIX no-op
+// Hook bind — for AF_NETLINK binds (vold only), return success
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     static int (*real_bind)(int, const struct sockaddr *, socklen_t) = NULL;
     if (!real_bind) real_bind = dlsym(RTLD_NEXT, "bind");
     
-    // For AF_NETLINK bind, just return success (the fd is actually AF_UNIX)
-    if (addr && addr->sa_family == AF_NETLINK) {
-        write_str(2, "[twoyi_loader] bind(AF_NETLINK) -> returning success (fake)\n");
+    // For AF_NETLINK bind (vold only), just return success
+    if (addr && addr->sa_family == AF_NETLINK && is_vold_process()) {
+        write_str(2, "[twoyi_loader] bind(AF_NETLINK) -> returning success (fake, vold)\n");
         return 0;
     }
     
@@ -777,13 +791,13 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return syscall(SYS_bind, sockfd, addr, addrlen);
 }
 
-// Hook setsockopt — for AF_NETLINK options, return success
+// Hook setsockopt — for AF_NETLINK options (vold only), return success
 int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
     static int (*real_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
     if (!real_setsockopt) real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
     
     // SOL_NETLINK = 270, common optnames: NETLINK_ADD_MEMBERSHIP=1, etc.
-    if (level == 270) {  // SOL_NETLINK
+    if (level == 270 && is_vold_process()) {  // SOL_NETLINK
         char msg[256];
         snprintf(msg, sizeof(msg),
             "[twoyi_loader] setsockopt(SOL_NETLINK, %d) -> returning success (fake)\n", optname);
