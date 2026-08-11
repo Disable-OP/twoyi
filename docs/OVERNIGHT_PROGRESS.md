@@ -1710,3 +1710,292 @@ grep -E "tombstone|SIGSEGV|SIGABRT|signal [0-9]+" logcat.txt | head -20
    graphics stubs (Task ID 6, commit f11b46f) are the next things to
    validate. The greps in Task ID 5's and Task ID 6's progress-log
    entries apply directly.
+
+---
+
+## Timestamp UTC: 2026-08-11 (overnight Task ID 8)
+## Task: Fix hook library search to use APK path (rootfs symlink broken)
+
+### Context
+
+KVM run 31501768195 (commit 8375802, Task ID 7's 4-candidate fix)
+COMPLETED with CI "success" — but the guest init still crashed with
+SIGSEGV (signal 11). Root cause confirmed from `kr64-stderr.log` +
+`logcat.txt`:
+
+```
+[KR64 ERROR] [KR64] PARENT: libgetpid_hook.so not found in any of 4 candidate locations -- LD_PRELOAD will fail
+[KR64 ERROR] [KR64] PARENT:   checked: /data/data/io.twoyi/profiles/default/rootfs/libgetpid_hook.so
+[KR64 ERROR] [KR64] PARENT:   checked: /data/data/io.twoyi/profiles/default/rootfs/system/lib64/libgetpid_hook.so
+[KR64 ERROR] [KR64] PARENT:   checked: /data/user/0/io.twoyi/rootfs/system/lib64/libgetpid_hook.so
+[KR64 ERROR] [KR64] PARENT:   checked: /data/user/0/io.twoyi/rootfs/libgetpid_hook.so
+```
+
+ALL 4 candidates failed — including candidate #3, which is exactly
+where RomManager's `ensureLibSymlink` puts the library. Why?
+
+From `logcat.txt` of run 31501768195:
+```
+E/ProfileManager( 5806): Failed to migrate old rootfs
+E/ProfileManager( 5806): java.nio.file.FileAlreadyExistsException: /data/user/0/io.twoyi/profiles/default/rootfs
+E/ProfileManager( 5806): Failed to update rootfs symlink
+E/ProfileManager( 5806): java.nio.file.DirectoryNotEmptyException: /data/user/0/io.twoyi/rootfs
+```
+
+This means:
+- `/data/user/0/io.twoyi/rootfs/` is a STALE real directory (from a
+  previous install). ProfileManager wanted to make it a SYMLINK to
+  `profiles/default/rootfs` but FAILED because it's a non-empty dir.
+- RomManager creates library symlinks at
+  `/data/user/0/io.twoyi/rootfs/system/lib64/libgetpid_hook.so` (in the
+  stale rootfs) pointing to
+  `/data/app/~~<random>/io.twoyi-<random>/lib/x86_64/libgetpid_hook.so`.
+- `Path::exists()` follows the symlink and returns false when the APK
+  lib path doesn't exist (e.g., APK reinstalled with a different random
+  suffix, or `extractNativeLibs=false`).
+
+### What was changed (commit 14755ab, +284/-10 lines in one file)
+
+**ONLY `app/rs/kr64/src/lib.rs` was edited** (per task constraint).
+
+**1. New helper `apk_native_lib_candidates_in(base, lib_name) -> Vec<String>`**
+scans the APK native library directory two levels deep:
+- Each subdir of `base` is treated as a `~~<random>` bucket.
+- Within each bucket, subdirs starting with `io.twoyi-` are treated as
+  the APK root.
+- Within each APK root, checks `lib/x86_64/<lib>` and `lib/arm64/<lib>`
+  (x86_64 first because the devcontainer runner is x86_64).
+- Returns the matching paths (empty Vec on non-Android hosts where
+  `/data/app/` doesn't exist).
+- `base` is a parameter purely for testability.
+
+**2. New helper `apk_native_lib_candidates(lib_name) -> Vec<String>`**
+is a thin wrapper that calls `_in` with `/data/app` and logs each
+found candidate at info level:
+```
+[KR64 INFO] [KR64] PARENT: APK native lib scan found candidate: /data/app/~~.../io.twoyi-.../lib/x86_64/libgetpid_hook.so
+```
+If no candidates found, logs:
+```
+[KR64 INFO] [KR64] PARENT: APK native lib scan for <lib> found no candidates in /data/app/
+```
+This makes the next KVM run verifiable — we'll see EXACTLY which APK
+paths the scan tried.
+
+**3. New helper `candidate_exists_with_diagnostics(path) -> bool`**
+replaces the bare `Path::new(p).exists()` call in
+`copy_hook_library_to_dev`. It's `Path::exists()` PLUS a diagnostic
+log for the broken-symlink case:
+- If `Path::exists()` returns true, returns true.
+- If false, checks `symlink_metadata`. If the path is a symlink, calls
+  `read_link` and logs:
+  ```
+  [KR64 WARN] [KR64] PARENT:   symlink exists but target is broken: <path> -> <target>
+  ```
+- Returns false.
+This is the EXACT diagnostic for the failure mode in run 31501768195:
+RomManager created the symlink but its APK target is missing. With
+this log, the next cycle can see what `ensureLibSymlink` was pointing
+at — the difference between "RomManager didn't create the symlink at
+all" and "RomManager created the symlink but its target is gone".
+
+**4. `hook_library_candidates` now appends the APK scan results** to
+the existing 4 symlink-path candidates:
+```rust
+let mut out = vec![
+    format!("{}/{}", cfg.rootfs, lib_name),
+    format!("{}/system/lib64/{}", cfg.rootfs, lib_name),
+    format!("{}/rootfs/system/lib64/{}", cfg.data_dir, lib_name),
+    format!("{}/rootfs/{}", cfg.data_dir, lib_name),
+];
+out.extend(apk_native_lib_candidates(lib_name));
+out
+```
+The APK scan is LAST because the symlink paths are faster (single
+stat call vs directory walk). If the symlink target exists, we use
+it (the per-profile path is more "correct" semantically). If the
+symlink is broken or missing, we fall through to the APK scan, which
+finds the canonical source directly.
+
+**5. Updated the section header comment** to document the deeper issue
+(ProfileManager's broken rootfs symlink) and the new APK scan
+approach, with explicit references to KVM run 31501768195.
+
+**6. Updated `copy_hook_library_to_dev`** to use
+`candidate_exists_with_diagnostics` instead of `Path::new(p).exists()`.
+
+**7. Updated existing 2 tests** to be tolerant of the APK scan
+returning extra candidates:
+- `hook_library_candidates_includes_all_four_paths_in_order` renamed
+  to `hook_library_candidates_starts_with_four_documented_paths`.
+  Asserts `cands.len() >= 4` (was `== 4`) and verifies the first 4
+  paths are in the documented order. On Linux where `/data/app/`
+  doesn't exist, the APK scan returns 0 candidates so this is still
+  exactly 4 — but the test is now robust to running on Android.
+- `hook_library_candidates_uses_passed_lib_name` similarly relaxed
+  to `>= 4`.
+
+**8. Three new tests** (188 → 191 tests, all pass):
+- `apk_native_lib_candidates_returns_empty_when_base_missing` —
+  verifies the function returns empty Vec when the base dir doesn't
+  exist (the Linux devcontainer case).
+- `apk_native_lib_candidates_finds_lib_in_fake_apk_dir` — creates a
+  fake `/tmp/.../~~random1==/io.twoyi-random2==/lib/{x86_64,arm64}/<lib>`
+  tree PLUS a decoy non-io.twoyi package in the same bucket, and
+  verifies the function returns exactly 2 candidates (x86_64 first,
+  then arm64) and SKIPS the decoy package.
+- `candidate_exists_with_diagnostics_handles_broken_symlink` —
+  creates a broken symlink, a regular file, and a non-existent path,
+  and verifies the function returns false/true/false respectively
+  WITHOUT panicking on the `symlink_metadata` call.
+
+### Build verification
+
+All 4 verification commands pass cleanly:
+
+- `cargo check` — Finished, no errors.
+- `cargo clippy --all-targets -- -D warnings` — Finished, exit 0, NO
+  warnings. (Had to fix one E0716 "temporary value dropped while
+  borrowed" error: `apk_entry.file_name().to_str()` returns a borrow
+  into a temporary `OsString` — bound the `OsString` to a
+  `let apk_name_owned` first.)
+- `cargo fmt` (auto-fixed 2 long lines) then `cargo fmt --check` —
+  exit 0.
+- `cargo test` — **191 passed; 0 failed; 0 ignored** (was 188 before,
+  +3 new tests).
+
+### Constraint compliance
+
+- ONLY `app/rs/kr64/src/lib.rs` was edited for the code fix. No loader
+  changes, no other kr64 files touched.
+- The LD_PRELOAD destination (`/dev/libgetpid_hook.so`) is UNCHANGED.
+- The copy-to-/dev/ behavior is UNCHANGED (still required for SELinux).
+- No crash suppression, no faked results. The broken-symlink diagnostic
+  LOGS the failure (as a warning), it does NOT hide it or pretend the
+  library exists.
+- The APK scan uses only `std::fs::read_dir` — NO external crates.
+
+### Confidence assessment
+
+**WILL this fix the SIGSEGV? HIGH confidence, with one caveat.**
+
+Reasoning:
+1. The SIGSEGV root cause is confirmed: all 4 symlink-path candidates
+   failed in run 31501768195 → no LD_PRELOAD → no getpid hook → init
+   crashes. This is a DIRECT cause-effect.
+2. The new APK scan bypasses ALL rootfs symlink state — it reads the
+   APK lib dir directly. As long as the APK has `extractNativeLibs=true`
+   (which is REQUIRED for `RomManager.ensureLibSymlink` to have created
+   the symlinks we saw in logcat — the symlink target path
+   `/data/app/.../lib/x86_64/libgetpid_hook.so` only exists if libs are
+   extracted), the scan WILL find the library.
+3. The fix is ADDITIVE (checks MORE paths, not different paths) — it
+   cannot break the case where a symlink candidate already worked.
+
+**The caveat:** if `extractNativeLibs=false` (libs stay zipped inside
+the APK), the scan returns nothing. In that case the diagnostic logs
+will show:
+- The broken-symlink warning for candidate #3 (pointing into the APK
+  lib dir that doesn't exist on disk).
+- The "APK native lib scan for <lib> found no candidates in /data/app/"
+  info log.
+- The full "checked:" list with all 4 symlink paths + 0 APK paths.
+At that point the next cycle would need to extract the lib from the
+APK zip — but that requires a zip parser (out of scope, no external
+crates allowed). For now, the diagnostic will make this case clearly
+visible.
+
+**What COULD still go wrong (lower-confidence risks):**
+- If `/data/app/` is somehow unreadable from inside the kr64 process
+  (SELinux denial), `read_dir` will return an error and the scan
+  returns empty. The diagnostic logs won't show the failure (the
+  function silently returns empty on error). The next cycle would
+  need to check logcat for SELinux avc denials on `/data/app`.
+- If there are MULTIPLE io.twoyi-* APKs (e.g., debug + release both
+  installed), the scan may find the wrong one first. The order is
+  filesystem-dependent (`read_dir` order). Both should have the same
+  lib, so this is low-risk.
+- Even with hooks loaded, init may hit OTHER blockers (binder IPC from
+  Task ID 5, graphics from Task ID 6, banned-fake-boot removal from
+  Task ID 4). This fix is NECESSARY but may not be SUFFICIENT for
+  full boot.
+
+### Greps for the next sub-agent analyzing the new KVM run 31503063598
+
+```
+# SUCCESS indicator #1: APK scan found a candidate (should see 2 lines,
+# one per library).
+grep -E "APK native lib scan found candidate:" kr64-stderr.log
+
+# SUCCESS indicator #2: library was FOUND and copied via the APK path
+# (the source path will start with /data/app/).
+grep -E "PARENT: copied (libgetpid_hook|libtwoyi_loader_shlib)\.so /data/app/" kr64-stderr.log
+
+# DIAGNOSTIC: if the symlink at candidate #3 is broken (RomManager
+# created it but the target is missing), this warning will appear.
+# Confirms the rootfs-symlink-broken hypothesis from run 31501768195.
+grep -E "symlink exists but target is broken" kr64-stderr.log
+
+# DIAGNOSTIC: if the APK scan returned nothing, this info line appears.
+# Means extractNativeLibs=false OR /data/app/ is unreadable.
+grep -E "APK native lib scan for .* found no candidates" kr64-stderr.log
+
+# REGRESSION CHECK: this line MUST NOT appear in the new run.
+# If it does, even the APK scan failed -- check the diagnostic logs above.
+grep "libgetpid_hook.so NOT found at /dev/" kr64-stderr.log
+
+# REGRESSION CHECK: this line MUST NOT appear (or must appear with a
+# DIFFERENT signal/message, indicating a different blocker further on).
+grep "guest killed by signal 11" kr64-stderr.log
+
+# If the fix works, init should progress further. Check for zygote /
+# surfaceflinger / system_server startup (the next blockers per
+# Tasks ID 3/5/6 analysis).
+grep -E "starting service 'zygote'|service zygote.*started" logcat.txt
+grep -E "starting service 'surfaceflinger'|service surfaceflinger.*started" logcat.txt
+grep -E "system_server|SystemServer" logcat.txt | head -20
+
+# If init still crashes, the FIRST tombstone's abort message + the
+# last few kr64-stderr.log lines before the crash are the key clue.
+grep -E "tombstone|SIGSEGV|SIGABRT|signal [0-9]+" logcat.txt | head -20
+```
+
+### Commit + KVM run
+
+- **Commit:** 14755ab "fix: search APK native lib dir for hook libraries
+  (rootfs symlink broken)" — pushed to origin/main (09d283c..14755ab).
+- **KVM run triggered:** 31503063598 (workflow `kvm-e2e-test.yml`,
+  ref main, started 2026-08-11T14:43:02Z). Status at trigger time:
+  in_progress.
+
+### Next steps for the next sub-agent
+
+1. **Wait for KVM run 31503063598 to complete** (previous runs took
+   ~9-10 minutes; allow up to 30).
+2. **Download the artifacts** and run the greps above. The PRIMARY
+   success signal is the `APK native lib scan found candidate:` line
+   followed by `copied libgetpid_hook.so /data/app/...` — that
+   confirms the APK scan found the library and the copy to /dev/
+   succeeded.
+3. **If both libraries were copied** but init STILL crashes: this fix
+   was necessary but not sufficient. The crash will now be at a LATER
+   point (zygote / surfaceflinger / system_server / binder IPC — per
+   Tasks ID 3/5/6). Analyze the new crash point. The first tombstone's
+   abort message is the key clue.
+4. **If the APK scan returned nothing** (`found no candidates` line
+   appears): `extractNativeLibs=false` OR `/data/app/` is unreadable.
+   Check logcat for SELinux avc denials on `/data/app`. If
+   `extractNativeLibs=false`, the next fix would need to extract the
+   lib from the APK zip (out of scope for this task — no external
+   crates).
+5. **If the broken-symlink warning appears** for candidate #3: this
+   confirms the rootfs-symlink-broken hypothesis. The APK scan should
+   STILL find the library (the lib exists at the canonical APK path
+   even if the symlink target is stale). If the APK scan also fails,
+   the lib truly doesn't exist on disk — RomManager's
+   `ensureLibSymlink` is creating symlinks to non-existent paths.
+6. **If init now boots further** (reaches zygote, surfaceflinger, or
+   system_server): the binder IPC fix (Task ID 5, commit bca0e7b) and
+   graphics stubs (Task ID 6, commit f11b46f) are the next things to
+   validate. The greps in Task ID 5's and Task ID 6's progress-log
+   entries apply directly.
