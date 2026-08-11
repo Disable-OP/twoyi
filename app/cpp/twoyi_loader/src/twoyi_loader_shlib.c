@@ -691,7 +691,16 @@ int __android_log_write(int prio, const char *tag, const char *text) {
 }
 
 // =========================================================================
-// Hook sendto — capture logd messages and mirror to stderr
+// Hook socket — intercept AF_NETLINK to prevent vold's NetlinkManager
+// from failing. vold's NetlinkManager::start() calls
+// socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT) to monitor
+// kernel uevents. In our container, netlink sockets may fail (EPERM
+// or ENOPROTOOPT), causing vold to exit(1).
+// Fix: replace AF_NETLINK with AF_UNIX (always succeeds), giving vold
+// a valid fd that won't fail on bind/setsockopt. vold won't receive
+// real uevents (there are no real block devices), but it won't crash.
+//
+// Also hook sendto — capture logd messages and mirror to stderr
 //
 // vold's LogdLogger sends messages directly to /dev/socket/logdw via
 // sendto(), bypassing our __android_log_write hooks above. This hook
@@ -702,6 +711,90 @@ int __android_log_write(int prio, const char *tag, const char *text) {
 // We still forward to the real sendto() so logd (if running) also gets
 // the message — we only add a side-channel mirror.
 // =========================================================================
+
+// Hook socket — intercept AF_NETLINK and replace with AF_UNIX
+int socket(int domain, int type, int protocol) {
+    static int (*real_socket)(int, int, int) = NULL;
+    if (!real_socket) real_socket = dlsym(RTLD_NEXT, "socket");
+    
+    if (domain == AF_NETLINK) {
+        // Replace AF_NETLINK with AF_UNIX — vold's NetlinkManager
+        // calls socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT)
+        // which fails in our container. AF_UNIX always succeeds.
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] socket(AF_NETLINK, %d, %d) -> replacing with AF_UNIX\n",
+            type, protocol);
+        write_str(2, msg);
+        domain = AF_UNIX;
+        type = SOCK_DGRAM;
+    }
+    
+    if (real_socket) return real_socket(domain, type, protocol);
+    return syscall(SYS_socket, domain, type, protocol);
+}
+
+// Hook bind — for AF_NETLINK binds, convert to AF_UNIX no-op
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    static int (*real_bind)(int, const struct sockaddr *, socklen_t) = NULL;
+    if (!real_bind) real_bind = dlsym(RTLD_NEXT, "bind");
+    
+    // For AF_NETLINK bind, just return success (the fd is actually AF_UNIX)
+    if (addr && addr->sa_family == AF_NETLINK) {
+        write_str(2, "[twoyi_loader] bind(AF_NETLINK) -> returning success (fake)\n");
+        return 0;
+    }
+    
+    // Normal bind path (with AF_UNIX translation for rootfs sockets)
+    if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
+        struct sockaddr_un *un = (struct sockaddr_un *)addr;
+        if (un->sun_path[0] == '/' && should_translate(un->sun_path)) {
+            char translated[600];
+            snprintf(translated, sizeof(translated), "%s%s", g_rootfs, un->sun_path);
+            char dir[600];
+            strncpy(dir, translated, sizeof(dir) - 1);
+            dir[sizeof(dir) - 1] = 0;
+            char *slash = strrchr(dir, '/');
+            if (slash) {
+                *slash = 0;
+                for (char *p = dir + 1; *p; p++) {
+                    if (*p == '/') { *p = 0; syscall(SYS_mkdirat, AT_FDCWD, dir, 0777); *p = '/'; }
+                }
+                syscall(SYS_mkdirat, AT_FDCWD, dir, 0777);
+            }
+            struct sockaddr_un new_addr;
+            memset(&new_addr, 0, sizeof(new_addr));
+            new_addr.sun_family = AF_UNIX;
+            strncpy(new_addr.sun_path, translated, sizeof(new_addr.sun_path) - 1);
+            char msg[256];
+            snprintf(msg, sizeof(msg), "[twoyi_loader] bind: translated %s -> %s\n", un->sun_path, translated);
+            write_str(2, msg);
+            if (real_bind) return real_bind(sockfd, (const struct sockaddr *)&new_addr, sizeof(new_addr));
+            return syscall(SYS_bind, sockfd, &new_addr, sizeof(new_addr));
+        }
+    }
+    if (real_bind) return real_bind(sockfd, addr, addrlen);
+    return syscall(SYS_bind, sockfd, addr, addrlen);
+}
+
+// Hook setsockopt — for AF_NETLINK options, return success
+int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+    static int (*real_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
+    if (!real_setsockopt) real_setsockopt = dlsym(RTLD_NEXT, "setsockopt");
+    
+    // SOL_NETLINK = 270, common optnames: NETLINK_ADD_MEMBERSHIP=1, etc.
+    if (level == 270) {  // SOL_NETLINK
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] setsockopt(SOL_NETLINK, %d) -> returning success (fake)\n", optname);
+        write_str(2, msg);
+        return 0;
+    }
+    
+    if (real_setsockopt) return real_setsockopt(sockfd, level, optname, optval, optlen);
+    return syscall(SYS_setsockopt, sockfd, level, optname, optval, optlen);
+}
+
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                const struct sockaddr *dest_addr, socklen_t addrlen) {
     static ssize_t (*real_sendto)(int, const void *, size_t, int,
@@ -766,59 +859,6 @@ int unlinkat(int dirfd, const char *path, int flags) {
     if (!real_unlinkat) real_unlinkat = dlsym(RTLD_NEXT, "unlinkat");
     if (real_unlinkat) return real_unlinkat(dirfd, path, flags);
     return syscall(SYS_unlinkat, dirfd, path, flags);
-}
-
-// Hook bind — redirect AF_UNIX socket paths to rootfs.
-// init creates sockets at /dev/socket/property_service, /dev/socket/..., etc.
-// Without this hook, these sockets would be created on the HOST, conflicting
-// with host services. We translate the socket path to {rootfs}/dev/socket/...
-int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    static int (*real_bind)(int, const struct sockaddr *, socklen_t) = NULL;
-    if (!real_bind) real_bind = dlsym(RTLD_NEXT, "bind");
-
-    if (addr && addr->sa_family == AF_UNIX && g_rootfs) {
-        struct sockaddr_un *un = (struct sockaddr_un *)addr;
-        if (un->sun_path[0] == '/' && should_translate(un->sun_path)) {
-            // Build translated path
-            char translated[600];
-            snprintf(translated, sizeof(translated), "%s%s", g_rootfs, un->sun_path);
-
-            // Ensure parent directory exists using DIRECT SYSCALLS
-            // (bypass our mkdir hook to avoid recursion/translation issues)
-            char dir[600];
-            strncpy(dir, translated, sizeof(dir) - 1);
-            dir[sizeof(dir) - 1] = 0;
-            char *slash = strrchr(dir, '/');
-            if (slash) {
-                *slash = 0;
-                // Create directory chain using direct syscalls
-                for (char *p = dir + 1; *p; p++) {
-                    if (*p == '/') {
-                        *p = 0;
-                        twoyi_sys_mkdir(dir, 0777);
-                        *p = '/';
-                    }
-                }
-                twoyi_sys_mkdir(dir, 0777);
-            }
-
-            // Create a copy of the sockaddr with the translated path
-            struct sockaddr_un new_addr;
-            memset(&new_addr, 0, sizeof(new_addr));
-            new_addr.sun_family = AF_UNIX;
-            strncpy(new_addr.sun_path, translated, sizeof(new_addr.sun_path) - 1);
-
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                "[twoyi_loader] bind: translated %s -> %s\n", un->sun_path, translated);
-            write_str(2, msg);
-
-            if (real_bind) return real_bind(sockfd, (const struct sockaddr *)&new_addr, sizeof(new_addr));
-            return syscall(SYS_bind, sockfd, &new_addr, sizeof(new_addr));
-        }
-    }
-    if (real_bind) return real_bind(sockfd, addr, addrlen);
-    return syscall(SYS_bind, sockfd, addr, addrlen);
 }
 
 // Hook connect — redirect AF_UNIX socket paths to rootfs (matches bind)
