@@ -922,6 +922,54 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
     }
 }
 
+/// Patch TWRP's init.rc to add `setenv LD_PRELOAD /dev/twrp_fb_hook.so`
+/// to the recovery service definition.
+///
+/// TWRP's init.rc defines the recovery service as:
+/// ```text
+/// service recovery /sbin/recovery
+/// ```
+/// (possibly with indented options like `seclabel`). We insert
+/// `    setenv LD_PRELOAD /dev/twrp_fb_hook.so` as a new indented option
+/// right after the `service recovery` line.
+///
+/// Returns the patched content, or `None` if the `service recovery` line
+/// was not found. The patch is IDEMPOTENT: if the setenv line is already
+/// present, the caller should skip the write (checked before calling).
+fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
+    // Find the "service recovery" line. It may be "service recovery /sbin/recovery"
+    // or "service recovery /sbin/recovery\r" (CRLF). We match the prefix
+    // "service recovery " at the start of a line.
+    let mut lines = content.lines().peekable();
+    let mut result = String::with_capacity(content.len() + 64);
+    let mut found = false;
+    while let Some(line) = lines.next() {
+        result.push_str(line);
+        // Check if this line starts the recovery service definition.
+        // We check the trimmed start to handle leading whitespace (shouldn't
+        // happen for service definitions, but be defensive).
+        let trimmed = line.trim_start();
+        if !found && trimmed.starts_with("service recovery ") {
+            // This is the recovery service line. Insert the setenv directive
+            // as the next line (indented with 4 spaces, matching init.rc
+            // convention for service options).
+            result.push('\n');
+            result.push_str("    setenv LD_PRELOAD /dev/twrp_fb_hook.so");
+            found = true;
+        }
+        // Preserve the original line ending (lines() strips \n, so we add
+        // it back). For the last line (no trailing \n), we don't add one.
+        if lines.peek().is_some() {
+            result.push('\n');
+        }
+    }
+    if found {
+        Some(result)
+    } else {
+        None
+    }
+}
+
 /// Set the SELinux security context of a file using the `lsetxattr(2)`
 /// syscall directly.
 ///
@@ -2081,6 +2129,60 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 "[KR64] PARENT: failed to create TWRP framebuffer: {} (recovery will crash in libminuitwrp.so)",
                 e
             );
+        }
+    }
+
+    // TWRP BOOT: patch {rootfs}/init.rc to add `setenv LD_PRELOAD
+    // /dev/twrp_fb_hook.so` to the recovery service definition.
+    //
+    // ROOT CAUSE (KVM run 31533796663): kr64 sets LD_PRELOAD in init's
+    // environment, but TWRP's init (based on AOSP's init) builds a FRESH
+    // environment for each service from the service's `setenv` directives
+    // plus a few inherited vars (ANDROID_ROOT, ANDROID_DATA, etc.).
+    // LD_PRELOAD is NOT in the inherited list, so recovery's bionic linker
+    // never sees it → our twrp_fb_hook.so is never loaded → recovery
+    // crashes at offset 0x57d7 in libminuitwrp.so (same as without the
+    // hook). Confirmed: no "[twrp_fb_hook] loaded" message in any log,
+    // and the segfault is at the exact same offset.
+    //
+    // FIX: patch init.rc to add `setenv LD_PRELOAD /dev/twrp_fb_hook.so`
+    // to the recovery service. TWRP's init supports `setenv` in service
+    // blocks (confirmed via `strings /tmp/twrp/rd/init | grep setenv`).
+    // This adds LD_PRELOAD to recovery's environment, so the bionic linker
+    // loads our hook → FB ioctls are intercepted → no crash.
+    //
+    // The patch is IDEMPOTENT: if the setenv line is already present
+    // (e.g., from a previous boot), we skip the write.
+    if cfg.boot_recovery {
+        let init_rc_path = format!("{}/init.rc", rootfs_prefix);
+        match std::fs::read_to_string(&init_rc_path) {
+            Ok(content) => {
+                // Check if the patch is already applied.
+                let patch_marker = "    setenv LD_PRELOAD /dev/twrp_fb_hook.so";
+                if content.contains(patch_marker) {
+                    info!(
+                        "[KR64] PARENT: init.rc already patched with LD_PRELOAD for recovery service (idempotent skip)"
+                    );
+                } else if let Some(patched) = patch_twrp_init_rc_recovery_service(&content) {
+                    match std::fs::write(&init_rc_path, &patched) {
+                        Ok(()) => info!(
+                            "[KR64] PARENT: patched init.rc — added 'setenv LD_PRELOAD /dev/twrp_fb_hook.so' to recovery service"
+                        ),
+                        Err(e) => warning!(
+                            "[KR64] PARENT: failed to write patched init.rc: {} (recovery will crash in libminuitwrp.so)",
+                            e
+                        ),
+                    }
+                } else {
+                    warning!(
+                        "[KR64] PARENT: could not find 'service recovery' in init.rc — LD_PRELOAD patch skipped (recovery will crash in libminuitwrp.so)"
+                    );
+                }
+            }
+            Err(e) => warning!(
+                "[KR64] PARENT: failed to read init.rc for LD_PRELOAD patching: {} (recovery will crash in libminuitwrp.so)",
+                e
+            ),
         }
     }
 
@@ -3628,5 +3730,72 @@ mod tests {
         let _ = set_selinux_context(&path_str, "u:object_r:system_file:s0");
         // Cleanup.
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// `patch_twrp_init_rc_recovery_service` must insert the setenv line
+    /// right after the `service recovery` line.
+    #[test]
+    fn patch_twrp_init_rc_inserts_setenv_after_service_recovery() {
+        let input = "service ueventd /sbin/ueventd\n\
+                     critical\n\
+                     \n\
+                     service recovery /sbin/recovery\n\
+                     \n\
+                     service adbd /sbin/adbd recovery\n\
+                     disabled\n";
+        let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
+        assert!(
+            patched.contains(
+                "service recovery /sbin/recovery\n    setenv LD_PRELOAD /dev/twrp_fb_hook.so"
+            ),
+            "setenv line should be inserted right after service recovery line. Patched:\n{}",
+            patched
+        );
+        // Other services should be untouched.
+        assert!(patched.contains("service ueventd /sbin/ueventd\n"));
+        assert!(patched.contains("service adbd /sbin/adbd recovery\n"));
+    }
+
+    /// `patch_twrp_init_rc_recovery_service` must return None if the
+    /// `service recovery` line is not found.
+    #[test]
+    fn patch_twrp_init_rc_returns_none_if_no_recovery_service() {
+        let input = "service ueventd /sbin/ueventd\ncritical\n";
+        assert!(patch_twrp_init_rc_recovery_service(input).is_none());
+    }
+
+    /// `patch_twrp_init_rc_recovery_service` must handle the case where
+    /// recovery has existing options (like seclabel) — the setenv line
+    /// is inserted BEFORE the existing options.
+    #[test]
+    fn patch_twrp_init_rc_inserts_before_existing_options() {
+        let input = "service recovery /sbin/recovery\n    seclabel u:r:recovery:s0\n";
+        let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
+        assert!(
+            patched.contains("service recovery /sbin/recovery\n    setenv LD_PRELOAD /dev/twrp_fb_hook.so\n    seclabel u:r:recovery:s0"),
+            "setenv should be inserted before seclabel. Patched:\n{}",
+            patched
+        );
+    }
+
+    /// `patch_twrp_init_rc_recovery_service` must not duplicate the
+    /// setenv line if the service is already patched (the caller checks
+    /// for the patch marker, but the function itself should also not
+    /// insert twice for the same service line).
+    #[test]
+    fn patch_twrp_init_rc_only_patches_first_recovery_service() {
+        // If init.rc has TWO recovery service definitions (shouldn't happen,
+        // but be defensive), only the first should be patched.
+        let input = "service recovery /sbin/recovery\n\
+                     \n\
+                     service recovery /sbin/recovery2\n";
+        let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
+        let count = patched
+            .matches("setenv LD_PRELOAD /dev/twrp_fb_hook.so")
+            .count();
+        assert_eq!(
+            count, 1,
+            "only the first recovery service should be patched"
+        );
     }
 }
