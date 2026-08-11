@@ -56,6 +56,7 @@ use std::path::Path;
 
 // Crate-local logging macros (defined in lib.rs) — no external `log` crate.
 use crate::info;
+use crate::warning;
 
 /// Synthesise the MVP `/proc` tree at `{rootfs}/proc`.
 ///
@@ -101,6 +102,24 @@ pub fn populate_proc(rootfs: &str, cpu_count: u32, mem_mb: u64) -> std::io::Resu
         // to defaults. Log so the operator knows why the props are absent.
         info!(
             "[KR64][proc_emu] warning: failed to write ro.vm.* props: {}",
+            e
+        );
+    }
+
+    // Boot-critical preset properties — appended to /system/build.prop so
+    // init's PropertyLoadBootDefaults() actually loads them. The key
+    // property is apexd.status=activated, which unblocks the
+    // `wait_for_prop apexd.status activated` at init.rc:763. Without
+    // this, init busy-loops forever on that wait (because the loader's
+    // __system_property_wait_any hook returns immediately, so a missing
+    // property = infinite spin) and never reaches the zygote-start
+    // trigger. See `write_boot_preset_properties` above for full details.
+    if let Err(e) = write_boot_preset_properties(rootfs) {
+        // Non-fatal in the sense that kr64 can still fork init, but init
+        // will almost certainly busy-loop at wait_for_prop. Log loudly.
+        warning!(
+            "[KR64][proc_emu] warning: failed to write boot preset properties: {} -- \
+             init will likely stall at wait_for_prop apexd.status activated",
             e
         );
     }
@@ -606,6 +625,119 @@ pub fn write_proc_vm_properties(rootfs: &str, cpu_count: u32, mem_mb: u64) -> st
     Ok(())
 }
 
+/// Write boot-critical preset properties to `{rootfs}/system/build.prop`.
+///
+/// `PropertyLoadBootDefaults()` in `system/core/init/property_service.cpp`
+/// loads a FIXED list of .prop files (it does NOT scan `/system/etc/`
+/// generically — only `/system/etc/prop.default`, `/system/build.prop`,
+/// `/vendor/build.prop`, `/product/build.prop`, etc.). The previously-used
+/// `/system/etc/ro.vm.prop` is therefore NOT loaded by init's property
+/// service; only `ro.vm.*` consumers that read the file directly (none in
+/// AOSP 11) would see those values. To inject properties that init's
+/// property service actually loads, we must append to one of the files in
+/// `PropertyLoadBootDefaults`'s fixed list. `/system/build.prop` is the
+/// safest target: it always exists in a standard Android rootfs and is
+/// always loaded unconditionally.
+///
+/// # Properties injected
+///
+/// | Property             | Value        | Why                                                          |
+/// |----------------------|--------------|--------------------------------------------------------------|
+/// | `apexd.status`       | `activated`  | Unblocks `wait_for_prop apexd.status activated` at           |
+/// |                      |              | init.rc:763. apexd exits 0 immediately in our container      |
+/// |                      |              | ("This device does not support updatable APEX. Exiting")     |
+/// |                      |              | and sets `apexd.status=activated` in its OWN per-process     |
+/// |                      |              | property table (the loader's in-memory `g_props` is          |
+/// |                      |              | per-process, not shared). Init's `wait_for_prop` busy-loops  |
+/// |                      |              | forever because the loader's `__system_property_wait_any`    |
+/// |                      |              | hook returns immediately, so a missing property = infinite   |
+/// |                      |              | spin. Pre-setting it in init's table (via this .prop file)   |
+/// |                      |              | lets `__system_property_find("apexd.status")` succeed and    |
+/// |                      |              | `wait_for_prop` return immediately.                          |
+///
+/// # Why not also set `ro.crypto.state`?
+///
+/// The `on zygote-start && property:ro.crypto.state=unsupported` action
+/// (init.rc:832) is what directly calls `start zygote`. However, previous
+/// attempts to pre-set `ro.crypto.state` caused an SIGABRT regression
+/// (see OVERNIGHT_PROGRESS.md ~04:15 and ~06:40 on 2026-08-11). The
+/// SIGABRT is believed to be a downstream effect of `createProcessGroup`
+/// failing for critical services started by the zygote-start action, not
+/// a direct result of the property itself. Rather than re-trigger that
+/// crash, we leave `ro.crypto.state` unset and rely on the loader's
+/// existing pre-set of `vold.decrypt=trigger_restart_framework` (which
+/// fires `class_start main` → starts zygote via a different path).
+///
+/// # Why append (not overwrite)?
+///
+/// `/system/build.prop` already contains `ro.build.*` and other standard
+/// properties that the guest's framework expects. Overwriting would break
+/// those. Appending is safe: `LoadProperties` in property_service.cpp
+/// stores later entries in a `std::map` keyed by property name, and
+/// `PropertySet` honours "last write wins" for non-`ro.` properties.
+/// `apexd.status` is not `ro.`, so our appended value is the one that
+/// sticks.
+pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
+    let build_prop_path = format!("{}/system/build.prop", rootfs);
+
+    // Read the existing /system/build.prop (if it exists) so we can append
+    // rather than overwrite. If it doesn't exist (unlikely for a standard
+    // Android rootfs, but possible for minimal test rootfs), create it.
+    let existing = fs::read_to_string(&build_prop_path).unwrap_or_default();
+
+    // Only append if the property isn't already present (idempotency: a
+    // previous kr64 run may have already appended it). We check for the
+    // exact line `apexd.status=activated` to avoid duplicate entries.
+    let marker = "apexd.status=activated";
+    if existing.contains(marker) {
+        info!("[KR64][proc_emu] build.prop already contains apexd.status=activated — skip append");
+        return Ok(());
+    }
+
+    // Make the file writable (it may be 0444 from a previous run or from
+    // the rootfs extraction). Ignore errors — if we can't chmod, the
+    // append below will fail with a clearer error.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&build_prop_path, fs::Permissions::from_mode(0o644));
+    }
+
+    // Build the append block. The leading newline ensures we don't
+    // concatenate with the last line of the existing file. No `format!`
+    // needed — there are no interpolation placeholders.
+    let append_block = "\n\
+         # --- twoyi kr64 boot preset properties ---\n\
+         # Appended by kr64's write_boot_preset_properties() to unblock\n\
+         # init's wait_for_prop apexd.status activated (init.rc:763).\n\
+         # apexd exits 0 immediately in our container and sets this prop\n\
+         # only in its own per-process table; init never sees it.\n\
+         apexd.status=activated\n";
+
+    // Open in append mode (creates the file if it doesn't exist).
+    // `std::io::Write` is already imported at the top of this file.
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&build_prop_path)?;
+    f.write_all(append_block.as_bytes())?;
+
+    // Restore 0644 (writable by owner, readable by all — standard for
+    // build.prop so init's property service can read it).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&build_prop_path, fs::Permissions::from_mode(0o644));
+    }
+
+    info!(
+        "[KR64][proc_emu] appended apexd.status=activated to {} ({} bytes appended)",
+        build_prop_path,
+        append_block.len()
+    );
+    Ok(())
+}
+
 /// Internal helper: write `content` to `{dir}/{name}` with mode 0444
 /// (read-only — these are kernel-synthesised files).
 fn write_file(dir: &str, name: &str, content: &str) -> std::io::Result<()> {
@@ -838,6 +970,92 @@ mod tests {
                 mode
             );
         }
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `write_boot_preset_properties` must append
+    /// `apexd.status=activated` to `{rootfs}/system/build.prop`. Without
+    /// this, init's `wait_for_prop apexd.status activated` (init.rc:763)
+    /// busy-loops forever because the loader's
+    /// `__system_property_wait_any` hook returns immediately, so a
+    /// missing property = infinite spin.
+    #[test]
+    fn write_boot_preset_properties_appends_apexd_status() {
+        let rootfs = tmpdir();
+
+        // Pre-create /system/build.prop with some existing content to
+        // verify we APPEND (not overwrite).
+        let build_prop = format!("{}/system/build.prop", rootfs);
+        std::fs::create_dir_all(format!("{}/system", rootfs)).unwrap();
+        std::fs::write(&build_prop, "# existing build.prop\nro.build.id=TEST\n").unwrap();
+
+        write_boot_preset_properties(&rootfs).expect("write_boot_preset_properties");
+
+        let content = std::fs::read_to_string(&build_prop).unwrap();
+        // Existing content preserved
+        assert!(
+            content.contains("ro.build.id=TEST"),
+            "existing build.prop content should be preserved: {}",
+            content
+        );
+        // New content appended
+        assert!(
+            content.contains("apexd.status=activated"),
+            "apexd.status=activated should be appended: {}",
+            content
+        );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `write_boot_preset_properties` is idempotent —
+    /// calling it twice on the same rootfs must NOT append the
+    /// `apexd.status=activated` line a second time (which would be
+    /// harmless but messy).
+    #[test]
+    fn write_boot_preset_properties_is_idempotent() {
+        let rootfs = tmpdir();
+        let build_prop = format!("{}/system/build.prop", rootfs);
+        std::fs::create_dir_all(format!("{}/system", rootfs)).unwrap();
+        std::fs::write(&build_prop, "# existing\n").unwrap();
+
+        write_boot_preset_properties(&rootfs).expect("first call");
+        write_boot_preset_properties(&rootfs).expect("second call");
+
+        let content = std::fs::read_to_string(&build_prop).unwrap();
+        // Exactly one occurrence of "apexd.status=activated"
+        let count = content.matches("apexd.status=activated").count();
+        assert_eq!(
+            count, 1,
+            "apexd.status=activated should appear exactly once (got {}): {}",
+            count, content
+        );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `populate_proc` must also invoke
+    /// `write_boot_preset_properties`, so that the apexd.status preset
+    /// is applied whenever the /proc tree is populated (the canonical
+    /// kr64 setup path).
+    #[test]
+    fn populate_proc_also_writes_boot_preset_properties() {
+        let rootfs = tmpdir();
+        // Pre-create /system/build.prop so the append has a file to
+        // append to (populate_proc itself doesn't create /system/).
+        std::fs::create_dir_all(format!("{}/system", rootfs)).unwrap();
+        std::fs::write(format!("{}/system/build.prop", rootfs), "# existing\n").unwrap();
+
+        populate_proc(&rootfs, 1, 1024).expect("populate_proc");
+
+        let build_prop = format!("{}/system/build.prop", rootfs);
+        let content = std::fs::read_to_string(&build_prop).unwrap();
+        assert!(
+            content.contains("apexd.status=activated"),
+            "populate_proc should append apexd.status=activated to build.prop: {}",
+            content
+        );
 
         let _ = std::fs::remove_dir_all(&rootfs);
     }

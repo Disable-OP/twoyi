@@ -358,19 +358,9 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
         // (path-in-rootfs, fstype, flags, data)
         ("/dev", "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755"),
         // Real procfs — the linker needs /proc/self/maps and /proc/self/auxv
-        (
-            "/proc",
-            "proc",
-            MS_NOSUID | MS_NOEXEC | MS_NODEV,
-            "",
-        ),
+        ("/proc", "proc", MS_NOSUID | MS_NOEXEC | MS_NODEV, ""),
         // Real sysfs — some init code reads /sys/... paths
-        (
-            "/sys",
-            "sysfs",
-            MS_NOSUID | MS_NOEXEC | MS_NODEV,
-            "",
-        ),
+        ("/sys", "sysfs", MS_NOSUID | MS_NOEXEC | MS_NODEV, ""),
         ("/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777"),
         // /mnt is where the guest's vold mounts external storage.
         (

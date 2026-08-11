@@ -872,13 +872,21 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             match std::fs::metadata(path) {
                 Ok(meta) => {
                     let ft = meta.file_type();
-                    let kind = if ft.is_symlink() { "symlink" }
-                        else if ft.is_file() { "file" }
-                        else if ft.is_dir() { "dir" }
-                        else { "other" };
+                    let kind = if ft.is_symlink() {
+                        "symlink"
+                    } else if ft.is_file() {
+                        "file"
+                    } else if ft.is_dir() {
+                        "dir"
+                    } else {
+                        "other"
+                    };
                     info!(
                         "[KR64] PARENT: {} -> {} ({} bytes, {:?})",
-                        path, kind, meta.len(), meta.permissions()
+                        path,
+                        kind,
+                        meta.len(),
+                        meta.permissions()
                     );
                 }
                 Err(e) => {
@@ -891,20 +899,32 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         match std::fs::read_dir("/apex/com.android.runtime") {
             Ok(entries) => {
                 let count = entries.count();
-                info!("[KR64] PARENT: /apex/com.android.runtime has {} entries", count);
+                info!(
+                    "[KR64] PARENT: /apex/com.android.runtime has {} entries",
+                    count
+                );
             }
             Err(e) => {
-                error!("[KR64] PARENT: /apex/com.android.runtime read_dir failed: {}", e);
+                error!(
+                    "[KR64] PARENT: /apex/com.android.runtime read_dir failed: {}",
+                    e
+                );
             }
         }
         // Check if /apex/com.android.runtime/lib64/bionic/ has libc.so
         match std::fs::read_dir("/apex/com.android.runtime/lib64/bionic") {
             Ok(entries) => {
                 let count = entries.count();
-                info!("[KR64] PARENT: /apex/com.android.runtime/lib64/bionic has {} entries", count);
+                info!(
+                    "[KR64] PARENT: /apex/com.android.runtime/lib64/bionic has {} entries",
+                    count
+                );
             }
             Err(e) => {
-                error!("[KR64] PARENT: /apex/com.android.runtime/lib64/bionic read_dir failed: {}", e);
+                error!(
+                    "[KR64] PARENT: /apex/com.android.runtime/lib64/bionic read_dir failed: {}",
+                    e
+                );
             }
         }
     }
@@ -937,11 +957,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         match std::fs::copy(&hook_src, &hook_dst) {
             Ok(_) => {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &hook_dst,
-                    std::fs::Permissions::from_mode(0o644),
+                let _ = std::fs::set_permissions(&hook_dst, std::fs::Permissions::from_mode(0o644));
+                info!(
+                    "[KR64] PARENT: copied libgetpid_hook.so {} -> {}",
+                    hook_src, hook_dst
                 );
-                info!("[KR64] PARENT: copied libgetpid_hook.so {} -> {}", hook_src, hook_dst);
             }
             Err(e) => {
                 error!(
@@ -966,14 +986,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         match std::fs::copy(&loader_src, &loader_dst) {
             Ok(_) => {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &loader_dst,
-                    std::fs::Permissions::from_mode(0o644),
+                let _ =
+                    std::fs::set_permissions(&loader_dst, std::fs::Permissions::from_mode(0o644));
+                info!(
+                    "[KR64] PARENT: copied libtwoyi_loader_shlib.so {} -> {}",
+                    loader_src, loader_dst
                 );
-                info!("[KR64] PARENT: copied libtwoyi_loader_shlib.so {} -> {}", loader_src, loader_dst);
             }
             Err(e) => {
-                error!("[KR64] PARENT: failed to copy libtwoyi_loader_shlib.so {} -> {}: {}", loader_src, loader_dst, e);
+                error!(
+                    "[KR64] PARENT: failed to copy libtwoyi_loader_shlib.so {} -> {}: {}",
+                    loader_src, loader_dst, e
+                );
             }
         }
     } else {
@@ -1038,10 +1062,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         use std::os::unix::fs::PermissionsExt;
         let dev_bin_dir = "/dev/twoyi-bin";
         let _ = std::fs::create_dir_all(dev_bin_dir);
-        let _ = std::fs::set_permissions(
-            dev_bin_dir,
-            std::fs::Permissions::from_mode(0o755),
-        );
+        let _ = std::fs::set_permissions(dev_bin_dir, std::fs::Permissions::from_mode(0o755));
 
         let critical_binaries = [
             "system/bin/logd",
@@ -1109,20 +1130,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             if Path::new(&src).exists() {
                 match std::fs::copy(&src, &dst) {
                     Ok(_) => {
-                        let _ = std::fs::set_permissions(
-                            &dst,
-                            std::fs::Permissions::from_mode(0o755),
-                        );
+                        let _ =
+                            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
                         // Try to chcon to system_file
                         let _ = std::process::Command::new("chcon")
                             .args(&["u:object_r:system_file:s0", &dst])
                             .status();
                     }
                     Err(e) => {
-                        warning!(
-                            "[KR64] PARENT: failed to copy {} -> {}: {}",
-                            src, dst, e
-                        );
+                        warning!("[KR64] PARENT: failed to copy {} -> {}: {}", src, dst, e);
                     }
                 }
             }
@@ -1192,10 +1208,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // binderfs/binder resolves to {rootfs}/dev/binderfs/binder.
             for name in &["binder", "hwbinder", "vndbinder"] {
                 let link_path = format!("{}/dev/{}", cfg.rootfs, name);
-                let target = format!("binderfs/{}", name);  // RELATIVE path
-                // Remove existing file/symlink/socket at this path.
-                // remove_file works for files, symlinks, and sockets.
-                // If it's a directory, use remove_dir.
+                let target = format!("binderfs/{}", name); // RELATIVE path
+                                                           // Remove existing file/symlink/socket at this path.
+                                                           // remove_file works for files, symlinks, and sockets.
+                                                           // If it's a directory, use remove_dir.
                 match std::fs::remove_file(&link_path) {
                     Ok(_) => info!("[KR64] PARENT: removed old {}", link_path),
                     Err(e) => {
@@ -1204,7 +1220,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             Ok(_) => info!("[KR64] PARENT: removed old dir {}", link_path),
                             Err(_) => {
                                 // Both failed — path might not exist, which is fine
-                                warning!("[KR64] PARENT: could not remove {} (may not exist): {}", link_path, e);
+                                warning!(
+                                    "[KR64] PARENT: could not remove {} (may not exist): {}",
+                                    link_path,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1213,12 +1233,51 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 match std::os::unix::fs::symlink(&target, &link_path) {
                     Ok(_) => {}
                     Err(e) => {
-                        warning!("[KR64] PARENT: failed to create symlink {} -> {}: {}", link_path, target, e);
+                        warning!(
+                            "[KR64] PARENT: failed to create symlink {} -> {}: {}",
+                            link_path,
+                            target,
+                            e
+                        );
                     }
                 }
             }
             info!("[KR64] PARENT: created binder symlinks (binderfs)");
-            
+
+            // chmod the binderfs character devices to 0666.
+            // ROOT CAUSE (KVM run 31489388552): HIDL HAL services
+            // (android.system.suspend@1.0-service, etc.) crash with
+            // "Binder driver could not be opened" because open(/dev/hwbinder)
+            // returns EACCES for them (22/26 opens failed with errno 13).
+            // SELinux is permissive (enforcing=0 confirmed in logcat before
+            // the first crash), so this is a DAC permission issue on the
+            // binderfs char device — the default mode left by the binder
+            // driver is not world-accessible to the guest HAL service
+            // contexts. vold's open succeeds (fd=5) because it is spawned
+            // earlier / with a permissive group set, but HIDL services
+            // spawned later get EACCES.
+            //
+            // Making the devices 0666 lets all guest processes open them
+            // directly (real binder IPC via the kernel binder driver). The
+            // loader's binder_open_fallback() is a second line of defence
+            // for any process that still can't open them.
+            use std::os::unix::fs::PermissionsExt;
+            for name in &["binder", "hwbinder", "vndbinder"] {
+                let dev_path = format!("{}/dev/binderfs/{}", cfg.rootfs, name);
+                match std::fs::set_permissions(&dev_path, std::fs::Permissions::from_mode(0o666)) {
+                    Ok(_) => info!(
+                        "[KR64] PARENT: chmod 0666 {} (binderfs device world-accessible)",
+                        dev_path
+                    ),
+                    Err(e) => warning!(
+                        "[KR64] PARENT: could not chmod {} -> {} (HIDL services may get EACCES; \
+                         loader fallback will provide a virtual binder fd)",
+                        dev_path,
+                        e
+                    ),
+                }
+            }
+
             // List binderfs contents for diagnostics
             if let Ok(entries) = std::fs::read_dir(&binderfs_dir) {
                 for entry in entries.flatten() {
@@ -1279,10 +1338,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         ] {
             let path = format!("{}/{}", cfg.rootfs, dir);
             let _ = std::fs::create_dir_all(&path);
-            let _ = std::fs::set_permissions(
-                &path,
-                std::fs::Permissions::from_mode(0o777),
-            );
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777));
         }
         info!("[KR64] PARENT: pre-created boot directories in rootfs");
     }
@@ -1348,7 +1404,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     info!("[KR64] PARENT: created host {} (mode 0711)", host_prop_dir);
                 }
                 Err(e) => {
-                    error!("[KR64] PARENT: failed to create host {}: {}", host_prop_dir, e);
+                    error!(
+                        "[KR64] PARENT: failed to create host {}: {}",
+                        host_prop_dir, e
+                    );
                 }
             }
         }
@@ -1365,10 +1424,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                         &host_prop_info,
                         std::fs::Permissions::from_mode(0o666),
                     );
-                    info!("[KR64] PARENT: pre-created host {} (mode 0666)", host_prop_info);
+                    info!(
+                        "[KR64] PARENT: pre-created host {} (mode 0666)",
+                        host_prop_info
+                    );
                 }
                 Err(e) => {
-                    error!("[KR64] PARENT: failed to pre-create host {}: {}", host_prop_info, e);
+                    error!(
+                        "[KR64] PARENT: failed to pre-create host {}: {}",
+                        host_prop_info, e
+                    );
                 }
             }
         }
@@ -1389,17 +1454,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     info!("[KR64] PARENT: pre-created host {}", host_prop_serial);
                 }
                 Err(e) => {
-                    error!("[KR64] PARENT: failed to pre-create host {}: {}", host_prop_serial, e);
+                    error!(
+                        "[KR64] PARENT: failed to pre-create host {}: {}",
+                        host_prop_serial, e
+                    );
                 }
             }
         }
         // Pre-create the directory + files in the rootfs too
         let rootfs_prop_dir = format!("{}/dev/__properties__", cfg.rootfs);
         let _ = std::fs::create_dir_all(&rootfs_prop_dir);
-        let _ = std::fs::set_permissions(
-            &rootfs_prop_dir,
-            std::fs::Permissions::from_mode(0o777),
-        );
+        let _ = std::fs::set_permissions(&rootfs_prop_dir, std::fs::Permissions::from_mode(0o777));
         for fname in &["property_info", "properties_serial"] {
             let path = format!("{}/{}", rootfs_prop_dir, fname);
             if !Path::new(&path).exists() {
@@ -1409,10 +1474,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     .open(&path)
                 {
                     Ok(_) => {
-                        let _ = std::fs::set_permissions(
-                            &path,
-                            std::fs::Permissions::from_mode(0o666),
-                        );
+                        let _ =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
                         info!("[KR64] PARENT: pre-created rootfs {}", path);
                     }
                     Err(e) => {
@@ -1520,7 +1583,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         } else {
             unsafe {
-                safe_write_err(b"[KR64 CHILD] non-root mode: skipping mount+chroot (seccomp blocks both)\n");
+                safe_write_err(
+                    b"[KR64 CHILD] non-root mode: skipping mount+chroot (seccomp blocks both)\n",
+                );
             }
         }
 
@@ -1568,9 +1633,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // for access()). This allocates, but we're in a single-threaded
             // path before execve -- safe per the existing format!() usage.
             let init_c = CString::new(full_init_path.as_str()).unwrap_or_default();
-            let init_exists = unsafe {
-                libc::access(init_c.as_ptr(), libc::F_OK) == 0
-            };
+            let init_exists = unsafe { libc::access(init_c.as_ptr(), libc::F_OK) == 0 };
             if !init_exists {
                 unsafe {
                     safe_write_err(b"[KR64 CHILD] FATAL: init binary not found at ");
@@ -1585,19 +1648,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 libc::access(linker_path.as_ptr() as *const libc::c_char, libc::F_OK) == 0
             };
             if linker_exists {
-                unsafe { safe_write_err(b"[KR64 CHILD] linker64 found at /system/bin/\n"); }
+                unsafe {
+                    safe_write_err(b"[KR64 CHILD] linker64 found at /system/bin/\n");
+                }
             } else {
-                unsafe { safe_write_err(b"[KR64 CHILD] linker64 NOT found at /system/bin/\n"); }
+                unsafe {
+                    safe_write_err(b"[KR64 CHILD] linker64 NOT found at /system/bin/\n");
+                }
             }
             // Check libc.so
             let libc_path = b"/system/lib64/libc.so\0";
-            let libc_exists = unsafe {
-                libc::access(libc_path.as_ptr() as *const libc::c_char, libc::F_OK) == 0
-            };
+            let libc_exists =
+                unsafe { libc::access(libc_path.as_ptr() as *const libc::c_char, libc::F_OK) == 0 };
             if libc_exists {
-                unsafe { safe_write_err(b"[KR64 CHILD] libc.so found at /system/lib64/\n"); }
+                unsafe {
+                    safe_write_err(b"[KR64 CHILD] libc.so found at /system/lib64/\n");
+                }
             } else {
-                unsafe { safe_write_err(b"[KR64 CHILD] libc.so NOT found at /system/lib64/\n"); }
+                unsafe {
+                    safe_write_err(b"[KR64 CHILD] libc.so NOT found at /system/lib64/\n");
+                }
             }
         }
 
@@ -1635,9 +1705,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             ) == 0
         };
         if hook_exists {
-            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /dev/\n"); }
+            unsafe {
+                safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /dev/\n");
+            }
         } else {
-            unsafe { safe_write_err(b"[KR64 CHILD] libgetpid_hook.so NOT found at /dev/\n"); }
+            unsafe {
+                safe_write_err(b"[KR64 CHILD] libgetpid_hook.so NOT found at /dev/\n");
+            }
         }
 
         // Build environment for the guest init. The CString::new calls
@@ -1747,7 +1821,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Pass "" as the rootfs prefix so the proxy constructs "/opengles".
     // Without pivot_root, pass the full rootfs path.
     let proxy_rootfs = if cfg.use_namespaces {
-        String::new()  // chroot-relative: format!("{}/{}", "", "opengles") = "/opengles"
+        String::new() // chroot-relative: format!("{}/{}", "", "opengles") = "/opengles"
     } else {
         cfg.rootfs.clone()
     };
