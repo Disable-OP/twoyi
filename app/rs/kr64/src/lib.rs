@@ -1219,7 +1219,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // skips first_stage_mount naturally; vold proceeds with an empty fstab.
     {
         let fstab_path = format!("{}/vendor/etc/fstab.ranchu", cfg.rootfs);
-        let fstab_content = "# Minimal fstab for twoyi virtualization\n# Empty — no block device entries\n";
+        let fstab_content = "# Minimal fstab for twoyi virtualization\n/dev/null /system ext4 ro wait\n/dev/null /vendor ext4 ro wait\n/dev/null /data ext4 nosuid,nodev wait,check,formattable,latemount,resize\n";
         let _ = std::fs::create_dir_all(format!("{}/vendor/etc", cfg.rootfs));
         let _ = std::fs::write(&fstab_path, fstab_content);
         info!("[KR64] PARENT: overwrote fstab.ranchu with minimal stub");
