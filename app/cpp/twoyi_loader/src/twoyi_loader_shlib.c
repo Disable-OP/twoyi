@@ -2445,6 +2445,7 @@ static void twoyi_init(void) {
                     syscall(SYS_close, stderr_fd);
                 }
                 write_str(2, "[twoyi_loader] vold stderr redirected to /data/local/tmp/twoyi-vold-stderr.log\n");
+                setenv("ANDROID_PRINTF_LOG", "stderr", 1);
 
                 // Also redirect stdout
                 int stdout_fd = syscall(SYS_openat, AT_FDCWD,
