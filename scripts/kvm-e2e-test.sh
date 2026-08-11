@@ -309,9 +309,15 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "── Step 4/6: install rootfs into twoyi data dir ──"
 TWOYI_DATA=/data/data/io.twoyi
-# RomManager.getRootfsDir() returns <dataDir>/rootfs (NOT profiles/default/rootfs).
-# The app looks for the rootfs at /data/data/io.twoyi/rootfs, so extract there.
-TWOYI_PROFILE="$TWOYI_DATA/rootfs"
+# ProfileManager.initializeProfiles expects the rootfs at
+# <dataDir>/profiles/default/rootfs and creates a symlink at
+# <dataDir>/rootfs -> <dataDir>/profiles/default/rootfs. RomManager reads
+# via <dataDir>/rootfs (following the symlink). Extract directly to the
+# profile path so ProfileManager doesn't need to migrate anything — it
+# just creates the symlink. This avoids the DirectoryNotEmptyException
+# flake that occurred when a stale <dataDir>/rootfs directory blocked
+# Files.move() during migration (see cleanup block below).
+TWOYI_PROFILE="$TWOYI_DATA/profiles/default/rootfs"
 
 # Stop twoyi if it's running (it shouldn't be — fresh boot — but be safe)
 "$ADB_BIN" -s emulator-5554 shell am force-stop io.twoyi 2>/dev/null || true
@@ -336,37 +342,39 @@ else
     "$ADB_BIN" -s emulator-5554 shell "chmod -R 777 /data/user/0/io.twoyi/dev 2>/dev/null; rm -rf /data/user/0/io.twoyi/dev" 2>/dev/null || true
 fi
 
-# Push the tarball to a temp location, then extract it into twoyi's
-# data dir. We can't `adb push` directly to /data/data/io.twoyi/.../
-# because that dir is created on first launch; create it first.
-"$ADB_BIN" -s emulator-5554 shell "run-as io.twoyi mkdir -p profiles/default/rootfs" 2>/dev/null \
-    || "$ADB_BIN" -s emulator-5554 shell "mkdir -p $TWOYI_PROFILE" 2>/dev/null \
-    || true
-
 # As root (we already `adb root`'d above for the emulator source; do it
-# again for the other sources), push + extract.
+# again for the other sources) before the cleanup + extract below.
 "$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
 sleep 1
 "$ADB_BIN" -s emulator-5554 wait-for-device
 
-# Fix CI flake: remove stale rootfs directory from previous runs.
-# ProfileManager.updateRootfsSymlink fails with
-# DirectoryNotEmptyException when /data/user/0/io.twoyi/rootfs
-# exists as a non-empty directory. This happens when a previous run's
-# ProfileManager migration failed, leaving a directory instead of a
-# symlink. We must remove the stale directory BEFORE extracting the new
-# rootfs so the new extraction lands in a clean path AND so
-# ProfileManager can later replace it with a fresh symlink.
+# Fix CI flake: clean up stale state from previous runs.
 #
-# The `[ ! -L ... ]` guard ensures we only remove a real directory —
-# if a previous run succeeded, the path is a symlink (to the profile
-# directory) and we leave it alone (it will be recreated by the
-# extraction below via the /data/user/0 → /data/data symlink).
+# ProfileManager.initializeProfiles does:
+#   1. If <dataDir>/rootfs exists as a real directory (not a symlink),
+#      Files.move() it to <dataDir>/profiles/default/rootfs.
+#   2. Calls updateRootfsSymlink(), which does Files.deleteIfExists()
+#      on <dataDir>/rootfs — this throws DirectoryNotEmptyException if
+#      <dataDir>/rootfs is a non-empty directory (e.g. because the
+#      Files.move above failed when <dataDir>/profiles/default/rootfs
+#      already existed and was non-empty).
+#
+# The previous fix (commit 131c89b) only removed <dataDir>/rootfs before
+# extraction — but the extraction recreated it, AND a stale
+# <dataDir>/profiles/default/rootfs from a prior failed run still
+# blocked the migration. Both paths have to be clean.
+#
+# Now that we extract directly to <dataDir>/profiles/default/rootfs
+# (see TWOYI_PROFILE above), ProfileManager doesn't need to migrate.
+# We just need to ensure BOTH <dataDir>/rootfs (so no migration is
+# attempted) and <dataDir>/profiles (so the new extraction lands in a
+# clean path) are absent before extraction. Remove them from both
+# /data/data and /data/user/0 (the latter is a symlink to the former
+# but some operations don't follow symlinks).
 "$ADB_BIN" -s emulator-5554 shell "
-    if [ -d /data/user/0/io.twoyi/rootfs ] && [ ! -L /data/user/0/io.twoyi/rootfs ]; then
-        rm -rf /data/user/0/io.twoyi/rootfs
-        echo 'removed stale rootfs directory'
-    fi
+    rm -rf /data/user/0/io.twoyi/rootfs /data/data/io.twoyi/rootfs
+    rm -rf /data/user/0/io.twoyi/profiles /data/data/io.twoyi/profiles
+    echo 'cleaned stale rootfs + profiles directories'
 " 2>/dev/null || true
 
 echo "  → push rootfs.tar to /data/local/tmp/"
@@ -493,11 +501,14 @@ if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
                 echo 'copied kr64 from installed APK'
             else
                 echo 'kr64 not found in installed APK either'
-                # Last resort: use the symlink created by RomManager
-                if [ -e /data/user/0/io.twoyi/rootfs/system/lib64/libkr64.so ]; then
-                    cp -L /data/user/0/io.twoyi/rootfs/system/lib64/libkr64.so /data/local/tmp/kr64
+                # Last resort: look in the extracted rootfs (the
+                # libkr64.so symlink is created later by RomManager on
+                # app launch, but the rootfs.tar may already contain
+                # one from a previous extraction).
+                if [ -e $TWOYI_PROFILE/system/lib64/libkr64.so ]; then
+                    cp -L $TWOYI_PROFILE/system/lib64/libkr64.so /data/local/tmp/kr64
                     chmod 755 /data/local/tmp/kr64
-                    echo 'copied kr64 from rootfs symlink'
+                    echo 'copied kr64 from extracted rootfs'
                 fi
             fi
         " 2>&1 | tail -5
