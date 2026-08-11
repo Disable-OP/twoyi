@@ -78,6 +78,12 @@
             android:summary="@string/settings_debug_renderer_summary"
             android:defaultValue="false" />
 
+        <CheckBoxPreference
+            android:key="@string/settings_key_boot_recovery"
+            android:title="@string/settings_boot_recovery_title"
+            android:summary="@string/settings_boot_recovery_summary"
+            android:defaultValue="false" />
+
         <Preference
             android:key="@string/settings_key_select_rom"
             android:summary="@string/settings_select_rom_summary"

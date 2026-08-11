@@ -96,7 +96,17 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             Renderer.setDataDir(dataDir);
             Log.i(TAG, "Data directory: " + dataDir);
 
-            
+            // Set the Boot Recovery (TWRP) flag BEFORE init() so the
+            // native core knows whether to pass --boot-recovery to kr64.
+            // The flag is read from the active profile's settings, so
+            // the user can toggle it via Settings → Boot to Recovery (TWRP)
+            // and the next container launch will boot TWRP instead of
+            // full Android. The flag is stored per-profile, so each
+            // profile can have its own boot mode.
+            boolean bootRecovery = io.twoyi.utils.ProfileSettings.isBootRecoveryEnabled(getApplicationContext());
+            Renderer.setBootRecovery(bootRecovery);
+            Log.i(TAG, "Boot Recovery (TWRP) flag: " + bootRecovery);
+
             // Calculate proper DPI based on physical screen and virtual display scaling
             WindowManager windowManager = getWindowManager();
             Display defaultDisplay = windowManager.getDefaultDisplay();

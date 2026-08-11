@@ -37,4 +37,22 @@ public class Renderer {
      * @param dataDir absolute path to the app's data directory
      */
     public static native void setDataDir(String dataDir);
+
+    /**
+     * Set whether the next container launch should boot a TWRP recovery
+     * image instead of full Android. When {@code true}, the native
+     * renderer core passes {@code --boot-recovery} to kr64, which:
+     * <ul>
+     *   <li>skips LD_PRELOAD (TWRP init is statically linked)</li>
+     *   <li>skips the /apex bind mount (TWRP doesn't use APEX packages)</li>
+     *   <li>skips the binderfs mount (TWRP doesn't use binder)</li>
+     *   <li>skips the SELinux permissive watchdog (TWRP handles SELinux in init.rc)</li>
+     *   <li>auto-sets init_path=/init (TWRP's init is at the root of the ramdisk)</li>
+     * </ul>
+     * Must be called before init(). The value is reset to {@code false}
+     * on process restart.
+     *
+     * @param enabled {@code true} to boot TWRP, {@code false} for full Android
+     */
+    public static native void setBootRecovery(boolean enabled);
 }

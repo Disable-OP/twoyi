@@ -124,6 +124,7 @@ public class SettingsActivity extends AppCompatActivity {
             Preference displayDpi = findPreference(R.string.settings_key_display_dpi);
             CheckBoxPreference useNewRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_use_new_renderer);
             CheckBoxPreference debugRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_debug_renderer);
+            CheckBoxPreference bootRecovery = (CheckBoxPreference) findPreference(R.string.settings_key_boot_recovery);
             Preference selectRom = findPreference(R.string.settings_key_select_rom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
@@ -215,6 +216,19 @@ public class SettingsActivity extends AppCompatActivity {
             debugRenderer.setChecked(ProfileSettings.isDebugRendererEnabled(getActivity()));
             debugRenderer.setOnPreferenceChangeListener((preference, newValue) -> {
                 ProfileSettings.setDebugRenderer(getActivity(), (Boolean) newValue);
+                Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
+                return true;
+            });
+
+            // Initialize Boot Recovery (TWRP) checkbox with profile-specific value.
+            // When checked, the next container launch will pass --boot-recovery to
+            // kr64, booting a TWRP recovery image instead of full Android. The
+            // user is responsible for installing a TWRP rootfs into the profile's
+            // rootfs directory before enabling this (e.g. via
+            // scripts/extract-twrp-ramdisk.py).
+            bootRecovery.setChecked(ProfileSettings.isBootRecoveryEnabled(getActivity()));
+            bootRecovery.setOnPreferenceChangeListener((preference, newValue) -> {
+                ProfileSettings.setBootRecovery(getActivity(), (Boolean) newValue);
                 Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                 return true;
             });

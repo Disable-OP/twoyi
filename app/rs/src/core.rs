@@ -25,6 +25,31 @@ use crate::renderer_bindings;
 
 static RENDERER_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// When true, the next container launch passes `--boot-recovery` to
+/// kr64, booting a TWRP recovery image instead of full Android. Set
+/// from Java via `Renderer.setBootRecovery(boolean)` before
+/// `Renderer.init()`. Defaults to false (full Android boot).
+///
+/// TWRP boot skips LD_PRELOAD, /apex bind mount, binderfs mount,
+/// SELinux permissive watchdog, /dev/twoyi-bin/ copy, and
+/// /dev/__properties__ pre-creation — TWRP's init.rc handles all of
+/// those itself. See `kr64::Config::boot_recovery` for the full
+/// list of what changes in TWRP mode.
+static BOOT_RECOVERY: AtomicBool = AtomicBool::new(false);
+
+/// Set the Boot Recovery (TWRP) flag. Called from JNI
+/// (`set_boot_recovery` in lib.rs) before `init_renderer`.
+pub fn set_boot_recovery(enabled: bool) {
+    BOOT_RECOVERY.store(enabled, Ordering::SeqCst);
+    info!("[CORE] Boot Recovery (TWRP) flag set to: {}", enabled);
+}
+
+/// Read the Boot Recovery (TWRP) flag. Used by `init_renderer` to
+/// decide whether to pass `--boot-recovery` to kr64.
+pub fn is_boot_recovery_enabled() -> bool {
+    BOOT_RECOVERY.load(Ordering::SeqCst)
+}
+
 /// The app's data directory, set from Java via `set_data_dir()`.
 ///
 /// This replaces the previously hardcoded `/data/data/io.twoyi` path.
@@ -337,6 +362,15 @@ pub fn init_renderer(
             cmd.arg("--vmid").arg("0");
             cmd.arg("--no-namespaces");
             cmd.arg("--no-seccomp");
+            // TWRP boot: pass --boot-recovery so kr64 uses the simple
+            // TWRP boot path (skips LD_PRELOAD, /apex bind, binderfs,
+            // SELinux watchdog, /dev/twoyi-bin/ copy; auto-sets
+            // init_path=/init). The flag is a no-op when false (the
+            // kr64 default is full-Android boot).
+            if is_boot_recovery_enabled() {
+                info!("[CORE] Boot Recovery (TWRP) enabled — passing --boot-recovery to kr64");
+                cmd.arg("--boot-recovery");
+            }
             // Use the HOST system lib64 for kr64's own dependencies
             // (libc.so, libdl.so, etc.) — NOT the rootfs's versions.
             // The rootfs's libc.so may be incompatible with the host
