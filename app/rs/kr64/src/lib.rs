@@ -2602,7 +2602,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
         if skip_preload {
             unsafe {
-                safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set -- skipping LD_PRELOAD (init will exit 31)\n");
+                if cfg.boot_recovery {
+                    safe_write_err(b"[KR64 CHILD] TWRP boot: skipping LD_PRELOAD (init is statically linked, no hooks needed)\n");
+                } else {
+                    safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set -- skipping LD_PRELOAD (init will exit 31)\n");
+                }
             }
         } else {
             env_vars.push(CString::new(ld_preload_str).unwrap());
@@ -2629,11 +2633,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // other call (any libc call can clobber it) and surface it.
         //
         // TWRP BOOT: redirect the guest init's stdout/stderr to
-        // /tmp/twrp-init.log so we can capture its output. TWRP's init
-        // writes to /dev/kmsg by default, but also to stderr in some
-        // code paths. Without this redirect, we'd lose all init output.
+        // /twrp-init.log (at the ROOT of the rootfs, NOT /tmp/ which
+        // is a tmpfs that gets unmounted when kr64 dies). This file
+        // is on the ext4 rootfs and survives kr64's death so the KVM
+        // test script can pull it.
         if cfg.boot_recovery {
-            let log_path = b"/tmp/twrp-init.log\0";
+            let log_path = b"/twrp-init.log\0";
             let fd = unsafe {
                 libc::open(
                     log_path.as_ptr() as *const libc::c_char,
@@ -2648,11 +2653,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     libc::close(fd);
                 }
                 unsafe {
-                    safe_write_err(b"[KR64 CHILD] TWRP: redirected stdout/stderr to /tmp/twrp-init.log\n");
+                    safe_write_err(b"[KR64 CHILD] TWRP: redirected stdout/stderr to /twrp-init.log\n");
                 }
             } else {
                 unsafe {
-                    safe_write_err(b"[KR64 CHILD] TWRP: WARN could not open /tmp/twrp-init.log for redirect\n");
+                    safe_write_err(b"[KR64 CHILD] TWRP: WARN could not open /twrp-init.log for redirect\n");
                 }
             }
         }
