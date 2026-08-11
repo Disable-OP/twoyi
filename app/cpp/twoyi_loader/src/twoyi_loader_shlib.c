@@ -1215,7 +1215,15 @@ int __system_property_read(const prop_info *pi, char *name, char *value) {
 
 // Hook __system_property_get — read from our in-memory table
 int __system_property_get(const char *name, char *value) {
-    return prop_get(name, value);
+    int ret = prop_get(name, value);
+    // Debug: log all property queries
+    if (name) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] prop_get(%s) = '%s' (ret=%d)\n",
+            name, ret > 0 ? value : "(empty)", ret);
+        write_str(2, msg);
+    }
+    return ret;
 }
 
 // Hook __system_property_find — return a fake pointer (non-NULL if found)
@@ -1225,9 +1233,15 @@ const void *__system_property_find(const char *name) {
     if (!name) return NULL;
     for (int i = 0; i < MAX_PROPS; i++) {
         if (g_props[i].used && strcmp(g_props[i].key, name) == 0) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "[twoyi_loader] prop_find(%s) = FOUND\n", name);
+            write_str(2, msg);
             return &g_props[i]; // return pointer to entry as fake prop_info
         }
     }
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[twoyi_loader] prop_find(%s) = NOT FOUND\n", name);
+    write_str(2, msg);
     return NULL;
 }
 
