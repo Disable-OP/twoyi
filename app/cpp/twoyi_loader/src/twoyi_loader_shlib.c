@@ -616,6 +616,80 @@ int android_get_control_socket(const char *name) {
     return 3;  // fake fd
 }
 
+// =========================================================================
+// Hook __android_log_buf_write / __android_log_write — write to stderr as fallback
+//
+// vold's LogdLogger sends LOG(ERROR) to logd, but logd may be unavailable in
+// the guest process. Error messages before exit(1) are silently dropped.
+//
+// Fix: hook these functions to write the message to stderr (which we redirect
+// to a file for vold) so we can see the actual error message. We still call
+// the real function (it may fail silently if logd is unavailable).
+//
+// CRITICAL: write_str() internally calls __android_log_write via
+// dlsym(RTLD_DEFAULT, ...), which resolves to OUR hook (since this library is
+// LD_PRELOAD'd and first in the symbol search order). Without the re-entrancy
+// guard, we'd have: __android_log_write -> write_str -> __android_log_write
+// -> write_str -> ... -> stack overflow.
+//
+// The thread-local `in_log_hook` flag breaks this cycle: when our hook is
+// re-entered via write_str, we skip the write_str call and only forward to
+// the real liblog function (found via RTLD_NEXT).
+// =========================================================================
+static __thread int in_log_hook = 0;
+
+int __android_log_buf_write(int bufID, int prio, const char *tag, const char *text) {
+    if (!in_log_hook) {
+        in_log_hook = 1;
+        if (text) {
+            char msg[1024];
+            const char *prio_str = "U";
+            switch (prio) {
+                case 0: prio_str = "V"; break;
+                case 1: prio_str = "D"; break;
+                case 2: prio_str = "I"; break;
+                case 3: prio_str = "W"; break;
+                case 4: prio_str = "E"; break;
+                case 5: prio_str = "F"; break;
+            }
+            snprintf(msg, sizeof(msg), "[%s/%s] %s\n", prio_str, tag ? tag : "?", text);
+            write_str(2, msg);
+        }
+        in_log_hook = 0;
+    }
+    // Call the real function (may fail silently if logd is unavailable)
+    static int (*real_log_buf_write)(int, int, const char *, const char *) = NULL;
+    if (!real_log_buf_write) real_log_buf_write = dlsym(RTLD_NEXT, "__android_log_buf_write");
+    if (real_log_buf_write) return real_log_buf_write(bufID, prio, tag, text);
+    return 0;
+}
+
+int __android_log_write(int prio, const char *tag, const char *text) {
+    if (!in_log_hook) {
+        in_log_hook = 1;
+        if (text) {
+            char msg[1024];
+            const char *prio_str = "U";
+            switch (prio) {
+                case 0: prio_str = "V"; break;
+                case 1: prio_str = "D"; break;
+                case 2: prio_str = "I"; break;
+                case 3: prio_str = "W"; break;
+                case 4: prio_str = "E"; break;
+                case 5: prio_str = "F"; break;
+            }
+            snprintf(msg, sizeof(msg), "[%s/%s] %s\n", prio_str, tag ? tag : "?", text);
+            write_str(2, msg);
+        }
+        in_log_hook = 0;
+    }
+    // Call real function (outside the guard to avoid recursion)
+    static int (*real_log_write)(int, const char *, const char *) = NULL;
+    if (!real_log_write) real_log_write = dlsym(RTLD_NEXT, "__android_log_write");
+    if (real_log_write) return real_log_write(prio, tag, text);
+    return 0;
+}
+
 // NOTE: abort(), raise(), kill(), sigaction(), signal() hooks were previously
 // here to suppress SIGABRT and prevent InitFatalReboot. They have been REMOVED
 // because the real fix (android_get_control_socket hook for lmkd) makes them
