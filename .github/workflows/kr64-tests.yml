@@ -86,33 +86,24 @@ jobs:
         shell: bash
         run: cd app/rs/kr64 && cargo test --no-fail-fast 2>&1 | tee cargo-test.log
 
-      - name: Upload test results to 0x0.st
-        # Replaces actions/upload-artifact — see build.yml for the rationale
-        # (GHA storage was at 0.01 GB of the 0.5 GB free tier). URLs are
-        # printed in the run log and added to the step summary.
+      - name: Pack test results
+        # Logs-only, xz-compressed, 7-day retention. See build.yml for
+        # the storage-budget rationale (deleted 1217 old artifacts to
+        # recover from 4.61 GB / 0.5 GB free tier).
         if: always()
         run: |
           # shellcheck disable=SC2086  # we WANT the glob to expand here
-          ./scripts/upload-to-0x0.sh "kr64-test-results" \
+          ./scripts/pack-logs.sh /tmp/kr64-test-results.tar.xz \
             app/rs/kr64/cargo-test.log \
             app/rs/kr64/target/debug/.fingerprint/ \
             app/rs/kr64/target/debug/kr64*
 
-      - name: Render all 0x0.st links as a summary table
+      - name: Upload test results
         if: always()
-        run: |
-          if [ -f /tmp/0x0-uploads.txt ] && [ -s /tmp/0x0-uploads.txt ]; then
-            {
-              echo "## 📦 Artifact downloads (0x0.st)"
-              echo ""
-              echo "| Label | File | URL |"
-              echo "|---|---|---|"
-              while IFS=$'\t' read -r label name url; do
-                echo "| ${label} | \`${name}\` | ${url} |"
-              done < /tmp/0x0-uploads.txt
-              echo ""
-              echo "_Links expire after 30–365 days depending on size. Re-run the workflow to refresh._"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "(no artifacts uploaded this run)" >> "$GITHUB_STEP_SUMMARY"
-          fi
+        uses: actions/upload-artifact@v4
+        with:
+          name: kr64-test-results
+          path: /tmp/kr64-test-results.tar.xz
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
