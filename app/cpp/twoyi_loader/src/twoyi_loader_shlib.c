@@ -866,6 +866,38 @@ int ioctl(int fd, unsigned long request, ...) {
     return syscall(SYS_ioctl, fd, request, argp);
 }
 
+// Hook mmap — for binder fds, return an anonymous mapping.
+// binderfs devices don't support mmap() the way real binder devices do.
+// ProcessState::ProcessState() calls mmap() on the binder fd and aborts
+// if it returns MAP_FAILED. We intercept mmap() for binder fds and
+// return an anonymous mapping instead.
+#include <sys/mman.h>
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
+    if (!real_mmap) real_mmap = dlsym(RTLD_NEXT, "mmap");
+    
+    // Check if fd is a binder device by checking if the ioctl works
+    // (we can't easily check without a syscall, so just check if
+    // BINDER_VERSION ioctl would succeed on this fd)
+    // Simpler: just try real mmap first, and if it fails with a binder
+    // fd, fall back to MAP_ANONYMOUS
+    if (real_mmap) {
+        void *result = real_mmap(addr, length, prot, flags, fd, offset);
+        if (result != MAP_FAILED) return result;
+        
+        // mmap failed — check if this might be a binder fd
+        // by trying BINDER_VERSION ioctl
+        int vers = 0;
+        if (ioctl(fd, 0xc0046209, &vers) == 0 || ioctl(fd, 0xc004620d, &vers) == 0) {
+            // This is a binder fd — return anonymous mapping
+            write_str(2, "[twoyi_loader] mmap on binder fd -> using MAP_ANONYMOUS\n");
+            return real_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
+        }
+        return MAP_FAILED;
+    }
+    return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+}
+
 // Hook setsockopt — for AF_NETLINK options (vold only), return success
 int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
     static int (*real_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
