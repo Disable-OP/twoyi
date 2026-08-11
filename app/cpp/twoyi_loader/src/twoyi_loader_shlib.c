@@ -59,6 +59,53 @@ typedef struct prop_info prop_info;
 #endif
 
 // =========================================================================
+// Fallback defines for bionic API 24 compatibility
+// =========================================================================
+// Bionic at API 24 doesn't expose some NR_* / SYS_* constants the same way
+// glibc does. SYS_* is the standard name (defined in <sys/syscall.h>) and
+// maps to the correct syscall number per architecture. We use SYS_*
+// throughout the file and provide defensive fallbacks here: prefer the
+// __NR_* kernel name when available, and fall back to verified x86_64
+// numbers only as a last resort (host glibc and bionic both define these
+// already, so the #else branches are effectively dead code on the targets
+// we ship).
+#ifndef SYS_open
+  #ifdef __NR_open
+    #define SYS_open __NR_open
+  #elif defined(__x86_64__)
+    #define SYS_open 2
+  #endif
+#endif
+#ifndef SYS_mkdir
+  #ifdef __NR_mkdir
+    #define SYS_mkdir __NR_mkdir
+  #elif defined(__x86_64__)
+    #define SYS_mkdir 39
+  #endif
+#endif
+#ifndef SYS_unlink
+  #ifdef __NR_unlink
+    #define SYS_unlink __NR_unlink
+  #elif defined(__x86_64__)
+    #define SYS_unlink 87
+  #endif
+#endif
+#ifndef SYS_chmod
+  #ifdef __NR_chmod
+    #define SYS_chmod __NR_chmod
+  #elif defined(__x86_64__)
+    #define SYS_chmod 90
+  #endif
+#endif
+#ifndef SYS_chown
+  #ifdef __NR_chown
+    #define SYS_chown __NR_chown
+  #elif defined(__x86_64__)
+    #define SYS_chown 92
+  #endif
+#endif
+
+// =========================================================================
 // Architecture-specific constants (VERIFIED from system headers)
 // =========================================================================
 
@@ -70,7 +117,6 @@ typedef struct prop_info prop_info;
   #define NR_mknod    133
   #define NR_mknodat  259
   #define NR_openat   257
-  #define NR_open     2
   #define NR_close    3
   #define NR_write    1
   #define NR_getpid   39
@@ -127,7 +173,7 @@ static void write_str(int fd, const char *s) {
     // Write to stderr (goes to logd's stderr collector)
     syscall(NR_write, fd, s, l);
     // Also write to /data/local/tmp/twoyi-loader.log for debugging
-    int logfd = syscall(NR_open, "/data/local/tmp/twoyi-loader.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    int logfd = syscall(SYS_open, "/data/local/tmp/twoyi-loader.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (logfd >= 0) { syscall(NR_write, logfd, s, l); syscall(NR_close, logfd); }
     // Also try __android_log_write via dlsym (goes directly to logd socket)
     // This is critical for processes where stderr is closed/redirected (e.g., after execv)
@@ -390,7 +436,7 @@ int mknod(const char *path, mode_t mode, dev_t dev) {
     mode_t fmt = mode & S_IFMT;
     if (fmt == S_IFCHR || fmt == S_IFBLK) {
 #if defined(__x86_64__)
-        int fd = syscall(NR_open, path, O_RDWR|O_CREAT, 0666);
+        int fd = syscall(SYS_open, path, O_RDWR|O_CREAT, 0666);
         if (fd >= 0) {
             syscall(NR_write, fd, &dev, sizeof(dev_t));
             syscall(NR_close, fd);
@@ -1004,7 +1050,7 @@ int __system_property_area_init(void) {
     // This is called from PropertyInit() BEFORE CreateSerializedPropertyInfo().
     struct stat st;
     if (stat("/dev/__properties__", &st) == 0) {
-        int fd = syscall(NR_open, "/dev/__properties__/property_info",
+        int fd = syscall(SYS_open, "/dev/__properties__/property_info",
                         O_WRONLY | O_CREAT, 0666);
         if (fd >= 0) {
             syscall(NR_close, fd);
@@ -1135,13 +1181,13 @@ static int (*real_execveat)(int, const char *, char *const[], char *const[], int
 static int get_elf_class(const char *path) {
     if (!path) return 0;
     // Use direct syscall to avoid recursion with our open hooks
-    int fd = syscall(NR_open, path, O_RDONLY, 0);
+    int fd = syscall(SYS_open, path, O_RDONLY, 0);
     if (fd < 0) {
         // Try with rootfs prefix
         if (g_rootfs && path[0] == '/') {
             char translated[512];
             snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
-            fd = syscall(NR_open, translated, O_RDONLY, 0);
+            fd = syscall(SYS_open, translated, O_RDONLY, 0);
         }
         if (fd < 0) return 0;
     }
@@ -1564,7 +1610,7 @@ static long emu_mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     }
     // Create regular file containing dev_t (use open() not openat() to avoid seccomp recursion)
 #if defined(__x86_64__)
-    int fd = syscall(NR_open, path, O_RDWR|O_CREAT, 0666);
+    int fd = syscall(SYS_open, path, O_RDWR|O_CREAT, 0666);
     if(fd<0) return -errno;
     syscall(NR_write, fd, &dev, sizeof(dev_t));
     syscall(NR_close, fd);
@@ -1633,7 +1679,7 @@ static void ensure_selinuxfs_files(void) {
     for (int i = 0; files[i]; i++) {
         char path[600];
         snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
-        int fd = syscall(NR_open, path, O_WRONLY | O_CREAT, 0666);
+        int fd = syscall(SYS_open, path, O_WRONLY | O_CREAT, 0666);
         if (fd >= 0) {
             if (strcmp(files[i], "checkreqprot") == 0) {
                 syscall(NR_write, fd, "0", 1);
@@ -1720,7 +1766,7 @@ static const char *translate(const char *path) {
 // Returns 1 if the calling process is "init" (first_stage or second_stage).
 // We use raw syscalls (NR_openat + SYS_read + NR_close) to avoid recursing
 // into our own open()/openat() PLT hooks. NR_openat is defined for both
-// x86_64 and arm64 in this file (unlike NR_open which is x86_64-only).
+// x86_64 and arm64 in this file (unlike SYS_open which is x86_64-only).
 static int is_init_process(void) {
     char comm[16] = {0};
     int fd = (int)syscall(NR_openat, AT_FDCWD, "/proc/self/comm", O_RDONLY, 0);
@@ -1870,14 +1916,14 @@ int open(const char *path, int flags, ...) {
         if (g_rootfs) {
             char file_path[600];
             snprintf(file_path, sizeof(file_path), "%s%s", g_rootfs, path);
-            int cfd = syscall(NR_open, file_path, O_WRONLY | O_CREAT, 0666);
+            int cfd = syscall(SYS_open, file_path, O_WRONLY | O_CREAT, 0666);
             if (cfd >= 0) syscall(NR_close, cfd);
         }
 
 #if defined(__x86_64__)
-        int fd = syscall(NR_open, translated, flags, mode);
+        int fd = syscall(SYS_open, translated, flags, mode);
         if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
-            fd = syscall(NR_open, translated, flags | O_CREAT, 0666);
+            fd = syscall(SYS_open, translated, flags | O_CREAT, 0666);
         }
         return trace_open_result(path, fd);
 #else
@@ -1894,7 +1940,7 @@ int open(const char *path, int flags, ...) {
 
     const char *translated = translate(path);
 #if defined(__x86_64__)
-    return trace_open_result(path, syscall(NR_open, translated, flags, mode));
+    return trace_open_result(path, syscall(SYS_open, translated, flags, mode));
 #else
     if (real_openat) return trace_open_result(path, real_openat(AT_FDCWD, translated, flags, mode));
     return trace_open_result(path, syscall(NR_openat, AT_FDCWD, translated, flags, mode));
@@ -1969,17 +2015,31 @@ void exit(int status) {
 
         // Print backtrace to identify which function called exit().
         // Diagnostic only — removed once root cause is found.
-        void *bt[32];
-        int n = backtrace(bt, 32);
-        char **symbols = backtrace_symbols(bt, n);
-        if (symbols) {
-            for (int i = 0; i < n; i++) {
-                char bt_msg[512];
-                snprintf(bt_msg, sizeof(bt_msg),
-                    "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
-                write_str(2, bt_msg);
+        // Resolve backtrace functions at runtime via dlsym: backtrace() and
+        // backtrace_symbols() from <execinfo.h> are only declared at API 28+,
+        // but the CI targets API 24. dlsym() lets us use them when present
+        // (newer devices) and skip gracefully when absent (API 24).
+        static int (*backtrace_p)(void **, int) = NULL;
+        static char **(*backtrace_symbols_p)(void *const *, int) = NULL;
+        static int backtrace_checked = 0;
+        if (!backtrace_checked) {
+            backtrace_p = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
+            backtrace_symbols_p = (char **(*)(void *const *, int))dlsym(RTLD_DEFAULT, "backtrace_symbols");
+            backtrace_checked = 1;
+        }
+        if (backtrace_p && backtrace_symbols_p) {
+            void *bt[32];
+            int n = backtrace_p(bt, 32);
+            char **symbols = backtrace_symbols_p(bt, n);
+            if (symbols) {
+                for (int i = 0; i < n; i++) {
+                    char bt_msg[512];
+                    snprintf(bt_msg, sizeof(bt_msg),
+                        "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
+                    write_str(2, bt_msg);
+                }
+                free(symbols);
             }
-            free(symbols);
         }
     }
     static void (*real_exit)(int) __attribute__((noreturn)) = NULL;
@@ -2001,17 +2061,31 @@ void _exit(int status) {
 
         // Print backtrace to identify which function called _exit().
         // Diagnostic only — removed once root cause is found.
-        void *bt[32];
-        int n = backtrace(bt, 32);
-        char **symbols = backtrace_symbols(bt, n);
-        if (symbols) {
-            for (int i = 0; i < n; i++) {
-                char bt_msg[512];
-                snprintf(bt_msg, sizeof(bt_msg),
-                    "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
-                write_str(2, bt_msg);
+        // Resolve backtrace functions at runtime via dlsym: backtrace() and
+        // backtrace_symbols() from <execinfo.h> are only declared at API 28+,
+        // but the CI targets API 24. dlsym() lets us use them when present
+        // (newer devices) and skip gracefully when absent (API 24).
+        static int (*backtrace_p)(void **, int) = NULL;
+        static char **(*backtrace_symbols_p)(void *const *, int) = NULL;
+        static int backtrace_checked = 0;
+        if (!backtrace_checked) {
+            backtrace_p = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
+            backtrace_symbols_p = (char **(*)(void *const *, int))dlsym(RTLD_DEFAULT, "backtrace_symbols");
+            backtrace_checked = 1;
+        }
+        if (backtrace_p && backtrace_symbols_p) {
+            void *bt[32];
+            int n = backtrace_p(bt, 32);
+            char **symbols = backtrace_symbols_p(bt, n);
+            if (symbols) {
+                for (int i = 0; i < n; i++) {
+                    char bt_msg[512];
+                    snprintf(bt_msg, sizeof(bt_msg),
+                        "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
+                    write_str(2, bt_msg);
+                }
+                free(symbols);
             }
-            free(symbols);
         }
     }
     // _exit is a raw syscall — can't call the real one via dlsym. Just go
@@ -2048,7 +2122,7 @@ int __open_2(const char *path, int flags) {
         if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
         if (real_open2) return real_open2(translated, flags);
 #if defined(__x86_64__)
-        return syscall(NR_open, translated, flags);
+        return syscall(SYS_open, translated, flags);
 #else
         return syscall(NR_openat, AT_FDCWD, translated, flags);
 #endif
@@ -2058,7 +2132,7 @@ int __open_2(const char *path, int flags) {
     if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
     if (real_open2) return real_open2(path, flags);
 #if defined(__x86_64__)
-    return syscall(NR_open, path, flags);
+    return syscall(SYS_open, path, flags);
 #else
     return syscall(NR_openat, AT_FDCWD, path, flags);
 #endif
@@ -2092,7 +2166,7 @@ int __open_real(const char *pathname, int flags, ...) {
         if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
         if (real_open_real) return real_open_real(translated, flags, mode);
 #if defined(__x86_64__)
-        return syscall(NR_open, translated, flags, mode);
+        return syscall(SYS_open, translated, flags, mode);
 #else
         return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
@@ -2104,7 +2178,7 @@ int __open_real(const char *pathname, int flags, ...) {
         if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
         if (real_open_real) return real_open_real(translated, flags, mode);
 #if defined(__x86_64__)
-        return syscall(NR_open, translated, flags, mode);
+        return syscall(SYS_open, translated, flags, mode);
 #else
         return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
@@ -2113,7 +2187,7 @@ int __open_real(const char *pathname, int flags, ...) {
     if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
     if (real_open_real) return real_open_real(pathname, flags, mode);
 #if defined(__x86_64__)
-    return syscall(NR_open, pathname, flags, mode);
+    return syscall(SYS_open, pathname, flags, mode);
 #else
     return syscall(NR_openat, AT_FDCWD, pathname, flags, mode);
 #endif
@@ -2445,14 +2519,14 @@ static void twoyi_init(void) {
         for (int i = 0; files[i]; i++) {
             char fpath[600];
             snprintf(fpath, sizeof(fpath), "%s/%s", prop_dir, files[i]);
-            int fd = syscall(NR_open, fpath, O_WRONLY | O_CREAT, 0666);
+            int fd = syscall(SYS_open, fpath, O_WRONLY | O_CREAT, 0666);
             if (fd >= 0) syscall(NR_close, fd);
         }
         // Also create on HOST (WriteStringToFile bypasses PLT hooks)
         struct stat st;
         if (stat("/dev/__properties__", &st) == 0) {
             // Only create property_info (NOT properties_serial — host uses that)
-            int fd = syscall(NR_open, "/dev/__properties__/property_info",
+            int fd = syscall(SYS_open, "/dev/__properties__/property_info",
                             O_WRONLY | O_CREAT, 0666);
             if (fd >= 0) {
                 syscall(NR_close, fd);
