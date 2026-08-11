@@ -1182,18 +1182,33 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         if ret == 0 {
             info!("[KR64] PARENT: mounted binderfs at {}", binderfs_dir);
 
-            // Create symlinks: /dev/binder -> /dev/binderfs/binder, etc.
-            // NOTE: symlink targets use absolute paths WITHOUT the rootfs
-            // prefix, because init's symlink commands in init.rc resolve
-            // them relative to the guest's root after pivot_root.
+            // Create symlinks: /dev/binder -> binderfs/binder, etc.
+            // NOTE: symlink targets use RELATIVE paths (e.g. "binderfs/binder")
+            // because in --no-namespaces mode, there is no chroot — absolute
+            // paths like /dev/binderfs/binder would resolve on the HOST
+            // filesystem, not the guest rootfs. Relative paths resolve
+            // correctly because open("/dev/binder") is translated to
+            // {rootfs}/dev/binder, and the symlink {rootfs}/dev/binder ->
+            // binderfs/binder resolves to {rootfs}/dev/binderfs/binder.
             for name in &["binder", "hwbinder", "vndbinder"] {
                 let link_path = format!("{}/dev/{}", cfg.rootfs, name);
-                let target = format!("/dev/binderfs/{}", name);
+                let target = format!("binderfs/{}", name);  // RELATIVE path
                 // Remove existing file/symlink/socket at this path.
                 // remove_file works for files, symlinks, and sockets.
                 // If it's a directory, use remove_dir.
-                let _ = std::fs::remove_file(&link_path);
-                let _ = std::fs::remove_dir(&link_path);
+                match std::fs::remove_file(&link_path) {
+                    Ok(_) => info!("[KR64] PARENT: removed old {}", link_path),
+                    Err(e) => {
+                        // Try remove_dir if remove_file failed
+                        match std::fs::remove_dir(&link_path) {
+                            Ok(_) => info!("[KR64] PARENT: removed old dir {}", link_path),
+                            Err(_) => {
+                                // Both failed — path might not exist, which is fine
+                                warning!("[KR64] PARENT: could not remove {} (may not exist): {}", link_path, e);
+                            }
+                        }
+                    }
+                }
                 // Create symlink (target is relative to the guest's root)
                 match std::os::unix::fs::symlink(&target, &link_path) {
                     Ok(_) => {}
