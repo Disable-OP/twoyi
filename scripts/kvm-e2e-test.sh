@@ -678,11 +678,12 @@ fi  # end of TWRP_MODE libgetpid_hook push branch
 # --- Push libtwoyi_loader_shlib.so (seccomp/SIGSYS virtualization) ---
 # This is the REAL virtualization library. Loaded via LD_PRELOAD.
 #
-# TWRP MODE: skip this push. Same reason as libgetpid_hook.so above
-# (init is statically linked, no LD_PRELOAD, no seccomp/SIGSYS
-# virtualization library needed).
+# TWRP MODE: skip this push. The x86_64 libtwoyi_loader_shlib.so can't be
+# loaded by the i386 recovery's bionic linker ("CANNOT LINK EXECUTABLE:
+# ... is 64-bit instead of 32-bit"). Instead, we push the i686
+# twrp_fb_hook.so below (TWRP-only FB ioctl hook).
 if [ "$TWRP_MODE" = "1" ]; then
-    echo "  → TWRP mode: skipping libtwoyi_loader_shlib.so push (no LD_PRELOAD)"
+    echo "  → TWRP mode: skipping libtwoyi_loader_shlib.so push (i386 recovery can't load x86_64 libs)"
 else
 if [ -f "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" ]; then
     "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" "$TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1 | tail -2
@@ -702,6 +703,33 @@ else
     echo "  ⚠ EXTRACT_DIR not populated — libtwoyi_loader_shlib.so not available"
 fi
 fi  # end of TWRP_MODE libtwoyi_loader_shlib push branch
+
+# --- Push twrp_fb_hook.so (i686 TWRP FB ioctl hook) ---
+# This is the TWRP-specific LD_PRELOAD library that intercepts FB ioctls
+# on /dev/graphics/fb0 and returns valid 720x1280@32bpp screen info,
+# fixing the libminuitwrp segfault at offset 0x57d7.
+#
+# Built in app/cpp/build.sh as i686 (32-bit x86) with -nostdlib. Placed
+# in jniLibs/x86_64/ so the APK packaging includes it (Android's
+# PackageManager doesn't validate ELF architecture per-file).
+#
+# Non-TWRP mode: skip (the x86_64 libtwoyi_loader_shlib.so handles all
+# the ioctl hooks needed for full Android boot via the binder ioctl hook).
+if [ "$TWRP_MODE" = "1" ]; then
+    APK_ABS_FB=$(readlink -f "$APK_PATH" 2>/dev/null || echo "$APK_PATH")
+    unzip -o "$APK_ABS_FB" "lib/x86_64/twrp_fb_hook.so" -d "$EXTRACT_DIR" 2>/dev/null || true
+    if [ -f "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" ]; then
+        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" "$TWOYI_PROFILE/twrp_fb_hook.so" 2>&1 | tail -2
+        "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/twrp_fb_hook.so" 2>&1
+        echo "  ✓ pushed twrp_fb_hook.so (i686) to rootfs (TWRP FB ioctl hook)"
+        # Verify it's actually a 32-bit ELF (catch build/packaging bugs).
+        "$ADB_BIN" -s emulator-5554 shell "head -c 20 $TWOYI_PROFILE/twrp_fb_hook.so | od -An -tx1 | head -1" 2>&1 | tail -1
+    else
+        echo "  ⚠ twrp_fb_hook.so not found in APK — TWRP recovery will crash in libminuitwrp.so"
+    fi
+else
+    echo "  → non-TWRP mode: skipping twrp_fb_hook.so push (only needed for TWRP)"
+fi
 
 # Also create the libkr64.so symlink in the rootfs (RomManager does this
 # when the app starts, but we want it ready before the app launches).
@@ -727,7 +755,12 @@ fi  # end of TWRP_MODE libtwoyi_loader_shlib push branch
 # Set TWOYI_LD_DEBUG=0 in the CI env to disable.
 #
 # TWRP MODE: pass --boot-recovery to kr64. This:
-#   - skips LD_PRELOAD (init is statically linked, no hooks needed)
+#   - loads twrp_fb_hook.so (i686) and sets LD_PRELOAD=/dev/twrp_fb_hook.so
+#     (the statically-linked init ignores LD_PRELOAD, but the dynamically-
+#     linked i386 recovery binary loads it → FB ioctls are intercepted →
+#     no libminuitwrp crash)
+#   - skips the x86_64 libgetpid_hook.so + libtwoyi_loader_shlib.so (i386
+#     recovery can't load x86_64 libs)
 #   - skips /apex bind mount (TWRP doesn't use APEX packages)
 #   - skips binderfs mount (TWRP doesn't use binder)
 #   - skips SELinux permissive watchdog (TWRP handles SELinux in init.rc)
@@ -742,7 +775,7 @@ INIT_PATH_OVERRIDE="${TWOYI_INIT_PATH:-}"
 NO_NAMESPACES_ENV="${TWOYI_NO_NAMESPACES:-}"
 LD_DEBUG_ENV="${TWOYI_LD_DEBUG:-2}"
 if [ "$TWRP_MODE" = "1" ]; then
-    echo "  → pre-launching kr64 as root (TWRP mode: --boot-recovery, no LD_PRELOAD)"
+    echo "  → pre-launching kr64 as root (TWRP mode: --boot-recovery, LD_PRELOAD=twrp_fb_hook.so for i386 recovery)"
 elif [ -n "$NO_NAMESPACES_ENV" ]; then
     echo "  → pre-launching kr64 as root (TWOYI_NO_NAMESPACES=1, no pivot_root/chroot)"
 elif [ -n "$SKIP_PRELOAD_ENV" ]; then

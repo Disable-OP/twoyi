@@ -348,9 +348,14 @@ jobs:
           #   - extracts the TWRP ramdisk from assets/twrp/*.img (via
           #     scripts/extract-twrp-ramdisk.py) instead of the Android rootfs
           #   - skips the /init symlink dance (TWRP init is a real binary)
-          #   - skips the libgetpid_hook.so + libtwoyi_loader_shlib.so push
-          #   - launches kr64 with --boot-recovery (skips LD_PRELOAD, /apex
-          #     bind, binderfs, SELinux watchdog; auto-sets init_path=/init)
+          #   - skips the x86_64 libgetpid_hook.so + libtwoyi_loader_shlib.so
+          #     push (i386 recovery can't load x86_64 libs)
+          #   - pushes twrp_fb_hook.so (i686) instead — LD_PRELOAD for the
+          #     i386 recovery process to intercept FB ioctls on
+          #     /dev/graphics/fb0 and fix the libminuitwrp segfault
+          #   - launches kr64 with --boot-recovery (loads twrp_fb_hook.so,
+          #     skips /apex bind, binderfs, SELinux watchdog; auto-sets
+          #     init_path=/init)
           TWOYI_TWRP: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
 
       - name: Print boot verdict
