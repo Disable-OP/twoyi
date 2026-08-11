@@ -455,6 +455,12 @@ int chroot(const char *path) {
 // Hook mkdir — redirect rootfs paths to {rootfs}/...
 // This catches init's mkdir calls for /linkerconfig, /acct, /config, etc.
 int mkdir(const char *path, mode_t mode) {
+    // DEBUG
+    if (path) {
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s, mode=0%o) called\n", path, mode);
+        write_str(2, msg);
+    }
     // Redirect /dev/__properties__ and its subdirectories to rootfs
     if (path && g_rootfs && (
         strcmp(path, "/dev/__properties__") == 0 ||
@@ -468,7 +474,11 @@ int mkdir(const char *path, mode_t mode) {
         if (lstat(path, &st) != 0) {
             symlink(real_path, path);
         }
-        return 0;
+        int ret = 0;
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
+        write_str(2, msg);
+        return ret;
     }
     // Redirect other rootfs paths (linkerconfig, acct, config, etc.)
     // to {rootfs}/... so init can create them
@@ -476,13 +486,63 @@ int mkdir(const char *path, mode_t mode) {
         char real_path[512];
         snprintf(real_path, sizeof(real_path), "%s%s", g_rootfs, path);
         mkdir_p(real_path, mode);
-        return 0;
+        int ret = 0;
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
+        write_str(2, msg);
+        return ret;
     }
     // For other paths (host paths like /dev, /proc, /sys, /data), call real mkdir
     static int (*real_mkdir)(const char *, mode_t) = NULL;
     if (!real_mkdir) real_mkdir = dlsym(RTLD_NEXT, "mkdir");
-    if (real_mkdir) return real_mkdir(path, mode);
-    return twoyi_sys_mkdir(path, mode);
+    if (real_mkdir) {
+        int ret = real_mkdir(path, mode);
+        const char *real_path = path;
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
+        write_str(2, msg);
+        return ret;
+    }
+    int ret = twoyi_sys_mkdir(path, mode);
+    const char *real_path = path;
+    char msg[600];
+    snprintf(msg, sizeof(msg), "[twoyi_loader] mkdir(%s) -> %s = %d (errno=%d)\n", path, real_path, ret, errno);
+    write_str(2, msg);
+    return ret;
+}
+
+// Hook mkdirat — bionic may inline mkdir() as mkdirat(AT_FDCWD, ...)
+// This catches the case where mkdir's PLT hook is bypassed
+int mkdirat(int dirfd, const char *path, mode_t mode) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+
+        // Create parent directories recursively
+        char dir[512];
+        strncpy(dir, translated, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = 0;
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = 0;
+            // Create directory chain using direct syscalls
+            for (char *p = dir + 1; *p; p++) {
+                if (*p == '/') {
+                    *p = 0;
+                    syscall(SYS_mkdirat, AT_FDCWD, dir, 0777);
+                    *p = '/';
+                }
+            }
+            syscall(SYS_mkdirat, AT_FDCWD, dir, 0777);
+        }
+
+        int ret = syscall(SYS_mkdirat, AT_FDCWD, translated, mode);
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] mkdirat(%s) -> %s = %d (errno=%d)\n", path, translated, ret, ret < 0 ? errno : 0);
+        write_str(2, msg);
+        return ret;
+    }
+    return syscall(SYS_mkdirat, dirfd, path, mode);
 }
 
 static int (*real_mknod)(const char *, mode_t, dev_t) = NULL;
