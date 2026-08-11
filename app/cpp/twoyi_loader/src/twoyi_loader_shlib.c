@@ -2410,37 +2410,49 @@ static void twoyi_init(void) {
             const char *basename = strrchr(exe_path, '/');
             if (basename) basename++; else basename = exe_path;
 
-            // List of services that block waiting for HALs we don't have
+            // List of services that block waiting for HALs we don't have.
+            // vold is NOT in this list — we need to find out why it exits
+            // on its own and fix the real cause.
             const char *blocking_services[] = {
                 "wait_for_keymaster",
                 "wait_for_gatekeeper",
-                "vold",  // vold requires real block devices / device-mapper
-                "vdc",  // vdc communicates with vold via binder; vold exits(0), so vdc would hang
+                "vdc",  // vdc communicates with vold via binder
                 NULL
             };
 
             for (int i = 0; blocking_services[i]; i++) {
                 if (strcmp(basename, blocking_services[i]) == 0) {
-                    if (strcmp(basename, "vold") == 0) {
-                        // vold needs to STAY RUNNING (not exit) so init doesn't
-                        // restart it in a loop. Sleep forever like a real daemon.
-                        write_str(2, "[twoyi_loader] detected vold — sleeping forever (daemon mode)\n");
-                        // Set the property that init waits for
-                        prop_set("vold.decrypt", "trigger_restart_framework");
-                        prop_set("vold.post_fs_data_done", "1");
-                        // Sleep forever
-                        while (1) {
-                            sleep(3600);
-                        }
-                    } else {
-                        // Other blocking services exit(0) immediately
-                        char msg[256];
-                        snprintf(msg, sizeof(msg),
-                            "[twoyi_loader] detected %s — exiting 0 to unblock init\n",
-                            basename);
-                        write_str(2, msg);
-                        _exit(0);
-                    }
+                    char msg[256];
+                    snprintf(msg, sizeof(msg),
+                        "[twoyi_loader] detected %s — exiting 0 to unblock init\n",
+                        basename);
+                    write_str(2, msg);
+                    _exit(0);
+                }
+            }
+
+            // For vold: redirect stderr to a file so we can capture
+            // vold's own error messages before it exits.
+            // Init redirects stderr to /dev/null, so we need to
+            // re-redirect it BEFORE vold's main() runs.
+            if (strcmp(basename, "vold") == 0) {
+                int stderr_fd = syscall(SYS_openat, AT_FDCWD,
+                    "/data/local/tmp/twoyi-vold-stderr.log",
+                    O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                if (stderr_fd >= 0) {
+                    // Redirect fd 2 (stderr) to the file
+                    syscall(SYS_dup3, stderr_fd, 2, 0);
+                    syscall(SYS_close, stderr_fd);
+                }
+                write_str(2, "[twoyi_loader] vold stderr redirected to /data/local/tmp/twoyi-vold-stderr.log\n");
+
+                // Also redirect stdout
+                int stdout_fd = syscall(SYS_openat, AT_FDCWD,
+                    "/data/local/tmp/twoyi-vold-stderr.log",
+                    O_WRONLY | O_CREAT | O_APPEND, 0666);
+                if (stdout_fd >= 0) {
+                    syscall(SYS_dup3, stdout_fd, 1, 0);
+                    syscall(SYS_close, stdout_fd);
                 }
             }
         }

@@ -784,6 +784,14 @@ if [ -f "$ARTIFACT_DIR/twoyi-loader.log" ]; then
     cat "$ARTIFACT_DIR/twoyi-loader.log"
 fi
 
+# Pull the vold stderr log (vold's own error output, redirected by our loader)
+"$ADB_BIN" -s emulator-5554 pull /data/local/tmp/twoyi-vold-stderr.log "$ARTIFACT_DIR/twoyi-vold-stderr.log" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/twoyi-vold-stderr.log" ]; then
+    echo "  ✓ pulled twoyi-vold-stderr.log ($(stat -c%s "$ARTIFACT_DIR/twoyi-vold-stderr.log") bytes)"
+    echo "  === twoyi-vold-stderr.log ==="
+    cat "$ARTIFACT_DIR/twoyi-vold-stderr.log"
+fi
+
 # Save a filtered logcat for quick scanning — the full logcat can be
 # 100k+ lines on a booted emulator.
 grep -E 'KR64 INFO|KR64 WARN|KR64 ERROR|CORE|NEW_RENDERER|CLIENT_EGL|SOCKET_MONITOR|BOOT_COMPLETED|TWOYI_RENDERER|emugl' \
