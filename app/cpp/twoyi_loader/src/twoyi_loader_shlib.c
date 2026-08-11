@@ -2158,14 +2158,19 @@ int open(const char *path, int flags, ...) {
 
 #if defined(__x86_64__)
         int fd = twoyi_sys_open(translated, flags, mode);
-        if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
+        // Only retry with O_CREAT for selinuxfs virtual files, NOT for
+        // binder devices or other character devices — O_CREAT on a
+        // binderfs device would create a regular file and corrupt it.
+        if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR) &&
+            strncmp(path, "/sys/fs/selinux", 15) == 0) {
             fd = twoyi_sys_open(translated, flags | O_CREAT, 0666);
         }
         return fd;
 #else
         if (real_openat) {
             int fd = real_openat(AT_FDCWD, translated, flags, mode);
-            if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
+            if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR) &&
+                strncmp(path, "/sys/fs/selinux", 15) == 0) {
                 fd = real_openat(AT_FDCWD, translated, flags | O_CREAT, 0666);
             }
             return fd;
@@ -2259,12 +2264,25 @@ int __open_2(const char *path, int flags) {
         const char *translated = translate(path);
         static int (*real_open2)(const char *, int) = NULL;
         if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
-        if (real_open2) return real_open2(translated, flags);
+        int fd;
+        if (real_open2) fd = real_open2(translated, flags);
 #if defined(__x86_64__)
-        return twoyi_sys_open2(translated, flags);
+        else fd = twoyi_sys_open2(translated, flags);
 #else
-        return syscall(NR_openat, AT_FDCWD, translated, flags);
+        else fd = syscall(NR_openat, AT_FDCWD, translated, flags);
 #endif
+        // Log binder device open results
+        if (path && (strcmp(path, "/dev/binder") == 0 ||
+                      strcmp(path, "/dev/hwbinder") == 0 ||
+                      strcmp(path, "/dev/vndbinder") == 0)) {
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] __open_2(%s) -> %s = %d (errno=%d: %s)\n",
+                path, translated, fd, fd < 0 ? errno : 0,
+                fd < 0 ? strerror(errno) : "OK");
+            write_str(2, msg);
+        }
+        return fd;
     }
     // Pass through (kernel paths: /proc, /sys, /dev, relative paths)
     static int (*real_open2)(const char *, int) = NULL;
