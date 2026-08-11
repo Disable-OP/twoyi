@@ -1900,6 +1900,57 @@ int open(const char *path, int flags, ...) {
 #endif
 }
 
+// Hook fopen — translate paths to rootfs.
+// fopen() internally calls openat() within libc, bypassing our PLT hooks.
+// This means vold's fs_mgr_read_fstab() (which uses fopen) can't find
+// /vendor/etc/fstab.ranchu in the rootfs. We must hook fopen directly.
+FILE *fopen(const char *path, const char *mode) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static FILE *(*real_fopen)(const char *, const char *) = NULL;
+        if (!real_fopen) real_fopen = dlsym(RTLD_NEXT, "fopen");
+        if (real_fopen) return real_fopen(translated, mode);
+        return NULL;
+    }
+    static FILE *(*real_fopen)(const char *, const char *) = NULL;
+    if (!real_fopen) real_fopen = dlsym(RTLD_NEXT, "fopen");
+    if (real_fopen) return real_fopen(path, mode);
+    return NULL;
+}
+
+// Hook fopen64 — same as fopen but for large file support
+FILE *fopen64(const char *path, const char *mode) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static FILE *(*real_fopen64)(const char *, const char *) = NULL;
+        if (!real_fopen64) real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
+        if (real_fopen64) return real_fopen64(translated, mode);
+        return NULL;
+    }
+    static FILE *(*real_fopen64)(const char *, const char *) = NULL;
+    if (!real_fopen64) real_fopen64 = dlsym(RTLD_NEXT, "fopen64");
+    if (real_fopen64) return real_fopen64(path, mode);
+    return NULL;
+}
+
+// Hook freopen — translate paths to rootfs
+FILE *freopen(const char *path, const char *mode, FILE *stream) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static FILE *(*real_freopen)(const char *, const char *, FILE *) = NULL;
+        if (!real_freopen) real_freopen = dlsym(RTLD_NEXT, "freopen");
+        if (real_freopen) return real_freopen(translated, mode, stream);
+        return NULL;
+    }
+    static FILE *(*real_freopen)(const char *, const char *, FILE *) = NULL;
+    if (!real_freopen) real_freopen = dlsym(RTLD_NEXT, "freopen");
+    if (real_freopen) return real_freopen(path, mode, stream);
+    return NULL;
+}
+
 // =========================================================================
 // DIAGNOSTIC (vold silent exit): exit() / _exit() hooks
 // vold exits with status 1 within ~89ms, producing zero log output.
