@@ -272,6 +272,51 @@ pub struct Config {
     /// not yet written). The field exists now so that callers can
     /// configure it and so the daemon logs the configured value.
     pub socks5_proxy: Option<String>,
+
+    /// Boot a TWRP-style recovery image instead of a full Android
+    /// rootfs. TWRP boot is MUCH simpler than full Android boot:
+    ///
+    ///   * TWRP's `init` binary is **statically linked** (i386), so
+    ///     it doesn't need LD_PRELOAD hook libraries. We skip the
+    ///     hook-library read + write phases entirely.
+    ///   * TWRP's ramdisk doesn't use APEX packages, so we skip the
+    ///     /apex bind mount (which would otherwise give the guest
+    ///     access to the host's APEX packages -- harmless but
+    ///     unnecessary for TWRP, and skipping it avoids the
+    ///     "is /apex accessible?" failure mode entirely).
+    ///   * TWRP's init.rc doesn't use binder, so we skip the
+    ///     binderfs mount (saves a `mount("binder", ...)` call and
+    ///     the symlink setup).
+    ///   * TWRP's init.rc has its own SELinux handling, so we skip
+    ///     the SELinux permissive watchdog thread (no thread
+    ///     continuously writing "0" to /sys/fs/selinux/enforce).
+    ///   * TWRP doesn't need the /dev/twoyi-bin/ copy of system
+    ///     binaries (logd, servicemanager, vold, zygote, etc.) --
+    ///     TWRP's init.rc only starts `ueventd`, `recovery`, and
+    ///     `partlink`.
+    ///   * TWRP doesn't need the property_info / properties_serial
+    ///     pre-creation (TWRP's property service is much simpler).
+    ///   * TWRP doesn't need the fstab.ranchu overwrite (TWRP has
+    ///     its own /etc/recovery.fstab).
+    ///
+    /// What we KEEP for TWRP boot:
+    ///   * Basic device creation (qemu_pipe for display, touch, key,
+    ///     event, gb, gb2 -- the recovery UI uses these).
+    ///   * Rootfs setup (mount tmpfs on /dev, /proc, /sys, /tmp +
+    ///     pivot_root + chdir).
+    ///   * proc_emu (8-core, 4GB synthesis -- TWRP reads /proc).
+    ///   * Samsung GameSDK compat paths (harmless, just empty dirs).
+    ///   * Graphics device stubs (recovery may probe /dev/graphics/fb0
+    ///     etc.).
+    ///   * Pre-created boot directories (/dev/block, /mnt, etc.).
+    ///   * PID namespace (CLONE_NEWPID so TWRP init becomes PID 1).
+    ///   * The coldboot_done + busybox + magisk markers.
+    ///
+    /// When `boot_recovery=true`, the caller MUST also set
+    /// `init_path="/init"` (TWRP's init is at the root of the
+    /// ramdisk, not at /system/bin/init). The `--boot-recovery` flag
+    /// sets this automatically if `--init` is not also passed.
+    pub boot_recovery: bool,
 }
 
 impl Default for Config {
@@ -290,6 +335,7 @@ impl Default for Config {
             install_seccomp: true,
             log_level: 3,
             socks5_proxy: None,
+            boot_recovery: false,
         }
     }
 }
@@ -308,9 +354,17 @@ impl Default for Config {
 ///   --no-namespaces           (disable unshare + pivot_root; chroot only)
 ///   --rw-rom                  (mount /system etc. read-write)
 ///   --no-seccomp              (skip seccomp filter installation)
+///   --boot-recovery           (TWRP recovery boot: skip LD_PRELOAD,
+///                              /apex bind, binderfs, SELinux watchdog,
+///                              twoyi-bin copy; set init_path=/init)
 ///   --help, -h                (show usage)
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut cfg = Config::default();
+    // Track whether --init was passed explicitly so --boot-recovery
+    // doesn't clobber an explicit --init value. (If the user passes
+    // both --boot-recovery AND --init /custom/init, the explicit
+    // --init wins and --boot-recovery only flips the bool.)
+    let mut init_explicitly_set = false;
     let mut iter = args.into_iter();
     // Skip argv[0] (program name).
     let _prog = iter.next();
@@ -339,6 +393,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                        --no-namespaces           Disable unshare + pivot_root; chroot only\n\
                        --rw-rom                  Mount /system etc. read-write (for dev)\n\
                        --no-seccomp              Skip seccomp filter installation\n\
+                       --boot-recovery           TWRP recovery boot (skip LD_PRELOAD,\n\
+                                                 /apex bind, binderfs, SELinux watchdog;\n\
+                                                 set init_path=/init)\n\
                      \n\
                      Networking:\n\
                        --socks5 <host:port>     Tunnel guest TCP through a SOCKS5 proxy (stub)\n"
@@ -357,6 +414,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             }
             "--init" => {
                 cfg.init_path = iter.next().ok_or("--init requires a path".to_string())?;
+                init_explicitly_set = true;
             }
             "--vmid" => {
                 cfg.vmid = iter
@@ -396,6 +454,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             "--no-namespaces" => cfg.use_namespaces = false,
             "--rw-rom" => cfg.read_only_rom = false,
             "--no-seccomp" => cfg.install_seccomp = false,
+            "--boot-recovery" => cfg.boot_recovery = true,
             "--socks5" => {
                 // SOCKS5 proxy stub: store the host:port string. The
                 // actual forwarding thread is not yet wired up -- see
@@ -427,6 +486,14 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
     }
     if cfg.data_dir.is_empty() {
         return Err("--data-dir is required".to_string());
+    }
+
+    // --boot-recovery implies init_path=/init (TWRP's init is at the
+    // root of the ramdisk, not at /system/bin/init). Don't override
+    // if the user explicitly passed --init /custom/init.
+    if cfg.boot_recovery && !init_explicitly_set {
+        cfg.init_path = "/init".to_string();
+        info!("[KR64] --boot-recovery: setting init_path to /init (TWRP statically-linked init)");
     }
 
     Ok(cfg)
@@ -1206,14 +1273,32 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // the hook library copy was happening AFTER pivot_root, so all
     // candidate source paths were unreachable, LD_PRELOAD was empty,
     // and init crashed with SIGSEGV (signal 11).
+    //
+    // TWRP BOOT: TWRP's init binary is statically linked (i386), so
+    // it doesn't need LD_PRELOAD hooks. We skip the read entirely --
+    // both `hook_lib_getpid` and `hook_lib_loader` stay `None`, the
+    // later write-to-/dev/ phase skips them, and the child env won't
+    // set LD_PRELOAD. This is the key simplification that makes TWRP
+    // boot dramatically simpler than full Android boot.
     // ---------------------------------------------------------------
-    let hook_lib_getpid =
-        find_and_read_hook_library(&cfg, "libgetpid_hook.so", "LD_PRELOAD will fail");
-    let hook_lib_loader = find_and_read_hook_library(
-        &cfg,
-        "libtwoyi_loader_shlib.so",
-        "seccomp virtualization disabled",
-    );
+    let hook_lib_getpid = if cfg.boot_recovery {
+        info!("[KR64] TWRP boot: skipping libgetpid_hook.so read (init is statically linked)");
+        None
+    } else {
+        find_and_read_hook_library(&cfg, "libgetpid_hook.so", "LD_PRELOAD will fail")
+    };
+    let hook_lib_loader = if cfg.boot_recovery {
+        info!(
+            "[KR64] TWRP boot: skipping libtwoyi_loader_shlib.so read (init is statically linked)"
+        );
+        None
+    } else {
+        find_and_read_hook_library(
+            &cfg,
+            "libtwoyi_loader_shlib.so",
+            "seccomp virtualization disabled",
+        )
+    };
 
     // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
@@ -1241,12 +1326,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // If setup_mounts fails (e.g. not root), we fall through to fork
     // without pivot_root. The child will exec init with full rootfs
     // paths prepended (see full_init_path below).
+    //
+    // TWRP BOOT: pass `boot_recovery=cfg.boot_recovery` so mount_mgr
+    // skips the /apex bind mount (TWRP's ramdisk doesn't use APEX
+    // packages; the bind mount would just give the guest access to the
+    // host's APEX packages, which is harmless but unnecessary and
+    // avoids the "is /apex accessible?" failure mode entirely).
     if cfg.use_namespaces {
         let mount_cfg = mount_mgr::MountConfig {
             rootfs: cfg.rootfs.clone(),
             rom_dir: cfg.rom_dir.clone(),
             use_namespaces: cfg.use_namespaces,
             read_only_rom: cfg.read_only_rom,
+            boot_recovery: cfg.boot_recovery,
         };
         match mount_mgr::setup_mounts(&mount_cfg) {
             Ok(()) => info!("[KR64] setup_mounts succeeded -- pivot_root done"),
@@ -1328,7 +1420,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // and returns success if the file exists, but doesn't tell us if
     // the file is a valid ELF binary. std::fs::metadata follows symlinks
     // and returns the size, which we can check.
-    if cfg.use_namespaces {
+    //
+    // TWRP BOOT: TWRP doesn't have /system/lib64/libc.so etc. (init
+    // is statically linked), so the standard diagnostic block would
+    // log a wall of "metadata failed" errors. Skip it and instead log
+    // a TWRP-specific diagnostic: verify /init exists and is a static
+    // ELF binary.
+    if cfg.boot_recovery {
+        // TWRP diagnostics: verify the init binary.
+        let init_full = if cfg.use_namespaces {
+            cfg.init_path.clone()
+        } else {
+            format!("{}{}", cfg.rootfs, cfg.init_path)
+        };
+        match std::fs::metadata(&init_full) {
+            Ok(meta) => {
+                info!(
+                    "[KR64] TWRP PARENT: {} -> file ({} bytes) -- ready to exec",
+                    init_full,
+                    meta.len()
+                );
+            }
+            Err(e) => {
+                error!(
+                    "[KR64] TWRP PARENT: {} -> metadata FAILED: {} (TWRP init binary missing from rootfs)",
+                    init_full,
+                    e
+                );
+            }
+        }
+    } else if cfg.use_namespaces {
         // After pivot_root, paths are relative to the new root.
         let paths_to_check = [
             "/system/bin/linker64",
@@ -1525,7 +1646,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // - logd, lmkd, servicemanager, hwservicemanager, vold
     // - zygote64, zygote (for app startup)
     // - surfaceflinger (for display)
-    {
+    //
+    // TWRP BOOT: skip this entire block. TWRP's init.rc only starts
+    // `ueventd`, `recovery`, and `partlink` (all in /sbin/), and these
+    // are statically linked or have known-good exec paths in the
+    // ramdisk. Copying 50+ Android binaries to /dev/twoyi-bin/ would
+    // be wasteful and could confuse TWRP's exec lookups.
+    if cfg.boot_recovery {
+        info!("[KR64] TWRP boot: skipping /dev/twoyi-bin/ copy (TWRP only needs /sbin/*)");
+    } else {
         use std::os::unix::fs::PermissionsExt;
         let dev_bin_dir = "/dev/twoyi-bin";
         let _ = std::fs::create_dir_all(dev_bin_dir);
@@ -1874,7 +2003,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // init's FirstStageMount() tries device-mapper mounts that fail fatally
     // (EBUSY) in our container → InitFatalReboot. With an empty fstab init
     // skips first_stage_mount naturally; vold proceeds with an empty fstab.
-    {
+    //
+    // TWRP BOOT: skip this overwrite. TWRP has its own /etc/recovery.fstab
+    // and doesn't read /vendor/etc/fstab.ranchu. Overwriting it would
+    // create a stub file that's never read, and worse, would create the
+    // /vendor/etc/ directory in TWRP's ramdisk if it doesn't exist (TWRP
+    // puts its vendor files in /sbin/, not /vendor/).
+    if cfg.boot_recovery {
+        info!("[KR64] TWRP boot: skipping /vendor/etc/fstab.ranchu overwrite (TWRP has /etc/recovery.fstab)");
+    } else {
         let fstab_path = format!("{}/vendor/etc/fstab.ranchu", rootfs_prefix);
         let fstab_content = "# Minimal fstab for twoyi virtualization\n/dev/null /system ext4 ro wait\n/dev/null /vendor ext4 ro wait\n/dev/null /data ext4 nosuid,nodev wait,check,formattable,latemount,resize\n";
         let _ = std::fs::create_dir_all(format!("{}/vendor/etc", rootfs_prefix));
@@ -1905,7 +2042,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // By pre-creating the file in BOTH locations (host + rootfs), we
     // ensure WriteStringToFile succeeds regardless of which path init
     // actually opens.
-    {
+    //
+    // TWRP BOOT: skip this block. TWRP's init.rc has a much simpler
+    // property service (no second_stage init / secilc / vendor_init
+    // chain), and doesn't write to /dev/__properties__/property_info.
+    if cfg.boot_recovery {
+        info!("[KR64] TWRP boot: skipping /dev/__properties__ pre-creation (TWRP has its own property service)");
+    } else {
         use std::os::unix::fs::PermissionsExt;
         // Create the directory on the host (if it doesn't exist)
         let host_prop_dir = "/dev/__properties__";
@@ -2023,23 +2166,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // 1. Modify the guest's SELinux policy to allow vendor_init access
     // 2. Use a different loading mechanism (PT_INTERP, DT_NEEDED)
     // 3. Don't use LD_PRELOAD for subcontexts
-    let enforce_thread = std::thread::Builder::new()
-        .name("selinux-permissive".to_string())
-        .spawn(|| {
-            info!("[KR64] PARENT: starting SELinux permissive watchdog thread");
-            loop {
-                // Write "0" to /sys/fs/selinux/enforce to set permissive mode
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .open("/sys/fs/selinux/enforce")
-                {
-                    use std::io::Write;
-                    let _ = f.write_all(b"0");
+    //
+    // TWRP BOOT: skip the permissive watchdog. TWRP's init.rc has its
+    // own SELinux handling (setenforce 0 in init.rc itself, no
+    // vendor_init subcontexts that need permissive mode to access
+    // /dev/lib*.so because we don't LD_PRELOAD anything). Spinning up
+    // the watchdog thread would just waste CPU writing "0" to a file
+    // that's already set to "0" by TWRP's own init.
+    let enforce_thread = if cfg.boot_recovery {
+        info!("[KR64] TWRP boot: skipping SELinux permissive watchdog (TWRP handles SELinux in init.rc)");
+        None
+    } else {
+        std::thread::Builder::new()
+            .name("selinux-permissive".to_string())
+            .spawn(|| {
+                info!("[KR64] PARENT: starting SELinux permissive watchdog thread");
+                loop {
+                    // Write "0" to /sys/fs/selinux/enforce to set permissive mode
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open("/sys/fs/selinux/enforce")
+                    {
+                        use std::io::Write;
+                        let _ = f.write_all(b"0");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        })
-        .ok();
+            })
+            .ok()
+    };
 
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
@@ -2288,7 +2443,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // entirely -- this is a diagnostic mode to check if the init binary
         // can link WITHOUT the getpid hook (init will exit 31, but if it
         // exits 31 instead of SIGSEGV, we know the linker works).
-        let skip_preload = std::env::var("TWOYI_SKIP_PRELOAD").is_ok();
+        //
+        // TWRP BOOT: skip_preload is always true when cfg.boot_recovery is
+        // set. TWRP's init is statically linked (no shared lib deps), so
+        // LD_PRELOAD is unnecessary -- the hook libs weren't read into
+        // memory and weren't written to /dev/, so even if we set
+        // LD_PRELOAD=/dev/libgetpid_hook.so the file wouldn't exist and
+        // the linker would fail with ENOENT. TWRP's init.rc also has its
+        // own PID-1 logic and property service.
+        let skip_preload = cfg.boot_recovery || std::env::var("TWOYI_SKIP_PRELOAD").is_ok();
         // LD_PRELOAD: load BOTH the seccomp/SIGSYS virtualization library
         // (libtwoyi_loader_shlib.so) AND the getpid hook (libgetpid_hook.so).
         // The virtualization library installs seccomp BPF filter + SIGSYS
@@ -2296,80 +2459,109 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // The getpid hook makes init think it's PID 1.
         let ld_preload_str =
             "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string();
-        let mut env_vars: Vec<CString> = vec![
-            CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
-            CString::new("ANDROID_ROOT=/system").unwrap(),
-            CString::new("ANDROID_DATA=/data").unwrap(),
-            CString::new("ANDROID_BOOTLOGO=1").unwrap(),
-            twoyi_rootfs_env,
-            // On Android 11+, many libraries (libc.so, libbase.so, liblog.so,
-            // etc.) live in /apex/com.android.runtime/lib64/ and are only
-            // symlinked from /system/lib64/. Some libraries (like libbase.so)
-            // have NO symlink in /system/lib64/ and can only be found in the
-            // apex directory. Without these paths in LD_LIBRARY_PATH, the
-            // linker gets a NULL soinfo for the missing library and crashes
-            // with SIGSEGV at address 0x86 (offset 0xaf174 in linker64).
-            //
-            // CRITICAL (KVM run 31505655579): The guest init (pid 5865) was
-            // crashing with SIGSEGV (signal 11) in linker64 with NO
-            // [twoyi_loader] init messages — meaning the linker crashed
-            // BEFORE the LD_PRELOAD constructor could run. Root cause:
-            // init's LD_LIBRARY_PATH was MISSING /vendor/lib64,
-            // /apex/com.android.os.statsd/lib64, /system_ext/lib64, and
-            // /product/lib64. If init (or any of its dependencies) needs a
-            // library that's ONLY in one of those directories, the linker
-            // gets a NULL soinfo and crashes.
-            //
-            // The execve hook in twoyi_loader_shlib.c (line ~1872) already
-            // builds a FULL LD_LIBRARY_PATH for execve'd processes that
-            // includes all these paths. But the FIRST init (launched by
-            // kr64 via execve) was getting a SHORTER LD_LIBRARY_PATH that
-            // was missing 4 directories. This fix makes the first init's
-            // LD_LIBRARY_PATH match what the execve hook builds, so the
-            // linker can find ALL libraries on the first exec.
-            CString::new(
-                // CRITICAL (KVM run 31509809060): The guest init (pid 6188)
-                // STILL crashes with SIGSEGV at 0x86 in linker64 even though
-                // both hook libraries are loaded and relabeled. The crash
-                // happens BEFORE the .init_array constructor runs (0
-                // twoyi_loader init messages), so it's during the linker's
-                // library loading (mapping segments, resolving DT_NEEDED,
-                // relocating).
+        // TWRP BOOT: use a minimal env that mirrors TWRP's init.rc exports.
+        // TWRP's init.rc does its own:
+        //   export PATH /sbin:/system/bin
+        //   export LD_LIBRARY_PATH /sbin:/system/lib
+        //   export ANDROID_ROOT /system
+        //   export EXTERNAL_STORAGE /sdcard
+        // We pre-set the same values so the statically-linked init binary
+        // has them available BEFORE init.rc's exports run (init.rc exports
+        // happen after init's main() starts, but some init code paths may
+        // need them earlier).
+        //
+        // Note: TWRP's LD_LIBRARY_PATH uses /system/lib (32-bit) not
+        // /system/lib64 (64-bit) -- this matches the i386 architecture
+        // of TWRP's binaries.
+        let mut env_vars: Vec<CString> = if cfg.boot_recovery {
+            vec![
+                CString::new("PATH=/sbin:/system/bin").unwrap(),
+                CString::new("ANDROID_ROOT=/system").unwrap(),
+                CString::new("ANDROID_DATA=/data").unwrap(),
+                CString::new("ANDROID_BOOTLOGO=1").unwrap(),
+                CString::new("EXTERNAL_STORAGE=/sdcard").unwrap(),
+                // TWRP's init.rc sets LD_LIBRARY_PATH itself, but pre-set
+                // it so any pre-init.rc code that needs /sbin libs can
+                // find them (e.g. /sbin/linker for dynamically-linked
+                // /sbin/recovery which has interpreter /sbin/linker).
+                CString::new("LD_LIBRARY_PATH=/sbin:/system/lib").unwrap(),
+                twoyi_rootfs_env,
+            ]
+        } else {
+            vec![
+                CString::new("PATH=/system/bin:/system/xbin:/vendor/bin").unwrap(),
+                CString::new("ANDROID_ROOT=/system").unwrap(),
+                CString::new("ANDROID_DATA=/data").unwrap(),
+                CString::new("ANDROID_BOOTLOGO=1").unwrap(),
+                twoyi_rootfs_env,
+                // On Android 11+, many libraries (libc.so, libbase.so, liblog.so,
+                // etc.) live in /apex/com.android.runtime/lib64/ and are only
+                // symlinked from /system/lib64/. Some libraries (like libbase.so)
+                // have NO symlink in /system/lib64/ and can only be found in the
+                // apex directory. Without these paths in LD_LIBRARY_PATH, the
+                // linker gets a NULL soinfo for the missing library and crashes
+                // with SIGSEGV at address 0x86 (offset 0xaf174 in linker64).
                 //
-                // The hook libraries (libgetpid_hook.so and
-                // libtwoyi_loader_shlib.so) have DT_NEEDED:
-                //   - libc.so (version LIBC)
-                //   - libdl.so (version LIBC)
+                // CRITICAL (KVM run 31505655579): The guest init (pid 5865) was
+                // crashing with SIGSEGV (signal 11) in linker64 with NO
+                // [twoyi_loader] init messages — meaning the linker crashed
+                // BEFORE the LD_PRELOAD constructor could run. Root cause:
+                // init's LD_LIBRARY_PATH was MISSING /vendor/lib64,
+                // /apex/com.android.os.statsd/lib64, /system_ext/lib64, and
+                // /product/lib64. If init (or any of its dependencies) needs a
+                // library that's ONLY in one of those directories, the linker
+                // gets a NULL soinfo and crashes.
                 //
-                // On Android 11, /system/lib64/libdl.so is a 5848-byte
-                // BOOTSTRAP STUB (used during early init before apexd
-                // mounts the APEX packages). The REAL libdl.so (with the
-                // full implementation) is at
-                // /apex/com.android.runtime/lib64/bionic/libdl.so.
-                //
-                // The bootstrap stub SHOULD provide the LIBC version, but
-                // there may be a subtle incompatibility (missing symbol,
-                // different version definition, etc.) that causes the
-                // linker to get a NULL soinfo and crash.
-                //
-                // FIX: Put /apex/com.android.runtime/lib64/bionic FIRST in
-                // LD_LIBRARY_PATH, so the linker finds the REAL bionic
-                // libraries (libc.so, libdl.so, libm.so) before the
-                // bootstrap stubs in /system/lib64/. This ensures the
-                // version requirements are satisfied by the full bionic
-                // implementation.
-                //
-                // This is safe because:
-                //   - /apex/com.android.runtime/lib64/bionic/libc.so is the
-                //     SAME file as /system/lib64/libc.so (same size, 984072
-                //     bytes — /system/lib64/libc.so is a hardlink/copy, not
-                //     a stub).
-                //   - /apex/com.android.runtime/lib64/bionic/libdl.so is
-                //     the REAL libdl.so (larger than the 5848-byte stub).
-                //   - The apex directory has all 4 bionic libraries
-                //     (libc.so, libm.so, libdl.so, libdl_android.so), so
-                //     they can find each other.
-                "LD_LIBRARY_PATH=\
+                // The execve hook in twoyi_loader_shlib.c (line ~1872) already
+                // builds a FULL LD_LIBRARY_PATH for execve'd processes that
+                // includes all these paths. But the FIRST init (launched by
+                // kr64 via execve) was getting a SHORTER LD_LIBRARY_PATH that
+                // was missing 4 directories. This fix makes the first init's
+                // LD_LIBRARY_PATH match what the execve hook builds, so the
+                // linker can find ALL libraries on the first exec.
+                CString::new(
+                    // CRITICAL (KVM run 31509809060): The guest init (pid 6188)
+                    // STILL crashes with SIGSEGV at 0x86 in linker64 even though
+                    // both hook libraries are loaded and relabeled. The crash
+                    // happens BEFORE the .init_array constructor runs (0
+                    // twoyi_loader init messages), so it's during the linker's
+                    // library loading (mapping segments, resolving DT_NEEDED,
+                    // relocating).
+                    //
+                    // The hook libraries (libgetpid_hook.so and
+                    // libtwoyi_loader_shlib.so) have DT_NEEDED:
+                    //   - libc.so (version LIBC)
+                    //   - libdl.so (version LIBC)
+                    //
+                    // On Android 11, /system/lib64/libdl.so is a 5848-byte
+                    // BOOTSTRAP STUB (used during early init before apexd
+                    // mounts the APEX packages). The REAL libdl.so (with the
+                    // full implementation) is at
+                    // /apex/com.android.runtime/lib64/bionic/libdl.so.
+                    //
+                    // The bootstrap stub SHOULD provide the LIBC version, but
+                    // there may be a subtle incompatibility (missing symbol,
+                    // different version definition, etc.) that causes the
+                    // linker to get a NULL soinfo and crash.
+                    //
+                    // FIX: Put /apex/com.android.runtime/lib64/bionic FIRST in
+                    // LD_LIBRARY_PATH, so the linker finds the REAL bionic
+                    // libraries (libc.so, libdl.so, libm.so) before the
+                    // bootstrap stubs in /system/lib64/. This ensures the
+                    // version requirements are satisfied by the full bionic
+                    // implementation.
+                    //
+                    // This is safe because:
+                    //   - /apex/com.android.runtime/lib64/bionic/libc.so is the
+                    //     SAME file as /system/lib64/libc.so (same size, 984072
+                    //     bytes — /system/lib64/libc.so is a hardlink/copy, not
+                    //     a stub).
+                    //   - /apex/com.android.runtime/lib64/bionic/libdl.so is
+                    //     the REAL libdl.so (larger than the 5848-byte stub).
+                    //   - The apex directory has all 4 bionic libraries
+                    //     (libc.so, libm.so, libdl.so, libdl_android.so), so
+                    //     they can find each other.
+                    "LD_LIBRARY_PATH=\
                 /apex/com.android.runtime/lib64/bionic:\
                 /apex/com.android.runtime/lib64:\
                 /apex/com.android.runtime/lib64/bootstrap:\
@@ -2379,9 +2571,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 /apex/com.android.os.statsd/lib64:\
                 /system_ext/lib64:\
                 /product/lib64",
-            )
-            .unwrap(),
-        ];
+                )
+                .unwrap(),
+            ]
+        };
         // LD_DEBUG support: if TWOYI_LD_DEBUG is set in the parent env,
         // propagate it as LD_DEBUG to the guest init. This enables bionic
         // linker debug output (which library is being loaded when the
@@ -2806,6 +2999,65 @@ mod tests {
         let r = parse_args(args(&["--help"]));
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("--socks5"));
+    }
+
+    #[test]
+    fn config_default_boot_recovery_is_false() {
+        let cfg = Config::default();
+        assert!(!cfg.boot_recovery, "boot_recovery should default to false");
+    }
+
+    /// `--boot-recovery` flips the bool AND auto-sets `init_path=/init`
+    /// (TWRP's init binary lives at the root of the ramdisk, not at
+    /// `/system/bin/init` like full Android).
+    #[test]
+    fn parse_args_boot_recovery_sets_init_path_to_slash_init() {
+        let cfg = parse_args(args(&[
+            "--rootfs",
+            "/r",
+            "--data-dir",
+            "/d",
+            "--boot-recovery",
+        ]))
+        .unwrap();
+        assert!(cfg.boot_recovery);
+        assert_eq!(cfg.init_path, "/init");
+    }
+
+    /// If the user passes BOTH `--boot-recovery` AND `--init /custom/init`,
+    /// the explicit `--init` wins (the bool is still flipped, but the
+    /// init_path is NOT overridden). This is the documented contract on
+    /// the `boot_recovery` field.
+    #[test]
+    fn parse_args_boot_recovery_does_not_override_explicit_init() {
+        let cfg = parse_args(args(&[
+            "--rootfs",
+            "/r",
+            "--data-dir",
+            "/d",
+            "--boot-recovery",
+            "--init",
+            "/sbin/init",
+        ]))
+        .unwrap();
+        assert!(cfg.boot_recovery);
+        assert_eq!(cfg.init_path, "/sbin/init");
+    }
+
+    /// `--boot-recovery` is mentioned in `--help` so users discover it.
+    #[test]
+    fn parse_args_help_mentions_boot_recovery() {
+        let r = parse_args(args(&["--help"]));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("--boot-recovery"));
+    }
+
+    /// `MountConfig::default()` must set `boot_recovery=false` so the
+    /// default (non-TWRP) path retains the /apex bind mount.
+    #[test]
+    fn mount_config_default_boot_recovery_is_false() {
+        let mc = mount_mgr::MountConfig::default();
+        assert!(!mc.boot_recovery);
     }
 
     /// `clear_zombie_processes` must be safe to call when there are no
