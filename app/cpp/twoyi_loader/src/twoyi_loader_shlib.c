@@ -825,6 +825,13 @@ int ioctl(int fd, unsigned long request, ...) {
     
     unsigned req = (unsigned)request;
     
+    // Debug: log ioctl calls that look like binder ioctls (magic 'b' = 0x62)
+    if ((req & 0xff00) == 0x6200) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] ioctl(fd=%d, req=0x%x) — binder ioctl\n", fd, req);
+        write_str(2, msg);
+    }
+    
     // BINDER_VERSION = 0xc004620d — returns protocol version
     if (req == 0xc004620du) {
         if (argp) {
