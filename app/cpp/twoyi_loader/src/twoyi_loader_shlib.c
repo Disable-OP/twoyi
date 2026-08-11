@@ -2421,12 +2421,26 @@ static void twoyi_init(void) {
 
             for (int i = 0; blocking_services[i]; i++) {
                 if (strcmp(basename, blocking_services[i]) == 0) {
-                    char msg[256];
-                    snprintf(msg, sizeof(msg),
-                        "[twoyi_loader] detected %s — exiting 0 to unblock init\n",
-                        basename);
-                    write_str(2, msg);
-                    _exit(0);
+                    if (strcmp(basename, "vold") == 0) {
+                        // vold needs to STAY RUNNING (not exit) so init doesn't
+                        // restart it in a loop. Sleep forever like a real daemon.
+                        write_str(2, "[twoyi_loader] detected vold — sleeping forever (daemon mode)\n");
+                        // Set the property that init waits for
+                        prop_set("vold.decrypt", "trigger_restart_framework");
+                        prop_set("vold.post_fs_data_done", "1");
+                        // Sleep forever
+                        while (1) {
+                            sleep(3600);
+                        }
+                    } else {
+                        // Other blocking services exit(0) immediately
+                        char msg[256];
+                        snprintf(msg, sizeof(msg),
+                            "[twoyi_loader] detected %s — exiting 0 to unblock init\n",
+                            basename);
+                        write_str(2, msg);
+                        _exit(0);
+                    }
                 }
             }
         }
