@@ -518,6 +518,22 @@ pub fn clear_zombie_processes() {
 //   kr64-stderr.log: "libgetpid_hook.so not found at {rootfs}/libgetpid_hook.so"
 //   logcat.txt:      "ensureLibSymlink: libgetpid_hook.so ->
 //                     {data_dir}/rootfs/system/lib64/libgetpid_hook.so"
+//
+// Task ID 7 (commit 8375802) added candidates #1-#4 below. KVM run
+// 31501768195 then revealed a DEEPER issue: ProfileManager's rootfs
+// symlink setup FAILED (FileAlreadyExistsException on
+// profiles/default/rootfs, DirectoryNotEmptyException on rootfs), so
+// RomManager's `ensureLibSymlink` created symlinks in the STALE rootfs
+// at `/data/user/0/io.twoyi/rootfs/system/lib64/`. Those symlinks point
+// into the APK's native lib dir (`/data/app/~~<rand>/io.twoyi-<rand>/
+// lib/<abi>/<lib>`), but `Path::exists()` follows the symlink and
+// returns false when the target APK lib path is missing or the APK
+// was reinstalled with a different random suffix.
+//
+// Fix (Task ID 8): add candidate #5 -- a direct scan of the APK native
+// lib directory. This bypasses the rootfs symlink entirely and reads
+// the canonical source installed by Android's package manager. See
+// `apk_native_lib_candidates` for the directory layout.
 // ============================================================================
 
 /// Returns candidate source paths for a hook library (e.g.
@@ -539,15 +555,154 @@ pub fn clear_zombie_processes() {
 ///    point at (`profiles/default/rootfs` vs `rootfs/`), so we check it
 ///    explicitly here.
 /// 4. `{data_dir}/rootfs/<lib>` -- alternative app-level rootfs root.
+/// 5. APK native lib dir scan (`/data/app/~~<rand>/io.twoyi-<rand>/lib/
+///    {x86_64,arm64}/<lib>`) -- the canonical source of the libraries,
+///    installed by Android's package manager at APK install time.
+///    Bypasses all rootfs symlink state. See [`apk_native_lib_candidates`]
+///    for why this is needed (ProfileManager's rootfs symlink is broken
+///    on KVM run 31501768195). On non-Android hosts (e.g. the Linux
+///    devcontainer) `/data/app/` doesn't exist, so this contributes
+///    zero candidates -- exactly what we want for unit tests.
 ///
 /// The caller picks the first candidate that exists on disk.
 fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
-    vec![
+    let mut out = vec![
         format!("{}/{}", cfg.rootfs, lib_name),
         format!("{}/system/lib64/{}", cfg.rootfs, lib_name),
         format!("{}/rootfs/system/lib64/{}", cfg.data_dir, lib_name),
         format!("{}/rootfs/{}", cfg.data_dir, lib_name),
-    ]
+    ];
+    // Candidate #5+: scan the APK's native library directory directly.
+    // This bypasses the rootfs symlink entirely -- the APK lib dir is
+    // the canonical source. See `apk_native_lib_candidates` for the
+    // full rationale (rootfs symlink is broken on KVM run 31501768195).
+    out.extend(apk_native_lib_candidates(lib_name));
+    out
+}
+
+/// Scan the APK native library directory for a given library name.
+///
+/// The APK path has randomized components
+/// (`/data/app/~~<random>/io.twoyi-<random>/lib/<abi>/<lib>`), so we
+/// scan two levels deep: each subdir of `base` is treated as a
+/// `~~<random>` bucket, and each subdir of THAT starting with
+/// `io.twoyi-` is treated as the APK root. Within each APK root we
+/// check `lib/x86_64/<lib>` and `lib/arm64/<lib>` (in that order;
+/// x86_64 is preferred because the devcontainer runner is x86_64).
+///
+/// This is the canonical source of the libraries (installed by Android's
+/// package manager at APK install time, when `extractNativeLibs=true`
+/// in the manifest). RomManager's `ensureLibSymlink` creates symlinks
+/// in the rootfs pointing into this directory, but those symlinks can
+/// be in the WRONG rootfs (see KVM run 31501768195: ProfileManager's
+/// rootfs symlink setup FAILED with FileAlreadyExistsException, so
+/// RomManager's symlinks ended up in the stale
+/// `/data/user/0/io.twoyi/rootfs/` instead of the profile rootfs at
+/// `/data/data/io.twoyi/profiles/default/rootfs/`). Scanning the APK
+/// directory directly bypasses all rootfs symlink state.
+///
+/// This is a NO-OP (returns empty Vec) on non-Android environments
+/// (e.g., the Linux devcontainer where `/data/app/` doesn't exist) --
+/// which is exactly what we want for unit tests.
+///
+/// `base` is a parameter (rather than hardcoded to `/data/app/`) purely
+/// for testability -- the public wrapper [`apk_native_lib_candidates`]
+/// passes `/data/app`.
+fn apk_native_lib_candidates_in(base: &Path, lib_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bucket_entries = match std::fs::read_dir(base) {
+        Ok(rd) => rd,
+        Err(_) => return out, // base dir doesn't exist (non-Android env).
+    };
+    for bucket_entry in bucket_entries.flatten() {
+        let bucket_path = bucket_entry.path(); // /data/app/~~<random>/
+        let apk_entries = match std::fs::read_dir(&bucket_path) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for apk_entry in apk_entries.flatten() {
+            let apk_name_owned = apk_entry.file_name();
+            let apk_name = match apk_name_owned.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            // Only consider io.twoyi-* directories (skip other packages
+            // that may share the same ~~<random> bucket).
+            if !apk_name.starts_with("io.twoyi-") {
+                continue;
+            }
+            let apk_path = apk_entry.path(); // /data/app/~~<random>/io.twoyi-<random>/
+                                             // Check lib/x86_64/<lib> first (preferred ABI on x86_64
+                                             // devcontainer), then lib/arm64/<lib> (fallback for ARM
+                                             // translators / native ARM hosts).
+            for abi in ["x86_64", "arm64"] {
+                let lib_path = apk_path.join("lib").join(abi).join(lib_name);
+                if lib_path.is_file() {
+                    out.push(lib_path.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Convenience wrapper around [`apk_native_lib_candidates_in`] that uses
+/// the standard Android APK install directory `/data/app/`. Logs each
+/// found candidate at info level so the next KVM run can verify the
+/// scan ran and what it found.
+fn apk_native_lib_candidates(lib_name: &str) -> Vec<String> {
+    let cands = apk_native_lib_candidates_in(Path::new("/data/app"), lib_name);
+    if cands.is_empty() {
+        info!(
+            "[KR64] PARENT: APK native lib scan for {} found no candidates in /data/app/",
+            lib_name
+        );
+    } else {
+        for c in &cands {
+            info!("[KR64] PARENT: APK native lib scan found candidate: {}", c);
+        }
+    }
+    cands
+}
+
+/// Returns true if `path` exists as a regular file (following symlinks).
+/// Returns false otherwise. As a side effect, if `path` is a BROKEN
+/// symlink (the symlink itself exists but its target does not), logs the
+/// symlink target so the next debugging cycle can see why a candidate
+/// path appeared in the list but failed the `Path::exists()` check.
+///
+/// This is critical for diagnosing RomManager's `ensureLibSymlink`
+/// failures: the symlink at `{data_dir}/rootfs/system/lib64/<lib>` may
+/// exist but point to a non-existent APK lib path (because the APK was
+/// reinstalled with a different random suffix, or because
+/// `extractNativeLibs=false`), leaving the candidate list with no
+/// usable copy source until the APK dir scan in
+/// [`apk_native_lib_candidates`] finds the real path.
+///
+/// `Path::exists()` already follows symlinks, so this function is
+/// `Path::exists()` PLUS a diagnostic log for the broken-symlink case.
+fn candidate_exists_with_diagnostics(path: &str) -> bool {
+    let p = Path::new(path);
+    if p.exists() {
+        return true;
+    }
+    // Path doesn't exist (or its final target is missing). If it's a
+    // symlink, log the target so the next debugging cycle can see what
+    // the symlink was pointing at (this is the difference between
+    // "RomManager didn't create the symlink at all" and "RomManager
+    // created the symlink but its target is gone").
+    if let Ok(meta) = std::fs::symlink_metadata(p) {
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = std::fs::read_link(p) {
+                warning!(
+                    "[KR64] PARENT:   symlink exists but target is broken: {} -> {}",
+                    path,
+                    target.display()
+                );
+            }
+        }
+    }
+    false
 }
 
 /// Copies a hook library into `/dev/` (tmpfs) so the guest can use it.
@@ -568,7 +723,10 @@ fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
 fn copy_hook_library_to_dev(cfg: &Config, lib_name: &str, dst: &str, not_found_msg: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let candidates = hook_library_candidates(cfg, lib_name);
-    match candidates.iter().find(|p| Path::new(p).exists()) {
+    match candidates
+        .iter()
+        .find(|p| candidate_exists_with_diagnostics(p))
+    {
         Some(src) => match std::fs::copy(src, dst) {
             Ok(_) => {
                 let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644));
@@ -2266,19 +2424,29 @@ mod tests {
         // If we get here without panicking, the test passes.
     }
 
-    /// `hook_library_candidates` must include all 4 candidate paths in
-    /// the documented priority order, including the app-level rootfs
-    /// path that RomManager's `ensureLibSymlink` ACTUALLY uses (which
-    /// is NOT the same as `cfg.rootfs` for per-profile rootfs).
+    /// `hook_library_candidates` must START with the 4 documented
+    /// candidate paths in priority order (the app-level rootfs path that
+    /// RomManager's `ensureLibSymlink` ACTUALLY uses, which is NOT the
+    /// same as `cfg.rootfs` for per-profile rootfs). The list may be
+    /// followed by APK native lib dir scan results (candidate #5+) if
+    /// `/data/app/` exists -- on the Linux devcontainer test runner it
+    /// doesn't, so the list is exactly 4 here.
     #[test]
-    fn hook_library_candidates_includes_all_four_paths_in_order() {
+    fn hook_library_candidates_starts_with_four_documented_paths() {
         let cfg = Config {
             rootfs: "/data/data/io.twoyi/profiles/default/rootfs".to_string(),
             data_dir: "/data/data/io.twoyi".to_string(),
             ..Config::default()
         };
         let cands = hook_library_candidates(&cfg, "libgetpid_hook.so");
-        assert_eq!(cands.len(), 4);
+        // The first 4 candidates are the documented symlink paths. The
+        // APK dir scan (candidate #5+) returns 0 entries on Linux.
+        assert!(
+            cands.len() >= 4,
+            "expected at least 4 candidates, got {}: {:?}",
+            cands.len(),
+            cands
+        );
         // 1. Direct rootfs (historical fallback).
         assert_eq!(
             cands[0],
@@ -2310,7 +2478,15 @@ mod tests {
             ..Config::default()
         };
         let cands = hook_library_candidates(&cfg, "libtwoyi_loader_shlib.so");
-        assert_eq!(cands.len(), 4);
+        // The first 4 candidates use the documented /r/ and /d/ bases.
+        // The APK dir scan (candidate #5+) returns 0 entries on Linux.
+        assert!(
+            cands.len() >= 4,
+            "expected at least 4 candidates, got {}: {:?}",
+            cands.len(),
+            cands
+        );
+        // Every documented candidate ends with the requested lib name.
         assert!(cands
             .iter()
             .all(|p| p.ends_with("/libtwoyi_loader_shlib.so")));
@@ -2318,6 +2494,104 @@ mod tests {
         assert!(cands
             .iter()
             .all(|p| p.starts_with("/r/") || p.starts_with("/d/")));
+    }
+
+    /// `apk_native_lib_candidates_in` returns an empty Vec when the
+    /// base directory doesn't exist (e.g., on the Linux devcontainer
+    /// where `/data/app/` is absent, or when passed a non-existent
+    /// path in a unit test).
+    #[test]
+    fn apk_native_lib_candidates_returns_empty_when_base_missing() {
+        let cands = apk_native_lib_candidates_in(
+            Path::new("/nonexistent-twoyi-apk-base-xyz"),
+            "libgetpid_hook.so",
+        );
+        assert!(
+            cands.is_empty(),
+            "expected no candidates when base dir is missing, got: {:?}",
+            cands
+        );
+    }
+
+    /// `apk_native_lib_candidates_in` finds the library in a fake APK
+    /// directory tree matching the standard
+    /// `/data/app/~~<random>/io.twoyi-<random>/lib/<abi>/<lib>` layout.
+    /// Verifies x86_64 is preferred over arm64 (listed first) and that
+    /// non-io.twoyi packages in the same bucket are skipped.
+    #[test]
+    fn apk_native_lib_candidates_finds_lib_in_fake_apk_dir() {
+        let tmp = std::env::temp_dir().join("twoyi-apk-scan-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Mimic /data/app/~~random1==/io.twoyi-random2==/lib/<abi>/<lib>.
+        let apk_root = tmp.join("~~random1==").join("io.twoyi-random2==");
+        let x86_64_lib = apk_root.join("lib/x86_64/libgetpid_hook.so");
+        let arm64_lib = apk_root.join("lib/arm64/libgetpid_hook.so");
+        std::fs::create_dir_all(x86_64_lib.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(arm64_lib.parent().unwrap()).unwrap();
+        std::fs::write(&x86_64_lib, b"fake x86_64 ELF").unwrap();
+        std::fs::write(&arm64_lib, b"fake arm64 ELF").unwrap();
+        // Add a decoy non-io.twoyi package in the same bucket -- it must
+        // be skipped by the `starts_with("io.twoyi-")` filter.
+        let decoy_root = tmp.join("~~random1==").join("com.other.app-1==");
+        std::fs::create_dir_all(decoy_root.join("lib/x86_64")).unwrap();
+        std::fs::write(decoy_root.join("lib/x86_64/libgetpid_hook.so"), b"decoy").unwrap();
+
+        let cands = apk_native_lib_candidates_in(&tmp, "libgetpid_hook.so");
+        // x86_64 must be preferred (listed first), then arm64. The decoy
+        // package's lib must NOT be in the list.
+        assert_eq!(
+            cands.len(),
+            2,
+            "expected 2 candidates (x86_64 + arm64), got: {:?}",
+            cands
+        );
+        assert!(
+            cands[0].ends_with("/lib/x86_64/libgetpid_hook.so"),
+            "x86_64 must be first: {}",
+            cands[0]
+        );
+        assert!(
+            cands[1].ends_with("/lib/arm64/libgetpid_hook.so"),
+            "arm64 must be second: {}",
+            cands[1]
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `candidate_exists_with_diagnostics` returns false for a broken
+    /// symlink (symlink exists but target doesn't) and true for a real
+    /// file. The diagnostic warning goes to stderr (eprintln), which we
+    /// don't capture here -- the test just verifies the boolean result.
+    #[test]
+    fn candidate_exists_with_diagnostics_handles_broken_symlink() {
+        let tmp = std::env::temp_dir().join("twoyi-broken-symlink-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Broken symlink: link itself exists, target doesn't.
+        let link = tmp.join("link-to-nowhere.so");
+        let target = tmp.join("does-not-exist.so");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_str = link.to_string_lossy().into_owned();
+        assert!(
+            !candidate_exists_with_diagnostics(&link_str),
+            "broken symlink must report false"
+        );
+        // Regular existing file: must report true.
+        let real = tmp.join("real.so");
+        std::fs::write(&real, b"x").unwrap();
+        let real_str = real.to_string_lossy().into_owned();
+        assert!(
+            candidate_exists_with_diagnostics(&real_str),
+            "existing regular file must report true"
+        );
+        // Non-existent path (no symlink, no file): must report false
+        // WITHOUT panicking on the symlink_metadata call.
+        let gone = tmp.join("totally-gone.so").to_string_lossy().into_owned();
+        assert!(!candidate_exists_with_diagnostics(&gone));
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// `copy_hook_library_to_dev` must log all checked paths and return
