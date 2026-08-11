@@ -832,8 +832,12 @@ int ioctl(int fd, unsigned long request, ...) {
         write_str(2, msg);
     }
     
-    // BINDER_VERSION = 0xc004620d — returns protocol version
-    if (req == 0xc004620du) {
+    // BINDER_VERSION — returns protocol version
+    // The actual ioctl number varies by kernel version:
+    // _IOWR('b', 13, struct{__s32}) = 0xc004620d (newer kernels)
+    // _IOWR('b', 9, struct{__s32}) = 0xc0046209 (observed on this kernel)
+    // Match both to be safe.
+    if (req == 0xc004620du || req == 0xc0046209u) {
         if (argp) {
             *(int *)argp = 8;  // BINDER_CURRENT_PROTOCOL_VERSION
         }
