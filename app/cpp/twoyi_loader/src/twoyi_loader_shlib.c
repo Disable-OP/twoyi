@@ -3024,13 +3024,51 @@ static void twoyi_init(void) {
     // present but currently fails — see debug logging in the lstat() hook.
     // vold.decrypt=trigger_restart_framework above is enough to start zygote.
 
-    // Try setting sys.boot_completed to trigger post-boot actions
-    prop_set("sys.boot_completed", "1");
-    // Also set dev.bootcomplete
-    prop_set("dev.bootcomplete", "1");
-    // Set service properties that init checks
-    prop_set("init.svc.vold", "running");
-    prop_set("init.svc.zygote", "running");
+    // ------------------------------------------------------------------
+    // BANNED: Fake boot completion pre-sets REMOVED (overnight Task ID 4).
+    // ------------------------------------------------------------------
+    // The following properties must NOT be pre-set here, because they are
+    // the FINAL GOALS of the boot, not infrastructure inputs:
+    //
+    //   prop_set("sys.boot_completed", "1");   // BANNED — removed
+    //   prop_set("dev.bootcomplete", "1");     // BANNED — removed
+    //   prop_set("init.svc.vold", "running");  // BANNED — removed
+    //   prop_set("init.svc.zygote", "running");// BANNED — removed
+    //
+    // Why banned:
+    //   * sys.boot_completed is THE signal that the entire userspace boot
+    //     finished. Pre-setting it makes the system think it booted when
+    //     it didn't. The comment on line 3005 above already says "we want
+    //     the guest to actually boot, not fake it" — the code below it
+    //     used to contradict that. Now they agree.
+    //   * dev.bootcomplete is set by init AFTER the device boot completes.
+    //     Pre-setting it is faking completion.
+    //   * init.svc.* properties are set BY init when the corresponding
+    //     service actually transitions states. Pre-setting
+    //     init.svc.zygote=running tells init "zygote is already running"
+    //     before zygote has started — that is exactly the kind of
+    //     "make a problem look solved when it isn't" that the overnight
+    //     rules forbid.
+    //
+    // Per the overnight rule: "Never make a problem look solved when it
+    // isn't." If zygote isn't really running, init.svc.zygote must not
+    // claim it is. If the boot isn't really complete, sys.boot_completed
+    // must not claim it is.
+    //
+    // What we KEEP (legitimate virtualization, not boot-status fakes):
+    //   * ro.boot.*             — hardware description, not boot status
+    //   * ro.zygote             — tells init which zygote .rc to parse
+    //   * vold.post_fs_data_done— vold exits(0) so it never sets this;
+    //                             pre-setting is virtualization of vold
+    //   * vold.decrypt          — same reason; vold exits(0)
+    //   * apexd.status          — apexd doesn't fully run in container
+    //   * ro.persistent_properties.ready,
+    //     ro.actionable_compatible_property.enabled — infrastructure props
+    // ------------------------------------------------------------------
+    // DO NOT re-add the four banned lines above. If a future contributor
+    // finds a regression that "looks like" it needs sys.boot_completed,
+    // investigate the real cause (zygote failing to start, init.svc.*
+    // transitions not firing) instead of faking the completion signal.
 
     g_runtime_ready = 1;
 }
