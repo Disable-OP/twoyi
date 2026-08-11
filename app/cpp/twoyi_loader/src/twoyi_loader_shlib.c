@@ -271,6 +271,57 @@ struct mount_entry {
 static struct mount_entry g_mounts[MAX_MOUNTS];
 static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 
+// ---------------------------------------------------------------------------
+// Binder fallback fd tracking.
+//
+// When binder_open_fallback() returns a /dev/null fd in place of a real
+// binder device fd, that fd is recorded here. The ioctl hook checks this
+// set to decide whether to fake binder ioctls (for /dev/null fallbacks,
+// where the real ioctl would return ENOTTY) or pass them through to the
+// real ioctl (for real binderfs fds, which support real binder IPC within
+// the container's binder domain).
+//
+// Real binderfs fds (opened successfully from /dev/binderfs/*) are NEVER
+// in this set, so the ioctl hook passes them through to the real ioctl —
+// real binder IPC works natively because the container has its own
+// binderfs (mounted by kr64 with chmod 0666) in a separate binder domain
+// from the host.
+//
+// The close() hook clears entries when fds are closed. binder_open_fallback
+// opens /dev/null with O_CLOEXEC, so fallback fds do not survive execve
+// (no stale entries after exec).
+//
+// Limitation: dup/dup2/dup3 of a fallback fd are not tracked (the new fd
+// would not be in the set). Binder fds are not typically dup'd, so this is
+// acceptable. If a dup'd fallback fd receives a binder ioctl, it falls
+// through to the real ioctl which returns ENOTTY — logged, not suppressed.
+// ---------------------------------------------------------------------------
+#define TWOYI_MAX_FD 1024
+static unsigned char g_binder_fallback_fds[(TWOYI_MAX_FD + 7) / 8];
+static pthread_mutex_t g_binder_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void binder_fd_mark_fallback(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    g_binder_fallback_fds[fd >> 3] |= (unsigned char)(1u << (fd & 7));
+    pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
+static int binder_fd_is_fallback(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return 0;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    int r = (g_binder_fallback_fds[fd >> 3] >> (fd & 7)) & 1;
+    pthread_mutex_unlock(&g_binder_fd_lock);
+    return r;
+}
+
+static void binder_fd_clear(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    g_binder_fallback_fds[fd >> 3] &= (unsigned char)~(1u << (fd & 7));
+    pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
 // =========================================================================
 // LD_PRELOAD path — stored at init time, re-set before each exec
 // ROOT CAUSE: Android init's FirstStageMain calls clearenv() which wipes
@@ -794,10 +845,33 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return syscall(SYS_bind, sockfd, addr, addrlen);
 }
 
-// Hook ioctl — intercept binder ioctls to fake success.
-// binderfs devices may not support BINDER_VERSION ioctl in the container
-// environment, causing vold to abort with "Binder driver could not be opened."
-// We fake the binder protocol version and other ioctls so vold can proceed.
+// Hook ioctl — intercept binder ioctls.
+//
+// Two kinds of binder fds reach this hook:
+//   1. REAL binderfs fds — opened successfully from /dev/binderfs/* (the
+//      container has its own binderfs, mounted by kr64 with chmod 0666).
+//      These support REAL binder IPC within the container's binder domain.
+//      For these, we pass BINDER_WRITE_READ / BINDER_SET_CONTEXT_MGR /
+//      BINDER_SET_MAX_THREADS / BINDER_VERSION through to the REAL ioctl.
+//      Without this, system_server's ServiceManager.addService/getService
+//      would silently no-op (the old hook returned 0 with no data) and
+//      binder-dependent services would crash or hang.
+//
+//   2. FALLBACK fds — /dev/null fds returned by binder_open_fallback()
+//      when the real open of a binder device failed (e.g., EACCES for a
+//      process that ran before the kr64 chmod took effect, or a SELinux
+//      denial). These CANNOT do real binder IPC — the real ioctl would
+//      return ENOTTY on /dev/null. For these, we keep faking
+//      BINDER_VERSION (-> 8), BINDER_SET_MAX_THREADS,
+//      BINDER_SET_CONTEXT_MGR, BINDER_WRITE_READ so the calling process
+//      (e.g., a HIDL HAL service) sees fd >= 0 and a valid protocol
+//      version, then blocks in its threadpool without crashing.
+//
+// Fd tracking: binder_open_fallback() records each fallback fd in
+// g_binder_fallback_fds (see above). The close() hook clears it. Real
+// binderfs fds are never in the set, so they pass through to the real
+// ioctl. We do NOT suppress real ioctl errors: if real_ioctl returns -1,
+// we log the errno and return -1.
 //
 // Binder ioctl numbers (from kernel: include/uapi/linux/android/binder.h):
 // BINDER_VERSION = _IOWR('b', 13, struct binder_version)
@@ -807,6 +881,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 //
 // On x86_64: 'b' = 0x62, so:
 // BINDER_VERSION = _IOWR(0x62, 13, struct{__s32}) = 0xc004620d
+//                 (older kernels: _IOWR(0x62, 9, ...) = 0xc0046209)
 // BINDER_SET_MAX_THREADS = _IOW(0x62, 5, __u32) = 0x40046205
 // BINDER_SET_CONTEXT_MGR = _IOW(0x62, 7, __u32) = 0x40046207
 // BINDER_WRITE_READ = _IOWR(0x62, 1, ...) = 0xc0306201
@@ -820,53 +895,80 @@ int ioctl(int fd, unsigned long request, ...) {
 #endif
     static int (*real_ioctl)() = NULL;
     if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
-    
+
     va_list ap;
     va_start(ap, request);
     void *argp = va_arg(ap, void *);
     va_end(ap);
-    
+
     unsigned req = (unsigned)request;
-    
-    // Debug: log ioctl calls that look like binder ioctls (magic 'b' = 0x62)
-    if ((req & 0xff00) == 0x6200) {
+
+    // Quick filter: is this a binder ioctl? (magic 'b' = 0x62 in high byte)
+    int is_binder_req = ((req & 0xff00) == 0x6200);
+    if (!is_binder_req) {
+        // Non-binder ioctl — pass through (existing behavior).
+        if (real_ioctl) return real_ioctl(fd, request, argp);
+        return syscall(SYS_ioctl, fd, request, argp);
+    }
+
+    // Binder ioctl. Decide fake-vs-real based on whether fd is a fallback.
+    int is_fallback = binder_fd_is_fallback(fd);
+
+    if (is_fallback) {
+        // /dev/null fallback fd — fake binder ioctls (the real ioctl would
+        // return ENOTTY on /dev/null). This is the virtualization path for
+        // processes that couldn't open the real binder device.
         char msg[256];
-        snprintf(msg, sizeof(msg), "[twoyi_loader] ioctl(fd=%d, req=0x%x) — binder ioctl\n", fd, req);
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] ioctl(fd=%d fallback, req=0x%x) -> faking\n",
+            fd, req);
         write_str(2, msg);
-    }
-    
-    // BINDER_VERSION — returns protocol version
-    // The actual ioctl number varies by kernel version:
-    // _IOWR('b', 13, struct{__s32}) = 0xc004620d (newer kernels)
-    // _IOWR('b', 9, struct{__s32}) = 0xc0046209 (observed on this kernel)
-    // Match both to be safe.
-    if (req == 0xc004620du || req == 0xc0046209u) {
-        if (argp) {
-            *(int *)argp = 8;  // BINDER_CURRENT_PROTOCOL_VERSION
+
+        // BINDER_VERSION — returns protocol version.
+        // Match both 0xc004620d (newer kernels) and 0xc0046209 (older).
+        if (req == 0xc004620du || req == 0xc0046209u) {
+            if (argp) {
+                *(int *)argp = 8;  // BINDER_CURRENT_PROTOCOL_VERSION
+            }
+            write_str(2, "[twoyi_loader] ioctl(BINDER_VERSION) -> faking version 8\n");
+            return 0;
         }
-        write_str(2, "[twoyi_loader] ioctl(BINDER_VERSION) -> faking version 8\n");
+        // BINDER_SET_MAX_THREADS = 0x40046205
+        if (req == 0x40046205u) {
+            write_str(2, "[twoyi_loader] ioctl(BINDER_SET_MAX_THREADS) -> success\n");
+            return 0;
+        }
+        // BINDER_SET_CONTEXT_MGR = 0x40046207
+        if (req == 0x40046207u) {
+            write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR) -> success\n");
+            return 0;
+        }
+        // BINDER_WRITE_READ = 0xc0306201 — return success with no data
+        if (req == 0xc0306201u) {
+            return 0;
+        }
+        // Unknown binder ioctl on fallback fd — fake success (the fd is
+        // /dev/null, so the real ioctl would fail anyway).
         return 0;
     }
-    
-    // BINDER_SET_MAX_THREADS = 0x40046205
-    if (req == 0x40046205u) {
-        write_str(2, "[twoyi_loader] ioctl(BINDER_SET_MAX_THREADS) -> success\n");
-        return 0;
+
+    // REAL binder fd (real binderfs device) — pass through to the real
+    // ioctl so real binder IPC happens within the container's binderfs
+    // domain. Do NOT fake success: if the real ioctl fails, log the errno
+    // and return -1 (don't suppress real failures — we need to see them).
+    int ret;
+    if (real_ioctl) ret = real_ioctl(fd, request, argp);
+    else            ret = syscall(SYS_ioctl, fd, request, argp);
+    if (ret < 0) {
+        int e = errno;
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] ioctl(fd=%d real, req=0x%x) -> -1 (errno=%d: %s)\n",
+            fd, req, e, strerror(e));
+        write_str(2, msg);
+        errno = e;
     }
-    
-    // BINDER_SET_CONTEXT_MGR = 0x40046207
-    if (req == 0x40046207u) {
-        write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR) -> success\n");
-        return 0;
-    }
-    
-    // BINDER_WRITE_READ = 0xc0306201 — return success with no data
-    if (req == 0xc0306201u) {
-        return 0;
-    }
-    
-    if (real_ioctl) return real_ioctl(fd, request, argp);
-    return syscall(SYS_ioctl, fd, request, argp);
+    return ret;
 }
 
 // Hook mmap — for binder fds, return an anonymous mapping.
@@ -899,6 +1001,21 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         return MAP_FAILED;
     }
     return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+}
+
+// Hook close — clear binder fallback fd tracking when an fd is closed.
+// This keeps g_binder_fallback_fds accurate: when a fallback fd is closed
+// and its fd number is recycled for a different file, the new fd is NOT
+// mistakenly treated as a binder fallback (which would wrongly fake its
+// ioctls). Real binderfs fds are never in the set, so clearing is a
+// no-op for them. We clear unconditionally — clearing an unset bit is
+// harmless and avoids a mutex-locked lookup before the mutex-locked clear.
+int close(int fd) {
+    static int (*real_close)(int) = NULL;
+    if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
+    binder_fd_clear(fd);
+    if (real_close) return real_close(fd);
+    return (int)syscall(NR_close, fd);
 }
 
 // Hook setsockopt — for AF_NETLINK options (vold only), return success
@@ -2426,6 +2543,14 @@ static int binder_open_fallback(const char *path, int real_fd, int saved_errno) 
     if (fb < 0) {
         // /dev/null itself failed (very unlikely) — restore original errno
         errno = saved_errno;
+    } else {
+        // Record this fd as a binder fallback so the ioctl hook knows to
+        // keep faking binder ioctls (the real ioctl would ENOTTY on
+        // /dev/null). Real binderfs fds (real_fd >= 0 path above) are NOT
+        // recorded, so they pass through to the real ioctl for real IPC.
+        // O_CLOEXEC ensures the fd (and thus the tracking entry) does not
+        // survive execve.
+        binder_fd_mark_fallback(fb);
     }
     return fb;
 }
