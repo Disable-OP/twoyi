@@ -2504,5 +2504,11 @@ static void twoyi_init(void) {
     // Pre-set it so init can proceed past post-fs-data to zygote-start.
     prop_set("vold.post_fs_data_done", "1");
 
+    // vold normally sets vold.decrypt=trigger_restart_framework after post-fs-data
+    // to trigger the "on property:vold.decrypt=trigger_restart_framework" action
+    // in init.rc, which starts class_start core/main (zygote).
+    // Since vold exits(0), pre-set this so init triggers zygote startup.
+    prop_set("vold.decrypt", "trigger_restart_framework");
+
     g_runtime_ready = 1;
 }
