@@ -2378,6 +2378,7 @@ static void twoyi_init(void) {
                 "wait_for_keymaster",
                 "wait_for_gatekeeper",
                 "vold",  // vold requires real block devices / device-mapper
+                "vdc",  // vdc communicates with vold via binder; vold exits(0), so vdc would hang
                 NULL
             };
 
@@ -2482,6 +2483,15 @@ static void twoyi_init(void) {
     // (from AOSP util.h: kColdBootDoneProp = "ro.cold_boot_done")
     prop_set("ro.cold_boot_done", "true");  // unblocks wait_for_coldboot_done
     prop_set("ro.coldboot_done", "true");   // alias just in case
+
+    // Pre-set vold/crypto properties so init doesn't wait for vold to set them.
+    // vold exits(0) in our container, so init must be told its post-fs-data work
+    // is "done" and that crypto is "unsupported" (no FBE in container).
+    prop_set("vold.post_fs_data_done", "1");
+    prop_set("vold.decrypt", "trigger_restart_framework");
+    prop_set("ro.crypto.state", "unsupported");
+    prop_set("ro.crypto.type", "block");
+    prop_set("ro.crypto.volume.options", "aes-256-cts:aes-256-xts");
     prop_set("ro.bootmode", "normal");
     prop_set("ro.boot.mode", "normal");
     prop_set("ro.boot.bootreason", "reboot");
