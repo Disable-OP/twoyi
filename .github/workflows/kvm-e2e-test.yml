@@ -43,6 +43,7 @@ name: KVM E2E Test
           - emulator
           - sdk_image
           - cyanmint
+          - twrp
       boot_wait_seconds:
         description: 'How long to wait for the container to boot (seconds) before capturing the final screenshot + logcat'
         required: false
