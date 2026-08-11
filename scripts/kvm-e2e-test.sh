@@ -198,19 +198,20 @@ if [ -z "$APK" ]; then
 fi
 echo "  APK: $APK ($(stat -c%s "$APK") bytes)"
 
-# Clear app data BEFORE install to force a fresh rootfs extraction.
-# This is CRITICAL: previous runs may have modified the rootfs (e.g.,
-# the bionic library copy replaced /system/lib64/ symlinks with real
-# files from the host). Without pm clear, the stale rootfs persists
-# and causes version mismatch crashes (linker SIGSEGV at 0x86).
-echo "  Clearing app data (force fresh rootfs extraction)..."
-"$ADB_BIN" -s emulator-5554 shell pm clear io.twoyi 2>/dev/null || true
+# Uninstall any previous version first to clear ALL app data (including
+# the cached rootfs). This is CRITICAL: previous runs may have modified
+# the rootfs (e.g., the bionic library copy replaced /system/lib64/
+# symlinks with real files from the host). Without a clean uninstall,
+# the stale rootfs persists and causes version mismatch crashes
+# (linker SIGSEGV at 0x86).
+echo "  Uninstalling previous version (clear all app data)..."
+"$ADB_BIN" -s emulator-5554 uninstall io.twoyi 2>/dev/null || true
 
-# -r : reinstall, keeping data
 # -t : allow test packages (twoyi isn't debuggable by default, but -t
 #      lets us install over a debug-signed variant if needed)
 # -g : grant all runtime permissions automatically
-if ! "$ADB_BIN" -s emulator-5554 install -r -t -g "$APK"; then
+# (no -r: we already uninstalled, so this is a fresh install)
+if ! "$ADB_BIN" -s emulator-5554 install -t -g "$APK"; then
     echo "  ✗ Install failed" >&2
     echo "    If the error is INSTALL_FAILED_NO_MATCHING_ABIS, your APK" >&2
     echo "    doesn't include x86_64. Rebuild with:" >&2
