@@ -354,27 +354,24 @@ jobs:
           fi
 
       # ───────────────────────────────────────────────────────────────
-      # Artifact uploads → 0x0.st
+      # Log-only artifact upload (xz-compressed)
       #
-      # Replaces 4 actions/upload-artifact steps. The repo was at 0.01 GB
-      # of the 0.5 GB free GHA storage tier; kvm-e2e-test alone produced
-      # ~50 MB of logcat + screenshots per run, which would have filled
-      # the quota in a single day. All artifacts now go to 0x0.st and
-      # URLs are surfaced in the run log + step summary.
+      # Replaces the previous 4-step actions/upload-artifact setup
+      # (APK + logcat + screenshots + crash-logs as separate artifacts).
+      # The repo's GHA storage was at 4.61 GB (vs 0.5 GB free tier); we
+      # deleted 1217 old artifacts to recover. Going forward we upload
+      # ONLY logs, compressed with xz (~10:1 on text), 7-day retention.
+      # No APK upload — reproducible via `./gradlew assembleRelease`.
+      # No screenshots — logcat is the primary diagnostic. The boot
+      # verdict is also printed to the run log in the previous step so
+      # it's visible without downloading the artifact.
       #
-      # See scripts/upload-to-0x0.sh for upload/retry/size-limit logic.
+      # See scripts/pack-logs.sh for the compression logic.
       # ───────────────────────────────────────────────────────────────
-      - name: Upload APK to 0x0.st
+      - name: Pack all logs into a single .tar.xz
         if: always()
         run: |
-          ./scripts/upload-to-0x0.sh \
-            "twoyi APK (x86_64)" \
-            app/build/outputs/apk/release/*.apk
-
-      - name: Upload logcat + boot logs to 0x0.st
-        if: always()
-        run: |
-          ./scripts/upload-to-0x0.sh "twoyi-logcat" \
+          ./scripts/pack-logs.sh /tmp/twoyi-logs.tar.xz \
             /tmp/ci-artifacts/logcat.txt \
             /tmp/ci-artifacts/logcat-*.txt \
             /tmp/ci-artifacts/twoyi-log.txt \
@@ -384,38 +381,20 @@ jobs:
             /tmp/ci-artifacts/twoyi-vold-stderr.log \
             /tmp/ci-artifacts/boot-verdict.txt \
             /tmp/ci-artifacts/emulator-stdout.log \
-            /tmp/ci-artifacts/emulator-stderr.log
-
-      - name: Upload screenshots to 0x0.st
-        if: always()
-        run: |
-          ./scripts/upload-to-0x0.sh "twoyi-screenshots" \
-            /tmp/ci-artifacts/screenshot-*.png
-
-      - name: Upload crash logs / tombstones to 0x0.st
-        if: always()
-        run: |
-          ./scripts/upload-to-0x0.sh "twoyi-crash-logs" \
+            /tmp/ci-artifacts/emulator-stderr.log \
             /tmp/ci-artifacts/tombstones/ \
             /tmp/ci-artifacts/dropbox/ \
             /tmp/ci-artifacts/anr/ \
             /tmp/ci-artifacts/rootfs-extract.log
 
-      - name: Render all 0x0.st links as a summary table
+      - name: Upload logs
         if: always()
-        run: |
-          if [ -f /tmp/0x0-uploads.txt ] && [ -s /tmp/0x0-uploads.txt ]; then
-            {
-              echo "## 📦 Artifact downloads (0x0.st)"
-              echo ""
-              echo "| Label | File | URL |"
-              echo "|---|---|---|"
-              while IFS=$'\t' read -r label name url; do
-                echo "| ${label} | \`${name}\` | ${url} |"
-              done < /tmp/0x0-uploads.txt
-              echo ""
-              echo "_Links expire after 30–365 days depending on size. Re-run the workflow to refresh._"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "(no artifacts uploaded this run)" >> "$GITHUB_STEP_SUMMARY"
-          fi
+        uses: actions/upload-artifact@v4
+        with:
+          name: twoyi-logs
+          path: /tmp/twoyi-logs.tar.xz
+          retention-days: 7
+          if-no-files-found: warn
+          # Already xz-compressed by pack-logs.sh — let upload-artifact
+          # store it verbatim instead of double-zipping.
+          compression-level: 0
