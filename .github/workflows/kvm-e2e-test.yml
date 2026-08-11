@@ -334,7 +334,7 @@ jobs:
       # step to grep.
       - name: Run E2E test
         run: |
-          timeout 600 ./scripts/kvm-e2e-test.sh \
+          timeout --signal=KILL 480 ./scripts/kvm-e2e-test.sh \
               --rootfs-source "${{ github.event.inputs.rootfs_source || 'emulator' }}" \
               --boot-wait "${{ github.event.inputs.boot_wait_seconds || '60' }}" \
               --artifact-dir /tmp/ci-artifacts || true
