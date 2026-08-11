@@ -819,3 +819,90 @@ init's g_props table.
 5. Consider whether to also pre-set ro.crypto.state=unsupported (the
    SIGABRT regression may have been fixed by subsequent createProcessGroup
    fixes — needs testing).
+
+### HIDL service "Binder driver could not be opened" — root cause = open() EACCES, NOT ioctl bypass
+### Timestamp UTC: 2026-08-11 ~13:15 (Task ID 1, commit 2268666)
+
+**The task hypothesis was WRONG.** The hypothesis was that libhidlbase calls
+`ioctl()` via `syscall(SYS_ioctl, ...)` directly, bypassing PLT hooks. After
+fetching the AOSP source (`system/libhwbinder/ProcessState.cpp`, the code that
+became `android::hardware::ProcessState` in libhidlbase.so), the `open_driver()`
+function uses STANDARD libc `open()` and `ioctl()` — both go through PLT and
+are intercepted by our LD_PRELOAD hooks. There is NO `syscall()` direct call.
+
+**Actual root cause — open(/dev/hwbinder) returns EACCES for HIDL services.**
+
+Concrete log evidence from twoyi-loader.log (run 31489388552, commit 14e3989):
+
+```
+[twoyi_loader] __open_2(/dev/hwbinder) -> {rootfs}/dev/hwbinder = 5 (errno=0: OK)       ← vold/init
+[twoyi_loader] __open_2(/dev/hwbinder) -> {rootfs}/dev/hwbinder = -1 (errno=13: Permission denied)  ← HIDL
+```
+
+Aggregate counts (twoyi-loader.log):
+- /dev/hwbinder opens: 22 × EACCES, 4 × OK (fd=4/5)
+- /dev/binder opens: 2 × OK
+- "Binder driver could not be opened. Terminating." crashes (logcat): 25
+- "ioctl(BINDER_VERSION) -> faking version 8" lines: 12 (only from processes
+  whose open SUCCEEDED — vold×4 + init/servicemanager×8)
+
+The 12 "faking version 8" vs 25 crashes proves the ioctl hook is NOT bypassed:
+it fires whenever open() succeeds. HIDL services crash because open() fails
+(EACCES) BEFORE ioctl() is ever called. libhidlbase's `open_driver()` returns
+-1, and `ProcessState::ProcessState()` runs `LOG_ALWAYS_FATAL_IF(mDriverFD < 0,
+"Binder driver could not be opened. Terminating.")`.
+
+SELinux is NOT the cause — logcat confirms `setenforce notice (enforcing=0)`
+at 12:09:00/01/03, BEFORE the first HIDL crash at 12:09:08. So this is a DAC
+permission issue on the binderfs character device: vold's open succeeds (it is
+spawned early / with a permissive group set) but HIDL HAL services spawned
+later get EACCES.
+
+**Backtrace (tombstone_00, confirms libhidlbase, not ioctl bypass):**
+```
+pid: 6055, name: android.system.  >>> /system/bin/hw/android.system.suspend@1.0-service <<<
+Abort message: 'Binder driver could not be opened. Terminating.'
+  #04 libhidlbase.so (android::hardware::ProcessState::ProcessState(unsigned long)+386)
+  #05 libhidlbase.so (android::hardware::ProcessState::self()+134)
+  #06 libhidlbase.so (android::hardware::configureBinderRpcThreadpool(unsigned long, bool)+34)
+```
+
+**Fix (commit 2268666, additive — no existing hooks removed):**
+
+1. **kr64** (already committed in e56f391 by parallel Task ID 2, which picked
+   up this working-tree edit): after mounting binderfs + creating the
+   /dev/{binder,hwbinder,vndbinder} symlinks, `chmod 0666` the binderfs
+   character devices. Fixes the DAC permission at the source so all guest
+   processes can open the REAL binder device (real binder IPC via the kernel
+   binder driver).
+
+2. **loader** (`app/cpp/twoyi_loader/src/twoyi_loader_shlib.c`, commit
+   2268666): added `binder_open_fallback()` — when the real open of a binder
+   device (/dev/binder, /dev/hwbinder, /dev/vndbinder) fails, fall back to
+   opening /dev/null and return that fd. ProcessState::open_driver() then
+   sees fd >= 0 and proceeds past the abort. The existing ioctl hook fakes
+   BINDER_VERSION (-> 8), BINDER_SET_MAX_THREADS, BINDER_SET_CONTEXT_MGR,
+   BINDER_WRITE_READ; the mmap hook returns MAP_ANONYMOUS. The HAL service
+   blocks in its threadpool, which init treats as "running" (not crashed) —
+   unblocking init's boot progress.
+
+   This is virtualization, NOT crash suppression: the BINDER_VERSION check
+   still runs and our ioctl hook returns a valid version (8). Applied to all
+   open variant hooks: `openat`, `open`, `__open_2`, `__open_real`.
+
+**Verification (local):**
+- shlib compiles clean with host gcc (`-fsyntax-only` and full `-shared` link)
+- kr64 `cargo check` clean, 182/182 unit tests pass
+
+**Expected outcome:** HIDL services no longer abort with "Binder driver could
+not be opened". With the kr64 chmod, they open the REAL binderfs device (real
+IPC); with the loader fallback as backup, any process that still can't open
+gets a virtual /dev/null fd (faked IPC). Either way, init stops crash-looping
+the HIDL services and can progress past post-fs-data toward zygote-start.
+
+**KVM run for verification: 31495098261** (commit 2268666, in_progress at
+trigger time). Next sub-agent: check whether "Binder driver could not be
+opened" is gone from logcat.txt, whether tombstone count drops from 33, and
+whether init progresses past post-fs-data (look for zygote-start / boot
+triggers). Also grep twoyi-loader.log for "binder_open_fallback" to see how
+often the fallback fired (ideally 0 if the kr64 chmod fixed the DAC issue).
