@@ -1999,3 +1999,350 @@ grep -E "tombstone|SIGSEGV|SIGABRT|signal [0-9]+" logcat.txt | head -20
    graphics stubs (Task ID 6, commit f11b46f) are the next things to
    validate. The greps in Task ID 5's and Task ID 6's progress-log
    entries apply directly.
+
+---
+
+## Timestamp UTC: 2026-08-11 (overnight Task ID 9)
+## Task: Fix CRITICAL ordering bug — hook library copy happens AFTER pivot_root
+
+### Context
+
+KVM run 31503063598 (commit 14755ab, Task ID 8's APK native lib scan)
+COMPLETED with CI "success" — but the guest init still crashed with
+SIGSEGV (signal 11). Root cause confirmed from `kr64-stderr.log`:
+
+```
+[KR64 INFO] [KR64][mount_mgr] pivot_root(...) succeeded
+[KR64 INFO] [KR64][mount_mgr] detached old root via umount2(/old_root, MNT_DETACH)
+[KR64 INFO] [KR64][mount_mgr] chdir("/") succeeded
+[KR64 INFO] [KR64] setup_mounts succeeded -- pivot_root done
+...
+[KR64 ERROR] [KR64] PARENT: libgetpid_hook.so not found in any of 4 candidate locations -- LD_PRELOAD will fail
+[KR64 ERROR] [KR64] PARENT:   checked: /data/data/io.twoyi/profiles/default/rootfs/libgetpid_hook.so
+[KR64 ERROR] [KR64] PARENT:   checked: /data/data/io.twoyi/profiles/default/rootfs/system/lib64/libgetpid_hook.so
+[KR64 ERROR] [KR64] PARENT:   checked: /data/user/0/io.twoyi/rootfs/system/lib64/libgetpid_hook.so
+[KR64 ERROR] [KR64] PARENT:   checked: /data/user/0/io.twoyi/rootfs/libgetpid_hook.so
+[KR64 INFO] [KR64] PARENT: APK native lib scan for libgetpid_hook.so found no candidates in /data/app/
+```
+
+ALL 4 symlink candidates AND the APK scan failed — NOT because the
+libraries don't exist, but because the search ran AFTER pivot_root +
+`umount2(/old_root, MNT_DETACH)`. After pivot_root, the process is in
+the rootfs jail: ALL host paths (`/data/app/*`, `/data/user/0/io.twoyi/*`,
+`/data/data/io.twoyi/*`) are unreachable. The symlinks under
+`{cfg.rootfs}/system/lib64/` (which point into `/data/app/`) have
+unresolvable targets. The APK scan of `/data/app/` returns nothing
+because `/data/app/` doesn't exist in the new root.
+
+This is the THIRD layer of the hook-library root cause:
+1. Layer 1 (Task 7): single-path search missed the real location.
+2. Layer 2 (Task 8): 4-candidate search + APK scan still failed
+   because ProfileManager's rootfs symlink was broken.
+3. Layer 3 (THIS TASK): the search ran AFTER pivot_root, when ALL
+   host paths (including the APK lib dir) are unreachable. The
+   search logic from Tasks 7+8 was correct — it just ran at the
+   wrong time.
+
+### What was changed (commit a746b98, +240/-78 lines in one file)
+
+**ONLY `app/rs/kr64/src/lib.rs` was edited** (per task constraint).
+
+**1. Split `copy_hook_library_to_dev` into a read phase + a write phase.**
+
+New `find_and_read_hook_library(cfg, lib_name, not_found_msg) ->
+Option<(String, Vec<u8>)>`: searches the candidate paths (same list
+as Task 7+8), finds the first existing one, READS ITS CONTENT INTO
+MEMORY, and returns `(source_path, content)`. Returns `None` if no
+candidate exists (logs all checked paths, same as before).
+
+New `write_hook_library_to_dev(lib_name, src, content, dst) -> bool`:
+writes the in-memory bytes to `dst` (always `/dev/<lib>`), chmods
+0644, logs success/failure.
+
+`copy_hook_library_to_dev` is now a thin wrapper around both (kept
+for test compatibility, marked `#[allow(dead_code)]` since `run()`
+uses the split flow).
+
+**2. In `run()`, the read happens BEFORE `setup_mounts`, the write
+happens AFTER.**
+
+Step 3.6 (new, before Step 4 / setup_mounts):
+```rust
+let hook_lib_getpid = find_and_read_hook_library(&cfg, "libgetpid_hook.so", "LD_PRELOAD will fail");
+let hook_lib_loader = find_and_read_hook_library(&cfg, "libtwoyi_loader_shlib.so", "seccomp virtualization disabled");
+```
+
+After setup_mounts (where the old `copy_hook_library_to_dev` calls
+were):
+```rust
+if let Some((src, content)) = &hook_lib_getpid {
+    write_hook_library_to_dev("libgetpid_hook.so", src, content, "/dev/libgetpid_hook.so");
+}
+if let Some((src, content)) = &hook_lib_loader {
+    write_hook_library_to_dev("libtwoyi_loader_shlib.so", src, content, "/dev/libtwoyi_loader_shlib.so");
+}
+```
+
+**Why the split is required** (the task's suggested approach of
+"copy to {rootfs}/dev/ before pivot_root" does NOT work):
+- Writing to `{cfg.rootfs}/dev/libgetpid_hook.so` BEFORE setup_mounts
+  would be HIDDEN by the tmpfs mount that setup_mounts places on
+  `{cfg.rootfs}/dev` (mount_mgr.rs line 359). After pivot_root,
+  `/dev/libgetpid_hook.so` wouldn't exist (the tmpfs overlay hides
+  the underlying ext4 file).
+- Reading from host paths AFTER pivot_root is impossible (old_root
+  detached, host paths gone).
+- Reading into memory BEFORE + writing to `/dev/` AFTER is the only
+  correct sequence. The libraries (~500KB total for both) briefly
+  live in the parent's heap — negligible memory cost.
+
+**3. Fixed the SAME ordering bug in ALL other post-setup_mounts
+operations that used `{cfg.rootfs}/...` host paths.**
+
+Introduced `rootfs_prefix` right after setup_mounts:
+```rust
+let rootfs_prefix: String = if cfg.use_namespaces {
+    String::new()          // chroot-relative: format!("{}/...", "") = "/..."
+} else {
+    cfg.rootfs.clone()     // host path (no pivot_root, or pivot_root failed)
+};
+```
+
+Updated ALL post-setup_mounts path-formatted strings to use
+`rootfs_prefix` instead of `cfg.rootfs`:
+- `critical_binaries` copy: `format!("{}/{}", rootfs_prefix, binary)`
+  → `/system/bin/logd` (chroot-relative, resolves through bind mount)
+- `hw/` directory scan: `/system/bin/hw`, `/vendor/bin/hw`
+- binderfs mount dir: `/dev/binderfs`
+- binderfs symlinks: `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`
+- binderfs chmod: `/dev/binderfs/{binder,hwbinder,vndbinder}`
+- binderfs fallback symlinks: same `/dev/{binder,...}`
+- pre-create boot dirs: `/acct`, `/metadata`, `/mnt/...`, etc.
+- graphics device stubs: `devices::create_graphics_device_stubs(&rootfs_prefix)`
+  → `format!("{}/dev/graphics", "")` = `/dev/graphics` (chroot-relative)
+- fstab.ranchu overwrite: `/vendor/etc/fstab.ranchu`
+- `/dev/__properties__` pre-creation: `/dev/__properties__`
+
+This is critical: after pivot_root, `{cfg.rootfs}/system/bin/logd`
+resolves to `/data/data/io.twoyi/rootfs/system/bin/logd` INSIDE the
+new root — which doesn't exist (the new root IS
+`/data/data/io.twoyi/rootfs`, so it would look for a nested
+`data/data/io.twoyi/rootfs/system/bin/logd`). The chroot-relative
+`/system/bin/logd` resolves through the bind mount set up by
+setup_mounts (step 3: bind-mount `rom_dir/system` → `{rootfs}/system`)
+to the actual file. Same logic for all other paths.
+
+**4. Fixed `TWOYI_ROOTFS` env var — was always `cfg.rootfs` (host
+path), which broke the loader's path translation after pivot_root.**
+
+The loader (`twoyi_loader_shlib.c`) reads `TWOYI_ROOTFS` into
+`g_rootfs` and uses `should_translate()` to decide whether to prepend
+`g_rootfs` to a path:
+```c
+if (strncmp(path, g_rootfs, strlen(g_rootfs)) == 0) return 0;  // already-prefixed guard
+... // then translate /dev/binder, /system, /vendor, /apex, etc.
+snprintf(real_path, sizeof(real_path), "%s%s", g_rootfs, path);
+```
+
+After pivot_root, `g_rootfs = cfg.rootfs = "/data/data/io.twoyi/rootfs"`
+(host path, unreachable). When init opens `/system/lib/foo.so`,
+`should_translate` returns 1 (path doesn't start with `g_rootfs`),
+and the loader translates it to
+`/data/data/io.twoyi/rootfs/system/lib/foo.so` — which is UNREACHABLE
+inside the jail (it would look for `data/data/io.twoyi/rootfs/...`
+INSIDE the new root, which doesn't exist). Open fails with ENOENT.
+This breaks ALL `/system`, `/vendor`, `/apex` access after pivot_root
+— init can't load any library.
+
+Fix: pass `"/"` when `use_namespaces=true`:
+```rust
+let twoyi_rootfs_value = if cfg.use_namespaces {
+    "/".to_string()
+} else {
+    cfg.rootfs.clone()
+};
+```
+
+With `g_rootfs = "/"`, the guard `strncmp(path, "/", 1)` matches
+EVERY absolute path (they all start with `/`), so `should_translate`
+returns 0 for all paths — translation is disabled. This is CORRECT
+after pivot_root: paths already resolve through the bind mounts and
+don't need a prefix.
+
+Why `"/"` and not `""`: the loader's `clearenv` hook only restores
+`TWOYI_ROOTFS` if `g_rootfs_env[0]` is non-zero. An empty string
+would NOT be restored after init's `clearenv()`, causing the loader
+to fall back to the default `"/data/data/io.twoyi/rootfs"` (the host
+path) — re-introducing the bug. `"/"` is non-empty, so it's restored
+correctly and keeps translation disabled across the execv chain
+(init first_stage → selinux_setup → secilc → second_stage).
+
+When `use_namespaces=false` (no pivot_root, or pivot_root failed),
+the loader MUST translate guest paths to host paths, so we pass the
+full `cfg.rootfs` as before.
+
+### Build verification
+
+All 4 verification commands pass cleanly:
+- `cargo check` — Finished, no errors, no warnings.
+- `cargo clippy --all-targets -- -D warnings` — Finished, exit 0, NO
+  warnings.
+- `cargo fmt` (auto-fixed 2 long lines) then `cargo fmt --check` —
+  exit 0.
+- `cargo test` — **191 passed; 0 failed; 0 ignored** (unchanged from
+  Task 8; the existing `copy_hook_library_to_dev_*` tests exercise
+  the new `find_and_read_hook_library` + `write_hook_library_to_dev`
+  via the wrapper, so no new tests were needed).
+
+### Constraint compliance
+
+- ONLY `app/rs/kr64/src/lib.rs` was edited for the code fix. No
+  loader changes, no other kr64 files touched (devices.rs, mount_mgr.rs
+  unchanged — the graphics stubs function takes `rootfs_prefix` as
+  its `&str` argument, no signature change needed).
+- The LD_PRELOAD destination (`/dev/libgetpid_hook.so`) is UNCHANGED.
+- The copy-to-`/dev/` behavior is UNCHANGED (still required for
+  SELinux: vendor_init is denied `app_data_file` access, `/dev/`
+  tmpfs is accessible to all domains).
+- No crash suppression, no faked results. The hook library read
+  failure is still logged at `error!` level with all checked paths.
+  If the read fails, the write is skipped and LD_PRELOAD references
+  a non-existent file — the child logs
+  `libgetpid_hook.so NOT found at /dev/` and init crashes with clear
+  diagnostics (no silent failure).
+
+### Confidence assessment
+
+**WILL this fix the SIGSEGV? HIGH confidence.**
+
+Reasoning:
+1. The SIGSEGV root cause is confirmed: hook library search ran AFTER
+   pivot_root, so all candidate source paths were unreachable,
+   LD_PRELOAD was empty, no hooks loaded, init crashed. DIRECT
+   cause-effect.
+2. The fix moves the search+read to BEFORE pivot_root (while host
+   paths are accessible). The candidates include the APK lib dir
+   (`/data/app/.../lib/x86_64/libgetpid_hook.so`) which is the
+   canonical source. As long as `extractNativeLibs=true` (which the
+   logcat evidence from run 31501768195 implies — RomManager's
+   `ensureLibSymlink` target path only exists if libs are extracted),
+   the read will succeed.
+3. The write happens AFTER pivot_root to `/dev/` (the tmpfs), so the
+   libraries survive pivot_root and are at the LD_PRELOAD path.
+4. The TWOYI_ROOTFS fix ensures the loader doesn't break `/system`
+   access after pivot_root — without this, even with hooks loaded,
+   init couldn't load libraries and would crash with a different
+   error.
+
+**What COULD still go wrong (lower-confidence risks):**
+- If `extractNativeLibs=false` (libs stay zipped in the APK), the
+  APK scan returns nothing and the read fails. The diagnostic logs
+  will show this clearly (`APK native lib scan for ... found no
+  candidates` + `not found in any of N candidate locations`).
+- If the KVM test environment's `/data/app/` is somehow unreadable
+  (SELinux denial), `read_dir` returns an error and the scan returns
+  empty. Check logcat for SELinux avc denials on `/data/app`.
+- Even with hooks loaded, init may hit OTHER blockers (binder IPC
+  from Task 5, graphics from Task 6, banned-fake-boot removal from
+  Task 4). This fix is NECESSARY but may not be SUFFICIENT for full
+  boot. It unblocks the FIRST step (loading hooks) so subsequent
+  blockers become visible.
+- The `rootfs_prefix` approach assumes `cfg.use_namespaces` is
+  accurate after setup_mounts. If setup_mounts fails and sets
+  `cfg.use_namespaces = false`, `rootfs_prefix` becomes `cfg.rootfs`
+  (host path) — correct for the chroot-only fallback.
+
+### Greps for the next sub-agent analyzing the new KVM run 31505655579
+
+```
+# SUCCESS indicator #1: hook library was READ into memory BEFORE
+# pivot_root (should see 2 lines, one per library). The log says
+# "BEFORE pivot_root" and includes the source path + byte count.
+grep -E "PARENT: read (libgetpid_hook|libtwoyi_loader_shlib)\.so .* BEFORE pivot_root" kr64-stderr.log
+
+# SUCCESS indicator #2: hook library was WRITTEN to /dev/ AFTER
+# pivot_root (should see 2 lines). The log says "AFTER pivot_root,
+# tmpfs" and includes the byte count.
+grep -E "PARENT: wrote (libgetpid_hook|libtwoyi_loader_shlib)\.so .* AFTER pivot_root" kr64-stderr.log
+
+# SUCCESS indicator #3: the child confirms the library exists at /dev/.
+grep "libgetpid_hook.so found at /dev/" kr64-stderr.log
+
+# REGRESSION CHECK #1: this line MUST NOT appear (the read failed).
+grep "not found in any of .* candidate locations" kr64-stderr.log
+
+# REGRESSION CHECK #2: this line MUST NOT appear (init still crashes
+# with SIGSEGV — or if it does, the message/signal should be DIFFERENT,
+# indicating a different blocker further on).
+grep "guest killed by signal 11" kr64-stderr.log
+
+# DIAGNOSTIC: if the TWOYI_ROOTFS fix works, the loader's init log
+# should show TWOYI_ROOTFS=/ (not the host path).
+grep -E "\[twoyi_loader\] init:.*TWOYI_ROOTFS=" kr64-stderr.log | head -3
+
+# DIAGNOSTIC: the loader's should_translate should NOT log binder
+# translation (translation is disabled when g_rootfs="/"). If these
+# lines appear, the TWOYI_ROOTFS fix didn't take effect.
+grep "should_translate: /dev/binder -> YES" kr64-stderr.log | head -5
+
+# If the fix works, init should progress further. Check for zygote /
+# surfaceflinger / system_server startup (the next blockers per
+# Tasks ID 3/5/6).
+grep -E "starting service 'zygote'|service zygote.*started" logcat.txt
+grep -E "starting service 'surfaceflinger'|service surfaceflinger.*started" logcat.txt
+grep -E "system_server|SystemServer" logcat.txt | head -20
+
+# If init still crashes, the FIRST tombstone's abort message + the
+# last few kr64-stderr.log lines before the crash are the key clue.
+grep -E "tombstone|SIGSEGV|SIGABRT|signal [0-9]+" logcat.txt | head -20
+
+# Check that critical_binaries copy succeeded (should see the summary line).
+grep "critical service binaries copied to /dev/twoyi-bin/" kr64-stderr.log
+
+# Check that binderfs mounted (should see the mount line).
+grep "mounted binderfs at" kr64-stderr.log
+
+# Check that fstab was overwritten.
+grep "overwrote fstab.ranchu" kr64-stderr.log
+```
+
+### Commit + KVM run
+
+- **Commit:** a746b98 "fix: read hook libraries BEFORE pivot_root,
+  write to /dev/ tmpfs AFTER" — pushed to origin/main
+  (81b978c..a746b98).
+- **KVM run triggered:** 31505655579 (workflow `kvm-e2e-test.yml`,
+  ref main, started 2026-08-11T15:11:15Z). Status at trigger time:
+  in_progress.
+
+### Next steps for the next sub-agent
+
+1. **Wait for KVM run 31505655579 to complete** (previous runs took
+   ~9-10 minutes; allow up to 30).
+2. **Download the artifacts** and run the greps above. The PRIMARY
+   success signal is the `PARENT: read ... BEFORE pivot_root` line
+   followed by `PARENT: wrote ... AFTER pivot_root` — that confirms
+   the split read+write flow worked.
+3. **If both libraries were read+written** but init STILL crashes:
+   this fix was necessary but not sufficient. The crash will now be
+   at a LATER point. Check:
+   - The `TWOYI_ROOTFS=/` diagnostic line (loader init log). If it
+     shows the host path instead of `/`, the env var fix didn't
+     propagate (check the execv chain).
+   - The `should_translate: /dev/binder -> YES` lines. If they
+     appear, translation is still active (TWOYI_ROOTFS fix didn't
+     work). If they DON'T appear, translation is disabled (fix
+     worked).
+   - The first tombstone's abort message — the key clue for the
+     next blocker.
+4. **If the libraries were NOT read** (the `not found in any of N
+   candidate locations` line appears BEFORE pivot_root): the host
+   paths were unreachable even BEFORE pivot_root. This would mean
+   `cfg.data_dir` / `cfg.rootfs` are wrong, OR the APK lib dir is
+   truly missing (`extractNativeLibs=false`). Check the `checked:`
+   lines for the actual paths tried.
+5. **If init now boots further** (reaches zygote, surfaceflinger, or
+   system_server): the binder IPC fix (Task 5, commit bca0e7b),
+   graphics stubs (Task 6, commit f11b46f), and banned-fake-boot
+   removal (Task 4, commit b069d5e) are the next things to validate.
+   The greps in those progress-log entries apply directly.
