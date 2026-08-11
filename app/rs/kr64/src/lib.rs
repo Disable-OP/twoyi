@@ -1218,6 +1218,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 }
             }
             info!("[KR64] PARENT: created binder symlinks (binderfs)");
+            
+            // List binderfs contents for diagnostics
+            if let Ok(entries) = std::fs::read_dir(&binderfs_dir) {
+                for entry in entries.flatten() {
+                    info!("[KR64] PARENT: binderfs entry: {:?}", entry.file_name());
+                }
+            }
         } else {
             let e = std::io::Error::last_os_error();
             warning!(
