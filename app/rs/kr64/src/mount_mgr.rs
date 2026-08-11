@@ -230,6 +230,13 @@ pub struct MountConfig {
     /// read-only (Treble convention). Set to `false` for development
     /// (so you can `adb push` test binaries into the running guest).
     pub read_only_rom: bool,
+    /// If `true`, skip the /apex bind mount. Used for TWRP recovery
+    /// boot, where the ramdisk doesn't use APEX packages (TWRP's init
+    /// is statically linked and doesn't need /apex/com.android.runtime/
+    /// libs). Skipping the bind mount avoids the "is /apex accessible?"
+    /// failure mode entirely and makes TWRP boot independent of the
+    /// host's APEX state.
+    pub boot_recovery: bool,
 }
 
 impl Default for MountConfig {
@@ -239,6 +246,7 @@ impl Default for MountConfig {
             rom_dir: None,
             use_namespaces: true,
             read_only_rom: true,
+            boot_recovery: false,
         }
     }
 }
@@ -402,18 +410,30 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     // We use MS_BIND | MS_REC to recursively bind-mount /apex/ and
     // all its sub-mounts (each APEX package is a separate mount on
     // Android).
-    let apex_dst = format!("{}/apex", cfg.rootfs);
-    let _ = std::fs::create_dir_all(&apex_dst);
-    match mount("/apex", &apex_dst, "", MS_BIND | MS_REC, None) {
-        Ok(()) => info!(
-            "[KR64][mount_mgr] bind-mounted /apex -> {} (APEX packages accessible)",
-            apex_dst
-        ),
-        Err(e) => warning!(
-            "[KR64][mount_mgr] bind-mount /apex -> {} failed: {} — linker may crash at 0x86 (NULL soinfo for missing libc.so)",
-            apex_dst,
-            e
-        ),
+    //
+    // TWRP BOOT: skip this bind mount when cfg.boot_recovery=true.
+    // TWRP's ramdisk doesn't use APEX packages (init is statically
+    // linked, no shared lib deps), so the bind mount would just give
+    // the guest access to the host's APEX packages -- harmless but
+    // unnecessary. Skipping it makes TWRP boot independent of the
+    // host's APEX state and avoids a potential failure mode if the
+    // host's /apex is empty or in a weird state.
+    if cfg.boot_recovery {
+        info!("[KR64][mount_mgr] TWRP boot: skipping /apex bind mount (no APEX packages needed)");
+    } else {
+        let apex_dst = format!("{}/apex", cfg.rootfs);
+        let _ = std::fs::create_dir_all(&apex_dst);
+        match mount("/apex", &apex_dst, "", MS_BIND | MS_REC, None) {
+            Ok(()) => info!(
+                "[KR64][mount_mgr] bind-mounted /apex -> {} (APEX packages accessible)",
+                apex_dst
+            ),
+            Err(e) => warning!(
+                "[KR64][mount_mgr] bind-mount /apex -> {} failed: {} — linker may crash at 0x86 (NULL soinfo for missing libc.so)",
+                apex_dst,
+                e
+            ),
+        }
     }
 
     // Step 5: pivot_root (or chroot fallback).
