@@ -1026,7 +1026,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     for lib_path in &["/dev/libgetpid_hook.so", "/dev/libtwoyi_loader_shlib.so"] {
         if Path::new(lib_path).exists() {
             let result = std::process::Command::new("chcon")
-                .args(&["u:object_r:system_file:s0", lib_path])
+                .args(["u:object_r:system_file:s0", lib_path])
                 .status();
             match result {
                 Ok(status) if status.success() => {
@@ -1035,7 +1035,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 _ => {
                     // chcon failed — try restorecon as fallback
                     let _ = std::process::Command::new("restorecon")
-                        .args(&[lib_path])
+                        .args([lib_path])
                         .status();
                     warning!("[KR64] PARENT: chcon {} failed, tried restorecon", lib_path);
                 }
@@ -1134,7 +1134,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
                         // Try to chcon to system_file
                         let _ = std::process::Command::new("chcon")
-                            .args(&["u:object_r:system_file:s0", &dst])
+                            .args(["u:object_r:system_file:s0", &dst])
                             .status();
                     }
                     Err(e) => {
@@ -1163,7 +1163,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     std::fs::Permissions::from_mode(0o755),
                                 );
                                 let _ = std::process::Command::new("chcon")
-                                    .args(&["u:object_r:system_file:s0", &dst])
+                                    .args(["u:object_r:system_file:s0", &dst])
                                     .status();
                             }
                         }
@@ -1188,9 +1188,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let binderfs_c = std::ffi::CString::new(binderfs_dir.as_str()).unwrap_or_default();
         let ret = unsafe {
             libc::mount(
-                b"binder\0".as_ptr() as *const libc::c_char,
+                c"binder".as_ptr(),
                 binderfs_c.as_ptr(),
-                b"binder\0".as_ptr() as *const libc::c_char,
+                c"binder".as_ptr(),
                 0,
                 std::ptr::null(),
             )
@@ -1411,12 +1411,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 }
             }
         }
-        // Pre-create property_info on host (empty regular file, mode 0666)
+        // Pre-create property_info on host (empty regular file, mode 0666).
+        // `.truncate(false)` makes the "do not overwrite an existing file"
+        // intent explicit (the `if !exists()` guard already ensures this).
         let host_prop_info = format!("{}/property_info", host_prop_dir);
         if !Path::new(&host_prop_info).exists() {
             match std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(false)
                 .open(&host_prop_info)
             {
                 Ok(_) => {
@@ -1444,6 +1447,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             match std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(false)
                 .open(&host_prop_serial)
             {
                 Ok(_) => {
@@ -1471,6 +1475,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 match std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
+                    .truncate(false)
                     .open(&path)
                 {
                     Ok(_) => {
@@ -1698,12 +1703,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // the full path in that case. But we can't use format! here
         // (async-signal-unsafe). So just check the chroot-relative path
         // and log the result -- it's only diagnostic.
-        let hook_exists = unsafe {
-            libc::access(
-                b"/dev/libgetpid_hook.so\0".as_ptr() as *const libc::c_char,
-                libc::F_OK,
-            ) == 0
-        };
+        let hook_exists =
+            unsafe { libc::access(c"/dev/libgetpid_hook.so".as_ptr(), libc::F_OK) == 0 };
         if hook_exists {
             unsafe {
                 safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /dev/\n");
