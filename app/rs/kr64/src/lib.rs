@@ -234,7 +234,7 @@ extern "C" fn sigterm_handler(_sig: libc::c_int) {
 fn install_sigterm_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigterm_handler as usize;
+        sa.sa_sigaction = sigterm_handler as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         sa.sa_flags = 0; // default: no SA_RESTART (we want EINTR)
         if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) == 0 {
