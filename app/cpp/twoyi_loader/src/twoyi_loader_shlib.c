@@ -33,6 +33,9 @@ extern char **environ;
 static int mkdir_p(const char *path, mode_t mode);
 static int should_translate(const char *path);
 static void unsetenv_internal(const char *name);
+// Binder device open fallback (defined later, before __open_2 hook)
+static int is_binder_device_path(const char *path);
+static int binder_open_fallback(const char *path, int real_fd, int saved_errno);
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -2210,9 +2213,24 @@ int openat(int dirfd, const char *path, int flags, ...) {
         return fd;
     }
 
-    if (!real_openat) return syscall(NR_openat, dirfd, path, flags, mode);
+    if (!real_openat) {
+        // real_openat not resolved — use direct syscall, then apply binder
+        // fallback if the path is a binder device.
+        int fd = syscall(NR_openat, dirfd, path, flags, mode);
+        if (is_binder_device_path(path)) {
+            int saved_errno = fd < 0 ? errno : 0;
+            return binder_open_fallback(path, fd, saved_errno);
+        }
+        return fd;
+    }
     const char *translated = translate(path);
-    return real_openat(dirfd, translated, flags, mode);
+    int fd = real_openat(dirfd, translated, flags, mode);
+    // Binder device open fallback (see binder_open_fallback() docs above).
+    if (is_binder_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return binder_open_fallback(path, fd, saved_errno);
+    }
+    return fd;
 }
 
 // open PLT interposition (for code that uses open() instead of openat())
@@ -2288,11 +2306,18 @@ int open(const char *path, int flags, ...) {
 
     const char *translated = translate(path);
 #if defined(__x86_64__)
-    return twoyi_sys_open(translated, flags, mode);
+    int fd = twoyi_sys_open(translated, flags, mode);
 #else
-    if (real_openat) return real_openat(AT_FDCWD, translated, flags, mode);
-    return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
+    int fd;
+    if (real_openat) fd = real_openat(AT_FDCWD, translated, flags, mode);
+    else fd = syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
+    // Binder device open fallback (see binder_open_fallback() docs above).
+    if (is_binder_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return binder_open_fallback(path, fd, saved_errno);
+    }
+    return fd;
 }
 
 // Hook fopen — translate paths to rootfs.
@@ -2346,6 +2371,65 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     return NULL;
 }
 
+// =========================================================================
+// Binder device open fallback
+// =========================================================================
+// ROOT CAUSE (KVM run 31489388552, commit 14e3989):
+//   HIDL HAL services (android.system.suspend@1.0-service, etc.) crash with
+//   "Binder driver could not be opened. Terminating." because open() of
+//   /dev/hwbinder returns EACCES for them. SELinux is permissive (enforcing=0
+//   confirmed in logcat before the first crash), so this is a DAC permission
+//   issue on the binderfs character device — vold's open succeeds (fd=5) but
+//   HIDL service opens fail 22/26 times. When open() fails, libhidlbase's
+//   ProcessState::open_driver() returns -1, and the constructor aborts.
+//
+//   Our ioctl hook (BINDER_VERSION -> 8) and mmap hook (MAP_ANONYMOUS) only
+//   fire when open() succeeds — that is why only 12 "faking version 8" lines
+//   appear (from vold/init/servicemanager, whose opens succeed) while 25 HIDL
+//   services crash. The ioctl hook is NOT bypassed; open() just fails first.
+//
+// FIX: when the real open of a binder device (/dev/binder, /dev/hwbinder,
+//   /dev/vndbinder) fails, fall back to opening /dev/null and return that fd.
+//   This gives the caller a valid fd. The existing ioctl hook then fakes
+//   BINDER_VERSION (-> 8), BINDER_SET_MAX_THREADS, BINDER_SET_CONTEXT_MGR and
+//   BINDER_WRITE_READ, and the mmap hook returns MAP_ANONYMOUS. The HIDL
+//   service's ProcessState::open_driver() sees fd >= 0 and proceeds past the
+//   "Binder driver could not be opened" LOG_ALWAYS_FATAL.
+//
+//   This is a virtualization technique (providing a virtual binder fd), NOT a
+//   crash suppression: the BINDER_VERSION check still runs and our ioctl hook
+//   returns a valid version (8). The HAL service simply cannot perform real
+//   binder IPC — it blocks in its threadpool, which init treats as "running".
+static int is_binder_device_path(const char *path) {
+    if (!path) return 0;
+    return (strcmp(path, "/dev/binder") == 0 ||
+            strcmp(path, "/dev/hwbinder") == 0 ||
+            strcmp(path, "/dev/vndbinder") == 0);
+}
+
+// Called from __open_2/open/openat after the real open of a binder device.
+// If the real open failed, returns a /dev/null fd as a virtual binder fd.
+// `real_fd` is the result of the real open; `saved_errno` is errno right
+// after the failed open (captured by the caller before any other syscall).
+static int binder_open_fallback(const char *path, int real_fd, int saved_errno) {
+    if (real_fd >= 0) return real_fd;           // real open succeeded — use it
+    if (!is_binder_device_path(path)) return real_fd;  // not a binder device
+    // Real open failed — open /dev/null as a virtual binder fd.
+    // twoyi_sys_open uses a direct syscall (no PLT recursion).
+    int fb = twoyi_sys_open("/dev/null", O_RDWR | O_CLOEXEC, 0);
+    char msg[320];
+    snprintf(msg, sizeof(msg),
+        "[twoyi_loader] binder_open_fallback: %s real open FAILED (errno=%d:%s) "
+        "-> virtual /dev/null fd=%d\n",
+        path, saved_errno, strerror(saved_errno), fb);
+    write_str(2, msg);
+    if (fb < 0) {
+        // /dev/null itself failed (very unlikely) — restore original errno
+        errno = saved_errno;
+    }
+    return fb;
+}
+
 // Hook __open_2 (bionic's fortified open — used by init's WriteFile)
 int __open_2(const char *path, int flags) {
     // Block fstab files for init only → first_stage_mount is skipped.
@@ -2378,17 +2462,24 @@ int __open_2(const char *path, int flags) {
 #else
         else fd = syscall(NR_openat, AT_FDCWD, translated, flags);
 #endif
+        int saved_errno = fd < 0 ? errno : 0;
         // Log binder device open results
-        if (path && (strcmp(path, "/dev/binder") == 0 ||
-                      strcmp(path, "/dev/hwbinder") == 0 ||
-                      strcmp(path, "/dev/vndbinder") == 0)) {
+        if (path && is_binder_device_path(path)) {
             char msg[512];
             snprintf(msg, sizeof(msg),
                 "[twoyi_loader] __open_2(%s) -> %s = %d (errno=%d: %s)\n",
-                path, translated, fd, fd < 0 ? errno : 0,
-                fd < 0 ? strerror(errno) : "OK");
+                path, translated, fd, saved_errno,
+                fd < 0 ? strerror(saved_errno) : "OK");
             write_str(2, msg);
         }
+        // Binder device open fallback: if the real open failed (e.g. EACCES on
+        // the binderfs char device for HIDL HAL services), return a /dev/null
+        // fd so ProcessState::open_driver() sees fd >= 0 and our ioctl hook
+        // can fake BINDER_VERSION. See binder_open_fallback() docs above.
+        if (is_binder_device_path(path)) {
+            return binder_open_fallback(path, fd, saved_errno);
+        }
+        if (fd < 0) errno = saved_errno;
         return fd;
     }
     // Pass through (kernel paths: /proc, /sys, /dev, relative paths)
@@ -2440,12 +2531,19 @@ int __open_real(const char *pathname, int flags, ...) {
         const char *translated = translate(pathname);
         static int (*real_open_real)(const char *, int, ...) = NULL;
         if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
-        if (real_open_real) return real_open_real(translated, flags, mode);
+        int fd;
+        if (real_open_real) fd = real_open_real(translated, flags, mode);
 #if defined(__x86_64__)
-        return twoyi_sys_open(translated, flags, mode);
+        else fd = twoyi_sys_open(translated, flags, mode);
 #else
-        return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
+        else fd = syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
+        // Binder device open fallback (see binder_open_fallback() docs above).
+        if (is_binder_device_path(pathname)) {
+            int saved_errno = fd < 0 ? errno : 0;
+            return binder_open_fallback(pathname, fd, saved_errno);
+        }
+        return fd;
     }
     static int (*real_open_real)(const char *, int, ...) = NULL;
     if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
