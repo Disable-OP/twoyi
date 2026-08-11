@@ -1972,9 +1972,15 @@ static int should_translate(const char *path) {
     if (strncmp(path, "/dev/__null__", 13) == 0) return 1;
     // Translate binder devices to rootfs — kr64 mounts binderfs there
     // so the guest has its own binder domain separate from the host.
-    if (strcmp(path, "/dev/binder") == 0) return 1;
-    if (strcmp(path, "/dev/hwbinder") == 0) return 1;
-    if (strcmp(path, "/dev/vndbinder") == 0) return 1;
+    if (strcmp(path, "/dev/binder") == 0 ||
+        strcmp(path, "/dev/hwbinder") == 0 ||
+        strcmp(path, "/dev/vndbinder") == 0) {
+        // Log binder opens for debugging
+        char msg[256];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] should_translate: %s -> YES (binder)\n", path);
+        write_str(2, msg);
+        return 1;
+    }
     if (strncmp(path, "/dev/binderfs/", 14) == 0) return 1;
     // Other /dev/ paths (null, zero, random, qemu_pipe, etc.) stay on host
     if (strncmp(path, "/dev/", 5) == 0) return 0;
