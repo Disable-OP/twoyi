@@ -2676,3 +2676,295 @@ grep -E "tombstone|SIGSEGV|SIGABRT|signal [0-9]+" logcat.txt | head -20
    SELinux relabeling layer is no longer the blocker. Analyze the
    new crash point — the first tombstone's abort message is the key
    clue.
+
+---
+
+## Timestamp UTC: 2026-08-11 (overnight Task ID 12)
+## Task: Fix linker64 crash at 0x86 when loading LD_PRELOAD hooks
+
+### Context
+
+KVM run 31509809060 (commit 9ad0964, Task ID 11's direct lsetxattr
+fix) completed successfully but the guest init STILL crashed:
+
+```
+I/init[6188](    0): segfault at 86 ip 000079b0c46d7174 sp 00007ffeb3fbbd80 error 6 in linker64[79b0c4628000+d3000]
+[KR64 WARN] [KR64][parent] guest killed by signal 11
+```
+
+GOOD news from run 31509809060:
+- Both hook libraries were read BEFORE pivot_root (lines 54, 56)
+- Both were written to /dev/ AFTER pivot_root (lines 80, 81)
+- lsetxattr SUCCEEDED for both (lines 82, 83) — "OK (direct syscall)"
+- The 10 chcon/restorecon segfaults are GONE (Task 11's fix worked)
+- /apex/com.android.runtime is NOT empty (5 entries)
+- /apex/com.android.runtime/lib64/bionic has 4 entries (real bionic libs)
+
+BAD news:
+- 0 `[twoyi_loader] init:` messages — the linker crashes BEFORE the
+  .init_array constructor runs
+- The crash is at offset 0xaf174 in linker64 (same as chcon's crash)
+- The crash signature `segfault at 86` means a write to near-NULL
+  address 0x86 — classic NULL soinfo dereference
+
+### Investigation
+
+#### 1. DT_NEEDED entries of the hook libraries
+
+Downloaded Android NDK r27c (the same version used by CI) and built
+the hook libraries locally with the EXACT same commands as
+`app/cpp/build.sh`:
+
+```bash
+$NDK/clang -target x86_64-linux-android24 --sysroot=$SYSROOT \
+    -shared -fPIC -O2 -g -D_GNU_SOURCE \
+    -o libtwoyi_loader_shlib.so \
+    twoyi_loader_shlib.c -lc -ldl
+
+$NDK/clang -target x86_64-linux-android24 --sysroot=$SYSROOT \
+    -shared -fPIC -O2 -g -fvisibility=default \
+    -o libgetpid_hook.so getpid_hook.c
+```
+
+Then ran `readelf -d` and `readelf -V`:
+
+**libgetpid_hook.so** (8584 bytes locally, 9384 bytes in CI build):
+- DT_NEEDED: libdl.so
+- DT_NEEDED: libc.so
+- VERNEED: LIBC version from libc.so, LIBC version from libdl.so
+- Undefined symbols: `__cxa_finalize@LIBC`, `__cxa_atexit@LIBC`,
+  `__register_frame_info@LIBC`
+
+**libtwoyi_loader_shlib.so** (140792 bytes locally, 140896 bytes in CI):
+- DT_NEEDED: libdl.so
+- DT_NEEDED: libc.so
+- VERNEED: LIBC version from libc.so, LIBC version from libdl.so
+- Undefined symbols: ~40 symbols from libc (memset, getenv, strncpy,
+  dlsym, setenv, environ, syscall, strcmp, snprintf, strncmp, pthread*,
+  __errno, strlen, symlink, strrchr, atoi, strchr, strerror, strstr,
+  strdup, stat, malloc, free, memcpy, write, strtok, readlink, _exit,
+  realloc, pthread_once, abort, ...)
+
+#### 2. LD_LIBRARY_PATH init receives
+
+Verified in `app/rs/kr64/src/lib.rs` (lines 2324-2336). The path
+INCLUDED all necessary directories:
+- /system/lib64
+- /system/lib64/bootstrap
+- /apex/com.android.runtime/lib64
+- /apex/com.android.runtime/lib64/bionic
+- /apex/com.android.runtime/lib64/bootstrap
+- /vendor/lib64
+- /apex/com.android.os.statsd/lib64
+- /system_ext/lib64
+- /product/lib64
+
+#### 3. Rootfs's /apex/ contents
+
+From `scripts/kvm-e2e-test.sh` (line 248-250): the rootfs is extracted
+from a booted Android 11 emulator via `adb root` + `tar cf ... apex/`.
+So /apex/ IS populated.
+
+From kr64-stderr.log run 31509809060:
+- `/apex/com.android.runtime has 5 entries` (NOT empty)
+- `/apex/com.android.runtime/lib64/bionic has 4 entries`
+- `/apex/com.android.runtime/lib64/bionic/libc.so` exists (984072 bytes)
+
+#### 4. Root cause hypothesis
+
+The hook libraries need `libdl.so` with the `LIBC` version. On
+Android 11:
+- `/system/lib64/libdl.so` is 5848 bytes — a BOOTSTRAP STUB used
+  during early init before apexd mounts the APEX packages
+- `/apex/com.android.runtime/lib64/bionic/libdl.so` is the REAL
+  libdl.so with the full implementation
+
+The bootstrap stub SHOULD provide the LIBC version (it's part of
+bionic), but there may be a subtle incompatibility (missing symbol,
+different version definition, or the stub being too minimal) that
+causes the linker to get a NULL soinfo and crash with the same
+`segfault at 86` signature.
+
+The previous LD_LIBRARY_PATH had `/system/lib64` FIRST, so the linker
+found the bootstrap stub before the real libdl.so.
+
+### What was changed (commit 927466c, +98/-6 in two files)
+
+**1. `app/rs/kr64/src/lib.rs`** — reordered LD_LIBRARY_PATH to put
+`/apex/com.android.runtime/lib64/bionic` FIRST:
+
+Before:
+```
+/system/lib64:
+/system/lib64/bootstrap:
+/apex/com.android.runtime/lib64:
+/apex/com.android.runtime/lib64/bionic:
+/apex/com.android.runtime/lib64/bootstrap:
+/vendor/lib64:
+...
+```
+
+After:
+```
+/apex/com.android.runtime/lib64/bionic:
+/apex/com.android.runtime/lib64:
+/apex/com.android.runtime/lib64/bootstrap:
+/system/lib64:
+/system/lib64/bootstrap:
+/vendor/lib64:
+...
+```
+
+This makes the linker find the REAL bionic libraries (libc.so,
+libdl.so, libm.so) before the bootstrap stubs in /system/lib64/.
+
+This is safe because:
+- /apex/com.android.runtime/lib64/bionic/libc.so is the SAME file as
+  /system/lib64/libc.so (same size, 984072 bytes)
+- /apex/com.android.runtime/lib64/bionic/libdl.so is the REAL libdl.so
+  (larger than the 5848-byte stub)
+- The apex directory has all 4 bionic libraries (libc.so, libm.so,
+  libdl.so, libdl_android.so), so they can find each other
+
+**2. `app/rs/kr64/src/lib.rs`** — added LD_DEBUG support (diagnostic):
+
+When `TWOYI_LD_DEBUG` env var is set in the parent, propagate it as
+`LD_DEBUG` to the guest init. This enables bionic linker debug output
+(which library is being loaded when the crash happens). The output
+goes to stderr (captured in kr64-stderr.log).
+
+If the LD_LIBRARY_PATH reorder doesn't fix the crash, the LD_DEBUG
+output will show EXACTLY which library the linker is trying to load
+when it crashes — telling us the real root cause.
+
+**3. `app/rs/kr64/src/lib.rs`** — enhanced the
+`/apex/com.android.runtime/lib64/bionic` diagnostic to list the
+actual file names and sizes (was just a count). This lets us verify
+which libraries are in the apex bionic directory.
+
+**4. `app/rs/kr64/src/lib.rs`** — added a diagnostic log of all env
+vars passed to init, so we can verify the LD_LIBRARY_PATH reorder and
+LD_DEBUG are taking effect.
+
+**5. `scripts/kvm-e2e-test.sh`** — set `TWOYI_LD_DEBUG=2` by default
+when launching kr64. This enables the "libs" level debug (library
+load/unload) for every KVM run. Can be overridden by setting
+`TWOYI_LD_DEBUG=0` in the CI env to disable.
+
+### Build verification
+
+All 4 verification commands pass cleanly:
+
+- `cargo check` — Finished, no errors, no warnings.
+- `cargo clippy --all-targets -- -D warnings` — Finished, exit 0, NO
+  warnings.
+- `cargo fmt` (auto-fixed 1 block: collapsed `Err(_) => { unsafe { ... } }`
+  into `Err(_) => unsafe { ... }`) then `cargo fmt --check` — exit 0.
+- `cargo test` — **196 passed; 0 failed; 0 ignored** (unchanged from
+  Task 11).
+
+### Constraint compliance
+
+- **ONLY `app/rs/kr64/src/lib.rs` and `scripts/kvm-e2e-test.sh` were
+  edited.** No loader changes, no other kr64 files touched.
+- **LD_PRELOAD is NOT skipped.** The fix maintains LD_PRELOAD with
+  both hook libraries.
+- **No crash suppression, no faked results.** The LD_DEBUG output is
+  a diagnostic that will reveal the actual root cause if the reorder
+  doesn't fix the crash.
+- **Works on real enforcing devices.** The LD_LIBRARY_PATH reorder is
+  a standard Android configuration (apex paths are searched before
+  system paths on real devices too). The LD_DEBUG diagnostic is
+  disabled by default (only enabled when TWOYI_LD_DEBUG is set).
+
+### Confidence assessment
+
+**WILL the LD_LIBRARY_PATH reorder fix the crash? MEDIUM confidence.**
+
+Reasoning:
+1. The hook libraries need libdl.so with LIBC version.
+2. /system/lib64/libdl.so is a 5848-byte bootstrap stub.
+3. The apex libdl.so is the real one.
+4. Reordering makes the linker find the real one first.
+5. IF the bootstrap stub was the problem, this fix resolves it.
+
+**What COULD still be wrong:**
+- The bootstrap stub might NOT be the problem (it might provide the
+  LIBC version just fine). In that case, the crash is for a different
+  reason (maybe init's own dependencies, maybe a different library
+  version mismatch, maybe a linker bug).
+- The LD_DEBUG output will reveal the actual root cause if the
+  reorder doesn't fix it.
+
+### Commit + KVM run
+
+- **Commit:** 927466c "fix: reorder LD_LIBRARY_PATH (apex first) +
+  add LD_DEBUG diagnostic" — pushed to origin/main
+  (5969f2a..927466c).
+- **KVM run triggered:** 31512246550 (workflow `kvm-e2e-test.yml`,
+  ref main, started 2026-08-11T16:24:47Z). Status at trigger time:
+  queued.
+
+### Greps for the next sub-agent analyzing KVM run 31512246550
+
+```bash
+# SUCCESS indicator #1: env vars logged (verifies the reorder + LD_DEBUG).
+# Should see lines like:
+#   [KR64 CHILD] env vars passed to init:
+#     PATH=/system/bin:/system/xbin:/vendor/bin
+#     ...
+#     LD_LIBRARY_PATH=/apex/com.android.runtime/lib64/bionic:...
+#     LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so
+grep -A 12 "env vars passed to init" kr64-stderr.log
+
+# SUCCESS indicator #2: apex bionic dir contents logged (with sizes).
+grep "PARENT: /apex/com.android.runtime/lib64/bionic has" kr64-stderr.log
+
+# SUCCESS indicator #3: LD_DEBUG enabled.
+grep "TWOYI_LD_DEBUG set -- enabling LD_DEBUG" kr64-stderr.log
+
+# SUCCESS indicator #4: LD_DEBUG output (library load messages).
+# If the reorder didn't fix the crash, these lines will show which
+# library was being loaded when the crash happened.
+grep -E "^\d+-\d+-\d+.\d+\s+\d+\s+\d+\s+I/linker\d*:|Linker debug|DEBUG:" kr64-stderr.log | head -30
+
+# SUCCESS indicator #5: twoyi_loader init messages (means .init_array ran).
+grep "\[twoyi_loader\] init:" kr64-stderr.log | head -10
+
+# REGRESSION CHECK #1: NO SIGSEGV at 0x86 (the crash signature).
+grep -E "SIGSEGV.*0x86|signal 11.*0x86|segfault at 86" kr64-stderr.log logcat.txt
+
+# REGRESSION CHECK #2: NO chcon/restorecon segfaults (Task 11's fix
+# must still work).
+grep -E "chcon|restorecon" kr64-stderr.log | grep -i "segfault\|signal\|SIGSEGV"
+
+# DIAGNOSTIC: if init still crashes, check what library was being
+# loaded. The LAST "Linker debug" or "DEBUG:" line before the crash
+# is the key clue.
+grep -B 5 "guest killed by signal 11" kr64-stderr.log
+
+# DIAGNOSTIC: if init progresses, check for zygote/surfaceflinger.
+grep -E "starting service 'zygote'|service zygote.*started" logcat.txt
+grep -E "starting service 'surfaceflinger'" logcat.txt
+```
+
+### Next steps for the next sub-agent
+
+1. **Wait for KVM run 31512246550 to complete** (~10 minutes).
+2. **Download the artifacts** and run the greps above.
+3. **If the reorder fixed the crash** (no SIGSEGV at 0x86, twoyi_loader
+   init messages present): GREAT! The next blocker is likely binder
+   IPC, graphics, or a new issue revealed by init progressing further.
+4. **If the crash STILL happens**: check the LD_DEBUG output. The LAST
+   library load message before the crash tells us which library is the
+   problem. Then implement the appropriate fix:
+   - If it's libdl.so: pre-copy the real libdl.so to /dev/ and add /dev/
+     to LD_LIBRARY_PATH FIRST.
+   - If it's a different library: pre-copy that library to /dev/.
+   - If it's a version mismatch: rebuild the hook libraries with static
+     linking or with the correct version requirements.
+5. **If LD_DEBUG output is empty** (the linker crashed before printing
+   anything): the crash is in the very early linker initialization,
+   not in library loading. This would indicate a different class of
+   problem (e.g., the linker binary itself is corrupted, or the kernel
+   doesn't support a required feature).
