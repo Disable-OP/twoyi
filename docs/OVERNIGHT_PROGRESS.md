@@ -1249,3 +1249,226 @@ and #3).**
 ### Commit
 - bca0e7b "fix: real binder IPC for real binderfs fds, keep fake for
   /dev/null fallbacks" — pushed to origin/main (c047ac4..bca0e7b).
+
+---
+
+## Timestamp UTC: 2026-08-11 (overnight Task ID 6)
+## Task: Investigate the graphics device blocker for surfaceflinger
+
+### Context
+
+Task ID 3's proactive blocker analysis identified surfaceflinger /
+graphics HAL init as the SECOND-high-confidence blocker (after the
+binder IPC blocker, which Task ID 5 fixed in commit bca0e7b). The
+current KVM run 31500117235 (commit e40e0e5 with real binder IPC) may
+reach surfaceflinger for the first time. This task prepares the
+graphics fix BEFORE that run completes.
+
+### Investigation findings
+
+#### 1. What graphics devices the container currently provides
+
+**Pre-created in kr64 (devices.rs + lib.rs):**
+- `/dev/qemu_pipe` — Unix socket, real GL command proxy → forwards to
+  `{rootfs}/opengles` renderer socket (libOpenglRender).
+- `/dev/gb`, `/dev/gb2` — Unix sockets, MVP stubs (accept + echo 1
+  byte + close). No real gralloc protocol implemented.
+- `/dev/dm-user` — Unix socket, MVP stub (accept thread only).
+- `/dev/input/touch`, `/dev/input/key0` — Unix sockets, MVP stubs.
+- `/dev/audio`, `/dev/sensors` — Unix sockets with real protocol handlers.
+- `/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder` — symlinks to real
+  binderfs devices (chmod 0666, commit e56f391).
+- `/dev/__properties__/{property_info,properties_serial}` — empty files.
+- `/dev/block/by-name` — empty directory.
+
+**NOT pre-created (the gap):**
+- `/dev/graphics/fb0` — legacy framebuffer (ranchu/goldfish SW-composer).
+- `/dev/fb0` — Linux framebuffer.
+- `/dev/dri/card0`, `/dev/dri/renderD128` — DRM.
+- `/dev/hwcomposer`, `/dev/hwcomposer0` — goldfish HWComposer char device.
+- `/dev/ion` — ION allocator (older gralloc).
+
+#### 2. What surfaceflinger / HWComposer / gralloc need (AOSP R ranchu)
+
+- **HWComposer HAL** via binder (`android.hardware.graphics.composer@2.4-service`).
+  Loads a vendor HAL module (e.g. `hwcomposer.ranchu.so`). The module may
+  open `/dev/hwcomposer` (char device) or use `/dev/qemu_pipe` with the
+  "hwcomposer" channel.
+- **Gralloc HAL** via binder (`allocator@4.0-service` + `mapper@4.0-impl`).
+  The allocator service opens `/dev/gb` / `/dev/gb2` (goldfish gralloc).
+- **EGL/GLES** via emugl (`libEGL_emulation.so`, `libGLESv2_emulation.so`).
+  Opens `/dev/qemu_pipe` with "opengles" channel.
+- **Legacy fallback**: `/dev/graphics/fb0` (rarely used on modern Android).
+
+#### 3. The intended graphics approach (from architecture docs)
+
+From `ROOTLESS_VIRTUALIZATION_ARCHITECTURE.md`:
+- ✅ Renderer (libOpenglRender.so — Emugl) — working
+- ✅ qemu_pipe proxy — working
+- Guest SurfaceFlinger opens `/dev/qemu_pipe`, writes "pipe:opengles"
+  handshake, streams GL commands to the host renderer.
+- This is **Option B** (surfaceflinger runs in headless mode using the
+  qemu_pipe GL transport) per the task's option list.
+
+#### 4. The gap — what's missing for surfaceflinger to work
+
+**Gap A (HIGH): `/dev/gb` / `/dev/gb2` are stub sockets.**
+The MVP `spawn_accept_thread` for `gb`/`gb2` just echoes a single byte
+and closes. The gralloc HAL service (`allocator@4.0-service`) opens
+`/dev/gb` and expects to do ioctls on it. But:
+- You can't `ioctl()` a Unix socket (returns ENOTTY).
+- The MVP stub closes the connection immediately (EPIPE on guest write).
+- The HAL service crashes when it can't allocate memory.
+- The real implementation (`app/rs/openglrenderer/src/gralloc.rs`)
+  referenced in devices.rs does NOT exist — it was planned but never
+  built.
+
+**Gap B (HIGH): qemu_pipe proxy closes on unknown channels.**
+The proxy only handles "opengles", "opengles2", "opengles3" channels.
+If the goldfish HWComposer HAL opens `/dev/qemu_pipe` with the
+"hwcomposer" channel, the proxy closes the connection (EPIPE). The
+HAL crashes.
+
+**Gap C (MEDIUM): HWComposer HAL service needs a real composer.**
+The `composer@2.4-service` loads a vendor HWComposer module. If the
+module needs `/dev/hwcomposer` (char device), it's now a `/dev/null`
+symlink (ENOTTY on ioctl). The HAL crashes or fails to register.
+
+**Gap D (LOW): Legacy `/dev/graphics/fb0` probe.**
+Some HALs probe fb0 defensively. Without the stub, they get ENOENT.
+With the stub (new), they get ENOTTY — graceful fallback.
+
+#### 5. What I implemented (commit f11b46f)
+
+**Defensive graphics device stubs in kr64** — 5 symlinks to `/dev/null`
++ 2 empty directories, created AFTER setup_mounts (on the tmpfs, survive
+pivot_root):
+
+| Path                   | Type    | Target      | Effect                              |
+|------------------------|---------|-------------|-------------------------------------|
+| /dev/graphics/fb0      | symlink | /dev/null   | open OK, ioctl ENOTTY               |
+| /dev/fb0               | symlink | /dev/null   | open OK, ioctl ENOTTY               |
+| /dev/hwcomposer        | symlink | /dev/null   | open OK, ioctl ENOTTY               |
+| /dev/hwcomposer0       | symlink | /dev/null   | open OK, ioctl ENOTTY               |
+| /dev/ion               | symlink | /dev/null   | open OK, ioctl ENOTTY               |
+| /dev/graphics/         | dir     | (empty)     | opendir OK, no entries              |
+| /dev/dri/              | dir     | (empty)     | opendir OK, no entries              |
+
+**This is DEFENSIVE — NOT fake graphics init:**
+- `open()` succeeds (returns fd to `/dev/null`, created by init's
+  coldboot mknod hook on the tmpfs).
+- `fstat()` reports `S_IFCHR` or `S_IFREG` (depending on how /dev/null
+  was materialised by the loader's `emu_mknodat` hook).
+- `ioctl()` returns `ENOTTY` — the REAL errno for "not a framebuffer".
+- The caller sees graceful `ENOTTY` instead of `ENOENT`, logs a clear
+  error, and falls back to the next display path.
+- **No ioctls are faked. No errors are suppressed. No crash suppression.**
+
+**Why `/dev/null`:** it is the standard "black hole" device. The guest's
+init creates it via mknod during coldboot (loader's `emu_mknodat`
+materialises it as a regular file on the tmpfs). The symlinks resolve
+correctly after pivot_root because `/dev/null` is on the same tmpfs.
+
+**Why after setup_mounts:** the stubs are created on the tmpfs mounted
+by `setup_mounts`, so they survive `pivot_root`. The guest init's own
+`mount("tmpfs", "/dev")` is no-op'd by the loader's `emu_mount` hook
+(returns 0 for `/dev` targets), so the stubs remain visible to the
+guest. This is the same pattern used by the binder symlinks and
+property files.
+
+#### 6. What this does NOT fix
+
+- The `/dev/gb`, `/dev/gb2` gralloc sockets are still MVP stubs. The
+  gralloc HAL will still fail when it tries to ioctl.
+- The HWComposer HAL may still fail to register if it needs a real
+  composer device or the `qemu_pipe` "hwcomposer" channel (which the
+  current qemu_pipe proxy closes as an unknown channel).
+- surfaceflinger may still crash if it requires a working HWComposer
+  HAL service via binder.
+
+These are the NEXT blockers for the next sub-agent. The stubs here
+convert `ENOENT` crashes into `ENOTTY` graceful failures, making the
+failure mode clearer and easier to diagnose.
+
+### Verification
+
+- `cargo check` — clean.
+- `cargo clippy` — clean (no warnings).
+- `cargo fmt` — clean.
+- `cargo test` — 184/184 tests pass (including 2 new tests:
+  `graphics_device_stubs_are_created`, `graphics_device_stubs_are_idempotent`).
+
+### Constraint compliance
+
+- ONLY `app/rs/kr64/src/devices.rs` and `app/rs/kr64/src/lib.rs` edited.
+- Did NOT edit `twoyi_loader_shlib.c` (Task ID 5's territory).
+- Did NOT trigger a KVM run (run 31500117235 is in progress).
+- Did NOT fake graphics init (no ioctl faking, no crash suppression).
+- Did NOT suppress real errors (ENOTTY is the real errno, returned as-is).
+
+### Greps for the next sub-agent analyzing KVM run 31500117235
+
+```
+# Graphics stack activity
+grep -E "surfaceflinger|HWComposer|gralloc|/dev/graphics|/dev/fb|/dev/dri|/dev/hwcomposer|/dev/ion" logcat.txt | head -40
+
+# Confirm stubs were created (should see 5 lines + 1 summary)
+grep -E "graphics stub:.*defensive" kr64-stderr.log
+
+# qemu_pipe channels the guest opened (look for "hwcomposer" or "opengles")
+grep -E "qemu_pipe.*session.*channel" kr64-stderr.log
+
+# If the guest's HWComposer uses an unknown channel, it's closed (EPIPE)
+grep -E "qemu_pipe.*unknown channel" kr64-stderr.log
+
+# Graphics HAL service registration
+grep -E "graphics\.allocator@4.0|graphics\.mapper@4.0|graphics\.composer@2.4" logcat.txt | head -20
+
+# fb0/hwcomposer ioctl failures (should see ENOTTY now, not ENOENT)
+grep -E "FBIOGET|ENOTTY|framebuffer|hwcomposer.*fail|hwcomposer.*error" logcat.txt | head -20
+
+# Crashes — first surfaceflinger tombstone's abort message is the key clue
+grep -E "tombstone|SIGSEGV|SIGABRT" logcat.txt | head -20
+
+# surfaceflinger start
+grep -E "starting service 'surfaceflinger'|service surfaceflinger.*started|surfaceflinger.*pid" logcat.txt
+
+# zygote start (precondition for surfaceflinger)
+grep -E "starting service 'zygote'|service zygote.*started|zygote.*pid" logcat.txt
+```
+
+### Commit
+- f11b46f "fix: defensive graphics device stubs for surfaceflinger init"
+  — pushed to origin/main (e40e0e5..f11b46f).
+
+### Next steps for the next sub-agent
+
+1. **Check KVM run 31500117235** (commit e40e0e5, real binder IPC) —
+   does zygote start? Does surfaceflinger start? The graphics stubs in
+   this commit (f11b46f) are NOT in that run — they'll be in the NEXT
+   run.
+
+2. **If surfaceflinger crashes on fb0/hwcomposer ENOENT** — trigger a
+   new KVM run on commit f11b46f to test the stubs. The ENOENT should
+   become ENOTTY.
+
+3. **If surfaceflinger crashes on gralloc** (gap A) — the next fix is
+   to implement the goldfish gralloc protocol for `/dev/gb` / `/dev/gb2`.
+   This is complex (needs `app/rs/openglrenderer/src/gralloc.rs` which
+   doesn't exist yet). Alternatively, make the gralloc HAL services
+   exit(0) early (like wait_for_keymaster) so init thinks they're
+   "running" — but this prevents surfaceflinger from getting a real
+   gralloc, so it would also need to be skipped.
+
+4. **If the HWComposer HAL crashes on qemu_pipe "hwcomposer" channel**
+   (gap B) — the next fix is to update `qemu_pipe.rs` to handle the
+   "hwcomposer" channel (keep the connection open or implement a minimal
+   HWComposer protocol). Or make the composer@2.4-service exit(0) early.
+
+5. **The HONEST assessment**: the graphics stack is complex and the
+   stubs here only address the symptom (ENOENT → ENOTTY). The real
+   fix requires implementing gralloc + HWComposer protocols, which is
+   a multi-day effort. For overnight progress, the priority should be
+   getting zygote + system_server to start (binder IPC, fixed by Task
+   ID 5). surfaceflinger can be deferred — system_server can boot
+   partially without it (with reduced functionality).
