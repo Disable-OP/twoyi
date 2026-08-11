@@ -906,3 +906,86 @@ opened" is gone from logcat.txt, whether tombstone count drops from 33, and
 whether init progresses past post-fs-data (look for zygote-start / boot
 triggers). Also grep twoyi-loader.log for "binder_open_fallback" to see how
 often the fallback fired (ideally 0 if the kr64 chmod fixed the DAC issue).
+
+### Proactive next-blocker analysis (Task ID 3, commit 38adae6)
+### Timestamp UTC: 2026-08-11 ~13:55
+
+**Context:** Task ID 1 (commit 2268666, binder open EACCES fix) and Task ID 2
+(commit e56f391, apexd.status preset) just landed. KVM e2e run 31497457100 is
+in_progress (~10min at analysis time). This section proactively identifies the
+next 2-3 likely blockers so the next sub-agent can act immediately when the
+KVM run completes. No waiting for the KVM run.
+
+**Audited existing hooks for the zygote -> system_server -> surfaceflinger phase:**
+
+Loader (`app/cpp/twoyi_loader/src/twoyi_loader_shlib.c`):
+- fork/clone: NOT hooked (native; LD_PRELOAD inherited — OK for zygote fork).
+- setuid/setgid/setresuid/setresgid/setgroups/unshare/setpgid/setsid: hooked, all return 0 (lines 561-578). Virtualization no-ops.
+- prctl(PR_SET_NO_NEW_PRIVS): handled by seccomp BPF (line 2671).
+- socket/bind: hooked AF_NETLINK (vold only) + AF_UNIX path translation (lines 733, 755). /dev/socket/* translated to rootfs — init's CreateSocket for zygote should work.
+- ioctl: hooks BINDER_VERSION/SET_MAX_THREADS/SET_CONTEXT_MGR/WRITE_READ (lines 817-870). *** ALL faked regardless of fd being real binderfs or /dev/null fallback. ***
+- mmap: real mmap first, MAP_ANONYMOUS fallback for binder fds (lines 878-902).
+- execv/execve/execvp/execvpe/execveat: hooked, translate /system/bin/<x> -> /dev/twoyi-bin/<x> first (lines 1665-1902).
+- open/openat/__open_2/__open_real/__openat_2: hooked + binder_open_fallback (lines 2132-2588). /dev/graphics/*, /dev/fb0, /dev/dri/* NOT translated (pass through to host /dev).
+- mkdir/mkdirat/lstat/chown/lchown: hooked with /acct path translation (lines 463, 500, 1061, 1045, 1077).
+- Property hooks: per-process g_props table; __system_property_wait_any returns immediately (line 1524) — missing props cause busy-loops, not blocks.
+- Pre-set props in constructor (lines 2990-3034): ro.cold_boot_done, ro.bootmode=normal, ro.boot.hardware=ranchu, ro.zygote=zygote64_32, vold.post_fs_data_done=1, vold.decrypt=trigger_restart_framework, sys.boot_completed=1, dev.bootcomplete=1, init.svc.{vold,zygote}=running. ro.crypto.state INTENTIONALLY NOT set (SIGABRT regression).
+
+kr64 (`app/rs/kr64/src/lib.rs`):
+- critical_binaries list (lines 1067-1120): app_process64/32, surfaceflinger, bootanimation, system_server, all graphics HALs, all HIDL services. Comprehensive.
+- apexd.status=activated appended to /system/build.prop via proc_emu.rs write_boot_preset_properties() (commit e56f391).
+- Pre-created dirs (lines 1310-1338): acct/uid_0, acct/uid_1000, metadata/*, linkerconfig/*, mnt/*, data_mirror/*, dev/block/by-name. NO /dev/graphics/.
+- binderfs mounted at {rootfs}/dev/binderfs with chmod 0666 (lines 1177-1279). /dev/{binder,hwbinder,vndbinder} relative symlinks.
+- /dev/__properties__/property_info + properties_serial pre-created host+rootfs (lines 1393-1488).
+- SELinux permissive watchdog thread writes "0" to /sys/fs/selinux/enforce every 50ms (lines 1506-1522).
+
+**TOP BLOCKER (HIGH confidence): Loader's BINDER_WRITE_READ hook prevents real binder IPC.**
+
+- What: `ioctl(fd, BINDER_WRITE_READ, &bwr)` returns 0 WITHOUT calling the real ioctl, even when fd is a REAL binderfs device (not /dev/null fallback). See `twoyi_loader_shlib.c:864-866`.
+- Why: This was harmless when only vold/servicemanager needed a valid fd (they don't transact during early boot). It becomes FATAL when system_server does real binder IPC:
+  * servicemanager "becomes" context manager (fake SET_CONTEXT_MGR success) but the real binder driver never registers it.
+  * system_server's `ServiceManager.addService("activity", this)` -> BC_TRANSACTION -> hook returns 0 with no data -> client's bwr.write_consumed stays 0 -> IPCThreadState::talkWithDriver doesn't clear mOut -> infinite retry loop OR silent "success" with no actual registration.
+  * system_server's `ServiceManager.getService("package")` -> same fake success -> returns null/garbage -> NullPointerException.
+- Where to look: `grep -c "ioctl(BINDER_WRITE_READ)" twoyi-loader.log` — high count = real binder IPC NOT happening. `grep -E "ServiceManager|addService|getService" logcat.txt` — silent after system_server starts = blocker confirmed. First system_server tombstone's abort message will likely be NullPointerException at ServiceManager.getService.
+- Proposed fix (LOADER — Task ID 1 owns, do NOT edit from other agents): In the ioctl hook, detect real binder fds (e.g., via fstat checking the device major/minor against /dev/binderfs/*, OR track which fds came from binder_open_fallback's /dev/null vs real open in a fd_set) and pass BINDER_WRITE_READ/SET_CONTEXT_MGR/SET_MAX_THREADS through to the real ioctl for real fds. Keep the fake-success path only for /dev/null fallback fds. Alternatively, simply remove the BINDER_WRITE_READ/SET_CONTEXT_MGR/SET_MAX_THREADS hooks entirely now that kr64 mounts a real binderfs with chmod 0666 — the BINDER_VERSION hook can stay as a safety net.
+
+**SECOND BLOCKER (MEDIUM-HIGH confidence): surfaceflinger / graphics HALs cannot initialize.**
+
+- What: No /dev/graphics/fb0 in the container. Loader's should_translate() does NOT translate /dev/graphics/* (line 2096: "Other /dev/ paths stay on host"), and the host KVM is headless (no /dev/graphics/fb0 either).
+- Why: surfaceflinger is class core, started by `on boot` -> `class_start core`. It crashes on HWComposer init (no fb0, no HWComposer HAL binder service due to blocker #1). Doesn't block zygote directly, but system_server's WindowManagerService needs surfaceflinger -> WMS init fails -> sys.boot_completed never set.
+- Where to look: `grep -E "surfaceflinger|HWComposer|gralloc|/dev/graphics" logcat.txt | head -30`. Expect crash-loop confirming the blocker.
+- Proposed fix (needs loader changes — graphics path translation + fb0/open hook — OR kr64 mknod-based approach). Lower priority than blocker #1 because it doesn't block zygote start.
+
+**THIRD BLOCKER (MEDIUM confidence): Zygote preload / system_server early init failures.**
+
+- What: Zygote reads /system/etc/preloaded-classes and loads /system/framework/*.jar. system_server loads libandroid_servers.so and starts bootstrap services. Any missing/corrupt file = crash.
+- Why: Rootfs-specific. Cannot predict without the actual rootfs image.
+- Where to look: `grep -E "Zygote|ZygoteInit|preloadClasses|preloadResources" logcat.txt | head -30` (zygote preload). `grep -E "system_server|SystemServer" logcat.txt | head -50` (system_server startup). `grep -E "FATAL|tombstone|signal|SIGABRT|SIGSEGV" logcat.txt | head -50` (crashes — first system_server tombstone's abort message is the key clue).
+- Proposed fix: rootfs-specific. Need to inspect the actual rootfs image and the first system_server tombstone.
+
+**Greps for the next sub-agent analyzing KVM run 31497457100:**
+- `grep -E "processing action \((zygote-start|boot|property:vold\.decrypt|property:sys\.boot_completed)" logcat.txt` — init trigger progress.
+- `grep -E "starting service 'zygote'|service zygote.*started|zygote.*pid" logcat.txt` — zygote start.
+- `grep -E "Binder driver could not be opened|binder_open_fallback" twoyi-loader.log` — should be ~0 (kr64 chmod 0666 fixes DAC).
+- `grep -c "ioctl(BINDER_WRITE_READ)" twoyi-loader.log` — count of faked binder ioctls. High = real IPC NOT happening (confirms blocker #1).
+- `grep -E "system_server|SystemServer" logcat.txt | head -50` — system_server startup.
+- `grep -E "ServiceManager|addService|getService" logcat.txt | head -30` — binder registration activity.
+- `grep -E "surfaceflinger|HWComposer|gralloc|/dev/graphics" logcat.txt | head -30` — graphics stack.
+- `grep -E "FATAL|tombstone|signal|SIGABRT|SIGSEGV" logcat.txt | head -50` — crashes.
+- `grep -E "Zygote|ZygoteInit|preloadClasses|preloadResources" logcat.txt | head -30` — zygote preload.
+- `grep -c "processing action" logcat.txt` — count of init actions processed (>10 = init progresses past post-fs-data).
+
+**Fix implemented (commit 38adae6, kr64 only — non-conflicting with loader):**
+CI 'kr64 lint + test' job was FAILING (run 31497448791) due to 10 pre-existing clippy errors in lib.rs (introduced by e56f391 chmod 0666 binderfs + critical_binaries chcon + property_info pre-create). Mechanical behavior-preserving fixes:
+- needless_borrows_for_generic_args: drop & in .args(&[...]) (4 sites: lib.rs:1029, 1038, 1137, 1166).
+- manual_c_str_literals: b"...\\0".as_ptr() as *const c_char -> c"...".as_ptr() (3 sites: lib.rs:1191, 1193, 1703).
+- suspicious_open_options: add .truncate(false) to 3 OpenOptions calls for property_info/properties_serial pre-creation (lib.rs:1418, 1445, 1472).
+Verified: cargo clippy clean, cargo fmt clean, 182/182 tests pass. Unblocks CI kr64 lint+test gate.
+
+**HONEST CAVEAT:** The #1 blocker (BINDER_WRITE_READ hook) is PRE-EXISTING loader behavior that only becomes fatal when system_server does real binder IPC. Whether system_server actually starts depends on (a) apexd fix unblocking init's main loop, (b) vold.decrypt=trigger_restart_framework trigger firing at queue_property_triggers time, (c) zygote successfully preloading and forking system_server. If zygote never starts (e.g., vold.decrypt trigger doesn't fire), the next investigation should focus on init's queue_property_triggers / CheckPropertyTriggers logic in the loader's property hooks — NOT on the BINDER_WRITE_READ issue.
+
+**No changes made to address the boot blockers themselves** because:
+1. The #1 blocker fix must be in the loader (which Task ID 1 owns — do not edit per task constraints).
+2. The #2 blocker fix needs loader changes (graphics path translation) OR kr64 mknod (uncertain — needs CAP_MKNOD and a real major/minor; not high-confidence).
+3. The #3 blocker is rootfs-specific — cannot predict or fix without the actual rootfs image.
+4. Setting ro.crypto.state=unsupported in build.prop (an alternative zygote-start trigger) was considered but REJECTED — the progress log explicitly warns it causes a SIGABRT regression at make_dir("/acct/uid"), and re-adding it is HIGH RISK of regressing the boot.
