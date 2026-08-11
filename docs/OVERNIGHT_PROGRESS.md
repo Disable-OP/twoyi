@@ -2968,3 +2968,230 @@ grep -E "starting service 'surfaceflinger'" logcat.txt
    not in library loading. This would indicate a different class of
    problem (e.g., the linker binary itself is corrupted, or the kernel
    doesn't support a required feature).
+
+---
+
+## Task 16 — TWRP init log analysis + SIGTERM handler (2026-08-11)
+
+### Run analyzed: 31530092425 (commit 6687470)
+
+**twrp-init.log WAS captured on device (62 bytes)** but was NOT in the
+artifact because `pack-logs.sh` was not told to include it. The GHA run
+log revealed its contents:
+
+```
+[KR64 CHILD] TWRP: redirected stdout/stderr to /twrp-init.log
+```
+
+That's it — one line. This is the redirect message written by kr64's
+child AFTER `dup2(fd, 2)`, so it goes to the file (fd 2 = the file),
+not to kr64-stderr.log. **TWRP init wrote ZERO output to stdout/stderr.**
+
+### kr64-stderr.log analysis
+
+The log ends at line 121 (`accept thread started (fd=8)` for gb2). There
+is NO `guest exited with status N` or `guest killed by signal N` message.
+
+Root cause: the script sent SIGTERM to kr64 while it was blocked in
+`waitpid(pid, &mut status, 0)`. The default SIGTERM action killed kr64
+instantly — `waitpid` never returned, so the guest's exit status was
+never logged.
+
+We don't know if init:
+- crashed (SIGSEGV) before writing anything
+- exited immediately (e.g., not-PID-1 detection)
+- was still running (logging to /dev/kmsg which kr64 doesn't create)
+- was still running (logging to logd which doesn't exist in our env)
+
+### Fixes implemented (3 parts)
+
+**Commit e097cfd** + **commit 4f9d993** (build fix):
+
+1. **kr64 SIGTERM handler** (`app/rs/kr64/src/lib.rs`):
+   - `static SHUTDOWN_REQUESTED: AtomicBool`
+   - `sigterm_handler()` sets the flag (async-signal-safe)
+   - `install_sigterm_handler()` uses `sigaction()`
+   - Replaced blocking `waitpid(pid, 0)` with `WNOHANG` + 200ms sleep loop
+   - On SIGTERM: final `WNOHANG` waitpid → log exit status; or SIGKILL
+     guest + reap + log "was still running (not a crash)"
+
+2. **Script dmesg + ps capture** (`scripts/kvm-e2e-test.sh`):
+   - SIGTERM first (8s timeout for graceful shutdown), then SIGKILL
+   - `adb shell dmesg` → dmesg.log (segfaults + init's kmsg writes)
+   - `adb shell ps -A` → twrp-ps.log (surviving TWRP daemons)
+
+3. **Artifact inclusion** (`.github/workflows/kvm-e2e-test.yml`):
+   - Added `twrp-init.log`, `dmesg.log`, `twrp-ps.log` to pack-logs.sh
+
+### Build failure + fix
+
+Run 31531309469 (commit e097cfd) failed at the build step:
+```
+error: direct cast of function item into an integer
+  --> src/lib.rs:237:43
+   |         sa.sa_sigaction = sigterm_handler as usize;
+```
+Fixed by casting through a pointer first: `sigterm_handler as *const () as usize`
+(commit 4f9d993).
+
+### New KVM run
+
+**Run 31531742745** (commit 4f9d993, twrp=true, boot_wait=30s) — in progress.
+
+### What the next sub-agent should check
+
+1. **kr64-stderr.log** — look for the NEW messages:
+   - `SIGTERM handler installed (graceful shutdown enabled)` — confirms handler
+   - `SIGTERM received — initiating graceful shutdown` — script SIGTERM caught
+   - `guest exited with status N (after SIGTERM)` — init had exited
+   - `guest killed by signal N (after SIGTERM)` — init crashed (N=11 = SIGSEGV)
+   - `guest (pid=N) still running — sending SIGKILL` — init was alive!
+   - `guest killed by our SIGKILL (was still running at shutdown — not a crash)`
+
+2. **dmesg.log** — look for:
+   - `segfault at ... init[...]` — init crashed with SIGSEGV
+   - Any `init[` or `recovery` messages — init's /dev/kmsg writes
+
+3. **twrp-ps.log** — look for surviving TWRP daemons (ueventd, partlink, recovery)
+
+4. **twrp-init.log** — now IN the artifact. If still only the redirect message,
+   init is logging elsewhere (kmsg/logd). If it has more content, init is
+   producing stdout/stderr output.
+
+### Decision tree for next steps
+
+- If init **crashed (SIGSEGV)**: check dmesg for the fault address. The i386
+  binary should run on x86_64 via IA-32 emulation. If the fault is in
+  early init, it might be a missing /dev node (kmsg, null, etc.) or an
+  unsupported syscall.
+
+- If init **exited with status 31**: it detected it's not PID 1. TWRP's
+  init may need a different approach — fake getpid() or patch the binary.
+
+- If init **was still running** (SIGKILLed by us): it's alive but silent.
+  Next: create /dev/kmsg in the guest (bind-mount host /dev/kmsg or
+  create a char device) so init can log there, OR redirect /dev/kmsg
+  to /twrp-init.log too.
+
+- If init **exited with status 0**: it exited cleanly. Check what it did
+  before exiting — maybe it ran a script and finished, or hit an error
+  it handled gracefully.
+
+---
+
+## Task 16 — BREAKTHROUGH: TWRP init confirmed running; recovery crashes in libminuitwrp.so
+
+### Run 31531742745 (commit 4f9d993) — SUCCESS
+
+The SIGTERM handler worked perfectly. kr64-stderr.log now shows:
+
+```
+[KR64 INFO] [KR64][parent] SIGTERM handler installed (graceful shutdown enabled)
+...
+[KR64 INFO] [KR64][parent] SIGTERM received — initiating graceful shutdown
+[KR64 WARN] [KR64][parent] guest (pid=4373) still running — sending SIGKILL
+[KR64 WARN] [KR64][parent] guest killed by our SIGKILL (was still running at shutdown — not a crash)
+```
+
+**TWRP init was ALIVE and RUNNING for the full 30-second boot wait.**
+It did NOT crash, did NOT exit. It was a healthy daemon.
+
+### dmesg.log — the gold mine
+
+Five recovery service segfaults at ~5-second intervals:
+
+```
+[  128.302656] recovery[5730]: segfault at 0 ip ...eba717d7 sp ... error 4 in libminuitwrp.so[eba6c000+1f000]
+[  133.375092] recovery[5802]: segfault at 0 ip ...eb2b27d7 ... in libminuitwrp.so[eb2ad000+1f000]
+[  138.447697] recovery[5874]: segfault at 0 ip ...f0c7b7d7 ... in libminuitwrp.so[f0c76000+1f000]
+[  143.499911] recovery[5947]: segfault at 0 ip ...e80ab7d7 ... in libminuitwrp.so[e80a6000+1f000]
+[  147.573593] recovery[6001]: segfault at 0 ip ...f6f867d7 ... in libminuitwrp.so[f6f81000+1f000]
+```
+
+Analysis:
+- **Crash location**: offset **0x57d7** in libminuitwrp.so (consistent across all 5 crashes)
+- **Crash type**: `segfault at 0` = NULL pointer dereference (reading from address 0)
+- **error 4**: user-mode read of a non-present page
+- **Faulting instruction**: `8b 01` = `mov eax, [ecx]` with ECX=0 (NULL)
+- **Behavior**: init starts recovery → recovery crashes → init restarts → repeat (5x in 30s)
+
+### twrp-ps.log — ueventd survived
+
+```
+root  5190  1  ... S ueventd
+```
+
+TWRP's ueventd (PID 5190) was started by init and survived kr64's death
+(reparented to host PID 1). This **confirms TWRP init processes init.rc
+and starts services successfully**.
+
+### Root cause of recovery crash
+
+libminuitwrp.so is TWRP's "minui" library — it handles framebuffer
+initialization (open /dev/graphics/fb0, FBIOGET_VSCREENINFO, mmap) and
+graphics rendering. kr64 stubs /dev/graphics/fb0 → /dev/null (a symlink).
+When libminuitwrp opens /dev/graphics/fb0 and does FB ioctls, the ioctl
+returns ENOTTY (inappropriate ioctl for /dev/null). The library doesn't
+check the return value, the screen-info struct stays zeroed/NULL, and
+the subsequent dereference crashes.
+
+The crash code dump confirms this — it's walking a data structure
+(loading pointers from struct fields), checking conditions, then
+dereferencing a NULL pointer:
+```
+8b 88 d0 ff ff ff   mov ecx, [eax-0x30]    ; load pointer from struct
+8b 11               mov edx, [ecx]          ; dereference
+8b 88 cc ff ff ff   mov ecx, [eax-0x34]    ; load another pointer
+85 d2               test edx, edx           ; check NULL
+8b 09               mov ecx, [ecx]          ; dereference
+74 08               je +8                   ; skip if NULL
+81 fa b4 00 00 00   cmp edx, 0xb4           ; compare with 180
+75 0a               jne +10                 ; skip if not equal
+8b 90 2c 08 00 00   mov edx, [eax+0x82c]   ; load field
+<8b> 01              mov eax, [ecx]          ; *** FAULT: ECX=0 ***
+```
+
+### Summary of progress
+
+| Milestone | Status |
+|-----------|--------|
+| kr64 TWRP boot path | ✓ Working |
+| pivot_root + mount setup | ✓ Working |
+| execve(/init) | ✓ Working |
+| TWRP init runs (doesn't crash/exit) | ✓ Confirmed (SIGTERM handler) |
+| init processes init.rc | ✓ Confirmed (ueventd started) |
+| init starts recovery service | ✓ Confirmed (dmesg segfaults) |
+| recovery service runs | ✗ Crashes in libminuitwrp.so (NULL deref) |
+| TWRP UI visible | ✗ Blocked by recovery crash |
+
+### Next steps for the next sub-agent
+
+**The next blocker is the libminuitwrp.so crash at offset 0x57d7.**
+
+The fix is to provide a working /dev/graphics/fb0 that responds to FB
+ioctls with valid screen info, instead of the current /dev/null stub.
+Options:
+
+1. **Virtual framebuffer device**: Create a char device at /dev/graphics/fb0
+   that responds to FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO, etc. with
+   valid data matching the configured display (720x1280@320dpi). This is
+   the most correct fix but requires implementing an ioctl handler.
+
+2. **Bind-mount host /dev/graphics/fb0**: The host Android emulator has a
+   real /dev/graphics/fb0. Bind-mounting it into the guest's rootfs would
+   give recovery a real framebuffer. But the host's fb0 might not match
+   TWRP's expected resolution, and mmap might not work across the pivot_root
+   boundary.
+
+3. **Use the qemu_pipe/opengles path**: If libminuitwrp can be configured
+   to use gralloc/hwcomposer instead of the raw framebuffer, it could go
+   through our qemu_pipe proxy. But this requires TWRP to support the
+   gralloc path (it typically uses raw fb).
+
+4. **Patch libminuitwrp.so**: Binary-patch the crash site to skip the NULL
+   deref. Fragile and architecture-specific.
+
+**Recommended approach**: Option 1 (virtual framebuffer) — implement a
+minimal FB ioctl handler in kr64's devices module that returns valid
+vscreeninfo/fscreeninfo for /dev/graphics/fb0. This unblocks recovery
+without requiring a full display stack.
