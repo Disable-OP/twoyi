@@ -1385,10 +1385,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Check if /apex/com.android.runtime/lib64/bionic/ has libc.so
         match std::fs::read_dir("/apex/com.android.runtime/lib64/bionic") {
             Ok(entries) => {
-                let count = entries.count();
+                let mut files = Vec::new();
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    files.push(format!("{} ({} bytes)", name, size));
+                }
                 info!(
-                    "[KR64] PARENT: /apex/com.android.runtime/lib64/bionic has {} entries",
-                    count
+                    "[KR64] PARENT: /apex/com.android.runtime/lib64/bionic has {} entries: [{}]",
+                    files.len(),
+                    files.join(", ")
                 );
             }
             Err(e) => {
@@ -2322,12 +2328,53 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // LD_LIBRARY_PATH match what the execve hook builds, so the
             // linker can find ALL libraries on the first exec.
             CString::new(
+                // CRITICAL (KVM run 31509809060): The guest init (pid 6188)
+                // STILL crashes with SIGSEGV at 0x86 in linker64 even though
+                // both hook libraries are loaded and relabeled. The crash
+                // happens BEFORE the .init_array constructor runs (0
+                // twoyi_loader init messages), so it's during the linker's
+                // library loading (mapping segments, resolving DT_NEEDED,
+                // relocating).
+                //
+                // The hook libraries (libgetpid_hook.so and
+                // libtwoyi_loader_shlib.so) have DT_NEEDED:
+                //   - libc.so (version LIBC)
+                //   - libdl.so (version LIBC)
+                //
+                // On Android 11, /system/lib64/libdl.so is a 5848-byte
+                // BOOTSTRAP STUB (used during early init before apexd
+                // mounts the APEX packages). The REAL libdl.so (with the
+                // full implementation) is at
+                // /apex/com.android.runtime/lib64/bionic/libdl.so.
+                //
+                // The bootstrap stub SHOULD provide the LIBC version, but
+                // there may be a subtle incompatibility (missing symbol,
+                // different version definition, etc.) that causes the
+                // linker to get a NULL soinfo and crash.
+                //
+                // FIX: Put /apex/com.android.runtime/lib64/bionic FIRST in
+                // LD_LIBRARY_PATH, so the linker finds the REAL bionic
+                // libraries (libc.so, libdl.so, libm.so) before the
+                // bootstrap stubs in /system/lib64/. This ensures the
+                // version requirements are satisfied by the full bionic
+                // implementation.
+                //
+                // This is safe because:
+                //   - /apex/com.android.runtime/lib64/bionic/libc.so is the
+                //     SAME file as /system/lib64/libc.so (same size, 984072
+                //     bytes — /system/lib64/libc.so is a hardlink/copy, not
+                //     a stub).
+                //   - /apex/com.android.runtime/lib64/bionic/libdl.so is
+                //     the REAL libdl.so (larger than the 5848-byte stub).
+                //   - The apex directory has all 4 bionic libraries
+                //     (libc.so, libm.so, libdl.so, libdl_android.so), so
+                //     they can find each other.
                 "LD_LIBRARY_PATH=\
+                /apex/com.android.runtime/lib64/bionic:\
+                /apex/com.android.runtime/lib64:\
+                /apex/com.android.runtime/lib64/bootstrap:\
                 /system/lib64:\
                 /system/lib64/bootstrap:\
-                /apex/com.android.runtime/lib64:\
-                /apex/com.android.runtime/lib64/bionic:\
-                /apex/com.android.runtime/lib64/bootstrap:\
                 /vendor/lib64:\
                 /apex/com.android.os.statsd/lib64:\
                 /system_ext/lib64:\
@@ -2335,12 +2382,49 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             )
             .unwrap(),
         ];
+        // LD_DEBUG support: if TWOYI_LD_DEBUG is set in the parent env,
+        // propagate it as LD_DEBUG to the guest init. This enables bionic
+        // linker debug output (which library is being loaded when the
+        // crash happens). The output goes to stderr (captured in
+        // kr64-stderr.log).
+        //
+        // Usage: set TWOYI_LD_DEBUG=2 in the CI env to enable "libs" level
+        // debug (library load/unload). Set TWOYI_LD_DEBUG=4 for "files"
+        // level (file opens). Set TWOYI_LD_DEBUG=6 for both.
+        if let Ok(ld_debug_val) = std::env::var("TWOYI_LD_DEBUG") {
+            if !ld_debug_val.is_empty() {
+                let ld_debug_env = format!("LD_DEBUG={}", ld_debug_val);
+                match CString::new(ld_debug_env) {
+                    Ok(c) => {
+                        env_vars.push(c);
+                        unsafe {
+                            safe_write_err(b"[KR64 CHILD] TWOYI_LD_DEBUG set -- enabling LD_DEBUG for guest init\n");
+                        }
+                    }
+                    Err(_) => unsafe {
+                        safe_write_err(b"[KR64 CHILD] WARN: TWOYI_LD_DEBUG contains NUL byte -- skipping LD_DEBUG\n");
+                    },
+                }
+            }
+        }
         if skip_preload {
             unsafe {
                 safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set -- skipping LD_PRELOAD (init will exit 31)\n");
             }
         } else {
             env_vars.push(CString::new(ld_preload_str).unwrap());
+        }
+        // Diagnostic: log the env vars being passed to init. This helps
+        // verify the LD_LIBRARY_PATH reorder and LD_DEBUG are taking effect.
+        // Use safe_write_err (async-signal-safe) since we're in the child
+        // between fork() and execve().
+        unsafe {
+            safe_write_err(b"[KR64 CHILD] env vars passed to init:\n");
+            for ev in &env_vars {
+                safe_write_err(b"  ");
+                safe_write_err(ev.to_bytes());
+                safe_write_err(b"\n");
+            }
         }
         let env_ptrs: Vec<*const libc::c_char> = env_vars
             .iter()
