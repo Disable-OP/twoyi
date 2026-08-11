@@ -1216,6 +1216,146 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     );
 
     // ---------------------------------------------------------------
+    // Step 3.7: copy bionic runtime libraries from HOST /apex/ to
+    // {rootfs}/system/lib64/ BEFORE pivot_root.
+    //
+    // On Android 11+, libc.so, libdl.so, libm.so live ONLY in
+    // /apex/com.android.runtime/lib64/bionic/. The rootfs's
+    // /system/lib64/libc.so is a SYMLINK to the /apex/ path. After
+    // pivot_root, /apex/ is empty (apexd hasn't mounted APEX packages
+    // yet), so the symlink is broken. The linker can't find libc.so →
+    // NULL soinfo → SIGSEGV at address 0x86 in linker64.
+    //
+    // This is the EXACT crash documented in getpid_hook/CMakeLists.txt:
+    //   "Linking against liblog.so causes the Android linker to load
+    //    liblog.so as a DT_NEEDED dependency, and if there's any
+    //    version mismatch ... the linker crashes with a NULL pointer
+    //    dereference at address 0x86 (signal 11 SIGSEGV in linker64)."
+    //
+    // Fix: copy the ACTUAL library files (not symlinks) from the
+    // HOST's /apex/ to {rootfs}/system/lib64/ BEFORE pivot_root.
+    // After pivot_root, these files are at /system/lib64/ and on
+    // LD_LIBRARY_PATH. The linker finds them and the hooks load.
+    //
+    // This works on BOTH:
+    // - KVM test environment (host is Android emulator with /apex/)
+    // - Real devices (host is a real Android device with /apex/)
+    //
+    // The copy is ADDITIVE — we only copy files that don't exist or
+    // are broken symlinks. We never overwrite real files.
+    // ---------------------------------------------------------------
+    let bionic_src_dir = "/apex/com.android.runtime/lib64/bionic";
+    let bionic_dst_dir = format!("{}/system/lib64", cfg.rootfs);
+    let bionic_libs = [
+        "libc.so",
+        "libdl.so",
+        "libm.so",
+        "libdl_android.so",
+        "libpthread.so",
+        "librt.so",
+    ];
+    let mut bionic_copied = 0;
+    for lib_name in &bionic_libs {
+        let src = format!("{}/{}", bionic_src_dir, lib_name);
+        let dst = format!("{}/{}", bionic_dst_dir, lib_name);
+
+        // Check if the source exists on the HOST (before pivot_root).
+        if !Path::new(&src).exists() {
+            continue;
+        }
+
+        // Check if the destination is already a real file (not a
+        // broken symlink). If so, skip — don't overwrite.
+        if let Ok(meta) = std::fs::metadata(&dst) {
+            if meta.is_file() {
+                continue; // Real file already exists, skip
+            }
+        }
+
+        // Copy the file. This replaces broken symlinks (which fail
+        // metadata()) with real files.
+        match std::fs::copy(&src, &dst) {
+            Ok(bytes) => {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
+                bionic_copied += 1;
+                info!(
+                    "[KR64] PARENT: copied bionic {} ({} bytes) {} -> {} (BEFORE pivot_root)",
+                    lib_name, bytes, src, dst
+                );
+            }
+            Err(e) => {
+                // Non-fatal — the library might already exist or the
+                // rootfs might not have /system/lib64/. Log and continue.
+                info!(
+                    "[KR64] PARENT: bionic {} copy failed ({} -> {}): {} -- continuing",
+                    lib_name, src, dst, e
+                );
+            }
+        }
+    }
+    if bionic_copied > 0 {
+        info!(
+            "[KR64] PARENT: copied {} bionic libraries from /apex/ to {}/system/lib64/ (BEFORE pivot_root)",
+            bionic_copied, cfg.rootfs
+        );
+    } else {
+        info!(
+            "[KR64] PARENT: no bionic libraries needed copying (all present or /apex/ unavailable)"
+        );
+    }
+
+    // Also copy other essential /apex/ libraries that the hook
+    // libraries or init may depend on (libbase.so, libc++.so, etc.)
+    // These live in /apex/com.android.runtime/lib64/ (not /bionic/).
+    let apex_runtime_libs = [
+        "libbase.so",
+        "libc++.so",
+        "liblog.so",
+        "libselinux.so",
+        "libpackagelistparser.so",
+        "libcgrouprc.so",
+    ];
+    let apex_src_dir = "/apex/com.android.runtime/lib64";
+    let mut apex_copied = 0;
+    for lib_name in &apex_runtime_libs {
+        let src = format!("{}/{}", apex_src_dir, lib_name);
+        let dst = format!("{}/system/lib64/{}", cfg.rootfs, lib_name);
+
+        if !Path::new(&src).exists() {
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&dst) {
+            if meta.is_file() {
+                continue;
+            }
+        }
+        match std::fs::copy(&src, &dst) {
+            Ok(bytes) => {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
+                apex_copied += 1;
+                info!(
+                    "[KR64] PARENT: copied apex {} ({} bytes) {} -> {} (BEFORE pivot_root)",
+                    lib_name, bytes, src, dst
+                );
+            }
+            Err(e) => {
+                info!(
+                    "[KR64] PARENT: apex {} copy failed ({} -> {}): {} -- continuing",
+                    lib_name, src, dst, e
+                );
+            }
+        }
+    }
+    if apex_copied > 0 {
+        info!(
+            "[KR64] PARENT: copied {} apex runtime libraries to {}/system/lib64/ (BEFORE pivot_root)",
+            apex_copied, cfg.rootfs
+        );
+    }
+
+    // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
     // ---------------------------------------------------------------
     // The parent calls setup_mounts() BEFORE fork(). This does:
