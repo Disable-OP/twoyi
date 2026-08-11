@@ -989,3 +989,72 @@ Verified: cargo clippy clean, cargo fmt clean, 182/182 tests pass. Unblocks CI k
 2. The #2 blocker fix needs loader changes (graphics path translation) OR kr64 mknod (uncertain — needs CAP_MKNOD and a real major/minor; not high-confidence).
 3. The #3 blocker is rootfs-specific — cannot predict or fix without the actual rootfs image.
 4. Setting ro.crypto.state=unsupported in build.prop (an alternative zygote-start trigger) was considered but REJECTED — the progress log explicitly warns it causes a SIGABRT regression at make_dir("/acct/uid"), and re-adding it is HIGH RISK of regressing the boot.
+
+---
+
+## Timestamp UTC: 2026-08-10 (overnight Task ID 4)
+## Task: Remove banned fake boot completion pre-sets from loader
+
+### What was wrong
+In `app/cpp/twoyi_loader/src/twoyi_loader_shlib.c`, the loader's
+`twoyi_init()` constructor was pre-setting FOUR properties that are the
+FINAL GOALS of the boot, not infrastructure inputs:
+
+- `sys.boot_completed=1` — THE signal that userspace boot finished
+- `dev.bootcomplete=1`   — set by init AFTER device boot completes
+- `init.svc.vold=running` — set BY init when vold actually starts
+- `init.svc.zygote=running` — set BY init when zygote actually starts
+
+The code comment on line 3005 even said: "sys.boot_completed is the
+final goal — but don't set it yet (we want the guest to actually boot,
+not fake it)" — but lines 3027-3033 immediately below contradicted it
+by setting it (and three more fakes) anyway.
+
+### What was changed (commit b069d5e)
+Removed the 4 banned `prop_set()` calls (old lines 3027-3033) and
+replaced them with a 45-line comment block explaining:
+- Why each of the 4 was banned
+- What legitimate virtualization pre-sets were KEPT
+- A "DO NOT re-add" warning for future contributors
+
+Diff: 1 file, +45 / -7 lines.
+
+### What was KEPT (legitimate virtualization, not boot-status fakes)
+- `ro.cold_boot_done`, `ro.coldboot_done` — unblock wait_for_coldboot_done
+- `ro.bootmode`, `ro.boot.mode`, `ro.boot.bootreason`, `ro.boot.bootdevice`,
+  `ro.boot.bootloader`, `ro.boot.serialno`, `ro.boot.hardware`,
+  `ro.bootfrog` — ro.boot.* hardware description (not boot status)
+- `ro.persistent_properties.ready`, `ro.actionable_compatible_property.enabled`
+  — infrastructure props
+- `ro.zygote=zygote64_32` — tells init which zygote .rc to parse
+- `vold.post_fs_data_done=1` — vold exits(0) in container, never sets this
+- `vold.decrypt=trigger_restart_framework` — same; vold exits(0)
+
+The legitimate pre-sets were untouched.
+
+### Build verification
+- `gcc -fsyntax-only -I app/cpp/twoyi_loader/include
+  app/cpp/twoyi_loader/src/twoyi_loader_shlib.c` → exit 0, no errors,
+  both before (baseline, via git stash) and after the edit. Pure removal
+  + comment additions, no new code paths.
+
+### Risk analysis
+Risk of removing these is LOW but non-zero:
+- Any code that was reading `sys.boot_completed` to decide "is boot
+  done" will now correctly see "no" until the guest actually completes
+  boot. That is the CORRECT behavior, but it may surface previously
+  hidden hangs in actions gated on `on property:sys.boot_completed=1`.
+- Any code reading `init.svc.zygote=running` to skip waiting for zygote
+  will now wait. Again correct, but may surface hangs if zygote fails
+  to start.
+- The previous behavior was effectively hiding real boot failures by
+  lying about completion. Removing the fakes is necessary to make
+  progress visible. The next KVM run (after the in-progress run
+  31497457100) will reveal whether the boot can complete honestly or
+  where it actually stalls.
+
+### Constraint compliance
+- ONLY `app/cpp/twoyi_loader/src/twoyi_loader_shlib.c` was edited.
+- No new hooks added. No existing hook behavior changed.
+- Did NOT trigger a KVM run (run 31497457100 is in progress).
+- Commit message + push to main completed: b069d5e.
