@@ -2624,5 +2624,13 @@ static void twoyi_init(void) {
     // present but currently fails — see debug logging in the lstat() hook.
     // vold.decrypt=trigger_restart_framework above is enough to start zygote.
 
+    // Try setting sys.boot_completed to trigger post-boot actions
+    prop_set("sys.boot_completed", "1");
+    // Also set dev.bootcomplete
+    prop_set("dev.bootcomplete", "1");
+    // Set service properties that init checks
+    prop_set("init.svc.vold", "running");
+    prop_set("init.svc.zygote", "running");
+
     g_runtime_ready = 1;
 }
