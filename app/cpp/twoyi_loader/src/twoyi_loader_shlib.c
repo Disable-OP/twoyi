@@ -791,6 +791,73 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return syscall(SYS_bind, sockfd, addr, addrlen);
 }
 
+// Hook ioctl — intercept binder ioctls to fake success.
+// binderfs devices may not support BINDER_VERSION ioctl in the container
+// environment, causing vold to abort with "Binder driver could not be opened."
+// We fake the binder protocol version and other ioctls so vold can proceed.
+//
+// Binder ioctl numbers (from kernel: include/uapi/linux/android/binder.h):
+// BINDER_VERSION = _IOWR('b', 13, struct binder_version)
+// BINDER_SET_MAX_THREADS = _IOW('b', 5, __u32)
+// BINDER_SET_CONTEXT_MGR = _IOW('b', 7, __u32)
+// BINDER_WRITE_READ = _IOWR('b', 1, struct binder_write_read)
+//
+// On x86_64: 'b' = 0x62, so:
+// BINDER_VERSION = _IOWR(0x62, 13, struct{__s32}) = 0xc004620d
+// BINDER_SET_MAX_THREADS = _IOW(0x62, 5, __u32) = 0x40046205
+// BINDER_SET_CONTEXT_MGR = _IOW(0x62, 7, __u32) = 0x40046207
+// BINDER_WRITE_READ = _IOWR(0x62, 1, ...) = 0xc0306201
+int ioctl(int fd, unsigned long request, ...) {
+    static int (*real_ioctl)(int, unsigned long, ...) = NULL;
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    
+    va_list ap;
+    va_start(ap, request);
+    void *argp = va_arg(ap, void *);
+    va_end(ap);
+    
+    // BINDER_VERSION = 0xc004620d — returns protocol version
+    // The struct is { __s32 protocol_version } and we write the current version (8)
+    if (request == 0xc004620d) {
+        // Write the binder protocol version (8 = BINDER_CURRENT_PROTOCOL_VERSION)
+        if (argp) {
+            *(int *)argp = 8;
+        }
+        write_str(2, "[twoyi_loader] ioctl(BINDER_VERSION) -> faking version 8\n");
+        return 0;
+    }
+    
+    // BINDER_SET_MAX_THREADS = 0x40046205 — just return success
+    if (request == 0x40046205) {
+        write_str(2, "[twoyi_loader] ioctl(BINDER_SET_MAX_THREADS) -> success\n");
+        return 0;
+    }
+    
+    // BINDER_SET_CONTEXT_MGR = 0x40046207 — return success
+    // This is needed for servicemanager to become context manager
+    if (request == 0x40046207) {
+        write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR) -> success\n");
+        return 0;
+    }
+    
+    // BINDER_WRITE_READ = 0xc0306201 — return success with no data
+    // This is the main data transfer ioctl; faking it means binder IPC
+    // won't actually work, but it prevents crashes during startup.
+    if (request == 0xc0306201) {
+        // Return 0 (success) with no read or write
+        return 0;
+    }
+    
+    // SOL_NETLINK = 270, common optnames for netlink
+    // This was previously in setsockopt but ioctl is also used
+    if (request == 0x8004620d) {  // SIOCGSTAMP might conflict; check
+        // This is actually not a binder ioctl; pass through
+    }
+    
+    if (real_ioctl) return real_ioctl(fd, request, argp);
+    return syscall(SYS_ioctl, fd, request, argp);
+}
+
 // Hook setsockopt — for AF_NETLINK options (vold only), return success
 int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
     static int (*real_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
