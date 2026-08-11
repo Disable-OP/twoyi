@@ -1370,10 +1370,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // Note: chcon requires SELinux to be compiled in the kernel (it is
     // on Android) and the process to have relabel permission (root has
     // this in permissive mode).
+    //
+    // CRITICAL (KVM run 31505655579): chcon/restorecon subprocesses were
+    // crashing with SIGSEGV at address 0x86 in linker64 (NULL soinfo).
+    // Root cause: after pivot_root, the chcon binary is the GUEST's chcon
+    // (bind-mounted from ROM), and it needs GUEST libraries. But the
+    // subprocess inherited kr64's LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
+    // (set by the test script), which is MISSING the /apex paths. On
+    // Android 11+, many libraries (libbase.so, libc++.so, etc.) live
+    // ONLY in /apex/com.android.runtime/lib64/. Without /apex in
+    // LD_LIBRARY_PATH, the linker gets a NULL soinfo for the missing
+    // library and crashes.
+    //
+    // FIX: Set LD_LIBRARY_PATH to include /apex paths (matching what
+    // init gets). Also clear LD_PRELOAD and TWOYI_ROOTFS defensively —
+    // these are HOST-side subprocesses that should NOT load the guest
+    // hooks or use the guest rootfs path.
+    const CHCON_LD_LIBRARY_PATH: &str = "/system/lib64\
+        :/system/lib64/bootstrap\
+        :/apex/com.android.runtime/lib64\
+        :/apex/com.android.runtime/lib64/bionic\
+        :/apex/com.android.runtime/lib64/bootstrap\
+        :/vendor/lib64";
     for lib_path in &["/dev/libgetpid_hook.so", "/dev/libtwoyi_loader_shlib.so"] {
         if Path::new(lib_path).exists() {
             let result = std::process::Command::new("chcon")
                 .args(["u:object_r:system_file:s0", lib_path])
+                .env_remove("LD_PRELOAD")
+                .env_remove("TWOYI_ROOTFS")
+                .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
                 .status();
             match result {
                 Ok(status) if status.success() => {
@@ -1383,6 +1408,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     // chcon failed — try restorecon as fallback
                     let _ = std::process::Command::new("restorecon")
                         .args([lib_path])
+                        .env_remove("LD_PRELOAD")
+                        .env_remove("TWOYI_ROOTFS")
+                        .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
                         .status();
                     warning!("[KR64] PARENT: chcon {} failed, tried restorecon", lib_path);
                 }
@@ -1482,6 +1510,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                         // Try to chcon to system_file
                         let _ = std::process::Command::new("chcon")
                             .args(["u:object_r:system_file:s0", &dst])
+                            .env_remove("LD_PRELOAD")
+                            .env_remove("TWOYI_ROOTFS")
+                            .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
                             .status();
                     }
                     Err(e) => {
@@ -1511,6 +1542,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 );
                                 let _ = std::process::Command::new("chcon")
                                     .args(["u:object_r:system_file:s0", &dst])
+                                    .env_remove("LD_PRELOAD")
+                                    .env_remove("TWOYI_ROOTFS")
+                                    .env("LD_LIBRARY_PATH", CHCON_LD_LIBRARY_PATH)
                                     .status();
                             }
                         }
@@ -2174,13 +2208,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // apex directory. Without these paths in LD_LIBRARY_PATH, the
             // linker gets a NULL soinfo for the missing library and crashes
             // with SIGSEGV at address 0x86 (offset 0xaf174 in linker64).
+            //
+            // CRITICAL (KVM run 31505655579): The guest init (pid 5865) was
+            // crashing with SIGSEGV (signal 11) in linker64 with NO
+            // [twoyi_loader] init messages — meaning the linker crashed
+            // BEFORE the LD_PRELOAD constructor could run. Root cause:
+            // init's LD_LIBRARY_PATH was MISSING /vendor/lib64,
+            // /apex/com.android.os.statsd/lib64, /system_ext/lib64, and
+            // /product/lib64. If init (or any of its dependencies) needs a
+            // library that's ONLY in one of those directories, the linker
+            // gets a NULL soinfo and crashes.
+            //
+            // The execve hook in twoyi_loader_shlib.c (line ~1872) already
+            // builds a FULL LD_LIBRARY_PATH for execve'd processes that
+            // includes all these paths. But the FIRST init (launched by
+            // kr64 via execve) was getting a SHORTER LD_LIBRARY_PATH that
+            // was missing 4 directories. This fix makes the first init's
+            // LD_LIBRARY_PATH match what the execve hook builds, so the
+            // linker can find ALL libraries on the first exec.
             CString::new(
                 "LD_LIBRARY_PATH=\
                 /system/lib64:\
                 /system/lib64/bootstrap:\
                 /apex/com.android.runtime/lib64:\
                 /apex/com.android.runtime/lib64/bionic:\
-                /apex/com.android.runtime/lib64/bootstrap",
+                /apex/com.android.runtime/lib64/bootstrap:\
+                /vendor/lib64:\
+                /apex/com.android.os.statsd/lib64:\
+                /system_ext/lib64:\
+                /product/lib64",
             )
             .unwrap(),
         ];
