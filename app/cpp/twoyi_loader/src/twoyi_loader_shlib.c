@@ -749,10 +749,24 @@ int lstat(const char *path, struct stat *buf) {
     if (path && should_translate(path)) {
         char translated[512];
         snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        // DEBUG: log every translated lstat so we can see why /acct/uid fails
+        char msg[600];
+        snprintf(msg, sizeof(msg), "[twoyi_loader] lstat(%s) -> %s\n", path, translated);
+        write_str(2, msg);
         static int (*real_lstat)(const char *, struct stat *) = NULL;
         if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
-        if (real_lstat) return real_lstat(translated, buf);
-        return syscall(SYS_newfstatat, AT_FDCWD, translated, buf, AT_SYMLINK_NOFOLLOW);
+        int ret;
+        if (real_lstat) ret = real_lstat(translated, buf);
+        else ret = syscall(SYS_newfstatat, AT_FDCWD, translated, buf, AT_SYMLINK_NOFOLLOW);
+        if (ret < 0) {
+            int saved_errno = errno;
+            snprintf(msg, sizeof(msg),
+                     "[twoyi_loader] lstat(%s) = %d (errno=%d: %s)\n",
+                     translated, ret, saved_errno, strerror(saved_errno));
+            write_str(2, msg);
+            errno = saved_errno;
+        }
+        return ret;
     }
     static int (*real_lstat)(const char *, struct stat *) = NULL;
     if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
@@ -2510,11 +2524,13 @@ static void twoyi_init(void) {
     // Since vold exits(0), pre-set this so init triggers zygote startup.
     prop_set("vold.decrypt", "trigger_restart_framework");
 
-    // Init needs ro.crypto.state to determine the boot path.
-    // "encrypted" + vold.decrypt=trigger_restart_framework → class_start core → zygote
-    // (Previous attempt with "unsupported" caused SIGABRT — "encrypted" takes a different path)
-    prop_set("ro.crypto.state", "encrypted");
-    prop_set("ro.crypto.type", "block");
+    // NOTE: ro.crypto.state/ro.crypto.type are intentionally NOT set here.
+    // Setting ro.crypto.state (any value: "encrypted", "unsupported", etc.)
+    // causes init to SIGABRT at make_dir("/acct/uid") because the lstat()
+    // that follows mkdir() fails with ENOENT. Without ro.crypto.state, init
+    // tolerates the lstat failure and continues booting. The lstat hook is
+    // present but currently fails — see debug logging in the lstat() hook.
+    // vold.decrypt=trigger_restart_framework above is enough to start zygote.
 
     g_runtime_ready = 1;
 }
