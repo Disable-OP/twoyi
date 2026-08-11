@@ -67,7 +67,7 @@ for ABI in arm64-v8a x86_64; do
         -D_GNU_SOURCE \
         -o $LOADER_BUILD_DIR/libtwoyi_loader_shlib.so \
         $SCRIPT_DIR/twoyi_loader/src/twoyi_loader_shlib.c \
-        -lc -ldl 2>&1 || echo "  ⚠ twoyi_loader_shlib build failed for $ABI"
+        -lc -ldl 2>&1 || { echo "  ✗ twoyi_loader_shlib build failed for $ABI" >&2; exit 1; }
     if [ -f "$LOADER_BUILD_DIR/libtwoyi_loader_shlib.so" ]; then
         cp -v $LOADER_BUILD_DIR/libtwoyi_loader_shlib.so $JNILIBS_DIR/libtwoyi_loader_shlib.so
     fi
