@@ -1158,6 +1158,62 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] PARENT: critical service binaries copied to /dev/twoyi-bin/");
     }
 
+    // Mount a new binderfs instance in the guest rootfs.
+    // This gives the guest its own /dev/binder, /dev/hwbinder, /dev/vndbinder
+    // that are separate from the host's. Without this, the guest's
+    // servicemanager can't become context manager (EBUSY) because the
+    // host's servicemanager already claimed that role on the shared
+    // /dev/binder device.
+    {
+        let binderfs_dir = format!("{}/dev/binderfs", cfg.rootfs);
+        let _ = std::fs::create_dir_all(&binderfs_dir);
+
+        // Mount binderfs
+        let binderfs_c = std::ffi::CString::new(binderfs_dir.as_str()).unwrap_or_default();
+        let ret = unsafe {
+            libc::mount(
+                b"binder\0".as_ptr() as *const libc::c_char,
+                binderfs_c.as_ptr(),
+                b"binder\0".as_ptr() as *const libc::c_char,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if ret == 0 {
+            info!("[KR64] PARENT: mounted binderfs at {}", binderfs_dir);
+
+            // Create symlinks: /dev/binder -> /dev/binderfs/binder, etc.
+            // NOTE: symlink targets use absolute paths WITHOUT the rootfs
+            // prefix, because init's symlink commands in init.rc resolve
+            // them relative to the guest's root after pivot_root.
+            for name in &["binder", "hwbinder", "vndbinder"] {
+                let link_path = format!("{}/dev/{}", cfg.rootfs, name);
+                let target = format!("/dev/binderfs/{}", name);
+                // Remove existing symlink/device if present
+                let _ = std::fs::remove_file(&link_path);
+                // Create symlink (target is relative to the guest's root)
+                let _ = std::os::unix::fs::symlink(&target, &link_path);
+            }
+            info!("[KR64] PARENT: created binder symlinks");
+        } else {
+            let e = std::io::Error::last_os_error();
+            warning!(
+                "[KR64] PARENT: failed to mount binderfs: {} (binder IPC may not work)",
+                e
+            );
+
+            // Fallback: try to use the host's binder device directly
+            // by creating symlinks to the host's /dev/binder
+            for name in &["binder", "hwbinder", "vndbinder"] {
+                let link_path = format!("{}/dev/{}", cfg.rootfs, name);
+                let target = format!("/dev/{}", name);
+                let _ = std::fs::remove_file(&link_path);
+                let _ = std::os::unix::fs::symlink(&target, &link_path);
+            }
+            info!("[KR64] PARENT: using host binder devices (fallback)");
+        }
+    }
+
     // Pre-create directories that init and services expect to exist.
     // These are created in the rootfs so init's mkdir commands succeed.
     {
