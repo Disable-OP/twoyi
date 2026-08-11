@@ -59,16 +59,76 @@ typedef struct prop_info prop_info;
 #endif
 
 // =========================================================================
-// Fallback defines for bionic API 24 compatibility
+// Architecture-specific constants (VERIFIED from system headers)
 // =========================================================================
-// Bionic at API 24 doesn't expose some NR_* / SYS_* constants the same way
-// glibc does. SYS_* is the standard name (defined in <sys/syscall.h>) and
-// maps to the correct syscall number per architecture. We use SYS_*
-// throughout the file and provide defensive fallbacks here: prefer the
-// __NR_* kernel name when available, and fall back to verified x86_64
-// numbers only as a last resort (host glibc and bionic both define these
-// already, so the #else branches are effectively dead code on the targets
-// we ship).
+
+#if defined(__x86_64__)
+  #define TWOYI_AUDIT_ARCH 0xC000003EU
+  #define NR_mount    165
+  #define NR_umount2  166
+  #define NR_chroot   161
+  #define NR_mknod    133
+  #define NR_mknodat  259
+  #define NR_openat   257
+  #define NR_mkdirat  258
+  #define NR_unlinkat 263
+  #define NR_fchmodat 268
+  #define NR_fchownat 260
+  #define NR_close    3
+  #define NR_write    1
+  #define NR_getpid   39
+  #define NR_setuid   105
+  #define NR_setgid   106
+  #define NR_setgroups 118
+  #define NR_setresuid 113
+  #define NR_setresgid 114
+  #define NR_unshare  272
+  #define NR_rt_sigaction 134
+  #define NR_sched_yield 24
+
+  #define GET_ARG(ctx, n) ({ \
+      unsigned long _a; \
+      switch(n) { \
+          case 0: _a = (ctx)->uc_mcontext.gregs[8]; break;  \
+          case 1: _a = (ctx)->uc_mcontext.gregs[9]; break;  \
+          case 2: _a = (ctx)->uc_mcontext.gregs[12]; break; \
+          case 3: _a = (ctx)->uc_mcontext.gregs[2]; break;  \
+          case 4: _a = (ctx)->uc_mcontext.gregs[0]; break;  \
+          case 5: _a = (ctx)->uc_mcontext.gregs[1]; break; \
+          default: _a = 0; break; \
+      } _a; })
+  #define SET_RET(ctx, val) (ctx)->uc_mcontext.gregs[13] = (long)(val)
+#elif defined(__aarch64__)
+  #define TWOYI_AUDIT_ARCH 0xC00000B7U
+  #define NR_mount    40
+  #define NR_umount2  39
+  #define NR_chroot   51
+  #define NR_mknod    14
+  #define NR_mknodat  33
+  #define NR_openat   56
+  #define NR_mkdirat  34
+  #define NR_unlinkat 35
+  #define NR_fchmodat 53
+  #define NR_fchownat 55
+  #define NR_close    57
+  #define NR_write    64
+  #define NR_getpid   172
+  #define NR_setuid   146
+  #define NR_setgid   144
+  #define NR_setgroups 159
+  #define NR_setresuid 147
+  #define NR_setresgid 149
+  #define NR_unshare  97
+  #define NR_rt_sigaction 134
+  #define NR_sched_yield 124
+
+  #define GET_ARG(ctx, n) ((unsigned long)(ctx)->uc_mcontext.regs[n])
+  #define SET_RET(ctx, val) (ctx)->uc_mcontext.regs[0] = (uint64_t)(val)
+#endif
+
+// Legacy fallback defines for bionic API 24 compatibility (x86_64 only).
+// On aarch64 these syscalls don't exist; the wrappers below route around
+// the missing definitions using the *at variants.
 #ifndef SYS_open
   #ifdef __NR_open
     #define SYS_open __NR_open
@@ -106,64 +166,67 @@ typedef struct prop_info prop_info;
 #endif
 
 // =========================================================================
-// Architecture-specific constants (VERIFIED from system headers)
+// Architecture-independent syscall wrappers
 // =========================================================================
+// On aarch64 (and other newer architectures) the legacy syscalls
+// SYS_open / SYS_mkdir / SYS_unlink / SYS_chmod / SYS_chown do NOT exist
+// in the kernel — only their *at variants (openat / mkdirat / unlinkat /
+// fchmodat / fchownat) are wired up. The previous version of this file
+// tried to #define SYS_open to a hardcoded x86_64 number, which silently
+// left it undefined on aarch64 and broke the build for arm64-v8a.
+//
+// These wrappers dispatch to the right syscall per architecture. They use
+// raw syscall() (not the libc wrappers open()/mkdir()/...) to avoid
+// recursing through the PLT — this file is loaded via LD_PRELOAD and
+// interposes open()/mkdir()/unlink()/chmod()/chown() themselves.
+//
+// NR_openat / NR_mkdirat / NR_unlinkat / NR_fchmodat / NR_fchownat are
+// defined in the arch-specific block above (x86_64 and aarch64).
+// AT_FDCWD comes from <fcntl.h>.
 
+static inline long twoyi_sys_open(const char *path, int flags, mode_t mode) {
 #if defined(__x86_64__)
-  #define TWOYI_AUDIT_ARCH 0xC000003EU
-  #define NR_mount    165
-  #define NR_umount2  166
-  #define NR_chroot   161
-  #define NR_mknod    133
-  #define NR_mknodat  259
-  #define NR_openat   257
-  #define NR_close    3
-  #define NR_write    1
-  #define NR_getpid   39
-  #define NR_setuid   105
-  #define NR_setgid   106
-  #define NR_setgroups 118
-  #define NR_setresuid 113
-  #define NR_setresgid 114
-  #define NR_unshare  272
-  #define NR_rt_sigaction 134
-  #define NR_sched_yield 24
-
-  #define GET_ARG(ctx, n) ({ \
-      unsigned long _a; \
-      switch(n) { \
-          case 0: _a = (ctx)->uc_mcontext.gregs[8]; break;  \
-          case 1: _a = (ctx)->uc_mcontext.gregs[9]; break;  \
-          case 2: _a = (ctx)->uc_mcontext.gregs[12]; break; \
-          case 3: _a = (ctx)->uc_mcontext.gregs[2]; break;  \
-          case 4: _a = (ctx)->uc_mcontext.gregs[0]; break;  \
-          case 5: _a = (ctx)->uc_mcontext.gregs[1]; break;  \
-          default: _a = 0; break; \
-      } _a; })
-  #define SET_RET(ctx, val) (ctx)->uc_mcontext.gregs[13] = (long)(val)
-#elif defined(__aarch64__)
-  #define TWOYI_AUDIT_ARCH 0xC00000B7U
-  #define NR_mount    40
-  #define NR_umount2  39
-  #define NR_chroot   51
-  #define NR_mknod    14
-  #define NR_mknodat  33
-  #define NR_openat   56
-  #define NR_close    57
-  #define NR_write    64
-  #define NR_getpid   172
-  #define NR_setuid   146
-  #define NR_setgid   144
-  #define NR_setgroups 159
-  #define NR_setresuid 147
-  #define NR_setresgid 149
-  #define NR_unshare  97
-  #define NR_rt_sigaction 134
-  #define NR_sched_yield 124
-
-  #define GET_ARG(ctx, n) ((unsigned long)(ctx)->uc_mcontext.regs[n])
-  #define SET_RET(ctx, val) (ctx)->uc_mcontext.regs[0] = (uint64_t)(val)
+    return syscall(SYS_open, path, flags, mode);
+#else
+    return syscall(NR_openat, AT_FDCWD, path, flags, mode);
 #endif
+}
+static inline long twoyi_sys_open2(const char *path, int flags) {
+    // 2-arg open() variant (no mode) — used by __open_2 fallbacks.
+#if defined(__x86_64__)
+    return syscall(SYS_open, path, flags);
+#else
+    return syscall(NR_openat, AT_FDCWD, path, flags);
+#endif
+}
+static inline long twoyi_sys_mkdir(const char *path, mode_t mode) {
+#if defined(__x86_64__)
+    return syscall(SYS_mkdir, path, mode);
+#else
+    return syscall(NR_mkdirat, AT_FDCWD, path, mode);
+#endif
+}
+static inline long twoyi_sys_unlink(const char *path) {
+#if defined(__x86_64__)
+    return syscall(SYS_unlink, path);
+#else
+    return syscall(NR_unlinkat, AT_FDCWD, path, 0);
+#endif
+}
+static inline long twoyi_sys_chmod(const char *path, mode_t mode) {
+#if defined(__x86_64__)
+    return syscall(SYS_chmod, path, mode);
+#else
+    return syscall(NR_fchmodat, AT_FDCWD, path, mode, 0);
+#endif
+}
+static inline long twoyi_sys_chown(const char *path, uid_t owner, gid_t group) {
+#if defined(__x86_64__)
+    return syscall(SYS_chown, path, owner, group);
+#else
+    return syscall(NR_fchownat, AT_FDCWD, path, owner, group, 0);
+#endif
+}
 
 // Helper: write to both stderr and a log file (for debugging when stderr is /dev/null)
 // Also tries to write to logd via __android_log_print (if available via dlsym)
@@ -173,7 +236,7 @@ static void write_str(int fd, const char *s) {
     // Write to stderr (goes to logd's stderr collector)
     syscall(NR_write, fd, s, l);
     // Also write to /data/local/tmp/twoyi-loader.log for debugging
-    int logfd = syscall(SYS_open, "/data/local/tmp/twoyi-loader.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    int logfd = twoyi_sys_open("/data/local/tmp/twoyi-loader.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
     if (logfd >= 0) { syscall(NR_write, logfd, s, l); syscall(NR_close, logfd); }
     // Also try __android_log_write via dlsym (goes directly to logd socket)
     // This is critical for processes where stderr is closed/redirected (e.g., after execv)
@@ -424,7 +487,7 @@ int mkdir(const char *path, mode_t mode) {
     static int (*real_mkdir)(const char *, mode_t) = NULL;
     if (!real_mkdir) real_mkdir = dlsym(RTLD_NEXT, "mkdir");
     if (real_mkdir) return real_mkdir(path, mode);
-    return syscall(SYS_mkdir, path, mode);
+    return twoyi_sys_mkdir(path, mode);
 }
 
 static int (*real_mknod)(const char *, mode_t, dev_t) = NULL;
@@ -436,7 +499,7 @@ int mknod(const char *path, mode_t mode, dev_t dev) {
     mode_t fmt = mode & S_IFMT;
     if (fmt == S_IFCHR || fmt == S_IFBLK) {
 #if defined(__x86_64__)
-        int fd = syscall(SYS_open, path, O_RDWR|O_CREAT, 0666);
+        int fd = twoyi_sys_open(path, O_RDWR|O_CREAT, 0666);
         if (fd >= 0) {
             syscall(NR_write, fd, &dev, sizeof(dev_t));
             syscall(NR_close, fd);
@@ -538,12 +601,12 @@ int unlink(const char *path) {
         static int (*real_unlink)(const char *) = NULL;
         if (!real_unlink) real_unlink = dlsym(RTLD_NEXT, "unlink");
         if (real_unlink) return real_unlink(translated);
-        return syscall(SYS_unlink, translated);
+        return twoyi_sys_unlink(translated);
     }
     static int (*real_unlink)(const char *) = NULL;
     if (!real_unlink) real_unlink = dlsym(RTLD_NEXT, "unlink");
     if (real_unlink) return real_unlink(path);
-    return syscall(SYS_unlink, path);
+    return twoyi_sys_unlink(path);
 }
 
 int unlinkat(int dirfd, const char *path, int flags) {
@@ -588,11 +651,11 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
                 for (char *p = dir + 1; *p; p++) {
                     if (*p == '/') {
                         *p = 0;
-                        syscall(SYS_mkdir, dir, 0777);
+                        twoyi_sys_mkdir(dir, 0777);
                         *p = '/';
                     }
                 }
-                syscall(SYS_mkdir, dir, 0777);
+                twoyi_sys_mkdir(dir, 0777);
             }
 
             // Create a copy of the sockaddr with the translated path
@@ -662,12 +725,12 @@ int chmod(const char *path, mode_t mode) {
         static int (*real_chmod)(const char *, mode_t) = NULL;
         if (!real_chmod) real_chmod = dlsym(RTLD_NEXT, "chmod");
         if (real_chmod) return real_chmod(translated, mode);
-        return syscall(SYS_chmod, translated, mode);
+        return twoyi_sys_chmod(translated, mode);
     }
     static int (*real_chmod)(const char *, mode_t) = NULL;
     if (!real_chmod) real_chmod = dlsym(RTLD_NEXT, "chmod");
     if (real_chmod) return real_chmod(path, mode);
-    return syscall(SYS_chmod, path, mode);
+    return twoyi_sys_chmod(path, mode);
 }
 
 // Hook chown — redirect paths to rootfs
@@ -678,12 +741,12 @@ int chown(const char *path, uid_t owner, gid_t group) {
         static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
         if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
         if (real_chown) return real_chown(translated, owner, group);
-        return syscall(SYS_chown, translated, owner, group);
+        return twoyi_sys_chown(translated, owner, group);
     }
     static int (*real_chown)(const char *, uid_t, gid_t) = NULL;
     if (!real_chown) real_chown = dlsym(RTLD_NEXT, "chown");
     if (real_chown) return real_chown(path, owner, group);
-    return syscall(SYS_chown, path, owner, group);
+    return twoyi_sys_chown(path, owner, group);
 }
 
 // Hook lstat — translate paths to rootfs (init's make_dir uses lstat)
@@ -1050,7 +1113,7 @@ int __system_property_area_init(void) {
     // This is called from PropertyInit() BEFORE CreateSerializedPropertyInfo().
     struct stat st;
     if (stat("/dev/__properties__", &st) == 0) {
-        int fd = syscall(SYS_open, "/dev/__properties__/property_info",
+        int fd = twoyi_sys_open("/dev/__properties__/property_info",
                         O_WRONLY | O_CREAT, 0666);
         if (fd >= 0) {
             syscall(NR_close, fd);
@@ -1181,13 +1244,13 @@ static int (*real_execveat)(int, const char *, char *const[], char *const[], int
 static int get_elf_class(const char *path) {
     if (!path) return 0;
     // Use direct syscall to avoid recursion with our open hooks
-    int fd = syscall(SYS_open, path, O_RDONLY, 0);
+    int fd = twoyi_sys_open(path, O_RDONLY, 0);
     if (fd < 0) {
         // Try with rootfs prefix
         if (g_rootfs && path[0] == '/') {
             char translated[512];
             snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
-            fd = syscall(SYS_open, translated, O_RDONLY, 0);
+            fd = twoyi_sys_open(translated, O_RDONLY, 0);
         }
         if (fd < 0) return 0;
     }
@@ -1610,7 +1673,7 @@ static long emu_mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     }
     // Create regular file containing dev_t (use open() not openat() to avoid seccomp recursion)
 #if defined(__x86_64__)
-    int fd = syscall(SYS_open, path, O_RDWR|O_CREAT, 0666);
+    int fd = twoyi_sys_open(path, O_RDWR|O_CREAT, 0666);
     if(fd<0) return -errno;
     syscall(NR_write, fd, &dev, sizeof(dev_t));
     syscall(NR_close, fd);
@@ -1679,7 +1742,7 @@ static void ensure_selinuxfs_files(void) {
     for (int i = 0; files[i]; i++) {
         char path[600];
         snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
-        int fd = syscall(SYS_open, path, O_WRONLY | O_CREAT, 0666);
+        int fd = twoyi_sys_open(path, O_WRONLY | O_CREAT, 0666);
         if (fd >= 0) {
             if (strcmp(files[i], "checkreqprot") == 0) {
                 syscall(NR_write, fd, "0", 1);
@@ -1916,14 +1979,14 @@ int open(const char *path, int flags, ...) {
         if (g_rootfs) {
             char file_path[600];
             snprintf(file_path, sizeof(file_path), "%s%s", g_rootfs, path);
-            int cfd = syscall(SYS_open, file_path, O_WRONLY | O_CREAT, 0666);
+            int cfd = twoyi_sys_open(file_path, O_WRONLY | O_CREAT, 0666);
             if (cfd >= 0) syscall(NR_close, cfd);
         }
 
 #if defined(__x86_64__)
-        int fd = syscall(SYS_open, translated, flags, mode);
+        int fd = twoyi_sys_open(translated, flags, mode);
         if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
-            fd = syscall(SYS_open, translated, flags | O_CREAT, 0666);
+            fd = twoyi_sys_open(translated, flags | O_CREAT, 0666);
         }
         return trace_open_result(path, fd);
 #else
@@ -1940,7 +2003,7 @@ int open(const char *path, int flags, ...) {
 
     const char *translated = translate(path);
 #if defined(__x86_64__)
-    return trace_open_result(path, syscall(SYS_open, translated, flags, mode));
+    return trace_open_result(path, twoyi_sys_open(translated, flags, mode));
 #else
     if (real_openat) return trace_open_result(path, real_openat(AT_FDCWD, translated, flags, mode));
     return trace_open_result(path, syscall(NR_openat, AT_FDCWD, translated, flags, mode));
@@ -2122,7 +2185,7 @@ int __open_2(const char *path, int flags) {
         if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
         if (real_open2) return real_open2(translated, flags);
 #if defined(__x86_64__)
-        return syscall(SYS_open, translated, flags);
+        return twoyi_sys_open2(translated, flags);
 #else
         return syscall(NR_openat, AT_FDCWD, translated, flags);
 #endif
@@ -2132,7 +2195,7 @@ int __open_2(const char *path, int flags) {
     if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
     if (real_open2) return real_open2(path, flags);
 #if defined(__x86_64__)
-    return syscall(SYS_open, path, flags);
+    return twoyi_sys_open2(path, flags);
 #else
     return syscall(NR_openat, AT_FDCWD, path, flags);
 #endif
@@ -2166,7 +2229,7 @@ int __open_real(const char *pathname, int flags, ...) {
         if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
         if (real_open_real) return real_open_real(translated, flags, mode);
 #if defined(__x86_64__)
-        return syscall(SYS_open, translated, flags, mode);
+        return twoyi_sys_open(translated, flags, mode);
 #else
         return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
@@ -2178,7 +2241,7 @@ int __open_real(const char *pathname, int flags, ...) {
         if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
         if (real_open_real) return real_open_real(translated, flags, mode);
 #if defined(__x86_64__)
-        return syscall(SYS_open, translated, flags, mode);
+        return twoyi_sys_open(translated, flags, mode);
 #else
         return syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
@@ -2187,7 +2250,7 @@ int __open_real(const char *pathname, int flags, ...) {
     if (!real_open_real) real_open_real = dlsym(RTLD_NEXT, "__open_real");
     if (real_open_real) return real_open_real(pathname, flags, mode);
 #if defined(__x86_64__)
-    return syscall(SYS_open, pathname, flags, mode);
+    return twoyi_sys_open(pathname, flags, mode);
 #else
     return syscall(NR_openat, AT_FDCWD, pathname, flags, mode);
 #endif
@@ -2519,14 +2582,14 @@ static void twoyi_init(void) {
         for (int i = 0; files[i]; i++) {
             char fpath[600];
             snprintf(fpath, sizeof(fpath), "%s/%s", prop_dir, files[i]);
-            int fd = syscall(SYS_open, fpath, O_WRONLY | O_CREAT, 0666);
+            int fd = twoyi_sys_open(fpath, O_WRONLY | O_CREAT, 0666);
             if (fd >= 0) syscall(NR_close, fd);
         }
         // Also create on HOST (WriteStringToFile bypasses PLT hooks)
         struct stat st;
         if (stat("/dev/__properties__", &st) == 0) {
             // Only create property_info (NOT properties_serial — host uses that)
-            int fd = syscall(SYS_open, "/dev/__properties__/property_info",
+            int fd = twoyi_sys_open("/dev/__properties__/property_info",
                             O_WRONLY | O_CREAT, 0666);
             if (fd >= 0) {
                 syscall(NR_close, fd);
