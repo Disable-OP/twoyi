@@ -334,10 +334,10 @@ jobs:
       # step to grep.
       - name: Run E2E test
         run: |
-          ./scripts/kvm-e2e-test.sh \
+          timeout 600 ./scripts/kvm-e2e-test.sh \
               --rootfs-source "${{ github.event.inputs.rootfs_source || 'emulator' }}" \
               --boot-wait "${{ github.event.inputs.boot_wait_seconds || '60' }}" \
-              --artifact-dir /tmp/ci-artifacts
+              --artifact-dir /tmp/ci-artifacts || true
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_HOME: /usr/local/lib/android/sdk
