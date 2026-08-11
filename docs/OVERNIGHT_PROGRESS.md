@@ -1472,3 +1472,241 @@ grep -E "starting service 'zygote'|service zygote.*started|zygote.*pid" logcat.t
    getting zygote + system_server to start (binder IPC, fixed by Task
    ID 5). surfaceflinger can be deferred — system_server can boot
    partially without it (with reduced functionality).
+
+---
+
+## Timestamp UTC: 2026-08-11 (overnight Task ID 7)
+## Task: Fix the critical hook library path mismatch (BLOCKING ALL BOOT)
+
+### Context
+
+KVM run 31500117235 (commit e40e0e5 / f2a518a) completed with CI
+status "success" (no workflow failure) BUT the guest init crashed
+with SIGSEGV (signal 11). Root cause confirmed from `kr64-stderr.log`:
+
+```
+[KR64 ERROR] [KR64] PARENT: libgetpid_hook.so not found at
+  /data/data/io.twoyi/profiles/default/rootfs/libgetpid_hook.so
+  -- LD_PRELOAD will fail
+[KR64 INFO] [KR64] PARENT: libtwoyi_loader_shlib.so not found at
+  /data/data/io.twoyi/profiles/default/rootfs/libtwoyi_loader_shlib.so
+  -- seccomp virtualization disabled
+[KR64 CHILD] libgetpid_hook.so NOT found at /dev/
+[KR64 WARN] [KR64][parent] guest killed by signal 11
+```
+
+And from `logcat.txt`:
+
+```
+I/RomManager( 5656): ensureLibSymlink: libgetpid_hook.so ->
+  /data/user/0/io.twoyi/rootfs/system/lib64/libgetpid_hook.so
+  (target /data/app/~~.../io.twoyi-.../lib/x86_64/libgetpid_hook.so)
+```
+
+### The path mismatch (root cause)
+
+- `cfg.rootfs` = `/data/data/io.twoyi/profiles/default/rootfs` (per-profile)
+- kr64 looked for `{cfg.rootfs}/libgetpid_hook.so`
+  = `/data/data/io.twoyi/profiles/default/rootfs/libgetpid_hook.so`
+- RomManager puts the library at
+  `/data/user/0/io.twoyi/rootfs/system/lib64/libgetpid_hook.so`
+- `/data/user/0/io.twoyi/` is an Android symlink to `/data/data/io.twoyi/`,
+  so that resolves to `/data/data/io.twoyi/rootfs/system/lib64/libgetpid_hook.so`
+- But kr64's rootfs is at `/data/data/io.twoyi/profiles/default/rootfs/` —
+  a DIFFERENT directory (`profiles/default/rootfs` vs `rootfs`).
+
+So the library exists on the device, just at a different path than
+where kr64 looked. LD_PRELOAD failed → no hooks loaded → init crashed
+with SIGSEGV (signal 11) because getpid() returned a bogus value (or
+some other unhooked syscall poisoned init's state).
+
+### What was changed (commit 8375802, +224/-60 lines in one file)
+
+**ONLY `app/rs/kr64/src/lib.rs` was edited** (per task constraint).
+
+**1. New helper `hook_library_candidates(cfg, lib_name) -> Vec<String>`**
+returns 4 candidate source paths in priority order:
+
+| # | Candidate path                                   | Rationale                                                |
+|---|--------------------------------------------------|----------------------------------------------------------|
+| 1 | `{cfg.rootfs}/<lib>`                             | Historical fallback; manual placement / direct rootfs.   |
+| 2 | `{cfg.rootfs}/system/lib64/<lib>`                | RomManager per-profile symlink (relative to profile rootfs). |
+| 3 | `{cfg.data_dir}/rootfs/system/lib64/<lib>`       | **CONFIRMED working path** from logcat — where RomManager's `ensureLibSymlink` ACTUALLY puts it. |
+| 4 | `{cfg.data_dir}/rootfs/<lib>`                    | Alternative app-level rootfs root.                       |
+
+The caller picks the first candidate that exists on disk.
+
+**2. New helper `copy_hook_library_to_dev(cfg, lib_name, dst, not_found_msg) -> bool`**
+replaces the two inline copy blocks. It:
+- Calls `hook_library_candidates` to get the 4 paths.
+- Uses `candidates.iter().find(|p| Path::new(p).exists())` to pick the
+  first that exists.
+- If found: copies to `dst` (always `/dev/<lib>` tmpfs), chmods 0644,
+  logs `[KR64] PARENT: copied <lib> <src> -> <dst>`. Returns true.
+- If NOT found: logs `[KR64] PARENT: <lib> not found in any of 4
+  candidate locations -- <not_found_msg>`, then logs EACH checked path
+  on its own line (`[KR64] PARENT:   checked: <path>`). Returns false.
+
+The "log ALL checked paths" behavior is the key diagnostic improvement
+— the old code only logged the single path it checked, so the next
+debugging cycle had no way to know what other paths might have worked.
+
+**3. The two call sites in `run()`** are now two-line calls to the
+helper:
+
+```rust
+copy_hook_library_to_dev(&cfg, "libgetpid_hook.so",
+    "/dev/libgetpid_hook.so", "LD_PRELOAD will fail");
+copy_hook_library_to_dev(&cfg, "libtwoyi_loader_shlib.so",
+    "/dev/libtwoyi_loader_shlib.so", "seccomp virtualization disabled");
+```
+
+The LD_PRELOAD destination path (`/dev/libgetpid_hook.so`) is
+UNCHANGED — that was already correct after the copy. The bug was in
+FINDING the source file to copy. The copy-to-/dev/ behavior is also
+unchanged (still required for SELinux access by vendor_init
+subcontexts — documented in the long comment above the call site).
+
+**4. Four new unit tests** (184 → 188 tests, all pass):
+- `hook_library_candidates_includes_all_four_paths_in_order` — verifies
+  the exact 4 paths and their order, using the real-world
+  `/data/data/io.twoyi/profiles/default/rootfs` + `/data/data/io.twoyi`
+  config from the bug report.
+- `hook_library_candidates_uses_passed_lib_name` — verifies the helper
+  works for both `libgetpid_hook.so` and `libtwoyi_loader_shlib.so`.
+- `copy_hook_library_to_dev_returns_false_when_not_found` — verifies
+  the not-found path returns false and does NOT create the destination.
+- `copy_hook_library_to_dev_finds_and_copies_when_candidate_exists` —
+  creates a temp file at candidate #3 (the confirmed RomManager path),
+  points `cfg.rootfs` at a non-existent dir so candidates #1 and #2
+  miss, and verifies the copy succeeds via candidate #3.
+
+### Build verification
+
+All 4 verification commands pass cleanly:
+
+- `cargo check` — Finished, no errors.
+- `cargo clippy --all-targets -- -D warnings` — Finished, exit 0, NO
+  warnings (the `candidates.iter().find(|p| Path::new(p).exists())`
+  closure passed clippy cleanly — `&&String` derefs to `&str` which
+  implements `AsRef<Path>`).
+- `cargo fmt` then `cargo fmt --check` — exit 0 (auto-formatted a few
+  long lines in the test bodies; the helper functions themselves were
+  already fmt-clean).
+- `cargo test` — **188 passed; 0 failed; 0 ignored** (was 184 before,
+  +4 new tests for the hook library lookup).
+
+### Constraint compliance
+
+- ONLY `app/rs/kr64/src/lib.rs` was edited for the code fix. No loader
+  changes, no other kr64 files touched.
+- The LD_PRELOAD destination (`/dev/libgetpid_hook.so`) is UNCHANGED.
+- The copy-to-/dev/ behavior is UNCHANGED (still required for SELinux).
+- No crash suppression, no faked results.
+- Did NOT skip the copy — the library MUST be at `/dev/` for SELinux.
+
+### Confidence assessment
+
+**WILL this fix the SIGSEGV? HIGH confidence.**
+
+Reasoning:
+1. The SIGSEGV root cause is confirmed: `libgetpid_hook.so NOT found
+   at /dev/` (from `kr64-stderr.log`) → no LD_PRELOAD → no getpid
+   hook → init crashes. This is a DIRECT cause-effect, not a guess.
+2. The confirmed working path from logcat
+   (`{data_dir}/rootfs/system/lib64/libgetpid_hook.so`) is candidate
+   #3 in the new search. As long as `cfg.data_dir` is set to
+   `/data/data/io.twoyi` (or `/data/user/0/io.twoyi` — same file via
+   the Android symlink), candidate #3 will find the library.
+3. The fix is additive (checks MORE paths, not different paths) — it
+   cannot break the case where the library was already being found
+   via candidate #1 (e.g., manual placement).
+4. If `cfg.data_dir` is NOT `/data/data/io.twoyi` but something else
+   (e.g., a per-VM subdir like `/data/data/io.twoyi/vm/vm0`), then
+   candidate #3 would be
+   `/data/data/io.twoyi/vm/vm0/rootfs/system/lib64/libgetpid_hook.so`
+   which would NOT exist. In that case the new "log ALL checked
+   paths" diagnostic will tell the next cycle exactly what `data_dir`
+   value kr64 received, so the fix can be refined.
+5. The 4 candidate paths cover the documented `Config` semantics
+   (`data_dir` = host-side per-VM data dir, `rootfs` = guest rootfs
+   dir) AND the confirmed RomManager behavior. The union is robust.
+
+**What COULD still go wrong (lower-confidence risks):**
+- If `cfg.data_dir` is empty (the `Default` impl sets it to
+  `String::new()`), candidate #3 becomes `/rootfs/system/lib64/...`
+  which won't exist. But `parse_args` requires `--data-dir`, so this
+  only happens if the caller bypasses arg parsing.
+- If RomManager changes its `ensureLibSymlink` target in a future
+  build, candidate #3 might miss. The new diagnostic logs will catch
+  this immediately.
+- Even with hooks loaded, init may hit OTHER blockers (the binder IPC
+  fix from Task ID 5 / commit bca0e7b, the graphics stubs from Task
+  ID 6 / commit f11b46f, the banned-fake-boot removal from Task ID 4
+  / commit b069d5e). This fix is NECESSARY but may not be SUFFICIENT
+  for full boot. It unblocks the VERY FIRST step (loading hooks) so
+  the subsequent blockers become visible.
+
+### Greps for the next sub-agent analyzing the new KVM run 31501768195
+
+```
+# SUCCESS indicator: library was FOUND and copied (should see 2 lines,
+# one per library, with the source path that actually worked).
+grep -E "PARENT: copied (libgetpid_hook|libtwoyi_loader_shlib)\.so" kr64-stderr.log
+
+# If the library was STILL not found, this will show all 4 checked
+# paths per library -- use them to refine the candidate list.
+grep -E "not found in any of 4 candidate locations" kr64-stderr.log
+grep -E "PARENT:   checked:" kr64-stderr.log
+
+# The CRITICAL regression check: this line MUST NOT appear in the new
+# run. If it does, the fix didn't work.
+grep "libgetpid_hook.so NOT found at /dev/" kr64-stderr.log
+
+# Guest init crash check: this line MUST NOT appear (or must appear
+# with a DIFFERENT signal/message, indicating a different blocker).
+grep "guest killed by signal 11" kr64-stderr.log
+
+# If the fix works, init should progress further. Check for zygote /
+# surfaceflinger / system_server startup (the next blockers per
+# Tasks ID 3/5/6 analysis).
+grep -E "starting service 'zygote'|service zygote.*started" logcat.txt
+grep -E "starting service 'surfaceflinger'|service surfaceflinger.*started" logcat.txt
+grep -E "system_server|SystemServer" logcat.txt | head -20
+
+# If init still crashes, the FIRST tombstone's abort message + the
+# last few kr64-stderr.log lines before the crash are the key clue.
+grep -E "tombstone|SIGSEGV|SIGABRT|signal [0-9]+" logcat.txt | head -20
+```
+
+### Commit + KVM run
+
+- **Commit:** 8375802 "fix: search multiple paths for hook libraries
+  (critical boot blocker)" — pushed to origin/main (f2a518a..8375802).
+- **KVM run triggered:** 31501768195 (workflow `kvm-e2e-test.yml`,
+  ref main, started 2026-08-11T14:29:01Z). Status at trigger time:
+  in_progress.
+
+### Next steps for the next sub-agent
+
+1. **Wait for KVM run 31501768195 to complete** (previous runs took
+   ~10 minutes; allow up to 30).
+2. **Download the artifacts** and run the greps above. The
+   `copied libgetpid_hook.so` and `copied
+   libtwoyi_loader_shlib.so` lines are the primary success signal.
+3. **If both libraries were copied** but init STILL crashes: this fix
+   was necessary but not sufficient. The crash will now be at a
+   LATER point (zygote / surfaceflinger / system_server / binder IPC
+   — per Tasks ID 3/5/6). Analyze the new crash point.
+4. **If the libraries were STILL not found** (the "not found in any
+   of 4 candidate locations" + "checked:" lines appear): the
+   diagnostic will show exactly what `cfg.rootfs` and `cfg.data_dir`
+   values kr64 received. Refine the candidate list based on those
+   real values — there may be a 5th path we haven't considered
+   (e.g., a `/data/data/io.twoyi/profiles/default/rootfs/system/lib64/`
+   variant if RomManager's profile setup also symlinks there).
+5. **If init now boots further** (reaches zygote, surfaceflinger, or
+   system_server): the binder IPC fix (Task ID 5, commit bca0e7b) and
+   graphics stubs (Task ID 6, commit f11b46f) are the next things to
+   validate. The greps in Task ID 5's and Task ID 6's progress-log
+   entries apply directly.
