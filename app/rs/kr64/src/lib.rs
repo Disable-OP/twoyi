@@ -507,6 +507,98 @@ pub fn clear_zombie_processes() {
 }
 
 // ============================================================================
+// Hook library lookup -- multi-path search.
+//
+// RomManager's `ensureLibSymlink` puts the hook .so files at
+// {data_dir}/rootfs/system/lib64/<lib>, but kr64's `cfg.rootfs` points
+// at the per-profile rootfs ({data_dir}/profiles/default/rootfs). The
+// old single-path lookup at `{rootfs}/<lib>` therefore failed, leaving
+// LD_PRELOAD broken and init crashing with SIGSEGV (signal 11) because
+// no hooks were loaded. See KVM run 31500117235:
+//   kr64-stderr.log: "libgetpid_hook.so not found at {rootfs}/libgetpid_hook.so"
+//   logcat.txt:      "ensureLibSymlink: libgetpid_hook.so ->
+//                     {data_dir}/rootfs/system/lib64/libgetpid_hook.so"
+// ============================================================================
+
+/// Returns candidate source paths for a hook library (e.g.
+/// `libgetpid_hook.so`, `libtwoyi_loader_shlib.so`), in priority order.
+///
+/// The library may live in any of several places depending on how the
+/// rootfs was provisioned by RomManager:
+///
+/// 1. `{rootfs}/<lib>` -- manual placement or direct rootfs (the
+///    historical fallback; kept for backwards compatibility).
+/// 2. `{rootfs}/system/lib64/<lib>` -- where RomManager's
+///    `ensureLibSymlink` would put it, relative to the profile rootfs.
+/// 3. `{data_dir}/rootfs/system/lib64/<lib>` -- where RomManager's
+///    `ensureLibSymlink` ACTUALLY puts it on a real device (confirmed
+///    from logcat: `ensureLibSymlink: libgetpid_hook.so ->
+///    /data/user/0/io.twoyi/rootfs/system/lib64/libgetpid_hook.so`,
+///    and `/data/user/0/io.twoyi/` symlinks to `/data/data/io.twoyi/`).
+///    This is the path that the per-profile `rootfs` field does NOT
+///    point at (`profiles/default/rootfs` vs `rootfs/`), so we check it
+///    explicitly here.
+/// 4. `{data_dir}/rootfs/<lib>` -- alternative app-level rootfs root.
+///
+/// The caller picks the first candidate that exists on disk.
+fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
+    vec![
+        format!("{}/{}", cfg.rootfs, lib_name),
+        format!("{}/system/lib64/{}", cfg.rootfs, lib_name),
+        format!("{}/rootfs/system/lib64/{}", cfg.data_dir, lib_name),
+        format!("{}/rootfs/{}", cfg.data_dir, lib_name),
+    ]
+}
+
+/// Copies a hook library into `/dev/` (tmpfs) so the guest can use it.
+///
+/// Searches the candidate paths returned by [`hook_library_candidates`]
+/// in order and uses the first one that exists. If none exist, logs ALL
+/// the paths that were checked (so the next debugging cycle has better
+/// diagnostics than the old single-path lookup).
+///
+/// The destination must always be on the HOST's `/dev/` tmpfs (NOT
+/// `{rootfs}/dev/`), because init second-stage forks subcontexts
+/// running as `u:r:vendor_init:s0` which are DENIED search access to
+/// `app_data_file` directories. See the long comment in `run()` for
+/// the full SELinux rationale.
+///
+/// Returns `true` if the library was copied successfully, `false` if
+/// not found or the copy failed (the error is already logged).
+fn copy_hook_library_to_dev(cfg: &Config, lib_name: &str, dst: &str, not_found_msg: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let candidates = hook_library_candidates(cfg, lib_name);
+    match candidates.iter().find(|p| Path::new(p).exists()) {
+        Some(src) => match std::fs::copy(src, dst) {
+            Ok(_) => {
+                let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644));
+                info!("[KR64] PARENT: copied {} {} -> {}", lib_name, src, dst);
+                true
+            }
+            Err(e) => {
+                error!(
+                    "[KR64] PARENT: failed to copy {} {} -> {}: {}",
+                    lib_name, src, dst, e
+                );
+                false
+            }
+        },
+        None => {
+            error!(
+                "[KR64] PARENT: {} not found in any of {} candidate locations -- {}",
+                lib_name,
+                candidates.len(),
+                not_found_msg
+            );
+            for c in &candidates {
+                error!("[KR64] PARENT:   checked: {}", c);
+            }
+            false
+        }
+    }
+}
+
+// ============================================================================
 // Daemon entry point.
 // ============================================================================
 
@@ -942,67 +1034,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //     subcontext's linker can't find them → "CANNOT LINK EXECUTABLE"
     //   - /dev/ (tmpfs) is accessible to ALL domains (labeled tmpfs)
     //
-    // After pivot_root (use_namespaces still true):
-    //   /libgetpid_hook.so = {rootfs}/libgetpid_hook.so (on ext4, source)
-    //   /dev/libgetpid_hook.so = tmpfs (destination, accessible to all)
-    //
-    // Without pivot_root (--no-namespaces):
-    //   {rootfs}/libgetpid_hook.so (source, on ext4)
-    //   /dev/libgetpid_hook.so (destination, on HOST's tmpfs — works because
-    //   kr64 runs as root and can write to /dev/)
-    let hook_src = format!("{}/libgetpid_hook.so", cfg.rootfs);
-    let hook_dst = "/dev/libgetpid_hook.so".to_string();
-    if Path::new(&hook_src).exists() {
-        // /dev/ always exists on the host, no need to create it
-        match std::fs::copy(&hook_src, &hook_dst) {
-            Ok(_) => {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&hook_dst, std::fs::Permissions::from_mode(0o644));
-                info!(
-                    "[KR64] PARENT: copied libgetpid_hook.so {} -> {}",
-                    hook_src, hook_dst
-                );
-            }
-            Err(e) => {
-                error!(
-                    "[KR64] PARENT: failed to copy libgetpid_hook.so {} -> {}: {}",
-                    hook_src, hook_dst, e
-                );
-            }
-        }
-    } else {
-        error!(
-            "[KR64] PARENT: libgetpid_hook.so not found at {} -- LD_PRELOAD will fail",
-            hook_src
-        );
-    }
+    // The source path is found by `copy_hook_library_to_dev`, which
+    // searches multiple candidate locations (profile rootfs, app-level
+    // rootfs, system/lib64 subdirs) -- see `hook_library_candidates` for
+    // the rationale (RomManager's ensureLibSymlink puts the library at a
+    // different path than `{cfg.rootfs}/<lib>`, which was the original
+    // SIGSEGV-on-boot root cause -- KVM run 31500117235).
+    copy_hook_library_to_dev(
+        &cfg,
+        "libgetpid_hook.so",
+        "/dev/libgetpid_hook.so",
+        "LD_PRELOAD will fail",
+    );
 
-    // Copy libtwoyi_loader_shlib.so to /dev/ (same pattern as libgetpid_hook.so)
-    // This is the seccomp/SIGSYS virtualization library.
-    // ALSO copied to /dev/ (tmpfs) for the same SELinux reason as above.
-    let loader_src = format!("{}/libtwoyi_loader_shlib.so", cfg.rootfs);
-    let loader_dst = "/dev/libtwoyi_loader_shlib.so".to_string();
-    if Path::new(&loader_src).exists() {
-        match std::fs::copy(&loader_src, &loader_dst) {
-            Ok(_) => {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&loader_dst, std::fs::Permissions::from_mode(0o644));
-                info!(
-                    "[KR64] PARENT: copied libtwoyi_loader_shlib.so {} -> {}",
-                    loader_src, loader_dst
-                );
-            }
-            Err(e) => {
-                error!(
-                    "[KR64] PARENT: failed to copy libtwoyi_loader_shlib.so {} -> {}: {}",
-                    loader_src, loader_dst, e
-                );
-            }
-        }
-    } else {
-        info!("[KR64] PARENT: libtwoyi_loader_shlib.so not found at {} -- seccomp virtualization disabled", loader_src);
-    }
+    // Copy libtwoyi_loader_shlib.so to /dev/ (same multi-path search as
+    // libgetpid_hook.so). This is the seccomp/SIGSYS virtualization
+    // library. ALSO copied to /dev/ (tmpfs) for the same SELinux reason
+    // as above.
+    copy_hook_library_to_dev(
+        &cfg,
+        "libtwoyi_loader_shlib.so",
+        "/dev/libtwoyi_loader_shlib.so",
+        "seccomp virtualization disabled",
+    );
 
     // Change SELinux label of /dev/lib*.so to system_file so that
     // vendor_init subcontexts can access them.
@@ -2210,5 +2264,115 @@ mod tests {
         // the "no children" condition. This is a smoke test.
         clear_zombie_processes();
         // If we get here without panicking, the test passes.
+    }
+
+    /// `hook_library_candidates` must include all 4 candidate paths in
+    /// the documented priority order, including the app-level rootfs
+    /// path that RomManager's `ensureLibSymlink` ACTUALLY uses (which
+    /// is NOT the same as `cfg.rootfs` for per-profile rootfs).
+    #[test]
+    fn hook_library_candidates_includes_all_four_paths_in_order() {
+        let cfg = Config {
+            rootfs: "/data/data/io.twoyi/profiles/default/rootfs".to_string(),
+            data_dir: "/data/data/io.twoyi".to_string(),
+            ..Config::default()
+        };
+        let cands = hook_library_candidates(&cfg, "libgetpid_hook.so");
+        assert_eq!(cands.len(), 4);
+        // 1. Direct rootfs (historical fallback).
+        assert_eq!(
+            cands[0],
+            "/data/data/io.twoyi/profiles/default/rootfs/libgetpid_hook.so"
+        );
+        // 2. Profile rootfs system/lib64 (RomManager per-profile symlink).
+        assert_eq!(
+            cands[1],
+            "/data/data/io.twoyi/profiles/default/rootfs/system/lib64/libgetpid_hook.so"
+        );
+        // 3. App-level rootfs system/lib64 -- the CONFIRMED working path
+        //    from logcat (ensureLibSymlink target).
+        assert_eq!(
+            cands[2],
+            "/data/data/io.twoyi/rootfs/system/lib64/libgetpid_hook.so"
+        );
+        // 4. App-level rootfs root (alternative).
+        assert_eq!(cands[3], "/data/data/io.twoyi/rootfs/libgetpid_hook.so");
+    }
+
+    /// `hook_library_candidates` must use the passed-in library name
+    /// verbatim (so the same function works for both libgetpid_hook.so
+    /// and libtwoyi_loader_shlib.so).
+    #[test]
+    fn hook_library_candidates_uses_passed_lib_name() {
+        let cfg = Config {
+            rootfs: "/r".to_string(),
+            data_dir: "/d".to_string(),
+            ..Config::default()
+        };
+        let cands = hook_library_candidates(&cfg, "libtwoyi_loader_shlib.so");
+        assert_eq!(cands.len(), 4);
+        assert!(cands
+            .iter()
+            .all(|p| p.ends_with("/libtwoyi_loader_shlib.so")));
+        // Sanity: every candidate embeds either /r or /d as the base.
+        assert!(cands
+            .iter()
+            .all(|p| p.starts_with("/r/") || p.starts_with("/d/")));
+    }
+
+    /// `copy_hook_library_to_dev` must log all checked paths and return
+    /// false when none of the candidates exist on disk. We point it at a
+    /// non-existent rootfs/data_dir so every candidate is missing.
+    #[test]
+    fn copy_hook_library_to_dev_returns_false_when_not_found() {
+        let cfg = Config {
+            rootfs: "/nonexistent-twoyi-rootfs-xyz".to_string(),
+            data_dir: "/nonexistent-twoyi-data-xyz".to_string(),
+            ..Config::default()
+        };
+        let ok = copy_hook_library_to_dev(
+            &cfg,
+            "libgetpid_hook.so",
+            "/tmp/twoyi-test-hook-should-not-exist.so",
+            "test-not-found",
+        );
+        assert!(!ok);
+        // Destination must NOT have been created.
+        assert!(!Path::new("/tmp/twoyi-test-hook-should-not-exist.so").exists());
+    }
+
+    /// `copy_hook_library_to_dev` must find and copy the library when a
+    /// candidate path DOES exist. We create a temp file at candidate #3
+    /// (the confirmed RomManager path) and verify it gets copied to the
+    /// destination.
+    #[test]
+    fn copy_hook_library_to_dev_finds_and_copies_when_candidate_exists() {
+        // Build a temp dir mimicking {data_dir}/rootfs/system/lib64/<lib>.
+        let tmp = std::env::temp_dir().join("twoyi-hook-copy-test");
+        let lib64 = tmp.join("rootfs/system/lib64");
+        std::fs::create_dir_all(&lib64).unwrap();
+        let src = lib64.join("libgetpid_hook.so");
+        std::fs::write(&src, b"fake ELF content").unwrap();
+
+        let cfg = Config {
+            // Point rootfs somewhere the lib does NOT live, so candidate
+            // #1 and #2 miss and we fall through to candidate #3.
+            rootfs: tmp
+                .join("nonexistent-profile-rootfs")
+                .to_string_lossy()
+                .into_owned(),
+            data_dir: tmp.to_string_lossy().into_owned(),
+            ..Config::default()
+        };
+        let dst = tmp.join("copied-libgetpid_hook.so");
+        let dst_str = dst.to_string_lossy().to_string();
+        let ok = copy_hook_library_to_dev(&cfg, "libgetpid_hook.so", &dst_str, "test-found");
+        assert!(ok, "expected copy to succeed via candidate #3");
+        assert!(dst.exists(), "destination file should exist after copy");
+        let content = std::fs::read_to_string(&dst).unwrap();
+        assert_eq!(content, "fake ELF content");
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
