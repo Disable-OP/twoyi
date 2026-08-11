@@ -608,3 +608,21 @@ that depends on vold doing real work.
 
 **Current blocker:** libprocessgroup's mkdir for /acct/uid_0/pid_<PID>
 isn't translated — either PLT hook not called or chown fails after mkdir.
+
+### vold stderr capture — root cause identified
+### Timestamp UTC: 2026-08-11 ~08:20
+
+**Finding from AOSP vold main.cpp source:**
+- vold's LOG(ERROR) goes to logd via LogdLogger
+- logd is unavailable in vold's process (socket may not exist)
+- Error messages before exit(1) are silently dropped
+- vold's main() DOES run (selinux_android_file_context_handle succeeds)
+- But exits(1) after that — likely at VolumeManager::Instance() or vm->start()
+- Error message lost because LogdLogger can't connect to logd
+
+**Root cause:** vold's error output goes to logd, not stderr.
+ANDROID_PRINTF_LOG=stderr doesn't help because InitLogging sets
+LogdLogger which bypasses ANDROID_PRINTF_LOG.
+
+**Fix needed:** Hook __android_log_buf_write to write to stderr as
+fallback when logd is unavailable.
