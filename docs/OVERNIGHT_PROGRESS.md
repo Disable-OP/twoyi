@@ -576,3 +576,20 @@ Boot verdict:
 - Zygote service starts (triggered by "on boot" or property trigger)
 - If abort hooks were needed, InitFatalReboot will return and we'll know
   the real cause
+
+### vdc exit(0) + crypto props revert — init still stuck at post-fs-data
+### Timestamp UTC: 2026-08-11 ~04:15
+
+**KVM run 31457391408 (commit 49ec461):**
+- vold exit(0): WORKS (26 times)
+- vdc exit(0): WORKS (2 times)
+- wait_for_keymaster exit(0): WORKS
+- NO InitFatalReboot, NO crashes
+- Init reaches post-fs-data (init.rc:540) but never progresses to boot/zygote-start
+- Crypto property pre-sets were reverted (caused SIGABRT regression)
+- Rootfs symlink flake fix works (b1e68aa)
+- Loader build fix works (d2c864e) — loader is present in APK
+
+**Current blocker:** Init stuck at post-fs-data — need to identify which
+command at init.rc:734+ is blocking. Likely an exec_start or wait_for_prop
+that depends on vold doing real work.
