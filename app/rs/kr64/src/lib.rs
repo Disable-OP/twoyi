@@ -1264,23 +1264,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             continue;
         }
 
-        // Check if the destination is already a real file (not a
-        // broken symlink). If so, skip — don't overwrite.
-        if let Ok(meta) = std::fs::metadata(&dst) {
-            if meta.is_file() {
-                continue; // Real file already exists, skip
+        // Check if the destination is a SYMLINK. If so, we MUST
+        // replace it with a real file copy — the symlink likely points
+        // into /apex/ which will be EMPTY after pivot_root.
+        //
+        // CRITICAL: do NOT use std::fs::metadata() here — it follows
+        // symlinks, so a symlink to /apex/... would look like a "real
+        // file" (because /apex/ is accessible BEFORE pivot_root) and
+        // we'd skip the copy. After pivot_root the symlink breaks and
+        // the linker crashes at 0x86 (NULL soinfo).
+        //
+        // symlink_metadata does NOT follow symlinks — if the dest is
+        // a symlink (even one that currently resolves), we replace it.
+        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
+            if meta.file_type().is_symlink() {
+                // Remove the symlink so we can create a real file.
+                let _ = std::fs::remove_file(&dst);
+            } else if meta.is_file() {
+                // Real file already exists, skip.
+                continue;
             }
         }
 
-        // Copy the file. This replaces broken symlinks (which fail
-        // metadata()) with real files.
+        // Copy the file. This creates a real file (not a symlink).
         match std::fs::copy(&src, &dst) {
             Ok(bytes) => {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
                 bionic_copied += 1;
                 info!(
-                    "[KR64] PARENT: copied bionic {} ({} bytes) {} -> {} (BEFORE pivot_root)",
+                    "[KR64] PARENT: copied bionic {} ({} bytes) {} -> {} (BEFORE pivot_root, replaced symlink)",
                     lib_name, bytes, src, dst
                 );
             }
@@ -1325,8 +1338,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         if !Path::new(&src).exists() {
             continue;
         }
-        if let Ok(meta) = std::fs::metadata(&dst) {
-            if meta.is_file() {
+        // Same symlink-aware check as the bionic libs above:
+        // use symlink_metadata to detect symlinks that point into
+        // /apex/ (which will be empty after pivot_root).
+        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
+            if meta.file_type().is_symlink() {
+                let _ = std::fs::remove_file(&dst);
+            } else if meta.is_file() {
                 continue;
             }
         }
@@ -1336,7 +1354,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644));
                 apex_copied += 1;
                 info!(
-                    "[KR64] PARENT: copied apex {} ({} bytes) {} -> {} (BEFORE pivot_root)",
+                    "[KR64] PARENT: copied apex {} ({} bytes) {} -> {} (BEFORE pivot_root, replaced symlink)",
                     lib_name, bytes, src, dst
                 );
             }
