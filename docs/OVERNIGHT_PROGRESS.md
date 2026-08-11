@@ -593,3 +593,18 @@ Boot verdict:
 **Current blocker:** Init stuck at post-fs-data — need to identify which
 command at init.rc:734+ is blocking. Likely an exec_start or wait_for_prop
 that depends on vold doing real work.
+
+### Pre-create directories fix — init reaches post-fs-data, vold loop blocks zygote
+### Timestamp UTC: 2026-08-11 ~06:40
+
+**KVM run 31465198017 (commit 3320d24):**
+- Pre-create directories: WORKS (lstat(/acct/uid) succeeds)
+- Init reaches post-fs-data (furthest ever)
+- NO SIGABRT (ro.crypto.state reverted)
+- BUT: vold restart loop blocks init — createProcessGroup fails
+  because /acct/uid_0/pid_<PID> can't be created
+- vold.decrypt trigger does NOT fire
+- Zygote does NOT start
+
+**Current blocker:** libprocessgroup's mkdir for /acct/uid_0/pid_<PID>
+isn't translated — either PLT hook not called or chown fails after mkdir.
