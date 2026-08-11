@@ -593,9 +593,16 @@ fi
 # This is a diagnostic mode: init will exit 31 (getpid != 1), but if it
 # exits 31 instead of SIGSEGV, we know the linker can load init without
 # the hook. Set TWOYI_SKIP_PRELOAD=1 in the CI env to test.
+#
+# TWOYI_LD_DEBUG: when set, kr64 propagates it as LD_DEBUG to the guest
+# init. This enables bionic linker debug output (which library is being
+# loaded when the crash happens). The output goes to stderr (captured in
+# kr64-stderr.log). Default is "2" (libs level — library load/unload).
+# Set TWOYI_LD_DEBUG=0 in the CI env to disable.
 SKIP_PRELOAD_ENV="${TWOYI_SKIP_PRELOAD:-}"
 INIT_PATH_OVERRIDE="${TWOYI_INIT_PATH:-}"
 NO_NAMESPACES_ENV="${TWOYI_NO_NAMESPACES:-}"
+LD_DEBUG_ENV="${TWOYI_LD_DEBUG:-2}"
 if [ -n "$NO_NAMESPACES_ENV" ]; then
     echo "  → pre-launching kr64 as root (TWOYI_NO_NAMESPACES=1, no pivot_root/chroot)"
 elif [ -n "$SKIP_PRELOAD_ENV" ]; then
@@ -608,6 +615,7 @@ fi
 "$ADB_BIN" -s emulator-5554 shell "
     export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
     ${SKIP_PRELOAD_ENV:+export TWOYI_SKIP_PRELOAD=1}
+    export TWOYI_LD_DEBUG=$LD_DEBUG_ENV
     /data/local/tmp/kr64 \
         --rootfs $TWOYI_PROFILE \
         --data-dir /data/user/0/io.twoyi \
