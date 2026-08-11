@@ -857,8 +857,8 @@ for i in 5 15 30 60; do
     fi
     SLEEP=$((i - PREV))
     sleep "$SLEEP"
-    "$ADB_BIN" -s emulator-5554 exec-out screencap -p \
-        > "$ARTIFACT_DIR/screenshot-${i}s.png"
+    timeout 10 "$ADB_BIN" -s emulator-5554 exec-out screencap -p \
+        > "$ARTIFACT_DIR/screenshot-${i}s.png" 2>/dev/null || true
     SIZE=$(stat -c%s "$ARTIFACT_DIR/screenshot-${i}s.png" 2>/dev/null || echo 0)
     echo "  ✓ screenshot-${i}s.png (${SIZE} bytes)"
     PREV=$i
@@ -868,9 +868,19 @@ done
 if [ "$BOOT_WAIT_SECONDS" -gt 60 ]; then
     REMAINDER=$((BOOT_WAIT_SECONDS - 60))
     sleep "$REMAINDER"
-    "$ADB_BIN" -s emulator-5554 exec-out screencap -p \
-        > "$ARTIFACT_DIR/screenshot-${BOOT_WAIT_SECONDS}s.png"
+    timeout 10 "$ADB_BIN" -s emulator-5554 exec-out screencap -p \
+        > "$ARTIFACT_DIR/screenshot-${BOOT_WAIT_SECONDS}s.png" 2>/dev/null || true
     echo "  ✓ screenshot-${BOOT_WAIT_SECONDS}s.png"
+fi
+
+# TWRP MODE: kill kr64 after the boot wait so the script can continue
+# to capture logs. In TWRP mode, kr64 + the guest init run indefinitely
+# (TWRP's recovery service never exits), which would cause the script
+# to hang forever waiting for kr64 to exit.
+if [ "$TWRP_MODE" = "1" ]; then
+    echo "  → TWRP mode: killing kr64 + guest init to continue log capture..."
+    timeout 5 "$ADB_BIN" -s emulator-5554 shell "kill \$(cat /data/local/tmp/kr64.pid 2>/dev/null) 2>/dev/null; pkill -f '/data/local/tmp/kr64' 2>/dev/null" 2>/dev/null || true
+    sleep 2
 fi
 
 # Stop logcat
