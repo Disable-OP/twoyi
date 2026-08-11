@@ -705,54 +705,133 @@ fn candidate_exists_with_diagnostics(path: &str) -> bool {
     false
 }
 
+/// Search for a hook library using the candidate paths returned by
+/// [`hook_library_candidates`], find the first one that exists, and
+/// READ ITS CONTENT INTO MEMORY.
+///
+/// Returns `Some((source_path, content))` on success, or `None` if no
+/// candidate exists (in which case ALL checked paths are logged).
+///
+/// This is the "read" phase of the hook-library copy, split out from
+/// [`copy_hook_library_to_dev`] so that the read can happen BEFORE
+/// `setup_mounts` (pivot_root) while host filesystem paths are still
+/// accessible, and the write can happen AFTER `setup_mounts` when
+/// `/dev/` is the tmpfs that survives pivot_root.
+///
+/// # Why this split exists
+///
+/// Before pivot_root, the hook library source paths are reachable:
+///   - `{cfg.rootfs}/system/lib64/<lib>` (a symlink into `/data/app/...`)
+///   - `{cfg.data_dir}/rootfs/system/lib64/<lib>` (same symlink)
+///   - `/data/app/~~<random>/io.twoyi-<random>/lib/<abi>/<lib>` (canonical)
+///
+/// After pivot_root + `umount2(/old_root, MNT_DETACH)`, ALL of these
+/// host paths are gone — the process is in the rootfs jail. So the
+/// search + read MUST happen before `setup_mounts`. See KVM run
+/// 31503063598: the search ran AFTER pivot_root and all 4 symlink
+/// candidates + the APK scan returned nothing (host paths unreachable),
+/// LD_PRELOAD was empty, and init crashed with SIGSEGV (signal 11).
+fn find_and_read_hook_library(
+    cfg: &Config,
+    lib_name: &str,
+    not_found_msg: &str,
+) -> Option<(String, Vec<u8>)> {
+    let candidates = hook_library_candidates(cfg, lib_name);
+    for p in &candidates {
+        if candidate_exists_with_diagnostics(p) {
+            match std::fs::read(p) {
+                Ok(content) => {
+                    info!(
+                        "[KR64] PARENT: read {} ({} bytes) from {} (BEFORE pivot_root)",
+                        lib_name,
+                        content.len(),
+                        p
+                    );
+                    return Some((p.clone(), content));
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PARENT: candidate {} exists but read failed: {} -- trying next",
+                        p,
+                        e
+                    );
+                    // Fall through to the next candidate.
+                }
+            }
+        }
+    }
+    error!(
+        "[KR64] PARENT: {} not found in any of {} candidate locations -- {}",
+        lib_name,
+        candidates.len(),
+        not_found_msg
+    );
+    for c in &candidates {
+        error!("[KR64] PARENT:   checked: {}", c);
+    }
+    None
+}
+
+/// Write hook-library bytes to `/dev/<lib>` (tmpfs) and chmod 0644.
+///
+/// This is the "write" phase of the hook-library copy. It MUST be called
+/// AFTER `setup_mounts` (pivot_root), so `/dev/` is the tmpfs mounted by
+/// `setup_mounts` (which survives pivot_root because it's a mount in the
+/// new mount namespace). Writing to `/dev/` BEFORE pivot_root would
+/// target the host's `/dev/` tmpfs, which is detached by
+/// `umount2(/old_root, MNT_DETACH)` and would NOT be visible inside the
+/// rootfs jail.
+///
+/// The content was read into memory by [`find_and_read_hook_library`]
+/// BEFORE pivot_root (while host paths were accessible). See the long
+/// comment in `run()` for the full SELinux rationale (why /dev/ tmpfs
+/// is required instead of `{rootfs}/dev/` app_data_file).
+///
+/// Returns `true` on success, `false` on write failure (logged).
+fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::write(dst, content) {
+        Ok(_) => {
+            let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644));
+            info!(
+                "[KR64] PARENT: wrote {} ({} bytes) {} -> {} (AFTER pivot_root, tmpfs)",
+                lib_name,
+                content.len(),
+                src,
+                dst
+            );
+            true
+        }
+        Err(e) => {
+            error!(
+                "[KR64] PARENT: failed to write {} {} -> {}: {}",
+                lib_name, src, dst, e
+            );
+            false
+        }
+    }
+}
+
 /// Copies a hook library into `/dev/` (tmpfs) so the guest can use it.
 ///
-/// Searches the candidate paths returned by [`hook_library_candidates`]
-/// in order and uses the first one that exists. If none exist, logs ALL
-/// the paths that were checked (so the next debugging cycle has better
-/// diagnostics than the old single-path lookup).
+/// This is a convenience wrapper around [`find_and_read_hook_library`]
+/// (read phase) + [`write_hook_library_to_dev`] (write phase), kept for
+/// test compatibility and for any caller that does NOT need to split
+/// the read and write across the pivot_root boundary.
 ///
-/// The destination must always be on the HOST's `/dev/` tmpfs (NOT
-/// `{rootfs}/dev/`), because init second-stage forks subcontexts
-/// running as `u:r:vendor_init:s0` which are DENIED search access to
-/// `app_data_file` directories. See the long comment in `run()` for
-/// the full SELinux rationale.
+/// In `run()`, the read and write are split: the read happens BEFORE
+/// `setup_mounts` (while host paths are accessible), and the write
+/// happens AFTER `setup_mounts` (when `/dev/` is the tmpfs). This split
+/// is REQUIRED — see [`find_and_read_hook_library`] for why.
 ///
 /// Returns `true` if the library was copied successfully, `false` if
 /// not found or the copy failed (the error is already logged).
+#[allow(dead_code)] // kept for test compatibility; run() uses the split find+write flow
 fn copy_hook_library_to_dev(cfg: &Config, lib_name: &str, dst: &str, not_found_msg: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let candidates = hook_library_candidates(cfg, lib_name);
-    match candidates
-        .iter()
-        .find(|p| candidate_exists_with_diagnostics(p))
-    {
-        Some(src) => match std::fs::copy(src, dst) {
-            Ok(_) => {
-                let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644));
-                info!("[KR64] PARENT: copied {} {} -> {}", lib_name, src, dst);
-                true
-            }
-            Err(e) => {
-                error!(
-                    "[KR64] PARENT: failed to copy {} {} -> {}: {}",
-                    lib_name, src, dst, e
-                );
-                false
-            }
-        },
-        None => {
-            error!(
-                "[KR64] PARENT: {} not found in any of {} candidate locations -- {}",
-                lib_name,
-                candidates.len(),
-                not_found_msg
-            );
-            for c in &candidates {
-                error!("[KR64] PARENT:   checked: {}", c);
-            }
-            false
-        }
+    if let Some((src, content)) = find_and_read_hook_library(cfg, lib_name, not_found_msg) {
+        write_hook_library_to_dev(lib_name, &src, &content, dst)
+    } else {
+        false
     }
 }
 
@@ -1020,6 +1099,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     // ---------------------------------------------------------------
+    // Step 3.6: read hook libraries into memory BEFORE setup_mounts.
+    //
+    // After pivot_root (in setup_mounts, Step 4 below), all host
+    // filesystem paths become unreachable -- /data/app/*,
+    // /data/user/0/io.twoyi/*, and the symlinks under
+    // {cfg.rootfs}/system/lib64/ (which point into /data/app/) all
+    // disappear from the rootfs jail. The hook libraries live at these
+    // host paths, so we MUST read them into memory NOW, before
+    // setup_mounts.
+    //
+    // The write to /dev/ happens AFTER setup_mounts (Step 4.6 below),
+    // when /dev/ is the tmpfs mounted by setup_mounts. That tmpfs
+    // survives pivot_root and is visible inside the jail at
+    // /dev/libgetpid_hook.so and /dev/libtwoyi_loader_shlib.so — exactly
+    // where LD_PRELOAD expects them.
+    //
+    // This split fixes the CRITICAL ordering bug from KVM run 31503063598:
+    // the hook library copy was happening AFTER pivot_root, so all
+    // candidate source paths were unreachable, LD_PRELOAD was empty,
+    // and init crashed with SIGSEGV (signal 11).
+    // ---------------------------------------------------------------
+    let hook_lib_getpid =
+        find_and_read_hook_library(&cfg, "libgetpid_hook.so", "LD_PRELOAD will fail");
+    let hook_lib_loader = find_and_read_hook_library(
+        &cfg,
+        "libtwoyi_loader_shlib.so",
+        "seccomp virtualization disabled",
+    );
+
+    // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
     // ---------------------------------------------------------------
     // The parent calls setup_mounts() BEFORE fork(). This does:
@@ -1067,6 +1176,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     } else {
         info!("[KR64] use_namespaces=false -- skipping setup_mounts (chroot only)");
     }
+
+    // ---------------------------------------------------------------
+    // Path prefix for post-pivot_root operations.
+    //
+    // After pivot_root (use_namespaces=true), the parent's root IS
+    // {cfg.rootfs}, so {cfg.rootfs}/system/bin/init is UNREACHABLE (it
+    // would resolve to /data/data/io.twoyi/rootfs/system/bin/init INSIDE
+    // the new root, which doesn't exist). All post-setup_mounts
+    // operations MUST use chroot-relative paths (e.g. /system/bin/init)
+    // which resolve through the bind mounts set up by setup_mounts.
+    //
+    // When use_namespaces=false (no pivot_root, or pivot_root failed
+    // and we fell back to chroot-only), {cfg.rootfs}/... host paths are
+    // still correct.
+    //
+    // We define `rootfs_prefix` once here and use it in all subsequent
+    // path-formatted strings. `format!("{}/...", rootfs_prefix)` gives
+    // `/...` when use_namespaces=true (chroot-relative) or
+    // `{cfg.rootfs}/...` when use_namespaces=false (host path).
+    // ---------------------------------------------------------------
+    let rootfs_prefix: String = if cfg.use_namespaces {
+        String::new()
+    } else {
+        cfg.rootfs.clone()
+    };
 
     // ---------------------------------------------------------------
     // Step 4.5: create a PID namespace so the guest init becomes PID 1.
@@ -1179,11 +1313,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
-    // Copy libgetpid_hook.so to /dev/ (tmpfs) so the child can use
+    // Write hook libraries to /dev/ (tmpfs) so the child can use
     // LD_PRELOAD=/dev/libgetpid_hook.so.
     //
-    // IMPORTANT: Always copy to the HOST's /dev/ (tmpfs), NOT to
-    // {rootfs}/dev/ (app_data_file on ext4). This is critical because:
+    // The library CONTENT was read into memory BEFORE setup_mounts
+    // (Step 3.6 above), while host filesystem paths were still
+    // accessible. Now, AFTER setup_mounts (pivot_root), /dev/ is the
+    // tmpfs mounted by setup_mounts — writing here places the libraries
+    // on the tmpfs that survives pivot_root and is visible inside the
+    // jail at /dev/libgetpid_hook.so (exactly where LD_PRELOAD expects).
+    //
+    // IMPORTANT: Always write to /dev/ (tmpfs), NOT to {rootfs}/dev/
+    // (app_data_file on ext4). This is critical for SELinux:
     //   - Init second stage forks subcontexts running as u:r:vendor_init:s0
     //   - vendor_init is DENIED search access to app_data_file directories
     //     (per SELinux policy: avc denied { search } for name="io.twoyi"
@@ -1192,29 +1333,23 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //     subcontext's linker can't find them → "CANNOT LINK EXECUTABLE"
     //   - /dev/ (tmpfs) is accessible to ALL domains (labeled tmpfs)
     //
-    // The source path is found by `copy_hook_library_to_dev`, which
-    // searches multiple candidate locations (profile rootfs, app-level
-    // rootfs, system/lib64 subdirs) -- see `hook_library_candidates` for
-    // the rationale (RomManager's ensureLibSymlink puts the library at a
-    // different path than `{cfg.rootfs}/<lib>`, which was the original
-    // SIGSEGV-on-boot root cause -- KVM run 31500117235).
-    copy_hook_library_to_dev(
-        &cfg,
-        "libgetpid_hook.so",
-        "/dev/libgetpid_hook.so",
-        "LD_PRELOAD will fail",
-    );
-
-    // Copy libtwoyi_loader_shlib.so to /dev/ (same multi-path search as
-    // libgetpid_hook.so). This is the seccomp/SIGSYS virtualization
-    // library. ALSO copied to /dev/ (tmpfs) for the same SELinux reason
-    // as above.
-    copy_hook_library_to_dev(
-        &cfg,
-        "libtwoyi_loader_shlib.so",
-        "/dev/libtwoyi_loader_shlib.so",
-        "seccomp virtualization disabled",
-    );
+    // If a library was not found in the pre-pivot read, the
+    // corresponding Option is None and we skip the write (the error
+    // was already logged by find_and_read_hook_library with the full
+    // list of checked paths). LD_PRELOAD will still reference the path
+    // — the child will log "libgetpid_hook.so NOT found at /dev/" and
+    // init will crash, but with clear diagnostics.
+    if let Some((src, content)) = &hook_lib_getpid {
+        write_hook_library_to_dev("libgetpid_hook.so", src, content, "/dev/libgetpid_hook.so");
+    }
+    if let Some((src, content)) = &hook_lib_loader {
+        write_hook_library_to_dev(
+            "libtwoyi_loader_shlib.so",
+            src,
+            content,
+            "/dev/libtwoyi_loader_shlib.so",
+        );
+    }
 
     // Change SELinux label of /dev/lib*.so to system_file so that
     // vendor_init subcontexts can access them.
@@ -1332,7 +1467,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         ];
 
         for binary in &critical_binaries {
-            let src = format!("{}/{}", cfg.rootfs, binary);
+            let src = format!("{}/{}", rootfs_prefix, binary);
             let binary_name = std::path::Path::new(binary)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1360,8 +1495,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // This ensures any HAL service can be exec'd without hitting
         // the data partition's noexec restriction.
         for hw_dir in &[
-            format!("{}/system/bin/hw", cfg.rootfs),
-            format!("{}/vendor/bin/hw", cfg.rootfs),
+            format!("{}/system/bin/hw", rootfs_prefix),
+            format!("{}/vendor/bin/hw", rootfs_prefix),
         ] {
             if let Ok(entries) = std::fs::read_dir(hw_dir) {
                 for entry in entries.flatten() {
@@ -1393,7 +1528,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // host's servicemanager already claimed that role on the shared
     // /dev/binder device.
     {
-        let binderfs_dir = format!("{}/dev/binderfs", cfg.rootfs);
+        let binderfs_dir = format!("{}/dev/binderfs", rootfs_prefix);
         let _ = std::fs::create_dir_all(&binderfs_dir);
 
         // Mount binderfs
@@ -1419,7 +1554,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // {rootfs}/dev/binder, and the symlink {rootfs}/dev/binder ->
             // binderfs/binder resolves to {rootfs}/dev/binderfs/binder.
             for name in &["binder", "hwbinder", "vndbinder"] {
-                let link_path = format!("{}/dev/{}", cfg.rootfs, name);
+                let link_path = format!("{}/dev/{}", rootfs_prefix, name);
                 let target = format!("binderfs/{}", name); // RELATIVE path
                                                            // Remove existing file/symlink/socket at this path.
                                                            // remove_file works for files, symlinks, and sockets.
@@ -1475,7 +1610,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // for any process that still can't open them.
             use std::os::unix::fs::PermissionsExt;
             for name in &["binder", "hwbinder", "vndbinder"] {
-                let dev_path = format!("{}/dev/binderfs/{}", cfg.rootfs, name);
+                let dev_path = format!("{}/dev/binderfs/{}", rootfs_prefix, name);
                 match std::fs::set_permissions(&dev_path, std::fs::Permissions::from_mode(0o666)) {
                     Ok(_) => info!(
                         "[KR64] PARENT: chmod 0666 {} (binderfs device world-accessible)",
@@ -1506,7 +1641,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // Fallback: try to use the host's binder device directly
             // by creating symlinks to the host's /dev/binder
             for name in &["binder", "hwbinder", "vndbinder"] {
-                let link_path = format!("{}/dev/{}", cfg.rootfs, name);
+                let link_path = format!("{}/dev/{}", rootfs_prefix, name);
                 let target = format!("/dev/{}", name);
                 let _ = std::fs::remove_file(&link_path);
                 let _ = std::os::unix::fs::symlink(&target, &link_path);
@@ -1548,7 +1683,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "dev/block/by-name",
             "dev/block/dm-5",
         ] {
-            let path = format!("{}/{}", cfg.rootfs, dir);
+            let path = format!("{}/{}", rootfs_prefix, dir);
             let _ = std::fs::create_dir_all(&path);
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777));
         }
@@ -1581,7 +1716,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // so the stubs are on the tmpfs and survive pivot_root. The guest
     // init's own mount("tmpfs", "/dev") is no-op'd by the loader's
     // emu_mount hook, so the stubs remain visible to the guest.
-    if let Err(e) = devices::create_graphics_device_stubs(&cfg.rootfs) {
+    if let Err(e) = devices::create_graphics_device_stubs(&rootfs_prefix) {
         warning!(
             "[KR64] PARENT: failed to create graphics device stubs: {} (non-fatal — guest may see ENOENT on graphics paths)",
             e
@@ -1605,9 +1740,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // (EBUSY) in our container → InitFatalReboot. With an empty fstab init
     // skips first_stage_mount naturally; vold proceeds with an empty fstab.
     {
-        let fstab_path = format!("{}/vendor/etc/fstab.ranchu", cfg.rootfs);
+        let fstab_path = format!("{}/vendor/etc/fstab.ranchu", rootfs_prefix);
         let fstab_content = "# Minimal fstab for twoyi virtualization\n/dev/null /system ext4 ro wait\n/dev/null /vendor ext4 ro wait\n/dev/null /data ext4 nosuid,nodev wait,check,formattable,latemount,resize\n";
-        let _ = std::fs::create_dir_all(format!("{}/vendor/etc", cfg.rootfs));
+        let _ = std::fs::create_dir_all(format!("{}/vendor/etc", rootfs_prefix));
         let _ = std::fs::write(&fstab_path, fstab_content);
         info!("[KR64] PARENT: overwrote fstab.ranchu with minimal stub");
     }
@@ -1711,7 +1846,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
         // Pre-create the directory + files in the rootfs too
-        let rootfs_prop_dir = format!("{}/dev/__properties__", cfg.rootfs);
+        let rootfs_prop_dir = format!("{}/dev/__properties__", rootfs_prefix);
         let _ = std::fs::create_dir_all(&rootfs_prop_dir);
         let _ = std::fs::set_permissions(&rootfs_prop_dir, std::fs::Permissions::from_mode(0o777));
         for fname in &["property_info", "properties_serial"] {
@@ -1965,7 +2100,34 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // format!() -- the format! allocation happens BEFORE execve, so
         // it's safe (we're not yet racing the post-fork window for the
         // allocator lock on this short, single-thread-of-control path).
-        let twoyi_rootfs_env = match CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs)) {
+        //
+        // TWOYI_ROOTFS value: after pivot_root (use_namespaces=true), the
+        // process is chrooted into the rootfs — paths like /system/lib/foo.so
+        // resolve through the bind mounts and do NOT need to be prefixed
+        // with the host rootfs path. Setting TWOYI_ROOTFS="/" makes the
+        // loader's should_translate() guard (strncmp(path, g_rootfs, strlen))
+        // match ALL absolute paths (since every absolute path starts with
+        // "/"), which disables path translation entirely. This is the
+        // CORRECT behaviour after pivot_root: the loader's translation
+        // (prepending the host rootfs path) would make every path
+        // UNREACHABLE inside the jail.
+        //
+        // Why "/" instead of "": the loader's clearenv hook only restores
+        // TWOYI_ROOTFS if g_rootfs_env[0] is non-zero. An empty string
+        // would NOT be restored after init's clearenv(), causing the
+        // loader to fall back to the default "/data/data/io.twoyi/rootfs"
+        // (the host path), which is unreachable. "/" is restored
+        // correctly and keeps translation disabled.
+        //
+        // When use_namespaces=false (no pivot_root), the loader MUST
+        // translate guest paths to host paths, so we pass the full
+        // cfg.rootfs as before.
+        let twoyi_rootfs_value = if cfg.use_namespaces {
+            "/".to_string()
+        } else {
+            cfg.rootfs.clone()
+        };
+        let twoyi_rootfs_env = match CString::new(format!("TWOYI_ROOTFS={}", twoyi_rootfs_value)) {
             Ok(s) => s,
             Err(_) => unsafe {
                 safe_write_err(b"[KR64 CHILD] FATAL: TWOYI_ROOTFS env contains NUL byte\n");
