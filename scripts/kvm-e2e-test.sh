@@ -1076,20 +1076,31 @@ else
     "$ADB_BIN" -s emulator-5554 pull /data/data/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
 fi
 
-# TWRP MODE: pull the TWRP init's stdout/stderr log from /tmp/twrp-init.log
+# TWRP MODE: pull the TWRP init's stdout/stderr log from /twrp-init.log
 # (kr64 redirects the guest init's output there in TWRP boot mode).
+# The file is at the ROOT of the rootfs (NOT /tmp/ which is tmpfs and
+# gets unmounted when kr64 dies).
 if [ "$TWRP_MODE" = "1" ]; then
     echo ""
     echo "── TWRP init log capture ──"
-    # The init runs inside the pivot_root jail, so /tmp/twrp-init.log is
-    # at {rootfs}/tmp/twrp-init.log from the host's perspective.
-    "$ADB_BIN" -s emulator-5554 pull "$TWOYI_PROFILE/tmp/twrp-init.log" "$ARTIFACT_DIR/twrp-init.log" 2>/dev/null || true
+    # The init runs inside the pivot_root jail, so /twrp-init.log is
+    # at {rootfs}/twrp-init.log from the host's perspective.
+    # Try multiple paths — the rootfs might be at different locations.
+    for TWRP_LOG_PATH in \
+        "$TWOYI_PROFILE/twrp-init.log" \
+        "/data/data/io.twoyi/profiles/default/rootfs/twrp-init.log" \
+        "/data/user/0/io.twoyi/rootfs/twrp-init.log"; do
+        "$ADB_BIN" -s emulator-5554 pull "$TWRP_LOG_PATH" "$ARTIFACT_DIR/twrp-init.log" 2>/dev/null && break
+    done
     if [ -f "$ARTIFACT_DIR/twrp-init.log" ] && [ -s "$ARTIFACT_DIR/twrp-init.log" ]; then
         echo "  ✓ twrp-init.log: $(stat -c%s "$ARTIFACT_DIR/twrp-init.log") bytes"
-        echo "  === twrp-init.log (first 50 lines) ==="
-        head -50 "$ARTIFACT_DIR/twrp-init.log"
+        echo "  === twrp-init.log (first 80 lines) ==="
+        head -80 "$ARTIFACT_DIR/twrp-init.log"
     else
         echo "  ⚠ twrp-init.log not found — TWRP init may not have started, or wrote to /dev/kmsg instead"
+        # Also try to find it via adb shell find
+        echo "  → searching for twrp-init.log on device..."
+        timeout 10 "$ADB_BIN" -s emulator-5554 shell "find /data/data/io.twoyi -name 'twrp-init.log' 2>/dev/null" 2>/dev/null || true
     fi
 fi
 
