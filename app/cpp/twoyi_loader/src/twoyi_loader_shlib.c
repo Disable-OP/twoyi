@@ -807,11 +807,15 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 // BINDER_SET_MAX_THREADS = _IOW(0x62, 5, __u32) = 0x40046205
 // BINDER_SET_CONTEXT_MGR = _IOW(0x62, 7, __u32) = 0x40046207
 // BINDER_WRITE_READ = _IOWR(0x62, 1, ...) = 0xc0306201
-// Use the correct ioctl signature for the build host (glibc: unsigned long,
-// bionic: int). We use unsigned long to match glibc (the host build system),
-// and cast to unsigned for comparison so high-bit-set codes match on both.
+// Use the correct ioctl signature for the build target:
+// - bionic (Android NDK): int ioctl(int, int, ...)
+// - glibc (host build): int ioctl(int, unsigned long, ...)
+#ifdef __BIONIC__
+int ioctl(int fd, int request, ...) {
+#else
 int ioctl(int fd, unsigned long request, ...) {
-    static int (*real_ioctl)(int, unsigned long, ...) = NULL;
+#endif
+    static int (*real_ioctl)() = NULL;
     if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
     
     va_list ap;
