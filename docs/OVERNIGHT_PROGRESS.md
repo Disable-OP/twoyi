@@ -626,3 +626,33 @@ LogdLogger which bypasses ANDROID_PRINTF_LOG.
 
 **Fix needed:** Hook __android_log_buf_write to write to stderr as
 fallback when logd is unavailable.
+
+### BINDER_VERSION ioctl number mismatch — ROOT CAUSE FOUND
+### Timestamp UTC: 2026-08-11 ~12:25
+
+**Root cause of vold exit(1): "Binder driver could not be opened"**
+
+The actual BINDER_VERSION ioctl number on this kernel is 0xc0046209,
+NOT 0xc004620d. Our ioctl hook only matched 0xc004620d, so the
+BINDER_VERSION ioctl was never intercepted. The real ioctl was called
+on the binderfs device, which returned -1 (ENOTTY or similar).
+ProcessState::self() then set mDriverFD=-1 and aborted.
+
+**Fix (commit 14e3989):** Match BOTH 0xc004620d and 0xc0046209.
+
+**Evidence from vold stderr:**
+```
+ioctl(fd=5, req=0xc0046209) — binder ioctl    ← BINDER_VERSION (not matched!)
+ioctl(fd=5, req=0x40046205) — binder ioctl    ← BINDER_SET_MAX_THREADS (matched OK)
+ioctl(BINDER_SET_MAX_THREADS) -> success
+```
+
+**Binderfs confirmed working:**
+- binderfs mount: OK (kr64-stderr.log)
+- binderfs entries: binder, hwbinder, vndbinder, binder-control
+- /dev/binder and /dev/hwbinder symlinks: relative, pointing to binderfs/
+- open() succeeds: fd=5 for hwbinder, fd=6 for binder
+- BINDER_SET_CONTEXT_MGR: no longer EBUSY (binderfs gives separate domain)
+
+**Still pending:** KVM test for commit 14e3989 is running (20+ minutes,
+longer than usual). Need to verify vold survives and init progresses.
