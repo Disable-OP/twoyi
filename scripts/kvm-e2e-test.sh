@@ -1066,6 +1066,23 @@ else
     "$ADB_BIN" -s emulator-5554 pull /data/data/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
 fi
 
+# TWRP MODE: pull the TWRP init's stdout/stderr log from /tmp/twrp-init.log
+# (kr64 redirects the guest init's output there in TWRP boot mode).
+if [ "$TWRP_MODE" = "1" ]; then
+    echo ""
+    echo "── TWRP init log capture ──"
+    # The init runs inside the pivot_root jail, so /tmp/twrp-init.log is
+    # at {rootfs}/tmp/twrp-init.log from the host's perspective.
+    "$ADB_BIN" -s emulator-5554 pull "$TWOYI_PROFILE/tmp/twrp-init.log" "$ARTIFACT_DIR/twrp-init.log" 2>/dev/null || true
+    if [ -f "$ARTIFACT_DIR/twrp-init.log" ] && [ -s "$ARTIFACT_DIR/twrp-init.log" ]; then
+        echo "  ✓ twrp-init.log: $(stat -c%s "$ARTIFACT_DIR/twrp-init.log") bytes"
+        echo "  === twrp-init.log (first 50 lines) ==="
+        head -50 "$ARTIFACT_DIR/twrp-init.log"
+    else
+        echo "  ⚠ twrp-init.log not found — TWRP init may not have started, or wrote to /dev/kmsg instead"
+    fi
+fi
+
 # Clean up the emulator
 echo ""
 echo "── Cleanup ──"

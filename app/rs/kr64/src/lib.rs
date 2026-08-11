@@ -2627,6 +2627,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
         // If execve returns at all, it failed. Capture errno BEFORE any
         // other call (any libc call can clobber it) and surface it.
+        //
+        // TWRP BOOT: redirect the guest init's stdout/stderr to
+        // /tmp/twrp-init.log so we can capture its output. TWRP's init
+        // writes to /dev/kmsg by default, but also to stderr in some
+        // code paths. Without this redirect, we'd lose all init output.
+        if cfg.boot_recovery {
+            let log_path = b"/tmp/twrp-init.log\0";
+            let fd = unsafe {
+                libc::open(
+                    log_path.as_ptr() as *const libc::c_char,
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                    0o644,
+                )
+            };
+            if fd >= 0 {
+                unsafe {
+                    libc::dup2(fd, 1); // stdout
+                    libc::dup2(fd, 2); // stderr
+                    libc::close(fd);
+                }
+                unsafe {
+                    safe_write_err(b"[KR64 CHILD] TWRP: redirected stdout/stderr to /tmp/twrp-init.log\n");
+                }
+            } else {
+                unsafe {
+                    safe_write_err(b"[KR64 CHILD] TWRP: WARN could not open /tmp/twrp-init.log for redirect\n");
+                }
+            }
+        }
+
         let _r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };
         let exec_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         unsafe {
