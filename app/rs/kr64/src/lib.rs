@@ -1343,6 +1343,39 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] PARENT: pre-created boot directories in rootfs");
     }
 
+    // Pre-create defensive graphics device stubs in the guest rootfs.
+    //
+    // RATIONALE: Task ID 3's proactive blocker analysis identified
+    // surfaceflinger / graphics HAL init as the SECOND-high-confidence
+    // blocker once zygote + system_server boot. The container currently
+    // provides /dev/qemu_pipe (GL command transport) and /dev/gb,
+    // /dev/gb2 (gralloc sockets — MVP stubs), but does NOT provide any
+    // of the legacy graphics device nodes that AOSP components may probe:
+    //   - /dev/graphics/fb0  (legacy framebuffer)
+    //   - /dev/fb0           (Linux framebuffer)
+    //   - /dev/hwcomposer    (goldfish HWComposer char device)
+    //   - /dev/hwcomposer0   (HWC 1.0 alternate name)
+    //   - /dev/ion           (ION memory allocator)
+    //   - /dev/dri/          (DRM directory)
+    //
+    // We create each as a symlink to /dev/null. This is DEFENSIVE — NOT
+    // fake graphics init. The symlinks convert ENOENT crashes (which
+    // some HALs treat as fatal) into ENOTTY failures (which surfaceflinger
+    // and the HALs handle gracefully by falling back to the next display
+    // path). No ioctls are faked; no errors are suppressed. See
+    // `devices::create_graphics_device_stubs` for the full rationale.
+    //
+    // This must be called AFTER setup_mounts (which mounts tmpfs on /dev)
+    // so the stubs are on the tmpfs and survive pivot_root. The guest
+    // init's own mount("tmpfs", "/dev") is no-op'd by the loader's
+    // emu_mount hook, so the stubs remain visible to the guest.
+    if let Err(e) = devices::create_graphics_device_stubs(&cfg.rootfs) {
+        warning!(
+            "[KR64] PARENT: failed to create graphics device stubs: {} (non-fatal — guest may see ENOENT on graphics paths)",
+            e
+        );
+    }
+
     // Always overwrite /vendor/etc/fstab.ranchu with a minimal stub.
     // The emulator's rootfs tar includes a real fstab.ranchu whose entries
     // reference real block devices (/dev/block/by-name/system, etc.) that

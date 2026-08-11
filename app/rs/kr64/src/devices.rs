@@ -564,6 +564,122 @@ pub fn create_dm_user_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
     })
 }
 
+/// Create graphics device stubs in the guest rootfs.
+///
+/// # Background
+///
+/// Task ID 3's proactive blocker analysis (see `OVERNIGHT_PROGRESS.md`)
+/// identified surfaceflinger / graphics HAL initialisation as the
+/// SECOND-HIGH-confidence blocker once zygote + system_server boot. The
+/// container currently provides `/dev/qemu_pipe` (GL command transport)
+/// and `/dev/gb` / `/dev/gb2` (gralloc sockets — MVP stubs), but does
+/// NOT provide any of the legacy graphics device nodes that AOSP
+/// components may probe during early init:
+///
+///   * `/dev/graphics/fb0` — legacy framebuffer (ranchu/goldfish
+///     SW-composer fallback). Modern Android R uses HWComposer HAL via
+///     binder, but some HAL modules still `open()` fb0 defensively and
+///     crash on `ENOENT`.
+///   * `/dev/fb0` — Linux framebuffer (generic fallback).
+///   * `/dev/hwcomposer` — goldfish HWComposer char device (used by
+///     `hwcomposer.ranchu.so` if loaded).
+///   * `/dev/hwcomposer0` — alternate name (HWC 1.0 convention).
+///   * `/dev/ion` — ION memory allocator (older gralloc).
+///   * `/dev/dri/` — DRM directory (some HALs `opendir`).
+///
+/// # What this function does
+///
+/// Creates each of the above paths in the guest rootfs as a **symlink
+/// to `/dev/null`** (or an empty directory for `/dev/dri/`). This is a
+/// *defensive* measure — NOT fake graphics initialisation:
+///
+///   * `open()` succeeds (returns a fd to `/dev/null`, which the guest
+///     init creates via `mknod` after coldboot — the loader's `emu_mknodat`
+///     hook materialises it as a regular file on the tmpfs).
+///   * `fstat()` reports `S_IFCHR` if `/dev/null` is a char device, or
+///     `S_IFREG` if the loader materialised it as a regular file. Either
+///     way, the caller's subsequent `ioctl()` (e.g. `FBIOGET_VSCREENINFO`)
+///     returns `ENOTTY` — the **real** errno for "not a framebuffer".
+///   * The caller (surfaceflinger, HWComposer HAL, gralloc HAL) sees a
+///     graceful `ENOTTY` / `EINVAL` instead of `ENOENT`, logs a clear
+///     error, and falls back to the next display path (HWComposer HAL →
+///     qemu_pipe → headless). We do NOT suppress the error or return
+///     fake success on any ioctl.
+///
+/// # What this function does NOT do
+///
+///   * Does NOT fake `FBIOGET_VSCREENINFO` / `FBIOGET_FSCREENINFO` —
+///     those ioctls genuinely fail with `ENOTTY`.
+///   * Does NOT provide a working HWComposer — the HWComposer HAL will
+///     still fail to register its binder service if it can't talk to a
+///     real composer device or the `qemu_pipe` "hwcomposer" channel.
+///   * Does NOT make surfaceflinger think it has a display — the stubs
+///     only convert `ENOENT` crashes into `ENOTTY` graceful failures.
+///
+/// # When to call this
+///
+/// Call AFTER `setup_mounts` (which mounts tmpfs on `/dev`), so the
+/// stubs are created on the tmpfs and survive `pivot_root`. The guest's
+/// init's own `mount("tmpfs", "/dev", ...)` is no-op'd by the loader's
+/// `emu_mount` hook (see `twoyi_loader_shlib.c:emu_mount` — returns 0
+/// for `/dev` targets), so the stubs remain visible to the guest.
+pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
+    // Ensure /dev/graphics and /dev/dri directories exist.
+    let graphics_dir = format!("{}/dev/graphics", rootfs);
+    let dri_dir = format!("{}/dev/dri", rootfs);
+    fs::create_dir_all(&graphics_dir)?;
+    fs::create_dir_all(&dri_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&graphics_dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::set_permissions(&dri_dir, fs::Permissions::from_mode(0o755));
+    }
+
+    // Each entry: (path-relative-to-rootfs, symlink-target).
+    // Targets are absolute ("/dev/null") which resolves correctly
+    // inside the pivoted root because /dev/null is created by init's
+    // coldboot (mknod hook materialises it on the tmpfs).
+    let stubs: &[(&str, &str)] = &[
+        ("dev/graphics/fb0", "/dev/null"),
+        ("dev/fb0", "/dev/null"),
+        ("dev/hwcomposer", "/dev/null"),
+        ("dev/hwcomposer0", "/dev/null"),
+        ("dev/ion", "/dev/null"),
+    ];
+
+    for (rel, target) in stubs {
+        let path = format!("{}/{}", rootfs, rel);
+        // Remove any existing file/symlink/socket at this path first
+        // (idempotent — safe to call on every boot).
+        let _ = fs::remove_file(&path);
+        match std::os::unix::fs::symlink(target, &path) {
+            Ok(()) => info!(
+                "[KR64][devices] graphics stub: {} -> {} (defensive; ioctls will ENOTTY)",
+                path, target
+            ),
+            Err(e) => {
+                // Non-fatal: the stub is a defensive measure. If we
+                // can't create it, the guest will see ENOENT on the
+                // device path instead of ENOTTY — still a graceful
+                // failure for most callers.
+                warning!(
+                    "[KR64][devices] could not create graphics stub {} -> {}: {} (non-fatal)",
+                    path,
+                    target,
+                    e
+                );
+            }
+        }
+    }
+
+    info!(
+        "[KR64][devices] graphics device stubs created under {}/dev/{{graphics,dri}} (defensive)",
+        rootfs
+    );
+    Ok(())
+}
+
 // ============================================================================
 // Tests — pure-Rust, no Android deps, so they run on the host too.
 // (cargo test --lib)
@@ -649,6 +765,40 @@ mod tests {
         assert!(dev.raw_fd() >= 0);
         drop(dev);
         assert!(!Path::new(&format!("{}/dev/dm-user", rootfs)).exists());
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn graphics_device_stubs_are_created() {
+        let rootfs = tmpdir();
+        create_graphics_device_stubs(&rootfs).expect("graphics stubs");
+        // /dev/graphics and /dev/dri directories should exist
+        assert!(Path::new(&format!("{}/dev/graphics", rootfs)).is_dir());
+        assert!(Path::new(&format!("{}/dev/dri", rootfs)).is_dir());
+        // Each stub should be a symlink to /dev/null
+        for rel in &[
+            "dev/graphics/fb0",
+            "dev/fb0",
+            "dev/hwcomposer",
+            "dev/hwcomposer0",
+            "dev/ion",
+        ] {
+            let p = format!("{}/{}", rootfs, rel);
+            assert!(Path::new(&p).exists(), "stub {} should exist", rel);
+            let target = fs::read_link(&p).expect("read_link");
+            assert_eq!(target.to_string_lossy(), "/dev/null", "stub {} target", rel);
+        }
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn graphics_device_stubs_are_idempotent() {
+        let rootfs = tmpdir();
+        // First call creates the stubs
+        create_graphics_device_stubs(&rootfs).expect("first call");
+        // Second call should not fail (idempotent — removes + re-creates)
+        create_graphics_device_stubs(&rootfs).expect("second call");
+        assert!(Path::new(&format!("{}/dev/graphics/fb0", rootfs)).exists());
         let _ = fs::remove_dir_all(&rootfs);
     }
 }
