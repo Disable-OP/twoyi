@@ -353,52 +353,69 @@ jobs:
               echo "  (no verdict file — script may have crashed early; see logs above)"
           fi
 
-      - name: Upload APK
+      # ───────────────────────────────────────────────────────────────
+      # Artifact uploads → 0x0.st
+      #
+      # Replaces 4 actions/upload-artifact steps. The repo was at 0.01 GB
+      # of the 0.5 GB free GHA storage tier; kvm-e2e-test alone produced
+      # ~50 MB of logcat + screenshots per run, which would have filled
+      # the quota in a single day. All artifacts now go to 0x0.st and
+      # URLs are surfaced in the run log + step summary.
+      #
+      # See scripts/upload-to-0x0.sh for upload/retry/size-limit logic.
+      # ───────────────────────────────────────────────────────────────
+      - name: Upload APK to 0x0.st
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: twoyi-apk-x86_64
-          path: app/build/outputs/apk/release/*.apk
-          retention-days: 30
-          if-no-files-found: warn
+        run: |
+          ./scripts/upload-to-0x0.sh \
+            "twoyi APK (x86_64)" \
+            app/build/outputs/apk/release/*.apk
 
-      - name: Upload logcat
+      - name: Upload logcat + boot logs to 0x0.st
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: twoyi-logcat
-          path: |
-            /tmp/ci-artifacts/logcat.txt
-            /tmp/ci-artifacts/logcat-*.txt
-            /tmp/ci-artifacts/twoyi-log.txt
-            /tmp/ci-artifacts/kr64-prelaunch.log
-            /tmp/ci-artifacts/kr64-stderr.log
-            /tmp/ci-artifacts/twoyi-loader.log
-            /tmp/ci-artifacts/twoyi-vold-stderr.log
-            /tmp/ci-artifacts/boot-verdict.txt
-            /tmp/ci-artifacts/emulator-stdout.log
+        run: |
+          ./scripts/upload-to-0x0.sh "twoyi-logcat" \
+            /tmp/ci-artifacts/logcat.txt \
+            /tmp/ci-artifacts/logcat-*.txt \
+            /tmp/ci-artifacts/twoyi-log.txt \
+            /tmp/ci-artifacts/kr64-prelaunch.log \
+            /tmp/ci-artifacts/kr64-stderr.log \
+            /tmp/ci-artifacts/twoyi-loader.log \
+            /tmp/ci-artifacts/twoyi-vold-stderr.log \
+            /tmp/ci-artifacts/boot-verdict.txt \
+            /tmp/ci-artifacts/emulator-stdout.log \
             /tmp/ci-artifacts/emulator-stderr.log
-          retention-days: 30
-          if-no-files-found: warn
 
-      - name: Upload screenshots
+      - name: Upload screenshots to 0x0.st
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: twoyi-screenshots
-          path: /tmp/ci-artifacts/screenshot-*.png
-          retention-days: 30
-          if-no-files-found: warn
+        run: |
+          ./scripts/upload-to-0x0.sh "twoyi-screenshots" \
+            /tmp/ci-artifacts/screenshot-*.png
 
-      - name: Upload crash logs / tombstones
+      - name: Upload crash logs / tombstones to 0x0.st
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: twoyi-crash-logs
-          path: |
-            /tmp/ci-artifacts/tombstones/
-            /tmp/ci-artifacts/dropbox/
-            /tmp/ci-artifacts/anr/
+        run: |
+          ./scripts/upload-to-0x0.sh "twoyi-crash-logs" \
+            /tmp/ci-artifacts/tombstones/ \
+            /tmp/ci-artifacts/dropbox/ \
+            /tmp/ci-artifacts/anr/ \
             /tmp/ci-artifacts/rootfs-extract.log
-          retention-days: 30
-          if-no-files-found: ignore
+
+      - name: Render all 0x0.st links as a summary table
+        if: always()
+        run: |
+          if [ -f /tmp/0x0-uploads.txt ] && [ -s /tmp/0x0-uploads.txt ]; then
+            {
+              echo "## 📦 Artifact downloads (0x0.st)"
+              echo ""
+              echo "| Label | File | URL |"
+              echo "|---|---|---|"
+              while IFS=$'\t' read -r label name url; do
+                echo "| ${label} | \`${name}\` | ${url} |"
+              done < /tmp/0x0-uploads.txt
+              echo ""
+              echo "_Links expire after 30–365 days depending on size. Re-run the workflow to refresh._"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(no artifacts uploaded this run)" >> "$GITHUB_STEP_SUMMARY"
+          fi
