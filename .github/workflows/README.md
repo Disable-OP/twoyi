@@ -31,7 +31,15 @@ Before the workflow can successfully build the APK, you need to:
 - **Manual trigger** via workflow_dispatch (with `abis` and `include_rootfs` inputs)
 - **Concurrency control** — superseded runs on the same ref are cancelled
   automatically, so rapid pushes don't queue redundant ~15-minute builds
-- **Artifact uploads** - APKs are stored for 30 days
+- **Artifact uploads to 0x0.st** — APKs, logcat, screenshots, and crash logs
+  are uploaded to https://0x0.st (a free anonymous file host) and the
+  returned URLs are printed in the run log + rendered as a markdown table
+  on the run summary page. This replaced GitHub Actions artifact storage
+  after the repo hit 0.01 GB of its 0.5 GB free tier. See
+  [scripts/upload-to-0x0.sh](../../scripts/upload-to-0x0.sh) for the upload
+  logic (size limit 512 MiB, 3 retries with backoff, multi-file artifacts
+  are tar+gzipped into one archive). Retention on 0x0.st is 30–365 days
+  depending on file size — re-run the workflow if a link has expired.
 - **Cargo-xdk caching** - Speeds up builds by caching the Rust toolchain helper
 - **Android target** - Automatically installs aarch64-linux-android and
   x86_64-linux-android Rust targets
@@ -63,7 +71,10 @@ To test the build locally before committing:
 ## Notes
 
 - The workflow uses NDK r27c (r22b has compatibility issues with modern Rust)
-- Build artifacts are automatically uploaded after successful builds
+- Build artifacts are uploaded to https://0x0.st after every build (success
+  or failure); URLs are printed in the run log and rendered as a markdown
+  table on the run summary page. The same flow applies to the kvm-e2e-test,
+  arm64-seccomp-test, and kr64-tests workflows.
 - Rust targets aarch64-linux-android and x86_64-linux-android are installed
   automatically
 - Placeholder assets are not bundled — CI builds produce a "shell" APK that

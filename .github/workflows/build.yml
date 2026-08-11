@@ -5,6 +5,11 @@
 # NOTE: Placeholder assets are included to allow CI builds.
 # For a functional APK, replace app/src/main/assets/rootfs.tar.gz with:
 #   https://github.com/cyanmint/twoyi/releases/download/original/rootfs.tar.gz
+#
+# NOTE: Artifacts are uploaded to https://0x0.st (not GitHub Actions storage)
+# because this repo was down to 0.01 GB of the 0.5 GB free tier. URLs are
+# printed in the run log and rendered as a markdown table on the run summary
+# page. Retention on 0x0.st is 30–365 days depending on file size.
 ---
 name: Build APK
 
@@ -168,26 +173,56 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
 
-      - name: Upload arm64-v8a APK
+      # ───────────────────────────────────────────────────────────────
+      # Artifact uploads → 0x0.st
+      #
+      # GitHub Actions storage was down to 0.01 GB of the 0.5 GB free
+      # tier, so artifacts are now uploaded to https://0x0.st instead of
+      # being stored on GitHub. The script (scripts/upload-to-0x0.sh):
+      #   - prints each URL to the live log
+      #   - appends a markdown row to $GITHUB_STEP_SUMMARY
+      #   - appends `label<TAB>filename<TAB>url` to /tmp/0x0-uploads.txt
+      #     for the final "All upload links" step to render as a table.
+      #
+      # 0x0.st retention: 30–365 days depending on file size. If a link
+      # has expired, just re-run the workflow.
+      # ───────────────────────────────────────────────────────────────
+      - name: Upload arm64-v8a APK to 0x0.st
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: twoyi-apk-arm64-v8a
-          # assembleRelease produces a single fat APK containing both ABIs,
-          # but if you want per-ABI splits you can enable splits in build.gradle.
-          # For now we upload the fat APK.
-          path: app/build/outputs/apk/release/*.apk
-          retention-days: 30
-          if-no-files-found: warn
+        run: |
+          ./scripts/upload-to-0x0.sh \
+            "twoyi APK (arm64-v8a + x86_64)" \
+            app/build/outputs/apk/release/*.apk
 
-      - name: Upload build logs on failure
+      - name: Upload build logs to 0x0.st (on failure)
         if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: |
-            app/build/reports/
-            app/rs/target/*/release/build.log
+        run: |
+          ./scripts/upload-to-0x0.sh "build-logs" \
+            app/build/reports/ \
+            app/rs/target/*/release/build.log \
             /tmp/cargo-xdk*.log
-          retention-days: 7
-          if-no-files-found: ignore
+
+      - name: Render all 0x0.st links as a summary table
+        # Aggregate every URL this job produced into a single markdown
+        # table at the top of the run summary. Earlier upload steps
+        # already appended rows to $GITHUB_STEP_SUMMARY, but those rows
+        # are interleaved with other step output. This step emits a
+        # clean, scannable table from /tmp/0x0-uploads.txt so a glance
+        # at the run page gives you every download link in one place.
+        if: always()
+        run: |
+          if [ -f /tmp/0x0-uploads.txt ] && [ -s /tmp/0x0-uploads.txt ]; then
+            {
+              echo "## 📦 Artifact downloads (0x0.st)"
+              echo ""
+              echo "| Label | File | URL |"
+              echo "|---|---|---|"
+              while IFS=$'\t' read -r label name url; do
+                echo "| ${label} | \`${name}\` | ${url} |"
+              done < /tmp/0x0-uploads.txt
+              echo ""
+              echo "_Links expire after 30–365 days depending on size. Re-run the workflow to refresh._"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(no artifacts uploaded this run)" >> "$GITHUB_STEP_SUMMARY"
+          fi
