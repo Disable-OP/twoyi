@@ -65,6 +65,11 @@ name: KVM E2E Test
         type: boolean
         required: false
         default: false
+      twrp:
+        description: 'Boot TWRP recovery image instead of full Android rootfs (uses assets/twrp/*.img, launches kr64 with --boot-recovery). Skips LD_PRELOAD, /apex bind, binderfs, SELinux watchdog. The Android rootfs_source / skip_preload / init_path inputs are IGNORED when this is true.'
+        type: boolean
+        required: false
+        default: false
 
 # Cancel any superseded manual run on the same ref. Manual dispatches
 # are rare (you'd typically only run this when investigating a boot
@@ -338,6 +343,14 @@ jobs:
           TWOYI_SKIP_PRELOAD: ${{ github.event.inputs.skip_preload == 'true' && '1' || '' }}
           TWOYI_INIT_PATH: ${{ github.event.inputs.init_path || '' }}
           TWOYI_NO_NAMESPACES: ${{ github.event.inputs.no_namespaces == 'true' && '1' || '' }}
+          # TWOYI_TWRP=1 flips TWRP_MODE in the script, which:
+          #   - extracts the TWRP ramdisk from assets/twrp/*.img (via
+          #     scripts/extract-twrp-ramdisk.py) instead of the Android rootfs
+          #   - skips the /init symlink dance (TWRP init is a real binary)
+          #   - skips the libgetpid_hook.so + libtwoyi_loader_shlib.so push
+          #   - launches kr64 with --boot-recovery (skips LD_PRELOAD, /apex
+          #     bind, binderfs, SELinux watchdog; auto-sets init_path=/init)
+          TWOYI_TWRP: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
 
       - name: Print boot verdict
         # The script writes a verdict file. We surface it in the GHA

@@ -49,6 +49,15 @@ ROOTFS_SOURCE="emulator"
 BOOT_WAIT_SECONDS=60
 ARTIFACT_DIR="/tmp/ci-artifacts"
 AVD_NAME="twoyi_test"
+# When TWRP_MODE=1, the script boots the TWRP recovery image instead
+# of a full Android rootfs. Set via the --twrp flag (or the TWOYI_TWRP
+# env var for the workflow). See the big TWRP block in Step 3 / Step 4
+# / Step 5 for what changes.
+TWRP_MODE=0
+# Path to the TWRP boot image (relative to repo root). Override via
+# --twrp-img for testing with a different TWRP image. The default is
+# the TWRP 3.7.0 image shipped in assets/twrp/.
+TWRP_IMG_DEFAULT="assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -58,6 +67,10 @@ while [ $# -gt 0 ]; do
             BOOT_WAIT_SECONDS="$2"; shift 2 ;;
         --artifact-dir)
             ARTIFACT_DIR="$2"; shift 2 ;;
+        --twrp)
+            TWRP_MODE=1; shift ;;
+        --twrp-img)
+            TWRP_IMG_DEFAULT="$2"; shift 2 ;;
         --help|-h)
             sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
             exit 0 ;;
@@ -66,6 +79,13 @@ while [ $# -gt 0 ]; do
             exit 2 ;;
     esac
 done
+
+# TWOYI_TWRP env var also flips TWRP_MODE (used by the workflow's
+# `twrp` input). The --twrp CLI flag wins over the env var if both
+# are set (the CLI flag is more explicit).
+if [ "${TWOYI_TWRP:-0}" = "1" ] || [ "${TWOYI_TWRP:-}" = "true" ]; then
+    TWRP_MODE=1
+fi
 
 mkdir -p "$ARTIFACT_DIR"
 # Always start with a fresh verdict file so a stale run can't fool the
@@ -113,6 +133,8 @@ echo "  emulator:        $EMULATOR_BIN"
 echo "  adb:             $ADB_BIN"
 echo "  AVD name:        $AVD_NAME"
 echo "  rootfs_source:   $ROOTFS_SOURCE"
+echo "  twrp_mode:       $TWRP_MODE"
+echo "  twrp_img:        $TWRP_IMG_DEFAULT"
 echo "  boot_wait:       ${BOOT_WAIT_SECONDS}s"
 echo "  artifact_dir:    $ARTIFACT_DIR"
 echo ""
@@ -237,6 +259,65 @@ echo ""
 echo "── Step 3/6: source rootfs ($ROOTFS_SOURCE) ──"
 ROOTFS_TAR="$ARTIFACT_DIR/rootfs.tar"
 
+if [ "$TWRP_MODE" = "1" ]; then
+    # -----------------------------------------------------------------------
+    # TWRP recovery ramdisk extraction.
+    #
+    # We use scripts/extract-twrp-ramdisk.py to:
+    #   1. Parse the Android boot image header (magic 'ANDROID!',
+    #      page_size 2048, kernel_size 7.4MB, ramdisk_size 7.4MB).
+    #   2. Read the gzip-compressed ramdisk at offset 7,473,152.
+    #   3. Decompress it (gzip → 20.4 MB cpio).
+    #   4. Parse the SVR4 cpio archive (magic 070701) and emit a tar.
+    #
+    # The tar is what gets pushed into twoyi's data dir (same path as the
+    # Android rootfs.tar from the emulator/sdk_image/cyanmint branches).
+    #
+    # The TWRP ramdisk contains:
+    #   - /init             statically linked i386 init binary (578 KB)
+    #   - /sbin/recovery    dynamically linked i386 (interp /sbin/linker)
+    #   - /sbin/linker      32-bit Android dynamic linker
+    #   - 3,107 total entries (66 dirs, 2,797 files, 244 symlinks)
+    #   - init.rc with the very simple TWRP boot script
+    #     (start ueventd, mount tmpfs on /tmp, class_start default+core,
+    #      service recovery /sbin/recovery)
+    #
+    # kr64 launches with --boot-recovery, which:
+    #   - skips LD_PRELOAD (init is statically linked, no hooks needed)
+    #   - skips /apex bind mount (TWRP doesn't use APEX packages)
+    #   - skips binderfs mount (TWRP doesn't use binder)
+    #   - skips SELinux permissive watchdog (TWRP handles SELinux in init.rc)
+    #   - skips /dev/twoyi-bin/ copy (TWRP only needs /sbin/*)
+    #   - auto-sets init_path=/init (TWRP's init is at the root, not
+    #     /system/bin/init)
+    # -----------------------------------------------------------------------
+    echo "  → TWRP mode: extracting ramdisk from $TWRP_IMG_DEFAULT"
+    if [ ! -f "$TWRP_IMG_DEFAULT" ]; then
+        echo "  ✗ TWRP boot image not found at $TWRP_IMG_DEFAULT" >&2
+        echo "    (override with --twrp-img <path>)" >&2
+        exit 1
+    fi
+    if [ ! -x scripts/extract-twrp-ramdisk.py ]; then
+        echo "  ✗ scripts/extract-twrp-ramdisk.py not found or not executable" >&2
+        exit 1
+    fi
+    # python3 is available on ubuntu-latest runners + devcontainers.
+    # The extractor outputs the tar to --output-tar; we then push that
+    # to the device in Step 4.
+    if ! python3 scripts/extract-twrp-ramdisk.py \
+            --boot-img "$TWRP_IMG_DEFAULT" \
+            --output-tar "$ROOTFS_TAR" \
+            2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log"; then
+        echo "  ✗ TWRP ramdisk extraction failed" >&2
+        exit 1
+    fi
+    if [ ! -s "$ROOTFS_TAR" ]; then
+        echo "  ✗ TWRP extraction produced empty $ROOTFS_TAR" >&2
+        exit 1
+    fi
+    echo "  ✓ TWRP rootfs.tar: $(stat -c%s "$ROOTFS_TAR") bytes"
+    echo "    twrp_mode=1" >> "$ARTIFACT_DIR/boot-verdict.txt"
+else
 case "$ROOTFS_SOURCE" in
     emulator)
         # Per X86_64_BREAKTHROUGH.md §"How to reproduce". The emulator's
@@ -308,6 +389,7 @@ case "$ROOTFS_SOURCE" in
         exit 2
         ;;
 esac
+fi  # end of TWRP_MODE branch
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -398,6 +480,24 @@ echo "  → extract into $TWOYI_PROFILE"
 # Fix init: X86_64_BREAKTHROUGH.md §4 — replace the symlinked /init
 # with the actual binary from /system/bin/init. This is required
 # because twoyi's chroot execs /init directly (not via /system/bin/init).
+#
+# TWRP MODE: skip this entire block. TWRP's /init is already a real
+# statically-linked ELF binary at the root of the ramdisk (NOT a
+# symlink to /system/bin/init), so the symlink dance is a no-op at
+# best and actively harmful at worst (it would copy an Android init
+# binary over TWRP's init).
+if [ "$TWRP_MODE" = "1" ]; then
+    echo "  → TWRP mode: skipping /init symlink dance (TWRP init is real)"
+    # Verify TWRP's /init exists and is a regular file (not a symlink)
+    "$ADB_BIN" -s emulator-5554 shell "
+        if [ -f $TWOYI_PROFILE/init ] && [ ! -L $TWOYI_PROFILE/init ]; then
+            ls -la $TWOYI_PROFILE/init
+            echo '✓ TWRP init is a regular file'
+        else
+            echo '✗ TWRP init is MISSING or is a symlink — TWRP ramdisk extraction may have failed'
+        fi
+    " 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" || true
+else
 "$ADB_BIN" -s emulator-5554 shell \
     "if [ -L $TWOYI_PROFILE/init ]; then \
          rm $TWOYI_PROFILE/init && \
@@ -412,6 +512,7 @@ echo "  → extract into $TWOYI_PROFILE"
          cp $TWOYI_PROFILE/init $TWOYI_PROFILE/system/bin/init; \
      fi" 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" || true
 echo "  ✓ ensured /system/bin/init exists in rootfs"
+fi  # end of TWRP_MODE init-fix branch
 
 # Fix permissions: the rootfs was extracted as root (via adb root), so
 # all files/dirs are owned by root. The twoyi app runs as u0_a167 and
@@ -546,6 +647,13 @@ fi
 # --- Push libgetpid_hook.so to ROOT of rootfs ---
 # Use the file from the CI runner's EXTRACT_DIR (not from the device's
 # /data/local/tmp/, which may not have been populated).
+#
+# TWRP MODE: skip this push. TWRP's init is statically linked, so
+# kr64's --boot-recovery mode doesn't read or write libgetpid_hook.so
+# at all. Pushing it would just leave a stale file in the rootfs.
+if [ "$TWRP_MODE" = "1" ]; then
+    echo "  → TWRP mode: skipping libgetpid_hook.so push (no LD_PRELOAD)"
+else
 if [ -f "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" ]; then
     "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libgetpid_hook.so" "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
     echo "  ✓ pushed libgetpid_hook.so to root of rootfs (from EXTRACT_DIR)"
@@ -565,9 +673,17 @@ else
     "$ADB_BIN" -s emulator-5554 push /data/local/tmp/libgetpid_hook.so "$TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2 || echo "  ⚠ push from /data/local/tmp/ failed"
 fi
 "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libgetpid_hook.so && ls -la $TWOYI_PROFILE/libgetpid_hook.so" 2>&1 | tail -2
+fi  # end of TWRP_MODE libgetpid_hook push branch
 
 # --- Push libtwoyi_loader_shlib.so (seccomp/SIGSYS virtualization) ---
 # This is the REAL virtualization library. Loaded via LD_PRELOAD.
+#
+# TWRP MODE: skip this push. Same reason as libgetpid_hook.so above
+# (init is statically linked, no LD_PRELOAD, no seccomp/SIGSYS
+# virtualization library needed).
+if [ "$TWRP_MODE" = "1" ]; then
+    echo "  → TWRP mode: skipping libtwoyi_loader_shlib.so push (no LD_PRELOAD)"
+else
 if [ -f "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" ]; then
     "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libtwoyi_loader_shlib.so" "$TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1 | tail -2
     "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libtwoyi_loader_shlib.so" 2>&1
@@ -585,6 +701,7 @@ elif [ -f "$EXTRACT_DIR/lib/x86_64/libkr64.so" ]; then
 else
     echo "  ⚠ EXTRACT_DIR not populated — libtwoyi_loader_shlib.so not available"
 fi
+fi  # end of TWRP_MODE libtwoyi_loader_shlib push branch
 
 # Also create the libkr64.so symlink in the rootfs (RomManager does this
 # when the app starts, but we want it ready before the app launches).
@@ -608,11 +725,25 @@ fi
 # loaded when the crash happens). The output goes to stderr (captured in
 # kr64-stderr.log). Default is "2" (libs level — library load/unload).
 # Set TWOYI_LD_DEBUG=0 in the CI env to disable.
+#
+# TWRP MODE: pass --boot-recovery to kr64. This:
+#   - skips LD_PRELOAD (init is statically linked, no hooks needed)
+#   - skips /apex bind mount (TWRP doesn't use APEX packages)
+#   - skips binderfs mount (TWRP doesn't use binder)
+#   - skips SELinux permissive watchdog (TWRP handles SELinux in init.rc)
+#   - skips /dev/twoyi-bin/ copy (TWRP only needs /sbin/*)
+#   - auto-sets init_path=/init (TWRP's init is at the root, not
+#     /system/bin/init)
+# The TWOYI_INIT_PATH env var is IGNORED in TWRP mode (--boot-recovery
+# auto-sets /init, and an explicit --init would override the auto-set
+# but we don't want that in TWRP mode unless the user explicitly asks).
 SKIP_PRELOAD_ENV="${TWOYI_SKIP_PRELOAD:-}"
 INIT_PATH_OVERRIDE="${TWOYI_INIT_PATH:-}"
 NO_NAMESPACES_ENV="${TWOYI_NO_NAMESPACES:-}"
 LD_DEBUG_ENV="${TWOYI_LD_DEBUG:-2}"
-if [ -n "$NO_NAMESPACES_ENV" ]; then
+if [ "$TWRP_MODE" = "1" ]; then
+    echo "  → pre-launching kr64 as root (TWRP mode: --boot-recovery, no LD_PRELOAD)"
+elif [ -n "$NO_NAMESPACES_ENV" ]; then
     echo "  → pre-launching kr64 as root (TWOYI_NO_NAMESPACES=1, no pivot_root/chroot)"
 elif [ -n "$SKIP_PRELOAD_ENV" ]; then
     echo "  → pre-launching kr64 as root (TWOYI_SKIP_PRELOAD=1, no LD_PRELOAD)"
@@ -620,6 +751,11 @@ elif [ -n "$INIT_PATH_OVERRIDE" ]; then
     echo "  → pre-launching kr64 as root (TWOYI_INIT_PATH=$INIT_PATH_OVERRIDE)"
 else
     echo "  → pre-launching kr64 as root (with namespaces, no seccomp)"
+fi
+# TWRP mode flag for the kr64 command line (empty in non-TWRP mode).
+TWRP_FLAG=""
+if [ "$TWRP_MODE" = "1" ]; then
+    TWRP_FLAG="--boot-recovery"
 fi
 "$ADB_BIN" -s emulator-5554 shell "
     export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
@@ -631,6 +767,7 @@ fi
         --vmid 0 \
         --no-seccomp \
         ${NO_NAMESPACES_ENV:+--no-namespaces} \
+        ${TWRP_FLAG} \
         ${INIT_PATH_OVERRIDE:+--init $INIT_PATH_OVERRIDE} \
         > /data/user/0/io.twoyi/kr64-stderr.log 2>&1 &
     echo \$! > /data/local/tmp/kr64.pid
