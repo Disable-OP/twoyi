@@ -1318,12 +1318,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // and init crashed with SIGSEGV (signal 11).
     //
     // TWRP BOOT: TWRP's init binary is statically linked (i386), so
-    // it doesn't need LD_PRELOAD hooks. We skip the read entirely --
-    // both `hook_lib_getpid` and `hook_lib_loader` stay `None`, the
-    // later write-to-/dev/ phase skips them, and the child env won't
-    // set LD_PRELOAD. This is the key simplification that makes TWRP
-    // boot dramatically simpler than full Android boot.
-    // ---------------------------------------------------------------
+    // it doesn't need the x86_64 LD_PRELOAD hooks (libgetpid_hook.so
+    // and libtwoyi_loader_shlib.so) — the statically-linked init doesn't
+    // use the dynamic linker and ignores LD_PRELOAD entirely.
+    //
+    // HOWEVER, TWRP's recovery service (forked+exec'd by init) is
+    // DYNAMICALLY linked (i386, interpreter /sbin/linker). It loads
+    // libminuitwrp.so which crashes in libminuitwrp.so at offset 0x57d7
+    // (NULL deref after FBIOGET_VSCREENINFO returns ENOTTY on the
+    // /dev/graphics/fb0 → /dev/null stub). See KVM run 31531742745
+    // dmesg.log for the crash signature.
+    //
+    // FIX: in TWRP mode, we DO load a SEPARATE i686 LD_PRELOAD library
+    // (`twrp_fb_hook.so`) that intercepts FB ioctls on /dev/graphics/fb0
+    // and returns valid 720x1280@32bpp screen info. The statically-linked
+    // init still ignores LD_PRELOAD (it doesn't use the dynamic linker),
+    // but when init forks+execs recovery, recovery's 32-bit bionic linker
+    // loads LD_PRELOAD → our twrp_fb_hook activates → FB ioctls succeed →
+    // no crash.
+    //
+    // We do NOT load libgetpid_hook.so or libtwoyi_loader_shlib.so in
+    // TWRP mode (both are x86_64; the i386 recovery linker would refuse
+    // to load them with "CANNOT LINK EXECUTABLE: ... is 64-bit instead
+    // of 32-bit").
     let hook_lib_getpid = if cfg.boot_recovery {
         info!("[KR64] TWRP boot: skipping libgetpid_hook.so read (init is statically linked)");
         None
@@ -1341,6 +1358,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "libtwoyi_loader_shlib.so",
             "seccomp virtualization disabled",
         )
+    };
+    // TWRP-only: read the i686 FB ioctl hook library. This is the FIX
+    // for the libminuitwrp segfault. Built in app/cpp/build.sh.
+    let hook_lib_twrp_fb = if cfg.boot_recovery {
+        find_and_read_hook_library(
+            &cfg,
+            "twrp_fb_hook.so",
+            "TWRP framebuffer virtualization disabled (recovery will crash in libminuitwrp.so)",
+        )
+    } else {
+        None
     };
 
     // ---------------------------------------------------------------
@@ -1607,6 +1635,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "/dev/libtwoyi_loader_shlib.so",
         );
     }
+    // TWRP-only: write twrp_fb_hook.so to /dev/ so the recovery process
+    // can load it via LD_PRELOAD=/dev/twrp_fb_hook.so. This is the i686
+    // FB ioctl hook that fixes the libminuitwrp segfault.
+    if let Some((src, content)) = &hook_lib_twrp_fb {
+        write_hook_library_to_dev("twrp_fb_hook.so", src, content, "/dev/twrp_fb_hook.so");
+    }
 
     // Change SELinux label of /dev/lib*.so to system_file so that
     // vendor_init subcontexts can access them.
@@ -1650,7 +1684,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // change is enforced by the kernel. On the KVM test environment
     // (permissive mode), the operation may fail with EPERM/ENOTSUP but
     // access is allowed anyway via the permissive watchdog.
-    for lib_path in &["/dev/libgetpid_hook.so", "/dev/libtwoyi_loader_shlib.so"] {
+    for lib_path in &[
+        "/dev/libgetpid_hook.so",
+        "/dev/libtwoyi_loader_shlib.so",
+        "/dev/twrp_fb_hook.so",
+    ] {
         if Path::new(lib_path).exists() {
             match set_selinux_context(lib_path, "u:object_r:system_file:s0") {
                 Ok(()) => {
@@ -2028,6 +2066,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "[KR64] PARENT: failed to create graphics device stubs: {} (non-fatal — guest may see ENOENT on graphics paths)",
             e
         );
+    }
+
+    // TWRP BOOT: replace the /dev/graphics/fb0 + /dev/fb0 symlinks (which
+    // point to /dev/null) with regular files of 3,686,400 bytes (720x1280x4
+    // RGBA8888). This makes open() succeed and mmap() work naturally, so
+    // libminuitwrp's graphics_fbdev_init can proceed past the open+mmap
+    // stage. The FB ioctls themselves are intercepted by twrp_fb_hook.so
+    // (LD_PRELOAD'd into the recovery process). See
+    // `devices::create_twrp_framebuffer` for the full rationale.
+    if cfg.boot_recovery {
+        if let Err(e) = devices::create_twrp_framebuffer(&rootfs_prefix) {
+            warning!(
+                "[KR64] PARENT: failed to create TWRP framebuffer: {} (recovery will crash in libminuitwrp.so)",
+                e
+            );
+        }
     }
 
     // Always overwrite /vendor/etc/fstab.ranchu with a minimal stub.
@@ -2487,21 +2541,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // can link WITHOUT the getpid hook (init will exit 31, but if it
         // exits 31 instead of SIGSEGV, we know the linker works).
         //
-        // TWRP BOOT: skip_preload is always true when cfg.boot_recovery is
-        // set. TWRP's init is statically linked (no shared lib deps), so
-        // LD_PRELOAD is unnecessary -- the hook libs weren't read into
-        // memory and weren't written to /dev/, so even if we set
-        // LD_PRELOAD=/dev/libgetpid_hook.so the file wouldn't exist and
-        // the linker would fail with ENOENT. TWRP's init.rc also has its
-        // own PID-1 logic and property service.
-        let skip_preload = cfg.boot_recovery || std::env::var("TWOYI_SKIP_PRELOAD").is_ok();
-        // LD_PRELOAD: load BOTH the seccomp/SIGSYS virtualization library
-        // (libtwoyi_loader_shlib.so) AND the getpid hook (libgetpid_hook.so).
-        // The virtualization library installs seccomp BPF filter + SIGSYS
-        // handler via .init_array constructor before init's main() runs.
-        // The getpid hook makes init think it's PID 1.
-        let ld_preload_str =
-            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string();
+        // TWRP BOOT: we DO set LD_PRELOAD in TWRP mode, but to a DIFFERENT
+        // library: `/dev/twrp_fb_hook.so` (i686, for the i386 recovery
+        // process) instead of the x86_64 libgetpid_hook.so +
+        // libtwoyi_loader_shlib.so. The statically-linked init ignores
+        // LD_PRELOAD (it doesn't use the dynamic linker), but when init
+        // forks+execs recovery (dynamically linked, i386), recovery's
+        // bionic linker loads LD_PRELOAD → twrp_fb_hook activates →
+        // FB ioctls on /dev/graphics/fb0 return valid screen info →
+        // no libminuitwrp crash.
+        //
+        // TWOYI_SKIP_PRELOAD still works in TWRP mode as a diagnostic
+        // override (disables twrp_fb_hook too, so we can confirm the
+        // crash returns without the hook).
+        let skip_preload = std::env::var("TWOYI_SKIP_PRELOAD").is_ok();
+        // LD_PRELOAD for non-TWRP mode: load BOTH the seccomp/SIGSYS
+        // virtualization library (libtwoyi_loader_shlib.so) AND the getpid
+        // hook (libgetpid_hook.so). The virtualization library installs
+        // seccomp BPF filter + SIGSYS handler via .init_array constructor
+        // before init's main() runs. The getpid hook makes init think
+        // it's PID 1.
+        //
+        // LD_PRELOAD for TWRP mode: load ONLY twrp_fb_hook.so (i686 FB
+        // ioctl hook). The x86_64 libs are NOT loaded because the i386
+        // recovery linker can't load 64-bit libs.
+        let ld_preload_str = if cfg.boot_recovery {
+            "LD_PRELOAD=/dev/twrp_fb_hook.so".to_string()
+        } else {
+            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string()
+        };
         // TWRP BOOT: use a minimal env that mirrors TWRP's init.rc exports.
         // TWRP's init.rc does its own:
         //   export PATH /sbin:/system/bin
@@ -2646,7 +2714,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         if skip_preload {
             unsafe {
                 if cfg.boot_recovery {
-                    safe_write_err(b"[KR64 CHILD] TWRP boot: skipping LD_PRELOAD (init is statically linked, no hooks needed)\n");
+                    safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set -- skipping LD_PRELOAD in TWRP mode (recovery will crash in libminuitwrp.so without twrp_fb_hook)\n");
                 } else {
                     safe_write_err(b"[KR64 CHILD] TWOYI_SKIP_PRELOAD set -- skipping LD_PRELOAD (init will exit 31)\n");
                 }
@@ -2696,11 +2764,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     libc::close(fd);
                 }
                 unsafe {
-                    safe_write_err(b"[KR64 CHILD] TWRP: redirected stdout/stderr to /twrp-init.log\n");
+                    safe_write_err(
+                        b"[KR64 CHILD] TWRP: redirected stdout/stderr to /twrp-init.log\n",
+                    );
                 }
             } else {
                 unsafe {
-                    safe_write_err(b"[KR64 CHILD] TWRP: WARN could not open /twrp-init.log for redirect\n");
+                    safe_write_err(
+                        b"[KR64 CHILD] TWRP: WARN could not open /twrp-init.log for redirect\n",
+                    );
                 }
             }
         }

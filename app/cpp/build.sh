@@ -73,6 +73,53 @@ for ABI in arm64-v8a x86_64; do
     fi
 done
 
+# Build twrp_fb_hook.so — a MINIMAL i686 (32-bit x86) LD_PRELOAD library
+# for TWRP framebuffer virtualization. This is a SEPARATE build from the
+# main loader because:
+#   - TWRP's recovery binary is i386 (32-bit), so its bionic linker can't
+#     load the 64-bit libtwoyi_loader_shlib.so.
+#   - We only need FB ioctl interception for TWRP (no seccomp, no path
+#     translation, no exec hooks), so a minimal hook file is cleaner than
+#     making the main loader build for i686 (which would require adding
+#     i686 syscall number defines throughout the file).
+#
+# NDK r27c dropped i686 sysroot libs, so we build with -nostdlib. The
+# resulting .so leaves libc/libdl symbols (syscall, dlsym, strcmp) unresol-
+# ved; bionic resolves them at load time from the recovery binary's own
+# libc/libdl. This produces a valid 32-bit ELF that bionic can load.
+#
+# The .so is placed in jniLibs/x86_64/ (despite being i686) so the APK
+# packaging includes it. Android's PackageManager extracts whatever is in
+# lib/<abi>/ without validating the ELF architecture, and the KVM test
+# script extracts it via `unzip` (not via PackageManager) and pushes it
+# to the device's rootfs where kr64 reads it. The library is NEVER loaded
+# by the Android app itself — it's just a file in the APK that the KVM
+# test pulls out and pushes to the guest.
+echo '=========================================='
+echo 'Building twrp_fb_hook.so (i686, TWRP framebuffer virtualization)'
+echo '=========================================='
+TWRP_HOOK_BUILD_DIR=$SCRIPT_DIR/build/twrp_fb_hook
+rm -rf "$TWRP_HOOK_BUILD_DIR"
+mkdir -p "$TWRP_HOOK_BUILD_DIR"
+TWRP_HOOK_JNILIBS_DIR=$SCRIPT_DIR/../src/main/jniLibs/x86_64
+mkdir -p "$TWRP_HOOK_JNILIBS_DIR"
+$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+    -target i686-linux-android24 \
+    --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+    -nostdlib -shared -fPIC -O2 -g \
+    -D_GNU_SOURCE \
+    -I$SCRIPT_DIR/twoyi_loader/include -I$SCRIPT_DIR/twoyi_loader/src \
+    -o $TWRP_HOOK_BUILD_DIR/twrp_fb_hook.so \
+    $SCRIPT_DIR/twoyi_loader/src/twrp_fb_hook.c 2>&1 \
+    || { echo "  ✗ twrp_fb_hook build failed" >&2; exit 1; }
+if [ -f "$TWRP_HOOK_BUILD_DIR/twrp_fb_hook.so" ]; then
+    cp -v $TWRP_HOOK_BUILD_DIR/twrp_fb_hook.so $TWRP_HOOK_JNILIBS_DIR/twrp_fb_hook.so
+    echo "  ✓ twrp_fb_hook.so: $(file -b $TWRP_HOOK_BUILD_DIR/twrp_fb_hook.so)"
+else
+    echo "  ✗ twrp_fb_hook.so not produced" >&2
+    exit 1
+fi
+
 echo '=========================================='
 echo 'Build complete!'
 echo '=========================================='

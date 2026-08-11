@@ -680,6 +680,93 @@ pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Create a virtual `/dev/graphics/fb0` (and `/dev/fb0`) for TWRP mode.
+///
+/// # Background
+///
+/// TWRP's `recovery` binary (i386, dynamically linked) loads `libminuitwrp.so`
+/// which calls `open("/dev/graphics/fb0", O_RDWR)` then `FBIOGET_VSCREENINFO`
+/// and `FBIOGET_FSCREENINFO` ioctls. On the regular `create_graphics_device_stubs`
+/// symlink-to-`/dev/null` approach, those ioctls return `ENOTTY`, the
+/// `fb_var_screeninfo`/`fb_fix_screeninfo` structs stay zeroed, and
+/// libminuitwrp dereferences the NULL `xres`/`smem_len` → segfault at
+/// offset 0x57d7 in libminuitwrp.so (confirmed in KVM run 31531742745
+/// dmesg.log: 5 crashes at ~5s intervals).
+///
+/// # What this function does
+///
+/// Replaces the `/dev/graphics/fb0` and `/dev/fb0` symlinks (created by
+/// `create_graphics_device_stubs`) with **regular files** of exactly
+/// `720 * 1280 * 4 = 3,686,400` bytes, pre-filled with zeros.
+///
+/// This makes `open()` succeed (returns a fd to a real file), and makes
+/// `mmap(fd, smem_len, PROT_READ|PROT_WRITE, MAP_SHARED, ...)` succeed
+/// naturally (the file is large enough and writable, so the kernel creates
+/// a file-backed shared mapping).
+///
+/// The FB ioctls themselves still return `ENOTTY` from the kernel (regular
+/// files don't support FB ioctls). The `twrp_fb_hook.so` LD_PRELOAD library
+/// (built in `app/cpp/build.sh`, loaded in the recovery process via
+/// `LD_PRELOAD=/dev/twrp_fb_hook.so`) intercepts these ioctls and returns
+/// valid screen info (720x1280 @ 32bpp RGBA8888), fixing the crash.
+///
+/// # Why a regular file and not a char device
+///
+/// Creating a real char device via `mknod c 29 0` would require CAP_MKNOD
+/// (available to root, which kr64 has) but wouldn't help: we can't
+/// intercept kernel char-device ioctls from userspace without a kernel
+/// module. A regular file + LD_PRELOAD ioctl hook is the cleanest
+/// userspace-only solution.
+///
+/// # When to call
+///
+/// Call AFTER `create_graphics_device_stubs` (which creates the initial
+/// symlinks), in TWRP boot mode only. In non-TWRP mode, the symlinks-to-
+/// `/dev/null` approach is correct (surfaceflinger and the HALs gracefully
+/// fall back to HWComposer/qemu_pipe when fb0 returns ENOTTY).
+pub fn create_twrp_framebuffer(rootfs: &str) -> std::io::Result<()> {
+    // 720x1280 @ 32bpp RGBA8888.
+    const FB_WIDTH: u32 = 720;
+    const FB_HEIGHT: u32 = 1280;
+    const FB_BYTES_PER_PIXEL: u32 = 4;
+    let smem_len: u64 = u64::from(FB_WIDTH) * u64::from(FB_HEIGHT) * u64::from(FB_BYTES_PER_PIXEL); // 3,686,400
+
+    // /dev/graphics/ and /dev/dri/ already exist (created by
+    // create_graphics_device_stubs). We just need to replace the fb0
+    // symlinks with regular files.
+    let fb_paths: [(&str, &str); 2] = [
+        ("dev/graphics/fb0", "/dev/graphics/fb0"),
+        ("dev/fb0", "/dev/fb0"),
+    ];
+
+    for (rel, _abs) in &fb_paths {
+        let path = format!("{}/{}", rootfs, rel);
+        // Remove the existing symlink (created by create_graphics_device_stubs).
+        let _ = fs::remove_file(&path);
+        // Create a regular file and truncate it to smem_len bytes.
+        // We use OpenOptions + set_len to create a sparse file (no actual
+        // disk I/O for the zero blocks on ext4/tmpfs).
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?;
+            f.set_len(smem_len)?;
+            // chmod 0666 so the recovery process (running as root or shell)
+            // can open it O_RDWR.
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o666));
+        }
+        info!(
+            "[KR64][devices] TWRP framebuffer: {} (regular file, {} bytes = {}x{}x{} RGBA8888)",
+            path, smem_len, FB_WIDTH, FB_HEIGHT, FB_BYTES_PER_PIXEL
+        );
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Tests — pure-Rust, no Android deps, so they run on the host too.
 // (cargo test --lib)
