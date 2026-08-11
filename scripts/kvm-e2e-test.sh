@@ -349,6 +349,26 @@ fi
 sleep 1
 "$ADB_BIN" -s emulator-5554 wait-for-device
 
+# Fix CI flake: remove stale rootfs directory from previous runs.
+# ProfileManager.updateRootfsSymlink fails with
+# DirectoryNotEmptyException when /data/user/0/io.twoyi/rootfs
+# exists as a non-empty directory. This happens when a previous run's
+# ProfileManager migration failed, leaving a directory instead of a
+# symlink. We must remove the stale directory BEFORE extracting the new
+# rootfs so the new extraction lands in a clean path AND so
+# ProfileManager can later replace it with a fresh symlink.
+#
+# The `[ ! -L ... ]` guard ensures we only remove a real directory —
+# if a previous run succeeded, the path is a symlink (to the profile
+# directory) and we leave it alone (it will be recreated by the
+# extraction below via the /data/user/0 → /data/data symlink).
+"$ADB_BIN" -s emulator-5554 shell "
+    if [ -d /data/user/0/io.twoyi/rootfs ] && [ ! -L /data/user/0/io.twoyi/rootfs ]; then
+        rm -rf /data/user/0/io.twoyi/rootfs
+        echo 'removed stale rootfs directory'
+    fi
+" 2>/dev/null || true
+
 echo "  → push rootfs.tar to /data/local/tmp/"
 "$ADB_BIN" -s emulator-5554 push "$ROOTFS_TAR" /data/local/tmp/rootfs.tar
 
