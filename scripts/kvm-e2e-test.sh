@@ -772,7 +772,20 @@ fi
         > /data/user/0/io.twoyi/kr64-stderr.log 2>&1 &
     echo \$! > /data/local/tmp/kr64.pid
     echo 'kr64 launched'
-" 2>&1 | tail -5
+" 2>&1 | tee -a "$ARTIFACT_DIR/rootfs-extract.log" | tail -5
+
+# Give kr64 2 seconds to start (or crash) before checking for qemu_pipe
+sleep 2
+
+# ALWAYS pull kr64-stderr.log right after launch — even if kr64 crashed
+# immediately, this captures the crash output for diagnosis.
+echo "  → pulling kr64-stderr.log (early capture)..."
+"$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/kr64-stderr.log" ] && [ -s "$ARTIFACT_DIR/kr64-stderr.log" ]; then
+    echo "  ✓ kr64-stderr.log captured ($(stat -c%s "$ARTIFACT_DIR/kr64-stderr.log") bytes)"
+    echo "  === kr64-stderr.log (first 30 lines) ==="
+    head -30 "$ARTIFACT_DIR/kr64-stderr.log"
+fi
 
 # Wait for /dev/qemu_pipe to be created (kr64 is setting up)
 echo "  → waiting for kr64 to create /dev/qemu_pipe..."
@@ -1038,6 +1051,20 @@ mkdir -p "$ARTIFACT_DIR/dropbox" "$ARTIFACT_DIR/anr"
 } >> "$ARTIFACT_DIR/boot-verdict.txt"
 
 cat "$ARTIFACT_DIR/boot-verdict.txt"
+
+# Final pull of kr64-stderr.log — always attempt, even if the script
+# finished normally. This catches cases where kr64 ran for a while and
+# produced output that wasn't captured by the early pull.
+echo ""
+echo "── Final kr64-stderr.log capture ──"
+"$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+if [ -f "$ARTIFACT_DIR/kr64-stderr.log" ] && [ -s "$ARTIFACT_DIR/kr64-stderr.log" ]; then
+    echo "  ✓ kr64-stderr.log: $(stat -c%s "$ARTIFACT_DIR/kr64-stderr.log") bytes"
+else
+    echo "  ⚠ kr64-stderr.log not found or empty — kr64 may have never started"
+    # Try alternate path
+    "$ADB_BIN" -s emulator-5554 pull /data/data/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+fi
 
 # Clean up the emulator
 echo ""
