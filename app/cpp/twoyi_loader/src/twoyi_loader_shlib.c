@@ -1965,12 +1965,18 @@ static int should_translate(const char *path) {
     if (strncmp(path, "/proc", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
     if (strncmp(path, "/sys", 4) == 0 && (path[4] == 0 || path[4] == '/')) return 0;
     if (strncmp(path, "/data", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
-    // /dev/ paths: translate socket, __properties__, and other guest paths
+    // /dev/ paths: translate socket, __properties__, binder, and other guest paths
     // but keep host device nodes (/dev/null, /dev/zero, /dev/qemu_pipe, etc.)
     if (strncmp(path, "/dev/socket", 11) == 0) return 1;  // guest sockets
     if (strncmp(path, "/dev/__properties__", 19) == 0) return 1;
     if (strncmp(path, "/dev/__null__", 13) == 0) return 1;
-    // Other /dev/ paths (null, zero, random, qemu_pipe, binder, etc.) stay on host
+    // Translate binder devices to rootfs — kr64 mounts binderfs there
+    // so the guest has its own binder domain separate from the host.
+    if (strcmp(path, "/dev/binder") == 0) return 1;
+    if (strcmp(path, "/dev/hwbinder") == 0) return 1;
+    if (strcmp(path, "/dev/vndbinder") == 0) return 1;
+    if (strncmp(path, "/dev/binderfs/", 14) == 0) return 1;
+    // Other /dev/ paths (null, zero, random, qemu_pipe, etc.) stay on host
     if (strncmp(path, "/dev/", 5) == 0) return 0;
     if (strncmp(path, "/dev", 4) == 0 && (path[4] == 0)) return 0;  // /dev exactly
     // Guest rootfs paths — translate

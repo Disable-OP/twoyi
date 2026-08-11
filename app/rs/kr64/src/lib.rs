@@ -1189,12 +1189,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             for name in &["binder", "hwbinder", "vndbinder"] {
                 let link_path = format!("{}/dev/{}", cfg.rootfs, name);
                 let target = format!("/dev/binderfs/{}", name);
-                // Remove existing symlink/device if present
+                // Remove existing file/symlink/socket at this path.
+                // remove_file works for files, symlinks, and sockets.
+                // If it's a directory, use remove_dir.
                 let _ = std::fs::remove_file(&link_path);
+                let _ = std::fs::remove_dir(&link_path);
                 // Create symlink (target is relative to the guest's root)
-                let _ = std::os::unix::fs::symlink(&target, &link_path);
+                match std::os::unix::fs::symlink(&target, &link_path) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warning!("[KR64] PARENT: failed to create symlink {} -> {}: {}", link_path, target, e);
+                    }
+                }
             }
-            info!("[KR64] PARENT: created binder symlinks");
+            info!("[KR64] PARENT: created binder symlinks (binderfs)");
         } else {
             let e = std::io::Error::last_os_error();
             warning!(
