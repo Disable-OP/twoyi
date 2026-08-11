@@ -2068,6 +2068,96 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
 // so we can see exactly when and how vold dies. Diagnostic only — the
 // hooks still actually terminate the process.
 // =========================================================================
+
+// Symbolicate a code address via dladdr() and write a one-line summary.
+// dladdr() has been in bionic since API 9 so we can call it directly
+// (no dlsym needed). On failure, just log the raw pointer.
+static void twoyi_log_addr(const char *tag, int idx, void *addr) {
+    Dl_info info;
+    char msg[512];
+    if (addr && dladdr(addr, &info) && info.dli_fname) {
+        const char *sym = info.dli_sname ? info.dli_sname : "?";
+        unsigned long off = info.dli_saddr
+            ? (unsigned long)((char *)addr - (char *)info.dli_saddr)
+            : 0UL;
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] %s[%d]: %p %s(%s+0x%lx) [%s]\n",
+            tag, idx, addr,
+            sym, sym, off,
+            info.dli_fname);
+    } else {
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] %s[%d]: %p (no symbol)\n",
+            tag, idx, addr);
+    }
+    write_str(2, msg);
+}
+
+// Common backtrace routine: try libc backtrace() first (if available via
+// dlsym — only API 28+), then fall back to __builtin_return_address for
+// the first 8 frames. Always logs at least one frame so we can identify
+// the immediate caller of exit() / _exit().
+static void twoyi_dump_backtrace(const char *tag) {
+    // First try libc's backtrace() / backtrace_symbols() (API 28+).
+    static int (*backtrace_p)(void **, int) = NULL;
+    static char **(*backtrace_symbols_p)(void *const *, int) = NULL;
+    static int backtrace_checked = 0;
+    static int backtrace_available = -1;
+    if (!backtrace_checked) {
+        backtrace_p = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
+        backtrace_symbols_p = (char **(*)(void *const *, int))dlsym(RTLD_DEFAULT, "backtrace_symbols");
+        backtrace_available = (backtrace_p && backtrace_symbols_p) ? 1 : 0;
+        backtrace_checked = 1;
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] %s: backtrace() via dlsym = %s\n",
+            tag, backtrace_available ? "available" : "UNAVAILABLE — falling back to __builtin_return_address");
+        write_str(2, msg);
+    }
+    if (backtrace_available == 1) {
+        void *bt[32];
+        int n = backtrace_p(bt, 32);
+        char **symbols = backtrace_symbols_p(bt, n);
+        if (symbols) {
+            for (int i = 0; i < n; i++) {
+                char bt_msg[512];
+                snprintf(bt_msg, sizeof(bt_msg),
+                    "[twoyi_loader] %s[%d]: %s\n", tag, i, symbols[i]);
+                write_str(2, bt_msg);
+            }
+            free(symbols);
+        }
+        // Also symbolicate via dladdr for richer info (file + offset).
+        for (int i = 0; i < n; i++) {
+            twoyi_log_addr(tag, i, bt[i]);
+        }
+        return;
+    }
+    // Fallback: walk the caller chain via __builtin_return_address.
+    // This requires frame pointers, so deeper frames may be NULL on -O2
+    // builds with -fomit-frame-pointer. The first frame (immediate caller)
+    // is always available.
+    void *frames[8] = {NULL};
+    frames[0] = __builtin_return_address(0);
+#if defined(__x86_64__)
+    frames[1] = __builtin_return_address(1);
+    frames[2] = __builtin_return_address(2);
+    frames[3] = __builtin_return_address(3);
+    frames[4] = __builtin_return_address(4);
+    frames[5] = __builtin_return_address(5);
+    frames[6] = __builtin_return_address(6);
+    frames[7] = __builtin_return_address(7);
+#elif defined(__aarch64__)
+    frames[1] = __builtin_return_address(1);
+    frames[2] = __builtin_return_address(2);
+    frames[3] = __builtin_return_address(3);
+#endif
+    for (int i = 0; i < 8; i++) {
+        if (!frames[i]) break;
+        twoyi_log_addr(tag, i, frames[i]);
+    }
+}
+
 __attribute__((noreturn))
 void exit(int status) {
     if (g_trace_opens) {
@@ -2075,35 +2165,7 @@ void exit(int status) {
         snprintf(msg, sizeof(msg),
             "[twoyi_loader] TRACE exit(%d) called\n", status);
         write_str(2, msg);
-
-        // Print backtrace to identify which function called exit().
-        // Diagnostic only — removed once root cause is found.
-        // Resolve backtrace functions at runtime via dlsym: backtrace() and
-        // backtrace_symbols() from <execinfo.h> are only declared at API 28+,
-        // but the CI targets API 24. dlsym() lets us use them when present
-        // (newer devices) and skip gracefully when absent (API 24).
-        static int (*backtrace_p)(void **, int) = NULL;
-        static char **(*backtrace_symbols_p)(void *const *, int) = NULL;
-        static int backtrace_checked = 0;
-        if (!backtrace_checked) {
-            backtrace_p = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
-            backtrace_symbols_p = (char **(*)(void *const *, int))dlsym(RTLD_DEFAULT, "backtrace_symbols");
-            backtrace_checked = 1;
-        }
-        if (backtrace_p && backtrace_symbols_p) {
-            void *bt[32];
-            int n = backtrace_p(bt, 32);
-            char **symbols = backtrace_symbols_p(bt, n);
-            if (symbols) {
-                for (int i = 0; i < n; i++) {
-                    char bt_msg[512];
-                    snprintf(bt_msg, sizeof(bt_msg),
-                        "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
-                    write_str(2, bt_msg);
-                }
-                free(symbols);
-            }
-        }
+        twoyi_dump_backtrace("BACKTRACE");
     }
     static void (*real_exit)(int) __attribute__((noreturn)) = NULL;
     if (!real_exit) real_exit = dlsym(RTLD_NEXT, "exit");
@@ -2121,35 +2183,7 @@ void _exit(int status) {
         snprintf(msg, sizeof(msg),
             "[twoyi_loader] TRACE _exit(%d) called\n", status);
         write_str(2, msg);
-
-        // Print backtrace to identify which function called _exit().
-        // Diagnostic only — removed once root cause is found.
-        // Resolve backtrace functions at runtime via dlsym: backtrace() and
-        // backtrace_symbols() from <execinfo.h> are only declared at API 28+,
-        // but the CI targets API 24. dlsym() lets us use them when present
-        // (newer devices) and skip gracefully when absent (API 24).
-        static int (*backtrace_p)(void **, int) = NULL;
-        static char **(*backtrace_symbols_p)(void *const *, int) = NULL;
-        static int backtrace_checked = 0;
-        if (!backtrace_checked) {
-            backtrace_p = (int (*)(void **, int))dlsym(RTLD_DEFAULT, "backtrace");
-            backtrace_symbols_p = (char **(*)(void *const *, int))dlsym(RTLD_DEFAULT, "backtrace_symbols");
-            backtrace_checked = 1;
-        }
-        if (backtrace_p && backtrace_symbols_p) {
-            void *bt[32];
-            int n = backtrace_p(bt, 32);
-            char **symbols = backtrace_symbols_p(bt, n);
-            if (symbols) {
-                for (int i = 0; i < n; i++) {
-                    char bt_msg[512];
-                    snprintf(bt_msg, sizeof(bt_msg),
-                        "[twoyi_loader] BACKTRACE[%d]: %s\n", i, symbols[i]);
-                    write_str(2, bt_msg);
-                }
-                free(symbols);
-            }
-        }
+        twoyi_dump_backtrace("BACKTRACE");
     }
     // _exit is a raw syscall — can't call the real one via dlsym. Just go
     // straight to exit_group so the process actually terminates.
