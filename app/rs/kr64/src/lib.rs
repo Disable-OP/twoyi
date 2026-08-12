@@ -2187,6 +2187,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // servicemanager can't become context manager (EBUSY) because the
     // host's servicemanager already claimed that role on the shared
     // /dev/binder device.
+    //
+    // NON-ROOT MODE: Skip binderfs mount entirely! The `mount()` syscall
+    // (syscall 165) is blocked by Android's seccomp filter for
+    // untrusted_app — calling it sends SIGSYS (signal 31) which kills
+    // the process instantly. This was the root cause of kr64 crashing
+    // immediately on the x86_64 emulator.
+    //
+    // In non-root mode, we already have a binder PROXY (unix socket at
+    // {rootfs}/vm0/dev/binder) that handles binder IPC without needing
+    // a real binderfs mount. The guest's servicemanager connects to
+    // our proxy socket instead of the kernel's /dev/binder.
+    if !cfg.use_namespaces {
+        info!("[KR64] PARENT: non-root mode — skipping binderfs mount (seccomp blocks mount(), would cause SIGSYS)");
+    } else {
     {
         let binderfs_dir = format!("{}/dev/binderfs", rootfs_prefix);
         let _ = std::fs::create_dir_all(&binderfs_dir);
@@ -2309,6 +2323,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             info!("[KR64] PARENT: using host binder devices (fallback)");
         }
     }
+    } // end if cfg.use_namespaces (binderfs mount)
 
     // Pre-create directories that init and services expect to exist.
     // These are created in the rootfs so init's mkdir commands succeed.
