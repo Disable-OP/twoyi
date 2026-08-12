@@ -14,6 +14,7 @@ import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -296,6 +297,10 @@ public final class FileLogger {
     // -------------------------------------------------------------------------
     // Internals — tee / format / write
     // -------------------------------------------------------------------------
+
+    private static void tee(char level, String tag, String msg) {
+        tee(level, tag, msg, null);
+    }
 
     private static void tee(char level, String tag, String msg, Throwable t) {
         FileLogger inst = INSTANCE;
@@ -633,7 +638,7 @@ public final class FileLogger {
                 // ps -A (best-effort — on Android 16+ only shows self)
                 sb.append("── ps -A (best-effort; may only show self on Android 16+) ──\n");
                 try {
-                    Process p = new ProcessBuilder("ps", "-A").redirectErrorStream(true).start();
+                    java.lang.Process p = new ProcessBuilder("ps", "-A").redirectErrorStream(true).start();
                     try (BufferedReader br = new BufferedReader(
                             new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                         String line;
@@ -719,7 +724,7 @@ public final class FileLogger {
             pb.redirectErrorStream(true);
             try {
                 // First read — verify dmesg is callable.
-                Process probe = pb.start();
+                java.lang.Process probe = pb.start();
                 int exit = probe.waitFor();
                 if (exit != 0) {
                     tee('I', TAG, "dmesg not available (exit=" + exit
@@ -734,7 +739,7 @@ public final class FileLogger {
             // Poll loop — read dmesg every 30 s, append.
             while (true) {
                 try {
-                    Process p = pb.start();
+                    java.lang.Process p = pb.start();
                     try (BufferedReader br = new BufferedReader(
                             new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                         StringBuilder sb = new StringBuilder();
@@ -850,17 +855,18 @@ public final class FileLogger {
             try {
                 String stamp = mDateFormat.format(new Date());
                 StringWriter sw = new StringWriter();
-                sw.write("── Uncaught exception ──\n");
-                sw.write("Time:       ").write(stamp).write("\n");
-                sw.write("Thread:     ").write(thread.getName())
-                        .write(" (id=").write(String.valueOf(thread.getId())).write(")\n");
-                sw.write("Process:    pid=").write(String.valueOf(Process.myPid()))
-                        .write(" uid=").write(String.valueOf(Process.myUid())).write("\n");
-                sw.write("BootElapsedMs: ").write(String.valueOf(
-                        SystemClock.elapsedRealtime() - mStartMs)).write("\n");
-                sw.write("\n");
-                throwable.printStackTrace(new PrintWriter(sw));
-                sw.write("\n");
+                PrintWriter pw = new PrintWriter(sw);
+                pw.println("── Uncaught exception ──");
+                pw.println("Time:       " + stamp);
+                pw.println("Thread:     " + thread.getName()
+                        + " (id=" + thread.getId() + ")");
+                pw.println("Process:    pid=" + Process.myPid()
+                        + " uid=" + Process.myUid());
+                pw.println("BootElapsedMs: " + (SystemClock.elapsedRealtime() - mStartMs));
+                pw.println();
+                throwable.printStackTrace(pw);
+                pw.println();
+                pw.flush();
                 try (FileOutputStream fos = new FileOutputStream(mCrashLog, true)) {
                     fos.write(sw.toString().getBytes(StandardCharsets.UTF_8));
                 }
