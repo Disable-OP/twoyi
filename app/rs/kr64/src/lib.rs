@@ -1756,19 +1756,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //
     // Requires CAP_SYS_ADMIN (or root). When kr64 is run via `su -c`
     // (as core.rs does on rooted devices), we have root and this works.
-    // When running as a regular untrusted_app, unshare fails and we
-    // fall through -- init will exit 31, but at least we get diagnostic
-    // output.
+    //
+    // NON-ROOT MODE: Skip unshare entirely! On stock AOSP seccomp
+    // (Android 11+ emulator), `unshare` is NOT in the seccomp
+    // allowlist for untrusted_app — calling it sends SIGSYS (signal
+    // 31) which kills the process instantly. On some vendor kernels
+    // (e.g. Honor), unshare is allowed but returns EPERM — either
+    // way, it doesn't work without root.
+    //
+    // Instead of unshare, we use PTRACE-based syscall emulation to
+    // intercept getpid() and return 1. This achieves the same effect
+    // as CLONE_NEWPID without requiring any privileges.
     // ---------------------------------------------------------------
-    match unsafe { libc::unshare(libc::CLONE_NEWPID) } {
-        0 => info!("[KR64] unshare(CLONE_NEWPID) succeeded -- child will be PID 1"),
-        _ => {
-            let e = std::io::Error::last_os_error();
+    if cfg.use_namespaces {
+        match unsafe { libc::unshare(libc::CLONE_NEWPID) } {
+            0 => info!("[KR64] unshare(CLONE_NEWPID) succeeded -- child will be PID 1"),
+            _ => {
+                let e = std::io::Error::last_os_error();
             warning!(
                 "[KR64] unshare(CLONE_NEWPID) failed: {} -- init will not be PID 1 (will exit 31)",
                 e
             );
+            }
         }
+    } else {
+        info!("[KR64] non-root mode: skipping unshare(CLONE_NEWPID) — seccomp blocks it on stock AOSP; ptrace emulation will fake getpid()=1 instead");
     }
 
     // ---------------------------------------------------------------
@@ -1976,6 +1988,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // change is enforced by the kernel. On the KVM test environment
     // (permissive mode), the operation may fail with EPERM/ENOTSUP but
     // access is allowed anyway via the permissive watchdog.
+    //
+    // NON-ROOT MODE: Skip lsetxattr entirely! On unrooted devices,
+    // Android's seccomp filter blocks lsetxattr (syscall 189) for
+    // untrusted_app, sending SIGSYS (signal 31) which kills the process
+    // instantly. This was the root cause of kr64 crashing immediately
+    // on the x86_64 emulator — kr64 never even got to write any output
+    // to stderr before being killed.
+    if !cfg.use_namespaces {
+        info!("[KR64] PARENT: non-root mode — skipping lsetxattr (seccomp blocks it, would cause SIGSYS)");
+    } else {
     for lib_path in &[
         "/dev/libgetpid_hook.so",
         "/dev/libtwoyi_loader_shlib.so",
@@ -2003,6 +2025,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
     }
+    } // end if cfg.use_namespaces
 
     // Copy critical service binaries to /dev/twoyi-bin/ (tmpfs, executable).
     //
