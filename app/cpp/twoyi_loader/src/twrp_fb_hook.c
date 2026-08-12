@@ -171,6 +171,23 @@ static void write_str(int fd, const char *s) {
     (void)raw_syscall3(SYS_write, fd, (long)s, (long)n);
 }
 
+// Hex formatter — used for logging ioctl request numbers and function
+// addresses in diagnostics. Writes "0x" + up to 8 hex digits.
+static void write_hex(int fd, unsigned int val) {
+    char buf[11];
+    int i = (int)sizeof(buf);
+    buf[--i] = '\0';
+    if (val == 0) {
+        buf[--i] = '0';
+    } else {
+        const char *hexd = "0123456789abcdef";
+        while (val) { buf[--i] = hexd[val & 0xf]; val >>= 4; }
+    }
+    buf[--i] = 'x';
+    buf[--i] = '0';
+    write_str(fd, &buf[i]);
+}
+
 static void write_num(int fd, int v) {
     char buf[16];
     int i = (int)sizeof(buf);
@@ -329,10 +346,41 @@ static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
 // Constructor (.init_array) — runs when the LD_PRELOAD library is loaded
 // by the bionic linker, BEFORE recovery's main() starts. Logs that we
 // loaded so we can verify in the KVM logs that LD_PRELOAD is working.
+//
+// DIAGNOSTIC (Task 31, KVM run 31578527978): the previous run showed that
+// our hook's constructor runs ([twrp_fb_hook] loaded appears 16×) but
+// NONE of our open/ioctl/close hooks are ever called by recovery — the
+// "tracking for FB ioctls" message NEVER appears, and recovery segfaults
+// at "I:Checking resolution..." because FBIOGET_VSCREENINFO returns
+// ENOTTY (fb0 is a regular file) and libminuitwrp derefs the zeroed vi.
+// To diagnose whether our hook's functions are actually exported in the
+// .dynsym table (and thus reachable by bionic's PLT resolution), we log
+// their addresses here. If bionic's linker can find these symbols via
+// DT_HASH lookup, open@<addr> should be the address that gets called
+// when libminuitwrp's PLT entry for `open` is resolved.
 // ---------------------------------------------------------------------------
+// Forward declarations so the constructor can take their addresses. open,
+// openat, close, ioctl are declared in standard headers (fcntl.h, unistd.h,
+// sys/ioctl.h), but __open_2 and __openat_2 are bionic-internal fortified
+// variants not in any public header — we must declare them ourselves.
+int __open_2(const char *path, int flags);
+int __openat_2(int dirfd, const char *path, int flags);
+
 __attribute__((constructor))
 static void twrp_fb_hook_init(void) {
     write_str(2, "[twrp_fb_hook] loaded (i686 LD_PRELOAD for /dev/graphics/fb0)\n");
+    // Log hook function addresses to confirm they're defined and to
+    // correlate with any future PLT-resolution diagnostics. These are
+    // the addresses of OUR definitions; if bionic's linker resolves
+    // libminuitwrp's `open` PLT entry to a DIFFERENT address, that
+    // would explain why our hook isn't being called.
+    write_str(2, "[twrp_fb_hook] addrs: open@"); write_hex(2, (unsigned int)(uintptr_t)&open);
+    write_str(2, " openat@"); write_hex(2, (unsigned int)(uintptr_t)&openat);
+    write_str(2, " __open_2@"); write_hex(2, (unsigned int)(uintptr_t)&__open_2);
+    write_str(2, " __openat_2@"); write_hex(2, (unsigned int)(uintptr_t)&__openat_2);
+    write_str(2, " close@"); write_hex(2, (unsigned int)(uintptr_t)&close);
+    write_str(2, " ioctl@"); write_hex(2, (unsigned int)(uintptr_t)&ioctl);
+    write_str(2, "\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -365,14 +413,21 @@ int open(const char *path, int flags, ...) {
     init_real_funcs();
     int fd = real_open ? real_open(path, flags, mode)
                        : (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, mode);
+    // DIAGNOSTIC (Task 31): log EVERY open() call to verify our hook is
+    // actually being invoked by bionic's PLT resolution. If this message
+    // NEVER appears in strace but strace shows openat() syscalls for
+    // /dev/graphics/fb0, then our LD_PRELOAD hook is NOT being called —
+    // meaning either our symbols aren't exported in .dynsym, or bionic's
+    // old (AOSP 5.1) linker isn't searching LD_PRELOAD for PLT resolution.
+    write_str(2, "[twrp_fb_hook] open(\"");
+    write_str(2, path ? path : "(null)");
+    write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
+    write_str(2, ") -> fd="); write_num(2, fd);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
-        write_str(2, "[twrp_fb_hook] open(");
-        write_str(2, path);
-        write_str(2, ") -> fd=");
-        write_num(2, fd);
-        write_str(2, " (tracking for FB ioctls)\n");
+        write_str(2, " [FB0 TRACKED]");
     }
+    write_str(2, "\n");
     return fd;
 }
 
@@ -384,14 +439,17 @@ int openat(int dirfd, const char *path, int flags, ...) {
     init_real_funcs();
     int fd = real_openat ? real_openat(dirfd, path, flags, mode)
                          : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
+    // DIAGNOSTIC (Task 31): log EVERY openat() call (see open() comment).
+    write_str(2, "[twrp_fb_hook] openat(df="); write_num(2, dirfd);
+    write_str(2, ", \"");
+    write_str(2, path ? path : "(null)");
+    write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
+    write_str(2, ") -> fd="); write_num(2, fd);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
-        write_str(2, "[twrp_fb_hook] openat(");
-        write_str(2, path);
-        write_str(2, ") -> fd=");
-        write_num(2, fd);
-        write_str(2, " (tracking for FB ioctls)\n");
+        write_str(2, " [FB0 TRACKED]");
     }
+    write_str(2, "\n");
     return fd;
 }
 
@@ -404,14 +462,19 @@ int __open_2(const char *path, int flags) {
     int fd;
     if (real_open2) fd = real_open2(path, flags);
     else            fd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, 0);
+    // DIAGNOSTIC (Task 31): log EVERY __open_2() call (bionic's fortified
+    // open variant — selected by -D_FORTIFY_SOURCE). If libminuitwrp was
+    // built with _FORTIFY_SOURCE, this is the variant that gets called
+    // instead of open().
+    write_str(2, "[twrp_fb_hook] __open_2(\"");
+    write_str(2, path ? path : "(null)");
+    write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
+    write_str(2, ") -> fd="); write_num(2, fd);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
-        write_str(2, "[twrp_fb_hook] __open_2(");
-        write_str(2, path);
-        write_str(2, ") -> fd=");
-        write_num(2, fd);
-        write_str(2, " (tracking for FB ioctls)\n");
+        write_str(2, " [FB0 TRACKED]");
     }
+    write_str(2, "\n");
     return fd;
 }
 
@@ -422,14 +485,17 @@ int __openat_2(int dirfd, const char *path, int flags) {
     int fd;
     if (real_openat2) fd = real_openat2(dirfd, path, flags);
     else              fd = (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, 0);
+    // DIAGNOSTIC (Task 31): log EVERY __openat_2() call.
+    write_str(2, "[twrp_fb_hook] __openat_2(df="); write_num(2, dirfd);
+    write_str(2, ", \"");
+    write_str(2, path ? path : "(null)");
+    write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
+    write_str(2, ") -> fd="); write_num(2, fd);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
-        write_str(2, "[twrp_fb_hook] __openat_2(");
-        write_str(2, path);
-        write_str(2, ") -> fd=");
-        write_num(2, fd);
-        write_str(2, " (tracking for FB ioctls)\n");
+        write_str(2, " [FB0 TRACKED]");
     }
+    write_str(2, "\n");
     return fd;
 }
 
@@ -504,6 +570,23 @@ int ioctl(int fd, int request, ...) {
     va_end(ap);
 
     unsigned req = (unsigned)request;
+
+    // DIAGNOSTIC (Task 31): log EVERY ioctl() call to verify our hook is
+    // being invoked. Key ioctl numbers to watch for:
+    //   FBIOGET_VSCREENINFO = 0x4600  (libminuitwrp reads screen size)
+    //   FBIOGET_FSCREENINFO = 0x4602  (libminuitwrp reads smem_len for mmap)
+    //   FBIOPUT_VSCREENINFO = 0x4601
+    //   FBIOPAN_DISPLAY     = 0x4606
+    //   FBIOBLANK            = 0x4611
+    // If our hook IS being called but recovery still segfaults, the issue
+    // is in our ioctl handling (wrong struct size, wrong values, etc.).
+    // If our hook is NOT being called, the issue is PLT interception.
+    {
+        int tracked = fb_fd_is_tracked(fd);
+        write_str(2, "[twrp_fb_hook] ioctl(fd="); write_num(2, fd);
+        write_str(2, ", req=0x"); write_hex(2, req);
+        write_str(2, ") [trk="); write_num(2, tracked); write_str(2, "]\n");
+    }
 
     // Fast path: not an fb0 fd, pass through.
     if (!fb_fd_is_tracked(fd)) {
