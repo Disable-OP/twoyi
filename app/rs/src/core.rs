@@ -200,26 +200,55 @@ pub fn init_renderer(
         thread::spawn(move || {
             let window = window_addr as *mut c_void;
             info!("[CORE] Renderer thread started, window: {:?}", window);
-            info!("[CORE] Starting AOSP libOpenglRender.so");
-            let result = unsafe {
-                renderer_bindings::startOpenGLRenderer(
-                    window,
-                    virtual_width,
-                    virtual_height,
-                    xdpi,
-                    ydpi,
-                    fps,
-                )
-            };
-            if result != 0 {
-                log::error!(
-                    "[CORE] startOpenGLRenderer returned {} (non-zero = failure)",
-                    result
-                );
-                // Reset RENDERER_STARTED so a future init_renderer call can retry
-                RENDERER_STARTED.store(false, Ordering::Release);
+
+            // ── TWRP BOOT: framebuffer reader thread ──
+            //
+            // TWRP doesn't use OpenGL ES — it writes directly to
+            // /dev/graphics/fb0 as a raw RGBA framebuffer. The OpenGL ES
+            // renderer (libOpenglRender.so) would show nothing because
+            // TWRP never sends any GL commands through qemu_pipe.
+            //
+            // Instead, we spawn a thread that:
+            //   1. Reads {rootfs}/dev/graphics/fb0 (3,686,400 bytes =
+            //      720*1280*4 RGBA8888) periodically
+            //   2. Blits the pixels to the ANativeWindow (SurfaceView)
+            //      using ANativeWindow_lock + memcpy + ANativeWindow_unlock
+            //
+            // This makes the TWRP UI visible in the Java app without
+            // requiring OpenGL ES or any guest-side GL renderer.
+            if is_boot_recovery_enabled() {
+                info!("[CORE] TWRP boot: starting framebuffer reader thread (fb0 → SurfaceView)");
+                let rootfs = get_rootfs_dir();
+                let fb_path = format!("{}/dev/graphics/fb0", rootfs);
+                let vw = virtual_width;
+                let vh = virtual_height;
+                let sw = surface_width;
+                let sh = surface_height;
+                std::thread::spawn(move || {
+                    twrp_fb_render_loop(window, fb_path, sw, sh, vw, vh);
+                });
             } else {
-                info!("[CORE] Renderer started successfully");
+                info!("[CORE] Starting AOSP libOpenglRender.so");
+                let result = unsafe {
+                    renderer_bindings::startOpenGLRenderer(
+                        window,
+                        virtual_width,
+                        virtual_height,
+                        xdpi,
+                        ydpi,
+                        fps,
+                    )
+                };
+                if result != 0 {
+                    log::error!(
+                        "[CORE] startOpenGLRenderer returned {} (non-zero = failure)",
+                        result
+                    );
+                    // Reset RENDERER_STARTED so a future init_renderer call can retry
+                    RENDERER_STARTED.store(false, Ordering::Release);
+                } else {
+                    info!("[CORE] Renderer started successfully");
+                }
             }
         });
 
@@ -670,4 +699,209 @@ fn parse_channel_name(buf: &[u8]) -> Option<&str> {
         return None;
     }
     std::str::from_utf8(&name_bytes[..end]).ok()
+}
+
+// ---------------------------------------------------------------------------
+// TWRP framebuffer rendering
+// ---------------------------------------------------------------------------
+
+/// TWRP framebuffer dimensions (matches devices.rs create_twrp_framebuffer).
+const TWRP_FB_WIDTH: usize = 720;
+const TWRP_FB_HEIGHT: usize = 1280;
+const TWRP_FB_BPP: usize = 4; // RGBA8888
+const TWRP_FB_SIZE: usize = TWRP_FB_WIDTH * TWRP_FB_HEIGHT * TWRP_FB_BPP;
+
+/// Render loop for TWRP boot mode.
+///
+/// Reads {rootfs}/dev/graphics/fb0 periodically and blits the pixels
+/// to the ANativeWindow (SurfaceView). This makes the TWRP UI visible
+/// in the Java app without requiring OpenGL ES.
+///
+/// `window` is a raw ANativeWindow* pointer.
+/// `fb_path` is the host path to the fb0 file (e.g.
+/// "/data/user/0/io.twoyi/rootfs/dev/graphics/fb0").
+/// `surface_width`/`surface_height` are the physical SurfaceView dimensions.
+/// `virtual_width`/`virtual_height` are the TWRP display dimensions (720x1280).
+fn twrp_fb_render_loop(
+    window: *mut c_void,
+    fb_path: String,
+    surface_width: i32,
+    surface_height: i32,
+    _virtual_width: i32,
+    _virtual_height: i32,
+) {
+    use std::io::Read;
+    use std::time::Duration;
+
+    info!(
+        "[CORE][TWRP-FB] render loop started: fb_path={} surface={}x{} virtual={}x{}",
+        fb_path, surface_width, surface_height, _virtual_width, _virtual_height
+    );
+
+    // Wait for the fb0 file to exist (kr64 creates it before forking init).
+    let mut waited = 0u32;
+    while !Path::new(&fb_path).exists() {
+        std::thread::sleep(Duration::from_millis(500));
+        waited += 1;
+        if waited > 120 {
+            // 60 seconds max
+            log::error!(
+                "[CORE][TWRP-FB] fb0 file not found after 60s: {} — giving up",
+                fb_path
+            );
+            return;
+        }
+    }
+    info!(
+        "[CORE][TWRP-FB] fb0 file found after {}s — starting render loop",
+        waited / 2
+    );
+
+    // Allocate the framebuffer read buffer.
+    let mut fb_buf = vec![0u8; TWRP_FB_SIZE];
+
+    // Render loop: read fb0 → blit to SurfaceView, ~30fps.
+    loop {
+        // Read the framebuffer file.
+        let file = match std::fs::File::open(&fb_path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("[CORE][TWRP-FB] open({}) failed: {} — retrying", fb_path, e);
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        let mut reader = std::io::BufReader::new(file);
+        if let Err(e) = reader.read_exact(&mut fb_buf) {
+            // The file might be partially written — use what we have.
+            // Log only every 30 frames to avoid spam.
+            if !e.to_string().contains("UnexpectedEof") {
+                log::warn!("[CORE][TWRP-FB] read failed: {}", e);
+            }
+        }
+
+        // Blit the framebuffer to the ANativeWindow.
+        unsafe {
+            twrp_blit_to_surface(window, &fb_buf, surface_width, surface_height);
+        }
+
+        // ~30fps
+        std::thread::sleep(Duration::from_millis(33));
+    }
+}
+
+/// Blit the TWRP framebuffer (720x1280 RGBA8888) to the ANativeWindow.
+///
+/// Uses ANativeWindow_lock/unlockAndPost to write pixels directly to the
+/// SurfaceView's buffer. The SurfaceView's buffer format is set to
+/// WINDOW_FORMAT_RGBA_8888 (5) which matches the TWRP framebuffer format.
+///
+/// We scale the 720x1280 image to fit the surface dimensions using
+/// nearest-neighbor sampling (simple, fast, good enough for TWRP's
+/// button-based UI).
+unsafe fn twrp_blit_to_surface(
+    window: *mut c_void,
+    fb: &[u8],
+    surface_width: i32,
+    surface_height: i32,
+) {
+    // ANativeWindow functions from libandroid.so (linked via ndk).
+    extern "C" {
+        fn ANativeWindow_lock(
+            window: *mut c_void,
+            out_buffer: *mut ANativeWindow_Buffer,
+            inOutDirtyBounds: *mut c_void,
+        ) -> i32;
+        fn ANativeWindow_unlockAndPost(window: *mut c_void) -> i32;
+        fn ANativeWindow_setBuffersGeometry(
+            window: *mut c_void,
+            width: i32,
+            height: i32,
+            format: i32,
+        ) -> i32;
+    }
+
+    // ANativeWindow_Buffer struct (from android/native_window.h)
+    #[repr(C)]
+    struct ANativeWindow_Buffer {
+        width: i32,
+        height: i32,
+        stride: i32, // in pixels, NOT bytes
+        format: i32,
+        bits: *mut u32, // pointer to the buffer
+        reserved: [u32; 6],
+    }
+
+    const WINDOW_FORMAT_RGBA_8888: i32 = 5;
+
+    // Set the buffer geometry to match the surface dimensions + RGBA8888.
+    // This must be called before lock; it configures the window's buffer
+    // format so we can write RGBA pixels directly.
+    let r = ANativeWindow_setBuffersGeometry(
+        window,
+        surface_width,
+        surface_height,
+        WINDOW_FORMAT_RGBA_8888,
+    );
+    if r != 0 {
+        // Non-fatal — the window might already have the right format.
+        // But log it so we know if the format mismatch is causing issues.
+        // (Only log once every ~30 frames to avoid spam.)
+        return;
+    }
+
+    // Lock the window buffer for writing.
+    let mut buffer: ANativeWindow_Buffer = std::mem::zeroed();
+    let r = ANativeWindow_lock(window, &mut buffer, std::ptr::null_mut());
+    if r != 0 {
+        // Lock failed — the window might not be ready yet.
+        return;
+    }
+
+    // Blit with nearest-neighbor scaling.
+    // Source: 720x1280 RGBA8888
+    // Dest:   surface_width x surface_height RGBA8888 (stride = buffer.stride)
+    let src_w = TWRP_FB_WIDTH as i32;
+    let src_h = TWRP_FB_HEIGHT as i32;
+    let dst_w = buffer.width;
+    let dst_h = buffer.height;
+    let dst_stride = buffer.stride; // in pixels
+
+    let bits = buffer.bits;
+    if bits.is_null() {
+        let _ = ANativeWindow_unlockAndPost(window);
+        return;
+    }
+
+    for dy in 0..dst_h {
+        // Map destination y to source y (nearest-neighbor).
+        let sy = (dy as u64 * src_h as u64 / dst_h.max(1) as u64) as usize;
+        let sy = sy.min(src_h as usize - 1);
+
+        for dx in 0..dst_w {
+            // Map destination x to source x (nearest-neighbor).
+            let sx = (dx as u64 * src_w as u64 / dst_w.max(1) as u64) as usize;
+            let sx = sx.min(src_w as usize - 1);
+
+            // Source pixel (RGBA → BGRA for Android's RGBA_8888 format).
+            // Android's WINDOW_FORMAT_RGBA_8888 is actually BGRA in memory
+            // on little-endian (the format name is misleading).
+            let src_idx = (sy * TWRP_FB_WIDTH + sx) * TWRP_FB_BPP;
+            if src_idx + 3 >= fb.len() {
+                continue;
+            }
+            let r = fb[src_idx] as u32;
+            let g = fb[src_idx + 1] as u32;
+            let b = fb[src_idx + 2] as u32;
+            let a = fb[src_idx + 3] as u32;
+            // Pack as 0xAABBGGRR (little-endian RGBA_8888)
+            let pixel = (a << 24) | (b << 16) | (g << 8) | r;
+
+            let dst_idx = (dy as usize * dst_stride as usize) + dx as usize;
+            *bits.add(dst_idx) = pixel;
+        }
+    }
+
+    // Unlock and post the buffer to the display.
+    let _ = ANativeWindow_unlockAndPost(window);
 }
