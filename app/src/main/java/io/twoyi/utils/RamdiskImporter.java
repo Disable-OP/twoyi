@@ -17,7 +17,6 @@ import android.content.Context;
 import android.net.Uri;
 import android.util.Log;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -30,14 +29,20 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
+import org.apache.commons.compress.compressors.lzma.LZMACompressorInputStream;
+import org.apache.commons.compress.compressors.xz.XZCompressorInputStream;
+
 /**
- * Import ramdisk/rootfs from various formats:
- * <ul>
- *   <li><b>.tar / .tar.gz</b> — standard rootfs tarball (existing behavior).</li>
- *   <li><b>.img</b> — Android boot image (e.g. TWRP recovery.img).</li>
- *   <li><b>.cpio / .cpio.gz</b> — raw ramdisk cpio archive.</li>
- *   <li><b>.zip</b> — ZIP file containing a ramdisk.</li>
- * </ul>
+ * Import ramdisk/rootfs from various formats — ALL PURE JAVA, no external commands.
+ *
+ * Supported formats (auto-detected by magic bytes):
+ *   - .img — Android boot image (extracts ramdisk, decompresses gzip/LZMA/uncompressed)
+ *   - .cpio — Raw SVR4 cpio archive (newc format)
+ *   - .cpio.gz — Gzipped cpio
+ *   - .cpio.lzma / .cpio.xz — LZMA/XZ compressed cpio
+ *   - .zip — ZIP containing a ramdisk entry
+ *   - .tar — TAR archive (extracted via Java TarInputStream)
+ *   - .tar.gz — Gzipped TAR
  */
 public class RamdiskImporter {
     private static final String TAG = "RamdiskImporter";
@@ -70,6 +75,9 @@ public class RamdiskImporter {
             case "lzma":
                 result = importLzmaFile(tempFile, targetDir);
                 break;
+            case "xz":
+                result = importXzFile(tempFile, targetDir);
+                break;
             case "zip":
                 result = importZipFile(tempFile, targetDir);
                 break;
@@ -77,24 +85,22 @@ public class RamdiskImporter {
                 result = extractCpioStreaming(tempFile, targetDir);
                 break;
             case "tar":
-                result = importTarFile(tempFile, targetDir);
+                result = extractTarJava(tempFile, targetDir);
                 break;
             default:
                 Log.w(TAG, "Unknown format, trying cpio then tar");
-                // Try cpio first (most ramdisks are cpio, and tar command
-                // may not exist on all Android devices)
                 try {
                     result = extractCpioStreaming(tempFile, targetDir);
-                } catch (Exception cpioEx) {
-                    Log.w(TAG, "cpio extraction failed: " + cpioEx.getMessage());
+                } catch (Exception e) {
+                    Log.w(TAG, "cpio failed: " + e.getMessage());
                     result = false;
                 }
                 if (!result) {
                     Log.w(TAG, "cpio failed, trying tar");
                     try {
-                        result = importTarFile(tempFile, targetDir);
-                    } catch (Exception tarEx) {
-                        Log.w(TAG, "tar extraction failed: " + tarEx.getMessage());
+                        result = extractTarJava(tempFile, targetDir);
+                    } catch (Exception e) {
+                        Log.w(TAG, "tar failed: " + e.getMessage());
                         result = false;
                     }
                 }
@@ -124,7 +130,13 @@ public class RamdiskImporter {
             return "gzip";
         }
 
-        // LZMA: 0x5d 0x00 (raw LZMA stream)
+        // XZ: 0xfd 0x37 0x7a 0x58 0x5a 0x00
+        if ((header[0] & 0xFF) == 0xfd && header[1] == '7' && header[2] == 'z' &&
+            header[3] == 'X' && header[4] == 'Z' && header[5] == 0) {
+            return "xz";
+        }
+
+        // LZMA: 0x5d 0x00 (raw LZMA stream — properties byte + dict size)
         if ((header[0] & 0xFF) == 0x5d) {
             return "lzma";
         }
@@ -149,6 +161,11 @@ public class RamdiskImporter {
         return "unknown";
     }
 
+    /**
+     * Import an Android boot image (.img).
+     * Pure Java: parses header, reads ramdisk, decompresses (gzip/LZMA/uncompressed),
+     * extracts cpio to targetDir.
+     */
     private static boolean importBootImage(File imgFile, File targetDir) throws IOException {
         try (FileInputStream fis = new FileInputStream(imgFile)) {
             byte[] header = new byte[16384];
@@ -179,8 +196,7 @@ public class RamdiskImporter {
                 read += n;
             }
 
-            // Decompress ramdisk -> cpio, then extract streaming
-            // Detect compression: gzip (0x1f 0x8b), LZMA (0x5d), or uncompressed cpio (070701)
+            // Decompress ramdisk -> cpio temp file
             File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
             if ((ramdiskCompressed[0] & 0xFF) == 0x1f && (ramdiskCompressed[1] & 0xFF) == 0x8b) {
                 // GZIP
@@ -192,29 +208,14 @@ public class RamdiskImporter {
                     while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
                 }
             } else if ((ramdiskCompressed[0] & 0xFF) == 0x5d) {
-                // LZMA — Java doesn't have a built-in LZMA raw stream decompressor.
-                // Write compressed data to temp file and use Python (if available)
-                // or try to use java.util.zip (Inflater won't work for raw LZMA).
-                // Fallback: write as-is and let the extract script handle it.
-                Log.i(TAG, "Ramdisk is LZMA-compressed (not natively supported in Java)");
-                // Try using ProcessBuilder with python3
-                File lzmaTemp = new File(targetDir.getParentFile(), "ramdisk.lzma");
-                try (FileOutputStream fos = new FileOutputStream(lzmaTemp)) {
-                    fos.write(ramdiskCompressed);
-                }
-                ProcessBuilder pb = new ProcessBuilder("python3", "-c",
-                    "import lzma,sys; sys.stdout.buffer.write(lzma.decompress(sys.stdin.buffer.read()))");
-                pb.redirectInput(lzmaTemp);
-                pb.redirectOutput(cpioTemp);
-                Process proc = pb.start();
-                try {
-                    proc.waitFor(60, java.util.concurrent.TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    throw new IOException("LZMA decompression interrupted", e);
-                }
-                lzmaTemp.delete();
-                if (proc.exitValue() != 0) {
-                    throw new IOException("LZMA decompression failed (python3 not available?)");
+                // LZMA — use Apache Commons Compress (pure Java)
+                Log.i(TAG, "Ramdisk is LZMA-compressed");
+                try (LZMACompressorInputStream lzis = new LZMACompressorInputStream(
+                         new java.io.ByteArrayInputStream(ramdiskCompressed));
+                     FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = lzis.read(buf)) > 0) fos.write(buf, 0, n);
                 }
             } else if (ramdiskCompressed[0] == '0' && ramdiskCompressed[1] == '7') {
                 // Uncompressed cpio
@@ -235,58 +236,9 @@ public class RamdiskImporter {
     }
 
     /**
-     * Import an LZMA-compressed file. Could be .cpio.lzma (ramdisk).
-     * Uses python3 to decompress (Java doesn't have native LZMA support).
+     * Import a gzip file. Could be .tar.gz (rootfs) or .cpio.gz (ramdisk).
+     * Pure Java: uses GZIPInputStream.
      */
-    private static boolean importLzmaFile(File lzmaFile, File targetDir) throws IOException {
-        Log.i(TAG, "Decompressing LZMA file...");
-        File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
-        ProcessBuilder pb = new ProcessBuilder("python3", "-c",
-            "import lzma,sys; sys.stdout.buffer.write(lzma.decompress(sys.stdin.buffer.read()))");
-        pb.redirectInput(lzmaFile);
-        pb.redirectOutput(cpioTemp);
-        Process proc = pb.start();
-        try {
-            if (!proc.waitFor(60, java.util.concurrent.TimeUnit.SECONDS)) {
-                proc.destroyForcibly();
-                throw new IOException("LZMA decompression timed out");
-            }
-        } catch (InterruptedException e) {
-            throw new IOException("LZMA decompression interrupted", e);
-        }
-        if (proc.exitValue() != 0) {
-            // python3 not available — try using busybox if available
-            Log.w(TAG, "python3 failed, trying busybox");
-            ProcessBuilder pb2 = new ProcessBuilder("busybox", "lzma", "-d", "-c");
-            pb2.redirectInput(lzmaFile);
-            pb2.redirectOutput(cpioTemp);
-            Process proc2 = pb2.start();
-            try {
-                proc2.waitFor(60, java.util.concurrent.TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                throw new IOException("busybox lzma interrupted", e);
-            }
-            if (proc2.exitValue() != 0) {
-                throw new IOException("LZMA decompression failed (neither python3 nor busybox available)");
-            }
-        }
-
-        // Check if decompressed content is cpio
-        byte[] header = new byte[6];
-        try (FileInputStream fis = new FileInputStream(cpioTemp)) {
-            fis.read(header);
-        }
-        if (new String(header).equals("070701") || new String(header).equals("070702")) {
-            boolean result = extractCpioStreaming(cpioTemp, targetDir);
-            cpioTemp.delete();
-            return result;
-        }
-
-        // Not cpio — maybe it's a tar
-        cpioTemp.delete();
-        return importTarFile(cpioTemp, targetDir);
-    }
-
     private static boolean importGzipFile(File gzFile, File targetDir) throws IOException {
         // Peek at decompressed content to determine if it's tar or cpio
         byte[] header = new byte[512];
@@ -310,17 +262,88 @@ public class RamdiskImporter {
             return result;
         }
 
-        // Assume tar.gz
-        return extractTarGz(gzFile, targetDir);
+        // Assume tar.gz — decompress then extract
+        File tarTemp = new File(targetDir.getParentFile(), "rootfs.tar");
+        try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile));
+             FileOutputStream fos = new FileOutputStream(tarTemp)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
+        }
+        boolean result = extractTarJava(tarTemp, targetDir);
+        tarTemp.delete();
+        return result;
     }
 
+    /**
+     * Import an LZMA-compressed file. Pure Java: uses Apache Commons Compress.
+     */
+    private static boolean importLzmaFile(File lzmaFile, File targetDir) throws IOException {
+        Log.i(TAG, "Decompressing LZMA file (pure Java)...");
+        File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
+        try (LZMACompressorInputStream lzis = new LZMACompressorInputStream(new FileInputStream(lzmaFile));
+             FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = lzis.read(buf)) > 0) fos.write(buf, 0, n);
+        }
+
+        // Check if decompressed content is cpio
+        byte[] header = new byte[6];
+        try (FileInputStream fis = new FileInputStream(cpioTemp)) {
+            fis.read(header);
+        }
+        if (new String(header).equals("070701") || new String(header).equals("070702")) {
+            boolean result = extractCpioStreaming(cpioTemp, targetDir);
+            cpioTemp.delete();
+            return result;
+        }
+
+        // Not cpio — try tar
+        boolean result = extractTarJava(cpioTemp, targetDir);
+        cpioTemp.delete();
+        return result;
+    }
+
+    /**
+     * Import an XZ-compressed file. Pure Java: uses Apache Commons Compress.
+     */
+    private static boolean importXzFile(File xzFile, File targetDir) throws IOException {
+        Log.i(TAG, "Decompressing XZ file (pure Java)...");
+        File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
+        try (XZCompressorInputStream xzis = new XZCompressorInputStream(new FileInputStream(xzFile));
+             FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = xzis.read(buf)) > 0) fos.write(buf, 0, n);
+        }
+
+        byte[] header = new byte[6];
+        try (FileInputStream fis = new FileInputStream(cpioTemp)) {
+            fis.read(header);
+        }
+        if (new String(header).equals("070701") || new String(header).equals("070702")) {
+            boolean result = extractCpioStreaming(cpioTemp, targetDir);
+            cpioTemp.delete();
+            return result;
+        }
+
+        boolean result = extractTarJava(cpioTemp, targetDir);
+        cpioTemp.delete();
+        return result;
+    }
+
+    /**
+     * Import a ZIP file containing a ramdisk. Pure Java: uses java.util.zip.ZipInputStream.
+     */
     private static boolean importZipFile(File zipFile, File targetDir) throws IOException {
         try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipFile))) {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 String name = entry.getName().toLowerCase();
                 if (name.endsWith(".cpio") || name.endsWith(".cpio.gz") ||
-                    name.endsWith(".ramdisk") || name.endsWith(".ramdisk.gz")) {
+                    name.endsWith(".ramdisk") || name.endsWith(".ramdisk.gz") ||
+                    name.endsWith(".cpio.lzma") || name.endsWith(".cpio.xz")) {
 
                     File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
                     try (FileOutputStream fos = new FileOutputStream(cpioTemp)) {
@@ -329,17 +352,37 @@ public class RamdiskImporter {
                         while ((n = zis.read(buf)) > 0) fos.write(buf, 0, n);
                     }
 
-                    // Decompress if gzipped
+                    // Decompress if needed
                     if (name.endsWith(".gz")) {
-                        File decompressed = new File(cpioTemp.getParent(), "ramdisk_dec.cpio");
+                        File dec = new File(cpioTemp.getParent(), "ramdisk_dec.cpio");
                         try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(cpioTemp));
-                             FileOutputStream fos = new FileOutputStream(decompressed)) {
+                             FileOutputStream fos = new FileOutputStream(dec)) {
                             byte[] buf = new byte[8192];
                             int n;
                             while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
                         }
                         cpioTemp.delete();
-                        cpioTemp = decompressed;
+                        cpioTemp = dec;
+                    } else if (name.endsWith(".lzma")) {
+                        File dec = new File(cpioTemp.getParent(), "ramdisk_dec.cpio");
+                        try (LZMACompressorInputStream lzis = new LZMACompressorInputStream(new FileInputStream(cpioTemp));
+                             FileOutputStream fos = new FileOutputStream(dec)) {
+                            byte[] buf = new byte[8192];
+                            int n;
+                            while ((n = lzis.read(buf)) > 0) fos.write(buf, 0, n);
+                        }
+                        cpioTemp.delete();
+                        cpioTemp = dec;
+                    } else if (name.endsWith(".xz")) {
+                        File dec = new File(cpioTemp.getParent(), "ramdisk_dec.cpio");
+                        try (XZCompressorInputStream xzis = new XZCompressorInputStream(new FileInputStream(cpioTemp));
+                             FileOutputStream fos = new FileOutputStream(dec)) {
+                            byte[] buf = new byte[8192];
+                            int n;
+                            while ((n = xzis.read(buf)) > 0) fos.write(buf, 0, n);
+                        }
+                        cpioTemp.delete();
+                        cpioTemp = dec;
                     }
 
                     boolean result = extractCpioStreaming(cpioTemp, targetDir);
@@ -351,37 +394,38 @@ public class RamdiskImporter {
         throw new IOException("No .cpio or .ramdisk entry found in ZIP");
     }
 
-    private static boolean importTarFile(File tarFile, File targetDir) throws IOException {
-        ProcessBuilder pb = new ProcessBuilder("tar", "-xf", tarFile.getAbsolutePath(),
-            "-C", targetDir.getAbsolutePath());
-        Process process = pb.start();
-        try {
-            if (!process.waitFor(120, java.util.concurrent.TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                throw new IOException("tar extraction timed out");
+    /**
+     * Extract a TAR archive using pure Java (Apache Commons Compress TarArchiveInputStream).
+     */
+    private static boolean extractTarJava(File tarFile, File targetDir) throws IOException {
+        try (org.apache.commons.compress.archivers.tar.TarArchiveInputStream tais =
+                 new org.apache.commons.compress.archivers.tar.TarArchiveInputStream(
+                     new FileInputStream(tarFile))) {
+            org.apache.commons.compress.archivers.tar.TarArchiveEntry entry;
+            int count = 0;
+            while ((entry = tais.getNextTarEntry()) != null) {
+                if (entry.isDirectory()) {
+                    new File(targetDir, entry.getName()).mkdirs();
+                    count++;
+                } else {
+                    File f = new File(targetDir, entry.getName());
+                    f.getParentFile().mkdirs();
+                    try (FileOutputStream fos = new FileOutputStream(f)) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = tais.read(buf)) > 0) fos.write(buf, 0, n);
+                    }
+                    count++;
+                }
             }
-            return process.exitValue() == 0;
-        } catch (InterruptedException e) {
-            throw new IOException("Interrupted during tar extraction", e);
+            Log.i(TAG, "Extracted " + count + " entries from tar");
+            return count > 0;
         }
-    }
-
-    private static boolean extractTarGz(File gzFile, File targetDir) throws IOException {
-        File tarFile = new File(targetDir.getParentFile(), "rootfs.tar");
-        try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile));
-             FileOutputStream fos = new FileOutputStream(tarFile)) {
-            byte[] buf = new byte[8192];
-            int n;
-            while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
-        }
-        boolean result = importTarFile(tarFile, targetDir);
-        tarFile.delete();
-        return result;
     }
 
     /**
-     * Extract a SVR4 cpio archive (newc format) using streaming.
-     * Reads the file in chunks instead of loading everything into memory.
+     * Extract a SVR4 cpio archive (newc format) using pure Java streaming.
+     * Reads the file in chunks — does NOT load everything into memory.
      */
     private static boolean extractCpioStreaming(File cpioFile, File targetDir) throws IOException {
         try (FileInputStream fis = new FileInputStream(cpioFile)) {
@@ -390,20 +434,17 @@ public class RamdiskImporter {
             long pos = 0;
 
             while (pos + 110 <= fileLength) {
-                // Read 110-byte header
                 byte[] header = new byte[110];
                 int headerRead = readFully(fis, header);
                 if (headerRead < 110) break;
                 pos += 110;
 
-                // Check magic
                 String magic = new String(header, 0, 6);
                 if (!magic.equals("070701") && !magic.equals("070702")) {
                     Log.w(TAG, "Invalid cpio magic at pos " + (pos - 110) + ": " + magic);
                     break;
                 }
 
-                // Parse header fields
                 int mode = parseHex(header, 14, 8);
                 long filesize = parseHexLong(header, 54, 8);
                 int namesize = parseHex(header, 62, 8);
@@ -413,13 +454,12 @@ public class RamdiskImporter {
                     break;
                 }
 
-                // Read filename
                 byte[] nameBytes = new byte[namesize];
                 int nameRead = readFully(fis, nameBytes);
                 if (nameRead < namesize) break;
                 pos += namesize;
 
-                String name = new String(nameBytes, 0, namesize - 1); // -1 for null
+                String name = new String(nameBytes, 0, namesize - 1);
 
                 // Align to 4 bytes after name
                 int namePadding = ((4 - ((110 + namesize) % 4)) % 4);
@@ -434,14 +474,12 @@ public class RamdiskImporter {
                     break;
                 }
 
-                // Read file data
                 long dataPos = pos;
                 int modeType = mode & 0xF000;
 
                 if (modeType == 0x4000) {
                     // Directory
-                    File dir = new File(targetDir, name);
-                    dir.mkdirs();
+                    new File(targetDir, name).mkdirs();
                     fileCount++;
                 } else if (modeType == 0x8000) {
                     // Regular file
@@ -461,11 +499,10 @@ public class RamdiskImporter {
                     }
                     fileCount++;
                 } else if (modeType == 0xA000) {
-                    // Symlink — read target, save as .symlink file
+                    // Symlink — save target as .symlink file
                     byte[] target = new byte[(int) filesize];
                     readFully(fis, target);
                     pos += filesize;
-
                     File linkFile = new File(targetDir, name + ".symlink");
                     linkFile.getParentFile().mkdirs();
                     try (FileOutputStream fos = new FileOutputStream(linkFile)) {
@@ -473,16 +510,19 @@ public class RamdiskImporter {
                     }
                     fileCount++;
                 } else {
-                    // Skip unknown types (char devices, block devices, fifos)
-                    if (filesize > 0) {
-                        byte[] skip = new byte[(int) Math.min(filesize, 65536)];
-                        long remaining = filesize;
-                        while (remaining > 0) {
-                            int toRead = (int) Math.min(skip.length, remaining);
-                            int n = fis.read(skip, 0, toRead);
+                    // Skip device nodes, fifos, etc.
+                    long remaining = filesize;
+                    while (remaining > 0) {
+                        long skipped = fis.skip(remaining);
+                        if (skipped <= 0) {
+                            byte[] skip = new byte[(int) Math.min(65536, remaining)];
+                            int n = fis.read(skip);
                             if (n < 0) break;
                             remaining -= n;
                             pos += n;
+                        } else {
+                            remaining -= skipped;
+                            pos += skipped;
                         }
                     }
                 }
@@ -490,14 +530,10 @@ public class RamdiskImporter {
                 // Align to 4 bytes after data
                 long dataEnd = dataPos + filesize;
                 long dataPadding = ((4 - (dataEnd % 4)) % 4);
-                if (dataPadding > 0 && (modeType == 0xA000 || modeType == 0x8000)) {
-                    // Already read the data above, just skip padding
+                if (dataPadding > 0) {
                     byte[] pad = new byte[(int) dataPadding];
                     readFully(fis, pad);
                     pos += dataPadding;
-                } else if (dataPadding > 0) {
-                    // For skipped entries, data was already skipped including padding
-                    // This case shouldn't happen since we skip inline above
                 }
             }
 

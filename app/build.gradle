@@ -175,8 +175,7 @@ dependencies {
     implementation 'com.github.medyo:android-about-page:1.2.4'
     implementation 'de.psdev.licensesdialog:licensesdialog:1.9.0'
     implementation 'com.afollestad.material-dialogs:core:0.9.6.0'
-    implementation 'moe.feng:AlipayZeroSdk:1.1'
-
+    
     implementation 'org.jdeferred:jdeferred-android-aar:1.2.4'
     implementation 'com.github.clans:fab:1.6.4'
 
@@ -190,6 +189,10 @@ dependencies {
     def appCenterSdkVersion = '4.3.1'
     implementation "com.microsoft.appcenter:appcenter-analytics:${appCenterSdkVersion}"
     implementation "com.microsoft.appcenter:appcenter-crashes:${appCenterSdkVersion}"
+
+    // Apache Commons Compress — pure Java LZMA/XZ decompression for ramdisk import.
+    // Used by RamdiskImporter to handle LZMA-compressed TWRP ramdisks (arm64 images).
+    implementation 'org.apache.commons:commons-compress:1.26.1'
 
 //    testImplementation 'junit:junit:4.+'
     androidTestImplementation 'androidx.test.ext:junit:1.1.1'
