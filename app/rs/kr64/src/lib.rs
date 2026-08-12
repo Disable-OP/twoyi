@@ -2778,28 +2778,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // /dev/lib*.so because we don't LD_PRELOAD anything). Spinning up
     // the watchdog thread would just waste CPU writing "0" to a file
     // that's already set to "0" by TWRP's own init.
-    let enforce_thread = if cfg.boot_recovery {
-        info!("[KR64] TWRP boot: skipping SELinux permissive watchdog (TWRP handles SELinux in init.rc)");
-        None
-    } else {
-        std::thread::Builder::new()
-            .name("selinux-permissive".to_string())
-            .spawn(|| {
-                info!("[KR64] PARENT: starting SELinux permissive watchdog thread");
-                loop {
+    // TWRP BOOT: keep the SELinux permissive watchdog ACTIVE. TWRP init
+    // loads its own SELinux policy and sets enforcing=1, which breaks the
+    // host's services (SurfaceFlinger, ActivityManager, etc.) because their
+    // SELinux contexts are invalid under TWRP's policy. The watchdog writes
+    // "0" to /sys/fs/selinux/enforce every 50ms, keeping the host alive.
+    let enforce_thread = std::thread::Builder::new()
+        .name("selinux-permissive".to_string())
+        .spawn(|| {
+            info!("[KR64] PARENT: starting SELinux permissive watchdog thread (TWRP mode — prevents host crash)");
+            loop {
                     // Write "0" to /sys/fs/selinux/enforce to set permissive mode
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .write(true)
-                        .open("/sys/fs/selinux/enforce")
-                    {
-                        use std::io::Write;
-                        let _ = f.write_all(b"0");
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    .open("/sys/fs/selinux/enforce")
+                {
+                    use std::io::Write;
+                    let _ = f.write_all(b"0");
                 }
-            })
-            .ok()
-    };
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+        .ok();
 
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
