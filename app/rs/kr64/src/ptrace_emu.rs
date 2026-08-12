@@ -295,6 +295,20 @@ fn set_syscall_ret(regs: &mut Regs, val: i64) {
     unsafe { *regs_ptr.add(REG_RET) = val as u64; }
 }
 
+/// Set the syscall number in registers.
+///
+/// On x86_64 this writes `orig_rax` (the kernel's "what syscall was
+/// requested" slot, distinct from `rax` which holds the return value).
+/// On aarch64 this writes `x8` (the syscall-number register).
+///
+/// Used by the SIGSYS handler to rewrite a seccomp-blocked syscall into
+/// a harmless one (getpid) before resuming, so the kernel does not
+/// re-evaluate the original (blocked) syscall number and re-raise SIGSYS.
+fn set_syscall_num(regs: &mut Regs, val: i64) {
+    let regs_ptr = regs as *mut Regs as *mut u64;
+    unsafe { *regs_ptr.add(REG_SYSCALL) = val as u64; }
+}
+
 // ── Path translation ───────────────────────────────────────────────
 
 /// Translate a guest path to a host path by prepending the rootfs.
@@ -496,6 +510,18 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
 
+                    // Log every syscall number on entry for the first 50
+                    // iterations so we can see exactly what TWRP's init
+                    // is calling (and in what order) before it dies or
+                    // settles into its main loop. This is invaluable for
+                    // diagnosing seccomp SIGSYS kills: the entry log
+                    // shows the syscall number that was about to be
+                    // attempted, and the very next log line is typically
+                    // the SIGSYS intercept.
+                    if loop_count <= 50 {
+                        log(&format!("syscall entry: nr={}", syscall_num));
+                    }
+
                     match syscall_num {
                         GETPID_SYSCALL => {
                             pending_getpid = true;
@@ -519,7 +545,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
-                                if translated != path && loop_count <= 50 {
+                                if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
                                 if translated != path {
@@ -607,12 +633,54 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // re-injected. We must NOT forward SIGTRAP back to the
                 // child — that would loop forever (the same breakpoint
                 // would fire again immediately).
+            } else if sig == libc::SIGSYS {
+                // SIGSYS (signal 31) is raised by the kernel when the
+                // child calls a syscall blocked by a SECCOMP_RET_TRAP
+                // filter (e.g. mount, mkdir, chmod, chroot, unshare).
+                // The default action for SIGSYS is to terminate the
+                // process with a core dump — so if we forwarded it to
+                // the child (as we do for other signals below), TWRP's
+                // init would die the moment it tried to mount /tmp or
+                // mkdir /dev/block.
+                //
+                // Instead we INTERCEPT the signal: rewrite the blocked
+                // syscall into a harmless getpid and force the return
+                // value to 0 (success), then resume WITHOUT delivering
+                // the signal. The child sees the call succeed and keeps
+                // going, which is the behaviour PROOT exhibits for
+                // rootless containers.
+                //
+                // We do NOT flip `in_syscall`: seccomp fires during
+                // syscall entry, so the next stop will be the
+                // syscall-exit-stop of the (now rewritten) syscall —
+                // the same phase we were already heading to.
+                log("intercepted SIGSYS (seccomp-blocked syscall) — skipping and returning 0");
+
+                let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
+                if ptrace_getregs(pid, &mut sigsys_regs).is_ok() {
+                    // Rewrite the syscall number to getpid (a harmless,
+                    // always-allowed syscall) so the kernel does not
+                    // re-evaluate the original blocked number and
+                    // re-raise SIGSYS when we resume.
+                    set_syscall_num(&mut sigsys_regs, GETPID_SYSCALL);
+                    // Force the return value to 0 (success). The child
+                    // will see the (blocked) syscall as having succeeded.
+                    set_syscall_ret(&mut sigsys_regs, 0);
+                    let _ = ptrace_setregs(pid, &sigsys_regs);
+                }
+
+                // Resume WITHOUT forwarding the signal (signal arg = 0).
+                unsafe {
+                    libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0);
+                }
+                continue;
             } else {
                 // The child stopped because of a real signal that was
-                // NOT a syscall-stop and NOT a debugger trap — e.g.
-                // SIGSEGV, SIGBUS, SIGFPE, or a SIGCHLD-style signal
-                // delivered by the kernel. Forward it to the child so
-                // its own signal handlers (or default action) run.
+                // NOT a syscall-stop, NOT a debugger trap, and NOT a
+                // seccomp SIGSYS — e.g. SIGSEGV, SIGBUS, SIGFPE, or a
+                // SIGCHLD-style signal delivered by the kernel. Forward
+                // it to the child so its own signal handlers (or default
+                // action) run.
                 //
                 // The `sig as c_long` 4th arg to PTRACE_SYSCALL is the
                 // signal to deliver on resume; the next waitpid will
@@ -624,6 +692,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // so the next stop will be the same phase (entry if we
                 // were heading to an entry, exit if we were heading to
                 // an exit) as it would have been without the signal.
+                log(&format!("forwarding signal {} to child", sig));
                 unsafe {
                     libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, sig as libc::c_long);
                 }
