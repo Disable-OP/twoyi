@@ -411,7 +411,9 @@ jobs:
             /tmp/ci-artifacts/twrp-init-cmdline.log \
             /tmp/ci-artifacts/twrp-init-status.log \
             /tmp/ci-artifacts/twrp-init-threads.log \
+            /tmp/ci-artifacts/twrp-init-fds.log \
             /tmp/ci-artifacts/twrp-kmsg.log \
+            /tmp/ci-artifacts/twrp-kmsg-symlink-check.log \
             /tmp/ci-artifacts/dmesg.log \
             /tmp/ci-artifacts/twrp-ps.log \
             /tmp/ci-artifacts/twrp-ps-pre-kill.log \
