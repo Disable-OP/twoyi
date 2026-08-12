@@ -366,6 +366,8 @@ jobs:
           #     via LD_PRELOAD, skips /apex bind, binderfs, SELinux watchdog;
           #     auto-sets init_path=/init)
           TWOYI_TWRP: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
+          # NO ROOT — simulate unmodified device (no adb root, no permissive mode)
+          TWOYI_NO_ROOT: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
 
       - name: Print boot verdict
         # The script writes a verdict file. We surface it in the GHA
