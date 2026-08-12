@@ -987,6 +987,37 @@ if [ "$TWRP_MODE" = "1" ]; then
         echo "    guest init state:   $(grep '^State:' "$ARTIFACT_DIR/twrp-init-status.log" 2>/dev/null | tr -d '\r\n')"
         echo "    guest init threads: $(tr '\r\n' ' ' < "$ARTIFACT_DIR/twrp-init-threads.log" 2>/dev/null)"
 
+        # Verify /dev/kmsg is the symlink we expect (kr64 creates it as
+        # /dev/kmsg → /twrp-kmsg.log so TWRP init's KLOG writes go to a
+        # retrievable file instead of the host's flooded dmesg ring buffer).
+        # If the symlink is missing or points elsewhere, twrp-kmsg.log will
+        # be empty (TWRP init's KLOG messages will be silently dropped).
+        KR64_PID_FOR_KMSG=$(awk '/^PPid:/ {print $2}' "$ARTIFACT_DIR/twrp-init-status.log" 2>/dev/null | tr -d '\r\n')
+        if [ -n "$KR64_PID_FOR_KMSG" ]; then
+            timeout 5 "$ADB_BIN" -s emulator-5554 shell "ls -la /proc/$KR64_PID_FOR_KMSG/root/dev/kmsg 2>/dev/null; ls -la /proc/$KR64_PID_FOR_KMSG/root/twrp-kmsg.log 2>/dev/null; wc -c /proc/$KR64_PID_FOR_KMSG/root/twrp-kmsg.log 2>/dev/null" \
+                > "$ARTIFACT_DIR/twrp-kmsg-symlink-check.log" 2>/dev/null || true
+            echo "    /dev/kmsg + /twrp-kmsg.log status (in kr64 mount ns):"
+            sed 's/^/      /' "$ARTIFACT_DIR/twrp-kmsg-symlink-check.log" 2>/dev/null | head -5
+        fi
+
+        # Also dump the TWRP init's open file descriptors — this shows
+        # whether init has /dev/kmsg open (and whether it's a symlink to
+        # /twrp-kmsg.log as expected). If /dev/kmsg is NOT in init's fd
+        # table, init never opened it (and we won't see KLOG output).
+        timeout 5 "$ADB_BIN" -s emulator-5554 shell "ls -la /proc/$GUEST_PID/fd 2>/dev/null" \
+            > "$ARTIFACT_DIR/twrp-init-fds.log" 2>/dev/null || true
+        if [ -s "$ARTIFACT_DIR/twrp-init-fds.log" ]; then
+            KMSG_FD=$(grep -E 'kmsg|/twrp-kmsg' "$ARTIFACT_DIR/twrp-init-fds.log" 2>/dev/null | head -3 || true)
+            if [ -n "$KMSG_FD" ]; then
+                echo "    init has /dev/kmsg open (KLOG should be captured):"
+                echo "$KMSG_FD" | sed 's/^/      /'
+            else
+                echo "    ⚠ init does NOT have /dev/kmsg open — KLOG messages are being dropped"
+                echo "      (init's open fds, first 10:)"
+                head -10 "$ARTIFACT_DIR/twrp-init-fds.log" | sed 's/^/        /'
+            fi
+        fi
+
         # Build the guest's process tree: all processes whose PPID chain
         # leads back to $GUEST_PID. We awk through twrp-ps-pre-kill.log
         # (PID,PPID,STAT,NAME format), record each pid's ppid, then for
@@ -1039,18 +1070,44 @@ if [ "$TWRP_MODE" = "1" ]; then
 
     # ── Step B: capture the TWRP virtual framebuffer BEFORE killing kr64 ──
     # TWRP renders to /dev/graphics/fb0 inside the pivot_root jail, which
-    # kr64 creates as a REGULAR FILE (3686400 bytes = 720×1280×4 RGBA8888)
-    # on the ext4 rootfs. From the host's perspective the file is at
-    # {rootfs}/dev/graphics/fb0. We pull it + convert RGBA8888 → PNG so a
-    # human can see whether TWRP actually rendered a menu (vs. an all-black
-    # or all-zero framebuffer = TWRP init crashed before reaching the UI).
+    # kr64 creates as a REGULAR FILE (3686400 bytes = 720×1280×4 RGBA8888).
+    # The file lives on the tmpfs that kr64 mounted on {rootfs}/dev BEFORE
+    # pivot_root — so it's INSIDE kr64's mount namespace, NOT visible from
+    # the host's normal /data/data/... path (which still shows the original
+    # ext4 /dev directory with the /dev/null symlink).
+    #
+    # To access kr64's mount namespace from the host, we use the magic
+    # /proc/<kr64_pid>/root/ path — the kernel exposes any process's
+    # rootfs via /proc/<pid>/root/, and that path DOES cross mount
+    # namespace boundaries (it follows the link to the process's mount
+    # namespace's root). So /proc/<kr64_pid>/root/dev/graphics/fb0 is
+    # the FB file inside the pivot_root jail.
+    #
+    # We MUST do this BEFORE killing kr64 — once kr64 dies, its mount
+    # namespace is destroyed and the tmpfs (with the FB file) is unmounted.
     if [ -n "$GUEST_PID" ] || [ "$TWRP_MODE" = "1" ]; then
         echo "  → capturing TWRP virtual framebuffer (RGBA8888 → PNG)..."
+        # Find kr64's PID (parent of the guest init) — needed for the
+        # /proc/<kr64_pid>/root/ path. Fall back to the kr64.pid file
+        # (written by the launch step) if /proc/<guest_pid>/status doesn't
+        # give us a PPID.
+        KR64_PID_HOST=$(awk '/^PPid:/ {print $2}' "$ARTIFACT_DIR/twrp-init-status.log" 2>/dev/null | tr -d '\r\n')
+        if [ -z "$KR64_PID_HOST" ]; then
+            KR64_PID_HOST=$("$ADB_BIN" -s emulator-5554 shell "cat /data/local/tmp/kr64.pid 2>/dev/null" 2>/dev/null | tr -d '\r\n' || true)
+        fi
+        echo "    kr64 host PID: ${KR64_PID_HOST:-unknown}"
         FB_PULLED=0
+        # Try in priority order:
+        #   1. /proc/<kr64_pid>/root/dev/graphics/fb0 — kr64's mount namespace (preferred)
+        #   2. /data/data/io.twoyi/profiles/default/rootfs/dev/graphics/fb0 — ext4 fallback
+        #   3. /data/user/0/io.twoyi/rootfs/dev/graphics/fb0 — alternate symlink path
         for FB_PATH in \
+            "/proc/$KR64_PID_HOST/root/dev/graphics/fb0" \
+            "/proc/$KR64_PID_HOST/root/dev/fb0" \
             "$TWOYI_PROFILE/dev/graphics/fb0" \
             "/data/data/io.twoyi/profiles/default/rootfs/dev/graphics/fb0" \
             "/data/user/0/io.twoyi/rootfs/dev/graphics/fb0"; do
+            if [ -z "$FB_PATH" ]; then continue; fi
             if "$ADB_BIN" -s emulator-5554 pull "$FB_PATH" "$ARTIFACT_DIR/twrp-fb-rgba.bin" 2>/dev/null; then
                 FB_PULLED=1
                 echo "  ✓ pulled $FB_PATH → twrp-fb-rgba.bin ($(stat -c%s "$ARTIFACT_DIR/twrp-fb-rgba.bin" 2>/dev/null || echo 0) bytes)"
