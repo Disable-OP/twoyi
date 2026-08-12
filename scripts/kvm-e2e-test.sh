@@ -861,15 +861,25 @@ if ! "$ADB_BIN" -s emulator-5554 shell "test -S $TWOYI_PROFILE/dev/qemu_pipe" 2>
     fi
 fi
 
+# IMPORTANT (Task ID 20, KVM run 31550762716): the previous version of
+# this block had NO timeouts on `am start`, `screencap`, `dumpsys`, or
+# `input tap`. When the TWRP container's guest init started running, it
+# made the host emulator's system server / SurfaceFlinger unresponsive,
+# causing `screencap` (line 870) to hang indefinitely. The script was
+# killed by the 480s workflow timeout before reaching the TWRP
+# diagnostic capture block (Step A at line ~957) — so NONE of the
+# twrp-*.log files were captured. This fix wraps every adb command in
+# `timeout` + `|| true` so a hang can't block the diagnostic capture.
 echo "  → launching io.twoyi/.ui.SettingsActivity (to trigger rootfs detection)"
-"$ADB_BIN" -s emulator-5554 shell am start -n io.twoyi/.ui.SettingsActivity
+timeout 30 "$ADB_BIN" -s emulator-5554 shell am start -n io.twoyi/.ui.SettingsActivity \
+    2>/dev/null || echo "  ⚠ am start SettingsActivity timed out or failed"
 sleep 3
 
 # Take the pre-launch screenshot so we can see what the settings list
 # looks like (and confirm the app actually opened).
-"$ADB_BIN" -s emulator-5554 exec-out screencap -p \
-    > "$ARTIFACT_DIR/screenshot-00_settings.png"
-echo "  ✓ screenshot-00_settings.png"
+timeout 15 "$ADB_BIN" -s emulator-5554 exec-out screencap -p \
+    > "$ARTIFACT_DIR/screenshot-00_settings.png" 2>/dev/null || true
+echo "  ✓ screenshot-00_settings.png ($(stat -c%s "$ARTIFACT_DIR/screenshot-00_settings.png" 2>/dev/null || echo 0) bytes)"
 
 # Give SettingsActivity time to initialize before launching Render2Activity
 sleep 5
@@ -880,13 +890,14 @@ sleep 5
 # activity that SettingsActivity's "Launch Container" preference starts,
 # so launching it directly is equivalent and 100% reliable.
 echo "  → launching io.twoyi/.Render2Activity (direct container launch)"
-"$ADB_BIN" -s emulator-5554 shell am start -n io.twoyi/.Render2Activity
+timeout 30 "$ADB_BIN" -s emulator-5554 shell am start -n io.twoyi/.Render2Activity \
+    2>/dev/null || echo "  ⚠ am start Render2Activity timed out or failed"
 sleep 2
 
 # Verify Render2Activity is in the foreground. If it crashed back to
 # settings or the home screen, log it but continue (screenshots will
 # show what happened).
-CURRENT_FOCUS=$("$ADB_BIN" -s emulator-5554 shell dumpsys activity activities 2>/dev/null \
+CURRENT_FOCUS=$(timeout 15 "$ADB_BIN" -s emulator-5554 shell dumpsys activity activities 2>/dev/null \
     | grep -E 'mResumedActivity|topResumedActivity' | head -1 || true)
 echo "  current focus: $CURRENT_FOCUS"
 if echo "$CURRENT_FOCUS" | grep -q "Render2Activity"; then
@@ -896,10 +907,42 @@ elif echo "$CURRENT_FOCUS" | grep -q "SettingsActivity"; then
     # Fallback: try the tap approach in case Render2Activity needs the
     # preference click path to set up state first.
     echo "  → fallback: tap 'Launch Container' (heuristic coords 540, 700)"
-    "$ADB_BIN" -s emulator-5554 shell input tap 540 700
+    timeout 10 "$ADB_BIN" -s emulator-5554 shell input tap 540 700 \
+        2>/dev/null || true
     sleep 2
 else
-    echo "  ⚠ unexpected focus — container may have crashed"
+    echo "  ⚠ unexpected focus — container may have crashed (or dumpsys timed out)"
+fi
+
+# ── EARLY TWRP diagnostic snapshot (Task ID 20) ──
+# In TWRP mode, capture /twrp-init.log + /twrp-kmsg.log + kr64-stderr.log
+# RIGHT NOW (before the boot_wait / screenshot sequence). This gives us a
+# snapshot of the TWRP init's output from the first ~10 seconds — even if
+# the later screenshot loop or Step A capture hangs due to system load.
+# The files are on ext4 (not tmpfs), so they survive even if kr64 dies.
+# The FULL diagnostic capture (Step A at line ~957) still runs later for
+# the post-boot-wait state.
+if [ "$TWRP_MODE" = "1" ]; then
+    echo "  → TWRP early snapshot: pulling /twrp-init.log + /twrp-kmsg.log + kr64-stderr.log..."
+    timeout 10 "$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-stderr.log \
+        "$ARTIFACT_DIR/kr64-stderr-early.log" 2>/dev/null || true
+    for EARLY_LOG_PATH in \
+        "$TWOYI_PROFILE/twrp-init.log" \
+        "/data/data/io.twoyi/profiles/default/rootfs/twrp-init.log" \
+        "/data/user/0/io.twoyi/rootfs/twrp-init.log"; do
+        timeout 10 "$ADB_BIN" -s emulator-5554 pull "$EARLY_LOG_PATH" \
+            "$ARTIFACT_DIR/twrp-init-early.log" 2>/dev/null && break
+    done
+    for EARLY_KMSG_PATH in \
+        "$TWOYI_PROFILE/twrp-kmsg.log" \
+        "/data/data/io.twoyi/profiles/default/rootfs/twrp-kmsg.log" \
+        "/data/user/0/io.twoyi/rootfs/twrp-kmsg.log"; do
+        timeout 10 "$ADB_BIN" -s emulator-5554 pull "$EARLY_KMSG_PATH" \
+            "$ARTIFACT_DIR/twrp-kmsg-early.log" 2>/dev/null && break
+    done
+    echo "    kr64-stderr-early.log: $(stat -c%s "$ARTIFACT_DIR/kr64-stderr-early.log" 2>/dev/null || echo 0) bytes"
+    echo "    twrp-init-early.log:   $(stat -c%s "$ARTIFACT_DIR/twrp-init-early.log" 2>/dev/null || echo 0) bytes"
+    echo "    twrp-kmsg-early.log:   $(stat -c%s "$ARTIFACT_DIR/twrp-kmsg-early.log" 2>/dev/null || echo 0) bytes"
 fi
 
 # Screenshot sequence: 5s, 15s, 30s, 60s (or however long boot_wait is)

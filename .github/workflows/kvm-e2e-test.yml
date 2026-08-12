@@ -333,8 +333,15 @@ jobs:
       # written to /tmp/ci-artifacts/boot-verdict.txt for the next
       # step to grep.
       - name: Run E2E test
+        # timeout increased from 480s → 600s (Task ID 20): the previous
+        # 480s timeout was too tight — the TWRP diagnostic capture block
+        # (Step A at line ~957 in the script) was never reached because
+        # unresponsive adb commands consumed the entire 8-minute budget.
+        # The script now wraps all adb commands in `timeout` so a hang
+        # can't block diagnostics, and 600s gives headroom for the full
+        # capture sequence even on a slow runner.
         run: |
-          timeout --signal=KILL 480 ./scripts/kvm-e2e-test.sh \
+          timeout --signal=KILL 600 ./scripts/kvm-e2e-test.sh \
               --rootfs-source "${{ github.event.inputs.rootfs_source || 'emulator' }}" \
               --boot-wait "${{ github.event.inputs.boot_wait_seconds || '60' }}" \
               --artifact-dir /tmp/ci-artifacts || true
@@ -398,6 +405,7 @@ jobs:
             /tmp/ci-artifacts/twoyi-log.txt \
             /tmp/ci-artifacts/kr64-prelaunch.log \
             /tmp/ci-artifacts/kr64-stderr.log \
+            /tmp/ci-artifacts/kr64-stderr-early.log \
             /tmp/ci-artifacts/twoyi-loader.log \
             /tmp/ci-artifacts/twoyi-vold-stderr.log \
             /tmp/ci-artifacts/boot-verdict.txt \
@@ -408,11 +416,13 @@ jobs:
             /tmp/ci-artifacts/anr/ \
             /tmp/ci-artifacts/rootfs-extract.log \
             /tmp/ci-artifacts/twrp-init.log \
+            /tmp/ci-artifacts/twrp-init-early.log \
             /tmp/ci-artifacts/twrp-init-cmdline.log \
             /tmp/ci-artifacts/twrp-init-status.log \
             /tmp/ci-artifacts/twrp-init-threads.log \
             /tmp/ci-artifacts/twrp-init-fds.log \
             /tmp/ci-artifacts/twrp-kmsg.log \
+            /tmp/ci-artifacts/twrp-kmsg-early.log \
             /tmp/ci-artifacts/twrp-kmsg-symlink-check.log \
             /tmp/ci-artifacts/dmesg.log \
             /tmp/ci-artifacts/twrp-ps.log \
