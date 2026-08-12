@@ -750,14 +750,21 @@ fn apk_native_lib_candidates_in(base: &Path, lib_name: &str) -> Vec<String> {
             if !apk_name.starts_with("io.twoyi-") {
                 continue;
             }
-            let apk_path = apk_entry.path(); // /data/app/~~<random>/io.twoyi-<random>/
-                                             // Check all standard Android ABI directories.
-                                             // Android package manager extracts native libs to
-                                             // lib/<abi>/ where <abi> is one of:
-                                             //   arm64-v8a, armeabi-v7a, x86, x86_64
-                                             // (NOT "arm64" — that was a bug that caused the scan
-                                             // to miss arm64-v8a libs on real arm64 devices.)
-            for abi in ["arm64-v8a", "x86_64", "armeabi-v7a", "x86"] {
+            // /data/app/~~<random>/io.twoyi-<random>/
+            let apk_path = apk_entry.path();
+            // Check all standard Android ABI directories.
+            // Android package manager extracts native libs to
+            // lib/<abi>/ where <abi> is one of:
+            //   x86_64, arm64-v8a, armeabi-v7a, x86
+            // (NOT "arm64" — that was a bug that caused the scan
+            // to miss arm64-v8a libs on real arm64 devices.)
+            //
+            // Iteration order matters: x86_64 is listed first because the
+            // devcontainer runner is x86_64, so we want the x86_64 copy to
+            // appear first in the candidate list (see the function-level
+            // doc comment and the `apk_native_lib_candidates_finds_lib_
+            // in_fake_apk_dir` test, which both rely on this ordering).
+            for abi in ["x86_64", "arm64-v8a", "armeabi-v7a", "x86"] {
                 let lib_path = apk_path.join("lib").join(abi).join(lib_name);
                 if lib_path.is_file() {
                     out.push(lib_path.to_string_lossy().into_owned());
@@ -4534,9 +4541,11 @@ mod tests {
         let tmp = std::env::temp_dir().join("twoyi-apk-scan-test");
         let _ = std::fs::remove_dir_all(&tmp);
         // Mimic /data/app/~~random1==/io.twoyi-random2==/lib/<abi>/<lib>.
+        // Use the standard Android ABI directory names (arm64-v8a, not
+        // "arm64") that `apk_native_lib_candidates_in` scans for.
         let apk_root = tmp.join("~~random1==").join("io.twoyi-random2==");
         let x86_64_lib = apk_root.join("lib/x86_64/libgetpid_hook.so");
-        let arm64_lib = apk_root.join("lib/arm64/libgetpid_hook.so");
+        let arm64_lib = apk_root.join("lib/arm64-v8a/libgetpid_hook.so");
         std::fs::create_dir_all(x86_64_lib.parent().unwrap()).unwrap();
         std::fs::create_dir_all(arm64_lib.parent().unwrap()).unwrap();
         std::fs::write(&x86_64_lib, b"fake x86_64 ELF").unwrap();
@@ -4562,8 +4571,8 @@ mod tests {
             cands[0]
         );
         assert!(
-            cands[1].ends_with("/lib/arm64/libgetpid_hook.so"),
-            "arm64 must be second: {}",
+            cands[1].ends_with("/lib/arm64-v8a/libgetpid_hook.so"),
+            "arm64-v8a must be second: {}",
             cands[1]
         );
 

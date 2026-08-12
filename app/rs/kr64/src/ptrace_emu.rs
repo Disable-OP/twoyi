@@ -69,7 +69,6 @@
 ///
 /// On aarch64, we use user_pt_regs which is u64[31] + sp + pc + pstate.
 /// We access x0-x30 as array[0..30], and the syscall number is in x8.
-
 #[cfg(target_arch = "x86_64")]
 type Regs = libc::user_regs_struct;
 
