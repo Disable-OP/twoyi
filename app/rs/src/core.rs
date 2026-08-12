@@ -224,8 +224,13 @@ pub fn init_renderer(
                 let vh = virtual_height;
                 let sw = surface_width;
                 let sh = surface_height;
+                // Wrap the raw pointer in a Send wrapper — the pointer is
+                // only used from this thread, but Rust doesn't know that.
+                struct SendPtr(*mut c_void);
+                unsafe impl Send for SendPtr {}
+                let window_wrap = SendPtr(window);
                 std::thread::spawn(move || {
-                    twrp_fb_render_loop(window, fb_path, sw, sh, vw, vh);
+                    twrp_fb_render_loop(window_wrap.0, fb_path, sw, sh, vw, vh);
                 });
             } else {
                 info!("[CORE] Starting AOSP libOpenglRender.so");
