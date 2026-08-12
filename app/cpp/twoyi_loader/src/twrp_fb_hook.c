@@ -379,7 +379,7 @@ static void twrp_fb_hook_init(void) {
     write_str(2, " __open_2@"); write_hex(2, (unsigned int)(uintptr_t)&__open_2);
     write_str(2, " __openat_2@"); write_hex(2, (unsigned int)(uintptr_t)&__openat_2);
     write_str(2, " close@"); write_hex(2, (unsigned int)(uintptr_t)&close);
-    write_str(2, " ioctl@"); write_hex(2, (unsigned int)(uintptr_t)&ioctl);
+    write_str(2, " ioctl@"); write_hex(2, (unsigned int)(uintptr_t)(int(*)(int,int,...))&ioctl);
     write_str(2, "\n");
 }
 
