@@ -93,7 +93,9 @@
     <string name="settings_debug_renderer_title">デバッグレンダラー</string>
     <string name="settings_debug_renderer_summary">すべてのレンダラーデータをログファイルにダンプ（警告：大量のログが生成されます、デフォルト OFF）</string>
     <string name="settings_key_select_rom">ROM選択</string>
-    <string name="settings_select_rom_summary">現在のプロファイルにROMファイルをインポート</string>
+    <string name="settings_select_rom_summary">rootfs (.tar)、ブートイメージ (.img)、ramdisk (.cpio/.cpio.gz)、または ramdisk を含む ZIP をインポート</string>
+    <string name="settings_boot_recovery_title">リカバリに起動</string>
+    <string name="settings_boot_recovery_summary">TWRP などのリカバリイメージを起動します。「ROM を選択」で .img、.cpio、または .zip ramdisk ファイルをインポートしてから、このオプションを有効にしてください。</string>
     <string name="settings_key_profile_manager">プロファイルマネージャー</string>
     <string name="settings_profile_manager_summary">異なるプロファイルを管理</string>
     <string name="profile_manager_title">プロファイルマネージャー</string>
