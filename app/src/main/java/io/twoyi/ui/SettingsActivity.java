@@ -42,6 +42,7 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 
 import io.twoyi.R;
+import android.util.Log;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.ProfileSettings;
@@ -397,57 +398,21 @@ public class SettingsActivity extends AppCompatActivity {
                 }
                 profileRootfsDir.mkdirs();
 
-                File tempFile = new File(activity.getCacheDir(), "rootfs_import.tar");
-
-                ContentResolver contentResolver = activity.getContentResolver();
-                try (InputStream inputStream = contentResolver.openInputStream(uri);
-                     OutputStream os = new FileOutputStream(tempFile)) {
-                    // Fixed: openInputStream can return null if the provider
-                    // revokes the grant between picker return and our read.
-                    // The original code NPE'd inside the try-with-resources.
-                    if (inputStream == null) {
-                        throw new IOException("ContentResolver returned null stream for " + uri);
-                    }
-                    byte[] buffer = new byte[8192];
-                    int count;
-                    while ((count = inputStream.read(buffer)) > 0) {
-                        os.write(buffer, 0, count);
-                    }
+                // Use RamdiskImporter which supports .tar, .img, .cpio, .zip formats
+                boolean success = false;
+                String errorMsg = null;
+                try {
+                    success = io.twoyi.utils.RamdiskImporter.importRamdisk(activity, uri, profileRootfsDir);
+                } catch (Exception e) {
+                    errorMsg = e.getMessage();
+                    Log.e("SettingsActivity", "Import failed", e);
                 }
 
-                String tempFilePath = tempFile.getAbsolutePath();
-                String rootfsPath = profileRootfsDir.getAbsolutePath();
-
-                if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
-                    rootfsPath.contains(";") || rootfsPath.contains("&")) {
-                    throw new SecurityException("Invalid path detected");
-                }
-
-                // Extract tar to rootfs directory
-                ProcessBuilder pb = new ProcessBuilder(
-                    "tar", "-xf", tempFilePath,
-                    "-C", rootfsPath
-                );
-                Process process = pb.start();
-                // Fixed: waitFor() without a timeout can block forever if tar
-                // hangs on a corrupt archive or a stalled FUSE mount. Cap at
-                // 120 s — a 500 MB rootfs tar extracts in ~30 s on most
-                // devices, so 120 s is generous.
-                int exitCode;
-                if (!process.waitFor(120, java.util.concurrent.TimeUnit.SECONDS)) {
-                    process.destroyForcibly();
-                    throw new IOException("tar extraction timed out after 120 s");
-                } else {
-                    exitCode = process.exitValue();
-                }
-
-                tempFile.delete();
-
-                if (exitCode == 0) {
+                if (success) {
                     RomManager.initRootfs(activity);
                 }
 
-                return exitCode == 0;
+                return success;
             }).done(result -> {
                 UIHelper.dismiss(dialog);
                 if (result) {
