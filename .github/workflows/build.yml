@@ -204,3 +204,15 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
           compression-level: 0
+
+      # Upload APK ONLY on manual workflow_dispatch runs (not on push/PR)
+      # to avoid filling GHA storage. The user triggers this when they
+      # want a downloadable APK.
+      - name: Upload APK
+        if: success() && github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: twoyi-apk-${{ github.event.inputs.abis || 'all' }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+          if-no-files-found: warn
