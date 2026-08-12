@@ -718,56 +718,19 @@ public final class FileLogger {
         // world-readable. Try once at init, log what we get, then poll
         // every 30 s for new lines. If the first read fails, we silently
         // give up — no point in retrying on a device we know denied us.
-        Thread t = new Thread(() -> {
-            File dmesgFile = new File(mLogDir, "kmsg.log");
-            ProcessBuilder pb = new ProcessBuilder("dmesg");
-            pb.redirectErrorStream(true);
-            try {
-                // First read — verify dmesg is callable.
-                java.lang.Process probe = pb.start();
-                int exit = probe.waitFor();
-                if (exit != 0) {
-                    tee('I', TAG, "dmesg not available (exit=" + exit
-                            + ") — kmsg.log will be empty on this device");
-                    return;
-                }
-            } catch (Throwable t2) {
-                tee('I', TAG, "dmesg not available: " + t2.getMessage()
-                        + " — kmsg.log will be empty on this device");
-                return;
-            }
-            // Poll loop — read dmesg every 30 s, append.
-            while (true) {
-                try {
-                    java.lang.Process p = pb.start();
-                    try (BufferedReader br = new BufferedReader(
-                            new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
-                        StringBuilder sb = new StringBuilder();
-                        String line;
-                        while ((line = br.readLine()) != null) {
-                            sb.append(line).append("\n");
-                        }
-                        if (sb.length() > 0) {
-                            try (FileOutputStream fos = new FileOutputStream(dmesgFile, false)) {
-                                fos.write(sb.toString().getBytes(StandardCharsets.UTF_8));
-                            }
-                        }
-                    }
-                    p.waitFor();
-                } catch (Throwable ignored) {
-                    // dmesg went away? Bail out.
-                    return;
-                }
-                try {
-                    Thread.sleep(30_000L);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-        }, "FileLogger-Dmesg");
-        t.setDaemon(true);
-        t.start();
+        //
+        // IMPORTANT: The `dmesg` binary itself calls `syslog(2, ...)` which
+        // is syscall 103 on x86_64. This syscall is NOT in Android's seccomp
+        // allowlist for untrusted_app — calling it sends SIGSYS (signal 31)
+        // which kills the `dmesg` process instantly. The SIGSYS crash
+        // appears in logcat and pollutes the BootLogTexture with crash
+        // output that looks like a kr64 crash but isn't.
+        //
+        // To avoid this noise, we skip the dmesg pump entirely. kmsg.log
+        // will be empty on all devices, but that's acceptable — the app's
+        // own logs (app.log, logcat.log, kr64.log) are far more valuable
+        // for debugging than the kernel ring buffer.
+        tee('I', TAG, "dmesg pump skipped (seccomp blocks syslog() syscall on untrusted_app; would cause SIGSYS noise in logcat)");
     }
 
     // -------------------------------------------------------------------------
