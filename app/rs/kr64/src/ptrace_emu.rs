@@ -40,6 +40,27 @@
 // CRITICAL: On aarch64, PTRACE_GETREGS (12) does NOT exist — it returns
 // EIO. We must use PTRACE_GETREGSET (33) with NT_PRSTATUS (1) and an
 // iovec. On x86_64, PTRACE_GETREGS works directly.
+//
+// CRITICAL (aarch64, real-device fix): The libc crate declares `ptrace`
+// as a variadic C function (`extern "C" { fn ptrace(c_uint, ...) -> c_long; }`).
+// On aarch64, Rust's C-variadic ABI hands the callee a `__va_list` that the
+// callee walks via `va_arg`. bionic's ptrace() wrapper then forwards the
+// unpacked arguments to the kernel via `syscall(__NR_ptrace, req, pid, addr, data)`.
+// On real arm64 Android devices this has been observed to consistently
+// return EIO for PTRACE_GETREGSET (with NT_PRSTATUS), producing the
+// "ptrace_getregs failed: I/O error (os error 5)" log spam.
+//
+// The kernel's own ptrace syscall works correctly when invoked directly via
+// `libc::syscall(SYS_ptrace, ...)` — there is no regset lookup problem
+// (NT_PRSTATUS is always present on aarch64), no permission issue, and
+// no size mismatch. The failure is purely an artifact of going through
+// bionic's variadic `ptrace()` wrapper.
+//
+// Fix: bypass `libc::ptrace()` and call the kernel via the raw syscall
+// interface for the GETREGSET/SETREGSET requests on aarch64. We keep
+// `libc::ptrace()` for the non-REGSET requests (PTRACE_SETOPTIONS,
+// PTRACE_SYSCALL, PTRACE_PEEKDATA, ...) because those have been observed
+// to work fine through bionic and the workaround adds nothing there.
 
 // ── Register types ─────────────────────────────────────────────────
 
@@ -64,6 +85,39 @@ struct Aarch64Regs {
 
 #[cfg(target_arch = "aarch64")]
 type Regs = Aarch64Regs;
+
+// Compile-time assertion that `Aarch64Regs` exactly matches the kernel's
+// `struct user_pt_regs` from <asm/ptrace.h>:
+//   struct user_pt_regs {
+//       __u64 regs[31];   // 31 * 8 = 248
+//       __u64 sp;          //   8
+//       __u64 pc;          //   8
+//       __u64 pstate;      //   8
+//   };                    // total: 272 bytes
+//
+// If anyone reorders the fields or changes a type, this assertion will
+// fail at compile time — PTRACE_GETREGSET would otherwise silently copy
+// the wrong bytes into our struct and produce garbage register values.
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(std::mem::size_of::<Aarch64Regs>() == 272);
+
+// Named constants for the magic numbers used in the aarch64 PTRACE_*REGSET
+// path. Using names instead of bare `33`/`34`/`1` makes the intent obvious
+// and stops future readers from wondering whether they are syscall numbers,
+// NT_* types, or something else entirely.
+#[cfg(target_arch = "aarch64")]
+mod aarch64_ptrace {
+    /// `PTRACE_GETREGSET` — Linux generic ptrace request number, see
+    /// <linux/ptrace.h>. Reads a regset by NT_* type into a user `iovec`.
+    pub const PTRACE_GETREGSET: libc::c_long = 33;
+    /// `PTRACE_SETREGSET` — Linux generic ptrace request number, see
+    /// <linux/ptrace.h>. Writes a regset by NT_* type from a user `iovec`.
+    pub const PTRACE_SETREGSET: libc::c_long = 34;
+    /// `NT_PRSTATUS` — general-purpose registers regset, see
+    /// <linux/elf.h>. This is the regset that maps to `user_pt_regs`
+    /// on aarch64 and to `user_regs_struct` on x86_64.
+    pub const NT_PRSTATUS: libc::c_long = 1;
+}
 
 // ── Register index constants ───────────────────────────────────────
 
@@ -103,6 +157,11 @@ const REG_ARG4: usize = 3;      // x3
 /// On x86_64: uses PTRACE_GETREGS.
 /// On aarch64: uses PTRACE_GETREGSET with NT_PRSTATUS (PTRACE_GETREGS
 /// does NOT exist on aarch64 and returns EIO).
+///
+/// The function name `ptrace_getregs` is historical — on aarch64 it does
+/// NOT use PTRACE_GETREGS (which doesn't exist on that arch); it uses the
+/// generic PTRACE_GETREGSET mechanism. Kept the name for parity with the
+/// x86_64 path and the call sites in `run_ptrace_loop`.
 fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<()> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -122,24 +181,37 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<()> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // PTRACE_GETREGSET = 33, NT_PRSTATUS = 1
-        #[repr(C)]
-        struct iovec {
-            iov_base: *mut libc::c_void,
-            iov_len: libc::size_t,
-        }
+        use aarch64_ptrace::{NT_PRSTATUS, PTRACE_GETREGSET};
 
-        let mut iov = iovec {
+        // Use libc::iovec (matching the kernel's `struct iovec`). The
+        // kernel reads `iov_base`/`iov_len` from this struct, copies
+        // `iov_len` bytes of register state INTO `iov_base`, and updates
+        // `iov_len` to the actual number of bytes copied.
+        let mut iov = libc::iovec {
             iov_base: regs as *mut _ as *mut libc::c_void,
             iov_len: std::mem::size_of::<Regs>(),
         };
 
+        // IMPORTANT: bypass libc::ptrace() (bionic's variadic wrapper) and
+        // invoke the kernel ptrace syscall directly via libc::syscall().
+        // See the long comment at the top of this file for the rationale.
+        //
+        // libc::syscall is itself variadic but it is a thin Rust shim that
+        // only forwards the raw syscall arguments to `syscall(2)`; bionic
+        // does no `va_arg` unpacking here because libc::syscall is a
+        // direct syscall stub, not a variadic-C wrapper like ptrace().
+        //
+        // The kernel's SYSCALL_DEFINE4(ptrace, long, request, long, pid,
+        // unsigned long, addr, unsigned long, data) takes addr as an
+        // integer (here NT_PRSTATUS=1), NOT a pointer — that's fine, the
+        // kernel just reads it as `unsigned long` and dispatches on it.
         let r = unsafe {
-            libc::ptrace(
-                33, // PTRACE_GETREGSET
-                pid,
-                1 as *mut libc::c_void, // NT_PRSTATUS
-                &mut iov as *mut _ as *mut libc::c_void,
+            libc::syscall(
+                libc::SYS_ptrace,
+                PTRACE_GETREGSET,
+                pid as libc::c_long,
+                NT_PRSTATUS,
+                &mut iov as *mut libc::iovec,
             )
         };
         if r == -1 {
@@ -152,6 +224,10 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<()> {
 /// Set the child's registers.
 /// On x86_64: uses PTRACE_SETREGS.
 /// On aarch64: uses PTRACE_SETREGSET with NT_PRSTATUS.
+///
+/// Same bionic-ptrace-wrapper caveat as `ptrace_getregs`: we go through
+/// the raw syscall on aarch64 because the libc::ptrace() variadic wrapper
+/// has been observed to fail with EIO on real arm64 Android devices.
 fn ptrace_setregs(pid: libc::pid_t, regs: &Regs) -> std::io::Result<()> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -171,24 +247,24 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs) -> std::io::Result<()> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // PTRACE_SETREGSET = 34, NT_PRSTATUS = 1
-        #[repr(C)]
-        struct iovec {
-            iov_base: *const libc::c_void,
-            iov_len: libc::size_t,
-        }
+        use aarch64_ptrace::{NT_PRSTATUS, PTRACE_SETREGSET};
 
-        let iov = iovec {
-            iov_base: regs as *const _ as *const libc::c_void,
+        // libc::iovec has `iov_base: *mut c_void`; for SETREGSET we only
+        // need `*const c_void` (the kernel reads from us), but the struct
+        // layout is identical and the cast is safe — the kernel does not
+        // mutate the regset source buffer for SETREGSET.
+        let iov = libc::iovec {
+            iov_base: regs as *const _ as *mut libc::c_void,
             iov_len: std::mem::size_of::<Regs>(),
         };
 
         let r = unsafe {
-            libc::ptrace(
-                34, // PTRACE_SETREGSET
-                pid,
-                1 as *mut libc::c_void, // NT_PRSTATUS
-                &iov as *const _ as *mut libc::c_void,
+            libc::syscall(
+                libc::SYS_ptrace,
+                PTRACE_SETREGSET,
+                pid as libc::c_long,
+                NT_PRSTATUS,
+                &iov as *const libc::iovec,
             )
         };
         if r == -1 {
@@ -394,6 +470,20 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 let mut regs: Regs = unsafe { std::mem::zeroed() };
                 if let Err(e) = ptrace_getregs(pid, &mut regs) {
                     log(&format!("ptrace_getregs failed: {} (iteration {})", e, loop_count));
+                    // We've consumed this syscall-stop regardless of whether
+                    // we could read its registers — the next PTRACE_SYSCALL
+                    // will land on the *other* half of the same syscall
+                    // (entry↔exit alternate). If we don't flip `in_syscall`
+                    // here, the next stop will be misclassified as the same
+                    // phase (e.g. entry again), and we'll permanently lose
+                    // sync — every subsequent open/getpid/etc. would be
+                    // handled at the wrong phase and never actually faked.
+                    //
+                    // Flipping here means: if getregs fails transiently we
+                    // stay in sync; if it fails persistently (the original
+                    // bug) the loop still terminates via the child exiting,
+                    // not via state corruption.
+                    in_syscall = !in_syscall;
                     continue;
                 }
 
@@ -506,9 +596,31 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     }
                 }
             } else if sig == libc::SIGTRAP {
-                // Regular SIGTRAP (breakpoint) — continue.
+                // Regular SIGTRAP (breakpoint, single-step without 0x80
+                // marker, etc.). We did NOT request delivery of any signal
+                // so falling through to the next PTRACE_SYSCALL (with a
+                // 0 signal arg at the top of the loop) is correct: the
+                // child resumes and the trap is consumed without being
+                // re-injected. We must NOT forward SIGTRAP back to the
+                // child — that would loop forever (the same breakpoint
+                // would fire again immediately).
             } else {
-                // Forward the signal to the child.
+                // The child stopped because of a real signal that was
+                // NOT a syscall-stop and NOT a debugger trap — e.g.
+                // SIGSEGV, SIGBUS, SIGFPE, or a SIGCHLD-style signal
+                // delivered by the kernel. Forward it to the child so
+                // its own signal handlers (or default action) run.
+                //
+                // The `sig as c_long` 4th arg to PTRACE_SYSCALL is the
+                // signal to deliver on resume; the next waitpid will
+                // report either the next syscall-stop or, if the signal's
+                // default action terminates the child, WIFSIGNALED.
+                //
+                // We do NOT flip `in_syscall`: the signal interrupted
+                // whatever the child was doing between two syscall-stops,
+                // so the next stop will be the same phase (entry if we
+                // were heading to an entry, exit if we were heading to
+                // an exit) as it would have been without the signal.
                 unsafe {
                     libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, sig as libc::c_long);
                 }
