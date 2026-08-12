@@ -41,9 +41,6 @@
 // EIO. We must use PTRACE_GETREGSET (33) with NT_PRSTATUS (1) and an
 // iovec. On x86_64, PTRACE_GETREGS works directly.
 
-use std::ffi::CString;
-use std::path::Path;
-
 // ── Register types ─────────────────────────────────────────────────
 
 /// On x86_64, user_regs_struct has 27 fields. We access them as u64
@@ -125,11 +122,7 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<()> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // PTRACE_GETREGSET (33) with NT_PRSTATUS (1)
-        const PTRACE_GETREGSET: libc::c_uint = 33;
-        const NT_PRSTATUS: libc::c_long = 1;
-
-        // iovec { void *iov_base; size_t iov_len; }
+        // PTRACE_GETREGSET = 33, NT_PRSTATUS = 1
         #[repr(C)]
         struct iovec {
             iov_base: *mut libc::c_void,
@@ -143,9 +136,9 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<()> {
 
         let r = unsafe {
             libc::ptrace(
-                PTRACE_GETREGSET as libc::c_uint,
+                33, // PTRACE_GETREGSET
                 pid,
-                NT_PRSTATUS,
+                1 as *mut libc::c_void, // NT_PRSTATUS
                 &mut iov as *mut _ as *mut libc::c_void,
             )
         };
@@ -178,9 +171,7 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs) -> std::io::Result<()> {
 
     #[cfg(target_arch = "aarch64")]
     {
-        const PTRACE_SETREGSET: libc::c_uint = 34;
-        const NT_PRSTATUS: libc::c_long = 1;
-
+        // PTRACE_SETREGSET = 34, NT_PRSTATUS = 1
         #[repr(C)]
         struct iovec {
             iov_base: *const libc::c_void,
@@ -194,9 +185,9 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs) -> std::io::Result<()> {
 
         let r = unsafe {
             libc::ptrace(
-                PTRACE_SETREGSET as libc::c_uint,
+                34, // PTRACE_SETREGSET
                 pid,
-                NT_PRSTATUS,
+                1 as *mut libc::c_void, // NT_PRSTATUS
                 &iov as *const _ as *mut libc::c_void,
             )
         };
