@@ -930,7 +930,7 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
     }
 }
 
-/// Patch TWRP's init.rc to add `setenv LD_PRELOAD /dev/twrp_fb_hook.so`
+/// Patch TWRP's init.rc to add `setenv LD_PRELOAD /sbin/twrp_fb_hook.so`
 /// to the recovery service definition.
 ///
 /// TWRP's init.rc defines the recovery service as:
@@ -938,7 +938,7 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
 /// service recovery /sbin/recovery
 /// ```
 /// (possibly with indented options like `seclabel`). We insert
-/// `    setenv LD_PRELOAD /dev/twrp_fb_hook.so` as a new indented option
+/// `    setenv LD_PRELOAD /sbin/twrp_fb_hook.so` as a new indented option
 /// right after the `service recovery` line.
 ///
 /// The hook library MUST be the i686 (32-bit x86) `twrp_fb_hook.so`,
@@ -965,10 +965,10 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
 ///     child `_exit(127)`s, the parent sees exit code 127, schedules
 ///     a restart, and the cycle repeats every ~4 s. Confirmed in
 ///     KVM run 31557318330 dmesg:
-///     ```
-///     [138.195] init: cannot setexeccon('u:r:recovery:s0'): Invalid argument
-///     [143.230] init: cannot setexeccon('u:r:recovery:s0'): Invalid argument
-///     [147.282] init: cannot setexeccon('u:r:recovery:s0'): Invalid argument
+///     ```text
+///     [138.195] init: cannot setexeccon u:r:recovery:s0 Invalid argument
+///     [143.230] init: cannot setexeccon u:r:recovery:s0 Invalid argument
+///     [147.282] init: cannot setexeccon u:r:recovery:s0 Invalid argument
 ///     ```
 ///   * Without the seclabel, init skips setexeccon entirely (per
 ///     AOSP 5.1 `service_start()` logic) and exec's recovery in init's
@@ -1003,7 +1003,7 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // kernel's SELinux policy doesn't have the recovery context,
             // so setexeccon returns EINVAL and aborts the service start.
             result.push('\n');
-            result.push_str("    setenv LD_PRELOAD /dev/twrp_fb_hook.so");
+            result.push_str("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so");
             found = true;
         }
         // Preserve the original line ending (lines() strips \n, so we add
@@ -1645,7 +1645,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         )
     };
     // TWRP-mode i686 FB ioctl hook (separate from the x86_64 main loader).
-    // Loaded ONLY in TWRP mode; written to /dev/twrp_fb_hook.so.
+    // Loaded ONLY in TWRP mode; written to /sbin/twrp_fb_hook.so.
     let hook_lib_twrp_fb = if cfg.boot_recovery {
         find_and_read_hook_library(
             &cfg,
@@ -1920,14 +1920,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "/dev/libtwoyi_loader_shlib.so",
         );
     }
-    // TWRP BOOT: write the i686 twrp_fb_hook.so to /dev/twrp_fb_hook.so
+    // TWRP BOOT: write the i686 twrp_fb_hook.so to /sbin/twrp_fb_hook.so
     // (tmpfs). The dynamically-linked i386 recovery binary loads it via
-    // LD_PRELOAD=/dev/twrp_fb_hook.so (injected via init.rc `setenv`).
+    // LD_PRELOAD=/sbin/twrp_fb_hook.so (injected via init.rc `setenv`).
     // The hook's open/ioctl intercepts FBIOGET_VSCREENINFO etc. on
     // /dev/graphics/fb0 and returns valid 720x1280@32bpp screen info,
     // fixing the libminuitwrp segfault at offset 0x57d7.
     if let Some((src, content)) = &hook_lib_twrp_fb {
-        write_hook_library_to_dev("twrp_fb_hook.so", src, content, "/dev/twrp_fb_hook.so");
+        write_hook_library_to_dev("twrp_fb_hook.so", src, content, "/sbin/twrp_fb_hook.so");
     }
 
     // Change SELinux label of /dev/lib*.so to system_file so that
@@ -1975,7 +1975,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     for lib_path in &[
         "/dev/libgetpid_hook.so",
         "/dev/libtwoyi_loader_shlib.so",
-        "/dev/twrp_fb_hook.so",
+        "/sbin/twrp_fb_hook.so",
     ] {
         if Path::new(lib_path).exists() {
             match set_selinux_context(lib_path, "u:object_r:system_file:s0") {
@@ -2486,7 +2486,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     // TWRP BOOT: patch {rootfs}/init.rc to add `setenv LD_PRELOAD
-    // /dev/twrp_fb_hook.so` to the recovery service definition.
+    // /sbin/twrp_fb_hook.so` to the recovery service definition.
     //
     // ROOT CAUSE (KVM run 31533796663): kr64 sets LD_PRELOAD in init's
     // environment, but TWRP's init (based on AOSP's init) builds a FRESH
@@ -2496,14 +2496,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // never sees it → our hook is never loaded → recovery crashes at
     // offset 0x57d7 in libminuitwrp.so (same as without the hook).
     //
-    // FIX: patch init.rc to add `setenv LD_PRELOAD /dev/twrp_fb_hook.so`
+    // FIX: patch init.rc to add `setenv LD_PRELOAD /sbin/twrp_fb_hook.so`
     // to the recovery service. TWRP's init supports `setenv` in service
     // blocks (confirmed via `strings /tmp/twrp/rd/init | grep setenv`).
     // This adds LD_PRELOAD to recovery's environment, so the bionic linker
     // loads our i686 hook → FB ioctls are intercepted → no crash.
     //
     // CRITICAL (Task ID 18, KVM run 31536016997): the LD_PRELOAD path
-    // MUST be `/dev/twrp_fb_hook.so` (i686), NOT `/dev/libtwoyi_loader_shlib.so`
+    // MUST be `/sbin/twrp_fb_hook.so` (i686), NOT `/dev/libtwoyi_loader_shlib.so`
     // (x86_64). TWRP's recovery binary is i386 and its 32-bit bionic
     // linker cannot load 64-bit libraries. Task ID 17 incorrectly used
     // the x86_64 path; the linker aborted recovery on the architecture
@@ -2516,7 +2516,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         match std::fs::read_to_string(&init_rc_path) {
             Ok(content) => {
                 // Check if the patch is already applied.
-                let patch_marker = "    setenv LD_PRELOAD /dev/twrp_fb_hook.so";
+                let patch_marker = "    setenv LD_PRELOAD /sbin/twrp_fb_hook.so";
                 if content.contains(patch_marker) {
                     info!(
                         "[KR64] PARENT: init.rc already patched with LD_PRELOAD for recovery service (idempotent skip)"
@@ -2524,7 +2524,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 } else if let Some(patched) = patch_twrp_init_rc_recovery_service(&content) {
                     match std::fs::write(&init_rc_path, &patched) {
                         Ok(()) => info!(
-                            "[KR64] PARENT: patched init.rc — added 'setenv LD_PRELOAD /dev/twrp_fb_hook.so' to recovery service"
+                            "[KR64] PARENT: patched init.rc — added 'setenv LD_PRELOAD /sbin/twrp_fb_hook.so' to recovery service"
                         ),
                         Err(e) => warning!(
                             "[KR64] PARENT: failed to write patched init.rc: {} (recovery will crash in libminuitwrp.so)",
@@ -3050,7 +3050,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // exits 31 instead of SIGSEGV, we know the linker works).
         //
         // TWRP BOOT: we DO set LD_PRELOAD in TWRP mode, to the i686
-        // (32-bit x86) hook library: `/dev/twrp_fb_hook.so`. The
+        // (32-bit x86) hook library: `/sbin/twrp_fb_hook.so`. The
         // statically-linked init ignores LD_PRELOAD (it doesn't use the
         // dynamic linker), but when init forks+execs recovery
         // (dynamically linked i386, interpreter /sbin/linker),
@@ -3084,7 +3084,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         //   - init is statically linked (ignores LD_PRELOAD)
         //   - recovery is i386 and its 32-bit linker can't load x86_64 libs
         let ld_preload_str = if cfg.boot_recovery {
-            "LD_PRELOAD=/dev/twrp_fb_hook.so".to_string()
+            "LD_PRELOAD=/sbin/twrp_fb_hook.so".to_string()
         } else {
             "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string()
         };
@@ -4162,7 +4162,7 @@ mod tests {
         let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
         assert!(
             patched.contains(
-                "service recovery /sbin/recovery\n    setenv LD_PRELOAD /dev/twrp_fb_hook.so"
+                "service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"
             ),
             "setenv line should be inserted right after service recovery line. Patched:\n{}",
             patched
@@ -4188,7 +4188,7 @@ mod tests {
         let input = "service recovery /sbin/recovery\n    seclabel u:r:recovery:s0\n";
         let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
         assert!(
-            patched.contains("service recovery /sbin/recovery\n    setenv LD_PRELOAD /dev/twrp_fb_hook.so\n    seclabel u:r:recovery:s0"),
+            patched.contains("service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/twrp_fb_hook.so\n    seclabel u:r:recovery:s0"),
             "setenv should be inserted before seclabel. Patched:\n{}",
             patched
         );
@@ -4207,7 +4207,7 @@ mod tests {
                      service recovery /sbin/recovery2\n";
         let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
         let count = patched
-            .matches("setenv LD_PRELOAD /dev/twrp_fb_hook.so")
+            .matches("setenv LD_PRELOAD /sbin/twrp_fb_hook.so")
             .count();
         assert_eq!(
             count, 1,

@@ -772,7 +772,7 @@ fi
 #
 # TWRP MODE: pass --boot-recovery to kr64. This:
 #   - loads twrp_fb_hook.so (i686) and sets
-#     LD_PRELOAD=/dev/twrp_fb_hook.so (the statically-linked
+#     LD_PRELOAD=/sbin/twrp_fb_hook.so (the statically-linked
 #     init ignores LD_PRELOAD, but the dynamically-linked i386 recovery
 #     binary loads it → FB ioctls are intercepted → no libminuitwrp crash).
 #     The i686 hook is required because the 32-bit bionic linker in TWRP's
