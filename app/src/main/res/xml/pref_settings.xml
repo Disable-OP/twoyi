@@ -66,6 +66,14 @@
             android:defaultValue="160"
             android:inputType="number" />
 
+        <ListPreference
+            android:key="@string/settings_key_display_color_depth"
+            android:title="@string/settings_display_color_depth_title"
+            android:summary="@string/settings_display_color_depth_summary"
+            android:defaultValue="32"
+            android:entries="@array/display_color_depth_entries"
+            android:entryValues="@array/display_color_depth_values" />
+
         <CheckBoxPreference
             android:key="@string/settings_key_use_new_renderer"
             android:title="@string/settings_use_new_renderer_title"

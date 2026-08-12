@@ -724,12 +724,13 @@ pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
 /// symlinks), in TWRP boot mode only. In non-TWRP mode, the symlinks-to-
 /// `/dev/null` approach is correct (surfaceflinger and the HALs gracefully
 /// fall back to HWComposer/qemu_pipe when fb0 returns ENOTTY).
-pub fn create_twrp_framebuffer(rootfs: &str) -> std::io::Result<()> {
-    // 720x1280 @ 32bpp RGBA8888.
-    const FB_WIDTH: u32 = 720;
-    const FB_HEIGHT: u32 = 1280;
+pub fn create_twrp_framebuffer(rootfs: &str, width: u32, height: u32) -> std::io::Result<()> {
+    // Use the profile's virtual display dimensions (passed from core.rs
+    // via kr64's --width/--height args). Default to 720x1280 if 0.
+    let fb_width = if width == 0 { 720 } else { width };
+    let fb_height = if height == 0 { 1280 } else { height };
     const FB_BYTES_PER_PIXEL: u32 = 4;
-    let smem_len: u64 = u64::from(FB_WIDTH) * u64::from(FB_HEIGHT) * u64::from(FB_BYTES_PER_PIXEL); // 3,686,400
+    let smem_len: u64 = u64::from(fb_width) * u64::from(fb_height) * u64::from(FB_BYTES_PER_PIXEL);
 
     // /dev/graphics/ and /dev/dri/ already exist (created by
     // create_graphics_device_stubs). We just need to replace the fb0
@@ -760,7 +761,7 @@ pub fn create_twrp_framebuffer(rootfs: &str) -> std::io::Result<()> {
         }
         info!(
             "[KR64][devices] TWRP framebuffer: {} (regular file, {} bytes = {}x{}x{} RGBA8888)",
-            path, smem_len, FB_WIDTH, FB_HEIGHT, FB_BYTES_PER_PIXEL
+            path, smem_len, fb_width, fb_height, FB_BYTES_PER_PIXEL
         );
     }
 
