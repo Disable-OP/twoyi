@@ -413,12 +413,28 @@ int open(const char *path, int flags, ...) {
     init_real_funcs();
     int fd = real_open ? real_open(path, flags, mode)
                        : (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, mode);
-    // DIAGNOSTIC (Task 31): log EVERY open() call to verify our hook is
-    // actually being invoked by bionic's PLT resolution. If this message
-    // NEVER appears in strace but strace shows openat() syscalls for
-    // /dev/graphics/fb0, then our LD_PRELOAD hook is NOT being called —
-    // meaning either our symbols aren't exported in .dynsym, or bionic's
-    // old (AOSP 5.1) linker isn't searching LD_PRELOAD for PLT resolution.
+    // If opening /dev/graphics/fb0 or /dev/fb0 fails with ENOENT, create
+    // the virtual framebuffer file and re-open it. TWRP init may re-mount
+    // /dev tmpfs, wiping kr64's pre-created fb0 file.
+    if (fd < 0 && is_fb_path(path)) {
+        // Create /dev/graphics/ directory if needed
+        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755);
+        // Create the fb0 file with the right size (720*1280*4 = 3686400)
+        int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
+            (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
+            O_CREAT | O_RDWR, 0644);
+        if (create_fd >= 0) {
+            // Truncate to framebuffer size
+            raw_syscall3(SYS_ftruncate, create_fd, 3686400);
+            raw_syscall1(SYS_close, create_fd);
+            // Re-open with the original flags
+            fd = real_open ? real_open(path, flags, mode)
+                           : (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, mode);
+            write_str(2, "[twrp_fb_hook] created virtual fb0 file, re-opened -> fd=");
+            write_num(2, fd);
+            write_str(2, "\n");
+        }
+    }
     write_str(2, "[twrp_fb_hook] open(\"");
     write_str(2, path ? path : "(null)");
     write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
@@ -439,7 +455,23 @@ int openat(int dirfd, const char *path, int flags, ...) {
     init_real_funcs();
     int fd = real_openat ? real_openat(dirfd, path, flags, mode)
                          : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
-    // DIAGNOSTIC (Task 31): log EVERY openat() call (see open() comment).
+    // If opening /dev/graphics/fb0 or /dev/fb0 fails with ENOENT, create
+    // the virtual framebuffer file and re-open it.
+    if (fd < 0 && is_fb_path(path)) {
+        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755);
+        int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
+            (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
+            O_CREAT | O_RDWR, 0644);
+        if (create_fd >= 0) {
+            raw_syscall3(SYS_ftruncate, create_fd, 3686400);
+            raw_syscall1(SYS_close, create_fd);
+            fd = real_openat ? real_openat(dirfd, path, flags, mode)
+                             : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
+            write_str(2, "[twrp_fb_hook] created virtual fb0 file, re-opened -> fd=");
+            write_num(2, fd);
+            write_str(2, "\n");
+        }
+    }
     write_str(2, "[twrp_fb_hook] openat(df="); write_num(2, dirfd);
     write_str(2, ", \"");
     write_str(2, path ? path : "(null)");
