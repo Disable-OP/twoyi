@@ -50,8 +50,10 @@ const REG_ARG1: usize = 5;    // rdi
 #[cfg(target_arch = "x86_64")]
 const REG_ARG2: usize = 4;    // rsi
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 const REG_ARG3: usize = 3;    // rdx
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 const REG_ARG4: usize = 10;   // r10
 
 #[cfg(target_arch = "aarch64")]
@@ -63,8 +65,10 @@ const REG_ARG1: usize = 0;      // x0
 #[cfg(target_arch = "aarch64")]
 const REG_ARG2: usize = 1;      // x1
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 const REG_ARG3: usize = 2;      // x2
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 const REG_ARG4: usize = 3;      // x3
 
 /// Check if ptrace is likely to work on this device.
@@ -271,12 +275,14 @@ fn set_syscall_ret(regs: &mut libc::user_regs_struct, val: i64) {
 /// Set the syscall number (to skip a syscall, set it to -1 / __NR_read with
 /// a return value of 0).
 #[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
 fn set_syscall_num(regs: &mut libc::user_regs_struct, num: i64) {
     let regs_ptr = regs as *mut libc::user_regs_struct as *mut u64;
     unsafe { *regs_ptr.add(REG_SYSCALL) = num as u64; }
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 fn set_syscall_num(regs: &mut libc::user_regs_struct, num: i64) {
     let regs_ptr = regs as *mut libc::user_regs_struct as *mut u64;
     unsafe { *regs_ptr.add(REG_SYSCALL) = num as u64; }
