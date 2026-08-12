@@ -59,7 +59,7 @@
 // it declares dlsym as a strong extern, which bionic's old linker (AOSP 5.1,
 // Android L) refuses to leave unresolved: it errors out with
 // "CANNOT LINK EXECUTABLE DEPENDENCIES: cannot locate symbol 'dlsym'
-// referenced by 'twrp_fb_hook.so'" (strace-confirmed in KVM runs 31574428304
+// referenced by 'libtwrp_fb_hook.so'" (strace-confirmed in KVM runs 31574428304
 // and 31576126359 — the recovery binary doesn't link against libdl.so, so
 // dlsym is unresolvable from the LD_PRELOAD).
 //
@@ -111,7 +111,7 @@ static unsigned int my_strlen(const char *s) {
 // fails to resolve the `syscall` symbol from our LD_PRELOAD library even
 // though libc.so exports it (strace-confirmed in KVM run 31572816370:
 // "CANNOT LINK EXECUTABLE DEPENDENCIES: cannot locate symbol \"syscall\"
-// referenced by \"twrp_fb_hook.so\"..."). Using inline asm eliminates the
+// referenced by \"libtwrp_fb_hook.so\"..."). Using inline asm eliminates the
 // undefined `syscall` symbol from our .so's dynsym, so bionic can load us.
 //
 // We support TWO architectures:

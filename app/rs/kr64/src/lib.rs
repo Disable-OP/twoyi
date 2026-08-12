@@ -324,7 +324,7 @@ pub struct Config {
     ///     it doesn't need LD_PRELOAD hook libraries for itself. We
     ///     skip the libgetpid_hook.so and libtwoyi_loader_shlib.so
     ///     read/write (init ignores LD_PRELOAD). We DO load a
-    ///     separate i686 (32-bit x86) hook library `twrp_fb_hook.so`
+    ///     separate i686 (32-bit x86) hook library `libtwrp_fb_hook.so`
     ///     — the dynamically-linked i386 `recovery` service loads it
     ///     via LD_PRELOAD to intercept FBIOGET_VSCREENINFO on
     ///     /dev/graphics/fb0 (fixing the libminuitwrp segfault at
@@ -739,9 +739,9 @@ pub fn clear_zombie_processes() {
 ///        log from HONOR NTH-NX9 (Android 13, work profile, kr64
 ///        running unprivileged):
 ///        ```
-///        PARENT: APK native lib scan for twrp_fb_hook.so found no
+///        PARENT: APK native lib scan for libtwrp_fb_hook.so found no
 ///        candidates in /data/app/
-///        PARENT: twrp_fb_hook.so not found in any of 4 candidate
+///        PARENT: libtwrp_fb_hook.so not found in any of 4 candidate
 ///        locations -- TWRP framebuffer virtualization disabled
 ///        ```
 ///        The scan silently returned 0 candidates because read_dir
@@ -1135,7 +1135,7 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
     }
 }
 
-/// Patch TWRP's init.rc to add `setenv LD_PRELOAD /sbin/twrp_fb_hook.so`
+/// Patch TWRP's init.rc to add `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so`
 /// to the recovery service definition.
 ///
 /// TWRP's init.rc defines the recovery service as:
@@ -1143,10 +1143,10 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
 /// service recovery /sbin/recovery
 /// ```
 /// (possibly with indented options like `seclabel`). We insert
-/// `    setenv LD_PRELOAD /sbin/twrp_fb_hook.so` as a new indented option
+/// `    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so` as a new indented option
 /// right after the `service recovery` line.
 ///
-/// The hook library MUST be the i686 (32-bit x86) `twrp_fb_hook.so`,
+/// The hook library MUST be the i686 (32-bit x86) `libtwrp_fb_hook.so`,
 /// NOT the x86_64 `libtwoyi_loader_shlib.so`. TWRP's recovery binary
 /// is i386 and its 32-bit bionic linker cannot load 64-bit libraries
 /// ("CANNOT LINK EXECUTABLE: ... is 64-bit instead of 32-bit"). See
@@ -1208,7 +1208,7 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // kernel's SELinux policy doesn't have the recovery context,
             // so setexeccon returns EINVAL and aborts the service start.
             result.push('\n');
-            result.push_str("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so");
+            result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
             found = true;
         }
         // Preserve the original line ending (lines() strips \n, so we add
@@ -1225,12 +1225,12 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
 }
 
 /// Marker string that, when present in a .rc file, indicates the
-/// `setenv LD_PRELOAD /sbin/twrp_fb_hook.so` line has already been
+/// `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so` line has already been
 /// injected into the recovery service definition. Used by the
 /// orchestrator below to make the patch IDEMPOTENT across boots.
-const TWRP_LD_PRELOAD_PATCH_MARKER: &str = "    setenv LD_PRELOAD /sbin/twrp_fb_hook.so";
+const TWRP_LD_PRELOAD_PATCH_MARKER: &str = "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so";
 
-/// Patch TWRP init to inject `setenv LD_PRELOAD /sbin/twrp_fb_hook.so`
+/// Patch TWRP init to inject `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so`
 /// into the recovery service definition, wherever it lives.
 ///
 /// # Why this exists (arm64 TWRP regression)
@@ -1396,7 +1396,7 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
         if let Some(patched) = patch_twrp_init_rc_recovery_service(&content) {
             match std::fs::write(path, &patched) {
                 Ok(()) => info!(
-                    "[KR64] PARENT: patched {} — added 'setenv LD_PRELOAD /sbin/twrp_fb_hook.so' to recovery service",
+                    "[KR64] PARENT: patched {} — added 'setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so' to recovery service",
                     path
                 ),
                 Err(e) => warning!(
@@ -1436,7 +1436,7 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
     // would break init.rc's service-option indentation requirement).
     let twoyi_rc_content = concat!(
         "service recovery /sbin/recovery\n",
-        "    setenv LD_PRELOAD /sbin/twrp_fb_hook.so\n",
+        "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so\n",
         "    seclabel u:r:recovery:s0\n",
     );
     if let Err(e) = std::fs::write(&twoyi_rc_path, twoyi_rc_content) {
@@ -2257,7 +2257,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // run 31531742745 dmesg.log for the crash signature.
     //
     // FIX: in TWRP mode, we load a SEPARATE i686 (32-bit x86)
-    // LD_PRELOAD library, `twrp_fb_hook.so`, that intercepts FB ioctls
+    // LD_PRELOAD library, `libtwrp_fb_hook.so`, that intercepts FB ioctls
     // on /dev/graphics/fb0 and returns valid 720x1280@32bpp screen
     // info. The statically-linked init ignores LD_PRELOAD (it doesn't
     // use the dynamic linker), but when init forks+execs recovery,
@@ -2270,7 +2270,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ID 17 incorrectly switched TWRP mode to use the x86_64 main loader;
     // the 32-bit linker aborts the recovery process on the architecture
     // mismatch, so recovery never starts and is invisible in `ps`. We
-    // reverted to the i686 twrp_fb_hook.so — the architecturally correct
+    // reverted to the i686 libtwrp_fb_hook.so — the architecturally correct
     // choice for the i386 recovery binary.
     //
     // We do NOT load libgetpid_hook.so in TWRP mode (recovery doesn't
@@ -2294,11 +2294,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         )
     };
     // TWRP-mode i686 FB ioctl hook (separate from the x86_64 main loader).
-    // Loaded ONLY in TWRP mode; written to /sbin/twrp_fb_hook.so.
+    // Loaded ONLY in TWRP mode; written to /sbin/libtwrp_fb_hook.so.
     let hook_lib_twrp_fb = if cfg.boot_recovery {
         find_and_read_hook_library(
             &cfg,
-            "twrp_fb_hook.so",
+            "libtwrp_fb_hook.so",
             "TWRP framebuffer virtualization disabled (recovery will crash in libminuitwrp.so)",
         )
     } else {
@@ -2581,14 +2581,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "/dev/libtwoyi_loader_shlib.so",
         );
     }
-    // TWRP BOOT: write the i686 twrp_fb_hook.so to /sbin/twrp_fb_hook.so
+    // TWRP BOOT: write the i686 libtwrp_fb_hook.so to /sbin/libtwrp_fb_hook.so
     // (tmpfs). The dynamically-linked i386 recovery binary loads it via
-    // LD_PRELOAD=/sbin/twrp_fb_hook.so (injected via init.rc `setenv`).
+    // LD_PRELOAD=/sbin/libtwrp_fb_hook.so (injected via init.rc `setenv`).
     // The hook's open/ioctl intercepts FBIOGET_VSCREENINFO etc. on
     // /dev/graphics/fb0 and returns valid 720x1280@32bpp screen info,
     // fixing the libminuitwrp segfault at offset 0x57d7.
     if let Some((src, content)) = &hook_lib_twrp_fb {
-        write_hook_library_to_dev("twrp_fb_hook.so", src, content, "/sbin/twrp_fb_hook.so");
+        write_hook_library_to_dev("libtwrp_fb_hook.so", src, content, "/sbin/libtwrp_fb_hook.so");
     }
 
     // Change SELinux label of /dev/lib*.so to system_file so that
@@ -2646,7 +2646,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     for lib_path in &[
         "/dev/libgetpid_hook.so",
         "/dev/libtwoyi_loader_shlib.so",
-        "/sbin/twrp_fb_hook.so",
+        "/sbin/libtwrp_fb_hook.so",
     ] {
         if Path::new(lib_path).exists() {
             match set_selinux_context(lib_path, "u:object_r:system_file:s0") {
@@ -3048,7 +3048,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // RGBA8888). This makes open() succeed and mmap() work naturally, so
     // libminuitwrp's graphics_fbdev_init can proceed past the open+mmap
     // stage. The FB ioctls themselves are intercepted by the i686
-    // `twrp_fb_hook.so` (LD_PRELOAD'd into the recovery process). See
+    // `libtwrp_fb_hook.so` (LD_PRELOAD'd into the recovery process). See
     // `devices::create_twrp_framebuffer` for the full rationale.
     if cfg.boot_recovery {
         if let Err(e) = devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width as u32, cfg.height as u32) {
@@ -3173,7 +3173,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     // TWRP BOOT: patch TWRP init to add `setenv LD_PRELOAD
-    // /sbin/twrp_fb_hook.so` to the recovery service definition.
+    // /sbin/libtwrp_fb_hook.so` to the recovery service definition.
     //
     // ROOT CAUSE (KVM run 31533796663): kr64 sets LD_PRELOAD in init's
     // environment, but TWRP's init (based on AOSP's init) builds a FRESH
@@ -3185,14 +3185,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //
     // FIX: patch init.rc (or, on arm64 TWRP, the imported .rc file that
     // actually defines the recovery service) to add
-    // `setenv LD_PRELOAD /sbin/twrp_fb_hook.so` to the recovery service.
+    // `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so` to the recovery service.
     // TWRP's init supports `setenv` in service blocks (confirmed via
     // `strings /tmp/twrp/rd/init | grep setenv`). This adds LD_PRELOAD to
     // recovery's environment, so the bionic linker loads our i686 hook →
     // FB ioctls are intercepted → no crash.
     //
     // CRITICAL (Task ID 18, KVM run 31536016997): the LD_PRELOAD path
-    // MUST be `/sbin/twrp_fb_hook.so` (i686), NOT `/dev/libtwoyi_loader_shlib.so`
+    // MUST be `/sbin/libtwrp_fb_hook.so` (i686), NOT `/dev/libtwoyi_loader_shlib.so`
     // (x86_64). TWRP's recovery binary is i386 and its 32-bit bionic
     // linker cannot load 64-bit libraries. Task ID 17 incorrectly used
     // the x86_64 path; the linker aborted recovery on the architecture
@@ -3818,7 +3818,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // exits 31 instead of SIGSEGV, we know the linker works).
         //
         // TWRP BOOT: we DO set LD_PRELOAD in TWRP mode, to the i686
-        // (32-bit x86) hook library: `/sbin/twrp_fb_hook.so`. The
+        // (32-bit x86) hook library: `/sbin/libtwrp_fb_hook.so`. The
         // statically-linked init ignores LD_PRELOAD (it doesn't use the
         // dynamic linker), but when init forks+execs recovery
         // (dynamically linked i386, interpreter /sbin/linker),
@@ -3846,13 +3846,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // before init's main() runs. The getpid hook makes init think
         // it's PID 1.
         //
-        // LD_PRELOAD for TWRP mode: load ONLY twrp_fb_hook.so (the i686
+        // LD_PRELOAD for TWRP mode: load ONLY libtwrp_fb_hook.so (the i686
         // FB ioctl hook). The x86_64 libgetpid_hook.so and
         // libtwoyi_loader_shlib.so are NOT loaded because:
         //   - init is statically linked (ignores LD_PRELOAD)
         //   - recovery is i386 and its 32-bit linker can't load x86_64 libs
         let ld_preload_str = if cfg.boot_recovery {
-            "LD_PRELOAD=/sbin/twrp_fb_hook.so".to_string()
+            "LD_PRELOAD=/sbin/libtwrp_fb_hook.so".to_string()
         } else {
             "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string()
         };
@@ -4788,14 +4788,14 @@ mod tests {
         // (NO ~~<rand> bucket level — the io.twoyi-* dir is directly
         // under the base dir.)
         let apk_root = tmp.join("io.twoyi-1");
-        let x86_64_lib = apk_root.join("lib/x86_64/twrp_fb_hook.so");
-        let arm64_lib = apk_root.join("lib/arm64-v8a/twrp_fb_hook.so");
+        let x86_64_lib = apk_root.join("lib/x86_64/libtwrp_fb_hook.so");
+        let arm64_lib = apk_root.join("lib/arm64-v8a/libtwrp_fb_hook.so");
         std::fs::create_dir_all(x86_64_lib.parent().unwrap()).unwrap();
         std::fs::create_dir_all(arm64_lib.parent().unwrap()).unwrap();
         std::fs::write(&x86_64_lib, b"fake i686 ELF in x86_64 dir").unwrap();
         std::fs::write(&arm64_lib, b"fake aarch64 ELF").unwrap();
 
-        let cands = apk_native_lib_candidates_in(&tmp, "twrp_fb_hook.so");
+        let cands = apk_native_lib_candidates_in(&tmp, "libtwrp_fb_hook.so");
         assert_eq!(
             cands.len(),
             2,
@@ -4803,12 +4803,12 @@ mod tests {
             cands
         );
         assert!(
-            cands[0].ends_with("/lib/x86_64/twrp_fb_hook.so"),
+            cands[0].ends_with("/lib/x86_64/libtwrp_fb_hook.so"),
             "x86_64 must be first: {}",
             cands[0]
         );
         assert!(
-            cands[1].ends_with("/lib/arm64-v8a/twrp_fb_hook.so"),
+            cands[1].ends_with("/lib/arm64-v8a/libtwrp_fb_hook.so"),
             "arm64-v8a must be second: {}",
             cands[1]
         );
@@ -4831,7 +4831,7 @@ mod tests {
         let direct_root = tmp.join("io.twoyi-1");
         std::fs::create_dir_all(direct_root.join("lib/x86_64")).unwrap();
         std::fs::write(
-            direct_root.join("lib/x86_64/twrp_fb_hook.so"),
+            direct_root.join("lib/x86_64/libtwrp_fb_hook.so"),
             b"direct-layout i686",
         )
         .unwrap();
@@ -4839,12 +4839,12 @@ mod tests {
         let bucket_root = tmp.join("~~rand").join("io.twoyi-2");
         std::fs::create_dir_all(bucket_root.join("lib/arm64-v8a")).unwrap();
         std::fs::write(
-            bucket_root.join("lib/arm64-v8a/twrp_fb_hook.so"),
+            bucket_root.join("lib/arm64-v8a/libtwrp_fb_hook.so"),
             b"bucket-layout aarch64",
         )
         .unwrap();
 
-        let cands = apk_native_lib_candidates_in(&tmp, "twrp_fb_hook.so");
+        let cands = apk_native_lib_candidates_in(&tmp, "libtwrp_fb_hook.so");
         assert_eq!(
             cands.len(),
             2,
@@ -4856,10 +4856,10 @@ mod tests {
         // present.
         let has_x86_64 = cands
             .iter()
-            .any(|p| p.ends_with("/lib/x86_64/twrp_fb_hook.so"));
+            .any(|p| p.ends_with("/lib/x86_64/libtwrp_fb_hook.so"));
         let has_arm64 = cands
             .iter()
-            .any(|p| p.ends_with("/lib/arm64-v8a/twrp_fb_hook.so"));
+            .any(|p| p.ends_with("/lib/arm64-v8a/libtwrp_fb_hook.so"));
         assert!(has_x86_64, "x86_64 candidate missing: {:?}", cands);
         assert!(has_arm64, "arm64-v8a candidate missing: {:?}", cands);
 
@@ -4885,7 +4885,7 @@ mod tests {
             native_lib_dir: None,
             ..Config::default()
         };
-        let cands = hook_library_candidates(&cfg, "twrp_fb_hook.so");
+        let cands = hook_library_candidates(&cfg, "libtwrp_fb_hook.so");
         // The 4 documented candidates collapse to 2 unique paths after
         // dedup (rootfs/{lib} == data_dir/rootfs/{lib}, and
         // rootfs/system/lib64/{lib} == data_dir/rootfs/system/lib64/{lib}).
@@ -4900,10 +4900,10 @@ mod tests {
         // Verify both unique paths are present.
         let has_rootfs_root = cands
             .iter()
-            .any(|p| p == "/data/user/11/io.twoyi/rootfs/twrp_fb_hook.so");
+            .any(|p| p == "/data/user/11/io.twoyi/rootfs/libtwrp_fb_hook.so");
         let has_rootfs_lib64 = cands
             .iter()
-            .any(|p| p == "/data/user/11/io.twoyi/rootfs/system/lib64/twrp_fb_hook.so");
+            .any(|p| p == "/data/user/11/io.twoyi/rootfs/system/lib64/libtwrp_fb_hook.so");
         assert!(has_rootfs_root, "missing rootfs/<lib> candidate: {:?}", cands);
         assert!(
             has_rootfs_lib64,
@@ -4925,7 +4925,7 @@ mod tests {
             native_lib_dir: Some("/data/app/~~rand/io.twoyi-rand/lib/x86_64".to_string()),
             ..Config::default()
         };
-        let cands = hook_library_candidates(&cfg, "twrp_fb_hook.so");
+        let cands = hook_library_candidates(&cfg, "libtwrp_fb_hook.so");
         assert!(
             !cands.is_empty(),
             "expected at least one candidate, got empty list"
@@ -4933,7 +4933,7 @@ mod tests {
         // Candidate #0 must be {native_lib_dir}/<lib>.
         assert_eq!(
             cands[0],
-            "/data/app/~~rand/io.twoyi-rand/lib/x86_64/twrp_fb_hook.so",
+            "/data/app/~~rand/io.twoyi-rand/lib/x86_64/libtwrp_fb_hook.so",
             "native_lib_dir must be candidate #0 (highest priority): {:?}",
             cands
         );
@@ -5227,7 +5227,7 @@ mod tests {
         let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
         assert!(
             patched.contains(
-                "service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"
+                "service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"
             ),
             "setenv line should be inserted right after service recovery line. Patched:\n{}",
             patched
@@ -5253,7 +5253,7 @@ mod tests {
         let input = "service recovery /sbin/recovery\n    seclabel u:r:recovery:s0\n";
         let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
         assert!(
-            patched.contains("service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/twrp_fb_hook.so\n    seclabel u:r:recovery:s0"),
+            patched.contains("service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so\n    seclabel u:r:recovery:s0"),
             "setenv should be inserted before seclabel. Patched:\n{}",
             patched
         );
@@ -5272,7 +5272,7 @@ mod tests {
                      service recovery /sbin/recovery2\n";
         let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
         let count = patched
-            .matches("setenv LD_PRELOAD /sbin/twrp_fb_hook.so")
+            .matches("setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so")
             .count();
         assert_eq!(
             count, 1,
@@ -5316,7 +5316,7 @@ mod tests {
         patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
         let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert!(
-            init_rc.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            init_rc.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "init.rc should be patched. Got:\n{}",
             init_rc
         );
@@ -5354,7 +5354,7 @@ mod tests {
         let init_recovery_rc =
             std::fs::read_to_string(dir.join("init.recovery.rc")).unwrap();
         assert!(
-            init_recovery_rc.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            init_recovery_rc.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "init.recovery.rc should be patched. Got:\n{}",
             init_recovery_rc
         );
@@ -5392,7 +5392,7 @@ mod tests {
         // The imported file SHOULD be patched.
         let imported = std::fs::read_to_string(dir.join("init.recovery.qcom.rc")).unwrap();
         assert!(
-            imported.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            imported.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "imported init.recovery.qcom.rc should be patched. Got:\n{}",
             imported
         );
@@ -5424,7 +5424,7 @@ mod tests {
         patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
         let imported = std::fs::read_to_string(dir.join("init.recovery.qcom.rc")).unwrap();
         assert!(
-            imported.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            imported.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "glob-matched init.recovery.qcom.rc should be patched. Got:\n{}",
             imported
         );
@@ -5455,7 +5455,7 @@ mod tests {
             twoyi_rc
         );
         assert!(
-            twoyi_rc.contains("setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            twoyi_rc.contains("setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "init.twoyi.rc should set LD_PRELOAD. Got:\n{}",
             twoyi_rc
         );
@@ -5491,7 +5491,7 @@ mod tests {
             "second run should not modify init.rc (idempotent)"
         );
         let count = init_rc_after_second
-            .matches("setenv LD_PRELOAD /sbin/twrp_fb_hook.so")
+            .matches("setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so")
             .count();
         assert_eq!(
             count, 1,
@@ -5538,7 +5538,7 @@ mod tests {
         patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
         let extra = std::fs::read_to_string(dir.join("extra.rc")).unwrap();
         assert!(
-            extra.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            extra.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "relative-imported extra.rc should be patched. Got:\n{}",
             extra
         );

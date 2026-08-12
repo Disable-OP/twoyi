@@ -705,9 +705,9 @@ pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
 /// a file-backed shared mapping).
 ///
 /// The FB ioctls themselves still return `ENOTTY` from the kernel (regular
-/// files don't support FB ioctls). The `twrp_fb_hook.so` LD_PRELOAD library
+/// files don't support FB ioctls). The `libtwrp_fb_hook.so` LD_PRELOAD library
 /// (built in `app/cpp/build.sh`, loaded in the recovery process via
-/// `LD_PRELOAD=/dev/twrp_fb_hook.so`) intercepts these ioctls and returns
+/// `LD_PRELOAD=/dev/libtwrp_fb_hook.so`) intercepts these ioctls and returns
 /// valid screen info (720x1280 @ 32bpp RGBA8888), fixing the crash.
 ///
 /// # Why a regular file and not a char device
