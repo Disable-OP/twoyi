@@ -14,7 +14,8 @@ Simulates a real user navigating the app entirely via UI taps:
   9. Pull app logs
 
 Uses uiautomator dump + XML parsing to find elements by text.
-No hardcoded coordinates — everything is text-based.
+Detects actual screen size from the hierarchy root bounds and scales
+all swipe/tap coordinates accordingly.
 """
 import os
 import re
@@ -26,6 +27,10 @@ import xml.etree.ElementTree as ET
 ADB = ["adb", "-s", "emulator-5554"]
 ART = "/tmp/ui-e2e-artifacts"
 os.makedirs(ART, exist_ok=True)
+
+# Screen dimensions — detected from the first uiautomator dump
+SCREEN_W = 320
+SCREEN_H = 640
 
 def adb(*args, timeout=30):
     try:
@@ -63,6 +68,17 @@ def parse_ui(xml_path):
         return tree.getroot()
     except Exception:
         return None
+
+def detect_screen_size(root):
+    """Detect screen size from the root hierarchy node bounds."""
+    global SCREEN_W, SCREEN_H
+    if root is not None:
+        bounds = root.get("bounds", "")
+        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        if m:
+            SCREEN_W = int(m.group(3))
+            SCREEN_H = int(m.group(4))
+            print(f"  [screen] {SCREEN_W}x{SCREEN_H}")
 
 def find_by_text(root, text, exact=False):
     """Find a UI node by text or content-desc. Returns (cx, cy, node) or None."""
@@ -108,12 +124,18 @@ def tap(x, y):
     adb_shell(f"input tap {x} {y}")
 
 def swipe_up():
-    """Swipe up to scroll down the list."""
-    adb_shell("input swipe 540 1500 540 300 300")
+    """Swipe up to scroll down the list. Uses screen-relative coordinates."""
+    cx = SCREEN_W // 2
+    y1 = int(SCREEN_H * 0.7)
+    y2 = int(SCREEN_H * 0.3)
+    adb_shell(f"input swipe {cx} {y1} {cx} {y2} 300")
 
 def swipe_down():
-    """Swipe down to scroll up the list."""
-    adb_shell("input swipe 540 300 540 1500 300")
+    """Swipe down to scroll up the list. Uses screen-relative coordinates."""
+    cx = SCREEN_W // 2
+    y1 = int(SCREEN_H * 0.3)
+    y2 = int(SCREEN_H * 0.7)
+    adb_shell(f"input swipe {cx} {y1} {cx} {y2} 300")
 
 def wait(seconds):
     time.sleep(seconds)
@@ -131,6 +153,8 @@ def scroll_to_find(text, max_scrolls=5, exact=True):
     for i in range(max_scrolls + 1):
         xml = dump_ui(f"scroll_{text}_{i}")
         root = parse_ui(xml)
+        if i == 0:
+            detect_screen_size(root)
         result = find_by_text(root, text, exact=exact)
         if result:
             print(f"  Found '{text}' at ({result[0]}, {result[1]}) after {i} scrolls")
@@ -140,6 +164,18 @@ def scroll_to_find(text, max_scrolls=5, exact=True):
             swipe_up()
             wait(1)
     return None
+
+def print_all_text(root, prefix="    "):
+    """Print all non-empty text/content-desc for debugging."""
+    if root is None:
+        return
+    for node in root.iter("node"):
+        t = node.get("text", "")
+        d = node.get("content-desc", "")
+        if t:
+            print(f"{prefix}text={t!r}")
+        if d:
+            print(f"{prefix}desc={d!r}")
 
 def main():
     boot_wait = int(os.environ.get("BOOT_WAIT_SECONDS", "60"))
@@ -154,6 +190,7 @@ def main():
     wait(5)
     xml = dump_ui("01_app_launched")
     root = parse_ui(xml)
+    detect_screen_size(root)
     print(f"  Current activity: {get_current_activity()}")
 
     # ─────────────────────────────────────────────
@@ -164,70 +201,132 @@ def main():
     print('  Step 2: Find and tap "Select ROM" preference')
     print("=" * 60)
     # "Select ROM" is deep in the Advanced category, below the fold.
-    # We need to scroll down to find it.
     # Use EXACT matching to avoid matching "ROM" in "from" etc.
-    result = scroll_to_find("Select ROM", max_scrolls=5, exact=True)
+    result = scroll_to_find("Select ROM", max_scrolls=8, exact=True)
     if result:
         cx, cy, _ = result
         print(f"  Tapping 'Select ROM' at ({cx}, {cy})")
         tap(cx, cy)
-        wait(3)
+        wait(4)
     else:
         print("  ✗ Could not find 'Select ROM' — dumping all visible text:")
         xml = dump_ui("02_debug_all_text")
         root = parse_ui(xml)
-        if root:
-            for node in root.iter("node"):
-                t = node.get("text", "")
-                if t:
-                    print(f"    text={t!r}")
+        print_all_text(root)
 
     xml = dump_ui("02_after_select_rom")
     root = parse_ui(xml)
-    print(f"  Current activity: {get_current_activity()}")
+    activity = get_current_activity()
+    print(f"  Current activity: {activity}")
+
+    # Check if the file picker actually opened
+    if "SettingsActivity" in activity:
+        print("  ⚠ Still on SettingsActivity — file picker did not open!")
+        # Maybe the tap hit the wrong row. Try scrolling more.
+        for extra_scroll in range(3):
+            swipe_up()
+            wait(1)
+            xml = dump_ui(f"02b_extra_scroll_{extra_scroll}")
+            root = parse_ui(xml)
+            result = find_by_text(root, "Select ROM", exact=True)
+            if result:
+                cx, cy, _ = result
+                print(f"  Found 'Select ROM' on extra scroll {extra_scroll} at ({cx}, {cy}) — tapping")
+                tap(cx, cy)
+                wait(4)
+                xml = dump_ui("02c_after_retry_tap")
+                root = parse_ui(xml)
+                activity = get_current_activity()
+                print(f"  Current activity: {activity}")
+                if "SettingsActivity" not in activity:
+                    break
 
     # ─────────────────────────────────────────────
     # Step 3: Navigate file picker to recovery.img
+    #
+    # The Android SAF (Storage Access Framework) file picker on API 30:
+    #   - Opens with "Recent" view by default
+    #   - Has a hamburger menu (top-left) → drawer with "Downloads", etc.
+    #   - Or has a breadcrumb path bar at the top
+    #   - Or shows "Internal storage" / "SD card" options
+    #
+    # Strategy (in order of preference):
+    #   a) Look for recovery.img directly (might be in Recent if we're lucky)
+    #   b) Open the hamburger menu / drawer → tap "Downloads"
+    #   c) Look for recovery.img in Downloads
+    #   d) If still not found, try "Show internal storage" → navigate tree
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
     print("  Step 3: Navigate file picker to recovery.img")
     print("=" * 60)
 
-    # The file picker (DocumentsUI) should now be open.
-    # Try to find recovery.img directly first (might be in Recent).
     found_file = False
+
+    # (a) Try to find recovery.img directly in the current view
     for text in ["recovery.img", "recovery"]:
         result = find_by_text(root, text, exact=False)
         if result:
             cx, cy, _ = result
-            print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+            print(f"  Found '{text}' directly at ({cx}, {cy}) — tapping")
             tap(cx, cy)
             wait(3)
             found_file = True
             break
 
     if not found_file:
-        # Open nav drawer (hamburger menu, top-left)
-        print("  File not in current view — opening nav drawer")
-        tap(50, 50)
-        wait(2)
+        # (b) Open the hamburger menu / drawer
+        # The SAF picker's hamburger is an ImageButton with content-desc
+        # "Navigate up" or "Show roots" or similar, at the top-left.
+        # On a 320x640 screen, the action bar is at y=24..80, so the
+        # hamburger center is around (28, 52). But let's find it by
+        # content-desc first for robustness.
+        print("  recovery.img not in current view — opening nav drawer")
+
+        # Look for the "Show roots" / "Navigate up" button
+        drawer_opened = False
+        for desc in ["Show roots", "Navigate up", "Show list", "More options"]:
+            result = find_by_text(root, desc, exact=False)
+            if result:
+                cx, cy, _ = result
+                print(f"  Found '{desc}' at ({cx}, {cy}) — tapping to open drawer")
+                tap(cx, cy)
+                wait(2)
+                drawer_opened = True
+                break
+
+        if not drawer_opened:
+            # Fall back to tapping the top-left corner (where the hamburger
+            # usually is). On a 320x640 screen, this is around (28, 52).
+            # The action bar starts at y=24 (after status bar) and is 56px tall.
+            hamburger_x = int(SCREEN_W * 0.08)  # ~28 on 320-wide
+            hamburger_y = int(SCREEN_H * 0.08)  # ~51 on 640-tall
+            print(f"  No drawer button found — tapping top-left ({hamburger_x}, {hamburger_y})")
+            tap(hamburger_x, hamburger_y)
+            wait(2)
+
         xml = dump_ui("03_drawer_open")
         root = parse_ui(xml)
+        print(f"  Current activity: {get_current_activity()}")
+        print("  Visible text after drawer tap:")
+        print_all_text(root, prefix="    ")
 
-        # Look for "Downloads" in the drawer
+        # (c) Look for "Downloads" in the drawer
         for text in ["Downloads", "Download"]:
             result = find_by_text(root, text, exact=False)
             if result:
                 cx, cy, _ = result
                 print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
                 tap(cx, cy)
-                wait(2)
+                wait(3)
                 break
 
         # Now look for recovery.img in the file list
         xml = dump_ui("03b_in_downloads")
         root = parse_ui(xml)
+        print("  Visible text in Downloads:")
+        print_all_text(root, prefix="    ")
+
         for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
             result = find_by_text(root, text, exact=False)
             if result:
@@ -239,13 +338,34 @@ def main():
                 break
 
         if not found_file:
-            # Try navigating via path bar
-            print("  Trying to navigate via path bar")
-            tap(540, 36)
-            wait(2)
-            xml = dump_ui("03c_path_bar")
+            # (d) Try "Show internal storage" / "SD card" / phone storage
+            print("  recovery.img not in Downloads — trying internal storage")
+            # Look for "Phone" / "Internal storage" / "SD card"
+            for text in ["Internal storage", "Phone", "SD card", "Storage"]:
+                result = find_by_text(root, text, exact=False)
+                if result:
+                    cx, cy, _ = result
+                    print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+                    tap(cx, cy)
+                    wait(2)
+                    break
+
+            # Navigate: Download folder
+            xml = dump_ui("03c_internal_storage")
             root = parse_ui(xml)
-            for text in ["recovery.img", "recovery", "Download"]:
+            for text in ["Download", "Downloads"]:
+                result = find_by_text(root, text, exact=False)
+                if result:
+                    cx, cy, _ = result
+                    print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+                    tap(cx, cy)
+                    wait(2)
+                    break
+
+            # Look for recovery.img
+            xml = dump_ui("03d_in_download_folder")
+            root = parse_ui(xml)
+            for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
                 result = find_by_text(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
@@ -274,7 +394,7 @@ def main():
         if root:
             for node in root.iter("node"):
                 txt = (node.get("text", "") or "").lower()
-                if any(w in txt for w in ["progress", "importing", "extracting", "loading", "please wait"]):
+                if any(w in txt for w in ["progress", "importing", "extracting", "loading", "please wait", "extract"]):
                     has_progress = True
                     break
         if not has_progress:
@@ -294,9 +414,8 @@ def main():
     print("=" * 60)
     print('  Step 5: Enable "Boot to Recovery" checkbox')
     print("=" * 60)
-    # "Boot to Recovery" is in the Advanced category, above "Select ROM".
-    # We may need to scroll to find it.
-    result = scroll_to_find("Boot to Recovery", max_scrolls=3, exact=False)
+    # We should be back on SettingsActivity now. Scroll to find it.
+    result = scroll_to_find("Boot to Recovery", max_scrolls=5, exact=False)
     if result:
         cx, cy, node = result
         checked = node.get("checked", "false")
@@ -317,10 +436,11 @@ def main():
     print("=" * 60)
     print('  Step 6: Tap "Launch Container"')
     print("=" * 60)
-    # Scroll back to top
-    for _ in range(5):
+    # Scroll back to top — swipe down multiple times
+    for _ in range(8):
         swipe_down()
         wait(0.5)
+    wait(1)
 
     xml = dump_ui("06_before_launch")
     root = parse_ui(xml)
@@ -331,12 +451,8 @@ def main():
         tap(cx, cy)
         wait(5)
     else:
-        print("  ✗ Could not find 'Launch Container'")
-        if root:
-            for node in root.iter("node"):
-                t = node.get("text", "")
-                if t:
-                    print(f"    text={t!r}")
+        print("  ✗ Could not find 'Launch Container' — visible text:")
+        print_all_text(root)
 
     xml = dump_ui("06_after_launch")
     root = parse_ui(xml)
@@ -354,9 +470,10 @@ def main():
         elapsed = (i + 1) * 5
         screenshot(f"07_boot_{elapsed}s")
         activity = get_current_activity()
-        if "Render2Activity" not in activity and elapsed > 15:
-            print(f"  Left Render2Activity at {elapsed}s: {activity}")
-            break
+        # Don't break on "left Render2Activity" — the TWRP screen might
+        # be visible even if the activity changed. Keep taking screenshots.
+        if "Render2Activity" not in activity and elapsed > 20:
+            print(f"  Note: not in Render2Activity at {elapsed}s: {activity}")
 
     # ─────────────────────────────────────────────
     # Step 8: Final capture
