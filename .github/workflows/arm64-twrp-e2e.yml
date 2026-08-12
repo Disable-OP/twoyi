@@ -124,7 +124,8 @@ jobs:
           fi
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --update
+          # sdkmanager --update may fail on arm64; skip it
+          # sdkmanager --update || true
           # Install arm64-v8a system image + emulator via sdkmanager
           # The emulator binary is a Linux binary that runs on both x86_64
           # and arm64 hosts (it uses QEMU internally for guest emulation).
@@ -133,7 +134,14 @@ jobs:
               "platforms;android-30" \
               "build-tools;30.0.3" \
               "emulator" \
-              "system-images;android-30;default;arm64-v8a"
+              "system-images;android-30;default;arm64-v8a" || {
+              echo "sdkmanager failed, trying individual packages..."
+              sdkmanager "platform-tools" || true
+              sdkmanager "platforms;android-30" || true
+              sdkmanager "build-tools;30.0.3" || true
+              sdkmanager "emulator" || true
+              sdkmanager "system-images;android-30;default;arm64-v8a" || true
+          }
           echo "=== Emulator installed via sdkmanager ==="
           "$ANDROID_HOME/emulator/emulator" -version 2>&1 | head -3 || true
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
