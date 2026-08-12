@@ -40,6 +40,7 @@ import java.io.OutputStream;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import io.twoyi.utils.FileLogger;
 import io.twoyi.utils.LogEvents;
 import io.twoyi.utils.NavUtils;
 import io.twoyi.utils.ProfileManager;
@@ -95,6 +96,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             String dataDir = getApplicationInfo().dataDir;
             Renderer.setDataDir(dataDir);
             Log.i(TAG, "Data directory: " + dataDir);
+            FileLogger.boot("renderer_set_data_dir", "dataDir=" + dataDir);
+            FileLogger.i(TAG, "surfaceCreated: dataDir=" + dataDir);
 
             // Set the Boot Recovery (TWRP) flag BEFORE init() so the
             // native core knows whether to pass --boot-recovery to kr64.
@@ -106,6 +109,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             boolean bootRecovery = io.twoyi.utils.ProfileSettings.isBootRecoveryEnabled(getApplicationContext());
             Renderer.setBootRecovery(bootRecovery);
             Log.i(TAG, "Boot Recovery (TWRP) flag: " + bootRecovery);
+            FileLogger.boot("boot_recovery_flag", "enabled=" + bootRecovery);
 
             // Calculate proper DPI based on physical screen and virtual display scaling
             WindowManager windowManager = getWindowManager();
@@ -127,6 +131,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
             Log.i(TAG, "surfaceCreated with virtual display: " + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight + 
                     " @ " + mVirtualDisplayDpi + " DPI, calculated xdpi=" + xdpi + ", ydpi=" + ydpi);
+            FileLogger.boot("renderer_init", "virt=" + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight
+                    + " dpi=" + mVirtualDisplayDpi + " xdpi=" + xdpi + " ydpi=" + ydpi);
         }
 
         @Override
@@ -135,12 +141,15 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             // Pass both physical surface dimensions and virtual framebuffer dimensions
             Renderer.resetWindow(surface, 0, 0, width, height, mVirtualDisplayWidth, mVirtualDisplayHeight);
             Log.i(TAG, "surfaceChanged: physical=" + width + "x" + height + ", virtual=" + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight);
+            FileLogger.boot("surface_changed", "phys=" + width + "x" + height
+                    + " virt=" + mVirtualDisplayWidth + "x" + mVirtualDisplayHeight);
         }
 
         @Override
         public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
             Renderer.removeWindow(holder.getSurface());
             Log.i(TAG, "surfaceDestroyed!");
+            FileLogger.boot("surface_destroyed", null);
         }
     };
 
@@ -275,7 +284,9 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     }
 
     private void bootSystem() {
+        FileLogger.boot("boot_system_start", null);
         boolean romExist = RomManager.romExist(this);
+        FileLogger.i(TAG, "bootSystem: romExist=" + romExist);
 
         if (!romExist) {
             // ROM doesn't exist - show message to user and prompt to select ROM
@@ -311,6 +322,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         }
 
         // ROM exists, boot normally.
+        FileLogger.boot("rom_exists", "starting boot procedure");
         // Clear dalvik-cache if the host build fingerprint changed (e.g. after a host OTA
         // update), so stale ART OAT entries don't cause "No original dex files found" crashes.
         // Called synchronously here (UI thread, before addView) to guarantee the cache is
@@ -331,6 +343,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         // both paths funnel through BootCompletionServer.markCompleted()
         // (idempotent via AtomicBoolean compare-and-set).
         BootCompletionServer.getInstance().start();
+        FileLogger.boot("boot_completion_server_started", null);
 
         mRootView.addView(mSurfaceView, 0);
         showBootingProcedure();
@@ -358,6 +371,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     }
 
     private void showBootingProcedure() {
+        FileLogger.boot("show_booting_procedure", "waiting for BOOT_COMPLETED (60s timeout)");
         // mLoadingText.setText(R.string.booting_tips);
         mLoadingText.setVisibility(View.GONE);
         mBootLogView.setVisibility(View.VISIBLE);
@@ -386,9 +400,12 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                     // so crash reporters and developers have a clue when
                     // `success == false` leads to trackBootFailure().
                     Log.e(TAG, "waitBoot threw — treating as boot failure", ignored);
+                    FileLogger.e(TAG, "waitBoot threw — treating as boot failure", ignored);
                 }
 
+                FileLogger.boot("wait_boot_result", "success=" + success);
                 if (!success) {
+                    FileLogger.boot("boot_failed", "trackBootFailure + System.exit");
                     LogEvents.trackBootFailure(getApplicationContext());
 
                     runOnUiThread(() -> Toast.makeText(getApplicationContext(), R.string.boot_failed, Toast.LENGTH_SHORT).show());

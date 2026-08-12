@@ -16,6 +16,7 @@ import com.microsoft.appcenter.crashes.Crashes;
 
 import java.lang.reflect.Field;
 
+import io.twoyi.utils.FileLogger;
 import io.twoyi.utils.ProfileManager;
 import io.twoyi.utils.RomManager;
 
@@ -29,6 +30,13 @@ public class TwoyiApplication extends Application {
     @Override
     protected void attachBaseContext(Context base) {
         super.attachBaseContext(base);
+
+        // Initialize the file logger FIRST, before any other app code —
+        // so every subsequent Log.x call (and every Rust-side android_logger
+        // call, captured via the logcat pump) has somewhere to write.
+        // Writes to /sdcard/Android/data/io.twoyi/files/log/{app.log,
+        // logcat.log, boot.log, crash.log, kmsg.log, deviceinfo.txt}.
+        FileLogger.init(base);
 
         ProfileManager.initializeProfiles(base);
         RomManager.ensureBootFiles(base);
