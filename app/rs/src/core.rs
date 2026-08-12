@@ -415,6 +415,12 @@ pub fn init_renderer(
             cmd.arg("--vmid").arg("0");
             cmd.arg("--no-namespaces");
             cmd.arg("--no-seccomp");
+            // Pass the profile's virtual display dimensions to kr64 so
+            // it creates the fb0 file with the correct size (instead of
+            // hardcoded 720x1280). These come from ProfileSettings which
+            // auto-detects the physical screen resolution.
+            cmd.arg("--width").arg(virtual_width.to_string());
+            cmd.arg("--height").arg(virtual_height.to_string());
             // TWRP boot: pass --boot-recovery so kr64 uses the simple
             // TWRP boot path (skips LD_PRELOAD, /apex bind, binderfs,
             // SELinux watchdog, /dev/twoyi-bin/ copy; auto-sets
