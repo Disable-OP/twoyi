@@ -851,6 +851,35 @@ for i in $(seq 1 15); do
     fi
     sleep 1
 done
+
+# TWRP MODE: attach strace to the guest init to capture KLOG writes.
+# TWRP init writes its log messages to /dev/__kmsg__ (a char device that
+# writes to the kernel kmsg ring buffer). Those messages are mixed with
+# the host's init messages in dmesg, making them impossible to find.
+# strace captures the write() calls directly, showing us exactly what
+# TWRP init is logging.
+if [ "$TWRP_MODE" = "1" ]; then
+    # Pull kr64-stderr.log to get the guest PID
+    "$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+    GUEST_PID=$(grep -oE 'guest pid = [0-9]+' "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null | tail -1 | awk '{print $NF}')
+    if [ -n "$GUEST_PID" ]; then
+        echo "  → TWRP: attaching strace to guest init (pid $GUEST_PID)..."
+        # Start strace in background, capture write + execve calls
+        "$ADB_BIN" -s emulator-5554 shell "
+            strace -e trace=write,execve -f -p $GUEST_PID -o /data/local/tmp/twrp-strace.log 2>/dev/null &
+            echo \$! > /data/local/tmp/strace.pid
+            echo 'strace attached'
+        " 2>&1 | tail -3
+        sleep 2
+        # Check if strace is running
+        STRACE_PID=$("$ADB_BIN" -s emulator-5554 shell "cat /data/local/tmp/strace.pid 2>/dev/null" 2>/dev/null | tr -d '\r\n ')
+        if [ -n "$STRACE_PID" ]; then
+            echo "  ✓ strace running (pid $STRACE_PID)"
+        else
+            echo "  ⚠ strace failed to start — strace may not be available on this device"
+        fi
+    fi
+fi
 if ! "$ADB_BIN" -s emulator-5554 shell "test -S $TWOYI_PROFILE/dev/qemu_pipe" 2>/dev/null; then
     echo "  ⚠ /dev/qemu_pipe not created after 15s — kr64 may have failed"
     echo "  → pulling kr64-stderr.log for diagnosis"
@@ -1603,6 +1632,21 @@ if [ "$TWRP_MODE" = "1" ]; then
         echo "  ⚠ twrp-kmsg.log not found or empty — TWRP init may not have written KLOG messages"
         echo "  → searching for twrp-kmsg.log on device..."
         timeout 10 "$ADB_BIN" -s emulator-5554 shell "find /data/data/io.twoyi -name 'twrp-kmsg.log' 2>/dev/null" 2>/dev/null || true
+    fi
+
+    # Pull strace log — captures TWRP init's write() calls (KLOG messages)
+    echo ""
+    echo "── TWRP strace log capture ──"
+    "$ADB_BIN" -s emulator-5554 pull /data/local/tmp/twrp-strace.log "$ARTIFACT_DIR/twrp-strace.log" 2>/dev/null || true
+    if [ -f "$ARTIFACT_DIR/twrp-strace.log" ] && [ -s "$ARTIFACT_DIR/twrp-strace.log" ]; then
+        echo "  ✓ twrp-strace.log: $(stat -c%s "$ARTIFACT_DIR/twrp-strace.log") bytes"
+        echo "  === twrp-strace.log (write calls to fd 3 = kmsg, first 80 lines) ==="
+        grep "write(3," "$ARTIFACT_DIR/twrp-strace.log" 2>/dev/null | head -80 || echo "    (no write(3,) calls found)"
+        echo ""
+        echo "  === execve calls ==="
+        grep "execve(" "$ARTIFACT_DIR/twrp-strace.log" 2>/dev/null | head -20 || echo "    (no execve calls found)"
+    else
+        echo "  ⚠ twrp-strace.log not found — strace may not be available on the device"
     fi
 fi
 
