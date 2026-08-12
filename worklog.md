@@ -4845,3 +4845,28 @@ changes — these are pure-comment fixes); clippy + fmt still clean on
 | Rust clippy (`kr64`)              | **0 warnings, 0 errors**                                 |
 | Rust clippy (`loader`)            | **0 warnings, 0 errors**                                 |
 | Rust fmt (`kr64`, `loader`)       | **0 drift**                                              |
+
+---
+Task ID: round-68
+Agent: main
+Task: Fix "Failed to import ROM: Import returned false (unknown reason)" — also make the log show "CPIO inside detected format GZIP-compressed file" and handle gzip + inner cpio fully.
+
+Work Log:
+- Read RamdiskImporter.java end-to-end and spotted the cpio newc header field-offset bug: namesize was parsed from offset 62 (c_devmajor) instead of 94 (c_namesize).
+- For most cpio entries devmajor="00000000" → namesize=0 → namesize<=0 guard breaks the loop → fileCount=0 → extractCpioStreaming returns false → caller shows "Import returned false (unknown reason)". Matches the user's symptom exactly.
+- Wrote a standalone Python verifier (scripts/verify_cpio_fix.py) that extracts the ramdisk from the in-repo TWRP boot image (assets/twrp/...img, gzipped cpio, 20 MB decompressed) and parses it with both the buggy offset and the fixed offset:
+    buggy offset 62 -> 0 entries parsed
+    fixed offset 94 -> 3107 entries parsed
+  Bug reproduced and fix verified against a real cpio archive.
+- Applied fix in RamdiskImporter.java:
+    1. extractCpioStreaming: namesize offset 62 → 94, with an inline comment listing every cpio newc field offset so the bug doesn't recur.
+    2. extractCpioStreaming: when fileCount==0, throw IOException with a clear message instead of silently returning false. Caller's catch block now surfaces the real reason in the toast.
+    3. importGzipFile: rewritten to fully decompress gzip to a temp file ONCE, then dispatch on the inner magic (cpio/tar/unknown-with-fallback). Logs the exact message the user asked for: "CPIO inside detected format GZIP-compressed file".
+    4. importLzmaFile / importXzFile: same diagnostic treatment — log decompressed size and "CPIO/TAR inside detected format LZMA/XZ-compressed file" for consistency. Switched inner-header peek from read() to readFully() so the 6-byte cpio magic is always fully read.
+- Committed as ee7519b and pushed to origin/main.
+
+Stage Summary:
+- Root cause: cpio newc header namesize field parsed from wrong offset (62 instead of 94) — extracted 0 entries instead of 3107, surfaced to user as "Import returned false (unknown reason)".
+- Fix verified against a real TWRP gzipped-cpio ramdisk (3107 entries parsed after fix vs 0 before).
+- All compression paths (gzip / lzma / xz / boot-image ramdisk) now produce consistent, greppable log lines including the user-requested "CPIO inside detected format GZIP-compressed file".
+- 0-entry extraction now throws instead of silently returning false, so the user will never again see the generic "(unknown reason)" toast — they'll see the actual cause.
