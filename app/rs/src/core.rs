@@ -197,8 +197,14 @@ pub fn init_renderer(
         );
 
         // Start the renderer in a separate thread
+        // Wrap the raw pointer in a Send wrapper — the pointer is only
+        // used from this thread, but Rust doesn't know that raw pointers
+        // are safe to send.
+        struct SendPtr(*mut c_void);
+        unsafe impl Send for SendPtr {}
+        let window_wrap = SendPtr(window_addr as *mut c_void);
         thread::spawn(move || {
-            let window = window_addr as *mut c_void;
+            let window = window_wrap.0;
             info!("[CORE] Renderer thread started, window: {:?}", window);
 
             // ── TWRP BOOT: framebuffer reader thread ──
@@ -224,13 +230,10 @@ pub fn init_renderer(
                 let vh = virtual_height;
                 let sw = surface_width;
                 let sh = surface_height;
-                // Wrap the raw pointer in a Send wrapper — the pointer is
-                // only used from this thread, but Rust doesn't know that.
-                struct SendPtr(*mut c_void);
-                unsafe impl Send for SendPtr {}
-                let window_wrap = SendPtr(window);
+                // Wrap again for the inner thread spawn.
+                let inner_wrap = SendPtr(window);
                 std::thread::spawn(move || {
-                    twrp_fb_render_loop(window_wrap.0, fb_path, sw, sh, vw, vh);
+                    twrp_fb_render_loop(inner_wrap.0, fb_path, sw, sh, vw, vh);
                 });
             } else {
                 info!("[CORE] Starting AOSP libOpenglRender.so");
