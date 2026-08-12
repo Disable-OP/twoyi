@@ -52,10 +52,7 @@ public class AboutActivity extends AppCompatActivity {
                 .isRTL(false)
                 .setImage(R.mipmap.ic_launcher)
                 .addItem(getCopyRightsElement())
-                .addItem(getAuthorElement())
                 .addItem(getVersionElement())
-                .addItem(getCheckUpdateElement())
-                .addItem(getWeChatPublicNumberElement())
                 .addItem(getWebsiteElement())
                 .addItem(getFaqElement())
                 .addItem(getFeedbackEmailElement())
@@ -63,7 +60,9 @@ public class AboutActivity extends AppCompatActivity {
                 .addItem(getLicenseElement())
                 .addItem(getPrivacyElement());
 
-        mPage.setDescription(getResources().getString(R.string.app_name));
+        mPage.setDescription("Twoyi — Android virtualization with TWRP recovery support. " +
+                "Boot full Android or TWRP recovery in a container on your device. " +
+                "Open source, no root required for recovery mode.");
 
         View aboutView = mPage.create();
         setContentView(aboutView);
