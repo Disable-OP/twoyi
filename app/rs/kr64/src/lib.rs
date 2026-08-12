@@ -2356,37 +2356,6 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         );
     }
 
-    // TWRP BOOT: remove /sepolicy to prevent TWRP init from loading its
-    // own SELinux policy. TWRP init calls selinux_load_policy("/sepolicy")
-    // which replaces the HOST's SELinux policy with TWRP's recovery policy.
-    // This breaks ALL host services (SurfaceFlinger, ActivityManager, etc.)
-    // because their SELinux contexts don't exist in TWRP's policy.
-    //
-    // By removing /sepolicy, TWRP init's selinux_load_policy fails (ENOENT),
-    // and the HOST's policy stays intact. The SELinux permissive watchdog
-    // keeps the host in permissive mode, so TWRP's services can still run.
-    //
-    // Evidence from strace (KVM run 31584767843):
-    //   write(3, "SELinux: Loaded policy from /sep"..., 38) = 38
-    //   open("/sys/fs/selinux/enforce", O_RDWR) = 5
-    //   write(5, "1", 1) = 1
-    // The policy load replaces the host's policy → host services crash.
-    if cfg.boot_recovery {
-        let sepolicy_path = format!("{}/sepolicy", rootfs_prefix);
-        match std::fs::remove_file(&sepolicy_path) {
-            Ok(()) => info!(
-                "[KR64] PARENT: removed /sepolicy to prevent TWRP from replacing host SELinux policy"
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                info!("[KR64] PARENT: /sepolicy not found (already removed) — OK")
-            }
-            Err(e) => warning!(
-                "[KR64] PARENT: failed to remove /sepolicy: {} — TWRP may replace host SELinux policy, causing host crash",
-                e
-            ),
-        }
-    }
-
     // TWRP BOOT: replace the /dev/graphics/fb0 + /dev/fb0 symlinks (which
     // point to /dev/null) with regular files of 3,686,400 bytes (720x1280x4
     // RGBA8888). This makes open() succeed and mmap() work naturally, so
