@@ -1030,17 +1030,22 @@ if [ "$TWRP_MODE" = "1" ]; then
         echo "    guest init state:   $(grep '^State:' "$ARTIFACT_DIR/twrp-init-status.log" 2>/dev/null | tr -d '\r\n')"
         echo "    guest init threads: $(tr '\r\n' ' ' < "$ARTIFACT_DIR/twrp-init-threads.log" 2>/dev/null)"
 
-        # Verify /dev/kmsg is the symlink we expect (kr64 creates it as
-        # /dev/kmsg → /twrp-kmsg.log so TWRP init's KLOG writes go to a
-        # retrievable file instead of the host's flooded dmesg ring buffer).
-        # If the symlink is missing or points elsewhere, twrp-kmsg.log will
-        # be empty (TWRP init's KLOG messages will be silently dropped).
+        # Verify /dev/kmsg AND /dev/__kmsg__ are the symlinks we expect.
+        # kr64 creates BOTH as symlinks → /twrp-kmsg.log so TWRP init's
+        # KLOG writes go to a retrievable file instead of the host's
+        # flooded dmesg ring buffer.
+        #
+        # IMPORTANT (Task ID 21): TWRP init (AOSP 5.1-based) uses
+        # /dev/__kmsg__ (NOT /dev/kmsg) for its log_init(). Without the
+        # /dev/__kmsg__ symlink, twrp-kmsg.log will be EMPTY — confirmed
+        # in KVM run 31552072308 where fd 3 -> /dev/__kmsg__ (deleted)
+        # but twrp-kmsg.log had 0 bytes.
         KR64_PID_FOR_KMSG=$(awk '/^PPid:/ {print $2}' "$ARTIFACT_DIR/twrp-init-status.log" 2>/dev/null | tr -d '\r\n')
         if [ -n "$KR64_PID_FOR_KMSG" ]; then
-            timeout 5 "$ADB_BIN" -s emulator-5554 shell "ls -la /proc/$KR64_PID_FOR_KMSG/root/dev/kmsg 2>/dev/null; ls -la /proc/$KR64_PID_FOR_KMSG/root/twrp-kmsg.log 2>/dev/null; wc -c /proc/$KR64_PID_FOR_KMSG/root/twrp-kmsg.log 2>/dev/null" \
+            timeout 5 "$ADB_BIN" -s emulator-5554 shell "ls -la /proc/$KR64_PID_FOR_KMSG/root/dev/kmsg 2>/dev/null; ls -la /proc/$KR64_PID_FOR_KMSG/root/dev/__kmsg__ 2>/dev/null; ls -la /proc/$KR64_PID_FOR_KMSG/root/twrp-kmsg.log 2>/dev/null; wc -c /proc/$KR64_PID_FOR_KMSG/root/twrp-kmsg.log 2>/dev/null" \
                 > "$ARTIFACT_DIR/twrp-kmsg-symlink-check.log" 2>/dev/null || true
-            echo "    /dev/kmsg + /twrp-kmsg.log status (in kr64 mount ns):"
-            sed 's/^/      /' "$ARTIFACT_DIR/twrp-kmsg-symlink-check.log" 2>/dev/null | head -5
+            echo "    /dev/kmsg + /dev/__kmsg__ + /twrp-kmsg.log status (in kr64 mount ns):"
+            sed 's/^/      /' "$ARTIFACT_DIR/twrp-kmsg-symlink-check.log" 2>/dev/null | head -8
         fi
 
         # Also dump the TWRP init's open file descriptors — this shows
@@ -1478,9 +1483,10 @@ mkdir -p "$ARTIFACT_DIR/dropbox" "$ARTIFACT_DIR/anr"
             echo "  Inspect twrp-kmsg.log for the last KLOG_ERROR / KLOG_WARNING line."
         elif [ "$TWRP_GUEST_PID_FOUND" = "1" ]; then
             echo "  ◐ PARTIAL — guest init ran but produced no KLOG output."
-            echo "  Likely cause: kr64's /dev/kmsg → /twrp-kmsg.log symlink wasn't"
-            echo "  created (older kr64 binary), OR TWRP init crashed before opening /dev/kmsg."
-            echo "  Inspect kr64-stderr.log for 'created /twrp-kmsg.log' + dmesg.log for segfaults."
+            echo "  Likely cause: kr64's /dev/__kmsg__ → /twrp-kmsg.log symlink wasn't"
+            echo "  created (older kr64 binary), OR TWRP init crashed before opening /dev/__kmsg__."
+            echo "  NOTE: TWRP init (AOSP 5.1) uses /dev/__kmsg__, NOT /dev/kmsg, for KLOG."
+            echo "  Inspect kr64-stderr.log for 'created /dev/__kmsg__' + dmesg.log for segfaults."
         else
             echo "  ✗ TWRP init did not run or crashed immediately."
             echo "  Inspect kr64-stderr.log + dmesg.log for the failure."
