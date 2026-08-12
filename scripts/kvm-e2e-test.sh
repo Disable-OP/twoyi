@@ -882,8 +882,28 @@ if [ "$TWRP_MODE" = "1" ]; then
         # shell's SIGHUP. `timeout 10` on the adb call is a safety net
         # in case the redirection ever regresses. The strace child is
         # backgrounded with `&`, so adb shell can return immediately.
+        #
+        # DIAGNOSTIC (Task 31, KVM run 31578527978): expanded the trace
+        # filter from `write,execve` to `write,execve,open,openat,ioctl,close`
+        # so we can see ALL relevant syscalls from the recovery process.
+        # The previous filter showed our hook's "[twrp_fb_hook] loaded"
+        # constructor message but NO open/ioctl messages — meaning either
+        # our LD_PRELOAD hook isn't being called (PLT interception failure)
+        # OR it IS being called but is_fb_path returned false. With the
+        # expanded filter, we can correlate:
+        #   - If strace shows openat(/dev/graphics/fb0) WITHOUT a
+        #     preceding "[twrp_fb_hook] open(...)" write → our hook is
+        #     NOT being called (PLT issue).
+        #   - If strace shows openat(/dev/graphics/fb0) WITH a preceding
+        #     "[twrp_fb_hook] open(...)" write → our hook IS being called
+        #     and is falling through to raw_syscall4(SYS_openat).
+        #   - If strace shows ioctl(fd, FBIOGET_VSCREENINFO) WITHOUT a
+        #     preceding "[twrp_fb_hook] ioctl(...)" write → our ioctl
+        #     hook isn't being called (PLT issue).
+        # Also added -v to not truncate env/args, so we can verify
+        # LD_PRELOAD=/sbin/twrp_fb_hook.so is actually in recovery's env.
         timeout 10 "$ADB_BIN" -s emulator-5554 shell "
-            nohup strace -e trace=write,execve -f -p $GUEST_PID -o /data/local/tmp/twrp-strace.log </dev/null >/dev/null 2>&1 &
+            nohup strace -v -e trace=write,execve,open,openat,ioctl,close -f -p $GUEST_PID -o /data/local/tmp/twrp-strace.log </dev/null >/dev/null 2>&1 &
             echo \$! > /data/local/tmp/strace.pid
             echo 'strace attached'
         " 2>&1 | tail -3
