@@ -35,5 +35,12 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2.112"
 
+[dev-dependencies]
+# flate2 is used only by the unit test that verifies the klog_init patch
+# pattern matches the real TWRP init binary in `assets/twrp/*.img`. It
+# decompresses the gzip-encoded ramdisk inside the boot image. We keep
+# it as a dev-dependency so the production kr64 binary stays small.
+flate2 = "1.0"
+
 [build-dependencies]
 cc = "1.0"
