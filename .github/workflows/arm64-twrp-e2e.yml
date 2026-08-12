@@ -91,12 +91,24 @@ jobs:
         if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
         run: cargo install cargo-xdk
 
-      - name: Setup Android NDK
+      - name: Install Android NDK manually (nttld/setup-ndk doesn't support arm64)
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27c
-          add-to-path: false
+        run: |
+          set -e
+          # Download NDK r27c for Linux ARM64
+          NDK_VERSION="r27c"
+          NDK_DIR="$HOME/android-ndk"
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "Downloading NDK $NDK_VERSION for linux-aarch64..."
+            # The NDK ships a universal zip that works on both x86_64 and arm64
+            curl -sL -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+            unzip -q /tmp/ndk.zip -d "$HOME"
+            mv "$HOME/android-ndk-${NDK_VERSION}" "$NDK_DIR"
+            rm /tmp/ndk.zip
+          fi
+          echo "ndk-path=$NDK_DIR" >> $GITHUB_OUTPUT
+          echo "NDK installed at $NDK_DIR"
+          ls "$NDK_DIR/toolchains/llvm/prebuilt/" 2>&1
 
       - name: Install Android SDK + emulator (arm64 system image)
         run: |
@@ -200,6 +212,8 @@ jobs:
           TWOYI_TWRP: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
           # Force TCG mode (no KVM on arm64 GitHub runners)
           TWOYI_ARM64_TCG: '1'
+          # NO ROOT — simulate unmodified device
+          TWOYI_NO_ROOT: '1'
 
       - name: Print boot verdict
         if: always()

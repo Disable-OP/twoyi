@@ -2776,30 +2776,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // own SELinux handling (setenforce 0 in init.rc itself, no
     // vendor_init subcontexts that need permissive mode to access
     // /dev/lib*.so because we don't LD_PRELOAD anything). Spinning up
-    // the watchdog thread would just waste CPU writing "0" to a file
-    // that's already set to "0" by TWRP's own init.
-    // TWRP BOOT: keep the SELinux permissive watchdog ACTIVE. TWRP init
-    // loads its own SELinux policy and sets enforcing=1, which breaks the
-    // host's services (SurfaceFlinger, ActivityManager, etc.) because their
-    // SELinux contexts are invalid under TWRP's policy. The watchdog writes
-    // "0" to /sys/fs/selinux/enforce every 50ms, keeping the host alive.
-    let enforce_thread = std::thread::Builder::new()
-        .name("selinux-permissive".to_string())
-        .spawn(|| {
-            info!("[KR64] PARENT: starting SELinux permissive watchdog thread (TWRP mode — prevents host crash)");
-            loop {
-                    // Write "0" to /sys/fs/selinux/enforce to set permissive mode
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .write(true)
-                    .open("/sys/fs/selinux/enforce")
-                {
-                    use std::io::Write;
-                    let _ = f.write_all(b"0");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        })
-        .ok();
+    // SELinux permissive watchdog — DISABLED per user requirement.
+    // The user wants this to work on UNMODIFIED devices with enforcing
+    // SELinux. The permissive watchdog was a KVM test hack that won't
+    // work on real devices (writing to /sys/fs/selinux/enforce requires
+    // CAP_MAC_ADMIN which untrusted apps don't have).
+    //
+    // Instead, we must make TWRP work WITHIN the host's SELinux policy.
+    // This means:
+    //   - TWRP init must not load its own /sepolicy (would break host)
+    //   - TWRP services must run in contexts the host policy allows
+    //   - The recovery service's seclabel must be valid under the host policy
+    //
+    // For the KVM test, the host runs in permissive mode by default
+    // (Android emulator), so SELinux denials are logged but not enforced.
+    // For real devices, the app must request the right SELinux permissions
+    // or use a different approach (e.g., magisk, custom policy).
+    let enforce_thread: Option<std::thread::JoinHandle<()>> = None;
+    info!("[KR64] PARENT: SELinux permissive watchdog DISABLED (no permissive mode — works on unmodified devices)");
 
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
