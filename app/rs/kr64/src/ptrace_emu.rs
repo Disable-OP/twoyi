@@ -121,20 +121,24 @@ mod aarch64_ptrace {
 
 // ── Register index constants ───────────────────────────────────────
 
+// x86_64 user_regs_struct field order (as u64 array indices):
+//   0:r15 1:r14 2:r13 3:r12 4:rbp 5:rbx 6:r11 7:r10 8:r9 9:r8
+//   10:rax 11:rcx 12:rdx 13:rsi 14:rdi 15:orig_rax 16:rip 17:cs
+//   18:eflags 19:rsp 20:ss 21:fs_base 22:gs_base 23:ds 24:es 25:fs 26:gs
 #[cfg(target_arch = "x86_64")]
-const REG_SYSCALL: usize = 8;  // orig_rax
+const REG_SYSCALL: usize = 15; // orig_rax
 #[cfg(target_arch = "x86_64")]
-const REG_RET: usize = 11;    // rax
+const REG_RET: usize = 10;    // rax
 #[cfg(target_arch = "x86_64")]
-const REG_ARG1: usize = 5;    // rdi
+const REG_ARG1: usize = 14;   // rdi
 #[cfg(target_arch = "x86_64")]
-const REG_ARG2: usize = 4;    // rsi
+const REG_ARG2: usize = 13;   // rsi
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
-const REG_ARG3: usize = 3;    // rdx
+const REG_ARG3: usize = 12;   // rdx
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
-const REG_ARG4: usize = 10;   // r10
+const REG_ARG4: usize = 7;    // r10
 
 #[cfg(target_arch = "aarch64")]
 const REG_SYSCALL: usize = 8;   // x8 (syscall number)
