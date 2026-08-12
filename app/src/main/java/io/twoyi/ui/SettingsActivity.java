@@ -125,7 +125,6 @@ public class SettingsActivity extends AppCompatActivity {
             Preference displayDpi = findPreference(R.string.settings_key_display_dpi);
             android.preference.ListPreference displayColorDepth =
                     (android.preference.ListPreference) findPreference(R.string.settings_key_display_color_depth);
-            CheckBoxPreference useNewRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_use_new_renderer);
             CheckBoxPreference debugRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_debug_renderer);
             CheckBoxPreference bootRecovery = (CheckBoxPreference) findPreference(R.string.settings_key_boot_recovery);
             Preference selectRom = findPreference(R.string.settings_key_select_rom);
@@ -213,14 +212,6 @@ public class SettingsActivity extends AppCompatActivity {
                     Toast.makeText(getActivity(), getString(R.string.settings_invalid_number), Toast.LENGTH_SHORT).show();
                     return false;
                 }
-            });
-
-            // Initialize renderer type checkbox with profile-specific value
-            useNewRenderer.setChecked(ProfileSettings.useNewRenderer(getActivity()));
-            useNewRenderer.setOnPreferenceChangeListener((preference, newValue) -> {
-                ProfileSettings.setUseNewRenderer(getActivity(), (Boolean) newValue);
-                Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
-                return true;
             });
 
             // Initialize display color depth with profile-specific value
@@ -339,36 +330,70 @@ public class SettingsActivity extends AppCompatActivity {
                 if (context == null) {
                     return true;
                 }
-                // Fixed: getBugreport() does heavy I/O (logcat -d, ps -ef, file
-                // reads, zip compression) and was running on the UI thread,
-                // causing an ANR when the user taps "Send log". Push it to the
-                // GLOBAL_EXECUTOR background pool, then hop back to the UI
-                // thread for the share-sheet startActivity call.
+                // Pack all logs from /sdcard/Android/data/io.twoyi/files/log/
+                // into a .zip file, then share via ACTION_SEND.
                 final ProgressDialog progressDialog = UIHelper.getProgressDialog(context);
                 progressDialog.setMessage(getString(R.string.settings_key_sendlog));
                 progressDialog.setCancelable(false);
                 progressDialog.show();
 
                 UIHelper.GLOBAL_EXECUTOR.execute(() -> {
-                    final byte[] bugreport = LogEvents.getBugreport(context);
-                    final File tmpLog = new File(context.getCacheDir(), "bugreport.zip");
-                    try {
-                        Files.write(tmpLog.toPath(), bugreport);
+                    // Get the external log directory (same as FileLogger uses)
+                    File logDir = context.getExternalFilesDir("log");
+                    if (logDir == null || !logDir.exists()) {
+                        new Handler(Looper.getMainLooper()).post(() -> {
+                            UIHelper.dismiss(progressDialog);
+                            Toast.makeText(context, "No logs found", Toast.LENGTH_SHORT).show();
+                        });
+                        return;
+                    }
+
+                    // Create a zip file in the cache dir containing all
+                    // external log files + internal kr64-app-stderr.log.
+                    final File zipFile = new File(context.getCacheDir(), "twoyi-logs.zip");
+                    try (java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(
+                            new java.io.FileOutputStream(zipFile))) {
+                        // Add all files from the external log directory
+                        File[] logFiles = logDir.listFiles();
+                        if (logFiles != null) {
+                            for (File logFile : logFiles) {
+                                if (logFile.isFile()) {
+                                    zos.putNextEntry(new java.util.zip.ZipEntry(logFile.getName()));
+                                    java.nio.file.Files.copy(logFile.toPath(), zos);
+                                    zos.closeEntry();
+                                }
+                            }
+                        }
+                        // Also add the internal kr64-app-stderr.log
+                        File kr64Log = new File(context.getDataDir(), "kr64-app-stderr.log");
+                        if (kr64Log.exists() && kr64Log.length() > 0) {
+                            zos.putNextEntry(new java.util.zip.ZipEntry("kr64-app-stderr.log"));
+                            java.nio.file.Files.copy(kr64Log.toPath(), zos);
+                            zos.closeEntry();
+                        }
+                        // Also add log.txt (fallback linker path)
+                        File logTxt = new File(context.getDataDir(), "log.txt");
+                        if (logTxt.exists() && logTxt.length() > 0) {
+                            zos.putNextEntry(new java.util.zip.ZipEntry("log.txt"));
+                            java.nio.file.Files.copy(logTxt.toPath(), zos);
+                            zos.closeEntry();
+                        }
                     } catch (IOException e) {
                         Crashes.trackError(e);
+                        new Handler(Looper.getMainLooper()).post(() -> {
+                            UIHelper.dismiss(progressDialog);
+                            Toast.makeText(context, "Failed to pack logs: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+                        });
+                        return;
                     }
-                    final Uri uri = FileProvider.getUriForFile(context, "io.twoyi.fileprovider", tmpLog);
+
+                    final Uri uri = FileProvider.getUriForFile(context, "io.twoyi.fileprovider", zipFile);
 
                     final Intent shareIntent = new Intent(Intent.ACTION_SEND);
                     shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
                     shareIntent.setDataAndType(uri, "application/zip");
                     shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
 
-                    // startActivity must be called on the UI thread.
-                    // runOnUiThread handles both Activity and Fragment contexts
-                    // gracefully (we already null-checked getActivity above).
-                    // Use Handler instead of Context#getMainExecutor (API 28+)
-                    // since minSdkVersion is 27.
                     new Handler(Looper.getMainLooper()).post(() -> {
                         UIHelper.dismiss(progressDialog);
                         try {

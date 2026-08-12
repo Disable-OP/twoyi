@@ -26,20 +26,49 @@
 //     - readlink/readlinkat → translate path
 //     - chdir → translate path
 //     - statx → translate path
-//     - creat → translate path
 //
 //   Path translation rules:
 //     - If path starts with "/" and is NOT under /dev/ (which kr64
 //       already sets up on the host), prepend the rootfs path.
 //     - Exception: /proc, /sys, /dev, /data, /apex, /system, /vendor
-//       are left as-is if they already exist on the host (the host's
-//       Android provides these). Otherwise, translate to rootfs.
+//       are left as-is if they already exist on the host.
 //     - Exception: /init.rc, /init.*.rc, /sbin/*, /etc/* → translate
 //       to rootfs (these are TWRP-specific files).
 
-// Architecture-specific syscall numbers and register indices.
-// Defined as const at module level (not in a sub-module) to avoid
-// `use arch::*` import issues.
+// Architecture-specific register access.
+//
+// CRITICAL: On aarch64, PTRACE_GETREGS (12) does NOT exist — it returns
+// EIO. We must use PTRACE_GETREGSET (33) with NT_PRSTATUS (1) and an
+// iovec. On x86_64, PTRACE_GETREGS works directly.
+
+use std::ffi::CString;
+use std::path::Path;
+
+// ── Register types ─────────────────────────────────────────────────
+
+/// On x86_64, user_regs_struct has 27 fields. We access them as u64
+/// array elements via index constants.
+///
+/// On aarch64, we use user_pt_regs which is u64[31] + sp + pc + pstate.
+/// We access x0-x30 as array[0..30], and the syscall number is in x8.
+
+#[cfg(target_arch = "x86_64")]
+type Regs = libc::user_regs_struct;
+
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Aarch64Regs {
+    regs: [u64; 31], // x0-x30
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+type Regs = Aarch64Regs;
+
+// ── Register index constants ───────────────────────────────────────
 
 #[cfg(target_arch = "x86_64")]
 const REG_SYSCALL: usize = 8;  // orig_rax
@@ -71,89 +100,157 @@ const REG_ARG3: usize = 2;      // x2
 #[allow(dead_code)]
 const REG_ARG4: usize = 3;      // x3
 
-/// Check if ptrace is likely to work on this device.
-/// On Android, untrusted apps CAN ptrace their own children.
-/// Returns true if ptrace should work, false if it's definitely blocked.
-pub fn ptrace_available() -> bool {
-    // Try a no-op ptrace call on ourselves. This doesn't do anything
-    // harmful but tells us if the syscall is available.
-    let r = unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
-    if r == 0 {
-        // Undo the TRACEME — we don't actually want to be traced.
-        // Unfortunately there's no PTRACE_DETACH from TRACEME.
-        // The process will be traced by its parent, but since the parent
-        // isn't waiting, this is effectively a no-op.
-        // Actually, PTRACE_TRACEME just sets a flag; it doesn't do anything
-        // until the parent calls wait(). So it's safe.
-        return true;
+// ── Architecture-specific get/set registers ────────────────────────
+
+/// Get the child's registers.
+/// On x86_64: uses PTRACE_GETREGS.
+/// On aarch64: uses PTRACE_GETREGSET with NT_PRSTATUS (PTRACE_GETREGS
+/// does NOT exist on aarch64 and returns EIO).
+fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETREGS,
+                pid,
+                0 as libc::c_long,
+                regs as *mut _ as *mut libc::c_void,
+            )
+        };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
-    // PTRACE_TRACEME failed — probably because we're already being traced
-    // (e.g., by Android Studio debugger) or ptrace is blocked.
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    // EPERM = already traced (ptrace is available, just can't TRACEME twice)
-    if errno == libc::EPERM {
-        return true;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // PTRACE_GETREGSET (33) with NT_PRSTATUS (1)
+        const PTRACE_GETREGSET: libc::c_uint = 33;
+        const NT_PRSTATUS: libc::c_long = 1;
+
+        // iovec { void *iov_base; size_t iov_len; }
+        #[repr(C)]
+        struct iovec {
+            iov_base: *mut libc::c_void,
+            iov_len: libc::size_t,
+        }
+
+        let mut iov = iovec {
+            iov_base: regs as *mut _ as *mut libc::c_void,
+            iov_len: std::mem::size_of::<Regs>(),
+        };
+
+        let r = unsafe {
+            libc::ptrace(
+                PTRACE_GETREGSET as libc::c_uint,
+                pid,
+                NT_PRSTATUS,
+                &mut iov as *mut _ as *mut libc::c_void,
+            )
+        };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
-    false
 }
 
+/// Set the child's registers.
+/// On x86_64: uses PTRACE_SETREGS.
+/// On aarch64: uses PTRACE_SETREGSET with NT_PRSTATUS.
+fn ptrace_setregs(pid: libc::pid_t, regs: &Regs) -> std::io::Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_SETREGS,
+                pid,
+                0 as libc::c_long,
+                regs as *const _ as *mut libc::c_void,
+            )
+        };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        const PTRACE_SETREGSET: libc::c_uint = 34;
+        const NT_PRSTATUS: libc::c_long = 1;
+
+        #[repr(C)]
+        struct iovec {
+            iov_base: *const libc::c_void,
+            iov_len: libc::size_t,
+        }
+
+        let iov = iovec {
+            iov_base: regs as *const _ as *const libc::c_void,
+            iov_len: std::mem::size_of::<Regs>(),
+        };
+
+        let r = unsafe {
+            libc::ptrace(
+                PTRACE_SETREGSET as libc::c_uint,
+                pid,
+                NT_PRSTATUS,
+                &iov as *const _ as *mut libc::c_void,
+            )
+        };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Get the syscall number from registers.
+fn get_syscall_num(regs: &Regs) -> i64 {
+    let regs_ptr = regs as *const Regs as *const u64;
+    unsafe { *regs_ptr.add(REG_SYSCALL) as i64 }
+}
+
+/// Get a syscall argument from registers.
+fn get_syscall_arg(regs: &Regs, arg: usize) -> u64 {
+    let regs_ptr = regs as *const Regs as *const u64;
+    unsafe { *regs_ptr.add(arg) }
+}
+
+/// Set the return value of a syscall in registers.
+fn set_syscall_ret(regs: &mut Regs, val: i64) {
+    let regs_ptr = regs as *mut Regs as *mut u64;
+    unsafe { *regs_ptr.add(REG_RET) = val as u64; }
+}
+
+// ── Path translation ───────────────────────────────────────────────
+
 /// Translate a guest path to a host path by prepending the rootfs.
-///
-/// Rules:
-/// - /dev/ paths: keep as-is (kr64 sets these up on the host)
-/// - /proc/ paths: keep as-is (host's procfs is fine)
-/// - /sys/ paths: keep as-is (host's sysfs is fine)
-/// - /data/ paths: keep as-is (host's data partition)
-/// - /apex/ paths: keep as-is (host's apex)
-/// - /system/ paths: keep as-is (host's system — TWRP doesn't need the
-///   guest's /system for recovery mode)
-/// - Everything else (/, /init.rc, /sbin/*, /etc/*, /var/*, /tmp/*):
-///   prepend rootfs path
 pub fn translate_path(rootfs: &str, path: &str) -> String {
-    // If the path doesn't start with /, it's relative — leave as-is.
     if !path.starts_with('/') {
         return path.to_string();
     }
-
-    // Paths that are left as-is (host provides these).
-    // NOTE: /dev/ is left as-is because kr64 creates device sockets/symlinks
-    // on the host's /dev. But we DO translate /dev/graphics/fb0 etc.
-    // because those are TWRP-specific.
-    for prefix in &[
-        "/proc/",
-        "/sys/",
-        "/data/",
-        "/apex/",
-    ] {
+    for prefix in &["/proc/", "/sys/", "/data/", "/apex/"] {
         if path.starts_with(prefix) {
             return path.to_string();
         }
     }
-
-    // /dev/ — leave as-is (kr64 sets up /dev/qemu_pipe etc. on the host).
-    // TWRP-specific /dev/ paths like /dev/graphics/fb0 are also left as-is
-    // because kr64 creates them.
     if path.starts_with("/dev/") || path == "/dev" {
         return path.to_string();
     }
-
-    // /system/ and /vendor/ — on the host, these exist as the host's
-    // Android system. TWRP's recovery doesn't need /system for recovery
-    // mode (it uses /sbin/ and /res/). Leave as-is.
     if path.starts_with("/system/") || path == "/system" {
         return path.to_string();
     }
     if path.starts_with("/vendor/") || path == "/vendor" {
         return path.to_string();
     }
-
-    // Everything else: prepend rootfs.
-    // This covers: /init.rc, /init.*.rc, /sbin/*, /etc/*, /res/*, /tmp/*, etc.
     format!("{}{}", rootfs, path)
 }
 
-/// Read a string from the child's memory at the given address.
-/// Uses PTRACE_PEEKDATA one word at a time.
+// ── String read/write helpers ──────────────────────────────────────
+
 fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     if addr == 0 {
         return None;
@@ -163,15 +260,8 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     loop {
         let word = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64 + offset, 0) };
         if word == -1 {
-            // Check errno — EIO means we've gone past the end of the mapping.
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EIO) {
-                break;
-            }
-            // Other error — stop reading.
             break;
         }
-        // The word is 8 bytes (on 64-bit). Copy bytes until we find a NUL.
         let bytes = word.to_ne_bytes();
         for &b in &bytes {
             if b == 0 {
@@ -180,41 +270,23 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
             result.push(b);
         }
         offset += std::mem::size_of::<libc::c_long>() as i64;
-        // Safety limit — don't read more than 4KB.
         if result.len() > 4096 {
             break;
         }
     }
-    if result.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&result).into_owned())
-    }
+    if result.is_empty() { None } else { Some(String::from_utf8_lossy(&result).into_owned()) }
 }
 
-/// Write a string to the child's memory at the given address.
-/// Uses PTRACE_POKEDATA one word at a time.
-/// The new string must be <= the old string's length (we can't extend
-/// the child's memory layout, only overwrite existing bytes).
 fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     if addr == 0 {
         return false;
     }
-    // Read the original string to know its length (we need the NUL terminator
-    // to fit within the original allocation).
     let orig = read_child_string(pid, addr).unwrap_or_default();
     if s.len() >= orig.len() {
-        // The new string is too long — can't fit in the original allocation.
-        // We'd need to allocate new memory in the child, which is much more
-        // complex. For now, skip the translation.
         return false;
     }
-
-    // Build the new bytes: the new string + NUL + padding.
     let mut new_bytes = s.as_bytes().to_vec();
-    new_bytes.push(0); // NUL terminator
-
-    // Write word by word.
+    new_bytes.push(0);
     let mut offset = 0i64;
     while offset < new_bytes.len() as i64 {
         let mut word_bytes = [0u8; 8];
@@ -230,77 +302,21 @@ fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     true
 }
 
-/// Get the syscall number from the child's registers.
-#[cfg(target_arch = "x86_64")]
-fn get_syscall_num(regs: &libc::user_regs_struct) -> i64 {
-    // orig_rax is at offset 120 (15 * 8) in user_regs_struct
-    // But we can't index it directly because Rust's libc doesn't expose
-    // the fields as an array. Use a union/reinterpret trick.
-    let regs_ptr = regs as *const libc::user_regs_struct as *const u64;
-    unsafe { *regs_ptr.add(REG_SYSCALL) as i64 }
+// ── Ptrace loop ────────────────────────────────────────────────────
+
+/// Check if ptrace is likely to work on this device.
+pub fn ptrace_available() -> bool {
+    let r = unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
+    if r == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if errno == libc::EPERM {
+        return true;
+    }
+    false
 }
 
-#[cfg(target_arch = "aarch64")]
-fn get_syscall_num(regs: &libc::user_regs_struct) -> i64 {
-    let regs_ptr = regs as *const libc::user_regs_struct as *const u64;
-    unsafe { *regs_ptr.add(REG_SYSCALL) as i64 }
-}
-
-/// Get a syscall argument from the registers.
-#[cfg(target_arch = "x86_64")]
-fn get_syscall_arg(regs: &libc::user_regs_struct, arg: usize) -> u64 {
-    let regs_ptr = regs as *const libc::user_regs_struct as *const u64;
-    unsafe { *regs_ptr.add(arg) }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn get_syscall_arg(regs: &libc::user_regs_struct, arg: usize) -> u64 {
-    let regs_ptr = regs as *const libc::user_regs_struct as *const u64;
-    unsafe { *regs_ptr.add(arg) }
-}
-
-/// Set the return value of a syscall in the child's registers.
-#[cfg(target_arch = "x86_64")]
-fn set_syscall_ret(regs: &mut libc::user_regs_struct, val: i64) {
-    let regs_ptr = regs as *mut libc::user_regs_struct as *mut u64;
-    unsafe { *regs_ptr.add(REG_RET) = val as u64; }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn set_syscall_ret(regs: &mut libc::user_regs_struct, val: i64) {
-    let regs_ptr = regs as *mut libc::user_regs_struct as *mut u64;
-    unsafe { *regs_ptr.add(REG_RET) = val as u64; }
-}
-
-/// Set the syscall number (to skip a syscall, set it to -1 / __NR_read with
-/// a return value of 0).
-#[cfg(target_arch = "x86_64")]
-#[allow(dead_code)]
-fn set_syscall_num(regs: &mut libc::user_regs_struct, num: i64) {
-    let regs_ptr = regs as *mut libc::user_regs_struct as *mut u64;
-    unsafe { *regs_ptr.add(REG_SYSCALL) = num as u64; }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-fn set_syscall_num(regs: &mut libc::user_regs_struct, num: i64) {
-    let regs_ptr = regs as *mut libc::user_regs_struct as *mut u64;
-    unsafe { *regs_ptr.add(REG_SYSCALL) = num as u64; }
-}
-
-/// Run the ptrace syscall interception loop in the PARENT process.
-///
-/// This function blocks until the child exits. It intercepts:
-/// - getpid/getppid → return 1
-/// - open/openat/openat2 → translate path
-/// - stat/lstat/newfstatat → translate path
-/// - access/faccessat → translate path
-/// - readlink/readlinkat → translate path
-/// - chdir → translate path
-/// - statx → translate path
-///
-/// `rootfs` is the host path to the guest's rootfs (e.g.
-/// "/data/user/0/io.twoyi/rootfs").
 pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     use std::io::Write;
     let log = |msg: &str| {
@@ -309,8 +325,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
 
     log(&format!("ptrace loop started for pid {} (rootfs={})", pid, rootfs));
 
-    // Set PTRACE_O_TRACESYSGOOD so we get SIGTRAP|0x80 for syscall stops,
-    // distinguishing them from other signals.
+    // Set PTRACE_O_TRACESYSGOOD so we get SIGTRAP|0x80 for syscall stops.
     let r = unsafe {
         libc::ptrace(
             libc::PTRACE_SETOPTIONS,
@@ -328,12 +343,29 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
 
     let mut in_syscall = false;
     let mut pending_getpid = false;
+    let mut loop_count: u64 = 0;
 
     loop {
         // Continue the child to the next syscall entry/exit.
         let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
         if r == -1 {
             let e = std::io::Error::last_os_error();
+            // ESRCH = child already exited — not an error, just done.
+            if e.raw_os_error() == Some(libc::ESRCH) {
+                log("PTRACE_SYSCALL: child already exited (ESRCH)");
+                // Try to reap the child to get its exit status.
+                let mut status: libc::c_int = 0;
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if waited == pid {
+                    if libc::WIFEXITED(status) {
+                        return libc::WEXITSTATUS(status);
+                    }
+                    if libc::WIFSIGNALED(status) {
+                        return -libc::WTERMSIG(status);
+                    }
+                }
+                return -1;
+            }
             log(&format!("PTRACE_SYSCALL failed: {}", e));
             return -1;
         }
@@ -350,12 +382,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
         // Check if the child exited.
         if libc::WIFEXITED(status) {
             let code = libc::WEXITSTATUS(status);
-            log(&format!("child exited with code {}", code));
+            log(&format!("child exited with code {} (after {} iterations)", code, loop_count));
             return code;
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
-            log(&format!("child killed by signal {}", sig));
+            log(&format!("child killed by signal {} (after {} iterations)", sig, loop_count));
             return -sig;
         }
 
@@ -365,19 +397,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
 
             // SIGTRAP | 0x80 = syscall stop (because we set TRACESYSGOOD).
             if sig == (libc::SIGTRAP | 0x80) {
-                // Get the child's registers.
-                let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-                let r = unsafe {
-                    libc::ptrace(
-                        libc::PTRACE_GETREGS,
-                        pid,
-                        0,
-                        &mut regs as *mut _ as *mut libc::c_void,
-                    )
-                };
-                if r == -1 {
-                    let e = std::io::Error::last_os_error();
-                    log(&format!("PTRACE_GETREGS failed: {}", e));
+                loop_count += 1;
+
+                // Get the child's registers using the arch-specific function.
+                let mut regs: Regs = unsafe { std::mem::zeroed() };
+                if let Err(e) = ptrace_getregs(pid, &mut regs) {
+                    log(&format!("ptrace_getregs failed: {} (iteration {})", e, loop_count));
                     continue;
                 }
 
@@ -389,19 +414,19 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
 
                     match syscall_num {
                         GETPID_SYSCALL => {
-                            // Intercept getpid → return 1
                             pending_getpid = true;
-                            log("intercepted getpid() → will return 1");
+                            if loop_count <= 20 {
+                                log("intercepted getpid() -> will return 1");
+                            }
                         }
                         GETPPID_SYSCALL => {
-                            // Intercept getppid → return 1
                             pending_getpid = true;
-                            log("intercepted getppid() → will return 1");
+                            if loop_count <= 20 {
+                                log("intercepted getppid() -> will return 1");
+                            }
                         }
                         #[allow(unreachable_patterns)]
                         OPEN_SYSCALL | OPENAT_SYSCALL | OPENAT2_SYSCALL => {
-                            // For open(path, ...) → arg1 = path
-                            // For openat(dirfd, path, ...) → arg2 = path
                             let path_arg_index = if syscall_num == OPEN_SYSCALL {
                                 REG_ARG1
                             } else {
@@ -410,25 +435,16 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
+                                if translated != path && loop_count <= 50 {
+                                    log(&format!("intercepted open({}) -> {}", path, translated));
+                                }
                                 if translated != path {
-                                    log(&format!(
-                                        "intercepted open({}) → translated to {}",
-                                        path, translated
-                                    ));
-                                    // Try to overwrite the path in the child's memory.
-                                    if write_child_string(pid, path_addr, &translated) {
-                                        log("path overwrite succeeded");
-                                    } else {
-                                        log("path overwrite FAILED (string too long) — skipping translation");
-                                    }
+                                    write_child_string(pid, path_addr, &translated);
                                 }
                             }
                         }
                         #[allow(unreachable_patterns)]
                         STAT_SYSCALL | LSTAT_SYSCALL | NEWFSTATAT_SYSCALL | STATX_SYSCALL => {
-                            // stat(path, ...) → arg1 = path
-                            // newfstatat(dirfd, path, ...) → arg2 = path
-                            // statx(dirfd, path, ...) → arg2 = path
                             let path_arg_index = if syscall_num == STAT_SYSCALL || syscall_num == LSTAT_SYSCALL {
                                 REG_ARG1
                             } else {
@@ -438,18 +454,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
                                 if translated != path {
-                                    log(&format!(
-                                        "intercepted stat({}) → translated to {}",
-                                        path, translated
-                                    ));
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
                         }
                         #[allow(unreachable_patterns)]
                         ACCESS_SYSCALL | FACCESSAT_SYSCALL => {
-                            // access(path, ...) → arg1 = path
-                            // faccessat(dirfd, path, ...) → arg2 = path
                             let path_arg_index = if syscall_num == ACCESS_SYSCALL {
                                 REG_ARG1
                             } else {
@@ -459,18 +469,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
                                 if translated != path {
-                                    log(&format!(
-                                        "intercepted access({}) → translated to {}",
-                                        path, translated
-                                    ));
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
                         }
                         #[allow(unreachable_patterns)]
                         READLINK_SYSCALL | READLINKAT_SYSCALL => {
-                            // readlink(path, ...) → arg1 = path
-                            // readlinkat(dirfd, path, ...) → arg2 = path
                             let path_arg_index = if syscall_num == READLINK_SYSCALL {
                                 REG_ARG1
                             } else {
@@ -480,10 +484,6 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
                                 if translated != path {
-                                    log(&format!(
-                                        "intercepted readlink({}) → translated to {}",
-                                        path, translated
-                                    ));
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
@@ -493,10 +493,6 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
                                 if translated != path {
-                                    log(&format!(
-                                        "intercepted chdir({}) → translated to {}",
-                                        path, translated
-                                    ));
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
@@ -510,37 +506,18 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     in_syscall = false;
 
                     if pending_getpid {
-                        // Override the return value to 1.
-                        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-                        let r = unsafe {
-                            libc::ptrace(
-                                libc::PTRACE_GETREGS,
-                                pid,
-                                0,
-                                &mut regs as *mut _ as *mut libc::c_void,
-                            )
-                        };
-                        if r == 0 {
-                            set_syscall_ret(&mut regs, 1);
-                            unsafe {
-                                libc::ptrace(
-                                    libc::PTRACE_SETREGS,
-                                    pid,
-                                    0,
-                                    &regs as *const _ as *mut libc::c_void,
-                                );
-                            }
-                            log("getpid/getppid return value set to 1");
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        if ptrace_getregs(pid, &mut regs2).is_ok() {
+                            set_syscall_ret(&mut regs2, 1);
+                            let _ = ptrace_setregs(pid, &regs2);
                         }
                         pending_getpid = false;
                     }
                 }
             } else if sig == libc::SIGTRAP {
-                // Regular SIGTRAP (not syscall) — could be a breakpoint.
-                // Just continue.
+                // Regular SIGTRAP (breakpoint) — continue.
             } else {
-                // The child received a signal (e.g., SIGSEGV, SIGBUS).
-                // Forward it to the child and continue.
+                // Forward the signal to the child.
                 unsafe {
                     libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, sig as libc::c_long);
                 }
@@ -550,7 +527,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     }
 }
 
-// Architecture-specific syscall number constants.
+// ── Architecture-specific syscall numbers ──────────────────────────
+
 #[cfg(target_arch = "x86_64")]
 const GETPID_SYSCALL: i64 = 39;
 #[cfg(target_arch = "x86_64")]
