@@ -428,10 +428,31 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     let mut in_syscall = false;
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
+    // Signal to deliver to the child on the next PTRACE_SYSCALL resume.
+    // 0 means "don't deliver any signal". Non-zero values are set by
+    // the signal-forwarding branch below so that the SINGLE
+    // PTRACE_SYSCALL at the loop top can inject the signal —
+    // having two PTRACE_SYSCALL calls (one in the handler, one at the
+    // loop top) caused the second to return ESRCH because the child
+    // was already running, which then made us return -1 prematurely.
+    let mut resume_signal: libc::c_int = 0;
 
     loop {
-        // Continue the child to the next syscall entry/exit.
-        let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
+        // Continue the child to the next syscall entry/exit. This is
+        // the ONLY PTRACE_SYSCALL in the loop — handlers below set
+        // `resume_signal` (and `continue`) instead of resuming the
+        // child themselves, so we never race the second ptrace call.
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_SYSCALL,
+                pid,
+                0,
+                resume_signal as libc::c_long,
+            )
+        };
+        // Reset for the next iteration — only set again if a
+        // signal-delivery branch below populates it.
+        resume_signal = 0;
         if r == -1 {
             let e = std::io::Error::last_os_error();
             // ESRCH = child already exited — not an error, just done.
@@ -669,10 +690,11 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     let _ = ptrace_setregs(pid, &sigsys_regs);
                 }
 
-                // Resume WITHOUT forwarding the signal (signal arg = 0).
-                unsafe {
-                    libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0);
-                }
+                // Do NOT call PTRACE_SYSCALL here — the loop top will
+                // do it with resume_signal = 0 (already reset), which
+                // resumes the child WITHOUT forwarding the signal.
+                // Calling PTRACE_SYSCALL here would race the loop-top
+                // call (child already running → ESRCH → premature exit).
                 continue;
             } else {
                 // The child stopped because of a real signal that was
@@ -693,9 +715,11 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // were heading to an entry, exit if we were heading to
                 // an exit) as it would have been without the signal.
                 log(&format!("forwarding signal {} to child", sig));
-                unsafe {
-                    libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, sig as libc::c_long);
-                }
+                // Stash the signal so the SINGLE PTRACE_SYSCALL at the
+                // loop top injects it on resume. We do NOT call
+                // PTRACE_SYSCALL here — doing so would race the loop-top
+                // call (child already running → ESRCH → premature exit).
+                resume_signal = sig;
                 continue;
             }
         }
