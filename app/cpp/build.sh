@@ -116,7 +116,9 @@ $NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
     -target i686-linux-android24 \
     --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
     -nostdlib -shared -fPIC -O2 -g \
+    -fno-builtin -fno-builtin-memset -fno-builtin-strcmp -fno-builtin-strlen \
     -Wl,--hash-style=sysv \
+    -Wl,--exclude-libs,ALL \
     -D_GNU_SOURCE \
     -I$SCRIPT_DIR/twoyi_loader/include -I$SCRIPT_DIR/twoyi_loader/src \
     -o $TWRP_HOOK_BUILD_DIR/twrp_fb_hook.so \
