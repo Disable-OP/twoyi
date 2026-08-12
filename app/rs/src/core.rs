@@ -112,6 +112,12 @@ pub fn get_opengles_paths() -> Vec<String> {
 /// under `$TWOYI_ROOTFS/opengles*` and serves the guest's EGL/GLES
 /// calls), then launches the container's `./init` process.
 ///
+/// Wrapper for raw pointers to make them Send — the pointer is only
+/// used from the spawned thread, but Rust doesn't know raw pointers
+/// are safe to send. This wrapper asserts Send safety.
+struct SendPtr(*mut c_void);
+unsafe impl Send for SendPtr {}
+
 /// On subsequent calls (e.g. when the Surface is recreated) the
 /// renderer thread is *not* restarted — only the subwindow is reset.
 #[allow(clippy::too_many_arguments)]
@@ -197,11 +203,8 @@ pub fn init_renderer(
         );
 
         // Start the renderer in a separate thread
-        // Wrap the raw pointer in a Send wrapper — the pointer is only
-        // used from this thread, but Rust doesn't know that raw pointers
-        // are safe to send.
-        struct SendPtr(*mut c_void);
-        unsafe impl Send for SendPtr {}
+        // SendPtr is defined at module level — it wraps the raw pointer
+        // so it can be sent to the spawned thread.
         let window_wrap = SendPtr(window_addr as *mut c_void);
         thread::spawn(move || {
             let window = window_wrap.0;
