@@ -106,17 +106,29 @@ jobs:
           "$ANDROID_HOME/emulator/emulator" -version 2>&1 || true
 
       - name: Create ARM64 AVD
-        shell: pwsh
+        shell: bash
         run: |
+          set -ex
+          export ANDROID_HOME="$LOCALAPPDATA/Android/Sdk"
+          export ANDROID_AVD_HOME="$USERPROFILE/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
           echo "no" | avdmanager create avd -n twoyi_arm64 -k "system-images;android-30;default;arm64-v8a" --force
-          $avdConfig = "$env:USERPROFILE\.android\avd\twoyi_arm64.avd\config.ini"
-          Add-Content $avdConfig "`nhw.keyboard=yes"
-          Add-Content $avdConfig "`nhw.gpu.enabled=yes"
-          Add-Content $avdConfig "`nhw.gpu.mode=swiftshader_indirect"
-          Add-Content $avdConfig "`nhw.ramSize=2048"
-          Add-Content $avdConfig "`ndisk.dataPartition.size=4096"
-          Add-Content $avdConfig "`nvm.heapSize=256"
-          Get-Content $avdConfig
+          AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_arm64.avd/config.ini"
+          if [ ! -f "$AVD_CONFIG" ]; then
+            echo "ERROR: AVD config not found at $AVD_CONFIG"
+            find "$ANDROID_AVD_HOME" -name "config.ini" 2>/dev/null || true
+            exit 1
+          fi
+          cat >> "$AVD_CONFIG" << 'EOF'
+          hw.keyboard=yes
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
+          hw.ramSize=2048
+          disk.dataPartition.size=4096
+          vm.heapSize=256
+          EOF
+          echo "=== AVD config ==="
+          cat "$AVD_CONFIG"
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
