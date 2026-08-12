@@ -1023,6 +1023,370 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
     }
 }
 
+/// Marker string that, when present in a .rc file, indicates the
+/// `setenv LD_PRELOAD /sbin/twrp_fb_hook.so` line has already been
+/// injected into the recovery service definition. Used by the
+/// orchestrator below to make the patch IDEMPOTENT across boots.
+const TWRP_LD_PRELOAD_PATCH_MARKER: &str = "    setenv LD_PRELOAD /sbin/twrp_fb_hook.so";
+
+/// Patch TWRP init to inject `setenv LD_PRELOAD /sbin/twrp_fb_hook.so`
+/// into the recovery service definition, wherever it lives.
+///
+/// # Why this exists (arm64 TWRP regression)
+///
+/// On x86 TWRP images, the recovery service is defined directly in
+/// `init.rc`:
+///
+/// ```text
+/// service recovery /sbin/recovery
+/// ```
+///
+/// On arm64 TWRP images, however, the recovery service is defined in an
+/// IMPORTED file — typically `init.recovery.rc` or
+/// `init.recovery.<ro.hardware>.rc` — and `init.rc` only contains an
+/// `import` directive for it. The previous implementation only scanned
+/// `init.rc`, so on arm64 it never found the recovery service, silently
+/// skipped the patch, and TWRP's recovery process crashed in
+/// `libminuitwrp.so` because the LD_PRELOAD hook was never loaded.
+///
+/// # Search order
+///
+/// This function scans the following files (in order) for the
+/// `service recovery` line and patches the FIRST one that contains it:
+///
+/// 1. `{rootfs}/init.rc`
+/// 2. Files imported by `init.rc` (parsed recursively, depth-first)
+/// 3. `{rootfs}/init.recovery.rc`
+/// 4. `{rootfs}/init.recovery.*.rc` (glob)
+/// 5. `{rootfs}/system/etc/init/recovery.rc`
+///
+/// # Fallback
+///
+/// If NONE of the scanned .rc files contain the `service recovery` line
+/// (e.g. a stripped-down or future TWRP layout we don't recognise), we
+/// create a new file `{rootfs}/init.twoyi.rc` containing a complete
+/// recovery service definition (with the `setenv LD_PRELOAD` line already
+/// present) and append `import /init.twoyi.rc` to the end of
+/// `{rootfs}/init.rc`. This guarantees the hook is loaded regardless of
+/// the TWRP layout.
+///
+/// # Idempotence
+///
+/// Before scanning, we look for the `setenv LD_PRELOAD` marker in every
+/// candidate file. If any file already contains it, the patch is
+/// considered already applied and we return immediately without
+/// modifying anything. The fallback `init.twoyi.rc` import is also
+/// added at most once (we check for an existing
+/// `import /init.twoyi.rc` line in `init.rc` before appending).
+///
+/// # Arguments
+///
+/// * `rootfs_prefix` — chroot-relative prefix ("/" in root mode, the
+///   full host path like `/data/user/0/io.twoyi/rootfs` in non-root
+///   mode). All file paths are constructed as
+///   `format!("{}/...", rootfs_prefix)` which gives `/...` when the
+///   prefix is empty (root mode, chroot-relative) or `{host_path}/...`
+///   when non-empty (non-root mode, host paths).
+fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
+    // -----------------------------------------------------------------
+    // Step 1: build the candidate .rc file list (ordered, deduplicated).
+    // -----------------------------------------------------------------
+    let mut candidate_files: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let init_rc_path = format!("{}/init.rc", rootfs_prefix);
+
+    // (1) init.rc itself — always the highest-priority candidate.
+    if seen.insert(init_rc_path.clone()) {
+        candidate_files.push(init_rc_path.clone());
+    }
+
+    // (2) Files imported by init.rc, recursively. We parse `import <path>`
+    //     lines and follow them depth-first (max depth 5 to prevent
+    //     infinite loops on pathological configs). Shell-style variables
+    //     (${ro.hardware}) in import paths are NOT expanded — those paths
+    //     won't exist on disk so we just skip them, and the glob step (4)
+    //     catches the common `init.recovery.${ro.hardware}.rc` case
+    //     separately.
+    if let Ok(init_rc_content) = std::fs::read_to_string(&init_rc_path) {
+        collect_imported_rc_files(
+            &init_rc_path,
+            &init_rc_content,
+            rootfs_prefix,
+            &mut seen,
+            &mut candidate_files,
+            0,
+            5,
+        );
+    }
+
+    // (3) {rootfs}/init.recovery.rc — the most common arm64 TWRP layout.
+    let p = format!("{}/init.recovery.rc", rootfs_prefix);
+    if seen.insert(p.clone()) {
+        candidate_files.push(p);
+    }
+
+    // (4) {rootfs}/init.recovery.*.rc — glob. We implement the glob
+    //     manually with read_dir because we don't depend on the `glob`
+    //     crate (keeping the kr64 binary small).
+    let dir_path = if rootfs_prefix.is_empty() {
+        "/".to_string()
+    } else {
+        rootfs_prefix.to_string()
+    };
+    if let Ok(entries) = std::fs::read_dir(&dir_path) {
+        let mut glob_matches: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                // Match `init.recovery.*.rc` but EXCLUDE the exact
+                // `init.recovery.rc` (already added in step 3).
+                if name.starts_with("init.recovery.")
+                    && name.ends_with(".rc")
+                    && name != "init.recovery.rc"
+                {
+                    glob_matches.push(entry.path().to_string_lossy().into_owned());
+                }
+            }
+        }
+        // Sort for deterministic ordering across boots/filesystems.
+        glob_matches.sort();
+        for m in glob_matches {
+            if seen.insert(m.clone()) {
+                candidate_files.push(m);
+            }
+        }
+    }
+
+    // (5) {rootfs}/system/etc/init/recovery.rc — modern AOSP/TWRP layout.
+    let p = format!("{}/system/etc/init/recovery.rc", rootfs_prefix);
+    if seen.insert(p.clone()) {
+        candidate_files.push(p);
+    }
+
+    // -----------------------------------------------------------------
+    // Step 2: idempotence check. If ANY candidate already contains the
+    // patch marker, we're done (a previous boot patched it). We check
+    // ALL candidates (not just the first) because the marker may have
+    // been written to a non-init.rc file by an earlier boot.
+    // -----------------------------------------------------------------
+    for path in &candidate_files {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if content.contains(TWRP_LD_PRELOAD_PATCH_MARKER) {
+                info!(
+                    "[KR64] PARENT: {} already patched with LD_PRELOAD for recovery service (idempotent skip)",
+                    path
+                );
+                return;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Step 3: scan candidates in order, patch the first one that contains
+    // the `service recovery` line. We re-read each file (the idempotence
+    // pass above already read them but didn't keep the contents; this is
+    // a handful of small files so the re-read is negligible).
+    // -----------------------------------------------------------------
+    for path in &candidate_files {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue, // missing/unreadable — skip silently
+        };
+        if let Some(patched) = patch_twrp_init_rc_recovery_service(&content) {
+            match std::fs::write(path, &patched) {
+                Ok(()) => info!(
+                    "[KR64] PARENT: patched {} — added 'setenv LD_PRELOAD /sbin/twrp_fb_hook.so' to recovery service",
+                    path
+                ),
+                Err(e) => warning!(
+                    "[KR64] PARENT: failed to write patched {}: {} (recovery will crash in libminuitwrp.so)",
+                    path,
+                    e
+                ),
+            }
+            return;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Step 4: FALLBACK. No .rc file contained `service recovery`. Create
+    // a new file {rootfs}/init.twoyi.rc with a complete recovery service
+    // definition (including the LD_PRELOAD setenv line) and add
+    // `import /init.twoyi.rc` to the end of {rootfs}/init.rc so init
+    // picks it up.
+    // -----------------------------------------------------------------
+    warning!(
+        "[KR64] PARENT: could not find 'service recovery' in any scanned .rc file (init.rc, init.recovery.rc, init.recovery.*.rc, system/etc/init/recovery.rc, or imports) — falling back to creating init.twoyi.rc"
+    );
+
+    let twoyi_rc_path = format!("{}/init.twoyi.rc", rootfs_prefix);
+    // Note: we DO include `seclabel u:r:recovery:s0` here because this is
+    // a complete service definition we author ourselves, not a patch to
+    // an existing one. On the host kernel's normal-boot SELinux policy
+    // the recovery context may be absent — but in that case setexeccon
+    // fails silently and init falls back to the parent context, which
+    // is sufficient for our KVM/devcontainer environment. See the
+    // doc comment on `patch_twrp_init_rc_recovery_service` (Task ID 24)
+    // for the reasoning why we DON'T add seclabel when PATCHING existing
+    // services but DO add it when authoring a new one from scratch.
+    // Use concat! so the 4-space indentation on `setenv` / `seclabel`
+    // is preserved literally (a backslash-newline continuation in a
+    // normal string literal would STRIP the leading whitespace, which
+    // would break init.rc's service-option indentation requirement).
+    let twoyi_rc_content = concat!(
+        "service recovery /sbin/recovery\n",
+        "    setenv LD_PRELOAD /sbin/twrp_fb_hook.so\n",
+        "    seclabel u:r:recovery:s0\n",
+    );
+    if let Err(e) = std::fs::write(&twoyi_rc_path, twoyi_rc_content) {
+        warning!(
+            "[KR64] PARENT: failed to create {}: {} (recovery will crash in libminuitwrp.so)",
+            twoyi_rc_path,
+            e
+        );
+        return;
+    }
+    info!(
+        "[KR64] PARENT: created {} with recovery service definition (no 'service recovery' found in any scanned .rc file)",
+        twoyi_rc_path
+    );
+
+    // Append `import /init.twoyi.rc` to init.rc (idempotent — check
+    // first to avoid duplicate imports across boots).
+    match std::fs::read_to_string(&init_rc_path) {
+        Ok(init_content) => {
+            const IMPORT_LINE: &str = "import /init.twoyi.rc";
+            if init_content.contains(IMPORT_LINE) {
+                info!(
+                    "[KR64] PARENT: init.rc already contains 'import /init.twoyi.rc' (idempotent skip)"
+                );
+                return;
+            }
+            let mut new_content = init_content;
+            // Ensure there's a blank line between the last existing line
+            // and our new import (purely cosmetic — init doesn't care).
+            if !new_content.is_empty() && !new_content.ends_with('\n') {
+                new_content.push('\n');
+            }
+            if !new_content.is_empty() && !new_content.ends_with("\n\n") {
+                new_content.push('\n');
+            }
+            new_content.push_str(IMPORT_LINE);
+            new_content.push('\n');
+            if let Err(e) = std::fs::write(&init_rc_path, &new_content) {
+                warning!(
+                    "[KR64] PARENT: failed to add 'import /init.twoyi.rc' to init.rc: {} (init.twoyi.rc will not be loaded — recovery will crash in libminuitwrp.so)",
+                    e
+                );
+                return;
+            }
+            info!(
+                "[KR64] PARENT: appended 'import /init.twoyi.rc' to init.rc — init will load our recovery service definition"
+            );
+        }
+        Err(e) => warning!(
+            "[KR64] PARENT: failed to read init.rc for import injection: {} (init.twoyi.rc will not be loaded — recovery will crash in libminuitwrp.so)",
+            e
+        ),
+    }
+}
+
+/// Recursively collect .rc files imported by another .rc file.
+///
+/// Parses `import <path>` lines (one per line, optionally quoted with
+/// double or single quotes). For each imported file:
+///
+/// 1. Resolves the path (absolute paths are taken as chroot-relative;
+///    relative paths are resolved against the importing file's parent
+///    directory).
+/// 2. Skips paths containing unexpanded shell-style variables
+///    (`${...}` or `$(...)`) — these can't be resolved at patch time
+///    (we don't have property_service yet) and the glob step in the
+///    caller catches the common `init.recovery.${ro.hardware}.rc` case.
+/// 3. Adds the resolved path to `out` (deduplicated via `seen`).
+/// 4. Recurses into the imported file (depth-first, max depth to
+///    prevent infinite loops on circular imports).
+///
+/// # Arguments
+///
+/// * `file_path` - path of the file whose content we're parsing
+///   (used to resolve relative import paths).
+/// * `content` - text content of `file_path`.
+/// * `rootfs_prefix` - chroot-relative prefix (see
+///   `patch_twrp_init_rc_recovery_service_in_rootfs`).
+/// * `seen` - set of paths already added to `out` (shared with
+///   the caller to deduplicate across all sources).
+/// * `out` - ordered list of candidate paths to append to.
+/// * `depth` - current recursion depth.
+/// * `max_depth` - max recursion depth (5 is plenty — real TWRP
+///   configs are at most 2-3 levels deep).
+fn collect_imported_rc_files(
+    file_path: &str,
+    content: &str,
+    rootfs_prefix: &str,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+    depth: usize,
+    max_depth: usize,
+) {
+    if depth > max_depth {
+        return;
+    }
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Skip comments and empty lines.
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        // An import directive looks like: `import <path>` or
+        // `import "<path>"`. The path may be chroot-absolute (starts
+        // with /) or relative to the importing file's directory.
+        let import_path = match trimmed.strip_prefix("import ") {
+            Some(rest) => rest.trim().trim_matches('"').trim_matches('\''),
+            None => continue,
+        };
+        // Skip paths with unexpanded shell variables.
+        if import_path.contains("${") || import_path.contains("$(") || import_path.is_empty() {
+            continue;
+        }
+        // Resolve to a host-or-chroot path.
+        let full_path = if import_path.starts_with('/') {
+            // Chroot-absolute: prepend rootfs_prefix (which may be empty
+            // in root mode, giving "/..." as required).
+            format!("{}{}", rootfs_prefix, import_path)
+        } else {
+            // Relative to the importing file's parent directory.
+            let parent = std::path::Path::new(file_path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if parent.is_empty() {
+                import_path.to_string()
+            } else {
+                format!("{}/{}", parent, import_path)
+            }
+        };
+        // Deduplicate. If we've already seen this path (either via the
+        // caller's static candidate list or via an earlier import), skip.
+        if !seen.insert(full_path.clone()) {
+            continue;
+        }
+        out.push(full_path.clone());
+        // Recurse into the imported file (if it exists and is readable).
+        if let Ok(imported_content) = std::fs::read_to_string(&full_path) {
+            collect_imported_rc_files(
+                &full_path,
+                &imported_content,
+                rootfs_prefix,
+                seen,
+                out,
+                depth + 1,
+                max_depth,
+            );
+        }
+    }
+}
+
 /// Patch TWRP's init binary to skip the mknod-failure check in klog_init().
 ///
 /// ROOT CAUSE (Task ID 22, KVM run 31553069752): TWRP init's klog_init()
@@ -1087,120 +1451,200 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
 /// writes via `klog_fd` go to `/twrp-kmsg.log`, which survives kr64's
 /// SIGKILL for KVM log retrieval.
 ///
-/// The patch is IDEMPOTENT: if `jne` is already `90 90`, we return true
-/// without modification. The patch is REVERSIBLE: it only changes 2 bytes.
+/// The patch is IDEMPOTENT: if `jne` is already `90 90`, we return
+/// [`KlogInitPatchResult::AlreadyApplied`] without modification. The
+/// patch is REVERSIBLE: it only changes 2 bytes.
+///
+/// # Architecture notes
+///
+/// The byte pattern we match is specific to the **i386** build of TWRP
+/// init (TWRP 3.7.0_9-0). On **aarch64** TWRP images, the binary uses
+/// an entirely different instruction encoding (AArch64), so the pattern
+/// will never match — but more importantly, the mknod-EEXIST-on-symlink
+/// bug this patch fixes is specific to the i386 `klog_init()` code path;
+/// aarch64 TWRP uses a different implementation. We therefore skip the
+/// patch entirely on aarch64 (returning [`KlogInitPatchResult::Skipped`])
+/// to avoid both a wasted pattern scan and the misleading
+/// `"TWRP version mismatch?"` warning that the caller would otherwise
+/// log on every arm64 boot.
 ///
 /// # Arguments
 /// * `init_bytes` - The init binary's bytes (read from `{rootfs}/init`).
 ///
 /// # Returns
-/// * `true` if the patch was applied (or was already applied).
-/// * `false` if the pattern was not found — the init binary has a different
-///   layout (perhaps a different TWRP version) and the patch cannot be
-///   applied safely. The caller should log a warning but continue boot.
-fn patch_twrp_init_klog_init(init_bytes: &mut [u8]) -> bool {
-    // klog_init's distinctive instruction sequence (i386, TWRP 3.7.0_9-0).
-    // We match 32 bytes of fixed instructions ending just before the `jne`,
-    // then verify the byte at offset 32 is `0x75` (jne) before patching.
-    //
-    //   mov DWORD PTR [esp+0x8], 0x10b   ; c7 44 24 08 0b 01 00 00
-    //                                     (dev = makedev(1, 11) = 0x10b)
-    //   lea esi, [ebx-0x1502e]           ; 8d b3 d2 af fe ff
-    //                                     (esi = ptr to "/dev/__kmsg__")
-    //   mov DWORD PTR [esp+0x4], 0x2180  ; c7 44 24 04 80 21 00 00
-    //                                     (mode = S_IFCHR | 0600 = 0x2180)
-    //   mov [esp], esi                   ; 89 34 24
-    //   call mknod                       ; e8 ?? ?? ?? ?? (relative call)
-    //   test eax, eax                    ; 85 c0
-    //   jne <return>                     ; 75 ?? (THIS is what we patch)
-    //
-    // We use a slice of Option<u8>: Some(b) means "must equal b", None means
-    // "wildcard" (for the call's relative offset and the jne's offset).
-    const PATTERN: [Option<u8>; 34] = [
-        // mov DWORD PTR [esp+0x8], 0x10b
-        Some(0xc7),
-        Some(0x44),
-        Some(0x24),
-        Some(0x08),
-        Some(0x0b),
-        Some(0x01),
-        Some(0x00),
-        Some(0x00),
-        // lea esi, [ebx-0x1502e]
-        Some(0x8d),
-        Some(0xb3),
-        Some(0xd2),
-        Some(0xaf),
-        Some(0xfe),
-        Some(0xff),
-        // mov DWORD PTR [esp+0x4], 0x2180
-        Some(0xc7),
-        Some(0x44),
-        Some(0x24),
-        Some(0x04),
-        Some(0x80),
-        Some(0x21),
-        Some(0x00),
-        Some(0x00),
-        // mov [esp], esi
-        Some(0x89),
-        Some(0x34),
-        Some(0x24),
-        // call mknod (e8 + 4-byte signed relative offset)
-        Some(0xe8),
-        None,
-        None,
-        None,
-        None,
-        // test eax, eax
-        Some(0x85),
-        Some(0xc0),
-        // jne <offset> or NOP NOP (if already patched) — use wildcards
-        // so the pattern matches BOTH unpatched (0x75) and patched (0x90).
-        // The actual byte check is done after the pattern matches.
-        None,
-        None,
-    ];
-    const JNE_OFFSET: usize = 32; // index of the jne/NOP byte within PATTERN
-
-    if init_bytes.len() < PATTERN.len() {
-        return false;
+///
+/// A [`KlogInitPatchResult`] indicating what happened:
+/// * [`KlogInitPatchResult::Applied`] — the patch was applied; the caller
+///   should write the modified bytes back to disk.
+/// * [`KlogInitPatchResult::AlreadyApplied`] — the patch was already
+///   present (idempotent); the caller can skip the write.
+/// * [`KlogInitPatchResult::Skipped`] — the patch was intentionally
+///   skipped (e.g. on aarch64). The skip reason has been logged; the
+///   caller should NOT log a "version mismatch" warning and should NOT
+///   write the bytes back.
+/// * [`KlogInitPatchResult::NotFound`] — the pattern was not found in
+///   the binary. This likely indicates a TWRP version mismatch (the
+///   init binary has a different code layout) and the caller should log
+///   a warning. The patch cannot be applied safely in this case.
+fn patch_twrp_init_klog_init(init_bytes: &mut [u8]) -> KlogInitPatchResult {
+    // The byte pattern we match (see PATTERN below) is specific to the
+    // i386 build of TWRP init. On aarch64 TWRP images, the binary uses
+    // an entirely different instruction encoding (AArch64), so the
+    // pattern will never match — and the mknod-EEXIST-on-symlink bug
+    // this patch fixes is specific to the i386 klog_init() code path
+    // anyway. Skip the patch entirely on aarch64 to avoid the misleading
+    // "TWRP version mismatch?" warning that the caller would otherwise
+    // log on every arm64 boot.
+    #[cfg(target_arch = "aarch64")]
+    {
+        info!(
+            "[KR64] klog_init patch is x86-only; skipped on arm64 (aarch64 TWRP uses a different klog_init implementation)"
+        );
+        // Mark `init_bytes` as intentionally unused on aarch64 to silence
+        // the unused_variables lint without renaming the parameter (which
+        // is shared with the non-aarch64 branch below).
+        let _ = init_bytes;
+        KlogInitPatchResult::Skipped
     }
-    for i in 0..=(init_bytes.len() - PATTERN.len()) {
-        let mut matched = true;
-        for (j, p) in PATTERN.iter().enumerate() {
-            if let Some(b) = p {
-                if init_bytes[i + j] != *b {
-                    matched = false;
-                    break;
+
+    // On non-aarch64 hosts (x86, x86_64, etc.), perform the actual
+    // i386-instruction-pattern match.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // klog_init's distinctive instruction sequence (i386, TWRP 3.7.0_9-0).
+        // We match 32 bytes of fixed instructions ending just before the `jne`,
+        // then verify the byte at offset 32 is `0x75` (jne) before patching.
+        //
+        //   mov DWORD PTR [esp+0x8], 0x10b   ; c7 44 24 08 0b 01 00 00
+        //                                     (dev = makedev(1, 11) = 0x10b)
+        //   lea esi, [ebx-0x1502e]           ; 8d b3 d2 af fe ff
+        //                                     (esi = ptr to "/dev/__kmsg__")
+        //   mov DWORD PTR [esp+0x4], 0x2180  ; c7 44 24 04 80 21 00 00
+        //                                     (mode = S_IFCHR | 0600 = 0x2180)
+        //   mov [esp], esi                   ; 89 34 24
+        //   call mknod                       ; e8 ?? ?? ?? ?? (relative call)
+        //   test eax, eax                    ; 85 c0
+        //   jne <return>                     ; 75 ?? (THIS is what we patch)
+        //
+        // We use a slice of Option<u8>: Some(b) means "must equal b", None means
+        // "wildcard" (for the call's relative offset and the jne's offset).
+        const PATTERN: [Option<u8>; 34] = [
+            // mov DWORD PTR [esp+0x8], 0x10b
+            Some(0xc7),
+            Some(0x44),
+            Some(0x24),
+            Some(0x08),
+            Some(0x0b),
+            Some(0x01),
+            Some(0x00),
+            Some(0x00),
+            // lea esi, [ebx-0x1502e]
+            Some(0x8d),
+            Some(0xb3),
+            Some(0xd2),
+            Some(0xaf),
+            Some(0xfe),
+            Some(0xff),
+            // mov DWORD PTR [esp+0x4], 0x2180
+            Some(0xc7),
+            Some(0x44),
+            Some(0x24),
+            Some(0x04),
+            Some(0x80),
+            Some(0x21),
+            Some(0x00),
+            Some(0x00),
+            // mov [esp], esi
+            Some(0x89),
+            Some(0x34),
+            Some(0x24),
+            // call mknod (e8 + 4-byte signed relative offset)
+            Some(0xe8),
+            None,
+            None,
+            None,
+            None,
+            // test eax, eax
+            Some(0x85),
+            Some(0xc0),
+            // jne <offset> or NOP NOP (if already patched) — use wildcards
+            // so the pattern matches BOTH unpatched (0x75) and patched (0x90).
+            // The actual byte check is done after the pattern matches.
+            None,
+            None,
+        ];
+        const JNE_OFFSET: usize = 32; // index of the jne/NOP byte within PATTERN
+
+        if init_bytes.len() < PATTERN.len() {
+            return KlogInitPatchResult::NotFound;
+        }
+        for i in 0..=(init_bytes.len() - PATTERN.len()) {
+            let mut matched = true;
+            for (j, p) in PATTERN.iter().enumerate() {
+                if let Some(b) = p {
+                    if init_bytes[i + j] != *b {
+                        matched = false;
+                        break;
+                    }
                 }
             }
+            if !matched {
+                continue;
+            }
+            // Pattern matched. The byte at offset i + JNE_OFFSET must be 0x75
+            // (jne) for an unpatched binary, or 0x90 (nop) for an already-
+            // patched binary. Any other value means the pattern matched by
+            // coincidence and we should NOT patch (could be a different binary
+            // or a different code path).
+            let jne = init_bytes[i + JNE_OFFSET];
+            let jne_off2 = i + JNE_OFFSET + 1;
+            if jne == 0x90 && init_bytes[jne_off2] == 0x90 {
+                // Already patched.
+                return KlogInitPatchResult::AlreadyApplied;
+            }
+            if jne == 0x75 {
+                // Apply the patch: replace `75 ??` with `90 90`.
+                init_bytes[i + JNE_OFFSET] = 0x90;
+                init_bytes[jne_off2] = 0x90;
+                return KlogInitPatchResult::Applied;
+            }
+            // Unexpected byte at jne location — pattern matched but the next
+            // byte isn't a jne. Don't patch (could brick the binary).
+            return KlogInitPatchResult::NotFound;
         }
-        if !matched {
-            continue;
-        }
-        // Pattern matched. The byte at offset i + JNE_OFFSET must be 0x75
-        // (jne) for an unpatched binary, or 0x90 (nop) for an already-
-        // patched binary. Any other value means the pattern matched by
-        // coincidence and we should NOT patch (could be a different binary
-        // or a different code path).
-        let jne = init_bytes[i + JNE_OFFSET];
-        let jne_off2 = i + JNE_OFFSET + 1;
-        if jne == 0x90 && init_bytes[jne_off2] == 0x90 {
-            // Already patched.
-            return true;
-        }
-        if jne == 0x75 {
-            // Apply the patch: replace `75 ??` with `90 90`.
-            init_bytes[i + JNE_OFFSET] = 0x90;
-            init_bytes[jne_off2] = 0x90;
-            return true;
-        }
-        // Unexpected byte at jne location — pattern matched but the next
-        // byte isn't a jne. Don't patch (could brick the binary).
-        return false;
+        KlogInitPatchResult::NotFound
     }
-    false
+}
+
+/// Result of attempting to apply the klog_init mknod-failure patch.
+///
+/// See [`patch_twrp_init_klog_init`] for the full root-cause analysis and
+/// the per-variant semantics. The variants are ordered roughly by
+/// "goodness" — `Applied` and `AlreadyApplied` are successes, `Skipped`
+/// is an expected non-action (e.g. aarch64), and `NotFound` is a
+/// potential problem (TWRP version mismatch).
+///
+/// `#[allow(dead_code)]` is needed because the variants are platform-
+/// conditional: `Skipped` is only constructed on aarch64, and the
+/// other three are only constructed on non-aarch64 hosts. On any given
+/// host, the "other" platform's variants would otherwise be flagged as
+/// dead code by the compiler.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KlogInitPatchResult {
+    /// Patch was applied to the bytes — caller should write them back.
+    Applied,
+    /// Patch was already applied in a previous boot — caller can skip
+    /// the write (no modification needed, idempotent).
+    AlreadyApplied,
+    /// Patch was intentionally skipped (e.g. on aarch64, where the
+    /// i386-only byte pattern is irrelevant). The skip reason has been
+    /// logged; the caller should NOT log a "version mismatch" warning
+    /// and should NOT write the bytes back.
+    Skipped,
+    /// Pattern was not found in the binary — caller should log a
+    /// warning because this likely indicates a TWRP version mismatch.
+    NotFound,
 }
 
 /// Set the SELinux security context of a file using the `lsetxattr(2)`
@@ -2527,7 +2971,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
-    // TWRP BOOT: patch {rootfs}/init.rc to add `setenv LD_PRELOAD
+    // TWRP BOOT: patch TWRP init to add `setenv LD_PRELOAD
     // /sbin/twrp_fb_hook.so` to the recovery service definition.
     //
     // ROOT CAUSE (KVM run 31533796663): kr64 sets LD_PRELOAD in init's
@@ -2538,11 +2982,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // never sees it → our hook is never loaded → recovery crashes at
     // offset 0x57d7 in libminuitwrp.so (same as without the hook).
     //
-    // FIX: patch init.rc to add `setenv LD_PRELOAD /sbin/twrp_fb_hook.so`
-    // to the recovery service. TWRP's init supports `setenv` in service
-    // blocks (confirmed via `strings /tmp/twrp/rd/init | grep setenv`).
-    // This adds LD_PRELOAD to recovery's environment, so the bionic linker
-    // loads our i686 hook → FB ioctls are intercepted → no crash.
+    // FIX: patch init.rc (or, on arm64 TWRP, the imported .rc file that
+    // actually defines the recovery service) to add
+    // `setenv LD_PRELOAD /sbin/twrp_fb_hook.so` to the recovery service.
+    // TWRP's init supports `setenv` in service blocks (confirmed via
+    // `strings /tmp/twrp/rd/init | grep setenv`). This adds LD_PRELOAD to
+    // recovery's environment, so the bionic linker loads our i686 hook →
+    // FB ioctls are intercepted → no crash.
     //
     // CRITICAL (Task ID 18, KVM run 31536016997): the LD_PRELOAD path
     // MUST be `/sbin/twrp_fb_hook.so` (i686), NOT `/dev/libtwoyi_loader_shlib.so`
@@ -2551,39 +2997,21 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // the x86_64 path; the linker aborted recovery on the architecture
     // mismatch, so recovery was invisible in `ps`.
     //
+    // ARM64 REGRESSION: on arm64 TWRP images, the recovery service is
+    // defined in an IMPORTED .rc file (e.g. `init.recovery.rc` or
+    // `init.recovery.<ro.hardware>.rc`), NOT directly in `init.rc`. The
+    // old implementation only scanned `init.rc`, so on arm64 it never
+    // found the service and silently skipped the patch, causing the
+    // libminuitwrp.so crash to come back. The orchestrator function
+    // `patch_twrp_init_rc_recovery_service_in_rootfs` now scans init.rc,
+    // all its imports (recursively), init.recovery.rc, init.recovery.*.rc,
+    // and system/etc/init/recovery.rc, and falls back to creating a new
+    // init.twoyi.rc if none of them define the recovery service.
+    //
     // The patch is IDEMPOTENT: if the setenv line is already present
     // (e.g., from a previous boot), we skip the write.
     if cfg.boot_recovery {
-        let init_rc_path = format!("{}/init.rc", rootfs_prefix);
-        match std::fs::read_to_string(&init_rc_path) {
-            Ok(content) => {
-                // Check if the patch is already applied.
-                let patch_marker = "    setenv LD_PRELOAD /sbin/twrp_fb_hook.so";
-                if content.contains(patch_marker) {
-                    info!(
-                        "[KR64] PARENT: init.rc already patched with LD_PRELOAD for recovery service (idempotent skip)"
-                    );
-                } else if let Some(patched) = patch_twrp_init_rc_recovery_service(&content) {
-                    match std::fs::write(&init_rc_path, &patched) {
-                        Ok(()) => info!(
-                            "[KR64] PARENT: patched init.rc — added 'setenv LD_PRELOAD /sbin/twrp_fb_hook.so' to recovery service"
-                        ),
-                        Err(e) => warning!(
-                            "[KR64] PARENT: failed to write patched init.rc: {} (recovery will crash in libminuitwrp.so)",
-                            e
-                        ),
-                    }
-                } else {
-                    warning!(
-                        "[KR64] PARENT: could not find 'service recovery' in init.rc — LD_PRELOAD patch skipped (recovery will crash in libminuitwrp.so)"
-                    );
-                }
-            }
-            Err(e) => warning!(
-                "[KR64] PARENT: failed to read init.rc for LD_PRELOAD patching: {} (recovery will crash in libminuitwrp.so)",
-                e
-            ),
-        }
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs_prefix);
     }
 
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
@@ -2611,20 +3039,37 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let init_path = format!("{}/init", rootfs_prefix);
         match std::fs::read(&init_path) {
             Ok(mut bytes) => {
-                if patch_twrp_init_klog_init(&mut bytes) {
-                    match std::fs::write(&init_path, &bytes) {
-                        Ok(()) => info!(
-                            "[KR64] PARENT: patched /init klog_init() — NOP'd jne after mknod failure (KLOG will be captured to /twrp-kmsg.log)"
-                        ),
-                        Err(e) => warning!(
-                            "[KR64] PARENT: patched /init in memory but failed to write back: {} (KLOG capture may not work)",
-                            e
-                        ),
+                match patch_twrp_init_klog_init(&mut bytes) {
+                    KlogInitPatchResult::Applied => {
+                        match std::fs::write(&init_path, &bytes) {
+                            Ok(()) => info!(
+                                "[KR64] PARENT: patched /init klog_init() — NOP'd jne after mknod failure (KLOG will be captured to /twrp-kmsg.log)"
+                            ),
+                            Err(e) => warning!(
+                                "[KR64] PARENT: patched /init in memory but failed to write back: {} (KLOG capture may not work)",
+                                e
+                            ),
+                        }
                     }
-                } else {
-                    warning!(
-                        "[KR64] PARENT: could not find klog_init mknod-failure pattern in /init (TWRP version mismatch?) — KLOG capture via /dev/__kmsg__ symlink will NOT work"
-                    );
+                    KlogInitPatchResult::AlreadyApplied => {
+                        info!(
+                            "[KR64] PARENT: /init klog_init() already patched (idempotent skip) — KLOG capture via /dev/__kmsg__ symlink is active"
+                        );
+                    }
+                    KlogInitPatchResult::Skipped => {
+                        // Skip reason already logged inside
+                        // `patch_twrp_init_klog_init` (currently fires
+                        // only on aarch64, where the i386-only byte
+                        // pattern is irrelevant). Do NOT log the
+                        // "TWRP version mismatch?" warning here — it
+                        // would be misleading on arm64, where the
+                        // skip is expected and harmless.
+                    }
+                    KlogInitPatchResult::NotFound => {
+                        warning!(
+                            "[KR64] PARENT: could not find klog_init mknod-failure pattern in /init (TWRP version mismatch?) — KLOG capture via /dev/__kmsg__ symlink will NOT work"
+                        );
+                    }
                 }
             }
             Err(e) => warning!(
@@ -4378,9 +4823,279 @@ mod tests {
         );
     }
 
+    // ====================================================================
+    // Tests for `patch_twrp_init_rc_recovery_service_in_rootfs` — the
+    // orchestrator that scans multiple .rc files (init.rc, init.recovery.rc,
+    // init.recovery.*.rc, system/etc/init/recovery.rc, plus imports) and
+    // falls back to creating init.twoyi.rc if none contain the recovery
+    // service. These tests use a tempdir to set up a realistic rootfs
+    // skeleton so we can verify the file I/O behaviour end-to-end.
+    // ====================================================================
+
+    /// Helper: build a unique tempdir rootfs skeleton with the given init.rc
+    /// content. Returns the tempdir path (kept alive for the test duration
+    /// by the caller holding the TempDir).
+    fn make_test_rootfs(init_rc_content: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "twoyi-kr64-test-rootfs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("init.rc"), init_rc_content).unwrap();
+        dir
+    }
+
+    /// `patch_twrp_init_rc_recovery_service_in_rootfs` must patch init.rc
+    /// when init.rc contains the `service recovery` line directly (the x86
+    /// TWRP layout — the original code path).
+    #[test]
+    fn rootfs_patcher_patches_init_rc_when_service_recovery_is_in_init_rc() {
+        let dir = make_test_rootfs("service recovery /sbin/recovery\n");
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert!(
+            init_rc.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            "init.rc should be patched. Got:\n{}",
+            init_rc
+        );
+        // No fallback file should be created.
+        assert!(
+            !dir.join("init.twoyi.rc").exists(),
+            "init.twoyi.rc should NOT be created when init.rc has the service"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `patch_twrp_init_rc_recovery_service_in_rootfs` must patch
+    /// init.recovery.rc (NOT init.rc) when init.rc doesn't contain the
+    /// recovery service but init.recovery.rc does. This is the arm64 TWRP
+    /// regression scenario described in the task.
+    #[test]
+    fn rootfs_patcher_patches_init_recovery_rc_when_init_rc_lacks_service() {
+        let dir = make_test_rootfs("service ueventd /sbin/ueventd\n");
+        // arm64-style: recovery service lives in init.recovery.rc.
+        std::fs::write(
+            dir.join("init.recovery.rc"),
+            "service recovery /sbin/recovery\n",
+        )
+        .unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        // init.rc should be UNTOUCHED (no service recovery line, no patch).
+        let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert!(
+            !init_rc.contains("setenv LD_PRELOAD"),
+            "init.rc should NOT be patched. Got:\n{}",
+            init_rc
+        );
+        // init.recovery.rc SHOULD be patched.
+        let init_recovery_rc =
+            std::fs::read_to_string(dir.join("init.recovery.rc")).unwrap();
+        assert!(
+            init_recovery_rc.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            "init.recovery.rc should be patched. Got:\n{}",
+            init_recovery_rc
+        );
+        // No fallback file should be created.
+        assert!(
+            !dir.join("init.twoyi.rc").exists(),
+            "init.twoyi.rc should NOT be created when init.recovery.rc has the service"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `patch_twrp_init_rc_recovery_service_in_rootfs` must follow `import`
+    /// directives in init.rc and patch an imported file when it contains
+    /// the recovery service.
+    #[test]
+    fn rootfs_patcher_follows_import_directives() {
+        let dir = make_test_rootfs(
+            "import /init.recovery.qcom.rc\nservice ueventd /sbin/ueventd\n",
+        );
+        // Imported file lives at the chroot root (matching the import path).
+        std::fs::write(
+            dir.join("init.recovery.qcom.rc"),
+            "service recovery /sbin/recovery\n",
+        )
+        .unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        // init.rc should be UNTOUCHED.
+        let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert!(
+            !init_rc.contains("setenv LD_PRELOAD"),
+            "init.rc should NOT be patched. Got:\n{}",
+            init_rc
+        );
+        // The imported file SHOULD be patched.
+        let imported = std::fs::read_to_string(dir.join("init.recovery.qcom.rc")).unwrap();
+        assert!(
+            imported.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            "imported init.recovery.qcom.rc should be patched. Got:\n{}",
+            imported
+        );
+        // No fallback file should be created.
+        assert!(
+            !dir.join("init.twoyi.rc").exists(),
+            "init.twoyi.rc should NOT be created when an import contains the service"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `patch_twrp_init_rc_recovery_service_in_rootfs` must skip shell-
+    /// style variables in import paths (e.g. `import /init.recovery.${ro.hardware}.rc`)
+    /// and rely on the glob step to pick up `init.recovery.*.rc` files.
+    #[test]
+    fn rootfs_patcher_skips_import_paths_with_unexpanded_vars_and_uses_glob() {
+        let dir = make_test_rootfs(
+            "import /init.recovery.${ro.hardware}.rc\nservice ueventd /sbin/ueventd\n",
+        );
+        // Glob-matched file (the import path itself can't be resolved
+        // because ${ro.hardware} is unexpanded, but the glob step picks
+        // up the file directly).
+        std::fs::write(
+            dir.join("init.recovery.qcom.rc"),
+            "service recovery /sbin/recovery\n",
+        )
+        .unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        let imported = std::fs::read_to_string(dir.join("init.recovery.qcom.rc")).unwrap();
+        assert!(
+            imported.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            "glob-matched init.recovery.qcom.rc should be patched. Got:\n{}",
+            imported
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FALLBACK: when NO .rc file (init.rc, init.recovery.rc,
+    /// init.recovery.*.rc, system/etc/init/recovery.rc, or imports)
+    /// contains the `service recovery` line, the orchestrator must create
+    /// `{rootfs}/init.twoyi.rc` with a complete recovery service definition
+    /// AND append `import /init.twoyi.rc` to init.rc.
+    #[test]
+    fn rootfs_patcher_falls_back_to_init_twoyi_rc_when_no_service_found() {
+        let dir = make_test_rootfs("service ueventd /sbin/ueventd\n");
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+
+        // init.twoyi.rc should be created with the expected content.
+        let twoyi_rc_path = dir.join("init.twoyi.rc");
+        assert!(
+            twoyi_rc_path.exists(),
+            "init.twoyi.rc should be created as fallback"
+        );
+        let twoyi_rc = std::fs::read_to_string(&twoyi_rc_path).unwrap();
+        assert!(
+            twoyi_rc.contains("service recovery /sbin/recovery"),
+            "init.twoyi.rc should define the recovery service. Got:\n{}",
+            twoyi_rc
+        );
+        assert!(
+            twoyi_rc.contains("setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            "init.twoyi.rc should set LD_PRELOAD. Got:\n{}",
+            twoyi_rc
+        );
+        assert!(
+            twoyi_rc.contains("seclabel u:r:recovery:s0"),
+            "init.twoyi.rc should set seclabel. Got:\n{}",
+            twoyi_rc
+        );
+
+        // init.rc should have the import line appended.
+        let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert!(
+            init_rc.contains("import /init.twoyi.rc"),
+            "init.rc should contain 'import /init.twoyi.rc'. Got:\n{}",
+            init_rc
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// IDEMPOTENCE: running the orchestrator twice should not create
+    /// duplicate patches or duplicate `import /init.twoyi.rc` lines.
+    #[test]
+    fn rootfs_patcher_is_idempotent_when_service_in_init_rc() {
+        let dir = make_test_rootfs("service recovery /sbin/recovery\n");
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        let init_rc_after_first = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        let init_rc_after_second = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert_eq!(
+            init_rc_after_first, init_rc_after_second,
+            "second run should not modify init.rc (idempotent)"
+        );
+        let count = init_rc_after_second
+            .matches("setenv LD_PRELOAD /sbin/twrp_fb_hook.so")
+            .count();
+        assert_eq!(
+            count, 1,
+            "exactly one setenv line should be present after two runs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// IDEMPOTENCE (fallback case): running the orchestrator twice when
+    /// no .rc file has the service should not create a duplicate
+    /// `import /init.twoyi.rc` line in init.rc.
+    #[test]
+    fn rootfs_patcher_fallback_is_idempotent_for_import_line() {
+        let dir = make_test_rootfs("service ueventd /sbin/ueventd\n");
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        let init_rc_after_first = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        let init_rc_after_second = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert_eq!(
+            init_rc_after_first, init_rc_after_second,
+            "second run should not modify init.rc (idempotent fallback)"
+        );
+        let count = init_rc_after_second
+            .matches("import /init.twoyi.rc")
+            .count();
+        assert_eq!(
+            count, 1,
+            "exactly one 'import /init.twoyi.rc' line should be present after two runs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `collect_imported_rc_files` must handle relative import paths
+    /// (relative to the importing file's parent directory), not just
+    /// chroot-absolute paths.
+    #[test]
+    fn rootfs_patcher_handles_relative_import_paths() {
+        // init.rc imports a relative path; we put the imported file in
+        // the same directory as init.rc.
+        let dir = make_test_rootfs("import extra.rc\nservice ueventd /sbin/ueventd\n");
+        std::fs::write(dir.join("extra.rc"), "service recovery /sbin/recovery\n").unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        let extra = std::fs::read_to_string(dir.join("extra.rc")).unwrap();
+        assert!(
+            extra.contains("    setenv LD_PRELOAD /sbin/twrp_fb_hook.so"),
+            "relative-imported extra.rc should be patched. Got:\n{}",
+            extra
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Build a 34-byte klog_init instruction sequence matching the pattern
     /// that `patch_twrp_init_klog_init` searches for. The `jne_offset`
     /// parameter fills the wildcard byte after `0x75` (jne).
+    ///
+    /// Only built on non-aarch64 hosts — the pattern-matching tests below
+    /// are x86/i386-specific (they verify the i386 klog_init byte pattern)
+    /// and the function under test short-circuits to `Skipped` on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
     fn build_klog_init_pattern(jne_offset: u8) -> Vec<u8> {
         let mut v = Vec::new();
         // mov DWORD PTR [esp+0x8], 0x10b
@@ -4404,12 +5119,18 @@ mod tests {
     /// `patch_twrp_init_klog_init` must find the mknod-failure pattern in
     /// an unpatched binary and replace the `jne` (75 ??) with two NOPs
     /// (90 90).
+    ///
+    /// Skipped on aarch64: the function short-circuits to `Skipped` there
+    /// (the i386 byte pattern is irrelevant), so the x86-specific assertions
+    /// below would never hold on arm64.
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn patch_twrp_init_klog_init_applies_to_unpatched_binary() {
         let mut bytes = build_klog_init_pattern(0xd4);
         // The patch should succeed.
-        assert!(
+        assert_eq!(
             patch_twrp_init_klog_init(&mut bytes),
+            KlogInitPatchResult::Applied,
             "patch should apply to unpatched binary"
         );
         // The jne at offset 32 should now be 90 90 (two NOPs).
@@ -4418,15 +5139,26 @@ mod tests {
     }
 
     /// `patch_twrp_init_klog_init` must be IDEMPOTENT: applying it twice
-    /// yields the same result as applying it once.
+    /// yields the same result as applying it once. The second call must
+    /// return `AlreadyApplied` (not `Applied`) and must NOT modify the
+    /// bytes.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_klog_init_applies_to_unpatched_binary` above.
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn patch_twrp_init_klog_init_is_idempotent() {
         let mut bytes = build_klog_init_pattern(0xd4);
-        assert!(patch_twrp_init_klog_init(&mut bytes), "first patch");
-        let after_first = bytes.clone();
-        assert!(
+        assert_eq!(
             patch_twrp_init_klog_init(&mut bytes),
-            "second patch (idempotent)"
+            KlogInitPatchResult::Applied,
+            "first patch should be Applied"
+        );
+        let after_first = bytes.clone();
+        assert_eq!(
+            patch_twrp_init_klog_init(&mut bytes),
+            KlogInitPatchResult::AlreadyApplied,
+            "second patch should be AlreadyApplied (idempotent)"
         );
         assert_eq!(
             bytes, after_first,
@@ -4436,7 +5168,11 @@ mod tests {
 
     /// `patch_twrp_init_klog_init` must find the pattern even when it's
     /// embedded in a larger binary (with prefix and suffix bytes).
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_klog_init_applies_to_unpatched_binary` above.
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn patch_twrp_init_klog_init_finds_pattern_in_context() {
         // 256 bytes of random-ish prefix, then the pattern, then 64 bytes
         // of suffix. The function should find the pattern and patch only
@@ -4454,7 +5190,11 @@ mod tests {
         assert_eq!(bytes[jne_file_offset], 0x75, "jne should be unpatched");
         assert_eq!(bytes[jne_file_offset + 1], 0x2a, "jne offset byte");
 
-        assert!(patch_twrp_init_klog_init(&mut bytes), "patch should apply");
+        assert_eq!(
+            patch_twrp_init_klog_init(&mut bytes),
+            KlogInitPatchResult::Applied,
+            "patch should apply"
+        );
         assert_eq!(bytes[jne_file_offset], 0x90, "jne byte 0 should be NOP'd");
         assert_eq!(
             bytes[jne_file_offset + 1],
@@ -4481,16 +5221,22 @@ mod tests {
         }
     }
 
-    /// `patch_twrp_init_klog_init` must return false if the pattern is not
-    /// found (e.g. a different TWRP version with a different code layout).
-    /// This is important — we must NOT silently corrupt an unknown binary.
+    /// `patch_twrp_init_klog_init` must return `NotFound` if the pattern
+    /// is not found (e.g. a different TWRP version with a different code
+    /// layout). This is important — we must NOT silently corrupt an
+    /// unknown binary.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_klog_init_applies_to_unpatched_binary` above.
     #[test]
-    fn patch_twrp_init_klog_init_returns_false_if_pattern_not_found() {
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_klog_init_returns_not_found_if_pattern_not_found() {
         // 256 bytes of 0x90 (NOP) — doesn't contain the pattern.
         let mut bytes = vec![0x90u8; 256];
-        assert!(
-            !patch_twrp_init_klog_init(&mut bytes),
-            "should return false if pattern is not found"
+        assert_eq!(
+            patch_twrp_init_klog_init(&mut bytes),
+            KlogInitPatchResult::NotFound,
+            "should return NotFound if pattern is not found"
         );
         // Bytes should be unchanged.
         assert!(
@@ -4503,7 +5249,11 @@ mod tests {
     /// (jne) is not what we expect — i.e. if the pattern matched by
     /// coincidence but the next instruction isn't a jne. We must be
     /// conservative and not corrupt the binary.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_klog_init_applies_to_unpatched_binary` above.
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn patch_twrp_init_klog_init_does_not_patch_if_jne_byte_unexpected() {
         // Build a pattern that matches up to byte 31, then has `0x75` at
         // offset 32, but with a strange byte after it... actually our
@@ -4517,9 +5267,10 @@ mod tests {
         let mut bytes = build_klog_init_pattern(0xd4);
         bytes[32] = 0xeb; // jmp instead of jne
                           // The function should detect this and NOT patch.
-        assert!(
-            !patch_twrp_init_klog_init(&mut bytes),
-            "should NOT patch if byte at jne location is unexpected"
+        assert_eq!(
+            patch_twrp_init_klog_init(&mut bytes),
+            KlogInitPatchResult::NotFound,
+            "should return NotFound (NOT patch) if byte at jne location is unexpected"
         );
         // Byte at offset 32 should be unchanged.
         assert_eq!(bytes[32], 0xeb, "byte at jne location should be unchanged");
@@ -4529,7 +5280,11 @@ mod tests {
     /// extracted from `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`. This
     /// is a regression test: if the TWRP version changes, this test will
     /// fail (alerting us to update the pattern).
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_klog_init_applies_to_unpatched_binary` above.
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
     fn patch_twrp_init_klog_init_works_on_real_twrp_init_binary() {
         // The TWRP boot image is at `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`
         // (relative to the repo root). We need to extract the ramdisk,
@@ -4638,18 +5393,26 @@ mod tests {
         );
         // Apply the patch.
         let mut init_bytes_mut = init_bytes.clone();
-        assert!(
+        assert_eq!(
             patch_twrp_init_klog_init(&mut init_bytes_mut),
+            KlogInitPatchResult::Applied,
             "patch should apply to real TWRP init binary"
         );
-        // Apply again — should be idempotent.
-        assert!(
+        // Apply again — should be idempotent (AlreadyApplied).
+        assert_eq!(
             patch_twrp_init_klog_init(&mut init_bytes_mut),
+            KlogInitPatchResult::AlreadyApplied,
             "patch should be idempotent on real TWRP init binary"
         );
     }
 
     /// Decompress a gzip-encoded byte slice using flate2.
+    ///
+    /// Only built on non-aarch64 hosts — this helper is used exclusively
+    /// by `patch_twrp_init_klog_init_works_on_real_twrp_init_binary`,
+    /// which is itself cfg-gated to non-aarch64 hosts (see that test for
+    /// the rationale).
+    #[cfg(not(target_arch = "aarch64"))]
     fn decompress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
         use std::io::Read;
         // flate2 is a dependency of kr64 (used elsewhere); we use it here
@@ -4662,6 +5425,9 @@ mod tests {
 
     /// Find a regular file entry in a cpio newc archive by name.
     /// Returns the file's bytes, or None if not found.
+    ///
+    /// Only built on non-aarch64 hosts — see `decompress_gzip` above.
+    #[cfg(not(target_arch = "aarch64"))]
     fn find_cpio_entry(cpio: &[u8], name: &[u8]) -> Option<Vec<u8>> {
         let mut pos = 0;
         while pos + 110 <= cpio.len() {
