@@ -479,7 +479,8 @@ int close(int fd) {
 // would be a conflicting second unmarked overload. (KVM run 31575531674
 // hit this exact error after commit ea3a484 changed the param to
 // `unsigned long` for spurious glibc-compat reasons.)
-int ioctl(int fd, int request, ...) {
+int ioctl(int fd, int request, ...) __attribute__((overloadable));
+int ioctl(int fd, int request, ...) __attribute__((overloadable)) {
     va_list ap;
     va_start(ap, request);
     void *argp = va_arg(ap, void *);
