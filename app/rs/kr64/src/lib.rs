@@ -2406,7 +2406,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // `twrp_fb_hook.so` (LD_PRELOAD'd into the recovery process). See
     // `devices::create_twrp_framebuffer` for the full rationale.
     if cfg.boot_recovery {
-        if let Err(e) = devices::create_twrp_framebuffer(&rootfs_prefix) {
+        if let Err(e) = devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width, cfg.height) {
             warning!(
                 "[KR64] PARENT: failed to create TWRP framebuffer: {} (recovery will crash in libminuitwrp.so)",
                 e
@@ -2972,6 +2972,59 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             format!("{}{}", cfg.rootfs, cfg.init_path)
         };
 
+        // NON-ROOT MODE: The rootfs is on the app's data partition which
+        // has noexec. execve() of {rootfs}/init fails with EACCES.
+        // Copy the init binary to the app's cache dir (which IS executable)
+        // and exec from there. The ptrace emulator translates all path
+        // syscalls so init still "sees" the rootfs as "/".
+        let exec_path = if !cfg.use_namespaces {
+            // Copy init to cache dir.
+            let cache_init = format!("{}/cache/twoyi_init", cfg.data_dir);
+            match std::fs::read(&full_init_path) {
+                Ok(init_bytes) => {
+                    // Ensure cache dir exists.
+                    let _ = std::fs::create_dir_all(format!("{}/cache", cfg.data_dir));
+                    match std::fs::write(&cache_init, &init_bytes) {
+                        Ok(_) => {
+                            use std::os::unix::fs::PermissionsExt;
+                            let _ = std::fs::set_permissions(
+                                &cache_init,
+                                std::fs::Permissions::from_mode(0o755),
+                            );
+                            unsafe {
+                                safe_write_err(b"[KR64 CHILD] copied init to ");
+                                safe_write_err(cache_init.as_bytes());
+                                safe_write_err(b" (");
+                                safe_write_err(format!("{}", init_bytes.len()).as_bytes());
+                                safe_write_err(b" bytes) for exec\n");
+                            }
+                            cache_init
+                        }
+                        Err(e) => {
+                            unsafe {
+                                safe_write_err(b"[KR64 CHILD] FATAL: failed to copy init to cache: ");
+                                safe_write_err(e.to_string().as_bytes());
+                                safe_write_err(b"\n");
+                                libc::_exit(127);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    unsafe {
+                        safe_write_err(b"[KR64 CHILD] FATAL: failed to read init binary at ");
+                        safe_write_err(full_init_path.as_bytes());
+                        safe_write_err(b": ");
+                        safe_write_err(e.to_string().as_bytes());
+                        safe_write_err(b"\n");
+                        libc::_exit(127);
+                    }
+                }
+            }
+        } else {
+            full_init_path.clone()
+        };
+
         // Pre-execve diagnostics: verify the init binary and linker exist.
         // The init binary's ELF INTERP field specifies the dynamic linker
         // path (usually /system/bin/linker64). If either file is missing,
@@ -3020,7 +3073,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        let init_cstr = match CString::new(full_init_path.as_str()) {
+        let init_cstr = match CString::new(exec_path.as_str()) {
             Ok(s) => s,
             Err(_) => unsafe {
                 safe_write_err(b"[KR64 CHILD] FATAL: init_path contains interior NUL byte\n");

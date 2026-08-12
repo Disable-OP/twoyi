@@ -89,6 +89,9 @@
     <string name="settings_display_height_summary">Virtual display height in pixels (default: 1920)</string>
     <string name="settings_key_display_dpi">Display DPI</string>
     <string name="settings_display_dpi_summary">Virtual display DPI (default: 160)</string>
+    <string name="settings_key_display_color_depth" translatable="false">display_color_depth</string>
+    <string name="settings_display_color_depth_title">Display Color Depth</string>
+    <string name="settings_display_color_depth_summary">Color depth in bits per pixel (affects TWRP framebuffer rendering)</string>
     <string name="settings_display_change_reboot">Display settings will take effect after reboot</string>
     <string name="settings_key_use_new_renderer" translatable="false">use_new_renderer</string>
     <string name="settings_use_new_renderer_title">Use New Renderer</string>

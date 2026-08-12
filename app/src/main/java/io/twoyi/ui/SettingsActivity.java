@@ -123,6 +123,8 @@ public class SettingsActivity extends AppCompatActivity {
             Preference displayWidth = findPreference(R.string.settings_key_display_width);
             Preference displayHeight = findPreference(R.string.settings_key_display_height);
             Preference displayDpi = findPreference(R.string.settings_key_display_dpi);
+            android.preference.ListPreference displayColorDepth =
+                    (android.preference.ListPreference) findPreference(R.string.settings_key_display_color_depth);
             CheckBoxPreference useNewRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_use_new_renderer);
             CheckBoxPreference debugRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_debug_renderer);
             CheckBoxPreference bootRecovery = (CheckBoxPreference) findPreference(R.string.settings_key_boot_recovery);
@@ -211,6 +213,25 @@ public class SettingsActivity extends AppCompatActivity {
                 Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                 return true;
             });
+
+            // Initialize display color depth with profile-specific value
+            if (displayColorDepth != null) {
+                int currentDepth = ProfileSettings.getDisplayColorDepth(getActivity());
+                displayColorDepth.setValue(String.valueOf(currentDepth));
+                displayColorDepth.setSummary("Color depth: " + currentDepth + " bpp");
+                displayColorDepth.setOnPreferenceChangeListener((preference, newValue) -> {
+                    try {
+                        int depth = Integer.parseInt(newValue.toString());
+                        ProfileSettings.setDisplayColorDepth(getActivity(), depth);
+                        displayColorDepth.setSummary("Color depth: " + depth + " bpp");
+                        Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
+                        return true;
+                    } catch (NumberFormatException e) {
+                        Toast.makeText(getActivity(), R.string.settings_invalid_number, Toast.LENGTH_SHORT).show();
+                        return false;
+                    }
+                });
+            }
 
             // Initialize debug renderer checkbox with profile-specific value
             debugRenderer.setChecked(ProfileSettings.isDebugRendererEnabled(getActivity()));

@@ -30,6 +30,7 @@ public class ProfileSettings {
     public static final String DISPLAY_WIDTH = "display_width";
     public static final String DISPLAY_HEIGHT = "display_height";
     public static final String DISPLAY_DPI = "display_dpi";
+    public static final String DISPLAY_COLOR_DEPTH = "display_color_depth";
     public static final String USE_NEW_RENDERER = "use_new_renderer";
     public static final String DEBUG_RENDERER = "debug_renderer";
     /**
@@ -170,6 +171,23 @@ public class ProfileSettings {
      */
     public static void setDisplayDpi(Context context, int dpi) {
         setInt(context, DISPLAY_DPI, dpi);
+    }
+
+    /**
+     * Get display color depth in bits per pixel for active profile.
+     * Supported values: 32 (RGBA8888, default), 24 (RGB888), 16 (RGB565).
+     * Used by the TWRP framebuffer renderer to determine the pixel format.
+     */
+    public static int getDisplayColorDepth(Context context) {
+        return getInt(context, DISPLAY_COLOR_DEPTH, 32);
+    }
+
+    /**
+     * Set display color depth for active profile.
+     * @param depth 32 (RGBA8888), 24 (RGB888), or 16 (RGB565)
+     */
+    public static void setDisplayColorDepth(Context context, int depth) {
+        setInt(context, DISPLAY_COLOR_DEPTH, depth);
     }
 
     /**

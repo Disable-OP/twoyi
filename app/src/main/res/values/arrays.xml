@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ~ This Source Code Form is subject to the terms of the Mozilla Public
+  ~ License, v. 2.0. If a copy of the MPL was not distributed with this
+  ~ file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  -->
+
+<resources>
+    <string-array name="display_color_depth_entries">
+        <item>32-bit (RGBA8888 — recommended)</item>
+        <item>24-bit (RGB888)</item>
+        <item>16-bit (RGB565 — faster, lower quality)</item>
+    </string-array>
+    <string-array name="display_color_depth_values">
+        <item>32</item>
+        <item>24</item>
+        <item>16</item>
+    </string-array>
+</resources>
