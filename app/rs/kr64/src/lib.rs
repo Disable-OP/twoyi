@@ -369,6 +369,21 @@ pub struct Config {
     /// ramdisk, not at /system/bin/init). The `--boot-recovery` flag
     /// sets this automatically if `--init` is not also passed.
     pub boot_recovery: bool,
+
+    /// The app's `ApplicationInfo.nativeLibraryDir` (e.g.
+    /// `/data/app/~~<rand>/io.twoyi-<rand>/lib/x86_64/`). Passed from
+    /// Java (core.rs) via the `TWOYI_NATIVE_LIB_DIR` env var (and
+    /// also accepted via `--native-lib-dir` for explicit testing).
+    ///
+    /// When `Some`, [`hook_library_candidates`] returns
+    /// `{native_lib_dir}/<lib>` as candidate #0 (highest priority) —
+    /// see its doc comment for why this is needed (the
+    /// `/data/app/` directory scan in [`apk_native_lib_candidates`]
+    /// fails with EACCES for untrusted_app, so on real devices
+    /// running kr64 unprivileged this is the ONLY reliable APK-source
+    /// candidate). When `None`, candidate #0 is omitted and the
+    /// caller falls back to the rootfs symlinks + /data/app/ scan.
+    pub native_lib_dir: Option<String>,
 }
 
 impl Default for Config {
@@ -388,6 +403,7 @@ impl Default for Config {
             log_level: 3,
             socks5_proxy: None,
             boot_recovery: false,
+            native_lib_dir: None,
         }
     }
 }
@@ -409,6 +425,11 @@ impl Default for Config {
 ///   --boot-recovery           (TWRP recovery boot: i686 LD_PRELOAD FB hook only,
 ///                              /apex bind, binderfs, SELinux watchdog,
 ///                              twoyi-bin copy; set init_path=/init)
+///   --native-lib-dir <path>   (Optional: app's nativeLibraryDir, also read from
+///                              the TWOYI_NATIVE_LIB_DIR env var. Used as
+///                              candidate #0 in hook_library_candidates so
+///                              kr64 can find hook .so files without scanning
+///                              /data/app/ — which is unreadable for untrusted_app)
 ///   --help, -h                (show usage)
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut cfg = Config::default();
@@ -448,6 +469,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                        --boot-recovery           TWRP recovery boot (i686 LD_PRELOAD FB hook only,\n\
                                                  /apex bind, binderfs, SELinux watchdog;\n\
                                                  set init_path=/init)\n\
+                     \n\
+                     Hook library discovery:\n\
+                       --native-lib-dir <path>  App's nativeLibraryDir (also read from env var\n\
+                                                 TWOYI_NATIVE_LIB_DIR). Used as candidate #0 in\n\
+                                                 hook_library_candidates so kr64 can find hook\n\
+                                                 .so files without scanning /data/app/ (which\n\
+                                                 is unreadable for untrusted_app).\n\
                      \n\
                      Networking:\n\
                        --socks5 <host:port>     Tunnel guest TCP through a SOCKS5 proxy (stub)\n"
@@ -507,6 +535,15 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             "--rw-rom" => cfg.read_only_rom = false,
             "--no-seccomp" => cfg.install_seccomp = false,
             "--boot-recovery" => cfg.boot_recovery = true,
+            "--native-lib-dir" => {
+                let val = iter
+                    .next()
+                    .ok_or("--native-lib-dir requires a path".to_string())?;
+                if val.is_empty() {
+                    return Err("--native-lib-dir argument must not be empty".to_string());
+                }
+                cfg.native_lib_dir = Some(val);
+            }
             "--socks5" => {
                 // SOCKS5 proxy stub: store the host:port string. The
                 // actual forwarding thread is not yet wired up -- see
@@ -546,6 +583,29 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
     if cfg.boot_recovery && !init_explicitly_set {
         cfg.init_path = "/init".to_string();
         info!("[KR64] --boot-recovery: setting init_path to /init (TWRP statically-linked init)");
+    }
+
+    // Populate cfg.native_lib_dir from the TWOYI_NATIVE_LIB_DIR env var
+    // if --native-lib-dir wasn't passed explicitly. core.rs sets this env
+    // var before exec'ing kr64 so kr64 can find hook .so files without
+    // scanning /data/app/ (which is mode 0771, unreadable for
+    // untrusted_app). See hook_library_candidates candidate #0.
+    if cfg.native_lib_dir.is_none() {
+        if let Ok(val) = std::env::var("TWOYI_NATIVE_LIB_DIR") {
+            let trimmed = val.trim().to_string();
+            if !trimmed.is_empty() {
+                info!(
+                    "[KR64] TWOYI_NATIVE_LIB_DIR env var set: {} (used as candidate #0 for hook library discovery)",
+                    trimmed
+                );
+                cfg.native_lib_dir = Some(trimmed);
+            }
+        }
+    } else if let Some(nd) = cfg.native_lib_dir.as_ref() {
+        info!(
+            "[KR64] --native-lib-dir={} (overrides TWOYI_NATIVE_LIB_DIR env var)",
+            nd
+        );
     }
 
     Ok(cfg)
@@ -661,6 +721,31 @@ pub fn clear_zombie_processes() {
 /// The library may live in any of several places depending on how the
 /// rootfs was provisioned by RomManager:
 ///
+/// 0. `cfg.native_lib_dir/<lib>` (if `cfg.native_lib_dir` is `Some`) —
+///    the app's `ApplicationInfo.nativeLibraryDir`, passed from Java
+///    (core.rs) via the `TWOYI_NATIVE_LIB_DIR` env var (which
+///    `parse_args` copies into `cfg.native_lib_dir`). This is the MOST
+///    RELIABLE candidate because:
+///      * Java knows the exact path (no scanning required).
+///      * The untrusted_app SELinux domain CAN read its OWN
+///        nativeLibraryDir (it's labelled `apk_data_file` and the
+///        app's own dir is mode 0755, readable by the app's UID).
+///      * By contrast, `read_dir("/data/app/")` is DENIED for
+///        untrusted_app (`/data/app/` is mode 0771 = `rwxrwx--x`,
+///        so "others" only have `--x` — they can traverse but NOT
+///        listdir). This means [`apk_native_lib_candidates`] returns
+///        an empty Vec when kr64 runs without root (the common case
+///        on real devices via the ptrace-emulation path). See the
+///        log from HONOR NTH-NX9 (Android 13, work profile, kr64
+///        running unprivileged):
+///        ```
+///        PARENT: APK native lib scan for twrp_fb_hook.so found no
+///        candidates in /data/app/
+///        PARENT: twrp_fb_hook.so not found in any of 4 candidate
+///        locations -- TWRP framebuffer virtualization disabled
+///        ```
+///        The scan silently returned 0 candidates because read_dir
+///        failed with EACCES — see [`apk_native_lib_candidates_in`].
 /// 1. `{rootfs}/<lib>` -- manual placement or direct rootfs (the
 ///    historical fallback; kept for backwards compatibility).
 /// 2. `{rootfs}/system/lib64/<lib>` -- where RomManager's
@@ -675,27 +760,60 @@ pub fn clear_zombie_processes() {
 ///    explicitly here.
 /// 4. `{data_dir}/rootfs/<lib>` -- alternative app-level rootfs root.
 /// 5. APK native lib dir scan (`/data/app/~~<rand>/io.twoyi-<rand>/lib/
-///    {x86_64,arm64}/<lib>`) -- the canonical source of the libraries,
+///    {x86_64,arm64-v8a}/<lib>`) -- the canonical source of the libraries,
 ///    installed by Android's package manager at APK install time.
 ///    Bypasses all rootfs symlink state. See [`apk_native_lib_candidates`]
 ///    for why this is needed (ProfileManager's rootfs symlink is broken
 ///    on KVM run 31501768195). On non-Android hosts (e.g. the Linux
 ///    devcontainer) `/data/app/` doesn't exist, so this contributes
-///    zero candidates -- exactly what we want for unit tests.
+///    zero candidates -- exactly what we want for unit tests. NOTE:
+///    this scan requires read permission on `/data/app/` (mode 0771 =
+///    `rwxrwx--x`), which is GRANTED for root but DENIED for
+///    untrusted_app — so on real devices running kr64 unprivileged
+///    (the ptrace-emulation path), this scan returns 0 and candidate
+///    #0 (`cfg.native_lib_dir`) is the only reliable APK-source
+///    candidate.
+///
+/// After collecting all candidates, the list is DEDUPLICATED in place
+/// (preserving priority order — first occurrence wins). This matters
+/// because in production `cfg.rootfs == format!("{}/rootfs",
+/// cfg.data_dir)` (set by `core.rs:get_rootfs_dir()`), so candidate #1
+/// collapses onto #4 and #2 onto #3 — leaving the log cluttered with
+/// duplicate "checked:" lines (confirmed in HONOR NTH-NX9 kr64.log:
+/// 4 candidates logged but only 2 unique paths). Dedup keeps the
+/// diagnostic log honest.
 ///
 /// The caller picks the first candidate that exists on disk.
 fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
-    let mut out = vec![
-        format!("{}/{}", cfg.rootfs, lib_name),
-        format!("{}/system/lib64/{}", cfg.rootfs, lib_name),
-        format!("{}/rootfs/system/lib64/{}", cfg.data_dir, lib_name),
-        format!("{}/rootfs/{}", cfg.data_dir, lib_name),
-    ];
+    let mut out: Vec<String> = Vec::with_capacity(8);
+    // Candidate #0: cfg.native_lib_dir (Java-passed nativeLibraryDir).
+    // See the function-level doc comment for why this is FIRST.
+    if let Some(native_lib_dir) = &cfg.native_lib_dir {
+        let trimmed = native_lib_dir.trim_end_matches('/');
+        if !trimmed.is_empty() {
+            out.push(format!("{}/{}", trimmed, lib_name));
+        }
+    }
+    // Candidates #1-#4: rootfs and app-level rootfs paths (RomManager's
+    // ensureLibSymlink targets).
+    out.push(format!("{}/{}", cfg.rootfs, lib_name));
+    out.push(format!("{}/system/lib64/{}", cfg.rootfs, lib_name));
+    out.push(format!("{}/rootfs/system/lib64/{}", cfg.data_dir, lib_name));
+    out.push(format!("{}/rootfs/{}", cfg.data_dir, lib_name));
     // Candidate #5+: scan the APK's native library directory directly.
     // This bypasses the rootfs symlink entirely -- the APK lib dir is
     // the canonical source. See `apk_native_lib_candidates` for the
     // full rationale (rootfs symlink is broken on KVM run 31501768195).
+    // NOTE: returns empty Vec when read_dir(/data/app/) is denied
+    // (untrusted_app on real devices) — that's expected, candidate #0
+    // covers that case.
     out.extend(apk_native_lib_candidates(lib_name));
+    // Deduplicate in place (preserving priority order). In production
+    // cfg.rootfs == {data_dir}/rootfs so candidates #1/#4 and #2/#3
+    // collapse; dedup removes the duplicates so the diagnostic log
+    // shows the true set of unique paths actually checked.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
     out
 }
 
@@ -706,7 +824,7 @@ fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
 /// scan two levels deep: each subdir of `base` is treated as a
 /// `~~<random>` bucket, and each subdir of THAT starting with
 /// `io.twoyi-` is treated as the APK root. Within each APK root we
-/// check `lib/x86_64/<lib>` and `lib/arm64/<lib>` (in that order;
+/// check `lib/x86_64/<lib>` and `lib/arm64-v8a/<lib>` (in that order;
 /// x86_64 is preferred because the devcontainer runner is x86_64).
 ///
 /// This is the canonical source of the libraries (installed by Android's
@@ -720,9 +838,42 @@ fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
 /// `/data/data/io.twoyi/profiles/default/rootfs/`). Scanning the APK
 /// directory directly bypasses all rootfs symlink state.
 ///
-/// This is a NO-OP (returns empty Vec) on non-Android environments
-/// (e.g., the Linux devcontainer where `/data/app/` doesn't exist) --
-/// which is exactly what we want for unit tests.
+/// # Layouts handled
+///
+/// This function handles BOTH standard Android APK install layouts:
+///
+/// 1. **Bucket layout** (Android 8.0+ / API 26+, including all modern
+///    emulators and devices): `/data/app/~~<rand>/<pkg>-<rand>/lib/<abi>/<lib>`.
+///    The `~~<rand>` "bucket" dirs randomize the parent path; we scan
+///    each bucket's subdirs for `<pkg>-<rand>`.
+///
+/// 2. **Direct layout** (older Android, and some custom ROMs that
+///    disable path randomization): `/data/app/<pkg>-<n>/lib/<abi>/<lib>`.
+///    Here the `<pkg>-<n>` dir is DIRECTLY under `/data/app/`, with no
+///    `~~<rand>` bucket level. The original code only handled layout
+///    (1) and silently returned 0 candidates on devices using layout
+///    (2) — this function now handles both.
+///
+/// # Permission caveat (CRITICAL)
+///
+/// `read_dir("/data/app/")` requires READ permission on `/data/app/`,
+/// which is mode 0771 (`rwxrwx--x`, owned by `system:system`). The
+/// "others" class only has `--x`, meaning untrusted_app processes CAN
+/// traverse (lookup known paths) but CANNOT listdir. This means:
+///
+///   * When kr64 runs as **root** (KVM e2e test, `su -c`): the scan
+///     succeeds and finds the library.
+///   * When kr64 runs as **untrusted_app** (real devices via the
+///     ptrace-emulation path): `read_dir("/data/app/")` returns
+///     `Err(EACCES)`, this function returns an empty Vec, and the
+///     caller falls back to candidate #0 (`TWOYI_NATIVE_LIB_DIR`),
+///     which is the Java-passed `nativeLibraryDir` — see
+///     [`hook_library_candidates`].
+///
+/// On read_dir failure, we log the OS error at WARNING level (NOT
+/// silently swallowed) so future debugging cycles can distinguish
+/// "no APK installed" (ENOENT) from "permission denied" (EACCES) from
+/// "APK installed but layout doesn't match" (0 candidates found).
 ///
 /// `base` is a parameter (rather than hardcoded to `/data/app/`) purely
 /// for testability -- the public wrapper [`apk_native_lib_candidates`]
@@ -731,41 +882,81 @@ fn apk_native_lib_candidates_in(base: &Path, lib_name: &str) -> Vec<String> {
     let mut out = Vec::new();
     let bucket_entries = match std::fs::read_dir(base) {
         Ok(rd) => rd,
-        Err(_) => return out, // base dir doesn't exist (non-Android env).
+        Err(e) => {
+            // Log the OS error so future debugging cycles can tell the
+            // difference between "no APK installed" (ENOENT) and
+            // "permission denied" (EACCES, the untrusted_app case).
+            // Without this log, the empty Vec looks identical to "APK
+            // installed but no lib match" — which sent the prior
+            // investigation down the wrong path (looking at ABI dir
+            // names instead of permissions).
+            warning!(
+                "[KR64] PARENT: apk_native_lib_candidates_in: read_dir({}) failed: {} — \
+                 if EACCES, this is expected for untrusted_app (no read perm on /data/app); \
+                 falling back to TWOYI_NATIVE_LIB_DIR candidate",
+                base.display(),
+                e
+            );
+            return out;
+        }
     };
-    for bucket_entry in bucket_entries.flatten() {
-        let bucket_path = bucket_entry.path(); // /data/app/~~<random>/
-        let apk_entries = match std::fs::read_dir(&bucket_path) {
-            Ok(rd) => rd,
-            Err(_) => continue,
+    for entry in bucket_entries.flatten() {
+        let entry_path = entry.path();
+        let entry_name = match entry.file_name().to_str() {
+            Some(s) => s.to_string(),
+            None => continue,
         };
-        for apk_entry in apk_entries.flatten() {
-            let apk_name_owned = apk_entry.file_name();
-            let apk_name = match apk_name_owned.to_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            // Only consider io.twoyi-* directories (skip other packages
-            // that may share the same ~~<random> bucket).
-            if !apk_name.starts_with("io.twoyi-") {
-                continue;
+        // Collect candidate APK roots from BOTH layouts in one pass:
+        //
+        //   * Direct layout: the entry itself starts with "io.twoyi-".
+        //     e.g. /data/app/io.twoyi-1/
+        //
+        //   * Bucket layout: the entry is a "~~<rand>" bucket dir; we
+        //     listdir it and look for "io.twoyi-*" subdirs.
+        //     e.g. /data/app/~~CUxx2UUjcOsBchPx-Qd61g==/io.twoyi-2Mhe.../
+        //
+        // The original code only handled the bucket layout, which silently
+        // broke on devices using the direct layout.
+        let mut apk_roots: Vec<std::path::PathBuf> = Vec::new();
+        if entry_name.starts_with("io.twoyi-") {
+            apk_roots.push(entry_path.clone());
+        }
+        // Only listdir the entry if its name DOESN'T already look like
+        // an io.twoyi-* package dir (avoid the redundant scan in the
+        // direct-layout case). For bucket dirs (starting with "~~" or
+        // any other name), we listdir to find io.twoyi-* subdirs.
+        if !entry_name.starts_with("io.twoyi-") {
+            if let Ok(sub_entries) = std::fs::read_dir(&entry_path) {
+                for sub_entry in sub_entries.flatten() {
+                    let sub_name = match sub_entry.file_name().to_str() {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    if sub_name.starts_with("io.twoyi-") {
+                        apk_roots.push(sub_entry.path());
+                    }
+                }
             }
-            // /data/app/~~<random>/io.twoyi-<random>/
-            let apk_path = apk_entry.path();
-            // Check all standard Android ABI directories.
-            // Android package manager extracts native libs to
-            // lib/<abi>/ where <abi> is one of:
-            //   x86_64, arm64-v8a, armeabi-v7a, x86
-            // (NOT "arm64" — that was a bug that caused the scan
-            // to miss arm64-v8a libs on real arm64 devices.)
-            //
-            // Iteration order matters: x86_64 is listed first because the
-            // devcontainer runner is x86_64, so we want the x86_64 copy to
-            // appear first in the candidate list (see the function-level
-            // doc comment and the `apk_native_lib_candidates_finds_lib_
-            // in_fake_apk_dir` test, which both rely on this ordering).
+            // Silently swallow read_dir errors on individual bucket
+            // dirs — a single unreadable bucket shouldn't abort the
+            // whole scan. The function-level EACCES log above covers
+            // the "all buckets unreadable" case (which is what matters).
+        }
+        // For each APK root, check all standard Android ABI dirs.
+        // Android package manager extracts native libs to
+        // lib/<abi>/ where <abi> is one of:
+        //   x86_64, arm64-v8a, armeabi-v7a, x86
+        // (NOT "arm64" — that was a bug that caused the scan
+        // to miss arm64-v8a libs on real arm64 devices.)
+        //
+        // Iteration order matters: x86_64 is listed first because the
+        // devcontainer runner is x86_64, so we want the x86_64 copy to
+        // appear first in the candidate list (see the function-level
+        // doc comment and the `apk_native_lib_candidates_finds_lib_
+        // in_fake_apk_dir` test, which both rely on this ordering).
+        for apk_root in &apk_roots {
             for abi in ["x86_64", "arm64-v8a", "armeabi-v7a", "x86"] {
-                let lib_path = apk_path.join("lib").join(abi).join(lib_name);
+                let lib_path = apk_root.join("lib").join(abi).join(lib_name);
                 if lib_path.is_file() {
                     out.push(lib_path.to_string_lossy().into_owned());
                 }
@@ -783,7 +974,10 @@ fn apk_native_lib_candidates(lib_name: &str) -> Vec<String> {
     let cands = apk_native_lib_candidates_in(Path::new("/data/app"), lib_name);
     if cands.is_empty() {
         info!(
-            "[KR64] PARENT: APK native lib scan for {} found no candidates in /data/app/",
+            "[KR64] PARENT: APK native lib scan for {} found no candidates in /data/app/ \
+             (this is expected if kr64 runs unprivileged — untrusted_app cannot listdir \
+             /data/app/. The TWOYI_NATIVE_LIB_DIR candidate (candidate #0 in \
+             hook_library_candidates) covers this case.)",
             lib_name
         );
     } else {
@@ -4578,6 +4772,260 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `apk_native_lib_candidates_in` must ALSO find the library under
+    /// the DIRECT APK install layout used by older Android and some
+    /// custom ROMs: `/data/app/<pkg>-<n>/lib/<abi>/<lib>` (no `~~<rand>`
+    /// bucket level). The original code only handled the bucket layout
+    /// and silently returned 0 candidates on devices using the direct
+    /// layout — this test guards against that regression.
+    #[test]
+    fn apk_native_lib_candidates_finds_lib_in_direct_layout() {
+        let tmp = std::env::temp_dir().join("twoyi-apk-scan-direct-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Direct layout: /data/app/io.twoyi-1/lib/<abi>/<lib>
+        // (NO ~~<rand> bucket level — the io.twoyi-* dir is directly
+        // under the base dir.)
+        let apk_root = tmp.join("io.twoyi-1");
+        let x86_64_lib = apk_root.join("lib/x86_64/twrp_fb_hook.so");
+        let arm64_lib = apk_root.join("lib/arm64-v8a/twrp_fb_hook.so");
+        std::fs::create_dir_all(x86_64_lib.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(arm64_lib.parent().unwrap()).unwrap();
+        std::fs::write(&x86_64_lib, b"fake i686 ELF in x86_64 dir").unwrap();
+        std::fs::write(&arm64_lib, b"fake aarch64 ELF").unwrap();
+
+        let cands = apk_native_lib_candidates_in(&tmp, "twrp_fb_hook.so");
+        assert_eq!(
+            cands.len(),
+            2,
+            "direct layout: expected 2 candidates (x86_64 + arm64-v8a), got: {:?}",
+            cands
+        );
+        assert!(
+            cands[0].ends_with("/lib/x86_64/twrp_fb_hook.so"),
+            "x86_64 must be first: {}",
+            cands[0]
+        );
+        assert!(
+            cands[1].ends_with("/lib/arm64-v8a/twrp_fb_hook.so"),
+            "arm64-v8a must be second: {}",
+            cands[1]
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `apk_native_lib_candidates_in` must find libs in BOTH layouts
+    /// simultaneously (e.g. an old direct-layout install + a new
+    /// bucket-layout install under the same /data/app/). The HONOR
+    /// NTH-NX9 device layout (`/data/app/~~CUxx...==/io.twoyi-XXX==/`)
+    /// is the bucket layout, but mixing both is the most defensive
+    /// test case.
+    #[test]
+    fn apk_native_lib_candidates_finds_lib_in_mixed_layouts() {
+        let tmp = std::env::temp_dir().join("twoyi-apk-scan-mixed-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Direct layout: /data/app/io.twoyi-1/lib/x86_64/<lib>
+        let direct_root = tmp.join("io.twoyi-1");
+        std::fs::create_dir_all(direct_root.join("lib/x86_64")).unwrap();
+        std::fs::write(
+            direct_root.join("lib/x86_64/twrp_fb_hook.so"),
+            b"direct-layout i686",
+        )
+        .unwrap();
+        // Bucket layout: /data/app/~~rand/io.twoyi-2/lib/arm64-v8a/<lib>
+        let bucket_root = tmp.join("~~rand").join("io.twoyi-2");
+        std::fs::create_dir_all(bucket_root.join("lib/arm64-v8a")).unwrap();
+        std::fs::write(
+            bucket_root.join("lib/arm64-v8a/twrp_fb_hook.so"),
+            b"bucket-layout aarch64",
+        )
+        .unwrap();
+
+        let cands = apk_native_lib_candidates_in(&tmp, "twrp_fb_hook.so");
+        assert_eq!(
+            cands.len(),
+            2,
+            "mixed layouts: expected 2 candidates (x86_64 + arm64-v8a), got: {:?}",
+            cands
+        );
+        // The exact order depends on the order entries come back from
+        // read_dir (filesystem-dependent); just verify both ABIs are
+        // present.
+        let has_x86_64 = cands
+            .iter()
+            .any(|p| p.ends_with("/lib/x86_64/twrp_fb_hook.so"));
+        let has_arm64 = cands
+            .iter()
+            .any(|p| p.ends_with("/lib/arm64-v8a/twrp_fb_hook.so"));
+        assert!(has_x86_64, "x86_64 candidate missing: {:?}", cands);
+        assert!(has_arm64, "arm64-v8a candidate missing: {:?}", cands);
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `hook_library_candidates` must DEDUPLICATE candidates when
+    /// `cfg.rootfs == format!("{}/rootfs", cfg.data_dir)` — the
+    /// production case (core.rs:get_rootfs_dir() returns
+    /// `{data_dir}/rootfs`). Without dedup, candidates #1/#4 and #2/#3
+    /// are identical, producing 4 log lines for 2 unique paths
+    /// (confirmed in HONOR NTH-NX9 kr64.log: 4 "checked:" lines, only
+    /// 2 unique paths).
+    #[test]
+    fn hook_library_candidates_deduplicates_when_rootfs_is_app_rootfs() {
+        // Mirror the production config: rootfs = {data_dir}/rootfs.
+        let data_dir = "/data/user/11/io.twoyi".to_string();
+        let rootfs = format!("{}/rootfs", data_dir); // matches core.rs
+        let cfg = Config {
+            rootfs,
+            data_dir,
+            native_lib_dir: None,
+            ..Config::default()
+        };
+        let cands = hook_library_candidates(&cfg, "twrp_fb_hook.so");
+        // The 4 documented candidates collapse to 2 unique paths after
+        // dedup (rootfs/{lib} == data_dir/rootfs/{lib}, and
+        // rootfs/system/lib64/{lib} == data_dir/rootfs/system/lib64/{lib}).
+        // The APK dir scan returns 0 entries on Linux.
+        assert_eq!(
+            cands.len(),
+            2,
+            "expected 2 UNIQUE candidates after dedup (rootfs == {{data_dir}}/rootfs), got {}: {:?}",
+            cands.len(),
+            cands
+        );
+        // Verify both unique paths are present.
+        let has_rootfs_root = cands
+            .iter()
+            .any(|p| p == "/data/user/11/io.twoyi/rootfs/twrp_fb_hook.so");
+        let has_rootfs_lib64 = cands
+            .iter()
+            .any(|p| p == "/data/user/11/io.twoyi/rootfs/system/lib64/twrp_fb_hook.so");
+        assert!(has_rootfs_root, "missing rootfs/<lib> candidate: {:?}", cands);
+        assert!(
+            has_rootfs_lib64,
+            "missing rootfs/system/lib64/<lib> candidate: {:?}",
+            cands
+        );
+    }
+
+    /// `hook_library_candidates` must put `cfg.native_lib_dir/<lib>` as
+    /// candidate #0 (highest priority) when `cfg.native_lib_dir` is
+    /// `Some`. This is the Java-passed `nativeLibraryDir` and is the
+    /// ONLY reliable APK-source candidate on real devices (where kr64
+    /// runs unprivileged and can't listdir /data/app/).
+    #[test]
+    fn hook_library_candidates_native_lib_dir_is_candidate_zero() {
+        let cfg = Config {
+            rootfs: "/r".to_string(),
+            data_dir: "/d".to_string(),
+            native_lib_dir: Some("/data/app/~~rand/io.twoyi-rand/lib/x86_64".to_string()),
+            ..Config::default()
+        };
+        let cands = hook_library_candidates(&cfg, "twrp_fb_hook.so");
+        assert!(
+            !cands.is_empty(),
+            "expected at least one candidate, got empty list"
+        );
+        // Candidate #0 must be {native_lib_dir}/<lib>.
+        assert_eq!(
+            cands[0],
+            "/data/app/~~rand/io.twoyi-rand/lib/x86_64/twrp_fb_hook.so",
+            "native_lib_dir must be candidate #0 (highest priority): {:?}",
+            cands
+        );
+        // The remaining candidates must be the 4 documented rootfs
+        // paths (no duplicates since /r != /d/rootfs).
+        assert!(
+            cands.len() >= 5,
+            "expected at least 5 candidates (1 native_lib_dir + 4 rootfs), got {}: {:?}",
+            cands.len(),
+            cands
+        );
+    }
+
+    /// `hook_library_candidates` must NOT add the native_lib_dir
+    /// candidate when `cfg.native_lib_dir` is `None` (the default).
+    /// This is the case when kr64 is launched without the
+    /// `TWOYI_NATIVE_LIB_DIR` env var (e.g. unit tests, or old Java
+    /// side that doesn't pass it yet).
+    #[test]
+    fn hook_library_candidates_omits_native_lib_dir_when_none() {
+        let cfg = Config {
+            rootfs: "/r".to_string(),
+            data_dir: "/d".to_string(),
+            native_lib_dir: None,
+            ..Config::default()
+        };
+        let cands = hook_library_candidates(&cfg, "libgetpid_hook.so");
+        // All candidates must start with /r/ or /d/ (no separate
+        // native_lib_dir prefix).
+        assert!(
+            cands
+                .iter()
+                .all(|p| p.starts_with("/r/") || p.starts_with("/d/")),
+            "no native_lib_dir candidate expected when cfg.native_lib_dir is None: {:?}",
+            cands
+        );
+    }
+
+    /// `parse_args` must accept the new `--native-lib-dir <path>` flag
+    /// and store it in `cfg.native_lib_dir`. This is the explicit
+    /// override path (the env var path is tested separately).
+    #[test]
+    fn parse_args_native_lib_dir_flag_sets_field() {
+        let cfg = parse_args(args(&[
+            "--rootfs",
+            "/r",
+            "--data-dir",
+            "/d",
+            "--native-lib-dir",
+            "/data/app/~~rand/io.twoyi-rand/lib/x86_64",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.native_lib_dir.as_deref(),
+            Some("/data/app/~~rand/io.twoyi-rand/lib/x86_64")
+        );
+    }
+
+    /// `parse_args` must reject an empty `--native-lib-dir` argument
+    /// with a clear error (rather than silently storing an empty
+    /// string that would later confuse `hook_library_candidates`).
+    #[test]
+    fn parse_args_native_lib_dir_rejects_empty() {
+        let r = parse_args(args(&[
+            "--rootfs",
+            "/r",
+            "--data-dir",
+            "/d",
+            "--native-lib-dir",
+            "",
+        ]));
+        assert!(r.is_err(), "empty --native-lib-dir must error");
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("--native-lib-dir"),
+            "error must mention --native-lib-dir: {}",
+            err
+        );
+    }
+
+    /// `--native-lib-dir` is mentioned in `--help` so users discover
+    /// it (consistent with the other documented flags).
+    #[test]
+    fn parse_args_help_mentions_native_lib_dir() {
+        let r = parse_args(args(&["--help"]));
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("--native-lib-dir"),
+            "--help must mention --native-lib-dir: {}",
+            err
+        );
     }
 
     /// `candidate_exists_with_diagnostics` returns false for a broken

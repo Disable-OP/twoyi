@@ -376,6 +376,37 @@ pub fn init_renderer(
         // is the path to libloader.so in the same dir.
         let kr64_path = loader_path.replace("libloader.so", "libkr64.so");
 
+        // Derive the app's nativeLibraryDir from loader_path. This is the
+        // directory where Android's package manager extracted the APK's
+        // lib/<abi>/*.so files at install time (extractNativeLibs=true).
+        // We pass it to kr64 via the TWOYI_NATIVE_LIB_DIR env var so kr64
+        // can directly read twrp_fb_hook.so (and other hook libs) from
+        // <nativeLibraryDir>/<lib> WITHOUT scanning /data/app/.
+        //
+        // Why this matters: kr64's apk_native_lib_candidates_in() does
+        // read_dir("/data/app/") to find the APK install dir, but
+        // /data/app/ is mode 0771 (rwxrwx--x) — untrusted_app CANNOT
+        // listdir it (only traverse). So on real devices where kr64
+        // runs unprivileged (the ptrace-emulation path), the scan
+        // returns 0 candidates and the hook library is "not found".
+        // Passing the path from Java (where ApplicationInfo.nativeLibraryDir
+        // is known and the app CAN read its own APK lib dir) sidesteps
+        // the permission issue entirely. See lib.rs::hook_library_candidates
+        // candidate #0 for the consumer of this env var.
+        let native_lib_dir = loader_path
+            .rsplitn(2, '/')
+            .nth(1)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if !native_lib_dir.is_empty() {
+            info!("[CORE] Passing TWOYI_NATIVE_LIB_DIR={} to kr64", native_lib_dir);
+        } else {
+            log::warn!(
+                "[CORE] Could not derive nativeLibraryDir from loader_path='{}' — \
+                 kr64 will fall back to the /data/app/ scan (which fails on real devices)",
+                loader_path
+            );
+        }
         let ld_library_path = format!(
             "{root}/system/lib64:{root}/system/lib64/bootstrap:{root}/system/lib64/vndk-sp-29:{root}/system/lib64/vndk-29:{root}/system/lib64/apex:{root}/system/lib",
             root = working_dir
@@ -468,6 +499,14 @@ pub fn init_renderer(
         cmd.env("TYLD_PRELOAD", "");
         cmd.env("TWOYI_ROOTFS", &working_dir);
         cmd.env("TYLOADER", &loader_path);
+        // Pass the app's nativeLibraryDir (derived from loader_path above)
+        // so kr64 can find hook libraries (twrp_fb_hook.so, libgetpid_hook.so,
+        // libtwoyi_loader_shlib.so) without scanning /data/app/ — which is
+        // mode 0771 and unreadable for untrusted_app. See lib.rs's
+        // hook_library_candidates() candidate #0 for the consumer.
+        if !native_lib_dir.is_empty() {
+            cmd.env("TWOYI_NATIVE_LIB_DIR", &native_lib_dir);
+        }
         cmd.env("ANDROID_BOOTLOGO", "1");
         cmd.env("ANDROID_ROOT", format!("{}/system", working_dir));
         cmd.env("ANDROID_DATA", format!("{}/data", working_dir));
