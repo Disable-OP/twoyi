@@ -233,10 +233,12 @@ pub fn init_renderer(
                 let vh = virtual_height;
                 let sw = surface_width;
                 let sh = surface_height;
-                // Wrap again for the inner thread spawn.
+                // Wrap the raw pointer in SendPtr for the inner thread spawn.
+                // We pass the SendPtr (not the raw pointer) to the spawned
+                // thread so Rust's Send checker is satisfied.
                 let inner_wrap = SendPtr(window);
                 std::thread::spawn(move || {
-                    twrp_fb_render_loop(inner_wrap.0, fb_path, sw, sh, vw, vh);
+                    twrp_fb_render_loop_wrapper(inner_wrap, fb_path, sw, sh, vw, vh);
                 });
             } else {
                 info!("[CORE] Starting AOSP libOpenglRender.so");
@@ -728,11 +730,23 @@ const TWRP_FB_SIZE: usize = TWRP_FB_WIDTH * TWRP_FB_HEIGHT * TWRP_FB_BPP;
 /// to the ANativeWindow (SurfaceView). This makes the TWRP UI visible
 /// in the Java app without requiring OpenGL ES.
 ///
-/// `window` is a raw ANativeWindow* pointer.
+/// `window` is a raw ANativeWindow* pointer (wrapped in SendPtr for
+/// thread safety).
 /// `fb_path` is the host path to the fb0 file (e.g.
 /// "/data/user/0/io.twoyi/rootfs/dev/graphics/fb0").
 /// `surface_width`/`surface_height` are the physical SurfaceView dimensions.
 /// `virtual_width`/`virtual_height` are the TWRP display dimensions (720x1280).
+fn twrp_fb_render_loop_wrapper(
+    window: SendPtr,
+    fb_path: String,
+    surface_width: i32,
+    surface_height: i32,
+    virtual_width: i32,
+    virtual_height: i32,
+) {
+    twrp_fb_render_loop(window.0, fb_path, surface_width, surface_height, virtual_width, virtual_height);
+}
+
 fn twrp_fb_render_loop(
     window: *mut c_void,
     fb_path: String,
