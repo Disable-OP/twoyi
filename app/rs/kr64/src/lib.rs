@@ -984,6 +984,186 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
     }
 }
 
+/// Patch TWRP's init binary to skip the mknod-failure check in klog_init().
+///
+/// ROOT CAUSE (Task ID 22, KVM run 31553069752): TWRP init's klog_init()
+/// function (in libcutils, statically linked into /init) does:
+///
+/// ```text
+///   1. mknod("/dev/__kmsg__", S_IFCHR|0600, makedev(1, 11))
+///   2. if (mknod failed) return;          <-- THIS is the bug
+///   3. open("/dev/__kmsg__", O_WRONLY)
+///   4. fcntl(klog_fd, F_SETFD, FD_CLOEXEC)
+///   5. unlink("/dev/__kmsg__")
+/// ```
+///
+/// kr64 creates `/dev/__kmsg__` as a symlink to `/twrp-kmsg.log` (a regular
+/// file on the ext4 rootfs) so that KLOG writes are captured to a file we
+/// can `adb pull` after the run. But the mknod call FAILS with EEXIST
+/// (because the symlink exists, and mknod does NOT follow symlinks for the
+/// final path component). klog_init then RETURNS EARLY — it never calls
+/// open(). `klog_fd` stays at -1, and ALL subsequent KLOG_INFO / KLOG_ERROR
+/// writes silently fail (write(-1, ...) returns -1 EBADF).
+///
+/// Symptom (KVM run 31553069752):
+///   * `/twrp-kmsg.log` is 0 bytes (empty)
+///   * `twrp-init-fds.log` shows `3 -> /dev/__kmsg__ (deleted)` — but the
+///     `deleted` here is misleading; init opened the char device created
+///     by an EARLIER klog_init call (during the AOSP libcutils static
+///     init), not our symlink. Our symlink was unlinked by that earlier
+///     call before the disassembled klog_init() even ran.
+///   * `dmesg.log` shows ONLY the host Android init's "Could not set
+///     execcon" flood — TWRP init's KLOG messages were either never
+///     written (because klog_fd == -1) or pushed out of the host's
+///     printk ring buffer within ~12 s.
+///   * `twrp-guest-tree.log` shows init + ueventd + thermald but NO
+///     `recovery` process — `class_start default` ran (thermald is in
+///     `class core`, which runs AFTER `class_start default`), so recovery
+///     was started but its exec failed silently. Without KLOG we cannot
+///     see the error message.
+///
+/// Disassembly of klog_init (TWRP 3.7.0_9-0, AOSP 5.1-based, i386 static):
+///
+/// ```text
+///   805fec8: c7 44 24 08 0b 01 00 00     mov    DWORD PTR [esp+0x8],0x10b
+///   805fed0: 8d b3 d2 af fe ff           lea    esi,[ebx-0x1502e]  ; "/dev/__kmsg__"
+///   805fed6: c7 44 24 04 80 21 00 00     mov    DWORD PTR [esp+0x4],0x2180
+///   805fede: 89 34 24                    mov    [esp],esi
+///   805fee1: e8 7a 9f 00 00              call   8069e60 <mknod>
+///   805fee6: 85 c0                       test   eax,eax
+///   805fee8: 75 d4                       jne    805febe <return>   ; <-- bug
+///   805feea: c7 44 24 04 01 00 00 00     mov    DWORD PTR [esp+0x4],0x1   ; O_WRONLY
+///   805fef2: 89 34 24                    mov    [esp],esi
+///   805fef5: e8 46 23 03 00              call   8092240 <open>
+///   ...
+///   805ff1f: e8 dc 9e 00 00              call   8069e00 <unlink>
+///   805ff24: eb 98                       jmp    805febe <return>
+/// ```
+///
+/// FIX: search for the 32-byte instruction sequence that uniquely identifies
+/// the mknod-failure check inside klog_init, then replace the 2-byte `jne`
+/// instruction (`75 ??`) with two NOPs (`90 90`). This makes klog_init
+/// continue to `open()` even if mknod fails. open() then follows the
+/// symlink and opens `/twrp-kmsg.log` (a regular file on ext4). All KLOG
+/// writes via `klog_fd` go to `/twrp-kmsg.log`, which survives kr64's
+/// SIGKILL for KVM log retrieval.
+///
+/// The patch is IDEMPOTENT: if `jne` is already `90 90`, we return true
+/// without modification. The patch is REVERSIBLE: it only changes 2 bytes.
+///
+/// # Arguments
+/// * `init_bytes` - The init binary's bytes (read from `{rootfs}/init`).
+///
+/// # Returns
+/// * `true` if the patch was applied (or was already applied).
+/// * `false` if the pattern was not found — the init binary has a different
+///   layout (perhaps a different TWRP version) and the patch cannot be
+///   applied safely. The caller should log a warning but continue boot.
+fn patch_twrp_init_klog_init(init_bytes: &mut [u8]) -> bool {
+    // klog_init's distinctive instruction sequence (i386, TWRP 3.7.0_9-0).
+    // We match 32 bytes of fixed instructions ending just before the `jne`,
+    // then verify the byte at offset 32 is `0x75` (jne) before patching.
+    //
+    //   mov DWORD PTR [esp+0x8], 0x10b   ; c7 44 24 08 0b 01 00 00
+    //                                     (dev = makedev(1, 11) = 0x10b)
+    //   lea esi, [ebx-0x1502e]           ; 8d b3 d2 af fe ff
+    //                                     (esi = ptr to "/dev/__kmsg__")
+    //   mov DWORD PTR [esp+0x4], 0x2180  ; c7 44 24 04 80 21 00 00
+    //                                     (mode = S_IFCHR | 0600 = 0x2180)
+    //   mov [esp], esi                   ; 89 34 24
+    //   call mknod                       ; e8 ?? ?? ?? ?? (relative call)
+    //   test eax, eax                    ; 85 c0
+    //   jne <return>                     ; 75 ?? (THIS is what we patch)
+    //
+    // We use a slice of Option<u8>: Some(b) means "must equal b", None means
+    // "wildcard" (for the call's relative offset and the jne's offset).
+    const PATTERN: [Option<u8>; 34] = [
+        // mov DWORD PTR [esp+0x8], 0x10b
+        Some(0xc7),
+        Some(0x44),
+        Some(0x24),
+        Some(0x08),
+        Some(0x0b),
+        Some(0x01),
+        Some(0x00),
+        Some(0x00),
+        // lea esi, [ebx-0x1502e]
+        Some(0x8d),
+        Some(0xb3),
+        Some(0xd2),
+        Some(0xaf),
+        Some(0xfe),
+        Some(0xff),
+        // mov DWORD PTR [esp+0x4], 0x2180
+        Some(0xc7),
+        Some(0x44),
+        Some(0x24),
+        Some(0x04),
+        Some(0x80),
+        Some(0x21),
+        Some(0x00),
+        Some(0x00),
+        // mov [esp], esi
+        Some(0x89),
+        Some(0x34),
+        Some(0x24),
+        // call mknod (e8 + 4-byte signed relative offset)
+        Some(0xe8),
+        None,
+        None,
+        None,
+        None,
+        // test eax, eax
+        Some(0x85),
+        Some(0xc0),
+        // jne <offset> or NOP NOP (if already patched) — use wildcards
+        // so the pattern matches BOTH unpatched (0x75) and patched (0x90).
+        // The actual byte check is done after the pattern matches.
+        None,
+        None,
+    ];
+    const JNE_OFFSET: usize = 32; // index of the jne/NOP byte within PATTERN
+
+    if init_bytes.len() < PATTERN.len() {
+        return false;
+    }
+    for i in 0..=(init_bytes.len() - PATTERN.len()) {
+        let mut matched = true;
+        for (j, p) in PATTERN.iter().enumerate() {
+            if let Some(b) = p {
+                if init_bytes[i + j] != *b {
+                    matched = false;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            continue;
+        }
+        // Pattern matched. The byte at offset i + JNE_OFFSET must be 0x75
+        // (jne) for an unpatched binary, or 0x90 (nop) for an already-
+        // patched binary. Any other value means the pattern matched by
+        // coincidence and we should NOT patch (could be a different binary
+        // or a different code path).
+        let jne = init_bytes[i + JNE_OFFSET];
+        let jne_off2 = i + JNE_OFFSET + 1;
+        if jne == 0x90 && init_bytes[jne_off2] == 0x90 {
+            // Already patched.
+            return true;
+        }
+        if jne == 0x75 {
+            // Apply the patch: replace `75 ??` with `90 90`.
+            init_bytes[i + JNE_OFFSET] = 0x90;
+            init_bytes[jne_off2] = 0x90;
+            return true;
+        }
+        // Unexpected byte at jne location — pattern matched but the next
+        // byte isn't a jne. Don't patch (could brick the binary).
+        return false;
+    }
+    false
+}
+
 /// Set the SELinux security context of a file using the `lsetxattr(2)`
 /// syscall directly.
 ///
@@ -2324,6 +2504,54 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
             Err(e) => warning!(
                 "[KR64] PARENT: failed to read init.rc for LD_PRELOAD patching: {} (recovery will crash in libminuitwrp.so)",
+                e
+            ),
+        }
+    }
+
+    // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
+    // check in klog_init(). See `patch_twrp_init_klog_init` for the full
+    // root-cause analysis.
+    //
+    // Without this patch, kr64's /dev/__kmsg__ -> /twrp-kmsg.log symlink
+    // is useless: TWRP init's klog_init() calls mknod("/dev/__kmsg__", ...)
+    // FIRST, which fails with EEXIST (because the symlink exists), and
+    // klog_init() returns early WITHOUT calling open(). klog_fd stays at
+    // -1, and ALL KLOG writes are silently dropped. /twrp-kmsg.log stays
+    // empty, and we cannot see TWRP init's "starting service 'recovery'"
+    // message or any error messages — making the recovery-not-starting
+    // issue impossible to diagnose.
+    //
+    // The patch is a 2-byte NOP-out of the `jne <return>` after the
+    // mknod-failure check. This makes klog_init continue to open() even
+    // if mknod fails. open() follows our symlink and opens /twrp-kmsg.log
+    // (a regular file on ext4). KLOG writes are then captured.
+    //
+    // The patch is IDEMPOTENT (skipped if already applied) and is safe
+    // to apply on every boot — if the pattern isn't found (e.g. a
+    // different TWRP version), we log a warning and continue.
+    if cfg.boot_recovery {
+        let init_path = format!("{}/init", rootfs_prefix);
+        match std::fs::read(&init_path) {
+            Ok(mut bytes) => {
+                if patch_twrp_init_klog_init(&mut bytes) {
+                    match std::fs::write(&init_path, &bytes) {
+                        Ok(()) => info!(
+                            "[KR64] PARENT: patched /init klog_init() — NOP'd jne after mknod failure (KLOG will be captured to /twrp-kmsg.log)"
+                        ),
+                        Err(e) => warning!(
+                            "[KR64] PARENT: patched /init in memory but failed to write back: {} (KLOG capture may not work)",
+                            e
+                        ),
+                    }
+                } else {
+                    warning!(
+                        "[KR64] PARENT: could not find klog_init mknod-failure pattern in /init (TWRP version mismatch?) — KLOG capture via /dev/__kmsg__ symlink will NOT work"
+                    );
+                }
+            }
+            Err(e) => warning!(
+                "[KR64] PARENT: failed to read /init for klog_init patching: {} (KLOG capture may not work)",
                 e
             ),
         }
@@ -3950,5 +4178,329 @@ mod tests {
             count, 1,
             "only the first recovery service should be patched"
         );
+    }
+
+    /// Build a 34-byte klog_init instruction sequence matching the pattern
+    /// that `patch_twrp_init_klog_init` searches for. The `jne_offset`
+    /// parameter fills the wildcard byte after `0x75` (jne).
+    fn build_klog_init_pattern(jne_offset: u8) -> Vec<u8> {
+        let mut v = Vec::new();
+        // mov DWORD PTR [esp+0x8], 0x10b
+        v.extend_from_slice(&[0xc7, 0x44, 0x24, 0x08, 0x0b, 0x01, 0x00, 0x00]);
+        // lea esi, [ebx-0x1502e]
+        v.extend_from_slice(&[0x8d, 0xb3, 0xd2, 0xaf, 0xfe, 0xff]);
+        // mov DWORD PTR [esp+0x4], 0x2180
+        v.extend_from_slice(&[0xc7, 0x44, 0x24, 0x04, 0x80, 0x21, 0x00, 0x00]);
+        // mov [esp], esi
+        v.extend_from_slice(&[0x89, 0x34, 0x24]);
+        // call mknod (relative call: e8 + 4-byte signed offset, here 0x7a 0x9f 0x00 0x00)
+        v.extend_from_slice(&[0xe8, 0x7a, 0x9f, 0x00, 0x00]);
+        // test eax, eax
+        v.extend_from_slice(&[0x85, 0xc0]);
+        // jne <offset>
+        v.extend_from_slice(&[0x75, jne_offset]);
+        assert_eq!(v.len(), 34);
+        v
+    }
+
+    /// `patch_twrp_init_klog_init` must find the mknod-failure pattern in
+    /// an unpatched binary and replace the `jne` (75 ??) with two NOPs
+    /// (90 90).
+    #[test]
+    fn patch_twrp_init_klog_init_applies_to_unpatched_binary() {
+        let mut bytes = build_klog_init_pattern(0xd4);
+        // The patch should succeed.
+        assert!(
+            patch_twrp_init_klog_init(&mut bytes),
+            "patch should apply to unpatched binary"
+        );
+        // The jne at offset 32 should now be 90 90 (two NOPs).
+        assert_eq!(bytes[32], 0x90, "jne byte 0 should be NOP'd");
+        assert_eq!(bytes[33], 0x90, "jne byte 1 should be NOP'd");
+    }
+
+    /// `patch_twrp_init_klog_init` must be IDEMPOTENT: applying it twice
+    /// yields the same result as applying it once.
+    #[test]
+    fn patch_twrp_init_klog_init_is_idempotent() {
+        let mut bytes = build_klog_init_pattern(0xd4);
+        assert!(patch_twrp_init_klog_init(&mut bytes), "first patch");
+        let after_first = bytes.clone();
+        assert!(
+            patch_twrp_init_klog_init(&mut bytes),
+            "second patch (idempotent)"
+        );
+        assert_eq!(
+            bytes, after_first,
+            "second patch should not modify the binary"
+        );
+    }
+
+    /// `patch_twrp_init_klog_init` must find the pattern even when it's
+    /// embedded in a larger binary (with prefix and suffix bytes).
+    #[test]
+    fn patch_twrp_init_klog_init_finds_pattern_in_context() {
+        // 256 bytes of random-ish prefix, then the pattern, then 64 bytes
+        // of suffix. The function should find the pattern and patch only
+        // the jne.
+        let mut bytes = Vec::new();
+        // Prefix: 0x90 (NOP) sled to make sure we don't match by accident.
+        bytes.extend(std::iter::repeat_n(0x90u8, 256));
+        // The pattern.
+        let pattern = build_klog_init_pattern(0x2a);
+        bytes.extend_from_slice(&pattern);
+        // Suffix.
+        bytes.extend(std::iter::repeat_n(0xccu8, 64));
+
+        let jne_file_offset = 256 + 32; // pattern_start + 32
+        assert_eq!(bytes[jne_file_offset], 0x75, "jne should be unpatched");
+        assert_eq!(bytes[jne_file_offset + 1], 0x2a, "jne offset byte");
+
+        assert!(patch_twrp_init_klog_init(&mut bytes), "patch should apply");
+        assert_eq!(bytes[jne_file_offset], 0x90, "jne byte 0 should be NOP'd");
+        assert_eq!(
+            bytes[jne_file_offset + 1],
+            0x90,
+            "jne byte 1 should be NOP'd"
+        );
+        // Prefix and suffix should be untouched.
+        for (i, b) in bytes.iter().enumerate() {
+            if (256..256 + 32).contains(&i) {
+                // Pattern prefix (before jne) — should be unchanged.
+                assert_eq!(
+                    *b,
+                    pattern[i - 256],
+                    "pattern byte at {} should be unchanged",
+                    i
+                );
+            } else if i < 256 {
+                // Prefix.
+                assert_eq!(*b, 0x90, "prefix byte at {} should be unchanged", i);
+            } else if (256 + 34..256 + 34 + 64).contains(&i) {
+                // Suffix.
+                assert_eq!(*b, 0xcc, "suffix byte at {} should be unchanged", i);
+            }
+        }
+    }
+
+    /// `patch_twrp_init_klog_init` must return false if the pattern is not
+    /// found (e.g. a different TWRP version with a different code layout).
+    /// This is important — we must NOT silently corrupt an unknown binary.
+    #[test]
+    fn patch_twrp_init_klog_init_returns_false_if_pattern_not_found() {
+        // 256 bytes of 0x90 (NOP) — doesn't contain the pattern.
+        let mut bytes = vec![0x90u8; 256];
+        assert!(
+            !patch_twrp_init_klog_init(&mut bytes),
+            "should return false if pattern is not found"
+        );
+        // Bytes should be unchanged.
+        assert!(
+            bytes.iter().all(|&b| b == 0x90),
+            "bytes should be unchanged"
+        );
+    }
+
+    /// `patch_twrp_init_klog_init` must NOT patch if the byte after `0x75`
+    /// (jne) is not what we expect — i.e. if the pattern matched by
+    /// coincidence but the next instruction isn't a jne. We must be
+    /// conservative and not corrupt the binary.
+    #[test]
+    fn patch_twrp_init_klog_init_does_not_patch_if_jne_byte_unexpected() {
+        // Build a pattern that matches up to byte 31, then has `0x75` at
+        // offset 32, but with a strange byte after it... actually our
+        // pattern requires `0x75` at offset 32 and patches the byte at
+        // offset 33. So if `0x75` is present, we always patch.
+        //
+        // Instead, test the case where the byte at offset 32 is NEITHER
+        // 0x75 (jne) NOR 0x90 (already patched). We modify the pattern
+        // so the byte at offset 32 is 0xeb (jmp) — which means the pattern
+        // matched by coincidence but it's not a jne.
+        let mut bytes = build_klog_init_pattern(0xd4);
+        bytes[32] = 0xeb; // jmp instead of jne
+                          // The function should detect this and NOT patch.
+        assert!(
+            !patch_twrp_init_klog_init(&mut bytes),
+            "should NOT patch if byte at jne location is unexpected"
+        );
+        // Byte at offset 32 should be unchanged.
+        assert_eq!(bytes[32], 0xeb, "byte at jne location should be unchanged");
+    }
+
+    /// `patch_twrp_init_klog_init` must work on a real TWRP init binary
+    /// extracted from `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`. This
+    /// is a regression test: if the TWRP version changes, this test will
+    /// fail (alerting us to update the pattern).
+    #[test]
+    fn patch_twrp_init_klog_init_works_on_real_twrp_init_binary() {
+        // The TWRP boot image is at `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`
+        // (relative to the repo root). We need to extract the ramdisk,
+        // decompress it, and read the /init file.
+        //
+        // This test is somewhat slow (it parses a 7 MB ramdisk) but it's
+        // the most important regression test — it verifies the pattern
+        // matches the actual TWRP init binary we ship.
+        let boot_img_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img");
+        if !boot_img_path.exists() {
+            eprintln!(
+                "skip: TWRP boot image not found at {} (this is OK in CI without assets)",
+                boot_img_path.display()
+            );
+            return;
+        }
+        // Read the boot image, extract ramdisk, decompress, parse cpio,
+        // and find the /init entry.
+        let boot_bytes = match std::fs::read(&boot_img_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: failed to read TWRP boot image: {}", e);
+                return;
+            }
+        };
+        if boot_bytes.len() < 0x1000 || &boot_bytes[..8] != b"ANDROID!" {
+            eprintln!("skip: TWRP boot image is not a valid Android boot image");
+            return;
+        }
+        // Parse Android boot image header (v0).
+        let kernel_size =
+            u32::from_le_bytes([boot_bytes[8], boot_bytes[9], boot_bytes[10], boot_bytes[11]])
+                as usize;
+        let ramdisk_size = u32::from_le_bytes([
+            boot_bytes[16],
+            boot_bytes[17],
+            boot_bytes[18],
+            boot_bytes[19],
+        ]) as usize;
+        let page_size = u32::from_le_bytes([
+            boot_bytes[36],
+            boot_bytes[37],
+            boot_bytes[38],
+            boot_bytes[39],
+        ]) as usize;
+        if page_size == 0 || kernel_size == 0 || ramdisk_size == 0 {
+            eprintln!("skip: TWRP boot image has invalid header");
+            return;
+        }
+        let ramdisk_off = page_size + kernel_size.div_ceil(page_size) * page_size;
+        if ramdisk_off + ramdisk_size > boot_bytes.len() {
+            eprintln!("skip: TWRP boot image ramdisk truncated");
+            return;
+        }
+        let ramdisk_gz = &boot_bytes[ramdisk_off..ramdisk_off + ramdisk_size];
+        // Verify gzip magic.
+        if ramdisk_gz.len() < 2 || ramdisk_gz[0] != 0x1f || ramdisk_gz[1] != 0x8b {
+            eprintln!("skip: TWRP ramdisk is not gzip-compressed");
+            return;
+        }
+        // Decompress gzip using flate2 if available; otherwise skip.
+        // We use std::io::Read with a Cursor to decompress.
+        let ramdisk_cpio = match decompress_gzip(ramdisk_gz) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: failed to decompress TWRP ramdisk: {}", e);
+                return;
+            }
+        };
+        // Parse cpio (newc format) and find the "init" entry.
+        let init_bytes = match find_cpio_entry(&ramdisk_cpio, b"init") {
+            Some(b) => b,
+            None => {
+                eprintln!("skip: /init not found in TWRP ramdisk cpio");
+                return;
+            }
+        };
+        // Verify the pattern is present (unpatched).
+        let pattern_len = 34;
+        assert!(
+            init_bytes.len() >= pattern_len,
+            "init binary too small: {} bytes",
+            init_bytes.len()
+        );
+        // Find the pattern manually to verify it's there pre-patch.
+        let mut found_unpatched = false;
+        for i in 0..=(init_bytes.len() - pattern_len) {
+            if init_bytes[i + 32] == 0x75 {
+                let p = &init_bytes[i..i + 32];
+                if p[0..8] == [0xc7, 0x44, 0x24, 0x08, 0x0b, 0x01, 0x00, 0x00]
+                    && p[8..14] == [0x8d, 0xb3, 0xd2, 0xaf, 0xfe, 0xff]
+                    && p[14..22] == [0xc7, 0x44, 0x24, 0x04, 0x80, 0x21, 0x00, 0x00]
+                    && p[22..25] == [0x89, 0x34, 0x24]
+                    && p[25] == 0xe8
+                    && p[30..32] == [0x85, 0xc0]
+                {
+                    found_unpatched = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_unpatched,
+            "klog_init mknod-failure pattern should be present in real TWRP init binary (TWRP version may have changed — update patch_twrp_init_klog_init pattern)"
+        );
+        // Apply the patch.
+        let mut init_bytes_mut = init_bytes.clone();
+        assert!(
+            patch_twrp_init_klog_init(&mut init_bytes_mut),
+            "patch should apply to real TWRP init binary"
+        );
+        // Apply again — should be idempotent.
+        assert!(
+            patch_twrp_init_klog_init(&mut init_bytes_mut),
+            "patch should be idempotent on real TWRP init binary"
+        );
+    }
+
+    /// Decompress a gzip-encoded byte slice using flate2.
+    fn decompress_gzip(input: &[u8]) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        // flate2 is a dependency of kr64 (used elsewhere); we use it here
+        // to decompress the TWRP ramdisk.
+        let decoder = flate2::read::GzDecoder::new(input);
+        let mut out = Vec::with_capacity(input.len() * 8);
+        decoder.take(64 * 1024 * 1024).read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Find a regular file entry in a cpio newc archive by name.
+    /// Returns the file's bytes, or None if not found.
+    fn find_cpio_entry(cpio: &[u8], name: &[u8]) -> Option<Vec<u8>> {
+        let mut pos = 0;
+        while pos + 110 <= cpio.len() {
+            if &cpio[pos..pos + 6] != b"070701" {
+                return None;
+            }
+            pos += 6;
+            // 13 8-char hex fields
+            let mut fields = [0u32; 13];
+            for i in 0..13 {
+                let s = std::str::from_utf8(&cpio[pos + i * 8..pos + (i + 1) * 8]).ok()?;
+                fields[i] = u32::from_str_radix(s, 16).ok()?;
+            }
+            pos += 13 * 8;
+            let mode = fields[1];
+            let filesize = fields[6] as usize;
+            let namesize = fields[11] as usize;
+            if pos + namesize > cpio.len() {
+                return None;
+            }
+            let entry_name = &cpio[pos..pos + namesize.saturating_sub(1)];
+            pos += namesize;
+            pos = (pos + 3) & !3;
+            if entry_name == b"TRAILER!!!" {
+                return None;
+            }
+            if pos + filesize > cpio.len() {
+                return None;
+            }
+            let data = &cpio[pos..pos + filesize];
+            pos += filesize;
+            pos = (pos + 3) & !3;
+            // Regular file?
+            if (mode >> 12) == 0o10 && entry_name == name {
+                return Some(data.to_vec());
+            }
+        }
+        None
     }
 }
