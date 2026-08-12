@@ -60,9 +60,12 @@ public class RamdiskImporter {
         }
 
         Log.i(TAG, "Import file size: " + tempFile.length() + " bytes");
+        FileLogger.i(TAG, "Import file size: " + tempFile.length() + " bytes");
 
         String format = detectFormat(tempFile);
         Log.i(TAG, "Detected format: " + format);
+        FileLogger.i(TAG, "Detected format: " + format);
+        FileLogger.boot("ramdisk_import_format_detected", "format=" + format + " size=" + tempFile.length());
 
         boolean result;
         switch (format) {
@@ -108,6 +111,7 @@ public class RamdiskImporter {
         }
 
         tempFile.delete();
+        FileLogger.boot("ramdisk_import_complete", "result=" + result);
         return result;
     }
 

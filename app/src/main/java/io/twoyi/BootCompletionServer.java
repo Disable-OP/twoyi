@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import io.twoyi.utils.FileLogger;
 import io.twoyi.utils.IOUtils;
 import io.twoyi.utils.LogEvents;
 
@@ -240,6 +241,7 @@ public class BootCompletionServer {
                     String msg = new String(data, 0, read, StandardCharsets.US_ASCII);
                     if (msg.startsWith(BOOT_COMPLETED)) {
                         Log.i(TAG, "BOOT_COMPLETED received on " + SOCK_NAME);
+                        FileLogger.boot("boot_completed_received", "sock=" + SOCK_NAME);
                         markCompleted();
                     }
                 }
@@ -269,8 +271,10 @@ public class BootCompletionServer {
         if (!mCompleted.compareAndSet(false, true)) {
             // Already marked — duplicate BOOT_COMPLETED (e.g. guest sent
             // to both sockets, or sent twice). Harmless.
+            FileLogger.boot("boot_completed_duplicate", "ignored (already marked)");
             return;
         }
+        FileLogger.boot("boot_completed_marked", "rendezvous with UI (60s)");
 
         // Notify TwoyiStatusManager so its switchOs() / isStarted() keep
         // working. markStarted() is now a plain setter (the boot latch
@@ -314,19 +318,24 @@ public class BootCompletionServer {
      * {@link #isCompleted()} on return.
      */
     public boolean waitBoot(long timeout, TimeUnit unit) {
+        FileLogger.boot("wait_boot_start", "timeout=" + timeout + " unit=" + unit);
         try {
             mBootLatch.await(timeout, unit);
+            FileLogger.boot("wait_boot_success", null);
             return true;
         } catch (TimeoutException e) {
+            FileLogger.boot("wait_boot_timeout", null);
             return false;
         } catch (BrokenBarrierException e) {
             // Barrier was reset() out from under us — treat as "not
             // booted yet" so the caller falls through to the boot-failure
             // path (which is the safer default for a re-launch race).
+            FileLogger.boot("wait_boot_broken_barrier", null);
             LogEvents.trackError(e);
             return false;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            FileLogger.boot("wait_boot_interrupted", null);
             LogEvents.trackError(e);
             return false;
         }
