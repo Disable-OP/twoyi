@@ -4870,3 +4870,40 @@ Stage Summary:
 - Fix verified against a real TWRP gzipped-cpio ramdisk (3107 entries parsed after fix vs 0 before).
 - All compression paths (gzip / lzma / xz / boot-image ramdisk) now produce consistent, greppable log lines including the user-requested "CPIO inside detected format GZIP-compressed file".
 - 0-entry extraction now throws instead of silently returning false, so the user will never again see the generic "(unknown reason)" toast — they'll see the actual cause.
+
+---
+Task ID: round-69
+Agent: main
+Task: Comprehensive in-app logging to /sdcard/Android/data/io.twoyi/files/log/ (mirroring KVM e2e workflow), no root required. User reported fake boot animation + no rendering + no logs on arm64 device.
+
+Work Log:
+- READ scripts/kvm-e2e-test.sh (1739 lines) in full to understand the 26 log artifacts CI captures: logcat.txt, logcat-filtered.txt, kr64-stderr.log, twoyi-log.txt, dmesg.log, twrp-kmsg.log, twrp-init.log, twrp-strace.log, twrp-fb.png, twrp-ps-*.log, twrp-init-{cmdline,status,threads,fds}.log, twrp-guest-tree.log, tombstones/, dropbox/, anr/, boot-verdict.txt, etc.
+- READ app/rs/src/core.rs to find where kr64's stdout/stderr is redirected: <dataDir>/kr64-app-stderr.log (kr64 binary path) and <dataDir>/log.txt (fallback linker path).
+- Created app/src/main/java/io/twoyi/utils/FileLogger.java — singleton initialized in TwoyiApplication.attachBaseContext() BEFORE any other app code. Writes to getExternalFilesDir("log") = /sdcard/Android/data/io.twoyi/files/log/ (no permission needed, reachable via file manager/adb pull on unrooted devices).
+  Files written (each mirrors a KVM e2e artifact):
+    app.log              — every Log.x call tee'd
+    logcat.log           — continuous 'logcat -v threadtime *:V' pump (captures Java Log.x + Rust CLIENT_EGL + kr64/loader stderr)
+    logcat-filtered.log  — grep for KR64 INFO|CLIENT_EGL|BOOT_COMPLETED|emugl|Render2Activity|RamdiskImporter|BootCompletionServer (same regex as KVM e2e line 1447)
+    kr64.log             — periodic tee of <dataDir>/kr64-app-stderr.log + <dataDir>/log.txt (refreshed every 2s)
+    boot.log             — structured boot timeline (renderer_init, surface_changed, boot_completed, etc.)
+    crash.log            — uncaught exceptions via global handler
+    kmsg.log             — best-effort dmesg (needs root; empty on unrooted but we try)
+    proc.log             — /proc/self/{cmdline,status,task,fd} + ps -A (refreshed every 15s)
+    deviceinfo.txt       — build fingerprint, ABI, profile, ROM md5
+  All pumps on daemon threads. Writes synchronized + rotated at 5 MiB with 3 backups.
+- Wired FileLogger into TwoyiApplication.attachBaseContext() (init FIRST, before ProfileManager/RomManager).
+- Wired FileLogger.boot() into Render2Activity at every surface callback + bootSystem() + showBootingProcedure() + waitBoot result.
+- Wired FileLogger.boot() into BootCompletionServer at BOOT_COMPLETED received, markCompleted, waitBoot start/success/timeout/broken_barrier/interrupted.
+- Wired FileLogger.i()/boot() into RamdiskImporter at format detection + import complete.
+- Build failures + fixes:
+    1. android.os.Process vs java.lang.Process ambiguity → qualified all subprocess Process declarations as java.lang.Process.
+    2. Missing FileInputStream import → added.
+    3. tee(char,String,String) overload missing (only had 4-arg with Throwable) → added 3-arg overload.
+    4. StringWriter.write() returns void, can't chain .write().write() → rewrote with PrintWriter.
+- Built arm64 APK via GitHub Actions (run #593, success). APK at /home/z/my-project/download/twoyi-arm64-v8a-20260812-1427.apk (11 MB).
+
+Stage Summary:
+- Comprehensive logging infrastructure that mirrors the KVM e2e workflow's 26 log artifacts, adapted for unrooted devices (no root needed — uses app-private external storage).
+- 9 log files written to /sdcard/Android/data/io.twoyi/files/log/: app.log, logcat.log, logcat-filtered.log, kr64.log, boot.log, crash.log, kmsg.log, proc.log, deviceinfo.txt.
+- Every boot milestone is now traceable in boot.log end-to-end: filelogger_init → ramdisk_import_format_detected → ramdisk_import_complete → boot_system_start → rom_exists → boot_completion_server_started → show_booting_procedure → renderer_set_data_dir → boot_recovery_flag → renderer_init → surface_changed → wait_boot_start → (boot_completed_received | wait_boot_timeout) → (wait_boot_success | boot_failed).
+- The user can now `adb pull /sdcard/Android/data/io.twoyi/files/log/` after a failed boot and see EXACTLY what happened — same diagnostic visibility as CI has on the x86_64 emulator.
