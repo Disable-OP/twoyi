@@ -2,15 +2,16 @@
 """
 UI navigation script for twoyi E2E test.
 
-Simulates a real user:
-  1. Launch app via monkey (equivalent to tapping launcher icon)
-  2. Tap "Select ROM" preference
-  3. Navigate file picker to /sdcard/Download/ → tap recovery.img
-  4. Wait for import to complete
-  5. Enable "Boot to Recovery" checkbox
-  6. Tap "Launch Container"
-  7. Wait for boot, taking screenshots every 5s to capture the TWRP screen
-  8. Pull app logs
+Simulates a real user navigating the app entirely via UI taps:
+  1. Launch app via monkey (taps launcher icon)
+  2. Scroll down to find "Select ROM" preference
+  3. Tap it → file picker opens
+  4. Navigate file picker to /sdcard/Download/ → tap recovery.img
+  5. Wait for import to complete
+  6. Scroll to find "Boot to Recovery" checkbox → enable it
+  7. Scroll back to top → tap "Launch Container"
+  8. Wait for boot, taking screenshots every 5s to capture the TWRP screen
+  9. Pull app logs
 
 Uses uiautomator dump + XML parsing to find elements by text.
 No hardcoded coordinates — everything is text-based.
@@ -26,11 +27,7 @@ ADB = ["adb", "-s", "emulator-5554"]
 ART = "/tmp/ui-e2e-artifacts"
 os.makedirs(ART, exist_ok=True)
 
-# TWRP recovery image is 720x1280; the emulator is typically 1080x1920.
-# The app's SurfaceView will be letterboxed inside the screen.
-
 def adb(*args, timeout=30):
-    """Run an adb command, return stdout."""
     try:
         r = subprocess.run(ADB + list(args), capture_output=True, text=True,
                            timeout=timeout)
@@ -39,24 +36,21 @@ def adb(*args, timeout=30):
         return ""
 
 def adb_shell(cmd, timeout=30):
-    """Run an adb shell command."""
     return adb("shell", cmd, timeout=timeout)
 
 def screenshot(name):
-    """Take a screenshot and save to artifacts dir."""
     path = os.path.join(ART, f"screenshot-{name}.png")
     try:
         r = subprocess.run(ADB + ["exec-out", "screencap", "-p"],
                           capture_output=True, timeout=15)
         with open(path, "wb") as f:
             f.write(r.stdout)
-        print(f"  [screenshot] {path} ({len(r.stdout)} bytes)")
+        print(f"  [screenshot] {name} ({len(r.stdout)} bytes)")
     except Exception as e:
         print(f"  [screenshot] FAILED: {e}")
     return path
 
 def dump_ui(name):
-    """Dump UI hierarchy to XML + save a copy to artifacts."""
     adb_shell("uiautomator dump /sdcard/ui-dump.xml")
     xml_path = os.path.join(ART, f"uiautomator-{name}.xml")
     subprocess.run(ADB + ["pull", "/sdcard/ui-dump.xml", xml_path],
@@ -64,14 +58,13 @@ def dump_ui(name):
     return xml_path
 
 def parse_ui(xml_path):
-    """Parse uiautomator XML and return list of nodes."""
     try:
         tree = ET.parse(xml_path)
         return tree.getroot()
     except Exception:
         return None
 
-def find_by_text(root, text, partial=True):
+def find_by_text(root, text, exact=False):
     """Find a UI node by text or content-desc. Returns (cx, cy, node) or None."""
     if root is None:
         return None
@@ -79,9 +72,9 @@ def find_by_text(root, text, partial=True):
     for node in root.iter("node"):
         txt = (node.get("text", "") or "").lower()
         desc = (node.get("content-desc", "") or "").lower()
-        match = (search in txt) if partial else (txt == search)
+        match = (txt == search) if exact else (search in txt)
         if not match:
-            match = (search in desc) if partial else (desc == search)
+            match = (desc == search) if exact else (search in desc)
         if match:
             bounds = node.get("bounds", "")
             m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
@@ -91,8 +84,7 @@ def find_by_text(root, text, partial=True):
                 return (cx, cy, node)
     return None
 
-def find_all_by_text(root, text, partial=True):
-    """Find ALL UI nodes matching text. Returns list of (cx, cy, node)."""
+def find_all_by_text(root, text, exact=False):
     results = []
     if root is None:
         return results
@@ -100,9 +92,9 @@ def find_all_by_text(root, text, partial=True):
     for node in root.iter("node"):
         txt = (node.get("text", "") or "").lower()
         desc = (node.get("content-desc", "") or "").lower()
-        match = (search in txt) if partial else (txt == search)
+        match = (txt == search) if exact else (search in txt)
         if not match:
-            match = (search in desc) if partial else (desc == search)
+            match = (desc == search) if exact else (search in desc)
         if match:
             bounds = node.get("bounds", "")
             m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
@@ -113,25 +105,47 @@ def find_all_by_text(root, text, partial=True):
     return results
 
 def tap(x, y):
-    """Tap at coordinates."""
     adb_shell(f"input tap {x} {y}")
+
+def swipe_up():
+    """Swipe up to scroll down the list."""
+    adb_shell("input swipe 540 1500 540 300 300")
+
+def swipe_down():
+    """Swipe down to scroll up the list."""
+    adb_shell("input swipe 540 300 540 1500 300")
 
 def wait(seconds):
     time.sleep(seconds)
 
 def get_current_activity():
-    """Get the currently focused activity."""
     out = adb_shell("dumpsys activity activities", timeout=10)
     for line in out.split("\n"):
         if "mResumedActivity" in line or "topResumedActivity" in line:
             return line.strip()
     return "(unknown)"
 
+def scroll_to_find(text, max_scrolls=5, exact=True):
+    """Scroll down up to max_scrolls times looking for text.
+    Returns (cx, cy, node) or None."""
+    for i in range(max_scrolls + 1):
+        xml = dump_ui(f"scroll_{text}_{i}")
+        root = parse_ui(xml)
+        result = find_by_text(root, text, exact=exact)
+        if result:
+            print(f"  Found '{text}' at ({result[0]}, {result[1]}) after {i} scrolls")
+            return result
+        if i < max_scrolls:
+            print(f"  '{text}' not visible — scrolling down (attempt {i+1}/{max_scrolls})")
+            swipe_up()
+            wait(1)
+    return None
+
 def main():
     boot_wait = int(os.environ.get("BOOT_WAIT_SECONDS", "60"))
 
     # ─────────────────────────────────────────────
-    # Step 1: Launch app via monkey (taps launcher icon)
+    # Step 1: Launch app
     # ─────────────────────────────────────────────
     print("=" * 60)
     print("  Step 1: Launch app via launcher (monkey -p)")
@@ -143,30 +157,30 @@ def main():
     print(f"  Current activity: {get_current_activity()}")
 
     # ─────────────────────────────────────────────
-    # Step 2: Tap "Select ROM" preference
+    # Step 2: Scroll to find "Select ROM" and tap it
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
-    print('  Step 2: Tap "Select ROM" preference')
+    print('  Step 2: Find and tap "Select ROM" preference')
     print("=" * 60)
-    # Try various text variants
-    for text in ["Select ROM", "Select ROM File", "ROM"]:
-        result = find_by_text(root, text)
-        if result:
-            cx, cy, _ = result
-            print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
-            tap(cx, cy)
-            wait(3)
-            break
+    # "Select ROM" is deep in the Advanced category, below the fold.
+    # We need to scroll down to find it.
+    # Use EXACT matching to avoid matching "ROM" in "from" etc.
+    result = scroll_to_find("Select ROM", max_scrolls=5, exact=True)
+    if result:
+        cx, cy, _ = result
+        print(f"  Tapping 'Select ROM' at ({cx}, {cy})")
+        tap(cx, cy)
+        wait(3)
     else:
-        print("  ✗ Could not find 'Select ROM' preference")
-        # Print all visible text for debugging
+        print("  ✗ Could not find 'Select ROM' — dumping all visible text:")
+        xml = dump_ui("02_debug_all_text")
+        root = parse_ui(xml)
         if root:
             for node in root.iter("node"):
                 t = node.get("text", "")
-                d = node.get("content-desc", "")
-                if t or d:
-                    print(f"    text={t!r} desc={d!r}")
+                if t:
+                    print(f"    text={t!r}")
 
     xml = dump_ui("02_after_select_rom")
     root = parse_ui(xml)
@@ -180,16 +194,11 @@ def main():
     print("  Step 3: Navigate file picker to recovery.img")
     print("=" * 60)
 
-    # The file picker (DocumentsUI) is now open. We need to find recovery.img.
-    # Strategy:
-    #   a) Look for "recovery.img" directly (might be in Recent)
-    #   b) If not found, open nav drawer (hamburger) → tap "Downloads"
-    #   c) Then look for "recovery.img" in the file list
-
-    # Try (a): look for the file directly
+    # The file picker (DocumentsUI) should now be open.
+    # Try to find recovery.img directly first (might be in Recent).
     found_file = False
-    for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-        result = find_by_text(root, text)
+    for text in ["recovery.img", "recovery"]:
+        result = find_by_text(root, text, exact=False)
         if result:
             cx, cy, _ = result
             print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
@@ -199,17 +208,16 @@ def main():
             break
 
     if not found_file:
-        # Try (b): open nav drawer
+        # Open nav drawer (hamburger menu, top-left)
         print("  File not in current view — opening nav drawer")
-        # Tap hamburger menu (top-left corner, ~50,100)
-        tap(50, 100)
+        tap(50, 50)
         wait(2)
         xml = dump_ui("03_drawer_open")
         root = parse_ui(xml)
 
         # Look for "Downloads" in the drawer
-        for text in ["Downloads", "Download", "All files"]:
-            result = find_by_text(root, text)
+        for text in ["Downloads", "Download"]:
+            result = find_by_text(root, text, exact=False)
             if result:
                 cx, cy, _ = result
                 print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
@@ -221,7 +229,7 @@ def main():
         xml = dump_ui("03b_in_downloads")
         root = parse_ui(xml)
         for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-            result = find_by_text(root, text)
+            result = find_by_text(root, text, exact=False)
             if result:
                 cx, cy, _ = result
                 print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
@@ -231,17 +239,14 @@ def main():
                 break
 
         if not found_file:
-            # Last resort: try navigating to /sdcard/Download via the
-            # breadcrumb path bar. Some DocumentsUI versions show a
-            # path bar at the top.
+            # Try navigating via path bar
             print("  Trying to navigate via path bar")
-            # Tap the path/breadcrumb area (top of screen)
-            tap(540, 72)
+            tap(540, 36)
             wait(2)
             xml = dump_ui("03c_path_bar")
             root = parse_ui(xml)
             for text in ["recovery.img", "recovery", "Download"]:
-                result = find_by_text(root, text)
+                result = find_by_text(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
                     print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
@@ -265,7 +270,6 @@ def main():
         wait(2)
         xml = dump_ui(f"05_import_wait_{i}")
         root = parse_ui(xml)
-        # Check if progress dialog is gone (import complete)
         has_progress = False
         if root:
             for node in root.iter("node"):
@@ -290,61 +294,42 @@ def main():
     print("=" * 60)
     print('  Step 5: Enable "Boot to Recovery" checkbox')
     print("=" * 60)
-    # We may need to scroll down to find it, or it might be visible.
-    # First, check current view.
-    for text in ["Boot to Recovery", "Boot Recovery", "Recovery"]:
-        results = find_all_by_text(root, text)
-        if results:
-            cx, cy, node = results[0]
-            # Check if it's a checkbox and whether it's already checked
-            checked = node.get("checked", "false")
-            print(f"  Found '{text}' at ({cx}, {cy}), checked={checked}")
-            if checked == "false":
-                print(f"  Tapping to enable")
-                tap(cx, cy)
-                wait(1)
-            else:
-                print(f"  Already enabled")
-            break
+    # "Boot to Recovery" is in the Advanced category, above "Select ROM".
+    # We may need to scroll to find it.
+    result = scroll_to_find("Boot to Recovery", max_scrolls=3, exact=False)
+    if result:
+        cx, cy, node = result
+        checked = node.get("checked", "false")
+        print(f"  Found 'Boot to Recovery' at ({cx}, {cy}), checked={checked}")
+        if checked == "false":
+            print("  Tapping to enable")
+            tap(cx, cy)
+            wait(1)
+        else:
+            print("  Already enabled")
     else:
-        print("  'Boot to Recovery' not found — scrolling down")
-        # Swipe up to scroll
-        adb_shell("input swipe 540 1500 540 300 300")
-        wait(1)
-        xml = dump_ui("05b_after_scroll")
-        root = parse_ui(xml)
-        for text in ["Boot to Recovery", "Boot Recovery", "Recovery"]:
-            results = find_all_by_text(root, text)
-            if results:
-                cx, cy, node = results[0]
-                checked = node.get("checked", "false")
-                print(f"  Found '{text}' at ({cx}, {cy}), checked={checked}")
-                if checked == "false":
-                    tap(cx, cy)
-                    wait(1)
-                break
+        print("  ✗ Could not find 'Boot to Recovery'")
 
     # ─────────────────────────────────────────────
-    # Step 6: Tap "Launch Container"
+    # Step 6: Scroll to top and tap "Launch Container"
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
     print('  Step 6: Tap "Launch Container"')
     print("=" * 60)
-    # Scroll back to top first
-    adb_shell("input swipe 540 300 540 1500 300")
-    wait(1)
+    # Scroll back to top
+    for _ in range(5):
+        swipe_down()
+        wait(0.5)
+
     xml = dump_ui("06_before_launch")
     root = parse_ui(xml)
-
-    for text in ["Launch Container", "Launch", "Start", "Boot", "Container", "Run"]:
-        results = find_all_by_text(root, text)
-        if results:
-            cx, cy, _ = results[0]
-            print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
-            tap(cx, cy)
-            wait(5)
-            break
+    result = find_by_text(root, "Launch Container", exact=True)
+    if result:
+        cx, cy, _ = result
+        print(f"  Found 'Launch Container' at ({cx}, {cy}) — tapping")
+        tap(cx, cy)
+        wait(5)
     else:
         print("  ✗ Could not find 'Launch Container'")
         if root:
@@ -358,7 +343,7 @@ def main():
     print(f"  Current activity: {get_current_activity()}")
 
     # ─────────────────────────────────────────────
-    # Step 7: Wait for boot — take screenshots every 5s
+    # Step 7: Wait for boot — screenshots every 5s
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
@@ -368,11 +353,9 @@ def main():
         wait(5)
         elapsed = (i + 1) * 5
         screenshot(f"07_boot_{elapsed}s")
-        # Check if we're still in Render2Activity
         activity = get_current_activity()
         if "Render2Activity" not in activity and elapsed > 15:
             print(f"  Left Render2Activity at {elapsed}s: {activity}")
-            # The app may have crashed or the user was kicked back
             break
 
     # ─────────────────────────────────────────────
@@ -399,7 +382,7 @@ def main():
                          os.path.join(ART, "app-logs/")],
                   capture_output=True, timeout=30)
 
-    # Try to pull kr64-app-stderr.log (needs root — usually fails)
+    # Try to pull kr64 logs
     subprocess.run(ADB + ["pull", "/data/data/io.twoyi/kr64-app-stderr.log",
                          os.path.join(ART, "kr64-app-stderr.log")],
                   capture_output=True, timeout=10)
