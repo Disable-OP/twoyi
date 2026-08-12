@@ -472,15 +472,32 @@ int close(int fd) {
 // bionic: int ioctl(int, int, ...)         (bits/ioctl.h on Android)
 // glibc:  int ioctl(int, unsigned long, ...) (sys/ioctl.h on Linux)
 //
-// We MUST match bionic's signature (int, not unsigned long) — otherwise
-// clang errors out: "at most one overload for a given name may lack the
-// 'overloadable' attribute" because bionic's <bits/ioctl.h> already
-// declares `int ioctl(int __fd, int __op, ...)` and our definition
-// would be a conflicting second unmarked overload. (KVM run 31575531674
-// hit this exact error after commit ea3a484 changed the param to
-// `unsigned long` for spurious glibc-compat reasons.)
-int ioctl(int fd, int request, ...) __attribute__((overloadable));
-int ioctl(int fd, int request, ...) __attribute__((overloadable)) {
+// We MUST match bionic's signature EXACTLY (int, not unsigned long) AND
+// must NOT add __attribute__((overloadable)). Bionic's <bits/ioctl.h>
+// declares `int ioctl(int __fd, int __op, ...);` UNMARKED — i.e. without
+// the overloadable attribute. clang enforces: ALL overloads of a given
+// name must consistently have (or not have) the overloadable attribute.
+//   - If we declare `int ioctl(int, unsigned long, ...)` (different
+//     signature, both unmarked) → clang errors:
+//       "at most one overload for a given name may lack the 'overloadable'
+//        attribute"
+//     (KVM run 31575531674 hit this after commit ea3a484 changed the
+//     request param to unsigned long for spurious glibc-compat reasons.)
+//   - If we declare `int ioctl(int, int, ...) __attribute__((overloadable))`
+//     (same signature, but we mark ours while bionic's is unmarked) →
+//     clang errors:
+//       "redeclaration of 'ioctl' must not have the 'overloadable' attribute"
+//     (KVM run 31577950499 hit this after commit d73a848 added overloadable
+//     on top of an already-matching signature — the attribute was redundant
+//     and conflicting.)
+//
+// The correct fix: match bionic's signature EXACTLY (int request) and do
+// NOT add overloadable. Two unmarked declarations with identical
+// signatures are the SAME function (not an overload), which is what we
+// want for LD_PRELOAD interposition — bionic's dynamic linker resolves
+// the first definition found in the link order, and LD_PRELOAD .so
+// entries come before the executable's own libs.
+int ioctl(int fd, int request, ...) {
     va_list ap;
     va_start(ap, request);
     void *argp = va_arg(ap, void *);
