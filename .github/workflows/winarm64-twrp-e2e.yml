@@ -106,28 +106,20 @@ jobs:
           "$ANDROID_HOME/emulator/emulator" -version 2>&1 || true
 
       - name: Create ARM64 AVD
-        shell: bash
+        shell: cmd
         run: |
-          set -ex
-          export ANDROID_HOME="$LOCALAPPDATA/Android/Sdk"
-          export ANDROID_AVD_HOME="$USERPROFILE/.android/avd"
-          AVDMGR="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
-          mkdir -p "$ANDROID_AVD_HOME"
-          echo "no" | "$AVDMGR" create avd -n twoyi_arm64 -k "system-images;android-30;default;arm64-v8a" --force
-          AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_arm64.avd/config.ini"
-          if [ ! -f "$AVD_CONFIG" ]; then
-            echo "ERROR: AVD config not found at $AVD_CONFIG"
-            find "$ANDROID_AVD_HOME" -name "config.ini" 2>/dev/null || true
-            exit 1
-          fi
-          echo "hw.keyboard=yes" >> "$AVD_CONFIG"
-          echo "hw.gpu.enabled=yes" >> "$AVD_CONFIG"
-          echo "hw.gpu.mode=swiftshader_indirect" >> "$AVD_CONFIG"
-          echo "hw.ramSize=2048" >> "$AVD_CONFIG"
-          echo "disk.dataPartition.size=4096" >> "$AVD_CONFIG"
-          echo "vm.heapSize=256" >> "$AVD_CONFIG"
-          echo "=== AVD config ==="
-          cat "$AVD_CONFIG"
+          set ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk
+          set ANDROID_AVD_HOME=%USERPROFILE%\.android\avd
+          mkdir "%ANDROID_AVD_HOME%" 2>nul
+          echo no | "%ANDROID_HOME%\cmdline-tools\latest\bin\avdmanager.bat" create avd -n twoyi_arm64 -k "system-images;android-30;default;arm64-v8a" --force
+          set AVD_CONFIG=%ANDROID_AVD_HOME%\twoyi_arm64.avd\config.ini
+          echo hw.keyboard=yes >> "%AVD_CONFIG%"
+          echo hw.gpu.enabled=yes >> "%AVD_CONFIG%"
+          echo hw.gpu.mode=swiftshader_indirect >> "%AVD_CONFIG%"
+          echo hw.ramSize=2048 >> "%AVD_CONFIG%"
+          echo disk.dataPartition.size=4096 >> "%AVD_CONFIG%"
+          echo vm.heapSize=256 >> "%AVD_CONFIG%"
+          type "%AVD_CONFIG%"
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
