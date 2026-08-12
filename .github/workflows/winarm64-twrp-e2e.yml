@@ -78,32 +78,40 @@ jobs:
           Write-Host "Android SDK installed at $ANDROID_HOME"
 
       - name: Install Android SDK packages
-        shell: cmd
+        shell: pwsh
         run: |
-          set ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk
-          set PATH=%ANDROID_HOME%\cmdline-tools\latest\bin;%ANDROID_HOME%\platform-tools;%ANDROID_HOME%\emulator;%PATH%
-          echo Accepting licenses...
-          call sdkmanager --licenses
-          echo Installing packages...
-          call sdkmanager "platform-tools" "platforms;android-30" "build-tools;30.0.3" "emulator" "system-images;android-30;default;arm64-v8a"
-          echo === Emulator version ===
-          call emulator -version
+          $env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
+          $env:PATH = "$env:ANDROID_HOME\cmdline-tools\latest\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator;$env:PATH"
+          Write-Host "ANDROID_HOME: $env:ANDROID_HOME"
+          Write-Host "sdkmanager path: $(Get-Command sdkmanager -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)"
+
+          # Accept licenses
+          Write-Host "Accepting licenses..."
+          'y' * 10 | sdkmanager --licenses 2>&1 | Out-Null
+
+          # Install packages
+          Write-Host "Installing packages..."
+          sdkmanager "platform-tools" "platforms;android-30" "build-tools;30.0.3" "emulator" "system-images;android-30;default;arm64-v8a" 2>&1
+
+          # Verify emulator
+          Write-Host "=== Emulator version ==="
+          & "$env:ANDROID_HOME\emulator\emulator.exe" -version 2>&1
 
       - name: Create ARM64 AVD
-        shell: cmd
+        shell: pwsh
         run: |
-          set ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk
-          set ANDROID_AVD_HOME=%USERPROFILE%\.android\avd
-          mkdir "%ANDROID_AVD_HOME%" 2>nul
-          echo no | "%ANDROID_HOME%\cmdline-tools\latest\bin\avdmanager.bat" create avd -n twoyi_arm64 -k "system-images;android-30;default;arm64-v8a" --force
-          set AVD_CONFIG=%ANDROID_AVD_HOME%\twoyi_arm64.avd\config.ini
-          echo hw.keyboard=yes >> "%AVD_CONFIG%"
-          echo hw.gpu.enabled=yes >> "%AVD_CONFIG%"
-          echo hw.gpu.mode=swiftshader_indirect >> "%AVD_CONFIG%"
-          echo hw.ramSize=2048 >> "%AVD_CONFIG%"
-          echo disk.dataPartition.size=4096 >> "%AVD_CONFIG%"
-          echo vm.heapSize=256 >> "%AVD_CONFIG%"
-          type "%AVD_CONFIG%"
+          $env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
+          $env:ANDROID_AVD_HOME = "$env:USERPROFILE\.android\avd"
+          New-Item -ItemType Directory -Force -Path $env:ANDROID_AVD_HOME | Out-Null
+          'no' | & "$env:ANDROID_HOME\cmdline-tools\latest\bin\avdmanager.bat" create avd -n twoyi_arm64 -k "system-images;android-30;default;arm64-v8a" --force
+          $avdConfig = "$env:ANDROID_AVD_HOME\twoyi_arm64.avd\config.ini"
+          Add-Content $avdConfig "`nhw.keyboard=yes"
+          Add-Content $avdConfig "`nhw.gpu.enabled=yes"
+          Add-Content $avdConfig "`nhw.gpu.mode=swiftshader_indirect"
+          Add-Content $avdConfig "`nhw.ramSize=2048"
+          Add-Content $avdConfig "`ndisk.dataPartition.size=4096"
+          Add-Content $avdConfig "`nvm.heapSize=256"
+          Get-Content $avdConfig
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
