@@ -965,10 +965,17 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
         let trimmed = line.trim_start();
         if !found && trimmed.starts_with("service recovery ") {
             // This is the recovery service line. Insert the setenv directive
-            // as the next line (indented with 4 spaces, matching init.rc
-            // convention for service options).
+            // AND the seclabel as the next lines (indented with 4 spaces,
+            // matching init.rc convention for service options).
+            //
+            // The seclabel u:r:recovery:s0 is needed because init.rc doesn't
+            // import init.recovery.service.rc (which has the seclabel).
+            // Without it, init tries to run recovery in the init context,
+            // which SELinux may deny.
             result.push('\n');
             result.push_str("    setenv LD_PRELOAD /dev/twrp_fb_hook.so");
+            result.push('\n');
+            result.push_str("    seclabel u:r:recovery:s0");
             found = true;
         }
         // Preserve the original line ending (lines() strips \n, so we add
