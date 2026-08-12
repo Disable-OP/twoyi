@@ -2587,8 +2587,41 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // The hook's open/ioctl intercepts FBIOGET_VSCREENINFO etc. on
     // /dev/graphics/fb0 and returns valid 720x1280@32bpp screen info,
     // fixing the libminuitwrp segfault at offset 0x57d7.
+    //
+    // NON-ROOT MODE (use_namespaces=false): kr64 can't chroot or pivot_root,
+    // so `/sbin` does NOT exist on the host filesystem (it only exists inside
+    // the rootfs). Writing to the bare `/sbin/libtwrp_fb_hook.so` fails with
+    // ENOENT, the LD_PRELOAD target is never populated, and init dies the
+    // moment it exec's recovery and the bionic linker can't find the preload.
+    //
+    // The init process runs on the HOST filesystem in this mode, but the
+    // ptrace emulator (see `ptrace_emu.rs`) translates guest path opens like
+    // `/sbin/libtwrp_fb_hook.so` to `{rootfs}/sbin/libtwrp_fb_hook.so` on the
+    // host. So we MUST write the library to the host-side translated path,
+    // which is `{rootfs_prefix}/sbin/libtwrp_fb_hook.so`:
+    //   - use_namespaces=true  -> rootfs_prefix == ""  -> `/sbin/...`
+    //     (pivot_root already happened; /sbin IS the rootfs's sbin, tmpfs)
+    //   - use_namespaces=false -> rootfs_prefix == cfg.rootfs
+    //     -> `{cfg.rootfs}/sbin/...` on the host filesystem
+    //
+    // The LD_PRELOAD path in init.rc stays as `/sbin/libtwrp_fb_hook.so` —
+    // the ptrace emulator performs the translation at runtime. We also
+    // `create_dir_all({rootfs_prefix}/sbin)` because in non-root mode the
+    // directory may not exist yet on the host (the rootfs image may not ship
+    // with an empty sbin, or it may have been stripped).
     if let Some((src, content)) = &hook_lib_twrp_fb {
-        write_hook_library_to_dev("libtwrp_fb_hook.so", src, content, "/sbin/libtwrp_fb_hook.so");
+        let sbin_dir = format!("{}/sbin", rootfs_prefix);
+        if let Err(e) = std::fs::create_dir_all(&sbin_dir) {
+            error!(
+                "[KR64] PARENT: failed to create sbin dir {} for libtwrp_fb_hook.so: {} (errno={})",
+                sbin_dir,
+                e,
+                e.raw_os_error().unwrap_or(0)
+            );
+        } else {
+            let twrp_fb_hook_dst = format!("{}/sbin/libtwrp_fb_hook.so", rootfs_prefix);
+            write_hook_library_to_dev("libtwrp_fb_hook.so", src, content, &twrp_fb_hook_dst);
+        }
     }
 
     // Change SELinux label of /dev/lib*.so to system_file so that
