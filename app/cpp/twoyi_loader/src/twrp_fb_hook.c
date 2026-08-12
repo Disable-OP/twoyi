@@ -418,14 +418,14 @@ int open(const char *path, int flags, ...) {
     // /dev tmpfs, wiping kr64's pre-created fb0 file.
     if (fd < 0 && is_fb_path(path)) {
         // Create /dev/graphics/ directory if needed
-        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755);
+        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755, 0);
         // Create the fb0 file with the right size (720*1280*4 = 3686400)
         int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
             (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
             O_CREAT | O_RDWR, 0644);
         if (create_fd >= 0) {
             // Truncate to framebuffer size
-            raw_syscall3(SYS_ftruncate, create_fd, 3686400);
+            raw_syscall3(SYS_ftruncate, create_fd, 3686400, 0);
             raw_syscall1(SYS_close, create_fd);
             // Re-open with the original flags
             fd = real_open ? real_open(path, flags, mode)
@@ -458,12 +458,12 @@ int openat(int dirfd, const char *path, int flags, ...) {
     // If opening /dev/graphics/fb0 or /dev/fb0 fails with ENOENT, create
     // the virtual framebuffer file and re-open it.
     if (fd < 0 && is_fb_path(path)) {
-        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755);
+        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755, 0);
         int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
             (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
             O_CREAT | O_RDWR, 0644);
         if (create_fd >= 0) {
-            raw_syscall3(SYS_ftruncate, create_fd, 3686400);
+            raw_syscall3(SYS_ftruncate, create_fd, 3686400, 0);
             raw_syscall1(SYS_close, create_fd);
             fd = real_openat ? real_openat(dirfd, path, flags, mode)
                              : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
