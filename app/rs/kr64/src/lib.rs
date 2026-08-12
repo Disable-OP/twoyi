@@ -947,6 +947,36 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
 /// ("CANNOT LINK EXECUTABLE: ... is 64-bit instead of 32-bit"). See
 /// Task ID 18 / KVM run 31536016997 for the regression this caused.
 ///
+/// # CRITICAL: do NOT add `seclabel u:r:recovery:s0` (Task ID 24)
+///
+/// A previous fix (commit 7fcfd24) added `seclabel u:r:recovery:s0` to
+/// the recovery service, reasoning that init.rc doesn't import
+/// init.recovery.service.rc (which has the seclabel). However, this
+/// BREAKS recovery startup in our KVM environment:
+///
+///   * The host kernel's SELinux policy is the **normal-boot** policy
+///     (not recovery-boot), so the context `u:r:recovery:s0` is **not
+///     loaded**. TWRP's sepolicy file in the rootfs is never applied
+///     to the kernel (we don't call `selinux_load_policy`).
+///   * When TWRP init's `service_start()` calls
+///     `setexeccon("u:r:recovery:s0")`, libselinux validates the
+///     context against the loaded policy and returns **EINVAL**.
+///   * AOSP 5.1 init treats setexeccon failure as fatal: the forked
+///     child `_exit(127)`s, the parent sees exit code 127, schedules
+///     a restart, and the cycle repeats every ~4 s. Confirmed in
+///     KVM run 31557318330 dmesg:
+///     ```
+///     [138.195] init: cannot setexeccon('u:r:recovery:s0'): Invalid argument
+///     [143.230] init: cannot setexeccon('u:r:recovery:s0'): Invalid argument
+///     [147.282] init: cannot setexeccon('u:r:recovery:s0'): Invalid argument
+///     ```
+///   * Without the seclabel, init skips setexeccon entirely (per
+///     AOSP 5.1 `service_start()` logic) and exec's recovery in init's
+///     own context. Since the host's SELinux is already in a degraded
+///     state (`Could not set execcon for 'u:r:vendor_init:s0'` loops
+///     for the host's own init), running recovery in init's context
+///     is fine — SELinux is effectively non-functional here.
+///
 /// Returns the patched content, or `None` if the `service recovery` line
 /// was not found. The patch is IDEMPOTENT: if the setenv line is already
 /// present, the caller should skip the write (checked before calling).
@@ -965,17 +995,15 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
         let trimmed = line.trim_start();
         if !found && trimmed.starts_with("service recovery ") {
             // This is the recovery service line. Insert the setenv directive
-            // AND the seclabel as the next lines (indented with 4 spaces,
-            // matching init.rc convention for service options).
+            // as the next line (indented with 4 spaces, matching init.rc
+            // convention for service options).
             //
-            // The seclabel u:r:recovery:s0 is needed because init.rc doesn't
-            // import init.recovery.service.rc (which has the seclabel).
-            // Without it, init tries to run recovery in the init context,
-            // which SELinux may deny.
+            // NOTE: do NOT add `seclabel u:r:recovery:s0` here — see the
+            // function-level doc comment above (Task ID 24). The host
+            // kernel's SELinux policy doesn't have the recovery context,
+            // so setexeccon returns EINVAL and aborts the service start.
             result.push('\n');
             result.push_str("    setenv LD_PRELOAD /dev/twrp_fb_hook.so");
-            result.push('\n');
-            result.push_str("    seclabel u:r:recovery:s0");
             found = true;
         }
         // Preserve the original line ending (lines() strips \n, so we add
