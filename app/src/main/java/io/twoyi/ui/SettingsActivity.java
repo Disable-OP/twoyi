@@ -402,13 +402,18 @@ public class SettingsActivity extends AppCompatActivity {
                     RomManager.initRootfs(activity);
                 }
 
-                return success;
+                // Return error message if failed (for display to user)
+                if (!success && errorMsg == null) {
+                    errorMsg = "Import returned false (unknown reason)";
+                }
+                return success ? "SUCCESS" : ("FAIL:" + (errorMsg != null ? errorMsg : "unknown"));
             }).done(result -> {
                 UIHelper.dismiss(dialog);
-                if (result) {
+                if ("SUCCESS".equals(result)) {
                     Toast.makeText(activity, getString(R.string.rom_imported_successfully), Toast.LENGTH_SHORT).show();
                 } else {
-                    Toast.makeText(activity, getString(R.string.rom_import_failed), Toast.LENGTH_SHORT).show();
+                    String msg = result != null && result.startsWith("FAIL:") ? result.substring(5) : "unknown error";
+                    Toast.makeText(activity, getString(R.string.rom_import_failed) + ": " + msg, Toast.LENGTH_LONG).show();
                 }
             }).fail(result -> activity.runOnUiThread(() -> {
                 Toast.makeText(activity, getString(R.string.rom_import_error, result.getMessage()), Toast.LENGTH_SHORT).show();
