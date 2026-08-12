@@ -56,6 +56,35 @@
 #include <linux/fb.h>
 
 // ---------------------------------------------------------------------------
+// CUSTOM LIBC FUNCTIONS — we build with -nostdlib, so we must provide our
+// own implementations of memset, strcmp, and strlen. Without these, the
+// compiler generates PLT calls to these symbols, which bionic tries to
+// resolve from the recovery binary's libc. But loading libc triggers a
+// cascade of symbol resolution that ultimately fails with "cannot locate
+// symbol 'syscall'".
+//
+// We use -fno-builtin-memset etc. in the build flags to prevent the
+// compiler from using its built-in implementations (which would generate
+// PLT calls). Then we provide our own static implementations.
+// ---------------------------------------------------------------------------
+static void *my_memset(void *s, int c, unsigned int n) {
+    unsigned char *p = (unsigned char *)s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
+
+static int my_strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+static unsigned int my_strlen(const char *s) {
+    unsigned int n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+// ---------------------------------------------------------------------------
 // RAW i386 SYSCALL HELPERS — we use inline `int $0x80` instead of calling
 // libc's `syscall()` function. This is CRITICAL: TWRP's bionic linker
 // (AOSP 5.1) fails to resolve the `syscall` symbol from our LD_PRELOAD
@@ -168,8 +197,8 @@ static void fb_fd_clear(int fd) {
 // Returns 1 if path is /dev/graphics/fb0 or /dev/fb0 (exact match).
 static int is_fb_path(const char *path) {
     if (!path) return 0;
-    if (strcmp(path, "/dev/graphics/fb0") == 0) return 1;
-    if (strcmp(path, "/dev/fb0") == 0) return 1;
+    if (my_strcmp(path, "/dev/graphics/fb0") == 0) return 1;
+    if (my_strcmp(path, "/dev/fb0") == 0) return 1;
     return 0;
 }
 
@@ -201,7 +230,7 @@ static int is_fb_path(const char *path) {
 #define TWRP_FB_VISUAL_TRUECOLOR 2
 
 static void fill_vscreeninfo(struct fb_var_screeninfo *v) {
-    memset(v, 0, sizeof(*v));
+    my_memset(v, 0, sizeof(*v));
     v->xres = TWRP_FB_WIDTH;
     v->yres = TWRP_FB_HEIGHT;
     v->xres_virtual = TWRP_FB_WIDTH;
@@ -240,7 +269,7 @@ static void fill_vscreeninfo(struct fb_var_screeninfo *v) {
 }
 
 static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
-    memset(f, 0, sizeof(*f));
+    my_memset(f, 0, sizeof(*f));
     // id is a 16-byte char array (kernel: char id[16]).
     // Use a short null-terminated string; the rest stays zeroed.
     strncpy(f->id, "twoyi_fb", sizeof(f->id) - 1);
@@ -408,7 +437,7 @@ int close(int fd) {
 // bionic: int ioctl(int, int, ...)
 // glibc:  int ioctl(int, unsigned long, ...)
 // We match bionic's signature since this runs in the recovery process.
-int ioctl(int fd, int request, ...) {
+int ioctl(int fd, unsigned long request, ...) {
     va_list ap;
     va_start(ap, request);
     void *argp = va_arg(ap, void *);
