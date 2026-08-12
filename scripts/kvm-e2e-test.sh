@@ -58,6 +58,21 @@ TWRP_MODE=0
 # --twrp-img for testing with a different TWRP image. The default is
 # the TWRP 3.7.0 image shipped in assets/twrp/.
 TWRP_IMG_DEFAULT="assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img"
+# ARM64 TCG mode: when TWOYI_ARM64_TCG=1, use -accel tcg instead of -accel kvm
+# (for arm64 GitHub runners which don't have KVM). Also uses arm64 AVD.
+ARM64_TCG=0
+# No-root mode: when TWOYI_NO_ROOT=1, don't use `adb root`. This simulates
+# a real unmodified device where the app doesn't have root access. The
+# test runs the app as a normal app process (no su, no adb root).
+NO_ROOT=0
+
+# Check env vars
+if [ "${TWOYI_ARM64_TCG:-0}" = "1" ]; then
+    ARM64_TCG=1
+fi
+if [ "${TWOYI_NO_ROOT:-0}" = "1" ]; then
+    NO_ROOT=1
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -131,29 +146,34 @@ echo "── Environment ──"
 echo "  ANDROID_HOME:    $ANDROID_HOME"
 echo "  emulator:        $EMULATOR_BIN"
 echo "  adb:             $ADB_BIN"
+# Determine acceleration mode based on ARM64_TCG flag
+if [ "$ARM64_TCG" = "1" ]; then
+    ACCEL_FLAG="-qemu -accel tcg"
+    echo "  → Using TCG (software emulation) — ARM64 mode, no KVM"
+else
+    ACCEL_FLAG="-qemu -enable-kvm"
+    echo "  → Using KVM (hardware acceleration)"
+fi
+
+# Use arm64 AVD name if in ARM64 mode
+if [ "$ARM64_TCG" = "1" ]; then
+    AVD_NAME="twoyi_arm64"
+fi
+
 echo "  AVD name:        $AVD_NAME"
 echo "  rootfs_source:   $ROOTFS_SOURCE"
 echo "  twrp_mode:       $TWRP_MODE"
 echo "  twrp_img:        $TWRP_IMG_DEFAULT"
+echo "  arm64_tcg:       $ARM64_TCG"
+echo "  no_root:         $NO_ROOT"
 echo "  boot_wait:       ${BOOT_WAIT_SECONDS}s"
 echo "  artifact_dir:    $ARTIFACT_DIR"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 1: Start the emulator headless with KVM + swiftshader.
+# Step 1: Start the emulator headless with KVM (or TCG for ARM64) + swiftshader.
 # ---------------------------------------------------------------------------
 echo "── Step 1/6: start emulator ──"
-# -no-window -no-audio           : headless CI
-# -no-snapshot                   : cold boot (we re-extract rootfs each run)
-# -no-boot-anim                  : skip the boot animation (faster boot)
-# -gpu swiftshader_indirect      : software GL renderer (works headless)
-# -qemu -enable-kvm              : enable hardware virtualization
-# -read-only                     : the SDK system image is read-only; we
-#                                 extract rootfs to the data partition
-# -partition-size 4096           : 4 GB data partition (room for rootfs)
-# -ports 5554,5555               : console on 5554, adb on 5555
-#                                 (must specify BOTH ports, else emulator
-#                                  dies with "Failed to parse option: |5554|")
 "$EMULATOR_BIN" -avd "$AVD_NAME" \
     -no-window \
     -no-audio \
@@ -163,7 +183,7 @@ echo "── Step 1/6: start emulator ──"
     -partition-size 4096 \
     -read-only \
     -ports 5554,5555 \
-    -qemu -enable-kvm \
+    $ACCEL_FLAG \
     > "$ARTIFACT_DIR/emulator-stdout.log" \
     2> "$ARTIFACT_DIR/emulator-stderr.log" &
 EMULATOR_PID=$!
@@ -323,10 +343,15 @@ case "$ROOTFS_SOURCE" in
         # Per X86_64_BREAKTHROUGH.md §"How to reproduce". The emulator's
         # /system is the SDK system image (Android 11, x86_64). Tarring
         # it out gives us a working rootfs with init, linker, libc, etc.
-        echo "  → adb root (restarts adbd as root)"
-        "$ADB_BIN" -s emulator-5554 root
-        sleep 2  # adbd takes a moment to come back up as root
-        "$ADB_BIN" -s emulator-5554 wait-for-device
+        if [ "$NO_ROOT" = "1" ]; then
+            echo "  → no-root mode: skipping adb root (simulating unmodified device)"
+            echo "  → using adb shell (non-root) to extract rootfs"
+        else
+            echo "  → adb root (restarts adbd as root)"
+            "$ADB_BIN" -s emulator-5554 root
+            sleep 2  # adbd takes a moment to come back up as root
+            "$ADB_BIN" -s emulator-5554 wait-for-device
+        fi
 
         echo "  → tar system/ init* default.prop apex/ from the booted emulator"
         # IMPORTANT: We also tar apex/ because on Android 11+,
@@ -435,9 +460,12 @@ fi
 
 # As root (we already `adb root`'d above for the emulator source; do it
 # again for the other sources) before the cleanup + extract below.
-"$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
-sleep 1
-"$ADB_BIN" -s emulator-5554 wait-for-device
+# In no-root mode, skip this — the app handles rootfs extraction itself.
+if [ "$NO_ROOT" = "0" ]; then
+    "$ADB_BIN" -s emulator-5554 root 2>/dev/null || true
+    sleep 1
+    "$ADB_BIN" -s emulator-5554 wait-for-device
+fi
 
 # Fix CI flake: clean up stale state from previous runs.
 #
