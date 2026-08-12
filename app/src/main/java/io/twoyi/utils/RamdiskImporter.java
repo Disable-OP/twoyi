@@ -152,21 +152,61 @@ public class RamdiskImporter {
                   " page=" + pageSize + " ramdiskOffset=" + ramdiskOffset);
 
             fis.getChannel().position(ramdiskOffset);
-            byte[] ramdiskGz = new byte[ramdiskSize];
+            byte[] ramdiskCompressed = new byte[ramdiskSize];
             int read = 0;
             while (read < ramdiskSize) {
-                int n = fis.read(ramdiskGz, read, ramdiskSize - read);
+                int n = fis.read(ramdiskCompressed, read, ramdiskSize - read);
                 if (n < 0) break;
                 read += n;
             }
 
-            // Decompress gzip -> cpio, then extract streaming
+            // Decompress ramdisk -> cpio, then extract streaming
+            // Detect compression: gzip (0x1f 0x8b), LZMA (0x5d), or uncompressed cpio (070701)
             File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
-            try (GZIPInputStream gzis = new GZIPInputStream(new java.io.ByteArrayInputStream(ramdiskGz));
-                 FileOutputStream fos = new FileOutputStream(cpioTemp)) {
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
+            if ((ramdiskCompressed[0] & 0xFF) == 0x1f && (ramdiskCompressed[1] & 0xFF) == 0x8b) {
+                // GZIP
+                Log.i(TAG, "Ramdisk is gzip-compressed");
+                try (GZIPInputStream gzis = new GZIPInputStream(new java.io.ByteArrayInputStream(ramdiskCompressed));
+                     FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
+                }
+            } else if ((ramdiskCompressed[0] & 0xFF) == 0x5d) {
+                // LZMA — Java doesn't have a built-in LZMA raw stream decompressor.
+                // Write compressed data to temp file and use Python (if available)
+                // or try to use java.util.zip (Inflater won't work for raw LZMA).
+                // Fallback: write as-is and let the extract script handle it.
+                Log.i(TAG, "Ramdisk is LZMA-compressed (not natively supported in Java)");
+                // Try using ProcessBuilder with python3
+                File lzmaTemp = new File(targetDir.getParentFile(), "ramdisk.lzma");
+                try (FileOutputStream fos = new FileOutputStream(lzmaTemp)) {
+                    fos.write(ramdiskCompressed);
+                }
+                ProcessBuilder pb = new ProcessBuilder("python3", "-c",
+                    "import lzma,sys; sys.stdout.buffer.write(lzma.decompress(sys.stdin.buffer.read()))");
+                pb.redirectInput(lzmaTemp);
+                pb.redirectOutput(cpioTemp);
+                Process proc = pb.start();
+                try {
+                    proc.waitFor(60, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    throw new IOException("LZMA decompression interrupted", e);
+                }
+                lzmaTemp.delete();
+                if (proc.exitValue() != 0) {
+                    throw new IOException("LZMA decompression failed (python3 not available?)");
+                }
+            } else if (ramdiskCompressed[0] == '0' && ramdiskCompressed[1] == '7') {
+                // Uncompressed cpio
+                Log.i(TAG, "Ramdisk is uncompressed cpio");
+                try (FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+                    fos.write(ramdiskCompressed);
+                }
+            } else {
+                throw new IOException("Unknown ramdisk compression: 0x" +
+                    Integer.toHexString(ramdiskCompressed[0] & 0xFF) +
+                    Integer.toHexString(ramdiskCompressed[1] & 0xFF));
             }
 
             boolean result = extractCpioStreaming(cpioTemp, targetDir);
