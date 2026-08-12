@@ -407,7 +407,7 @@ public final class FileLogger {
             ProcessBuilder pb = new ProcessBuilder(
                     "logcat", "-v", "threadtime", "*:V");
             pb.redirectErrorStream(true);
-            Process proc = null;
+            java.lang.Process proc = null;
             BufferedReader reader = null;
             try {
                 proc = pb.start();
@@ -478,7 +478,7 @@ public final class FileLogger {
             ProcessBuilder pb = new ProcessBuilder(
                     "logcat", "-v", "threadtime", "*:V");
             pb.redirectErrorStream(true);
-            Process proc = null;
+            java.lang.Process proc = null;
             BufferedReader reader = null;
             try {
                 proc = pb.start();
