@@ -272,7 +272,17 @@ static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
     my_memset(f, 0, sizeof(*f));
     // id is a 16-byte char array (kernel: char id[16]).
     // Use a short null-terminated string; the rest stays zeroed.
-    strncpy(f->id, "twoyi_fb", sizeof(f->id) - 1);
+    // We avoid strncpy() here because it would generate a PLT call to
+    // libc's strncpy (we build with -nostdlib), which bionic's old
+    // linker can't resolve cleanly. Manual byte copy is safe because
+    // my_memset already zeroed all 16 bytes of f->id above.
+    {
+        static const char id_str[] = "twoyi_fb";
+        unsigned int i;
+        for (i = 0; i < (unsigned int)sizeof(f->id) - 1 && id_str[i]; i++) {
+            f->id[i] = id_str[i];
+        }
+    }
     // smem_start is an unsigned long — on i386 it's 4 bytes. We set it
     // to a non-zero placeholder (libminuitwrp doesn't dereference it;
     // it only uses smem_len for the mmap size).
@@ -434,10 +444,17 @@ int close(int fd) {
 //   - For all other fds: pass through to the real ioctl (do NOT suppress
 //     real ioctl errors — we only fake for fb0).
 // ---------------------------------------------------------------------------
-// bionic: int ioctl(int, int, ...)
-// glibc:  int ioctl(int, unsigned long, ...)
-// We match bionic's signature since this runs in the recovery process.
-int ioctl(int fd, unsigned long request, ...) {
+// bionic: int ioctl(int, int, ...)         (bits/ioctl.h on Android)
+// glibc:  int ioctl(int, unsigned long, ...) (sys/ioctl.h on Linux)
+//
+// We MUST match bionic's signature (int, not unsigned long) — otherwise
+// clang errors out: "at most one overload for a given name may lack the
+// 'overloadable' attribute" because bionic's <bits/ioctl.h> already
+// declares `int ioctl(int __fd, int __op, ...)` and our definition
+// would be a conflicting second unmarked overload. (KVM run 31575531674
+// hit this exact error after commit ea3a484 changed the param to
+// `unsigned long` for spurious glibc-compat reasons.)
+int ioctl(int fd, int request, ...) {
     va_list ap;
     va_start(ap, request);
     void *argp = va_arg(ap, void *);
