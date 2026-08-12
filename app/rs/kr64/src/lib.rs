@@ -2157,6 +2157,69 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
+    // TWRP BOOT: create /dev/kmsg as a symlink to /twrp-kmsg.log so TWRP's
+    // init can write kernel log messages to a file we can retrieve.
+    //
+    // ROOT CAUSE (Task ID 18, KVM run 31548039158): TWRP's init (AOSP 5.1.1)
+    // writes ALL its log messages via KLOG_INFO/KLOG_ERROR, which open
+    // /dev/kmsg and write to it. Without /dev/kmsg, init's messages are
+    // silently dropped — we can't see "starting service 'recovery'" or any
+    // error messages. The /twrp-init.log redirect only captures stdout/stderr,
+    // which init doesn't use.
+    //
+    // The host's dmesg ring buffer is flooded by the OUTER Android init's
+    // "Could not set execcon for 'u:r:vendor_init:s0'" loop (TWRP's SELinux
+    // policy replaces the outer policy, breaking the outer init's contexts).
+    // So even if TWRP init wrote to a real /dev/kmsg char device, the
+    // messages would be pushed out of the ring buffer within ~12s.
+    //
+    // FIX: create /dev/kmsg as a SYMLINK to /twrp-kmsg.log (a regular file
+    // on the ext4 rootfs). TWRP init opens /dev/kmsg → resolves to
+    // /twrp-kmsg.log → writes go to the ext4 file. The file survives
+    // kr64's death (it's on ext4, not tmpfs), so the KVM test can
+    // `adb pull` it and we can finally see what TWRP init is doing.
+    //
+    // This is a DIAGNOSTIC aid — it doesn't fix the recovery-not-starting
+    // issue, but it lets us see the next error message from TWRP init.
+    if cfg.boot_recovery {
+        let kmsg_log_path = format!("{}/twrp-kmsg.log", rootfs_prefix);
+        // Create the target file (empty) on the ext4 rootfs.
+        match std::fs::write(&kmsg_log_path, b"") {
+            Ok(()) => {
+                info!(
+                    "[KR64] PARENT: created /twrp-kmsg.log (empty) on ext4 rootfs for TWRP init KLOG capture"
+                );
+            }
+            Err(e) => {
+                warning!(
+                    "[KR64] PARENT: failed to create /twrp-kmsg.log: {} (TWRP init KLOG messages will be lost)",
+                    e
+                );
+            }
+        }
+        // Create /dev/kmsg as a symlink to /twrp-kmsg.log (chroot-relative
+        // after pivot_root). Use std::os::unix::fs::symlink for symlinks.
+        use std::os::unix::fs::symlink;
+        let kmsg_target = "/twrp-kmsg.log";
+        let kmsg_link = "/dev/kmsg";
+        // Remove existing /dev/kmsg if present (defensive).
+        let _ = std::fs::remove_file(kmsg_link);
+        match symlink(kmsg_target, kmsg_link) {
+            Ok(()) => {
+                info!(
+                    "[KR64] PARENT: /dev/kmsg -> {} symlink created (TWRP init KLOG will be captured to /twrp-kmsg.log)",
+                    kmsg_target
+                );
+            }
+            Err(e) => {
+                warning!(
+                    "[KR64] PARENT: failed to create /dev/kmsg symlink: {} (TWRP init KLOG messages will be lost)",
+                    e
+                );
+            }
+        }
+    }
+
     // TWRP BOOT: patch {rootfs}/init.rc to add `setenv LD_PRELOAD
     // /dev/twrp_fb_hook.so` to the recovery service definition.
     //
