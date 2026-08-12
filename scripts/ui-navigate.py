@@ -178,7 +178,13 @@ def find_tap_target_for_text(root, text, exact=False):
     return None
 
 def tap(x, y):
-    adb_shell(f"input tap {x} {y}")
+    """Tap at coordinates. Use 'input swipe' with same start/end point and
+    100ms duration instead of 'input tap' — the short-duration 'input tap'
+    sometimes doesn't register on RecyclerView items that use
+    OnItemTouchListener (like the Android SAF file picker). The swipe
+    variant sends a proper DOWN→UP sequence with sufficient duration for
+    the GestureDetector to register it as a click."""
+    adb_shell(f"input swipe {x} {y} {x} {y} 100")
 
 def swipe_up():
     """Swipe up to scroll down the list. Uses screen-relative coordinates."""
@@ -466,6 +472,24 @@ def main():
             root = parse_ui(xml)
             activity = get_current_activity()
             print(f"  After preview tap: {activity}")
+
+            if "documentsui" in activity.lower() or "picker" in activity.lower():
+                print("  Still on file picker — trying DPAD navigation...")
+                # Use keyboard navigation: tap the first file to give focus,
+                # then use DPAD to navigate to recovery.img and ENTER to select.
+                # First, tap on the file list area to give it focus
+                tap(SCREEN_W // 2, int(SCREEN_H * 0.6))
+                wait(1)
+                # Navigate down with DPAD — recovery.img is the 2nd file
+                for _ in range(3):
+                    adb_shell("input keyevent KEYCODE_DPAD_DOWN")
+                    wait(0.5)
+                adb_shell("input keyevent KEYCODE_ENTER")
+                wait(3)
+                xml = dump_ui("04d_after_dpad")
+                root = parse_ui(xml)
+                activity = get_current_activity()
+                print(f"  After DPAD: {activity}")
 
     # ─────────────────────────────────────────────
     # Step 4: Wait for ROM import to complete
