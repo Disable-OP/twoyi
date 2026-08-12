@@ -1,0 +1,244 @@
+# ARM64 TWRP E2E Test — boots TWRP recovery on a native ARM64 GitHub runner.
+#
+# Uses the FREE ubuntu-24.04-arm runner (native ARM64 hardware, no KVM).
+# The Android emulator runs in TCG mode (software emulation) which is slow
+# but sufficient for testing TWRP boot.
+#
+# This workflow tests the ARM64 (aarch64) path which is what real devices
+# use. The x86_64 KVM e2e test (kvm-e2e-test.yml) tests the x86_64 path.
+#
+# Key differences from the x86_64 KVM test:
+#   - Uses ubuntu-24.04-arm runner (native ARM64)
+#   - Android emulator runs in TCG mode (no KVM, slow but works)
+#   - Builds APK for arm64-v8a only
+#   - Uses a TWRP image built for ARM64 (if available) or falls back to
+#     the i386 byt_t_crv2 image (which runs via TCG's x86 emulation on ARM64)
+#
+# IMPORTANT: TCG is VERY slow. The emulator boot alone takes 5-10 minutes.
+# The TWRP boot adds another 2-3 minutes. Total workflow time: ~20-30 min.
+# The timeout is set to 45 minutes to accommodate this.
+---
+name: ARM64 TWRP E2E Test
+
+'on':
+  workflow_dispatch:
+    inputs:
+      boot_wait_seconds:
+        description: 'How long to wait for TWRP to boot (seconds)'
+        required: false
+        default: '120'
+      twrp:
+        description: 'Boot TWRP recovery image (uses assets/twrp/*.img)'
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: arm64-twrp-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64-twrp-e2e:
+    name: Boot TWRP on ARM64 emulator
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify ARM64 architecture
+        run: |
+          echo "=== Architecture ==="
+          uname -m
+          echo "=== /dev/kvm check ==="
+          ls -la /dev/kvm 2>/dev/null || echo "No /dev/kvm (expected — using TCG)"
+          echo "=== CPU info ==="
+          cat /proc/cpuinfo | head -10
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-linux-android
+          cache: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rs/target
+            app/rs/loader/target
+          key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-arm64-cargo-
+
+      - name: Cache cargo-xdk
+        id: cache-cargo-xdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-xdk
+          key: ${{ runner.os }}-arm64-cargo-xdk-2.12.6
+
+      - name: Install cargo-xdk
+        if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
+        run: cargo install cargo-xdk
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Install Android SDK + emulator (arm64 system image)
+        run: |
+          set -e
+          export ANDROID_HOME=$HOME/android-sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
+              cd /tmp
+              curl -sL -o cmdline-tools.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+              rm cmdline-tools.zip
+          fi
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --update
+          # Install arm64-v8a system image (API 30, default — not google_apis
+          # because the default image is smaller and sufficient for TWRP testing)
+          sdkmanager \
+              "platform-tools" \
+              "platforms;android-30" \
+              "build-tools;30.0.3" \
+              "system-images;android-30;default;arm64-v8a"
+          # The emulator package may not be available for arm64 Linux via sdkmanager.
+          # Download it manually from the Android repository.
+          echo "=== Downloading emulator package manually ==="
+          EMULATOR_URLS=(
+            "https://dl.google.com/android/repository/emulator-linux-13477706.zip"
+            "https://dl.google.com/android/repository/emulator-linux-13114558.zip"
+          )
+          for URL in "${EMULATOR_URLS[@]}"; do
+            echo "Trying: $URL"
+            if curl -sL --fail -o /tmp/emulator.zip "$URL"; then
+              echo "Downloaded from: $URL"
+              break
+            fi
+          done
+          if [ -f /tmp/emulator.zip ] && unzip -t /tmp/emulator.zip >/dev/null 2>&1; then
+            unzip -q -o /tmp/emulator.zip -d "$ANDROID_HOME/"
+            rm /tmp/emulator.zip
+            chmod +x "$ANDROID_HOME/emulator/emulator" 2>/dev/null || true
+            echo "=== Emulator installed ==="
+            "$ANDROID_HOME/emulator/emulator" -version 2>&1 | head -3 || true
+          else
+            echo "⚠ Could not download emulator package"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+
+      - name: Create arm64 AVD (TCG mode, no KVM)
+        env:
+          ANDROID_AVD_HOME: /home/runner/.android/avd
+        run: |
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p $ANDROID_AVD_HOME
+          echo "no" | avdmanager create avd \
+              -n twoyi_arm64 \
+              -k "system-images;android-30;default;arm64-v8a" \
+              --force
+          AVD_CONFIG=$ANDROID_AVD_HOME/twoyi_arm64.avd/config.ini
+          {
+              echo "hw.keyboard=yes"
+              echo "hw.gpu.enabled=yes"
+              echo "hw.gpu.mode=swiftshader_indirect"
+              echo "hw.ramSize=2048"
+              echo "disk.dataPartition.size=4096"
+              echo "vm.heapSize=256"
+          } >> "$AVD_CONFIG"
+          echo "=== AVD config ==="
+          cat "$AVD_CONFIG"
+
+      - name: Grant execute permission for gradlew and build scripts
+        run: |
+          chmod +x gradlew
+          chmod +x app/rs/build_rs.sh
+          chmod +x app/rs/loader/build.sh || true
+          chmod +x scripts/kvm-e2e-test.sh
+          chmod +x scripts/extract-twrp-ramdisk.py 2>/dev/null || true
+          chmod +x scripts/pack-logs.sh
+
+      - name: Build APK (arm64-v8a only)
+        run: ./gradlew assembleRelease -Pabis=arm64-v8a
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+
+      - name: Run TWRP E2E test
+        run: |
+          timeout --signal=KILL 1200 ./scripts/kvm-e2e-test.sh \
+              --rootfs-source emulator \
+              --boot-wait "${{ github.event.inputs.boot_wait_seconds || '120' }}" \
+              --artifact-dir /tmp/ci-artifacts \
+              --twrp \
+              || true
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+          TWOYI_TWRP: ${{ github.event.inputs.twrp == 'true' && '1' || '' }}
+          # Force TCG mode (no KVM on arm64 GitHub runners)
+          TWOYI_ARM64_TCG: '1'
+
+      - name: Print boot verdict
+        if: always()
+        run: |
+          echo "── TWRP boot verdict ──"
+          if [ -f /tmp/ci-artifacts/boot-verdict.txt ]; then
+              cat /tmp/ci-artifacts/boot-verdict.txt
+          else
+              echo "  (no verdict file — script may have crashed early)"
+          fi
+
+      - name: Pack logs
+        if: always()
+        run: |
+          ./scripts/pack-logs.sh /tmp/twoyi-logs.tar.xz \
+            /tmp/ci-artifacts/logcat.txt \
+            /tmp/ci-artifacts/logcat-*.txt \
+            /tmp/ci-artifacts/kr64-stderr.log \
+            /tmp/ci-artifacts/boot-verdict.txt \
+            /tmp/ci-artifacts/emulator-stdout.log \
+            /tmp/ci-artifacts/emulator-stderr.log \
+            /tmp/ci-artifacts/tombstones/ \
+            /tmp/ci-artifacts/dropbox/ \
+            /tmp/ci-artifacts/anr/ \
+            /tmp/ci-artifacts/rootfs-extract.log \
+            /tmp/ci-artifacts/twrp-init.log \
+            /tmp/ci-artifacts/twrp-strace.log \
+            /tmp/ci-artifacts/twrp-guest-tree.log \
+            /tmp/ci-artifacts/twrp-fb-rgba.bin \
+            /tmp/ci-artifacts/twrp-fb.png \
+            /tmp/ci-artifacts/dmesg.log \
+            || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-twrp-logs
+          path: /tmp/twoyi-logs.tar.xz
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
