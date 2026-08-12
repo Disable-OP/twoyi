@@ -2197,12 +2197,44 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 );
             }
         }
-        // Create /dev/kmsg as a symlink to /twrp-kmsg.log (chroot-relative
-        // after pivot_root). Use std::os::unix::fs::symlink for symlinks.
+        // Create /dev/kmsg AND /dev/__kmsg__ as symlinks to /twrp-kmsg.log
+        // (chroot-relative after pivot_root). Use std::os::unix::fs::symlink.
+        //
+        // ROOT CAUSE (Task ID 21, KVM run 31552072308): TWRP's init (AOSP
+        // 5.1-based) does NOT use /dev/kmsg for KLOG output. Its log_init()
+        // creates /dev/__kmsg__ as a char device (major 1, minor 11), opens
+        // it for writing, then unlinks it. The open fd is kept and all
+        // KLOG_INFO/KLOG_ERROR writes go through that fd to the kernel's
+        // kmsg ring buffer — which is flooded by the outer Android init's
+        // "Could not set execcon for 'u:r:vendor_init:s0'" loop, pushing
+        // TWRP init's messages out within ~12s.
+        //
+        // Evidence from KVM run 31552072308:
+        //   - twrp-init-fds.log shows: fd 3 -> /dev/__kmsg__ (deleted)
+        //   - twrp-kmsg.log is EMPTY (0 bytes) despite the /dev/kmsg symlink
+        //   - dmesg shows NO TWRP init messages (only host's init flooding)
+        //
+        // FIX: create /dev/__kmsg__ as a SYMLINK to /twrp-kmsg.log. Then:
+        //   1. TWRP init's mknod("/dev/__kmsg__", S_IFCHR, ...) follows the
+        //      symlink and tries to mknod /twrp-kmsg.log. /twrp-kmsg.log
+        //      exists as a regular file -> mknod returns EEXIST. Init's
+        //      log_init treats EEXIST as success and continues.
+        //   2. TWRP init's open("/dev/__kmsg__", O_WRONLY) follows the
+        //      symlink and opens /twrp-kmsg.log (the regular file). SUCCESS.
+        //   3. TWRP init's unlink("/dev/__kmsg__") removes the symlink
+        //      (NOT the target /twrp-kmsg.log). The target file remains.
+        //   4. TWRP init's write(log_fd, ...) writes to /twrp-kmsg.log via
+        //      the still-open fd. The file accumulates KLOG output.
+        //   5. After kr64 SIGKILLs init, the open fd is closed, but
+        //      /twrp-kmsg.log is on ext4 (not tmpfs) and survives — we can
+        //      `adb pull` it and finally see TWRP init's KLOG messages.
+        //
+        // We ALSO keep the /dev/kmsg symlink (harmless; some TWRP init
+        // variants may try /dev/kmsg as a fallback).
         use std::os::unix::fs::symlink;
         let kmsg_target = "/twrp-kmsg.log";
+        // /dev/kmsg symlink (kept for compatibility / fallback).
         let kmsg_link = "/dev/kmsg";
-        // Remove existing /dev/kmsg if present (defensive).
         let _ = std::fs::remove_file(kmsg_link);
         match symlink(kmsg_target, kmsg_link) {
             Ok(()) => {
@@ -2214,6 +2246,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             Err(e) => {
                 warning!(
                     "[KR64] PARENT: failed to create /dev/kmsg symlink: {} (TWRP init KLOG messages will be lost)",
+                    e
+                );
+            }
+        }
+        // /dev/__kmsg__ symlink — THIS is the path TWRP init's log_init()
+        // actually opens (confirmed via twrp-init-fds.log in KVM run 31552072308).
+        let kmsg_link_double = "/dev/__kmsg__";
+        let _ = std::fs::remove_file(kmsg_link_double);
+        match symlink(kmsg_target, kmsg_link_double) {
+            Ok(()) => {
+                info!(
+                    "[KR64] PARENT: /dev/__kmsg__ -> {} symlink created (TWRP init log_init() will write KLOG to /twrp-kmsg.log)",
+                    kmsg_target
+                );
+            }
+            Err(e) => {
+                warning!(
+                    "[KR64] PARENT: failed to create /dev/__kmsg__ symlink: {} (TWRP init KLOG messages will be lost — this is the PRIMARY kmsg path)",
                     e
                 );
             }
