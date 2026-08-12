@@ -1206,6 +1206,35 @@ if [ "$TWRP_MODE" = "1" ]; then
         echo "  → searching for twrp-init.log on device..."
         timeout 10 "$ADB_BIN" -s emulator-5554 shell "find /data/data/io.twoyi -name 'twrp-init.log' 2>/dev/null" 2>/dev/null || true
     fi
+
+    # Pull /twrp-kmsg.log — TWRP init's KLOG messages (captured via the
+    # /dev/kmsg → /twrp-kmsg.log symlink that kr64 creates in TWRP mode).
+    # AOSP 5.1.1 init writes ALL its log messages via KLOG_INFO/KLOG_ERROR
+    # to /dev/kmsg. Without this capture, we can't see "starting service
+    # 'recovery'" or any error messages from TWRP init. The host's dmesg
+    # ring buffer is flooded by the outer Android init's subcontext loop,
+    # so even if TWRP init wrote to a real /dev/kmsg char device, the
+    # messages would be pushed out within ~12s.
+    echo ""
+    echo "── TWRP init KMSG log capture ──"
+    for TWRP_KMSG_PATH in \
+        "$TWOYI_PROFILE/twrp-kmsg.log" \
+        "/data/data/io.twoyi/profiles/default/rootfs/twrp-kmsg.log" \
+        "/data/user/0/io.twoyi/rootfs/twrp-kmsg.log"; do
+        "$ADB_BIN" -s emulator-5554 pull "$TWRP_KMSG_PATH" "$ARTIFACT_DIR/twrp-kmsg.log" 2>/dev/null && break
+    done
+    if [ -f "$ARTIFACT_DIR/twrp-kmsg.log" ] && [ -s "$ARTIFACT_DIR/twrp-kmsg.log" ]; then
+        echo "  ✓ twrp-kmsg.log: $(stat -c%s "$ARTIFACT_DIR/twrp-kmsg.log") bytes"
+        echo "  === twrp-kmsg.log (first 120 lines) ==="
+        head -120 "$ARTIFACT_DIR/twrp-kmsg.log"
+        # Surface any recovery-related lines for quick diagnosis.
+        echo "  → lines mentioning recovery/service/segfault:"
+        grep -iE "recovery|starting service|signal|segfault|execve|exec|setenv" "$ARTIFACT_DIR/twrp-kmsg.log" 2>/dev/null | tail -30 || echo "    (none found)"
+    else
+        echo "  ⚠ twrp-kmsg.log not found or empty — TWRP init may not have written KLOG messages"
+        echo "  → searching for twrp-kmsg.log on device..."
+        timeout 10 "$ADB_BIN" -s emulator-5554 shell "find /data/data/io.twoyi -name 'twrp-kmsg.log' 2>/dev/null" 2>/dev/null || true
+    fi
 fi
 
 # Clean up the emulator

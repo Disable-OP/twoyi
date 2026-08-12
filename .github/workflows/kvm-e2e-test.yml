@@ -408,6 +408,7 @@ jobs:
             /tmp/ci-artifacts/anr/ \
             /tmp/ci-artifacts/rootfs-extract.log \
             /tmp/ci-artifacts/twrp-init.log \
+            /tmp/ci-artifacts/twrp-kmsg.log \
             /tmp/ci-artifacts/dmesg.log \
             /tmp/ci-artifacts/twrp-ps.log
 
