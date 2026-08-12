@@ -403,13 +403,13 @@ public class RamdiskImporter {
                     break;
                 }
 
-                int modeType = mode & 0o170000;
-                if (modeType == 0o040000) {
+                int modeType = mode & 0xF000;
+                if (modeType == 0x4000) {
                     // Directory
                     File dir = new File(targetDir, name);
                     dir.mkdirs();
                     fileCount++;
-                } else if (modeType == 0o100000) {
+                } else if (modeType == 0x8000) {
                     // Regular file
                     File file = new File(targetDir, name);
                     file.getParentFile().mkdirs();
@@ -417,7 +417,7 @@ public class RamdiskImporter {
                         fos.write(data, dataStart, filesize);
                     }
                     fileCount++;
-                } else if (modeType == 0o120000) {
+                } else if (modeType == 0xA000) {
                     // Symlink — skip (sandbox may not allow creating symlinks)
                     // Write target to a .symlink file for reference
                     File linkFile = new File(targetDir, name + ".symlink");
