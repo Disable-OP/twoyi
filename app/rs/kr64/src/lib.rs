@@ -2894,7 +2894,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     // Continue anyway — init will exit 31 but we'll get
                     // diagnostic output.
                 } else {
-                    safe_write_err(b"[KR64 CHILD] PTRACE_TRACEME OK — raising SIGSTOP for parent\n");
+                    safe_write_err(b"[KR64 CHILD] PTRACE_TRACEME OK - raising SIGSTOP for parent\n");
                     libc::kill(libc::getpid(), libc::SIGSTOP);
                 }
             }

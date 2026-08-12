@@ -297,7 +297,7 @@ fn set_syscall_num(regs: &mut libc::user_regs_struct, num: i64) {
 /// "/data/user/0/io.twoyi/rootfs").
 pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     use std::io::Write;
-    let mut log = |msg: &str| {
+    let log = |msg: &str| {
         let _ = writeln!(std::io::stderr(), "[KR64][ptrace] {}", msg);
     };
 
@@ -321,7 +321,6 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     log("PTRACE_O_TRACESYSGOOD set");
 
     let mut in_syscall = false;
-    let mut pending_path_override: Option<(u64, String)> = None; // (arg_addr, new_path)
     let mut pending_getpid = false;
 
     loop {
@@ -393,6 +392,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             pending_getpid = true;
                             log("intercepted getppid() → will return 1");
                         }
+                        #[allow(unreachable_patterns)]
                         OPEN_SYSCALL | OPENAT_SYSCALL | OPENAT2_SYSCALL => {
                             // For open(path, ...) → arg1 = path
                             // For openat(dirfd, path, ...) → arg2 = path
@@ -418,6 +418,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                 }
                             }
                         }
+                        #[allow(unreachable_patterns)]
                         STAT_SYSCALL | LSTAT_SYSCALL | NEWFSTATAT_SYSCALL | STATX_SYSCALL => {
                             // stat(path, ...) → arg1 = path
                             // newfstatat(dirfd, path, ...) → arg2 = path
@@ -439,6 +440,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                 }
                             }
                         }
+                        #[allow(unreachable_patterns)]
                         ACCESS_SYSCALL | FACCESSAT_SYSCALL => {
                             // access(path, ...) → arg1 = path
                             // faccessat(dirfd, path, ...) → arg2 = path
@@ -459,6 +461,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                 }
                             }
                         }
+                        #[allow(unreachable_patterns)]
                         READLINK_SYSCALL | READLINKAT_SYSCALL => {
                             // readlink(path, ...) → arg1 = path
                             // readlinkat(dirfd, path, ...) → arg2 = path
