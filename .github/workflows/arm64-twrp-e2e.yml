@@ -125,37 +125,17 @@ jobs:
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager --update
-          # Install arm64-v8a system image (API 30, default — not google_apis
-          # because the default image is smaller and sufficient for TWRP testing)
+          # Install arm64-v8a system image + emulator via sdkmanager
+          # The emulator binary is a Linux binary that runs on both x86_64
+          # and arm64 hosts (it uses QEMU internally for guest emulation).
           sdkmanager \
               "platform-tools" \
               "platforms;android-30" \
               "build-tools;30.0.3" \
+              "emulator" \
               "system-images;android-30;default;arm64-v8a"
-          # The emulator package may not be available for arm64 Linux via sdkmanager.
-          # Download it manually from the Android repository.
-          echo "=== Downloading emulator package manually ==="
-          EMULATOR_URLS=(
-            "https://dl.google.com/android/repository/emulator-linux-13477706.zip"
-            "https://dl.google.com/android/repository/emulator-linux-13114558.zip"
-          )
-          for URL in "${EMULATOR_URLS[@]}"; do
-            echo "Trying: $URL"
-            if curl -sL --fail -o /tmp/emulator.zip "$URL"; then
-              echo "Downloaded from: $URL"
-              break
-            fi
-          done
-          if [ -f /tmp/emulator.zip ] && unzip -t /tmp/emulator.zip >/dev/null 2>&1; then
-            unzip -q -o /tmp/emulator.zip -d "$ANDROID_HOME/"
-            rm /tmp/emulator.zip
-            chmod +x "$ANDROID_HOME/emulator/emulator" 2>/dev/null || true
-            echo "=== Emulator installed ==="
-            "$ANDROID_HOME/emulator/emulator" -version 2>&1 | head -3 || true
-          else
-            echo "⚠ Could not download emulator package"
-            exit 1
-          fi
+          echo "=== Emulator installed via sdkmanager ==="
+          "$ANDROID_HOME/emulator/emulator" -version 2>&1 | head -3 || true
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
 
