@@ -111,8 +111,9 @@ jobs:
           set -ex
           export ANDROID_HOME="$LOCALAPPDATA/Android/Sdk"
           export ANDROID_AVD_HOME="$USERPROFILE/.android/avd"
+          AVDMGR="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
           mkdir -p "$ANDROID_AVD_HOME"
-          echo "no" | avdmanager create avd -n twoyi_arm64 -k "system-images;android-30;default;arm64-v8a" --force
+          echo "no" | "$AVDMGR" create avd -n twoyi_arm64 -k "system-images;android-30;default;arm64-v8a" --force
           AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_arm64.avd/config.ini"
           if [ ! -f "$AVD_CONFIG" ]; then
             echo "ERROR: AVD config not found at $AVD_CONFIG"
@@ -120,13 +121,13 @@ jobs:
             exit 1
           fi
           cat >> "$AVD_CONFIG" << 'EOF'
-          hw.keyboard=yes
-          hw.gpu.enabled=yes
-          hw.gpu.mode=swiftshader_indirect
-          hw.ramSize=2048
-          disk.dataPartition.size=4096
-          vm.heapSize=256
-          EOF
+hw.keyboard=yes
+hw.gpu.enabled=yes
+hw.gpu.mode=swiftshader_indirect
+hw.ramSize=2048
+disk.dataPartition.size=4096
+vm.heapSize=256
+EOF
           echo "=== AVD config ==="
           cat "$AVD_CONFIG"
 
