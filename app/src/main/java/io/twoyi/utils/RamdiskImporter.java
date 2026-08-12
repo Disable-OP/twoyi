@@ -238,40 +238,82 @@ public class RamdiskImporter {
     /**
      * Import a gzip file. Could be .tar.gz (rootfs) or .cpio.gz (ramdisk).
      * Pure Java: uses GZIPInputStream.
+     *
+     * Fully decompresses the gzip stream to a temp file, then dispatches to the
+     * correct inner handler (CPIO newc / TAR) based on the decompressed magic.
      */
     private static boolean importGzipFile(File gzFile, File targetDir) throws IOException {
-        // Peek at decompressed content to determine if it's tar or cpio
-        byte[] header = new byte[512];
-        try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile))) {
-            int read = gzis.read(header);
-            if (read < 8) throw new IOException("Decompressed file too small");
-        }
+        Log.i(TAG, "GZIP-compressed file detected");
 
-        // Check if it's a cpio (070701)
-        if (header[0] == '0' && header[1] == '7' && header[2] == '0' && header[3] == '7') {
-            // It's a cpio.gz — decompress to temp file, then extract
-            File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
-            try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile));
-                 FileOutputStream fos = new FileOutputStream(cpioTemp)) {
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
-            }
-            boolean result = extractCpioStreaming(cpioTemp, targetDir);
-            cpioTemp.delete();
-            return result;
-        }
-
-        // Assume tar.gz — decompress then extract
-        File tarTemp = new File(targetDir.getParentFile(), "rootfs.tar");
+        // Fully decompress the gzip stream to a temp file ONCE.
+        // We don't peek-and-restart because GZIPInputStream doesn't support
+        // mark/reset reliably across implementations.
+        File innerTemp = new File(targetDir.getParentFile(), "ramdisk.inner");
+        long decompressedBytes = 0;
         try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile));
-             FileOutputStream fos = new FileOutputStream(tarTemp)) {
+             FileOutputStream fos = new FileOutputStream(innerTemp)) {
             byte[] buf = new byte[8192];
             int n;
-            while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
+            while ((n = gzis.read(buf)) > 0) {
+                fos.write(buf, 0, n);
+                decompressedBytes += n;
+            }
+        } catch (java.util.zip.ZipException ze) {
+            innerTemp.delete();
+            throw new IOException("GZIP decompress failed: " + ze.getMessage(), ze);
         }
-        boolean result = extractTarJava(tarTemp, targetDir);
-        tarTemp.delete();
+        Log.i(TAG, "GZIP decompressed " + decompressedBytes + " bytes -> " + innerTemp.getName());
+
+        if (decompressedBytes < 8) {
+            innerTemp.delete();
+            throw new IOException("Decompressed file too small (" + decompressedBytes + " bytes)");
+        }
+
+        // Read the inner magic to dispatch
+        byte[] header = new byte[Math.min(512, (int) Math.min(innerTemp.length(), 512))];
+        try (FileInputStream fis = new FileInputStream(innerTemp)) {
+            int read = readFully(fis, header);
+            if (read < 8) {
+                innerTemp.delete();
+                throw new IOException("Could not read inner header");
+            }
+        }
+
+        boolean isCpio  = header[0] == '0' && header[1] == '7' && header[2] == '0' && header[3] == '7'
+                       && (header[4] == '0' && (header[5] == '1' || header[5] == '2'));
+        boolean isTar   = header.length > 262 && header[257] == 'u' && header[258] == 's'
+                       && header[259] == 't' && header[260] == 'a' && header[261] == 'r';
+
+        boolean result;
+        if (isCpio) {
+            Log.i(TAG, "CPIO inside detected format GZIP-compressed file");
+            result = extractCpioStreaming(innerTemp, targetDir);
+        } else if (isTar) {
+            Log.i(TAG, "TAR inside detected format GZIP-compressed file");
+            result = extractTarJava(innerTemp, targetDir);
+        } else {
+            // Unknown inner format — try cpio first, then tar, as a last resort.
+            Log.w(TAG, "Unknown inner format inside gzip (magic=0x"
+                    + Integer.toHexString(header[0] & 0xFF)
+                    + Integer.toHexString(header[1] & 0xFF)
+                    + "), trying cpio then tar");
+            try {
+                result = extractCpioStreaming(innerTemp, targetDir);
+            } catch (Exception e) {
+                Log.w(TAG, "cpio fallback failed: " + e.getMessage());
+                result = false;
+            }
+            if (!result) {
+                try {
+                    result = extractTarJava(innerTemp, targetDir);
+                } catch (Exception e) {
+                    Log.w(TAG, "tar fallback failed: " + e.getMessage());
+                    result = false;
+                }
+            }
+        }
+
+        innerTemp.delete();
         return result;
     }
 
@@ -279,7 +321,7 @@ public class RamdiskImporter {
      * Import an LZMA-compressed file. Pure Java: uses Apache Commons Compress.
      */
     private static boolean importLzmaFile(File lzmaFile, File targetDir) throws IOException {
-        Log.i(TAG, "Decompressing LZMA file (pure Java)...");
+        Log.i(TAG, "LZMA-compressed file detected");
         File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
         try (LZMACompressorInputStream lzis = new LZMACompressorInputStream(new FileInputStream(lzmaFile));
              FileOutputStream fos = new FileOutputStream(cpioTemp)) {
@@ -287,19 +329,21 @@ public class RamdiskImporter {
             int n;
             while ((n = lzis.read(buf)) > 0) fos.write(buf, 0, n);
         }
+        Log.i(TAG, "LZMA decompressed -> " + cpioTemp.length() + " bytes");
 
         // Check if decompressed content is cpio
         byte[] header = new byte[6];
         try (FileInputStream fis = new FileInputStream(cpioTemp)) {
-            fis.read(header);
+            readFully(fis, header);
         }
         if (new String(header).equals("070701") || new String(header).equals("070702")) {
+            Log.i(TAG, "CPIO inside detected format LZMA-compressed file");
             boolean result = extractCpioStreaming(cpioTemp, targetDir);
             cpioTemp.delete();
             return result;
         }
 
-        // Not cpio — try tar
+        Log.i(TAG, "TAR inside detected format LZMA-compressed file");
         boolean result = extractTarJava(cpioTemp, targetDir);
         cpioTemp.delete();
         return result;
@@ -309,7 +353,7 @@ public class RamdiskImporter {
      * Import an XZ-compressed file. Pure Java: uses Apache Commons Compress.
      */
     private static boolean importXzFile(File xzFile, File targetDir) throws IOException {
-        Log.i(TAG, "Decompressing XZ file (pure Java)...");
+        Log.i(TAG, "XZ-compressed file detected");
         File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
         try (XZCompressorInputStream xzis = new XZCompressorInputStream(new FileInputStream(xzFile));
              FileOutputStream fos = new FileOutputStream(cpioTemp)) {
@@ -317,17 +361,20 @@ public class RamdiskImporter {
             int n;
             while ((n = xzis.read(buf)) > 0) fos.write(buf, 0, n);
         }
+        Log.i(TAG, "XZ decompressed -> " + cpioTemp.length() + " bytes");
 
         byte[] header = new byte[6];
         try (FileInputStream fis = new FileInputStream(cpioTemp)) {
-            fis.read(header);
+            readFully(fis, header);
         }
         if (new String(header).equals("070701") || new String(header).equals("070702")) {
+            Log.i(TAG, "CPIO inside detected format XZ-compressed file");
             boolean result = extractCpioStreaming(cpioTemp, targetDir);
             cpioTemp.delete();
             return result;
         }
 
+        Log.i(TAG, "TAR inside detected format XZ-compressed file");
         boolean result = extractTarJava(cpioTemp, targetDir);
         cpioTemp.delete();
         return result;
@@ -445,9 +492,19 @@ public class RamdiskImporter {
                     break;
                 }
 
+                // cpio newc header field offsets (each field is 8 hex chars,
+                // magic is 6 bytes, total header = 110 bytes):
+                //   0   magic ("070701")
+                //   6   ino
+                //   14  mode
+                //   22  uid / 30 gid / 38 nlink / 46 mtime
+                //   54  filesize
+                //   62  devmajor / 70 devminor / 78 rdevmajor / 86 rdevminor
+                //   94  namesize  <-- was incorrectly 62 before, reading devmajor
+                //   102 check
                 int mode = parseHex(header, 14, 8);
                 long filesize = parseHexLong(header, 54, 8);
-                int namesize = parseHex(header, 62, 8);
+                int namesize = parseHex(header, 94, 8);
 
                 if (namesize <= 0 || namesize > 4096) {
                     Log.w(TAG, "Invalid namesize: " + namesize);
@@ -538,7 +595,12 @@ public class RamdiskImporter {
             }
 
             Log.i(TAG, "Extracted " + fileCount + " entries from cpio");
-            return fileCount > 0;
+            if (fileCount == 0) {
+                throw new IOException("CPIO archive contained 0 entries (parsed magic="
+                    + (fileLength > 0 ? "valid" : "empty")
+                    + ", fileLength=" + fileLength + ")");
+            }
+            return true;
         }
     }
 
