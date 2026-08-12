@@ -21,6 +21,7 @@ android {
         minSdkVersion 27
         //noinspection ExpiredTargetSdkVersion
         targetSdkVersion 28
+        multiDexEnabled true
         versionCode 30505
         versionName "3.5.5-${buildSerial}"
 
@@ -192,7 +193,10 @@ dependencies {
 
     // Apache Commons Compress — pure Java LZMA/XZ decompression for ramdisk import.
     // Used by RamdiskImporter to handle LZMA-compressed TWRP ramdisks (arm64 images).
-    implementation 'org.apache.commons:commons-compress:1.26.1'
+    implementation 'org.apache.commons:commons-compress:1.21'
+
+    // Multidex — required because commons-compress adds many methods
+    implementation 'androidx.multidex:multidex:2.0.1'
 
 //    testImplementation 'junit:junit:4.+'
     androidTestImplementation 'androidx.test.ext:junit:1.1.1'
