@@ -89,9 +89,36 @@ jobs:
           Write-Host "Accepting licenses..."
           'y' * 10 | sdkmanager --licenses 2>&1 | Out-Null
 
-          # Install packages
+          # Install packages (emulator not available via sdkmanager on WinARM)
           Write-Host "Installing packages..."
-          sdkmanager "platform-tools" "platforms;android-30" "build-tools;30.0.3" "emulator" "system-images;android-30;default;arm64-v8a" 2>&1
+          sdkmanager "platform-tools" "platforms;android-30" "build-tools;30.0.3" "system-images;android-30;default;arm64-v8a" 2>&1
+
+          # Download emulator manually (x86_64 binary, runs via Prism on WinARM)
+          $emuDir = "$env:ANDROID_HOME\emulator"
+          if (-not (Test-Path "$emuDir\emulator.exe")) {
+            Write-Host "Emulator not in sdkmanager, downloading manually..."
+            # The emulator zip is x86_64 but runs on WinARM via Prism translation
+            $emuUrl = "https://dl.google.com/android/repository/emulator-windows-13477706.zip"
+            $emuZip = "$env:TEMP\emulator.zip"
+            try {
+              Invoke-WebRequest -Uri $emuUrl -OutFile $emuZip -MaximumRedirection 5
+              Expand-Archive -Path $emuZip -DestinationPath $env:ANDROID_HOME -Force
+              Remove-Item $emuZip
+              Write-Host "Emulator downloaded and extracted"
+            } catch {
+              Write-Host "Failed to download from $emuUrl, trying alternative..."
+              $emuUrl2 = "https://dl.google.com/android/repository/emulator-windows-11591348.zip"
+              try {
+                Invoke-WebRequest -Uri $emuUrl2 -OutFile $emuZip -MaximumRedirection 5
+                Expand-Archive -Path $emuZip -DestinationPath $env:ANDROID_HOME -Force
+                Remove-Item $emuZip
+                Write-Host "Emulator downloaded from alternative URL"
+              } catch {
+                Write-Host "ERROR: Cannot download emulator. WinARM may not support x86_64 emulator."
+                exit 1
+              }
+            }
+          }
 
           # Verify emulator
           Write-Host "=== Emulator version ==="
