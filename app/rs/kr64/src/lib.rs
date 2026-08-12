@@ -2406,7 +2406,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // `twrp_fb_hook.so` (LD_PRELOAD'd into the recovery process). See
     // `devices::create_twrp_framebuffer` for the full rationale.
     if cfg.boot_recovery {
-        if let Err(e) = devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width, cfg.height) {
+        if let Err(e) = devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width as u32, cfg.height as u32) {
             warning!(
                 "[KR64] PARENT: failed to create TWRP framebuffer: {} (recovery will crash in libminuitwrp.so)",
                 e
