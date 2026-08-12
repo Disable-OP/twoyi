@@ -713,7 +713,7 @@ fi  # end of TWRP_MODE libgetpid_hook push branch
 # TWRP MODE: skip this push. TWRP's recovery binary is i386 (32-bit x86)
 # and its 32-bit bionic linker CANNOT load the 64-bit libtwoyi_loader_shlib.so
 # ("CANNOT LINK EXECUTABLE: ... is 64-bit instead of 32-bit"). Instead, we
-# push the i686 twrp_fb_hook.so below, which is the architecturally correct
+# push the i686 libtwrp_fb_hook.so below, which is the architecturally correct
 # 32-bit hook library for the i386 recovery. Task ID 17 incorrectly pushed
 # the x86_64 libtwoyi_loader_shlib.so in TWRP mode and set LD_PRELOAD to
 # it; the linker aborted recovery on the arch mismatch, making recovery
@@ -740,7 +740,7 @@ else
 fi
 fi  # end of TWRP_MODE libtwoyi_loader_shlib push branch
 
-# --- Push twrp_fb_hook.so (TWRP mode only — i686 FB ioctl hook) ---
+# --- Push libtwrp_fb_hook.so (TWRP mode only — i686 FB ioctl hook) ---
 # This is the i686 (32-bit x86) LD_PRELOAD library for TWRP framebuffer
 # virtualization. TWRP's recovery binary is i386 and loads libminuitwrp.so
 # which crashes at offset 0x57d7 (NULL deref after FBIOGET_VSCREENINFO
@@ -754,23 +754,23 @@ fi  # end of TWRP_MODE libtwoyi_loader_shlib push branch
 #
 # Task ID 18 (KVM run 31536016997): reverted from the x86_64
 # libtwoyi_loader_shlib.so (which the i386 recovery's 32-bit bionic linker
-# cannot load) back to the i686 twrp_fb_hook.so — the architecturally
+# cannot load) back to the i686 libtwrp_fb_hook.so — the architecturally
 # correct choice for the i386 recovery binary.
 if [ "$TWRP_MODE" = "1" ]; then
-    if [ -f "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" ]; then
-        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" "$TWOYI_PROFILE/twrp_fb_hook.so" 2>&1 | tail -2
-        "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/twrp_fb_hook.so" 2>&1
-        echo "  ✓ pushed twrp_fb_hook.so to rootfs"
+    if [ -f "$EXTRACT_DIR/lib/x86_64/libtwrp_fb_hook.so" ]; then
+        "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libtwrp_fb_hook.so" "$TWOYI_PROFILE/libtwrp_fb_hook.so" 2>&1 | tail -2
+        "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libtwrp_fb_hook.so" 2>&1
+        echo "  ✓ pushed libtwrp_fb_hook.so to rootfs"
     else
         # Try extracting from the APK directly.
         APK_ABS4=$(readlink -f "$APK_PATH" 2>/dev/null || echo "$APK_PATH")
-        unzip -o "$APK_ABS4" "lib/x86_64/twrp_fb_hook.so" -d "$EXTRACT_DIR" 2>/dev/null || true
-        if [ -f "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" ]; then
-            "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/twrp_fb_hook.so" "$TWOYI_PROFILE/twrp_fb_hook.so" 2>&1 | tail -2
-            "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/twrp_fb_hook.so" 2>&1
-            echo "  ✓ pushed twrp_fb_hook.so to rootfs (extracted separately)"
+        unzip -o "$APK_ABS4" "lib/x86_64/libtwrp_fb_hook.so" -d "$EXTRACT_DIR" 2>/dev/null || true
+        if [ -f "$EXTRACT_DIR/lib/x86_64/libtwrp_fb_hook.so" ]; then
+            "$ADB_BIN" -s emulator-5554 push "$EXTRACT_DIR/lib/x86_64/libtwrp_fb_hook.so" "$TWOYI_PROFILE/libtwrp_fb_hook.so" 2>&1 | tail -2
+            "$ADB_BIN" -s emulator-5554 shell "chmod 644 $TWOYI_PROFILE/libtwrp_fb_hook.so" 2>&1
+            echo "  ✓ pushed libtwrp_fb_hook.so to rootfs (extracted separately)"
         else
-            echo "  ⚠ twrp_fb_hook.so not found in APK — TWRP framebuffer virtualization disabled (recovery will crash in libminuitwrp.so)"
+            echo "  ⚠ libtwrp_fb_hook.so not found in APK — TWRP framebuffer virtualization disabled (recovery will crash in libminuitwrp.so)"
         fi
     fi
 fi
@@ -799,8 +799,8 @@ fi
 # Set TWOYI_LD_DEBUG=0 in the CI env to disable.
 #
 # TWRP MODE: pass --boot-recovery to kr64. This:
-#   - loads twrp_fb_hook.so (i686) and sets
-#     LD_PRELOAD=/sbin/twrp_fb_hook.so (the statically-linked
+#   - loads libtwrp_fb_hook.so (i686) and sets
+#     LD_PRELOAD=/sbin/libtwrp_fb_hook.so (the statically-linked
 #     init ignores LD_PRELOAD, but the dynamically-linked i386 recovery
 #     binary loads it → FB ioctls are intercepted → no libminuitwrp crash).
 #     The i686 hook is required because the 32-bit bionic linker in TWRP's
@@ -929,7 +929,7 @@ if [ "$TWRP_MODE" = "1" ]; then
         #     preceding "[twrp_fb_hook] ioctl(...)" write → our ioctl
         #     hook isn't being called (PLT issue).
         # Also added -v to not truncate env/args, so we can verify
-        # LD_PRELOAD=/sbin/twrp_fb_hook.so is actually in recovery's env.
+        # LD_PRELOAD=/sbin/libtwrp_fb_hook.so is actually in recovery's env.
         timeout 10 "$ADB_BIN" -s emulator-5554 shell "
             nohup strace -v -e trace=write,execve,open,openat,ioctl,close -f -p $GUEST_PID -o /data/local/tmp/twrp-strace.log </dev/null >/dev/null 2>&1 &
             echo \$! > /data/local/tmp/strace.pid

@@ -122,9 +122,9 @@ public final class RomManager {
         // Failures are non-fatal: a missing symlink means the guest
         // can't load that specific lib, but boot continues.
         //
-        // twrp_fb_hook.so (Task ID: twrp-fb-hook-symlink): added here
+        // libtwrp_fb_hook.so (Task ID: twrp-fb-hook-symlink): added here
         // so kr64's hook_library_candidates() can find it via the
-        // {data_dir}/rootfs/system/lib64/twrp_fb_hook.so symlink
+        // {data_dir}/rootfs/system/lib64/libtwrp_fb_hook.so symlink
         // (candidate #3 in hook_library_candidates). Without this
         // symlink, kr64's only fallback on real devices is the
         // TWOYI_NATIVE_LIB_DIR env var (candidate #0, passed by
@@ -136,7 +136,7 @@ public final class RomManager {
                 "libkr64.so",
                 "libOpenglRender.so",
                 "libgetpid_hook.so",
-                "twrp_fb_hook.so",
+                "libtwrp_fb_hook.so",
         }) {
             try {
                 ensureLibSymlink(context, lib, new File(rootfsLib64, lib));

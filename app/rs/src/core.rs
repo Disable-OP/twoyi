@@ -380,7 +380,7 @@ pub fn init_renderer(
         // directory where Android's package manager extracted the APK's
         // lib/<abi>/*.so files at install time (extractNativeLibs=true).
         // We pass it to kr64 via the TWOYI_NATIVE_LIB_DIR env var so kr64
-        // can directly read twrp_fb_hook.so (and other hook libs) from
+        // can directly read libtwrp_fb_hook.so (and other hook libs) from
         // <nativeLibraryDir>/<lib> WITHOUT scanning /data/app/.
         //
         // Why this matters: kr64's apk_native_lib_candidates_in() does
@@ -500,7 +500,7 @@ pub fn init_renderer(
         cmd.env("TWOYI_ROOTFS", &working_dir);
         cmd.env("TYLOADER", &loader_path);
         // Pass the app's nativeLibraryDir (derived from loader_path above)
-        // so kr64 can find hook libraries (twrp_fb_hook.so, libgetpid_hook.so,
+        // so kr64 can find hook libraries (libtwrp_fb_hook.so, libgetpid_hook.so,
         // libtwoyi_loader_shlib.so) without scanning /data/app/ — which is
         // mode 0771 and unreadable for untrusted_app. See lib.rs's
         // hook_library_candidates() candidate #0 for the consumer.
