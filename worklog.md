@@ -5064,3 +5064,34 @@ Stage Summary:
 - TWRP framebuffer reader renders content to SurfaceView
 - Ptrace emulation works for basic syscalls (getpid, open, stat, etc.)
 - Remaining: x86 TWRP init crashes with SIGSYS on x86_64 emulator (32-bit vs 64-bit syscall number mismatch in ptrace emulator) — not an issue on arm64 devices
+
+---
+Task ID: round-73
+Agent: main + sub-agents
+Task: Fix three critical bugs blocking arm64 TWRP boot (PTRACE_GETREGSET on aarch64, x86_64 register indices, init.rc import following) and produce a fresh APK with twrp_fb_hook.so bundled.
+
+Work Log:
+- PTRACE_GETREGSET fix for aarch64 (commit f7b85c5): bionic's ptrace() wrapper rejects PTRACE_GETREGSET/SETREGSET on aarch64 with EINVAL, so bypassed it by calling libc::syscall(SYS_ptrace, ...) directly for GETREGSET/SETREGSET on aarch64. Also fixed a state-desync bug where in_syscall wasn't flipped on GETREGS failure (the previous code only flipped it on the success path, leaving the emulator stuck after a failed GETREGS).
+- x86_64 register index fix (commit 8e4e34f): corrected all 6 register index constants in the ptrace emulator that were completely wrong. REG_SYSCALL was 8 (r9) instead of 15 (orig_rax), REG_RET was 9 instead of 14 (rax), and so on — every single constant was off. This made x86_64 ptrace emulation entirely non-functional (wrong register reads/writes for every traced syscall). Now matches the kernel's user_regs_struct layout (r15=0 ... orig_rax=15, rip=16, eflags=17).
+- init.rc patching fix for arm64 TWRP (commit b2f3406): the patcher previously only scanned a hard-coded list of init.rc paths and missed the actual service definitions in TWRP recovery images. Now it:
+    * Follows `import` directives recursively in init.rc
+    * Scans init.recovery.rc, init.recovery.*.rc, and system/etc/init/recovery.rc
+    * Has a fallback that creates init.twoyi.rc with the full service definition + LD_PRELOAD set to twrp_fb_hook.so, then imports it from the main init.rc
+  Also fixed the misleading klog_init warning on aarch64: it previously said "TWRP version mismatch?" which confused users; it now correctly says "x86-only; skipped on arm64".
+- All builds succeeded:
+    * arm64 APK build #635 (commit 8e4e34f) — passed
+    * arm64 APK build #637 (commit b2f3406) — passed
+    * UI E2E test #16 (commit 8e4e34f) — passed
+    * UI E2E test #17 (commit b2f3406) — passed
+    * APK verified to contain lib/arm64-v8a/twrp_fb_hook.so
+- Fresh APK available at /home/z/my-project/download/twoyi-arm64-v8a-latest.apk (commit b2f3406, 11.2 MB).
+
+Stage Summary:
+- Three blocking bugs fixed: aarch64 PTRACE_GETREGSET (bionic wrapper bypass), x86_64 register index table (all 6 constants wrong), and init.rc import following for arm64 TWRP.
+- Fresh APK at /home/z/my-project/download/twoyi-arm64-v8a-latest.apk (commit b2f3406, 11.2 MB) — verified to contain lib/arm64-v8a/twrp_fb_hook.so.
+- All CI builds (#635, #637) and UI E2E tests (#16, #17) passed.
+- Remaining issues to verify on a REAL arm64 device (not emulator):
+    * PTRACE_GETREGSET now uses raw syscall (SYS_ptrace) — needs on-device verification that it returns valid regs
+    * init.rc patching now follows imports + has fallback — needs on-device verification that the twoyi service actually starts
+    * twrp_fb_hook.so is in the APK — needs on-device verification that kr64 finds and loads it (LD_PRELOAD path)
+    * IMPORTANT: The user's previous logs were from a STALE APK — it had hardcoded 720x1280 dimensions, no ptrace fix, and no twrp_fb_hook.so. Must re-test with the fresh APK before drawing any new conclusions.
