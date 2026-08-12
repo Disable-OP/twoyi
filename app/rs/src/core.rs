@@ -118,6 +118,58 @@ pub fn get_opengles_paths() -> Vec<String> {
 struct SendPtr(*mut c_void);
 unsafe impl Send for SendPtr {}
 
+/// Renderer thread main function. Called from `thread::spawn` in
+/// `init_renderer`. Takes a `SendPtr` (not a raw pointer) so the
+/// closure doesn't capture `*mut c_void` (which is not Send).
+fn renderer_thread_main(
+    window_sp: SendPtr,
+    surface_width: i32,
+    surface_height: i32,
+    virtual_width: i32,
+    virtual_height: i32,
+    xdpi: i32,
+    ydpi: i32,
+    fps: i32,
+) {
+    let window = window_sp.0;
+    info!("[CORE] Renderer thread started, window: {:?}", window);
+
+    if is_boot_recovery_enabled() {
+        info!("[CORE] TWRP boot: starting framebuffer reader thread (fb0 → SurfaceView)");
+        let rootfs = get_rootfs_dir();
+        let fb_path = format!("{}/dev/graphics/fb0", rootfs);
+        let sw = surface_width;
+        let sh = surface_height;
+        let vw = virtual_width;
+        let vh = virtual_height;
+        let inner_wrap = SendPtr(window);
+        std::thread::spawn(move || {
+            twrp_fb_render_loop_wrapper(inner_wrap, fb_path, sw, sh, vw, vh);
+        });
+    } else {
+        info!("[CORE] Starting AOSP libOpenglRender.so");
+        let result = unsafe {
+            renderer_bindings::startOpenGLRenderer(
+                window,
+                virtual_width,
+                virtual_height,
+                xdpi,
+                ydpi,
+                fps,
+            )
+        };
+        if result != 0 {
+            log::error!(
+                "[CORE] startOpenGLRenderer returned {} (non-zero = failure)",
+                result
+            );
+            RENDERER_STARTED.store(false, Ordering::Release);
+        } else {
+            info!("[CORE] Renderer started successfully");
+        }
+    }
+}
+
 /// On subsequent calls (e.g. when the Surface is recreated) the
 /// renderer thread is *not* restarted — only the subwindow is reset.
 #[allow(clippy::too_many_arguments)]
@@ -204,65 +256,24 @@ pub fn init_renderer(
 
         // Start the renderer in a separate thread
         // SendPtr is defined at module level — it wraps the raw pointer
-        // so it can be sent to the spawned thread.
+        // so it can be sent to the spawned thread. We keep the SendPtr
+        // intact throughout the closure (never extract .0 until passing
+        // to a function) so Rust's Send checker is satisfied.
         let window_wrap = SendPtr(window_addr as *mut c_void);
         thread::spawn(move || {
-            let window = window_wrap.0;
-            info!("[CORE] Renderer thread started, window: {:?}", window);
-
-            // ── TWRP BOOT: framebuffer reader thread ──
-            //
-            // TWRP doesn't use OpenGL ES — it writes directly to
-            // /dev/graphics/fb0 as a raw RGBA framebuffer. The OpenGL ES
-            // renderer (libOpenglRender.so) would show nothing because
-            // TWRP never sends any GL commands through qemu_pipe.
-            //
-            // Instead, we spawn a thread that:
-            //   1. Reads {rootfs}/dev/graphics/fb0 (3,686,400 bytes =
-            //      720*1280*4 RGBA8888) periodically
-            //   2. Blits the pixels to the ANativeWindow (SurfaceView)
-            //      using ANativeWindow_lock + memcpy + ANativeWindow_unlock
-            //
-            // This makes the TWRP UI visible in the Java app without
-            // requiring OpenGL ES or any guest-side GL renderer.
-            if is_boot_recovery_enabled() {
-                info!("[CORE] TWRP boot: starting framebuffer reader thread (fb0 → SurfaceView)");
-                let rootfs = get_rootfs_dir();
-                let fb_path = format!("{}/dev/graphics/fb0", rootfs);
-                let vw = virtual_width;
-                let vh = virtual_height;
-                let sw = surface_width;
-                let sh = surface_height;
-                // Wrap the raw pointer in SendPtr for the inner thread spawn.
-                // We pass the SendPtr (not the raw pointer) to the spawned
-                // thread so Rust's Send checker is satisfied.
-                let inner_wrap = SendPtr(window);
-                std::thread::spawn(move || {
-                    twrp_fb_render_loop_wrapper(inner_wrap, fb_path, sw, sh, vw, vh);
-                });
-            } else {
-                info!("[CORE] Starting AOSP libOpenglRender.so");
-                let result = unsafe {
-                    renderer_bindings::startOpenGLRenderer(
-                        window,
-                        virtual_width,
-                        virtual_height,
-                        xdpi,
-                        ydpi,
-                        fps,
-                    )
-                };
-                if result != 0 {
-                    log::error!(
-                        "[CORE] startOpenGLRenderer returned {} (non-zero = failure)",
-                        result
-                    );
-                    // Reset RENDERER_STARTED so a future init_renderer call can retry
-                    RENDERER_STARTED.store(false, Ordering::Release);
-                } else {
-                    info!("[CORE] Renderer started successfully");
-                }
-            }
+            // Pass the SendPtr to a non-closure helper that extracts .0
+            // and does the actual work. This avoids the closure capturing
+            // the raw *mut c_void field (which is not Send).
+            renderer_thread_main(
+                window_wrap,
+                surface_width,
+                surface_height,
+                virtual_width,
+                virtual_height,
+                xdpi,
+                ydpi,
+                fps,
+            );
         });
 
         let working_dir = get_rootfs_dir();
