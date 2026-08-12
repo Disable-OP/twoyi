@@ -23,12 +23,12 @@
 //     (720x1280 @ 32bpp, RGBA8888). This is the FIX for the libminuitwrp
 //     segfault at offset 0x57d7 (NULL deref after FBIOGET_VSCREENINFO
 //     returned ENOTTY on /dev/null and the struct stayed zeroed).
-//   - mmap() — for fb0 fds, fall back to MAP_ANONYMOUS if the real mmap
-//     fails (some callers use MAP_SHARED which requires the file to be
-//     writable; our regular file is writable so this usually isn't
-//     needed, but it's a safety net).
 //
 // WHAT THIS DOES NOT HOOK:
+//   - mmap() — REMOVED. kr64 pre-creates /dev/graphics/fb0 as a regular
+//     file of exactly 3,686,400 bytes, so bionic's native mmap() works
+//     without intervention. (The old mmap hook required dlsym, which is
+//     unavailable on TWRP's old bionic — see the weak-dlsym comment below.)
 //   - mount/mkdir/etc — TWRP's init is statically linked and doesn't
 //     need path translation or mount emulation.
 //   - execv/execve — TWRP's recovery doesn't fork+exec other binaries
@@ -49,11 +49,32 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <dlfcn.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <linux/fb.h>
+
+// ---------------------------------------------------------------------------
+// WEAK dlsym DECLARATION — we deliberately do NOT include <dlfcn.h> because
+// it declares dlsym as a strong extern, which bionic's old linker (AOSP 5.1,
+// Android L) refuses to leave unresolved: it errors out with
+// "CANNOT LINK EXECUTABLE DEPENDENCIES: cannot locate symbol 'dlsym'
+// referenced by 'twrp_fb_hook.so'" (strace-confirmed in KVM runs 31574428304
+// and 31576126359 — the recovery binary doesn't link against libdl.so, so
+// dlsym is unresolvable from the LD_PRELOAD).
+//
+// By declaring dlsym as a WEAK symbol, bionic's linker will leave it as NULL
+// when it can't be resolved, instead of erroring out. At runtime we check
+// `if (dlsym)` before calling it, and fall back to raw syscalls when it's
+// NULL. This lets the SAME .so load on both:
+//   - modern bionic (libdl loaded) — uses dlsym to find real_* functions
+//   - old bionic (libdl not loaded) — uses raw_syscall* fallbacks
+//
+// RTLD_NEXT is normally defined in <dlfcn.h> as ((void *)-1L); we redefine
+// it here since we're not including the header.
+// ---------------------------------------------------------------------------
+extern void *dlsym(void *handle, const char *symbol) __attribute__((weak));
+#define RTLD_NEXT ((void *)-1L)
 
 // ---------------------------------------------------------------------------
 // CUSTOM LIBC FUNCTIONS — we build with -nostdlib, so we must provide our
@@ -101,9 +122,10 @@ static unsigned int my_strlen(const char *s) {
 //   int $0x80
 //   eax = return value (negative errno on error)
 //
-// We only need 1/3/4-arg variants (no 6-arg syscalls after removing the
-// dead SYS_mmap2 fallback in mmap()). For the 6-arg case ebp would have
-// to be saved/restored (it's the frame pointer); we avoid that entirely.
+// We only need 1/3/4-arg variants (no 6-arg syscalls now that the
+// mmap hook is removed — see the mmap comment at the bottom). For the
+// 6-arg case ebp would have to be saved/restored (it's the frame
+// pointer); we avoid that entirely.
 // ---------------------------------------------------------------------------
 static long raw_syscall1(long num, long a) {
     long ret;
@@ -211,9 +233,9 @@ static int is_fb_path(const char *path) {
 //
 // The framebuffer memory is 720*1280*4 = 3,686,400 bytes. kr64 pre-
 // creates /dev/graphics/fb0 as a regular file of exactly this size, so
-// mmap() on the fd works naturally (no mmap hook needed for the common
-// case). The mmap hook below is a safety net for callers that use
-// MAP_SHARED with unusual flags.
+// mmap() on the fd works naturally via bionic's native mmap() — no
+// mmap hook needed (see the "mmap() — NOT HOOKED" comment at the
+// bottom of this file for why the previous safety-net hook was removed).
 // ---------------------------------------------------------------------------
 #define TWRP_FB_WIDTH          720
 #define TWRP_FB_HEIGHT         1280
@@ -328,8 +350,11 @@ static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_openat)(int, const char *, int, ...) = NULL;
 
 static void init_real_funcs(void) {
-    if (!real_open)    real_open    = dlsym(RTLD_NEXT, "open");
-    if (!real_openat)  real_openat  = dlsym(RTLD_NEXT, "openat");
+    // dlsym may be NULL (weak unresolved on old bionic without libdl).
+    // In that case real_open / real_openat stay NULL and callers fall
+    // back to raw_syscall4(SYS_openat, ...).
+    if (!real_open   && dlsym) real_open   = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
+    if (!real_openat && dlsym) real_openat = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat");
 }
 
 int open(const char *path, int flags, ...) {
@@ -375,7 +400,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
 int __open_2(const char *path, int flags) {
     init_real_funcs();
     static int (*real_open2)(const char *, int) = NULL;
-    if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
+    if (!real_open2 && dlsym) real_open2 = (int (*)(const char *, int))dlsym(RTLD_NEXT, "__open_2");
     int fd;
     if (real_open2) fd = real_open2(path, flags);
     else            fd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, 0);
@@ -393,7 +418,7 @@ int __open_2(const char *path, int flags) {
 int __openat_2(int dirfd, const char *path, int flags) {
     init_real_funcs();
     static int (*real_openat2)(int, const char *, int) = NULL;
-    if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
+    if (!real_openat2 && dlsym) real_openat2 = (int (*)(int, const char *, int))dlsym(RTLD_NEXT, "__openat_2");
     int fd;
     if (real_openat2) fd = real_openat2(dirfd, path, flags);
     else              fd = (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, 0);
@@ -419,7 +444,7 @@ int close(int fd) {
         write_str(2, ") (was tracked fb0 fd)\n");
     }
     static int (*real_close)(int) = NULL;
-    if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
+    if (!real_close && dlsym) real_close = (int (*)(int))dlsym(RTLD_NEXT, "close");
     if (real_close) return real_close(fd);
     return (int)raw_syscall1(SYS_close, fd);
 }
@@ -465,7 +490,7 @@ int ioctl(int fd, int request, ...) {
     // Fast path: not an fb0 fd, pass through.
     if (!fb_fd_is_tracked(fd)) {
         static int (*real_ioctl)(int, int, ...) = NULL;
-        if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+        if (!real_ioctl && dlsym) real_ioctl = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
         if (real_ioctl) return real_ioctl(fd, request, argp);
         return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
     }
@@ -512,7 +537,7 @@ int ioctl(int fd, int request, ...) {
             }
             // Non-FB ioctl on an fb0 fd — shouldn't happen, but pass through.
             static int (*real_ioctl)(int, int, ...) = NULL;
-            if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+            if (!real_ioctl && dlsym) real_ioctl = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
             if (real_ioctl) return real_ioctl(fd, request, argp);
             return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
         }
@@ -520,41 +545,27 @@ int ioctl(int fd, int request, ...) {
 }
 
 // ---------------------------------------------------------------------------
-// mmap() PLT interposition — safety net for fb0 fds.
+// mmap() — NOT HOOKED.
 //
-// libminuitwrp does:
-//   bits = mmap(0, fi.smem_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+// The previous version of this file intercepted mmap() to provide a
+// MAP_ANONYMOUS fallback if the real mmap failed on an fb0 fd. But that
+// hook required dlsym(RTLD_NEXT, "mmap") to find the real mmap, and on
+// old bionic (AOSP 5.1, TWRP) dlsym is unavailable (weak unresolved —
+// see the comment above the dlsym declaration). Without real_mmap, the
+// hook returned MAP_FAILED unconditionally, which would crash TWRP's
+// libminuitwrp at the mmap() call.
 //
-// On a regular file of size 3,686,400 bytes, this should succeed. But if
-// for some reason it fails (e.g. the file wasn't pre-allocated to the
-// right size, or the caller used unusual flags), we fall back to
-// MAP_ANONYMOUS so the caller gets a writable mapping and doesn't crash.
-// The mapping won't be backed by the file, but for TWRP's software
-// renderer the framebuffer memory just needs to be writable — the pixels
-// are never displayed on a real screen.
+// Removing the mmap hook entirely is the correct fix:
+//   - kr64 pre-creates /dev/graphics/fb0 as a REGULAR FILE of exactly
+//     3,686,400 bytes (720×1280×4). mmap() on a regular file works
+//     natively via bionic's libc → kernel mmap2 syscall. No hook needed.
+//   - bionic's mmap sets errno correctly (our raw_syscall6 fallback
+//     would not, since i386's 6th syscall arg clobbers ebp).
+//   - The LD_PRELOAD .so no longer needs to export an mmap symbol, so
+//     there's no risk of recursing into our own hook.
+//
+// If a future TWRP build requires mmap interception (e.g. for a real
+// device file that can't be a regular file), we'd need to implement
+// raw_syscall6 with explicit ebp save/restore — see the i386 syscall
+// convention comment above raw_syscall1.
 // ---------------------------------------------------------------------------
-void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
-    static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
-    if (!real_mmap) real_mmap = dlsym(RTLD_NEXT, "mmap");
-
-    // Try the real mmap first.
-    if (real_mmap) {
-        void *result = real_mmap(addr, length, prot, flags, fd, offset);
-        if (result != MAP_FAILED) return result;
-    }
-
-    // mmap failed — if this is an fb0 fd, fall back to MAP_ANONYMOUS.
-    if (fb_fd_is_tracked(fd)) {
-        write_str(2, "[twrp_fb_hook] mmap on fb0 fd failed -> MAP_ANONYMOUS fallback\n");
-        if (real_mmap) {
-            return real_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
-        }
-        // real_mmap is NULL (dlsym failed — shouldn't happen, bionic always
-        // has mmap in libc.so). We can't do a raw 6-arg SYS_mmap2 syscall
-        // here without saving/restoring ebp (the frame pointer on i386).
-        // Rather than risk corrupting the caller's frame, return MAP_FAILED
-        // and let the caller handle the error.
-    }
-
-    return MAP_FAILED;
-}
