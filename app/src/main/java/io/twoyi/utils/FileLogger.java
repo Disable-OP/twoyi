@@ -567,6 +567,16 @@ public final class FileLogger {
                                 fos.write(bytes);
                             }
                         }
+                        // ALSO log each line to logcat so kr64's output is
+                        // visible even if the external storage file write
+                        // fails. This is critical for debugging: without this,
+                        // we can't see what kr64 is doing on devices where
+                        // the external storage isn't writable.
+                        for (String line : sb.toString().split("\n")) {
+                            if (!line.isEmpty()) {
+                                Log.i("KR64", line);
+                            }
+                        }
                     }
                 } catch (IOException ignored) {
                     // Source file may be briefly locked by kr64's write —
