@@ -88,6 +88,15 @@ done
 # ved; bionic resolves them at load time from the recovery binary's own
 # libc/libdl. This produces a valid 32-bit ELF that bionic can load.
 #
+# CRITICAL: We MUST pass -Wl,--hash-style=sysv. By default clang/ld.lld
+# emit only DT_GNU_HASH (no DT_HASH). TWRP's bionic linker (AOSP 5.1,
+# Android L) does NOT understand DT_GNU_HASH — it warns
+# "unused DT entry: type 0x6ffffef5" (DT_GNU_HASH) and then errors out
+# "CANNOT LINK EXECUTABLE: empty/missing DT_HASH in twrp_fb_hook.so",
+# causing /sbin/recovery to exit(1) before main() runs (strace-confirmed
+# in KVM run 31562902048). --hash-style=sysv makes ld emit DT_HASH (the
+# classic SysV hash table) and omit DT_GNU_HASH, satisfying old bionic.
+#
 # The .so is placed in jniLibs/x86_64/ (despite being i686) so the APK
 # packaging includes it. Android's PackageManager extracts whatever is in
 # lib/<abi>/ without validating the ELF architecture, and the KVM test
@@ -107,6 +116,7 @@ $NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
     -target i686-linux-android24 \
     --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
     -nostdlib -shared -fPIC -O2 -g \
+    -Wl,--hash-style=sysv \
     -D_GNU_SOURCE \
     -I$SCRIPT_DIR/twoyi_loader/include -I$SCRIPT_DIR/twoyi_loader/src \
     -o $TWRP_HOOK_BUILD_DIR/twrp_fb_hook.so \
