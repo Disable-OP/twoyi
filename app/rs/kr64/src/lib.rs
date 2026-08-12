@@ -750,10 +750,13 @@ fn apk_native_lib_candidates_in(base: &Path, lib_name: &str) -> Vec<String> {
                 continue;
             }
             let apk_path = apk_entry.path(); // /data/app/~~<random>/io.twoyi-<random>/
-                                             // Check lib/x86_64/<lib> first (preferred ABI on x86_64
-                                             // devcontainer), then lib/arm64/<lib> (fallback for ARM
-                                             // translators / native ARM hosts).
-            for abi in ["x86_64", "arm64"] {
+                                             // Check all standard Android ABI directories.
+                                             // Android package manager extracts native libs to
+                                             // lib/<abi>/ where <abi> is one of:
+                                             //   arm64-v8a, armeabi-v7a, x86, x86_64
+                                             // (NOT "arm64" — that was a bug that caused the scan
+                                             // to miss arm64-v8a libs on real arm64 devices.)
+            for abi in ["arm64-v8a", "x86_64", "armeabi-v7a", "x86"] {
                 let lib_path = apk_path.join("lib").join(abi).join(lib_name);
                 if lib_path.is_file() {
                     out.push(lib_path.to_string_lossy().into_owned());
