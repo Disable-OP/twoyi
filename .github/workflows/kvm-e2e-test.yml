@@ -408,9 +408,18 @@ jobs:
             /tmp/ci-artifacts/anr/ \
             /tmp/ci-artifacts/rootfs-extract.log \
             /tmp/ci-artifacts/twrp-init.log \
+            /tmp/ci-artifacts/twrp-init-cmdline.log \
+            /tmp/ci-artifacts/twrp-init-status.log \
+            /tmp/ci-artifacts/twrp-init-threads.log \
             /tmp/ci-artifacts/twrp-kmsg.log \
             /tmp/ci-artifacts/dmesg.log \
-            /tmp/ci-artifacts/twrp-ps.log
+            /tmp/ci-artifacts/twrp-ps.log \
+            /tmp/ci-artifacts/twrp-ps-pre-kill.log \
+            /tmp/ci-artifacts/twrp-ps-ef.log \
+            /tmp/ci-artifacts/twrp-ps-post-kill.log \
+            /tmp/ci-artifacts/twrp-guest-tree.log \
+            /tmp/ci-artifacts/twrp-fb-rgba.bin \
+            /tmp/ci-artifacts/twrp-fb.png
 
       - name: Upload logs
         if: always()

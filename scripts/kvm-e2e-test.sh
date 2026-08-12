@@ -938,20 +938,181 @@ fi
 # the exit status (crash, exit, or still-running-then-SIGKILLed). This
 # is critical — without it we can't tell whether init crashed, exited,
 # or was still running.
+#
+# ────────────────────────────────────────────────────────────────────
+# IMPORTANT: we capture the TWRP container's processes + framebuffer
+# BEFORE killing kr64. The previous logic ran `ps -A` AFTER kill, which
+# captured the HOST emulator's processes (init, surfaceflinger, etc.)
+# and not the TWRP container's processes — because the guest init was
+# already SIGKILLed.
+#
+# The TWRP guest init is NOT PID 1 (kr64's unshare(CLONE_NEWPID) fails
+# with EINVAL on the KVM runner). kr64 forks the guest init, the guest
+# init gets a normal PID (logged by kr64 as "guest pid = NNNN" in
+# kr64-stderr.log). So `ps -A` shows BOTH the host's init (PID 1) AND
+# the TWRP init (some other PID). We need to find the guest PID and
+# walk its process tree to see what services it spawned (ueventd,
+# recovery, etc.).
+# ────────────────────────────────────────────────────────────────────
 if [ "$TWRP_MODE" = "1" ]; then
+    # ── Step A: capture TWRP container's processes BEFORE killing kr64 ──
+    # Pull the latest kr64-stderr.log so we can parse the guest PID.
+    # The earlier pull (right after launch) may be stale if kr64 logged
+    # the guest pid later in its lifecycle.
+    "$ADB_BIN" -s emulator-5554 pull /data/user/0/io.twoyi/kr64-stderr.log "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null || true
+
+    GUEST_PID=$(grep -oE 'guest pid = [0-9]+' "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null | tail -1 | awk '{print $NF}')
+    if [ -n "$GUEST_PID" ]; then
+        echo "  → TWRP guest init PID: $GUEST_PID (from kr64-stderr.log)"
+        echo "  → capturing TWRP process tree BEFORE kill (so we see live processes)..."
+
+        # Capture full process list with parent PIDs — needed for tree walking.
+        # `ps -A -o PID,PPID,STAT,NAME` is the portable syntax; some Android
+        # toolboxes support `ps -ef` too, so we capture both for redundancy.
+        timeout 5 "$ADB_BIN" -s emulator-5554 shell "ps -A -o PID,PPID,STAT,NAME 2>/dev/null" \
+            > "$ARTIFACT_DIR/twrp-ps-pre-kill.log" 2>/dev/null || true
+        timeout 5 "$ADB_BIN" -s emulator-5554 shell "ps -ef 2>/dev/null" \
+            > "$ARTIFACT_DIR/twrp-ps-ef.log" 2>/dev/null || true
+
+        # Verify the guest init is still alive + capture its identity.
+        # /proc/<pid>/cmdline is NUL-separated; we convert to spaces.
+        timeout 5 "$ADB_BIN" -s emulator-5554 shell "cat /proc/$GUEST_PID/cmdline 2>/dev/null | tr '\0' ' '; echo" \
+            > "$ARTIFACT_DIR/twrp-init-cmdline.log" 2>/dev/null || true
+        timeout 5 "$ADB_BIN" -s emulator-5554 shell "cat /proc/$GUEST_PID/status 2>/dev/null" \
+            > "$ARTIFACT_DIR/twrp-init-status.log" 2>/dev/null || true
+        timeout 5 "$ADB_BIN" -s emulator-5554 shell "ls /proc/$GUEST_PID/task 2>/dev/null" \
+            > "$ARTIFACT_DIR/twrp-init-threads.log" 2>/dev/null || true
+
+        echo "    guest init cmdline: $(tr -d '\r\n' < "$ARTIFACT_DIR/twrp-init-cmdline.log" 2>/dev/null)"
+        echo "    guest init state:   $(grep '^State:' "$ARTIFACT_DIR/twrp-init-status.log" 2>/dev/null | tr -d '\r\n')"
+        echo "    guest init threads: $(tr '\r\n' ' ' < "$ARTIFACT_DIR/twrp-init-threads.log" 2>/dev/null)"
+
+        # Build the guest's process tree: all processes whose PPID chain
+        # leads back to $GUEST_PID. We awk through twrp-ps-pre-kill.log
+        # (PID,PPID,STAT,NAME format), record each pid's ppid, then for
+        # each pid walk up the parent chain looking for $GUEST_PID.
+        if [ -s "$ARTIFACT_DIR/twrp-ps-pre-kill.log" ]; then
+            awk -v root="$GUEST_PID" '
+                NR == 1 { next }     # skip header
+                NF >= 4 {
+                    ppid[$1] = $2
+                    stat[$1] = $3
+                    # NAME may contain spaces (rare), so join fields 4..NF
+                    name[$1] = ""
+                    for (i = 4; i <= NF; i++) name[$1] = (name[$1] " " $i)
+                    sub(/^ /, "", name[$1])
+                }
+                END {
+                    # Print the root (guest init) first.
+                    if (ppid[root] != "" || name[root] != "") {
+                        printf "  root  PID=%s PPID=%s STAT=%s NAME=%s\n", root, ppid[root], stat[root], name[root]
+                    }
+                    # Walk each process parent chain up to 20 hops deep.
+                    for (pid in ppid) {
+                        if (pid == root) continue
+                        cur = ppid[pid]
+                        depth = 0
+                        while (cur != "" && cur != "0" && cur != "1" && cur != "2" && depth < 20) {
+                            if (cur == root) {
+                                printf "  child PID=%s PPID=%s STAT=%s NAME=%s\n", pid, ppid[pid], stat[pid], name[pid]
+                                break
+                            }
+                            cur = ppid[cur]
+                            depth++
+                        }
+                    }
+                }
+            ' "$ARTIFACT_DIR/twrp-ps-pre-kill.log" > "$ARTIFACT_DIR/twrp-guest-tree.log" 2>/dev/null
+        fi
+
+        if [ -s "$ARTIFACT_DIR/twrp-guest-tree.log" ]; then
+            TREE_LINES=$(wc -l < "$ARTIFACT_DIR/twrp-guest-tree.log")
+            echo "  ✓ TWRP guest process tree ($TREE_LINES entries):"
+            sed 's/^/    /' "$ARTIFACT_DIR/twrp-guest-tree.log"
+        else
+            echo "  ⚠ no TWRP processes found in tree walk — guest init may have exited before capture"
+        fi
+    else
+        echo "  ⚠ could not parse 'guest pid = NNNN' from kr64-stderr.log"
+        echo "    → kr64 may have crashed before forking the guest; check kr64-stderr.log"
+    fi
+
+    # ── Step B: capture the TWRP virtual framebuffer BEFORE killing kr64 ──
+    # TWRP renders to /dev/graphics/fb0 inside the pivot_root jail, which
+    # kr64 creates as a REGULAR FILE (3686400 bytes = 720×1280×4 RGBA8888)
+    # on the ext4 rootfs. From the host's perspective the file is at
+    # {rootfs}/dev/graphics/fb0. We pull it + convert RGBA8888 → PNG so a
+    # human can see whether TWRP actually rendered a menu (vs. an all-black
+    # or all-zero framebuffer = TWRP init crashed before reaching the UI).
+    if [ -n "$GUEST_PID" ] || [ "$TWRP_MODE" = "1" ]; then
+        echo "  → capturing TWRP virtual framebuffer (RGBA8888 → PNG)..."
+        FB_PULLED=0
+        for FB_PATH in \
+            "$TWOYI_PROFILE/dev/graphics/fb0" \
+            "/data/data/io.twoyi/profiles/default/rootfs/dev/graphics/fb0" \
+            "/data/user/0/io.twoyi/rootfs/dev/graphics/fb0"; do
+            if "$ADB_BIN" -s emulator-5554 pull "$FB_PATH" "$ARTIFACT_DIR/twrp-fb-rgba.bin" 2>/dev/null; then
+                FB_PULLED=1
+                echo "  ✓ pulled $FB_PATH → twrp-fb-rgba.bin ($(stat -c%s "$ARTIFACT_DIR/twrp-fb-rgba.bin" 2>/dev/null || echo 0) bytes)"
+                break
+            fi
+        done
+        if [ "$FB_PULLED" = "1" ] && [ -s "$ARTIFACT_DIR/twrp-fb-rgba.bin" ]; then
+            # Convert RGBA8888 (4 bytes/pixel, R+G+B+A) to PNG (RGB, 3 bytes/pixel).
+            # We avoid the Pillow dependency — pure stdlib zlib + struct.
+            # TWRP's fb0 is 720x1280 RGBA8888 (per kr64's create_twrp_framebuffer).
+            python3 - <<'PY' "$ARTIFACT_DIR/twrp-fb-rgba.bin" "$ARTIFACT_DIR/twrp-fb.png" 2>&1 | tail -5
+import struct, zlib, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, 'rb') as f:
+    data = f.read()
+W, H = 720, 1280
+expected = W * H * 4
+if len(data) < expected:
+    print(f"  ⚠ FB file too small: {len(data)} bytes (expected {expected}) — TWRP init may not have written to it")
+    # Still produce a PNG so the user can see what (if anything) was written.
+    # Pad with zeros so struct.unpack doesn't fail.
+    data = data + b'\x00' * (expected - len(data))
+# Drop alpha, keep RGB.
+rgb = bytearray(W * H * 3)
+for i in range(W * H):
+    r, g, b = data[i*4], data[i*4+1], data[i*4+2]
+    rgb[i*3], rgb[i*3+1], rgb[i*3+2] = r, g, b
+# Count non-zero pixels (TWRP UI has buttons + text on a colored bg).
+nonzero_px = sum(1 for i in range(W * H) if rgb[i*3] or rgb[i*3+1] or rgb[i*3+2])
+def chunk(typ, payload):
+    c = typ + payload
+    return struct.pack('>I', len(payload)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+png = b'\x89PNG\r\n\x1a\n'
+png += chunk(b'IHDR', struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0))  # 8-bit RGB
+raw = bytearray()
+row_stride = W * 3
+for y in range(H):
+    raw.append(0)  # filter byte (None)
+    raw.extend(rgb[y*row_stride:(y+1)*row_stride])
+png += chunk(b'IDAT', zlib.compress(bytes(raw), 9))
+png += chunk(b'IEND', b'')
+with open(dst, 'wb') as f:
+    f.write(png)
+print(f"  ✓ twrp-fb.png ({len(png)} bytes) — {nonzero_px}/{W*H} non-zero pixels ({100*nonzero_px//(W*H)}%)")
+PY
+        else
+            echo "  ⚠ could not pull TWRP virtual framebuffer (fb0 not found on device)"
+        fi
+    fi
+
+    # ── Step C: graceful shutdown of kr64 (existing logic) ──
     echo "  → TWRP mode: sending SIGTERM to kr64 (graceful shutdown)..."
-    # Send SIGTERM (default for `kill`) — kr64's handler logs the guest's
-    # exit status before dying. Wait up to 8s for kr64 to finish.
     timeout 8 "$ADB_BIN" -s emulator-5554 shell "kill \$(cat /data/local/tmp/kr64.pid 2>/dev/null) 2>/dev/null" 2>/dev/null || true
     sleep 2
-    # If kr64 is still alive (handler stuck?), escalate to SIGKILL + pkill.
     timeout 5 "$ADB_BIN" -s emulator-5554 shell "kill -9 \$(cat /data/local/tmp/kr64.pid 2>/dev/null) 2>/dev/null; pkill -9 -f '/data/local/tmp/kr64' 2>/dev/null" 2>/dev/null || true
     sleep 1
 
     # Capture kernel log (dmesg) — the guest shares the host emulator's
     # kernel, so any segfault from TWRP init appears here. TWRP init also
-    # tries to log to /dev/kmsg (which may or may not exist in the guest's
-    # /dev); if it does, those messages appear in dmesg too.
+    # tries to log to /dev/kmsg (which kr64 symlinks to /twrp-kmsg.log
+    # in TWRP mode); the symlinked messages do NOT appear in dmesg (they
+    # go to the file instead), but kernel-level segfaults still do.
     echo "  → capturing dmesg (kernel log)..."
     timeout 10 "$ADB_BIN" -s emulator-5554 shell dmesg > "$ARTIFACT_DIR/dmesg.log" 2>/dev/null || true
     if [ -s "$ARTIFACT_DIR/dmesg.log" ]; then
@@ -963,18 +1124,17 @@ if [ "$TWRP_MODE" = "1" ]; then
         echo "  ⚠ dmesg.log empty or not captured"
     fi
 
-    # Check if any TWRP processes are still alive after kr64 died.
+    # Check if any TWRP processes are still alive AFTER kr64 died.
     # kr64's SIGKILL of the guest init (in the handler) should have killed
     # it, but if init forked daemons (ueventd, partlink, recovery) they
-    # may survive as orphans reparented to the host's init.
-    echo "  → checking for surviving TWRP processes..."
-    timeout 5 "$ADB_BIN" -s emulator-5554 shell "ps -A 2>/dev/null" > "$ARTIFACT_DIR/twrp-ps.log" 2>/dev/null || true
-    if [ -s "$ARTIFACT_DIR/twrp-ps.log" ]; then
-        # Surface TWRP-related daemons (ueventd, partlink, recovery) and
-        # any "init" process that is NOT the host's PID 1.
-        SURVIVORS=$(grep -iE 'ueventd|partlink|recovery' "$ARTIFACT_DIR/twrp-ps.log" 2>/dev/null || true)
-        # Also check for non-PID-1 init processes (the TWRP guest init).
-        INIT_PROCS=$(awk '/[i]nit/ && $2 != 1' "$ARTIFACT_DIR/twrp-ps.log" 2>/dev/null || true)
+    # may survive as orphans reparented to the host's init (PID 1).
+    echo "  → checking for surviving TWRP processes (post-kill)..."
+    timeout 5 "$ADB_BIN" -s emulator-5554 shell "ps -A 2>/dev/null" > "$ARTIFACT_DIR/twrp-ps-post-kill.log" 2>/dev/null || true
+    # Also keep the legacy twrp-ps.log name (back-compat with old tooling).
+    cp "$ARTIFACT_DIR/twrp-ps-post-kill.log" "$ARTIFACT_DIR/twrp-ps.log" 2>/dev/null || true
+    if [ -s "$ARTIFACT_DIR/twrp-ps-post-kill.log" ]; then
+        SURVIVORS=$(grep -iE 'ueventd|partlink|recovery' "$ARTIFACT_DIR/twrp-ps-post-kill.log" 2>/dev/null || true)
+        INIT_PROCS=$(awk '/[i]nit/ && $2 != 1' "$ARTIFACT_DIR/twrp-ps-post-kill.log" 2>/dev/null || true)
         if [ -n "$SURVIVORS" ] || [ -n "$INIT_PROCS" ]; then
             echo "  ⚠ TWRP-related processes still alive after kr64 died:"
             [ -n "$SURVIVORS" ] && echo "$SURVIVORS"
@@ -1085,7 +1245,58 @@ QEMU_PIPE_CREATED=$(grep -c 'created device /dev/qemu_pipe' "$ARTIFACT_DIR/logca
 PIPE_AVAIL=$(grep -c 'QEMU pipe device.*availability: true' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
 PIPE_CONN=$(grep -c 'Successfully connected to QEMU pipe' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
 GL_CTX=$(grep -c 'GL context created successfully' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
+# WARNING: in TWRP mode, logcat is the HOST emulator's logcat, NOT the
+# TWRP container's. The "BOOT_COMPLETED" line in logcat is from the host's
+# ActivityManager, not from TWRP init. So in TWRP mode we MUST NOT treat
+# this as a container-boot signal — see the TWRP-specific verdict below.
 BOOT_COMPLETED=$(grep -c 'BOOT_COMPLETED' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
+
+# ── TWRP-mode milestone extraction ──
+# In TWRP mode, the meaningful boot signal is "init: starting service
+# 'recovery'" in twrp-kmsg.log (TWRP init's KLOG, captured via the
+# /dev/kmsg → /twrp-kmsg.log symlink that kr64 creates in TWRP mode).
+# We also check twrp-guest-tree.log (children of guest init PID) to see
+# whether the recovery process actually started, and twrp-fb.png's
+# non-zero pixel count to see whether TWRP actually rendered a UI.
+TWRP_KMSG_EXISTS=0
+TWRP_RECOVERY_STARTED=0
+TWRP_UEVENTD_STARTED=0
+TWRP_RECOVERY_PROC=0
+TWRP_FB_NONZERO_PCT=0
+TWRP_GUEST_PID_FOUND=0
+if [ "$TWRP_MODE" = "1" ]; then
+    if [ -f "$ARTIFACT_DIR/twrp-kmsg.log" ] && [ -s "$ARTIFACT_DIR/twrp-kmsg.log" ]; then
+        TWRP_KMSG_EXISTS=1
+        # TWRP init's KLOG_INFO writes look like "init: starting service 'recovery'"
+        # (matching AOSP 5.1.1 init's service-start log format).
+        TWRP_RECOVERY_STARTED=$(grep -cE "init: starting service 'recovery'|starting service 'recovery'" "$ARTIFACT_DIR/twrp-kmsg.log" 2>/dev/null || echo 0)
+        TWRP_UEVENTD_STARTED=$(grep -cE "init: starting service 'ueventd'|starting service 'ueventd'" "$ARTIFACT_DIR/twrp-kmsg.log" 2>/dev/null || echo 0)
+    fi
+    if [ -s "$ARTIFACT_DIR/twrp-guest-tree.log" ]; then
+        TWRP_GUEST_PID_FOUND=1
+        # Look for a "recovery" entry in the guest's process tree.
+        if grep -qiE 'NAME=.*recovery' "$ARTIFACT_DIR/twrp-guest-tree.log" 2>/dev/null; then
+            TWRP_RECOVERY_PROC=1
+        fi
+    fi
+    # Check the framebuffer non-zero pixel percentage (from the python
+    # script's output, captured to FB_INFO). We re-derive it from the
+    # bin file size: if it's exactly 3686400 bytes (720*1280*4), the FB
+    # was created and may have data; if 0 bytes, TWRP never wrote to it.
+    if [ -f "$ARTIFACT_DIR/twrp-fb-rgba.bin" ]; then
+        FB_SIZE=$(stat -c%s "$ARTIFACT_DIR/twrp-fb-rgba.bin" 2>/dev/null || echo 0)
+        if [ "$FB_SIZE" -ge 3686400 ]; then
+            # Count non-zero bytes (cheap heuristic for "did TWRP render anything").
+            TWRP_FB_NONZERO_PCT=$(python3 -c "
+import sys
+with open('$ARTIFACT_DIR/twrp-fb-rgba.bin', 'rb') as f:
+    data = f.read(3686400)
+nz = sum(1 for b in data if b != 0)
+print(100 * nz // len(data) if data else 0)
+" 2>/dev/null || echo 0)
+        fi
+    fi
+fi
 
 # Is the twoyi process still alive?
 TWOYI_PID=$("$ADB_BIN" -s emulator-5554 shell pidof io.twoyi 2>/dev/null | tr -d '\r' || true)
@@ -1119,12 +1330,26 @@ mkdir -p "$ARTIFACT_DIR/dropbox" "$ARTIFACT_DIR/anr"
 # Write the verdict
 {
     echo "── Boot milestone checklist ──"
-    echo "  KR64 daemon started:           $([ "$KR64_START" -gt 0 ] && echo "✓ ($KR64_START lines)" || echo "✗")"
-    echo "  /dev/qemu_pipe created:        $([ "$QEMU_PIPE_CREATED" -gt 0 ] && echo "✓ ($QEMU_PIPE_CREATED lines)" || echo "✗")"
-    echo "  Pipe availability: true:       $([ "$PIPE_AVAIL" -gt 0 ] && echo "✓ ($PIPE_AVAIL lines)" || echo "✗")"
-    echo "  Pipe connected:                $([ "$PIPE_CONN" -gt 0 ] && echo "✓ ($PIPE_CONN lines)" || echo "✗")"
-    echo "  GL context created:            $([ "$GL_CTX" -gt 0 ] && echo "✓ ($GL_CTX lines)" || echo "✗")"
-    echo "  BOOT_COMPLETED signal:         $([ "$BOOT_COMPLETED" -gt 0 ] && echo "✓ ($BOOT_COMPLETED lines)" || echo "✗")"
+    if [ "$TWRP_MODE" = "1" ]; then
+        # TWRP-specific checklist — uses twrp-kmsg.log + twrp-guest-tree.log
+        # + twrp-fb.png, NOT the host emulator's logcat.
+        echo "  (TWRP mode — logcat milestones below are HOST's, not TWRP's)"
+        echo "  KR64 daemon started:           $([ "$KR64_START" -gt 0 ] && echo "✓ ($KR64_START lines)" || echo "✗")"
+        echo "  TWRP init KMSG captured:       $([ "$TWRP_KMSG_EXISTS" = "1" ] && echo "✓" || echo "✗")"
+        echo "  TWRP ueventd started:          $([ "$TWRP_UEVENTD_STARTED" -gt 0 ] && echo "✓ ($TWRP_UEVENTD_STARTED lines)" || echo "✗")"
+        echo "  TWRP 'recovery' svc started:   $([ "$TWRP_RECOVERY_STARTED" -gt 0 ] && echo "✓ ($TWRP_RECOVERY_STARTED lines)" || echo "✗")"
+        echo "  recovery proc in guest tree:   $([ "$TWRP_RECOVERY_PROC" = "1" ] && echo "✓" || echo "✗")"
+        echo "  guest init PID found:          $([ "$TWRP_GUEST_PID_FOUND" = "1" ] && echo "✓" || echo "✗")"
+        echo "  TWRP framebuffer non-zero:     ${TWRP_FB_NONZERO_PCT}% (100% = empty/zero; <100% = rendered)"
+        echo "  (host's BOOT_COMPLETED line:   $([ "$BOOT_COMPLETED" -gt 0 ] && echo "present (IGNORED — host's, not TWRP's)" || echo "absent"))"
+    else
+        echo "  KR64 daemon started:           $([ "$KR64_START" -gt 0 ] && echo "✓ ($KR64_START lines)" || echo "✗")"
+        echo "  /dev/qemu_pipe created:        $([ "$QEMU_PIPE_CREATED" -gt 0 ] && echo "✓ ($QEMU_PIPE_CREATED lines)" || echo "✗")"
+        echo "  Pipe availability: true:       $([ "$PIPE_AVAIL" -gt 0 ] && echo "✓ ($PIPE_AVAIL lines)" || echo "✗")"
+        echo "  Pipe connected:                $([ "$PIPE_CONN" -gt 0 ] && echo "✓ ($PIPE_CONN lines)" || echo "✗")"
+        echo "  GL context created:            $([ "$GL_CTX" -gt 0 ] && echo "✓ ($GL_CTX lines)" || echo "✗")"
+        echo "  BOOT_COMPLETED signal:         $([ "$BOOT_COMPLETED" -gt 0 ] && echo "✓ ($BOOT_COMPLETED lines)" || echo "✗")"
+    fi
     echo ""
     echo "── Runtime state ──"
     if [ -n "$TWOYI_PID" ]; then
@@ -1135,7 +1360,32 @@ mkdir -p "$ARTIFACT_DIR/dropbox" "$ARTIFACT_DIR/anr"
     echo "  tombstones during run:         $TOMBSTONE_COUNT"
     echo ""
     echo "── Overall verdict ──"
-    if [ "$BOOT_COMPLETED" -gt 0 ]; then
+    if [ "$TWRP_MODE" = "1" ]; then
+        # TWRP verdict: did TWRP init start the recovery service AND
+        # render something to the framebuffer?
+        if [ "$TWRP_RECOVERY_STARTED" -gt 0 ] && [ "$TWRP_RECOVERY_PROC" = "1" ] && [ "$TWRP_FB_NONZERO_PCT" -gt 0 ] && [ "$TWRP_FB_NONZERO_PCT" -lt 100 ]; then
+            echo "  ✓✓✓ TWRP BOOTED — recovery service started + framebuffer rendered."
+            echo "  Inspect twrp-fb.png to confirm the TWRP menu is visible."
+        elif [ "$TWRP_RECOVERY_STARTED" -gt 0 ] && [ "$TWRP_RECOVERY_PROC" = "1" ]; then
+            echo "  ◐ PARTIAL — recovery service started but framebuffer is empty."
+            echo "  Likely cause: recovery binary crashed before calling fb_update,"
+            echo "  OR our LD_PRELOAD FB hook isn't being loaded by the i386 recovery."
+            echo "  Inspect twrp-kmsg.log + twrp-guest-tree.log for the next error."
+        elif [ "$TWRP_KMSG_EXISTS" = "1" ]; then
+            echo "  ◐ PARTIAL — TWRP init ran (KLOG captured) but didn't start recovery."
+            echo "  Likely cause: init.rc parse error, missing service binary, or"
+            echo "  init crashed before reaching the 'on boot' trigger."
+            echo "  Inspect twrp-kmsg.log for the last KLOG_ERROR / KLOG_WARNING line."
+        elif [ "$TWRP_GUEST_PID_FOUND" = "1" ]; then
+            echo "  ◐ PARTIAL — guest init ran but produced no KLOG output."
+            echo "  Likely cause: kr64's /dev/kmsg → /twrp-kmsg.log symlink wasn't"
+            echo "  created (older kr64 binary), OR TWRP init crashed before opening /dev/kmsg."
+            echo "  Inspect kr64-stderr.log for 'created /twrp-kmsg.log' + dmesg.log for segfaults."
+        else
+            echo "  ✗ TWRP init did not run or crashed immediately."
+            echo "  Inspect kr64-stderr.log + dmesg.log for the failure."
+        fi
+    elif [ "$BOOT_COMPLETED" -gt 0 ]; then
         echo "  ✓✓✓ CONTAINER BOOTED — BOOT_COMPLETED signal received."
         echo "  This is the holy grail. Phase 0 has landed!"
     elif [ -n "$TWOYI_PID" ] && [ "$GL_CTX" -gt 0 ]; then
@@ -1158,6 +1408,19 @@ mkdir -p "$ARTIFACT_DIR/dropbox" "$ARTIFACT_DIR/anr"
     echo "  Full logcat:        $ARTIFACT_DIR/logcat.txt"
     echo "  Filtered logcat:    $ARTIFACT_DIR/logcat-filtered.txt"
     echo "  Screenshots:        $ARTIFACT_DIR/screenshot-*.png"
+    if [ "$TWRP_MODE" = "1" ]; then
+        echo "  TWRP framebuffer:   $ARTIFACT_DIR/twrp-fb.png (RGBA8888 → PNG)"
+        echo "  TWRP FB raw:        $ARTIFACT_DIR/twrp-fb-rgba.bin (3.5 MB)"
+        echo "  TWRP KMSG log:      $ARTIFACT_DIR/twrp-kmsg.log (TWRP init's KLOG)"
+        echo "  TWRP init log:      $ARTIFACT_DIR/twrp-init.log (stdout/stderr)"
+        echo "  TWRP ps pre-kill:   $ARTIFACT_DIR/twrp-ps-pre-kill.log (live container procs)"
+        echo "  TWRP ps-ef:         $ARTIFACT_DIR/twrp-ps-ef.log (full process tree)"
+        echo "  TWRP guest tree:    $ARTIFACT_DIR/twrp-guest-tree.log (children of guest init)"
+        echo "  TWRP init cmdline:  $ARTIFACT_DIR/twrp-init-cmdline.log"
+        echo "  TWRP init status:   $ARTIFACT_DIR/twrp-init-status.log"
+        echo "  TWRP init threads:  $ARTIFACT_DIR/twrp-init-threads.log"
+        echo "  TWRP ps post-kill:  $ARTIFACT_DIR/twrp-ps-post-kill.log (survivors after kill)"
+    fi
     echo "  Tombstones:         $ARTIFACT_DIR/tombstones/"
     echo "  Rootfs extract log: $ARTIFACT_DIR/rootfs-extract.log"
     echo "  Emulator stdout:    $ARTIFACT_DIR/emulator-stdout.log"
