@@ -14,7 +14,6 @@
 package io.twoyi.utils;
 
 import android.content.Context;
-import android.content.UriPermission;
 import android.net.Uri;
 import android.util.Log;
 
@@ -34,39 +33,16 @@ import java.util.zip.ZipInputStream;
 /**
  * Import ramdisk/rootfs from various formats:
  * <ul>
- *   <li><b>.tar / .tar.gz</b> — standard rootfs tarball (existing behavior).
- *       Extracted directly to the rootfs directory.</li>
- *   <li><b>.img</b> — Android boot image (e.g. TWRP recovery.img).
- *       The ramdisk is extracted from the boot image header, decompressed
- *       (gzip), and the cpio archive is extracted to the rootfs directory.</li>
- *   <li><b>.cpio / .cpio.gz</b> — raw ramdisk cpio archive.
- *       Decompressed if gzipped, then extracted to the rootfs directory.</li>
- *   <li><b>.zip</b> — ZIP file containing a ramdisk (cpio or cpio.gz).
- *       The first .cpio or .cpio.gz entry is extracted and processed.</li>
+ *   <li><b>.tar / .tar.gz</b> — standard rootfs tarball (existing behavior).</li>
+ *   <li><b>.img</b> — Android boot image (e.g. TWRP recovery.img).</li>
+ *   <li><b>.cpio / .cpio.gz</b> — raw ramdisk cpio archive.</li>
+ *   <li><b>.zip</b> — ZIP file containing a ramdisk.</li>
  * </ul>
- *
- * The importer detects the format by file extension AND magic bytes:
- *   - Android boot image: starts with "ANDROID!"
- *   - GZIP: starts with 0x1f 0x8b
- *   - ZIP: starts with "PK"
- *   - CPIO (newc): starts with "070701" or "070702"
- *   - TAR: starts with "ustar" at offset 257
  */
 public class RamdiskImporter {
     private static final String TAG = "RamdiskImporter";
 
-    /**
-     * Import a ramdisk/rootfs from a Uri.
-     *
-     * @param context    The context for ContentResolver
-     * @param uri        The Uri of the file to import
-     * @param targetDir  The directory to extract the rootfs into
-     * @return true if import succeeded
-     * @throws IOException on I/O errors
-     */
     public static boolean importRamdisk(Context context, Uri uri, File targetDir) throws IOException {
-        // Copy the file to a temp file first (ContentResolver streams can't be
-        // re-read, and we need to check magic bytes)
         File tempFile = new File(context.getCacheDir(), "ramdisk_import");
         try (InputStream is = context.getContentResolver().openInputStream(uri);
              OutputStream os = new FileOutputStream(tempFile)) {
@@ -78,7 +54,8 @@ public class RamdiskImporter {
             }
         }
 
-        // Detect format by magic bytes
+        Log.i(TAG, "Import file size: " + tempFile.length() + " bytes");
+
         String format = detectFormat(tempFile);
         Log.i(TAG, "Detected format: " + format);
 
@@ -88,22 +65,25 @@ public class RamdiskImporter {
                 result = importBootImage(tempFile, targetDir);
                 break;
             case "gzip":
-                // Could be a .tar.gz rootfs or a .cpio.gz ramdisk
                 result = importGzipFile(tempFile, targetDir);
                 break;
             case "zip":
                 result = importZipFile(tempFile, targetDir);
                 break;
             case "cpio":
-                result = importCpioFile(tempFile, targetDir);
+                result = extractCpioStreaming(tempFile, targetDir);
                 break;
             case "tar":
                 result = importTarFile(tempFile, targetDir);
                 break;
             default:
-                // Try tar as fallback (most common for rootfs)
-                Log.w(TAG, "Unknown format, trying tar extraction");
+                Log.w(TAG, "Unknown format, trying tar then cpio");
+                // Try tar first, then cpio as fallback
                 result = importTarFile(tempFile, targetDir);
+                if (!result) {
+                    Log.w(TAG, "tar failed, trying cpio");
+                    result = extractCpioStreaming(tempFile, targetDir);
+                }
                 break;
         }
 
@@ -111,9 +91,6 @@ public class RamdiskImporter {
         return result;
     }
 
-    /**
-     * Detect the file format by reading magic bytes.
-     */
     private static String detectFormat(File file) throws IOException {
         byte[] header = new byte[512];
         try (FileInputStream fis = new FileInputStream(file)) {
@@ -122,14 +99,14 @@ public class RamdiskImporter {
         }
 
         // Android boot image: "ANDROID!"
-        if (header.length >= 8 && header[0] == 'A' && header[1] == 'N' &&
-            header[2] == 'D' && header[3] == 'R' && header[4] == 'O' &&
-            header[5] == 'I' && header[6] == 'D' && header[7] == '!') {
+        if (header[0] == 'A' && header[1] == 'N' && header[2] == 'D' &&
+            header[3] == 'R' && header[4] == 'O' && header[5] == 'I' &&
+            header[6] == 'D' && header[7] == '!') {
             return "android_bootimg";
         }
 
         // GZIP: 0x1f 0x8b
-        if (header[0] == 0x1f && header[1] == (byte) 0x8b) {
+        if ((header[0] & 0xFF) == 0x1f && (header[1] & 0xFF) == 0x8b) {
             return "gzip";
         }
 
@@ -140,13 +117,7 @@ public class RamdiskImporter {
 
         // CPIO newc: "070701" or "070702"
         if (header[0] == '0' && header[1] == '7' && header[2] == '0' &&
-            header[3] == '7' && (header[4] == '0' || header[4] == '1') &&
-            header[5] == '1') {
-            return "cpio";
-        }
-        // Also check "070702"
-        if (header[0] == '0' && header[1] == '7' && header[2] == '0' &&
-            header[3] == '7' && header[4] == '0' && header[5] == '2') {
+            header[3] == '7' && header[4] == '0' && (header[5] == '1' || header[5] == '2')) {
             return "cpio";
         }
 
@@ -159,47 +130,27 @@ public class RamdiskImporter {
         return "unknown";
     }
 
-    /**
-     * Import an Android boot image (.img).
-     * Parses the boot image header, extracts the ramdisk (gzip-compressed
-     * cpio), decompresses it, and extracts the cpio to targetDir.
-     */
     private static boolean importBootImage(File imgFile, File targetDir) throws IOException {
-        byte[] header = new byte[16384]; // boot image header can be up to 16KB
         try (FileInputStream fis = new FileInputStream(imgFile)) {
+            byte[] header = new byte[16384];
             int headerSize = fis.read(header);
-            if (headerSize < 110) {
-                throw new IOException("Boot image too small");
-            }
+            if (headerSize < 110) throw new IOException("Boot image too small");
 
-            // Parse Android boot image header
-            // magic: 8 bytes ("ANDROID!")
-            // kernel_size: 4 bytes (offset 8)
-            // kernel_addr: 4 bytes (offset 12)
-            // ramdisk_size: 4 bytes (offset 16)
-            // ramdisk_addr: 4 bytes (offset 20)
-            // second_size: 4 bytes (offset 24)
-            // second_addr: 4 bytes (offset 28)
-            // tags_addr: 4 bytes (offset 32)
-            // page_size: 4 bytes (offset 36)
             ByteBuffer bb = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN);
-
             int kernelSize = bb.getInt(8);
             int ramdiskSize = bb.getInt(16);
             int pageSize = bb.getInt(36);
 
             if (pageSize == 0 || ramdiskSize == 0) {
-                throw new IOException("Invalid boot image header: pageSize=" + pageSize + " ramdiskSize=" + ramdiskSize);
+                throw new IOException("Invalid boot image: pageSize=" + pageSize + " ramdiskSize=" + ramdiskSize);
             }
 
-            // Calculate ramdisk offset
             int kernelPages = (kernelSize + pageSize - 1) / pageSize;
             int ramdiskOffset = pageSize + kernelPages * pageSize;
 
             Log.i(TAG, "Boot image: kernel=" + kernelSize + " ramdisk=" + ramdiskSize +
                   " page=" + pageSize + " ramdiskOffset=" + ramdiskOffset);
 
-            // Read the ramdisk
             fis.getChannel().position(ramdiskOffset);
             byte[] ramdiskGz = new byte[ramdiskSize];
             int read = 0;
@@ -209,29 +160,23 @@ public class RamdiskImporter {
                 read += n;
             }
 
-            // Decompress gzip → cpio
-            File cpioFile = new File(targetDir.getParentFile(), "ramdisk.cpio");
+            // Decompress gzip -> cpio, then extract streaming
+            File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
             try (GZIPInputStream gzis = new GZIPInputStream(new java.io.ByteArrayInputStream(ramdiskGz));
-                 FileOutputStream fos = new FileOutputStream(cpioFile)) {
+                 FileOutputStream fos = new FileOutputStream(cpioTemp)) {
                 byte[] buf = new byte[8192];
                 int n;
-                while ((n = gzis.read(buf)) > 0) {
-                    fos.write(buf, 0, n);
-                }
+                while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
             }
 
-            // Extract cpio to targetDir using cpio command
-            // (Android doesn't have cpio, but we can use tar or a Java cpio extractor)
-            // Fall back to using the extract-twrp-ramdisk.py script or a built-in extractor
-            return extractCpioWithPython(cpioFile, targetDir, imgFile);
+            boolean result = extractCpioStreaming(cpioTemp, targetDir);
+            cpioTemp.delete();
+            return result;
         }
     }
 
-    /**
-     * Import a gzip file. Could be .tar.gz (rootfs) or .cpio.gz (ramdisk).
-     */
     private static boolean importGzipFile(File gzFile, File targetDir) throws IOException {
-        // Read the first few decompressed bytes to check if it's a tar or cpio
+        // Peek at decompressed content to determine if it's tar or cpio
         byte[] header = new byte[512];
         try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile))) {
             int read = gzis.read(header);
@@ -239,34 +184,24 @@ public class RamdiskImporter {
         }
 
         // Check if it's a cpio (070701)
-        if (header[0] == '0' && header[1] == '7' && header[2] == '0' &&
-            header[3] == '7') {
-            // It's a cpio.gz — decompress and extract
-            File cpioFile = new File(targetDir.getParentFile(), "ramdisk.cpio");
+        if (header[0] == '0' && header[1] == '7' && header[2] == '0' && header[3] == '7') {
+            // It's a cpio.gz — decompress to temp file, then extract
+            File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
             try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile));
-                 FileOutputStream fos = new FileOutputStream(cpioFile)) {
+                 FileOutputStream fos = new FileOutputStream(cpioTemp)) {
                 byte[] buf = new byte[8192];
                 int n;
                 while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
             }
-            return extractCpioWithPython(cpioFile, targetDir, gzFile);
+            boolean result = extractCpioStreaming(cpioTemp, targetDir);
+            cpioTemp.delete();
+            return result;
         }
 
-        // Check if it's a tar (ustar at offset 257)
-        if (header.length > 262 && header[257] == 'u' && header[258] == 's' &&
-            header[259] == 't' && header[260] == 'a' && header[261] == 'r') {
-            // It's a tar.gz — extract with tar
-            return extractTarGz(gzFile, targetDir);
-        }
-
-        // Unknown gzip content — try tar extraction
+        // Assume tar.gz
         return extractTarGz(gzFile, targetDir);
     }
 
-    /**
-     * Import a ZIP file containing a ramdisk.
-     * Looks for the first .cpio or .cpio.gz entry.
-     */
     private static boolean importZipFile(File zipFile, File targetDir) throws IOException {
         try (ZipInputStream zis = new ZipInputStream(new FileInputStream(zipFile))) {
             ZipEntry entry;
@@ -275,46 +210,36 @@ public class RamdiskImporter {
                 if (name.endsWith(".cpio") || name.endsWith(".cpio.gz") ||
                     name.endsWith(".ramdisk") || name.endsWith(".ramdisk.gz")) {
 
-                    // Extract the entry to a temp file
-                    File cpioFile = new File(targetDir.getParentFile(), "ramdisk.cpio");
-                    try (FileOutputStream fos = new FileOutputStream(cpioFile)) {
+                    File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
+                    try (FileOutputStream fos = new FileOutputStream(cpioTemp)) {
                         byte[] buf = new byte[8192];
                         int n;
                         while ((n = zis.read(buf)) > 0) fos.write(buf, 0, n);
                     }
 
-                    // If it's gzipped, decompress
+                    // Decompress if gzipped
                     if (name.endsWith(".gz")) {
-                        File decompressed = new File(cpioFile.getParent(), "ramdisk_dec.cpio");
-                        try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(cpioFile));
+                        File decompressed = new File(cpioTemp.getParent(), "ramdisk_dec.cpio");
+                        try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(cpioTemp));
                              FileOutputStream fos = new FileOutputStream(decompressed)) {
                             byte[] buf = new byte[8192];
                             int n;
                             while ((n = gzis.read(buf)) > 0) fos.write(buf, 0, n);
                         }
-                        cpioFile.delete();
-                        cpioFile = decompressed;
+                        cpioTemp.delete();
+                        cpioTemp = decompressed;
                     }
 
-                    return extractCpioWithPython(cpioFile, targetDir, zipFile);
+                    boolean result = extractCpioStreaming(cpioTemp, targetDir);
+                    cpioTemp.delete();
+                    return result;
                 }
             }
         }
         throw new IOException("No .cpio or .ramdisk entry found in ZIP");
     }
 
-    /**
-     * Import a raw cpio file.
-     */
-    private static boolean importCpioFile(File cpioFile, File targetDir) throws IOException {
-        return extractCpioWithPython(cpioFile, targetDir, cpioFile);
-    }
-
-    /**
-     * Import a tar/tar.gz rootfs (existing behavior).
-     */
     private static boolean importTarFile(File tarFile, File targetDir) throws IOException {
-        // Use the existing tar extraction (shell out to tar)
         ProcessBuilder pb = new ProcessBuilder("tar", "-xf", tarFile.getAbsolutePath(),
             "-C", targetDir.getAbsolutePath());
         Process process = pb.start();
@@ -329,11 +254,7 @@ public class RamdiskImporter {
         }
     }
 
-    /**
-     * Extract a tar.gz file.
-     */
     private static boolean extractTarGz(File gzFile, File targetDir) throws IOException {
-        // Decompress to a temp tar, then extract
         File tarFile = new File(targetDir.getParentFile(), "rootfs.tar");
         try (GZIPInputStream gzis = new GZIPInputStream(new FileInputStream(gzFile));
              FileOutputStream fos = new FileOutputStream(tarFile)) {
@@ -347,63 +268,64 @@ public class RamdiskImporter {
     }
 
     /**
-     * Extract a cpio archive using Python (available on Android via Termux
-     * or the built-in Python in some ROMs). Falls back to a Java cpio
-     * extractor if Python is not available.
-     *
-     * The cpio format used by Android ramdisks is SVR4 (newc) with
-     * magic "070701" or "070702". Each entry has a 110-byte ASCII header
-     * followed by the filename, file data, and padding.
+     * Extract a SVR4 cpio archive (newc format) using streaming.
+     * Reads the file in chunks instead of loading everything into memory.
      */
-    private static boolean extractCpioWithPython(File cpioFile, File targetDir, File sourceFile) throws IOException {
-        // First, try the built-in cpio extraction in Java
-        // (Android doesn't have the cpio command, and Python isn't guaranteed)
-        return extractCpioJava(cpioFile, targetDir);
-    }
-
-    /**
-     * Extract a SVR4 cpio archive (newc format) using pure Java.
-     * This handles the "070701" and "070702" magic formats used by
-     * Android ramdisks.
-     */
-    private static boolean extractCpioJava(File cpioFile, File targetDir) throws IOException {
+    private static boolean extractCpioStreaming(File cpioFile, File targetDir) throws IOException {
         try (FileInputStream fis = new FileInputStream(cpioFile)) {
-            byte[] data = new byte[(int) cpioFile.length()];
-            int offset = 0;
-            while (offset < data.length) {
-                int n = fis.read(data, offset, data.length - offset);
-                if (n < 0) break;
-                offset += n;
-            }
-
-            int pos = 0;
             int fileCount = 0;
-            while (pos + 110 <= data.length) {
+            long fileLength = cpioFile.length();
+            long pos = 0;
+
+            while (pos + 110 <= fileLength) {
+                // Read 110-byte header
+                byte[] header = new byte[110];
+                int headerRead = readFully(fis, header);
+                if (headerRead < 110) break;
+                pos += 110;
+
                 // Check magic
-                String magic = new String(data, pos, 6);
+                String magic = new String(header, 0, 6);
                 if (!magic.equals("070701") && !magic.equals("070702")) {
+                    Log.w(TAG, "Invalid cpio magic at pos " + (pos - 110) + ": " + magic);
                     break;
                 }
-                if (magic.equals("070702")) break; // CRC variant, stop
 
-                // Parse header fields (8 hex chars each)
-                int mode = parseHex(data, pos + 14, 8);
-                int filesize = parseHex(data, pos + 54, 8);
-                int namesize = parseHex(data, pos + 62, 8);
+                // Parse header fields
+                int mode = parseHex(header, 14, 8);
+                long filesize = parseHexLong(header, 54, 8);
+                int namesize = parseHex(header, 62, 8);
 
-                // Name starts at offset 110
-                int nameStart = pos + 110;
-                String name = new String(data, nameStart, namesize - 1); // -1 for null terminator
+                if (namesize <= 0 || namesize > 4096) {
+                    Log.w(TAG, "Invalid namesize: " + namesize);
+                    break;
+                }
 
-                // Align data start to 4 bytes
-                int dataStart = nameStart + namesize;
-                dataStart = (dataStart + 3) & ~3;
+                // Read filename
+                byte[] nameBytes = new byte[namesize];
+                int nameRead = readFully(fis, nameBytes);
+                if (nameRead < namesize) break;
+                pos += namesize;
+
+                String name = new String(nameBytes, 0, namesize - 1); // -1 for null
+
+                // Align to 4 bytes after name
+                int namePadding = ((4 - ((110 + namesize) % 4)) % 4);
+                if (namePadding > 0) {
+                    byte[] pad = new byte[namePadding];
+                    readFully(fis, pad);
+                    pos += namePadding;
+                }
 
                 if (name.equals("TRAILER!!!") || name.isEmpty()) {
+                    Log.i(TAG, "Reached cpio trailer");
                     break;
                 }
 
+                // Read file data
+                long dataPos = pos;
                 int modeType = mode & 0xF000;
+
                 if (modeType == 0x4000) {
                     // Directory
                     File dir = new File(targetDir, name);
@@ -414,24 +336,57 @@ public class RamdiskImporter {
                     File file = new File(targetDir, name);
                     file.getParentFile().mkdirs();
                     try (FileOutputStream fos = new FileOutputStream(file)) {
-                        fos.write(data, dataStart, filesize);
+                        byte[] buf = new byte[8192];
+                        long remaining = filesize;
+                        while (remaining > 0) {
+                            int toRead = (int) Math.min(buf.length, remaining);
+                            int n = fis.read(buf, 0, toRead);
+                            if (n < 0) break;
+                            fos.write(buf, 0, n);
+                            remaining -= n;
+                            pos += n;
+                        }
                     }
                     fileCount++;
                 } else if (modeType == 0xA000) {
-                    // Symlink — skip (sandbox may not allow creating symlinks)
-                    // Write target to a .symlink file for reference
+                    // Symlink — read target, save as .symlink file
+                    byte[] target = new byte[(int) filesize];
+                    readFully(fis, target);
+                    pos += filesize;
+
                     File linkFile = new File(targetDir, name + ".symlink");
                     linkFile.getParentFile().mkdirs();
-                    String target = new String(data, dataStart, filesize);
                     try (FileOutputStream fos = new FileOutputStream(linkFile)) {
-                        fos.write(target.getBytes());
+                        fos.write(target);
                     }
                     fileCount++;
+                } else {
+                    // Skip unknown types (char devices, block devices, fifos)
+                    if (filesize > 0) {
+                        byte[] skip = new byte[(int) Math.min(filesize, 65536)];
+                        long remaining = filesize;
+                        while (remaining > 0) {
+                            int toRead = (int) Math.min(skip.length, remaining);
+                            int n = fis.read(skip, 0, toRead);
+                            if (n < 0) break;
+                            remaining -= n;
+                            pos += n;
+                        }
+                    }
                 }
 
-                // Advance to next entry (align to 4 bytes)
-                pos = dataStart + filesize;
-                pos = (pos + 3) & ~3;
+                // Align to 4 bytes after data
+                long dataEnd = dataPos + filesize;
+                long dataPadding = ((4 - (dataEnd % 4)) % 4);
+                if (dataPadding > 0 && (modeType == 0xA000 || modeType == 0x8000)) {
+                    // Already read the data above, just skip padding
+                    byte[] pad = new byte[(int) dataPadding];
+                    readFully(fis, pad);
+                    pos += dataPadding;
+                } else if (dataPadding > 0) {
+                    // For skipped entries, data was already skipped including padding
+                    // This case shouldn't happen since we skip inline above
+                }
             }
 
             Log.i(TAG, "Extracted " + fileCount + " entries from cpio");
@@ -439,11 +394,22 @@ public class RamdiskImporter {
         }
     }
 
-    /**
-     * Parse 8 hex characters as an integer.
-     */
+    private static int readFully(InputStream is, byte[] buf) throws IOException {
+        int total = 0;
+        while (total < buf.length) {
+            int n = is.read(buf, total, buf.length - total);
+            if (n < 0) return total;
+            total += n;
+        }
+        return total;
+    }
+
     private static int parseHex(byte[] data, int offset, int len) {
-        int result = 0;
+        return (int) parseHexLong(data, offset, len);
+    }
+
+    private static long parseHexLong(byte[] data, int offset, int len) {
+        long result = 0;
         for (int i = 0; i < len; i++) {
             byte c = data[offset + i];
             int val;
