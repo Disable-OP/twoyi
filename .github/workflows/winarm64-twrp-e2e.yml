@@ -41,12 +41,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Verify ARM64 architecture
+        shell: pwsh
         run: |
-          echo "=== Architecture ==="
-          echo $PROCESSOR_ARCHITECTURE
-          wmic os get osarchitecture
-          echo "=== CPU info ==="
-          wmic cpu get name
+          Write-Host "=== Architecture ==="
+          Write-Host $env:PROCESSOR_ARCHITECTURE
+          Write-Host "=== OS Architecture ==="
+          (Get-CimInstance Win32_OperatingSystem).OSArchitecture
+          Write-Host "=== CPU info ==="
+          (Get-CimInstance Win32_Processor).Name
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
