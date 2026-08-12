@@ -106,27 +106,39 @@ static unsigned int my_strlen(const char *s) {
 }
 
 // ---------------------------------------------------------------------------
-// RAW i386 SYSCALL HELPERS — we use inline `int $0x80` instead of calling
-// libc's `syscall()` function. This is CRITICAL: TWRP's bionic linker
-// (AOSP 5.1) fails to resolve the `syscall` symbol from our LD_PRELOAD
-// library even though libc.so exports it (strace-confirmed in KVM run
-// 31572816370: "CANNOT LINK EXECUTABLE DEPENDENCIES: cannot locate
-// symbol \"syscall\" referenced by \"twrp_fb_hook.so\"..."). Using inline
-// asm eliminates the undefined `syscall` symbol from our .so's dynsym,
-// so bionic can load us.
+// RAW SYSCALL HELPERS — we use inline asm instead of calling libc's
+// `syscall()` function. This is CRITICAL: TWRP's bionic linker (AOSP 5.1)
+// fails to resolve the `syscall` symbol from our LD_PRELOAD library even
+// though libc.so exports it (strace-confirmed in KVM run 31572816370:
+// "CANNOT LINK EXECUTABLE DEPENDENCIES: cannot locate symbol \"syscall\"
+// referenced by \"twrp_fb_hook.so\"..."). Using inline asm eliminates the
+// undefined `syscall` symbol from our .so's dynsym, so bionic can load us.
 //
-// i386 syscall convention (kernel sigreturn ABI):
+// We support TWO architectures:
+//   - i386 (32-bit x86): int $0x80, eax=num, ebx/cx/dx/si/di/bp=args
+//   - aarch64 (64-bit ARM): svc #0, x8=num, x0-x5=args
+//
+// i386 syscall convention:
 //   eax = syscall number
 //   ebx = arg1, ecx = arg2, edx = arg3
 //   esi = arg4, edi = arg5, ebp = arg6
 //   int $0x80
 //   eax = return value (negative errno on error)
 //
+// aarch64 syscall convention:
+//   x8 = syscall number
+//   x0 = arg1, x1 = arg2, x2 = arg3
+//   x3 = arg4, x4 = arg5, x5 = arg6
+//   svc #0
+//   x0 = return value (negative errno on error)
+//
 // We only need 1/3/4-arg variants (no 6-arg syscalls now that the
 // mmap hook is removed — see the mmap comment at the bottom). For the
-// 6-arg case ebp would have to be saved/restored (it's the frame
+// 6-arg case on i386 ebp would have to be saved/restored (it's the frame
 // pointer); we avoid that entirely.
 // ---------------------------------------------------------------------------
+#if defined(__i386__)
+
 static long raw_syscall1(long num, long a) {
     long ret;
     __asm__ volatile (
@@ -159,6 +171,62 @@ static long raw_syscall4(long num, long a, long b, long c, long d) {
     );
     return ret;
 }
+
+#elif defined(__aarch64__)
+
+static long raw_syscall1(long num, long a) {
+    register long x8 __asm__("x8") = num;
+    register long x0 __asm__("x0") = a;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8)
+        : "memory"
+    );
+    return x0;
+}
+
+static long raw_syscall3(long num, long a, long b, long c) {
+    register long x8 __asm__("x8") = num;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2)
+        : "memory"
+    );
+    return x0;
+}
+
+static long raw_syscall4(long num, long a, long b, long c, long d) {
+    register long x8 __asm__("x8") = num;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3)
+        : "memory"
+    );
+    return x0;
+}
+
+#else
+#error "twrp_fb_hook.c: unsupported architecture (need __i386__ or __aarch64__)"
+#endif
+
+// aarch64 has no SYS_mkdir — only SYS_mkdirat. Provide a portable wrapper.
+#if defined(__aarch64__)
+  #define SYS_mkdir_portable SYS_mkdirat
+  #define mkdir_raw(path, mode) raw_syscall4(SYS_mkdirat, AT_FDCWD, (long)(path), (mode), 0)
+#else
+  #define SYS_mkdir_portable SYS_mkdir
+  #define mkdir_raw(path, mode) raw_syscall3(SYS_mkdir, (long)(path), (mode), 0)
+#endif
 
 // ---------------------------------------------------------------------------
 // Async-signal-safe write to stderr (for diagnostics from the constructor
@@ -418,7 +486,7 @@ int open(const char *path, int flags, ...) {
     // /dev tmpfs, wiping kr64's pre-created fb0 file.
     if (fd < 0 && is_fb_path(path)) {
         // Create /dev/graphics/ directory if needed
-        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755, 0);
+        mkdir_raw("/dev/graphics", 0755);
         // Create the fb0 file with the right size (720*1280*4 = 3686400)
         int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
             (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
@@ -458,7 +526,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     // If opening /dev/graphics/fb0 or /dev/fb0 fails with ENOENT, create
     // the virtual framebuffer file and re-open it.
     if (fd < 0 && is_fb_path(path)) {
-        raw_syscall3(SYS_mkdir, (long)"/dev/graphics", 0755, 0);
+        mkdir_raw("/dev/graphics", 0755);
         int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
             (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
             O_CREAT | O_RDWR, 0644);
