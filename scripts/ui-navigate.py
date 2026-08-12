@@ -120,6 +120,63 @@ def find_all_by_text(root, text, exact=False):
                 results.append((cx, cy, node))
     return results
 
+def find_tap_target_for_text(root, text, exact=False):
+    """Find a UI node by text, then walk up the parent chain to find the
+    widest ancestor (the row/card container). Return the center of that
+    container — this is where to tap to actually trigger a click, because
+    the text node itself is often NOT clickable (clickable=false in the
+    uiautomator dump) even though the row container IS clickable at the
+    RecyclerView level.
+
+    This is critical for the Android SAF file picker: the file name text
+    is NOT clickable, but the row containing it IS (via the RecyclerView's
+    ViewHolder click handler). Tapping the text center does nothing; we
+    need to tap the row center."""
+    if root is None:
+        return None
+    # Build parent map for walking up
+    parent_map = {c: p for p in root.iter() for c in p}
+    search = text.lower()
+    for node in root.iter("node"):
+        txt = (node.get("text", "") or "").lower()
+        desc = (node.get("content-desc", "") or "").lower()
+        match = (txt == search) if exact else (search in txt)
+        if not match:
+            match = (desc == search) if exact else (search in desc)
+        if match:
+            # Walk up the parent chain to find the widest ancestor
+            widest_node = node
+            widest_width = 0
+            cur = node
+            depth = 0
+            while cur in parent_map and depth < 15:
+                parent = parent_map[cur]
+                pbounds = parent.get("bounds", "")
+                m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", pbounds)
+                if m:
+                    x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                    w = x2 - x1
+                    if w > widest_width:
+                        widest_width = w
+                        widest_node = parent
+                cur = parent
+                depth += 1
+            # Return center of the widest ancestor
+            bounds = widest_node.get("bounds", "")
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+            if m:
+                x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                return (cx, cy, widest_node)
+            # Fallback: return the text node's own center
+            bounds = node.get("bounds", "")
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+            if m:
+                x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                return (cx, cy, node)
+    return None
+
 def tap(x, y):
     adb_shell(f"input tap {x} {y}")
 
@@ -263,12 +320,16 @@ def main():
 
     found_file = False
 
-    # (a) Try to find recovery.img directly in the current view
+    # (a) Try to find recovery.img directly in the current view.
+    # CRITICAL: use find_tap_target_for_text() instead of find_by_text()
+    # because the file name text node is NOT clickable — we need to tap
+    # the center of the file ROW (the widest ancestor), which is the
+    # clickable RecyclerView item.
     for text in ["recovery.img", "recovery"]:
-        result = find_by_text(root, text, exact=False)
+        result = find_tap_target_for_text(root, text, exact=False)
         if result:
             cx, cy, _ = result
-            print(f"  Found '{text}' directly at ({cx}, {cy}) — tapping")
+            print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
             tap(cx, cy)
             wait(3)
             found_file = True
@@ -276,14 +337,9 @@ def main():
 
     if not found_file:
         # (b) Open the hamburger menu / drawer
-        # The SAF picker's hamburger is an ImageButton with content-desc
-        # "Navigate up" or "Show roots" or similar, at the top-left.
-        # On a 320x640 screen, the action bar is at y=24..80, so the
-        # hamburger center is around (28, 52). But let's find it by
-        # content-desc first for robustness.
         print("  recovery.img not in current view — opening nav drawer")
 
-        # Look for the "Show roots" / "Navigate up" button
+        # Look for the "Show Roots" / "Navigate up" button
         drawer_opened = False
         for desc in ["Show roots", "Navigate up", "Show list", "More options"]:
             result = find_by_text(root, desc, exact=False)
@@ -296,11 +352,8 @@ def main():
                 break
 
         if not drawer_opened:
-            # Fall back to tapping the top-left corner (where the hamburger
-            # usually is). On a 320x640 screen, this is around (28, 52).
-            # The action bar starts at y=24 (after status bar) and is 56px tall.
-            hamburger_x = int(SCREEN_W * 0.08)  # ~28 on 320-wide
-            hamburger_y = int(SCREEN_H * 0.08)  # ~51 on 640-tall
+            hamburger_x = int(SCREEN_W * 0.08)
+            hamburger_y = int(SCREEN_H * 0.08)
             print(f"  No drawer button found — tapping top-left ({hamburger_x}, {hamburger_y})")
             tap(hamburger_x, hamburger_y)
             wait(2)
@@ -313,10 +366,10 @@ def main():
 
         # (c) Look for "Downloads" in the drawer
         for text in ["Downloads", "Download"]:
-            result = find_by_text(root, text, exact=False)
+            result = find_tap_target_for_text(root, text, exact=False)
             if result:
                 cx, cy, _ = result
-                print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+                print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
                 tap(cx, cy)
                 wait(3)
                 break
@@ -328,10 +381,10 @@ def main():
         print_all_text(root, prefix="    ")
 
         for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-            result = find_by_text(root, text, exact=False)
+            result = find_tap_target_for_text(root, text, exact=False)
             if result:
                 cx, cy, _ = result
-                print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+                print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
                 tap(cx, cy)
                 wait(3)
                 found_file = True
@@ -340,44 +393,79 @@ def main():
         if not found_file:
             # (d) Try "Show internal storage" / "SD card" / phone storage
             print("  recovery.img not in Downloads — trying internal storage")
-            # Look for "Phone" / "Internal storage" / "SD card"
             for text in ["Internal storage", "Phone", "SD card", "Storage"]:
-                result = find_by_text(root, text, exact=False)
+                result = find_tap_target_for_text(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
-                    print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+                    print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
                     tap(cx, cy)
                     wait(2)
                     break
 
-            # Navigate: Download folder
             xml = dump_ui("03c_internal_storage")
             root = parse_ui(xml)
             for text in ["Download", "Downloads"]:
-                result = find_by_text(root, text, exact=False)
+                result = find_tap_target_for_text(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
-                    print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+                    print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
                     tap(cx, cy)
                     wait(2)
                     break
 
-            # Look for recovery.img
             xml = dump_ui("03d_in_download_folder")
             root = parse_ui(xml)
             for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-                result = find_by_text(root, text, exact=False)
+                result = find_tap_target_for_text(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
-                    print(f"  Found '{text}' at ({cx}, {cy}) — tapping")
+                    print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
                     tap(cx, cy)
                     wait(3)
                     found_file = True
                     break
 
+    # After tapping the file, check if we're back on SettingsActivity
+    # (file picker closed = file was selected). If still on PickActivity,
+    # the tap didn't work — try double-tapping or tapping a different spot.
     xml = dump_ui("04_after_file_select")
     root = parse_ui(xml)
-    print(f"  Current activity: {get_current_activity()}")
+    activity = get_current_activity()
+    print(f"  Current activity: {activity}")
+
+    if "documentsui" in activity.lower() or "picker" in activity.lower():
+        print("  ⚠ Still on file picker — file was not selected!")
+        print("  Visible text:")
+        print_all_text(root, prefix="    ")
+        # Try double-tapping recovery.img
+        print("  Trying double-tap on recovery.img...")
+        result = find_tap_target_for_text(root, "recovery.img", exact=False)
+        if result:
+            cx, cy, _ = result
+            tap(cx, cy)
+            wait(0.1)
+            tap(cx, cy)
+            wait(3)
+        xml = dump_ui("04b_after_doubletap")
+        root = parse_ui(xml)
+        activity = get_current_activity()
+        print(f"  After double-tap: {activity}")
+
+        if "documentsui" in activity.lower() or "picker" in activity.lower():
+            print("  Still on file picker — trying to tap the 'Preview' icon instead...")
+            # The "Preview the file recovery.img" FrameLayout IS clickable
+            for desc in ["Preview the file recovery.img", "Preview"]:
+                result = find_by_text(root, desc, exact=False)
+                if result:
+                    cx, cy, _ = result
+                    print(f"  Found '{desc}' at ({cx}, {cy}) — tapping")
+                    tap(cx, cy)
+                    wait(3)
+                    break
+            xml = dump_ui("04c_after_preview_tap")
+            root = parse_ui(xml)
+            activity = get_current_activity()
+            print(f"  After preview tap: {activity}")
 
     # ─────────────────────────────────────────────
     # Step 4: Wait for ROM import to complete
