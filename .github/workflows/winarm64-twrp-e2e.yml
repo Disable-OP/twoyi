@@ -120,14 +120,12 @@ jobs:
             find "$ANDROID_AVD_HOME" -name "config.ini" 2>/dev/null || true
             exit 1
           fi
-          cat >> "$AVD_CONFIG" << 'EOF'
-hw.keyboard=yes
-hw.gpu.enabled=yes
-hw.gpu.mode=swiftshader_indirect
-hw.ramSize=2048
-disk.dataPartition.size=4096
-vm.heapSize=256
-EOF
+          echo "hw.keyboard=yes" >> "$AVD_CONFIG"
+          echo "hw.gpu.enabled=yes" >> "$AVD_CONFIG"
+          echo "hw.gpu.mode=swiftshader_indirect" >> "$AVD_CONFIG"
+          echo "hw.ramSize=2048" >> "$AVD_CONFIG"
+          echo "disk.dataPartition.size=4096" >> "$AVD_CONFIG"
+          echo "vm.heapSize=256" >> "$AVD_CONFIG"
           echo "=== AVD config ==="
           cat "$AVD_CONFIG"
 
