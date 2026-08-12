@@ -78,32 +78,16 @@ jobs:
           Write-Host "Android SDK installed at $ANDROID_HOME"
 
       - name: Install Android SDK packages
-        shell: bash
+        shell: cmd
         run: |
-          set -ex
-          # Use bash (Git Bash on Windows) for better error handling
-          export ANDROID_HOME="$LOCALAPPDATA/Android/Sdk"
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-
-          # Accept licenses
-          yes | sdkmanager --licenses 2>/dev/null || true
-
-          # Install packages one at a time to see which fails
-          sdkmanager "platform-tools" || echo "WARN: platform-tools failed"
-          sdkmanager "platforms;android-30" || echo "WARN: platforms failed"
-          sdkmanager "build-tools;30.0.3" || echo "WARN: build-tools failed"
-          sdkmanager "system-images;android-30;default;arm64-v8a" || echo "WARN: system-image failed"
-
-          # Try emulator package
-          sdkmanager "emulator" 2>&1 || echo "WARN: emulator package install failed"
-
-          # Check if emulator binary exists
-          ls -la "$ANDROID_HOME/emulator/emulator.exe" 2>/dev/null || \
-          ls -la "$ANDROID_HOME/emulator/emulator" 2>/dev/null || \
-          echo "ERROR: emulator binary not found"
-
-          # Try running it
-          "$ANDROID_HOME/emulator/emulator" -version 2>&1 || true
+          set ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk
+          set PATH=%ANDROID_HOME%\cmdline-tools\latest\bin;%ANDROID_HOME%\platform-tools;%ANDROID_HOME%\emulator;%PATH%
+          echo Accepting licenses...
+          call sdkmanager --licenses
+          echo Installing packages...
+          call sdkmanager "platform-tools" "platforms;android-30" "build-tools;30.0.3" "emulator" "system-images;android-30;default;arm64-v8a"
+          echo === Emulator version ===
+          call emulator -version
 
       - name: Create ARM64 AVD
         shell: cmd
