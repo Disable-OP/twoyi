@@ -56,13 +56,68 @@
 #include <linux/fb.h>
 
 // ---------------------------------------------------------------------------
+// RAW i386 SYSCALL HELPERS — we use inline `int $0x80` instead of calling
+// libc's `syscall()` function. This is CRITICAL: TWRP's bionic linker
+// (AOSP 5.1) fails to resolve the `syscall` symbol from our LD_PRELOAD
+// library even though libc.so exports it (strace-confirmed in KVM run
+// 31572816370: "CANNOT LINK EXECUTABLE DEPENDENCIES: cannot locate
+// symbol \"syscall\" referenced by \"twrp_fb_hook.so\"..."). Using inline
+// asm eliminates the undefined `syscall` symbol from our .so's dynsym,
+// so bionic can load us.
+//
+// i386 syscall convention (kernel sigreturn ABI):
+//   eax = syscall number
+//   ebx = arg1, ecx = arg2, edx = arg3
+//   esi = arg4, edi = arg5, ebp = arg6
+//   int $0x80
+//   eax = return value (negative errno on error)
+//
+// We only need 1/3/4-arg variants (no 6-arg syscalls after removing the
+// dead SYS_mmap2 fallback in mmap()). For the 6-arg case ebp would have
+// to be saved/restored (it's the frame pointer); we avoid that entirely.
+// ---------------------------------------------------------------------------
+static long raw_syscall1(long num, long a) {
+    long ret;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(num), "b"(a)
+        : "memory"
+    );
+    return ret;
+}
+
+static long raw_syscall3(long num, long a, long b, long c) {
+    long ret;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(num), "b"(a), "c"(b), "d"(c)
+        : "memory"
+    );
+    return ret;
+}
+
+static long raw_syscall4(long num, long a, long b, long c, long d) {
+    long ret;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(num), "b"(a), "c"(b), "d"(c), "S"(d)
+        : "memory"
+    );
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
 // Async-signal-safe write to stderr (for diagnostics from the constructor
-// and hooks). We use raw SYS_write to avoid recursing into our own hooks.
+// and hooks). We use raw SYS_write via inline asm to avoid recursing into
+// our own hooks AND to avoid the `syscall` symbol dependency (see above).
 // ---------------------------------------------------------------------------
 static void write_str(int fd, const char *s) {
     size_t n = 0;
     while (s[n]) n++;
-    (void)syscall(SYS_write, fd, s, n);
+    (void)raw_syscall3(SYS_write, fd, (long)s, (long)n);
 }
 
 static void write_num(int fd, int v) {
@@ -77,7 +132,7 @@ static void write_num(int fd, int v) {
         while (u) { buf[--i] = (char)('0' + (u % 10)); u /= 10; }
         if (neg) buf[--i] = '-';
     }
-    (void)syscall(SYS_write, fd, &buf[i], sizeof(buf) - (size_t)i);
+    (void)raw_syscall3(SYS_write, fd, (long)&buf[i], (long)(sizeof(buf) - (size_t)i));
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +300,7 @@ int open(const char *path, int flags, ...) {
     }
     init_real_funcs();
     int fd = real_open ? real_open(path, flags, mode)
-                       : (int)syscall(SYS_openat, AT_FDCWD, path, flags, mode);
+                       : (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, mode);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
         write_str(2, "[twrp_fb_hook] open(");
@@ -264,7 +319,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
     init_real_funcs();
     int fd = real_openat ? real_openat(dirfd, path, flags, mode)
-                         : (int)syscall(SYS_openat, dirfd, path, flags, mode);
+                         : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
         write_str(2, "[twrp_fb_hook] openat(");
@@ -284,7 +339,7 @@ int __open_2(const char *path, int flags) {
     if (!real_open2) real_open2 = dlsym(RTLD_NEXT, "__open_2");
     int fd;
     if (real_open2) fd = real_open2(path, flags);
-    else            fd = (int)syscall(SYS_openat, AT_FDCWD, path, flags);
+    else            fd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, 0);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
         write_str(2, "[twrp_fb_hook] __open_2(");
@@ -302,7 +357,7 @@ int __openat_2(int dirfd, const char *path, int flags) {
     if (!real_openat2) real_openat2 = dlsym(RTLD_NEXT, "__openat_2");
     int fd;
     if (real_openat2) fd = real_openat2(dirfd, path, flags);
-    else              fd = (int)syscall(SYS_openat, dirfd, path, flags);
+    else              fd = (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, 0);
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
         write_str(2, "[twrp_fb_hook] __openat_2(");
@@ -327,7 +382,7 @@ int close(int fd) {
     static int (*real_close)(int) = NULL;
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     if (real_close) return real_close(fd);
-    return (int)syscall(SYS_close, fd);
+    return (int)raw_syscall1(SYS_close, fd);
 }
 
 // ---------------------------------------------------------------------------
@@ -366,7 +421,7 @@ int ioctl(int fd, int request, ...) {
         static int (*real_ioctl)(int, int, ...) = NULL;
         if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
         if (real_ioctl) return real_ioctl(fd, request, argp);
-        return (int)syscall(SYS_ioctl, fd, request, argp);
+        return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
     }
 
     // fb0 fd — respond to FB ioctls.
@@ -413,7 +468,7 @@ int ioctl(int fd, int request, ...) {
             static int (*real_ioctl)(int, int, ...) = NULL;
             if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
             if (real_ioctl) return real_ioctl(fd, request, argp);
-            return (int)syscall(SYS_ioctl, fd, request, argp);
+            return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
         }
     }
 }
@@ -448,8 +503,11 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         if (real_mmap) {
             return real_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
         }
-        return (void *)syscall(SYS_mmap2, addr, length, prot,
-                               flags | MAP_ANONYMOUS, -1, offset >> 12);
+        // real_mmap is NULL (dlsym failed — shouldn't happen, bionic always
+        // has mmap in libc.so). We can't do a raw 6-arg SYS_mmap2 syscall
+        // here without saving/restoring ebp (the frame pointer on i386).
+        // Rather than risk corrupting the caller's frame, return MAP_FAILED
+        // and let the caller handle the error.
     }
 
     return MAP_FAILED;
