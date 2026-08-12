@@ -864,19 +864,46 @@ if [ "$TWRP_MODE" = "1" ]; then
     GUEST_PID=$(grep -oE 'guest pid = [0-9]+' "$ARTIFACT_DIR/kr64-stderr.log" 2>/dev/null | tail -1 | awk '{print $NF}')
     if [ -n "$GUEST_PID" ]; then
         echo "  → TWRP: attaching strace to guest init (pid $GUEST_PID)..."
-        # Start strace in background, capture write + execve calls
-        "$ADB_BIN" -s emulator-5554 shell "
-            strace -e trace=write,execve -f -p $GUEST_PID -o /data/local/tmp/twrp-strace.log 2>/dev/null &
+        # Start strace in background, capture write + execve calls.
+        #
+        # IMPORTANT (Task ID 25, KVM run 31559261755): the previous
+        # version of this block used `strace ... 2>/dev/null &` — only
+        # strace's stderr was redirected. strace's stdout was still
+        # attached to the adb shell pipe, and adb shell waits for ALL
+        # child processes to close their stdout before returning. Since
+        # strace runs forever (until the traced init exits), adb shell
+        # never returned — the script hung for 8m48s until the 600s
+        # workflow timeout killed it. NONE of the downstream diagnostic
+        # capture (twrp-ps-pre-kill.log, twrp-guest-tree.log, dmesg.log,
+        # twrp-strace.log itself) ran.
+        #
+        # Fix: redirect ALL THREE std streams (stdin, stdout, stderr)
+        # away from the adb pipe. `nohup` makes strace survive adb
+        # shell's SIGHUP. `timeout 10` on the adb call is a safety net
+        # in case the redirection ever regresses. The strace child is
+        # backgrounded with `&`, so adb shell can return immediately.
+        timeout 10 "$ADB_BIN" -s emulator-5554 shell "
+            nohup strace -e trace=write,execve -f -p $GUEST_PID -o /data/local/tmp/twrp-strace.log </dev/null >/dev/null 2>&1 &
             echo \$! > /data/local/tmp/strace.pid
             echo 'strace attached'
         " 2>&1 | tail -3
         sleep 2
-        # Check if strace is running
+        # Check if strace is running. We verify by checking that the
+        # PID in strace.pid is still alive (kill -0) — this catches
+        # both "strace not installed" and "strace exited immediately
+        # (e.g. permission denied, PID not found)".
         STRACE_PID=$("$ADB_BIN" -s emulator-5554 shell "cat /data/local/tmp/strace.pid 2>/dev/null" 2>/dev/null | tr -d '\r\n ')
         if [ -n "$STRACE_PID" ]; then
-            echo "  ✓ strace running (pid $STRACE_PID)"
+            STRACE_ALIVE=$("$ADB_BIN" -s emulator-5554 shell "kill -0 $STRACE_PID 2>/dev/null && echo yes || echo no" 2>/dev/null | tr -d '\r\n ')
+            if [ "$STRACE_ALIVE" = "yes" ]; then
+                echo "  ✓ strace running (pid $STRACE_PID)"
+            else
+                echo "  ⚠ strace pid $STRACE_PID is not alive — strace may have failed to attach"
+                echo "    (check if strace is installed: adb shell which strace)"
+            fi
         else
             echo "  ⚠ strace failed to start — strace may not be available on this device"
+            echo "    (run 'adb shell which strace' to verify)"
         fi
     fi
 fi
