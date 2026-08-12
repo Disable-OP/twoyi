@@ -432,7 +432,8 @@ jobs:
             /tmp/ci-artifacts/twrp-guest-tree.log \
             /tmp/ci-artifacts/twrp-fb-rgba.bin \
             /tmp/ci-artifacts/twrp-fb.png \
-            /tmp/ci-artifacts/twrp-strace.log
+            /tmp/ci-artifacts/twrp-strace.log \
+            || true
 
       - name: Upload logs
         if: always()
