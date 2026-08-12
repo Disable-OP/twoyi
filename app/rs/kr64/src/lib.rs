@@ -71,6 +71,7 @@ pub mod compat_paths;
 pub mod devices;
 pub mod mount_mgr;
 pub mod proc_emu;
+pub mod ptrace_emu;
 pub mod qemu_pipe;
 pub mod seccomp;
 pub mod sensors;
@@ -2864,6 +2865,39 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     b"[KR64 CHILD] non-root mode: skipping mount+chroot (seccomp blocks both)\n",
                 );
             }
+            // ── PTRACE-BASED SYSCALL EMULATION (non-root TWRP boot) ──
+            //
+            // On unrooted devices, we can't chroot or unshare(CLONE_NEWPID).
+            // TWRP's init is statically linked, so LD_PRELOAD doesn't work.
+            //
+            // The ONLY way to make init think it's PID 1 in a chrooted
+            // filesystem is to use ptrace to intercept its syscalls:
+            //   - getpid() → return 1
+            //   - open("/init.rc") → translate to "{rootfs}/init.rc"
+            //   - stat("/sbin/recovery") → translate to "{rootfs}/sbin/recovery"
+            //
+            // This is the same technique PROOT uses for rootless containers.
+            // ptrace IS allowed by Android's seccomp policy for untrusted
+            // apps on their own children.
+            //
+            // The child calls PTRACE_TRACEME + raises SIGSTOP so the parent
+            // can attach before we exec init. The parent then runs the
+            // ptrace interception loop (see ptrace_emu::run_ptrace_loop).
+            unsafe {
+                safe_write_err(b"[KR64 CHILD] enabling PTRACE_TRACEME for syscall emulation\n");
+                let r = libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                if r == -1 {
+                    let e = std::io::Error::last_os_error();
+                    safe_write_err(b"[KR64 CHILD] PTRACE_TRACEME failed: ");
+                    safe_write_err_errno(b"", e.raw_os_error().unwrap_or(0));
+                    safe_write_err(b"\n");
+                    // Continue anyway — init will exit 31 but we'll get
+                    // diagnostic output.
+                } else {
+                    safe_write_err(b"[KR64 CHILD] PTRACE_TRACEME OK — raising SIGSTOP for parent\n");
+                    libc::kill(libc::getpid(), libc::SIGSTOP);
+                }
+            }
         }
 
         if cfg.install_seccomp {
@@ -3305,6 +3339,47 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
     // ----- PARENT (the daemon) -----
     info!("[KR64][parent] guest pid = {}", pid);
+
+    // ── PTRACE SYSCALL EMULATION (non-root TWRP boot) ──
+    //
+    // In non-root mode, the child called PTRACE_TRACEME + raise(SIGSTOP)
+    // before exec'ing init. We need to:
+    //   1. waitpid for the SIGSTOP
+    //   2. Run the ptrace syscall interception loop (translates paths,
+    //      fakes getpid → 1)
+    //   3. The loop returns when the child exits
+    //
+    // In root mode (use_namespaces=true), the child did NOT call
+    // PTRACE_TRACEME, so we skip the ptrace loop and use plain waitpid.
+    if !cfg.use_namespaces {
+        // Wait for the child to stop itself (SIGSTOP from PTRACE_TRACEME).
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited == -1 {
+            let e = std::io::Error::last_os_error();
+            error!("[KR64][parent] waitpid for SIGSTOP failed: {}", e);
+        } else if libc::WIFSTOPPED(status) {
+            let sig = libc::WSTOPSIG(status);
+            info!(
+                "[KR64][parent] child stopped with signal {} — starting ptrace emulation loop",
+                sig
+            );
+            // Run the ptrace loop — this blocks until the child exits.
+            let exit_code = ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs);
+            info!(
+                "[KR64][parent] ptrace emulation loop ended — child exit code: {}",
+                exit_code
+            );
+            // The child has exited — we're done. Skip the normal waitpid
+            // loop below (it would return ECHILD immediately).
+            return if exit_code >= 0 { exit_code } else { 1 };
+        } else {
+            warning!(
+                "[KR64][parent] child did not stop as expected (status=0x{:x}) — ptrace emulation skipped",
+                status
+            );
+        }
+    }
 
     // Keep the SELinux permissive watchdog thread alive (it's detached,
     // but we hold the handle to avoid a compiler warning)
