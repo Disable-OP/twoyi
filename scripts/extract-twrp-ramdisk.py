@@ -142,13 +142,31 @@ def read_ramdisk(boot_img_path: str) -> bytes:
                 f"{ramdisk_offset}, got {len(rd)}"
             )
 
-    if rd[:4] != b"\x1f\x8b\x08\x00":
+    # Detect compression format and decompress
+    if rd[:2] == b"\x1f\x8b":
+        # GZIP
+        cpio = gzip.decompress(rd)
+        compression = "gzip"
+    elif rd[:1] == b"\x5d":
+        # LZMA (raw LZMA stream — starts with 0x5d)
+        import lzma
+        cpio = lzma.decompress(rd)
+        compression = "lzma"
+    elif rd[:6] == b"\xfd7zXZ":
+        # XZ
+        import lzma
+        cpio = lzma.decompress(rd)
+        compression = "xz"
+    elif rd[:6] in (b"070701", b"070702"):
+        # Uncompressed cpio
+        cpio = rd
+        compression = "none"
+    else:
         raise ValueError(
-            f"ramdisk is not gzip-compressed (first 4 bytes: {rd[:4].hex()}); "
-            f"this extractor only handles gzip ramdisks"
+            f"ramdisk has unknown compression (first 4 bytes: {rd[:4].hex()}); "
+            f"supported: gzip, lzma, xz, uncompressed cpio"
         )
 
-    cpio = gzip.decompress(rd)
     if cpio[:6] not in (b"070701", b"070702"):
         raise ValueError(
             f"decompressed ramdisk is not a SVR4 cpio archive "
@@ -157,7 +175,7 @@ def read_ramdisk(boot_img_path: str) -> bytes:
 
     print(
         f"boot image: kernel_size={meta['kernel_size']} ramdisk_size={ramdisk_size} "
-        f"(gzip) -> cpio_size={len(cpio)} page_size={page_size}",
+        f"({compression}) -> cpio_size={len(cpio)} page_size={page_size}",
         file=sys.stderr,
     )
     return cpio
