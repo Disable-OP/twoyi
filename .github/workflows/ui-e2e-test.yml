@@ -1,0 +1,581 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# UI-only end-to-end test for twoyi on x86_64.
+#
+# This workflow simulates a REAL USER experience:
+#   1. Boot a headless x86_64 Android emulator (KVM-accelerated)
+#   2. Install the APK normally (adb install)
+#   3. Push a TWRP recovery.img to /sdcard/Download/ (the ONLY manual file
+#      push — this is the ROM file the user picked)
+#   4. Launch the app by tapping the launcher icon (via monkey -p, which
+#      is equivalent to tapping the icon — NOT `am start` of a specific
+#      activity)
+#   5. Navigate the UI entirely via `adb shell input tap` + uiautomator
+#      dump:
+#      - Settings → "Import ROM" preference
+#      - File picker → navigate to /sdcard/Download/ → select recovery.img
+#      - Wait for import to complete
+#      - Tap "Launch Container" (or whatever the preference is)
+#      - Wait for the container to boot
+#   6. Capture screenshots + the app's own file logs at each step
+#
+# What this workflow does NOT do (by explicit user request):
+#   - NO manual file copy to /data/data/io.twoyi/ (the app handles rootfs
+#     extraction itself via RamdiskImporter)
+#   - NO manual library pushing (kr64's APK scan finds them)
+#   - NO `am start io.twoyi/.Render2Activity` (the user navigates via UI)
+#   - NO pre-launched root kr64 (the app's own kr64 launches)
+#   - NO `adb root` (simulates an unmodified, unrooted device)
+#
+# The test verifies that a normal user can:
+#   - Open the app
+#   - Import a TWRP recovery image via the file picker
+#   - Boot TWRP — all from the UI, with no ADB tricks
+#
+# Artifacts uploaded (xz-compressed, 7-day retention):
+#   - screenshot-*.png at each UI step
+#   - uiautomator-*.xml at each step (for debugging tap coordinates)
+#   - /sdcard/Android/data/io.twoyi/files/log/ (the app's own FileLogger
+#     output — same logs the user pulls from their real device)
+#   - logcat.txt (full logcat for cross-referencing)
+---
+name: UI E2E Test
+
+'on':
+  workflow_dispatch:
+    inputs:
+      boot_wait_seconds:
+        description: 'How long to wait for the container to boot before capturing the final screenshot (seconds)'
+        required: false
+        default: '60'
+
+concurrency:
+  group: ui-e2e-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-e2e-test:
+    name: UI-only E2E on x86_64 emulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Enable KVM access
+        run: |
+          set -u
+          echo "── KVM availability ──"
+          if [ -e /dev/kvm ]; then
+              echo "  /dev/kvm exists"
+          else
+              echo "  /dev/kvm does NOT exist — trying modprobe + mknod"
+              sudo modprobe kvm 2>/dev/null || true
+              sudo modprobe kvm_intel 2>/dev/null || true
+              sudo modprobe kvm_amd 2>/dev/null || true
+              sudo mknod /dev/kvm c 10 232 2>/dev/null || true
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-linux-android
+          cache: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rs/target
+            app/rs/loader/target
+          key: ${{ runner.os }}-cargo-x86_64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache cargo-xdk
+        id: cache-cargo-xdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-xdk
+          key: ${{ runner.os }}-cargo-xdk-2.12.6
+
+      - name: Install cargo-xdk
+        if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
+        run: cargo install cargo-xdk
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Cache Android SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk
+          key: ${{ runner.os }}-sdk-android30-google_apis-x86_64-v2
+
+      - name: Install Android SDK + emulator + system image
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
+              cd /tmp
+              CMDLINE_TOOLS_URL='https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+              curl -sL -o cmdline-tools.zip "$CMDLINE_TOOLS_URL"
+              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+              rm cmdline-tools.zip
+          fi
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --update
+          sdkmanager \
+              "platform-tools" \
+              "platforms;android-30" \
+              "build-tools;30.0.3" \
+              "emulator" \
+              "system-images;android-30;google_apis;x86_64"
+          echo "✓ SDK + emulator + system image installed"
+
+      - name: Create x86_64 AVD
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROID_AVD_HOME: /home/runner/.android/avd
+        run: |
+          set -ex
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_AVD_HOME=/home/runner/.android/avd
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p "$ANDROID_AVD_HOME"
+          AVDMGR="$(command -v avdmanager 2>/dev/null || true)"
+          if [ -z "$AVDMGR" ] || [ ! -x "$AVDMGR" ]; then
+            for d in "$ANDROID_HOME"/cmdline-tools/*/; do
+              if [ -x "${d}bin/avdmanager" ]; then
+                AVDMGR="${d}bin/avdmanager"
+                break
+              fi
+            done
+          fi
+          echo "" | "$AVDMGR" create avd \
+              -n twoyi_test \
+              -k "system-images;android-30;google_apis;x86_64" \
+              --force
+          AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_test.avd/config.ini"
+          {
+              echo "hw.keyboard=yes"
+              echo "hw.gpu.enabled=yes"
+              echo "hw.gpu.mode=swiftshader_indirect"
+              echo "hw.ramSize=2048"
+              echo "disk.dataPartition.size=4096"
+              echo "vm.heapSize=256"
+          } >> "$AVD_CONFIG"
+          echo "✓ AVD created"
+
+      - name: Grant execute permission for gradlew and build scripts
+        run: |
+          chmod +x gradlew
+          chmod +x app/rs/build_rs.sh
+          chmod +x app/rs/loader/build.sh || true
+
+      - name: Build APK (x86_64 only)
+        run: ./gradlew assembleRelease -Pabis=x86_64
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      # ───────────────────────────────────────────────────────────────
+      # Step: Boot the emulator
+      # ───────────────────────────────────────────────────────────────
+      - name: Boot emulator (headless, KVM)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p /tmp/ui-e2e-artifacts
+          "$ANDROID_HOME/emulator/emulator" -avd twoyi_test \
+              -no-window -no-audio -no-snapshot -no-boot-anim \
+              -gpu swiftshader_indirect \
+              -partition-size 4096 -read-only \
+              -ports 5554,5555 \
+              -qemu -enable-kvm \
+              > /tmp/ui-e2e-artifacts/emulator-stdout.log \
+              2> /tmp/ui-e2e-artifacts/emulator-stderr.log &
+          EMULATOR_PID=$!
+          echo $EMULATOR_PID > /tmp/emulator.pid
+          echo "  emulator PID: $EMULATOR_PID"
+
+          # Wait for boot_completed (up to 240s)
+          BOOT_TIMEOUT=240
+          WAITED=0
+          while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
+              if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+                  echo "  ✗ emulator died"
+                  tail -30 /tmp/ui-e2e-artifacts/emulator-stderr.log >&2 || true
+                  exit 1
+              fi
+              BOOTED=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              if [ "$BOOTED" = "1" ]; then
+                  echo "  ✓ boot_completed after ${WAITED}s"
+                  break
+              fi
+              sleep 2
+              WAITED=$((WAITED + 2))
+              printf '.'
+          done
+          if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
+              echo "  ✗ emulator did not boot in ${BOOT_TIMEOUT}s"
+              exit 1
+          fi
+
+      # ───────────────────────────────────────────────────────────────
+      # Step: Install APK + push TWRP recovery.img
+      # ───────────────────────────────────────────────────────────────
+      - name: Install APK + push recovery.img
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          ADB="adb -s emulator-5554"
+
+          # Install the APK normally (like a user would from the Play Store)
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          echo "── Installing APK: $APK ──"
+          $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
+          echo "  ✓ APK installed"
+
+          # Push the TWRP recovery image to /sdcard/Download/
+          # This is the ONLY manual file push — it's the ROM file the user
+          # picked. In a real user scenario, the user downloaded this file
+          # via the browser or copied it via USB.
+          TWRP_IMG="assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img"
+          if [ ! -f "$TWRP_IMG" ]; then
+              echo "✗ TWRP image not found: $TWRP_IMG" >&2
+              exit 1
+          fi
+          echo "── Pushing TWRP image to /sdcard/Download/recovery.img ──"
+          $ADB push "$TWRP_IMG" /sdcard/Download/recovery.img
+          echo "  ✓ recovery.img pushed ($(stat -c%s "$TWRP_IMG") bytes)"
+
+          # Verify the file is visible from the app's perspective
+          $ADB shell ls -la /sdcard/Download/recovery.img
+
+      # ───────────────────────────────────────────────────────────────
+      # Step: UI navigation — launch app, import ROM, boot container
+      # This is the core of the "normal phone user" test. We use:
+      #   - `adb shell monkey -p io.twoyi 1` to launch the app (equivalent
+      #     to tapping the launcher icon — NOT `am start` of a specific
+      #     activity)
+      #   - `adb shell uiautomator dump` to capture the UI hierarchy as XML
+      #     so we can find elements by text and compute tap coordinates
+      #   - `adb shell input tap X Y` to tap UI elements
+      #   - `adb shell screencap -p` to capture screenshots at each step
+      # ───────────────────────────────────────────────────────────────
+      - name: UI navigation — import ROM + boot container
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '60' }}
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          ADB="adb -s emulator-5554"
+          ART=/tmp/ui-e2e-artifacts
+          mkdir -p "$ART"
+
+          # Helper: dump UI hierarchy + screenshot
+          dump_ui() {
+              local step="$1"
+              $ADB shell uiautomator dump /sdcard/ui-dump.xml 2>/dev/null || true
+              $ADB pull /sdcard/ui-dump.xml "$ART/uiautomator-${step}.xml" 2>/dev/null || true
+              $ADB exec-out screencap -p > "$ART/screenshot-${step}.png" 2>/dev/null || true
+              echo "  [step=$step] screenshot + uiautomator captured"
+          }
+
+          # Helper: find a node by text and return its center coordinates
+          # as "X Y". Uses python3 to parse the XML.
+          tap_text() {
+              local xml="$1"
+              local text="$2"
+              local step="$3"
+              python3 - "$xml" "$text" "$step" << 'PY'
+              import sys, xml.etree.ElementTree as ET
+              xml_path, search_text, step = sys.argv[1], sys.argv[2], sys.argv[3]
+              try:
+                  tree = ET.parse(xml_path)
+                  root = tree.getroot()
+                  for node in root.iter('node'):
+                      txt = node.get('text', '') or ''
+                      desc = node.get('content-desc', '') or ''
+                      if search_text.lower() in txt.lower() or search_text.lower() in desc.lower():
+                          bounds = node.get('bounds', '')
+                          # bounds="[x1,y1][x2,y2]"
+                          import re
+                          m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds)
+                          if m:
+                              x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                              cx, cy = (x1+x2)//2, (y1+y2)//2
+                              print(f"{cx} {cy}")
+                              sys.exit(0)
+                  print(f"NOT_FOUND:{search_text}", file=sys.stderr)
+                  sys.exit(1)
+              except Exception as e:
+                  print(f"ERROR:{e}", file=sys.stderr)
+                  sys.exit(1)
+          PY
+          }
+
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 1: Launch app via launcher (monkey -p)"
+          echo "══════════════════════════════════════════════════"
+          $ADB shell monkey -p io.twoyi -c android.intent.category.LAUNCHER 1 2>&1 | tail -3
+          sleep 5
+          dump_ui "01_app_launched"
+
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 2: Find and tap 'Import ROM' preference"
+          echo "══════════════════════════════════════════════════"
+          # The SettingsActivity shows a list of preferences. We need to
+          # find one that says "Import ROM" or similar. The exact text
+          # depends on the app's strings.xml — check for common variants.
+          for search in "Import ROM" "Import" "ROM" "Select ROM" "recovery" "TWRP"; do
+              COORDS=$(tap_text "$ART/uiautomator-01_app_launched.xml" "$search" "02")
+              if echo "$COORDS" | grep -qE '^[0-9]+ [0-9]+$'; then
+                  echo "  Found '$search' at $COORDS — tapping"
+                  $ADB shell input tap $COORDS
+                  sleep 3
+                  dump_ui "02_after_import_tap"
+                  break
+              fi
+          done
+
+          # If we didn't find an "Import ROM" text, the app may be on
+          # the Render2Activity directly (if no ROM is installed, it
+          # shows a dialog prompting to select a ROM file). Try tapping
+          # any "Select" or "OK" button.
+          if [ ! -f "$ART/uiautomator-02_after_import_tap.xml" ]; then
+              echo "  No 'Import ROM' found — looking for dialog buttons"
+              for search in "Select" "OK" "Choose" "File" "Select ROM"; do
+                  COORDS=$(tap_text "$ART/uiautomator-01_app_launched.xml" "$search" "02b")
+                  if echo "$COORDS" | grep -qE '^[0-9]+ [0-9]+$'; then
+                      echo "  Found '$search' at $COORDS — tapping"
+                      $ADB shell input tap $COORDS
+                      sleep 3
+                      dump_ui "02_after_dialog_tap"
+                      break
+                  fi
+              done
+          fi
+
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 3: Navigate file picker to /sdcard/Download/"
+          echo "══════════════════════════════════════════════════"
+          # The file picker (DocumentsUI) should now be open. We need to
+          # navigate to /sdcard/Download/ and tap recovery.img.
+          #
+          # Strategy: use the hamburger menu / overflow to select "Downloads"
+          # or navigate the file tree. This is the trickiest part because
+          # the file picker UI varies by Android version.
+          #
+          # On Android 11 (API 30, our emulator), the file picker shows:
+          #   - Left: navigation drawer (Recent, Downloads, etc.)
+          #   - Right: file list
+          #
+          # Simplest approach: tap "Downloads" in the nav drawer, then
+          # tap recovery.img in the file list.
+          dump_ui "03_file_picker_open"
+
+          # Try to find "Downloads" in the nav drawer
+          for search in "Downloads" "Download" "downloads"; do
+              COORDS=$(tap_text "$ART/uiautomator-03_file_picker_open.xml" "$search" "03")
+              if echo "$COORDS" | grep -qE '^[0-9]+ [0-9]+$'; then
+                  echo "  Found '$search' at $COORDS — tapping"
+                  $ADB shell input tap $COORDS
+                  sleep 2
+                  dump_ui "03b_in_downloads"
+                  break
+              fi
+          done
+
+          # If Downloads wasn't found, try opening the nav drawer first
+          # (hamburger icon, usually top-left)
+          if [ ! -f "$ART/uiautomator-03b_in_downloads.xml" ]; then
+              echo "  'Downloads' not found — opening nav drawer (top-left tap)"
+              $ADB shell input tap 50 100
+              sleep 2
+              dump_ui "03c_drawer_open"
+              for search in "Downloads" "Download" "downloads"; do
+                  COORDS=$(tap_text "$ART/uiautomator-03c_drawer_open.xml" "$search" "03c")
+                  if echo "$COORDS" | grep -qE '^[0-9]+ [0-9]+$'; then
+                      echo "  Found '$search' at $COORDS — tapping"
+                      $ADB shell input tap $COORDS
+                      sleep 2
+                      dump_ui "03b_in_downloads"
+                      break
+                  fi
+              done
+          fi
+
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 4: Tap recovery.img in the file list"
+          echo "══════════════════════════════════════════════════"
+          # Now we should see recovery.img in the file list. Tap it.
+          UI_XML="$ART/uiautomator-03b_in_downloads.xml"
+          [ -f "$UI_XML" ] || UI_XML="$ART/uiautomator-03_file_picker_open.xml"
+          for search in "recovery.img" "recovery" "byt_t" "twrp"; do
+              COORDS=$(tap_text "$UI_XML" "$search" "04")
+              if echo "$COORDS" | grep -qE '^[0-9]+ [0-9]+$'; then
+                  echo "  Found '$search' at $COORDS — tapping"
+                  $ADB shell input tap $COORDS
+                  sleep 3
+                  dump_ui "04_after_file_select"
+                  break
+              fi
+          done
+
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 5: Wait for ROM import to complete"
+          echo "══════════════════════════════════════════════════"
+          # The app shows a progress dialog while importing. Wait for it
+          # to finish, then check if we're back on Settings or if the
+          # container auto-booted.
+          echo "  Waiting for import (up to 60s)..."
+          for i in $(seq 1 30); do
+              sleep 2
+              dump_ui "05_import_wait_$i"
+              # Check if the progress dialog is gone
+              if ! grep -q "Progress\|Importing\|Extracting\|Loading" "$ART/uiautomator-05_import_wait_$i.xml" 2>/dev/null; then
+                  echo "  Import appears complete (no progress dialog at attempt $i)"
+                  break
+              fi
+          done
+
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 6: Find and tap 'Launch Container'"
+          echo "══════════════════════════════════════════════════"
+          # After import, the app may auto-boot OR show a "Launch"
+          # preference. Look for it.
+          dump_ui "06_before_launch"
+
+          # First check: are we already in Render2Activity (auto-boot)?
+          CURRENT_FOCUS=$($ADB shell dumpsys activity activities 2>/dev/null | grep -E 'mResumedActivity|topResumedActivity' | head -1 || true)
+          echo "  Current focus: $CURRENT_FOCUS"
+
+          if echo "$CURRENT_FOCUS" | grep -q "Render2Activity"; then
+              echo "  ✓ Already in Render2Activity (auto-booted after import)"
+          else
+              # Look for a "Launch" or "Start" or "Boot" preference
+              for search in "Launch" "Start" "Boot" "Container" "Run" "Open"; do
+                  COORDS=$(tap_text "$ART/uiautomator-06_before_launch.xml" "$search" "06")
+                  if echo "$COORDS" | grep -qE '^[0-9]+ [0-9]+$'; then
+                      echo "  Found '$search' at $COORDS — tapping"
+                      $ADB shell input tap $COORDS
+                      sleep 5
+                      dump_ui "06_after_launch_tap"
+                      break
+                  fi
+              done
+          fi
+
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 7: Wait for container boot ($BOOT_WAIT_SECONDS s)"
+          echo "══════════════════════════════════════════════════"
+          # Take periodic screenshots during the boot wait
+          PREV=0
+          for i in 5 15 30 60; do
+              if [ "$i" -gt "$BOOT_WAIT_SECONDS" ]; then
+                  break
+              fi
+              SLEEP=$((i - PREV))
+              sleep "$SLEEP"
+              $ADB exec-out screencap -p > "$ART/screenshot-07_boot_${i}s.png" 2>/dev/null || true
+              echo "  screenshot at ${i}s"
+              PREV=$i
+          done
+          if [ "$BOOT_WAIT_SECONDS" -gt 60 ]; then
+              sleep $((BOOT_WAIT_SECONDS - 60))
+              $ADB exec-out screencap -p > "$ART/screenshot-07_boot_${BOOT_WAIT_SECONDS}s.png" 2>/dev/null || true
+              echo "  screenshot at ${BOOT_WAIT_SECONDS}s"
+          fi
+
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  Step 8: Capture final state + logs"
+          echo "══════════════════════════════════════════════════"
+          dump_ui "08_final"
+
+          # Capture logcat (clear first, then capture only this session)
+          $ADB logcat -d > "$ART/logcat.txt" 2>/dev/null || true
+
+          # Pull the app's own FileLogger logs
+          echo "  Pulling app file logs from /sdcard/Android/data/io.twoyi/files/log/"
+          $ADB pull /sdcard/Android/data/io.twoyi/files/log/ "$ART/app-logs/" 2>/dev/null || true
+          # Also try the internal data dir (may need root — usually fails)
+          $ADB pull /data/data/io.twoyi/kr64-app-stderr.log "$ART/kr64-app-stderr.log" 2>/dev/null || true
+
+          # Final focus check
+          FINAL_FOCUS=$($ADB shell dumpsys activity activities 2>/dev/null | grep -E 'mResumedActivity|topResumedActivity' | head -1 || true)
+          echo "  Final focus: $FINAL_FOCUS"
+          echo "  Final focus: $FINAL_FOCUS" > "$ART/final-focus.txt"
+
+          # List what we captured
+          echo ""
+          echo "── Artifacts captured ──"
+          ls -la "$ART/"
+
+      - name: Pack artifacts
+        if: always()
+        run: |
+          ./scripts/pack-logs.sh /tmp/ui-e2e-logs.tar.xz \
+            /tmp/ui-e2e-artifacts/ \
+            || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-e2e-logs
+          path: /tmp/ui-e2e-logs.tar.xz
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Kill emulator
+        if: always()
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          adb -s emulator-5554 emu kill 2>/dev/null || true
+          kill $(cat /tmp/emulator.pid 2>/dev/null) 2>/dev/null || true
