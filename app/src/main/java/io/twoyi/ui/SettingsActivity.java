@@ -142,18 +142,23 @@ public class SettingsActivity extends AppCompatActivity {
             });
 
             // Initialize display configuration preferences
+            // Default values (0) mean "auto-detect from physical screen".
             android.preference.EditTextPreference displayWidthPref = (android.preference.EditTextPreference) displayWidth;
             android.preference.EditTextPreference displayHeightPref = (android.preference.EditTextPreference) displayHeight;
             android.preference.EditTextPreference displayDpiPref = (android.preference.EditTextPreference) displayDpi;
 
-            displayWidthPref.setText(String.valueOf(ProfileSettings.getDisplayWidth(getActivity())));
-            displayWidthPref.setSummary("Virtual display width in pixels (current: " + ProfileSettings.getDisplayWidth(getActivity()) + ")");
+            // Show the auto-detected screen values in the summary even when
+            // the stored value is 0 (auto-detect).
+            int actualWidth = ProfileSettings.getDisplayWidth(getActivity());
+            displayWidthPref.setText(String.valueOf(actualWidth));
+            displayWidthPref.setSummary("Virtual display width (current: " + actualWidth + ", 0 = auto-detect screen)");
             displayWidthPref.setOnPreferenceChangeListener((preference, newValue) -> {
                 try {
                     int width = Integer.parseInt(newValue.toString());
-                    if (width >= MIN_VALUE && width <= MAX_DISPLAY_DIMENSION) {
+                    if (width == 0 || (width >= MIN_VALUE && width <= MAX_DISPLAY_DIMENSION)) {
                         ProfileSettings.setDisplayWidth(getActivity(), width);
-                        displayWidthPref.setSummary("Virtual display width in pixels (current: " + width + ")");
+                        int display = width > 0 ? width : ProfileSettings.getDisplayWidth(getActivity());
+                        displayWidthPref.setSummary("Virtual display width (current: " + display + ", 0 = auto-detect screen)");
                         Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
@@ -166,14 +171,16 @@ public class SettingsActivity extends AppCompatActivity {
                 }
             });
 
-            displayHeightPref.setText(String.valueOf(ProfileSettings.getDisplayHeight(getActivity())));
-            displayHeightPref.setSummary("Virtual display height in pixels (current: " + ProfileSettings.getDisplayHeight(getActivity()) + ")");
+            int actualHeight = ProfileSettings.getDisplayHeight(getActivity());
+            displayHeightPref.setText(String.valueOf(actualHeight));
+            displayHeightPref.setSummary("Virtual display height (current: " + actualHeight + ", 0 = auto-detect screen)");
             displayHeightPref.setOnPreferenceChangeListener((preference, newValue) -> {
                 try {
                     int height = Integer.parseInt(newValue.toString());
-                    if (height >= MIN_VALUE && height <= MAX_DISPLAY_DIMENSION) {
+                    if (height == 0 || (height >= MIN_VALUE && height <= MAX_DISPLAY_DIMENSION)) {
                         ProfileSettings.setDisplayHeight(getActivity(), height);
-                        displayHeightPref.setSummary("Virtual display height in pixels (current: " + height + ")");
+                        int display = height > 0 ? height : ProfileSettings.getDisplayHeight(getActivity());
+                        displayHeightPref.setSummary("Virtual display height (current: " + display + ", 0 = auto-detect screen)");
                         Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {
@@ -186,14 +193,16 @@ public class SettingsActivity extends AppCompatActivity {
                 }
             });
 
-            displayDpiPref.setText(String.valueOf(ProfileSettings.getDisplayDpi(getActivity())));
-            displayDpiPref.setSummary("Virtual display DPI (current: " + ProfileSettings.getDisplayDpi(getActivity()) + ")");
+            int actualDpi = ProfileSettings.getDisplayDpi(getActivity());
+            displayDpiPref.setText(String.valueOf(actualDpi));
+            displayDpiPref.setSummary("Virtual display DPI (current: " + actualDpi + ", 0 = auto-detect screen)");
             displayDpiPref.setOnPreferenceChangeListener((preference, newValue) -> {
                 try {
                     int dpi = Integer.parseInt(newValue.toString());
-                    if (dpi >= MIN_VALUE && dpi <= MAX_DPI) {
+                    if (dpi == 0 || (dpi >= MIN_VALUE && dpi <= MAX_DPI)) {
                         ProfileSettings.setDisplayDpi(getActivity(), dpi);
-                        displayDpiPref.setSummary("Virtual display DPI (current: " + dpi + ")");
+                        int display = dpi > 0 ? dpi : ProfileSettings.getDisplayDpi(getActivity());
+                        displayDpiPref.setSummary("Virtual display DPI (current: " + display + ", 0 = auto-detect screen)");
                         Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
                         return true;
                     } else {

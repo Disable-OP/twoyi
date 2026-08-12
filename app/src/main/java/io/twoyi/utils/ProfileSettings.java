@@ -16,6 +16,9 @@ package io.twoyi.utils;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.os.Build;
+import android.util.DisplayMetrics;
+import android.view.WindowManager;
 
 /**
  * Profile-specific settings storage.
@@ -132,10 +135,71 @@ public class ProfileSettings {
     }
 
     /**
-     * Get display width for active profile (default: 1080)
+     * Get the physical screen width in pixels. Uses DisplayMetrics.
+     */
+    private static int getScreenWidth(Context context) {
+        try {
+            WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+            if (wm != null) {
+                DisplayMetrics dm = new DisplayMetrics();
+                wm.getDefaultDisplay().getRealMetrics(dm);
+                if (dm.widthPixels > 0) return dm.widthPixels;
+            }
+        } catch (Throwable ignored) {}
+        return 1080; // fallback
+    }
+
+    /**
+     * Get the physical screen height in pixels. Uses DisplayMetrics.
+     */
+    private static int getScreenHeight(Context context) {
+        try {
+            WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+            if (wm != null) {
+                DisplayMetrics dm = new DisplayMetrics();
+                wm.getDefaultDisplay().getRealMetrics(dm);
+                if (dm.heightPixels > 0) return dm.heightPixels;
+            }
+        } catch (Throwable ignored) {}
+        return 1920; // fallback
+    }
+
+    /**
+     * Get the physical screen DPI. Uses DisplayMetrics.
+     */
+    private static int getScreenDpi(Context context) {
+        try {
+            DisplayMetrics dm = context.getResources().getDisplayMetrics();
+            if (dm.densityDpi > 0) return dm.densityDpi;
+        } catch (Throwable ignored) {}
+        return 160; // fallback
+    }
+
+    /**
+     * Get the screen's color depth in bits per pixel.
+     * Android doesn't expose a direct API for this, but we can infer it
+     * from the display's pixel format. Most modern Android devices use
+     * 32-bit RGBA8888. Some older or budget devices use 24-bit RGB888
+     * or 16-bit RGB565.
+     *
+     * We default to 32 (RGBA8888) which matches the vast majority of
+     * modern Android devices.
+     */
+    private static int getScreenColorDepth(Context context) {
+        // Android's PixelFormat doesn't expose a direct BPP query, but
+        // WINDOW_FORMAT_RGBA_8888 (5) is the standard for modern devices.
+        // Default to 32 bpp (RGBA8888).
+        return 32;
+    }
+
+    /**
+     * Get display width for active profile.
+     * Default: the physical screen width (auto-detected).
+     * A stored value of 0 means "auto-detect" and returns the screen width.
      */
     public static int getDisplayWidth(Context context) {
-        return getInt(context, DISPLAY_WIDTH, 1080);
+        int val = getInt(context, DISPLAY_WIDTH, 0);
+        return val > 0 ? val : getScreenWidth(context);
     }
 
     /**
@@ -146,10 +210,13 @@ public class ProfileSettings {
     }
 
     /**
-     * Get display height for active profile (default: 1920)
+     * Get display height for active profile.
+     * Default: the physical screen height (auto-detected).
+     * A stored value of 0 means "auto-detect" and returns the screen height.
      */
     public static int getDisplayHeight(Context context) {
-        return getInt(context, DISPLAY_HEIGHT, 1920);
+        int val = getInt(context, DISPLAY_HEIGHT, 0);
+        return val > 0 ? val : getScreenHeight(context);
     }
 
     /**
@@ -160,10 +227,13 @@ public class ProfileSettings {
     }
 
     /**
-     * Get display DPI for active profile (default: 160)
+     * Get display DPI for active profile.
+     * Default: the physical screen DPI (auto-detected).
+     * A stored value of 0 means "auto-detect" and returns the screen DPI.
      */
     public static int getDisplayDpi(Context context) {
-        return getInt(context, DISPLAY_DPI, 160);
+        int val = getInt(context, DISPLAY_DPI, 0);
+        return val > 0 ? val : getScreenDpi(context);
     }
 
     /**
@@ -175,11 +245,12 @@ public class ProfileSettings {
 
     /**
      * Get display color depth in bits per pixel for active profile.
-     * Supported values: 32 (RGBA8888, default), 24 (RGB888), 16 (RGB565).
+     * Default: the physical screen's color depth (auto-detected, usually 32).
+     * Supported values: 32 (RGBA8888), 24 (RGB888), 16 (RGB565).
      * Used by the TWRP framebuffer renderer to determine the pixel format.
      */
     public static int getDisplayColorDepth(Context context) {
-        return getInt(context, DISPLAY_COLOR_DEPTH, 32);
+        return getInt(context, DISPLAY_COLOR_DEPTH, getScreenColorDepth(context));
     }
 
     /**

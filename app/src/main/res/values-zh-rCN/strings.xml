@@ -87,6 +87,8 @@
     <string name="settings_display_height_summary">虚拟显示高度（像素）（默认：1920）</string>
     <string name="settings_key_display_dpi">显示 DPI</string>
     <string name="settings_display_dpi_summary">虚拟显示 DPI（默认：160）</string>
+    <string name="settings_display_color_depth_title">Display Color Depth</string>
+    <string name="settings_display_color_depth_summary">Color depth in bits per pixel (affects TWRP framebuffer rendering)</string>
     <string name="settings_display_change_reboot">显示设置将在重启后生效</string>
     <string name="settings_use_new_renderer_title">使用新渲染器</string>
     <string name="settings_use_new_renderer_summary">使用开源 Rust 渲染器（实验性，需要重启）</string>
