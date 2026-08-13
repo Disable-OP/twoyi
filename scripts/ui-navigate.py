@@ -519,30 +519,39 @@ def main():
     #   - Or has a breadcrumb path bar at the top
     #   - Or shows "Internal storage" / "SD card" options
     #
-    # Strategy (in order of preference):
-    #   a) FIRST: Look for recovery.img DIRECTLY in the current view
-    #      (RECENT FILES). The picker opens with recovery.img already
-    #      visible here — tapping it directly is by far the most reliable
-    #      path. Use safe_row_tap_target() to tap the LEFT 30% of the row
-    #      (avoids the per-row 'Preview' icon at the right edge). Retry
-    #      the dump a few times to give the picker's RecyclerView time to
-    #      populate. Verify the picker closed AND we are back on io.twoyi
-    #      (a real file selection) before trusting the tap.
-    #   b) ONLY IF (a) fails: open the hamburger drawer → tap Downloads
-    #      → look for recovery.img. If not in Downloads, try Internal
-    #      storage → Download folder → look for recovery.img.
-    #   c) ONLY IF (b) fails: DPAD navigation with retry loop.
-    #   d) ONLY IF (c) fails: coordinate-based tap from a fresh dump.
+    # Strategy order — ALL are tried before aborting. The DPAD strategy
+    # is PRIMARY because it was previously the most reliable. Trying it
+    # FIRST means we usually select recovery.img before any drawer
+    # navigation can drift us into Google Photos.
+    #   a) DPAD navigation (PRIMARY — previously the most reliable).
+    #      Tap the left side of the file list to focus a row (NOT the
+    #      preview icon), then DPAD_DOWN + ENTER. Retry with increasing
+    #      DPAD_DOWN counts. Dismiss any share sheet before each attempt.
+    #   b) Direct tap on recovery.img in RECENT FILES (left-30% of the
+    #      row, away from the preview icon). If the tap doesn't close
+    #      the picker (the RecyclerView's OnItemTouchListener didn't
+    #      fire), fall through to (c) — do NOT retry the same
+    #      unresponsive tap.
+    #   c) Drawer → Downloads → file. If not in Downloads, try Internal
+    #      storage → Download folder → file. Can drift into Google
+    #      Photos if the wrong root is tapped — escape and fall through.
+    #   d) Coordinate-based tap from a fresh uiautomator dump.
+    #
+    # CRITICAL: after EACH strategy fails, call escape_google_photos()
+    # and attempt to return to the picker (ensure_on_picker) before
+    # trying the next strategy. We do NOT break out of the cascade —
+    # every strategy gets a chance. Only abort after ALL fail.
+    #
+    # A tap is only a SUCCESS if the picker closed AND we are back on
+    # io.twoyi. Being on Google Photos (or any other non-picker app) is
+    # NOT a success. The old code accepted "not on picker" as success,
+    # which incorrectly treated accidental Google Photos navigation as
+    # a successful file selection.
     #
     # Throughout: if we accidentally navigate into Google Photos (which
     # can happen if the drawer's wrong root is tapped, or a thumbnail
     # row is tapped instead of recovery.img), escape_google_photos()
     # sends BACK multiple times to return to the picker.
-    #
-    # CRITICAL: a tap is only considered a SUCCESS if the picker closed
-    # AND we are back on io.twoyi. The old code accepted "not on picker"
-    # as success, which incorrectly treated accidental Google Photos
-    # navigation as a successful file selection.
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
@@ -574,6 +583,73 @@ def main():
             return "picker"
         return "other"
 
+    # Helper: ensure we are on the SAF file picker before running a
+    # strategy. Called between strategies after the previous one failed.
+    # Escapes Google Photos if needed, then — if we drifted off the
+    # picker entirely (e.g. BACK from Photos landed on io.twoyi settings
+    # or the home screen) — attempts to recover back to the picker.
+    # Returns True if we are on the picker now, False otherwise.
+    #
+    # Recovery logic (no `am start` — UI taps only):
+    #   - If on Google Photos: escape_google_photos() (sends BACK keys).
+    #   - If on io.twoyi (picker closed without a real selection): the
+    #     picker is gone. Re-open it by re-tapping "Select ROM" via
+    #     scroll_to_find (a UI tap, NOT an activity launch).
+    #   - If elsewhere (home screen etc.): try a few BACK keys, then
+    #     re-open via Select ROM if BACK lands on io.twoyi.
+    def ensure_on_picker(tag):
+        if escape_google_photos():
+            _xml, _root, _act = fresh_picker_state(tag + "_post_escape")
+            print(f"  After Google-Photos escape: {_act}")
+        activity = get_current_activity()
+        if is_on_file_picker(activity):
+            return True
+        a = (activity or "").lower()
+        # If on io.twoyi settings, the picker closed without a selection.
+        # Re-open it by re-tapping "Select ROM" (a UI tap, not am start).
+        if "io.twoyi" in a:
+            print(f"  Picker closed (on {activity!r}) — re-opening by re-tapping 'Select ROM'")
+            result = scroll_to_find("Select ROM", max_scrolls=8, exact=True)
+            if result:
+                cx, cy, _ = result
+                print(f"  Re-tapping 'Select ROM' at ({cx}, {cy}) to reopen picker")
+                tap(cx, cy)
+                wait(4)
+                activity = get_current_activity()
+                if is_on_file_picker(activity):
+                    print(f"  ✓ Picker re-opened (activity={activity!r})")
+                    return True
+                print(f"  ⚠ Picker did not re-open after re-tap (activity={activity!r})")
+            else:
+                print(f"  ⚠ Could not find 'Select ROM' to re-open picker")
+            return False
+        # Somewhere else (home screen, etc.) — try BACK keys to recover.
+        for i in range(3):
+            print(f"  Not on picker ({activity!r}) — sending BACK to recover (attempt {i+1}/3)")
+            adb_shell("input keyevent KEYCODE_BACK")
+            wait(1)
+            activity = get_current_activity()
+            if is_on_file_picker(activity):
+                print(f"  ✓ Back on picker after {i+1} BACK key(s)")
+                return True
+            if "io.twoyi" in (activity or "").lower():
+                # BACK landed on io.twoyi — re-open picker via Select ROM.
+                print(f"  BACK landed on io.twoyi — re-opening picker")
+                result = scroll_to_find("Select ROM", max_scrolls=8, exact=True)
+                if result:
+                    cx, cy, _ = result
+                    tap(cx, cy)
+                    wait(4)
+                    activity = get_current_activity()
+                    if is_on_file_picker(activity):
+                        print(f"  ✓ Picker re-opened (activity={activity!r})")
+                        return True
+                break
+        print(f"  ⚠ Could not return to picker — on {activity!r}")
+        return False
+
+    found_file = False
+
     # Initial dump + dismiss any stray share sheet from the previous step.
     xml, root, activity = fresh_picker_state("03_picker_open")
     print(f"  Current activity: {activity}")
@@ -585,213 +661,34 @@ def main():
         xml, root, activity = fresh_picker_state("03_after_initial_dismiss")
         print(f"  After initial share-sheet dismiss: {activity}")
 
-    found_file = False
-
-    # (a) FIRST: Try to find and tap recovery.img DIRECTLY in the current
-    # view (RECENT FILES). The picker opens with recovery.img already
-    # visible here. Retry the dump a few times to give the picker's
-    # RecyclerView time to populate (the "Recent" view sometimes shows
-    # "No items" briefly before populating).
-    print("  (a) Looking for recovery.img in current view (RECENT FILES) — FIRST strategy")
-    for dump_attempt in range(3):
-        if dump_attempt > 0:
-            print(f"  recovery.img not visible yet — waiting 2s and re-dumping (attempt {dump_attempt+1}/3)")
-            wait(2)
-            xml, root, activity = fresh_picker_state(f"03_recent_retry_{dump_attempt}")
-        tap_outcome = None  # "success" | "photos" | "picker_or_other" | "not_found"
-        for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-            result = safe_row_tap_target(root, text, exact=False)
-            if not result:
-                continue
-            cx, cy, _ = result
-            print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-            tap(cx, cy)
-            wait(3)
-            a = get_current_activity()
-            status = classify_tap_result(a)
-            print(f"  Tap result: {status} (activity={a!r})")
-            if status == "success":
-                found_file = True
-                print(f"  ✓ Picker closed and back on io.twoyi — file selected")
-                tap_outcome = "success"
-                break
-            elif status == "photos":
-                # Tap accidentally opened Google Photos instead of selecting
-                # the file — escape and retry the direct tap.
-                print(f"  ⚠ Tap opened Google Photos instead of selecting file — escaping")
-                escape_google_photos()
-                xml, root, activity = fresh_picker_state(f"03_after_photos_escape_{dump_attempt}")
-                tap_outcome = "photos"
-                break  # break inner loop; outer loop will re-dump and retry
-            else:
-                # "picker" (still on picker — tap missed) or "other".
-                print(f"  ⚠ Picker still open or drifted (status={status}) after direct tap")
-                if dismiss_share_sheet(root):
-                    xml, root, activity = fresh_picker_state("03_after_tap_dismiss")
-                tap_outcome = "picker_or_other"
-                break  # break inner loop; fall through to (b)
-        if found_file:
-            break
-        if tap_outcome == "picker_or_other":
-            # Tap was sent but picker didn't close — don't retry the dump,
-            # fall through to (b) drawer navigation.
-            break
-        # tap_outcome == "not_found" or "photos": retry the dump (outer loop)
-        # to give the picker more time to load OR to retry after escaping Photos.
-
-    # (b) ONLY IF (a) fails: open the hamburger drawer → Downloads →
-    # look for recovery.img. If not in Downloads, try Internal storage →
-    # Download folder → look for recovery.img.
-    if not found_file:
-        # We may have drifted into Google Photos during (a) — escape first.
-        if escape_google_photos():
-            xml, root, activity = fresh_picker_state("03_pre_drawer_escape")
-            print(f"  After pre-drawer Google-Photos escape: {activity}")
-    if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (b) recovery.img not in RECENT FILES — opening nav drawer")
-        # Look for the "Show Roots" / "Navigate up" button
-        drawer_opened = False
-        for desc in ["Show roots", "Navigate up", "Show list", "More options"]:
-            result = find_by_text(root, desc, exact=False)
-            if result:
-                cx, cy, _ = result
-                print(f"  Found '{desc}' at ({cx}, {cy}) — tapping to open drawer")
-                tap(cx, cy)
-                wait(3)  # was 2s — increased to 3s for drawer animation
-                drawer_opened = True
-                break
-
-        if not drawer_opened:
-            hamburger_x = int(SCREEN_W * 0.08)
-            hamburger_y = int(SCREEN_H * 0.08)
-            print(f"  No drawer button found — tapping top-left ({hamburger_x}, {hamburger_y})")
-            tap(hamburger_x, hamburger_y)
-            wait(3)  # was 2s
-
-        xml, root, activity = fresh_picker_state("03_drawer_open")
-        print(f"  Current activity: {activity}")
-        print("  Visible text after drawer tap:")
-        print_all_text(root, prefix="    ")
-
-        # If the drawer tap accidentally launched Google Photos, escape.
-        if escape_google_photos():
-            xml, root, activity = fresh_picker_state("03_drawer_after_photos_escape")
-            print(f"  After drawer Google-Photos escape: {activity}")
-
-        # Look for "Downloads" in the drawer
-        for text in ["Downloads", "Download"]:
-            result = safe_row_tap_target(root, text, exact=False)
-            if result:
-                cx, cy, _ = result
-                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-                tap(cx, cy)
-                wait(3)
-                break
-
-        # Now look for recovery.img in the Downloads file list
-        xml, root, activity = fresh_picker_state("03b_in_downloads")
-        print("  Visible text in Downloads:")
-        print_all_text(root, prefix="    ")
-
-        for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-            result = safe_row_tap_target(root, text, exact=False)
-            if not result:
-                continue
-            cx, cy, _ = result
-            print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-            tap(cx, cy)
-            wait(3)
-            a = get_current_activity()
-            status = classify_tap_result(a)
-            print(f"  Tap result: {status} (activity={a!r})")
-            if status == "success":
-                found_file = True
-                print(f"  ✓ Picker closed after Downloads tap — file selected")
-                break
-            elif status == "photos":
-                print(f"  ⚠ Tap opened Google Photos — escaping")
-                escape_google_photos()
-                xml, root, activity = fresh_picker_state("03b_after_photos_escape")
-                break
-            else:
-                print(f"  ⚠ Picker still open after Downloads tap (status={status})")
-                if dismiss_share_sheet(root):
-                    xml, root, activity = fresh_picker_state("03b_after_dismiss")
-                break
-
-        # If still not found, try "Internal storage" → Download folder
-        if not found_file and is_on_file_picker(get_current_activity()):
-            print("  (b-cont) recovery.img not in Downloads — trying internal storage")
-            for text in ["Internal storage", "Phone", "SD card", "Storage"]:
-                result = safe_row_tap_target(root, text, exact=False)
-                if result:
-                    cx, cy, _ = result
-                    print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-                    tap(cx, cy)
-                    wait(3)  # was 2s
-                    break
-
-            xml, root, activity = fresh_picker_state("03c_internal_storage")
-            for text in ["Download", "Downloads"]:
-                result = safe_row_tap_target(root, text, exact=False)
-                if result:
-                    cx, cy, _ = result
-                    print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-                    tap(cx, cy)
-                    wait(3)  # was 2s
-                    break
-
-            xml, root, activity = fresh_picker_state("03d_in_download_folder")
-            for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-                result = safe_row_tap_target(root, text, exact=False)
-                if not result:
-                    continue
-                cx, cy, _ = result
-                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-                tap(cx, cy)
-                wait(3)
-                a = get_current_activity()
-                status = classify_tap_result(a)
-                print(f"  Tap result: {status} (activity={a!r})")
-                if status == "success":
-                    found_file = True
-                    print(f"  ✓ Picker closed after internal-storage tap — file selected")
-                    break
-                elif status == "photos":
-                    print(f"  ⚠ Tap opened Google Photos — escaping")
-                    escape_google_photos()
-                    xml, root, activity = fresh_picker_state("03d_after_photos_escape")
-                    break
-                else:
-                    if dismiss_share_sheet(root):
-                        xml, root, activity = fresh_picker_state("03d_after_dismiss")
-                    break
-
-    # (c) DPAD fallback with retry loop — only if picker is still open.
-    # This is the most fragile strategy: DPAD_ENTER can land on the
-    # per-row 'Preview' icon (focusable=true) and trigger a share sheet
-    # instead of selecting the file. We mitigate by:
+    # ═══════════════════════════════════════════════════════════════
+    # (a) DPAD navigation — PRIMARY strategy (previously the most
+    # reliable). Tried FIRST so we select recovery.img before any drawer
+    # navigation can drift us into Google Photos.
+    #
+    # DPAD_ENTER can land on the per-row 'Preview' icon (focusable=true)
+    # and trigger a share sheet instead of selecting the file. We
+    # mitigate by:
     #   - Dismissing any share sheet BEFORE each DPAD attempt.
-    #   - Tapping the LEFT side of the file list (away from preview icons)
-    #     to give the row focus, not the preview icon.
+    #   - Tapping the LEFT side of the file list (away from preview
+    #     icons) to give the row focus, not the preview icon.
     #   - Using INCREASING DPAD_DOWN counts (1, 2, 3) across 3 attempts.
     #   - Verifying the picker closed AND we're back on io.twoyi after
     #     each ENTER; if a share sheet appeared instead, dismiss it and
     #     try the next attempt. If we drifted to Google Photos, escape.
+    # ═══════════════════════════════════════════════════════════════
     if not found_file:
-        if escape_google_photos():
-            xml, root, activity = fresh_picker_state("03_pre_dpad_escape")
-            print(f"  After pre-DPAD Google-Photos escape: {activity}")
+        ensure_on_picker("03a_pre_dpad")
     if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (c) Direct taps failed — trying DPAD navigation with retry loop")
+        print("  (a) PRIMARY: DPAD navigation with retry loop")
         for attempt in range(3):
             downs = attempt + 1  # 1, 2, 3
             print(f"  DPAD attempt {attempt+1}/3: dismiss-sheet + tap-list + {downs}x DPAD_DOWN + ENTER")
 
             # Take a fresh dump and dismiss any share sheet BEFORE the DPAD.
-            xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_pre")
+            xml, root, activity = fresh_picker_state(f"03a_dpad_{attempt}_pre")
             if dismiss_share_sheet(root):
-                xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_post_dismiss")
+                xml, root, activity = fresh_picker_state(f"03a_dpad_{attempt}_post_dismiss")
                 print(f"  After pre-DPAD share-sheet dismiss: {activity}")
                 # If dismissing the sheet closed the picker too, make sure
                 # we actually selected a file (back on io.twoyi) — not drifted.
@@ -802,8 +699,8 @@ def main():
                     break
 
             # Tap the LEFT side of the file list area to give the row focus.
-            # CRITICAL: do NOT tap the center/right — the 'Preview' icon lives
-            # at the right edge and would steal focus.
+            # CRITICAL: do NOT tap the center/right — the 'Preview' icon
+            # lives at the right edge and would steal focus.
             list_tap_x = int(SCREEN_W * 0.20)
             list_tap_y = int(SCREEN_H * 0.55)
             print(f"  Tapping file list left side ({list_tap_x}, {list_tap_y}) to give row focus")
@@ -830,26 +727,217 @@ def main():
                 if status == "photos":
                     escape_google_photos()
                 # A share sheet may have appeared — dismiss before next attempt.
-                xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_post")
+                xml, root, activity = fresh_picker_state(f"03a_dpad_{attempt}_post")
                 if dismiss_share_sheet(root):
-                    xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_post2")
+                    xml, root, activity = fresh_picker_state(f"03a_dpad_{attempt}_post2")
                     if classify_tap_result(activity) == "success":
                         found_file = True
                         print(f"  ✓ Picker closed after post-DPAD share-sheet dismiss")
                         break
+        # End of DPAD attempts — fall through to (b) regardless of outcome.
 
-    # (d) Final fallback: coordinate-based tap from a fresh uiautomator dump.
-    # If DPAD failed (e.g., focus kept landing on the preview icon), the
-    # file is still visible in the picker — take a fresh dump and tap the
-    # row's left-30% coordinate directly, which is the most reliable way
-    # to trigger the RecyclerView's OnItemTouchListener.
+    # ═══════════════════════════════════════════════════════════════
+    # (b) Direct tap on recovery.img in RECENT FILES. The picker opens
+    # with recovery.img already visible here. Retry the dump a few times
+    # to give the picker's RecyclerView time to populate. If the tap
+    # doesn't close the picker (the RecyclerView's OnItemTouchListener
+    # didn't fire), fall through to (c) drawer navigation — do NOT retry
+    # the same unresponsive tap.
+    # ═══════════════════════════════════════════════════════════════
     if not found_file:
-        if escape_google_photos():
-            xml, root, activity = fresh_picker_state("03_pre_final_escape")
-            print(f"  After pre-final Google-Photos escape: {activity}")
+        ensure_on_picker("03b_pre_tap")
     if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (d) DPAD failed — trying coordinate-based tap from fresh uiautomator dump")
-        xml, root, activity = fresh_picker_state("03_final_dump")
+        print("  (b) Looking for recovery.img in current view (RECENT FILES) — direct tap")
+        for dump_attempt in range(3):
+            if dump_attempt > 0:
+                print(f"  recovery.img not visible yet — waiting 2s and re-dumping (attempt {dump_attempt+1}/3)")
+                wait(2)
+                xml, root, activity = fresh_picker_state(f"03b_recent_retry_{dump_attempt}")
+            tap_outcome = None  # "success" | "photos" | "picker_or_other" | "not_found"
+            for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
+                result = safe_row_tap_target(root, text, exact=False)
+                if not result:
+                    continue
+                cx, cy, _ = result
+                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
+                tap(cx, cy)
+                wait(3)
+                a = get_current_activity()
+                status = classify_tap_result(a)
+                print(f"  Tap result: {status} (activity={a!r})")
+                if status == "success":
+                    found_file = True
+                    print(f"  ✓ Picker closed and back on io.twoyi — file selected")
+                    tap_outcome = "success"
+                    break
+                elif status == "photos":
+                    # Tap accidentally opened Google Photos instead of selecting
+                    # the file — escape and retry the direct tap.
+                    print(f"  ⚠ Tap opened Google Photos instead of selecting file — escaping")
+                    escape_google_photos()
+                    xml, root, activity = fresh_picker_state(f"03b_after_photos_escape_{dump_attempt}")
+                    tap_outcome = "photos"
+                    break  # break inner loop; outer loop will re-dump and retry
+                else:
+                    # "picker" (still on picker — tap missed) or "other".
+                    print(f"  ⚠ Picker still open or drifted (status={status}) after direct tap")
+                    if dismiss_share_sheet(root):
+                        xml, root, activity = fresh_picker_state("03b_after_tap_dismiss")
+                    tap_outcome = "picker_or_other"
+                    break  # break inner loop; fall through to (c)
+            if found_file:
+                break
+            if tap_outcome == "picker_or_other":
+                # Tap was sent but picker didn't close — the RecyclerView
+                # isn't responding to taps. Fall through to (c) drawer
+                # navigation instead of retrying the same unresponsive tap.
+                break
+            # tap_outcome == "not_found" or "photos": retry the dump
+            # (outer loop) to give the picker more time to load OR to
+            # retry after escaping Photos.
+        # End of direct-tap attempts — fall through to (c).
+
+    # ═══════════════════════════════════════════════════════════════
+    # (c) Drawer → Downloads → file. If not in Downloads, try Internal
+    # storage → Download folder → file. Can drift into Google Photos if
+    # the wrong root is tapped — escape and fall through to (d).
+    # ═══════════════════════════════════════════════════════════════
+    if not found_file:
+        ensure_on_picker("03c_pre_drawer")
+    if not found_file and is_on_file_picker(get_current_activity()):
+        print("  (c) Opening nav drawer → Downloads → recovery.img")
+        # Look for the "Show Roots" / "Navigate up" button
+        drawer_opened = False
+        for desc in ["Show roots", "Navigate up", "Show list", "More options"]:
+            result = find_by_text(root, desc, exact=False)
+            if result:
+                cx, cy, _ = result
+                print(f"  Found '{desc}' at ({cx}, {cy}) — tapping to open drawer")
+                tap(cx, cy)
+                wait(3)  # was 2s — increased to 3s for drawer animation
+                drawer_opened = True
+                break
+
+        if not drawer_opened:
+            hamburger_x = int(SCREEN_W * 0.08)
+            hamburger_y = int(SCREEN_H * 0.08)
+            print(f"  No drawer button found — tapping top-left ({hamburger_x}, {hamburger_y})")
+            tap(hamburger_x, hamburger_y)
+            wait(3)  # was 2s
+
+        xml, root, activity = fresh_picker_state("03c_drawer_open")
+        print(f"  Current activity: {activity}")
+        print("  Visible text after drawer tap:")
+        print_all_text(root, prefix="    ")
+
+        # If the drawer tap accidentally launched Google Photos, escape.
+        if escape_google_photos():
+            xml, root, activity = fresh_picker_state("03c_drawer_after_photos_escape")
+            print(f"  After drawer Google-Photos escape: {activity}")
+
+        # Look for "Downloads" in the drawer
+        for text in ["Downloads", "Download"]:
+            result = safe_row_tap_target(root, text, exact=False)
+            if result:
+                cx, cy, _ = result
+                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
+                tap(cx, cy)
+                wait(3)
+                break
+
+        # Now look for recovery.img in the Downloads file list
+        xml, root, activity = fresh_picker_state("03c_in_downloads")
+        print("  Visible text in Downloads:")
+        print_all_text(root, prefix="    ")
+
+        for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
+            result = safe_row_tap_target(root, text, exact=False)
+            if not result:
+                continue
+            cx, cy, _ = result
+            print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
+            tap(cx, cy)
+            wait(3)
+            a = get_current_activity()
+            status = classify_tap_result(a)
+            print(f"  Tap result: {status} (activity={a!r})")
+            if status == "success":
+                found_file = True
+                print(f"  ✓ Picker closed after Downloads tap — file selected")
+                break
+            elif status == "photos":
+                print(f"  ⚠ Tap opened Google Photos — escaping")
+                escape_google_photos()
+                xml, root, activity = fresh_picker_state("03c_after_photos_escape")
+                break
+            else:
+                print(f"  ⚠ Picker still open after Downloads tap (status={status})")
+                if dismiss_share_sheet(root):
+                    xml, root, activity = fresh_picker_state("03c_after_dismiss")
+                break
+
+        # If still not found, try "Internal storage" → Download folder
+        if not found_file and is_on_file_picker(get_current_activity()):
+            print("  (c-cont) recovery.img not in Downloads — trying internal storage")
+            for text in ["Internal storage", "Phone", "SD card", "Storage"]:
+                result = safe_row_tap_target(root, text, exact=False)
+                if result:
+                    cx, cy, _ = result
+                    print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
+                    tap(cx, cy)
+                    wait(3)  # was 2s
+                    break
+
+            xml, root, activity = fresh_picker_state("03c_internal_storage")
+            for text in ["Download", "Downloads"]:
+                result = safe_row_tap_target(root, text, exact=False)
+                if result:
+                    cx, cy, _ = result
+                    print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
+                    tap(cx, cy)
+                    wait(3)  # was 2s
+                    break
+
+            xml, root, activity = fresh_picker_state("03c_in_download_folder")
+            for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
+                result = safe_row_tap_target(root, text, exact=False)
+                if not result:
+                    continue
+                cx, cy, _ = result
+                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
+                tap(cx, cy)
+                wait(3)
+                a = get_current_activity()
+                status = classify_tap_result(a)
+                print(f"  Tap result: {status} (activity={a!r})")
+                if status == "success":
+                    found_file = True
+                    print(f"  ✓ Picker closed after internal-storage tap — file selected")
+                    break
+                elif status == "photos":
+                    print(f"  ⚠ Tap opened Google Photos — escaping")
+                    escape_google_photos()
+                    xml, root, activity = fresh_picker_state("03c_internal_after_photos_escape")
+                    break
+                else:
+                    if dismiss_share_sheet(root):
+                        xml, root, activity = fresh_picker_state("03c_internal_after_dismiss")
+                    break
+        # End of drawer strategy — fall through to (d).
+
+    # ═══════════════════════════════════════════════════════════════
+    # (d) Final fallback: coordinate-based tap from a fresh uiautomator
+    # dump. If DPAD and taps all failed (e.g., focus kept landing on the
+    # preview icon), the file is still visible in the picker — take a
+    # fresh dump and tap the row's left-30% coordinate directly, which
+    # is the most reliable way to trigger the RecyclerView's
+    # OnItemTouchListener.
+    # ═══════════════════════════════════════════════════════════════
+    if not found_file:
+        ensure_on_picker("03d_pre_final")
+    if not found_file and is_on_file_picker(get_current_activity()):
+        print("  (d) Coordinate-based tap from fresh uiautomator dump")
+        xml, root, activity = fresh_picker_state("03d_final_dump")
         for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
             result = safe_row_tap_target(root, text, exact=False)
             if not result:
@@ -870,11 +958,12 @@ def main():
                 if status == "photos":
                     escape_google_photos()
                 if dismiss_share_sheet(root):
-                    xml, root, activity = fresh_picker_state("03_final_after_dismiss")
+                    xml, root, activity = fresh_picker_state("03d_final_after_dismiss")
                     if classify_tap_result(activity) == "success":
                         found_file = True
                         print(f"  ✓ Picker closed after final share-sheet dismiss")
                         break
+        # End of coordinate strategy — all strategies exhausted.
 
     # Final status report for Step 3.
     xml = dump_ui("04_after_file_select")
@@ -883,6 +972,7 @@ def main():
     print(f"  Step 3 final activity: {activity}")
     if is_on_file_picker(activity):
         print("  ✗✗✗ FILE PICKER STILL OPEN — could not select recovery.img")
+        print("  All strategies tried: (a) DPAD, (b) direct tap, (c) drawer, (d) coordinate.")
         print("  Step 4 import verification will catch this and abort the test.")
         print("  Visible text on picker:")
         print_all_text(root, prefix="    ")
