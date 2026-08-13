@@ -738,7 +738,7 @@ pub fn clear_zombie_processes() {
 ///        on real devices via the ptrace-emulation path). See the
 ///        log from HONOR NTH-NX9 (Android 13, work profile, kr64
 ///        running unprivileged):
-///        ```
+///        ```text
 ///        PARENT: APK native lib scan for libtwrp_fb_hook.so found no
 ///        candidates in /data/app/
 ///        PARENT: libtwrp_fb_hook.so not found in any of 4 candidate
@@ -2418,7 +2418,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             0 => info!("[KR64] unshare(CLONE_NEWPID) succeeded -- child will be PID 1"),
             _ => {
                 let e = std::io::Error::last_os_error();
-            warning!(
+                warning!(
                 "[KR64] unshare(CLONE_NEWPID) failed: {} -- init will not be PID 1 (will exit 31)",
                 e
             );
@@ -2676,33 +2676,33 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     if !cfg.use_namespaces {
         info!("[KR64] PARENT: non-root mode — skipping lsetxattr (seccomp blocks it, would cause SIGSYS)");
     } else {
-    for lib_path in &[
-        "/dev/libgetpid_hook.so",
-        "/dev/libtwoyi_loader_shlib.so",
-        "/sbin/libtwrp_fb_hook.so",
-    ] {
-        if Path::new(lib_path).exists() {
-            match set_selinux_context(lib_path, "u:object_r:system_file:s0") {
-                Ok(()) => {
-                    info!(
+        for lib_path in &[
+            "/dev/libgetpid_hook.so",
+            "/dev/libtwoyi_loader_shlib.so",
+            "/sbin/libtwrp_fb_hook.so",
+        ] {
+            if Path::new(lib_path).exists() {
+                match set_selinux_context(lib_path, "u:object_r:system_file:s0") {
+                    Ok(()) => {
+                        info!(
                         "[KR64] PARENT: lsetxattr {} -> u:object_r:system_file:s0 OK (direct syscall, no chcon subprocess)",
                         lib_path
                     );
-                }
-                Err(e) => {
-                    // Don't crash — the permissive watchdog (KVM test
-                    // only) will allow access anyway. On a real device
-                    // with root + CAP_MAC_ADMIN this should succeed.
-                    warning!(
+                    }
+                    Err(e) => {
+                        // Don't crash — the permissive watchdog (KVM test
+                        // only) will allow access anyway. On a real device
+                        // with root + CAP_MAC_ADMIN this should succeed.
+                        warning!(
                         "[KR64] PARENT: lsetxattr {} -> u:object_r:system_file:s0 FAILED: {} (errno={}). On KVM permissive this is non-fatal; on real device this indicates missing CAP_MAC_ADMIN or SELinux policy.",
                         lib_path,
                         e,
                         e.raw_os_error().unwrap_or(0)
                     );
+                    }
                 }
             }
         }
-    }
     } // end if cfg.use_namespaces
 
     // Copy critical service binaries to /dev/twoyi-bin/ (tmpfs, executable).
@@ -2879,128 +2879,131 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     if !cfg.use_namespaces {
         info!("[KR64] PARENT: non-root mode — skipping binderfs mount (seccomp blocks mount(), would cause SIGSYS)");
     } else {
-    {
-        let binderfs_dir = format!("{}/dev/binderfs", rootfs_prefix);
-        let _ = std::fs::create_dir_all(&binderfs_dir);
+        {
+            let binderfs_dir = format!("{}/dev/binderfs", rootfs_prefix);
+            let _ = std::fs::create_dir_all(&binderfs_dir);
 
-        // Mount binderfs
-        let binderfs_c = std::ffi::CString::new(binderfs_dir.as_str()).unwrap_or_default();
-        let ret = unsafe {
-            libc::mount(
-                c"binder".as_ptr(),
-                binderfs_c.as_ptr(),
-                c"binder".as_ptr(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if ret == 0 {
-            info!("[KR64] PARENT: mounted binderfs at {}", binderfs_dir);
+            // Mount binderfs
+            let binderfs_c = std::ffi::CString::new(binderfs_dir.as_str()).unwrap_or_default();
+            let ret = unsafe {
+                libc::mount(
+                    c"binder".as_ptr(),
+                    binderfs_c.as_ptr(),
+                    c"binder".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            };
+            if ret == 0 {
+                info!("[KR64] PARENT: mounted binderfs at {}", binderfs_dir);
 
-            // Create symlinks: /dev/binder -> binderfs/binder, etc.
-            // NOTE: symlink targets use RELATIVE paths (e.g. "binderfs/binder")
-            // because in --no-namespaces mode, there is no chroot — absolute
-            // paths like /dev/binderfs/binder would resolve on the HOST
-            // filesystem, not the guest rootfs. Relative paths resolve
-            // correctly because open("/dev/binder") is translated to
-            // {rootfs}/dev/binder, and the symlink {rootfs}/dev/binder ->
-            // binderfs/binder resolves to {rootfs}/dev/binderfs/binder.
-            for name in &["binder", "hwbinder", "vndbinder"] {
-                let link_path = format!("{}/dev/{}", rootfs_prefix, name);
-                let target = format!("binderfs/{}", name); // RELATIVE path
-                                                           // Remove existing file/symlink/socket at this path.
-                                                           // remove_file works for files, symlinks, and sockets.
-                                                           // If it's a directory, use remove_dir.
-                match std::fs::remove_file(&link_path) {
-                    Ok(_) => info!("[KR64] PARENT: removed old {}", link_path),
-                    Err(e) => {
-                        // Try remove_dir if remove_file failed
-                        match std::fs::remove_dir(&link_path) {
-                            Ok(_) => info!("[KR64] PARENT: removed old dir {}", link_path),
-                            Err(_) => {
-                                // Both failed — path might not exist, which is fine
-                                warning!(
-                                    "[KR64] PARENT: could not remove {} (may not exist): {}",
-                                    link_path,
-                                    e
-                                );
+                // Create symlinks: /dev/binder -> binderfs/binder, etc.
+                // NOTE: symlink targets use RELATIVE paths (e.g. "binderfs/binder")
+                // because in --no-namespaces mode, there is no chroot — absolute
+                // paths like /dev/binderfs/binder would resolve on the HOST
+                // filesystem, not the guest rootfs. Relative paths resolve
+                // correctly because open("/dev/binder") is translated to
+                // {rootfs}/dev/binder, and the symlink {rootfs}/dev/binder ->
+                // binderfs/binder resolves to {rootfs}/dev/binderfs/binder.
+                for name in &["binder", "hwbinder", "vndbinder"] {
+                    let link_path = format!("{}/dev/{}", rootfs_prefix, name);
+                    let target = format!("binderfs/{}", name); // RELATIVE path
+                                                               // Remove existing file/symlink/socket at this path.
+                                                               // remove_file works for files, symlinks, and sockets.
+                                                               // If it's a directory, use remove_dir.
+                    match std::fs::remove_file(&link_path) {
+                        Ok(_) => info!("[KR64] PARENT: removed old {}", link_path),
+                        Err(e) => {
+                            // Try remove_dir if remove_file failed
+                            match std::fs::remove_dir(&link_path) {
+                                Ok(_) => info!("[KR64] PARENT: removed old dir {}", link_path),
+                                Err(_) => {
+                                    // Both failed — path might not exist, which is fine
+                                    warning!(
+                                        "[KR64] PARENT: could not remove {} (may not exist): {}",
+                                        link_path,
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                // Create symlink (target is relative to the guest's root)
-                match std::os::unix::fs::symlink(&target, &link_path) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warning!(
-                            "[KR64] PARENT: failed to create symlink {} -> {}: {}",
-                            link_path,
-                            target,
-                            e
-                        );
+                    // Create symlink (target is relative to the guest's root)
+                    match std::os::unix::fs::symlink(&target, &link_path) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warning!(
+                                "[KR64] PARENT: failed to create symlink {} -> {}: {}",
+                                link_path,
+                                target,
+                                e
+                            );
+                        }
                     }
                 }
-            }
-            info!("[KR64] PARENT: created binder symlinks (binderfs)");
+                info!("[KR64] PARENT: created binder symlinks (binderfs)");
 
-            // chmod the binderfs character devices to 0666.
-            // ROOT CAUSE (KVM run 31489388552): HIDL HAL services
-            // (android.system.suspend@1.0-service, etc.) crash with
-            // "Binder driver could not be opened" because open(/dev/hwbinder)
-            // returns EACCES for them (22/26 opens failed with errno 13).
-            // SELinux is permissive (enforcing=0 confirmed in logcat before
-            // the first crash), so this is a DAC permission issue on the
-            // binderfs char device — the default mode left by the binder
-            // driver is not world-accessible to the guest HAL service
-            // contexts. vold's open succeeds (fd=5) because it is spawned
-            // earlier / with a permissive group set, but HIDL services
-            // spawned later get EACCES.
-            //
-            // Making the devices 0666 lets all guest processes open them
-            // directly (real binder IPC via the kernel binder driver). The
-            // loader's binder_open_fallback() is a second line of defence
-            // for any process that still can't open them.
-            use std::os::unix::fs::PermissionsExt;
-            for name in &["binder", "hwbinder", "vndbinder"] {
-                let dev_path = format!("{}/dev/binderfs/{}", rootfs_prefix, name);
-                match std::fs::set_permissions(&dev_path, std::fs::Permissions::from_mode(0o666)) {
-                    Ok(_) => info!(
-                        "[KR64] PARENT: chmod 0666 {} (binderfs device world-accessible)",
-                        dev_path
-                    ),
-                    Err(e) => warning!(
+                // chmod the binderfs character devices to 0666.
+                // ROOT CAUSE (KVM run 31489388552): HIDL HAL services
+                // (android.system.suspend@1.0-service, etc.) crash with
+                // "Binder driver could not be opened" because open(/dev/hwbinder)
+                // returns EACCES for them (22/26 opens failed with errno 13).
+                // SELinux is permissive (enforcing=0 confirmed in logcat before
+                // the first crash), so this is a DAC permission issue on the
+                // binderfs char device — the default mode left by the binder
+                // driver is not world-accessible to the guest HAL service
+                // contexts. vold's open succeeds (fd=5) because it is spawned
+                // earlier / with a permissive group set, but HIDL services
+                // spawned later get EACCES.
+                //
+                // Making the devices 0666 lets all guest processes open them
+                // directly (real binder IPC via the kernel binder driver). The
+                // loader's binder_open_fallback() is a second line of defence
+                // for any process that still can't open them.
+                use std::os::unix::fs::PermissionsExt;
+                for name in &["binder", "hwbinder", "vndbinder"] {
+                    let dev_path = format!("{}/dev/binderfs/{}", rootfs_prefix, name);
+                    match std::fs::set_permissions(
+                        &dev_path,
+                        std::fs::Permissions::from_mode(0o666),
+                    ) {
+                        Ok(_) => info!(
+                            "[KR64] PARENT: chmod 0666 {} (binderfs device world-accessible)",
+                            dev_path
+                        ),
+                        Err(e) => warning!(
                         "[KR64] PARENT: could not chmod {} -> {} (HIDL services may get EACCES; \
                          loader fallback will provide a virtual binder fd)",
                         dev_path,
                         e
                     ),
+                    }
                 }
-            }
 
-            // List binderfs contents for diagnostics
-            if let Ok(entries) = std::fs::read_dir(&binderfs_dir) {
-                for entry in entries.flatten() {
-                    info!("[KR64] PARENT: binderfs entry: {:?}", entry.file_name());
+                // List binderfs contents for diagnostics
+                if let Ok(entries) = std::fs::read_dir(&binderfs_dir) {
+                    for entry in entries.flatten() {
+                        info!("[KR64] PARENT: binderfs entry: {:?}", entry.file_name());
+                    }
                 }
-            }
-        } else {
-            let e = std::io::Error::last_os_error();
-            warning!(
-                "[KR64] PARENT: failed to mount binderfs: {} (binder IPC may not work)",
-                e
-            );
+            } else {
+                let e = std::io::Error::last_os_error();
+                warning!(
+                    "[KR64] PARENT: failed to mount binderfs: {} (binder IPC may not work)",
+                    e
+                );
 
-            // Fallback: try to use the host's binder device directly
-            // by creating symlinks to the host's /dev/binder
-            for name in &["binder", "hwbinder", "vndbinder"] {
-                let link_path = format!("{}/dev/{}", rootfs_prefix, name);
-                let target = format!("/dev/{}", name);
-                let _ = std::fs::remove_file(&link_path);
-                let _ = std::os::unix::fs::symlink(&target, &link_path);
+                // Fallback: try to use the host's binder device directly
+                // by creating symlinks to the host's /dev/binder
+                for name in &["binder", "hwbinder", "vndbinder"] {
+                    let link_path = format!("{}/dev/{}", rootfs_prefix, name);
+                    let target = format!("/dev/{}", name);
+                    let _ = std::fs::remove_file(&link_path);
+                    let _ = std::os::unix::fs::symlink(&target, &link_path);
+                }
+                info!("[KR64] PARENT: using host binder devices (fallback)");
             }
-            info!("[KR64] PARENT: using host binder devices (fallback)");
         }
-    }
     } // end if cfg.use_namespaces (binderfs mount)
 
     // Pre-create directories that init and services expect to exist.
@@ -3084,7 +3087,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // `libtwrp_fb_hook.so` (LD_PRELOAD'd into the recovery process). See
     // `devices::create_twrp_framebuffer` for the full rationale.
     if cfg.boot_recovery {
-        if let Err(e) = devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width as u32, cfg.height as u32) {
+        if let Err(e) =
+            devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width as u32, cfg.height as u32)
+        {
             warning!(
                 "[KR64] PARENT: failed to create TWRP framebuffer: {} (recovery will crash in libminuitwrp.so)",
                 e
@@ -3544,8 +3549,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // reuse it without allocating (which is async-signal-unsafe)
     // between fork() and execve().
     use std::os::unix::fs::PermissionsExt;
-    let twrp_log_path_str: String =
-        format!("{}/twrp-init.log", rootfs_prefix);
+    let twrp_log_path_str: String = format!("{}/twrp-init.log", rootfs_prefix);
     let twrp_log_path_cstr: CString =
         CString::new(twrp_log_path_str.as_str()).unwrap_or_else(|_| {
             // Path contained an interior NUL — extremely unlikely for
@@ -3679,7 +3683,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     // Continue anyway — init will exit 31 but we'll get
                     // diagnostic output.
                 } else {
-                    safe_write_err(b"[KR64 CHILD] PTRACE_TRACEME OK - raising SIGSTOP for parent\n");
+                    safe_write_err(
+                        b"[KR64 CHILD] PTRACE_TRACEME OK - raising SIGSTOP for parent\n",
+                    );
                     libc::kill(libc::getpid(), libc::SIGSTOP);
                 }
             }
@@ -3747,26 +3753,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             }
                             cache_init
                         }
-                        Err(e) => {
-                            unsafe {
-                                safe_write_err(b"[KR64 CHILD] FATAL: failed to copy init to cache: ");
-                                safe_write_err(e.to_string().as_bytes());
-                                safe_write_err(b"\n");
-                                libc::_exit(127);
-                            }
-                        }
+                        Err(e) => unsafe {
+                            safe_write_err(b"[KR64 CHILD] FATAL: failed to copy init to cache: ");
+                            safe_write_err(e.to_string().as_bytes());
+                            safe_write_err(b"\n");
+                            libc::_exit(127);
+                        },
                     }
                 }
-                Err(e) => {
-                    unsafe {
-                        safe_write_err(b"[KR64 CHILD] FATAL: failed to read init binary at ");
-                        safe_write_err(full_init_path.as_bytes());
-                        safe_write_err(b": ");
-                        safe_write_err(e.to_string().as_bytes());
-                        safe_write_err(b"\n");
-                        libc::_exit(127);
-                    }
-                }
+                Err(e) => unsafe {
+                    safe_write_err(b"[KR64 CHILD] FATAL: failed to read init binary at ");
+                    safe_write_err(full_init_path.as_bytes());
+                    safe_write_err(b": ");
+                    safe_write_err(e.to_string().as_bytes());
+                    safe_write_err(b"\n");
+                    libc::_exit(127);
+                },
             }
         } else {
             full_init_path.clone()
@@ -5033,7 +5035,11 @@ mod tests {
         let has_rootfs_lib64 = cands
             .iter()
             .any(|p| p == "/data/user/11/io.twoyi/rootfs/system/lib64/libtwrp_fb_hook.so");
-        assert!(has_rootfs_root, "missing rootfs/<lib> candidate: {:?}", cands);
+        assert!(
+            has_rootfs_root,
+            "missing rootfs/<lib> candidate: {:?}",
+            cands
+        );
         assert!(
             has_rootfs_lib64,
             "missing rootfs/system/lib64/<lib> candidate: {:?}",
@@ -5061,8 +5067,7 @@ mod tests {
         );
         // Candidate #0 must be {native_lib_dir}/<lib>.
         assert_eq!(
-            cands[0],
-            "/data/app/~~rand/io.twoyi-rand/lib/x86_64/libtwrp_fb_hook.so",
+            cands[0], "/data/app/~~rand/io.twoyi-rand/lib/x86_64/libtwrp_fb_hook.so",
             "native_lib_dir must be candidate #0 (highest priority): {:?}",
             cands
         );
@@ -5480,8 +5485,7 @@ mod tests {
             init_rc
         );
         // init.recovery.rc SHOULD be patched.
-        let init_recovery_rc =
-            std::fs::read_to_string(dir.join("init.recovery.rc")).unwrap();
+        let init_recovery_rc = std::fs::read_to_string(dir.join("init.recovery.rc")).unwrap();
         assert!(
             init_recovery_rc.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "init.recovery.rc should be patched. Got:\n{}",
@@ -5500,9 +5504,8 @@ mod tests {
     /// the recovery service.
     #[test]
     fn rootfs_patcher_follows_import_directives() {
-        let dir = make_test_rootfs(
-            "import /init.recovery.qcom.rc\nservice ueventd /sbin/ueventd\n",
-        );
+        let dir =
+            make_test_rootfs("import /init.recovery.qcom.rc\nservice ueventd /sbin/ueventd\n");
         // Imported file lives at the chroot root (matching the import path).
         std::fs::write(
             dir.join("init.recovery.qcom.rc"),
