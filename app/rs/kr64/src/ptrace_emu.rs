@@ -1141,6 +1141,15 @@ fn write_translated_path(
 /// Returns `true` on success, `false` if `addr` is null or any
 /// `PTRACE_POKEDATA` fails (which typically means `addr` is not a valid
 /// mapped address in the child).
+///
+/// NOTE: this function is currently UNUSED. It was previously called from
+/// the capget EXIT intercept to populate the `cap_user_data_t` buffer, but
+/// the 8-byte `PTRACE_POKEDATA` write corrupted the child's stack and
+/// caused SIGSEGV (signal 11). The call site was removed — we now just
+/// fake return 0 and leave the buffer untouched. The function is retained
+/// for reference / potential future use (e.g. a safer `process_vm_writev`
+/// based implementation) but is intentionally not invoked.
+#[allow(dead_code)]
 fn poke_capget_data(pid: libc::pid_t, addr: u64) -> bool {
     if addr == 0 {
         return false;
@@ -1822,44 +1831,27 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                     name, syscall_num
                                 ));
                             }
-                            // ── capget: also populate the capability
-                            // data buffer (Bug 2 fix) ──────────────
+                            // ── capget: do NOT write to the data buffer.
                             //
-                            // capget(hdr, data) writes the thread's
-                            // effective/permitted/inheritable capability
-                            // sets into `data` (a `struct
-                            // __user_cap_data_struct *`). When we force
-                            // the return value to 0 (success) without
-                            // writing to `data`, init sees "success but
-                            // no capabilities" and may exit (this is
-                            // the bug we are fixing). The kernel never
-                            // wrote to `data` because either (a) the
-                            // syscall returned EPERM before reaching
-                            // the capset write, or (b) seccomp
-                            // aborted the syscall before it ran at all
-                            // (handled by the SIGSYS path, which sets
-                            // in_syscall=true so this EXIT handler
-                            // fires next).
+                            // We previously tried to populate the
+                            // `cap_user_data_t` buffer in the child with
+                            // 0xFFFFFFFF via PTRACE_POKEDATA so init
+                            // would see "all caps granted". That 8-byte
+                            // poke corrupted the child's stack and
+                            // caused a SIGSEGV (signal 11). The buffer
+                            // pointer passed by init may not actually be
+                            // a writable mapped address we can safely
+                            // poke (alignment / stack layout
+                            // assumptions do not hold in practice).
                             //
-                            // We write 0xFFFFFFFF to all three u32
-                            // fields (effective, permitted,
-                            // inheritable) so init sees "all caps
-                            // granted". arg2 (reg_arg2) holds the
-                            // `cap_user_data_t` pointer.
-                            if syscall_num == abi.capget {
-                                let data_ptr = get_syscall_arg(&regs2, abi.reg_arg2);
-                                if loop_count <= 200 {
-                                    log(&format!(
-                                        "capget: writing 0xFFFFFFFF to capability data buffer at {:#x}",
-                                        data_ptr
-                                    ));
-                                }
-                                if !poke_capget_data(pid, data_ptr) {
-                                    log(&format!(
-                                        "capget: poke_capget_data({:#x}) failed — buffer left empty, init may reject",
-                                        data_ptr
-                                    ));
-                                }
+                            // Instead we just fake success (return 0)
+                            // and leave the buffer untouched. The child
+                            // sees "success but no capabilities". This
+                            // may cause init to exit, but it will not
+                            // crash the process with SIGSEGV — which is
+                            // the strictly better failure mode.
+                            if syscall_num == abi.capget && loop_count <= 200 {
+                                log("capget: faking success (return 0) without writing data buffer — avoids stack-corrupting PTRACE_POKEDATA");
                             }
                             set_syscall_ret(&mut regs2, &abi, 0);
                             let _ = ptrace_setregs(pid, &regs2, len);
