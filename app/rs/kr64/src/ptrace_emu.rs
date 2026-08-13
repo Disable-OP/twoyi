@@ -26,6 +26,18 @@
 //     - readlink/readlinkat → translate path
 //     - chdir → translate path
 //     - statx → translate path
+//     - fchown / fchmod / capget / ioprio_get → fake success (return 0)
+//       TWRP init calls these early in startup; as untrusted_app they
+//       all return EPERM and init gives up with exit(1). We intercept
+//       them at syscall EXIT and force the return value to 0 so init
+//       proceeds. They are ALSO handled in the SIGSYS path in case
+//       some devices' seccomp filter blocks them outright.
+//       NOTE: the original diagnostic log reported "fchown (nr=91)"
+//       but nr=91 on x86_64 is actually fchmod (real fchown is 93).
+//       We intercept BOTH — the field named `fchown` uses the correct
+//       fchown numbers (93/95/55), and the field named `fchmod` uses
+//       the correct fchmod numbers (91/94/52) which matches the
+//       diagnostic's nr=91. Either way the bug is fixed.
 //
 //   32-bit (i386) child support:
 //   - TWRP's init binary ships as a 32-bit static ELF, so on an x86_64
@@ -209,6 +221,26 @@ struct ChildAbi {
     readlink: i64,
     readlinkat: i64,
     chdir: i64,
+    // Syscalls that TWRP init calls early in startup which return EPERM
+    // as untrusted_app (capget — no capabilities; fchown/fchmod — can't
+    // change ownership/permissions of fds; ioprio_get — needs CAP_SYS_ADMIN
+    // for some classes). Init sees the failures and exits with code 1.
+    // We intercept these at syscall EXIT and force the return value to 0
+    // (success) so init proceeds. They are also handled in the SIGSYS
+    // path (return 0, no rewrite to getpid — same as rt_sigprocmask) in
+    // case some devices' seccomp filter blocks them.
+    //
+    // NOTE on fchown vs fchmod: the diagnostic log that motivated this
+    // fix reported "fchown (nr=91)" but nr=91 on x86_64 is actually
+    // fchmod (real fchown is 93). The aarch64 number reported (55) IS
+    // correct for fchown. We carry BOTH `fchown` (with the actually-
+    // correct fchown numbers) AND `fchmod` (with the actually-correct
+    // fchmod numbers, matching the diagnostic's nr=91) so the bug is
+    // fixed regardless of which syscall init was really calling.
+    fchown: i64,
+    fchmod: i64,
+    capget: i64,
+    ioprio_get: i64,
     // Syscalls we never actually emulate, but whose numbers we need for
     // the SIGSYS diagnostic logging (we look up the original syscall
     // number to print a human-readable name when seccomp blocks it).
@@ -289,6 +321,15 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     readlink: 89,
     readlinkat: 267,
     chdir: 80,
+    // TWRP-init EPERM workaround — see the long comment on these
+    // fields in `ChildAbi`. Real fchown on x86_64 is 93 (NOT 91, which
+    // is fchmod — the diagnostic log that motivated this fix reported
+    // "fchown (nr=91)" but nr=91 is actually fchmod; we carry both
+    // `fchown` and `fchmod` so the fix works either way).
+    fchown: 93,
+    fchmod: 91,
+    capget: 125,
+    ioprio_get: 252,
     mount: 165,
     chroot: 161,
     mkdir: 83,
@@ -321,6 +362,13 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     readlink: 85,
     readlinkat: 303,
     chdir: 12,
+    // TWRP-init EPERM workaround — see the long comment on these
+    // fields in `ChildAbi`. i386 fchown=95, fchmod=94, capget=184,
+    // ioprio_get=290 (per asm-i386/unistd_32.h).
+    fchown: 95,
+    fchmod: 94,
+    capget: 184,
+    ioprio_get: 290,
     mount: 21,
     chroot: 61,
     mkdir: 39,
@@ -361,6 +409,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     readlink: -1,
     readlinkat: 78,
     chdir: 49,
+    // TWRP-init EPERM workaround — see the long comment on these
+    // fields in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
+    // fchown=55, fchmod=52, capget=90, ioprio_get=31.
+    fchown: 55,
+    fchmod: 52,
+    capget: 90,
+    ioprio_get: 31,
     mount: 165,
     chroot: 51,
     mkdir: 34,
@@ -790,6 +845,14 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "chmod"
     } else if nr == abi.unshare {
         "unshare"
+    } else if nr == abi.fchown {
+        "fchown"
+    } else if nr == abi.fchmod {
+        "fchmod"
+    } else if nr == abi.capget {
+        "capget"
+    } else if nr == abi.ioprio_get {
+        "ioprio_get"
     } else {
         "unknown"
     }
@@ -1619,6 +1682,55 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         }
                         pending_getpid = false;
                     }
+
+                    // ── TWRP-init EPERM workaround ──────────────────────
+                    //
+                    // fchown / fchmod / capget / ioprio_get all return
+                    // EPERM as untrusted_app (no CAP_CHOWN / CAP_FOWNER /
+                    // CAP_SYS_ADMIN / CAP_SYS_RESOURCE / CAP_SYS_NICE).
+                    // TWRP's init calls these early in its startup and
+                    // GIVES UP with exit(1) if any of them fail, before
+                    // it has done any useful work.
+                    //
+                    // These syscalls are NOT blocked by Android's seccomp
+                    // filter (no SIGSYS) — they execute normally and the
+                    // kernel returns -EPERM. So we cannot rely on the
+                    // SIGSYS handler below to mask them; we have to
+                    // intercept them HERE at the syscall-exit stop and
+                    // overwrite the return value with 0 (success).
+                    //
+                    // `syscall_num` was computed at the top of the
+                    // SIGTRAP|0x80 block from the SAME `regs` snapshot
+                    // we are about to refresh — on every supported
+                    // architecture the syscall-number register
+                    // (orig_rax on x86_64, orig_eax on i386 compat, x8
+                    // on aarch64) is preserved across the syscall, so
+                    // `syscall_num` at the EXIT stop still names the
+                    // syscall that just returned. The same property is
+                    // what lets `pending_getpid` work without having to
+                    // re-read the syscall number from registers.
+                    //
+                    // We do NOT log this branch on every iteration
+                    // (only for the first 200) to avoid log spam if
+                    // init calls fchown/fchmod in a hot loop.
+                    if syscall_num == abi.fchown
+                        || syscall_num == abi.fchmod
+                        || syscall_num == abi.capget
+                        || syscall_num == abi.ioprio_get
+                    {
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                            let name = syscall_name(syscall_num, &abi);
+                            if loop_count <= 200 {
+                                log(&format!(
+                                    "intercepted {}() nr={} at EXIT → faking success (return 0) — original return was EPERM as untrusted_app",
+                                    name, syscall_num
+                                ));
+                            }
+                            set_syscall_ret(&mut regs2, &abi, 0);
+                            let _ = ptrace_setregs(pid, &regs2, len);
+                        }
+                    }
                 }
             } else if sig == libc::SIGTRAP {
                 // Regular SIGTRAP (breakpoint, single-step without 0x80
@@ -1853,7 +1965,32 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         // (seccomp fired), so it will skip straight to
                         // syscall-exit using our return value of 0,
                         // which is exactly what bionic expects.
-                        if original_syscall != a.rt_sigprocmask {
+                        //
+                        // EXCEPTION — fchown / fchmod / capget /
+                        // ioprio_get: same rationale as
+                        // rt_sigprocmask above. These syscalls take
+                        // user-space pointers or integer args that
+                        // bionic's linker init code inspects on
+                        // return; if we rewrite the syscall to getpid
+                        // the kernel may EXECUTE getpid and overwrite
+                        // our 0 return value with the child's real
+                        // PID, which init interprets as a failure.
+                        // Leaving the original (blocked) syscall
+                        // number in place and just forcing the return
+                        // to 0 is the same pattern that already works
+                        // for rt_sigprocmask — and it covers the
+                        // (rare) case where a device's seccomp filter
+                        // blocks these syscalls outright. On most
+                        // devices these are NOT blocked by seccomp
+                        // (they execute and return EPERM); the
+                        // syscall-EXIT handler above fakes success
+                        // there.
+                        let is_no_rewrite_syscall = original_syscall == a.rt_sigprocmask
+                            || original_syscall == a.fchown
+                            || original_syscall == a.fchmod
+                            || original_syscall == a.capget
+                            || original_syscall == a.ioprio_get;
+                        if !is_no_rewrite_syscall {
                             set_syscall_num(&mut sigsys_regs, &a, a.getpid);
                         }
 
@@ -1891,6 +2028,27 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             log(&format!(
                                 "intercepted SIGSYS — rt_sigprocmask() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — signal mask emulation)",
                                 original_syscall, name
+                            ));
+                            0
+                        } else if original_syscall == a.fchown
+                            || original_syscall == a.fchmod
+                            || original_syscall == a.capget
+                            || original_syscall == a.ioprio_get
+                        {
+                            // NO rewrite — see the EXCEPTION comment
+                            // above. Seccomp already aborted the syscall,
+                            // so we just set the return value to 0
+                            // (success) and resume. TWRP's init needs
+                            // these to "succeed" during its startup; on
+                            // most devices they execute and return EPERM
+                            // (handled by the syscall-EXIT path above),
+                            // but on devices where seccomp blocks them
+                            // outright we hit this SIGSYS path. Returning
+                            // 0 without rewriting to getpid matches the
+                            // proven rt_sigprocmask behaviour.
+                            log(&format!(
+                                "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — fake success for TWRP init)",
+                                name, original_syscall, name
                             ));
                             0
                         } else {
