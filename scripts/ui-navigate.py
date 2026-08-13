@@ -251,13 +251,16 @@ def tap_picker_row_with_fallbacks(x, y):
          Available on Android 7+. This bypasses the `input` tool's
          tap/swipe abstractions and injects MotionEvent objects
          directly, which should trigger ANY OnItemTouchListener.
-      6. `input trackball roll X Y` + `input trackball press` — moves
-         the trackball cursor to the file position (rolling by the
-         X/Y deltas) and then "clicks" it with a trackball press.
-         Trackball events have a different input source
-         (SOURCE_TRACKBALL) than touch events; some RecyclerView
-         OnItemTouchListeners that drop touch events may still
-         respond to a trackball press.
+      6. `input trackball roll 0 1` + `input trackball press` scan —
+         IMPORTANT: `input trackball roll X Y` takes RELATIVE deltas,
+         not absolute coordinates, so rolling by (x, y) from the origin
+         would overshoot the target wildly. Instead we perform an
+         incremental scan: roll DOWN by 1 pixel, press the trackball,
+         check whether the picker closed, and repeat up to 20 times
+         (covering the full 320x640 screen height). Trackball events
+         use a different input source (SOURCE_TRACKBALL) than touch
+         events; some RecyclerView OnItemTouchListeners that drop
+         touch events may still respond to a trackball press.
     """
     # Guard: only run if we're on the file picker. If we've drifted
     # off (e.g., to Google Photos), tapping would do the wrong thing.
@@ -318,17 +321,36 @@ def tap_picker_row_with_fallbacks(x, y):
                    f"input motionevent UP {x+1} {y}"],
                   is_sequence=True):
         return True
-    # Method 6: input trackball roll + press — move the trackball cursor
-    # to the file position (rolling by the X/Y deltas from the origin)
-    # and then "click" it with a trackball press. Trackball events use a
-    # different input source (SOURCE_TRACKBALL) than touch events; some
-    # RecyclerView OnItemTouchListeners that drop touch events may still
-    # respond to a trackball press.
-    if try_method("trackball roll + press",
-                  [f"input trackball roll {x} {y}",
-                   "input trackball press"],
-                  is_sequence=True):
-        return True
+    # Method 6: input trackball scan. NOTE: `input trackball roll X Y`
+    # takes RELATIVE deltas, not absolute coordinates, so a single roll
+    # to (x, y) from the origin would move the cursor x pixels right and
+    # y pixels down — way past the target. Instead, roll DOWN by 1 pixel
+    # at a time (`input trackball roll 0 1`), press the trackball after
+    # each roll, and check whether the picker has closed. Up to 20 rolls
+    # covers the full 320x640 screen height. This is effectively a
+    # trackball-based scan: move down one line, click, check if picker
+    # closed, repeat.
+    print("    tap_picker_row: trying trackball scan")
+    probe = subprocess.run(ADB + ["shell", "input trackball roll 0 0"],
+                           capture_output=True, text=True, timeout=30)
+    probe_out = (probe.stdout + probe.stderr).lower()
+    if any(s in probe_out for s in ("usage", "unknown", "error", "not found", "invalid")):
+        print("    tap_picker_row: trackball not supported on device — skipping")
+    else:
+        closed = False
+        for i in range(1, 21):
+            subprocess.run(ADB + ["shell", "input trackball roll 0 1"],
+                           capture_output=True, text=True, timeout=30)
+            subprocess.run(ADB + ["shell", "input trackball press"],
+                           capture_output=True, text=True, timeout=30)
+            wait(1.0)  # give picker time to close (or not)
+            if picker_closed():
+                print(f"    tap_picker_row: ✓ picker closed after trackball roll #{i}")
+                closed = True
+                break
+        if closed:
+            return True
+        print("    tap_picker_row: picker still open after 20 trackball rolls")
     print(f"    tap_picker_row: ✗ all 6 tap methods failed to close the picker")
     return False
 
