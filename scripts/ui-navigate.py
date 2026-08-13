@@ -526,7 +526,11 @@ def main():
     #   a) DPAD navigation (PRIMARY — previously the most reliable).
     #      Tap the left side of the file list to focus a row (NOT the
     #      preview icon), then DPAD_DOWN + ENTER. Retry with increasing
-    #      DPAD_DOWN counts. Dismiss any share sheet before each attempt.
+    #      DPAD_DOWN counts (2, 3, 4 — starting at 2x to skip ui-dump.xml,
+    #      the 1st RECENT item, and land on recovery.img, the 2nd). If
+    #      the picker closes but no ROM was imported, re-open it and
+    #      retry with more DOWN presses. Dismiss any share sheet before
+    #      each attempt.
     #   b) Direct tap on recovery.img in RECENT FILES (left-30% of the
     #      row, away from the preview icon). If the tap doesn't close
     #      the picker (the RecyclerView's OnItemTouchListener didn't
@@ -648,6 +652,47 @@ def main():
         print(f"  ⚠ Could not return to picker — on {activity!r}")
         return False
 
+    # Helper: after the picker has just closed (we're back on io.twoyi),
+    # determine whether a ROM was actually imported. The RECENT FILES list
+    # contains ui-dump.xml (1st item) and recovery.img (2nd item).
+    # Selecting ui-dump.xml closes the picker WITHOUT importing a ROM (it
+    # isn't a valid ROM file). Selecting recovery.img starts an import —
+    # an import progress dialog appears and the 'Select ROM' summary
+    # eventually changes from the default 'Import rootfs ...' prompt.
+    #
+    # We wait up to ~12s for EITHER signal:
+    #   - an import progress dialog (importing/extracting/loading/...) →
+    #     import started, OR
+    #   - verify_rom_imported() returning True (summary changed) →
+    #     import finished (fast or already done).
+    # If neither appears, no ROM was imported — re-open the picker (scroll
+    # to + tap 'Select ROM') so the next DPAD attempt can retry with more
+    # DOWN presses.
+    # Returns True if a ROM was (being) imported (caller stops), False
+    # otherwise (caller continues to the next attempt; picker re-opened).
+    def verify_import_or_reopen(tag):
+        progress_words = ["progress", "importing", "extracting", "loading",
+                          "please wait", "extract"]
+        for i in range(6):  # up to ~12s
+            _xml, _root, _act = fresh_picker_state(f"{tag}_{i}")
+            if _root is not None:
+                for node in _root.iter("node"):
+                    txt = (node.get("text", "") or "").lower()
+                    if any(w in txt for w in progress_words):
+                        print(f"  ✓ Import progress dialog detected — ROM import started")
+                        return True
+            wait(2)
+        # No progress dialog seen — do a final summary check.
+        _xml, _root, _act = fresh_picker_state(f"{tag}_final")
+        if verify_rom_imported(_root):
+            print(f"  ✓ Select ROM summary changed — ROM imported")
+            return True
+        print(f"  ⚠ No import progress and summary unchanged — no ROM imported")
+        print(f"     (likely selected ui-dump.xml, the 1st RECENT item, not recovery.img)")
+        print(f"     Re-opening picker to retry with more DPAD_DOWN presses")
+        ensure_on_picker(tag + "_reopen")
+        return False
+
     found_file = False
 
     # Initial dump + dismiss any stray share sheet from the previous step.
@@ -666,23 +711,42 @@ def main():
     # reliable). Tried FIRST so we select recovery.img before any drawer
     # navigation can drift us into Google Photos.
     #
+    # The RECENT FILES list contains TWO items: ui-dump.xml (1st) and
+    # recovery.img (2nd). We need at least 2 DPAD_DOWN presses to reach
+    # recovery.img — 1x would land on ui-dump.xml, which closes the
+    # picker WITHOUT importing a ROM (it isn't a valid ROM file).
+    #
     # DPAD_ENTER can land on the per-row 'Preview' icon (focusable=true)
     # and trigger a share sheet instead of selecting the file. We
     # mitigate by:
     #   - Dismissing any share sheet BEFORE each DPAD attempt.
     #   - Tapping the LEFT side of the file list (away from preview
     #     icons) to give the row focus, not the preview icon.
-    #   - Using INCREASING DPAD_DOWN counts (1, 2, 3) across 3 attempts.
+    #   - Using INCREASING DPAD_DOWN counts (2, 3, 4) across 3 attempts
+    #     — starting at 2x so the first attempt already skips
+    #     ui-dump.xml and lands on recovery.img.
     #   - Verifying the picker closed AND we're back on io.twoyi after
     #     each ENTER; if a share sheet appeared instead, dismiss it and
     #     try the next attempt. If we drifted to Google Photos, escape.
+    #   - After each ENTER that closes the picker, verifying a ROM was
+    #     actually imported (import progress dialog OR changed 'Select
+    #     ROM' summary). If the picker closed but NO ROM was imported
+    #     (e.g. ui-dump.xml was selected), re-opening the picker and
+    #     retrying with more DPAD_DOWN presses.
     # ═══════════════════════════════════════════════════════════════
     if not found_file:
         ensure_on_picker("03a_pre_dpad")
     if not found_file and is_on_file_picker(get_current_activity()):
         print("  (a) PRIMARY: DPAD navigation with retry loop")
+        # RECENT FILES list order: ui-dump.xml (1st), recovery.img (2nd).
+        # We need at least 2 DPAD_DOWN presses to reach recovery.img —
+        # 1x would land on ui-dump.xml, which closes the picker without
+        # importing a ROM. Start at 2x and increase (2, 3, 4) across 3
+        # attempts. After each ENTER that closes the picker, verify a ROM
+        # was actually imported; if not, re-open the picker (via
+        # verify_import_or_reopen) and retry with more DOWN presses.
         for attempt in range(3):
-            downs = attempt + 1  # 1, 2, 3
+            downs = attempt + 2  # 2, 3, 4
             print(f"  DPAD attempt {attempt+1}/3: dismiss-sheet + tap-list + {downs}x DPAD_DOWN + ENTER")
 
             # Take a fresh dump and dismiss any share sheet BEFORE the DPAD.
@@ -690,13 +754,17 @@ def main():
             if dismiss_share_sheet(root):
                 xml, root, activity = fresh_picker_state(f"03a_dpad_{attempt}_post_dismiss")
                 print(f"  After pre-DPAD share-sheet dismiss: {activity}")
-                # If dismissing the sheet closed the picker too, make sure
-                # we actually selected a file (back on io.twoyi) — not drifted.
+                # If dismissing the sheet closed the picker too, verify a
+                # ROM was actually imported (not a false success from
+                # selecting ui-dump.xml). Re-open and retry if not.
                 status = classify_tap_result(activity)
                 if status == "success":
-                    found_file = True
-                    print(f"  ✓ Picker closed after pre-DPAD share-sheet dismiss")
-                    break
+                    if verify_import_or_reopen(f"03a_dpad_{attempt}_preverify"):
+                        found_file = True
+                        print(f"  ✓ ROM imported after pre-DPAD share-sheet dismiss")
+                        break
+                    else:
+                        continue  # picker re-opened; try next attempt
 
             # Tap the LEFT side of the file list area to give the row focus.
             # CRITICAL: do NOT tap the center/right — the 'Preview' icon
@@ -719,9 +787,17 @@ def main():
             print(f"  After DPAD attempt {attempt+1}: {a}")
             status = classify_tap_result(a)
             if status == "success":
-                found_file = True
-                print(f"  ✓ Picker closed after DPAD attempt {attempt+1}")
-                break
+                # Picker closed — verify a ROM was actually imported. With
+                # too few DPAD_DOWNs we may have selected ui-dump.xml (1st
+                # RECENT item), which closes the picker without importing.
+                if verify_import_or_reopen(f"03a_dpad_{attempt}_verify"):
+                    found_file = True
+                    print(f"  ✓ ROM import verified after DPAD attempt {attempt+1}")
+                    break
+                else:
+                    # Picker closed but no ROM imported — verify_import_or_reopen
+                    # has re-opened the picker. Try next attempt (more DOWNs).
+                    continue
             else:
                 print(f"  ⚠ Picker still open or drifted (status={status}) after DPAD attempt {attempt+1}")
                 if status == "photos":
@@ -731,9 +807,12 @@ def main():
                 if dismiss_share_sheet(root):
                     xml, root, activity = fresh_picker_state(f"03a_dpad_{attempt}_post2")
                     if classify_tap_result(activity) == "success":
-                        found_file = True
-                        print(f"  ✓ Picker closed after post-DPAD share-sheet dismiss")
-                        break
+                        if verify_import_or_reopen(f"03a_dpad_{attempt}_postverify"):
+                            found_file = True
+                            print(f"  ✓ ROM imported after post-DPAD share-sheet dismiss")
+                            break
+                        else:
+                            continue  # picker re-opened; try next attempt
         # End of DPAD attempts — fall through to (b) regardless of outcome.
 
     # ═══════════════════════════════════════════════════════════════
