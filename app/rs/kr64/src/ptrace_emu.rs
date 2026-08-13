@@ -1099,6 +1099,98 @@ fn write_translated_path(
     true
 }
 
+/// Write `0xFFFFFFFF` to all three fields of a `struct __user_cap_data_struct`
+/// (effective, permitted, inheritable) at `addr` in the child's memory.
+///
+/// The struct is 12 bytes (3 × `u32`, see `<linux/capability.h>`):
+/// ```c
+/// struct __user_cap_data_struct {
+///     __u32 effective;    // offset 0
+///     __u32 permitted;    // offset 4
+///     __u32 inheritable;  // offset 8
+/// };
+/// ```
+///
+/// We write `0xFFFFFFFF` to all three fields so init sees "all capabilities
+/// granted" when it inspects the buffer after we forced capget to return 0.
+/// Without this, the buffer stays zeroed (the kernel never wrote to it
+/// because either seccomp aborted the syscall or the syscall returned
+/// EPERM before writing) and init interprets "success but no caps" as a
+/// fatal condition — exactly the bug we are fixing.
+///
+/// The host is always 64-bit (`x86_64` or `aarch64`), so `c_long` is 8
+/// bytes and `PTRACE_POKEDATA` writes 8 bytes at a time. We need to
+/// write 12 bytes, so:
+///   - Word 1 (offset 0): effective + permitted (both `0xFFFFFFFF`) =
+///     `0xFFFFFFFFFFFFFFFF` (= `-1` in two's complement).
+///   - Word 2 (offset 8): inheritable (`0xFFFFFFFF`) at bytes 0-3, plus
+///     the EXISTING bytes 4-7 preserved via read-modify-write to avoid
+///     clobbering adjacent stack memory (which may be another local
+///     variable, not just padding).
+///
+/// If `PTRACE_PEEKDATA` fails for word 2 (returns `-1` with `errno != 0`),
+/// we fall back to writing `0xFFFFFFFFFFFFFFFF` directly. This clobbers
+/// 4 bytes of adjacent memory — typically safe because the 4 bytes after
+/// a 12-byte struct on a 16-byte-aligned stack are padding, but the
+/// read-modify-write path is preferred for robustness.
+///
+/// `PTRACE_PEEKDATA` returns `long`, and `-1` is also a valid word value,
+/// so we follow the standard `ptrace(2)` pattern: clear `errno` first,
+/// then check `errno` after the call to disambiguate.
+///
+/// Returns `true` on success, `false` if `addr` is null or any
+/// `PTRACE_POKEDATA` fails (which typically means `addr` is not a valid
+/// mapped address in the child).
+fn poke_capget_data(pid: libc::pid_t, addr: u64) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    // Word 1: effective (0xFFFFFFFF) + permitted (0xFFFFFFFF).
+    // 0xFFFFFFFFFFFFFFFF in two's complement is just -1.
+    let all_ones: libc::c_long = -1;
+    let r1 = unsafe {
+        libc::ptrace(
+            libc::PTRACE_POKEDATA,
+            pid,
+            addr as i64,
+            all_ones as libc::c_long,
+        )
+    };
+    if r1 == -1 {
+        return false;
+    }
+    // Word 2: inheritable (0xFFFFFFFF) at bytes 0-3, plus existing bytes
+    // 4-7 preserved via read-modify-write. PTRACE_PEEKDATA returns -1 on
+    // error, but -1 is also a valid word value — clear errno first, then
+    // check errno after the call to disambiguate (see ptrace(2)).
+    unsafe { *libc::__errno_location() = 0 };
+    let existing = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64 + 8, 0) };
+    let peek_errno = unsafe { *libc::__errno_location() };
+    let word2: libc::c_long = if existing == -1 && peek_errno != 0 {
+        // PEEKDATA genuinely failed — fall back to writing all-ones
+        // directly. This clobbers 4 bytes of adjacent memory (typically
+        // stack padding), which is safe in practice.
+        all_ones
+    } else {
+        // Preserve existing high 4 bytes, set low 4 bytes to 0xFFFFFFFF.
+        let mut bytes = existing.to_ne_bytes();
+        bytes[0..4].copy_from_slice(&0xFFFFFFFFu32.to_ne_bytes());
+        libc::c_long::from_ne_bytes(bytes)
+    };
+    let r2 = unsafe {
+        libc::ptrace(
+            libc::PTRACE_POKEDATA,
+            pid,
+            addr as i64 + 8,
+            word2 as libc::c_long,
+        )
+    };
+    if r2 == -1 {
+        return false;
+    }
+    true
+}
+
 // ── Ptrace loop ────────────────────────────────────────────────────
 
 /// Check if ptrace is likely to work on this device.
@@ -1727,6 +1819,45 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                     name, syscall_num
                                 ));
                             }
+                            // ── capget: also populate the capability
+                            // data buffer (Bug 2 fix) ──────────────
+                            //
+                            // capget(hdr, data) writes the thread's
+                            // effective/permitted/inheritable capability
+                            // sets into `data` (a `struct
+                            // __user_cap_data_struct *`). When we force
+                            // the return value to 0 (success) without
+                            // writing to `data`, init sees "success but
+                            // no capabilities" and may exit (this is
+                            // the bug we are fixing). The kernel never
+                            // wrote to `data` because either (a) the
+                            // syscall returned EPERM before reaching
+                            // the capset write, or (b) seccomp
+                            // aborted the syscall before it ran at all
+                            // (handled by the SIGSYS path, which sets
+                            // in_syscall=true so this EXIT handler
+                            // fires next).
+                            //
+                            // We write 0xFFFFFFFF to all three u32
+                            // fields (effective, permitted,
+                            // inheritable) so init sees "all caps
+                            // granted". arg2 (reg_arg2) holds the
+                            // `cap_user_data_t` pointer.
+                            if syscall_num == abi.capget {
+                                let data_ptr = get_syscall_arg(&regs2, abi.reg_arg2);
+                                if loop_count <= 200 {
+                                    log(&format!(
+                                        "capget: writing 0xFFFFFFFF to capability data buffer at {:#x}",
+                                        data_ptr
+                                    ));
+                                }
+                                if !poke_capget_data(pid, data_ptr) {
+                                    log(&format!(
+                                        "capget: poke_capget_data({:#x}) failed — buffer left empty, init may reject",
+                                        data_ptr
+                                    ));
+                                }
+                            }
                             set_syscall_ret(&mut regs2, &abi, 0);
                             let _ = ptrace_setregs(pid, &regs2, len);
                         }
@@ -1793,10 +1924,34 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // child would either re-raise SIGSYS (if 39 is blocked)
                 // or invoke the wrong syscall entirely.
                 //
-                // We do NOT flip `in_syscall`: seccomp fires during
-                // syscall entry, so the next stop will be the
-                // syscall-exit-stop of the (now rewritten) syscall —
-                // the same phase we were already heading to.
+                // ── Bug 1 fix: in_syscall flag desync ──────────────
+                //
+                // DIAGNOSTIC: log the in_syscall state at SIGSYS time.
+                // Normally SIGSYS fires BETWEEN the ENTRY and EXIT
+                // stops (seccomp traps the syscall mid-flight), so
+                // in_syscall is already true here. But on some kernels
+                // SECCOMP_RET_TRAP can fire BEFORE the ptrace ENTRY
+                // stop is delivered — in that case in_syscall is false,
+                // and without the fix below the next SIGTRAP|0x80 stop
+                // (the EXIT stop) would be misclassified as ENTRY,
+                // permanently desyncing the loop. This is exactly the
+                // bug that caused ioprio_get's EXIT intercept to never
+                // fire: the EXIT was being treated as an ENTRY.
+                //
+                // FIX: ALWAYS set in_syscall = true after processing
+                // the SIGSYS (see the `in_syscall = true` line right
+                // before `continue` below). This ensures the next stop
+                // is treated as EXIT regardless of whether SIGSYS
+                // fired before or after the ENTRY stop.
+                log(&format!(
+                    "SIGSYS handler: in_syscall={} before processing{}",
+                    in_syscall,
+                    if in_syscall {
+                        " (normal — SIGSYS fired between ENTRY and EXIT)"
+                    } else {
+                        " (DESYNC — SIGSYS fired before ENTRY stop; setting in_syscall=true to recover)"
+                    }
+                ));
                 let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
                 match ptrace_getregs(pid, &mut sigsys_regs) {
                     Ok(len) => {
@@ -2072,6 +2227,27 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     }
                 }
 
+                // Bug 1 fix: ALWAYS set in_syscall = true so the next
+                // SIGTRAP|0x80 stop is treated as the syscall-EXIT stop
+                // of the (rewritten or aborted) syscall. This is correct
+                // in BOTH cases:
+                //   - Normal case (SIGSYS fired between ENTRY and EXIT):
+                //     in_syscall was already true; setting it again is a
+                //     no-op, and the next stop is correctly EXIT.
+                //   - Desync case (SIGSYS fired BEFORE the ENTRY stop,
+                //     observed on some kernels where SECCOMP_RET_TRAP
+                //     preempts the ptrace ENTRY delivery): in_syscall
+                //     was false; without this set, the next stop (EXIT)
+                //     would be misclassified as ENTRY — permanently
+                //     desyncing the loop and preventing the EXIT
+                //     intercepts (e.g. capget's buffer-write fix) from
+                //     ever firing.
+                //
+                // We set this AFTER the `match ptrace_getregs` block
+                // (which may log/diagnose the SIGSYS) but BEFORE
+                // `continue` so it always runs, even on the
+                // ptrace_getregs-failure path.
+                in_syscall = true;
                 // Do NOT call PTRACE_SYSCALL here — the loop top will
                 // do it with resume_signal = 0 (already reset), which
                 // resumes the child WITHOUT forwarding the signal.
