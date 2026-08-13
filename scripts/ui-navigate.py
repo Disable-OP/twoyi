@@ -616,26 +616,43 @@ def main():
                          os.path.join(ART, "kr64-app-stderr.log")],
                   capture_output=True, timeout=10)
 
-    # Pull the TWRP init log from the app's rootfs directory. This log
-    # is written by the ptrace emulator (kr64) and captures the
-    # SIGSYS interceptions, syscall entries, and child exit code —
-    # it is the single most useful artifact for diagnosing init boot
-    # failures (e.g. "init exits with code 1 after 183 iterations").
-    # Both pulls are conditional: capture_output=True silently swallows
-    # the "does not exist" adb error if kr64 did not produce the file
-    # (e.g. if init never got far enough to write the log).
+    # Pull the TWRP diagnostic logs from the app's rootfs directory.
+    #
+    # All three pulls use `check=False` (the default for subprocess.run),
+    # which is the Python equivalent of `adb pull ... || true` — if the
+    # source file does not exist (e.g. kr64 never created it, or TWRP
+    # init's unlink() already removed it by the time we pull), adb
+    # returns a non-zero exit code that is captured by capture_output
+    # and silently swallowed. This is intentional: these logs are
+    # diagnostic aids, not required artifacts.
+    #
+    #   - twrp-init.log: written by the ptrace emulator (kr64). Captures
+    #     SIGSYS interceptions, syscall entries, and child exit code.
+    #     The single most useful artifact for diagnosing init boot
+    #     failures (e.g. "init exits with code 1 after 183 iterations").
+    #
+    #   - twrp-kmsg.log: captures kernel-side KLOG messages written by
+    #     TWRP init via the /dev/__kmsg__ -> /twrp-kmsg.log symlink
+    #     (root mode) or directly to /dev/__kmsg__ (non-root mode).
+    #     Complements twrp-init.log by giving the kernel-side view of
+    #     what init was doing right before it died.
+    #
+    #   - dev/__kmsg__: in non-root mode kr64 creates this as a regular
+    #     file (empty, mode 0666) because the host /dev is read-only.
+    #     TWRP init's log_init() opens it and writes KLOG messages
+    #     here. TWRP init later unlink()s the file, but the open fd
+    #     keeps the inode alive — if we pull before kr64 SIGKILLs init
+    #     (or if the unlink is intercepted by the loader), the file
+    #     may still be on disk and contain KLOG output. Pulled best-
+    #     effort; missing file is not an error.
     subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/twrp-init.log",
                          os.path.join(ART, "twrp-init.log")],
                   capture_output=True, timeout=10)
-
-    # Pull the TWRP kernel-message log from the app's rootfs directory.
-    # This log captures kernel-side messages written by kr64 (e.g. via
-    # the klog_init patch in the TWRP ramdisk) and complements
-    # twrp-init.log when diagnosing boot failures — together they give
-    # both the ptrace-emulator side and the kernel-side view of what
-    # init was doing right before it died.
     subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/twrp-kmsg.log",
                          os.path.join(ART, "twrp-kmsg.log")],
+                  capture_output=True, timeout=10)
+    subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/dev/__kmsg__",
+                         os.path.join(ART, "dev-__kmsg__")],
                   capture_output=True, timeout=10)
 
     print()
