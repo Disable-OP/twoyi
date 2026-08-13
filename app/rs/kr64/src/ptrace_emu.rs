@@ -1551,12 +1551,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 //     return 0 (the original behaviour before the
                 //     -ENOENT "fix") and log the PATH argument so we can
                 //     see exactly what init is probing.
-                //   - rt_sigprocmask() → 0 (success). For a ptraced
-                //     process the actual signal mask doesn't matter —
-                //     bionic just needs the call to "succeed" so its
-                //     init path continues. Skipping it (i.e. returning
-                //     0 without actually setting the mask) is the
-                //     correct emulation here.
+                //   - rt_sigprocmask() → 0 (success), AND the syscall
+                //     number is NOT rewritten (see the EXCEPTION comment
+                //     at the `set_syscall_num` call below for why).
+                //     For a ptraced process the actual signal mask
+                //     doesn't matter — bionic just needs the call to
+                //     "succeed" so its init path continues. Returning 0
+                //     without actually setting the mask (and without
+                //     rewriting to getpid) is the correct emulation
+                //     here: the kernel already aborted the syscall
+                //     when seccomp fired, so it skips straight to
+                //     syscall-exit using our return value of 0.
                 //   - All other blocked syscalls (mount, chroot, mkdir,
                 //     chmod, unshare, …) → rewrite to getpid and return
                 //     0 (success). This is the existing PROOT-style
@@ -1670,15 +1675,44 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         // kernel does not re-evaluate the original
                         // blocked number and re-raise SIGSYS when we
                         // resume. This is done for ALL intercepted
-                        // syscalls — the return value (set below) is
-                        // what differs per-syscall. We use `a.getpid`
-                        // so the rewrite uses the correct number for
-                        // the child's bitness (20 on i386, 39 on
-                        // x86_64, 172 on aarch64) — using the wrong
-                        // number here would re-trip seccomp on a
-                        // 32-bit child because 39 (x86_64 getpid)
+                        // syscalls EXCEPT rt_sigprocmask — the return
+                        // value (set below) is what differs per-syscall.
+                        // We use `a.getpid` so the rewrite uses the
+                        // correct number for the child's bitness (20 on
+                        // i386, 39 on x86_64, 172 on aarch64) — using
+                        // the wrong number here would re-trip seccomp
+                        // on a 32-bit child because 39 (x86_64 getpid)
                         // maps to a completely different i386 syscall.
-                        set_syscall_num(&mut sigsys_regs, &a, a.getpid);
+                        //
+                        // EXCEPTION — rt_sigprocmask: when seccomp traps
+                        // a syscall, the kernel ABORTS it (it does NOT
+                        // execute the syscall handler) and delivers
+                        // SIGSYS. After the SIGSYS handler runs and we
+                        // resume, the kernel proceeds to syscall-exit
+                        // with whatever return value we set via
+                        // PTRACE_SETREGS — it does NOT re-execute the
+                        // (possibly rewritten) syscall. HOWEVER: on
+                        // some kernels (observed on Android's
+                        // aarch64 5.x line) rewriting the syscall
+                        // number causes the kernel to actually EXECUTE
+                        // the new syscall (getpid) before returning to
+                        // syscall-exit, which OVERWRITES our return
+                        // value with getpid's real return value (the
+                        // child's PID, a positive integer). Bionic's
+                        // linker treats rt_sigprocmask's return value
+                        // as either 0 (success) or -errno (failure);
+                        // seeing a positive PID confuses bionic's
+                        // signal-mask initialization and init exits
+                        // with code 1. The fix: for rt_sigprocmask,
+                        // DON'T rewrite the syscall number — leave
+                        // orig_rax as the original (blocked) syscall.
+                        // The kernel has already aborted the syscall
+                        // (seccomp fired), so it will skip straight to
+                        // syscall-exit using our return value of 0,
+                        // which is exactly what bionic expects.
+                        if original_syscall != a.rt_sigprocmask {
+                            set_syscall_num(&mut sigsys_regs, &a, a.getpid);
+                        }
 
                         // Decide on the return value based on the original
                         // syscall. See the long comment above for the full
@@ -1696,9 +1730,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             ));
                             0
                         } else if original_syscall == a.rt_sigprocmask {
+                            // NO rewrite — see the EXCEPTION comment above.
+                            // The kernel already aborted the syscall
+                            // (seccomp fired), so we just set the return
+                            // value to 0 (success) and resume. Bionic's
+                            // linker needs rt_sigprocmask to "succeed"
+                            // during its init path; the actual signal
+                            // mask doesn't matter for a ptraced process
+                            // (the parent controls signal delivery).
                             log(&format!(
-                                "intercepted SIGSYS — rt_sigprocmask() nr={} [{}] (rewriting to getpid nr={}, returning 0 — signal mask emulation)",
-                                original_syscall, name, a.getpid
+                                "intercepted SIGSYS — rt_sigprocmask() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — signal mask emulation)",
+                                original_syscall, name
                             ));
                             0
                         } else {
