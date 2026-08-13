@@ -523,14 +523,18 @@ def main():
     # is PRIMARY because it was previously the most reliable. Trying it
     # FIRST means we usually select recovery.img before any drawer
     # navigation can drift us into Google Photos.
-    #   a) DPAD navigation (PRIMARY — previously the most reliable).
-    #      Tap the left side of the file list to focus a row (NOT the
-    #      preview icon), then DPAD_DOWN + ENTER. Retry with increasing
-    #      DPAD_DOWN counts (2, 3, 4 — starting at 2x to skip ui-dump.xml,
-    #      the 1st RECENT item, and land on recovery.img, the 2nd). If
-    #      the picker closes but no ROM was imported, re-open it and
-    #      retry with more DOWN presses. Dismiss any share sheet before
-    #      each attempt.
+    #   a) COMBINED coordinate-swipe + DPAD navigation (PRIMARY).
+    #      FIRST: take a fresh uiautomator dump, find recovery.img's
+    #      bounds, compute the center of the LEFT 30% of the row, and
+    #      `input swipe X Y X Y 100` (more reliable than `input tap` for
+    #      the SAF picker's RecyclerView OnItemTouchListener). If that
+    #      closes the picker, done. FALL BACK to DPAD: tap recovery.img's
+    #      exact coords to give the row focus, then DPAD_DOWN + ENTER.
+    #      Retry with increasing DPAD_DOWN counts (3, 4, 5 — starting at
+    #      3x because 2x still selected ui-dump.xml, the 1st RECENT
+    #      item). If the picker closes but no ROM was imported, re-open
+    #      it and retry with more DOWN presses. Dismiss any share sheet
+    #      before each attempt.
     #   b) Direct tap on recovery.img in RECENT FILES (left-30% of the
     #      row, away from the preview icon). If the tap doesn't close
     #      the picker (the RecyclerView's OnItemTouchListener didn't
@@ -707,47 +711,116 @@ def main():
         print(f"  After initial share-sheet dismiss: {activity}")
 
     # ═══════════════════════════════════════════════════════════════
-    # (a) DPAD navigation — PRIMARY strategy (previously the most
-    # reliable). Tried FIRST so we select recovery.img before any drawer
-    # navigation can drift us into Google Photos.
+    # (a) COMBINED coordinate-swipe + DPAD navigation — PRIMARY
+    # strategy (previously the most reliable). Tried FIRST so we
+    # select recovery.img before any drawer navigation can drift us
+    # into Google Photos.
     #
     # The RECENT FILES list contains TWO items: ui-dump.xml (1st) and
-    # recovery.img (2nd). We need at least 2 DPAD_DOWN presses to reach
-    # recovery.img — 1x would land on ui-dump.xml, which closes the
-    # picker WITHOUT importing a ROM (it isn't a valid ROM file).
+    # recovery.img (2nd). The previous DPAD-only strategy started at
+    # 2x DPAD_DOWN, but 2x still sometimes selected ui-dump.xml (the
+    # 1st item) — likely because the initial "tap the list area at
+    # (20%, 55%)" was hitting something other than the file list (a
+    # header text or empty space), so the DPAD focus started on the
+    # "RECENT FILES" header text rather than on the first row.
     #
-    # DPAD_ENTER can land on the per-row 'Preview' icon (focusable=true)
-    # and trigger a share sheet instead of selecting the file. We
-    # mitigate by:
-    #   - Dismissing any share sheet BEFORE each DPAD attempt.
-    #   - Tapping the LEFT side of the file list (away from preview
-    #     icons) to give the row focus, not the preview icon.
-    #   - Using INCREASING DPAD_DOWN counts (2, 3, 4) across 3 attempts
-    #     — starting at 2x so the first attempt already skips
-    #     ui-dump.xml and lands on recovery.img.
-    #   - Verifying the picker closed AND we're back on io.twoyi after
-    #     each ENTER; if a share sheet appeared instead, dismiss it and
-    #     try the next attempt. If we drifted to Google Photos, escape.
-    #   - After each ENTER that closes the picker, verifying a ROM was
-    #     actually imported (import progress dialog OR changed 'Select
-    #     ROM' summary). If the picker closed but NO ROM was imported
-    #     (e.g. ui-dump.xml was selected), re-opening the picker and
-    #     retrying with more DPAD_DOWN presses.
+    # NEW COMBINED APPROACH:
+    #   1. Take a fresh uiautomator dump, find recovery.img's bounds,
+    #      compute the center of the LEFT 30% of the row (well away
+    #      from the per-row 'Preview' icon at the right edge), and use
+    #      `input swipe X Y X Y 100` (NOT `input tap`) at those exact
+    #      coordinates — `input swipe` with 100ms duration is more
+    #      reliable for the SAF picker's RecyclerView OnItemTouchListener,
+    #      which sometimes drops short `input tap` events.
+    #   2. If the coordinate-based swipe closes the picker AND we're
+    #      back on io.twoyi, verify a ROM was imported and stop.
+    #   3. If the swipe doesn't close the picker (RecyclerView didn't
+    #      respond) OR recovery.img isn't in the dump, fall back to
+    #      DPAD: tap recovery.img's exact coordinates (or (20%, 55%)
+    #      if recovery.img isn't found) to give the row focus, then
+    #      DPAD_DOWN + ENTER. Retry with INCREASING DPAD_DOWN counts
+    #      (3, 4, 5 — starting at 3x because 2x still sometimes
+    #      selected ui-dump.xml; the extra DOWN ensures we skip past
+    #      both the "RECENT FILES" header AND ui-dump.xml to land on
+    #      recovery.img). After each ENTER that closes the picker,
+    #      verify a ROM was actually imported; if not, re-open the
+    #      picker (via verify_import_or_reopen) and retry with more
+    #      DOWN presses.
+    #   4. DPAD_ENTER can land on the per-row 'Preview' icon
+    #      (focusable=true) and trigger a share sheet instead of
+    #      selecting the file. Mitigate by dismissing any share sheet
+    #      BEFORE each attempt, and after each ENTER.
+    #   5. If we drift to Google Photos, escape_google_photos() sends
+    #      BACK keys to return to the picker.
     # ═══════════════════════════════════════════════════════════════
     if not found_file:
         ensure_on_picker("03a_pre_dpad")
     if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (a) PRIMARY: DPAD navigation with retry loop")
-        # RECENT FILES list order: ui-dump.xml (1st), recovery.img (2nd).
-        # We need at least 2 DPAD_DOWN presses to reach recovery.img —
-        # 1x would land on ui-dump.xml, which closes the picker without
-        # importing a ROM. Start at 2x and increase (2, 3, 4) across 3
-        # attempts. After each ENTER that closes the picker, verify a ROM
-        # was actually imported; if not, re-open the picker (via
-        # verify_import_or_reopen) and retry with more DOWN presses.
+        print("  (a) PRIMARY: combined coordinate-swipe + DPAD navigation")
+
+        # ── Step 1: coordinate-based swipe at recovery.img's EXACT
+        # location. Use safe_row_tap_target() to find recovery.img in
+        # the current uiautomator dump and compute the center of the
+        # LEFT 30% of its row (away from the 'Preview' icon at the
+        # right edge). Then `input swipe X Y X Y 100` — more reliable
+        # than `input tap` for the SAF picker's RecyclerView
+        # OnItemTouchListener, which sometimes drops short `input tap`
+        # events. If this closes the picker, we're done — no DPAD
+        # fallback needed.
+        xml, root, activity = fresh_picker_state("03a_coord_pre")
+        if dismiss_share_sheet(root):
+            xml, root, activity = fresh_picker_state("03a_coord_post_dismiss")
+        coord_target = None
+        for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
+            coord_target = safe_row_tap_target(root, text, exact=False)
+            if coord_target:
+                print(f"  Coordinate-swipe: found '{text}' at ({coord_target[0]}, {coord_target[1]}) (left-30% of row)")
+                break
+        if coord_target:
+            cx, cy, _ = coord_target
+            print(f"  Coordinate-swipe: input swipe {cx} {cy} {cx} {cy} 100 (recovery.img exact location)")
+            tap(cx, cy)  # tap() uses `input swipe X Y X Y 100`
+            wait(3)
+            a = get_current_activity()
+            status = classify_tap_result(a)
+            print(f"  Coordinate-swipe result: {status} (activity={a!r})")
+            if status == "success":
+                if verify_import_or_reopen("03a_coord_verify"):
+                    found_file = True
+                    print(f"  ✓ ROM imported after coordinate-swipe — DPAD fallback not needed")
+                # else: picker re-opened by verify_import_or_reopen; fall through to DPAD
+            elif status == "photos":
+                escape_google_photos()
+            else:
+                # Picker still open or drifted — dismiss any share sheet
+                # and check again before falling back to DPAD.
+                if dismiss_share_sheet(root):
+                    xml, root, activity = fresh_picker_state("03a_coord_post_dismiss2")
+                    if classify_tap_result(activity) == "success":
+                        if verify_import_or_reopen("03a_coord_postverify"):
+                            found_file = True
+                            print(f"  ✓ ROM imported after coordinate-swipe share-sheet dismiss")
+                if not found_file:
+                    print(f"  Coordinate-swipe did not close picker — falling back to DPAD")
+        else:
+            print(f"  recovery.img not found in dump — skipping coordinate-swipe, going straight to DPAD")
+
+        # ── Step 2: DPAD fallback with INCREASING DPAD_DOWN counts
+        # (3, 4, 5). Starting at 3x because 2x still sometimes selected
+        # ui-dump.xml (the 1st RECENT item) — the extra DOWN ensures we
+        # skip past both the "RECENT FILES" header AND ui-dump.xml to
+        # land on recovery.img. The list-area tap now uses recovery.img's
+        # EXACT coordinates (LEFT 30% of the row) instead of the old
+        # (20%, 55%) screen-relative tap, which sometimes hit empty
+        # space or the "RECENT FILES" header text and left DPAD focus
+        # on the header instead of the first row.
         for attempt in range(3):
-            downs = attempt + 2  # 2, 3, 4
-            print(f"  DPAD attempt {attempt+1}/3: dismiss-sheet + tap-list + {downs}x DPAD_DOWN + ENTER")
+            # If the coordinate-swipe (Step 1) already closed the picker
+            # and imported a ROM, skip the DPAD fallback entirely.
+            if found_file or not is_on_file_picker(get_current_activity()):
+                break
+            downs = attempt + 3  # 3, 4, 5
+            print(f"  DPAD attempt {attempt+1}/3: dismiss-sheet + tap-row + {downs}x DPAD_DOWN + ENTER")
 
             # Take a fresh dump and dismiss any share sheet BEFORE the DPAD.
             xml, root, activity = fresh_picker_state(f"03a_dpad_{attempt}_pre")
@@ -766,12 +839,26 @@ def main():
                     else:
                         continue  # picker re-opened; try next attempt
 
-            # Tap the LEFT side of the file list area to give the row focus.
-            # CRITICAL: do NOT tap the center/right — the 'Preview' icon
-            # lives at the right edge and would steal focus.
-            list_tap_x = int(SCREEN_W * 0.20)
-            list_tap_y = int(SCREEN_H * 0.55)
-            print(f"  Tapping file list left side ({list_tap_x}, {list_tap_y}) to give row focus")
+            # Tap recovery.img's EXACT coordinates (LEFT 30% of the row,
+            # away from the 'Preview' icon at the right edge) to give
+            # the row focus BEFORE DPAD navigation. This replaces the
+            # old (20%, 55%) screen-relative tap which sometimes hit
+            # empty space or the "RECENT FILES" header text and left
+            # DPAD focus on the header instead of the first row. If
+            # recovery.img isn't in the dump (rare), fall back to the
+            # (20%, 55%) list-area tap.
+            coord_target = None
+            for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
+                coord_target = safe_row_tap_target(root, text, exact=False)
+                if coord_target:
+                    break
+            if coord_target:
+                list_tap_x, list_tap_y, _ = coord_target
+                print(f"  Tapping recovery.img exact coords ({list_tap_x}, {list_tap_y}) to give row focus")
+            else:
+                list_tap_x = int(SCREEN_W * 0.20)
+                list_tap_y = int(SCREEN_H * 0.55)
+                print(f"  recovery.img not in dump — tapping file list left side ({list_tap_x}, {list_tap_y})")
             tap(list_tap_x, list_tap_y)
             wait(1)
 
