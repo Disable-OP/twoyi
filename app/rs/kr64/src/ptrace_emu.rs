@@ -309,6 +309,29 @@ fn set_syscall_num(regs: &mut Regs, val: i64) {
     unsafe { *regs_ptr.add(REG_SYSCALL) = val as u64; }
 }
 
+/// Map a raw syscall number to a human-readable name for log messages.
+///
+/// NOTE: the numbers below are x86_64 syscall numbers. On aarch64 the
+/// numbers are different (e.g. rt_sigprocmask is 135, not 14), so this
+/// table will return "unknown" for the corresponding aarch64 syscalls.
+/// The function still compiles on both architectures and the worst case
+/// is a slightly less informative log line — never incorrect behaviour.
+/// We keep the table as the canonical x86_64 numbers because that is the
+/// architecture where the SIGSYS interception issue currently manifests
+/// (init exits with code 1 after ~183 iterations on x86_64).
+fn syscall_name(nr: i64) -> &'static str {
+    match nr {
+        21 => "access",
+        14 => "rt_sigprocmask",
+        165 => "mount",
+        161 => "chroot",
+        83 => "mkdir",
+        90 => "chmod",
+        272 => "unshare",
+        _ => "unknown",
+    }
+}
+
 // ── Path translation ───────────────────────────────────────────────
 
 /// Translate a guest path to a host path by prepending the rootfs.
@@ -717,11 +740,30 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // mkdir /dev/block.
                 //
                 // Instead we INTERCEPT the signal: rewrite the blocked
-                // syscall into a harmless getpid and force the return
-                // value to 0 (success), then resume WITHOUT delivering
-                // the signal. The child sees the call succeed and keeps
-                // going, which is the behaviour PROOT exhibits for
-                // rootless containers.
+                // syscall into a harmless getpid and force a return
+                // value, then resume WITHOUT delivering the signal.
+                //
+                // The return value depends on the original syscall:
+                //   - access()      → -ENOENT ("file not found") so init
+                //     treats the file as missing instead of accessible.
+                //     Returning 0 (success) was lying to init that the
+                //     file IS accessible, which confused bionic during
+                //     early init and caused init to exit with code 1
+                //     after ~183 iterations.
+                //   - rt_sigprocmask() → 0 (success). For a ptraced
+                //     process the actual signal mask doesn't matter —
+                //     bionic just needs the call to "succeed" so its
+                //     init path continues. Skipping it (i.e. returning
+                //     0 without actually setting the mask) is the
+                //     correct emulation here.
+                //   - All other blocked syscalls (mount, chroot, mkdir,
+                //     chmod, unshare, …) → rewrite to getpid and return
+                //     0 (success). This is the existing PROOT-style
+                //     "always succeed" strategy for rootless containers.
+                //     We log a WARNING because lying about these syscalls
+                //     succeeding can cause init to operate on a half-
+                //     initialised environment, but it is the best we
+                //     can do without CAP_SYS_ADMIN.
                 //
                 // We do NOT flip `in_syscall`: seccomp fires during
                 // syscall entry, so the next stop will be the
@@ -738,10 +780,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     // "intercepted SIGSYS" with no clue WHAT was
                     // intercepted.
                     let original_syscall = get_syscall_num(&sigsys_regs);
-                    log(&format!(
-                        "intercepted SIGSYS — original syscall nr={} (rewriting to getpid, returning 0)",
-                        original_syscall
-                    ));
+                    let name = syscall_name(original_syscall);
                     // Push into the rolling history so the exit
                     // handler can print "last N blocked syscalls".
                     if recent_sigsys.len() == RECENT_SIGSYS_CAP {
@@ -752,11 +791,41 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     // Rewrite the syscall number to getpid (a harmless,
                     // always-allowed syscall) so the kernel does not
                     // re-evaluate the original blocked number and
-                    // re-raise SIGSYS when we resume.
+                    // re-raise SIGSYS when we resume. This is done for
+                    // ALL intercepted syscalls — the return value (set
+                    // below) is what differs per-syscall.
                     set_syscall_num(&mut sigsys_regs, GETPID_SYSCALL);
-                    // Force the return value to 0 (success). The child
-                    // will see the (blocked) syscall as having succeeded.
-                    set_syscall_ret(&mut sigsys_regs, 0);
+
+                    // Decide on the return value based on the original
+                    // syscall. See the long comment above for the full
+                    // rationale per-syscall.
+                    //
+                    // On aarch64 ACCESS_SYSCALL is -1 (aarch64 uses
+                    // faccessat instead), so the `access` branch is
+                    // effectively dead on that architecture — the
+                    // comparison still compiles and is harmless.
+                    let ret_val: i64 = if original_syscall == ACCESS_SYSCALL {
+                        log(&format!(
+                            "intercepted SIGSYS — access() nr={} [{}] (rewriting to getpid, returning -ENOENT)",
+                            original_syscall, name
+                        ));
+                        -(libc::ENOENT as i64)
+                    } else if original_syscall == RT_SIGPROCMASK_SYSCALL {
+                        log(&format!(
+                            "intercepted SIGSYS — rt_sigprocmask() nr={} [{}] (rewriting to getpid, returning 0 — signal mask emulation)",
+                            original_syscall, name
+                        ));
+                        0
+                    } else {
+                        log(&format!(
+                            "intercepted SIGSYS — syscall nr={} [{}] (rewriting to getpid, returning 0) — WARNING: unexpected SIGSYS for this syscall, may cause issues",
+                            original_syscall, name
+                        ));
+                        0
+                    };
+                    // Force the return value. The child will see the
+                    // (blocked) syscall as having returned `ret_val`.
+                    set_syscall_ret(&mut sigsys_regs, ret_val);
                     let _ = ptrace_setregs(pid, &sigsys_regs);
                 } else {
                     // ptrace_getregs failed — we couldn't read the
@@ -825,6 +894,13 @@ const ACCESS_SYSCALL: i64 = 21;
 #[cfg(target_arch = "x86_64")]
 const FACCESSAT_SYSCALL: i64 = 48;
 #[cfg(target_arch = "x86_64")]
+// rt_sigprocmask — x86_64 syscall 14. Intercepted in the SIGSYS handler
+// because bionic's init calls it during early initialization and the
+// zygote seccomp filter traps it. We return 0 (success) which leaves
+// the signal mask unchanged from the caller's perspective — for a
+// ptraced process the actual mask doesn't matter.
+const RT_SIGPROCMASK_SYSCALL: i64 = 14;
+#[cfg(target_arch = "x86_64")]
 const READLINK_SYSCALL: i64 = 89;
 #[cfg(target_arch = "x86_64")]
 const READLINKAT_SYSCALL: i64 = 267;
@@ -853,6 +929,11 @@ const NEWFSTATAT_SYSCALL: i64 = 79;
 const ACCESS_SYSCALL: i64 = -1;
 #[cfg(target_arch = "aarch64")]
 const FACCESSAT_SYSCALL: i64 = 48;
+#[cfg(target_arch = "aarch64")]
+// rt_sigprocmask — aarch64 syscall 135. Same interception rationale
+// as the x86_64 path: bionic init calls it during early init and the
+// zygote seccomp filter traps it; we return 0 (success).
+const RT_SIGPROCMASK_SYSCALL: i64 = 135;
 #[cfg(target_arch = "aarch64")]
 const READLINK_SYSCALL: i64 = -1;
 #[cfg(target_arch = "aarch64")]

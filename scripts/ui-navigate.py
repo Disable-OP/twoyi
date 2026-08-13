@@ -616,6 +616,15 @@ def main():
                          os.path.join(ART, "kr64-app-stderr.log")],
                   capture_output=True, timeout=10)
 
+    # Pull the TWRP init log from the app's rootfs directory. This log
+    # is written by the ptrace emulator (kr64) and captures the
+    # SIGSYS interceptions, syscall entries, and child exit code —
+    # it is the single most useful artifact for diagnosing init boot
+    # failures (e.g. "init exits with code 1 after 183 iterations").
+    subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/twrp-init.log",
+                         os.path.join(ART, "twrp-init.log")],
+                  capture_output=True, timeout=10)
+
     print()
     print("=" * 60)
     print("  Artifacts captured:")
