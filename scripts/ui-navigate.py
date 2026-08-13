@@ -178,19 +178,32 @@ def find_tap_target_for_text(root, text, exact=False):
     return None
 
 def tap(x, y):
-    """Tap at coordinates. Use 'input touchscreen swipe' with same start/end
-    point and 100ms duration — this is a DIFFERENT code path than 'input tap'
-    or 'input swipe': it simulates a real touchscreen event (source =
-    SOURCE_TOUCHSCREEN) rather than a trackball/keyboard event, which
-    reliably triggers the RecyclerView's OnItemTouchListener that the
-    Android SAF file picker uses (and which sometimes drops short
-    'input tap' events). Falls back to 'input swipe' if the 'touchscreen'
-    source isn't recognized on this device."""
-    r = subprocess.run(ADB + ["shell", f"input touchscreen swipe {x} {y} {x} {y} 100"],
+    """Tap at coordinates. PRIMARY method is `input tap X Y` — the
+    simplest approach, and the one most likely to trigger Android's
+    RecyclerView OnItemTouchListener (which is what the SAF file
+    picker uses). The previous implementation used `input touchscreen
+    swipe X Y X Y 100` as a workaround for a 'short-duration event'
+    issue, but that workaround may have prevented the tap from
+    registering as a real tap on RecyclerView rows.
+
+    Falls back to `input touchscreen swipe X Y X Y 100` (a real
+    touchscreen event, source = SOURCE_TOUCHSCREEN) if `input tap`
+    returns an error, and finally to `input swipe X Y X Y 100` if
+    the touchscreen source isn't recognized on this device.
+
+    For file-picker-row taps that need to try MULTIPLE methods in
+    sequence (with picker-closed checks between each), use
+    `tap_picker_row_with_fallbacks()` instead."""
+    r = subprocess.run(ADB + ["shell", f"input tap {x} {y}"],
                        capture_output=True, text=True, timeout=30)
     combined = (r.stdout + r.stderr).lower()
     if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
-        adb_shell(f"input swipe {x} {y} {x} {y} 100")
+        # input tap not recognized — fall back to touchscreen swipe
+        r2 = subprocess.run(ADB + ["shell", f"input touchscreen swipe {x} {y} {x} {y} 100"],
+                            capture_output=True, text=True, timeout=30)
+        combined2 = (r2.stdout + r2.stderr).lower()
+        if any(s in combined2 for s in ("usage", "unknown", "error", "not found", "invalid")):
+            adb_shell(f"input swipe {x} {y} {x} {y} 100")
 
 def touchscreen_tap(x, y):
     """Tap at coordinates using 'input touchscreen tap' — a real touchscreen
@@ -204,6 +217,103 @@ def touchscreen_tap(x, y):
     combined = (r.stdout + r.stderr).lower()
     if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
         adb_shell(f"input tap {x} {y}")
+
+
+def tap_picker_row_with_fallbacks(x, y):
+    """Tap a file picker row trying MULTIPLE tap methods in sequence,
+    checking after each whether the picker closed (file was selected).
+    Returns True if the picker closed after one of the methods, False
+    if the picker is still open after all methods have been tried.
+
+    This is the lowest-level touch-input approach: it tries `input tap`
+    first (the simplest and most reliable for RecyclerView), then falls
+    back through increasingly low-level methods. The SAF file picker's
+    RecyclerView OnItemTouchListener should respond to at least one of
+    these.
+
+    Methods tried, in order:
+      1. `input tap X Y` — the simplest approach; a real tap event.
+         This is the most likely to trigger the RecyclerView's
+         OnItemTouchListener (which `input swipe X Y X Y 100` does
+         not always do).
+      2. `input touchscreen swipe X Y X Y 100` — a real touchscreen
+         event (source = SOURCE_TOUCHSCREEN), 100ms duration.
+      3. `input swipe X Y X+1 Y 50` — a tiny 1-pixel horizontal
+         movement, 50ms duration; registers as a tap (not a long
+         press) while sending a slightly different motion-event
+         sequence than (1) or (2).
+      4. `input swipe X Y X Y 500` (LONG-PRESS) — a 500ms hold.
+         Some RecyclerView OnItemTouchListeners only fire
+         onLongPress, not onSingleTapUp; this also tests whether
+         the picker responds differently to a long touch.
+      5. `input motionevent DOWN/MOVE/UP` sequence — the lowest-
+         level touch input API; sends raw MotionEvent actions.
+         Available on Android 7+. This bypasses the `input` tool's
+         tap/swipe abstractions and injects MotionEvent objects
+         directly, which should trigger ANY OnItemTouchListener.
+    """
+    # Guard: only run if we're on the file picker. If we've drifted
+    # off (e.g., to Google Photos), tapping would do the wrong thing.
+    current = get_current_activity()
+    if not is_on_file_picker(current):
+        print(f"    tap_picker_row: not on file picker (activity={current!r}) — skipping")
+        return False
+
+    def picker_closed():
+        return not is_on_file_picker(get_current_activity())
+
+    def try_method(name, cmd, is_sequence=False):
+        """Run a tap method and check if picker closed. Returns True if
+        picker closed, False otherwise (or if method not supported)."""
+        print(f"    tap_picker_row: trying {name}")
+        if is_sequence:
+            # cmd is a list of shell commands to run in sequence
+            for sub in cmd:
+                r = subprocess.run(ADB + ["shell", sub],
+                                   capture_output=True, text=True, timeout=30)
+                combined = (r.stdout + r.stderr).lower()
+                if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
+                    print(f"    tap_picker_row: {name} not supported on device — skipping")
+                    return False
+        else:
+            r = subprocess.run(ADB + ["shell", cmd],
+                               capture_output=True, text=True, timeout=30)
+            combined = (r.stdout + r.stderr).lower()
+            if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
+                print(f"    tap_picker_row: {name} not supported on device — skipping")
+                return False
+        wait(1.5)  # give picker time to close (or not)
+        if picker_closed():
+            print(f"    tap_picker_row: ✓ picker closed after {name}")
+            return True
+        print(f"    tap_picker_row: picker still open after {name}")
+        return False
+
+    # Method 1: input tap
+    if try_method(f"input tap {x} {y}", f"input tap {x} {y}"):
+        return True
+    # Method 2: input touchscreen swipe (same start/end, 100ms)
+    if try_method(f"touchscreen swipe {x} {y} {x} {y} 100",
+                  f"input touchscreen swipe {x} {y} {x} {y} 100"):
+        return True
+    # Method 3: tiny horizontal swipe (1px, 50ms)
+    if try_method(f"tiny swipe {x} {y} {x+1} {y} 50",
+                  f"input swipe {x} {y} {x+1} {y} 50"):
+        return True
+    # Method 4: long-press (500ms hold)
+    if try_method(f"long-press {x} {y} {x} {y} 500",
+                  f"input swipe {x} {y} {x} {y} 500"):
+        return True
+    # Method 5: input motionevent DOWN/MOVE/UP sequence (lowest-level)
+    if try_method("motionevent DOWN/MOVE/UP",
+                  [f"input motionevent DOWN {x} {y}",
+                   f"input motionevent MOVE {x+1} {y}",
+                   f"input motionevent UP {x+1} {y}"],
+                  is_sequence=True):
+        return True
+    print(f"    tap_picker_row: ✗ all 5 tap methods failed to close the picker")
+    return False
+
 
 def swipe_up():
     """Swipe up to scroll down the list. Uses screen-relative coordinates."""
@@ -799,8 +909,8 @@ def main():
                 break
         if coord_target:
             cx, cy, _ = coord_target
-            print(f"  Coordinate-swipe: input swipe {cx} {cy} {cx} {cy} 100 (recovery.img exact location)")
-            tap(cx, cy)  # tap() uses `input swipe X Y X Y 100`
+            print(f"  Coordinate-swipe: tap_picker_row_with_fallbacks at ({cx}, {cy}) (recovery.img exact location)")
+            tap_picker_row_with_fallbacks(cx, cy)  # tries 5 tap methods in sequence with picker-closed checks
             wait(3)
             a = get_current_activity()
             status = classify_tap_result(a)
@@ -880,10 +990,23 @@ def main():
                 list_tap_x = int(SCREEN_W * 0.20)
                 list_tap_y = int(SCREEN_H * 0.55)
                 print(f"  recovery.img not in dump — tapping file list left side ({list_tap_x}, {list_tap_y})")
-            tap(list_tap_x, list_tap_y)
-            wait(1)
-
-            # DPAD navigation
+            tap_closed = tap_picker_row_with_fallbacks(list_tap_x, list_tap_y)
+            if tap_closed:
+                # The tap itself closed the picker — file was selected!
+                # Skip DPAD navigation and verify the import.
+                a = get_current_activity()
+                status = classify_tap_result(a)
+                if status == "success":
+                    if verify_import_or_reopen(f"03a_dpad_{attempt}_tapverify"):
+                        found_file = True
+                        print(f"  ✓ ROM imported after tap_picker_row (DPAD not needed)")
+                        break
+                elif status == "photos":
+                    escape_google_photos()
+                # Whether success-but-not-imported or photos, continue to
+                # next DPAD attempt (verify_import_or_reopen re-opens picker).
+                continue
+            # Picker still open — proceed with DPAD navigation.
             for _ in range(downs):
                 adb_shell("input keyevent KEYCODE_DPAD_DOWN")
                 wait(0.5)
@@ -946,8 +1069,8 @@ def main():
                 if not result:
                     continue
                 cx, cy, _ = result
-                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-                tap(cx, cy)
+                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping (tap_picker_row_with_fallbacks)")
+                tap_picker_row_with_fallbacks(cx, cy)
                 wait(3)
                 a = get_current_activity()
                 status = classify_tap_result(a)
@@ -1042,8 +1165,8 @@ def main():
             if not result:
                 continue
             cx, cy, _ = result
-            print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-            tap(cx, cy)
+            print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping (tap_picker_row_with_fallbacks)")
+            tap_picker_row_with_fallbacks(cx, cy)
             wait(3)
             a = get_current_activity()
             status = classify_tap_result(a)
@@ -1091,8 +1214,8 @@ def main():
                 if not result:
                     continue
                 cx, cy, _ = result
-                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
-                tap(cx, cy)
+                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping (tap_picker_row_with_fallbacks)")
+                tap_picker_row_with_fallbacks(cx, cy)
                 wait(3)
                 a = get_current_activity()
                 status = classify_tap_result(a)
@@ -1130,8 +1253,8 @@ def main():
             if not result:
                 continue
             cx, cy, _ = result
-            print(f"  Final attempt: tapping '{text}' at ({cx}, {cy})")
-            tap(cx, cy)
+            print(f"  Final attempt: tapping '{text}' at ({cx}, {cy}) (tap_picker_row_with_fallbacks)")
+            tap_picker_row_with_fallbacks(cx, cy)
             wait(3)
             a = get_current_activity()
             status = classify_tap_result(a)
