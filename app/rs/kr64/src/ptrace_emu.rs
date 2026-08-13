@@ -1163,9 +1163,12 @@ fn poke_capget_data(pid: libc::pid_t, addr: u64) -> bool {
     // 4-7 preserved via read-modify-write. PTRACE_PEEKDATA returns -1 on
     // error, but -1 is also a valid word value — clear errno first, then
     // check errno after the call to disambiguate (see ptrace(2)).
-    unsafe { *libc::__errno_location() = 0 };
+    // On Android, __errno_location is not available via libc crate; use
+    // std::io::Error::last_os_error() instead.
+    let _ = std::io::Error::last_os_error(); // clear errno
     let existing = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64 + 8, 0) };
-    let peek_errno = unsafe { *libc::__errno_location() };
+    let peek_err = std::io::Error::last_os_error();
+    let peek_errno = peek_err.raw_os_error().unwrap_or(0);
     let word2: libc::c_long = if existing == -1 && peek_errno != 0 {
         // PEEKDATA genuinely failed — fall back to writing all-ones
         // directly. This clobbers 4 bytes of adjacent memory (typically
