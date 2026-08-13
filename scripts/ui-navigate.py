@@ -911,12 +911,18 @@ def main():
     #      methods (input tap, touchscreen swipe, motionevent,
     #      trackball) FAIL on this picker's filtered list. Instead, go
     #      DIRECTLY to DPAD:
-    #   h. Press KEYCODE_DPAD_DOWN once + KEYCODE_ENTER, then wait 3s.
-    #      Since the filtered list has only ONE item (recovery.img),
-    #      1x DPAD_DOWN should focus it, and ENTER should select it.
-    #   i. If the picker is still open (not closed), escalate: try
-    #      2x DPAD_DOWN + ENTER, then 3x. (Rare edge cases where focus
-    #      starts above the search bar.)
+    #   h. NEW: Press KEYCODE_TAB multiple times to cycle DPAD focus
+    #      through the picker's UI elements until it lands on the
+    #      filtered results list. After BACK, focus is frequently STILL
+    #      on the search input (or other chrome), so DPAD_DOWN from
+    #      there closes the picker without selecting recovery.img. Try
+    #      3x TAB first (search input -> some element -> results list),
+    #      then 1x DPAD_DOWN + ENTER. If that fails, escalate to 5x then
+    #      7x TAB + DPAD_DOWN + ENTER.
+    #   i. FALLBACK: If all TAB counts fail to land focus on the results
+    #      list, fall back to the original DPAD-only escalation — try
+    #      1x DPAD_DOWN + ENTER, then 2x, then 3x (rare edge cases where
+    #      focus starts above the search bar).
     #   j. If the picker closed, verify a ROM was actually imported.
     #      If verify fails, the picker has been re-opened by
     #      verify_import_or_reopen; fall through to (b) DPAD on the
@@ -975,11 +981,64 @@ def main():
                     break
 
             if recovery_in_filter:
-                # The filtered list has only ONE item (recovery.img),
-                # so 1x DPAD_DOWN should focus it and ENTER should
-                # select it. If the picker is still open after 1x,
-                # escalate to 2x then 3x DOWN (rare edge cases where
-                # focus starts above the search bar).
+                # NEW PRIMARY: After BACK, DPAD focus is frequently STILL
+                # on the search input (or other picker chrome), not on the
+                # filtered results list — pressing DPAD_DOWN from there
+                # closes the picker without selecting recovery.img. Cycle
+                # focus by pressing KEYCODE_TAB multiple times (0.5s between
+                # each) until it lands on the filtered results list, THEN
+                # press 1x DPAD_DOWN + ENTER. Escalate the TAB count through
+                # 3, 5, 7 to cover different picker layouts.
+                for tabs in (3, 5, 7):
+                    if found_file or not is_on_file_picker(get_current_activity()):
+                        break
+                    print(f"  SEARCH+TAB+DPAD attempt ({tabs}x TAB + 1x DPAD_DOWN + ENTER)")
+                    for _ in range(tabs):
+                        adb_shell("input keyevent KEYCODE_TAB")
+                        wait(0.5)
+                    adb_shell("input keyevent KEYCODE_DPAD_DOWN")
+                    wait(0.5)
+                    adb_shell("input keyevent KEYCODE_ENTER")
+                    wait(3)
+
+                    a = get_current_activity()
+                    status = classify_tap_result(a)
+                    print(f"  After {tabs}x TAB + DPAD_DOWN + ENTER: {status} (activity={a!r})")
+                    if status == "success":
+                        # Picker closed — verify a ROM was actually imported.
+                        # Do NOT escalate further within the SEARCH strategy;
+                        # if verify fails, fall through to the DPAD-only
+                        # fallback below, then to (b) DPAD on the unfiltered
+                        # list.
+                        if verify_import_or_reopen(f"03a_search_tab{tabs}_verify"):
+                            found_file = True
+                            print(f"  ✓ ROM imported after SEARCH + {tabs}x TAB + DPAD_DOWN + ENTER")
+                        break
+                    elif status == "photos":
+                        print(f"  ⚠ TAB+DPAD ENTER opened Google Photos — escaping")
+                        escape_google_photos()
+                        break
+                    else:
+                        # Picker still open or drifted — escalate to a
+                        # larger TAB count unless a share sheet is in the
+                        # way (dismiss it first).
+                        print(f"  ⚠ Picker still open (status={status}) after {tabs}x TAB + DPAD_DOWN + ENTER — escalating TAB count")
+                        if dismiss_share_sheet(root):
+                            xml, root, activity = fresh_picker_state(f"03a_search_tab{tabs}_after_dismiss")
+                            if classify_tap_result(activity) == "success":
+                                if verify_import_or_reopen(f"03a_search_tab{tabs}_postverify"):
+                                    found_file = True
+                                    print(f"  ✓ ROM imported after search share-sheet dismiss (TAB path)")
+                                    break
+                        # Continue to next TAB count.
+
+                # FALLBACK: DPAD-only escalation (no prior TABs). Used when
+                # TAB cycling did not land focus on the results list — the
+                # filtered list has only ONE item (recovery.img), so 1x
+                # DPAD_DOWN should focus it and ENTER should select it. If
+                # the picker is still open after 1x, escalate to 2x then 3x
+                # DOWN (rare edge cases where focus starts above the search
+                # bar).
                 for downs in (1, 2, 3):
                     if found_file or not is_on_file_picker(get_current_activity()):
                         break
