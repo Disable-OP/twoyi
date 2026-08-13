@@ -69,6 +69,45 @@ def pull_via_run_as(remote_path, local_path, timeout=10):
         pass
     return False
 
+def pull_with_fallback(external_path, internal_path, local_path, timeout=10):
+    """Pull a diagnostic log via `adb pull` (external mirror), falling
+    back to `pull_via_run_as` (app private dir) on failure.
+
+    kr64 mirrors twrp-init.log, twrp-kmsg.log and dev/__kmsg__ to
+    /sdcard/Android/data/io.twoyi/files/ once the guest exits. That
+    directory is readable via `adb pull` on release builds (where
+    `run-as io.twoyi` is rejected and the app's private data dir is
+    inaccessible), so we try the external copy first.
+
+    If the external pull fails for any reason (file not yet mirrored,
+    partial write, timeout, non-zero exit), any empty/partial local
+    file is removed and we fall back to `pull_via_run_as`, which reads
+    the original copy under /data/user/0/io.twoyi/rootfs/ via
+    `run-as io.twoyi cat`. This keeps the script working on debuggable
+    builds where run-as still functions, and on devices where the
+    external mirror hasn't landed yet.
+
+    Returns True if the file was fetched successfully, False otherwise.
+    Like the `adb pull` calls it wraps, failures are silent — these
+    logs are diagnostic aids, not required artifacts.
+    """
+    try:
+        r = subprocess.run(ADB + ["pull", external_path, local_path],
+                           capture_output=True, timeout=timeout)
+        if (r.returncode == 0 and os.path.exists(local_path)
+                and os.path.getsize(local_path) > 0):
+            return True
+    except subprocess.TimeoutExpired:
+        pass
+    # External pull failed — remove any empty/partial file so the
+    # run-as fallback starts from a clean slate.
+    if os.path.exists(local_path):
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+    return pull_via_run_as(internal_path, local_path, timeout=timeout)
+
 def screenshot(name):
     path = os.path.join(ART, f"screenshot-{name}.png")
     try:
@@ -952,17 +991,16 @@ def main():
                          os.path.join(ART, "kr64-app-stderr.log")],
                   capture_output=True, timeout=10)
 
-    # Pull the TWRP diagnostic logs from the app's rootfs directory.
+    # Pull the TWRP diagnostic logs.
     #
-    # twrp-init.log and twrp-kmsg.log live under /data/user/0/io.twoyi/
-    # rootfs/ — the app's private data dir. On a non-rooted device
-    # `adb pull` CANNOT read these files directly (they're owned by
-    # untrusted_app, mode 0700 dir), so we use `adb shell run-as
-    # io.twoyi cat <path>` instead, which switches to the app's UID
-    # before reading. The `pull_via_run_as` helper captures stdout
-    # (the file contents) and writes it verbatim to the local artifact
-    # path. Failures are silent (file missing, run-as denied, etc.) —
-    # these logs are diagnostic aids, not required artifacts.
+    # kr64 mirrors these three files to /sdcard/Android/data/io.twoyi/
+    # files/ once the guest exits (see kr64 src/lib.rs around the
+    # ptrace emulation loop). That directory is readable via `adb pull`
+    # on release builds — where `adb shell run-as io.twoyi` is rejected
+    # and the app's private data dir (/data/user/0/io.twoyi/rootfs/)
+    # is inaccessible — so we pull from the external mirror first and
+    # only fall back to `pull_via_run_as` (run-as cat from the private
+    # dir) if the external copy is missing or the pull fails.
     #
     #   - twrp-init.log: written by the ptrace emulator (kr64). Captures
     #     SIGSYS interceptions, syscall entries, and child exit code.
@@ -981,15 +1019,21 @@ def main():
     #     here. TWRP init later unlink()s the file, but the open fd
     #     keeps the inode alive — if we pull before kr64 SIGKILLs init
     #     (or if the unlink is intercepted by the loader), the file
-    #     may still be on disk and contain KLOG output. Also pulled
-    #     via run-as (same private-dir ownership); missing file is
-    #     not an error.
-    pull_via_run_as("/data/user/0/io.twoyi/rootfs/twrp-init.log",
-                    os.path.join(ART, "twrp-init.log"))
-    pull_via_run_as("/data/user/0/io.twoyi/rootfs/twrp-kmsg.log",
-                    os.path.join(ART, "twrp-kmsg.log"))
-    pull_via_run_as("/data/user/0/io.twoyi/rootfs/dev/__kmsg__",
-                    os.path.join(ART, "dev-__kmsg__"))
+    #     may still be on disk and contain KLOG output. Mirrored to
+    #     the external dir as `dev-__kmsg__` (flat name); missing file
+    #     is not an error.
+    pull_with_fallback(
+        "/sdcard/Android/data/io.twoyi/files/twrp-init.log",
+        "/data/user/0/io.twoyi/rootfs/twrp-init.log",
+        os.path.join(ART, "twrp-init.log"))
+    pull_with_fallback(
+        "/sdcard/Android/data/io.twoyi/files/twrp-kmsg.log",
+        "/data/user/0/io.twoyi/rootfs/twrp-kmsg.log",
+        os.path.join(ART, "twrp-kmsg.log"))
+    pull_with_fallback(
+        "/sdcard/Android/data/io.twoyi/files/dev-__kmsg__",
+        "/data/user/0/io.twoyi/rootfs/dev/__kmsg__",
+        os.path.join(ART, "dev-__kmsg__"))
 
     print()
     print("=" * 60)
