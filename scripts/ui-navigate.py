@@ -178,32 +178,25 @@ def find_tap_target_for_text(root, text, exact=False):
     return None
 
 def tap(x, y):
-    """Tap at coordinates. PRIMARY method is `input tap X Y` — the
-    simplest approach, and the one most likely to trigger Android's
-    RecyclerView OnItemTouchListener (which is what the SAF file
-    picker uses). The previous implementation used `input touchscreen
-    swipe X Y X Y 100` as a workaround for a 'short-duration event'
-    issue, but that workaround may have prevented the tap from
-    registering as a real tap on RecyclerView rows.
+    """Tap at coordinates. PRIMARY method is `input swipe X Y X Y 100`
+    — a zero-distance swipe with a 100ms duration. This is the form
+    that worked reliably on the Android 11 emulator: `input tap X Y`
+    was found to NOT register as a real tap on certain UI elements
+    (e.g. preference rows), causing the app to fall through to the
+    home screen instead of opening the file picker.
 
-    Falls back to `input touchscreen swipe X Y X Y 100` (a real
-    touchscreen event, source = SOURCE_TOUCHSCREEN) if `input tap`
-    returns an error, and finally to `input swipe X Y X Y 100` if
-    the touchscreen source isn't recognized on this device.
+    Falls back to `input tap X Y` only if the swipe returns an error
+    (e.g. on devices where `input swipe` is not recognized).
 
     For file-picker-row taps that need to try MULTIPLE methods in
     sequence (with picker-closed checks between each), use
     `tap_picker_row_with_fallbacks()` instead."""
-    r = subprocess.run(ADB + ["shell", f"input tap {x} {y}"],
+    r = subprocess.run(ADB + ["shell", f"input swipe {x} {y} {x} {y} 100"],
                        capture_output=True, text=True, timeout=30)
     combined = (r.stdout + r.stderr).lower()
     if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
-        # input tap not recognized — fall back to touchscreen swipe
-        r2 = subprocess.run(ADB + ["shell", f"input touchscreen swipe {x} {y} {x} {y} 100"],
-                            capture_output=True, text=True, timeout=30)
-        combined2 = (r2.stdout + r2.stderr).lower()
-        if any(s in combined2 for s in ("usage", "unknown", "error", "not found", "invalid")):
-            adb_shell(f"input swipe {x} {y} {x} {y} 100")
+        # input swipe not recognized — fall back to input tap
+        adb_shell(f"input tap {x} {y}")
 
 def touchscreen_tap(x, y):
     """Tap at coordinates using 'input touchscreen tap' — a real touchscreen
