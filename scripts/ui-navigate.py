@@ -688,32 +688,34 @@ def main():
     #   - Or has a breadcrumb path bar at the top
     #   - Or shows "Internal storage" / "SD card" options
     #
-    # Strategy order — ALL are tried before aborting. The DPAD strategy
-    # is PRIMARY because it was previously the most reliable. Trying it
-    # FIRST means we usually select recovery.img before any drawer
-    # navigation can drift us into Google Photos.
-    #   a) COMBINED coordinate-tap + DPAD navigation (PRIMARY).
-    #      FIRST: take a fresh uiautomator dump, find recovery.img's
-    #      bounds, compute the center of the LEFT 30% of the row, and
-    #      `input touchscreen tap X Y` — a real touchscreen event (NOT a
-    #      trackball/keyboard event like `input tap`), which reliably
-    #      triggers the SAF picker's RecyclerView OnItemTouchListener. If
-    #      that closes the picker, done. FALL BACK to DPAD: tap
-    #      recovery.img's exact coords to give the row focus, then
-    #      DPAD_DOWN + ENTER. Retry with increasing DPAD_DOWN counts
-    #      (1 through 10 — a broad range so we land on recovery.img
-    #      regardless of how many list items precede it). If the picker
-    #      closes but no ROM was imported, re-open it and retry with more
-    #      DOWN presses. Dismiss any share sheet before each attempt.
-    #   b) Direct tap on recovery.img in RECENT FILES (left-30% of the
+    # Strategy order — ALL are tried before aborting. The SEARCH strategy
+    # is now PRIMARY because it is the most reliable: it filters the
+    # picker's list down to a single item (recovery.img), so there is no
+    # RecyclerView focus to wander, no preview icon to accidentally tap,
+    # and no risk of drifting into Google Photos.
+    #   a) SEARCH the picker (NEW PRIMARY). Tap the search icon
+    #      (content-desc "Search") in the top-right of the picker, type
+    #      "recovery" via `adb shell input text "recovery"`, wait for the
+    #      filter to apply, then tap the single filtered result
+    #      (recovery.img) via tap_picker_row_with_fallbacks. Verify the
+    #      picker closed AND a ROM was imported. This bypasses the
+    #      RecyclerView focus issue entirely because there's only ONE
+    #      item in the filtered list.
+    #   b) DPAD-only navigation (was PRIMARY). Press DPAD_DOWN directly
+    #      from the default focus position (no tap before DPAD), then
+    #      ENTER. Retry with 1, 2, 3 DPAD_DOWNs to cover the possible
+    #      default focus positions. If the picker closes but no ROM was
+    #      imported, re-open and retry with more DOWNs. Dismiss any share
+    #      sheet before each attempt.
+    #   c) Direct tap on recovery.img in RECENT FILES (left-30% of the
     #      row, away from the preview icon). If the tap doesn't close
     #      the picker (the RecyclerView's OnItemTouchListener didn't
-    #      fire), fall through to (c) — do NOT retry the same
+    #      fire), fall through to (d) — do NOT retry the same
     #      unresponsive tap.
-    #   c) Drawer → Downloads → file. If not in Downloads, try Internal
+    #   d) Drawer → Downloads → file. If not in Downloads, try Internal
     #      storage → Download folder → file. Can drift into Google
     #      Photos if the wrong root is tapped — escape and fall through.
-    #   d) Coordinate-based tap from a fresh uiautomator dump.
+    #   e) Coordinate-based tap from a fresh uiautomator dump.
     #
     # CRITICAL: after EACH strategy fails, call escape_google_photos()
     # and attempt to return to the picker (ensure_on_picker) before
@@ -881,7 +883,89 @@ def main():
         print(f"  After initial share-sheet dismiss: {activity}")
 
     # ═══════════════════════════════════════════════════════════════
-    # (a) DPAD-only navigation — PRIMARY strategy.
+    # (a) SEARCH the picker to filter the list to recovery.img —
+    # NEW PRIMARY strategy. The SAF file picker has a search icon
+    # (magnifying glass) in the top-right area; tapping it opens a
+    # search input. Typing "recovery" filters the list so that ONLY
+    # recovery.img is shown — there is exactly one item, so tapping it
+    # selects recovery.img regardless of any RecyclerView focus issue.
+    #
+    # Steps:
+    #   a. Find the search icon by content-desc "Search" in the
+    #      uiautomator dump, and tap it.
+    #   b. Wait 1s for the search input to appear.
+    #   c. Type "recovery" via `adb shell input text "recovery"`.
+    #   d. Wait 2s for the filter to apply.
+    #   e. Take a fresh uiautomator dump and find recovery.img in the
+    #      filtered list, tapping it via tap_picker_row_with_fallbacks.
+    #   f. Verify the picker closed AND a ROM was imported.
+    #
+    # This bypasses the RecyclerView focus issue entirely because
+    # there's only ONE item in the filtered list — no focus wandering,
+    # no accidental taps on the per-row preview icon, no drift into
+    # Google Photos. Falls through to (b) DPAD if the search icon
+    # can't be found or the filtered tap doesn't close the picker.
+    # ═══════════════════════════════════════════════════════════════
+    if not found_file:
+        ensure_on_picker("03a_pre_search")
+    if not found_file and is_on_file_picker(get_current_activity()):
+        print("  (a) PRIMARY: SEARCH the picker to filter to recovery.img")
+        xml, root, activity = fresh_picker_state("03a_search_pre")
+        # (a) Find the search icon (content-desc "Search") and tap it.
+        search_result = find_by_text(root, "Search", exact=True)
+        if search_result:
+            sx, sy, _ = search_result
+            print(f"  Found 'Search' icon at ({sx}, {sy}) — tapping to open search input")
+            tap(sx, sy)
+            wait(1)  # wait 1s for the search input to appear
+            # (b) Type "recovery" to filter the list.
+            print("  Typing 'recovery' into the search input")
+            adb_shell('input text "recovery"')
+            wait(2)  # wait 2s for the filter to apply
+            # (c) Take a fresh uiautomator dump and tap recovery.img in
+            # the filtered list.
+            xml, root, activity = fresh_picker_state("03a_search_filtered")
+            print("  Visible text after search filter:")
+            print_all_text(root, prefix="    ")
+            for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
+                result = safe_row_tap_target(root, text, exact=False)
+                if not result:
+                    continue
+                cx, cy, _ = result
+                print(f"  Found '{text}' in filtered list — safe row tap at ({cx}, {cy}) — tapping (tap_picker_row_with_fallbacks)")
+                tap_picker_row_with_fallbacks(cx, cy)
+                wait(3)
+                a = get_current_activity()
+                status = classify_tap_result(a)
+                print(f"  Tap result: {status} (activity={a!r})")
+                if status == "success":
+                    # Verify a ROM was actually imported (not a false
+                    # success from selecting ui-dump.xml or similar).
+                    if verify_import_or_reopen("03a_search_verify"):
+                        found_file = True
+                        print(f"  ✓ ROM imported after SEARCH-and-tap strategy")
+                    # else: verify_import_or_reopen has re-opened the
+                    # picker; fall through to (b) DPAD.
+                    break
+                elif status == "photos":
+                    print(f"  ⚠ Tap opened Google Photos — escaping")
+                    escape_google_photos()
+                    break
+                else:
+                    print(f"  ⚠ Picker still open or drifted (status={status}) after search-filtered tap")
+                    if dismiss_share_sheet(root):
+                        xml, root, activity = fresh_picker_state("03a_search_after_dismiss")
+                        if classify_tap_result(activity) == "success":
+                            if verify_import_or_reopen("03a_search_postverify"):
+                                found_file = True
+                                print(f"  ✓ ROM imported after search share-sheet dismiss")
+                    break
+        else:
+            print("  ⚠ 'Search' icon not found in uiautomator dump — falling through to (b) DPAD")
+        # End of SEARCH strategy — fall through to (b) regardless of outcome.
+
+    # ═══════════════════════════════════════════════════════════════
+    # (b) DPAD-only navigation (was PRIMARY — now secondary to SEARCH).
     #
     # The RECENT FILES list contains TWO items: ui-dump.xml (1st) and
     # recovery.img (2nd). We press DPAD_DOWN directly from whatever the
@@ -915,7 +999,7 @@ def main():
     if not found_file:
         ensure_on_picker("03a_pre_dpad")
     if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (a) PRIMARY: DPAD-only navigation (no tap before DPAD)")
+        print("  (b) DPAD-only navigation (no tap before DPAD)")
 
         for attempt in range(3):
             # If a previous attempt already closed the picker and imported
@@ -986,20 +1070,20 @@ def main():
                             break
                         else:
                             continue  # picker re-opened; try next attempt
-        # End of DPAD attempts — fall through to (b) regardless of outcome.
+        # End of DPAD attempts — fall through to (c) regardless of outcome.
 
     # ═══════════════════════════════════════════════════════════════
-    # (b) Direct tap on recovery.img in RECENT FILES. The picker opens
+    # (c) Direct tap on recovery.img in RECENT FILES. The picker opens
     # with recovery.img already visible here. Retry the dump a few times
     # to give the picker's RecyclerView time to populate. If the tap
     # doesn't close the picker (the RecyclerView's OnItemTouchListener
-    # didn't fire), fall through to (c) drawer navigation — do NOT retry
+    # didn't fire), fall through to (d) drawer navigation — do NOT retry
     # the same unresponsive tap.
     # ═══════════════════════════════════════════════════════════════
     if not found_file:
         ensure_on_picker("03b_pre_tap")
     if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (b) Looking for recovery.img in current view (RECENT FILES) — direct tap")
+        print("  (c) Looking for recovery.img in current view (RECENT FILES) — direct tap")
         for dump_attempt in range(3):
             if dump_attempt > 0:
                 print(f"  recovery.img not visible yet — waiting 2s and re-dumping (attempt {dump_attempt+1}/3)")
@@ -1047,17 +1131,17 @@ def main():
             # tap_outcome == "not_found" or "photos": retry the dump
             # (outer loop) to give the picker more time to load OR to
             # retry after escaping Photos.
-        # End of direct-tap attempts — fall through to (c).
+        # End of direct-tap attempts — fall through to (d).
 
     # ═══════════════════════════════════════════════════════════════
-    # (c) Drawer → Downloads → file. If not in Downloads, try Internal
+    # (d) Drawer → Downloads → file. If not in Downloads, try Internal
     # storage → Download folder → file. Can drift into Google Photos if
-    # the wrong root is tapped — escape and fall through to (d).
+    # the wrong root is tapped — escape and fall through to (e).
     # ═══════════════════════════════════════════════════════════════
     if not found_file:
         ensure_on_picker("03c_pre_drawer")
     if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (c) Opening nav drawer → Downloads → recovery.img")
+        print("  (d) Opening nav drawer → Downloads → recovery.img")
         # Look for the "Show Roots" / "Navigate up" button
         drawer_opened = False
         for desc in ["Show roots", "Navigate up", "Show list", "More options"]:
@@ -1130,7 +1214,7 @@ def main():
 
         # If still not found, try "Internal storage" → Download folder
         if not found_file and is_on_file_picker(get_current_activity()):
-            print("  (c-cont) recovery.img not in Downloads — trying internal storage")
+            print("  (d-cont) recovery.img not in Downloads — trying internal storage")
             for text in ["Internal storage", "Phone", "SD card", "Storage"]:
                 result = safe_row_tap_target(root, text, exact=False)
                 if result:
@@ -1175,20 +1259,20 @@ def main():
                     if dismiss_share_sheet(root):
                         xml, root, activity = fresh_picker_state("03c_internal_after_dismiss")
                     break
-        # End of drawer strategy — fall through to (d).
+        # End of drawer strategy — fall through to (e).
 
     # ═══════════════════════════════════════════════════════════════
-    # (d) Final fallback: coordinate-based tap from a fresh uiautomator
-    # dump. If DPAD and taps all failed (e.g., focus kept landing on the
-    # preview icon), the file is still visible in the picker — take a
-    # fresh dump and tap the row's left-30% coordinate directly, which
-    # is the most reliable way to trigger the RecyclerView's
-    # OnItemTouchListener.
+    # (e) Final fallback: coordinate-based tap from a fresh uiautomator
+    # dump. If SEARCH, DPAD, and taps all failed (e.g., focus kept
+    # landing on the preview icon), the file is still visible in the
+    # picker — take a fresh dump and tap the row's left-30% coordinate
+    # directly, which is the most reliable way to trigger the
+    # RecyclerView's OnItemTouchListener.
     # ═══════════════════════════════════════════════════════════════
     if not found_file:
         ensure_on_picker("03d_pre_final")
     if not found_file and is_on_file_picker(get_current_activity()):
-        print("  (d) Coordinate-based tap from fresh uiautomator dump")
+        print("  (e) Coordinate-based tap from fresh uiautomator dump")
         xml, root, activity = fresh_picker_state("03d_final_dump")
         for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
             result = safe_row_tap_target(root, text, exact=False)
@@ -1224,7 +1308,7 @@ def main():
     print(f"  Step 3 final activity: {activity}")
     if is_on_file_picker(activity):
         print("  ✗✗✗ FILE PICKER STILL OPEN — could not select recovery.img")
-        print("  All strategies tried: (a) DPAD, (b) direct tap, (c) drawer, (d) coordinate.")
+        print("  All strategies tried: (a) SEARCH, (b) DPAD, (c) direct tap, (d) drawer, (e) coordinate.")
         print("  Step 4 import verification will catch this and abort the test.")
         print("  Visible text on picker:")
         print_all_text(root, prefix="    ")
