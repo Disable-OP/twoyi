@@ -795,6 +795,33 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
     }
 }
 
+/// Format the rolling "all syscalls" buffer (a `VecDeque<i64>` of raw
+/// syscall numbers) as a comma-separated list of `nr=N [name]` entries
+/// (oldest first). Used by the exit handlers in `run_ptrace_loop` to
+/// print the last few syscalls the child made before dying.
+///
+/// `abi` is the (lazily-initialized) child ABI — if `None` (the child
+/// died before any syscall-stop populated the ABI) we fall back to bare
+/// `nr=N` formatting. `ChildAbi` is `Copy`, so the caller may pass
+/// `abi` (an `Option<ChildAbi>`) by value without consuming the
+/// caller's variable.
+fn format_syscall_buffer(list: &std::collections::VecDeque<i64>, abi: Option<ChildAbi>) -> String {
+    list.iter()
+        .map(|&nr| match abi {
+            Some(a) => {
+                let name = syscall_name(nr, &a);
+                if name == "unknown" {
+                    format!("nr={}", nr)
+                } else {
+                    format!("nr={} [{}]", nr, name)
+                }
+            }
+            None => format!("nr={}", nr),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // ── Path translation ───────────────────────────────────────────────
 
 /// Translate a guest path to a host path by prepending the rootfs.
@@ -1113,6 +1140,24 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     // looking for).
     let mut recent_sigsys: std::collections::VecDeque<String> =
         std::collections::VecDeque::with_capacity(RECENT_SIGSYS_CAP);
+    // Rolling log of the last N syscall numbers — captures BOTH
+    // seccomp-intercepted syscalls (recorded in the SIGSYS handler
+    // below, because seccomp-blocked syscalls do NOT produce a
+    // syscall-entry stop) AND unintercepted syscalls (recorded at the
+    // syscall ENTRY stop). Used on child exit to print "the last few
+    // syscalls the child made before dying", which complements
+    // `recent_sigsys` (which only captures intercepted ones).
+    //
+    // When init dies with exit code 1 after a flurry of access()
+    // probes, the last few UNintercepted syscalls are usually the
+    // ones that returned the error init is reacting to (an openat()
+    // that returned -ENOENT, an fstat() that returned -EBADF, …), so
+    // logging them is the single most useful next diagnostic. The
+    // cap (10) is small to keep the exit log line readable — we only
+    // need the last few to spot the failing syscall.
+    const RECENT_ALL_SYSCALLS_CAP: usize = 10;
+    let mut recent_all_syscalls: std::collections::VecDeque<i64> =
+        std::collections::VecDeque::with_capacity(RECENT_ALL_SYSCALLS_CAP);
     // Signal to deliver to the child on the next PTRACE_SYSCALL resume.
     // 0 means "don't deliver any signal". Non-zero values are set by
     // the signal-forwarding branch below so that the SINGLE
@@ -1150,6 +1195,22 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         collected.len(),
                         collected
                     ));
+                }
+                // Print the rolling ALL-syscalls history before reaping.
+                // This complements `recent_sigsys` by also showing the
+                // UNintercepted syscalls that ran in between the
+                // SIGSYS interceptions — typically the openat()/stat()
+                // call whose -ENOENT return value is what made init
+                // decide to exit(1). Without this log we only ever
+                // see the SIGSYS side of the picture.
+                if !recent_all_syscalls.is_empty() {
+                    log(&format!(
+                        "last {} ALL syscalls before ESRCH (intercepted + unintercepted, oldest->newest): {}",
+                        recent_all_syscalls.len(),
+                        format_syscall_buffer(&recent_all_syscalls, abi)
+                    ));
+                } else {
+                    log("no syscalls recorded in all-syscalls buffer before ESRCH");
                 }
                 // Try to reap the child to get its exit status.
                 let mut status: libc::c_int = 0;
@@ -1204,6 +1265,21 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     collected
                 ));
             }
+            // Print the rolling ALL-syscalls history so we can see the
+            // last few UNintercepted syscalls init made before exiting.
+            // This is the single most useful diagnostic for narrowing
+            // down WHY init gave up: the last unintercepted syscall
+            // before exit(1) is typically the one whose error return
+            // (e.g. openat() → -ENOENT) triggered the exit.
+            if !recent_all_syscalls.is_empty() {
+                log(&format!(
+                    "last {} ALL syscalls before exit (intercepted + unintercepted, oldest->newest): {}",
+                    recent_all_syscalls.len(),
+                    format_syscall_buffer(&recent_all_syscalls, abi)
+                ));
+            } else {
+                log("no syscalls recorded in all-syscalls buffer before exit");
+            }
             return code;
         }
         if libc::WIFSIGNALED(status) {
@@ -1219,6 +1295,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     collected.len(),
                     collected
                 ));
+            }
+            // Print the rolling ALL-syscalls history on signal death
+            // too — same rationale as the WIFEXITED branch.
+            if !recent_all_syscalls.is_empty() {
+                log(&format!(
+                    "last {} ALL syscalls before kill (intercepted + unintercepted, oldest->newest): {}",
+                    recent_all_syscalls.len(),
+                    format_syscall_buffer(&recent_all_syscalls, abi)
+                ));
+            } else {
+                log("no syscalls recorded in all-syscalls buffer before kill");
             }
             return -sig;
         }
@@ -1300,6 +1387,21 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 if !in_syscall {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
+
+                    // Record the syscall number in the rolling "all
+                    // syscalls" buffer. This captures UNintercepted
+                    // syscalls — seccomp-blocked syscalls are recorded
+                    // separately in the SIGSYS handler below (they do
+                    // NOT produce a syscall-entry stop, only a SIGSYS
+                    // stop followed by the syscall-exit stop of the
+                    // rewritten getpid), so without the SIGSYS-side
+                    // recording they'd be missing from this buffer.
+                    // We push at ENTRY (not EXIT) so the buffer reflects
+                    // what init ASKED for, in the order init asked.
+                    if recent_all_syscalls.len() == RECENT_ALL_SYSCALLS_CAP {
+                        recent_all_syscalls.pop_front();
+                    }
+                    recent_all_syscalls.push_back(syscall_num);
 
                     // Log every syscall number on entry for the first 50
                     // iterations so we can see exactly what TWRP's init
@@ -1626,25 +1728,49 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         let original_syscall = get_syscall_num(&sigsys_regs, &a);
                         let name = syscall_name(original_syscall, &a);
 
-                        // For access(): read the PATH argument from the
-                        // child's memory so we can log what init is
-                        // probing. access() takes (const char *pathname,
-                        // int mode), so the path pointer is in
-                        // reg_arg1. On aarch64 `abi.access` is -1
+                        // Record the intercepted syscall in the rolling
+                        // "all syscalls" buffer too — seccomp-blocked
+                        // syscalls do NOT produce a syscall-entry stop
+                        // (the SIGSYS stop replaces it), so without
+                        // recording here the buffer would miss every
+                        // intercepted syscall. We record the ORIGINAL
+                        // syscall number (what init asked for), not the
+                        // rewritten getpid number, so the buffer reflects
+                        // what init was actually trying to do.
+                        if recent_all_syscalls.len() == RECENT_ALL_SYSCALLS_CAP {
+                            recent_all_syscalls.pop_front();
+                        }
+                        recent_all_syscalls.push_back(original_syscall);
+
+                        // For access(): read BOTH the path argument
+                        // (REG_ARG1) AND the mode argument (REG_ARG2).
+                        // On x86_64 access(pathname, mode) puts the path
+                        // pointer in rdi (REG_ARG1=14) and the mode int
+                        // in rsi (REG_ARG2=13). At a SIGSYS stop,
+                        // however, the argument registers may have been
+                        // clobbered by the seccomp trap dance — we have
+                        // observed the path showing up as the literal
+                        // string "mode=0755" instead of the actual path.
+                        // To diagnose which register holds what, we read
+                        // both as a pointer-to-string AND log both raw
+                        // register values. On aarch64 `a.access` is -1
                         // (aarch64 uses faccessat instead), so this
                         // branch is dead on that architecture — the
                         // comparison still compiles and is harmless.
-                        // The same applies on x86_64: `abi.access` is
-                        // 21 (64-bit) or 33 (32-bit), matched against
-                        // the original syscall number from the child's
-                        // own ABI so the comparison is correct for both
-                        // bitnesses.
-                        let access_path: Option<String> = if original_syscall == a.access {
-                            let path_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
-                            read_child_string(pid, path_addr)
-                        } else {
-                            None
-                        };
+                        let (access_path, access_path_from_arg2): (Option<String>, Option<String>) =
+                            if original_syscall == a.access {
+                                let path_addr_arg1 = get_syscall_arg(&sigsys_regs, a.reg_arg1);
+                                let path_addr_arg2 = get_syscall_arg(&sigsys_regs, a.reg_arg2);
+                                let s1 = read_child_string(pid, path_addr_arg1);
+                                let s2 = read_child_string(pid, path_addr_arg2);
+                                log(&format!(
+                                    "access() SIGSYS raw args: reg_arg1={:#x} reg_arg2={:#x} str(arg1)={:?} str(arg2)={:?}",
+                                    path_addr_arg1, path_addr_arg2, s1, s2
+                                ));
+                                (s1, s2)
+                            } else {
+                                (None, None)
+                            };
 
                         // Push a human-readable description into the rolling
                         // history so the exit handler can print "last N
@@ -1654,11 +1780,28 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         // of access() calls (it tells us which file init
                         // was looking for and couldn't find).
                         let history_entry: String = if original_syscall == a.access {
-                            match &access_path {
-                                Some(p) => {
-                                    format!("access({:?}) nr={}", p, original_syscall)
+                            // Include BOTH the REG_ARG1 string and the
+                            // REG_ARG2 string in the history entry so we
+                            // can tell (from the rolling SIGSYS log on
+                            // exit) which register held the path and
+                            // which held the mode. Until we know for
+                            // sure which register to trust at the SIGSYS
+                            // stop, recording both is the only way to
+                            // recover the path init was probing.
+                            match (&access_path, &access_path_from_arg2) {
+                                (Some(p1), Some(p2)) => {
+                                    format!(
+                                        "access(arg1={:?}, arg2={:?}) nr={}",
+                                        p1, p2, original_syscall
+                                    )
                                 }
-                                None => {
+                                (Some(p), None) => {
+                                    format!("access(arg1={:?}) nr={}", p, original_syscall)
+                                }
+                                (None, Some(p)) => {
+                                    format!("access(arg2={:?}) nr={}", p, original_syscall)
+                                }
+                                (None, None) => {
                                     format!("access(?) nr={} [{}]", original_syscall, name)
                                 }
                             }
@@ -1724,9 +1867,16 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         // comparison still compiles and is harmless.
                         let ret_val: i64 = if original_syscall == a.access {
                             let path_display = access_path.as_deref().unwrap_or("?");
+                            let path_arg2_display = access_path_from_arg2.as_deref().unwrap_or("?");
+                            // Log BOTH the REG_ARG1 path and the REG_ARG2
+                            // string so we can see, for every intercepted
+                            // access() call, which register held the
+                            // actual path pointer and which held the
+                            // mode int (or "mode=0755" if REG_ARG1 was
+                            // clobbered by the SIGSYS trap dance).
                             log(&format!(
-                                "intercepted SIGSYS — access({}) nr={} → returning 0 (success)",
-                                path_display, original_syscall
+                                "intercepted SIGSYS — access(arg1={}, arg2={}) nr={} → returning 0 (success)",
+                                path_display, path_arg2_display, original_syscall
                             ));
                             0
                         } else if original_syscall == a.rt_sigprocmask {
