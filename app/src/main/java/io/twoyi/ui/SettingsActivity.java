@@ -57,15 +57,26 @@ import io.twoyi.utils.UIHelper;
 public class SettingsActivity extends AppCompatActivity {
 
     private static final int REQUEST_SELECT_ROM = 1001;
+    private static final String TAG = "SettingsActivity";
+
+    /** Reference to the hosted SettingsFragment so the activity can forward
+     *  ACTION_VIEW intents (file manager / `am start`) to the same import
+     *  path the SAF picker uses via onActivityResult. */
+    private SettingsFragment mSettingsFragment;
+
+    /** Guards against re-processing the same ACTION_VIEW intent twice
+     *  (e.g. on configuration change, which restarts the activity with the
+     *  same launching Intent). */
+    private boolean mHandledViewIntent = false;
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
         setContentView(R.layout.activity_settings);
-        SettingsFragment settingsFragment = new SettingsFragment();
+        mSettingsFragment = new SettingsFragment();
         getFragmentManager().beginTransaction()
-                .replace(R.id.settingsFrameLayout, settingsFragment)
+                .replace(R.id.settingsFrameLayout, mSettingsFragment)
                 .commit();
 
         ActionBar actionBar = getSupportActionBar();
@@ -77,6 +88,70 @@ public class SettingsActivity extends AppCompatActivity {
             actionBar.setBackgroundDrawable(new ColorDrawable(ContextCompat.getColor(this, R.color.colorPrimary)));
             actionBar.setTitle(R.string.title_settings);
         }
+
+        // Cold-start path: a file manager (or `am start`) launched us with
+        // ACTION_VIEW + a file/content URI. Defer handling until the
+        // SettingsFragment is attached (the fragment transaction is async).
+        handleViewIntent(getIntent());
+    }
+
+    /**
+     * Warm-start path: SettingsActivity has launchMode="singleTask", so a
+     * new ACTION_VIEW intent (e.g. user taps another ROM file while twoyi
+     * is in the foreground) is delivered here without recreating the
+     * activity. Forward it to the same handler.
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        // Allow a fresh ACTION_VIEW to be processed even if a previous one
+        // was already handled (the user picked a different file).
+        mHandledViewIntent = false;
+        handleViewIntent(intent);
+    }
+
+    /**
+     * If the launching (or new) intent is ACTION_VIEW with a file/content
+     * URI, treat it as a ROM selection request — identical to what the SAF
+     * picker does via onActivityResult. The URI is forwarded to the hosted
+     * SettingsFragment.importRomForActiveProfile(Uri).
+     *
+     * This is what makes `am start -a android.intent.action.VIEW -d
+     * "file:///sdcard/Download/recovery.img" -t "*/*"` work for the E2E
+     * UI test, and what lets a user tap a .img file in their file manager
+     * to import it directly into twoyi (no picker UI required).
+     */
+    private void handleViewIntent(Intent intent) {
+        if (intent == null) return;
+        if (!Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        if (mHandledViewIntent) return;
+        Uri uri = intent.getData();
+        if (uri == null) return;
+        mHandledViewIntent = true;
+        Log.i(TAG, "Received ACTION_VIEW for ROM file: " + uri);
+
+        // The fragment transaction in onCreate is committed but not yet
+        // attached when onCreate is still on the call stack. Post to the
+        // main looper so the import runs AFTER the fragment is attached
+        // (otherwise getActivity()/findPreference() inside the fragment
+        // would NPE).
+        final Uri finalUri = uri;
+        new Handler(Looper.getMainLooper()).post(() -> {
+            if (mSettingsFragment != null && mSettingsFragment.isAdded()) {
+                mSettingsFragment.importRomForActiveProfile(finalUri);
+            } else {
+                // Retry once after a short delay in case the fragment still
+                // isn't ready (rare race during cold start).
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    if (mSettingsFragment != null && mSettingsFragment.isAdded()) {
+                        mSettingsFragment.importRomForActiveProfile(finalUri);
+                    } else {
+                        Log.w(TAG, "SettingsFragment not attached — cannot import ROM from " + finalUri);
+                    }
+                }, 500);
+            }
+        });
     }
 
     @Override
@@ -425,7 +500,7 @@ public class SettingsActivity extends AppCompatActivity {
             }
         }
 
-        private void importRomForActiveProfile(Uri uri) {
+        public void importRomForActiveProfile(Uri uri) {
             Activity activity = getActivity();
             if (activity == null) return;
 
@@ -466,6 +541,20 @@ public class SettingsActivity extends AppCompatActivity {
                 UIHelper.dismiss(dialog);
                 if ("SUCCESS".equals(result)) {
                     Toast.makeText(activity, getString(R.string.rom_imported_successfully), Toast.LENGTH_SHORT).show();
+                    // Update the 'Select ROM' preference summary to reflect
+                    // the just-imported file. This is purely cosmetic for
+                    // end-users (they see the file name in the preference
+                    // row), but it is ALSO what the E2E UI test
+                    // (scripts/ui-navigate.py::verify_rom_imported) inspects
+                    // to confirm a ROM was actually imported — without this,
+                    // the summary would still show the default "Import
+                    // rootfs (.tar), ..." prompt and the test would abort.
+                    Preference selectRomPref = findPreference(R.string.settings_key_select_rom);
+                    if (selectRomPref != null && uri != null) {
+                        String name = uri.getLastPathSegment();
+                        if (name == null || name.isEmpty()) name = uri.toString();
+                        selectRomPref.setSummary(name);
+                    }
                 } else {
                     String msg = result != null && result.startsWith("FAIL:") ? result.substring(5) : "unknown error";
                     Toast.makeText(activity, getString(R.string.rom_import_failed) + ": " + msg, Toast.LENGTH_LONG).show();

@@ -28,10 +28,41 @@
         <activity android:name=".ui.SettingsActivity"
             android:label="@string/title_settings"
             android:exported="true"
+            android:launchMode="singleTask"
             android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!--
+              Allow a file manager (or `adb shell am start`) to open a ROM
+              file directly with twoyi. This is equivalent to what the SAF
+              picker does internally (return a content/file URI to the
+              caller), but skips the unreliable picker UI entirely — useful
+              for E2E UI tests and a nicer UX for users who tap a .img file
+              in their file manager.
+
+              SettingsActivity.onCreate / onNewIntent inspects the intent;
+              if action == ACTION_VIEW and data is a file/content URI, it
+              calls importRomForActiveProfile(uri) directly (the same path
+              the picker's onActivityResult takes).
+
+              pathPattern restricts to the ROM formats RamdiskImporter
+              understands (.img / .tar / .cpio / .zip), so twoyi is NOT
+              offered for unrelated files. MIME is */* because the SAF
+              picker uses */* and Android sometimes infers a wrong MIME
+              type for .img files (e.g. image/*).
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="file" />
+                <data android:scheme="content" />
+                <data android:mimeType="*/*" />
+                <data android:pathPattern=".*\\.img" />
+                <data android:pathPattern=".*\\.tar" />
+                <data android:pathPattern=".*\\.cpio" />
+                <data android:pathPattern=".*\\.zip" />
             </intent-filter>
         </activity>
 
