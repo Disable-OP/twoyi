@@ -3170,42 +3170,127 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         //      `adb pull` it and finally see TWRP init's KLOG messages.
         //
         // We ALSO keep the /dev/kmsg symlink (harmless; some TWRP init
-        // variants may try /dev/kmsg as a fallback).
+        // variants may try /dev/kmsg as a fallback). The /dev/kmsg symlink
+        // is only created in root mode (use_namespaces=true) where we have
+        // pivot_root'd into the rootfs and /dev is the writable tmpfs we
+        // own. In non-root mode the host's /dev is owned by root, so the
+        // symlink attempt fails with EACCES — that's expected and only
+        // affects the fallback path; the PRIMARY kmsg path (/dev/__kmsg__)
+        // is handled separately below.
         use std::os::unix::fs::symlink;
         let kmsg_target = "/twrp-kmsg.log";
-        // /dev/kmsg symlink (kept for compatibility / fallback).
-        let kmsg_link = "/dev/kmsg";
-        let _ = std::fs::remove_file(kmsg_link);
-        match symlink(kmsg_target, kmsg_link) {
-            Ok(()) => {
-                info!(
-                    "[KR64] PARENT: /dev/kmsg -> {} symlink created (TWRP init KLOG will be captured to /twrp-kmsg.log)",
-                    kmsg_target
-                );
+        // /dev/kmsg symlink (kept for compatibility / fallback). Root mode
+        // only — in non-root mode the host /dev is read-only.
+        if cfg.use_namespaces {
+            let kmsg_link = "/dev/kmsg";
+            let _ = std::fs::remove_file(kmsg_link);
+            match symlink(kmsg_target, kmsg_link) {
+                Ok(()) => {
+                    info!(
+                        "[KR64] PARENT: /dev/kmsg -> {} symlink created (TWRP init KLOG will be captured to /twrp-kmsg.log)",
+                        kmsg_target
+                    );
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PARENT: failed to create /dev/kmsg symlink: {} (TWRP init KLOG messages will be lost)",
+                        e
+                    );
+                }
             }
-            Err(e) => {
-                warning!(
-                    "[KR64] PARENT: failed to create /dev/kmsg symlink: {} (TWRP init KLOG messages will be lost)",
-                    e
-                );
-            }
+        } else {
+            info!(
+                "[KR64] PARENT: non-root mode — skipping /dev/kmsg symlink (host /dev is read-only; /dev/__kmsg__ regular file is created below as the PRIMARY kmsg path)"
+            );
         }
-        // /dev/__kmsg__ symlink — THIS is the path TWRP init's log_init()
-        // actually opens (confirmed via twrp-init-fds.log in KVM run 31552072308).
-        let kmsg_link_double = "/dev/__kmsg__";
-        let _ = std::fs::remove_file(kmsg_link_double);
-        match symlink(kmsg_target, kmsg_link_double) {
-            Ok(()) => {
-                info!(
-                    "[KR64] PARENT: /dev/__kmsg__ -> {} symlink created (TWRP init log_init() will write KLOG to /twrp-kmsg.log)",
-                    kmsg_target
-                );
+        // /dev/__kmsg__ — THIS is the path TWRP init's log_init() actually
+        // opens (confirmed via twrp-init-fds.log in KVM run 31552072308).
+        //
+        // The path is constructed with `format!("{}/dev/__kmsg__", rootfs_prefix)`
+        // which gives "/dev/__kmsg__" in root mode (rootfs_prefix == "",
+        // chroot-relative after pivot_root) and "{cfg.rootfs}/dev/__kmsg__"
+        // in non-root mode (host path under the app's private data dir,
+        // which is writable).
+        //
+        // ROOT MODE (use_namespaces=true): create as a SYMLINK to
+        // /twrp-kmsg.log (chroot-relative). Then:
+        //   1. TWRP init's mknod("/dev/__kmsg__", S_IFCHR, ...) follows the
+        //      symlink and tries to mknod /twrp-kmsg.log. /twrp-kmsg.log
+        //      exists as a regular file -> mknod returns EEXIST. Init's
+        //      log_init treats EEXIST as success and continues.
+        //   2. TWRP init's open("/dev/__kmsg__", O_WRONLY) follows the
+        //      symlink and opens /twrp-kmsg.log (the regular file). SUCCESS.
+        //   3. TWRP init's unlink("/dev/__kmsg__") removes the symlink
+        //      (NOT the target /twrp-kmsg.log). The target file remains.
+        //   4. TWRP init's write(log_fd, ...) writes to /twrp-kmsg.log via
+        //      the still-open fd. The file accumulates KLOG output.
+        //   5. After kr64 SIGKILLs init, the open fd is closed, but
+        //      /twrp-kmsg.log is on ext4 (not tmpfs) and survives — we can
+        //      `adb pull` it and finally see TWRP init's KLOG messages.
+        //
+        // NON-ROOT MODE (use_namespaces=false): kr64 is running as an
+        // untrusted_app and the host's /dev is owned by root — creating a
+        // symlink at literal /dev/__kmsg__ fails with EACCES. The loader's
+        // syscall emulation translates guest open("/dev/__kmsg__") to host
+        // open("{rootfs_prefix}/dev/__kmsg__"), so we create the file UNDER
+        // the rootfs prefix instead. We can't use a symlink here (the
+        // absolute target /twrp-kmsg.log would resolve on the HOST
+        // filesystem, not the guest rootfs), so we create /dev/__kmsg__ as
+        // a REGULAR FILE (empty, mode 0666). TWRP init's mknod is
+        // translated by the loader -> mknod returns EEXIST (treated as
+        // success). The open() opens the regular file -> SUCCESS. KLOG
+        // writes go to the file via the open fd. (TWRP init's later
+        // unlink() removes the file from disk, but the open fd keeps the
+        // inode alive until kr64 SIGKILLs init — `adb pull` may or may not
+        // find the file depending on timing; that's why ui-navigate.py
+        // pulls it with `|| true`.)
+        let kmsg_link_double = format!("{}/dev/__kmsg__", rootfs_prefix);
+        let _ = std::fs::remove_file(&kmsg_link_double);
+        if cfg.use_namespaces {
+            // ROOT MODE: symlink to /twrp-kmsg.log (chroot-relative).
+            match symlink(kmsg_target, &kmsg_link_double) {
+                Ok(()) => {
+                    info!(
+                        "[KR64] PARENT: /dev/__kmsg__ -> {} symlink created (TWRP init log_init() will write KLOG to /twrp-kmsg.log)",
+                        kmsg_target
+                    );
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PARENT: failed to create /dev/__kmsg__ symlink: {} (TWRP init KLOG messages will be lost — this is the PRIMARY kmsg path)",
+                        e
+                    );
+                }
             }
-            Err(e) => {
-                warning!(
-                    "[KR64] PARENT: failed to create /dev/__kmsg__ symlink: {} (TWRP init KLOG messages will be lost — this is the PRIMARY kmsg path)",
-                    e
-                );
+        } else {
+            // NON-ROOT MODE: create as a regular file (empty, mode 0666).
+            // Symlinks can't be used because (a) the host /dev is read-only
+            // for the untrusted_app, and (b) a symlink target /twrp-kmsg.log
+            // would resolve on the HOST filesystem, not the guest rootfs.
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&kmsg_link_double)
+            {
+                Ok(_) => {
+                    let _ = std::fs::set_permissions(
+                        &kmsg_link_double,
+                        std::fs::Permissions::from_mode(0o666),
+                    );
+                    info!(
+                        "[KR64] PARENT: /dev/__kmsg__ regular file created at {} (mode 0666, non-root mode — TWRP init log_init() will write KLOG here)",
+                        kmsg_link_double
+                    );
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PARENT: failed to create /dev/__kmsg__ regular file at {}: {} (TWRP init KLOG messages will be lost — this is the PRIMARY kmsg path)",
+                        kmsg_link_double,
+                        e
+                    );
+                }
             }
         }
     }
