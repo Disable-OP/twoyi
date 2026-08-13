@@ -899,18 +899,25 @@ def main():
     #   b. Wait 1s for the search input to appear.
     #   c. Type "recovery" via `adb shell input text "recovery"`.
     #   d. Wait 2s for the filter to apply.
-    #   e. Take a fresh uiautomator dump and CONFIRM recovery.img is
-    #      present in the filtered list (via safe_row_tap_target).
-    #      Do NOT actually tap it — all 6 tap methods (input tap,
-    #      touchscreen swipe, motionevent, trackball) FAIL on this
-    #      picker's filtered list. Instead, go DIRECTLY to DPAD:
-    #   f. Press KEYCODE_DPAD_DOWN once + KEYCODE_ENTER, then wait 3s.
+    #   e. Press KEYCODE_BACK to close the IME / exit the search input
+    #      field. After typing, DPAD focus is on the SEARCH INPUT, not
+    #      on the filtered results list — pressing DPAD_DOWN from the
+    #      search input closes the picker without selecting recovery.img.
+    #   f. Wait 1s for the keyboard to dismiss.
+    #   g. Take a fresh uiautomator dump and CONFIRM we're still on the
+    #      picker (BACK can close it outright in edge cases) AND that
+    #      recovery.img is present in the filtered list (via
+    #      safe_row_tap_target). Do NOT actually tap it — all 6 tap
+    #      methods (input tap, touchscreen swipe, motionevent,
+    #      trackball) FAIL on this picker's filtered list. Instead, go
+    #      DIRECTLY to DPAD:
+    #   h. Press KEYCODE_DPAD_DOWN once + KEYCODE_ENTER, then wait 3s.
     #      Since the filtered list has only ONE item (recovery.img),
     #      1x DPAD_DOWN should focus it, and ENTER should select it.
-    #   g. If the picker is still open (not closed), escalate: try
+    #   i. If the picker is still open (not closed), escalate: try
     #      2x DPAD_DOWN + ENTER, then 3x. (Rare edge cases where focus
     #      starts above the search bar.)
-    #   h. If the picker closed, verify a ROM was actually imported.
+    #   j. If the picker closed, verify a ROM was actually imported.
     #      If verify fails, the picker has been re-opened by
     #      verify_import_or_reopen; fall through to (b) DPAD on the
     #      unfiltered list.
@@ -938,12 +945,25 @@ def main():
             print("  Typing 'recovery' into the search input")
             adb_shell('input text "recovery"')
             wait(2)  # wait 2s for the filter to apply
-            # (c) Take a fresh uiautomator dump and CONFIRM recovery.img
-            # is present in the filtered list. Do NOT tap it — all 6 tap
-            # methods (input tap, touchscreen swipe, motionevent,
-            # trackball) FAIL on this picker's filtered list. Instead,
-            # go directly to DPAD: N x KEYCODE_DPAD_DOWN + ENTER.
+            # (c) After typing, DPAD focus is on the SEARCH INPUT FIELD,
+            # not on the filtered results list — pressing DPAD_DOWN from
+            # the search input closes the picker without selecting
+            # recovery.img. Press KEYCODE_BACK to close the IME / exit
+            # the search input field so subsequent DPAD events land on
+            # the filtered results list.
+            print("  Pressing KEYCODE_BACK to close keyboard / exit search input")
+            adb_shell("input keyevent KEYCODE_BACK")
+            wait(1)
+            # (d) Take a fresh uiautomator dump and CONFIRM we're still
+            # on the picker (BACK can close it outright in some edge
+            # cases), AND that recovery.img is present in the filtered
+            # list. Do NOT tap it — all 6 tap methods (input tap,
+            # touchscreen swipe, motionevent, trackball) FAIL on this
+            # picker's filtered list. Instead, go directly to DPAD:
+            # N x KEYCODE_DPAD_DOWN + ENTER.
             xml, root, activity = fresh_picker_state("03a_search_filtered")
+            if not is_on_file_picker(activity):
+                print("  ⚠ BACK closed the picker (not just the keyboard) — falling through to (b) DPAD")
             print("  Visible text after search filter:")
             print_all_text(root, prefix="    ")
             recovery_in_filter = None
