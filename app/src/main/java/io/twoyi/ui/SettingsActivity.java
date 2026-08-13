@@ -117,10 +117,10 @@ public class SettingsActivity extends AppCompatActivity {
      * picker does via onActivityResult. The URI is forwarded to the hosted
      * SettingsFragment.importRomForActiveProfile(Uri).
      *
-     * This is what makes `am start -a android.intent.action.VIEW -d
-     * "file:///sdcard/Download/recovery.img" -t "*/*"` work for the E2E
-     * UI test, and what lets a user tap a .img file in their file manager
-     * to import it directly into twoyi (no picker UI required).
+     * This is what makes {@code am start -a android.intent.action.VIEW -d
+     * "file:///sdcard/Download/recovery.img" -t "application/octet-stream"}
+     * work for the E2E UI test, and what lets a user tap a .img file in
+     * their file manager to import it directly into twoyi.
      */
     private void handleViewIntent(Intent intent) {
         if (intent == null) return;
