@@ -251,6 +251,13 @@ def tap_picker_row_with_fallbacks(x, y):
          Available on Android 7+. This bypasses the `input` tool's
          tap/swipe abstractions and injects MotionEvent objects
          directly, which should trigger ANY OnItemTouchListener.
+      6. `input trackball roll X Y` + `input trackball press` — moves
+         the trackball cursor to the file position (rolling by the
+         X/Y deltas) and then "clicks" it with a trackball press.
+         Trackball events have a different input source
+         (SOURCE_TRACKBALL) than touch events; some RecyclerView
+         OnItemTouchListeners that drop touch events may still
+         respond to a trackball press.
     """
     # Guard: only run if we're on the file picker. If we've drifted
     # off (e.g., to Google Photos), tapping would do the wrong thing.
@@ -311,7 +318,18 @@ def tap_picker_row_with_fallbacks(x, y):
                    f"input motionevent UP {x+1} {y}"],
                   is_sequence=True):
         return True
-    print(f"    tap_picker_row: ✗ all 5 tap methods failed to close the picker")
+    # Method 6: input trackball roll + press — move the trackball cursor
+    # to the file position (rolling by the X/Y deltas from the origin)
+    # and then "click" it with a trackball press. Trackball events use a
+    # different input source (SOURCE_TRACKBALL) than touch events; some
+    # RecyclerView OnItemTouchListeners that drop touch events may still
+    # respond to a trackball press.
+    if try_method("trackball roll + press",
+                  [f"input trackball roll {x} {y}",
+                   "input trackball press"],
+                  is_sequence=True):
+        return True
+    print(f"    tap_picker_row: ✗ all 6 tap methods failed to close the picker")
     return False
 
 
