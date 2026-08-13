@@ -621,8 +621,21 @@ def main():
     # SIGSYS interceptions, syscall entries, and child exit code —
     # it is the single most useful artifact for diagnosing init boot
     # failures (e.g. "init exits with code 1 after 183 iterations").
+    # Both pulls are conditional: capture_output=True silently swallows
+    # the "does not exist" adb error if kr64 did not produce the file
+    # (e.g. if init never got far enough to write the log).
     subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/twrp-init.log",
                          os.path.join(ART, "twrp-init.log")],
+                  capture_output=True, timeout=10)
+
+    # Pull the TWRP kernel-message log from the app's rootfs directory.
+    # This log captures kernel-side messages written by kr64 (e.g. via
+    # the klog_init patch in the TWRP ramdisk) and complements
+    # twrp-init.log when diagnosing boot failures — together they give
+    # both the ptrace-emulator side and the kernel-side view of what
+    # init was doing right before it died.
+    subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/twrp-kmsg.log",
+                         os.path.join(ART, "twrp-kmsg.log")],
                   capture_output=True, timeout=10)
 
     print()
