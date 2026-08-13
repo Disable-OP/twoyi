@@ -240,6 +240,160 @@ def print_all_text(root, prefix="    "):
         if d:
             print(f"{prefix}desc={d!r}")
 
+def is_on_file_picker(activity_str):
+    """Return True if the given activity string indicates we're still on
+    the SAF file picker (DocumentsUI) or any other picker activity."""
+    if not activity_str:
+        return False
+    a = activity_str.lower()
+    return "documentsui" in a or "picker" in a
+
+def dismiss_share_sheet(root):
+    """Detect Android's share sheet / 'Complete action using' dialog / 'Open with'
+    dialog and dismiss it with BACK. Returns True if a dialog was detected
+    and dismissed, False otherwise.
+
+    This is critical: the SAF file picker's per-row 'Preview' icon is
+    focusable, and a DPAD_ENTER on it opens a share/preview sheet instead
+    of selecting the file. If we don't dismiss the sheet before retrying,
+    subsequent DPAD keyevents go to the sheet (not the picker) and the
+    test spirals into unrelated UI.
+
+    IMPORTANT: the markers are intentionally SPECIFIC. We do NOT match
+    on generic words like 'share' or 'preview' alone — those would
+    false-match the picker's own 'Preview the file X' content-desc
+    (a normal picker UI element, not a share sheet) and cause us to
+    press BACK on the picker itself, closing it. We only match phrases
+    that appear EXCLUSIVELY on a share/open-with sheet."""
+    if root is None:
+        return False
+    markers = [
+        "complete action using",
+        "open with",
+        "share via",
+        "share to",
+        "send to",
+        "just once",
+        "share & send",
+    ]
+    for node in root.iter("node"):
+        txt = (node.get("text", "") or "").lower()
+        desc = (node.get("content-desc", "") or "").lower()
+        for marker in markers:
+            if marker in txt or marker in desc:
+                print(f"  Detected share/open-with sheet (marker='{marker}') — pressing BACK")
+                adb_shell("input keyevent KEYCODE_BACK")
+                wait(1)
+                return True
+    return False
+
+def safe_row_tap_target(root, text, exact=False):
+    """Like find_tap_target_for_text(), but returns a tap coordinate that
+    is intentionally offset to the LEFT 30% of the row — well away from
+    the per-row 'Preview' icon that sits at the right edge of every SAF
+    picker row. Tapping the preview icon opens a share/preview sheet
+    instead of selecting the file; tapping the left/center of the row
+    triggers the RecyclerView's OnItemTouchListener which selects the file.
+
+    Returns (cx, cy, node) or None.
+    """
+    if root is None:
+        return None
+    parent_map = {c: p for p in root.iter() for c in p}
+    search = text.lower()
+    for node in root.iter("node"):
+        txt = (node.get("text", "") or "").lower()
+        desc = (node.get("content-desc", "") or "").lower()
+        match = (txt == search) if exact else (search in txt)
+        if not match:
+            match = (desc == search) if exact else (search in desc)
+        if match:
+            # Walk up parent chain to find the widest ancestor (the row container)
+            widest_node = node
+            widest_width = 0
+            cur = node
+            depth = 0
+            while cur in parent_map and depth < 15:
+                parent = parent_map[cur]
+                pbounds = parent.get("bounds", "")
+                m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", pbounds)
+                if m:
+                    x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+                    w = x2 - x1
+                    if w > widest_width:
+                        widest_width = w
+                        widest_node = parent
+                cur = parent
+                depth += 1
+            bounds = widest_node.get("bounds", "")
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+            if not m:
+                # Fallback to node's own bounds
+                bounds = node.get("bounds", "")
+                m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+                if not m:
+                    continue
+            x1, y1, x2, y2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            # Use LEFT 30% of the row for the x-coordinate, vertical center.
+            # This avoids the preview_icon at the right edge (~last 25%).
+            safe_x = x1 + int((x2 - x1) * 0.30)
+            safe_y = (y1 + y2) // 2
+            # Clamp to screen
+            safe_x = max(20, min(safe_x, SCREEN_W - 20))
+            safe_y = max(20, min(safe_y, SCREEN_H - 20))
+            return (safe_x, safe_y, widest_node)
+    return None
+
+def verify_rom_imported(root):
+    """Check whether a ROM appears to have been imported by inspecting the
+    SettingsActivity UI hierarchy. Returns True if a ROM appears imported,
+    False otherwise.
+
+    Two signals indicate NO ROM was imported:
+      1. The 'Select ROM' preference's summary still contains the import
+         prompt text ('Import rootfs', 'Import a', etc.) — once a ROM is
+         imported, the summary changes to show the file name.
+      2. Any node contains 'No ROM Installed' or similar text.
+    """
+    if root is None:
+        # Conservative: assume imported (let the test continue) — but this
+        # should not normally happen because we always dump_ui first.
+        return True
+    # Check for explicit "No ROM" markers
+    for node in root.iter("node"):
+        txt = (node.get("text", "") or "").lower()
+        desc = (node.get("content-desc", "") or "").lower()
+        for marker in ["no rom installed", "no rom", "no roms"]:
+            if marker in txt or marker in desc:
+                print(f"  ✗ ROM import verification failed: found '{marker}' (text={txt!r}, desc={desc!r})")
+                return False
+    # Check the 'Select ROM' preference summary — if it still says
+    # 'Import rootfs ...', no ROM was imported.
+    parent_map = {c: p for p in root.iter() for c in p}
+    for node in root.iter("node"):
+        if node.get("resource-id", "") != "android:id/title":
+            continue
+        txt = (node.get("text", "") or "").lower()
+        if "select rom" not in txt:
+            continue
+        # Found the 'Select ROM' title node — look at sibling summary
+        parent = parent_map.get(node)
+        if parent is None:
+            continue
+        for sib in parent:
+            if sib.get("resource-id", "") == "android:id/summary":
+                summary = (sib.get("text", "") or "").lower()
+                print(f"  'Select ROM' summary: {summary!r}")
+                # If the summary still mentions importing rootfs, no ROM is imported
+                if "import rootfs" in summary or "import a " in summary or "import a." in summary:
+                    print("  ✗ Select ROM summary still shows import prompt — NO ROM imported")
+                    return False
+                print("  ✓ Select ROM summary changed from default import prompt — ROM appears imported")
+                return True
+    # If we can't find the Select ROM preference at all, be conservative
+    print("  ⚠ Could not find 'Select ROM' preference in UI — assuming ROM imported (no signal either way)")
+    return True
+
 def main():
     boot_wait = int(os.environ.get("BOOT_WAIT_SECONDS", "60"))
 
@@ -324,27 +478,77 @@ def main():
     print("  Step 3: Navigate file picker to recovery.img")
     print("=" * 60)
 
+    # CRITICAL FIX (round-76): the previous run failed because:
+    #   1. The SAF picker's "Recent" view sometimes shows "No items" briefly
+    #      before populating, so a tap fired too early hits nothing.
+    #   2. The DPAD fallback's KEYCODE_ENTER landed on the per-row 'Preview'
+    #      icon (focusable=true) instead of the row itself, which triggered
+    #      Android's share/open-with sheet — closing the picker without
+    #      selecting a file. The test then continued thinking a ROM was
+    #      imported, but SettingsActivity still showed "No ROM Installed".
+    #
+    # Robustness fixes applied below:
+    #   - 3s initial wait (was 2s) so the picker's RecyclerView fully loads.
+    #   - All per-row taps use safe_row_tap_target() which targets the LEFT
+    #     30% of the row, avoiding the 'Preview' icon at the right edge.
+    #   - Share/open-with sheets are detected and dismissed with BACK before
+    #     every DPAD attempt and between attempts.
+    #   - DPAD retry loop: 3 attempts with INCREASING DPAD_DOWN counts
+    #     (1, 2, 3). After each ENTER we verify the picker actually closed.
+    #   - Coordinate-based fallback: if DPAD fails, take a fresh uiautomator
+    #     dump and tap the file row's left-30% coordinate directly.
+    #   - found_file is only set TRUE when the picker actually closes
+    #     (verified via is_on_file_picker()), not just when a tap is sent.
+
+    # Give the picker time to fully load its RecyclerView.
+    print("  Waiting 3s for picker to fully load...")
+    wait(3)
+
+    # Helper: take a fresh dump, dismiss any share sheet, return (xml, root, activity).
+    def fresh_picker_state(tag):
+        xml = dump_ui(tag)
+        root = parse_ui(xml)
+        activity = get_current_activity()
+        return xml, root, activity
+
+    # Initial dump + dismiss any stray share sheet from the previous step.
+    xml, root, activity = fresh_picker_state("03_picker_open")
+    print(f"  Current activity: {activity}")
+    if dismiss_share_sheet(root):
+        xml, root, activity = fresh_picker_state("03_after_initial_dismiss")
+        print(f"  After initial share-sheet dismiss: {activity}")
+
     found_file = False
 
-    # (a) Try to find recovery.img directly in the current view.
-    # CRITICAL: use find_tap_target_for_text() instead of find_by_text()
-    # because the file name text node is NOT clickable — we need to tap
-    # the center of the file ROW (the widest ancestor), which is the
-    # clickable RecyclerView item.
+    # (a) Try to find recovery.img directly in the current view (Recent).
+    # Use safe_row_tap_target() to avoid the per-row 'Preview' icon.
+    print("  (a) Looking for recovery.img in current view (Recent)")
     for text in ["recovery.img", "recovery"]:
-        result = find_tap_target_for_text(root, text, exact=False)
+        result = safe_row_tap_target(root, text, exact=False)
         if result:
             cx, cy, _ = result
-            print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
+            print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
             tap(cx, cy)
             wait(3)
-            found_file = True
-            break
+            # VERIFY the picker actually closed before trusting the tap.
+            a = get_current_activity()
+            if not is_on_file_picker(a):
+                found_file = True
+                print(f"  ✓ Picker closed after direct tap — file selected")
+                break
+            else:
+                print(f"  ⚠ Picker still open after direct tap — trying next strategy")
+                # A share/preview sheet may have appeared — dismiss and re-dump.
+                if dismiss_share_sheet(root):
+                    pass
+                xml, root, activity = fresh_picker_state("03_after_tap_retry")
+                if dismiss_share_sheet(root):
+                    xml, root, activity = fresh_picker_state("03_after_tap_dismiss")
+                break  # fall through to drawer navigation
 
-    if not found_file:
-        # (b) Open the hamburger menu / drawer
-        print("  recovery.img not in current view — opening nav drawer")
-
+    # (b) If direct tap didn't work, open the hamburger drawer → Downloads.
+    if not found_file and is_on_file_picker(get_current_activity()):
+        print("  (b) recovery.img not in current view — opening nav drawer")
         # Look for the "Show Roots" / "Navigate up" button
         drawer_opened = False
         for desc in ["Show roots", "Navigate up", "Show list", "More options"]:
@@ -353,7 +557,7 @@ def main():
                 cx, cy, _ = result
                 print(f"  Found '{desc}' at ({cx}, {cy}) — tapping to open drawer")
                 tap(cx, cy)
-                wait(2)
+                wait(3)  # was 2s — increased to 3s for drawer animation
                 drawer_opened = True
                 break
 
@@ -362,134 +566,191 @@ def main():
             hamburger_y = int(SCREEN_H * 0.08)
             print(f"  No drawer button found — tapping top-left ({hamburger_x}, {hamburger_y})")
             tap(hamburger_x, hamburger_y)
-            wait(2)
+            wait(3)  # was 2s
 
-        xml = dump_ui("03_drawer_open")
-        root = parse_ui(xml)
-        print(f"  Current activity: {get_current_activity()}")
+        xml, root, activity = fresh_picker_state("03_drawer_open")
+        print(f"  Current activity: {activity}")
         print("  Visible text after drawer tap:")
         print_all_text(root, prefix="    ")
 
-        # (c) Look for "Downloads" in the drawer
+        # Look for "Downloads" in the drawer
         for text in ["Downloads", "Download"]:
-            result = find_tap_target_for_text(root, text, exact=False)
+            result = safe_row_tap_target(root, text, exact=False)
             if result:
                 cx, cy, _ = result
-                print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
+                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
                 tap(cx, cy)
                 wait(3)
                 break
 
-        # Now look for recovery.img in the file list
-        xml = dump_ui("03b_in_downloads")
-        root = parse_ui(xml)
+        # Now look for recovery.img in the Downloads file list
+        xml, root, activity = fresh_picker_state("03b_in_downloads")
         print("  Visible text in Downloads:")
         print_all_text(root, prefix="    ")
 
         for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-            result = find_tap_target_for_text(root, text, exact=False)
+            result = safe_row_tap_target(root, text, exact=False)
             if result:
                 cx, cy, _ = result
-                print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
+                print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
                 tap(cx, cy)
                 wait(3)
-                found_file = True
-                break
+                a = get_current_activity()
+                if not is_on_file_picker(a):
+                    found_file = True
+                    print(f"  ✓ Picker closed after Downloads tap — file selected")
+                    break
+                else:
+                    print(f"  ⚠ Picker still open after Downloads tap")
+                    if dismiss_share_sheet(root):
+                        xml, root, activity = fresh_picker_state("03b_after_dismiss")
+                    break
 
-        if not found_file:
-            # (d) Try "Show internal storage" / "SD card" / phone storage
-            print("  recovery.img not in Downloads — trying internal storage")
+        # (c) If still not found, try "Internal storage" → Download folder
+        if not found_file and is_on_file_picker(get_current_activity()):
+            print("  (c) recovery.img not in Downloads — trying internal storage")
             for text in ["Internal storage", "Phone", "SD card", "Storage"]:
-                result = find_tap_target_for_text(root, text, exact=False)
+                result = safe_row_tap_target(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
-                    print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
+                    print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
                     tap(cx, cy)
-                    wait(2)
+                    wait(3)  # was 2s
                     break
 
-            xml = dump_ui("03c_internal_storage")
-            root = parse_ui(xml)
+            xml, root, activity = fresh_picker_state("03c_internal_storage")
             for text in ["Download", "Downloads"]:
-                result = find_tap_target_for_text(root, text, exact=False)
+                result = safe_row_tap_target(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
-                    print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
+                    print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
                     tap(cx, cy)
-                    wait(2)
+                    wait(3)  # was 2s
                     break
 
-            xml = dump_ui("03d_in_download_folder")
-            root = parse_ui(xml)
+            xml, root, activity = fresh_picker_state("03d_in_download_folder")
             for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
-                result = find_tap_target_for_text(root, text, exact=False)
+                result = safe_row_tap_target(root, text, exact=False)
                 if result:
                     cx, cy, _ = result
-                    print(f"  Found '{text}' — row center at ({cx}, {cy}) — tapping")
+                    print(f"  Found '{text}' — safe row tap at ({cx}, {cy}) — tapping")
                     tap(cx, cy)
                     wait(3)
+                    a = get_current_activity()
+                    if not is_on_file_picker(a):
+                        found_file = True
+                        print(f"  ✓ Picker closed after internal-storage tap — file selected")
+                        break
+                    else:
+                        if dismiss_share_sheet(root):
+                            xml, root, activity = fresh_picker_state("03d_after_dismiss")
+                        break
+
+    # (d) DPAD fallback with retry loop — only if picker is still open.
+    # This is the most fragile strategy: DPAD_ENTER can land on the
+    # per-row 'Preview' icon (focusable=true) and trigger a share sheet
+    # instead of selecting the file. We mitigate by:
+    #   - Dismissing any share sheet BEFORE each DPAD attempt.
+    #   - Tapping the LEFT side of the file list (away from preview icons)
+    #     to give the row focus, not the preview icon.
+    #   - Using INCREASING DPAD_DOWN counts (1, 2, 3) across 3 attempts.
+    #   - Verifying the picker closed after each ENTER; if a share sheet
+    #     appeared instead, dismiss it and try the next attempt.
+    if not found_file and is_on_file_picker(get_current_activity()):
+        print("  (d) Direct taps failed — trying DPAD navigation with retry loop")
+        for attempt in range(3):
+            downs = attempt + 1  # 1, 2, 3
+            print(f"  DPAD attempt {attempt+1}/3: dismiss-sheet + tap-list + {downs}x DPAD_DOWN + ENTER")
+
+            # Take a fresh dump and dismiss any share sheet BEFORE the DPAD.
+            xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_pre")
+            if dismiss_share_sheet(root):
+                xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_post_dismiss")
+                print(f"  After pre-DPAD share-sheet dismiss: {activity}")
+                # If dismissing the sheet closed the picker too, we're done.
+                if not is_on_file_picker(activity):
                     found_file = True
+                    print(f"  ✓ Picker closed after pre-DPAD share-sheet dismiss")
                     break
 
-    # After tapping the file, check if we're back on SettingsActivity
-    # (file picker closed = file was selected). If still on PickActivity,
-    # the tap didn't work — try double-tapping or tapping a different spot.
+            # Tap the LEFT side of the file list area to give the row focus.
+            # CRITICAL: do NOT tap the center/right — the 'Preview' icon lives
+            # at the right edge and would steal focus.
+            list_tap_x = int(SCREEN_W * 0.20)
+            list_tap_y = int(SCREEN_H * 0.55)
+            print(f"  Tapping file list left side ({list_tap_x}, {list_tap_y}) to give row focus")
+            tap(list_tap_x, list_tap_y)
+            wait(1)
+
+            # DPAD navigation
+            for _ in range(downs):
+                adb_shell("input keyevent KEYCODE_DPAD_DOWN")
+                wait(0.5)
+            adb_shell("input keyevent KEYCODE_ENTER")
+            wait(3)
+
+            # Verify the picker actually closed.
+            a = get_current_activity()
+            print(f"  After DPAD attempt {attempt+1}: {a}")
+            if not is_on_file_picker(a):
+                found_file = True
+                print(f"  ✓ Picker closed after DPAD attempt {attempt+1}")
+                break
+            else:
+                print(f"  ⚠ Picker still open after DPAD attempt {attempt+1}")
+                # A share sheet may have appeared — dismiss before next attempt.
+                xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_post")
+                if dismiss_share_sheet(root):
+                    xml, root, activity = fresh_picker_state(f"03_dpad_{attempt}_post2")
+                    if not is_on_file_picker(activity):
+                        found_file = True
+                        print(f"  ✓ Picker closed after post-DPAD share-sheet dismiss")
+                        break
+
+    # (e) Final fallback: coordinate-based tap from a fresh uiautomator dump.
+    # If DPAD failed (e.g., focus kept landing on the preview icon), the
+    # file is still visible in the picker — take a fresh dump and tap the
+    # row's left-30% coordinate directly, which is the most reliable way
+    # to trigger the RecyclerView's OnItemTouchListener.
+    if not found_file and is_on_file_picker(get_current_activity()):
+        print("  (e) DPAD failed — trying coordinate-based tap from fresh uiautomator dump")
+        xml, root, activity = fresh_picker_state("03_final_dump")
+        for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
+            result = safe_row_tap_target(root, text, exact=False)
+            if result:
+                cx, cy, _ = result
+                print(f"  Final attempt: tapping '{text}' at ({cx}, {cy})")
+                tap(cx, cy)
+                wait(3)
+                a = get_current_activity()
+                if not is_on_file_picker(a):
+                    found_file = True
+                    print(f"  ✓ Picker closed after final coordinate tap")
+                    break
+                else:
+                    print(f"  ⚠ Picker still open after final coordinate tap")
+                    if dismiss_share_sheet(root):
+                        xml, root, activity = fresh_picker_state("03_final_after_dismiss")
+                        if not is_on_file_picker(activity):
+                            found_file = True
+                            print(f"  ✓ Picker closed after final share-sheet dismiss")
+                            break
+
+    # Final status report for Step 3.
     xml = dump_ui("04_after_file_select")
     root = parse_ui(xml)
     activity = get_current_activity()
-    print(f"  Current activity: {activity}")
-
-    if "documentsui" in activity.lower() or "picker" in activity.lower():
-        print("  ⚠ Still on file picker — file was not selected!")
-        print("  Visible text:")
+    print(f"  Step 3 final activity: {activity}")
+    if is_on_file_picker(activity):
+        print("  ✗✗✗ FILE PICKER STILL OPEN — could not select recovery.img")
+        print("  Step 4 import verification will catch this and abort the test.")
+        print("  Visible text on picker:")
         print_all_text(root, prefix="    ")
-        # Try double-tapping recovery.img
-        print("  Trying double-tap on recovery.img...")
-        result = find_tap_target_for_text(root, "recovery.img", exact=False)
-        if result:
-            cx, cy, _ = result
-            tap(cx, cy)
-            wait(0.1)
-            tap(cx, cy)
-            wait(3)
-        xml = dump_ui("04b_after_doubletap")
-        root = parse_ui(xml)
-        activity = get_current_activity()
-        print(f"  After double-tap: {activity}")
-
-        if "documentsui" in activity.lower() or "picker" in activity.lower():
-            print("  Still on file picker — trying to tap the 'Preview' icon instead...")
-            # The "Preview the file recovery.img" FrameLayout IS clickable
-            for desc in ["Preview the file recovery.img", "Preview"]:
-                result = find_by_text(root, desc, exact=False)
-                if result:
-                    cx, cy, _ = result
-                    print(f"  Found '{desc}' at ({cx}, {cy}) — tapping")
-                    tap(cx, cy)
-                    wait(3)
-                    break
-            xml = dump_ui("04c_after_preview_tap")
-            root = parse_ui(xml)
-            activity = get_current_activity()
-            print(f"  After preview tap: {activity}")
-
-            if "documentsui" in activity.lower() or "picker" in activity.lower():
-                print("  Still on file picker — trying DPAD navigation...")
-                # Use keyboard navigation: tap the first file to give focus,
-                # then use DPAD to navigate to recovery.img and ENTER to select.
-                # First, tap on the file list area to give it focus
-                tap(SCREEN_W // 2, int(SCREEN_H * 0.6))
-                wait(1)
-                # Navigate down with DPAD — recovery.img is the 2nd file
-                for _ in range(3):
-                    adb_shell("input keyevent KEYCODE_DPAD_DOWN")
-                    wait(0.5)
-                adb_shell("input keyevent KEYCODE_ENTER")
-                wait(3)
-                xml = dump_ui("04d_after_dpad")
-                root = parse_ui(xml)
-                activity = get_current_activity()
-                print(f"  After DPAD: {activity}")
+    elif found_file:
+        print("  ✓ File selection succeeded — picker closed.")
+    else:
+        print("  ⚠ Picker closed but selection was not explicitly confirmed (no found_file flag).")
+        print("  Step 4 will verify whether a ROM was actually imported.")
 
     # ─────────────────────────────────────────────
     # Step 4: Wait for ROM import to complete
@@ -518,6 +779,43 @@ def main():
     xml = dump_ui("05_import_done")
     root = parse_ui(xml)
     print(f"  Current activity: {get_current_activity()}")
+
+    # CRITICAL FIX (round-76): verify a ROM was actually imported before
+    # continuing to Step 5/6/7. If the file picker navigation failed
+    # silently (picker closed via BACK or share-sheet dismissal instead
+    # of a real selection), SettingsActivity will still show "No ROM
+    # Installed" / the default "Import rootfs..." prompt — and Steps 5-7
+    # will produce misleading "No ROM Installed" screenshots that waste
+    # CI time. Abort early with a clear error instead.
+    print()
+    print("  Verifying ROM was actually imported...")
+    rom_imported = verify_rom_imported(root)
+    if not rom_imported:
+        print()
+        print("=" * 60)
+        print("  ✗✗✗ ABORTING TEST EARLY: No ROM was imported")
+        print("=" * 60)
+        print("  The file picker navigation in Step 3 likely failed silently")
+        print("  (picker closed without a real file selection). Continuing")
+        print("  to Step 5/6/7 would only produce misleading 'No ROM")
+        print("  Installed' screenshots — aborting instead.")
+        print()
+        # Capture diagnostic artifacts before exiting.
+        screenshot("08_abort_no_rom")
+        logcat = adb("logcat", "-d", timeout=15)
+        with open(os.path.join(ART, "logcat.txt"), "w") as f:
+            f.write(logcat)
+        # Pull app logs too — they may show why the import didn't start.
+        try:
+            os.makedirs(os.path.join(ART, "app-logs"), exist_ok=True)
+            subprocess.run(ADB + ["pull", "/sdcard/Android/data/io.twoyi/files/log/",
+                                 os.path.join(ART, "app-logs/")],
+                          capture_output=True, timeout=30)
+        except Exception:
+            pass
+        print("  Diagnostic artifacts captured. Exiting with code 1.")
+        sys.exit(1)
+    print("  ✓ ROM import verified — continuing to Step 5.")
 
     # ─────────────────────────────────────────────
     # Step 5: Enable "Boot to Recovery" checkbox
