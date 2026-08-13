@@ -209,6 +209,19 @@ struct ChildAbi {
     readlink: i64,
     readlinkat: i64,
     chdir: i64,
+    // mmap — used to allocate a scratch page in the child's address
+    // space for translated paths. The translated path is almost always
+    // LONGER than the original (e.g. "/init.rc" →
+    // "/data/user/0/io.twoyi/rootfs/init.rc"), so we cannot overwrite
+    // the original string in place (it may live in read-only .rodata,
+    // and even when writable the new string would clobber adjacent
+    // bytes). Instead we mmap a dedicated 4 KiB scratch page in the
+    // child, write translated paths into it, and rewrite the path
+    // argument register to point at the scratch offset. On i386 the
+    // `mmap` syscall is `mmap2` (nr 192) which takes the offset in
+    // pages instead of bytes; for MAP_ANONYMOUS the offset is ignored
+    // so this difference is irrelevant.
+    mmap: i64,
     // Syscalls we never actually emulate, but whose numbers we need for
     // the SIGSYS diagnostic logging (we look up the original syscall
     // number to print a human-readable name when seccomp blocks it).
@@ -217,6 +230,14 @@ struct ChildAbi {
     mkdir: i64,
     chmod: i64,
     unshare: i64,
+    // True if the traced child is a 32-bit (i386 compat) ELF. Used to
+    // interpret raw syscall return values: the kernel zero-extends a
+    // 32-bit return value into the 64-bit register slot, so a 32-bit
+    // error code (e.g. -ENOMEM = 0xFFFFFFF4) appears as
+    // 0x00000000FFFFFFF4 in rax — which a naive `as i64 >= 0` check
+    // would wrongly classify as a valid address. See
+    // `is_valid_mmap_return`.
+    is_32bit: bool,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -264,11 +285,13 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     readlink: 89,
     readlinkat: 267,
     chdir: 80,
+    mmap: 9, // SYS_mmap on x86_64
     mount: 165,
     chroot: 161,
     mkdir: 83,
     chmod: 90,
     unshare: 272,
+    is_32bit: false,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -295,11 +318,17 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     readlink: 85,
     readlinkat: 303,
     chdir: 12,
+    // i386 has no plain `mmap` syscall — it uses `mmap2` (nr 192) which
+    // takes the offset in page-sized units instead of bytes. For our
+    // MAP_ANONYMOUS allocation the offset is ignored, so mmap2 is
+    // indistinguishable from mmap here.
+    mmap: 192, // SYS_mmap2 on i386
     mount: 21,
     chroot: 61,
     mkdir: 39,
     chmod: 15,
     unshare: 310,
+    is_32bit: true,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -331,11 +360,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     readlink: -1,
     readlinkat: 78,
     chdir: 49,
+    mmap: 222, // SYS_mmap on aarch64
     mount: 165,
     chroot: 51,
     mkdir: 34,
     chmod: 53,
     unshare: 97,
+    is_32bit: false,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -716,6 +747,49 @@ fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
     }
 }
 
+/// Set a syscall argument register to `val`.
+///
+/// `arg` is a register index into the `Regs` buffer reinterpreted as a
+/// `u64` array — typically one of `abi.reg_arg1` .. `abi.reg_arg4`. Used
+/// by the scratch-page allocator to rewrite the path-argument register
+/// to point at the translated path inside the scratch page (instead of
+/// trying to overwrite the original, possibly read-only, possibly too-
+/// short path string in the child's memory).
+///
+/// On a 32-bit x86 child the kernel takes the low 32 bits of the slot
+/// on writeback, which is correct — a 32-bit pointer fits in 32 bits.
+fn set_syscall_arg(regs: &mut Regs, arg: usize, val: u64) {
+    let regs_ptr = regs as *mut Regs as *mut u64;
+    unsafe {
+        *regs_ptr.add(arg) = val;
+    }
+}
+
+/// Classify a raw `mmap` syscall return value as either a valid mapped
+/// address or an error.
+///
+/// The kernel returns either the mapped address (a positive user-space
+/// pointer) or a negative error code (e.g. `-ENOMEM`). For a 64-bit
+/// child a negative value has bit 63 set, so `as i64 >= 0` correctly
+/// distinguishes the two cases.
+///
+/// For a 32-bit (i386 compat) child the kernel writes the 32-bit return
+/// value into `eax` and PTRACE_GETREGS zero-extends it into the 64-bit
+/// `rax` slot. A 32-bit error code (e.g. `-ENOMEM` = `0xFFFFFFF4`) thus
+/// appears as `0x00000000FFFFFFF4` in `rax` — bit 63 is clear, so the
+/// naive `as i64 >= 0` check would wrongly classify it as a valid
+/// address. We instead inspect the low 32 bits and treat bit 31 as the
+/// sign bit, which matches how the i386 kernel reports errors.
+fn is_valid_mmap_return(ret: u64, is_32bit: bool) -> bool {
+    if is_32bit {
+        // Low 32 bits as a signed i32: non-negative ⇒ valid address.
+        (ret as u32) < 0x8000_0000
+    } else {
+        // Full 64-bit value as a signed i64: non-negative ⇒ valid address.
+        (ret as i64) >= 0
+    }
+}
+
 /// Map a raw syscall number to a human-readable name for log messages.
 ///
 /// Takes the per-child `ChildAbi` so the match works regardless of
@@ -832,6 +906,129 @@ fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     true
 }
 
+/// Write a NUL-terminated string `s` to the child's memory at `addr`,
+/// WITHOUT the "new string must be shorter than the existing string"
+/// guard that [`write_child_string`] enforces.
+///
+/// This is used to write translated paths into the dedicated scratch
+/// page we `mmap` in the child (see `run_ptrace_loop`). The scratch
+/// page is freshly allocated and entirely under our control, so there
+/// is no pre-existing string to overflow and no adjacent data to
+/// clobber — the length guard is both unnecessary and harmful, because
+/// translated paths (e.g. `/init.rc` → `/data/user/0/io.twoyi/rootfs/init.rc`)
+/// are ALWAYS longer than the originals.
+///
+/// Writes one `c_long` (8 bytes on 64-bit hosts, 4 on 32-bit) at a
+/// time via `PTRACE_POKEDATA`. The final partial word is zero-padded,
+/// which means a few bytes past the NUL terminator are also written —
+/// that is fine because the scratch page is zero-initialised (anonymous
+/// mmap) and we always read the path back as a C string (NUL-terminated).
+///
+/// Returns `true` on success, `false` on a `PTRACE_POKEDATA` failure
+/// (which typically means `addr` is not a valid mapped address in the
+/// child).
+fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let mut new_bytes = s.as_bytes().to_vec();
+    new_bytes.push(0); // NUL terminator
+    let word_size = std::mem::size_of::<libc::c_long>();
+    let mut offset = 0i64;
+    while offset < new_bytes.len() as i64 {
+        let mut word_bytes = [0u8; 8];
+        let chunk_len = std::cmp::min(word_size, new_bytes.len() - offset as usize);
+        word_bytes[..chunk_len]
+            .copy_from_slice(&new_bytes[offset as usize..offset as usize + chunk_len]);
+        let word = libc::c_long::from_ne_bytes(word_bytes);
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKEDATA,
+                pid,
+                addr as i64 + offset,
+                word as libc::c_long,
+            )
+        };
+        if r == -1 {
+            return false;
+        }
+        offset += word_size as i64;
+    }
+    true
+}
+
+/// Write a translated path into the child's scratch page and rewrite the
+/// path-argument register to point at it.
+///
+/// This is the core of the path-translation fix. The previous code
+/// called [`write_child_string`] with the ORIGINAL path address, which
+/// has a length guard (`s.len() >= orig.len() → return false`) that
+/// rejects every translated path — translated paths are always longer
+/// than the originals. As a result path translation was a complete
+/// no-op and init's `openat("/init.rc")` hit the HOST's `/init.rc`
+/// (which doesn't exist) → ENOENT → `exit(1)`.
+///
+/// This helper instead writes the translated path into the dedicated
+/// scratch page (allocated by hijacking the first getpid — see
+/// `run_ptrace_loop`), then updates the path-argument register
+/// (`path_arg_index`) to point at the freshly-written string. The
+/// child's syscall then proceeds with the translated path.
+///
+/// # Arguments
+/// - `pid` — traced child PID.
+/// - `regs` — the child's current register snapshot (taken at the
+///   syscall ENTRY stop). Modified in place: the path-arg register is
+///   updated, then the whole register set is written back via
+///   `ptrace_setregs`.
+/// - `iov_len` — the `iovec.iov_len` returned by the matching
+///   `ptrace_getregs` call (forwarded to `ptrace_setregs`).
+/// - `path_arg_index` — which register slot holds the path pointer
+///   (differs per syscall: arg1 for `open`/`stat`/`chdir`, arg2 for
+///   `openat`/`newfstatat`/`faccessat`/`readlinkat`).
+/// - `scratch_addr` — base address of the scratch page in the child
+///   (0 means "not yet allocated").
+/// - `scratch_offset` — rotating write cursor within the page; advanced
+///   by the path length (8-byte aligned) and wrapped to 0 near the end.
+/// - `translated` — the translated path string (no NUL — we add it).
+///
+/// Returns `true` if the path was written and the arg register updated,
+/// `false` if the scratch page is not yet allocated (caller should fall
+/// back to the legacy in-place overwrite, which will typically fail
+/// silently for longer strings — but at least we don't crash).
+fn write_translated_path(
+    pid: libc::pid_t,
+    regs: &mut Regs,
+    iov_len: usize,
+    path_arg_index: usize,
+    scratch_addr: u64,
+    scratch_offset: &mut usize,
+    translated: &str,
+) -> bool {
+    if scratch_addr == 0 {
+        return false; // scratch page not yet allocated
+    }
+    let new_addr = scratch_addr + *scratch_offset as u64;
+    if !write_child_string_unchecked(pid, new_addr, translated) {
+        return false;
+    }
+    // Update the path-argument register to point at the scratch copy.
+    set_syscall_arg(regs, path_arg_index, new_addr);
+    if ptrace_setregs(pid, regs, iov_len).is_err() {
+        return false;
+    }
+    // Advance the rotating cursor: round up the path length (including
+    // the NUL terminator) to 8-byte alignment so the next path starts
+    // on a clean word boundary. Wrap to 0 when fewer than 256 bytes
+    // remain — that is plenty of room for any realistic path and avoids
+    // a path straddling the end of the page.
+    let path_len = translated.len() + 1; // include NUL
+    *scratch_offset += (path_len + 7) & !7;
+    if *scratch_offset + 256 > 4096 {
+        *scratch_offset = 0;
+    }
+    true
+}
+
 // ── Ptrace loop ────────────────────────────────────────────────────
 
 /// Check if ptrace is likely to work on this device.
@@ -884,6 +1081,34 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     // ABI_AARCH64 (on aarch64). Until then we have no registers to
     // look at, so there is nothing to dispatch on.
     let mut abi: Option<ChildAbi> = None;
+    // ── Scratch page for translated paths ───────────────────────────
+    //
+    // Translated paths (e.g. `/init.rc` →
+    // `/data/user/0/io.twoyi/rootfs/init.rc`) are ALWAYS longer than
+    // the original, so we cannot overwrite the original string in the
+    // child's memory — it may live in read-only .rodata, and even when
+    // writable the longer translation would clobber adjacent bytes.
+    //
+    // Instead we `mmap` a dedicated 4 KiB scratch page in the child's
+    // address space and write translated paths into it, then rewrite
+    // the path-argument register to point at the translated path. The
+    // allocation is done lazily by hijacking the FIRST getpid() call:
+    // we rewrite the syscall number to mmap at the ENTRY stop, capture
+    // the return value at the EXIT stop, then fake the getpid return
+    // value to 1 (as we already do for every intercepted getpid). The
+    // child never observes that the first getpid actually executed
+    // mmap — it just sees `getpid() == 1`, which is the intended
+    // fake-PID-1 behaviour.
+    //
+    // `scratch_addr` is 0 until the mmap succeeds; `scratch_offset`
+    // is the rotating write cursor within the page (paths are laid out
+    // end-to-end, 8-byte aligned, and the cursor wraps to 0 when the
+    // page is nearly full); `scratch_pending_mmap` is set between the
+    // ENTRY rewrite and the EXIT capture so the EXIT handler knows to
+    // grab the mmap return value before faking the getpid result.
+    let mut scratch_addr: u64 = 0;
+    let mut scratch_offset: usize = 0;
+    let mut scratch_pending_mmap: bool = false;
     // Rolling log of the last N SIGSYS-intercepted syscall numbers.
     // Used on child exit to print "the last few syscalls seccomp
     // blocked" — this is the single most useful diagnostic when init
@@ -1024,29 +1249,39 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // detection — we read /proc/<pid>/exe instead (see
                 // `detect_child_is_64bit`), because the PTRACE_GETREGS
                 // fallback path on x86_64 has no real iov_len to inspect.
-                // We still need to call ptrace_getregs to populate `regs`.
+                // We DO still need iov_len itself, though: it is the
+                // `iovec.iov_len` value we must hand back to
+                // `ptrace_setregs` when rewriting registers (e.g. when
+                // hijacking getpid → mmap, or when pointing the path
+                // argument register at the scratch page). On the
+                // PTRACE_GETREGS fallback path it is just sizeof(Regs),
+                // which the SETREGS fallback ignores — so forwarding it
+                // is always correct.
                 let mut regs: Regs = unsafe { std::mem::zeroed() };
-                if let Err(e) = ptrace_getregs(pid, &mut regs) {
-                    log(&format!(
-                        "ptrace_getregs failed: {} (iteration {})",
-                        e, loop_count
-                    ));
-                    // We've consumed this syscall-stop regardless of whether
-                    // we could read its registers — the next PTRACE_SYSCALL
-                    // will land on the *other* half of the same syscall
-                    // (entry↔exit alternate). If we don't flip `in_syscall`
-                    // here, the next stop will be misclassified as the same
-                    // phase (e.g. entry again), and we'll permanently lose
-                    // sync — every subsequent open/getpid/etc. would be
-                    // handled at the wrong phase and never actually faked.
-                    //
-                    // Flipping here means: if getregs fails transiently we
-                    // stay in sync; if it fails persistently (the original
-                    // bug) the loop still terminates via the child exiting,
-                    // not via state corruption.
-                    in_syscall = !in_syscall;
-                    continue;
-                }
+                let iov_len = match ptrace_getregs(pid, &mut regs) {
+                    Ok(len) => len,
+                    Err(e) => {
+                        log(&format!(
+                            "ptrace_getregs failed: {} (iteration {})",
+                            e, loop_count
+                        ));
+                        // We've consumed this syscall-stop regardless of whether
+                        // we could read its registers — the next PTRACE_SYSCALL
+                        // will land on the *other* half of the same syscall
+                        // (entry↔exit alternate). If we don't flip `in_syscall`
+                        // here, the next stop will be misclassified as the same
+                        // phase (e.g. entry again), and we'll permanently lose
+                        // sync — every subsequent open/getpid/etc. would be
+                        // handled at the wrong phase and never actually faked.
+                        //
+                        // Flipping here means: if getregs fails transiently we
+                        // stay in sync; if it fails persistently (the original
+                        // bug) the loop still terminates via the child exiting,
+                        // not via state corruption.
+                        in_syscall = !in_syscall;
+                        continue;
+                    }
+                };
 
                 // Lazily initialize the per-child ABI on the first
                 // successful register read. On x86_64 we read the
@@ -1092,6 +1327,52 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         log(&format!("syscall entry: nr={}", syscall_num));
                     }
 
+                    // ── Lazy scratch-page allocation ────────────────────
+                    //
+                    // Translated paths are always longer than the originals
+                    // (e.g. `/init.rc` → `/data/user/0/io.twoyi/rootfs/init.rc`),
+                    // so we cannot overwrite the original string in the
+                    // child's memory. Instead we mmap a 4 KiB scratch page
+                    // in the child and point the path-argument register at
+                    // translated paths inside it.
+                    //
+                    // We allocate the page LAZILY by hijacking the FIRST
+                    // getpid()/getppid() call: at the ENTRY stop we rewrite
+                    // the syscall number to mmap (args: NULL, 4096,
+                    // PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE).
+                    // At the matching EXIT stop we read rax/x0 to get the
+                    // mapped address, store it in `scratch_addr`, and THEN
+                    // overwrite the return value with 1 — so the child
+                    // observes `getpid() == 1` (the intended fake-PID-1
+                    // behaviour) and never knows the syscall actually
+                    // executed mmap.
+                    //
+                    // MAP_ANONYMOUS ignores the `fd` and `offset` args, so
+                    // we only need to set arg1..arg4 — the original
+                    // getpid's arg5/arg6 (which are garbage for a
+                    // no-arg syscall) are harmlessly ignored by the kernel.
+                    if scratch_addr == 0
+                        && !scratch_pending_mmap
+                        && (syscall_num == abi.getpid || syscall_num == abi.getppid)
+                    {
+                        set_syscall_num(&mut regs, &abi, abi.mmap);
+                        set_syscall_arg(&mut regs, abi.reg_arg1, 0); // addr = NULL
+                        set_syscall_arg(&mut regs, abi.reg_arg2, 4096); // len = 4 KiB
+                        set_syscall_arg(&mut regs, abi.reg_arg3, 3); // prot = PROT_READ|PROT_WRITE
+                        set_syscall_arg(&mut regs, abi.reg_arg4, 0x22); // flags = MAP_PRIVATE|MAP_ANONYMOUS
+                        if ptrace_setregs(pid, &regs, iov_len).is_err() {
+                            log("scratch mmap injection: ptrace_setregs failed");
+                            // Leave scratch_pending_mmap false so we retry
+                            // on the next getpid/getppid — no harm done.
+                        } else {
+                            scratch_pending_mmap = true;
+                            log(&format!(
+                                "hijacked getpid/getppid (nr={}) -> mmap({}, 4096, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE) to allocate scratch page",
+                                syscall_num, abi.mmap
+                            ));
+                        }
+                    }
+
                     match syscall_num {
                         n if n == abi.getpid => {
                             pending_getpid = true;
@@ -1117,7 +1398,23 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
-                                if translated != path {
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        path_arg_index,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
+                                    // Scratch page not yet allocated — fall
+                                    // back to the legacy in-place overwrite
+                                    // (will likely fail for longer strings
+                                    // but does not crash). This branch is
+                                    // only taken before the first getpid
+                                    // hijack succeeds.
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
@@ -1136,7 +1433,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
-                                if translated != path {
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        path_arg_index,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
@@ -1150,7 +1457,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
-                                if translated != path {
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        path_arg_index,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
@@ -1164,7 +1481,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
-                                if translated != path {
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        path_arg_index,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
@@ -1173,7 +1500,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             let path_addr = get_syscall_arg(&regs, abi.reg_arg1);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
-                                if translated != path {
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        abi.reg_arg1,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
                                     write_child_string(pid, path_addr, &translated);
                                 }
                             }
@@ -1195,6 +1532,36 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             // ever set pending_getpid on a syscall
                             // ENTRY stop, which can only happen after
                             // the ENTRY stop that initialized `abi`.
+
+                            // If we hijacked this getpid/getppid to
+                            // execute mmap (for scratch-page allocation),
+                            // capture the mapped address BEFORE we
+                            // overwrite the return value with 1. The
+                            // raw mmap return is in the syscall-return
+                            // register (rax on x86_64, x0 on aarch64),
+                            // which `abi.reg_ret` indexes.
+                            if scratch_pending_mmap {
+                                let mmap_ret = get_syscall_arg(&regs2, abi.reg_ret);
+                                if is_valid_mmap_return(mmap_ret, abi.is_32bit) {
+                                    scratch_addr = mmap_ret;
+                                    log(&format!(
+                                        "scratch page allocated at {:#x} via hijacked getpid/getppid -> mmap",
+                                        scratch_addr
+                                    ));
+                                } else {
+                                    log(&format!(
+                                        "scratch mmap failed: raw return {:#x} — translated paths before next getpid will use the (broken) in-place fallback",
+                                        mmap_ret
+                                    ));
+                                }
+                                scratch_pending_mmap = false;
+                            }
+
+                            // Fake the getpid/getppid return value to 1
+                            // (the intended fake-PID-1 behaviour). This
+                            // runs whether or not we hijacked the call
+                            // for mmap — in both cases the child must
+                            // observe `getpid() == 1`.
                             set_syscall_ret(&mut regs2, &abi, 1);
                             let _ = ptrace_setregs(pid, &regs2, len);
                         }
@@ -1569,5 +1936,89 @@ mod tests {
             Some(true),
             "the test binary itself is a 64-bit x86_64 ELF"
         );
+    }
+
+    // ── is_valid_mmap_return tests ──────────────────────────────────
+    //
+    // These tests pin down the 32-bit-vs-64-bit return-value decoding
+    // that `run_ptrace_loop` relies on when capturing the address of
+    // the scratch page allocated by the hijacked-getpid mmap injection.
+    // The 32-bit case is especially subtle: a 32-bit error code (e.g.
+    // -ENOMEM = 0xFFFFFFF4) is zero-extended into the 64-bit rax slot
+    // and would be misclassified as a valid address by a naive
+    // `as i64 >= 0` check.
+
+    #[test]
+    fn is_valid_mmap_return_64bit_accepts_typical_address() {
+        // A typical x86_64 mmap return (e.g. 0x7f1234560000) is valid.
+        assert!(is_valid_mmap_return(0x7f1234560000, false));
+    }
+
+    #[test]
+    fn is_valid_mmap_return_64bit_rejects_negative_errno() {
+        // -ENOMEM (0xFFFFFFFFFFFFFFF4 as u64) must be rejected.
+        assert!(!is_valid_mmap_return(0xFFFF_FFFF_FFFF_FFF4, false));
+        // -1 / MAP_FAILED (0xFFFFFFFFFFFFFFFF) must be rejected.
+        assert!(!is_valid_mmap_return(0xFFFF_FFFF_FFFF_FFFF, false));
+    }
+
+    #[test]
+    fn is_valid_mmap_return_32bit_accepts_typical_address() {
+        // A typical i386 mmap return (e.g. 0x40000000) is valid.
+        // Note: zero-extended into 64 bits, so high 32 bits are 0.
+        assert!(is_valid_mmap_return(0x00000000_40000000, true));
+    }
+
+    #[test]
+    fn is_valid_mmap_return_32bit_rejects_zero_extended_errno() {
+        // -ENOMEM as a 32-bit value (0xFFFFFFF4), zero-extended into
+        // the 64-bit rax slot (0x00000000FFFFFFF4). The high 32 bits
+        // are clear, so a naive `as i64 >= 0` check would WRONGLY
+        // classify this as a valid address. Our function must reject
+        // it by inspecting bit 31 of the low 32 bits.
+        assert!(!is_valid_mmap_return(0x0000_0000_FFFF_FFF4, true));
+        // -1 / MAP_FAILED (0xFFFFFFFF zero-extended) must be rejected.
+        assert!(!is_valid_mmap_return(0x0000_0000_FFFF_FFFF, true));
+    }
+
+    // ── translate_path tests ────────────────────────────────────────
+    //
+    // These verify the path-translation rules that the scratch-page
+    // mechanism exists to support — making sure a translated path is
+    // indeed longer than the original (which is the whole reason we
+    // need the scratch page in the first place).
+
+    #[test]
+    fn translate_path_prepends_rootfs_for_init_rc() {
+        let t = translate_path("/data/user/0/io.twoyi/rootfs", "/init.rc");
+        assert_eq!(t, "/data/user/0/io.twoyi/rootfs/init.rc");
+        // The translated path MUST be longer — this is the exact
+        // situation that broke the old `write_child_string` length
+        // guard and motivated the scratch-page fix.
+        assert!(t.len() > "/init.rc".len());
+    }
+
+    #[test]
+    fn translate_path_leaves_proc_sys_dev_untouched() {
+        let rootfs = "/data/user/0/io.twoyi/rootfs";
+        for p in &[
+            "/proc/self/status",
+            "/sys/class/net",
+            "/dev/null",
+            "/data/data",
+        ] {
+            assert_eq!(
+                translate_path(rootfs, p),
+                *p,
+                "path {} should not be translated",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn translate_path_leaves_relative_untouched() {
+        // Relative paths are returned as-is (no rootfs prefix).
+        assert_eq!(translate_path("/r", "relative/path"), "relative/path");
     }
 }
