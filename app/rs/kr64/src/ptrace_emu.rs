@@ -428,6 +428,16 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     let mut in_syscall = false;
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
+    // Rolling log of the last N SIGSYS-intercepted syscall numbers.
+    // Used on child exit to print "the last few syscalls seccomp
+    // blocked" — this is the single most useful diagnostic when init
+    // dies with a non-zero exit code, because it shows the syscall
+    // that the rewrite-to-getpid strategy is masking. Cap is small
+    // (32) to keep memory bounded if init triggers thousands of
+    // SIGSYS in a tight loop.
+    const RECENT_SIGSYS_CAP: usize = 32;
+    let mut recent_sigsys: std::collections::VecDeque<i64> =
+        std::collections::VecDeque::with_capacity(RECENT_SIGSYS_CAP);
     // Signal to deliver to the child on the next PTRACE_SYSCALL resume.
     // 0 means "don't deliver any signal". Non-zero values are set by
     // the signal-forwarding branch below so that the SINGLE
@@ -458,15 +468,33 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
             // ESRCH = child already exited — not an error, just done.
             if e.raw_os_error() == Some(libc::ESRCH) {
                 log("PTRACE_SYSCALL: child already exited (ESRCH)");
+                // Print the rolling SIGSYS history before reaping — the
+                // main WIFEXITED/WIFSIGNALED branches below won't run
+                // on this path, so without this log we'd lose the
+                // "last N intercepted syscalls" diagnostic when the
+                // child dies between a syscall-exit-stop and our
+                // next PTRACE_SYSCALL.
+                if !recent_sigsys.is_empty() {
+                    let collected: Vec<i64> = recent_sigsys.iter().copied().collect();
+                    log(&format!(
+                        "last {} SIGSYS-intercepted syscall numbers before ESRCH (oldest->newest): {:?}",
+                        collected.len(),
+                        collected
+                    ));
+                }
                 // Try to reap the child to get its exit status.
                 let mut status: libc::c_int = 0;
                 let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
                 if waited == pid {
                     if libc::WIFEXITED(status) {
-                        return libc::WEXITSTATUS(status);
+                        let code = libc::WEXITSTATUS(status);
+                        log(&format!("ESRCH path: child exit code {}", code));
+                        return code;
                     }
                     if libc::WIFSIGNALED(status) {
-                        return -libc::WTERMSIG(status);
+                        let sig = libc::WTERMSIG(status);
+                        log(&format!("ESRCH path: child killed by signal {}", sig));
+                        return -sig;
                     }
                 }
                 return -1;
@@ -488,11 +516,35 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
         if libc::WIFEXITED(status) {
             let code = libc::WEXITSTATUS(status);
             log(&format!("child exited with code {} (after {} iterations)", code, loop_count));
+            // Print the last few SIGSYS-intercepted syscalls so we can
+            // identify what init was doing right before it died. This is
+            // critical for diagnosing the "init exits with code 1 at
+            // iteration 177" issue: the last few SIGSYS numbers tell us
+            // which seccomp-blocked syscall (mount? chroot? unshare?)
+            // init was retrying right before it gave up and exited.
+            if recent_sigsys.is_empty() {
+                log("no SIGSYS interceptions recorded during this run");
+            } else {
+                let collected: Vec<i64> = recent_sigsys.iter().copied().collect();
+                log(&format!(
+                    "last {} SIGSYS-intercepted syscall numbers (oldest->newest): {:?}",
+                    collected.len(),
+                    collected
+                ));
+            }
             return code;
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
             log(&format!("child killed by signal {} (after {} iterations)", sig, loop_count));
+            if !recent_sigsys.is_empty() {
+                let collected: Vec<i64> = recent_sigsys.iter().copied().collect();
+                log(&format!(
+                    "last {} SIGSYS-intercepted syscall numbers before kill (oldest->newest): {:?}",
+                    collected.len(),
+                    collected
+                ));
+            }
             return -sig;
         }
 
@@ -675,10 +727,28 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // syscall entry, so the next stop will be the
                 // syscall-exit-stop of the (now rewritten) syscall —
                 // the same phase we were already heading to.
-                log("intercepted SIGSYS (seccomp-blocked syscall) — skipping and returning 0");
-
                 let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
                 if ptrace_getregs(pid, &mut sigsys_regs).is_ok() {
+                    // Read the ORIGINAL syscall number BEFORE rewriting
+                    // it. This is the syscall that seccomp blocked —
+                    // logging it is the only way to know which kernel
+                    // facilities TWRP's init is asking for that we're
+                    // silently masking (mount? chroot? unshare? ioctl
+                    // on a specific fd?). Without this log we just see
+                    // "intercepted SIGSYS" with no clue WHAT was
+                    // intercepted.
+                    let original_syscall = get_syscall_num(&sigsys_regs);
+                    log(&format!(
+                        "intercepted SIGSYS — original syscall nr={} (rewriting to getpid, returning 0)",
+                        original_syscall
+                    ));
+                    // Push into the rolling history so the exit
+                    // handler can print "last N blocked syscalls".
+                    if recent_sigsys.len() == RECENT_SIGSYS_CAP {
+                        recent_sigsys.pop_front();
+                    }
+                    recent_sigsys.push_back(original_syscall);
+
                     // Rewrite the syscall number to getpid (a harmless,
                     // always-allowed syscall) so the kernel does not
                     // re-evaluate the original blocked number and
@@ -688,6 +758,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     // will see the (blocked) syscall as having succeeded.
                     set_syscall_ret(&mut sigsys_regs, 0);
                     let _ = ptrace_setregs(pid, &sigsys_regs);
+                } else {
+                    // ptrace_getregs failed — we couldn't read the
+                    // registers, so we can't log the original syscall
+                    // number. Fall back to the old generic message so
+                    // the count of SIGSYS events is still visible.
+                    log("intercepted SIGSYS (seccomp-blocked syscall) — ptrace_getregs failed; skipping and returning 0");
                 }
 
                 // Do NOT call PTRACE_SYSCALL here — the loop top will

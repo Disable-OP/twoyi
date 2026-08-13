@@ -3516,6 +3516,74 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     let enforce_thread: Option<std::thread::JoinHandle<()>> = None;
     info!("[KR64] PARENT: SELinux permissive watchdog DISABLED (no permissive mode — works on unmodified devices)");
 
+    // ── Pre-create /twrp-init.log in the rootfs ──────────────────────
+    //
+    // The child branch below redirects init's stdout/stderr to a log
+    // file via `open(... O_CREAT|O_TRUNC, 0o644)` + dup2. In root mode
+    // (use_namespaces=true) the parent has already pivot_root'd into
+    // the rootfs, so `/twrp-init.log` resolves there and `open` works.
+    //
+    // In NON-root mode (use_namespaces=false) the child is NOT chrooted
+    // — it inherits the host's filesystem namespace. The literal
+    // `/twrp-init.log` would resolve to the HOST's root, which an
+    // untrusted_app has no permission to write to (EROFS / EACCES), so
+    // the open fails and we log:
+    //   "[KR64 CHILD] TWRP: WARN could not open /twrp-init.log for redirect"
+    // and init's stdout/stderr stay attached to kr64's stderr (the
+    // inherited fd 1/2). That makes debugging init's actual output
+    // impossible because it's interleaved with kr64's logs.
+    //
+    // FIX: Pre-create the file in the parent (which CAN use std::fs
+    // safely) at the host-visible path
+    // `{rootfs_prefix}/twrp-init.log`. In root mode rootfs_prefix is
+    // "" so this is `/twrp-init.log` (chroot-relative). In non-root
+    // mode rootfs_prefix is cfg.rootfs so this is the host path under
+    // the app's private data dir, which is writable.
+    //
+    // We also build a CString of the same path here so the child can
+    // reuse it without allocating (which is async-signal-unsafe)
+    // between fork() and execve().
+    use std::os::unix::fs::PermissionsExt;
+    let twrp_log_path_str: String =
+        format!("{}/twrp-init.log", rootfs_prefix);
+    let twrp_log_path_cstr: CString =
+        CString::new(twrp_log_path_str.as_str()).unwrap_or_else(|_| {
+            // Path contained an interior NUL — extremely unlikely for
+            // an app-private data dir, but fall back to the literal
+            // so we don't panic in the parent. The child's open() will
+            // then fail and the existing WARN branch will fire.
+            CString::new("/twrp-init.log").unwrap()
+        });
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&twrp_log_path_str)
+    {
+        Ok(_) => {
+            // World-readable so init (which may run as a different
+            // UID under TWRP's recovery policy) can still append.
+            let _ = std::fs::set_permissions(
+                &twrp_log_path_str,
+                std::fs::Permissions::from_mode(0o666),
+            );
+            info!(
+                "[KR64] PARENT: pre-created {} (mode 0666, truncated)",
+                twrp_log_path_str
+            );
+        }
+        Err(e) => {
+            // Don't make this fatal — the child's open() will still
+            // try and produce its own diagnostic. We just lose the
+            // pre-creation guarantee.
+            warning!(
+                "[KR64] PARENT: failed to pre-create {}: {} — child redirect may fail",
+                twrp_log_path_str,
+                e
+            );
+        }
+    }
+
     info!("[KR64] forking guest process");
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -4067,11 +4135,32 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // is a tmpfs that gets unmounted when kr64 dies). This file
         // is on the ext4 rootfs and survives kr64's death so the KVM
         // test script can pull it.
+        //
+        // PATH RESOLUTION:
+        //   - root mode (use_namespaces=true): the parent has pivot_root'd,
+        //     so `/twrp-init.log` resolves inside the rootfs. The path
+        //     string is `/twrp-init.log` (rootfs_prefix == "").
+        //   - non-root mode (use_namespaces=false): the child is NOT
+        //     chrooted, so `/twrp-init.log` would resolve to the HOST's
+        //     root (not writable by an untrusted_app). We use the
+        //     pre-built `twrp_log_path_cstr` instead, which is
+        //     `{cfg.rootfs}/twrp-init.log` on the host filesystem.
+        //
+        // The parent already pre-created the file (see the "Pre-create
+        // /twrp-init.log" block above), so the open() below should
+        // succeed via O_CREAT even if the file was deleted between the
+        // parent's pre-create and our open.
         if cfg.boot_recovery {
-            let log_path = b"/twrp-init.log\0";
+            // `twrp_log_path_cstr` is a CString built in the parent
+            // BEFORE the fork — using its .as_ptr() here is async-
+            // signal-safe (no allocation, no locks). The bytes are
+            // NUL-terminated and live for the duration of the child
+            // branch (the parent's stack frame is preserved across
+            // fork()).
+            let log_path_ptr = twrp_log_path_cstr.as_ptr();
             let fd = unsafe {
                 libc::open(
-                    log_path.as_ptr() as *const libc::c_char,
+                    log_path_ptr,
                     libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
                     0o644,
                 )
@@ -4088,10 +4177,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     );
                 }
             } else {
+                // Capture errno BEFORE any other call (the safe_write_err
+                // path goes through libc::write which can clobber it).
+                let open_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 unsafe {
                     safe_write_err(
                         b"[KR64 CHILD] TWRP: WARN could not open /twrp-init.log for redirect\n",
                     );
+                    safe_write_err_errno(b"[KR64 CHILD] TWRP: open errno=", open_errno);
+                    safe_write_err(b"[KR64 CHILD] TWRP: path=");
+                    safe_write_err(twrp_log_path_cstr.to_bytes());
+                    safe_write_err(b"\n");
                 }
             }
         }
