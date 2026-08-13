@@ -127,32 +127,32 @@ mod aarch64_ptrace {
 #[cfg(target_arch = "x86_64")]
 const REG_SYSCALL: usize = 15; // orig_rax
 #[cfg(target_arch = "x86_64")]
-const REG_RET: usize = 10;    // rax
+const REG_RET: usize = 10; // rax
 #[cfg(target_arch = "x86_64")]
-const REG_ARG1: usize = 14;   // rdi
+const REG_ARG1: usize = 14; // rdi
 #[cfg(target_arch = "x86_64")]
-const REG_ARG2: usize = 13;   // rsi
-#[cfg(target_arch = "x86_64")]
-#[allow(dead_code)]
-const REG_ARG3: usize = 12;   // rdx
+const REG_ARG2: usize = 13; // rsi
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
-const REG_ARG4: usize = 7;    // r10
+const REG_ARG3: usize = 12; // rdx
+#[cfg(target_arch = "x86_64")]
+#[allow(dead_code)]
+const REG_ARG4: usize = 7; // r10
 
 #[cfg(target_arch = "aarch64")]
-const REG_SYSCALL: usize = 8;   // x8 (syscall number)
+const REG_SYSCALL: usize = 8; // x8 (syscall number)
 #[cfg(target_arch = "aarch64")]
-const REG_RET: usize = 0;       // x0 (return value)
+const REG_RET: usize = 0; // x0 (return value)
 #[cfg(target_arch = "aarch64")]
-const REG_ARG1: usize = 0;      // x0
+const REG_ARG1: usize = 0; // x0
 #[cfg(target_arch = "aarch64")]
-const REG_ARG2: usize = 1;      // x1
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-const REG_ARG3: usize = 2;      // x2
+const REG_ARG2: usize = 1; // x1
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
-const REG_ARG4: usize = 3;      // x3
+const REG_ARG3: usize = 2; // x2
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+const REG_ARG4: usize = 3; // x3
 
 // ── Architecture-specific get/set registers ────────────────────────
 
@@ -292,7 +292,9 @@ fn get_syscall_arg(regs: &Regs, arg: usize) -> u64 {
 /// Set the return value of a syscall in registers.
 fn set_syscall_ret(regs: &mut Regs, val: i64) {
     let regs_ptr = regs as *mut Regs as *mut u64;
-    unsafe { *regs_ptr.add(REG_RET) = val as u64; }
+    unsafe {
+        *regs_ptr.add(REG_RET) = val as u64;
+    }
 }
 
 /// Set the syscall number in registers.
@@ -306,7 +308,9 @@ fn set_syscall_ret(regs: &mut Regs, val: i64) {
 /// re-evaluate the original (blocked) syscall number and re-raise SIGSYS.
 fn set_syscall_num(regs: &mut Regs, val: i64) {
     let regs_ptr = regs as *mut Regs as *mut u64;
-    unsafe { *regs_ptr.add(REG_SYSCALL) = val as u64; }
+    unsafe {
+        *regs_ptr.add(REG_SYSCALL) = val as u64;
+    }
 }
 
 /// Map a raw syscall number to a human-readable name for log messages.
@@ -381,7 +385,11 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
             break;
         }
     }
-    if result.is_empty() { None } else { Some(String::from_utf8_lossy(&result).into_owned()) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&result).into_owned())
+    }
 }
 
 fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
@@ -398,9 +406,17 @@ fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     while offset < new_bytes.len() as i64 {
         let mut word_bytes = [0u8; 8];
         let chunk_len = std::cmp::min(8, new_bytes.len() - offset as usize);
-        word_bytes[..chunk_len].copy_from_slice(&new_bytes[offset as usize..offset as usize + chunk_len]);
+        word_bytes[..chunk_len]
+            .copy_from_slice(&new_bytes[offset as usize..offset as usize + chunk_len]);
         let word = libc::c_long::from_ne_bytes(word_bytes);
-        let r = unsafe { libc::ptrace(libc::PTRACE_POKEDATA, pid, addr as i64 + offset, word as libc::c_long) };
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKEDATA,
+                pid,
+                addr as i64 + offset,
+                word as libc::c_long,
+            )
+        };
         if r == -1 {
             return false;
         }
@@ -430,7 +446,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
         let _ = writeln!(std::io::stderr(), "[KR64][ptrace] {}", msg);
     };
 
-    log(&format!("ptrace loop started for pid {} (rootfs={})", pid, rootfs));
+    log(&format!(
+        "ptrace loop started for pid {} (rootfs={})",
+        pid, rootfs
+    ));
 
     // Set PTRACE_O_TRACESYSGOOD so we get SIGTRAP|0x80 for syscall stops.
     let r = unsafe {
@@ -482,14 +501,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
         // the ONLY PTRACE_SYSCALL in the loop — handlers below set
         // `resume_signal` (and `continue`) instead of resuming the
         // child themselves, so we never race the second ptrace call.
-        let r = unsafe {
-            libc::ptrace(
-                libc::PTRACE_SYSCALL,
-                pid,
-                0,
-                resume_signal as libc::c_long,
-            )
-        };
+        let r =
+            unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, resume_signal as libc::c_long) };
         // Reset for the next iteration — only set again if a
         // signal-delivery branch below populates it.
         resume_signal = 0;
@@ -545,7 +558,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
         // Check if the child exited.
         if libc::WIFEXITED(status) {
             let code = libc::WEXITSTATUS(status);
-            log(&format!("child exited with code {} (after {} iterations)", code, loop_count));
+            log(&format!(
+                "child exited with code {} (after {} iterations)",
+                code, loop_count
+            ));
             // Print the last few SIGSYS-intercepted syscalls so we can
             // identify what init was doing right before it died. This is
             // critical for diagnosing the "init exits with code 1 at
@@ -566,7 +582,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
-            log(&format!("child killed by signal {} (after {} iterations)", sig, loop_count));
+            log(&format!(
+                "child killed by signal {} (after {} iterations)",
+                sig, loop_count
+            ));
             if !recent_sigsys.is_empty() {
                 let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                 log(&format!(
@@ -589,7 +608,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // Get the child's registers using the arch-specific function.
                 let mut regs: Regs = unsafe { std::mem::zeroed() };
                 if let Err(e) = ptrace_getregs(pid, &mut regs) {
-                    log(&format!("ptrace_getregs failed: {} (iteration {})", e, loop_count));
+                    log(&format!(
+                        "ptrace_getregs failed: {} (iteration {})",
+                        e, loop_count
+                    ));
                     // We've consumed this syscall-stop regardless of whether
                     // we could read its registers — the next PTRACE_SYSCALL
                     // will land on the *other* half of the same syscall
@@ -658,11 +680,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         }
                         #[allow(unreachable_patterns)]
                         STAT_SYSCALL | LSTAT_SYSCALL | NEWFSTATAT_SYSCALL | STATX_SYSCALL => {
-                            let path_arg_index = if syscall_num == STAT_SYSCALL || syscall_num == LSTAT_SYSCALL {
-                                REG_ARG1
-                            } else {
-                                REG_ARG2
-                            };
+                            let path_arg_index =
+                                if syscall_num == STAT_SYSCALL || syscall_num == LSTAT_SYSCALL {
+                                    REG_ARG1
+                                } else {
+                                    REG_ARG2
+                                };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
