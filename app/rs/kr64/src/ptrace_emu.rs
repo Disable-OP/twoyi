@@ -459,7 +459,14 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     // (32) to keep memory bounded if init triggers thousands of
     // SIGSYS in a tight loop.
     const RECENT_SIGSYS_CAP: usize = 32;
-    let mut recent_sigsys: std::collections::VecDeque<i64> =
+    // Rolling history of the last N SIGSYS-intercepted syscalls, stored
+    // as human-readable descriptions (e.g. `access("/init.rc") nr=21`
+    // or `nr=14 [rt_sigprocmask]`). Storing strings instead of bare
+    // syscall numbers lets us include the path argument for access()
+    // calls — the single most useful diagnostic when init dies after
+    // a flurry of access() probes (it shows which file init was
+    // looking for).
+    let mut recent_sigsys: std::collections::VecDeque<String> =
         std::collections::VecDeque::with_capacity(RECENT_SIGSYS_CAP);
     // Signal to deliver to the child on the next PTRACE_SYSCALL resume.
     // 0 means "don't deliver any signal". Non-zero values are set by
@@ -498,9 +505,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // child dies between a syscall-exit-stop and our
                 // next PTRACE_SYSCALL.
                 if !recent_sigsys.is_empty() {
-                    let collected: Vec<i64> = recent_sigsys.iter().copied().collect();
+                    let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                     log(&format!(
-                        "last {} SIGSYS-intercepted syscall numbers before ESRCH (oldest->newest): {:?}",
+                        "last {} SIGSYS-intercepted syscalls before ESRCH (oldest->newest): {:?}",
                         collected.len(),
                         collected
                     ));
@@ -548,9 +555,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
             if recent_sigsys.is_empty() {
                 log("no SIGSYS interceptions recorded during this run");
             } else {
-                let collected: Vec<i64> = recent_sigsys.iter().copied().collect();
+                let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                 log(&format!(
-                    "last {} SIGSYS-intercepted syscall numbers (oldest->newest): {:?}",
+                    "last {} SIGSYS-intercepted syscalls (oldest->newest): {:?}",
                     collected.len(),
                     collected
                 ));
@@ -561,9 +568,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
             let sig = libc::WTERMSIG(status);
             log(&format!("child killed by signal {} (after {} iterations)", sig, loop_count));
             if !recent_sigsys.is_empty() {
-                let collected: Vec<i64> = recent_sigsys.iter().copied().collect();
+                let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                 log(&format!(
-                    "last {} SIGSYS-intercepted syscall numbers before kill (oldest->newest): {:?}",
+                    "last {} SIGSYS-intercepted syscalls before kill (oldest->newest): {:?}",
                     collected.len(),
                     collected
                 ));
@@ -744,12 +751,15 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // value, then resume WITHOUT delivering the signal.
                 //
                 // The return value depends on the original syscall:
-                //   - access()      → -ENOENT ("file not found") so init
-                //     treats the file as missing instead of accessible.
-                //     Returning 0 (success) was lying to init that the
-                //     file IS accessible, which confused bionic during
-                //     early init and caused init to exit with code 1
-                //     after ~183 iterations.
+                //   - access()      → 0 (success). The previous behaviour
+                //     returned -ENOENT so init would treat the probed
+                //     path as missing, but init apparently needs certain
+                //     paths to "exist" (e.g. to decide which init.rc
+                //     fragment to source) and the -ENOENT caused init
+                //     to exit with code 1 after ~183 iterations. We now
+                //     return 0 (the original behaviour before the
+                //     -ENOENT "fix") and log the PATH argument so we can
+                //     see exactly what init is probing.
                 //   - rt_sigprocmask() → 0 (success). For a ptraced
                 //     process the actual signal mask doesn't matter —
                 //     bionic just needs the call to "succeed" so its
@@ -781,12 +791,41 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     // intercepted.
                     let original_syscall = get_syscall_num(&sigsys_regs);
                     let name = syscall_name(original_syscall);
-                    // Push into the rolling history so the exit
-                    // handler can print "last N blocked syscalls".
+
+                    // For access() (x86_64 nr=21): read the PATH
+                    // argument from the child's memory so we can log
+                    // what init is probing. access() takes
+                    // (const char *pathname, int mode), so the path
+                    // pointer is in REG_ARG1. On aarch64 ACCESS_SYSCALL
+                    // is -1 (aarch64 uses faccessat instead), so this
+                    // branch is dead on that architecture — the
+                    // comparison still compiles and is harmless.
+                    let access_path: Option<String> = if original_syscall == ACCESS_SYSCALL {
+                        let path_addr = get_syscall_arg(&sigsys_regs, REG_ARG1);
+                        read_child_string(pid, path_addr)
+                    } else {
+                        None
+                    };
+
+                    // Push a human-readable description into the rolling
+                    // history so the exit handler can print "last N
+                    // blocked syscalls". For access() we include the
+                    // path being probed — that is the single most
+                    // useful diagnostic when init dies after a flurry
+                    // of access() calls (it tells us which file init
+                    // was looking for and couldn't find).
+                    let history_entry: String = if original_syscall == ACCESS_SYSCALL {
+                        match &access_path {
+                            Some(p) => format!("access({:?}) nr={}", p, original_syscall),
+                            None => format!("access(?) nr={} [{}]", original_syscall, name),
+                        }
+                    } else {
+                        format!("nr={} [{}]", original_syscall, name)
+                    };
                     if recent_sigsys.len() == RECENT_SIGSYS_CAP {
                         recent_sigsys.pop_front();
                     }
-                    recent_sigsys.push_back(original_syscall);
+                    recent_sigsys.push_back(history_entry);
 
                     // Rewrite the syscall number to getpid (a harmless,
                     // always-allowed syscall) so the kernel does not
@@ -805,11 +844,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     // effectively dead on that architecture — the
                     // comparison still compiles and is harmless.
                     let ret_val: i64 = if original_syscall == ACCESS_SYSCALL {
+                        let path_display = access_path.as_deref().unwrap_or("?");
                         log(&format!(
-                            "intercepted SIGSYS — access() nr={} [{}] (rewriting to getpid, returning -ENOENT)",
-                            original_syscall, name
+                            "intercepted SIGSYS — access({}) nr={} → returning 0 (success)",
+                            path_display, original_syscall
                         ));
-                        -(libc::ENOENT as i64)
+                        0
                     } else if original_syscall == RT_SIGPROCMASK_SYSCALL {
                         log(&format!(
                             "intercepted SIGSYS — rt_sigprocmask() nr={} [{}] (rewriting to getpid, returning 0 — signal mask emulation)",
