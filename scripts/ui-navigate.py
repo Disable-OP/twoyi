@@ -43,6 +43,32 @@ def adb(*args, timeout=30):
 def adb_shell(cmd, timeout=30):
     return adb("shell", cmd, timeout=timeout)
 
+def pull_via_run_as(remote_path, local_path, timeout=10):
+    """Read a file from the app's private data dir via `adb shell run-as`.
+
+    On non-rooted devices, `adb pull` cannot read files in
+    /data/user/0/io.twoyi/ because they're owned by the app's UID
+    (untrusted_app). `run-as io.twoyi` switches to the app's UID, so
+    `cat <path>` can read them. The stdout (file contents) is captured
+    and written to `local_path` verbatim.
+
+    Returns True if the file was read successfully (non-empty stdout,
+    exit code 0), False otherwise (file missing, run-as denied, etc.).
+    Like the `adb pull` calls it replaces, failures are silent — these
+    logs are diagnostic aids, not required artifacts.
+    """
+    try:
+        r = subprocess.run(ADB + ["shell", "run-as", "io.twoyi",
+                                  "cat", remote_path],
+                           capture_output=True, timeout=timeout)
+        if r.returncode == 0 and r.stdout:
+            with open(local_path, "wb") as f:
+                f.write(r.stdout)
+            return True
+    except subprocess.TimeoutExpired:
+        pass
+    return False
+
 def screenshot(name):
     path = os.path.join(ART, f"screenshot-{name}.png")
     try:
@@ -928,13 +954,15 @@ def main():
 
     # Pull the TWRP diagnostic logs from the app's rootfs directory.
     #
-    # All three pulls use `check=False` (the default for subprocess.run),
-    # which is the Python equivalent of `adb pull ... || true` — if the
-    # source file does not exist (e.g. kr64 never created it, or TWRP
-    # init's unlink() already removed it by the time we pull), adb
-    # returns a non-zero exit code that is captured by capture_output
-    # and silently swallowed. This is intentional: these logs are
-    # diagnostic aids, not required artifacts.
+    # twrp-init.log and twrp-kmsg.log live under /data/user/0/io.twoyi/
+    # rootfs/ — the app's private data dir. On a non-rooted device
+    # `adb pull` CANNOT read these files directly (they're owned by
+    # untrusted_app, mode 0700 dir), so we use `adb shell run-as
+    # io.twoyi cat <path>` instead, which switches to the app's UID
+    # before reading. The `pull_via_run_as` helper captures stdout
+    # (the file contents) and writes it verbatim to the local artifact
+    # path. Failures are silent (file missing, run-as denied, etc.) —
+    # these logs are diagnostic aids, not required artifacts.
     #
     #   - twrp-init.log: written by the ptrace emulator (kr64). Captures
     #     SIGSYS interceptions, syscall entries, and child exit code.
@@ -953,17 +981,15 @@ def main():
     #     here. TWRP init later unlink()s the file, but the open fd
     #     keeps the inode alive — if we pull before kr64 SIGKILLs init
     #     (or if the unlink is intercepted by the loader), the file
-    #     may still be on disk and contain KLOG output. Pulled best-
-    #     effort; missing file is not an error.
-    subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/twrp-init.log",
-                         os.path.join(ART, "twrp-init.log")],
-                  capture_output=True, timeout=10)
-    subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/twrp-kmsg.log",
-                         os.path.join(ART, "twrp-kmsg.log")],
-                  capture_output=True, timeout=10)
-    subprocess.run(ADB + ["pull", "/data/user/0/io.twoyi/rootfs/dev/__kmsg__",
-                         os.path.join(ART, "dev-__kmsg__")],
-                  capture_output=True, timeout=10)
+    #     may still be on disk and contain KLOG output. Also pulled
+    #     via run-as (same private-dir ownership); missing file is
+    #     not an error.
+    pull_via_run_as("/data/user/0/io.twoyi/rootfs/twrp-init.log",
+                    os.path.join(ART, "twrp-init.log"))
+    pull_via_run_as("/data/user/0/io.twoyi/rootfs/twrp-kmsg.log",
+                    os.path.join(ART, "twrp-kmsg.log"))
+    pull_via_run_as("/data/user/0/io.twoyi/rootfs/dev/__kmsg__",
+                    os.path.join(ART, "dev-__kmsg__"))
 
     print()
     print("=" * 60)
