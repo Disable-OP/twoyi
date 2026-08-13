@@ -696,8 +696,12 @@ def main():
     #   a) SEARCH the picker (NEW PRIMARY). Tap the search icon
     #      (content-desc "Search") in the top-right of the picker, type
     #      "recovery" via `adb shell input text "recovery"`, wait for the
-    #      filter to apply, then tap the single filtered result
-    #      (recovery.img) via tap_picker_row_with_fallbacks. Verify the
+    #      filter to apply, then — CRITICAL — do NOT try tap methods
+    #      (they all fail on this picker); go DIRECTLY to DPAD:
+    #      KEYCODE_DPAD_DOWN once + KEYCODE_ENTER. Since the filtered
+    #      list has only ONE item (recovery.img), 1x DPAD_DOWN should
+    #      focus it, and ENTER should select it. If the picker is still
+    #      open, escalate to 2x then 3x DPAD_DOWN + ENTER. Verify the
     #      picker closed AND a ROM was imported. This bypasses the
     #      RecyclerView focus issue entirely because there's only ONE
     #      item in the filtered list.
@@ -887,8 +891,7 @@ def main():
     # NEW PRIMARY strategy. The SAF file picker has a search icon
     # (magnifying glass) in the top-right area; tapping it opens a
     # search input. Typing "recovery" filters the list so that ONLY
-    # recovery.img is shown — there is exactly one item, so tapping it
-    # selects recovery.img regardless of any RecyclerView focus issue.
+    # recovery.img is shown — there is exactly one item.
     #
     # Steps:
     #   a. Find the search icon by content-desc "Search" in the
@@ -896,15 +899,28 @@ def main():
     #   b. Wait 1s for the search input to appear.
     #   c. Type "recovery" via `adb shell input text "recovery"`.
     #   d. Wait 2s for the filter to apply.
-    #   e. Take a fresh uiautomator dump and find recovery.img in the
-    #      filtered list, tapping it via tap_picker_row_with_fallbacks.
-    #   f. Verify the picker closed AND a ROM was imported.
+    #   e. Take a fresh uiautomator dump and CONFIRM recovery.img is
+    #      present in the filtered list (via safe_row_tap_target).
+    #      Do NOT actually tap it — all 6 tap methods (input tap,
+    #      touchscreen swipe, motionevent, trackball) FAIL on this
+    #      picker's filtered list. Instead, go DIRECTLY to DPAD:
+    #   f. Press KEYCODE_DPAD_DOWN once + KEYCODE_ENTER, then wait 3s.
+    #      Since the filtered list has only ONE item (recovery.img),
+    #      1x DPAD_DOWN should focus it, and ENTER should select it.
+    #   g. If the picker is still open (not closed), escalate: try
+    #      2x DPAD_DOWN + ENTER, then 3x. (Rare edge cases where focus
+    #      starts above the search bar.)
+    #   h. If the picker closed, verify a ROM was actually imported.
+    #      If verify fails, the picker has been re-opened by
+    #      verify_import_or_reopen; fall through to (b) DPAD on the
+    #      unfiltered list.
     #
-    # This bypasses the RecyclerView focus issue entirely because
-    # there's only ONE item in the filtered list — no focus wandering,
-    # no accidental taps on the per-row preview icon, no drift into
-    # Google Photos. Falls through to (b) DPAD if the search icon
-    # can't be found or the filtered tap doesn't close the picker.
+    # This bypasses BOTH the RecyclerView focus issue AND the
+    # tap-method failure mode — the filter narrows the list to one
+    # item, and DPAD navigation works on a single-item list where taps
+    # do not. Falls through to (b) DPAD if the search icon can't be
+    # found, no recovery-like text is in the filtered list, or all
+    # three DPAD_DOWN counts fail to close the picker.
     # ═══════════════════════════════════════════════════════════════
     if not found_file:
         ensure_on_picker("03a_pre_search")
@@ -922,44 +938,72 @@ def main():
             print("  Typing 'recovery' into the search input")
             adb_shell('input text "recovery"')
             wait(2)  # wait 2s for the filter to apply
-            # (c) Take a fresh uiautomator dump and tap recovery.img in
-            # the filtered list.
+            # (c) Take a fresh uiautomator dump and CONFIRM recovery.img
+            # is present in the filtered list. Do NOT tap it — all 6 tap
+            # methods (input tap, touchscreen swipe, motionevent,
+            # trackball) FAIL on this picker's filtered list. Instead,
+            # go directly to DPAD: N x KEYCODE_DPAD_DOWN + ENTER.
             xml, root, activity = fresh_picker_state("03a_search_filtered")
             print("  Visible text after search filter:")
             print_all_text(root, prefix="    ")
+            recovery_in_filter = None
             for text in ["recovery.img", "recovery", "byt_t", "twrp"]:
                 result = safe_row_tap_target(root, text, exact=False)
-                if not result:
-                    continue
-                cx, cy, _ = result
-                print(f"  Found '{text}' in filtered list — safe row tap at ({cx}, {cy}) — tapping (tap_picker_row_with_fallbacks)")
-                tap_picker_row_with_fallbacks(cx, cy)
-                wait(3)
-                a = get_current_activity()
-                status = classify_tap_result(a)
-                print(f"  Tap result: {status} (activity={a!r})")
-                if status == "success":
-                    # Verify a ROM was actually imported (not a false
-                    # success from selecting ui-dump.xml or similar).
-                    if verify_import_or_reopen("03a_search_verify"):
-                        found_file = True
-                        print(f"  ✓ ROM imported after SEARCH-and-tap strategy")
-                    # else: verify_import_or_reopen has re-opened the
-                    # picker; fall through to (b) DPAD.
+                if result:
+                    recovery_in_filter = result
+                    print(f"  Found '{text}' in filtered list at ({result[0]}, {result[1]}) — skipping tap (all 6 tap methods fail on this picker), going directly to DPAD")
                     break
-                elif status == "photos":
-                    print(f"  ⚠ Tap opened Google Photos — escaping")
-                    escape_google_photos()
-                    break
-                else:
-                    print(f"  ⚠ Picker still open or drifted (status={status}) after search-filtered tap")
-                    if dismiss_share_sheet(root):
-                        xml, root, activity = fresh_picker_state("03a_search_after_dismiss")
-                        if classify_tap_result(activity) == "success":
-                            if verify_import_or_reopen("03a_search_postverify"):
-                                found_file = True
-                                print(f"  ✓ ROM imported after search share-sheet dismiss")
-                    break
+
+            if recovery_in_filter:
+                # The filtered list has only ONE item (recovery.img),
+                # so 1x DPAD_DOWN should focus it and ENTER should
+                # select it. If the picker is still open after 1x,
+                # escalate to 2x then 3x DOWN (rare edge cases where
+                # focus starts above the search bar).
+                for downs in (1, 2, 3):
+                    if found_file or not is_on_file_picker(get_current_activity()):
+                        break
+                    print(f"  SEARCH+DPAD attempt {downs}/3: {downs}x DPAD_DOWN + ENTER (no tap)")
+                    for _ in range(downs):
+                        adb_shell("input keyevent KEYCODE_DPAD_DOWN")
+                        wait(0.5)
+                    adb_shell("input keyevent KEYCODE_ENTER")
+                    wait(3)
+
+                    a = get_current_activity()
+                    status = classify_tap_result(a)
+                    print(f"  After {downs}x DPAD_DOWN + ENTER: {status} (activity={a!r})")
+                    if status == "success":
+                        # Picker closed — verify a ROM was actually
+                        # imported. Do NOT escalate further within the
+                        # SEARCH strategy; if verify fails, fall through
+                        # to (b) DPAD on the unfiltered list.
+                        if verify_import_or_reopen(f"03a_search_dpad{downs}_verify"):
+                            found_file = True
+                            print(f"  ✓ ROM imported after SEARCH + {downs}x DPAD_DOWN + ENTER")
+                        # else: verify_import_or_reopen has re-opened
+                        # the picker; fall through to (b) DPAD.
+                        break
+                    elif status == "photos":
+                        print(f"  ⚠ DPAD ENTER opened Google Photos — escaping")
+                        escape_google_photos()
+                        break
+                    else:
+                        # Picker still open or drifted — escalate to
+                        # (downs+1)x DPAD_DOWN unless a share sheet is
+                        # in the way (dismiss it first).
+                        nxt = downs + 1 if downs < 3 else 3
+                        print(f"  ⚠ Picker still open (status={status}) after {downs}x DPAD_DOWN + ENTER — escalating to {nxt}x DOWN")
+                        if dismiss_share_sheet(root):
+                            xml, root, activity = fresh_picker_state(f"03a_search_dpad{downs}_after_dismiss")
+                            if classify_tap_result(activity) == "success":
+                                if verify_import_or_reopen(f"03a_search_dpad{downs}_postverify"):
+                                    found_file = True
+                                    print(f"  ✓ ROM imported after search share-sheet dismiss")
+                                    break
+                        # Continue to next downs count.
+            else:
+                print("  ⚠ No recovery-like text found in filtered list — falling through to (b) DPAD")
         else:
             print("  ⚠ 'Search' icon not found in uiautomator dump — falling through to (b) DPAD")
         # End of SEARCH strategy — fall through to (b) regardless of outcome.
