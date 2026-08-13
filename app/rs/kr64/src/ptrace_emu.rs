@@ -35,10 +35,16 @@
 //     user_regs_struct used by 64-bit children, and the child uses
 //     the i386 syscall-number table (e.g. getpid is 20, not 39).
 //   - We detect the child's bitness at the first syscall stop by
-//     inspecting the `iov_len` returned by PTRACE_GETREGSET, then
-//     pick the matching `ChildAbi` (ABI_X86_32 vs ABI_X86_64). All
+//     reading /proc/<pid>/exe and inspecting the ELF header
+//     (EI_CLASS at byte 4, e_machine at bytes 18-19), then pick
+//     the matching `ChildAbi` (ABI_X86_32 vs ABI_X86_64). All
 //     syscall-number comparisons and register-index lookups go
 //     through that ABI so the same loop body handles both cases.
+//     We previously detected bitness by inspecting the `iov_len`
+//     returned by PTRACE_GETREGSET, but on the x86_64 Android
+//     emulator PTRACE_GETREGSET returns EIO (forcing us onto the
+//     PTRACE_GETREGS fallback, which has no iov_len) so we now use
+//     the ELF header as the single source of truth for bitness.
 //   - On aarch64 there is no 32-bit userspace, so we always use
 //     ABI_AARCH64.
 //
@@ -54,10 +60,21 @@
 //
 // CRITICAL: On aarch64, PTRACE_GETREGS (12) does NOT exist — it returns
 // EIO. We must use PTRACE_GETREGSET (33) with NT_PRSTATUS (1) and an
-// iovec. On x86_64, we NOW ALSO use PTRACE_GETREGSET (we used to use
-// PTRACE_GETREGS, but that does not expose `iov_len`, which we need
-// in order to detect whether the child is a 32-bit i386 binary or a
-// 64-bit x86_64 binary — see the "32-bit child support" note above).
+// iovec. PTRACE_GETREGSET works reliably on real aarch64 hardware.
+//
+// CRITICAL (x86_64, emulator fix): PTRACE_GETREGSET returns EIO on the
+// x86_64 Android emulator. On x86_64 we therefore TRY PTRACE_GETREGSET
+// first (so the aarch64 and x86_64 paths share the same primary code)
+// and FALL BACK to the legacy PTRACE_GETREGS (request 12) on EIO.
+// PTRACE_GETREGS works on x86_64 for both 64-bit children and 32-bit
+// (i386 compat) children — the kernel zero-extends each 32-bit register
+// value into the corresponding 64-bit slot of user_regs_struct, so the
+// ABI_X86_32 register indices (5=rbx, 11=rcx, 12=rdx, 13=rsi) work
+// correctly against that 64-bit view.
+//
+// Because the GETREGS fallback path has no iov_len, child-bitness
+// detection is now done independently by reading /proc/<pid>/exe and
+// inspecting the ELF header — see `detect_child_is_64bit`.
 //
 // CRITICAL (aarch64, real-device fix): The libc crate declares `ptrace`
 // as a variadic C function (`extern "C" { fn ptrace(c_uint, ...) -> c_long; }`).
@@ -75,8 +92,8 @@
 // bionic's variadic `ptrace()` wrapper.
 //
 // Fix: bypass `libc::ptrace()` and call the kernel via the raw syscall
-// interface for the GETREGSET/SETREGSET requests on aarch64. We now do
-// the same on x86_64 (the raw-syscall path costs nothing there and keeps
+// interface for the GETREGSET/SETREGSET requests on aarch64. We do the
+// same on x86_64 (the raw-syscall path costs nothing there and keeps
 // the GET/SET code paths identical across architectures). We keep
 // `libc::ptrace()` for the non-REGSET requests (PTRACE_SETOPTIONS,
 // PTRACE_SYSCALL, PTRACE_PEEKDATA, ...) because those have been observed
@@ -121,14 +138,17 @@ type Regs = Aarch64Regs;
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(std::mem::size_of::<Aarch64Regs>() == 272);
 
-// Named constants for the generic PTRACE_*REGSET interface, now used on
-// BOTH x86_64 and aarch64. (Previously x86_64 used PTRACE_GETREGS, but
-// that does not expose `iov_len` so we cannot detect child bitness with
-// it — and on x86_64 we need that detection to support i386 compat-mode
-// children like TWRP's static init binary.) Using names instead of bare
-// `33`/`34`/`1` makes the intent obvious and stops future readers from
-// wondering whether they are syscall numbers, NT_* types, or something
-// else entirely.
+// Named constants for the generic PTRACE_*REGSET interface, used as
+// the PRIMARY register-fetch path on BOTH x86_64 and aarch64. On
+// x86_64 we fall back to the legacy PTRACE_GETREGS/SETREGS (numbers
+// 12/13) when GETREGSET returns EIO — see `ptrace_getregs_legacy`
+// and `ptrace_setregs_legacy`. The constants below cover only the
+// REGSET requests because the legacy request numbers are small
+// integers that read more clearly as `12`/`13` at the fallback call
+// sites (with a comment pointing at <linux/ptrace.h>). Using names
+// instead of bare `33`/`34`/`1` makes the intent obvious and stops
+// future readers from wondering whether they are syscall numbers,
+// NT_* types, or something else entirely.
 mod ptrace_regset {
     /// `PTRACE_GETREGSET` — Linux generic ptrace request number, see
     /// <linux/ptrace.h>. Reads a regset by NT_* type into a user `iovec`.
@@ -154,11 +174,14 @@ mod ptrace_regset {
 // — we have to pick the right set at runtime based on the child's
 // actual bitness.
 //
-// We detect bitness at the first syscall stop by inspecting the
-// `iov_len` returned by PTRACE_GETREGSET(NT_PRSTATUS):
-//   - 68 bytes  → 32-bit child (user_regs_struct32, 17 * 4)
-//   - 216 bytes → 64-bit child (user_regs_struct, 27 * 8)
-// and then select ABI_X86_32 or ABI_X86_64 accordingly.
+// We detect bitness at the first syscall stop by reading
+// /proc/<pid>/exe and inspecting the ELF header (see
+// `detect_child_is_64bit`): EI_CLASS=1 → 32-bit i386 child,
+// EI_CLASS=2 → 64-bit x86_64 child. We then select ABI_X86_32 or
+// ABI_X86_64 accordingly. (We used to inspect the `iov_len` returned
+// by PTRACE_GETREGSET, but on the x86_64 Android emulator
+// PTRACE_GETREGSET returns EIO and the GETREGS fallback has no
+// iov_len — so the ELF header is now the single source of truth.)
 //
 // On aarch64 there is no 32-bit userspace, so we always use ABI_AARCH64.
 
@@ -321,60 +344,138 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     reg_arg4: 3,    // x3
 };
 
-/// Expected iov_len for a 32-bit (i386 compat) child's NT_PRSTATUS
-/// regset — `user_regs_struct32` is 17 * 4 = 68 bytes. Used by
-/// `pick_abi_from_iov_len` (on x86_64) and by the bitness-detection
-/// log messages to label the child as 32-bit vs 64-bit.
+/// Detect whether the traced child is a 32-bit (i386) or 64-bit (x86_64)
+/// ELF by reading its `/proc/<pid>/exe` symlink target and parsing the
+/// ELF header.
 ///
-/// On aarch64 this value is never meaningful (aarch64 has no 32-bit
-/// userspace), but we still define it so the `cfg!()`-gated logging
-/// code in `run_ptrace_loop` compiles uniformly across architectures —
-/// the `cfg!(target_arch = "x86_64")` branch that compares against it
-/// is dead on aarch64.
-const USER_REGS32_LEN: usize = 68;
+/// We do NOT rely on the `iov_len` returned by PTRACE_GETREGSET for
+/// bitness detection anymore. On the x86_64 Android emulator (and
+/// possibly other bionic/kernel combinations) PTRACE_GETREGSET returns
+/// EIO, which forces `ptrace_getregs` to fall back to PTRACE_GETREGS —
+/// and PTRACE_GETREGS does not expose `iov_len` at all. Reading the
+/// child's own ELF header is also a more reliable bitness signal than
+/// the regset size the kernel happened to report: it tells us the
+/// executable's actual architecture.
+///
+/// # What we read
+///
+/// The ELF header's first 20 bytes contain everything we need:
+///   - bytes 0-3   : ELFMAG ("\x7fELF")
+///   - byte  4     : `EI_CLASS` (1=ELFCLASS32, 2=ELFCLASS64)
+///   - byte  5     : `EI_DATA`  (1=LSB, 2=MSB) — assumed LSB for x86
+///   - bytes 18-19 : `e_machine` (little-endian u16; EM_386=3, EM_X86_64=62)
+///
+/// `EI_CLASS` is the primary bitness signal — we cross-check `e_machine`
+/// for robustness (in case of a malformed ELF header). On disagreement
+/// `EI_CLASS` wins.
+///
+/// # Return value
+///
+/// - `Some(true)`  → 64-bit (x86_64) child
+/// - `Some(false)` → 32-bit (i386 compat) child
+/// - `None`        → detection failed (file missing, not an ELF, I/O
+///   error, …). Callers fall back to the 64-bit ABI on `None`, which
+///   matches the historical behaviour.
+///
+/// On aarch64 this function does not exist — aarch64 has no 32-bit
+/// userspace, so the child is unconditionally 64-bit and the loop uses
+/// `ABI_AARCH64` directly without any detection step.
+#[cfg(target_arch = "x86_64")]
+fn detect_child_is_64bit(pid: libc::pid_t) -> Option<bool> {
+    use std::io::Read;
 
-/// Pick the right `ChildAbi` based on the `iov_len` returned by
-/// PTRACE_GETREGSET. On x86_64 this distinguishes 32-bit (68 bytes)
-/// from 64-bit (216 bytes) children. On aarch64 there is no choice to
-/// make — the child is always 64-bit.
-fn pick_abi_from_iov_len(iov_len: usize) -> ChildAbi {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if iov_len == USER_REGS32_LEN {
-            ABI_X86_32
-        } else {
-            // 216 (sizeof user_regs_struct) or any other size → default
-            // to 64-bit. Defaulting is safer than panicking: if the
-            // kernel ever reports an unexpected size we still try the
-            // 64-bit ABI, which is the historical behaviour.
-            ABI_X86_64
-        }
+    // /proc/<pid>/exe is a symlink to the child's executable. We use
+    // std::fs::File::open, which follows symlinks automatically, so we
+    // read the actual ELF image rather than the symlink target string.
+    let path = format!("/proc/{}/exe", pid);
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+
+    let mut hdr = [0u8; 20];
+    if f.read_exact(&mut hdr).is_err() {
+        return None;
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = iov_len;
-        ABI_AARCH64
+
+    classify_elf_bitness(&hdr)
+}
+
+/// Pure byte-level ELF header classifier — the testable core of
+/// [`detect_child_is_64bit`]. Takes the first 20 bytes of a file's
+/// ELF header and returns:
+///   - `Some(true)`  → 64-bit (ELFCLASS64 / EM_X86_64)
+///   - `Some(false)` → 32-bit (ELFCLASS32 / EM_386)
+///   - `None`        → not a recognizable x86 ELF (bad magic, unknown
+///     EI_CLASS, unknown e_machine).
+///
+/// `EI_CLASS` (byte 4) takes precedence over `e_machine` (bytes 18-19)
+/// because every valid i386/x86_64 ELF has EI_CLASS set correctly;
+/// `e_machine` is only consulted as a tiebreaker for malformed headers
+/// where EI_CLASS is neither 1 nor 2.
+///
+/// Defined on all architectures so the unit tests run on the host
+/// (typically x86_64-linux), even when the production caller
+/// (`detect_child_is_64bit`) is x86_64-only. On aarch64 the function
+/// has no production caller, so we silence the dead-code lint — the
+/// tests still exercise the byte-parsing logic.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn classify_elf_bitness(hdr: &[u8; 20]) -> Option<bool> {
+    // Validate the ELF magic. If this isn't an ELF we have no way to
+    // detect bitness — return None so the caller falls back to 64-bit.
+    if &hdr[0..4] != b"\x7fELF" {
+        return None;
+    }
+
+    let ei_class = hdr[4];
+    // e_machine is a little-endian u16 at offset 18. i386 and x86_64
+    // are both little-endian, so `from_le_bytes` is always correct
+    // here.
+    const EM_386: u16 = 3;
+    const EM_X86_64: u16 = 62;
+    let e_machine = u16::from_le_bytes([hdr[18], hdr[19]]);
+
+    // EI_CLASS takes precedence over e_machine: a valid i386 or x86_64
+    // ELF always has EI_CLASS == 1 or 2 respectively, and e_machine is
+    // only consulted as a tiebreaker for malformed headers.
+    match (ei_class, e_machine) {
+        (1, _) => Some(false), // ELFCLASS32 — i386 child
+        (2, _) => Some(true),  // ELFCLASS64 — x86_64 child
+        (_, EM_386) => Some(false),
+        (_, EM_X86_64) => Some(true),
+        _ => None,
     }
 }
 
 // ── Architecture-specific get/set registers ────────────────────────
 
-/// Get the child's registers via PTRACE_GETREGSET with NT_PRSTATUS.
+/// Get the child's registers.
 ///
-/// This used to call PTRACE_GETREGS on x86_64, but we switched to
-/// PTRACE_GETREGSET on BOTH architectures so that we can inspect the
-/// `iov_len` the kernel writes back — that length tells us whether the
-/// child is a 32-bit (i386) or 64-bit ELF, which we need to pick the
-/// correct syscall-number table and register-index mapping.
+/// On **aarch64** we always use `PTRACE_GETREGSET` with `NT_PRSTATUS`
+/// (the only regset-fetching ptrace request the aarch64 kernel
+/// supports — `PTRACE_GETREGS` returns `EIO` there).
 ///
-/// Returns the actual `iov_len` reported by the kernel on success.
-/// Callers use this at the first syscall stop to lazily initialize
-/// the per-child `ChildAbi`.
+/// On **x86_64** we try `PTRACE_GETREGSET` first (because it exposes
+/// `iov_len`, which historically we used for child-bitness detection),
+/// but on the x86_64 Android emulator `PTRACE_GETREGSET` returns
+/// `EIO`. In that case we fall back to the legacy `PTRACE_GETREGS`
+/// request (number 12), which works on x86_64 — both for 64-bit
+/// children and for 32-bit (i386 compat) children, where the kernel
+/// zero-extends each 32-bit register value into the corresponding
+/// 64-bit slot of `user_regs_struct`.
 ///
-/// The function name `ptrace_getregs` is historical — neither arch now
-/// uses PTRACE_GETREGS; both go through the generic PTRACE_GETREGSET
-/// mechanism. Kept the name for parity with the call sites in
-/// `run_ptrace_loop`.
+/// Because the fallback path has no `iov_len`, child bitness is now
+/// detected separately by [`detect_child_is_64bit`] (which reads the
+/// child's ELF header via `/proc/<pid>/exe`). The `usize` we return
+/// is therefore only used as the `iov_len` argument to the matching
+/// [`ptrace_setregs`] call — on the GETREGS fallback path it is just
+/// `sizeof(Regs)` (216 on x86_64), which the SETREGS fallback path
+/// ignores.
+///
+/// The function name `ptrace_getregs` is historical — on x86_64 it
+/// may now actually use `PTRACE_GETREGS` (the legacy request), and on
+/// aarch64 it always uses `PTRACE_GETREGSET`. Kept the name for parity
+/// with the call sites in `run_ptrace_loop`.
 fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
     use ptrace_regset::{NT_PRSTATUS, PTRACE_GETREGSET};
 
@@ -401,7 +502,7 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
     // integer (here NT_PRSTATUS=1), NOT a pointer — that's fine, the
     // kernel just reads it as `unsigned long` and dispatches on it.
     //
-    // We use the raw-syscall path on BOTH architectures now: the
+    // We use the raw-syscall path on BOTH architectures: the
     // historical bionic variadic-ptrace EIO problem was observed on
     // aarch64, but going through libc::syscall uniformly costs nothing
     // on x86_64 and means we don't need a cfg-split here.
@@ -415,29 +516,91 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
         )
     };
     if r == -1 {
-        return Err(std::io::Error::last_os_error());
+        let e = std::io::Error::last_os_error();
+        // On x86_64, PTRACE_GETREGSET returns EIO on the Android
+        // emulator (the kernel exposes PTRACE_GETREGSET only for
+        // ptrace requests that the kernel actually implements for the
+        // traced task's architecture; the emulator's bionic/kernel
+        // combination evidently does not). Fall back to the legacy
+        // PTRACE_GETREGS, which works on x86_64 for both 64-bit and
+        // 32-bit (compat) children. On aarch64 PTRACE_GETREGS does
+        // not exist at all, so we DON'T fall back there — the
+        // aarch64 path MUST go through PTRACE_GETREGSET (which works
+        // on real aarch64 hardware).
+        #[cfg(target_arch = "x86_64")]
+        if e.raw_os_error() == Some(libc::EIO) {
+            return ptrace_getregs_legacy(pid, regs);
+        }
+        return Err(e);
     }
     Ok(iov.iov_len)
 }
 
-/// Set the child's registers via PTRACE_SETREGSET with NT_PRSTATUS.
+/// x86_64-only fallback for [`ptrace_getregs`]: read registers via the
+/// legacy `PTRACE_GETREGS` request (number 12).
 ///
-/// Same switch as `ptrace_getregs`: we used to call PTRACE_SETREGS on
-/// x86_64, but now use PTRACE_SETREGSET on both architectures so the
-/// GET and SET paths are symmetric (and so we write back the same
-/// regset size the kernel gave us at GETREGSET time, which matters for
-/// 32-bit children — writing 216 bytes to a 32-bit child would confuse
-/// the kernel's 32-bit regset handler).
+/// `PTRACE_GETREGS` is the historical x86_64 register-fetch request.
+/// It does NOT expose `iov_len` — the kernel always writes
+/// `sizeof(user_regs_struct)` (= 216) bytes into the data pointer —
+/// so we return `sizeof(Regs)` as the "iov_len" and rely on
+/// [`detect_child_is_64bit`] for bitness detection.
 ///
-/// `iov_len` is the regset size captured at the matching GETREGSET
-/// call. Passing it through (instead of `sizeof(Regs)`) makes the
-/// 32-bit and 64-bit paths symmetric.
+/// For a 32-bit (i386 compat) child the kernel zero-extends each
+/// 32-bit register value into the corresponding 64-bit slot of
+/// `user_regs_struct` (rbx ← ebx, rcx ← ecx, …), so the indices in
+/// [`ABI_X86_32`] work correctly against this 64-bit view.
 ///
-/// Same bionic-ptrace-wrapper caveat as `ptrace_getregs`: we go through
-/// the raw syscall on BOTH architectures because the libc::ptrace()
-/// variadic wrapper has been observed to fail with EIO on real arm64
-/// Android devices, and going through libc::syscall uniformly costs
-/// nothing on x86_64.
+/// We invoke the kernel via `libc::syscall(SYS_ptrace, …)` for the
+/// same reason [`ptrace_getregs`] does — to bypass bionic's variadic
+/// `ptrace()` wrapper.
+#[cfg(target_arch = "x86_64")]
+fn ptrace_getregs_legacy(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
+    // PTRACE_GETREGS = 12 (see <linux/ptrace.h>). Not exposed by the
+    // `libc` crate on every target, so use the literal value with a
+    // named binding for clarity.
+    const PTRACE_GETREGS: libc::c_long = 12;
+
+    // PTRACE_GETREGS signature:
+    //   ptrace(PTRACE_GETREGS, pid, /*addr*/ 0, /*data*/ void *)
+    // The kernel writes sizeof(user_regs_struct) bytes into `data`.
+    // We pass `regs` directly — `Regs` IS `user_regs_struct` on
+    // x86_64 (see the type alias near the top of this file).
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            PTRACE_GETREGS,
+            pid as libc::c_long,
+            0,
+            regs as *mut Regs as *mut libc::c_void,
+        )
+    };
+    if r == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // No iov_len on this path — return sizeof(Regs) (= 216 on x86_64)
+    // so the matching `ptrace_setregs` call has a sane value to
+    // forward. The SETREGS fallback path ignores this argument
+    // anyway.
+    Ok(std::mem::size_of::<Regs>())
+}
+
+/// Set the child's registers.
+///
+/// Mirrors [`ptrace_getregs`]:
+///   - On **aarch64** we always use `PTRACE_SETREGSET` with `NT_PRSTATUS`.
+///   - On **x86_64** we try `PTRACE_SETREGSET` first, and on `EIO` (the
+///     same failure that triggers the GETREGS fallback in `ptrace_getregs`)
+///     we fall back to the legacy `PTRACE_SETREGS` request.
+///
+/// `iov_len` is the value returned by the matching `ptrace_getregs`
+/// call. On the SETREGS fallback path it is ignored (the kernel always
+/// reads exactly `sizeof(user_regs_struct)` bytes from the data
+/// pointer); on the SETREGSET path it is forwarded to the kernel as
+/// the iovec length.
+///
+/// The GET and SET paths are intentionally symmetric: if GETREGSET
+/// returned EIO for this child then SETREGSET almost certainly will
+/// too, so we fall back to SETREGS in lockstep.
 fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Result<()> {
     use ptrace_regset::{NT_PRSTATUS, PTRACE_SETREGSET};
 
@@ -457,6 +620,48 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Res
             pid as libc::c_long,
             NT_PRSTATUS,
             &iov as *const libc::iovec,
+        )
+    };
+    if r == -1 {
+        let e = std::io::Error::last_os_error();
+        // Same fallback as in `ptrace_getregs`: on x86_64 the
+        // PTRACE_*REGSET requests return EIO on the Android emulator,
+        // so use the legacy PTRACE_SETREGS (request 13) which writes
+        // sizeof(user_regs_struct) bytes from the data pointer. We
+        // MUST stay symmetric with `ptrace_getregs` — if we read via
+        // GETREGS we must write via SETREGS, otherwise the kernel
+        // would reject the write (and we'd silently drop register
+        // updates like the SIGSYS "rewrite to getpid" return value).
+        #[cfg(target_arch = "x86_64")]
+        if e.raw_os_error() == Some(libc::EIO) {
+            return ptrace_setregs_legacy(pid, regs);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// x86_64-only fallback for [`ptrace_setregs`]: write registers via
+/// the legacy `PTRACE_SETREGS` request (number 13).
+///
+/// Symmetric with [`ptrace_getregs_legacy`] — see the comment on that
+/// function for why we go through `libc::syscall` directly. The kernel
+/// reads `sizeof(user_regs_struct)` (= 216) bytes from `regs` and
+/// writes them to the child; for a 32-bit compat child the kernel
+/// truncates each 64-bit slot to its low 32 bits when populating the
+/// child's `user_regs_struct32`.
+#[cfg(target_arch = "x86_64")]
+fn ptrace_setregs_legacy(pid: libc::pid_t, regs: &Regs) -> std::io::Result<()> {
+    // PTRACE_SETREGS = 13 (see <linux/ptrace.h>).
+    const PTRACE_SETREGS: libc::c_long = 13;
+
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            PTRACE_SETREGS,
+            pid as libc::c_long,
+            0,
+            regs as *const Regs as *mut libc::c_void,
         )
     };
     if r == -1 {
@@ -674,10 +879,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     let mut loop_count: u64 = 0;
     // Runtime-detected syscall/register layout for the child. `None`
     // until the first successful ptrace_getregs — at that point we
-    // inspect the returned `iov_len` to pick ABI_X86_32 vs ABI_X86_64
-    // (on x86_64) or unconditionally use ABI_AARCH64 (on aarch64).
-    // Until then we have no registers to look at, so there is nothing
-    // to dispatch on.
+    // read /proc/<pid>/exe and inspect the ELF header to pick
+    // ABI_X86_32 vs ABI_X86_64 (on x86_64), or unconditionally use
+    // ABI_AARCH64 (on aarch64). Until then we have no registers to
+    // look at, so there is nothing to dispatch on.
     let mut abi: Option<ChildAbi> = None;
     // Rolling log of the last N SIGSYS-intercepted syscall numbers.
     // Used on child exit to print "the last few syscalls seccomp
@@ -815,51 +1020,55 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 loop_count += 1;
 
                 // Get the child's registers using the arch-specific function.
+                // The returned `iov_len` is no longer used here for bitness
+                // detection — we read /proc/<pid>/exe instead (see
+                // `detect_child_is_64bit`), because the PTRACE_GETREGS
+                // fallback path on x86_64 has no real iov_len to inspect.
+                // We still need to call ptrace_getregs to populate `regs`.
                 let mut regs: Regs = unsafe { std::mem::zeroed() };
-                let iov_len = match ptrace_getregs(pid, &mut regs) {
-                    Ok(len) => len,
-                    Err(e) => {
-                        log(&format!(
-                            "ptrace_getregs failed: {} (iteration {})",
-                            e, loop_count
-                        ));
-                        // We've consumed this syscall-stop regardless of whether
-                        // we could read its registers — the next PTRACE_SYSCALL
-                        // will land on the *other* half of the same syscall
-                        // (entry↔exit alternate). If we don't flip `in_syscall`
-                        // here, the next stop will be misclassified as the same
-                        // phase (e.g. entry again), and we'll permanently lose
-                        // sync — every subsequent open/getpid/etc. would be
-                        // handled at the wrong phase and never actually faked.
-                        //
-                        // Flipping here means: if getregs fails transiently we
-                        // stay in sync; if it fails persistently (the original
-                        // bug) the loop still terminates via the child exiting,
-                        // not via state corruption.
-                        in_syscall = !in_syscall;
-                        continue;
-                    }
-                };
+                if let Err(e) = ptrace_getregs(pid, &mut regs) {
+                    log(&format!(
+                        "ptrace_getregs failed: {} (iteration {})",
+                        e, loop_count
+                    ));
+                    // We've consumed this syscall-stop regardless of whether
+                    // we could read its registers — the next PTRACE_SYSCALL
+                    // will land on the *other* half of the same syscall
+                    // (entry↔exit alternate). If we don't flip `in_syscall`
+                    // here, the next stop will be misclassified as the same
+                    // phase (e.g. entry again), and we'll permanently lose
+                    // sync — every subsequent open/getpid/etc. would be
+                    // handled at the wrong phase and never actually faked.
+                    //
+                    // Flipping here means: if getregs fails transiently we
+                    // stay in sync; if it fails persistently (the original
+                    // bug) the loop still terminates via the child exiting,
+                    // not via state corruption.
+                    in_syscall = !in_syscall;
+                    continue;
+                }
 
                 // Lazily initialize the per-child ABI on the first
-                // successful register read. The iov_len tells us
-                // whether the child is 32-bit (68) or 64-bit (216) on
-                // x86_64; on aarch64 the choice is always ABI_AARCH64.
+                // successful register read. On x86_64 we read the
+                // child's ELF header via /proc/<pid>/exe to detect
+                // bitness (PTRACE_GETREGS, which is the fallback path
+                // on the x86_64 Android emulator, does not expose
+                // iov_len — so iov_len-based detection no longer
+                // works there). On aarch64 the child is always 64-bit
+                // so we use ABI_AARCH64 unconditionally.
                 if abi.is_none() {
-                    let picked = pick_abi_from_iov_len(iov_len);
-                    let bitness_label = if cfg!(target_arch = "x86_64") {
-                        if iov_len == USER_REGS32_LEN {
-                            "32-bit (i386 compat)"
-                        } else {
-                            "64-bit (x86_64)"
-                        }
-                    } else {
-                        "64-bit (aarch64)"
+                    #[cfg(target_arch = "x86_64")]
+                    let (picked, bitness_label) = match detect_child_is_64bit(pid) {
+                        Some(true) => (ABI_X86_64, "64-bit (x86_64)"),
+                        Some(false) => (ABI_X86_32, "32-bit (i386 compat)"),
+                        None => (
+                            ABI_X86_64,
+                            "unknown (ELF detection failed — defaulting to 64-bit)",
+                        ),
                     };
-                    log(&format!(
-                        "detected child bitness: {} (iov_len={})",
-                        bitness_label, iov_len
-                    ));
+                    #[cfg(target_arch = "aarch64")]
+                    let (picked, bitness_label) = (ABI_AARCH64, "64-bit (aarch64)");
+                    log(&format!("detected child bitness: {}", bitness_label));
                     abi = Some(picked);
                 }
                 // Safe to unwrap: we just set `abi` if it was None.
@@ -1059,21 +1268,26 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         // register read — seccomp can fire on the very
                         // first syscall after execve, before any
                         // SIGTRAP|0x80 syscall-stop has had a chance
-                        // to set it.
+                        // to set it. We use the same ELF-based
+                        // detection as the SIGTRAP|0x80 path so the
+                        // two paths agree on the child's bitness even
+                        // when PTRACE_GETREGSET returns EIO (and we
+                        // silently fell through to PTRACE_GETREGS).
                         if abi.is_none() {
-                            let picked = pick_abi_from_iov_len(len);
-                            let bitness_label = if cfg!(target_arch = "x86_64") {
-                                if len == USER_REGS32_LEN {
-                                    "32-bit (i386 compat)"
-                                } else {
-                                    "64-bit (x86_64)"
-                                }
-                            } else {
-                                "64-bit (aarch64)"
+                            #[cfg(target_arch = "x86_64")]
+                            let (picked, bitness_label) = match detect_child_is_64bit(pid) {
+                                Some(true) => (ABI_X86_64, "64-bit (x86_64)"),
+                                Some(false) => (ABI_X86_32, "32-bit (i386 compat)"),
+                                None => (
+                                    ABI_X86_64,
+                                    "unknown (ELF detection failed — defaulting to 64-bit)",
+                                ),
                             };
+                            #[cfg(target_arch = "aarch64")]
+                            let (picked, bitness_label) = (ABI_AARCH64, "64-bit (aarch64)");
                             log(&format!(
-                                "detected child bitness (SIGSYS path): {} (iov_len={})",
-                                bitness_label, len
+                                "detected child bitness (SIGSYS path): {}",
+                                bitness_label
                             ));
                             abi = Some(picked);
                         }
@@ -1224,5 +1438,136 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 continue;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic 20-byte ELF header with the given EI_CLASS
+    /// and e_machine values. All other bytes are zero — they're not
+    /// consulted by `classify_elf_bitness`, so this is sufficient.
+    fn elf_hdr(ei_class: u8, e_machine: u16) -> [u8; 20] {
+        let mut hdr = [0u8; 20];
+        hdr[0..4].copy_from_slice(b"\x7fELF");
+        hdr[4] = ei_class;
+        // EI_DATA = 1 (little-endian) — what we assume for x86.
+        hdr[5] = 1;
+        hdr[18..20].copy_from_slice(&e_machine.to_le_bytes());
+        hdr
+    }
+
+    #[test]
+    fn classify_elf_bitness_detects_x86_64() {
+        // Real x86_64 ELF: EI_CLASS=2, e_machine=EM_X86_64 (62).
+        let hdr = elf_hdr(2, 62);
+        assert_eq!(classify_elf_bitness(&hdr), Some(true));
+    }
+
+    #[test]
+    fn classify_elf_bitness_detects_i386() {
+        // Real i386 ELF: EI_CLASS=1, e_machine=EM_386 (3).
+        let hdr = elf_hdr(1, 3);
+        assert_eq!(classify_elf_bitness(&hdr), Some(false));
+    }
+
+    #[test]
+    fn classify_elf_bitness_rejects_non_elf() {
+        // Not an ELF — random bytes with no ELFMAG.
+        let hdr = [0u8; 20];
+        assert_eq!(classify_elf_bitness(&hdr), None);
+    }
+
+    #[test]
+    fn classify_elf_bitness_e_machine_tiebreaker_for_unknown_class() {
+        // EI_CLASS=0 (invalid) but e_machine=EM_X86_64 — should fall
+        // through to the e_machine tiebreaker and classify as 64-bit.
+        let hdr = elf_hdr(0, 62);
+        assert_eq!(classify_elf_bitness(&hdr), Some(true));
+    }
+
+    #[test]
+    fn classify_elf_bitness_e_machine_tiebreaker_for_em_386() {
+        // EI_CLASS=0 (invalid) but e_machine=EM_386 — tiebreaker
+        // classifies as 32-bit.
+        let hdr = elf_hdr(0, 3);
+        assert_eq!(classify_elf_bitness(&hdr), Some(false));
+    }
+
+    #[test]
+    fn classify_elf_bitness_ei_class_wins_on_disagreement() {
+        // EI_CLASS=2 (64-bit) but e_machine=EM_386 (32-bit) — EI_CLASS
+        // takes precedence, so this is classified as 64-bit. This case
+        // doesn't occur for real ELFs but documents the precedence
+        // rule.
+        let hdr = elf_hdr(2, 3);
+        assert_eq!(classify_elf_bitness(&hdr), Some(true));
+    }
+
+    /// Verify the classifier against a REAL ELF on disk (the test
+    /// binary itself). This is a smoke test that the byte offsets and
+    /// endianness assumptions in `classify_elf_bitness` match what
+    /// real-world compilers produce.
+    #[test]
+    fn classify_elf_bitness_against_real_elf() {
+        use std::io::Read;
+
+        // The test binary is the current executable. Read the first
+        // 20 bytes of /proc/self/exe and classify. On x86_64 hosts
+        // this should be a 64-bit ELF; on aarch64 hosts the
+        // classification should also be 64-bit (because aarch64 ELFs
+        // have EI_CLASS=2 too, and `classify_elf_bitness` falls into
+        // the `(2, _) => Some(true)` arm regardless of e_machine).
+        let mut f = match std::fs::File::open("/proc/self/exe") {
+            Ok(f) => f,
+            Err(_) => {
+                // /proc/self/exe isn't available on every platform
+                // (e.g. some sandboxes). Skip rather than fail.
+                return;
+            }
+        };
+        let mut hdr = [0u8; 20];
+        if f.read_exact(&mut hdr).is_err() {
+            return;
+        }
+        let classified = classify_elf_bitness(&hdr);
+        // The test binary must be a valid ELF — `None` would indicate
+        // a regression in either the magic check or the host
+        // environment.
+        assert!(
+            classified == Some(true) || classified == Some(false),
+            "classify_elf_bitness returned {:?} for a real ELF",
+            classified
+        );
+
+        // On x86_64 hosts the test binary IS a 64-bit x86_64 ELF, so
+        // the classifier must say so. (We don't assert anything on
+        // aarch64 because the function is x86_64-only in production
+        // — the aarch64 path never calls it.)
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                classified,
+                Some(true),
+                "x86_64 test binary should be classified as 64-bit"
+            );
+        }
+    }
+
+    /// `detect_child_is_64bit` (the production caller of
+    /// `classify_elf_bitness`) reads `/proc/<pid>/exe`. Verify that
+    /// passing our own PID correctly identifies the host binary's
+    /// bitness. This exercises the file-reading code path on top of
+    /// the byte-level classifier.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn detect_child_is_64bit_against_self() {
+        let self_pid = unsafe { libc::getpid() };
+        let classified = detect_child_is_64bit(self_pid);
+        assert_eq!(
+            classified,
+            Some(true),
+            "the test binary itself is a 64-bit x86_64 ELF"
+        );
     }
 }
