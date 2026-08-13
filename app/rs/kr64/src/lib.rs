@@ -4323,6 +4323,45 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 "[KR64][parent] ptrace emulation loop ended — child exit code: {}",
                 exit_code
             );
+            // -------------------------------------------------------------
+            // Copy diagnostic logs to external storage.
+            //
+            // The guest writes twrp-init.log, twrp-kmsg.log and
+            // dev/__kmsg__ into the rootfs, which lives under the app's
+            // private data dir (/data/user/0/io.twoyi/rootfs/...). On
+            // release (non-debuggable) builds `adb shell run-as` is
+            // rejected and `adb pull` cannot read from the app's private
+            // dir, so the logs are effectively inaccessible.
+            //
+            // The external app-specific files dir
+            // (/sdcard/Android/data/io.twoyi/files/) IS readable via
+            // `adb pull` without root on release builds, so we mirror
+            // the logs there once the child has exited.
+            // -------------------------------------------------------------
+            {
+                let ext_files_dir = "/sdcard/Android/data/io.twoyi/files";
+                let _ = std::fs::create_dir_all(ext_files_dir);
+                // (rootfs-relative source, external-files-dst filename)
+                let copies: &[(&str, &str)] = &[
+                    ("twrp-init.log", "twrp-init.log"),
+                    ("twrp-kmsg.log", "twrp-kmsg.log"),
+                    ("dev/__kmsg__", "dev-__kmsg__"),
+                ];
+                for (src_rel, dst_name) in copies {
+                    let src = format!("{}/{}", cfg.rootfs, src_rel);
+                    let dst = format!("{}/{}", ext_files_dir, dst_name);
+                    match std::fs::copy(&src, &dst) {
+                        Ok(n) => info!(
+                            "[KR64] copied diagnostic log {} -> {} ({} bytes)",
+                            src, dst, n
+                        ),
+                        Err(e) => warning!(
+                            "[KR64] failed to copy diagnostic log {}: {}",
+                            src, e
+                        ),
+                    }
+                }
+            }
             // The child has exited — we're done. Skip the normal waitpid
             // loop below (it would return ECHILD immediately).
             return if exit_code >= 0 { exit_code } else { 1 };
