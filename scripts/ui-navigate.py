@@ -178,13 +178,32 @@ def find_tap_target_for_text(root, text, exact=False):
     return None
 
 def tap(x, y):
-    """Tap at coordinates. Use 'input swipe' with same start/end point and
-    100ms duration instead of 'input tap' — the short-duration 'input tap'
-    sometimes doesn't register on RecyclerView items that use
-    OnItemTouchListener (like the Android SAF file picker). The swipe
-    variant sends a proper DOWN→UP sequence with sufficient duration for
-    the GestureDetector to register it as a click."""
-    adb_shell(f"input swipe {x} {y} {x} {y} 100")
+    """Tap at coordinates. Use 'input touchscreen swipe' with same start/end
+    point and 100ms duration — this is a DIFFERENT code path than 'input tap'
+    or 'input swipe': it simulates a real touchscreen event (source =
+    SOURCE_TOUCHSCREEN) rather than a trackball/keyboard event, which
+    reliably triggers the RecyclerView's OnItemTouchListener that the
+    Android SAF file picker uses (and which sometimes drops short
+    'input tap' events). Falls back to 'input swipe' if the 'touchscreen'
+    source isn't recognized on this device."""
+    r = subprocess.run(ADB + ["shell", f"input touchscreen swipe {x} {y} {x} {y} 100"],
+                       capture_output=True, text=True, timeout=30)
+    combined = (r.stdout + r.stderr).lower()
+    if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
+        adb_shell(f"input swipe {x} {y} {x} {y} 100")
+
+def touchscreen_tap(x, y):
+    """Tap at coordinates using 'input touchscreen tap' — a real touchscreen
+    event (source = SOURCE_TOUCHSCREEN), NOT a trackball/keyboard event like
+    'input tap'. This is the most reliable way to trigger the RecyclerView's
+    OnItemTouchListener in the Android SAF file picker, which sometimes
+    drops short 'input tap' events. Falls back to 'input tap' if the
+    'touchscreen' source isn't supported on this device."""
+    r = subprocess.run(ADB + ["shell", f"input touchscreen tap {x} {y}"],
+                       capture_output=True, text=True, timeout=30)
+    combined = (r.stdout + r.stderr).lower()
+    if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
+        adb_shell(f"input tap {x} {y}")
 
 def swipe_up():
     """Swipe up to scroll down the list. Uses screen-relative coordinates."""
@@ -523,18 +542,19 @@ def main():
     # is PRIMARY because it was previously the most reliable. Trying it
     # FIRST means we usually select recovery.img before any drawer
     # navigation can drift us into Google Photos.
-    #   a) COMBINED coordinate-swipe + DPAD navigation (PRIMARY).
+    #   a) COMBINED coordinate-tap + DPAD navigation (PRIMARY).
     #      FIRST: take a fresh uiautomator dump, find recovery.img's
     #      bounds, compute the center of the LEFT 30% of the row, and
-    #      `input swipe X Y X Y 100` (more reliable than `input tap` for
-    #      the SAF picker's RecyclerView OnItemTouchListener). If that
-    #      closes the picker, done. FALL BACK to DPAD: tap recovery.img's
-    #      exact coords to give the row focus, then DPAD_DOWN + ENTER.
-    #      Retry with increasing DPAD_DOWN counts (3, 4, 5 — starting at
-    #      3x because 2x still selected ui-dump.xml, the 1st RECENT
-    #      item). If the picker closes but no ROM was imported, re-open
-    #      it and retry with more DOWN presses. Dismiss any share sheet
-    #      before each attempt.
+    #      `input touchscreen tap X Y` — a real touchscreen event (NOT a
+    #      trackball/keyboard event like `input tap`), which reliably
+    #      triggers the SAF picker's RecyclerView OnItemTouchListener. If
+    #      that closes the picker, done. FALL BACK to DPAD: tap
+    #      recovery.img's exact coords to give the row focus, then
+    #      DPAD_DOWN + ENTER. Retry with increasing DPAD_DOWN counts
+    #      (1 through 10 — a broad range so we land on recovery.img
+    #      regardless of how many list items precede it). If the picker
+    #      closes but no ROM was imported, re-open it and retry with more
+    #      DOWN presses. Dismiss any share sheet before each attempt.
     #   b) Direct tap on recovery.img in RECENT FILES (left-30% of the
     #      row, away from the preview icon). If the tap doesn't close
     #      the picker (the RecyclerView's OnItemTouchListener didn't
@@ -728,24 +748,24 @@ def main():
     #   1. Take a fresh uiautomator dump, find recovery.img's bounds,
     #      compute the center of the LEFT 30% of the row (well away
     #      from the per-row 'Preview' icon at the right edge), and use
-    #      `input swipe X Y X Y 100` (NOT `input tap`) at those exact
-    #      coordinates — `input swipe` with 100ms duration is more
-    #      reliable for the SAF picker's RecyclerView OnItemTouchListener,
-    #      which sometimes drops short `input tap` events.
-    #   2. If the coordinate-based swipe closes the picker AND we're
+    #      `input touchscreen tap X Y` (NOT `input tap` — `input
+    #      touchscreen tap` is a real touchscreen event, a different
+    #      code path from the trackball/keyboard event that `input tap`
+    #      produces) at those exact coordinates. This reliably triggers
+    #      the SAF picker's RecyclerView OnItemTouchListener, which
+    #      sometimes drops short `input tap` events.
+    #   2. If the coordinate-based tap closes the picker AND we're
     #      back on io.twoyi, verify a ROM was imported and stop.
-    #   3. If the swipe doesn't close the picker (RecyclerView didn't
+    #   3. If the tap doesn't close the picker (RecyclerView didn't
     #      respond) OR recovery.img isn't in the dump, fall back to
     #      DPAD: tap recovery.img's exact coordinates (or (20%, 55%)
     #      if recovery.img isn't found) to give the row focus, then
     #      DPAD_DOWN + ENTER. Retry with INCREASING DPAD_DOWN counts
-    #      (3, 4, 5 — starting at 3x because 2x still sometimes
-    #      selected ui-dump.xml; the extra DOWN ensures we skip past
-    #      both the "RECENT FILES" header AND ui-dump.xml to land on
-    #      recovery.img). After each ENTER that closes the picker,
-    #      verify a ROM was actually imported; if not, re-open the
-    #      picker (via verify_import_or_reopen) and retry with more
-    #      DOWN presses.
+    #      (1 through 10 — a broad range so we land on recovery.img
+    #      regardless of how many list items precede it). After each
+    #      ENTER that closes the picker, verify a ROM was actually
+    #      imported; if not, re-open the picker (via
+    #      verify_import_or_reopen) and retry with more DOWN presses.
     #   4. DPAD_ENTER can land on the per-row 'Preview' icon
     #      (focusable=true) and trigger a share sheet instead of
     #      selecting the file. Mitigate by dismissing any share sheet
@@ -758,15 +778,16 @@ def main():
     if not found_file and is_on_file_picker(get_current_activity()):
         print("  (a) PRIMARY: combined coordinate-swipe + DPAD navigation")
 
-        # ── Step 1: coordinate-based swipe at recovery.img's EXACT
-        # location. Use safe_row_tap_target() to find recovery.img in
-        # the current uiautomator dump and compute the center of the
-        # LEFT 30% of its row (away from the 'Preview' icon at the
-        # right edge). Then `input swipe X Y X Y 100` — more reliable
-        # than `input tap` for the SAF picker's RecyclerView
-        # OnItemTouchListener, which sometimes drops short `input tap`
-        # events. If this closes the picker, we're done — no DPAD
-        # fallback needed.
+        # ── Step 1: coordinate-based tap at recovery.img's EXACT
+        # location using `input touchscreen tap` (a real touchscreen
+        # event — NOT a trackball/keyboard event like `input tap`).
+        # Use safe_row_tap_target() to find recovery.img in the current
+        # uiautomator dump and compute the center of the LEFT 30% of
+        # its row (away from the 'Preview' icon at the right edge).
+        # `input touchscreen tap` reliably triggers the SAF picker's
+        # RecyclerView OnItemTouchListener, which sometimes drops short
+        # `input tap` events. If this closes the picker, we're done —
+        # no DPAD fallback needed.
         xml, root, activity = fresh_picker_state("03a_coord_pre")
         if dismiss_share_sheet(root):
             xml, root, activity = fresh_picker_state("03a_coord_post_dismiss")
