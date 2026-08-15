@@ -77,6 +77,7 @@ pub mod seccomp;
 pub mod sensors;
 
 use std::ffi::CString;
+use std::os::unix::fs::symlink;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3674,6 +3675,82 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     info!("[KR64] forking guest process");
+
+    // ── Pre-create essential /dev files in rootfs ──────────────────────
+    //
+    // TWRP init expects certain files in /dev to exist (or be creatable):
+    //   /dev/null, /dev/zero, /dev/urandom, /dev/random — real kernel
+    //     devices. We create symlinks to the host's /dev/* so opens
+    //     reach the real devices.
+    //   /dev/console, /dev/ptmx — real kernel devices (symlinks).
+    //   /dev/.booting — marker file init creates with O_CREAT|O_EXCL.
+    //     Pre-create it so O_CREAT without O_EXCL succeeds. If init
+    //     uses O_EXCL, it gets EEXIST (which init handles).
+    //   /dev/__null__ — temp file init creates via mknod, then opens,
+    //     then unlinks. Pre-create as a regular file so open succeeds
+    //     even when mknod is seccomp-blocked.
+    //
+    // This is needed because translate_path now redirects /dev/* to
+    // {rootfs}/dev/* (the host /dev is read-only for untrusted_app).
+    {
+        let dev_dir = format!("{}/dev", rootfs_prefix);
+        let _ = std::fs::create_dir_all(&dev_dir);
+        let _ = std::fs::create_dir_all(format!("{}/dev/pts", rootfs_prefix));
+        let _ = std::fs::create_dir_all(format!("{}/dev/socket", rootfs_prefix));
+
+        // Symlinks to host kernel devices (target is absolute, resolves
+        // on the host filesystem because we're NOT chrooted in non-root
+        // mode).
+        let symlinks: &[(&str, &str)] = &[
+            ("dev/null", "/dev/null"),
+            ("dev/zero", "/dev/zero"),
+            ("dev/urandom", "/dev/urandom"),
+            ("dev/random", "/dev/random"),
+            ("dev/console", "/dev/console"),
+            ("dev/ptmx", "/dev/ptmx"),
+            ("dev/tty", "/dev/tty"),
+            ("dev/kmsg", "/dev/kmsg"),
+        ];
+        for (rel, target) in symlinks {
+            let link_path = format!("{}/{}", rootfs_prefix, rel);
+            // Remove existing file/symlink first (ignore errors — might
+            // not exist, or might be a directory we shouldn't touch).
+            let _ = std::fs::remove_file(&link_path);
+            match symlink(*target, &link_path) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Not fatal — init may handle missing /dev/null etc.
+                    warning!(
+                        "[KR64] PARENT: failed to create {} -> {} symlink: {}",
+                        link_path,
+                        target,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Regular files init expects to create/open
+        let booting_path = format!("{}/dev/.booting", rootfs_prefix);
+        let _ = std::fs::write(&booting_path, b"");
+        let _ = std::fs::set_permissions(
+            &booting_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o666),
+        );
+
+        let null_temp_path = format!("{}/dev/__null__", rootfs_prefix);
+        let _ = std::fs::write(&null_temp_path, b"");
+        let _ = std::fs::set_permissions(
+            &null_temp_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o666),
+        );
+
+        info!(
+            "[KR64] PARENT: pre-created essential /dev files in {} (null, zero, urandom, console, ptmx, .booting, __null__)",
+            dev_dir
+        );
+    }
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = std::io::Error::last_os_error();
