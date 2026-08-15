@@ -935,8 +935,25 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
             return path.to_string();
         }
     }
-    if path.starts_with("/dev/") || path == "/dev" {
+    // /dev/* — translate to rootfs/dev/* so init finds the pre-created
+    // device stubs and files (e.g., /dev/.booting, /dev/__null__).
+    // The host's /dev is read-only for untrusted_app, so opens of
+    // /dev/* on the host fail with EACCES. By translating to rootfs/dev/,
+    // init operates on the writable rootfs copy.
+    //
+    // Essential device files (null, urandom, zero, etc.) are pre-created
+    // as symlinks to the host's /dev/* by the parent setup, so opens of
+    // these still reach the real kernel devices.
+    //
+    // EXCEPTION: /dev/__properties__ is a host-side tmpfs file used by
+    // Android's property service. It exists on the host but not in
+    // rootfs. Leave it untranslated so init can attempt to open it on
+    // the host (it may fail with EACCES, but that's not fatal).
+    if path == "/dev/__properties__" {
         return path.to_string();
+    }
+    if path.starts_with("/dev/") || path == "/dev" {
+        return format!("{}{}", rootfs, path);
     }
     if path.starts_with("/system/") || path == "/system" {
         return path.to_string();
@@ -2481,14 +2498,88 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             // Filesystem-related seccomp-blocked syscalls.
                             // These are the ones TWRP init calls during
                             // early boot (mount tmpfs/proc/sysfs, mkdir
-                            // /dev/pts, etc.). We fake success (return 0)
-                            // WITHOUT rewriting orig_rax — the previous
-                            // "rewrite to getpid" strategy caused the
-                            // kernel to return -ENOSYS on i386 compat,
-                            // which made init think every mount/mkdir
-                            // failed and exit(1) after 36 syscalls.
+                            // /dev/pts, etc.).
+                            //
+                            // TWO-PRONGED FIX:
+                            // 1. Fake success (return 0) WITHOUT rewriting
+                            //    orig_rax. The previous "rewrite to getpid"
+                            //    strategy caused the kernel to return -ENOSYS
+                            //    on i386 compat.
+                            // 2. ALSO perform the actual filesystem operation
+                            //    in the rootfs (mkdir for mount/mkdir). This
+                            //    ensures the filesystem state is correct for
+                            //    subsequent opens, even if the kernel returns
+                            //    -ENOSYS to init. Without this, init's later
+                            //    open(/dev/X) would fail with ENOENT because
+                            //    the seccomp-faked mount/mkdir didn't actually
+                            //    create anything.
+
+                            // Perform the actual filesystem operation in
+                            // the rootfs. We read the path argument(s) from
+                            // the child's memory and translate them to
+                            // rootfs-relative paths.
+                            if original_syscall == a.mount {
+                                // mount(source, target, fstype, flags, data)
+                                // arg1=source, arg2=target, arg3=fstype
+                                let tgt_addr = get_syscall_arg(&sigsys_regs, a.reg_arg2);
+                                let fs_addr = get_syscall_arg(&sigsys_regs, a.reg_arg3);
+                                if tgt_addr != 0 {
+                                    if let Some(tgt) = read_child_string(pid, tgt_addr) {
+                                        let fstype = if fs_addr != 0 {
+                                            read_child_string(pid, fs_addr).unwrap_or_default()
+                                        } else {
+                                            String::new()
+                                        };
+                                        // Translate target to rootfs-relative
+                                        let real_tgt = if tgt.starts_with('/') {
+                                            format!("{}{}", rootfs, tgt)
+                                        } else {
+                                            tgt.clone()
+                                        };
+                                        // For tmpfs mounts, create the target
+                                        // directory (init expects a fresh
+                                        // tmpfs to exist at the mount point).
+                                        // For proc/sysfs/devpts, the host
+                                        // already has these — skip.
+                                        if fstype == "tmpfs" || fstype == "devpts" {
+                                            match std::fs::create_dir_all(&real_tgt) {
+                                                Ok(()) => log(&format!(
+                                                    "SIGSYS mount: created directory {} (fstype={}) in rootfs",
+                                                    real_tgt, fstype
+                                                )),
+                                                Err(e) => log(&format!(
+                                                    "SIGSYS mount: FAILED to create {} (fstype={}): {}",
+                                                    real_tgt, fstype, e
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if original_syscall == a.mkdir {
+                                // mkdir(path, mode) — arg1=path
+                                let path_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
+                                if path_addr != 0 {
+                                    if let Some(path) = read_child_string(pid, path_addr) {
+                                        let real_path = if path.starts_with('/') {
+                                            format!("{}{}", rootfs, path)
+                                        } else {
+                                            path.clone()
+                                        };
+                                        match std::fs::create_dir_all(&real_path) {
+                                            Ok(()) => log(&format!(
+                                                "SIGSYS mkdir: created directory {} in rootfs",
+                                                real_path
+                                            )),
+                                            Err(e) => log(&format!(
+                                                "SIGSYS mkdir: FAILED to create {}: {}",
+                                                real_path, e
+                                            )),
+                                        }
+                                    }
+                                }
+                            }
                             log(&format!(
-                                "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting orig_rax — seccomp aborted, returning 0 — fake success)",
+                                "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting orig_rax — seccomp aborted, returning 0 — fake success + performed fs op in rootfs)",
                                 name, original_syscall, name
                             ));
                             0
@@ -2729,14 +2820,12 @@ mod tests {
     }
 
     #[test]
-    fn translate_path_leaves_proc_sys_dev_untouched() {
+    fn translate_path_leaves_proc_sys_data_untouched() {
         let rootfs = "/data/user/0/io.twoyi/rootfs";
-        for p in &[
-            "/proc/self/status",
-            "/sys/class/net",
-            "/dev/null",
-            "/data/data",
-        ] {
+        // /proc, /sys, /data are left untranslated (they hit the host's
+        // real proc/sys/data, which is correct for a ptraced unprivileged
+        // child that can't mount a fresh proc/sysfs).
+        for p in &["/proc/self/status", "/sys/class/net", "/data/data"] {
             assert_eq!(
                 translate_path(rootfs, p),
                 *p,
@@ -2744,6 +2833,23 @@ mod tests {
                 p
             );
         }
+        // /dev/* IS now translated to rootfs/dev/* (the host /dev is
+        // read-only for untrusted_app, so we redirect to the writable
+        // rootfs copy where we pre-create device stubs and symlinks).
+        assert_eq!(
+            translate_path(rootfs, "/dev/null"),
+            format!("{}/dev/null", rootfs)
+        );
+        assert_eq!(
+            translate_path(rootfs, "/dev/.booting"),
+            format!("{}/dev/.booting", rootfs)
+        );
+        // EXCEPTION: /dev/__properties__ is left untranslated (it's a
+        // host-side tmpfs file for Android's property service).
+        assert_eq!(
+            translate_path(rootfs, "/dev/__properties__"),
+            "/dev/__properties__"
+        );
     }
 
     #[test]
