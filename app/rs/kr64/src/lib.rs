@@ -3730,20 +3730,52 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        // Regular files init expects to create/open
-        let booting_path = format!("{}/dev/.booting", rootfs_prefix);
-        let _ = std::fs::write(&booting_path, b"");
-        let _ = std::fs::set_permissions(
-            &booting_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o666),
-        );
-
-        let null_temp_path = format!("{}/dev/__null__", rootfs_prefix);
-        let _ = std::fs::write(&null_temp_path, b"");
-        let _ = std::fs::set_permissions(
-            &null_temp_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o666),
-        );
+        // Regular files init expects to create/open.
+        // Use OpenOptions (same pattern as /dev/__kmsg__ creation above)
+        // and log success/failure for each file.
+        use std::os::unix::fs::OpenOptionsExt;
+        let regular_files: &[(&str, u32)] = &[("dev/.booting", 0o666), ("dev/__null__", 0o666)];
+        for (rel, mode) in regular_files {
+            let file_path = format!("{}/{}", rootfs_prefix, rel);
+            // Remove existing file first (in case it was unlinked by a
+            // previous init run's unlink() call).
+            let _ = std::fs::remove_file(&file_path);
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(*mode)
+                .open(&file_path)
+            {
+                Ok(_) => {
+                    let _ = std::fs::set_permissions(
+                        &file_path,
+                        std::fs::Permissions::from_mode(*mode),
+                    );
+                    // Verify the file exists and is accessible
+                    match std::fs::metadata(&file_path) {
+                        Ok(m) => info!(
+                            "[KR64] PARENT: pre-created {} (mode={:o}, size={})",
+                            file_path,
+                            std::os::unix::fs::PermissionsExt::mode(&m.permissions()),
+                            m.len()
+                        ),
+                        Err(e) => warning!(
+                            "[KR64] PARENT: pre-created {} but metadata check failed: {}",
+                            file_path,
+                            e
+                        ),
+                    }
+                }
+                Err(e) => warning!(
+                    "[KR64] PARENT: FAILED to pre-create {} (mode={:o}): {} (errno={})",
+                    file_path,
+                    mode,
+                    e,
+                    e.raw_os_error().unwrap_or(0)
+                ),
+            }
+        }
 
         info!(
             "[KR64] PARENT: pre-created essential /dev files in {} (null, zero, urandom, console, ptmx, .booting, __null__)",
