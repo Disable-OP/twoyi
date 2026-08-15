@@ -1444,6 +1444,28 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
             reset_abi_next = false;
             past_first_execve = true;
             post_execve_syscall_count = 0;
+            // CRITICAL: reset the scratch area. The scratch area was
+            // allocated BELOW the child's stack pointer BEFORE execve
+            // (when the child was kr64, x86_64). After execve, the
+            // child becomes i386 (32-bit) and its stack pointer moves
+            // to a 32-bit address. The old 64-bit scratch address
+            // (e.g. 0x7fffc9356038) is OUTSIDE the i386 child's
+            // 32-bit address space, so PTRACE_POKEDATA to that address
+            // fails with EIO. This caused write_translated_path to
+            // fail for EVERY post-execve open, making path translation
+            // a no-op — init opened the UNTRANSLATED host paths
+            // (/dev/.booting on host → EACCES, /dev/__null__ on host
+            // → ENOENT). By resetting scratch_addr to 0, the next
+            // syscall ENTRY stop will re-allocate the scratch area at
+            // the new (32-bit) stack address.
+            if scratch_addr != 0 {
+                log(&format!(
+                    "execve completed — resetting scratch area (was {:#x}) — will re-allocate at new stack pointer",
+                    scratch_addr
+                ));
+                scratch_addr = 0;
+                scratch_offset = 0;
+            }
         }
 
         // Continue the child to the next syscall entry/exit. This is
