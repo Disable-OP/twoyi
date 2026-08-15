@@ -4355,10 +4355,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             "[KR64] copied diagnostic log {} -> {} ({} bytes)",
                             src, dst, n
                         ),
-                        Err(e) => warning!(
-                            "[KR64] failed to copy diagnostic log {}: {}",
-                            src, e
-                        ),
+                        Err(e) => warning!("[KR64] failed to copy diagnostic log {}: {}", src, e),
                     }
                 }
             }
