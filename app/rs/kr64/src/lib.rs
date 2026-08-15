@@ -3790,7 +3790,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Minimal Android boot parameters that TWRP init expects.
         // androidboot.hardware is particularly important — init uses it
         // to find the right init.{hardware}.rc file.
-        let cmdline_content = "androidboot.hardware=ranchu androidboot.serialno=twoyi qemu=1\n";
+        let cmdline_content = "androidboot.hardware=ranchu androidboot.hardware.gralloc=ranchu androidboot.hardware.vulkan=ranchu androidboot.serialno=twoyi androidboot.boot_devices=pci0000:00/0000:00:03.0 androidboot.verifiedbootstate=orange androidboot.flash.locked=0 androidboot.slot_suffix= androidboot.vbmeta.size=0 qemu=1 qemu.avd_name=twoyi_test\n";
         match std::fs::write(&cmdline_path, cmdline_content) {
             Ok(_) => {
                 let _ =
