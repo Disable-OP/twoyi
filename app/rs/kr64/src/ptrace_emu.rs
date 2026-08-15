@@ -930,6 +930,13 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
     if !path.starts_with('/') {
         return path.to_string();
     }
+    // /proc/cmdline — translate to rootfs/proc/cmdline so init can read
+    // the (fake) kernel command line. The host's /proc/cmdline is not
+    // readable by untrusted_app (EACCES from SELinux proc_cmdline label).
+    // We pre-create {rootfs}/proc/cmdline with appropriate content.
+    if path == "/proc/cmdline" {
+        return format!("{}{}", rootfs, path);
+    }
     for prefix in &["/proc/", "/sys/", "/data/", "/apex/"] {
         if path.starts_with(prefix) {
             return path.to_string();
