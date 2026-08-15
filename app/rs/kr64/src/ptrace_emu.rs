@@ -2920,7 +2920,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         // Read the child's registers to get the instruction
                         // pointer (RIP on x86_64, EIP on i386 compat).
                         let mut crash_regs: Regs = unsafe { std::mem::zeroed() };
-                        if let Ok(_) = ptrace_getregs(pid, &mut crash_regs) {
+                        if ptrace_getregs(pid, &mut crash_regs).is_ok() {
                             if let Some(a) = abi {
                                 // On x86_64 user_regs_struct, RIP is at
                                 // index 16 (byte offset 128). Each field
