@@ -2615,27 +2615,46 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     }
                 }
 
-                // Bug 1 fix: ALWAYS set in_syscall = true so the next
-                // SIGTRAP|0x80 stop is treated as the syscall-EXIT stop
-                // of the (rewritten or aborted) syscall. This is correct
-                // in BOTH cases:
-                //   - Normal case (SIGSYS fired between ENTRY and EXIT):
-                //     in_syscall was already true; setting it again is a
-                //     no-op, and the next stop is correctly EXIT.
-                //   - Desync case (SIGSYS fired BEFORE the ENTRY stop,
-                //     observed on some kernels where SECCOMP_RET_TRAP
-                //     preempts the ptrace ENTRY delivery): in_syscall
-                //     was false; without this set, the next stop (EXIT)
-                //     would be misclassified as ENTRY — permanently
-                //     desyncing the loop and preventing the EXIT
-                //     intercepts (e.g. capget's buffer-write fix) from
-                //     ever firing.
+                // ── in_syscall handling after SIGSYS ──
                 //
-                // We set this AFTER the `match ptrace_getregs` block
-                // (which may log/diagnose the SIGSYS) but BEFORE
-                // `continue` so it always runs, even on the
-                // ptrace_getregs-failure path.
-                in_syscall = true;
+                // PREVIOUS behaviour: ALWAYS set in_syscall = true. This
+                // was intended to make the next SIGTRAP|0x80 stop be
+                // treated as the syscall-EXIT of the aborted syscall.
+                //
+                // PROBLEM (observed in 5b76fe1 E2E run): for seccomp-
+                // aborted syscalls on i386 compat, the kernel SKIPS the
+                // syscall-exit-stop. The next SIGTRAP|0x80 is the ENTRY
+                // of the NEXT syscall. Setting in_syscall=true causes
+                // this ENTRY to be misclassified as EXIT, permanently
+                // desyncing the loop. The EXIT log then shows the WRONG
+                // syscall number (the next syscall's) and the WRONG
+                // return value (residual rax from the previous syscall).
+                //
+                // NEW behaviour: do NOT modify in_syscall. Leave it
+                // whatever it was:
+                //   - Normal case (SIGSYS fired between ENTRY and EXIT):
+                //     in_syscall was true. The kernel may or may not
+                //     deliver the EXIT stop. If it does, we correctly
+                //     treat it as EXIT. If it doesn't, the next ENTRY
+                //     is correctly treated as ENTRY (because in_syscall
+                //     stays true, but the NEXT stop after a skipped EXIT
+                //     would be ENTRY — hmm, this is the issue).
+                //
+                // Actually, the cleanest fix: for seccomp-aborted
+                // syscalls, the kernel does NOT deliver an EXIT stop.
+                // So after SIGSYS, we should set in_syscall=FALSE so
+                // the next SIGTRAP|0x80 (which is the ENTRY of the
+                // next syscall) is correctly treated as ENTRY.
+                //
+                // RISK: on kernels that DO deliver the EXIT stop for
+                // seccomp-aborted syscalls, this would cause the EXIT
+                // to be misclassified as ENTRY. The EXIT intercepts
+                // (fchown/fchmod/capget/ioprio_get) would not fire.
+                // However, on the x86_64 Android emulator, those
+                // syscalls are NOT seccomp-blocked (they execute and
+                // return EPERM, handled by the EXIT handler without
+                // SIGSYS). So this risk is acceptable for now.
+                in_syscall = false;
                 // Do NOT call PTRACE_SYSCALL here — the loop top will
                 // do it with resume_signal = 0 (already reset), which
                 // resumes the child WITHOUT forwarding the signal.
