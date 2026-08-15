@@ -3781,6 +3781,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "[KR64] PARENT: pre-created essential /dev files in {} (null, zero, urandom, console, ptmx, .booting, __null__)",
             dev_dir
         );
+
+        // Pre-create /proc/cmdline — init reads this to get kernel boot
+        // parameters. The host's /proc/cmdline is not readable by
+        // untrusted_app (EACCES from SELinux). We create a fake one in
+        // rootfs with the essential Android boot parameters.
+        let proc_dir = format!("{}/proc", rootfs_prefix);
+        let _ = std::fs::create_dir_all(&proc_dir);
+        let cmdline_path = format!("{}/proc/cmdline", rootfs_prefix);
+        // Minimal Android boot parameters that TWRP init expects.
+        // androidboot.hardware is particularly important — init uses it
+        // to find the right init.{hardware}.rc file.
+        let cmdline_content = "androidboot.hardware=ranchu androidboot.serialno=twoyi qemu=1\n";
+        match std::fs::write(&cmdline_path, cmdline_content) {
+            Ok(_) => {
+                let _ =
+                    std::fs::set_permissions(&cmdline_path, std::fs::Permissions::from_mode(0o444));
+                info!(
+                    "[KR64] PARENT: pre-created {} ({} bytes)",
+                    cmdline_path,
+                    cmdline_content.len()
+                );
+            }
+            Err(e) => warning!(
+                "[KR64] PARENT: FAILED to pre-create {}: {} (errno={})",
+                cmdline_path,
+                e,
+                e.raw_os_error().unwrap_or(0)
+            ),
+        }
     }
 
     let pid = unsafe { libc::fork() };
