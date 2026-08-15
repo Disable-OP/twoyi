@@ -1707,12 +1707,98 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                     // log gate would suppress these.
                     if past_first_execve {
                         post_execve_syscall_count = post_execve_syscall_count.saturating_add(1);
-                        if post_execve_syscall_count <= 50 {
+                        if post_execve_syscall_count <= 150 {
                             log(&format!(
                                 "post-execve syscall #{}: nr={} [{}]",
                                 post_execve_syscall_count,
                                 syscall_num,
                                 syscall_name(syscall_num, &abi)
+                            ));
+                        }
+                    }
+
+                    // ── Post-execve PATH logging ──────────────────────
+                    //
+                    // The existing "intercepted open({}) -> {}" log below
+                    // is gated by `loop_count <= 500`, but kr64's own
+                    // pre-execve setup (copying init, patching init.rc,
+                    // creating /dev sockets, etc.) inflates `loop_count`
+                    // well past 500 by the time TWRP init runs. As a
+                    // result, NO post-execve open paths are logged, and we
+                    // cannot see what init is opening — only the bare
+                    // syscall numbers above.
+                    //
+                    // This dedicated block bypasses the `loop_count` gate
+                    // and logs the path argument (arg1, or arg2 for the
+                    // *at syscalls) for EVERY path-bearing syscall during
+                    // the first 150 post-execve syscalls. It also covers
+                    // UNtranslated paths (/dev/*, /proc/*, /sys/*, which
+                    // `translate_path` leaves untouched and therefore
+                    // never produce an "intercepted open" log), so we see
+                    // those opens too.
+                    //
+                    // For mount(source, target, fstype, flags, data) we
+                    // additionally log arg2 (target) and arg3 (fstype) so
+                    // we can see exactly what init is mounting where.
+                    if past_first_execve && post_execve_syscall_count <= 150 {
+                        let path_idx = match syscall_num {
+                            n if n == abi.open => Some(abi.reg_arg1),
+                            n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
+                            n if n == abi.stat || n == abi.lstat => Some(abi.reg_arg1),
+                            n if n == abi.newfstatat || n == abi.statx => Some(abi.reg_arg2),
+                            n if n == abi.access => Some(abi.reg_arg1),
+                            n if n == abi.faccessat => Some(abi.reg_arg2),
+                            n if n == abi.mkdir => Some(abi.reg_arg1),
+                            n if n == abi.chdir => Some(abi.reg_arg1),
+                            n if n == abi.readlink => Some(abi.reg_arg1),
+                            n if n == abi.readlinkat => Some(abi.reg_arg2),
+                            n if n == abi.chmod => Some(abi.reg_arg1),
+                            n if n == abi.chroot => Some(abi.reg_arg1),
+                            n if n == abi.execve => Some(abi.reg_arg1),
+                            // mount's arg1 is the SOURCE path (may be NULL
+                            // for bind/virtual mounts) — logged below; we
+                            // do NOT set path_idx here so the generic
+                            // "post-execve path" log is skipped for mount
+                            // (mount gets its own structured 3-arg log).
+                            _ => None,
+                        };
+                        if let Some(idx) = path_idx {
+                            let path_addr = get_syscall_arg(&regs, idx);
+                            if path_addr != 0 {
+                                if let Some(path) = read_child_string(pid, path_addr) {
+                                    log(&format!(
+                                        "post-execve path: {} -> {:?}",
+                                        syscall_name(syscall_num, &abi),
+                                        path
+                                    ));
+                                }
+                            }
+                        }
+                        // mount(source, target, fstype, flags, data):
+                        //   arg1=source, arg2=target, arg3=fstype.
+                        // Log all three non-NULL string args.
+                        if syscall_num == abi.mount {
+                            let src_addr = get_syscall_arg(&regs, abi.reg_arg1);
+                            let tgt_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let fs_addr = get_syscall_arg(&regs, abi.reg_arg3);
+                            let src = if src_addr != 0 {
+                                read_child_string(pid, src_addr).unwrap_or_else(|| "<null>".into())
+                            } else {
+                                "<null>".into()
+                            };
+                            let tgt = if tgt_addr != 0 {
+                                read_child_string(pid, tgt_addr).unwrap_or_else(|| "<null>".into())
+                            } else {
+                                "<null>".into()
+                            };
+                            let fs = if fs_addr != 0 {
+                                read_child_string(pid, fs_addr).unwrap_or_else(|| "<null>".into())
+                            } else {
+                                "<null>".into()
+                            };
+                            log(&format!(
+                                "post-execve mount: source={:?} target={:?} fstype={:?}",
+                                src, tgt, fs
                             ));
                         }
                     }
@@ -1903,6 +1989,40 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
+
+                    // ── Post-execve RETURN-VALUE logging ─────────────
+                    //
+                    // Logs the kernel's return value for every post-execve
+                    // syscall (first 150), so we can see EXACTLY which
+                    // open/mount/mkdir/mknod fails and with what errno.
+                    // This is read from the `regs` snapshot taken at the
+                    // TOP of this SIGTRAP|0x80 stop (BEFORE the
+                    // pending_getpid / EPERM-workaround rewrites below
+                    // overwrite the return register), so it reflects the
+                    // REAL kernel return value — e.g. -ENOENT (-2),
+                    // -EPERM (-1), -EEXIST (-17), or 0 (success).
+                    //
+                    // For seccomp-trapped syscalls (mount, mknod) the
+                    // SIGSYS handler runs BEFORE this EXIT stop and sets
+                    // the return to 0 (faked success); the value logged
+                    // here will be that faked 0, which is still useful
+                    // (confirms the fake was applied) — the ENTRY-side
+                    // path log above tells us WHAT was attempted.
+                    if past_first_execve && post_execve_syscall_count <= 150 {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        let ret_desc: String = if ret < 0 && ret > -4096 {
+                            format!("{} (-errno {})", ret, -ret)
+                        } else {
+                            format!("{}", ret)
+                        };
+                        log(&format!(
+                            "post-execve return #{}: {} nr={} -> {}",
+                            post_execve_syscall_count,
+                            syscall_name(syscall_num, &abi),
+                            syscall_num,
+                            ret_desc
+                        ));
+                    }
 
                     // ── execve EXIT: schedule ABI reset ──
                     //
