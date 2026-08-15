@@ -3402,6 +3402,83 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 e
             ),
         }
+
+        // ── Patch find_property to return NULL immediately ──
+        //
+        // ROOT CAUSE of SIGSEGV after reading /proc/cmdline:
+        // Init calls find_property() to look up properties. The property
+        // area is not initialized (because /dev/__properties__ is not
+        // accessible to untrusted_app). The first argument to
+        // find_property is a pointer derived from the uninitialized
+        // property area — it's 0x80 (a small address in the NULL page).
+        // find_property dereferences it at offset 0x10, accessing
+        // address 0x90, which is unmapped → SIGSEGV.
+        //
+        // FIX: Patch find_property's first 3 bytes to `xor eax,eax; ret`
+        // (31 c0 c3). This makes ALL property lookups return NULL
+        // immediately, preventing the crash. Init handles NULL property
+        // returns gracefully (properties are optional during early boot).
+        //
+        // The pattern to match (first 12 bytes of find_property at
+        // virtual address 0x08092500, file offset 0x4a500):
+        //   55 89 e5 57 56 89 c6 53 8d 64 24 a4
+        //   push ebp; mov esp,ebp; push edi; push esi; mov eax,esi;
+        //   push ebx; lea -0x5c(esp),esp
+        //
+        // Replacement (first 3 bytes only):
+        //   31 c0 c3  xor eax,eax; ret
+        {
+            let init_path = format!("{}/init", rootfs_prefix);
+            match std::fs::read(&init_path) {
+                Ok(mut bytes) => {
+                    let pattern: &[u8] = &[
+                        0x55, 0x89, 0xe5, 0x57, 0x56, 0x89, 0xc6, 0x53, 0x8d, 0x64, 0x24, 0xa4,
+                    ];
+                    let patch: &[u8] = &[0x31, 0xc0, 0xc3]; // xor eax,eax; ret
+
+                    // Check if already patched
+                    let already_patched = bytes.len() >= 3 && bytes[0] == 0x31 && bytes[1] == 0xc0
+                        && bytes[2] == 0xc3;
+
+                    if !already_patched {
+                        let mut found = false;
+                        for i in 0..=(bytes.len().saturating_sub(pattern.len())) {
+                            if bytes[i..i + pattern.len()] == *pattern {
+                                // Apply patch: replace first 3 bytes with xor eax,eax; ret
+                                bytes[i] = patch[0];
+                                bytes[i + 1] = patch[1];
+                                bytes[i + 2] = patch[2];
+                                found = true;
+                                break;
+                            }
+                        }
+                        if found {
+                            match std::fs::write(&init_path, &bytes) {
+                                Ok(()) => info!(
+                                    "[KR64] PARENT: patched /init find_property() — replaced first 3 bytes with 'xor eax,eax; ret' (prevents SIGSEGV when property area is not initialized)"
+                                ),
+                                Err(e) => warning!(
+                                    "[KR64] PARENT: patched find_property in memory but failed to write back: {} (init may crash with SIGSEGV)",
+                                    e
+                                ),
+                            }
+                        } else {
+                            warning!(
+                                "[KR64] PARENT: could not find find_property pattern in /init (TWRP version mismatch?) — init may crash with SIGSEGV when accessing properties"
+                            );
+                        }
+                    } else {
+                        info!(
+                            "[KR64] PARENT: /init find_property() already patched (idempotent skip)"
+                        );
+                    }
+                }
+                Err(e) => warning!(
+                    "[KR64] PARENT: failed to read /init for find_property patching: {} (init may crash with SIGSEGV)",
+                    e
+                ),
+            }
+        }
     }
 
     // Always overwrite /vendor/etc/fstab.ranchu with a minimal stub.
