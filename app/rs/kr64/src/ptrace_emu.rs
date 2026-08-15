@@ -1879,8 +1879,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
-                                if translated != path
-                                    && !write_translated_path(
+                                if translated != path {
+                                    let wtp_ok = write_translated_path(
                                         pid,
                                         &mut regs,
                                         iov_len,
@@ -1888,20 +1888,25 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                         scratch_addr,
                                         &mut scratch_offset,
                                         &translated,
-                                    )
-                                {
-                                    // Scratch area not yet allocated — fall
-                                    // back to the legacy in-place overwrite
-                                    // (will likely fail for longer strings
-                                    // but does not crash). In practice this
-                                    // branch is dead because we reserve the
-                                    // scratch area at the very first syscall
-                                    // ENTRY stop (before any path-bearing
-                                    // syscall can be intercepted), but the
-                                    // fallback is harmless and keeps the
-                                    // `write_translated_path` failure mode
-                                    // well-defined.
-                                    write_child_string(pid, path_addr, &translated);
+                                    );
+                                    if !wtp_ok {
+                                        log(&format!(
+                                            "WARNING: write_translated_path FAILED for {} -> {} (scratch_addr={:#x}, offset={}) — falling back to in-place overwrite (will likely fail for longer paths)",
+                                            path, translated, scratch_addr, scratch_offset
+                                        ));
+                                        // Scratch area not yet allocated — fall
+                                        // back to the legacy in-place overwrite
+                                        // (will likely fail for longer strings
+                                        // but does not crash). In practice this
+                                        // branch is dead because we reserve the
+                                        // scratch area at the very first syscall
+                                        // ENTRY stop (before any path-bearing
+                                        // syscall can be intercepted), but the
+                                        // fallback is harmless and keeps the
+                                        // `write_translated_path` failure mode
+                                        // well-defined.
+                                        write_child_string(pid, path_addr, &translated);
+                                    }
                                 }
                             }
                         }
