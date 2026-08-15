@@ -805,11 +805,13 @@ fn set_syscall_ret(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 /// 32-bit x86 child the same 64-bit `orig_rax` slot is used because
 /// PTRACE_GETREGS zero-extends `orig_eax` into it.
 ///
-/// Used by the SIGSYS handler to rewrite a seccomp-blocked syscall
-/// into a harmless one (getpid) before resuming, so the kernel does
-/// not re-evaluate the original (blocked) syscall number and re-raise
-/// SIGSYS. The `getpid` number is taken from `abi` so it is correct
-/// for both 32-bit (20) and 64-bit (39) children.
+/// Historically used by the SIGSYS handler to rewrite a seccomp-blocked
+/// syscall into a harmless one (getpid) before resuming. This rewrite
+/// was REMOVED in the "never rewrite orig_rax" fix — see the SIGSYS
+/// handler for the rationale. The function is retained for potential
+/// future use (e.g. if a different code path needs to rewrite the
+/// syscall number for a non-seccomp reason).
+#[allow(dead_code)]
 fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
     let regs_ptr = regs as *mut Regs as *mut u64;
     unsafe {
@@ -2412,14 +2414,31 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         // (they execute and return EPERM); the
                         // syscall-EXIT handler above fakes success
                         // there.
-                        let is_no_rewrite_syscall = original_syscall == a.rt_sigprocmask
-                            || original_syscall == a.fchown
-                            || original_syscall == a.fchmod
-                            || original_syscall == a.capget
-                            || original_syscall == a.ioprio_get;
-                        if !is_no_rewrite_syscall {
-                            set_syscall_num(&mut sigsys_regs, &a, a.getpid);
-                        }
+                        // ── NEVER rewrite orig_rax ──
+                        //
+                        // Previous behaviour: rewrite the syscall number
+                        // to `getpid` for all syscalls EXCEPT an explicit
+                        // "no-rewrite" list (rt_sigprocmask, fchown,
+                        // fchmod, capget, ioprio_get). The theory was that
+                        // rewriting prevents the kernel from re-evaluating
+                        // the original (blocked) syscall and re-raising
+                        // SIGSYS on resume.
+                        //
+                        // REALITY (observed in c87d6be7 E2E run): for
+                        // seccomp-aborted syscalls the kernel does NOT
+                        // re-evaluate the syscall number — it goes straight
+                        // to syscall-exit. So the rewrite is unnecessary.
+                        // Worse, on i386 compat children the rewrite
+                        // causes the kernel to return -ENOSYS (-38)
+                        // instead of our faked 0 — every mount/mkdir/mknod
+                        // appears to fail with ENOSYS, and TWRP init
+                        // exits(1) after 36 syscalls.
+                        //
+                        // The fix: NEVER rewrite orig_rax. Just set rax=0
+                        // (or the per-syscall fake return value below).
+                        // This matches the proven pattern for
+                        // rt_sigprocmask, which has always been in the
+                        // "no-rewrite" list and works correctly.
 
                         // Decide on the return value based on the original
                         // syscall. See the long comment above for the full
@@ -2432,26 +2451,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         let ret_val: i64 = if original_syscall == a.access {
                             let path_display = access_path.as_deref().unwrap_or("?");
                             let path_arg2_display = access_path_from_arg2.as_deref().unwrap_or("?");
-                            // Log BOTH the REG_ARG1 path and the REG_ARG2
-                            // string so we can see, for every intercepted
-                            // access() call, which register held the
-                            // actual path pointer and which held the
-                            // mode int (or "mode=0755" if REG_ARG1 was
-                            // clobbered by the SIGSYS trap dance).
                             log(&format!(
-                                "intercepted SIGSYS — access(arg1={}, arg2={}) nr={} → returning 0 (success)",
+                                "intercepted SIGSYS — access(arg1={}, arg2={}) nr={} → returning 0 (success, NOT rewriting orig_rax)",
                                 path_display, path_arg2_display, original_syscall
                             ));
                             0
                         } else if original_syscall == a.rt_sigprocmask {
-                            // NO rewrite — see the EXCEPTION comment above.
-                            // The kernel already aborted the syscall
-                            // (seccomp fired), so we just set the return
-                            // value to 0 (success) and resume. Bionic's
-                            // linker needs rt_sigprocmask to "succeed"
-                            // during its init path; the actual signal
-                            // mask doesn't matter for a ptraced process
-                            // (the parent controls signal delivery).
                             log(&format!(
                                 "intercepted SIGSYS — rt_sigprocmask() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — signal mask emulation)",
                                 original_syscall, name
@@ -2462,33 +2467,53 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             || original_syscall == a.capget
                             || original_syscall == a.ioprio_get
                         {
-                            // NO rewrite — see the EXCEPTION comment
-                            // above. Seccomp already aborted the syscall,
-                            // so we just set the return value to 0
-                            // (success) and resume. TWRP's init needs
-                            // these to "succeed" during its startup; on
-                            // most devices they execute and return EPERM
-                            // (handled by the syscall-EXIT path above),
-                            // but on devices where seccomp blocks them
-                            // outright we hit this SIGSYS path. Returning
-                            // 0 without rewriting to getpid matches the
-                            // proven rt_sigprocmask behaviour.
                             log(&format!(
                                 "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — fake success for TWRP init)",
                                 name, original_syscall, name
                             ));
                             0
+                        } else if original_syscall == a.mount
+                            || original_syscall == a.mkdir
+                            || original_syscall == a.chmod
+                            || original_syscall == a.chroot
+                            || original_syscall == a.unshare
+                        {
+                            // Filesystem-related seccomp-blocked syscalls.
+                            // These are the ones TWRP init calls during
+                            // early boot (mount tmpfs/proc/sysfs, mkdir
+                            // /dev/pts, etc.). We fake success (return 0)
+                            // WITHOUT rewriting orig_rax — the previous
+                            // "rewrite to getpid" strategy caused the
+                            // kernel to return -ENOSYS on i386 compat,
+                            // which made init think every mount/mkdir
+                            // failed and exit(1) after 36 syscalls.
+                            log(&format!(
+                                "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting orig_rax — seccomp aborted, returning 0 — fake success)",
+                                name, original_syscall, name
+                            ));
+                            0
                         } else {
                             log(&format!(
-                                "intercepted SIGSYS — syscall nr={} [{}] (rewriting to getpid nr={}, returning 0) — WARNING: unexpected SIGSYS for this syscall, may cause issues",
-                                original_syscall, name, a.getpid
+                                "intercepted SIGSYS — syscall nr={} [{}] (NOT rewriting orig_rax, returning 0) — NOTE: unexpected SIGSYS for this syscall",
+                                original_syscall, name
                             ));
                             0
                         };
                         // Force the return value. The child will see the
                         // (blocked) syscall as having returned `ret_val`.
                         set_syscall_ret(&mut sigsys_regs, &a, ret_val);
-                        let _ = ptrace_setregs(pid, &sigsys_regs, len);
+                        if let Err(e) = ptrace_setregs(pid, &sigsys_regs, len) {
+                            // PTRACE_SETREGS failed — the faked return
+                            // value was NOT applied. The child will see
+                            // whatever rax the kernel set (typically
+                            // -ENOSYS for seccomp-aborted syscalls). This
+                            // is a fatal condition for TWRP boot because
+                            // every faked syscall will appear to fail.
+                            log(&format!(
+                                "SIGSYS handler: ptrace_setregs FAILED for nr={} [{}]: {} — child will see kernel's -ENOSYS, not our faked 0",
+                                original_syscall, name, e
+                            ));
+                        }
                     }
                     Err(_) => {
                         // ptrace_getregs failed — we couldn't read the
