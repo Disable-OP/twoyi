@@ -2739,10 +2739,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         let mut crash_regs: Regs = unsafe { std::mem::zeroed() };
                         if let Ok(_) = ptrace_getregs(pid, &mut crash_regs) {
                             if let Some(a) = abi {
-                                // On x86_64, RIP is at index 128 (user_regs_struct)
-                                // On i386 compat, EIP is the lower 32 bits of RIP
+                                // On x86_64 user_regs_struct, RIP is at
+                                // index 16 (byte offset 128). Each field
+                                // is u64 (8 bytes), so index 16 = offset
+                                // 16*8 = 128 bytes.
                                 let regs_ptr = &crash_regs as *const Regs as *const u64;
-                                let rip = unsafe { *regs_ptr.add(128) };
+                                let rip = unsafe { *regs_ptr.add(16) };
                                 let rsp = get_syscall_arg(&crash_regs, a.reg_sp);
                                 // siginfo fields: si_signo, si_errno, si_code
                                 // For SIGSEGV: si_addr is the faulting address
