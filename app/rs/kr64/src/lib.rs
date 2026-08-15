@@ -3786,9 +3786,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // parameters. The host's /proc/cmdline is not readable by
         // untrusted_app (EACCES from SELinux). We create a fake one in
         // rootfs with the essential Android boot parameters.
-        let proc_dir = format!("{}/proc", rootfs_prefix);
-        let _ = std::fs::create_dir_all(&proc_dir);
-        let cmdline_path = format!("{}/proc/cmdline", rootfs_prefix);
+        let cmdline_path = format!("{}/twrp-cmdline", rootfs_prefix);
         // Minimal Android boot parameters that TWRP init expects.
         // androidboot.hardware is particularly important — init uses it
         // to find the right init.{hardware}.rc file.
