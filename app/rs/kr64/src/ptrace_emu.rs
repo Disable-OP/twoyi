@@ -2717,6 +2717,50 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // were heading to an entry, exit if we were heading to
                 // an exit) as it would have been without the signal.
                 log(&format!("forwarding signal {} to child", sig));
+
+                // For SIGSEGV (signal 11), log the crash address and
+                // instruction pointer via PTRACE_GETSIGINFO. This helps
+                // pinpoint WHERE init crashes, which is critical for
+                // diagnosing boot failures.
+                if sig == 11 {
+                    // PTRACE_GETSIGINFO = 0x4202
+                    let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                    let r = unsafe {
+                        libc::ptrace(
+                            0x4202, // PTRACE_GETSIGINFO
+                            pid,
+                            0,
+                            &mut siginfo as *mut _ as libc::c_long,
+                        )
+                    };
+                    if r == 0 {
+                        // Read the child's registers to get the instruction
+                        // pointer (RIP on x86_64, EIP on i386 compat).
+                        let mut crash_regs: Regs = unsafe { std::mem::zeroed() };
+                        if let Ok(_) = ptrace_getregs(pid, &mut crash_regs) {
+                            if let Some(a) = abi {
+                                // On x86_64, RIP is at index 128 (user_regs_struct)
+                                // On i386 compat, EIP is the lower 32 bits of RIP
+                                let regs_ptr = &crash_regs as *const Regs as *const u64;
+                                let rip = unsafe { *regs_ptr.add(128) };
+                                let rsp = get_syscall_arg(&crash_regs, a.reg_sp);
+                                // siginfo fields: si_signo, si_errno, si_code
+                                // For SIGSEGV: si_addr is the faulting address
+                                // The siginfo_t layout is complex in Rust's
+                                // libc binding, so we read the raw bytes.
+                                let si_ptr = &siginfo as *const libc::siginfo_t as *const u8;
+                                let si_code = unsafe { *si_ptr.add(8) as i32 };
+                                // si_addr is at offset 16 (on x86_64)
+                                let si_addr = unsafe { *(si_ptr.add(16) as *const u64) };
+                                log(&format!(
+                                    "SIGSEGV details: si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, rip={:#x}, rsp={:#x}",
+                                    si_code, si_addr, rip, rsp
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 // Stash the signal so the SINGLE PTRACE_SYSCALL at the
                 // loop top injects it on resume. We do NOT call
                 // PTRACE_SYSCALL here — doing so would race the loop-top
