@@ -241,6 +241,15 @@ struct ChildAbi {
     fchmod: i64,
     capget: i64,
     ioprio_get: i64,
+    // execve syscall number for this ABI. Used to detect when the child
+    // replaces its image (kr64 → TWRP init, or TWRP init → recovery), so
+    // we can reset the lazily-detected ABI and re-read /proc/<pid>/exe
+    // to pick up the new binary's bitness. Without this, the first
+    // bitness detection (which runs at the FIRST syscall stop, BEFORE
+    // execve) would permanently lock in the kr64 binary's bitness
+    // (x86_64) even after the child exec's a 32-bit i386 init — causing
+    // every subsequent syscall number and register index to be wrong.
+    execve: i64,
     // Syscalls we never actually emulate, but whose numbers we need for
     // the SIGSYS diagnostic logging (we look up the original syscall
     // number to print a human-readable name when seccomp blocks it).
@@ -330,6 +339,7 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     fchmod: 91,
     capget: 125,
     ioprio_get: 252,
+    execve: 59, // SYS_execve (x86_64)
     mount: 165,
     chroot: 161,
     mkdir: 83,
@@ -369,6 +379,7 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     fchmod: 94,
     capget: 184,
     ioprio_get: 290,
+    execve: 11, // SYS_execve (i386)
     mount: 21,
     chroot: 61,
     mkdir: 39,
@@ -416,6 +427,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     fchmod: 52,
     capget: 90,
     ioprio_get: 31,
+    execve: 221, // SYS_execve (aarch64)
     mount: 165,
     chroot: 51,
     mkdir: 34,
@@ -853,8 +865,32 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "capget"
     } else if nr == abi.ioprio_get {
         "ioprio_get"
+    } else if nr == abi.execve {
+        "execve"
     } else {
         "unknown"
+    }
+}
+
+/// Human-readable label for a `ChildAbi` (used in log messages when
+/// reporting the ABI transition around execve).
+#[allow(unused_variables)]
+fn abi_label(abi: ChildAbi) -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if abi.execve == 59 {
+            "64-bit (x86_64)"
+        } else if abi.execve == 11 {
+            "32-bit (i386 compat)"
+        } else {
+            "unknown-x86-abi"
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // On aarch64 there is no 32-bit userspace, so the child is
+        // always 64-bit. The `abi` parameter is unused on this target.
+        "64-bit (aarch64)"
     }
 }
 
@@ -1334,7 +1370,63 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     // was already running, which then made us return -1 prematurely.
     let mut resume_signal: libc::c_int = 0;
 
+    // ── execve tracking for ABI re-detection ──────────────────────────
+    //
+    // The child ABI (`abi` below) is lazily detected by reading
+    // /proc/<pid>/exe at the FIRST syscall stop. But the first syscall
+    // stop happens BEFORE the child has called execve — the child is
+    // still running kr64's own code (copying the init binary, writing
+    // status messages, etc.). So /proc/<pid>/exe points to kr64 (the
+    // x86_64 host binary), and the ABI is permanently locked to x86_64
+    // — even after the child exec's a 32-bit i386 TWRP init binary.
+    //
+    // This causes every subsequent syscall number to be misinterpreted
+    // (i386 mount=21 read as x86_64 access=21) and every register index
+    // to be wrong (x86_64 rdi=14 used to read arg1, but on an i386
+    // compat child rdi actually holds edi, the 5th arg — so the ptrace
+    // emulator reads "mode=0755" instead of the mount source path).
+    //
+    // FIX: track execve explicitly. When we see an execve ENTRY, set
+    // `saw_execve`. At the execve EXIT, set `reset_abi_next`. At the
+    // top of the next loop iteration (before any handler runs), reset
+    // `abi = None` so the NEXT syscall stop re-reads /proc/<pid>/exe
+    // — which now points to the new binary (i386 init).
+    //
+    // We check the execve number for ALL ABIs the child could be at
+    // that point (x86_64=59, i386=11, aarch64=221) so we catch execve
+    // regardless of the child's current bitness.
+    let mut saw_execve: bool = false;
+    let mut reset_abi_next: bool = false;
+    // True once we've processed the first execve's ABI reset. Used to
+    // log the first N post-execve syscalls (which are the new binary's
+    // own syscalls — the most useful diagnostic for "what does TWRP
+    // init do after execve?").
+    let mut past_first_execve: bool = false;
+    let mut post_execve_syscall_count: u64 = 0;
+
     loop {
+        // ── Deferred ABI reset (after execve EXIT) ──
+        //
+        // If the previous iteration was an execve EXIT, reset `abi`
+        // here so the CURRENT iteration's handler re-detects the
+        // child's bitness from /proc/<pid>/exe (which now points to
+        // the new binary). This runs BEFORE waitpid, so both the
+        // SIGTRAP|0x80 path and the SIGSYS path will see abi=None
+        // and re-detect.
+        if reset_abi_next {
+            if abi.is_some() {
+                let prev_label = abi_label(abi.unwrap());
+                log(&format!(
+                    "execve completed — resetting ABI (was {}) to re-detect child bitness from /proc/{}/exe",
+                    prev_label, pid
+                ));
+                abi = None;
+            }
+            reset_abi_next = false;
+            past_first_execve = true;
+            post_execve_syscall_count = 0;
+        }
+
         // Continue the child to the next syscall entry/exit. This is
         // the ONLY PTRACE_SYSCALL in the loop — handlers below set
         // `resume_signal` (and `continue`) instead of resuming the
@@ -1582,6 +1674,49 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         log(&format!("syscall entry: nr={}", syscall_num));
                     }
 
+                    // ── execve detection (ABI re-detection trigger) ──
+                    //
+                    // When the child calls execve, its memory image is
+                    // about to be replaced. /proc/<pid>/exe currently
+                    // still points to the OLD binary, but at execve EXIT
+                    // it will point to the NEW binary. We set `saw_execve`
+                    // here so the EXIT handler can schedule an ABI reset.
+                    //
+                    // We compare against `abi.execve` (the current ABI's
+                    // execve number). This is correct because:
+                    //   - Before the first execve, the child is kr64
+                    //     (same bitness as host), so abi.execve matches
+                    //     the host's native execve number.
+                    //   - After the first execve (and ABI re-detection),
+                    //     abi.execve matches the new binary's execve
+                    //     number, so a second execve (e.g. init →
+                    //     recovery) is also caught.
+                    if syscall_num == abi.execve {
+                        saw_execve = true;
+                        log(&format!(
+                            "execve ENTRY (nr={}) — will reset ABI after EXIT to re-detect child bitness",
+                            syscall_num
+                        ));
+                    }
+
+                    // Log the first 50 post-execve syscalls so we can
+                    // see exactly what the new binary (TWRP init) does
+                    // after execve. This is critical because loop_count
+                    // may already be large (kr64's pre-execve syscalls
+                    // inflate it), so the existing "loop_count <= 50"
+                    // log gate would suppress these.
+                    if past_first_execve {
+                        post_execve_syscall_count = post_execve_syscall_count.saturating_add(1);
+                        if post_execve_syscall_count <= 50 {
+                            log(&format!(
+                                "post-execve syscall #{}: nr={} [{}]",
+                                post_execve_syscall_count,
+                                syscall_num,
+                                syscall_name(syscall_num, &abi)
+                            ));
+                        }
+                    }
+
                     // ── Lazy scratch-area reservation ──────────────────
                     //
                     // Translated paths are always longer than the originals
@@ -1768,6 +1903,28 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
+
+                    // ── execve EXIT: schedule ABI reset ──
+                    //
+                    // If the ENTRY for this syscall was an execve (flag
+                    // set above), the child's image has now been
+                    // replaced. /proc/<pid>/exe points to the new
+                    // binary. We set `reset_abi_next` so the TOP of the
+                    // next loop iteration resets `abi = None`, forcing
+                    // a fresh bitness detection at the next syscall
+                    // stop. This is what actually fixes the
+                    // "permanently locked to x86_64" bug.
+                    //
+                    // We do the reset at the TOP of the next iteration
+                    // (not here) so the SIGSYS handler — which also
+                    // checks `abi.is_none()` and re-detects — sees the
+                    // reset state if a SIGSYS fires before the next
+                    // SIGTRAP|0x80 stop.
+                    if saw_execve {
+                        saw_execve = false;
+                        reset_abi_next = true;
+                        log("execve EXIT — will reset ABI at next stop");
+                    }
 
                     if pending_getpid {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
