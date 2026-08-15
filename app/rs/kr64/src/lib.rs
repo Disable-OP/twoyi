@@ -3453,9 +3453,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             }
                         }
                         if found {
+                            // Verify the patch was applied by reading back
+                            let patch_offset = (0..bytes.len()).find(|&i| bytes[i] == 0x31 && i + 2 < bytes.len() && bytes[i+1] == 0xc0 && bytes[i+2] == 0xc3 && i + 12 <= bytes.len() && bytes[i+3] == 0x57 && bytes[i+4] == 0x56).map(|i| i).unwrap_or(0);
                             match std::fs::write(&init_path, &bytes) {
                                 Ok(()) => info!(
-                                    "[KR64] PARENT: patched /init find_property() — replaced first 3 bytes with 'xor eax,eax; ret' (prevents SIGSEGV when property area is not initialized)"
+                                    "[KR64] PARENT: patched /init find_property() at offset {:#x} — replaced first 3 bytes with 'xor eax,eax; ret' (prevents SIGSEGV when property area is not initialized)",
+                                    patch_offset
                                 ),
                                 Err(e) => warning!(
                                     "[KR64] PARENT: patched find_property in memory but failed to write back: {} (init may crash with SIGSEGV)",
