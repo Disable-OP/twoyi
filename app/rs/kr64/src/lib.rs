@@ -3433,6 +3433,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 Ok(mut bytes) => {
                     let pattern: &[u8] = &[
                         0x55, 0x89, 0xe5, 0x57, 0x56, 0x89, 0xc6, 0x53, 0x8d, 0x64, 0x24, 0xa4,
+                        0x89, 0x55, 0xc4, 0x8b, 0x55, 0x0c,
                     ];
                     let patch: &[u8] = &[0x31, 0xc0, 0xc3]; // xor eax,eax; ret
 
