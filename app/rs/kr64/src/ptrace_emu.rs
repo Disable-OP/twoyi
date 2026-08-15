@@ -258,6 +258,26 @@ struct ChildAbi {
     mkdir: i64,
     chmod: i64,
     unshare: i64,
+    // SysV shared-memory syscalls (shmget / shmat / shmctl). TWRP
+    // init calls shmget() during early boot — Android's
+    // __system_property_area_init uses a SysV shared memory segment
+    // for the property file. The host's seccomp filter blocks these
+    // (not in the untrusted_app allow list), raising SIGSYS.
+    //
+    // Returning 0 (fake success) for shmget causes init to loop
+    // forever: shmid=0 is not a valid shmid, so init retries shmget
+    // — observed in the 0a4be80 E2E run as a 13k-iteration SIGSYS
+    // loop that OOM'd the Java FileLogger-Kr64Tee thread.
+    //
+    // Returning -ENOSYS (-38) tells init "this kernel does not
+    // implement SysV shared memory", which makes bionic fall back to
+    // a non-shared-memory property area initialization path (the
+    // same fallback used on kernels built without CONFIG_SYSVIPC).
+    // This is the correct emulation for an unprivileged rootless
+    // container.
+    shmget: i64,
+    shmat: i64,
+    shmctl: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -345,6 +365,12 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     mkdir: 83,
     chmod: 90,
     unshare: 272,
+    // SysV shared-memory syscalls — see the comment on these fields
+    // in `ChildAbi`. x86_64: shmget=29, shmat=30, shmctl=31
+    // (asm/unistd_64.h).
+    shmget: 29,
+    shmat: 30,
+    shmctl: 31,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -385,6 +411,12 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     mkdir: 39,
     chmod: 15,
     unshare: 310,
+    // SysV shared-memory syscalls — see the comment on these fields
+    // in `ChildAbi`. i386: shmget=29, shmat=30, shmctl=31
+    // (asm-i386/unistd_32.h).
+    shmget: 29,
+    shmat: 30,
+    shmctl: 31,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -433,6 +465,12 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     mkdir: 34,
     chmod: 53,
     unshare: 97,
+    // SysV shared-memory syscalls — see the comment on these fields
+    // in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
+    // shmget=194, shmctl=195, shmat=196.
+    shmget: 194,
+    shmat: 196,
+    shmctl: 195,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -859,6 +897,12 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "chmod"
     } else if nr == abi.unshare {
         "unshare"
+    } else if nr == abi.shmget {
+        "shmget"
+    } else if nr == abi.shmat {
+        "shmat"
+    } else if nr == abi.shmctl {
+        "shmctl"
     } else if nr == abi.fchown {
         "fchown"
     } else if nr == abi.fchmod {
@@ -1372,6 +1416,40 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
     // looking for).
     let mut recent_sigsys: std::collections::VecDeque<String> =
         std::collections::VecDeque::with_capacity(RECENT_SIGSYS_CAP);
+    // ── SIGSYS log rate-limiting ──────────────────────────────────────
+    //
+    // When init hits a SIGSYS loop (e.g. the 0a4be80 E2E run where
+    // shmget returned 0 → init retried because shmid=0 is invalid),
+    // the SIGSYS handler emits 2+ log lines per iteration. At 3000+
+    // iterations per second this floods logcat and OOMs the Java
+    // FileLogger-Kr64Tee thread (which accumulates the tee'd output
+    // into a single String before flushing — a single 155MB
+    // String.getBytes() allocation was observed in that run).
+    //
+    // To prevent the OOM we rate-limit the per-SIGSYS log output:
+    //   - Track the last SIGSYS syscall number and how many times it
+    //     has repeated consecutively.
+    //   - For the first 5 repetitions, log normally (so the operator
+    //     still sees the diagnostic for any NEW syscall that starts
+    //     looping — the first few iterations carry the useful
+    //     "what changed?" context).
+    //   - After 5 repetitions of the SAME syscall number, suppress
+    //     ALL per-SIGSYS log output (the in_syscall DESYNC log, the
+    //     access() raw-args log, and the per-syscall "intercepted
+    //     SIGSYS" log).
+    //   - Every 100 suppressed iterations, emit ONE summary log line
+    //     so the operator can still see that the loop is ongoing and
+    //     track its progress.
+    //
+    // The actual SIGSYS handling (return-value forcing, history
+    // buffer push, ptrace_setregs) is NOT affected by suppression —
+    // only the log() calls are gated. This ensures the emulated
+    // return value (e.g. -ENOSYS for shmget) is still applied to the
+    // child's registers on every iteration, so the loop terminates
+    // once init acts on the -ENOSYS.
+    let mut last_sigsys_nr: i64 = -1;
+    let mut sigsys_repeat_count: u64 = 0;
+    let mut sigsys_suppressed_total: u64 = 0;
     // Rolling log of the last N syscall numbers — captures BOTH
     // seccomp-intercepted syscalls (recorded in the SIGSYS handler
     // below, because seccomp-blocked syscalls do NOT produce a
@@ -2271,15 +2349,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                 // before `continue` below). This ensures the next stop
                 // is treated as EXIT regardless of whether SIGSYS
                 // fired before or after the ENTRY stop.
-                log(&format!(
-                    "SIGSYS handler: in_syscall={} before processing{}",
-                    in_syscall,
-                    if in_syscall {
-                        " (normal — SIGSYS fired between ENTRY and EXIT)"
-                    } else {
-                        " (DESYNC — SIGSYS fired before ENTRY stop; setting in_syscall=true to recover)"
-                    }
-                ));
+                //
+                // NOTE: the in_syscall DESYNC diagnostic log that used
+                // to live here is now emitted AFTER the rate-limit
+                // check inside the `Ok(len) =>` branch below. The
+                // per-SIGSYS log output is rate-limited so a tight
+                // SIGSYS loop on a single syscall number (e.g. shmget
+                // returning 0 → init retries) does not flood logcat
+                // and OOM the Java FileLogger-Kr64Tee thread — see the
+                // comment on `last_sigsys_nr` / `sigsys_repeat_count`
+                // at the top of `run_ptrace_loop` for the full
+                // rationale.
                 let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
                 match ptrace_getregs(pid, &mut sigsys_regs) {
                     Ok(len) => {
@@ -2323,6 +2403,74 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         let original_syscall = get_syscall_num(&sigsys_regs, &a);
                         let name = syscall_name(original_syscall, &a);
 
+                        // ── SIGSYS log rate-limiting ──
+                        //
+                        // Track how many times the SAME syscall number
+                        // has fired SIGSYS in a row. After 5 repetitions
+                        // we suppress ALL per-SIGSYS log output to
+                        // prevent flooding logcat (which OOMs the Java
+                        // FileLogger-Kr64Tee thread — see the comment on
+                        // `last_sigsys_nr` at the top of run_ptrace_loop).
+                        // Every 100 suppressed iterations we emit ONE
+                        // summary line so the operator can still see the
+                        // loop is ongoing. The actual SIGSYS handling
+                        // (return-value forcing below) is NOT gated —
+                        // only the log() calls are, via the `sigsys_log`
+                        // closure defined below.
+                        if original_syscall == last_sigsys_nr {
+                            sigsys_repeat_count = sigsys_repeat_count.saturating_add(1);
+                        } else {
+                            last_sigsys_nr = original_syscall;
+                            sigsys_repeat_count = 1;
+                        }
+                        let suppress_log = sigsys_repeat_count > 5;
+                        if suppress_log {
+                            sigsys_suppressed_total = sigsys_suppressed_total.saturating_add(1);
+                            // Emit ONE summary line every 100 suppressed
+                            // iterations (1, 101, 201, …) so the operator
+                            // can still see the loop is ongoing. Uses the
+                            // outer `log` directly — this summary must
+                            // NOT be suppressed by `sigsys_log`.
+                            if sigsys_suppressed_total % 100 == 1 {
+                                log(&format!(
+                                    "suppressing repeated SIGSYS for nr={} [{}] (repeat_count={}, suppressed_total={})",
+                                    original_syscall,
+                                    name,
+                                    sigsys_repeat_count,
+                                    sigsys_suppressed_total
+                                ));
+                            }
+                        }
+
+                        // Rate-limited log helper. Every per-SIGSYS log
+                        // call below uses `sigsys_log` instead of `log`
+                        // so that a tight SIGSYS loop on a single syscall
+                        // number does not flood logcat. The closure
+                        // captures `suppress_log` (by shared ref — it is
+                        // not mutated after the check above) and `log`
+                        // (by shared ref — `log` is `Fn(&str)`).
+                        let sigsys_log = |msg: &str| {
+                            if !suppress_log {
+                                log(msg);
+                            }
+                        };
+
+                        // in_syscall DESYNC diagnostic — moved here from
+                        // before the ptrace_getregs call so it can be
+                        // gated by the rate-limit check above. See the
+                        // "Bug 1 fix: in_syscall flag desync" comment
+                        // earlier in this SIGSYS handler for the full
+                        // rationale.
+                        sigsys_log(&format!(
+                            "SIGSYS handler: in_syscall={} before processing{}",
+                            in_syscall,
+                            if in_syscall {
+                                " (normal — SIGSYS fired between ENTRY and EXIT)"
+                            } else {
+                                " (DESYNC — SIGSYS fired before ENTRY stop; setting in_syscall=true to recover)"
+                            }
+                        ));
+
                         // Record the intercepted syscall in the rolling
                         // "all syscalls" buffer too — seccomp-blocked
                         // syscalls do NOT produce a syscall-entry stop
@@ -2358,7 +2506,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                 let path_addr_arg2 = get_syscall_arg(&sigsys_regs, a.reg_arg2);
                                 let s1 = read_child_string(pid, path_addr_arg1);
                                 let s2 = read_child_string(pid, path_addr_arg2);
-                                log(&format!(
+                                sigsys_log(&format!(
                                     "access() SIGSYS raw args: reg_arg1={:#x} reg_arg2={:#x} str(arg1)={:?} str(arg2)={:?}",
                                     path_addr_arg1, path_addr_arg2, s1, s2
                                 ));
@@ -2505,13 +2653,13 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                         let ret_val: i64 = if original_syscall == a.access {
                             let path_display = access_path.as_deref().unwrap_or("?");
                             let path_arg2_display = access_path_from_arg2.as_deref().unwrap_or("?");
-                            log(&format!(
+                            sigsys_log(&format!(
                                 "intercepted SIGSYS — access(arg1={}, arg2={}) nr={} → returning 0 (success, NOT rewriting orig_rax)",
                                 path_display, path_arg2_display, original_syscall
                             ));
                             0
                         } else if original_syscall == a.rt_sigprocmask {
-                            log(&format!(
+                            sigsys_log(&format!(
                                 "intercepted SIGSYS — rt_sigprocmask() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — signal mask emulation)",
                                 original_syscall, name
                             ));
@@ -2521,7 +2669,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             || original_syscall == a.capget
                             || original_syscall == a.ioprio_get
                         {
-                            log(&format!(
+                            sigsys_log(&format!(
                                 "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — fake success for TWRP init)",
                                 name, original_syscall, name
                             ));
@@ -2580,11 +2728,11 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                         // already has these — skip.
                                         if fstype == "tmpfs" || fstype == "devpts" {
                                             match std::fs::create_dir_all(&real_tgt) {
-                                                Ok(()) => log(&format!(
+                                                Ok(()) => sigsys_log(&format!(
                                                     "SIGSYS mount: created directory {} (fstype={}) in rootfs",
                                                     real_tgt, fstype
                                                 )),
-                                                Err(e) => log(&format!(
+                                                Err(e) => sigsys_log(&format!(
                                                     "SIGSYS mount: FAILED to create {} (fstype={}): {}",
                                                     real_tgt, fstype, e
                                                 )),
@@ -2603,11 +2751,11 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                             path.clone()
                                         };
                                         match std::fs::create_dir_all(&real_path) {
-                                            Ok(()) => log(&format!(
+                                            Ok(()) => sigsys_log(&format!(
                                                 "SIGSYS mkdir: created directory {} in rootfs",
                                                 real_path
                                             )),
-                                            Err(e) => log(&format!(
+                                            Err(e) => sigsys_log(&format!(
                                                 "SIGSYS mkdir: FAILED to create {}: {}",
                                                 real_path, e
                                             )),
@@ -2615,13 +2763,48 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                                     }
                                 }
                             }
-                            log(&format!(
+                            sigsys_log(&format!(
                                 "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting orig_rax — seccomp aborted, returning 0 — fake success + performed fs op in rootfs)",
                                 name, original_syscall, name
                             ));
                             0
+                        } else if original_syscall == a.shmget
+                            || original_syscall == a.shmat
+                            || original_syscall == a.shmctl
+                        {
+                            // SysV shared-memory syscalls (shmget /
+                            // shmat / shmctl). TWRP init calls shmget()
+                            // during early boot for Android's
+                            // __system_property_area_init, which uses a
+                            // SysV shared memory segment for the property
+                            // file.
+                            //
+                            // The host's seccomp filter blocks these
+                            // (not in the untrusted_app allow list),
+                            // raising SIGSYS. Returning 0 (fake success)
+                            // for shmget causes init to loop forever:
+                            // shmid=0 is not a valid shmid, so init
+                            // retries shmget — observed in the 0a4be80
+                            // E2E run as a 13k-iteration SIGSYS loop
+                            // that OOM'd the Java FileLogger-Kr64Tee
+                            // thread.
+                            //
+                            // Returning -ENOSYS (-38) tells init "this
+                            // kernel does not implement SysV shared
+                            // memory", which makes bionic fall back to a
+                            // non-shared-memory property area
+                            // initialization path (the same fallback
+                            // used on kernels built without
+                            // CONFIG_SYSVIPC). This is the correct
+                            // emulation for an unprivileged rootless
+                            // container.
+                            sigsys_log(&format!(
+                                "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting orig_rax — returning -ENOSYS so init falls back to non-shared-memory property init)",
+                                name, original_syscall, name
+                            ));
+                            -(libc::ENOSYS as i64)
                         } else {
-                            log(&format!(
+                            sigsys_log(&format!(
                                 "intercepted SIGSYS — syscall nr={} [{}] (NOT rewriting orig_rax, returning 0) — NOTE: unexpected SIGSYS for this syscall",
                                 original_syscall, name
                             ));
@@ -2958,5 +3141,60 @@ mod tests {
     fn translate_path_leaves_relative_untouched() {
         // Relative paths are returned as-is (no rootfs prefix).
         assert_eq!(translate_path("/r", "relative/path"), "relative/path");
+    }
+
+    // ── SysV shared-memory syscall number tests ─────────────────────
+    //
+    // These verify that the shmget / shmat / shmctl syscall numbers
+    // in each ChildAbi match the real kernel ABI. The 0a4be80 E2E run
+    // showed that init calls shmget (i386 nr=29) during early boot
+    // for __system_property_area_init; if our ABI table had the wrong
+    // number the SIGSYS handler would not recognise it and would fall
+    // through to the "unexpected SIGSYS" path (returning 0, causing
+    // the infinite shmget loop that OOM'd the Java FileLogger).
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_shm_numbers() {
+        // asm/unistd_64.h: shmget=29, shmat=30, shmctl=31
+        assert_eq!(ABI_X86_64.shmget, 29, "x86_64 shmget must be 29");
+        assert_eq!(ABI_X86_64.shmat, 30, "x86_64 shmat must be 30");
+        assert_eq!(ABI_X86_64.shmctl, 31, "x86_64 shmctl must be 31");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_shm_numbers() {
+        // asm-i386/unistd_32.h: shmget=29, shmat=30, shmctl=31
+        // (same as x86_64 — the i386 IPC syscalls are NOT multiplexed
+        // through ipc(5) on Linux; they have direct entry points.)
+        assert_eq!(ABI_X86_32.shmget, 29, "i386 shmget must be 29");
+        assert_eq!(ABI_X86_32.shmat, 30, "i386 shmat must be 30");
+        assert_eq!(ABI_X86_32.shmctl, 31, "i386 shmctl must be 31");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_shm_numbers() {
+        // asm-generic/unistd.h: shmget=194, shmctl=195, shmat=196
+        assert_eq!(ABI_AARCH64.shmget, 194, "aarch64 shmget must be 194");
+        assert_eq!(ABI_AARCH64.shmat, 196, "aarch64 shmat must be 196");
+        assert_eq!(ABI_AARCH64.shmctl, 195, "aarch64 shmctl must be 195");
+    }
+
+    #[test]
+    fn syscall_name_resolves_shm_calls() {
+        // Verify that syscall_name() recognises shmget/shmat/shmctl
+        // on the current target's ABI (so the SIGSYS handler logs a
+        // human-readable name instead of "[unknown]" when init trips
+        // seccomp on these syscalls).
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+
+        assert_eq!(syscall_name(abi.shmget, &abi), "shmget");
+        assert_eq!(syscall_name(abi.shmat, &abi), "shmat");
+        assert_eq!(syscall_name(abi.shmctl, &abi), "shmctl");
     }
 }
