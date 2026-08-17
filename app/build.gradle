@@ -69,6 +69,40 @@ android {
             signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+        // A debuggable variant of the release build — used for on-device
+        // diagnostics (task 3-A Part 3, 1-A section E #3). Inherits all
+        // of release's config (release keystore signing, no minification,
+        // the same native libs and ABIs) EXCEPT:
+        //   * `debuggable true`  — enables `adb shell run-as io.twoyi.debug`.
+        //   * `applicationIdSuffix ".debug"` — installable alongside the
+        //     release build (so the user can keep the production app
+        //     installed while debugging).
+        //
+        // Usage:
+        //   ./gradlew assembleDebuggable
+        //   adb install -r app/build/outputs/apk/debuggable/*.apk
+        //   adb shell run-as io.twoyi.debug cat \
+        //     /data/user/0/io.twoyi.debug/rootfs/twrp-init.log
+        //
+        // The kr64 log mirror (lib.rs post-ptrace-loop) writes to
+        // /sdcard/Download/twoyi-logs/ on BOTH the `release` and
+        // `debuggable` variants — adb pull works on either. The
+        // run-as path is the canonical fallback for poking around
+        // the guest rootfs, but requires the `debuggable` variant
+        // (release builds reject run-as).
+        debuggable {
+            initWith release
+            debuggable true
+            applicationIdSuffix ".debug"
+            // The debug keystore is intentionally NOT used — `initWith
+            // release` already inherits the release signingConfig, so
+            // the debuggable APK is signed with the same key as the
+            // release APK. This means an installed `io.twoyi.debug`
+            // can be UPGRADED to `io.twoyi` (the release appId) by
+            // uninstalling first — but the two CANNOT coexist with the
+            // SAME signing identity on the SAME applicationId (which
+            // is exactly the point of the `.debug` suffix).
+        }
     }
     // extractNativeLibs="true" is set in AndroidManifest.xml, so we must
     // opt into the legacy packaging behavior explicitly. Without this,
@@ -157,7 +191,11 @@ task cargoBuild {
 }
 
 tasks.whenTaskAdded { task ->
-    if ((task.name == 'javaPreCompileDebug' || task.name == 'javaPreCompileRelease')) {
+    // Match any javaPreCompile* task (Debug, Release, and the new
+    // Debuggable buildType added in task 3-A Part 3) so the native
+    // build dependencies are wired for every variant without having
+    // to enumerate them.
+    if (task.name.startsWith('javaPreCompile')) {
         task.dependsOn 'cargoBuild'
         task.dependsOn 'loaderBuild'
         task.dependsOn 'kr64Build'
