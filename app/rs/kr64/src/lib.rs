@@ -3633,112 +3633,214 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ensure WriteStringToFile succeeds regardless of which path init
     // actually opens.
     //
-    // TWRP BOOT: skip this block. TWRP's init.rc has a much simpler
-    // property service (no second_stage init / secilc / vendor_init
-    // chain), and doesn't write to /dev/__properties__/property_info.
-    if cfg.boot_recovery {
-        info!("[KR64] TWRP boot: skipping /dev/__properties__ pre-creation (TWRP has its own property service)");
-    } else {
+    // TWRP BOOT (cfg.boot_recovery=true): pre-create `/dev/__properties__`
+    // as a SINGLE FILE with the OLD AOSP 5.1 prop_area header (128 KB).
+    // TWRP's bionic opens `/dev/__properties__` directly (NOT the Android
+    // 8+ `/dev/__properties__/properties_serial` subdirectory path that the
+    // else-branch below prepares). Providing the OLD-format file here makes
+    // `__system_property_area_init` succeed → `__system_property_area__`
+    // is non-NULL → `find_property()` reads valid memory instead of
+    // NULL+0x90 → no SIGSEGV at rip=0x809255d. This is the PROPER
+    // root-cause fix per 5-Z's recommendation #2 (not the revert of
+    // f720934). See worklog 5-Z's disassembly for the full chain.
+    //
+    // ANDROID BOOT (cfg.boot_recovery=false): pre-create the directory +
+    // `property_info` + `properties_serial` (NEW Android 8+ format) on host
+    // + rootfs, as before.
+    {
         use std::os::unix::fs::PermissionsExt;
-        // Create the directory on the host (if it doesn't exist)
-        let host_prop_dir = "/dev/__properties__";
-        if !Path::new(host_prop_dir).exists() {
-            match std::fs::create_dir_all(host_prop_dir) {
-                Ok(_) => {
-                    let _ = std::fs::set_permissions(
-                        host_prop_dir,
-                        std::fs::Permissions::from_mode(0o711),
-                    );
-                    info!("[KR64] PARENT: created host {} (mode 0711)", host_prop_dir);
-                }
-                Err(e) => {
-                    error!(
-                        "[KR64] PARENT: failed to create host {}: {}",
-                        host_prop_dir, e
-                    );
-                }
+        if cfg.boot_recovery {
+            // Build the OLD-format prop_area bytes (128 KB) — magic=PROP,
+            // version=0xfc6ed0ab, bytes_used=0, serial=0, then zero-padded
+            // data area. init's __system_property_area_init will re-mmap + memset
+            // the in-memory header on top of this file (per AOSP 5.1 source),
+            // but providing the correct header bytes here makes the file
+            // self-describing for diagnostics and future property-injection.
+            let prop_bytes = vfs::make_old_format_property_area();
+            // Pre-create {rootfs}/dev/__properties__ as a regular FILE.
+            let rootfs_prop_file = format!("{}/dev/__properties__", rootfs_prefix);
+            // Ensure {rootfs}/dev exists (it usually does by this point).
+            let _ = std::fs::create_dir_all(format!("{}/dev", rootfs_prefix));
+            // Remove any pre-existing DIRECTORY at this path (from a prior
+            // Android-mode run on the same rootfs) — a directory would block
+            // the file write with EISDIR.
+            let rootfs_prop_md = std::fs::metadata(&rootfs_prop_file);
+            if matches!(rootfs_prop_md, Ok(ref md) if md.is_dir()) {
+                let _ = std::fs::remove_dir_all(&rootfs_prop_file);
+                info!(
+                    "[KR64] PARENT: removed stale dir at {} (switching to OLD-format file)",
+                    rootfs_prop_file
+                );
             }
-        }
-        // Pre-create property_info on host (empty regular file, mode 0666).
-        // `.truncate(false)` makes the "do not overwrite an existing file"
-        // intent explicit (the `if !exists()` guard already ensures this).
-        let host_prop_info = format!("{}/property_info", host_prop_dir);
-        if !Path::new(&host_prop_info).exists() {
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&host_prop_info)
-            {
+            match std::fs::write(&rootfs_prop_file, &prop_bytes) {
                 Ok(_) => {
                     let _ = std::fs::set_permissions(
-                        &host_prop_info,
+                        &rootfs_prop_file,
                         std::fs::Permissions::from_mode(0o666),
                     );
                     info!(
-                        "[KR64] PARENT: pre-created host {} (mode 0666)",
-                        host_prop_info
+                        "[KR64] PARENT: pre-created rootfs {} (OLD-format, {} bytes, mode 0666)",
+                        rootfs_prop_file,
+                        prop_bytes.len()
                     );
                 }
                 Err(e) => {
                     error!(
-                        "[KR64] PARENT: failed to pre-create host {}: {}",
-                        host_prop_info, e
+                        "[KR64] PARENT: failed to pre-create rootfs {}: {}",
+                        rootfs_prop_file, e
                     );
                 }
             }
-        }
-        // Also pre-create properties_serial on host (host's property service
-        // needs this; don't truncate if it already exists)
-        let host_prop_serial = format!("{}/properties_serial", host_prop_dir);
-        if !Path::new(&host_prop_serial).exists() {
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&host_prop_serial)
-            {
-                Ok(_) => {
-                    let _ = std::fs::set_permissions(
-                        &host_prop_serial,
-                        std::fs::Permissions::from_mode(0o666),
-                    );
-                    info!("[KR64] PARENT: pre-created host {}", host_prop_serial);
-                }
-                Err(e) => {
-                    error!(
-                        "[KR64] PARENT: failed to pre-create host {}: {}",
-                        host_prop_serial, e
-                    );
+            // Also pre-create on the host /dev/__properties__ (defensive —
+            // the SIGSYS handler may translate paths through the host's /dev
+            // before falling back to rootfs). Don't clobber an existing
+            // directory (host's property service may have created it on a
+            // real-Android host — we don't want to break that).
+            let host_prop_file = "/dev/__properties__";
+            let host_md = std::fs::metadata(host_prop_file);
+            let host_exists_as_file = matches!(host_md, Ok(ref md) if md.is_file());
+            if !host_exists_as_file {
+                // Only write if the path doesn't already exist OR exists as a
+                // non-directory. If a directory exists at /dev/__properties__
+                // on the host (rare — only happens on real Android hosts where
+                // the system's init already created the directory), skip the
+                // write to avoid breaking the host's property service.
+                let host_exists_as_dir = matches!(host_md, Ok(ref md) if md.is_dir());
+                if !host_exists_as_dir {
+                    match std::fs::write(host_prop_file, &prop_bytes) {
+                        Ok(_) => {
+                            let _ = std::fs::set_permissions(
+                                host_prop_file,
+                                std::fs::Permissions::from_mode(0o666),
+                            );
+                            info!(
+                            "[KR64] PARENT: pre-created host {} (OLD-format, {} bytes, mode 0666)",
+                            host_prop_file,
+                            prop_bytes.len()
+                        );
+                        }
+                        Err(e) => {
+                            // Likely EACCES on the host /dev in non-root mode
+                            // — not fatal, the rootfs copy is what init opens
+                            // after path translation. Log and continue.
+                            info!(
+                            "[KR64] PARENT: did not pre-create host {} ({} — non-fatal, rootfs copy is what init opens)",
+                            host_prop_file, e
+                        );
+                        }
+                    }
+                } else {
+                    info!(
+                    "[KR64] PARENT: host {} exists as a directory (real-Android host?) — leaving it untouched",
+                    host_prop_file
+                );
                 }
             }
-        }
-        // Pre-create the directory + files in the rootfs too
-        let rootfs_prop_dir = format!("{}/dev/__properties__", rootfs_prefix);
-        let _ = std::fs::create_dir_all(&rootfs_prop_dir);
-        let _ = std::fs::set_permissions(&rootfs_prop_dir, std::fs::Permissions::from_mode(0o777));
-        for fname in &["property_info", "properties_serial"] {
-            let path = format!("{}/{}", rootfs_prop_dir, fname);
-            if !Path::new(&path).exists() {
+        } else {
+            // ----- Android-guest (NEW Android 8+ subdirectory format) -----
+            // Create the directory on the host (if it doesn't exist)
+            let host_prop_dir = "/dev/__properties__";
+            if !Path::new(host_prop_dir).exists() {
+                match std::fs::create_dir_all(host_prop_dir) {
+                    Ok(_) => {
+                        let _ = std::fs::set_permissions(
+                            host_prop_dir,
+                            std::fs::Permissions::from_mode(0o711),
+                        );
+                        info!("[KR64] PARENT: created host {} (mode 0711)", host_prop_dir);
+                    }
+                    Err(e) => {
+                        error!(
+                            "[KR64] PARENT: failed to create host {}: {}",
+                            host_prop_dir, e
+                        );
+                    }
+                }
+            }
+            // Pre-create property_info on host (empty regular file, mode 0666).
+            // `.truncate(false)` makes the "do not overwrite an existing file"
+            // intent explicit (the `if !exists()` guard already ensures this).
+            let host_prop_info = format!("{}/property_info", host_prop_dir);
+            if !Path::new(&host_prop_info).exists() {
                 match std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
                     .truncate(false)
-                    .open(&path)
+                    .open(&host_prop_info)
                 {
                     Ok(_) => {
-                        let _ =
-                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
-                        info!("[KR64] PARENT: pre-created rootfs {}", path);
+                        let _ = std::fs::set_permissions(
+                            &host_prop_info,
+                            std::fs::Permissions::from_mode(0o666),
+                        );
+                        info!(
+                            "[KR64] PARENT: pre-created host {} (mode 0666)",
+                            host_prop_info
+                        );
                     }
                     Err(e) => {
-                        error!("[KR64] PARENT: failed to pre-create rootfs {}: {}", path, e);
+                        error!(
+                            "[KR64] PARENT: failed to pre-create host {}: {}",
+                            host_prop_info, e
+                        );
                     }
                 }
             }
+            // Also pre-create properties_serial on host (host's property service
+            // needs this; don't truncate if it already exists)
+            let host_prop_serial = format!("{}/properties_serial", host_prop_dir);
+            if !Path::new(&host_prop_serial).exists() {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&host_prop_serial)
+                {
+                    Ok(_) => {
+                        let _ = std::fs::set_permissions(
+                            &host_prop_serial,
+                            std::fs::Permissions::from_mode(0o666),
+                        );
+                        info!("[KR64] PARENT: pre-created host {}", host_prop_serial);
+                    }
+                    Err(e) => {
+                        error!(
+                            "[KR64] PARENT: failed to pre-create host {}: {}",
+                            host_prop_serial, e
+                        );
+                    }
+                }
+            }
+            // Pre-create the directory + files in the rootfs too
+            let rootfs_prop_dir = format!("{}/dev/__properties__", rootfs_prefix);
+            let _ = std::fs::create_dir_all(&rootfs_prop_dir);
+            let _ =
+                std::fs::set_permissions(&rootfs_prop_dir, std::fs::Permissions::from_mode(0o777));
+            for fname in &["property_info", "properties_serial"] {
+                let path = format!("{}/{}", rootfs_prop_dir, fname);
+                if !Path::new(&path).exists() {
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&path)
+                    {
+                        Ok(_) => {
+                            let _ = std::fs::set_permissions(
+                                &path,
+                                std::fs::Permissions::from_mode(0o666),
+                            );
+                            info!("[KR64] PARENT: pre-created rootfs {}", path);
+                        }
+                        Err(e) => {
+                            error!("[KR64] PARENT: failed to pre-create rootfs {}: {}", path, e);
+                        }
+                    }
+                }
+            }
+            info!("[KR64] PARENT: property files pre-created on host + rootfs");
         }
-        info!("[KR64] PARENT: property files pre-created on host + rootfs");
-    }
+    } // end of { use PermissionsExt; if cfg.boot_recovery { ... } else { ... } }
 
     // Start a background thread that continuously sets SELinux to permissive.
     //
