@@ -26,12 +26,15 @@
 //     - readlink/readlinkat → translate path
 //     - chdir → translate path
 //     - statx → translate path
-//     - fchown / fchmod / capget / ioprio_get → fake success (return 0)
+//     - fchown / fchmod / capget / ioprio_get / ioprio_set → fake success (return 0)
 //       TWRP init calls these early in startup; as untrusted_app they
 //       all return EPERM and init gives up with exit(1). We intercept
 //       them at syscall EXIT and force the return value to 0 so init
 //       proceeds. They are ALSO handled in the SIGSYS path in case
 //       some devices' seccomp filter blocks them outright.
+//       (ioprio_set was MISSING from this set until Task 5-S — see the
+//       comment on `ioprio_set` in `ChildAbi` for the verified
+//       per-ABI numbers and the dispatcher's misdiagnosis it corrected.)
 //       NOTE: the original diagnostic log reported "fchown (nr=91)"
 //       but nr=91 on x86_64 is actually fchmod (real fchown is 93).
 //       We intercept BOTH — the field named `fchown` uses the correct
@@ -223,12 +226,13 @@ struct ChildAbi {
     chdir: i64,
     // Syscalls that TWRP init calls early in startup which return EPERM
     // as untrusted_app (capget — no capabilities; fchown/fchmod — can't
-    // change ownership/permissions of fds; ioprio_get — needs CAP_SYS_ADMIN
-    // for some classes). Init sees the failures and exits with code 1.
-    // We intercept these at syscall EXIT and force the return value to 0
-    // (success) so init proceeds. They are also handled in the SIGSYS
-    // path (return 0, no rewrite to getpid — same as rt_sigprocmask) in
-    // case some devices' seccomp filter blocks them.
+    // change ownership/permissions of fds; ioprio_get / ioprio_set —
+    // need CAP_SYS_ADMIN for some classes). Init sees the failures and
+    // exits with code 1. We intercept these at syscall EXIT and force
+    // the return value to 0 (success) so init proceeds. They are also
+    // handled in the SIGSYS path (return 0, no rewrite to getpid — same
+    // as rt_sigprocmask) in case some devices' seccomp filter blocks
+    // them.
     //
     // NOTE on fchown vs fchmod: the diagnostic log that motivated this
     // fix reported "fchown (nr=91)" but nr=91 on x86_64 is actually
@@ -237,10 +241,33 @@ struct ChildAbi {
     // correct fchown numbers) AND `fchmod` (with the actually-correct
     // fchmod numbers, matching the diagnostic's nr=91) so the bug is
     // fixed regardless of which syscall init was really calling.
+    //
+    // NOTE on ioprio_set: this field was MISSING until Task 5-S — only
+    // `ioprio_get` was present. TWRP init DOES call ioprio_set during
+    // early boot (it sets the I/O priority of background threads /
+    // services), and an EPERM there can trip init's "fatal config
+    // error" path. The numbers per the kernel's own UAPI headers
+    // (verified in Task 5-S against /usr/lib/linux/uapi/x86/asm/
+    // unist_32.h, /usr/include/x86_64-linux-gnu/asm/unistd_64.h, and
+    // /usr/include/asm-generic/unistd.h) are:
+    //   i386:   ioprio_set=289, ioprio_get=290
+    //   x86_64: ioprio_set=251, ioprio_get=252
+    //   aarch64: ioprio_set=30,  ioprio_get=31
+    // NOTE: the dispatcher's task spec for 5-S claimed i386
+    // ioprio_set=252 / ioprio_get=251 — that was WRONG. 252 on i386 is
+    // `exit_group` (NOT ioprio_set!), 251 is UNUSED in the i386 table
+    // (the table jumps from fadvise64=250 straight to exit_group=252),
+    // and 290 is `ioprio_get` (NOT epoll_create1 — epoll_create1 is
+    // 329 on i386). Setting i386 ioprio_set=252 would have collided
+    // with exit_group: every exit_group call would have been
+    // mislabelled "ioprio_set" in the syscall_name() diagnostic AND
+    // would have entered the fake-success branch (return Some(0)),
+    // making future debugging of init's exit path much harder.
     fchown: i64,
     fchmod: i64,
     capget: i64,
     ioprio_get: i64,
+    ioprio_set: i64,
     // ── chmod / lchown / chown / fchmodat / fchownat ─────────────
     //
     // These are the path-taking siblings of fchmod/fchown. TWRP's
@@ -397,6 +424,12 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     fchmod: 91,
     capget: 125,
     ioprio_get: 252,
+    // ioprio_set on x86_64 = 251 (per asm/unistd_64.h, verified in
+    // Task 5-S against /usr/include/x86_64-linux-gnu/asm/unistd_64.h).
+    // Pre-5-S this field was MISSING — added defensively because TWRP
+    // init DOES call ioprio_set during early boot and an EPERM there
+    // can trip init's fatal-config-error path.
+    ioprio_set: 251,
     // chmod / lchown / chown / fchmodat / fchownat (x86_64 numbers
     // per asm/unistd_64.h):
     //   chmod=90, lchown=94, chown=182, fchmodat=268, fchownat=260.
@@ -450,11 +483,16 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     chdir: 12,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. i386 fchown=95, fchmod=94, capget=184,
-    // ioprio_get=290 (per asm-i386/unistd_32.h).
+    // ioprio_get=290, ioprio_set=289 (per /usr/lib/linux/uapi/x86/
+    // asm/unistd_32.h — verified directly against the kernel's UAPI
+    // headers in Task 5-S; the dispatcher's task spec for 5-S claimed
+    // ioprio_get should be 251 / ioprio_set should be 252, which was
+    // WRONG: 251 is UNUSED in the i386 table and 252 is `exit_group`).
     fchown: 95,
     fchmod: 94,
     capget: 184,
     ioprio_get: 290,
+    ioprio_set: 289,
     // chmod / lchown / chown / fchmodat / fchownat (i386 numbers
     // per asm-i386/unistd_32.h):
     //   chmod=15, lchown=16, chown=182, fchmodat=306, fchownat=298.
@@ -518,11 +556,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     chdir: 49,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
-    // fchown=55, fchmod=52, capget=90, ioprio_get=31.
+    // fchown=55, fchmod=52, capget=90, ioprio_get=31, ioprio_set=30
+    // (verified in Task 5-S against /usr/include/asm-generic/unistd.h).
     fchown: 55,
     fchmod: 52,
     capget: 90,
     ioprio_get: 31,
+    ioprio_set: 30,
     // chmod / lchown / chown / fchmodat / fchownat (aarch64 numbers
     // per asm-generic/unistd.h):
     //   fchmodat=53, fchownat=54.
@@ -958,6 +998,13 @@ fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 /// -EPERM) at the syscall-EXIT stop on i386 compat, init's chmod-error
 /// path dereferenced a NULL+0x90 pointer and SIGSEGV'd.
 ///
+/// `ioprio_set` was ALSO MISSING until Task 5-S — only `ioprio_get` was
+/// in the historical list. TWRP init calls ioprio_set during early boot
+/// (to set the I/O priority of background services), and an EPERM there
+/// can trip init's fatal-config-error path. The number set is verified
+/// against the kernel's UAPI headers in Task 5-S — see the comment on
+/// `ioprio_set` in `ChildAbi` for the per-ABI values.
+///
 /// Returns `Some(0)` for the faked-success syscalls, `None` for syscalls
 /// whose return value the caller should leave untouched. The value (0) is
 /// hard-coded because every faked-success syscall uses the same return
@@ -978,6 +1025,7 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.fchownat
         || syscall_nr == abi.capget
         || syscall_nr == abi.ioprio_get
+        || syscall_nr == abi.ioprio_set
     {
         Some(0)
     } else {
@@ -1047,8 +1095,8 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
 ///
 /// `compute_exit_return_value` is consulted by BOTH the EXIT handler
 /// (at line ~2434) and the SIGSYS handler's "fchown/fchmod/capget/
-/// ioprio_get/lchown/chown/fchmodat/fchownat" branch (which mirrors
-/// the same set). For chmod specifically, the SIGSYS handler's
+/// ioprio_get/ioprio_set/lchown/chown/fchmodat/fchownat" branch
+/// (which mirrors the same set). For chmod specifically, the SIGSYS
 /// "mount/mkdir/chmod/chroot/unshare" branch also returns 0. So in
 /// DESYNC mode the EXIT handler has ALREADY written rax=0 for every
 /// syscall that the SIGSYS handler would also write rax=0 for — the
@@ -1127,6 +1175,8 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "capget"
     } else if nr == abi.ioprio_get {
         "ioprio_get"
+    } else if nr == abi.ioprio_set {
+        "ioprio_set"
     } else if nr == abi.execve {
         "execve"
     } else {
@@ -2463,16 +2513,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // ── TWRP-init EPERM / syscall-number-leak workaround ───
                     //
                     // chmod / fchmod / fchown / lchown / chown / fchmodat /
-                    // fchownat / capget / ioprio_get all return EPERM as
-                    // untrusted_app (no CAP_CHOWN / CAP_FOWNER / CAP_SYS_ADMIN
-                    // / CAP_SYS_RESOURCE / CAP_SYS_NICE). TWRP's init calls
-                    // these early in its startup and EITHER gives up with
-                    // exit(1) (capget/ioprio_get/fchown/fchmod — the
-                    // Round-78/79 blocker fixed by commit f279552) OR takes
-                    // an error-handling path that ends up dereferencing
-                    // NULL+0x90 (chmod/lchown/chown/fchmodat/fchownat — the
-                    // Round-80/81 blocker fixed here, see the worklog entry
-                    // for Task 5-A).
+                    // fchownat / capget / ioprio_get / ioprio_set all return
+                    // EPERM as untrusted_app (no CAP_CHOWN / CAP_FOWNER /
+                    // CAP_SYS_ADMIN / CAP_SYS_RESOURCE / CAP_SYS_NICE).
+                    // TWRP's init calls these early in its startup and
+                    // EITHER gives up with exit(1) (capget / ioprio_get /
+                    // ioprio_set / fchown / fchmod — the Round-78/79 blocker
+                    // fixed by commit f279552; ioprio_set added by Task 5-S)
+                    // OR takes an error-handling path that ends up
+                    // dereferencing NULL+0x90 (chmod/lchown/chown/fchmodat/
+                    // fchownat — the Round-80/81 blocker fixed here, see the
+                    // worklog entry for Task 5-A).
                     //
                     // These syscalls are NOT blocked by Android's seccomp
                     // filter (no SIGSYS) on most devices — they execute
@@ -2948,7 +2999,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // which is exactly what bionic expects.
                         //
                         // EXCEPTION — fchown / fchmod / capget /
-                        // ioprio_get: same rationale as
+                        // ioprio_get / ioprio_set: same rationale as
                         // rt_sigprocmask above. These syscalls take
                         // user-space pointers or integer args that
                         // bionic's linker init code inspects on
@@ -2971,9 +3022,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // Previous behaviour: rewrite the syscall number
                         // to `getpid` for all syscalls EXCEPT an explicit
                         // "no-rewrite" list (rt_sigprocmask, fchown,
-                        // fchmod, capget, ioprio_get). The theory was that
-                        // rewriting prevents the kernel from re-evaluating
-                        // the original (blocked) syscall and re-raising
+                        // fchmod, capget, ioprio_get, ioprio_set). The
+                        // theory was that rewriting prevents the kernel
+                        // from re-evaluating the original (blocked)
+                        // syscall and re-raising
                         // SIGSYS on resume.
                         //
                         // REALITY (observed in c87d6be7 E2E run): for
@@ -3018,21 +3070,23 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             || original_syscall == a.fchmod
                             || original_syscall == a.capget
                             || original_syscall == a.ioprio_get
+                            || original_syscall == a.ioprio_set
                             || original_syscall == a.lchown
                             || original_syscall == a.chown
                             || original_syscall == a.fchmodat
                             || original_syscall == a.fchownat
                         {
                             // chmod/lchown/chown/fchmodat/fchownat/
-                            // fchown/fchmod/capget/ioprio_get — same
-                            // rationale as the syscall-EXIT handler's
-                            // `compute_exit_return_value` set (see the
-                            // "TWRP-init EPERM / syscall-number-leak
-                            // workaround" comment above). We use the
-                            // explicit `||` chain here (instead of
-                            // calling `compute_exit_return_value`) only
-                            // because we ALSO need to exclude `chmod`
-                            // from this block — chmod is handled by the
+                            // fchown/fchmod/capget/ioprio_get/ioprio_set
+                            // — same rationale as the syscall-EXIT
+                            // handler's `compute_exit_return_value`
+                            // set (see the "TWRP-init EPERM /
+                            // syscall-number-leak workaround" comment
+                            // above). We use the explicit `||` chain
+                            // here (instead of calling
+                            // `compute_exit_return_value`) only because
+                            // we ALSO need to exclude `chmod` from this
+                            // block — chmod is handled by the
                             // mount/mkdir/chmod/chroot/unshare block
                             // below (which performs an fs op in the
                             // rootfs and uses the same fake-success
@@ -3203,11 +3257,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // call. The EXIT handler's rax=0 is the final
                         // value the child sees. This is safe because:
                         //   - chmod/lchown/chown/fchmodat/fchownat/
-                        //     fchown/fchmod/capget/ioprio_get are all
-                        //     covered by BOTH compute_exit_return_value
-                        //     (EXIT handler) and the SIGSYS handler's
-                        //     explicit `||` chains — the EXIT handler
-                        //     ALWAYS runs first in DESYNC mode.
+                        //     fchown/fchmod/capget/ioprio_get/ioprio_set
+                        //     are all covered by BOTH
+                        //     compute_exit_return_value (EXIT handler)
+                        //     and the SIGSYS handler's explicit `||`
+                        //     chains — the EXIT handler ALWAYS runs
+                        //     first in DESYNC mode.
                         //   - mount/mkdir/chmod/chroot/unshare all return
                         //     0 in the SIGSYS handler AND are covered by
                         //     compute_exit_return_value for chmod (the
@@ -3322,10 +3377,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                 // RISK: on kernels that DO deliver the EXIT stop for
                 // seccomp-aborted syscalls, this would cause the EXIT
                 // to be misclassified as ENTRY. The EXIT intercepts
-                // (fchown/fchmod/capget/ioprio_get) would not fire.
-                // However, on the x86_64 Android emulator, those
-                // syscalls are NOT seccomp-blocked (they execute and
-                // return EPERM, handled by the EXIT handler without
+                // (fchown/fchmod/capget/ioprio_get/ioprio_set) would
+                // not fire. However, on the x86_64 Android emulator,
+                // those syscalls are NOT seccomp-blocked (they execute
+                // and return EPERM, handled by the EXIT handler without
                 // SIGSYS). So this risk is acceptable for now.
                 in_syscall = false;
                 // Do NOT call PTRACE_SYSCALL here — the loop top will
@@ -3668,6 +3723,7 @@ mod tests {
     // -ENOSYS (-38), NOT 0. The EXIT handler must force rax = 0 for ALL
     // of the chmod/fchown siblings, not just the historical
     // fchown/fchmod/capget/ioprio_get set from commit f279552.
+    // (ioprio_set was added to this set in Task 5-S.)
     //
     // Each test verifies two things:
     //   (1) `compute_exit_return_value` returns `Some(0)` for this
@@ -3753,9 +3809,129 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn compute_exit_return_value_i386_ioprio_get_returns_zero() {
-        // i386 ioprio_get = 290 — pre-existing.
+        // i386 ioprio_get = 290 — pre-existing (commit f279552), verified
+        // against /usr/lib/linux/uapi/x86/asm/unistd_32.h in Task 5-S.
+        // IMPORTANT: the dispatcher's task spec for 5-S claimed i386
+        // ioprio_get should be 251 — that was WRONG (251 is UNUSED in
+        // the i386 syscall table; the table jumps from fadvise64=250
+        // to exit_group=252). 290 IS ioprio_get (NOT epoll_create1 —
+        // epoll_create1 is 329 on i386). This test locks in the correct
+        // value so a future "fix" based on the dispatcher's incorrect
+        // numbers can't regress it silently.
         assert_eq!(compute_exit_return_value(290, &ABI_X86_32), Some(0));
         assert_eq!(syscall_name(290, &ABI_X86_32), "ioprio_get");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_ioprio_set_returns_zero() {
+        // i386 ioprio_set = 289 — verified against
+        // /usr/lib/linux/uapi/x86/asm/unistd_32.h in Task 5-S.
+        // IMPORTANT: the dispatcher's task spec for 5-S claimed i386
+        // ioprio_set = 252 — that was WRONG. 252 is `exit_group` on
+        // i386 (NOT ioprio_set). Faking success on exit_group would
+        // (a) mislabel every exit_group call as "ioprio_set" in the
+        // syscall_name() diagnostic, AND (b) enter the fake-success
+        // branch (Some(0)) which is meaningless for a non-returning
+        // syscall but pollutes the EXIT handler's match set. The
+        // correct i386 ioprio_set number is 289 (immediately below
+        // ioprio_get=290, per the kernel's UAPI header).
+        assert_eq!(compute_exit_return_value(289, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(289, &ABI_X86_32), "ioprio_set");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_exit_group_not_faked() {
+        // REGRESSION GUARD (Task 5-S): 252 is `exit_group` on i386
+        // (verified against /usr/lib/linux/uapi/x86/asm/unistd_32.h).
+        // The dispatcher's task spec for 5-S mistakenly claimed 252
+        // was ioprio_set; if we had followed that prescription, this
+        // test would have been `assert_eq!(Some(0))` (wrong) instead
+        // of `assert_eq!(None)` (correct). exit_group must NEVER be
+        // faked-success — it doesn't return to userspace, so a
+        // forced rax=0 is meaningless, AND the syscall_name() must
+        // NOT mislabel it "ioprio_set" (that would hide the fact
+        // that init is calling exit_group to die, which is the
+        // diagnostic signal the next agent needs to find the REAL
+        // cause of init's exit(1)).
+        assert_eq!(
+            compute_exit_return_value(252, &ABI_X86_32),
+            None,
+            "i386 exit_group (252) must NOT be faked-success"
+        );
+        assert_ne!(
+            syscall_name(252, &ABI_X86_32),
+            "ioprio_set",
+            "i386 syscall 252 is exit_group, NOT ioprio_set"
+        );
+        // And the converse: 289 must match ioprio_set and be faked.
+        assert_eq!(ABI_X86_32.ioprio_set, 289, "i386 ioprio_set must be 289");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_ioprio_numbers_correct() {
+        // Regression guard (Task 5-S): the i386 ioprio_set/ioprio_get
+        // numbers MUST match the kernel's UAPI header
+        // /usr/lib/linux/uapi/x86/asm/unistd_32.h:
+        //   __NR_ioprio_set 289
+        //   __NR_ioprio_get 290
+        // If anyone "fixes" these to the dispatcher's incorrect
+        // numbers (251 / 252), the fake-success path silently stops
+        // matching the real syscalls AND 252 would collide with
+        // exit_group, breaking the EXIT handler's exit_group path
+        // (which must remain None).
+        assert_eq!(ABI_X86_32.ioprio_get, 290, "i386 ioprio_get must be 290");
+        assert_eq!(ABI_X86_32.ioprio_set, 289, "i386 ioprio_set must be 289");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_ioprio_numbers_correct() {
+        // Regression guard (Task 5-S): the x86_64 ioprio numbers
+        // per /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+        //   __NR_ioprio_set 251
+        //   __NR_ioprio_get 252
+        assert_eq!(ABI_X86_64.ioprio_get, 252, "x86_64 ioprio_get must be 252");
+        assert_eq!(ABI_X86_64.ioprio_set, 251, "x86_64 ioprio_set must be 251");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_ioprio_numbers_correct() {
+        // Regression guard (Task 5-S): the aarch64 (asm-generic)
+        // ioprio numbers per /usr/include/asm-generic/unistd.h:
+        //   __NR_ioprio_set 30
+        //   __NR_ioprio_get 31
+        // NOTE: the dispatcher's task spec for 5-S said aarch64
+        // ioprio_set=31 / ioprio_get=30 — these were SWAPPED (31 is
+        // ioprio_get, not ioprio_set). Verified directly against the
+        // kernel's UAPI header.
+        assert_eq!(ABI_AARCH64.ioprio_get, 31, "aarch64 ioprio_get must be 31");
+        assert_eq!(ABI_AARCH64.ioprio_set, 30, "aarch64 ioprio_set must be 30");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_x86_64_ioprio_set_returns_zero() {
+        // x86_64 ioprio_set = 251 (verified against
+        // /usr/include/x86_64-linux-gnu/asm/unistd_64.h in Task 5-S).
+        // Pre-5-S MISSING from the fake-success list — added by
+        // Task 5-S.
+        assert_eq!(compute_exit_return_value(251, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(251, &ABI_X86_64), "ioprio_set");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn compute_exit_return_value_aarch64_ioprio_set_returns_zero() {
+        // aarch64 ioprio_set = 30 (verified against
+        // /usr/include/asm-generic/unistd.h in Task 5-S).
+        // Pre-5-S MISSING from the fake-success list — added by
+        // Task 5-S.
+        assert_eq!(compute_exit_return_value(30, &ABI_AARCH64), Some(0));
+        assert_eq!(syscall_name(30, &ABI_AARCH64), "ioprio_set");
     }
 
     #[cfg(target_arch = "x86_64")]
