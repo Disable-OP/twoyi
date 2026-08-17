@@ -27,7 +27,7 @@
 //     - chdir → translate path
 //     - statx → translate path
 //     - fchown / fchmod / capget / ioprio_get / ioprio_set /
-//       mount / rt_sigprocmask → fake success (return 0)
+//       mount / rt_sigprocmask / mknod → fake success (return 0)
 //       TWRP init calls these early in startup; as untrusted_app they
 //       all return EPERM (or are seccomp-blocked with SIGSYS) and init
 //       gives up with exit(1). We intercept them at syscall EXIT and
@@ -44,6 +44,15 @@
 //       corrected. This was the REAL root cause of the UI E2E TWRP init
 //       exit(1) at iter 189: mount(nr=21) returned 21 — the syscall
 //       NUMBER, not 0 — four times in a row, then init exit(1)'d.)
+//       (mknod was MISSING from this set until Task 5-X — see the doc
+//       on `compute_exit_return_value` for the verified per-ABI
+//       numbers. 5-T's mount fix advanced mount from "returns 21" to
+//       "returns 0", surfacing mknod (i386 syscall 14) as the next
+//       blocker per 5-W's VLM-verified UI E2E analysis. mknod was
+//       ALSO given a rootfs-level empty-file stub in the SIGSYS
+//       handler so the guest's subsequent open() of /dev/null etc.
+//       succeeds — the only faked-success syscall with an fs op that
+//       creates a non-directory file.)
 //       NOTE: the original diagnostic log reported "fchown (nr=91)"
 //       but nr=91 on x86_64 is actually fchmod (real fchown is 93).
 //       We intercept BOTH — the field named `fchown` uses the correct
@@ -328,10 +337,41 @@ struct ChildAbi {
     // Syscalls we never actually emulate, but whose numbers we need for
     // the SIGSYS diagnostic logging (we look up the original syscall
     // number to print a human-readable name when seccomp blocks it).
+    //
+    // NOTE: `mount`, `mkdir`, AND `mknod` ALSO get a real filesystem
+    // operation performed in the rootfs by the SIGSYS handler's
+    // "mount/mkdir/chmod/chroot/unshare" block (mkdir for mount/mkdir,
+    // empty-file-creation for mknod — so the guest's subsequent open()
+    // of the device node succeeds). chmod/chroot/unshare do NOT get an
+    // fs op (they are pure fake-success). See the SIGSYS handler for
+    // the per-syscall branches.
+    //
+    // NOTE on `mknod` (Task 5-X): the per-ABI numbers are:
+    //   i386:   mknod = 14
+    //   x86_64: mknod = 133
+    //   aarch64: mknod = -1 (sentinel "not present on this ABI"; the
+    //     asm-generic/unistd.h table dropped plain `mknod`, only
+    //     `mknodat = 33` survives — bionic's mknod() libc wrapper on
+    //     aarch64 issues mknodat(AT_FDCWD, ...) under the hood. A
+    //     future aarch64-specific fix would need to add a dedicated
+    //     mknodat field. This mirrors the existing pattern for
+    //     ABI_AARCH64.open / access / lchown / chown, which are also
+    //     set to -1 for the same "asm-generic dropped it" reason.)
+    // Verified directly against /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h (__NR_mknod 14), unistd_64.h (__NR_mknod 133), and
+    // /usr/include/asm-generic/unistd.h (no __NR_mknod — only
+    // __NR_mknodat 33) in Task 5-X.
     mount: i64,
     chroot: i64,
     mkdir: i64,
     unshare: i64,
+    // mknod(pathname, mode, dev) — TWRP init calls this for /dev/null,
+    // /dev/zero, /dev/urandom etc. during early boot. As untrusted_app
+    // it returns EPERM (no CAP_MKNOD), and init's fatal-config-error
+    // path triggers exit(1) on non-zero non-EPERM return values. See
+    // the doc on `compute_exit_return_value` for why mknod was added
+    // in Task 5-X (the immediate next blocker after 5-T's mount fix).
+    mknod: i64,
     // SysV shared-memory syscalls (shmget / shmat / shmctl). TWRP
     // init calls shmget() during early boot — Android's
     // __system_property_area_init uses a SysV shared memory segment
@@ -457,6 +497,16 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     chroot: 161,
     mkdir: 83,
     unshare: 272,
+    // x86_64 mknod = 133 (per /usr/include/x86_64-linux-gnu/asm/
+    // unistd_64.h, verified directly against the kernel's UAPI
+    // header in Task 5-X). Pre-5-X this field was MISSING — added
+    // defensively because TWRP init DOES call mknod for /dev/null,
+    // /dev/zero, /dev/urandom during early boot and an EPERM there
+    // can trip init's fatal-config-error path. TWRP's init binary is
+    // i386, so this x86_64 number doesn't currently fire at runtime,
+    // but the EXIT handler's if-chain is ABI-aware so we lock the
+    // x86_64 number in too (cheap insurance).
+    mknod: 133,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. x86_64: shmget=29, shmat=30, shmctl=31
     // (asm/unistd_64.h).
@@ -531,6 +581,23 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     chroot: 61,
     mkdir: 39,
     unshare: 310,
+    // i386 mknod = 14 (per /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h: __NR_mknod 14, verified directly against the
+    // kernel's UAPI header in Task 5-X). Pre-5-X this field was
+    // MISSING — added because TWRP init calls mknod() for /dev/null,
+    // /dev/zero, /dev/urandom during early boot and the kernel's
+    // syscall-number-leak value (rax = 14) at the EXIT stop caused
+    // init's fatal-config-error path to fire exit(1) at iter 189.
+    //
+    // This is the IMMEDIATE NEXT BLOCKER after 5-T's mount fix — see
+    // the worklog entry for 5-W (VLM-verified analysis) and 5-X
+    // (this fix). 5-T's i386 rt_sigprocmask number correction
+    // (14 → 175) cleared the way for this: pre-5-T, the SIGSYS
+    // handler was matching syscall 14 against ABI_X86_32.
+    // rt_sigprocmask=14 (WRONG) and mislabelling it; post-5-T the
+    // diagnostic label correctly says "[unknown]" for syscall 14
+    // — and post-5-X it correctly says "mknod" (this addition).
+    mknod: 14,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. i386: shmget=29, shmat=30, shmctl=31
     // (asm-i386/unistd_32.h).
@@ -614,6 +681,36 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     chroot: 51,
     mkdir: 34,
     unshare: 97,
+    // aarch64 mknod = -1 (SENTINEL "not present on this ABI"). The
+    // asm-generic/unistd.h table (used by aarch64) has NO plain
+    // `mknod` — only `mknodat = 33` (verified directly against
+    // /usr/include/asm-generic/unistd.h in Task 5-X). bionic's
+    // mknod(pathname, mode, dev) libc wrapper on aarch64 issues
+    // mknodat(AT_FDCWD, pathname, mode, dev) under the hood, so the
+    // syscall that actually hits the kernel is mknodat (33), not
+    // mknod. With ABI_AARCH64.mknod = -1:
+    //   - syscall_name(-1, &ABI_AARCH64) falls through to "unknown"
+    //     (the mknod branch never matches — no real syscall is -1).
+    //   - compute_exit_return_value(-1, &ABI_AARCH64) would match the
+    //     `|| syscall_nr == abi.mknod` clause (`-1 == -1`) and return
+    //     Some(0) — but no real caller ever passes -1, so this is
+    //     harmless. (If you wanted to be strictly correct you could
+    //     special-case -1 in the if-chain, but the existing pattern
+    //     for ABI_AARCH64.open / access / lchown / chown does NOT
+    //     special-case -1 either — open/access aren't in the if-chain
+    //     at all, lchown/chown ARE. For lchown/chown the same
+    //     "harmless if no real syscall is -1" reasoning applies.)
+    //   - A future aarch64-specific fix would add a dedicated
+    //     `mknodat: i64` field (= 33) instead of aliasing mknod to 33.
+    //     Aliasing mknod to 33 would mislabel mknodat SIGSYS as "mknod"
+    //     in syscall_name() (mislabeled but harmless) AND would
+    //     intercept a real mknodat in compute_exit_return_value
+    //     (acceptable, but conflates two different syscalls in one
+    //     field — confusing for future maintainers).
+    // The host is x86_64 running an i386 child, so this aarch64 path
+    // is currently dead code at runtime — the sentinel keeps the
+    // compile happy and documents the aarch64 behaviour.
+    mknod: -1,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
     // shmget=194, shmctl=195, shmat=196.
@@ -1078,6 +1175,49 @@ fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 ///   x86_64: mount=165, rt_sigprocmask=14    (both already correct)
 ///   aarch64: mount=40, rt_sigprocmask=135   (mount was WRONG: 165)
 ///
+/// `mknod` was ALSO MISSING until Task 5-X. After 5-T's mount fix
+/// advanced mount from "returns 21" to "returns 0", the next blocker
+/// surfaced in 5-W's VLM-verified UI E2E analysis: the post-5-T
+/// logcat showed
+/// ```text
+/// post-execve syscall #34: nr=14 [unknown]
+/// post-execve return  #34: unknown nr=14 -> 14   ← NON-ZERO, NOT faked
+/// ... then exit_group(1) at iter 189 (unchanged from 3b571fe)
+/// ```
+/// i386 syscall 14 is `mknod` (per /usr/include/x86_64-linux-gnu/asm/
+/// unistd_32.h, verified directly in Task 5-X). 5-T's i386
+/// rt_sigprocmask number correction (14 → 175) had CLEARED the
+/// diagnostic-label misnomer — pre-5-T the kr64 SIGSYS handler was
+/// mislabelling every mknod SIGSYS as "rt_sigprocmask() nr=14";
+/// post-5-T it correctly says "[unknown]" for syscall 14. 5-X adds
+/// the mknod field (so syscall_name() says "mknod", not "[unknown]")
+/// AND adds mknod to the fake-success list (so the EXIT handler
+/// writes rax=0 instead of leaving the kernel's leaked 14).
+///
+/// 5-W's CRITICAL FOLLOW-UP: the mknod fix fakes `rax=0` BUT does NOT
+/// actually create a device node in the rootfs (unlike the
+/// mount/mkdir/chmod/chroot/unshare block which creates real
+/// directories). The guest's NEXT `open(/dev/null)` may fail. 5-X
+/// therefore ALSO extends the SIGSYS handler's mknod branch to create
+/// a matching EMPTY regular file at `{rootfs}<path>` so guest open()
+/// succeeds (mirroring what the mount/mkdir block already does for
+/// directories). This is a best-effort stub — empty-file creation is
+/// sufficient for /dev/null (writes succeed as no-op, reads return
+/// EOF) but gives wrong read-content for /dev/zero and /dev/urandom
+/// (reads return 0 bytes instead of \0-bytes / random bytes). Good
+/// enough to get init past the mknod failure + subsequent open; if a
+/// later TWRP code path actually reads from /dev/zero or /dev/urandom
+/// expecting real content, that's the next-next blocker.
+///
+/// The per-ABI mknod numbers (verified against the kernel's UAPI
+/// headers in Task 5-X):
+///   i386:   mknod = 14   (per asm/unistd_32.h)
+///   x86_64: mknod = 133  (per asm/unistd_64.h)
+///   aarch64: mknod = -1  (SENTINEL — no plain mknod in asm-generic/
+///     unistd.h, only mknodat=33. bionic's mknod() libc wrapper on
+///     aarch64 issues mknodat(AT_FDCWD, ...) under the hood. A future
+///     aarch64-specific fix would need a dedicated mknodat field.)
+///
 /// Returns `Some(0)` for the faked-success syscalls, `None` for syscalls
 /// whose return value the caller should leave untouched. The value (0) is
 /// hard-coded because every faked-success syscall uses the same return
@@ -1095,6 +1235,15 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
     // the only writer — and these two were missing, so the kernel's
     // syscall-number-leak value (21 for mount, 14/175 for rt_sigprocmask)
     // was the final value the child saw → init exit(1).
+    //
+    // Task 5-X added mknod to this set: 5-W's VLM-verified UI E2E
+    // analysis showed that AFTER 5-T's mount fix, mknod (i386 syscall
+    // 14) became the next blocker — the post-5-T logcat showed
+    // "post-execve return #34: unknown nr=14 -> 14" (NON-ZERO, NOT
+    // faked) → init treats it as a fatal config error → exit(1) at
+    // iter 189 (UNCHANGED from 3b571fe — 5-T's mount fix advanced
+    // mount but not mknod). With mknod in this list, the EXIT handler
+    // writes rax=0 and init sees "mknod returned 0 (success)".
     if syscall_nr == abi.chmod
         || syscall_nr == abi.fchmod
         || syscall_nr == abi.fchown
@@ -1107,6 +1256,7 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.ioprio_set
         || syscall_nr == abi.mount
         || syscall_nr == abi.rt_sigprocmask
+        || syscall_nr == abi.mknod
     {
         Some(0)
     } else {
@@ -1227,6 +1377,18 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "rt_sigprocmask"
     } else if nr == abi.mount {
         "mount"
+    } else if nr == abi.mknod {
+        // Added in Task 5-X. Pre-5-X, syscall 14 on i386 was labelled
+        // "[unknown]" (because no field matched it — the i386
+        // rt_sigprocmask number was corrected to 175 in Task 5-T, so
+        // syscall 14 no longer matched that branch either). The
+        // post-5-T logcat's "post-execve syscall #34: nr=14 [unknown]"
+        // made 5-W's VLM-verified UI E2E analysis immediate — but the
+        // "[unknown]" label was still misleading for any reader who
+        // didn't cross-reference against the kernel's UAPI header.
+        // With this entry, syscall 14 on i386 is correctly labelled
+        // "mknod" in the SIGSYS diagnostic log.
+        "mknod"
     } else if nr == abi.chroot {
         "chroot"
     } else if nr == abi.mkdir {
@@ -2596,11 +2758,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     //
                     // chmod / fchmod / fchown / lchown / chown / fchmodat /
                     // fchownat / capget / ioprio_get / ioprio_set / mount /
-                    // rt_sigprocmask all return EPERM (or are seccomp-blocked
-                    // with SIGSYS) as untrusted_app (no CAP_CHOWN /
-                    // CAP_FOWNER / CAP_SYS_ADMIN / CAP_SYS_RESOURCE /
-                    // CAP_SYS_NICE; mount/rt_sigprocmask hit the seccomp
-                    // filter for sys_admin-related operations).
+                    // rt_sigprocmask / mknod all return EPERM (or are
+                    // seccomp-blocked with SIGSYS) as untrusted_app (no
+                    // CAP_CHOWN / CAP_FOWNER / CAP_SYS_ADMIN / CAP_SYS_RESOURCE
+                    // / CAP_SYS_NICE / CAP_MKNOD; mount/rt_sigprocmask hit
+                    // the seccomp filter for sys_admin-related operations;
+                    // mknod needs CAP_MKNOD which untrusted_app lacks).
                     // TWRP's init calls these early in its startup and
                     // EITHER gives up with exit(1) (capget / ioprio_get /
                     // ioprio_set / fchown / fchmod — the Round-78/79 blocker
@@ -2608,7 +2771,11 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // mount + rt_sigprocmask added by Task 5-T — these were
                     // the REAL root cause of the UI E2E TWRP init exit(1)
                     // at iter 189, misdiagnosed earlier as ioprio_set=252
-                    // which is actually exit_group)
+                    // which is actually exit_group; mknod added by Task 5-X
+                    // — the next blocker after 5-T's mount fix per 5-W's
+                    // VLM-verified UI E2E analysis: "post-execve return #34:
+                    // unknown nr=14 -> 14" (non-zero, NOT faked) → init
+                    // exit(1) at iter 189 unchanged)
                     // OR takes an error-handling path that ends up
                     // dereferencing NULL+0x90 (chmod/lchown/chown/fchmodat/
                     // fchownat — the Round-80/81 blocker fixed here, see the
@@ -3190,11 +3357,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             || original_syscall == a.chmod
                             || original_syscall == a.chroot
                             || original_syscall == a.unshare
+                            || original_syscall == a.mknod
                         {
                             // Filesystem-related seccomp-blocked syscalls.
                             // These are the ones TWRP init calls during
                             // early boot (mount tmpfs/proc/sysfs, mkdir
-                            // /dev/pts, etc.).
+                            // /dev/pts, mknod /dev/null etc.).
                             //
                             // TWO-PRONGED FIX:
                             // 1. Fake success (return 0) WITHOUT rewriting
@@ -3202,13 +3370,36 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             //    strategy caused the kernel to return -ENOSYS
                             //    on i386 compat.
                             // 2. ALSO perform the actual filesystem operation
-                            //    in the rootfs (mkdir for mount/mkdir). This
-                            //    ensures the filesystem state is correct for
-                            //    subsequent opens, even if the kernel returns
-                            //    -ENOSYS to init. Without this, init's later
+                            //    in the rootfs (mkdir for mount/mkdir, empty-
+                            //    file creation for mknod). This ensures the
+                            //    filesystem state is correct for subsequent
+                            //    opens, even if the kernel returns -ENOSYS to
+                            //    init. Without this, init's later
                             //    open(/dev/X) would fail with ENOENT because
-                            //    the seccomp-faked mount/mkdir didn't actually
-                            //    create anything.
+                            //    the seccomp-faked mount/mkdir/mknod didn't
+                            //    actually create anything.
+                            //
+                            // NOTE on the mknod branch (Task 5-X): the
+                            // guest's NEXT open(/dev/null) after mknod
+                            // would otherwise fail with ENOENT — the
+                            // seccomp-faked mknod returned 0 (success)
+                            // but no actual device node exists. We
+                            // create an EMPTY regular file (NOT a real
+                            // device node — mknod(2) on the host would
+                            // need CAP_MKNOD which untrusted_app lacks)
+                            // so the guest's subsequent open() succeeds.
+                            // This is a best-effort stub: empty-file
+                            // creation is sufficient for /dev/null
+                            // (writes succeed as no-op, reads return
+                            // EOF) but gives WRONG read-content for
+                            // /dev/zero (reads return 0 bytes instead
+                            // of \0-bytes) and /dev/urandom (reads
+                            // return 0 bytes instead of random bytes).
+                            // Good enough to get init past the mknod
+                            // failure + subsequent open; if a later
+                            // TWRP code path actually reads from
+                            // /dev/zero or /dev/urandom expecting real
+                            // content, that's the next-next blocker.
 
                             // Perform the actual filesystem operation in
                             // the rootfs. We read the path argument(s) from
@@ -3268,6 +3459,64 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                             )),
                                             Err(e) => sigsys_log(&format!(
                                                 "SIGSYS mkdir: FAILED to create {}: {}",
+                                                real_path, e
+                                            )),
+                                        }
+                                    }
+                                }
+                            } else if original_syscall == a.mknod {
+                                // mknod(pathname, mode, dev) — arg1=pathname
+                                // (Task 5-X). TWRP init calls mknod() for
+                                // /dev/null, /dev/zero, /dev/urandom etc.
+                                // during early boot. As untrusted_app we
+                                // can't actually mknod a device node (no
+                                // CAP_MKNOD — host mknod would return
+                                // EPERM, and on Android the syscall is also
+                                // blocked by seccomp → SIGSYS), so we
+                                // create an EMPTY regular file at the
+                                // path instead. The guest's subsequent
+                                // open(/dev/null) succeeds (ENOENT would
+                                // otherwise trip init's "device node
+                                // missing" fatal path). Best-effort stub:
+                                // see the long comment above for the
+                                // /dev/zero and /dev/urandom caveat.
+                                //
+                                // We create the parent directory first
+                                // (create_dir_all on the parent) so that
+                                // mknod("/dev/null") succeeds even when
+                                // /dev doesn't exist in the rootfs yet —
+                                // mirroring the mount/mkdir block's
+                                // create_dir_all behaviour.
+                                let path_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
+                                if path_addr != 0 {
+                                    if let Some(path) = read_child_string(pid, path_addr) {
+                                        let real_path = if path.starts_with('/') {
+                                            format!("{}{}", rootfs, path)
+                                        } else {
+                                            path.clone()
+                                        };
+                                        // Create the parent directory
+                                        // (e.g. /data/.../rootfs/dev) so
+                                        // File::create succeeds. Ignore
+                                        // errors — if the parent already
+                                        // exists (the usual case after the
+                                        // first mknod in the same /dev
+                                        // directory), create_dir_all is a
+                                        // no-op; if it fails for some other
+                                        // reason, the File::create below
+                                        // will fail and log the error.
+                                        if let Some(parent) =
+                                            std::path::Path::new(&real_path).parent()
+                                        {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        match std::fs::File::create(&real_path) {
+                                            Ok(_) => sigsys_log(&format!(
+                                                "SIGSYS mknod: created empty file stub {} in rootfs (guest open() will succeed; reads return EOF — best-effort stub for /dev/null, /dev/zero, /dev/urandom)",
+                                                real_path
+                                            )),
+                                            Err(e) => sigsys_log(&format!(
+                                                "SIGSYS mknod: FAILED to create empty file stub {}: {}",
                                                 real_path, e
                                             )),
                                         }
@@ -3352,10 +3601,11 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         //     and the SIGSYS handler's explicit `||`
                         //     chains — the EXIT handler ALWAYS runs
                         //     first in DESYNC mode.
-                        //   - mount/mkdir/chmod/chroot/unshare all return
-                        //     0 in the SIGSYS handler. chmod + mount are
-                        //     ALSO in compute_exit_return_value (mount was
-                        //     added in Task 5-T — see the doc on
+                        //   - mount/mkdir/chmod/chroot/unshare/mknod all
+                        //     return 0 in the SIGSYS handler. chmod + mount
+                        //     + mknod are ALSO in compute_exit_return_value
+                        //     (mount added in Task 5-T, mknod added in
+                        //     Task 5-X — see the doc on
                         //     `compute_exit_return_value`), so in DESYNC
                         //     mode the EXIT handler DID write rax=0 for
                         //     them. mkdir/chroot/unshare are NOT in
@@ -3385,16 +3635,44 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // report what we WOULD have written.
                         set_syscall_ret(&mut sigsys_regs, &a, ret_val);
                         if should_skip_sigsys_setregs(in_syscall_at_sigsys) {
-                            // DESYNC mode: EXIT handler already wrote rax=0
-                            // for the faked-success syscalls. Skip setregs
-                            // to avoid racing with the kernel's signal-
-                            // delivery-stop register snapshotting. The fs
-                            // op (mount/mkdir) has already been performed
-                            // above; we just don't write regs back.
-                            sigsys_log(&format!(
-                                "SIGSYS handler: DESYNC mode — skipping ptrace_setregs for nr={} [{}] (EXIT handler already wrote rax=0; would-have-written rax={})",
-                                original_syscall, name, ret_val
-                            ));
+                            // DESYNC mode: SIGSYS fired AFTER the EXIT
+                            // stop. The EXIT handler may or may not have
+                            // already written rax=0 for this syscall —
+                            // it depends on whether the syscall is in
+                            // `compute_exit_return_value`'s fake-success
+                            // list. We skip setregs EITHER WAY to avoid
+                            // racing with the kernel's signal-delivery-
+                            // stop register snapshotting (5-J's fix).
+                            //
+                            // The fs op (mount/mkdir/mknod) has already
+                            // been performed above; we just don't write
+                            // regs back.
+                            //
+                            // 5-X drive-by diagnostic fix: the original
+                            // message here unconditionally claimed
+                            // "EXIT handler already wrote rax=0" — which
+                            // was misleading for any syscall NOT in the
+                            // fake-success list (the kernel's leaked
+                            // rax = syscall-number value was left
+                            // untouched). Now the message is conditional:
+                            // only claim "EXIT handler already wrote rax=0"
+                            // when compute_exit_return_value actually
+                            // returned Some(0) for this syscall; otherwise
+                            // we explicitly note "did NOT write rax —
+                            // rax retains the kernel's leaked value".
+                            let exit_handler_wrote_zero =
+                                compute_exit_return_value(original_syscall, &a).is_some();
+                            if exit_handler_wrote_zero {
+                                sigsys_log(&format!(
+                                    "SIGSYS handler: DESYNC mode — skipping ptrace_setregs for nr={} [{}] (EXIT handler already wrote rax=0; would-have-written rax={})",
+                                    original_syscall, name, ret_val
+                                ));
+                            } else {
+                                sigsys_log(&format!(
+                                    "SIGSYS handler: DESYNC mode — skipping ptrace_setregs for nr={} [{}] (EXIT handler did NOT write rax for this syscall — NOT in compute_exit_return_value's fake-success list; rax retains the kernel's leaked syscall-number value; would-have-written rax={})",
+                                    original_syscall, name, ret_val
+                                ));
+                            }
                         } else if let Err(e) = ptrace_setregs(pid, &sigsys_regs, len) {
                             // PTRACE_SETREGS failed — the faked return
                             // value was NOT applied. The child will see
@@ -4098,6 +4376,177 @@ mod tests {
         // honest caveat + recommended follow-up.)
         assert_eq!(compute_exit_return_value(175, &ABI_X86_32), Some(0));
         assert_eq!(syscall_name(175, &ABI_X86_32), "rt_sigprocmask");
+    }
+
+    // ── Task 5-X regression guards: mknod numbers + fake-success ──────
+    //
+    // These guard the mknod fake-success addition (the immediate next
+    // blocker after 5-T's mount fix, per 5-W's VLM-verified UI E2E
+    // analysis). The post-5-T logcat showed
+    //   "post-execve syscall #34: nr=14 [unknown]"
+    //   "post-execve return  #34: unknown nr=14 -> 14"   ← NON-ZERO
+    // → init exit(1) at iter 189 (UNCHANGED from 3b571fe — 5-T's mount
+    // fix advanced mount but not mknod). i386 syscall 14 is `mknod`
+    // (verified directly against /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h in Task 5-X). These tests lock in:
+    //   - the i386 mknod number (14)
+    //   - the x86_64 mknod number (133)
+    //   - the aarch64 mknod sentinel (-1 — no plain mknod in asm-generic)
+    //   - the compute_exit_return_value fake-success match for nr=14
+    //   - the syscall_name() diagnostic label for nr=14 ("mknod", not
+    //     "[unknown]" — the post-5-T misnomer 5-T's i386-rt_sigprocmask
+    //     number correction surfaced, now fixed)
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_mknod_number_correct() {
+        // Regression guard (Task 5-X): the i386 mknod number MUST be 14
+        // (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+        // __NR_mknod 14, verified directly against the kernel's UAPI
+        // header in Task 5-X).
+        //
+        // This is the syscall that 5-T's i386 rt_sigprocmask number
+        // correction (14 → 175) CLEARED THE WAY FOR: pre-5-T, the
+        // kr64 SIGSYS handler was matching syscall 14 against the
+        // (wrong) ABI_X86_32.rt_sigprocmask=14 and mislabelling every
+        // mknod SIGSYS as "rt_sigprocmask() nr=14". Post-5-T the
+        // diagnostic label correctly says "[unknown]" for syscall 14
+        // (no field matched it). Post-5-X (this addition) it correctly
+        // says "mknod".
+        //
+        // 5-W's VLM-verified UI E2E analysis confirmed mknod (nr=14) is
+        // the immediate next blocker after 5-T's mount fix: the
+        // post-5-T logcat shows "post-execve return #34: unknown nr=14
+        // -> 14" (NON-ZERO, NOT faked) → init exit(1) at iter 189.
+        assert_eq!(
+            ABI_X86_32.mknod, 14,
+            "i386 mknod must be 14 (per asm/unistd_32.h)"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_mknod_number_correct() {
+        // Regression guard (Task 5-X): the x86_64 mknod number MUST be
+        // 133 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+        // __NR_mknod 133, verified directly against the kernel's UAPI
+        // header in Task 5-X).
+        //
+        // TWRP's init binary is i386, so this x86_64 number doesn't
+        // currently fire at runtime — but the EXIT handler's if-chain
+        // is ABI-aware so we lock the x86_64 number in too (cheap
+        // insurance; cost is one assert_eq).
+        assert_eq!(
+            ABI_X86_64.mknod, 133,
+            "x86_64 mknod must be 133 (per asm/unistd_64.h)"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_mknod_number_correct() {
+        // Regression guard (Task 5-X): the aarch64 (asm-generic) mknod
+        // number MUST be -1 (SENTINEL "not present on this ABI"). The
+        // asm-generic/unistd.h table (used by aarch64) has NO plain
+        // `mknod` — only `mknodat = 33` (verified directly against
+        // /usr/include/asm-generic/unistd.h in Task 5-X). bionic's
+        // mknod(pathname, mode, dev) libc wrapper on aarch64 issues
+        // mknodat(AT_FDCWD, pathname, mode, dev) under the hood, so
+        // the syscall that actually hits the kernel is mknodat (33),
+        // not mknod.
+        //
+        // With ABI_AARCH64.mknod = -1:
+        //   - syscall_name(-1, &ABI_AARCH64) falls through to "unknown"
+        //     (the mknod branch never matches — no real syscall is -1).
+        //   - compute_exit_return_value(-1, &ABI_AARCH64) DOES match
+        //     the `|| syscall_nr == abi.mknod` clause (`-1 == -1`) and
+        //     returns Some(0) — but no real caller ever passes -1, so
+        //     this is harmless. (Same "harmless if no real syscall is
+        //     -1" reasoning that the existing pattern for ABI_AARCH64.
+        //     lchown / chown relies on, since those are also -1 on
+        //     aarch64 AND in the if-chain.)
+        //   - A future aarch64-specific fix would add a dedicated
+        //     `mknodat: i64` field (= 33) instead of aliasing mknod to
+        //     33. Aliasing would mislabel mknodat SIGSYS as "mknod" in
+        //     syscall_name() (mislabeled but harmless) AND would
+        //     intercept a real mknodat in compute_exit_return_value
+        //     (acceptable, but conflates two different syscalls in one
+        //     field — confusing for future maintainers).
+        //
+        // The host is x86_64 running an i386 child, so this aarch64
+        // path is currently dead code at runtime — the sentinel keeps
+        // the compile happy and documents the aarch64 behaviour.
+        assert_eq!(
+            ABI_AARCH64.mknod, -1,
+            "aarch64 mknod must be -1 (no plain mknod on aarch64; use mknodat=33 instead — needs a dedicated field)"
+        );
+        // Converse: mknodat (33) must NOT match the mknod branch on
+        // aarch64 — mknodat is a separate syscall that needs its own
+        // dedicated field (which is NOT in this commit's scope).
+        assert_eq!(
+            compute_exit_return_value(33, &ABI_AARCH64),
+            None,
+            "aarch64 mknodat (syscall 33) must NOT be in the fake-success list via the mknod field"
+        );
+        assert_ne!(syscall_name(33, &ABI_AARCH64), "mknod");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_mknod_returns_zero() {
+        // i386 mknod = 14. THIS is the exact syscall that was returning
+        // 14 (the syscall NUMBER) at EXIT in the post-5-T UI E2E logcat
+        // (line: "post-execve return #34: unknown nr=14 -> 14") — the
+        // immediate next blocker after 5-T's mount fix. init sees
+        // "mknod returned 14" (a non-zero non-EPERM value) and treats
+        // it as a fatal config error → exit_group(1) at iter 189
+        // (UNCHANGED from 3b571fe — 5-T's mount fix advanced mount
+        // from "returns 21" to "returns 0" but did NOT add mknod to
+        // the fake-success list).
+        //
+        // Pre-5-X, mknod was NOT in compute_exit_return_value's fake-
+        // success list, so in DESYNC mode (5-J's fix that makes the
+        // SIGSYS handler SKIP setregs) the EXIT handler left rax = the
+        // kernel's syscall-number-leak value (14). After 5-X the EXIT
+        // handler writes rax=0, so init sees "mknod returned 0
+        // (success)" and proceeds past the mknod-failure check.
+        //
+        // 5-W's VLM-verified UI E2E analysis confirmed this is the
+        // immediate next blocker — VLM analysis of all 4 screenshots
+        // showed the twoyi loading screen (early/mid) and the twoyi
+        // Settings screen (late/final, after the 60s timeout) — NO TWRP
+        // recovery interface rendered at any point.
+        //
+        // Honest caveat: correct-by-inspection; needs ui-e2e-test.yml
+        // run + VLM screenshot analysis to confirm TWRP actually boots.
+        assert_eq!(compute_exit_return_value(14, &ABI_X86_32), Some(0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_i386_mknod() {
+        // i386 mknod = 14. Pre-5-X the diagnostic label for syscall 14
+        // was "[unknown]" (because no field matched it — the i386
+        // rt_sigprocmask number was corrected to 175 in Task 5-T, so
+        // syscall 14 no longer matched that branch either). The
+        // post-5-T logcat's "post-execve syscall #34: nr=14 [unknown]"
+        // made 5-W's VLM-verified UI E2E analysis immediate — but the
+        // "[unknown]" label was still misleading for any reader who
+        // didn't cross-reference against the kernel's UAPI header.
+        //
+        // With this entry, syscall 14 on i386 is correctly labelled
+        // "mknod" in the SIGSYS diagnostic log. The next round of
+        // logcat analysis will show "post-execve syscall #34: nr=14
+        // [mknod]" instead of "[unknown]" — immediate clarity.
+        assert_eq!(syscall_name(14, &ABI_X86_32), "mknod");
+        // Converse negative-asserts: 14 must NOT match the
+        // rt_sigprocmask branch on i386 (rt_sigprocmask is 175 on
+        // i386, per Task 5-T's correction — pre-5-T this WAS the
+        // misnomer that mislabelled mknod as rt_sigprocmask).
+        assert_ne!(syscall_name(14, &ABI_X86_32), "rt_sigprocmask");
+        // And 14 must NOT fall through to "unknown" (the previous
+        // post-5-T behaviour).
+        assert_ne!(syscall_name(14, &ABI_X86_32), "unknown");
     }
 
     #[cfg(target_arch = "x86_64")]
