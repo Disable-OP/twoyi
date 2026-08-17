@@ -4459,6 +4459,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // ----- PARENT (the daemon) -----
     info!("[KR64][parent] guest pid = {}", pid);
 
+    // Spawn the touch device accept thread EARLY (before the ptrace loop
+    // or the waitpid loop) so the guest's EventHub can probe
+    // `/dev/input/touch` during TWRP init OR full-Android boot. The
+    // thread runs `devices::make_touch_device` + the encode_touch_*
+    // helpers added by 2-B (commit `370b8ee`) to send the DeviceInfo
+    // header (896 bytes) on accept, then forward encoded InputEvents
+    // from the host's `{data_dir}/dev/touch-events` IPC socket.
+    spawn_touch_accept_thread(device_set.touch, cfg.clone());
+
     // ── PTRACE SYSCALL EMULATION (non-root TWRP boot) ──
     //
     // In non-root mode, the child called PTRACE_TRACEME + raise(SIGSTOP)
@@ -4600,7 +4609,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //   key       -> input::key_server
     //   event     -> TwoyiSocketServer (event IPC)
     //   gb/gb2    -> openglrenderer::gralloc
-    spawn_accept_thread(device_set.touch, "touch");
+    //
+    // NOTE: `device_set.touch` is no longer passed here — it was
+    // consumed by `spawn_touch_accept_thread` above (which sends the
+    // DeviceInfo header + streams encoded InputEvents, using the
+    // helpers from 2-B's commit `370b8ee`). The other four devices
+    // still use the generic stub.
     spawn_accept_thread(device_set.key, "key");
     spawn_accept_thread(device_set.event, "event");
     spawn_accept_thread(device_set.gb.gb, "gb");
@@ -4779,6 +4793,416 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
             }
         })
         .expect("spawn kr64 accept thread");
+}
+
+// ============================================================================
+// Touch device dispatcher.
+//
+// `spawn_accept_thread` above is the generic "accept-and-close" loop used
+// for the device sockets we don't yet implement (key, event, gb, gb2). The
+// touch device is different: the guest's EventHub opens `/dev/input/touch`
+// and expects:
+//   1. One `DeviceInfo` struct (896 bytes) advertising the device's
+//      multi-touch Type-B capabilities (BTN_TOUCH, BTN_TOOL_FINGER,
+//      ABS_MT_SLOT/TRACKING_ID/POSITION_X/Y/PRESSURE).
+//   2. A continuous stream of `InputEvent` records, grouped into frames
+//      by `SYN_REPORT`.
+//
+// The DeviceInfo header + InputEvent encoders already exist in
+// `devices.rs` (added by 2-B at commit `370b8ee`). This module wires
+// them into the socket accept loop: it sends the `DeviceInfo` on
+// `accept()`, then enters a read loop where `TouchMessage` records
+// (raw action + pointer_id + x + y + pressure) from the host-side
+// IPC socket are encoded via `devices::encode_touch_*` and forwarded
+// to the guest fd.
+//
+// ── IPC contract (host → kr64) ──────────────────────────────────────
+//
+// The host's `app/rs/src/input.rs` is expected to:
+//   1. Bind a `UnixListener` at `{data_dir}/dev/touch-events`.
+//   2. For each `MotionEvent` received via JNI
+//      (`Renderer.handleTouch`), write a 20-byte little-endian
+//      `TouchMessage` record to the accepted connection.
+//
+// ── TODO (out-of-scope for task 3-A) ──────────────────────────────
+//
+// As of commit `370b8ee` (2-B), `app/rs/src/input.rs::touch_server`
+// binds `{data_dir}/rootfs/dev/input/touch` — the SAME path kr64 binds
+// — and writes ENCODED `InputEvent` records directly. For this kr64-
+// side dispatcher to receive raw `MotionEvent` data, `input.rs` must
+// be refactored to:
+//   * STOP binding the guest-facing `/dev/input/touch` socket (kr64
+//     owns it now).
+//   * Bind `{data_dir}/dev/touch-events` instead.
+//   * Send raw `TouchMessage` records (action + pointer_id + x + y +
+//     pressure) instead of pre-encoded `InputEvent`s.
+//
+// That change is OUT OF SCOPE for task 3-A (only `lib.rs` may be
+// modified). Until it lands, kr64's touch dispatcher will accept the
+// guest's connection, send the correct `DeviceInfo` header (so the
+// guest's EventHub probes the device's capabilities correctly), then
+// block forever on the empty `{data_dir}/dev/touch-events` socket —
+// the guest will see a correctly-advertised multi-touch device but
+// receive no events.
+// ============================================================================
+
+/// Size of one `TouchMessage` record on the host→kr64 IPC socket
+/// (`{data_dir}/dev/touch-events`), in bytes. All fields are 4-byte
+/// little-endian, no padding:
+/// ```text
+///   offset  size  field
+///   ------  ----  -----
+///     0      4    action      (u32: 0=DOWN, 1=MOVE, 2=UP, 3=CANCEL)
+///     4      4    pointer_id  (i32: slot index 0..MAX_POINTERS-1)
+///     8      4    x           (i32: pixel x)
+///    12      4    y           (i32: pixel y)
+///    16      4    pressure    (i32: 0..255)
+/// ```
+const TOUCH_MESSAGE_SIZE: usize = 20;
+
+/// `TouchMessage::action` values. These match the subset of Android's
+/// `MotionAction` that the touch dispatcher cares about (see
+/// `app/rs/src/input.rs::handle_touch` for the same set).
+mod touch_action {
+    /// A new finger touched the screen (MotionEvent.ACTION_DOWN /
+    /// ACTION_POINTER_DOWN).
+    pub const DOWN: u32 = 0;
+    /// An existing finger moved (MotionEvent.ACTION_MOVE).
+    pub const MOVE: u32 = 1;
+    /// The last finger lifted (MotionEvent.ACTION_UP).
+    pub const UP: u32 = 2;
+    /// A non-last finger lifted or the gesture was cancelled
+    /// (MotionEvent.ACTION_POINTER_UP / ACTION_CANCEL).
+    pub const CANCEL: u32 = 3;
+}
+
+/// A parsed touch message from the host's input.rs dispatcher. See
+/// `TOUCH_MESSAGE_SIZE` for the on-wire layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TouchMessage {
+    action: u32,
+    pointer_id: i32,
+    x: i32,
+    y: i32,
+    pressure: i32,
+}
+
+impl TouchMessage {
+    /// Parse a 20-byte little-endian record into a `TouchMessage`.
+    /// Returns `None` if the buffer is the wrong size.
+    fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < TOUCH_MESSAGE_SIZE {
+            return None;
+        }
+        let action = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let pointer_id = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let x = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let y = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let pressure = i32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        Some(TouchMessage {
+            action,
+            pointer_id,
+            x,
+            y,
+            pressure,
+        })
+    }
+
+    /// Serialise a `TouchMessage` into its 20-byte little-endian
+    /// on-wire form. Used by tests to construct expected byte buffers.
+    #[cfg(test)]
+    fn to_bytes(self) -> [u8; TOUCH_MESSAGE_SIZE] {
+        let mut buf = [0u8; TOUCH_MESSAGE_SIZE];
+        buf[0..4].copy_from_slice(&self.action.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.pointer_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.x.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.y.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.pressure.to_le_bytes());
+        buf
+    }
+}
+
+/// Encode a parsed `TouchMessage` into the `InputEvent` byte stream the
+/// guest's `EventHub` expects, by dispatching to `devices::encode_touch_*`.
+///
+/// `next_tracking_id` is a caller-maintained monotonic counter — each
+/// fresh DOWN gets a new tracking ID assigned, and the assigned ID is
+/// stored in `tracking_ids[slot]` so subsequent MOVE/UP events for that
+/// slot know the same ID (the kernel's Type-B protocol requires the
+/// tracking ID to be stable across a touch lifecycle). The kernel
+/// releases the slot when it sees `ABS_MT_TRACKING_ID = -1`.
+///
+/// Returns the encoded bytes (empty `Vec<u8>` if the message was
+/// ignored — e.g. out-of-range pointer_id or unknown action).
+fn encode_touch_message(
+    msg: &TouchMessage,
+    time: libc::timeval,
+    next_tracking_id: &mut i32,
+    tracking_ids: &mut [i32; devices::MAX_POINTERS],
+) -> Vec<u8> {
+    let slot = msg.pointer_id;
+    if slot < 0 || (slot as usize) >= devices::MAX_POINTERS {
+        warning!(
+            "[KR64][touch] out-of-range pointer_id {} (max {}) — dropping",
+            slot,
+            devices::MAX_POINTERS - 1
+        );
+        return Vec::new();
+    }
+    let slot_idx = slot as usize;
+    match msg.action {
+        touch_action::DOWN => {
+            // Assign a fresh, non-zero tracking ID. The kernel treats
+            // 0 as "uninitialised" and -1 as "released", so we start
+            // the counter at 1 and increment by 1 per DOWN.
+            let tid = *next_tracking_id;
+            *next_tracking_id = next_tracking_id.wrapping_add(1);
+            // Guard against the (extremely unlikely) wrap-around to 0
+            // or -1 — skip the message rather than emit a malformed
+            // tracking ID.
+            if tid == 0 || tid == -1 {
+                warning!(
+                    "[KR64][touch] tracking-id counter wrapped to {} — skipping DOWN",
+                    tid
+                );
+                return Vec::new();
+            }
+            tracking_ids[slot_idx] = tid;
+            devices::encode_touch_down(time, slot, tid, msg.x, msg.y, msg.pressure)
+        }
+        touch_action::MOVE => {
+            if tracking_ids[slot_idx] == 0 {
+                // MOVE without a preceding DOWN — skip (the guest
+                // would treat it as a stale slot state).
+                return Vec::new();
+            }
+            devices::encode_touch_move(time, slot, msg.x, msg.y, msg.pressure)
+        }
+        touch_action::UP | touch_action::CANCEL => {
+            if tracking_ids[slot_idx] == 0 {
+                // UP/CANCEL without DOWN — nothing to release.
+                return Vec::new();
+            }
+            tracking_ids[slot_idx] = 0;
+            devices::encode_touch_release(time, slot)
+        }
+        other => {
+            warning!("[KR64][touch] unknown action {} — dropping", other);
+            Vec::new()
+        }
+    }
+}
+
+/// Get the current time as a `libc::timeval` (CLOCK_REALTIME). Used to
+/// stamp each `InputEvent` so the guest's `EventHub` can group events
+/// into frames via `SYN_REPORT`.
+fn current_timeval() -> libc::timeval {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => libc::timeval {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_usec: d.subsec_micros() as libc::suseconds_t,
+        },
+        Err(_) => libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    }
+}
+
+/// Spawn the touch device accept thread.
+///
+/// On accept (guest's EventHub opens `/dev/input/touch`):
+///   1. Send the `DeviceInfo` header (896 bytes) built via
+///      `devices::make_touch_device(cfg.width, cfg.height, &socket_path)`.
+///      This advertises the multi-touch Type-B protocol capabilities
+///      (BTN_TOUCH/BTN_TOOL_FINGER/ABS_MT_*).
+///   2. Spawn a per-connection worker thread that reads `TouchMessage`
+///      records (20-byte LE: action + pointer_id + x + y + pressure)
+///      from the host-side IPC socket at `{cfg.data_dir}/dev/touch-events`
+///      and writes encoded `InputEvent` bytes to the guest.
+///
+/// The thread takes ownership of the underlying `UnixListener` (so
+/// `DeviceSocket` is consumed). The thread runs forever — it is
+/// detached and cleaned up implicitly when the daemon exits.
+fn spawn_touch_accept_thread(mut dev: devices::DeviceSocket, cfg: Config) {
+    let listener = match dev.take_listener() {
+        Some(l) => l,
+        None => {
+            warning!("[KR64][touch] cannot spawn accept thread: listener already taken");
+            return;
+        }
+    };
+    // Non-blocking so we can poll for shutdown (consistent with the
+    // generic `spawn_accept_thread`).
+    let fd = listener.as_raw_fd();
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+
+    let width = cfg.width;
+    let height = cfg.height;
+    let socket_path = dev.path.clone();
+    let touch_events_path = format!("{}/dev/touch-events", cfg.data_dir);
+
+    std::thread::Builder::new()
+        .name("kr64-accept-touch".to_string())
+        .spawn(move || {
+            info!(
+                "[KR64][touch] accept thread started (fd={}, device_info_path={}, host_events_path={})",
+                fd, socket_path, touch_events_path
+            );
+            // Build the DeviceInfo ONCE — it doesn't change per
+            // connection. `devices::make_touch_device` advertises the
+            // full Type-B multi-touch capabilities (BTN_TOUCH,
+            // BTN_TOOL_FINGER, ABS_MT_SLOT/TRACKING_ID/POSITION_X/Y/
+            // PRESSURE) so the guest's EventHub can probe the device.
+            let device_info = devices::make_touch_device(width, height, &socket_path);
+            // SAFETY: we're reading `DeviceInfo::size()` bytes from a
+            // valid `&DeviceInfo` that we own. The slice does not
+            // outlive `device_info` — we copy the bytes into a Vec
+            // immediately.
+            let device_info_bytes: Vec<u8> = unsafe {
+                std::slice::from_raw_parts(
+                    &device_info as *const devices::DeviceInfo as *const u8,
+                    devices::DeviceInfo::size(),
+                )
+                .to_vec()
+            };
+            assert_eq!(
+                device_info_bytes.len(),
+                896,
+                "DeviceInfo must be 896 bytes (got {})",
+                device_info_bytes.len()
+            );
+
+            loop {
+                match listener.accept() {
+                    Ok((stream, _addr)) => {
+                        info!("[KR64][touch] guest connected");
+                        // Spawn a per-connection worker thread so the
+                        // accept loop can keep accepting new
+                        // connections (the guest may reconnect after
+                        // a suspend/resume).
+                        let dev_bytes = device_info_bytes.clone();
+                        let ev_path = touch_events_path.clone();
+                        std::thread::Builder::new()
+                            .name("kr64-touch-conn".to_string())
+                            .spawn(move || {
+                                touch_connection_loop(stream, dev_bytes, ev_path);
+                            })
+                            .ok();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        warning!("[KR64][touch] accept error: {}", e);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+        })
+        .expect("spawn kr64 touch accept thread");
+}
+
+/// Per-connection touch worker: send the `DeviceInfo` header, then read
+/// `TouchMessage` records from the host's `{data_dir}/dev/touch-events`
+/// socket and write encoded `InputEvent` bytes to the guest fd.
+///
+/// This function blocks for the lifetime of one guest connection. When
+/// either side closes the socket, it returns (the worker thread exits
+/// and the OS cleans up the fd).
+fn touch_connection_loop(
+    guest: std::os::unix::net::UnixStream,
+    device_info_bytes: Vec<u8>,
+    touch_events_path: String,
+) {
+    use std::io::{Read, Write};
+    let mut guest = guest;
+
+    // Step 1: send the DeviceInfo header so the guest's EventHub can
+    // probe the device's capabilities (BTN_TOUCH, BTN_TOOL_FINGER,
+    // ABS_MT_* axes). Without this header the guest sees a 1-byte
+    // short-read (the old `spawn_accept_thread` behaviour) and drops
+    // the device from its input device list.
+    if let Err(e) = guest.write_all(&device_info_bytes) {
+        warning!(
+            "[KR64][touch] failed to send DeviceInfo header ({} bytes): {}",
+            device_info_bytes.len(),
+            e
+        );
+        return;
+    }
+    info!(
+        "[KR64][touch] sent DeviceInfo header ({} bytes) — device advertised",
+        device_info_bytes.len()
+    );
+
+    // Step 2: connect to the host-side touch-events IPC socket. The
+    // host's input.rs is expected to bind this socket and write
+    // TouchMessage records to it. Retry for up to 30s (150 × 200ms) so
+    // a brief ordering race (kr64 started before host's input.rs) is
+    // tolerated.
+    let mut host_stream: Option<std::os::unix::net::UnixStream> = None;
+    for attempt in 0..150u32 {
+        match std::os::unix::net::UnixStream::connect(&touch_events_path) {
+            Ok(s) => {
+                host_stream = Some(s);
+                info!(
+                    "[KR64][touch] connected to host touch-events socket at {} (attempt {})",
+                    touch_events_path, attempt
+                );
+                break;
+            }
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+    let mut host = match host_stream {
+        Some(s) => s,
+        None => {
+            warning!(
+                "[KR64][touch] host touch-events socket at {} never appeared after 30s — \
+                 the guest will see the device but receive no events. \
+                 TODO: update app/rs/src/input.rs to bind this socket and send TouchMessage records",
+                touch_events_path
+            );
+            return;
+        }
+    };
+
+    // Step 3: per-connection state for the Type-B multi-touch
+    // protocol. `next_tracking_id` is a monotonically-increasing
+    // counter — each fresh DOWN gets a new ID. `tracking_ids[slot]`
+    // caches the active ID per slot (0 = unused) so MOVE/UP know the
+    // same ID.
+    let mut next_tracking_id: i32 = 1;
+    let mut tracking_ids = [0i32; devices::MAX_POINTERS];
+
+    let mut buf = [0u8; TOUCH_MESSAGE_SIZE];
+    loop {
+        if let Err(e) = host.read_exact(&mut buf) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                info!("[KR64][touch] host touch-events socket closed");
+            } else {
+                warning!("[KR64][touch] read from host socket failed: {}", e);
+            }
+            return;
+        }
+        let msg = match TouchMessage::parse(&buf) {
+            Some(m) => m,
+            None => continue,
+        };
+        let time = current_timeval();
+        let encoded = encode_touch_message(&msg, time, &mut next_tracking_id, &mut tracking_ids);
+        if encoded.is_empty() {
+            continue;
+        }
+        if let Err(e) = guest.write_all(&encoded) {
+            warning!("[KR64][touch] write to guest failed: {}", e);
+            return;
+        }
+    }
 }
 
 // ============================================================================
@@ -6353,5 +6777,431 @@ mod tests {
             }
         }
         None
+    }
+
+    // ========================================================================
+    // Touch dispatcher tests (Task 3-A, Part 1).
+    //
+    // These tests cover the message-parse → encode-touch-* flow that
+    // `spawn_touch_accept_thread` runs in production:
+    //   * `TouchMessage::parse` roundtrips through `to_bytes` byte-for-byte.
+    //   * `encode_touch_message` dispatches DOWN/MOVE/UP/CANCEL to the
+    //     correct `devices::encode_touch_*` helper.
+    //   * Per-slot tracking IDs are stable across a touch lifecycle
+    //     (DOWN assigns, MOVE preserves, UP clears).
+    //   * Out-of-range pointer_id and unknown action are dropped silently.
+    //   * The full DOWN→MOVE→UP cycle produces the concatenation of the
+    //     three encoded frames (verifies the wire-level integration).
+    // ========================================================================
+
+    /// Helper: build a `TouchMessage` (avoids repeating the field list
+    /// in every test below).
+    fn touch_msg(action: u32, pointer_id: i32, x: i32, y: i32, pressure: i32) -> TouchMessage {
+        TouchMessage {
+            action,
+            pointer_id,
+            x,
+            y,
+            pressure,
+        }
+    }
+
+    /// Helper: zero timeval (so the encoded bytes are deterministic
+    /// and tests can hand-compute expected values).
+    fn zero_timeval() -> libc::timeval {
+        libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        }
+    }
+
+    /// `TOUCH_MESSAGE_SIZE` must be 20 bytes (4×5 little-endian fields).
+    /// The host's `input.rs` IPC writer will pack the same layout — a
+    /// size mismatch would silently misparse the stream.
+    #[test]
+    fn touch_message_size_is_20_bytes() {
+        assert_eq!(TOUCH_MESSAGE_SIZE, 20);
+    }
+
+    /// `TouchMessage::parse` roundtrips through `to_bytes` byte-for-byte.
+    #[test]
+    fn touch_message_parse_roundtrip() {
+        let cases = [
+            touch_msg(touch_action::DOWN, 0, 100, 200, 128),
+            touch_msg(touch_action::MOVE, 1, 500, 750, 200),
+            touch_msg(touch_action::UP, 4, 0, 0, 0),
+            touch_msg(touch_action::CANCEL, 2, -10, -20, -30),
+        ];
+        for msg in cases {
+            let bytes = msg.to_bytes();
+            assert_eq!(bytes.len(), TOUCH_MESSAGE_SIZE);
+            let parsed =
+                TouchMessage::parse(&bytes).expect("parse should succeed for a 20-byte buffer");
+            assert_eq!(parsed, msg, "roundtrip failed for {:?}", msg);
+        }
+    }
+
+    /// `TouchMessage::parse` returns `None` for buffers shorter than
+    /// `TOUCH_MESSAGE_SIZE`. This protects against a short-read on the
+    /// IPC socket silently producing a garbled `TouchMessage`.
+    #[test]
+    fn touch_message_parse_rejects_short_buffer() {
+        assert!(TouchMessage::parse(&[]).is_none());
+        assert!(TouchMessage::parse(&[0u8; 19]).is_none());
+        // Exactly 20 bytes parses OK.
+        let msg = touch_msg(touch_action::DOWN, 0, 1, 2, 3);
+        assert!(TouchMessage::parse(&msg.to_bytes()).is_some());
+        // Extra bytes are ignored (we read the first 20) — but in
+        // practice `read_exact` always produces exactly 20 bytes.
+        let mut buf = msg.to_bytes().to_vec();
+        buf.push(0xff);
+        assert!(TouchMessage::parse(&buf).is_some());
+    }
+
+    /// Verify the on-wire byte layout of a `TouchMessage` (little-endian,
+    /// fields at the documented offsets). This catches a struct-layout
+    /// drift that would break inter-process IPC with the host's
+    /// `input.rs`.
+    #[test]
+    fn touch_message_byte_layout() {
+        let msg = touch_msg(touch_action::MOVE, 3, 0x12345678, -5, 255);
+        let b = msg.to_bytes();
+        assert_eq!(
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            touch_action::MOVE
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            3,
+            "pointer_id at offset 4"
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            0x12345678,
+            "x at offset 8"
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            -5,
+            "y at offset 12"
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+            255,
+            "pressure at offset 16"
+        );
+    }
+
+    /// DOWN must emit the full 8-event multi-touch frame and assign a
+    /// fresh tracking ID to the slot. Verifies the
+    /// `devices::encode_touch_down` helper is called with the right
+    /// arguments.
+    #[test]
+    fn encode_touch_message_down_emits_full_frame_and_assigns_tracking_id() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+        let msg = touch_msg(touch_action::DOWN, 0, 100, 200, 128);
+        let out = encode_touch_message(&msg, zero_timeval(), &mut next_tid, &mut tracking);
+
+        assert_eq!(
+            out.len(),
+            8 * devices::InputEvent::size(),
+            "DOWN frame must be 8 events"
+        );
+        assert_eq!(next_tid, 2, "DOWN must increment next_tracking_id");
+        assert_eq!(tracking[0], 1, "DOWN must cache the assigned tracking ID");
+    }
+
+    /// MOVE without a preceding DOWN must be silently dropped (the
+    /// kernel would treat a slot state change without a tracking ID as
+    /// a stale slot — better to skip than confuse the InputReader).
+    #[test]
+    fn encode_touch_message_move_without_down_is_dropped() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+        let msg = touch_msg(touch_action::MOVE, 0, 100, 200, 128);
+        let out = encode_touch_message(&msg, zero_timeval(), &mut next_tid, &mut tracking);
+        assert!(out.is_empty(), "MOVE without DOWN must produce no bytes");
+        assert_eq!(next_tid, 1, "MOVE must not bump the tracking-id counter");
+    }
+
+    /// MOVE after a DOWN must emit the 5-event move frame and preserve
+    /// the slot's tracking ID (so the next UP uses the same ID).
+    #[test]
+    fn encode_touch_message_move_after_down_preserves_tracking_id() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+
+        // DOWN first.
+        let down = touch_msg(touch_action::DOWN, 0, 100, 200, 128);
+        let _ = encode_touch_message(&down, zero_timeval(), &mut next_tid, &mut tracking);
+        let tid_after_down = tracking[0];
+        assert_eq!(tid_after_down, 1);
+
+        // MOVE on the same slot.
+        let mv = touch_msg(touch_action::MOVE, 0, 150, 250, 200);
+        let out = encode_touch_message(&mv, zero_timeval(), &mut next_tid, &mut tracking);
+        assert_eq!(
+            out.len(),
+            5 * devices::InputEvent::size(),
+            "MOVE frame must be 5 events"
+        );
+        assert_eq!(
+            tracking[0], tid_after_down,
+            "MOVE must preserve tracking ID"
+        );
+        assert_eq!(next_tid, 2, "MOVE must not bump the tracking-id counter");
+    }
+
+    /// UP after DOWN must emit the 5-event release frame and CLEAR the
+    /// slot's tracking ID (so a subsequent MOVE on the same slot is
+    /// dropped — the touch lifecycle is over).
+    #[test]
+    fn encode_touch_message_up_after_down_clears_tracking_id() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+
+        let down = touch_msg(touch_action::DOWN, 2, 100, 200, 128);
+        let _ = encode_touch_message(&down, zero_timeval(), &mut next_tid, &mut tracking);
+        assert_eq!(tracking[2], 1);
+
+        let up = touch_msg(touch_action::UP, 2, 0, 0, 0);
+        let out = encode_touch_message(&up, zero_timeval(), &mut next_tid, &mut tracking);
+        assert_eq!(
+            out.len(),
+            5 * devices::InputEvent::size(),
+            "UP frame must be 5 events"
+        );
+        assert_eq!(tracking[2], 0, "UP must clear the tracking ID");
+    }
+
+    /// CANCEL is treated identically to UP (single-slot release).
+    /// This matches the host's `app/rs/src/input.rs::handle_touch`
+    /// ACTION_CANCEL path, which releases the slot + the BTN keys.
+    #[test]
+    fn encode_touch_message_cancel_treated_as_up() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+
+        let down = touch_msg(touch_action::DOWN, 1, 10, 20, 30);
+        let _ = encode_touch_message(&down, zero_timeval(), &mut next_tid, &mut tracking);
+
+        let cancel = touch_msg(touch_action::CANCEL, 1, 0, 0, 0);
+        let out = encode_touch_message(&cancel, zero_timeval(), &mut next_tid, &mut tracking);
+        assert_eq!(out.len(), 5 * devices::InputEvent::size());
+        assert_eq!(tracking[1], 0, "CANCEL must clear the tracking ID");
+    }
+
+    /// UP without a preceding DOWN must be silently dropped (no
+    /// tracking ID to release).
+    #[test]
+    fn encode_touch_message_up_without_down_is_dropped() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+        let up = touch_msg(touch_action::UP, 0, 0, 0, 0);
+        let out = encode_touch_message(&up, zero_timeval(), &mut next_tid, &mut tracking);
+        assert!(out.is_empty(), "UP without DOWN must produce no bytes");
+    }
+
+    /// Out-of-range pointer_id (negative OR >= MAX_POINTERS) must be
+    /// dropped silently. Without this, a malformed `TouchMessage` would
+    /// panic on array indexing in `tracking_ids[slot_idx]`.
+    #[test]
+    fn encode_touch_message_drops_out_of_range_pointer_id() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+
+        // Negative pointer_id.
+        let neg = touch_msg(touch_action::DOWN, -1, 0, 0, 0);
+        assert!(
+            encode_touch_message(&neg, zero_timeval(), &mut next_tid, &mut tracking).is_empty()
+        );
+
+        // pointer_id == MAX_POINTERS (one past the end).
+        let over = touch_msg(touch_action::DOWN, devices::MAX_POINTERS as i32, 0, 0, 0);
+        assert!(
+            encode_touch_message(&over, zero_timeval(), &mut next_tid, &mut tracking).is_empty()
+        );
+
+        // pointer_id == MAX_POINTERS - 1 (last valid slot) — succeeds.
+        let last = touch_msg(
+            touch_action::DOWN,
+            (devices::MAX_POINTERS - 1) as i32,
+            0,
+            0,
+            0,
+        );
+        assert!(
+            !encode_touch_message(&last, zero_timeval(), &mut next_tid, &mut tracking).is_empty()
+        );
+    }
+
+    /// Unknown action values (anything outside 0..=3) must be dropped
+    /// silently rather than produce garbage `InputEvent`s.
+    #[test]
+    fn encode_touch_message_drops_unknown_action() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+        let unknown = touch_msg(99, 0, 0, 0, 0);
+        let out = encode_touch_message(&unknown, zero_timeval(), &mut next_tid, &mut tracking);
+        assert!(out.is_empty(), "unknown action must produce no bytes");
+        assert_eq!(next_tid, 1, "unknown action must not bump the counter");
+        assert_eq!(
+            tracking[0], 0,
+            "unknown action must not assign a tracking ID"
+        );
+    }
+
+    /// Full touch lifecycle (DOWN → MOVE → UP) on slot 0 must produce
+    /// a stream that concatenates cleanly into 8 + 5 + 5 = 18 events
+    /// AND the second DOWN (slot 0 reused) must get a NEW tracking ID
+    /// (so the guest's InputReader treats it as a fresh touch, not a
+    /// stale-slot state change).
+    #[test]
+    fn encode_touch_message_full_lifecycle_concatenates() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+
+        let mut stream = Vec::new();
+        stream.extend(encode_touch_message(
+            &touch_msg(touch_action::DOWN, 0, 100, 200, 128),
+            zero_timeval(),
+            &mut next_tid,
+            &mut tracking,
+        ));
+        stream.extend(encode_touch_message(
+            &touch_msg(touch_action::MOVE, 0, 150, 250, 200),
+            zero_timeval(),
+            &mut next_tid,
+            &mut tracking,
+        ));
+        stream.extend(encode_touch_message(
+            &touch_msg(touch_action::UP, 0, 0, 0, 0),
+            zero_timeval(),
+            &mut next_tid,
+            &mut tracking,
+        ));
+
+        assert_eq!(stream.len(), 18 * devices::InputEvent::size());
+
+        // A second DOWN on the same slot must get a fresh tracking ID
+        // (the kernel requires this to distinguish two touches that
+        // happen on the same slot at different times).
+        let first_tid = tracking[0]; // 0 (cleared by UP)
+        assert_eq!(first_tid, 0);
+        let down2 = encode_touch_message(
+            &touch_msg(touch_action::DOWN, 0, 50, 60, 70),
+            zero_timeval(),
+            &mut next_tid,
+            &mut tracking,
+        );
+        assert_eq!(tracking[0], 2, "second DOWN must get a new tracking ID");
+        assert_eq!(next_tid, 3);
+        assert!(!down2.is_empty());
+    }
+
+    /// Multi-touch: two simultaneous fingers (slots 0 and 1) must
+    /// have INDEPENDENT tracking IDs and INDEPENDENT slot state.
+    /// This catches a regression where the slot index is ignored and
+    /// both touches get collapsed to the same slot.
+    #[test]
+    fn encode_touch_message_multi_touch_independent_slots() {
+        let mut next_tid = 1i32;
+        let mut tracking = [0i32; devices::MAX_POINTERS];
+
+        // Finger 1 down on slot 0.
+        encode_touch_message(
+            &touch_msg(touch_action::DOWN, 0, 100, 200, 128),
+            zero_timeval(),
+            &mut next_tid,
+            &mut tracking,
+        );
+        // Finger 2 down on slot 1.
+        encode_touch_message(
+            &touch_msg(touch_action::DOWN, 1, 300, 400, 200),
+            zero_timeval(),
+            &mut next_tid,
+            &mut tracking,
+        );
+
+        // Each slot has its OWN tracking ID.
+        assert_eq!(tracking[0], 1, "slot 0 must have tracking ID 1");
+        assert_eq!(tracking[1], 2, "slot 1 must have tracking ID 2");
+        assert_eq!(next_tid, 3);
+
+        // Releasing slot 0 must not affect slot 1.
+        encode_touch_message(
+            &touch_msg(touch_action::UP, 0, 0, 0, 0),
+            zero_timeval(),
+            &mut next_tid,
+            &mut tracking,
+        );
+        assert_eq!(tracking[0], 0, "slot 0 released");
+        assert_eq!(
+            tracking[1], 2,
+            "slot 1 must be unaffected by slot 0 release"
+        );
+    }
+
+    /// `current_timeval` must produce a timeval with non-zero `tv_sec`
+    /// when called after the UNIX epoch (i.e. always, in practice).
+    /// A zero timeval would cause all events to look simultaneous,
+    /// breaking the guest's InputReader frame grouping.
+    #[test]
+    fn current_timeval_is_nonzero() {
+        let tv = current_timeval();
+        // We can't assert an exact value, but tv_sec must be > 0
+        // (it's been 50+ years since the UNIX epoch).
+        assert!(
+            tv.tv_sec > 0,
+            "current_timeval tv_sec must be non-zero, got {}",
+            tv.tv_sec
+        );
+        // tv_usec is in [0, 1_000_000).
+        assert!(
+            tv.tv_usec >= 0 && tv.tv_usec < 1_000_000,
+            "tv_usec out of range: {}",
+            tv.tv_usec
+        );
+    }
+
+    /// Verify the `DeviceInfo` built by `devices::make_touch_device`
+    /// (called from `spawn_touch_accept_thread`) advertises all the
+    /// capabilities the guest's EventHub needs. This is an integration
+    /// sanity check — the per-field details are tested in
+    /// `devices::tests::make_touch_device_advertises_full_capabilities`.
+    #[test]
+    fn touch_dispatcher_uses_make_touch_device_with_full_capabilities() {
+        let info = devices::make_touch_device(720, 1280, "/dev/input/touch");
+        assert_eq!(devices::DeviceInfo::size(), 896);
+        assert_eq!(&info.name[..6], b"vtouch");
+
+        // ABS_MT_* axes advertised.
+        for &axis in &[
+            devices::abs::ABS_MT_SLOT,
+            devices::abs::ABS_MT_TRACKING_ID,
+            devices::abs::ABS_MT_POSITION_X,
+            devices::abs::ABS_MT_POSITION_Y,
+            devices::abs::ABS_MT_PRESSURE,
+        ] {
+            let byte = (axis / 8) as usize;
+            let bit = axis % 8;
+            assert!(
+                info.abs_bitmask[byte] & (1 << bit) != 0,
+                "abs_bitmask should advertise axis 0x{:x}",
+                axis
+            );
+        }
+
+        // BTN_TOUCH + BTN_TOOL_FINGER advertised.
+        for &key in &[devices::btn::BTN_TOUCH, devices::btn::BTN_TOOL_FINGER] {
+            let byte = (key / 8) as usize;
+            let bit = key % 8;
+            assert!(
+                info.key_bitmask[byte] & (1 << bit) != 0,
+                "key_bitmask should advertise key 0x{:x}",
+                key
+            );
+        }
     }
 }
