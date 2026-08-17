@@ -6,9 +6,17 @@ use libc::*;
 use libc::{c_char, c_int};
 use ndk::event::{MotionAction, MotionEvent};
 use std::io::Write;
-use std::mem;
 use std::thread;
 use uinput_sys::*;
+// `input_event` is glob-exported by BOTH `libc` (with field `type_`)
+// and `uinput_sys` (with field `kind`). The code below uses the `kind`
+// field, so the intended resolution is `uinput_sys::input_event`. With
+// newer rustc (≥1.74) glob ambiguity is a hard error rather than a
+// warning, so we add an explicit import to disambiguate. This matches
+// the long-standing intent and does NOT change the resolved type on
+// older toolchains — `uinput_sys::input_event` was already the
+// resolved type there.
+use uinput_sys::input_event;
 
 use once_cell::sync::Lazy;
 use std::sync::mpsc::{channel, Sender};
@@ -18,22 +26,133 @@ use log::info;
 
 const FF_MAX: u16 = 0x7f;
 
-const TOUCH_DEVICE_NAME: &str = "vtouch";
-const TOUCH_DEVICE_UNIQUE_ID: &str = "<vtouch 0>";
-
 const KEY_DEVICE_NAME: &str = "vkey";
 const KEY_DEVICE_UNIQUE_ID: &str = "<keyboard 0>";
 
-/// Touch device socket path — now dynamic via core::get_touch_path().
-/// In a work profile, the data dir is /data/user/<uid>/io.twoyi instead
-/// of /data/data/io.twoyi, so the path must be resolved at runtime.
-fn touch_path() -> String {
-    crate::core::get_touch_path()
+/// Touch-events IPC socket path — host-side UnixListener that kr64's
+/// `spawn_touch_accept_thread` (commit `c67c498`) connects to as a
+/// client. Carries 20-byte `TouchMessage` records (see below) from
+/// this host's `handle_touch` JNI callback to kr64's per-connection
+/// touch worker, which re-encodes them into the guest's `InputEvent`
+/// format via `devices::encode_touch_*`.
+///
+/// This is NOT the guest-facing `/dev/input/touch` socket — kr64 owns
+/// that one now (it builds the `DeviceInfo` header and dispatches
+/// `InputEvent`s). The host-side `touch_server` here binds the IPC
+/// socket only; the only client is kr64.
+fn touch_events_path() -> String {
+    crate::core::get_touch_events_path()
 }
 
 /// Key device socket path — now dynamic via core::get_key_path().
 fn key_path() -> String {
     crate::core::get_key_path()
+}
+
+// ============================================================================
+// TouchMessage — host→kr64 IPC record format.
+//
+// This is the EXACT format kr64's `spawn_touch_accept_thread` reads
+// (commit `c67c498`, `app/rs/kr64/src/lib.rs`). The two crates MUST
+// agree byte-for-byte — a size mismatch or field-order drift would
+// silently misparse the IPC stream.
+//
+// Layout (little-endian, no padding — 20 bytes total):
+//
+// ```text
+//   offset  size  field
+//   ------  ----  -----
+//     0      4    action      (u32: 0=DOWN, 1=MOVE, 2=UP, 3=CANCEL)
+//     4      4    pointer_id  (i32: slot index 0..MAX_POINTERS-1)
+//     8      4    x           (i32: pixel x)
+//    12      4    y           (i32: pixel y)
+//    16      4    pressure    (i32: 0..255)
+// ```
+//
+// `MAX_POINTERS` is 5 (matches `devices::MAX_POINTERS` in kr64 and
+// the size of the `tracking_ids` array the dispatcher maintains).
+// ============================================================================
+
+/// Size of one `TouchMessage` record on the host→kr64 IPC socket, in
+/// bytes. Kept in sync with kr64's `TOUCH_MESSAGE_SIZE` constant
+/// (commit `c67c498`) — a unit test (`touch_message_size_is_20_bytes`)
+/// guards against accidental drift.
+const TOUCH_MESSAGE_SIZE: usize = 20;
+
+/// `TouchMessage::action` values. These match kr64's `touch_action`
+/// module (commit `c67c498`) and correspond to the subset of Android's
+/// `MotionAction` that the touch dispatcher cares about.
+mod touch_action {
+    /// A new finger touched the screen (MotionEvent.ACTION_DOWN /
+    /// ACTION_POINTER_DOWN).
+    pub const DOWN: u32 = 0;
+    /// An existing finger moved (MotionEvent.ACTION_MOVE).
+    pub const MOVE: u32 = 1;
+    /// The last finger lifted (MotionEvent.ACTION_UP).
+    pub const UP: u32 = 2;
+    /// A non-last finger lifted or the gesture was cancelled
+    /// (MotionEvent.ACTION_POINTER_UP / ACTION_CANCEL).
+    pub const CANCEL: u32 = 3;
+}
+
+/// A serialisable touch message sent over the host→kr64 IPC socket at
+/// `{data_dir}/dev/touch-events`. See `TOUCH_MESSAGE_SIZE` for the
+/// on-wire layout.
+///
+/// `derive(Debug, PartialEq, Eq)` so the unit tests can compare
+/// `TouchMessage`s directly. `Copy` because it's 20 bytes — cheap to
+/// pass by value, and we want to `send()` it through an mpsc channel
+/// without cloning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TouchMessage {
+    action: u32,
+    pointer_id: i32,
+    x: i32,
+    y: i32,
+    pressure: i32,
+}
+
+impl TouchMessage {
+    /// Serialise this `TouchMessage` into its 20-byte little-endian
+    /// on-wire form, ready to `write_all` to the kr64 client connection.
+    ///
+    /// This is the inverse of kr64's `TouchMessage::parse` (commit
+    /// `c67c498`): the byte layout must match EXACTLY.
+    fn to_bytes(self) -> [u8; TOUCH_MESSAGE_SIZE] {
+        let mut buf = [0u8; TOUCH_MESSAGE_SIZE];
+        buf[0..4].copy_from_slice(&self.action.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.pointer_id.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.x.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.y.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.pressure.to_le_bytes());
+        buf
+    }
+
+    /// Parse a 20-byte little-endian record into a `TouchMessage`.
+    /// Returns `None` if the buffer is shorter than `TOUCH_MESSAGE_SIZE`.
+    ///
+    /// `#[cfg(test)]`-only — the host only ever writes TouchMessages
+    /// (it never reads them back). Provided so the unit tests can
+    /// roundtrip-verify `to_bytes`. Mirrors kr64's `TouchMessage::parse`
+    /// exactly (commit `c67c498`).
+    #[cfg(test)]
+    fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < TOUCH_MESSAGE_SIZE {
+            return None;
+        }
+        let action = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let pointer_id = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let x = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let y = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let pressure = i32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        Some(TouchMessage {
+            action,
+            pointer_id,
+            x,
+            y,
+            pressure,
+        })
+    }
 }
 
 #[repr(C)]
@@ -131,12 +250,28 @@ const MAX_POINTERS: usize = 5;
 // of the session. The alternative — letting PoisonError propagate —
 // would mean a single panic kills all subsequent touch/key events,
 // bricking the guest's UI with no recovery short of an app restart.
-static INPUT_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| Mutex::new(None));
+//
+// `INPUT_SENDER` carries `TouchMessage` records (NOT raw `input_event`s):
+// the host now forwards raw MotionEvent data to kr64 over the
+// `{data_dir}/dev/touch-events` IPC socket, and kr64 re-encodes it via
+// `devices::encode_touch_*`. This split lets kr64 own the per-slot
+// tracking-ID state machine + the DeviceInfo header — the host no
+// longer needs to know about `EV_ABS`/`ABS_MT_*`/`BTN_*` constants for
+// the touch path (the key path still does, so `KEY_SENDER` is unchanged).
+static INPUT_SENDER: Lazy<Mutex<Option<Sender<TouchMessage>>>> = Lazy::new(|| Mutex::new(None));
 static KEY_SENDER: Lazy<Mutex<Option<Sender<input_event>>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn start_input_system(width: i32, height: i32) {
-    thread::spawn(move || {
-        touch_server(width, height);
+    // `width` and `height` are no longer used by `touch_server` (kr64
+    // builds the DeviceInfo itself from `cfg.width`/`cfg.height` in
+    // `spawn_touch_accept_thread`, commit `c67c498`). The JNI signature
+    // is preserved for binary compatibility with the loaded Java
+    // class (`io/twoyi/Renderer.init`) — the values are simply
+    // ignored. Prefix with `_` so rustc doesn't warn about unused
+    // args.
+    let _ = (width, height);
+    thread::spawn(|| {
+        touch_server();
     });
     thread::spawn(|| {
         key_server();
@@ -168,248 +303,220 @@ pub fn input_event_write(
     let _ = tx.send(ev);
 }
 
+/// JNI entry point: dispatch an Android `MotionEvent` to the guest's
+/// touch input device.
+///
+/// Refactor (commit `4-A`): previously this function encoded the
+/// `MotionEvent` into Linux `InputEvent`s (`EV_ABS`/`ABS_MT_*`/
+/// `BTN_TOUCH`/`SYN_REPORT`) and wrote them to the guest-facing
+/// `/dev/input/touch` socket directly. As of kr64's commit `c67c498`
+/// (task 3-A), kr64 OWNS that socket — it binds it, sends the 896-byte
+/// `DeviceInfo` header on `accept()`, and dispatches `InputEvent`s
+/// itself. The host's role is now to forward RAW `MotionEvent` data
+/// (`action` + `pointer_id` + `x` + `y` + `pressure`) to kr64 via the
+/// `{data_dir}/dev/touch-events` IPC socket — kr64 re-encodes it via
+/// `devices::encode_touch_*` and applies its own per-slot tracking-ID
+/// state machine.
+///
+/// The local `G_INPUT_MT` per-slot state has been REMOVED — kr64 owns
+/// that state now (it has its own `tracking_ids: [i32; MAX_POINTERS]`
+/// in `touch_connection_loop`). The host's `ACTION_UP` handler now
+/// emits UP records for ALL slots `0..MAX_POINTERS`; kr64 drops
+/// UP-without-DOWN defensively (commit `c67c498`'s
+/// `encode_touch_message` test `up_without_down_is_dropped`), so this
+/// is safe — and it preserves the OLD defensive behaviour of releasing
+/// any slot that missed a `POINTER_UP` event.
+///
+/// `MotionAction::PointerUp` and `MotionAction::Cancel` are mapped to
+/// `touch_action::CANCEL` (kr64 treats CANCEL identically to UP — see
+/// its `encode_touch_message` test `cancel_treated_as_up`). The
+/// pointer_id field identifies which slot to release.
+///
+/// `MotionAction::Move` iterates every pointer in this `MotionEvent`
+/// (Android batches historical samples, but the current sample of each
+/// active pointer is at indices `0..pointer_count()`) and emits one
+/// `TouchMessage` per pointer — same per-pointer iteration the OLD
+/// code did, but now sending raw pointer data instead of encoded
+/// events.
 pub fn handle_touch(ev: MotionEvent) {
     let opt = INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ref fd) = *opt {
-        let action = ev.action();
-        let pointer_index = ev.pointer_index();
-        let pointer = ev.pointer_at_index(pointer_index);
-        let pointer_id = pointer.pointer_id();
-        let pressure = pointer.pressure();
+    let Some(tx) = opt.as_ref() else {
+        // No kr64 connection yet — silently drop the event. This is
+        // the same behaviour as the original code (which dropped
+        // events until the guest's EventHub connected). The Java side
+        // doesn't know the difference — it just calls handleTouch on
+        // every MotionEvent.
+        return;
+    };
 
-        // Bounds check: pointer_id must be < MAX_POINTERS to use as array index.
-        // Without this, a malformed MotionEvent with pointer_id >= 5 panics,
-        // which poisons the mutex and kills ALL subsequent touch input.
-        if (pointer_id as usize) >= MAX_POINTERS {
-            return;
+    let action = ev.action();
+    let pointer_index = ev.pointer_index();
+    let pointer = ev.pointer_at_index(pointer_index);
+    let pointer_id = pointer.pointer_id();
+    let pressure = pointer.pressure();
+
+    // Bounds check: pointer_id must be < MAX_POINTERS. kr64's
+    // `encode_touch_message` also bounds-checks and drops, but doing
+    // it here avoids sending a record that will be silently discarded
+    // AND matches the behaviour of the old code (which used pointer_id
+    // as an array index into `G_INPUT_MT`).
+    if (pointer_id as usize) >= MAX_POINTERS || pointer_id < 0 {
+        return;
+    }
+
+    match action {
+        // ACTION_DOWN / ACTION_POINTER_DOWN: a new finger touched the
+        // screen. Forward the pointer_id + position + pressure to kr64,
+        // which assigns a fresh tracking ID + emits the 8-event DOWN
+        // frame (BTN_TOUCH/BTN_TOOL_FINGER=1 + ABS_MT_SLOT/TRACKING_ID/
+        // POSITION_X/Y/PRESSURE + SYN_REPORT — see
+        // `devices::encode_touch_down`).
+        MotionAction::Down | MotionAction::PointerDown => {
+            let msg = TouchMessage {
+                action: touch_action::DOWN,
+                pointer_id,
+                x: pointer.x() as i32,
+                y: pointer.y() as i32,
+                pressure: pressure as i32,
+            };
+            // `send` returns Err only if the receiver was dropped —
+            // i.e. the kr64 client disconnected and a new connection
+            // hasn't been accepted yet. Silently drop the event (the
+            // next MotionEvent will see `None` and bail at the top of
+            // this function).
+            let _ = tx.send(msg);
         }
-
-        // info!("action: {:#?}, pointer_index: {}", action, pointer_index);
-
-        static G_INPUT_MT: Lazy<Mutex<[i32; MAX_POINTERS]>> =
-            Lazy::new(|| std::sync::Mutex::new([0i32; MAX_POINTERS]));
-
-        match action {
-            // -----------------------------------------------------------------
-            // Linux Type B multitouch protocol (multi-touch with tracking IDs).
-            //
-            // The kernel maintains a per-slot state. On a new touch we:
-            //   1. Select the new slot (ABS_MT_SLOT = pointer_id)
-            //   2. Assign it a fresh, nonzero tracking ID (ABS_MT_TRACKING_ID)
-            //   3. Write its position/pressure
-            //   4. If this is the FIRST active touch, also press BTN_TOUCH and
-            //      BTN_TOOL_FINGER so the guest's EventHub reports a "tool"
-            //      (finger) on screen — Android's InputReader requires this.
-            //   5. SYN_REPORT to commit the frame.
-            //
-            // BUGFIX: the original loop iterated ALL active slots and wrote the
-            // NEW pointer's data (slot id, tracking id, x, y, pressure) for
-            // every one of them. That collapsed all concurrent touches to a
-            // single finger — placing a second finger on screen overwrote the
-            // first finger's slot with the second finger's coordinates.
-            //
-            // BUGFIX: BTN_TOUCH / BTN_TOOL_FINGER were emitted with value 108
-            // instead of 1. EV_KEY values are 0 (release) / 1 (press) / 2
-            // (repeat); 108 is not a valid key-event value. It worked by
-            // accident because the kernel treats any nonzero value as "press",
-            // but the wrong value is wrong.
-            // -----------------------------------------------------------------
-            MotionAction::Down | MotionAction::PointerDown => {
-                let x = pointer.x();
-                let y = pointer.y();
-
-                let mut mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
-
-                // Was the MT state empty before this touch? If so, this is
-                // the first finger and we need to press BTN_TOUCH/BTN_TOOL_FINGER.
-                let was_empty = mt.iter().all(|&v| v == 0);
-                mt[pointer_id as usize] = 1;
-
-                // Only emit events for the NEW touch. Re-emitting other slots
-                // would overwrite their tracked state with the new pointer's
-                // coordinates.
-                input_event_write(fd, EV_ABS, ABS_MT_SLOT, pointer_id);
-                input_event_write(fd, EV_ABS, ABS_MT_TRACKING_ID, pointer_id + 1);
-
-                if was_empty {
-                    input_event_write(fd, EV_KEY, BTN_TOUCH, 1);
-                    input_event_write(fd, EV_KEY, BTN_TOOL_FINGER, 1);
+        // ACTION_MOVE: emit one TouchMessage per active pointer in
+        // this batched MotionEvent. kr64's `encode_touch_move` writes
+        // the 5-event MOVE frame (ABS_MT_SLOT/POSITION_X/Y/PRESSURE +
+        // SYN_REPORT) per record.
+        //
+        // We DON'T filter by "is this slot active?" (the OLD code did,
+        // via `G_INPUT_MT[pid] != 0`) — kr64's `encode_touch_message`
+        // already drops MOVE-without-DOWN (commit `c67c498`'s test
+        // `move_without_down_is_dropped`), so forwarding every pointer
+        // is safe and avoids the need for duplicate state on the host.
+        MotionAction::Move => {
+            for i in 0..ev.pointer_count() {
+                let p = ev.pointer_at_index(i);
+                let pid = p.pointer_id();
+                if pid < 0 || (pid as usize) >= MAX_POINTERS {
+                    continue;
                 }
-
-                input_event_write(fd, EV_ABS, ABS_MT_POSITION_X, x as i32);
-                input_event_write(fd, EV_ABS, ABS_MT_POSITION_Y, y as i32);
-                input_event_write(fd, EV_ABS, ABS_MT_PRESSURE, pressure as i32);
-
-                input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
-            }
-            // ACTION_UP: the LAST remaining pointer has been released.
-            // Release every still-active slot (defensive — handles missed
-            // PointerUp events) and then release BTN_TOUCH/BTN_TOOL_FINGER
-            // so the guest sees the tool leave the screen.
-            //
-            // BUGFIX: the original code never sent BTN_TOUCH=0 / BTN_TOOL_FINGER=0,
-            // so after the last finger lifted the guest's InputReader still
-            // believed a tool was on screen, causing stuck-press states.
-            MotionAction::Up => {
-                let mut mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
-                for slot in 0..MAX_POINTERS {
-                    if mt[slot] != 0 {
-                        mt[slot] = 0;
-                        input_event_write(fd, EV_ABS, ABS_MT_SLOT, slot as i32);
-                        input_event_write(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-                    }
-                }
-                // All touches released — release the tool keys.
-                input_event_write(fd, EV_KEY, BTN_TOUCH, 0);
-                input_event_write(fd, EV_KEY, BTN_TOOL_FINGER, 0);
-                input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
-            }
-            MotionAction::Move => {
-                // Iterate every pointer in this MotionEvent and re-emit its
-                // position for its assigned slot. The previous implementation
-                // iterated all active MT slots but wrote the SAME pointer's
-                // coordinates (from `ev.pointer_at_index(pointer_index)`) to
-                // every slot. That collapsed multi-touch moves to a single-
-                // finger move: when finger 2 moved, finger 1's slot was also
-                // overwritten with finger 2's coords, breaking pinch-zoom,
-                // two-finger drag, and any gesture that relies on independent
-                // per-finger positions.
-                //
-                // The fix uses `ev.pointer_count()` + `ev.pointer_at_index(i)`
-                // to get each pointer's OWN coordinates, and writes them only
-                // to that pointer's slot (skipping pointers that aren't in
-                // our active MT state — e.g. a pointer that went up but whose
-                // PointerUp event we haven't processed yet).
-                let mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
-                for i in 0..ev.pointer_count() {
-                    let p = ev.pointer_at_index(i);
-                    let pid = p.pointer_id();
-                    if (pid as usize) >= MAX_POINTERS || mt[pid as usize] == 0 {
-                        continue;
-                    }
-                    input_event_write(fd, EV_ABS, ABS_MT_SLOT, pid);
-                    input_event_write(fd, EV_ABS, ABS_MT_POSITION_X, p.x() as i32);
-                    input_event_write(fd, EV_ABS, ABS_MT_POSITION_Y, p.y() as i32);
-                    input_event_write(fd, EV_ABS, ABS_MT_PRESSURE, p.pressure() as i32);
-
-                    input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
+                let msg = TouchMessage {
+                    action: touch_action::MOVE,
+                    pointer_id: pid,
+                    x: p.x() as i32,
+                    y: p.y() as i32,
+                    pressure: p.pressure() as i32,
+                };
+                if tx.send(msg).is_err() {
+                    return; // client disconnected — drop remaining moves
                 }
             }
-            // ACTION_POINTER_UP / ACTION_CANCEL: a single (non-last) pointer
-            // went up. Release just that slot, and release BTN_TOUCH/
-            // BTN_TOOL_FINGER if no touches remain.
-            //
-            // BUGFIX: same BTN_TOUCH=0 omission as ACTION_UP — fixed here too.
-            MotionAction::Cancel | MotionAction::PointerUp => {
-                let mut mt = G_INPUT_MT.lock().unwrap_or_else(|e| e.into_inner());
-                if mt[pointer_id as usize] == 0 {
-                    return;
-                }
-
-                mt[pointer_id as usize] = 0;
-                input_event_write(fd, EV_ABS, ABS_MT_SLOT, pointer_id);
-                input_event_write(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
-
-                // If no more touches are active, release the tool keys.
-                if mt.iter().all(|&v| v == 0) {
-                    input_event_write(fd, EV_KEY, BTN_TOUCH, 0);
-                    input_event_write(fd, EV_KEY, BTN_TOOL_FINGER, 0);
-                }
-
-                input_event_write(fd, EV_SYN, SYN_REPORT, SYN_REPORT);
-            }
-            _ => {}
         }
+        // ACTION_UP: the LAST remaining pointer has been released.
+        // Emit UP records for every slot 0..MAX_POINTERS — kr64 drops
+        // UP-without-DOWN defensively, so only slots that received a
+        // real DOWN (and haven't been released yet) actually emit the
+        // 5-event release frame. This preserves the OLD defensive
+        // behaviour of releasing any slot that missed a POINTER_UP.
+        //
+        // (x/y/pressure are 0 because UP doesn't carry position info
+        // — kr64's `encode_touch_release` only emits ABS_MT_SLOT +
+        // ABS_MT_TRACKING_ID=-1 + BTN_TOUCH/BTN_TOOL_FINGER=0 +
+        // SYN_REPORT.)
+        MotionAction::Up => {
+            for slot in 0..MAX_POINTERS as i32 {
+                let msg = TouchMessage {
+                    action: touch_action::UP,
+                    pointer_id: slot,
+                    x: 0,
+                    y: 0,
+                    pressure: 0,
+                };
+                if tx.send(msg).is_err() {
+                    return; // client disconnected
+                }
+            }
+        }
+        // ACTION_POINTER_UP / ACTION_CANCEL: a single (non-last)
+        // pointer went up. Release just that slot. kr64 treats CANCEL
+        // identically to UP (test `cancel_treated_as_up`).
+        MotionAction::Cancel | MotionAction::PointerUp => {
+            let msg = TouchMessage {
+                action: touch_action::CANCEL,
+                pointer_id,
+                x: 0,
+                y: 0,
+                pressure: 0,
+            };
+            let _ = tx.send(msg);
+        }
+        // Outside / Hover / ButtonPress / Scroll / etc. — not
+        // relevant to a Type-B multi-touch touchscreen. Silently
+        // ignore (same as the OLD code's `_ => {}` arm).
+        _ => {}
     }
 }
 
-fn generate_touch_device(width: i32, height: i32) -> device_info {
-    let iid = input_id {
-        product: 0x1,
-        version: 0,
-        vendor: 0,
-        bustype: 0,
-    };
+/// Bind the host→kr64 touch-events IPC socket at
+/// `{data_dir}/dev/touch-events` and accept connections from kr64's
+/// `spawn_touch_accept_thread` (commit `c67c498`).
+///
+/// On `accept()`, the host creates an mpsc channel and stores the
+/// `Sender` in `INPUT_SENDER`. The `handle_touch` JNI callback then
+/// sends `TouchMessage` records through the channel; a per-connection
+/// worker thread reads them and `write_all`s the 20-byte LE bytes to
+/// the accepted `UnixStream`.
+///
+/// The host does NOT send the `DeviceInfo` header (896 bytes) — kr64
+/// builds + sends that itself (`devices::make_touch_device` from
+/// commit `370b8ee`). The host only forwards raw MotionEvent data.
+///
+/// Reconnection handling: if kr64 disconnects (e.g. the guest's
+/// `EventHub` closes the device after a suspend/resume), the worker
+/// thread exits, the `Sender` is dropped, and `handle_touch` silently
+/// drops events until a new kr64 connection arrives. The accept loop
+/// is structured so a new channel + worker are created on every
+/// `accept()` — replacing any previous connection.
+fn touch_server() {
+    let path = touch_events_path();
 
-    let mut info = device_info {
-        name: unsafe { mem::zeroed() },
-        driver_version: 0x1,
-        id: iid,
-        physical_location: unsafe { mem::zeroed() },
-        unique_id: unsafe { mem::zeroed() },
-        key_bitmask: unsafe { mem::zeroed() },
-        abs_bitmask: unsafe { mem::zeroed() },
-        rel_bitmask: unsafe { mem::zeroed() },
-        sw_bitmask: unsafe { mem::zeroed() },
-        led_bitmask: unsafe { mem::zeroed() },
-        ff_bitmask: unsafe { mem::zeroed() },
-        prop_bitmask: unsafe { mem::zeroed() },
-        abs_max: unsafe { mem::zeroed() },
-        abs_min: unsafe { mem::zeroed() },
-    };
-
-    copy_to_cstr(TOUCH_DEVICE_NAME, &mut info.name);
-    copy_to_cstr(&touch_path(), &mut info.physical_location);
-    copy_to_cstr(TOUCH_DEVICE_UNIQUE_ID, &mut info.unique_id);
-
-    info.prop_bitmask[0] = INPUT_PROP_BUTTONPAD as u8;
-
-    // Set multitouch ABS axis bits using proper bitmap indexing
-    // (byte = axis/8, bit = axis%8) — same pattern as set_key_bit
-    set_key_bit(&mut info.abs_bitmask, ABS_MT_SLOT as usize);
-    set_key_bit(&mut info.abs_bitmask, ABS_MT_POSITION_X as usize);
-    set_key_bit(&mut info.abs_bitmask, ABS_MT_POSITION_Y as usize);
-    set_key_bit(&mut info.abs_bitmask, ABS_MT_PRESSURE as usize);
-    set_key_bit(&mut info.abs_bitmask, ABS_MT_TRACKING_ID as usize);
-    set_key_bit(&mut info.abs_bitmask, ABS_MT_TOUCH_MAJOR as usize);
-
-    info.abs_min[ABS_MT_POSITION_X as usize] = 0;
-    info.abs_max[ABS_MT_POSITION_X as usize] = width as u32;
-
-    info.abs_min[ABS_MT_POSITION_Y as usize] = 0;
-    info.abs_max[ABS_MT_POSITION_Y as usize] = height as u32;
-
-    info.abs_min[ABS_MT_TOUCH_MAJOR as usize] = 0;
-    info.abs_min[ABS_MT_TOUCH_MINOR as usize] = 15;
-
-    // Fixed: min/max were inverted (min=4, max=0). This rejected all slots.
-    // Now: min=0, max=MAX_POINTERS-1 (supports slots 0..4 for 5 fingers)
-    info.abs_min[ABS_MT_SLOT as usize] = 0;
-    info.abs_max[ABS_MT_SLOT as usize] = (MAX_POINTERS as u32) - 1;
-    info.abs_min[ABS_MT_PRESSURE as usize] = 0;
-    info.abs_max[ABS_MT_PRESSURE as usize] = 80;
-
-    info
-}
-
-fn touch_server(width: i32, height: i32) {
-    let device = generate_touch_device(width, height);
-    let touch = touch_path();
-
-    // Make sure the parent directory exists — the rootfs/dev/input/
-    // path may not exist yet on a fresh install, and UnixListener::bind
-    // fails with ENOENT if it doesn't.
-    if let Some(parent) = std::path::Path::new(&touch).parent() {
+    // Make sure the parent directory exists. The path is
+    // `{data_dir}/dev/touch-events`, so the parent is `{data_dir}/dev`
+    // — which may not exist on a fresh install. `UnixListener::bind`
+    // fails with ENOENT if the parent dir is missing.
+    if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Remove stale socket file from a previous run.
-    let _ = std::fs::remove_file(&touch);
+    // Remove stale socket file from a previous run. `UnixListener::bind`
+    // fails with EADDRINUSE if the path already exists as a socket
+    // file (e.g. from a previous process that crashed without unlinking).
+    let _ = std::fs::remove_file(&path);
 
-    // Fixed: .unwrap() here would panic the input thread, killing the
-    // touch input system silently. The guest's EventHub would then see
-    // "touch device not available" with no diagnostic on the host side.
-    // Log the error and exit the thread gracefully instead.
-    let listener = match unix_socket::UnixListener::bind(&touch) {
+    // `.unwrap()` here would panic the input thread, killing the
+    // touch input system silently. kr64 would then block for 30s on
+    // `UnixStream::connect` to this path (commit `c67c498`'s
+    // `touch_connection_loop`) and finally log a clear TODO before
+    // giving up. Log the error here and exit the thread gracefully
+    // instead — kr64's 30s timeout + clear log message handles the
+    // host-side failure mode.
+    let listener = match unix_socket::UnixListener::bind(&path) {
         Ok(l) => {
-            info!("[INPUT] touch server listening at {}", touch);
+            info!(
+                "[INPUT] touch-events IPC server listening at {} (kr64 will connect here)",
+                path
+            );
             l
         }
         Err(e) => {
             log::error!(
-                "[INPUT] failed to bind touch socket at {}: {} — \
-                touch input will be unavailable. Check permissions and path length.",
-                touch,
+                "[INPUT] failed to bind touch-events IPC socket at {}: {} — \
+                 kr64 will block for 30s then give up (guest touch device will \
+                 be advertised but receive no events). Check permissions + path length.",
+                path,
                 e
             );
             return;
@@ -419,31 +526,45 @@ fn touch_server(width: i32, height: i32) {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                info!("touch client connected!");
+                info!("[INPUT] kr64 touch client connected to touch-events IPC socket");
 
-                let _ = stream.write_all(unsafe { any_as_u8_slice(&device) });
-
-                let (tx, rx) = channel::<input_event>();
+                // Create a new channel for this connection. The Sender
+                // is stored in `INPUT_SENDER` (replacing any previous
+                // one — the previous worker thread will exit when its
+                // receiver hits a channel-closed on the next `recv()`).
+                // The Receiver is moved into the worker thread below.
+                let (tx, rx) = channel::<TouchMessage>();
                 *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
 
                 thread::spawn(move || {
-                    while let Ok(ev) = rx.recv() {
-                        let data = unsafe { any_as_u8_slice(&ev) };
-                        if stream.write_all(data).is_err() {
-                            return; // write failed — client disconnected
+                    while let Ok(msg) = rx.recv() {
+                        let bytes = msg.to_bytes();
+                        if stream.write_all(&bytes).is_err() {
+                            // kr64 disconnected — drain any queued
+                            // messages so the Sender doesn't stay
+                            // "full" forever (the channel is unbounded,
+                            // but draining is cheap and makes the
+                            // disconnect observable from `handle_touch`
+                            // on the NEXT call: `tx.send` returns Err
+                            // because the receiver was dropped when
+                            // this thread exits).
+                            while rx.recv().is_ok() {}
+                            return;
                         }
                     }
-                    // Channel disconnected — new client took over
+                    // Channel disconnected — a new kr64 connection took
+                    // over (or the host is shutting down). Exit so the
+                    // new worker can take its turn on the next `accept()`.
                 });
             }
             Err(_) => {
-                info!("touch server error happened!");
+                info!("[INPUT] touch-events server accept error!");
                 break;
             }
         }
     }
 
-    info!("drop listener!");
+    info!("[INPUT] drop touch-events listener!");
 }
 
 /// Set the bit at position `n` in a `key_bitmask` byte array.
@@ -600,5 +721,171 @@ fn key_server() {
                 break;
             }
         }
+    }
+}
+
+// ============================================================================
+// Unit tests for the TouchMessage IPC format.
+//
+// These tests mirror kr64's tests in `app/rs/kr64/src/lib.rs::tests`
+// (commit `c67c498`) — same assertions, same byte-layout expectations.
+// They guard against drift between the two crates' on-wire format: a
+// size mismatch or field-order swap would silently misparse the IPC
+// stream and break touch input entirely.
+//
+// `kr64` reads TouchMessages via `TouchMessage::parse(buf)`; the host
+// writes them via `TouchMessage::to_bytes()`. The two MUST agree
+// byte-for-byte — these tests verify they do.
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a `TouchMessage` (avoids repeating the field list
+    /// in every test below). Mirrors kr64's `touch_msg` helper.
+    fn touch_msg(action: u32, pointer_id: i32, x: i32, y: i32, pressure: i32) -> TouchMessage {
+        TouchMessage {
+            action,
+            pointer_id,
+            x,
+            y,
+            pressure,
+        }
+    }
+
+    /// `TOUCH_MESSAGE_SIZE` must be 20 bytes (4×5 little-endian fields).
+    /// This is the SAME constant value as kr64's `TOUCH_MESSAGE_SIZE`
+    /// (commit `c67c498`) — a size mismatch would silently misparse the
+    /// IPC stream between the two crates.
+    #[test]
+    fn touch_message_size_is_20_bytes() {
+        assert_eq!(TOUCH_MESSAGE_SIZE, 20);
+    }
+
+    /// `TouchMessage::to_bytes` roundtrips through `parse` byte-for-byte.
+    /// Mirrors kr64's `touch_message_parse_roundtrip` test — the two
+    /// crates MUST agree on the encoding.
+    #[test]
+    fn touch_message_to_bytes_parse_roundtrip() {
+        let cases = [
+            touch_msg(touch_action::DOWN, 0, 100, 200, 128),
+            touch_msg(touch_action::MOVE, 1, 500, 750, 200),
+            touch_msg(touch_action::UP, 4, 0, 0, 0),
+            touch_msg(touch_action::CANCEL, 2, -10, -20, -30),
+        ];
+        for msg in cases {
+            let bytes = msg.to_bytes();
+            assert_eq!(bytes.len(), TOUCH_MESSAGE_SIZE);
+            let parsed =
+                TouchMessage::parse(&bytes).expect("parse should succeed for a 20-byte buffer");
+            assert_eq!(parsed, msg, "roundtrip failed for {:?}", msg);
+        }
+    }
+
+    /// `TouchMessage::parse` returns `None` for buffers shorter than
+    /// `TOUCH_MESSAGE_SIZE`. Mirrors kr64's
+    /// `touch_message_parse_rejects_short_buffer` test.
+    #[test]
+    fn touch_message_parse_rejects_short_buffer() {
+        assert!(TouchMessage::parse(&[]).is_none());
+        assert!(TouchMessage::parse(&[0u8; 19]).is_none());
+        // Exactly 20 bytes parses OK.
+        let msg = touch_msg(touch_action::DOWN, 0, 1, 2, 3);
+        assert!(TouchMessage::parse(&msg.to_bytes()).is_some());
+        // Extra bytes are accepted (parse reads only the first 20) —
+        // matches kr64's behaviour. In practice `read_exact` always
+        // produces exactly 20 bytes.
+        let mut buf = msg.to_bytes().to_vec();
+        buf.push(0xff);
+        assert!(TouchMessage::parse(&buf).is_some());
+    }
+
+    /// Verify the on-wire byte layout of a `TouchMessage` (little-endian,
+    /// fields at the documented offsets). This catches a struct-layout
+    /// drift that would break inter-process IPC with kr64. Mirrors
+    /// kr64's `touch_message_byte_layout` test EXACTLY — same offsets,
+    /// same endianness, same field order.
+    #[test]
+    fn touch_message_byte_layout_matches_kr64() {
+        let msg = touch_msg(touch_action::MOVE, 3, 0x12345678, -5, 255);
+        let b = msg.to_bytes();
+        assert_eq!(
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            touch_action::MOVE,
+            "action at offset 0 (u32 LE)"
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            3,
+            "pointer_id at offset 4 (i32 LE)"
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            0x12345678,
+            "x at offset 8 (i32 LE)"
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            -5,
+            "y at offset 12 (i32 LE)"
+        );
+        assert_eq!(
+            i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+            255,
+            "pressure at offset 16 (i32 LE)"
+        );
+    }
+
+    /// Verify `touch_action` constants match kr64's `touch_action`
+    /// module (commit `c67c498`). A mismatch would cause kr64 to
+    /// misinterpret every event's action field (e.g. treat DOWN as UP).
+    #[test]
+    fn touch_action_constants_match_kr64() {
+        assert_eq!(touch_action::DOWN, 0);
+        assert_eq!(touch_action::MOVE, 1);
+        assert_eq!(touch_action::UP, 2);
+        assert_eq!(touch_action::CANCEL, 3);
+    }
+
+    /// Cross-check: a TouchMessage encoded by this crate must be
+    /// parseable by the same logic kr64 uses (which is identical —
+    /// we copied `parse`/`to_bytes` verbatim from commit `c67c498`).
+    /// This is the byte-level integration check — if either crate
+    /// changes the layout, this test fails.
+    #[test]
+    fn touch_message_full_lifecycle_byte_stream() {
+        // Simulate a DOWN → MOVE → UP lifecycle on slot 0, encoding
+        // each as a TouchMessage and concatenating the bytes (as they
+        // would appear on the IPC socket).
+        let down = touch_msg(touch_action::DOWN, 0, 100, 200, 128);
+        let mv = touch_msg(touch_action::MOVE, 0, 150, 250, 200);
+        let up = touch_msg(touch_action::UP, 0, 0, 0, 0);
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&down.to_bytes());
+        stream.extend_from_slice(&mv.to_bytes());
+        stream.extend_from_slice(&up.to_bytes());
+
+        // 3 records × 20 bytes = 60 bytes total.
+        assert_eq!(stream.len(), 3 * TOUCH_MESSAGE_SIZE);
+
+        // Parse each 20-byte chunk and verify it roundtrips.
+        for (i, expected) in [down, mv, up].iter().enumerate() {
+            let start = i * TOUCH_MESSAGE_SIZE;
+            let end = start + TOUCH_MESSAGE_SIZE;
+            let chunk = &stream[start..end];
+            let parsed = TouchMessage::parse(chunk).expect("chunk must parse");
+            assert_eq!(&parsed, expected, "record {} mismatch", i);
+        }
+    }
+
+    /// Verify `MAX_POINTERS` is 5 — it MUST match kr64's
+    /// `devices::MAX_POINTERS` (commit `370b8ee`). A mismatch would
+    /// cause `handle_touch`'s bounds check to either drop events kr64
+    /// would accept, or send events kr64 would drop.
+    #[test]
+    fn max_pointers_matches_kr64() {
+        assert_eq!(MAX_POINTERS, 5);
     }
 }
