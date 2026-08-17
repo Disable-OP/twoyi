@@ -1376,7 +1376,7 @@ mod tests {
     fn parse_events(bytes: &[u8]) -> Vec<(u16, u16, i32)> {
         let stride = InputEvent::size();
         assert!(
-            bytes.len() % stride == 0,
+            bytes.len().is_multiple_of(stride),
             "byte stream length {} is not a multiple of InputEvent size {}",
             bytes.len(),
             stride
