@@ -262,7 +262,7 @@ struct ChildAbi {
     // We force rax=0 for ALL of these siblings at syscall-EXIT (see
     // `compute_exit_return_value`). On i386 compat the fchmodat /
     // fchownat numbers are large (306 / 298); on x86_64 they're 268
-    // / 257; on aarch64 only fchmodat (53) and fchownat (54) exist
+    // / 260; on aarch64 only fchmodat (53) and fchownat (54) exist
     // (asm-generic has no plain `chmod` / `lchown` / `chown` —
     // bionic's `chmod(path, mode)` shim issues `fchmodat(AT_FDCWD,
     // path, mode, 0)`, and similarly for chown).
@@ -399,14 +399,17 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     ioprio_get: 252,
     // chmod / lchown / chown / fchmodat / fchownat (x86_64 numbers
     // per asm/unistd_64.h):
-    //   chmod=90, lchown=94, chown=182, fchmodat=268, fchownat=257.
+    //   chmod=90, lchown=94, chown=182, fchmodat=268, fchownat=260.
+    // NOTE: 257 is `openat` on x86_64 — Task 5-A's commit ee93ac0 had a
+    //   1-char typo here (`fchownat: 257`) which made every openat()
+    //   call fake-success returning stdin fd (0); fixed by Task 5-H.
     // We ALSO fake success (return 0) for these at syscall-EXIT —
     // see the comment on `chmod` in `ChildAbi` for why.
     chmod: 90,
     lchown: 94,
     chown: 182,
     fchmodat: 268,
-    fchownat: 257,
+    fchownat: 260,
     execve: 59, // SYS_execve (x86_64)
     mount: 165,
     chroot: 161,
@@ -3555,9 +3558,42 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn compute_exit_return_value_x86_64_fchownat_returns_zero() {
-        // x86_64 fchownat = 257. Pre-fix MISSING — added by Task 5-A.
-        assert_eq!(compute_exit_return_value(257, &ABI_X86_64), Some(0));
-        assert_eq!(syscall_name(257, &ABI_X86_64), "fchownat");
+        // x86_64 fchownat = 260 (per asm/unistd_64.h). Pre-fix MISSING
+        // from the EXIT handler — added by Task 5-A. Task 5-A's commit
+        // ee93ac0 used 257 here (a 1-char typo: 257 is openat on x86_64,
+        // NOT fchownat), which made compute_exit_return_value(257, X86_64)
+        // incorrectly return Some(0) — i.e. every openat() got fake
+        // success returning stdin fd 0 instead of a real fd. Fixed by
+        // Task 5-H (257 -> 260). See `abi_x86_64_openat_257_not_faked`
+        // below for the explicit openat-not-faked regression guard.
+        assert_eq!(compute_exit_return_value(260, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(260, &ABI_X86_64), "fchownat");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_openat_257_not_faked() {
+        // REGRESSION GUARD (Task 5-H): 257 is `openat` on x86_64, NOT
+        // fchownat. Task 5-A's commit ee93ac0 had `fchownat: 257` here,
+        // which caused compute_exit_return_value(257, X86_64) to return
+        // Some(0), making the EXIT handler fake-success every openat()
+        // call — TWRP init then got rax=0 (stdin fd) from openat()
+        // instead of a real fd and crashed with exit_group(127) at
+        // iteration 113 (5-F's finding). This test asserts the bug is
+        // gone: 257 must NOT match any faked-success syscall on x86_64,
+        // and must NOT be labelled "fchownat".
+        assert_eq!(
+            compute_exit_return_value(257, &ABI_X86_64),
+            None,
+            "x86_64 openat (257) must NOT be faked-success — fchownat is 260"
+        );
+        assert_ne!(
+            syscall_name(257, &ABI_X86_64),
+            "fchownat",
+            "x86_64 syscall 257 is openat, NOT fchownat (fchownat is 260)"
+        );
+        // And the converse: 260 must match fchownat and be faked.
+        assert_eq!(ABI_X86_64.fchownat, 260, "x86_64 fchownat must be 260");
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -3667,7 +3703,10 @@ mod tests {
         assert_eq!(ABI_X86_64.lchown, 94, "x86_64 lchown must be 94");
         assert_eq!(ABI_X86_64.chown, 182, "x86_64 chown must be 182");
         assert_eq!(ABI_X86_64.fchmodat, 268, "x86_64 fchmodat must be 268");
-        assert_eq!(ABI_X86_64.fchownat, 257, "x86_64 fchownat must be 257");
+        assert_eq!(
+            ABI_X86_64.fchownat, 260,
+            "x86_64 fchownat must be 260 (NOT 257 — 257 is openat)"
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
