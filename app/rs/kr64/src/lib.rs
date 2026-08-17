@@ -3547,34 +3547,113 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             ),
         }
 
-        // ── Property lookups (formerly the find_property binary patch) ──
+        // ── find_property binary patch — WORKAROUND for missing property service ──
         //
-        // HISTORY: kr64 previously patched TWRP's `/init` binary to
-        // short-circuit `find_property()` by overwriting its first 3
-        // bytes with `xor eax,eax; ret` (31 c0 c3). That made every
-        // property lookup return NULL immediately, preventing a SIGSEGV
-        // that fired because `/dev/__properties__` was not initialized
-        // in the rootfs. See commits 9154e59 + 0a4be80 + 5d561cf.
+        // WORKAROUND (NOT a "suppressed crash"):
         //
-        // This was a SUPPRESSED CRASH (worklog 1-A F.1) — it neutered
-        // find_property() instead of fixing the root cause (missing
-        // property area).
+        // 5-Z's disassembly DEFINITIVELY identified the SIGSEGV at
+        // rip=0x809255d in `find_property()`: the faulting instruction
+        // reads `[esi + 0x10]` where `esi = __system_property_area__ +
+        // 0x80`, and the global `__system_property_area__` (BSS at
+        // 0x8104de0) is NULL → SIGSEGV at NULL + 0x90 (exact match with
+        // si_addr=0x90). This reframes 1-A's original "suppressed crash"
+        // F.1 flag — the patch was a NECESSARY workaround, not a crash
+        // being papered over.
         //
-        // PROPER FIX (worklog 1-A E.4 + 1-B Task 3): Property lookups
-        // are now handled by the VFS layer (vfs.rs). The Vfs provides a
-        // valid `/dev/__properties__/properties_serial` Dynamic node
-        // that synthesizes a minimal AOSP `__system_property_area__`
-        // (128-byte header: magic='PROP', version=1, 0 properties). The
-        // ptrace_emu's open/openat ENTRY-stop handler calls
-        // `vfs.materialize()` BEFORE `translate_path()` so the file
-        // exists at `{rootfs}/dev/__properties__/properties_serial` by
-        // the time the real kernel `open()` runs. find_property() then
-        // iterates over 0 properties and returns NULL for any lookup
-        // naturally — no binary mutation needed.
+        // 6-A's commit 3eb83d9 made REAL PROGRESS on the proper fix:
+        // `/dev/__properties__` now exists + opens + mmaps successfully
+        // (mmap returns 0xEE930000, a valid address — see worklog
+        // DISPATCHER-UPDATE-6). BUT the global `__system_property_area__`
+        // is STILL NULL despite the successful mmap, because
+        // `__system_property_area_init()` validates the mapped header
+        // and bails BEFORE setting the global — AOSP 5.1 bionic expects
+        // a property SERVICE to have written initial property entries
+        // via the property socket first, and the kr64 sandboxed
+        // environment does NOT provide a property service. The proper
+        // fix (a full property service) is a future, much larger effort.
         //
-        // No code runs here. This comment exists to document WHY the
-        // old binary patch was removed and where the equivalent
-        // behaviour now lives (vfs.rs + ptrace_emu.rs's open path).
+        // PRAGMATIC UNBLOCK: restore the find_property binary patch
+        // (commits 9154e59 + 0a4be80 + 5d561cf, removed by f720934).
+        // The patch overwrites find_property()'s first 3 bytes with
+        // `31 c0 c3` (xor eax,eax; ret) so every property lookup
+        // returns NULL (0) immediately. TWRP init tolerates NULL
+        // property values (it checks for NULL and uses defaults), so
+        // this is safe for early boot. 6-A's `/dev/__properties__`
+        // file + vfs.rs OLD-format prop_area remain in place for when
+        // a full property service is implemented.
+        //
+        // Pattern (first 18 bytes of find_property at file offset
+        // 0x4a500, virtual address 0x08092500):
+        //   55 89 e5 57 56 89 c6 53 8d 64 24 a4 89 55 c4 8b 55 0c
+        //   push ebp; mov esp,ebp; push edi; push esi; mov eax,esi;
+        //   push ebx; lea -0x5c(esp),esp; mov [ebp-0x3c],edx;
+        //   mov edx,[ebp+0xc]
+        //
+        // Replacement (first 3 bytes only):
+        //   31 c0 c3  xor eax,eax; ret
+        //
+        // IDEMPOTENT: a prior application replaces the first 3 bytes of
+        // the pattern with `31 c0 c3`, so the unpatched pattern no
+        // longer matches. We detect that case by scanning for the
+        // patched signature (`31 c0 c3` + bytes 3..7 of the original
+        // pattern, `57 56 89 c6`) and skip the rewrite. This is the
+        // SAME idempotency scheme as `patch_twrp_init_klog_init` above.
+        {
+            let init_path = format!("{}/init", rootfs_prefix);
+            match std::fs::read(&init_path) {
+                Ok(mut bytes) => {
+                    let pattern: &[u8] = &[
+                        0x55, 0x89, 0xe5, 0x57, 0x56, 0x89, 0xc6, 0x53, 0x8d, 0x64, 0x24, 0xa4,
+                        0x89, 0x55, 0xc4, 0x8b, 0x55, 0x0c,
+                    ];
+                    let patch: &[u8] = &[0x31, 0xc0, 0xc3]; // xor eax,eax; ret
+                    // Patched signature: `31 c0 c3` (patch prologue) + the
+                    // unchanged tail bytes 3..7 of the original pattern
+                    // (`57 56 89 c6`). Used to detect an already-applied
+                    // patch so we skip the rewrite instead of (mis)matching
+                    // nothing and logging a false "TWRP version mismatch?".
+                    let patched_sig: &[u8] = &[0x31, 0xc0, 0xc3, 0x57, 0x56, 0x89, 0xc6];
+
+                    let already_patched = bytes
+                        .windows(patched_sig.len())
+                        .any(|w| w == patched_sig);
+
+                    if already_patched {
+                        info!(
+                            "[KR64] PARENT: /init find_property() already patched (idempotent skip) — property lookups return NULL safely (workaround for missing property service)"
+                        );
+                    } else {
+                        let found_off = bytes
+                            .windows(pattern.len())
+                            .position(|w| w == pattern);
+
+                        if let Some(off) = found_off {
+                            bytes[off] = patch[0];
+                            bytes[off + 1] = patch[1];
+                            bytes[off + 2] = patch[2];
+                            match std::fs::write(&init_path, &bytes) {
+                                Ok(()) => info!(
+                                    "[KR64] PARENT: patched /init find_property() at file offset {:#x} — replaced first 3 bytes with 'xor eax,eax; ret' (workaround for missing property service; see worklog 5-Z + DISPATCHER-UPDATE-6)",
+                                    off
+                                ),
+                                Err(e) => warning!(
+                                    "[KR64] PARENT: patched find_property in memory but failed to write back: {} (init may crash with SIGSEGV at rip=0x809255d)",
+                                    e
+                                ),
+                            }
+                        } else {
+                            warning!(
+                                "[KR64] PARENT: could not find find_property pattern in /init (TWRP version mismatch?) — init may crash with SIGSEGV at rip=0x809255d when accessing properties"
+                            );
+                        }
+                    }
+                }
+                Err(e) => warning!(
+                    "[KR64] PARENT: failed to read /init for find_property patching: {} (init may crash with SIGSEGV at rip=0x809255d)",
+                    e
+                ),
+            }
+        }
     }
 
     // Always overwrite /vendor/etc/fstab.ranchu with a minimal stub.
