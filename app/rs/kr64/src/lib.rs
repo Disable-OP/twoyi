@@ -3404,86 +3404,34 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             ),
         }
 
-        // ── Patch find_property to return NULL immediately ──
+        // ── Property lookups (formerly the find_property binary patch) ──
         //
-        // ROOT CAUSE of SIGSEGV after reading /proc/cmdline:
-        // Init calls find_property() to look up properties. The property
-        // area is not initialized (because /dev/__properties__ is not
-        // accessible to untrusted_app). The first argument to
-        // find_property is a pointer derived from the uninitialized
-        // property area — it's 0x80 (a small address in the NULL page).
-        // find_property dereferences it at offset 0x10, accessing
-        // address 0x90, which is unmapped → SIGSEGV.
+        // HISTORY: kr64 previously patched TWRP's `/init` binary to
+        // short-circuit `find_property()` by overwriting its first 3
+        // bytes with `xor eax,eax; ret` (31 c0 c3). That made every
+        // property lookup return NULL immediately, preventing a SIGSEGV
+        // that fired because `/dev/__properties__` was not initialized
+        // in the rootfs. See commits 9154e59 + 0a4be80 + 5d561cf.
         //
-        // FIX: Patch find_property's first 3 bytes to `xor eax,eax; ret`
-        // (31 c0 c3). This makes ALL property lookups return NULL
-        // immediately, preventing the crash. Init handles NULL property
-        // returns gracefully (properties are optional during early boot).
+        // This was a SUPPRESSED CRASH (worklog 1-A F.1) — it neutered
+        // find_property() instead of fixing the root cause (missing
+        // property area).
         //
-        // The pattern to match (first 12 bytes of find_property at
-        // virtual address 0x08092500, file offset 0x4a500):
-        //   55 89 e5 57 56 89 c6 53 8d 64 24 a4
-        //   push ebp; mov esp,ebp; push edi; push esi; mov eax,esi;
-        //   push ebx; lea -0x5c(esp),esp
+        // PROPER FIX (worklog 1-A E.4 + 1-B Task 3): Property lookups
+        // are now handled by the VFS layer (vfs.rs). The Vfs provides a
+        // valid `/dev/__properties__/properties_serial` Dynamic node
+        // that synthesizes a minimal AOSP `__system_property_area__`
+        // (128-byte header: magic='PROP', version=1, 0 properties). The
+        // ptrace_emu's open/openat ENTRY-stop handler calls
+        // `vfs.materialize()` BEFORE `translate_path()` so the file
+        // exists at `{rootfs}/dev/__properties__/properties_serial` by
+        // the time the real kernel `open()` runs. find_property() then
+        // iterates over 0 properties and returns NULL for any lookup
+        // naturally — no binary mutation needed.
         //
-        // Replacement (first 3 bytes only):
-        //   31 c0 c3  xor eax,eax; ret
-        {
-            let init_path = format!("{}/init", rootfs_prefix);
-            match std::fs::read(&init_path) {
-                Ok(mut bytes) => {
-                    let pattern: &[u8] = &[
-                        0x55, 0x89, 0xe5, 0x57, 0x56, 0x89, 0xc6, 0x53, 0x8d, 0x64, 0x24, 0xa4,
-                        0x89, 0x55, 0xc4, 0x8b, 0x55, 0x0c,
-                    ];
-                    let patch: &[u8] = &[0x31, 0xc0, 0xc3]; // xor eax,eax; ret
-
-                    // Check if already patched
-                    let already_patched = bytes.len() >= 3 && bytes[0] == 0x31 && bytes[1] == 0xc0
-                        && bytes[2] == 0xc3;
-
-                    if !already_patched {
-                        let mut found = false;
-                        for i in 0..=(bytes.len().saturating_sub(pattern.len())) {
-                            if bytes[i..i + pattern.len()] == *pattern {
-                                // Apply patch: replace first 3 bytes with xor eax,eax; ret
-                                bytes[i] = patch[0];
-                                bytes[i + 1] = patch[1];
-                                bytes[i + 2] = patch[2];
-                                found = true;
-                                break;
-                            }
-                        }
-                        if found {
-                            // Verify the patch was applied by reading back
-                            let patch_offset = (0..bytes.len()).find(|&i| bytes[i] == 0x31 && i + 2 < bytes.len() && bytes[i+1] == 0xc0 && bytes[i+2] == 0xc3 && i + 12 <= bytes.len() && bytes[i+3] == 0x57 && bytes[i+4] == 0x56).unwrap_or(0);
-                            match std::fs::write(&init_path, &bytes) {
-                                Ok(()) => info!(
-                                    "[KR64] PARENT: patched /init find_property() at offset {:#x} — replaced first 3 bytes with 'xor eax,eax; ret' (prevents SIGSEGV when property area is not initialized)",
-                                    patch_offset
-                                ),
-                                Err(e) => warning!(
-                                    "[KR64] PARENT: patched find_property in memory but failed to write back: {} (init may crash with SIGSEGV)",
-                                    e
-                                ),
-                            }
-                        } else {
-                            warning!(
-                                "[KR64] PARENT: could not find find_property pattern in /init (TWRP version mismatch?) — init may crash with SIGSEGV when accessing properties"
-                            );
-                        }
-                    } else {
-                        info!(
-                            "[KR64] PARENT: /init find_property() already patched (idempotent skip)"
-                        );
-                    }
-                }
-                Err(e) => warning!(
-                    "[KR64] PARENT: failed to read /init for find_property patching: {} (init may crash with SIGSEGV)",
-                    e
-                ),
-            }
-        }
+        // No code runs here. This comment exists to document WHY the
+        // old binary patch was removed and where the equivalent
+        // behaviour now lives (vfs.rs + ptrace_emu.rs's open path).
     }
 
     // Always overwrite /vendor/etc/fstab.ranchu with a minimal stub.
