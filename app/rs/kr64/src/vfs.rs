@@ -107,8 +107,38 @@ impl Vfs {
     /// Adding the Android nodes here is harmless for TWRP (the host
     /// kernel still serves the real `/proc/*` in non-root mode), and it
     /// keeps a single source of truth for what the Vfs knows about.
+    ///
+    /// ## Property area: OLD single-file format (AOSP 5.1 bionic)
+    ///
+    /// TWRP's bionic (AOSP 5.1) opens `/dev/__properties__` as a SINGLE
+    /// FILE — the OLD pre-Android-8 property area layout. It does NOT
+    /// use `/dev/__properties__/properties_serial` (the NEW Android 8+
+    /// subdirectory format that `new_android()` registers below). So
+    /// `new_twrp()` overrides the parent `/dev/__properties__` entry to
+    /// be a `Synthetic` FILE (not `SyntheticDir`) with the OLD-format
+    /// `prop_area` header (128KB) — and removes the Android-guest
+    /// `properties_serial` entry that can't exist when the parent is a
+    /// file.
+    ///
+    /// This is the root-cause fix for the SIGSEGV at rip=0x809255d in
+    /// TWRP init's `find_property()` (NULL `__system_property_area__`
+    /// because `__system_property_area_init` could not open/mmap
+    /// `/dev/__properties__`). See worklog 5-Z's disassembly report.
     pub fn new_twrp() -> Self {
-        Self::new_android(1)
+        let mut vfs = Self::new_android(1);
+        // Override /dev/__properties__ for TWRP's AOSP 5.1 bionic: provide
+        // a 128KB Synthetic FILE with the OLD-format prop_area header.
+        vfs.entries.insert(
+            "/dev/__properties__".to_string(),
+            VfsNode::Synthetic(make_old_format_property_area()),
+        );
+        // The Android-guest `/dev/__properties__/properties_serial` path
+        // is not used by TWRP's bionic and is unreachable once the parent
+        // `/dev/__properties__` is a regular file. Remove it so the SIGSYS
+        // handler's `materialize()` doesn't try to create a child file
+        // inside a file (which would fail with ENOTDIR).
+        vfs.entries.remove("/dev/__properties__/properties_serial");
+        vfs
     }
 
     /// Create a Vfs pre-populated for Android-guest boot.
@@ -292,6 +322,91 @@ fn make_minimal_property_area() -> Vec<u8> {
         128,
         "property area header must be exactly 128 bytes"
     );
+    buf
+}
+
+/// Standard property area file size (128 KB) — `__system_property_area_init`
+/// calls `ftruncate(fd, 0x20000)` to extend the file to this size, and mmaps
+/// the same length. Pre-sizing the file avoids any filesystem-specific
+/// behaviour around ftruncate on a 0-byte file.
+pub const PROP_AREA_SIZE: usize = 0x20000;
+
+/// OLD-format `prop_area` version constant (AOSP 5.1 bionic).
+///
+/// This is the value `__system_property_area_init` writes to
+/// `prop_area.version` in TWRP's i386 init binary (extracted from the
+/// disassembly at worklog 5-Z Step 3 — the version is the constant stored
+/// at offset 12 of the prop_area header). Stock AOSP 5.1 source defines
+/// this as `PROP_AREA_VERSION` in `bionic/libc/include/sys/_system_properties.h`.
+/// NOTE: this is NOT 1 (the NEW Android 8+ format version that
+/// `make_minimal_property_area()` uses for `/dev/__properties__/properties_serial`).
+pub const PROP_AREA_VERSION_OLD: u32 = 0xfc6ed0ab;
+
+/// Build a valid OLD-format AOSP `__system_property_area__` for TWRP's
+/// AOSP 5.1 bionic — the proper root-cause fix for the SIGSEGV at
+/// rip=0x809255d in `find_property()` (worklog 5-Z).
+///
+/// TWRP's bionic opens `/dev/__properties__` as a SINGLE FILE (no
+/// subdirectory) — the OLD pre-Android-8 property area layout. The NEW
+/// Android 8+ layout uses `/dev/__properties__/properties_serial` (a
+/// file under a subdirectory), which TWRP's bionic never opens.
+///
+/// Layout (from `bionic/libc/include/sys/_system_properties.h` AOSP 5.1):
+/// ```c
+/// struct prop_area {
+///     unsigned bytes_used;       // 4 — payload bytes used (0 for empty)
+///     unsigned volatile serial;  // 4 — increment on write (0 = stable)
+///     unsigned magic;            // 4 = PROP_AREA_MAGIC (0x504f5250 "PROP")
+///     unsigned version;          // 4 = PROP_AREA_VERSION (0xfc6ed0ab OLD)
+///     unsigned reserved[28];     // 112 bytes of zero (rounds out 128-byte header)
+///     char data[];               // payload: prop_info structs (empty)
+/// };
+/// ```
+/// Total header = 128 bytes. Standard area file size = 0x20000 (128 KB).
+///
+/// The OLD-format version is `0xfc6ed0ab` (NOT `1` like the NEW format
+/// used by `make_minimal_property_area()` for the Android 8+ path). The
+/// magic is the same `0x504f5250` ("PROP") in both formats.
+///
+/// The 128 KB file size matches what `__system_property_area_init` calls
+/// `ftruncate(fd, 0x20000)` + `mmap(NULL, 0x20000, ...)` against. With a
+/// pre-sized file the open→ftruncate→mmap sequence has the best chance of
+/// succeeding regardless of host filesystem quirks (some filesystems reject
+/// `mmap(MAP_SHARED)` on a 0-byte regular file).
+///
+/// Even though `__system_property_area_init` will `memset` the in-memory
+/// header and overwrite `magic/version/bytes_used/serial` itself, we still
+/// emit the correct header bytes — this makes the file self-describing if
+/// any code reads it without going through bionic's init path (e.g. host
+/// diagnostics, `adb pull` inspection, future property-injection hooks).
+pub fn make_old_format_property_area() -> Vec<u8> {
+    const PROP_AREA_MAGIC: u32 = 0x504f5250; // "PROP" little-endian
+    const PROP_AREA_HEADER_SIZE: usize = 128;
+    let mut buf = Vec::with_capacity(PROP_AREA_SIZE);
+    // bytes_used: 0 (no properties have been written to the data area).
+    // NOTE: AOSP 5.1 stock bionic's `init_property_area()` sets
+    // `pa->bytes_used = sizeof(prop_area)` (= 128) after mmap. We emit 0
+    // here; init will overwrite it on first mmap+memset regardless. The
+    // find_property() crash fix only needs the data area zero-initialised
+    // (which it is, via the resize() zero-fill below) so the root prop_bt
+    // is all-zeros and the tree-walk returns NULL immediately.
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // serial: 0 (stable, no concurrent writes).
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // magic = "PROP"
+    buf.extend_from_slice(&PROP_AREA_MAGIC.to_le_bytes());
+    // version = 0xfc6ed0ab (OLD AOSP 5.1 format)
+    buf.extend_from_slice(&PROP_AREA_VERSION_OLD.to_le_bytes());
+    // reserved[28] = 112 bytes of zero (rounds out the 128-byte header)
+    buf.extend_from_slice(&[0u8; 112]);
+    debug_assert_eq!(
+        buf.len(),
+        PROP_AREA_HEADER_SIZE,
+        "OLD-format prop_area header must be exactly 128 bytes"
+    );
+    // data area: zero-pad to 0x20000 (128 KB) so ftruncate + mmap MAP_SHARED
+    // succeed (the file needs to be backed by real storage of the right size).
+    buf.resize(PROP_AREA_SIZE, 0u8);
     buf
 }
 
@@ -643,10 +758,13 @@ mod tests {
     }
 
     #[test]
-    fn test_vfs_resolves_properties_serial() {
-        let vfs = Vfs::new_twrp();
+    fn test_vfs_resolves_properties_serial_in_android_mode() {
+        // The NEW Android 8+ format `/dev/__properties__/properties_serial`
+        // is registered in `new_android()` (Android-guest path). It is NOT
+        // in `new_twrp()` (TWRP path uses the OLD single-file format).
+        let vfs = Vfs::new_android(1);
         let node = vfs.resolve("/dev/__properties__/properties_serial");
-        assert!(node.is_some(), "properties_serial must be in the VFS");
+        assert!(node.is_some(), "properties_serial must be in new_android()");
         match node.unwrap() {
             VfsNode::Dynamic(_) => { /* ok */ }
             other => panic!("expected Dynamic, got {:?}", other),
@@ -654,31 +772,33 @@ mod tests {
     }
 
     #[test]
-    fn test_vfs_is_synthetic() {
-        let vfs = Vfs::new_twrp();
+    fn test_vfs_is_synthetic_android_mode() {
+        let vfs = Vfs::new_android(1);
         assert!(vfs.is_synthetic("/dev/__properties__/properties_serial"));
         assert!(vfs.is_synthetic("/dev/__properties__"));
         assert!(!vfs.is_synthetic("/dev/null"));
     }
 
     #[test]
-    fn test_vfs_materialize_writes_properties_serial_file() {
-        // Materialize the property-area Dynamic node into a temp rootfs
-        // and verify the file content matches make_minimal_property_area().
+    fn test_vfs_materialize_writes_properties_serial_file_android_mode() {
+        // Materialize the NEW Android 8+ format property-area Dynamic node
+        // into a temp rootfs and verify the file content matches
+        // make_minimal_property_area(). Uses new_android(1) because
+        // new_twrp() overrides /dev/__properties__ with the OLD-format file.
         let tmp = std::env::temp_dir().join(format!("kr64_vfs_test_{}", std::process::id()));
         let rootfs = tmp.to_str().unwrap();
         // Clean up any prior run + recreate
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        let vfs = Vfs::new_twrp();
+        let vfs = Vfs::new_android(1);
         vfs.materialize("/dev/__properties__/properties_serial", rootfs)
             .expect("materialize must succeed");
         let written = std::fs::read(format!("{}/dev/__properties__/properties_serial", rootfs))
             .expect("file must exist after materialize");
         assert_eq!(written, make_minimal_property_area());
         assert_eq!(written.len(), 128);
-        // The directory itself is registered as a SyntheticDir entry —
-        // materializing it must create_dir_all the dir at rootfs.
+        // The directory itself is registered as a SyntheticDir entry in
+        // new_android(1) — materializing it must create_dir_all the dir at rootfs.
         vfs.materialize("/dev/__properties__", rootfs)
             .expect("SyntheticDir materialize must succeed");
         let md = std::fs::metadata(format!("{}/dev/__properties__", rootfs))
@@ -688,12 +808,164 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // ===== Tests for the OLD-format /dev/__properties__ file (worklog 6-A) =====
+    // TWRP's AOSP 5.1 bionic opens /dev/__properties__ as a SINGLE FILE
+    // (not the Android 8+ subdirectory). new_twrp() registers it as a
+    // Synthetic FILE with the OLD-format prop_area header (128KB).
+
+    #[test]
+    fn test_old_format_property_area_header() {
+        let buf = make_old_format_property_area();
+        assert_eq!(
+            buf.len(),
+            PROP_AREA_SIZE,
+            "total file size must be 0x20000 (128 KB)"
+        );
+        // Header is the first 128 bytes; verify each field.
+        // bytes_used = 0 (no properties written yet)
+        assert_eq!(&buf[0..4], &0u32.to_le_bytes(), "bytes_used must be 0");
+        // serial = 0 (stable, no concurrent writes)
+        assert_eq!(&buf[4..8], &0u32.to_le_bytes(), "serial must be 0");
+        // magic = "PROP" (0x504f5250 little-endian)
+        assert_eq!(
+            &buf[8..12],
+            &0x504f5250u32.to_le_bytes(),
+            "magic must be 0x504f5250 ('PROP')"
+        );
+        // version = 0xfc6ed0ab (OLD AOSP 5.1 format)
+        assert_eq!(
+            &buf[12..16],
+            &PROP_AREA_VERSION_OLD.to_le_bytes(),
+            "version must be 0xfc6ed0ab (OLD AOSP 5.1 format)"
+        );
+        // Sanity: must NOT be the NEW format version (1).
+        assert_ne!(
+            &buf[12..16],
+            &1u32.to_le_bytes(),
+            "must not be NEW format (version 1)"
+        );
+    }
+
+    #[test]
+    fn test_old_format_property_area_size() {
+        let buf = make_old_format_property_area();
+        // Standard property area size = 0x20000 = 131072 bytes = 128 KB.
+        assert_eq!(
+            buf.len(),
+            0x20000,
+            "OLD-format property area must be 0x20000 bytes"
+        );
+        assert_eq!(buf.len(), 128 * 1024, "must be 128 KB exactly");
+        // All bytes beyond the 128-byte header must be zero (no props).
+        for (i, &b) in buf[128..].iter().enumerate() {
+            assert_eq!(
+                b,
+                0u8,
+                "byte at offset {} (in data area) must be zero",
+                128 + i
+            );
+        }
+    }
+
+    #[test]
+    fn test_vfs_resolves_dev_properties_old_format() {
+        // new_twrp() must register /dev/__properties__ as a Synthetic FILE
+        // (the OLD-format single-file layout TWRP's AOSP 5.1 bionic opens).
+        let vfs = Vfs::new_twrp();
+        let node = vfs.resolve("/dev/__properties__");
+        assert!(
+            node.is_some(),
+            "/dev/__properties__ must resolve in new_twrp()"
+        );
+        match node.unwrap() {
+            VfsNode::Synthetic(bytes) => {
+                assert_eq!(
+                    bytes.len(),
+                    PROP_AREA_SIZE,
+                    "Synthetic /dev/__properties__ must be 0x20000 bytes"
+                );
+                // Header sanity: magic + version must match OLD format.
+                assert_eq!(
+                    &bytes[8..12],
+                    &0x504f5250u32.to_le_bytes(),
+                    "magic must be PROP"
+                );
+                assert_eq!(
+                    &bytes[12..16],
+                    &PROP_AREA_VERSION_OLD.to_le_bytes(),
+                    "version must be OLD-format 0xfc6ed0ab"
+                );
+            }
+            other => panic!("expected Synthetic, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_vfs_twrp_does_not_register_properties_serial() {
+        // new_twrp() must NOT register the Android 8+ subdirectory path
+        // (it conflicts with the file-only /dev/__properties__ entry).
+        let vfs = Vfs::new_twrp();
+        assert!(
+            vfs.resolve("/dev/__properties__/properties_serial")
+                .is_none(),
+            "new_twrp() must not register /dev/__properties__/properties_serial"
+        );
+    }
+
+    #[test]
+    fn test_vfs_materialize_writes_old_format_properties_file() {
+        // Materialize the OLD-format Synthetic file into a temp rootfs and
+        // verify the on-disk file is a regular file (NOT a directory) with
+        // the full 128KB OLD-format content.
+        let tmp =
+            std::env::temp_dir().join(format!("kr64_vfs_old_prop_test_{}", std::process::id()));
+        let rootfs = tmp.to_str().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let vfs = Vfs::new_twrp();
+        vfs.materialize("/dev/__properties__", rootfs)
+            .expect("materialize /dev/__properties__ must succeed");
+        let written = std::fs::read(format!("{}/dev/__properties__", rootfs))
+            .expect("file must exist after materialize");
+        assert_eq!(written, make_old_format_property_area());
+        assert_eq!(written.len(), PROP_AREA_SIZE);
+        // Must be a regular file (NOT a directory) — TWRP's bionic opens it
+        // with O_RDWR and mmaps it as a regular file.
+        let md = std::fs::metadata(format!("{}/dev/__properties__", rootfs))
+            .expect("metadata must succeed");
+        assert!(
+            md.is_file(),
+            "/dev/__properties__ must be a regular FILE in new_twrp()"
+        );
+        assert!(
+            !md.is_dir(),
+            "/dev/__properties__ must NOT be a directory in new_twrp()"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_vfs_materialize_no_op_for_unknown_path() {
         let vfs = Vfs::new_twrp();
         // A path that is NOT in the VFS must materialize as a no-op Ok.
         vfs.materialize("/dev/null", "/tmp/nonexistent_rootfs")
             .expect("materialize on unknown path must be Ok no-op");
+    }
+
+    #[test]
+    fn test_vfs_is_synthetic_twrp_old_format() {
+        // new_twrp() must register /dev/__properties__ (as a Synthetic FILE)
+        // and NOT register /dev/__properties__/properties_serial.
+        let vfs = Vfs::new_twrp();
+        assert!(
+            vfs.is_synthetic("/dev/__properties__"),
+            "/dev/__properties__ must be synthetic in new_twrp()"
+        );
+        assert!(
+            !vfs.is_synthetic("/dev/__properties__/properties_serial"),
+            "properties_serial must NOT be synthetic in new_twrp()"
+        );
+        assert!(!vfs.is_synthetic("/dev/null"));
     }
 
     // ===== Tests for the new /proc/self/* Dynamic nodes (worklog 4-B) =====
