@@ -26,15 +26,24 @@
 //     - readlink/readlinkat → translate path
 //     - chdir → translate path
 //     - statx → translate path
-//     - fchown / fchmod / capget / ioprio_get / ioprio_set → fake success (return 0)
+//     - fchown / fchmod / capget / ioprio_get / ioprio_set /
+//       mount / rt_sigprocmask → fake success (return 0)
 //       TWRP init calls these early in startup; as untrusted_app they
-//       all return EPERM and init gives up with exit(1). We intercept
-//       them at syscall EXIT and force the return value to 0 so init
-//       proceeds. They are ALSO handled in the SIGSYS path in case
-//       some devices' seccomp filter blocks them outright.
+//       all return EPERM (or are seccomp-blocked with SIGSYS) and init
+//       gives up with exit(1). We intercept them at syscall EXIT and
+//       force the return value to 0 so init proceeds. They are ALSO
+//       handled in the SIGSYS path in case some devices' seccomp filter
+//       blocks them outright.
 //       (ioprio_set was MISSING from this set until Task 5-S — see the
 //       comment on `ioprio_set` in `ChildAbi` for the verified
 //       per-ABI numbers and the dispatcher's misdiagnosis it corrected.)
+//       (mount + rt_sigprocmask were MISSING from the EXIT-handler's
+//       fake-success set until Task 5-T — see the doc on
+//       `compute_exit_return_value` for the verified per-ABI numbers
+//       and the dispatcher's i386-rt_sigprocmask-number misdiagnosis it
+//       corrected. This was the REAL root cause of the UI E2E TWRP init
+//       exit(1) at iter 189: mount(nr=21) returned 21 — the syscall
+//       NUMBER, not 0 — four times in a row, then init exit(1)'d.)
 //       NOTE: the original diagnostic log reported "fchown (nr=91)"
 //       but nr=91 on x86_64 is actually fchmod (real fchown is 93).
 //       We intercept BOTH — the field named `fchown` uses the correct
@@ -477,7 +486,16 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     statx: 383,
     access: 33,
     faccessat: 307,
-    rt_sigprocmask: 14,
+    // i386 rt_sigprocmask = 175 (per /usr/include/x86_64-linux-gnu/
+    // asm/unistd_32.h, verified directly against the kernel's UAPI
+    // header in Task 5-T). Pre-5-T this was 14 — WRONG: i386 syscall 14
+    // is `mknod`, NOT `rt_sigprocmask`. The kr64 SIGSYS-handler
+    // diagnostic was therefore mislabelling every mknod SIGSYS as
+    // "rt_sigprocmask() nr=14" — see the worklog entry for Task 5-T
+    // for the full root-cause analysis. The x86_64 number (14 below)
+    // IS correctly rt_sigprocmask on x86_64; this correction is i386-
+    // only because the i386 and x86_64 syscall tables diverge here.
+    rt_sigprocmask: 175,
     readlink: 85,
     readlinkat: 303,
     chdir: 12,
@@ -585,7 +603,14 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     fchmodat: 53,
     fchownat: 54,
     execve: 221, // SYS_execve (aarch64)
-    mount: 165,
+    // aarch64 mount = 40 (per /usr/include/asm-generic/unistd.h,
+    // verified directly against the kernel's UAPI header in Task 5-T).
+    // Pre-5-T this was 165 — WRONG: aarch64 syscall 165 is `getrusage`,
+    // NOT `mount` (the 165 value was copy-pasted from ABI_X86_64 where
+    // it IS correct). With the wrong number the SIGSYS handler's
+    // `mount` branch would never match a real mount() call on aarch64
+    // (and worse, would have spurious-matched any getrusage SIGSYS).
+    mount: 40,
     chroot: 51,
     mkdir: 34,
     unshare: 97,
@@ -1005,6 +1030,54 @@ fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 /// against the kernel's UAPI headers in Task 5-S — see the comment on
 /// `ioprio_set` in `ChildAbi` for the per-ABI values.
 ///
+/// `mount` and `rt_sigprocmask` were ALSO MISSING until Task 5-T. These
+/// are the REAL root cause of the UI E2E TWRP init exit(1) at iter 189
+/// (the ioprio_set hypothesis from 5-S was a misdiagnosis — see
+/// DISPATCHER-CORRECTION-3 in the worklog: nr=252 in the logcat was
+/// `exit_group`, the SYMPTOM of init deciding to exit, not the cause).
+/// The 3b571fe UI E2E logcat (re-read after 5-S caught the ioprio
+/// misdiagnosis) shows:
+/// ```text
+/// #26: mount(nr=21)         → returns 21  ← BUG! syscall NUMBER, not 0
+/// #29: mount(nr=21)         → returns 21
+/// #30: mount(nr=21)         → returns 21
+/// #31: mount(nr=21)         → returns 21
+/// #34: rt_sigprocmask(nr=14) → returns 14  ← BUG! (see NOTE below)
+/// ... then exit_group(1)
+/// ```
+///
+/// The mount SIGSYS handler already returns 0 via the
+/// `mount/mkdir/chmod/chroot/unshare` block — but in DESYNC mode
+/// (5-J's fix) the SIGSYS handler SKIPS its `ptrace_setregs` call, so
+/// the EXIT handler's write is the only one. Without `mount` in this
+/// list, the EXIT handler leaves rax = the kernel's syscall-number-leak
+/// value (21 on i386) → init sees "mount returned 21" four times in a
+/// row → init's mount-sequence-failed path → exit_group(1).
+///
+/// NOTE on the i386 rt_sigprocmask number: the diagnostic label
+/// "rt_sigprocmask() nr=14" in the 3b571fe logcat is itself a misnomer
+/// caused by a SECOND bug fixed in this same commit: ABI_X86_32.
+/// rt_sigprocmask was previously 14 — but i386 syscall 14 is actually
+/// `mknod` (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h, verified
+/// in Task 5-T). The real i386 rt_sigprocmask number is 175. So the
+/// child was EITHER calling mknod (syscall 14 — TWRP init does call
+/// mknod for /dev nodes during early boot) OR calling rt_sigprocmask
+/// (syscall 175 — also called by bionic's signal-mask init); either way
+/// the kr64 SIGSYS handler was matching syscall 14 against the (wrong)
+/// ABI_X86_32.rt_sigprocmask=14 and labelling it "rt_sigprocmask".
+/// After this commit the i386 rt_sigprocmask number is corrected to
+/// 175 AND both mount and rt_sigprocmask are in the fake-success list,
+/// so the EXIT handler writes rax=0 for whichever of the two the child
+/// actually calls. (If the child was actually calling mknod, this
+/// commit does NOT add mknod to the fake-success list — that is left
+/// for a follow-up; see the worklog entry for 5-T.)
+///
+/// The per-ABI rt_sigprocmask + mount numbers (verified against the
+/// kernel's UAPI headers in Task 5-T):
+///   i386:   mount=21,  rt_sigprocmask=175   (was WRONG: rt_sigprocmask=14)
+///   x86_64: mount=165, rt_sigprocmask=14    (both already correct)
+///   aarch64: mount=40, rt_sigprocmask=135   (mount was WRONG: 165)
+///
 /// Returns `Some(0)` for the faked-success syscalls, `None` for syscalls
 /// whose return value the caller should leave untouched. The value (0) is
 /// hard-coded because every faked-success syscall uses the same return
@@ -1016,6 +1089,12 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
     // Order the comparisons by expected frequency-of-occurrence during
     // TWRP init's early boot: chmod and the *at siblings are called
     // multiple times before the SIGSEGV that motivated this fix.
+    //
+    // Task 5-T added mount + rt_sigprocmask to this set: in DESYNC mode
+    // (5-J) the SIGSYS handler skips setregs, so the EXIT handler is
+    // the only writer — and these two were missing, so the kernel's
+    // syscall-number-leak value (21 for mount, 14/175 for rt_sigprocmask)
+    // was the final value the child saw → init exit(1).
     if syscall_nr == abi.chmod
         || syscall_nr == abi.fchmod
         || syscall_nr == abi.fchown
@@ -1026,6 +1105,8 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.capget
         || syscall_nr == abi.ioprio_get
         || syscall_nr == abi.ioprio_set
+        || syscall_nr == abi.mount
+        || syscall_nr == abi.rt_sigprocmask
     {
         Some(0)
     } else {
@@ -1096,15 +1177,16 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
 /// `compute_exit_return_value` is consulted by BOTH the EXIT handler
 /// (at line ~2434) and the SIGSYS handler's "fchown/fchmod/capget/
 /// ioprio_get/ioprio_set/lchown/chown/fchmodat/fchownat" branch
-/// (which mirrors the same set). For chmod specifically, the SIGSYS
-/// "mount/mkdir/chmod/chroot/unshare" branch also returns 0. So in
-/// DESYNC mode the EXIT handler has ALREADY written rax=0 for every
-/// syscall that the SIGSYS handler would also write rax=0 for — the
-/// SIGSYS handler's `setregs` is genuinely redundant in this case.
-/// Skipping it cannot leave rax non-zero (the EXIT handler wrote 0).
-/// It only AVOIDS the race where the SIGSYS handler's whole-struct
-/// `setregs` clobbers the EXIT handler's rax=0 with a kernel-
-/// re-snapshotted value.
+/// (which mirrors the same set). For chmod + mount specifically, the
+/// SIGSYS "mount/mkdir/chmod/chroot/unshare" branch ALSO returns 0,
+/// AND chmod + mount are in `compute_exit_return_value` (mount was
+/// added in Task 5-T). So in DESYNC mode the EXIT handler has
+/// ALREADY written rax=0 for every faked-success syscall that the
+/// SIGSYS handler would also write rax=0 for — the SIGSYS handler's
+/// `setregs` is genuinely redundant in this case. Skipping it cannot
+/// leave rax non-zero (the EXIT handler wrote 0). It only AVOIDS the
+/// race where the SIGSYS handler's whole-struct `setregs` clobbers
+/// the EXIT handler's rax=0 with a kernel-re-snapshotted value.
 fn should_skip_sigsys_setregs(in_syscall_at_sigsys: bool) -> bool {
     // DESYNC = SIGSYS fired AFTER the EXIT handler. The EXIT handler
     // already wrote rax=0, so the SIGSYS handler's setregs is
@@ -2513,13 +2595,20 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // ── TWRP-init EPERM / syscall-number-leak workaround ───
                     //
                     // chmod / fchmod / fchown / lchown / chown / fchmodat /
-                    // fchownat / capget / ioprio_get / ioprio_set all return
-                    // EPERM as untrusted_app (no CAP_CHOWN / CAP_FOWNER /
-                    // CAP_SYS_ADMIN / CAP_SYS_RESOURCE / CAP_SYS_NICE).
+                    // fchownat / capget / ioprio_get / ioprio_set / mount /
+                    // rt_sigprocmask all return EPERM (or are seccomp-blocked
+                    // with SIGSYS) as untrusted_app (no CAP_CHOWN /
+                    // CAP_FOWNER / CAP_SYS_ADMIN / CAP_SYS_RESOURCE /
+                    // CAP_SYS_NICE; mount/rt_sigprocmask hit the seccomp
+                    // filter for sys_admin-related operations).
                     // TWRP's init calls these early in its startup and
                     // EITHER gives up with exit(1) (capget / ioprio_get /
                     // ioprio_set / fchown / fchmod — the Round-78/79 blocker
-                    // fixed by commit f279552; ioprio_set added by Task 5-S)
+                    // fixed by commit f279552; ioprio_set added by Task 5-S;
+                    // mount + rt_sigprocmask added by Task 5-T — these were
+                    // the REAL root cause of the UI E2E TWRP init exit(1)
+                    // at iter 189, misdiagnosed earlier as ioprio_set=252
+                    // which is actually exit_group)
                     // OR takes an error-handling path that ends up
                     // dereferencing NULL+0x90 (chmod/lchown/chown/fchmodat/
                     // fchownat — the Round-80/81 blocker fixed here, see the
@@ -3264,15 +3353,18 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         //     chains — the EXIT handler ALWAYS runs
                         //     first in DESYNC mode.
                         //   - mount/mkdir/chmod/chroot/unshare all return
-                        //     0 in the SIGSYS handler AND are covered by
-                        //     compute_exit_return_value for chmod (the
-                        //     others — mount/mkdir/chroot/unshare — are
-                        //     NOT in compute_exit_return_value, but in
-                        //     DESYNC mode the EXIT handler didn't write
-                        //     rax for them either, so skipping setregs
-                        //     leaves the kernel's value untouched — same
-                        //     as the previous behaviour for those
-                        //     syscalls in DESYNC mode).
+                        //     0 in the SIGSYS handler. chmod + mount are
+                        //     ALSO in compute_exit_return_value (mount was
+                        //     added in Task 5-T — see the doc on
+                        //     `compute_exit_return_value`), so in DESYNC
+                        //     mode the EXIT handler DID write rax=0 for
+                        //     them. mkdir/chroot/unshare are NOT in
+                        //     compute_exit_return_value, so in DESYNC
+                        //     mode the EXIT handler didn't write rax for
+                        //     them either — skipping setregs leaves the
+                        //     kernel's value untouched (same as the
+                        //     previous behaviour for those syscalls in
+                        //     DESYNC mode).
                         //   - shmget/shmat/shmctl return -ENOSYS in the
                         //     SIGSYS handler. These are NOT in
                         //     compute_exit_return_value, so the EXIT
@@ -3884,6 +3976,128 @@ mod tests {
         // (which must remain None).
         assert_eq!(ABI_X86_32.ioprio_get, 290, "i386 ioprio_get must be 290");
         assert_eq!(ABI_X86_32.ioprio_set, 289, "i386 ioprio_set must be 289");
+    }
+
+    // ── Task 5-T regression guards: mount + rt_sigprocmask numbers ──
+    //
+    // These guard the i386 rt_sigprocmask number correction (14 → 175)
+    // and the aarch64 mount number correction (165 → 40) — both verified
+    // against the kernel's UAPI headers in Task 5-T. The dispatcher's task
+    // spec for 5-T correctly identified the i386 rt_sigprocmask bug (14 is
+    // mknod, not rt_sigprocmask); the aarch64 mount bug (165 is getrusage,
+    // not mount) was found independently by the 5-T agent during the
+    // spec-mandated "VERIFY all syscall numbers against the local kernel
+    // header" step.
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_rt_sigprocmask_number_correct() {
+        // Regression guard (Task 5-T): the i386 rt_sigprocmask number
+        // MUST be 175 (per /usr/include/x86_64-linux-gnu/asm/
+        // unistd_32.h). Pre-5-T this was 14 — WRONG: i386 syscall 14 is
+        // `mknod`, NOT `rt_sigprocmask`. The kr64 SIGSYS-handler
+        // diagnostic was therefore mislabelling every mknod SIGSYS as
+        // "rt_sigprocmask() nr=14" (and conversely, every real
+        // rt_sigprocmask call on i386, which uses syscall 175, was
+        // falling through to the "unexpected SIGSYS" else branch).
+        //
+        // The dispatcher's task spec for 5-T explicitly directed this
+        // fix; verified directly against the kernel's UAPI header.
+        assert_eq!(
+            ABI_X86_32.rt_sigprocmask, 175,
+            "i386 rt_sigprocmask must be 175 (14 is mknod, not rt_sigprocmask)"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_mount_number_correct() {
+        // Regression guard (Task 5-T): the i386 mount number MUST be
+        // 21 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h). This
+        // was already correct pre-5-T; the test exists to lock it in
+        // so a future "fix" based on incorrect numbers (e.g. someone
+        // copy-pasting the x86_64 mount number 165) can't silently
+        // regress it.
+        //
+        // Mount is the syscall whose non-zero return value (21) at
+        // EXIT was the REAL root cause of the UI E2E TWRP init
+        // exit(1) at iter 189 — see the worklog entry for 5-T.
+        assert_eq!(
+            ABI_X86_32.mount, 21,
+            "i386 mount must be 21 (per asm/unistd_32.h)"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_mount_number_correct() {
+        // Regression guard (Task 5-T): the aarch64 mount number MUST
+        // be 40 (per /usr/include/asm-generic/unistd.h). Pre-5-T this
+        // was 165 — WRONG: aarch64 syscall 165 is `getrusage`, NOT
+        // `mount`. The 165 value was copy-pasted from ABI_X86_64 (where
+        // it IS correct for x86_64) without adjusting for the asm-
+        // generic table divergence. With the wrong number the SIGSYS
+        // handler's `mount` branch would never match a real mount()
+        // call on aarch64 (and worse, would have spurious-matched any
+        // getrusage SIGSYS). This bug was found independently by the
+        // 5-T agent during the spec-mandated "VERIFY all syscall
+        // numbers against the local kernel header" step.
+        assert_eq!(
+            ABI_AARCH64.mount, 40,
+            "aarch64 mount must be 40 (165 is getrusage, not mount)"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_mount_returns_zero() {
+        // i386 mount = 21. THIS is the exact syscall that was returning
+        // 21 (the syscall NUMBER) at EXIT four times in a row in the
+        // 3b571fe UI E2E logcat — the REAL root cause of TWRP init's
+        // exit(1) at iter 189 (misdiagnosed earlier as ioprio_set=252,
+        // which is actually exit_group, the SYMPTOM of init deciding to
+        // exit, not the cause).
+        //
+        // Pre-5-T, mount was NOT in compute_exit_return_value's fake-
+        // success list, so in DESYNC mode (5-J's fix that makes the
+        // SIGSYS handler SKIP setregs) the EXIT handler left rax = the
+        // kernel's syscall-number-leak value (21). After 5-T the EXIT
+        // handler writes rax=0, so init sees "mount returned 0 (success)"
+        // and proceeds past the mount-sequence-failed check.
+        //
+        // The mount SIGSYS handler already returns 0 via the
+        // mount/mkdir/chmod/chroot/unshare block — but in DESYNC mode
+        // that writeback is skipped, so the EXIT handler's write is
+        // the only one. This test verifies the EXIT handler will now
+        // fake-success mount.
+        assert_eq!(compute_exit_return_value(21, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(21, &ABI_X86_32), "mount");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_rt_sigprocmask_returns_zero() {
+        // i386 rt_sigprocmask = 175 (corrected in Task 5-T from the
+        // wrong value 14, which is actually mknod on i386).
+        //
+        // Pre-5-T, rt_sigprocmask was NOT in compute_exit_return_value's
+        // fake-success list. The 3b571fe UI E2E logcat showed
+        // "rt_sigprocmask() nr=14 → returns 14" — the syscall NUMBER,
+        // not 0 — and init exited(1). In DESYNC mode (5-J's fix that
+        // makes the SIGSYS handler SKIP setregs), the EXIT handler's
+        // write is the only one — and rt_sigprocmask wasn't faked there,
+        // so rax retained the kernel's syscall-number-leak value (14
+        // for the mislabelled mknod, or 175 for a real rt_sigprocmask
+        // call).
+        //
+        // After 5-T the EXIT handler writes rax=0 for whichever of
+        // mount(21) or rt_sigprocmask(175) the child actually calls.
+        // (NOTE: if the child was actually calling mknod — syscall 14
+        // on i386 — then this fix does NOT help; mknod is not in the
+        // fake-success list. See the worklog entry for 5-T for the
+        // honest caveat + recommended follow-up.)
+        assert_eq!(compute_exit_return_value(175, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(175, &ABI_X86_32), "rt_sigprocmask");
     }
 
     #[cfg(target_arch = "x86_64")]
