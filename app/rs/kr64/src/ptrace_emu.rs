@@ -241,6 +241,45 @@ struct ChildAbi {
     fchmod: i64,
     capget: i64,
     ioprio_get: i64,
+    // ── chmod / lchown / chown / fchmodat / fchownat ─────────────
+    //
+    // These are the path-taking siblings of fchmod/fchown. TWRP's
+    // init calls `chmod("/proc/cmdline", ...)` TWICE in a row right
+    // before parsing /proc/cmdline (verified in the dbcac85 / 4-E
+    // E2E log). If the chmod return value is not 0 (success), init's
+    // error-handling path corrupts a pointer that leads to a SIGSEGV
+    // at rip=0x809255d (NULL+0x90 deref) immediately after reading
+    // /proc/cmdline.
+    //
+    // The kernel leaves rax holding the syscall number (15 on i386,
+    // 90 on x86_64) at the syscall-EXIT stop when seccomp
+    // SECCOMP_RET_TRAP fires on i386 compat — NOT -ENOSYS (-38) as
+    // the kernel docs imply. Without forcing rax=0 here, init sees
+    // `chmod returned 15`, takes the error path, and crashes. See the
+    // "Decoded crash" block in the worklog entry for Task 5-A for the
+    // full sequence.
+    //
+    // We force rax=0 for ALL of these siblings at syscall-EXIT (see
+    // `compute_exit_return_value`). On i386 compat the fchmodat /
+    // fchownat numbers are large (306 / 298); on x86_64 they're 268
+    // / 257; on aarch64 only fchmodat (53) and fchownat (54) exist
+    // (asm-generic has no plain `chmod` / `lchown` / `chown` —
+    // bionic's `chmod(path, mode)` shim issues `fchmodat(AT_FDCWD,
+    // path, mode, 0)`, and similarly for chown).
+    //
+    // Pre-existing data note: the existing ABI_AARCH64.chmod field is
+    // set to 53 — that value IS fchmodat in asm-generic, so the
+    // SIGSYS handler has always routed aarch64 chmod through the
+    // fchmodat slot. We keep ABI_AARCH64.chmod=53 unchanged for
+    // backwards compatibility and ALSO expose fchmodat=53 explicitly
+    // so the EXIT handler matches both names. The net effect is that
+    // syscall 53 on aarch64 is faked-success at EXIT (the desired
+    // behaviour).
+    chmod: i64,
+    lchown: i64,
+    chown: i64,
+    fchmodat: i64,
+    fchownat: i64,
     // execve syscall number for this ABI. Used to detect when the child
     // replaces its image (kr64 → TWRP init, or TWRP init → recovery), so
     // we can reset the lazily-detected ABI and re-read /proc/<pid>/exe
@@ -256,7 +295,6 @@ struct ChildAbi {
     mount: i64,
     chroot: i64,
     mkdir: i64,
-    chmod: i64,
     unshare: i64,
     // SysV shared-memory syscalls (shmget / shmat / shmctl). TWRP
     // init calls shmget() during early boot — Android's
@@ -359,11 +397,20 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     fchmod: 91,
     capget: 125,
     ioprio_get: 252,
+    // chmod / lchown / chown / fchmodat / fchownat (x86_64 numbers
+    // per asm/unistd_64.h):
+    //   chmod=90, lchown=94, chown=182, fchmodat=268, fchownat=257.
+    // We ALSO fake success (return 0) for these at syscall-EXIT —
+    // see the comment on `chmod` in `ChildAbi` for why.
+    chmod: 90,
+    lchown: 94,
+    chown: 182,
+    fchmodat: 268,
+    fchownat: 257,
     execve: 59, // SYS_execve (x86_64)
     mount: 165,
     chroot: 161,
     mkdir: 83,
-    chmod: 90,
     unshare: 272,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. x86_64: shmget=29, shmat=30, shmctl=31
@@ -405,11 +452,25 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     fchmod: 94,
     capget: 184,
     ioprio_get: 290,
+    // chmod / lchown / chown / fchmodat / fchownat (i386 numbers
+    // per asm-i386/unistd_32.h):
+    //   chmod=15, lchown=16, chown=182, fchmodat=306, fchownat=298.
+    //
+    // CRITICAL: i386 lchown is 16, NOT 94 (94 is fchmod on i386).
+    // The task spec mistakenly listed lchown=96 for i386 — verified
+    // against asm-i386/unistd_32.h: the real value is 16.
+    //
+    // We ALSO fake success (return 0) for these at syscall-EXIT —
+    // see the comment on `chmod` in `ChildAbi` for why.
+    chmod: 15,
+    lchown: 16,
+    chown: 182,
+    fchmodat: 306,
+    fchownat: 298,
     execve: 11, // SYS_execve (i386)
     mount: 21,
     chroot: 61,
     mkdir: 39,
-    chmod: 15,
     unshare: 310,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. i386: shmget=29, shmat=30, shmctl=31
@@ -459,11 +520,31 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     fchmod: 52,
     capget: 90,
     ioprio_get: 31,
+    // chmod / lchown / chown / fchmodat / fchownat (aarch64 numbers
+    // per asm-generic/unistd.h):
+    //   fchmodat=53, fchownat=54.
+    // asm-generic has NO plain `chmod` / `lchown` / `chown` — bionic's
+    // `chmod(path, mode)` shim issues `fchmodat(AT_FDCWD, path, mode, 0)`
+    // (syscall 53), and similarly for chown (fchownat, syscall 54).
+    //
+    // The existing ABI_AARCH64.chmod field is set to 53 (the
+    // fchmodat number) for historical reasons — pre-5-A code routed
+    // the SIGSYS handler's "chmod" branch through syscall 53. We keep
+    // chmod=53 unchanged AND set fchmodat=53 so both names match.
+    // (Net effect: syscall 53 is faked-success at EXIT.)
+    //
+    // lchown / chown are set to -1 ("does not exist on this ABI") so
+    // the EXIT-handler comparisons simply never match them — they
+    // are reached only via fchownat (54) at runtime.
+    chmod: 53,
+    lchown: -1,
+    chown: -1,
+    fchmodat: 53,
+    fchownat: 54,
     execve: 221, // SYS_execve (aarch64)
     mount: 165,
     chroot: 51,
     mkdir: 34,
-    chmod: 53,
     unshare: 97,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
@@ -857,6 +938,50 @@ fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
     }
 }
 
+/// Decide whether a given syscall number should have its return value
+/// forced to 0 (success) at syscall-EXIT, and if so return `Some(0)`.
+///
+/// This is the central definition of "TWRP init treats a non-zero return
+/// here as a fatal error" — both the EXIT handler (for non-seccomp-blocked
+/// syscalls that return EPERM) and the SIGSYS handler (for
+/// seccomp-blocked syscalls) consult this list so the two paths agree.
+/// Without this single source of truth, the two handlers drifted:
+/// historically the EXIT handler covered only `fchown / fchmod / capget /
+/// ioprio_get` (commit f279552) and the SIGSYS handler covered only those
+/// four PLUS `chmod` (via the `mount/mkdir/chmod/chroot/unshare` block).
+/// The path-taking siblings `lchown / chown / fchmodat / fchownat` were
+/// MISSING from BOTH — when init called `chmod("/proc/cmdline", ...)` and
+/// the kernel left rax = 15 (the syscall number, NOT 0, NOT -ENOSYS, NOT
+/// -EPERM) at the syscall-EXIT stop on i386 compat, init's chmod-error
+/// path dereferenced a NULL+0x90 pointer and SIGSEGV'd.
+///
+/// Returns `Some(0)` for the faked-success syscalls, `None` for syscalls
+/// whose return value the caller should leave untouched. The value (0) is
+/// hard-coded because every faked-success syscall uses the same return
+/// value; if a future case needs a different value (e.g. -ENOSYS for a
+/// "this kernel does not implement X" emulation), it must be handled
+/// separately (as `shmget` is in the SIGSYS handler — see the
+/// `-(libc::ENOSYS as i64)` branch).
+fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
+    // Order the comparisons by expected frequency-of-occurrence during
+    // TWRP init's early boot: chmod and the *at siblings are called
+    // multiple times before the SIGSEGV that motivated this fix.
+    if syscall_nr == abi.chmod
+        || syscall_nr == abi.fchmod
+        || syscall_nr == abi.fchown
+        || syscall_nr == abi.lchown
+        || syscall_nr == abi.chown
+        || syscall_nr == abi.fchmodat
+        || syscall_nr == abi.fchownat
+        || syscall_nr == abi.capget
+        || syscall_nr == abi.ioprio_get
+    {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 /// Set a syscall argument register to `val`.
 ///
 /// `arg` is a register index into the `Regs` buffer reinterpreted as a
@@ -907,6 +1032,14 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "fchown"
     } else if nr == abi.fchmod {
         "fchmod"
+    } else if nr == abi.lchown {
+        "lchown"
+    } else if nr == abi.chown {
+        "chown"
+    } else if nr == abi.fchmodat {
+        "fchmodat"
+    } else if nr == abi.fchownat {
+        "fchownat"
     } else if nr == abi.capget {
         "capget"
     } else if nr == abi.ioprio_get {
@@ -2244,21 +2377,42 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         pending_getpid = false;
                     }
 
-                    // ── TWRP-init EPERM workaround ──────────────────────
+                    // ── TWRP-init EPERM / syscall-number-leak workaround ───
                     //
-                    // fchown / fchmod / capget / ioprio_get all return
-                    // EPERM as untrusted_app (no CAP_CHOWN / CAP_FOWNER /
-                    // CAP_SYS_ADMIN / CAP_SYS_RESOURCE / CAP_SYS_NICE).
-                    // TWRP's init calls these early in its startup and
-                    // GIVES UP with exit(1) if any of them fail, before
-                    // it has done any useful work.
+                    // chmod / fchmod / fchown / lchown / chown / fchmodat /
+                    // fchownat / capget / ioprio_get all return EPERM as
+                    // untrusted_app (no CAP_CHOWN / CAP_FOWNER / CAP_SYS_ADMIN
+                    // / CAP_SYS_RESOURCE / CAP_SYS_NICE). TWRP's init calls
+                    // these early in its startup and EITHER gives up with
+                    // exit(1) (capget/ioprio_get/fchown/fchmod — the
+                    // Round-78/79 blocker fixed by commit f279552) OR takes
+                    // an error-handling path that ends up dereferencing
+                    // NULL+0x90 (chmod/lchown/chown/fchmodat/fchownat — the
+                    // Round-80/81 blocker fixed here, see the worklog entry
+                    // for Task 5-A).
                     //
                     // These syscalls are NOT blocked by Android's seccomp
-                    // filter (no SIGSYS) — they execute normally and the
-                    // kernel returns -EPERM. So we cannot rely on the
-                    // SIGSYS handler below to mask them; we have to
-                    // intercept them HERE at the syscall-exit stop and
+                    // filter (no SIGSYS) on most devices — they execute
+                    // normally and the kernel returns -EPERM. So we cannot
+                    // rely on the SIGSYS handler below to mask them; we have
+                    // to intercept them HERE at the syscall-exit stop and
                     // overwrite the return value with 0 (success).
+                    //
+                    // THERE IS A SECOND, MORE SUBTLE CASE: on i386 compat
+                    // children the kernel does NOT always call
+                    // `syscall_set_return_value(-ENOSYS)` for
+                    // seccomp-aborted syscalls. The 4-E E2E log
+                    // (dbcac85) shows that at the syscall-EXIT stop for
+                    // `chmod("/proc/cmdline")` (i386 nr=15), rax = 15 (the
+                    // syscall number), NOT -ENOSYS (-38), NOT 0, NOT -EPERM.
+                    // The SIGSYS handler later sets rax = 0 — but only AFTER
+                    // this EXIT log fires, and only IF the kernel delivers
+                    // the SIGSYS signal-delivery-stop with the right
+                    // timing. Forcing rax = 0 HERE at the EXIT stop is a
+                    // belt-and-suspenders fix: it guarantees that even if the
+                    // SIGSYS handler's setregs doesn't take effect (for
+                    // whatever reason — kernel quirk, ptrace_setregs race,
+                    // signal-delivery ordering), the userspace sees rax = 0.
                     //
                     // `syscall_num` was computed at the top of the
                     // SIGTRAP|0x80 block from the SAME `regs` snapshot
@@ -2274,17 +2428,13 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // We do NOT log this branch on every iteration
                     // (only for the first 200) to avoid log spam if
                     // init calls fchown/fchmod in a hot loop.
-                    if syscall_num == abi.fchown
-                        || syscall_num == abi.fchmod
-                        || syscall_num == abi.capget
-                        || syscall_num == abi.ioprio_get
-                    {
+                    if let Some(_forced_ret) = compute_exit_return_value(syscall_num, &abi) {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
                             let name = syscall_name(syscall_num, &abi);
                             if loop_count <= 200 {
                                 log(&format!(
-                                    "intercepted {}() nr={} at EXIT → faking success (return 0) — original return was EPERM as untrusted_app",
+                                    "intercepted {}() nr={} at EXIT → faking success (return 0) — original return was EPERM as untrusted_app OR rax=nr leak on i386 compat seccomp-abort",
                                     name, syscall_num
                                 ));
                             }
@@ -2714,7 +2864,25 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             || original_syscall == a.fchmod
                             || original_syscall == a.capget
                             || original_syscall == a.ioprio_get
+                            || original_syscall == a.lchown
+                            || original_syscall == a.chown
+                            || original_syscall == a.fchmodat
+                            || original_syscall == a.fchownat
                         {
+                            // chmod/lchown/chown/fchmodat/fchownat/
+                            // fchown/fchmod/capget/ioprio_get — same
+                            // rationale as the syscall-EXIT handler's
+                            // `compute_exit_return_value` set (see the
+                            // "TWRP-init EPERM / syscall-number-leak
+                            // workaround" comment above). We use the
+                            // explicit `||` chain here (instead of
+                            // calling `compute_exit_return_value`) only
+                            // because we ALSO need to exclude `chmod`
+                            // from this block — chmod is handled by the
+                            // mount/mkdir/chmod/chroot/unshare block
+                            // below (which performs an fs op in the
+                            // rootfs and uses the same fake-success
+                            // return value 0).
                             sigsys_log(&format!(
                                 "intercepted SIGSYS — {}() nr={} [{}] (NOT rewriting — seccomp already aborted the syscall, returning 0 — fake success for TWRP init)",
                                 name, original_syscall, name
@@ -3249,5 +3417,276 @@ mod tests {
         assert_eq!(syscall_name(abi.shmget, &abi), "shmget");
         assert_eq!(syscall_name(abi.shmat, &abi), "shmat");
         assert_eq!(syscall_name(abi.shmctl, &abi), "shmctl");
+    }
+
+    // ── chmod / fchown / sibling EXIT-return-value tests ──────────
+    //
+    // These guard the regression that caused TWRP init to SIGSEGV at
+    // rip=0x809255d (NULL+0x90 deref) immediately after parsing
+    // /proc/cmdline. The 4-E E2E log (commit dbcac85) showed the kernel
+    // leaves rax = the syscall NUMBER (15 for i386 chmod) at the
+    // syscall-EXIT stop on i386 compat seccomp-aborted syscalls — NOT
+    // -ENOSYS (-38), NOT 0. The EXIT handler must force rax = 0 for ALL
+    // of the chmod/fchown siblings, not just the historical
+    // fchown/fchmod/capget/ioprio_get set from commit f279552.
+    //
+    // Each test verifies two things:
+    //   (1) `compute_exit_return_value` returns `Some(0)` for this
+    //       syscall (so the EXIT handler will fake the return value).
+    //   (2) `syscall_name` returns the expected name (so the diagnostic
+    //       log shows "chmod" instead of "unknown").
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_chmod_returns_zero() {
+        // i386 chmod = 15. THIS is the exact syscall that triggered
+        // the SIGSEGV: the kernel left rax = 15 at EXIT, and the
+        // pre-fix EXIT handler did NOT include chmod in its faked-
+        // success list, so rax stayed 15 — init saw "chmod returned
+        // 15" and crashed.
+        assert_eq!(compute_exit_return_value(15, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(15, &ABI_X86_32), "chmod");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_fchmod_returns_zero() {
+        // i386 fchmod = 94 — pre-existing in the EXIT handler's list
+        // (commit f279552), but now goes through compute_exit_return_value.
+        assert_eq!(compute_exit_return_value(94, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(94, &ABI_X86_32), "fchmod");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_fchown_returns_zero() {
+        // i386 fchown = 95 — same as fchmod, pre-existing.
+        assert_eq!(compute_exit_return_value(95, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(95, &ABI_X86_32), "fchown");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_lchown_returns_zero() {
+        // i386 lchown = 16 (NOT 94 — the task spec erroneously listed
+        // 96 for i386; verified against asm-i386/unistd_32.h: lchown
+        // is 16, NOT 94 or 96). Pre-fix this was MISSING from the
+        // EXIT handler — added by Task 5-A.
+        assert_eq!(compute_exit_return_value(16, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(16, &ABI_X86_32), "lchown");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_chown_returns_zero() {
+        // i386 chown = 182 (same as x86_64). Pre-fix MISSING from the
+        // EXIT handler — added by Task 5-A.
+        assert_eq!(compute_exit_return_value(182, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(182, &ABI_X86_32), "chown");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_fchmodat_returns_zero() {
+        // i386 fchmodat = 306. Pre-fix MISSING from the EXIT handler —
+        // added by Task 5-A.
+        assert_eq!(compute_exit_return_value(306, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(306, &ABI_X86_32), "fchmodat");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_fchownat_returns_zero() {
+        // i386 fchownat = 298. Pre-fix MISSING from the EXIT handler —
+        // added by Task 5-A.
+        assert_eq!(compute_exit_return_value(298, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(298, &ABI_X86_32), "fchownat");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_capget_returns_zero() {
+        // i386 capget = 184 — pre-existing.
+        assert_eq!(compute_exit_return_value(184, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(184, &ABI_X86_32), "capget");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_ioprio_get_returns_zero() {
+        // i386 ioprio_get = 290 — pre-existing.
+        assert_eq!(compute_exit_return_value(290, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(290, &ABI_X86_32), "ioprio_get");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_x86_64_chmod_returns_zero() {
+        // x86_64 chmod = 90 — pre-existing in the SIGSYS handler but
+        // now also covered by the EXIT handler via compute_exit_return_value.
+        assert_eq!(compute_exit_return_value(90, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(90, &ABI_X86_64), "chmod");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_x86_64_lchown_returns_zero() {
+        // x86_64 lchown = 94. Pre-fix MISSING — added by Task 5-A.
+        assert_eq!(compute_exit_return_value(94, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(94, &ABI_X86_64), "lchown");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_x86_64_chown_returns_zero() {
+        // x86_64 chown = 182. Pre-fix MISSING — added by Task 5-A.
+        assert_eq!(compute_exit_return_value(182, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(182, &ABI_X86_64), "chown");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_x86_64_fchmodat_returns_zero() {
+        // x86_64 fchmodat = 268. Pre-fix MISSING — added by Task 5-A.
+        assert_eq!(compute_exit_return_value(268, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(268, &ABI_X86_64), "fchmodat");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_x86_64_fchownat_returns_zero() {
+        // x86_64 fchownat = 257. Pre-fix MISSING — added by Task 5-A.
+        assert_eq!(compute_exit_return_value(257, &ABI_X86_64), Some(0));
+        assert_eq!(syscall_name(257, &ABI_X86_64), "fchownat");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn compute_exit_return_value_aarch64_fchmodat_returns_zero() {
+        // aarch64 fchmodat = 53. asm-generic has no plain chmod/lchown/
+        // chown — bionic issues fchmodat for chmod() callers.
+        assert_eq!(compute_exit_return_value(53, &ABI_AARCH64), Some(0));
+        assert_eq!(syscall_name(53, &ABI_AARCH64), "chmod");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn compute_exit_return_value_aarch64_fchownat_returns_zero() {
+        // aarch64 fchownat = 54.
+        assert_eq!(compute_exit_return_value(54, &ABI_AARCH64), Some(0));
+        assert_eq!(syscall_name(54, &ABI_AARCH64), "fchownat");
+    }
+
+    #[test]
+    fn compute_exit_return_value_returns_none_for_unrelated_syscalls() {
+        // Syscalls NOT in the faked-success set should return None so
+        // the EXIT handler leaves the kernel's return value alone.
+        // (open, read, write, close, fstat — the "normal" syscalls
+        // TWRP init issues between the chmod and the crash.)
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+
+        // open (i386 nr=5), read (nr=3), close (nr=6) — these are the
+        // syscalls init makes IMMEDIATELY after the chmod that crashed
+        // (openat(/proc/cmdline) → read(322 bytes) → close → SIGSEGV).
+        // None of them should be faked.
+        assert_eq!(
+            compute_exit_return_value(5, &abi),
+            None,
+            "open must NOT be faked"
+        );
+        assert_eq!(
+            compute_exit_return_value(3, &abi),
+            None,
+            "read must NOT be faked"
+        );
+        assert_eq!(
+            compute_exit_return_value(6, &abi),
+            None,
+            "close must NOT be faked"
+        );
+    }
+
+    #[test]
+    fn compute_exit_return_value_returns_none_for_syscall_number_leak_value() {
+        // The bug: on i386 compat the kernel left rax = the syscall
+        // NUMBER (15 for chmod) at the EXIT stop. The pre-fix EXIT
+        // handler would NOT match this against its (incomplete) list
+        // and would NOT force rax = 0. This test verifies that calling
+        // compute_exit_return_value with the leaked syscall-number
+        // value (15) DOES match (returns Some(0)) — i.e. the EXIT
+        // handler will now correctly force rax = 0 even when the
+        // kernel leaks the syscall number into rax.
+        //
+        // NOTE: this test passes "15" as both the syscall_nr AND as
+        // the would-be return value — the same number, deliberately,
+        // to make the regression-via-confusion impossible: if
+        // someone accidentally swaps the two arguments the test
+        // still catches the bug because the value 15 maps to chmod
+        // (Some(0)) when interpreted as a syscall number, and to
+        // "unrelated" (None) when interpreted as a different
+        // syscall's return value.
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+
+        // 15 = i386 chmod — the exact syscall + value from the 4-E log.
+        assert_eq!(compute_exit_return_value(15, &abi), Some(0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_chmod_number_is_15() {
+        // Regression guard: the i386 chmod syscall number MUST be 15
+        // (this is the value the 4-E log shows in the crash sequence).
+        // If anyone "fixes" this to a different number (e.g. by
+        // accidentally copying the x86_64 value 90), the chmod EXIT
+        // handler would silently stop matching and the SIGSEGV would
+        // come back.
+        assert_eq!(ABI_X86_32.chmod, 15, "i386 chmod must be 15");
+        // The siblings — verify the i386 numbers are correct so the
+        // EXIT handler matches them.
+        assert_eq!(
+            ABI_X86_32.lchown, 16,
+            "i386 lchown must be 16 (NOT 94 or 96)"
+        );
+        assert_eq!(ABI_X86_32.chown, 182, "i386 chown must be 182");
+        assert_eq!(ABI_X86_32.fchmodat, 306, "i386 fchmodat must be 306");
+        assert_eq!(ABI_X86_32.fchownat, 298, "i386 fchownat must be 298");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_chown_sibling_numbers() {
+        // x86_64 chmod / lchown / chown / fchmodat / fchownat numbers
+        // per asm/unistd_64.h.
+        assert_eq!(ABI_X86_64.chmod, 90, "x86_64 chmod must be 90");
+        assert_eq!(ABI_X86_64.lchown, 94, "x86_64 lchown must be 94");
+        assert_eq!(ABI_X86_64.chown, 182, "x86_64 chown must be 182");
+        assert_eq!(ABI_X86_64.fchmodat, 268, "x86_64 fchmodat must be 268");
+        assert_eq!(ABI_X86_64.fchownat, 257, "x86_64 fchownat must be 257");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_chown_sibling_numbers() {
+        // aarch64 (asm-generic): no plain chmod/lchown/chown; only
+        // fchmodat (53) and fchownat (54). chmod field is kept at 53
+        // for historical reasons (the SIGSYS handler's "chmod" branch
+        // matched syscall 53).
+        assert_eq!(ABI_AARCH64.fchmodat, 53, "aarch64 fchmodat must be 53");
+        assert_eq!(ABI_AARCH64.fchownat, 54, "aarch64 fchownat must be 54");
+        // lchown / chown are -1 (not present on aarch64).
+        assert_eq!(
+            ABI_AARCH64.lchown, -1,
+            "aarch64 lchown must be -1 (not present)"
+        );
+        assert_eq!(
+            ABI_AARCH64.chown, -1,
+            "aarch64 chown must be -1 (not present)"
+        );
     }
 }
