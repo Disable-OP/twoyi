@@ -4519,13 +4519,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // rejected and `adb pull` cannot read from the app's private
             // dir, so the logs are effectively inaccessible.
             //
-            // The external app-specific files dir
-            // (/sdcard/Android/data/io.twoyi/files/) IS readable via
-            // `adb pull` without root on release builds, so we mirror
-            // the logs there once the child has exited.
+            // Android 11 scoped storage further restricts the legacy
+            // mirror target `/sdcard/Android/data/io.twoyi/files/` —
+            // `adb pull` from that path is unreliable on release builds
+            // (the path is owned by the app and not browsable from
+            // outside). The public Downloads directory
+            // `/sdcard/Download/twoyi-logs/` IS readable via `adb pull`
+            // without root on all builds (it's a MediaProvider-
+            // managed shared collection, not an app-specific external
+            // dir), so we mirror the logs there once the child has
+            // exited.
+            //
+            // For debuggable builds (task 3-A Part 3 adds a twoyiDebug
+            // flavor) `adb shell run-as io.twoyi.debug cat
+            // /data/user/0/io.twoyi.debug/rootfs/twrp-init.log` is the
+            // canonical fallback for poking around the guest rootfs.
             // -------------------------------------------------------------
             {
-                let ext_files_dir = "/sdcard/Android/data/io.twoyi/files";
+                let ext_files_dir = "/sdcard/Download/twoyi-logs";
                 let _ = std::fs::create_dir_all(ext_files_dir);
                 // (rootfs-relative source, external-files-dst filename)
                 let copies: &[(&str, &str)] = &[
