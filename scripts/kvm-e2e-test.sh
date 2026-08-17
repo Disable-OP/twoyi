@@ -1449,7 +1449,30 @@ grep -E 'KR64 INFO|KR64 WARN|KR64 ERROR|CORE|NEW_RENDERER|CLIENT_EGL|SOCKET_MONI
     > "$ARTIFACT_DIR/logcat-filtered.txt" || true
 
 # Look for the milestones from TESTING_GUIDE.md §5.1
-KR64_START=$(grep -c 'KR64 INFO.*kr64 daemon starting' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
+#
+# KR64_START (Task ID 5-D): grep kr64-stderr.log — NOT logcat-filtered.txt.
+# Reason: kr64 is a Rust binary whose `info!` / `warning!` / `error!` macros
+# write to stderr (and to Android logcat ONLY when kr64 is loaded by the
+# twoyi Android app's JVM via libkr64.so). In the KVM E2E test, kr64 runs
+# as a standalone binary (forked by the test harness) and its stderr is
+# redirected to kr64-stderr.log — NOT propagated to logcat. The previous
+# check `grep 'KR64 INFO.*kr64 daemon starting' logcat-filtered.txt` was
+# therefore a FALSE NEGATIVE in the KVM E2E environment. The actual
+# daemon-start line in kr64-stderr.log is "[KR64] starting daemon with
+# config: Config { ... }" (emitted by lib.rs at the top of `run_daemon`).
+#
+# The non-TWRP-mode checks below (QEMU_PIPE_CREATED, PIPE_AVAIL, PIPE_CONN,
+# GL_CTX, BOOT_COMPLETED) still grep logcat-filtered.txt — these are host
+# emulator milestones emitted by the twoyi Android app's renderer, which
+# DOES propagate to logcat.
+if [ -f "$ARTIFACT_DIR/kr64-stderr.log" ]; then
+    KR64_START=$(grep -c '\[KR64\] starting daemon with config' "$ARTIFACT_DIR/kr64-stderr.log" || true)
+else
+    # Fallback for non-TWRP runs where kr64-stderr.log isn't captured:
+    # keep the old logcat-based check (it works when kr64 is loaded by
+    # the twoyi Android app via libkr64.so).
+    KR64_START=$(grep -c 'KR64 INFO.*kr64 daemon starting' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
+fi
 QEMU_PIPE_CREATED=$(grep -c 'created device /dev/qemu_pipe' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
 PIPE_AVAIL=$(grep -c 'QEMU pipe device.*availability: true' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
 PIPE_CONN=$(grep -c 'Successfully connected to QEMU pipe' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
@@ -1461,12 +1484,38 @@ GL_CTX=$(grep -c 'GL context created successfully' "$ARTIFACT_DIR/logcat-filtere
 BOOT_COMPLETED=$(grep -c 'BOOT_COMPLETED' "$ARTIFACT_DIR/logcat-filtered.txt" || true)
 
 # ── TWRP-mode milestone extraction ──
-# In TWRP mode, the meaningful boot signal is "init: starting service
-# 'recovery'" in twrp-kmsg.log (TWRP init's KLOG, captured via the
-# /dev/kmsg → /twrp-kmsg.log symlink that kr64 creates in TWRP mode).
-# We also check twrp-guest-tree.log (children of guest init PID) to see
-# whether the recovery process actually started, and twrp-fb.png's
-# non-zero pixel count to see whether TWRP actually rendered a UI.
+#
+# (Task ID 5-D) The TWRP boot evidence lives in TWRP-side artifacts —
+# NOT in host Android logcat. TWRP init runs in its own pivot_root'd
+# namespace, so its KLOG messages, service-start signals, and process
+# tree do NOT appear in host logcat. The previous version of this block
+# grepped twrp-kmsg.log for "init: starting service 'recovery'", but
+# twrp-kmsg.log is frequently EMPTY due to the /dev/__kmsg__ "(deleted)"
+# issue (init's log_init unlinks the /dev/__kmsg__ symlink after opening
+# it; subsequent processes — ueventd, recovery — call mknod which
+# creates a fresh char device, and writes go to the kernel kmsg ring
+# buffer which is flooded by the host's vendor_init loop). That made 4
+# of the 7 verdict checks FALSE NEGATIVES.
+#
+# Fixed evidence sources (all verified against KVM run on commit
+# 411629c, which BOOTED successfully but was reported as "PARTIAL"):
+#
+#   1. KR64 daemon started         — kr64-stderr.log line:
+#                                    "[KR64] starting daemon with config"
+#   2. TWRP init KMSG captured     — twrp-strace.log lines:
+#                                    `write(3, "<N>...` (KLOG writes to fd 3).
+#                                    twrp-kmsg.log is the PREFERRED source
+#                                    (non-empty file = direct KLOG capture),
+#                                    but twrp-strace.log is the FALLBACK
+#                                    when the /dev/__kmsg__ symlink got
+#                                    "(deleted)" and twrp-kmsg.log is empty.
+#   3. TWRP ueventd started        — twrp-guest-tree.log line:
+#                                    `NAME=ueventd` (init forked ueventd)
+#   4. TWRP 'recovery' svc started — twrp-guest-tree.log line:
+#                                    `NAME=recovery` (init forked recovery)
+#
+# Checks 5-7 were already correct (TWRP_RECOVERY_PROC, TWRP_GUEST_PID_FOUND,
+# TWRP_FB_NONZERO_PCT) — they grep twrp-guest-tree.log and twrp-fb-rgba.bin.
 TWRP_KMSG_EXISTS=0
 TWRP_RECOVERY_STARTED=0
 TWRP_UEVENTD_STARTED=0
@@ -1474,19 +1523,51 @@ TWRP_RECOVERY_PROC=0
 TWRP_FB_NONZERO_PCT=0
 TWRP_GUEST_PID_FOUND=0
 if [ "$TWRP_MODE" = "1" ]; then
+    # ── Check 2: TWRP init KMSG captured ──
+    # PREFERRED source: twrp-kmsg.log non-empty (direct KLOG capture via
+    # the /dev/__kmsg__ → /twrp-kmsg.log symlink). FALLBACK source:
+    # twrp-strace.log shows KLOG writes (write(3, "<N>...) — this works
+    # even when the symlink got "(deleted)" and twrp-kmsg.log is empty,
+    # because strace captures the actual write() syscalls (the writes
+    # go to the open fd 3, regardless of where the inode lives).
     if [ -f "$ARTIFACT_DIR/twrp-kmsg.log" ] && [ -s "$ARTIFACT_DIR/twrp-kmsg.log" ]; then
         TWRP_KMSG_EXISTS=1
-        # TWRP init's KLOG_INFO writes look like "init: starting service 'recovery'"
-        # (matching AOSP 5.1.1 init's service-start log format).
-        TWRP_RECOVERY_STARTED=$(grep -cE "init: starting service 'recovery'|starting service 'recovery'" "$ARTIFACT_DIR/twrp-kmsg.log" 2>/dev/null || echo 0)
-        TWRP_UEVENTD_STARTED=$(grep -cE "init: starting service 'ueventd'|starting service 'ueventd'" "$ARTIFACT_DIR/twrp-kmsg.log" 2>/dev/null || echo 0)
+    elif [ -s "$ARTIFACT_DIR/twrp-strace.log" ]; then
+        # Count write(3, "<N>...) calls — TWRP init's KLOG_INFO/KLOG_ERROR
+        # writes look like `write(3, "<3>init: ...", N) = N`. The "<N>"
+        # prefix is the kernel log level (0=emerg through 7=debug).
+        # Init's klog_fd is always fd 3 (set up by log_init before any
+        # other fd is opened). 1+ KLOG writes => init's KLOG was captured
+        # to strace, even if the file at /twrp-kmsg.log is empty.
+        TWRP_KMSG_WRITES=$(grep -cE 'write\(3, "<[0-7]>' "$ARTIFACT_DIR/twrp-strace.log" 2>/dev/null || echo 0)
+        if [ "$TWRP_KMSG_WRITES" -gt 0 ]; then
+            TWRP_KMSG_EXISTS=1
+        fi
     fi
+
+    # ── Checks 3 & 4: ueventd + recovery started ──
+    # Source: twrp-guest-tree.log (children of guest init PID).
+    # The previous version grepped twrp-kmsg.log for
+    # "init: starting service 'recovery'" / "'ueventd'", but twrp-kmsg.log
+    # is empty due to the /dev/__kmsg__ "(deleted)" issue. The guest-tree
+    # log is the authoritative source — it's a `ps` snapshot taken BEFORE
+    # the harness SIGKILLs init, showing all running processes by name.
+    # `NAME=ueventd` / `NAME=recovery` => the service was forked by init
+    # and is still alive at the snapshot time.
     if [ -s "$ARTIFACT_DIR/twrp-guest-tree.log" ]; then
         TWRP_GUEST_PID_FOUND=1
         # Look for a "recovery" entry in the guest's process tree.
         if grep -qiE 'NAME=.*recovery' "$ARTIFACT_DIR/twrp-guest-tree.log" 2>/dev/null; then
             TWRP_RECOVERY_PROC=1
+            # Check 4: "recovery" service started — same source as
+            # TWRP_RECOVERY_PROC. (TWRP_RECOVERY_STARTED counts the
+            # matches; TWRP_RECOVERY_PROC is a 0/1 flag.) Both are
+            # derived from twrp-guest-tree.log because that's the
+            # authoritative evidence when twrp-kmsg.log is empty.
+            TWRP_RECOVERY_STARTED=$(grep -cE 'NAME=recovery' "$ARTIFACT_DIR/twrp-guest-tree.log" 2>/dev/null || echo 0)
         fi
+        # Check 3: "ueventd" service started.
+        TWRP_UEVENTD_STARTED=$(grep -cE 'NAME=ueventd' "$ARTIFACT_DIR/twrp-guest-tree.log" 2>/dev/null || echo 0)
     fi
     # Check the framebuffer non-zero pixel percentage (from the python
     # script's output, captured to FB_INFO). We re-derive it from the
