@@ -124,6 +124,49 @@ pub fn populate_proc(rootfs: &str, cpu_count: u32, mem_mb: u64) -> std::io::Resu
         );
     }
 
+    // vendor/default.prop — read by init's PropertyLoadBootDefaults()
+    // (app/cpp/init/property_service.cpp:891 — /vendor/default.prop is
+    // one of the FIXED list of .prop files init loads, alongside
+    // /system/build.prop, /vendor/build.prop, etc.). The CRITICAL key
+    // is ro.hardware=goldfish which tells init to load AOSP Goldfish
+    // virtualization HALs (audio.primary.goldfish.so, gralloc.goldfish.so,
+    // etc.) that tolerate missing real hardware — essential for a
+    // containerized guest that has no real device drivers.
+    //
+    // Adopted from Nogitsune's ensureVendorDefaultProp (BootHelper.kt:191-206).
+    //
+    // This runs for BOTH TWRP and Android modes (no boot_recovery gating)
+    // because populate_proc itself is called for both modes (lib.rs:2206
+    // has no TWRP-mode skip — TWRP's init.rc reads /proc/* just like
+    // Android's, and TWRP's recovery service probes for HALs via
+    // libminuitwrp.so where ro.hardware=goldfish is also useful).
+    //
+    // TODO: wire lcd_density from cfg.dpi (currently hardcoded 320 —
+    // matching Config::default().dpi). The locale/timezone defaults
+    // ("en"/"US"/"America/New_York") match Nogitsune's defaults; a
+    // follow-up should detect them from the host Locale/TimeZone.
+    // populate_proc's signature would need to change to accept these
+    // (or write_vendor_default_prop would need to be called separately
+    // from lib.rs with cfg.dpi — but lib.rs is owned by another sub-agent
+    // and is off-limits per the ground rules, so we hardcode here for now).
+    if let Err(e) = write_vendor_default_prop(
+        rootfs,
+        /* lcd_density   */ 320,
+        /* language      */ "en",
+        /* country       */ "US",
+        /* timezone      */ "America/New_York",
+    ) {
+        // Non-fatal in the sense that kr64 can still fork init, but the
+        // guest will fall back to the build-time ro.hardware (e.g. ranchu)
+        // whose HALs may not exist in the container's /vendor/lib64/hw/,
+        // causing HAL-load failures during boot. Log loudly.
+        warning!(
+            "[KR64][proc_emu] warning: failed to write vendor/default.prop: {} -- \
+             init may fail to load goldfish virtualization HALs",
+            e
+        );
+    }
+
     // Now that all files are in place, mark /proc read-only (matching
     // the kernel's behaviour — `/proc` is mounted with mode 0555).
     #[cfg(unix)]
@@ -1180,6 +1223,132 @@ mod tests {
             "populate_proc should append apexd.status=activated to build.prop: {}",
             content
         );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `write_vendor_default_prop` must create
+    /// `{rootfs}/vendor/default.prop` with the expected boot-critical
+    /// keys (locale, timezone, density). Without this, init loads wrong
+    /// HALs (or none) for a containerized guest.
+    ///
+    /// Adopted from Nogitsune's ensureVendorDefaultProp
+    /// (BootHelper.kt:191-206) which writes the same 6 keys before init
+    /// runs.
+    #[test]
+    fn test_write_vendor_default_prop_creates_file() {
+        let rootfs = tmpdir();
+        write_vendor_default_prop(&rootfs, 440, "en", "US", "America/New_York")
+            .expect("write_vendor_default_prop");
+
+        let prop_path = format!("{}/vendor/default.prop", rootfs);
+        assert!(
+            Path::new(&prop_path).exists(),
+            "vendor/default.prop should exist"
+        );
+
+        let content = std::fs::read_to_string(&prop_path).unwrap();
+        assert!(
+            content.contains("persist.sys.language=en"),
+            "missing persist.sys.language=en: {}",
+            content
+        );
+        assert!(
+            content.contains("persist.sys.country=US"),
+            "missing persist.sys.country=US: {}",
+            content
+        );
+        assert!(
+            content.contains("persist.sys.timezone=America/New_York"),
+            "missing persist.sys.timezone=America/New_York: {}",
+            content
+        );
+        assert!(
+            content.contains("ro.sf.lcd_density=440"),
+            "missing ro.sf.lcd_density=440: {}",
+            content
+        );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `vendor/default.prop` MUST contain
+    /// `ro.hardware=goldfish` — this is the CRITICAL line that tells
+    /// init to load AOSP Goldfish virtualization HALs (the AOSP-shipped
+    /// audio.primary.goldfish.so, gralloc.goldfish.so, etc.) that
+    /// tolerate missing real hardware. Without this, init looks for
+    /// HALs matching the build-time ro.hardware (e.g. ranchu) which
+    /// may not exist in the container's /vendor/lib64/hw/.
+    ///
+    /// This is the headline value of the whole function — guards
+    /// against accidentally renaming or removing this single line.
+    #[test]
+    fn test_vendor_default_prop_contains_goldfish() {
+        let rootfs = tmpdir();
+        write_vendor_default_prop(&rootfs, 320, "en", "US", "America/New_York")
+            .expect("write_vendor_default_prop");
+
+        let prop_path = format!("{}/vendor/default.prop", rootfs);
+        let content = std::fs::read_to_string(&prop_path).unwrap();
+        assert!(
+            content.contains("ro.hardware=goldfish"),
+            "ro.hardware=goldfish missing from vendor/default.prop: {}",
+            content
+        );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Regression test: `vendor/default.prop` MUST contain
+    /// `ro.zygote=zygote64` — this tells init to spawn the 64-bit
+    /// zygote (not the 32-bit one). Nogitsune's ensureVendorDefaultProp
+    /// hardcodes this (BootHelper.kt:201) for both Android and TWRP
+    /// modes since both guest paths run on 64-bit Android.
+    #[test]
+    fn test_vendor_default_prop_contains_zygote64() {
+        let rootfs = tmpdir();
+        write_vendor_default_prop(&rootfs, 320, "en", "US", "America/New_York")
+            .expect("write_vendor_default_prop");
+
+        let prop_path = format!("{}/vendor/default.prop", rootfs);
+        let content = std::fs::read_to_string(&prop_path).unwrap();
+        assert!(
+            content.contains("ro.zygote=zygote64"),
+            "ro.zygote=zygote64 missing from vendor/default.prop: {}",
+            content
+        );
+
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    /// Integration test: `populate_proc` must also invoke
+    /// `write_vendor_default_prop`, so that vendor/default.prop is
+    /// written whenever the /proc tree is populated (the canonical
+    /// kr64 setup path — called from lib.rs:2206 for BOTH TWRP and
+    /// Android modes). Without this wiring, the function added in the
+    /// previous commit would be dead code.
+    #[test]
+    fn populate_proc_also_writes_vendor_default_prop() {
+        let rootfs = tmpdir();
+        populate_proc(&rootfs, 1, 1024).expect("populate_proc");
+
+        let prop_path = format!("{}/vendor/default.prop", rootfs);
+        assert!(
+            Path::new(&prop_path).exists(),
+            "populate_proc should write vendor/default.prop"
+        );
+
+        let content = std::fs::read_to_string(&prop_path).unwrap();
+        // The CRITICAL line — see `test_vendor_default_prop_contains_goldfish`.
+        assert!(
+            content.contains("ro.hardware=goldfish"),
+            "populate_proc-written vendor/default.prop should contain ro.hardware=goldfish: {}",
+            content
+        );
+        assert!(content.contains("ro.zygote=zygote64"));
+        // Defaults wired inside populate_proc.
+        assert!(content.contains("ro.sf.lcd_density=320"));
+        assert!(content.contains("persist.sys.language=en"));
 
         let _ = std::fs::remove_dir_all(&rootfs);
     }
