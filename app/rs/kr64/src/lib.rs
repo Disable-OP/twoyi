@@ -2349,11 +2349,63 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // LD_PRELOAD=/sbin/libtwrp_fb_hook.so), but the i686 libtwrp_fb_hook
     // is built against the 32-bit bionic which doesn't have the
     // stub-vs-real libdl.so problem on Android 11.
+    //
+    // ----------------------------------------------------------------
+    // OPTION D (5-U's recommendation, PRIMARY path): try the APK
+    // asset first. The real libdl.so is shipped as
+    // app/src/main/assets/libdl.so (extracted by Java on app init to
+    // {data_dir}/files/libdl.so via RomManager.extractLibdlAsset).
+    // This bypasses the APEX loopback mount pipeline entirely, which
+    // hit 4 sequential failure modes in 5-L/5-N/5-O/5-P/5-U (temp-write
+    // ENOENT → loop_open ENOENT → mknod+fallback loop_open ENXIO for
+    // all N 0..31 → kernel has no registered gendisk). Each fix exposed
+    // the next layer; the loopback-mount approach depends on too many
+    // kernel/permission prerequisites (CAP_MKNOD + CAP_SYS_ADMIN +
+    // kernel loop driver + init.rc mknod + ext4 driver).
+    //
+    // Option D requires only: APK asset read (always works — Java
+    // extracted it on init) + write to /dev/libdl.so on tmpfs (always
+    // works, /dev is tmpfs after pivot_root).
+    //
+    // The `> 5848` byte-size guard in is_real_libdl catches accidentally
+    // shipping the Android bootstrap stub as the asset. A placeholder
+    // asset (small text file or zero-filled bytes) is also rejected
+    // (size + ELF magic check both fail), so the code falls through
+    // gracefully to find_real_libdl_so (APEX extraction).
+    //
+    // If Option D's read_libdl_asset returns None (asset missing,
+    // placeholder, or stub-sized), fall back to the existing APEX
+    // extraction pipeline (find_real_libdl_so). This is the path that
+    // 5-L/5-N/5-O/5-P/5-U analyzed: still broken on the Android
+    // emulator (open /dev/loopN returns ENXIO for all N 0..31 per 5-U),
+    // but kept as a defensive fallback for future environments where
+    // loop devices DO work.
     let real_libdl: Option<(String, Vec<u8>)> = if cfg.boot_recovery {
         info!("[KR64] TWRP boot: skipping APEX libdl.so extraction (init is statically linked, doesn't need libdl.so)");
         None
     } else {
-        apex_extract::find_real_libdl_so(&cfg)
+        // Option D (PRIMARY, 5-U's recommendation): try the APK asset
+        // first. The asset is shipped in the APK + extracted by Java to
+        // {data_dir}/files/libdl.so on app init.
+        if let Some((src, bytes)) = apex_extract::read_libdl_asset(&cfg) {
+            info!(
+                "[KR64] Option D: using APK asset libdl.so ({} bytes from {}) — bypasses APEX loopback mount pipeline",
+                bytes.len(),
+                src
+            );
+            Some((src, bytes))
+        } else {
+            // Option D unavailable (asset missing, placeholder, or
+            // stub-sized) — fall back to the APEX extraction pipeline
+            // (find_real_libdl_so). This is the existing 5-L/5-N/5-O/5-P
+            // path: still broken on the Android emulator per 5-U, but
+            // kept as a defensive fallback for future environments
+            // where loop devices DO work.
+            info!(
+                "[KR64] Option D unavailable (no real libdl.so APK asset) — falling back to APEX extraction (find_real_libdl_so)"
+            );
+            apex_extract::find_real_libdl_so(&cfg)
+        }
     };
 
     // ---------------------------------------------------------------

@@ -936,6 +936,187 @@ pub fn find_real_libdl_so(cfg: &crate::Config) -> Option<(String, Vec<u8>)> {
     None
 }
 
+// ============================================================================
+// Option D (5-U's recommendation): ship libdl.so as an APK asset.
+//
+// Background: 5-L/5-N/5-O/5-P hit 4 sequential failure modes in the
+// loopback-mount pipeline (5-L temp-write ENOENT → 5-N loop_open ENOENT →
+// 5-P mknod+fallback loop_open ENXIO for all N in 0..31). 5-U's diagnosis:
+// "Each fix exposes the next layer. The loopback-mount approach depends on
+// CAP_MKNOD + CAP_SYS_ADMIN + kernel loop driver + init.rc mknod + ext4
+// driver. Too many failure modes."
+//
+// Option D bypasses ALL of them by shipping the real libdl.so as an APK
+// asset (app/src/main/assets/libdl.so). Java extracts the asset to
+// {data_dir}/files/libdl.so on app startup (see
+// RomManager.extractLibdlAsset in app/src/main/java/io/twoyi/utils/
+// RomManager.java). The kr64 daemon reads the file via
+// [`read_libdl_asset`] BEFORE attempting the APEX extraction. The asset is
+// validated via [`is_real_libdl`] (> 5848 bytes + ELF magic) so a
+// placeholder asset is gracefully rejected and falls through to APEX
+// extraction.
+//
+// If the asset is missing (no libdl.so in assets/) OR is a placeholder
+// (< 5848 bytes / no ELF magic), [`read_libdl_asset`] returns None and kr64
+// falls through to [`find_real_libdl_so`] (APEX extraction, still broken on
+// the Android emulator per 5-U, but kept as a defensive fallback).
+// ============================================================================
+
+/// Returns the list of candidate paths for the libdl.so APK asset
+/// (extracted from the APK by Java on app init via
+/// `RomManager.extractLibdlAsset`).
+///
+/// Built from:
+/// 1. `{cfg.data_dir}/files/libdl.so` — the primary path where Java
+///    extracts the asset on app startup. In a work profile, `cfg.data_dir`
+///    is `/data/user/<id>/io.twoyi` (set by `Renderer.setDataDir` from
+///    `getDataDir().getAbsolutePath()`), so the `{data_dir}/files/` prefix
+///    still resolves correctly to the work profile's files dir.
+/// 2. `/data/data/io.twoyi/files/libdl.so` — fallback if `cfg.data_dir`
+///    is not set to the canonical io.twoyi path (e.g. test env, or a
+///    future data-dir override that points elsewhere). This matches the
+///    canonical single-user install path.
+///
+/// Order matters: the path derived from `cfg.data_dir` is tried first
+/// because it correctly handles work profiles (where `/data/data/io.twoyi`
+/// doesn't exist; the per-user `/data/user/<id>/io.twoyi` path does).
+/// The hardcoded `/data/data/io.twoyi/files/libdl.so` is a defensive
+/// fallback for the single-user install case + test environments that
+/// don't set `--data-dir`.
+pub fn libdl_asset_candidate_paths(cfg: &crate::Config) -> Vec<String> {
+    let mut v = Vec::new();
+    if !cfg.data_dir.is_empty() {
+        v.push(format!("{}/files/libdl.so", cfg.data_dir));
+    }
+    v.push("/data/data/io.twoyi/files/libdl.so".to_string());
+    v
+}
+
+/// Read the libdl.so APK asset (extracted to the app's files dir by Java
+/// on startup) and return its bytes if it's the REAL libdl.so (> stub size,
+/// ELF magic). This is the **Option D primary path** (5-U's recommendation):
+/// instead of extracting libdl.so from the APEX ext4 image at runtime
+/// (which depends on CAP_MKNOD + CAP_SYS_ADMIN + kernel loop driver + ext4
+/// driver — 4 sequential failure modes documented in 5-L/5-N/5-O/5-P/5-U),
+/// we ship the real libdl.so as an APK asset + Java extracts it on app init
+/// to `{data_dir}/files/libdl.so`.
+///
+/// Returns `(source_path, file_bytes)` on success, or `None` if:
+/// - The asset file doesn't exist (Java extraction didn't run yet OR the
+///   asset is missing from the APK — graceful degradation to APEX).
+/// - The asset is the 5848-byte stub (size guard rejects; this catches
+///   accidentally shipping the Android bootstrap stub as the asset).
+/// - The asset is a placeholder (size < 5848 OR not ELF magic — the dev
+///   hasn't yet run `scripts/extract_libdl_from_apex.sh` to drop the real
+///   one in).
+/// - The asset is corrupted (read succeeds but bytes aren't ELF).
+///
+/// # Diagnostics
+///
+/// Every step logs to stderr (visible in `kr64-stderr.log`):
+///   - Which candidate paths were tried.
+///   - Whether each was missing, stub-sized, non-ELF, or real.
+///   - The final verdict (asset found + real → Some, else → None → fall
+///     through to [`find_real_libdl_so`]).
+///
+/// # Why this is preferred over `find_real_libdl_so`
+///
+/// The APEX extraction pipeline ([`find_real_libdl_so`]) requires:
+/// 1. `mknod(/dev/loopN, S_IFBLK)` to succeed (CAP_MKNOD).
+/// 2. `open(/dev/loopN, O_RDWR)` to succeed (kernel loop driver loaded
+///    with a registered gendisk for major=7, minor=N).
+/// 3. `LOOP_SET_FD` ioctl to succeed (CAP_SYS_ADMIN).
+/// 4. `mount(loop_dev, mountpoint, "ext4")` to succeed (ext4 driver
+///    accepts the APEX payload image).
+///
+/// All 4 prerequisites are kernel/permission-dependent and have failed
+/// sequentially in 5-L/5-N/5-O/5-P. [`read_libdl_asset`] requires only:
+/// 1. The APK asset `libdl.so` exists (a build-time decision — CI/dev
+///    drops it in via `scripts/extract_libdl_from_apex.sh`).
+/// 2. Java's `RomManager.extractLibdlAsset` ran on app init (always true
+///    once the Java code is in place).
+/// 3. The file at `{data_dir}/files/libdl.so` is readable (always true;
+///    it's on the app's user-data partition).
+///
+/// All 3 are guaranteed by the build + app init, not by the kernel.
+pub fn read_libdl_asset(cfg: &crate::Config) -> Option<(String, Vec<u8>)> {
+    let candidates = libdl_asset_candidate_paths(cfg);
+    info!(
+        "[KR64][apex_extract] Option D: searching for libdl.so APK asset — {} candidate paths",
+        candidates.len()
+    );
+    for c in &candidates {
+        info!("[KR64][apex_extract]   asset candidate: {}", c);
+    }
+
+    for path in &candidates {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                if is_real_libdl(&bytes) {
+                    info!(
+                        "[KR64][apex_extract] Option D: found real libdl.so APK asset at {} ({} bytes, > stub {}) — using it",
+                        path,
+                        bytes.len(),
+                        LIBDL_STUB_SIZE
+                    );
+                    return Some((path.clone(), bytes));
+                }
+
+                // Size guard rejected the asset. Classify the rejection
+                // reason so the diagnostic log makes it obvious what
+                // went wrong (placeholder vs. accidentally-shipped stub
+                // vs. corrupted extraction).
+                if bytes.len() <= LIBDL_STUB_SIZE && bytes.starts_with(&ELF_MAGIC) {
+                    // The asset is an ELF ≤ 5848 bytes — looks EXACTLY
+                    // like the Android bootstrap stub that lives at
+                    // /apex/com.android.runtime/lib64/bionic/libdl.so.
+                    // Someone probably copied the stub (instead of the
+                    // real one) into the assets dir.
+                    warning!(
+                        "[KR64][apex_extract] Option D: asset at {} is {} bytes (≤ stub {}) + ELF magic — looks like the 5848-byte bootstrap stub (NOT the real libdl.so). Rejecting + falling through to APEX extraction. If this is the placeholder asset, replace app/src/main/assets/libdl.so with the REAL libdl.so extracted from a booted AOSP x86_64 system (see scripts/extract_libdl_from_apex.sh).",
+                        path,
+                        bytes.len(),
+                        LIBDL_STUB_SIZE
+                    );
+                } else if !bytes.starts_with(&ELF_MAGIC) {
+                    // Not even an ELF — this is either a placeholder
+                    // text file (intentional, until CI/dev drops the
+                    // real one in) or a corrupted extraction.
+                    warning!(
+                        "[KR64][apex_extract] Option D: asset at {} is {} bytes but NOT ELF magic — placeholder or corrupted. Rejecting + falling through to APEX extraction. Run scripts/extract_libdl_from_apex.sh to drop the real libdl.so in.",
+                        path,
+                        bytes.len()
+                    );
+                } else {
+                    // ELF magic but size in (LIBDL_STUB_SIZE, ?) — wait,
+                    // is_real_libdl checks `> LIBDL_STUB_SIZE` strictly.
+                    // If we got here, size was ≤ LIBDL_STUB_SIZE but
+                    // ELF magic matched, so the first branch should have
+                    // fired. Defensive logging for any future edge case.
+                    warning!(
+                        "[KR64][apex_extract] Option D: asset at {} is {} bytes (≤ stub {}) — too small to be real libdl.so. Rejecting + falling through to APEX extraction.",
+                        path,
+                        bytes.len(),
+                        LIBDL_STUB_SIZE
+                    );
+                }
+            }
+            Err(e) => {
+                info!(
+                    "[KR64][apex_extract] Option D: asset at {} not readable: {} — falling through to next candidate or APEX extraction (find_real_libdl_so)",
+                    path,
+                    e
+                );
+            }
+        }
+    }
+
+    info!(
+        "[KR64][apex_extract] Option D: no real libdl.so APK asset found — falling through to APEX extraction (find_real_libdl_so)"
+    );
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1674,5 +1855,200 @@ mod tests {
             assert_eq!(ma, 7, "major(dev_t for n={}) should be 7", n);
             assert_eq!(mi, n, "minor(dev_t for n={}) should be {}", n, n);
         }
+    }
+
+    // ========================================================================
+    // Tests for libdl_asset_candidate_paths + read_libdl_asset (Option D,
+    // 5-U's recommendation: ship libdl.so as APK asset + Java extraction).
+    // ========================================================================
+
+    #[test]
+    fn libdl_asset_candidate_paths_includes_data_dir_files_libdl() {
+        // The primary candidate is derived from cfg.data_dir. cfg.data_dir
+        // is set by Java via Renderer.setDataDir(getApplicationInfo().dataDir)
+        // → "/data/data/io.twoyi" (single-user) or
+        // "/data/user/<id>/io.twoyi" (work profile).
+        let cfg = crate::Config {
+            data_dir: "/data/data/io.twoyi".to_string(),
+            ..crate::Config::default()
+        };
+        let candidates = libdl_asset_candidate_paths(&cfg);
+        assert!(
+            candidates.contains(&"/data/data/io.twoyi/files/libdl.so".to_string()),
+            "expected /data/data/io.twoyi/files/libdl.so in candidates: {:?}",
+            candidates
+        );
+        // The cfg.data_dir-derived path must be the FIRST candidate (so
+        // work-profile paths are preferred over the hardcoded single-user
+        // fallback).
+        assert_eq!(
+            candidates[0], "/data/data/io.twoyi/files/libdl.so",
+            "first candidate should be the cfg.data_dir-derived path"
+        );
+    }
+
+    #[test]
+    fn libdl_asset_candidate_paths_handles_work_profile_data_dir() {
+        // In a work profile, cfg.data_dir is /data/user/<id>/io.twoyi
+        // (NOT /data/data/io.twoyi). The candidate list must derive from
+        // cfg.data_dir so the work profile's files dir is used.
+        let cfg = crate::Config {
+            data_dir: "/data/user/11/io.twoyi".to_string(),
+            ..crate::Config::default()
+        };
+        let candidates = libdl_asset_candidate_paths(&cfg);
+        assert!(
+            candidates.contains(&"/data/user/11/io.twoyi/files/libdl.so".to_string()),
+            "expected /data/user/11/io.twoyi/files/libdl.so in candidates: {:?}",
+            candidates
+        );
+        assert_eq!(
+            candidates[0], "/data/user/11/io.twoyi/files/libdl.so",
+            "work-profile path must be the first candidate"
+        );
+        // The hardcoded single-user fallback is still present as the
+        // last candidate (defensive — the work profile's path won't
+        // exist on a single-user install, but it's tried anyway).
+        assert!(
+            candidates.contains(&"/data/data/io.twoyi/files/libdl.so".to_string()),
+            "expected /data/data/io.twoyi/files/libdl.so fallback in candidates: {:?}",
+            candidates
+        );
+    }
+
+    #[test]
+    fn libdl_asset_candidate_paths_has_hardcoded_fallback_when_data_dir_empty() {
+        // If cfg.data_dir is empty (test env or unset), the candidate
+        // list must still include the hardcoded fallback path so the
+        // search doesn't silently no-op.
+        let cfg = crate::Config {
+            data_dir: String::new(),
+            ..crate::Config::default()
+        };
+        let candidates = libdl_asset_candidate_paths(&cfg);
+        assert_eq!(
+            candidates,
+            vec!["/data/data/io.twoyi/files/libdl.so".to_string()],
+            "expected only the hardcoded fallback when data_dir is empty"
+        );
+    }
+
+    #[test]
+    fn read_libdl_asset_returns_none_when_file_missing() {
+        // Point data_dir at a non-existent path so no candidate exists.
+        // The function should log the candidates + return None (not panic).
+        let cfg = crate::Config {
+            data_dir: "/nonexistent-twoyi-data-dir-option-d-test".to_string(),
+            ..crate::Config::default()
+        };
+        let result = read_libdl_asset(&cfg);
+        assert!(
+            result.is_none(),
+            "expected None when asset file doesn't exist, got: {:?}",
+            result.map(|(p, _)| p)
+        );
+    }
+
+    #[test]
+    fn read_libdl_asset_returns_none_when_asset_is_stub_sized_elf() {
+        // Write a 5848-byte ELF-magic file (mimics the Android bootstrap
+        // stub that someone might accidentally ship). The size guard
+        // (bytes.len() > LIBDL_STUB_SIZE) must reject it.
+        let tmp = std::env::temp_dir().join("twoyi-option-d-test-stub");
+        let files_dir = tmp.join("files");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let mut stub = vec![0u8; LIBDL_STUB_SIZE];
+        stub[0..4].copy_from_slice(&ELF_MAGIC);
+        std::fs::write(files_dir.join("libdl.so"), &stub).unwrap();
+
+        let cfg = crate::Config {
+            data_dir: tmp.to_str().unwrap().to_string(),
+            ..crate::Config::default()
+        };
+        let result = read_libdl_asset(&cfg);
+        assert!(
+            result.is_none(),
+            "5848-byte ELF stub must be rejected by Option D guard, got: {:?}",
+            result.map(|(p, b)| (p, b.len()))
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_libdl_asset_returns_none_when_asset_is_placeholder_text() {
+        // Write a small text placeholder (not ELF, not 5848 bytes) — this
+        // is what gets shipped in the assets/ dir until CI/dev drops the
+        // real libdl.so in. Both the size guard AND ELF-magic guard reject
+        // it; the function must return None and fall through gracefully.
+        let tmp = std::env::temp_dir().join("twoyi-option-d-test-placeholder");
+        std::fs::create_dir_all(tmp.join("files")).unwrap();
+        std::fs::write(
+            tmp.join("files").join("libdl.so"),
+            b"PLACEHOLDER - run scripts/extract_libdl_from_apex.sh to replace",
+        )
+        .unwrap();
+
+        let cfg = crate::Config {
+            data_dir: tmp.to_str().unwrap().to_string(),
+            ..crate::Config::default()
+        };
+        let result = read_libdl_asset(&cfg);
+        assert!(
+            result.is_none(),
+            "placeholder text asset must be rejected, got: {:?}",
+            result.map(|(p, b)| (p, b.len()))
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_libdl_asset_returns_some_when_asset_is_real_elf() {
+        // Write a > 5848-byte ELF-magic file (mimics the real libdl.so
+        // after CI/dev runs the extract script). The function must
+        // return Some((path, bytes)).
+        let tmp = std::env::temp_dir().join("twoyi-option-d-test-real");
+        std::fs::create_dir_all(tmp.join("files")).unwrap();
+        let mut real = vec![0u8; 20000]; // > LIBDL_STUB_SIZE = 5848
+        real[0..4].copy_from_slice(&ELF_MAGIC);
+        std::fs::write(tmp.join("files").join("libdl.so"), &real).unwrap();
+
+        let cfg = crate::Config {
+            data_dir: tmp.to_str().unwrap().to_string(),
+            ..crate::Config::default()
+        };
+        let result = read_libdl_asset(&cfg);
+        assert!(
+            result.is_some(),
+            "real ELF asset (> 5848 bytes) must be accepted by Option D"
+        );
+        let (path, bytes) = result.unwrap();
+        assert!(
+            path.ends_with("files/libdl.so"),
+            "returned path should point at the asset: {}",
+            path
+        );
+        assert_eq!(bytes.len(), 20000);
+        assert_eq!(&bytes[0..4], &ELF_MAGIC);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_libdl_asset_falls_back_to_hardcoded_path_when_data_dir_empty() {
+        // When cfg.data_dir is empty, the candidate list is just the
+        // hardcoded /data/data/io.twoyi/files/libdl.so. On a typical
+        // dev machine this path doesn't exist, so the function returns
+        // None. (This test verifies the fallback doesn't panic when the
+        // hardcoded path is missing.)
+        let cfg = crate::Config {
+            data_dir: String::new(),
+            ..crate::Config::default()
+        };
+        // Don't assert on the result — the path may or may not exist on
+        // this test host. The point is just to verify the function
+        // doesn't panic when data_dir is empty.
+        let _ = read_libdl_asset(&cfg);
     }
 }
