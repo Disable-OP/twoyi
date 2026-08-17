@@ -87,8 +87,32 @@ pub fn get_log_path() -> String {
 }
 
 /// Get the touch device socket path.
+///
+/// This is the GUEST-FACING touch device socket — the path the guest's
+/// `EventHub` opens via `connect()`. As of commit `c67c498` (task 3-A),
+/// **kr64 owns this socket** (it binds it via `devices::create_touch_device`
+/// and dispatches `InputEvent`s from the IPC socket below). The host's
+/// `input.rs` MUST NOT bind this path — doing so conflicts with kr64.
 pub fn get_touch_path() -> String {
     format!("{}/rootfs/dev/input/touch", get_data_dir())
+}
+
+/// Get the touch-events IPC socket path — the host-side socket the
+/// libtwoyi daemon (`app/rs/src/input.rs::touch_server`) binds, and
+/// kr64's `spawn_touch_accept_thread` connects to as a client.
+///
+/// Path: `{data_dir}/dev/touch-events` (NOT under `rootfs/` — this is a
+/// host-side IPC channel, not a guest-facing device node).
+///
+/// This socket carries 20-byte little-endian `TouchMessage` records
+/// (action + pointer_id + x + y + pressure) from the host's
+/// `handle_touch` JNI callback to kr64's per-connection touch worker,
+/// which re-encodes them into the guest's `InputEvent` format via
+/// `devices::encode_touch_*`. See commit `c67c498` (kr64 side) and the
+/// matching `app/rs/src/input.rs` refactor (host side) for the full
+/// IPC contract.
+pub fn get_touch_events_path() -> String {
+    format!("{}/dev/touch-events", get_data_dir())
 }
 
 /// Get the key device socket path.
