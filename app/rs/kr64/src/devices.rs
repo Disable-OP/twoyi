@@ -263,6 +263,475 @@ pub fn create_key_device(rootfs: &str) -> std::io::Result<DeviceSocket> {
     })
 }
 
+// ============================================================================
+// Multi-touch input protocol — full Android Type-B multi-touch sequence.
+//
+// The guest's EventHub (TWRP `libminuitwrp` and Android's
+// `InputReader`) open `/dev/input/touch` as a Unix stream socket, read
+// one `DeviceInfo` header struct on connect (advertising the device's
+// capabilities), then read a stream of `InputEvent` records. Each
+// `SYN_REPORT`-terminated batch of events forms one input frame.
+//
+// This module mirrors the protocol that Nogitsune's `input.cpp`
+// (`make_touch_device` at lines 66-87 + `input_handle_touch` at lines
+// 247-300) emits, with two intentional improvements over the upstream:
+//
+// 1. `BTN_TOUCH`/`BTN_TOOL_FINGER` are advertised in `key_bitmask`
+//    (Nogitsune's `make_touch_device` never sets these bits, so the
+//    guest's EventHub may drop the corresponding EV_KEY events as
+//    "out of capability range").
+// 2. `BTN_TOUCH`/`BTN_TOOL_FINGER` use value 1 on press and 0 on
+//    release (Nogitsune's `input_handle_touch` uses 108 on press and
+//    omits the release entirely — 108 is not a valid EV_KEY value;
+//    the kernel treats any nonzero value as press, but the wrong
+//    value is wrong, and the missing release leaves the guest's
+//    InputReader in a stuck-press state).
+//
+// The struct layouts match `struct input_event` and the AOSP
+// `struct device_info` used by VirtualMaster / Nogitsune exactly:
+//
+// * `InputEvent` is 24 bytes on 64-bit (timeval=16 + type=2 + code=2
+//   + value=4) and 16 bytes on 32-bit (timeval=8 + type=2 + code=2
+//   + value=4) — both with no padding.
+// * `DeviceInfo` is 896 bytes on both 32-bit and 64-bit (only field
+//   sizes/alignments up to 4 bytes are used; the only padding is 2
+//   bytes between `prop_bitmask[4]` and the 4-aligned `abs_max[64]`).
+//
+// The encoding helpers below are pure functions returning `Vec<u8>`
+// so they can be unit-tested without a real Unix socket.
+// ============================================================================
+
+/// Linux input event types (`event.type` field of `struct input_event`).
+///
+/// See `linux/input-event-codes.h`. Only the subset we emit is listed
+/// here — the full enum has dozens more (EV_REL, EV_MSC, EV_LED, ...).
+pub mod ev {
+    /// Synchronization events (`SYN_REPORT`, `SYN_CONFIG`, ...).
+    pub const EV_SYN: u16 = 0x00;
+    /// Key/button events (`BTN_TOUCH`, `KEY_BACK`, ...).
+    pub const EV_KEY: u16 = 0x01;
+    /// Absolute-axis events (`ABS_MT_POSITION_X`, ...).
+    pub const EV_ABS: u16 = 0x03;
+}
+
+/// `EV_SYN` codes (`event.code` field when `event.type == EV_SYN`).
+pub mod syn {
+    /// End-of-frame marker. The guest's InputReader processes the
+    /// pending events as one atomic input frame on this code.
+    pub const SYN_REPORT: u16 = 0x00;
+}
+
+/// `EV_KEY` codes for multi-touch button-state signalling.
+///
+/// `BTN_TOUCH` (0x14a) signals "finger on screen".
+/// `BTN_TOOL_FINGER` (0x145) signals "finger tool is active".
+/// Android's `InputReader` requires both to be pressed for a touch
+/// to register as a finger touch (vs. a stylus or mouse).
+pub mod btn {
+    pub const BTN_TOOL_FINGER: u16 = 0x145;
+    pub const BTN_TOUCH: u16 = 0x14a;
+}
+
+/// `EV_ABS` codes for multi-touch axes.
+///
+/// See `linux/input-event-codes.h` for the full list. We advertise
+/// only the Type-B protocol axes (slot-based, with tracking IDs).
+pub mod abs {
+    pub const ABS_MT_SLOT: u16 = 0x2f;
+    pub const ABS_MT_POSITION_X: u16 = 0x35;
+    pub const ABS_MT_POSITION_Y: u16 = 0x36;
+    pub const ABS_MT_TRACKING_ID: u16 = 0x39;
+    pub const ABS_MT_PRESSURE: u16 = 0x3a;
+}
+
+/// Maximum supported simultaneous touch pointers (matches Nogitsune's
+/// `clamp_pointer` upper bound — see `input.cpp:227-231`).
+pub const MAX_POINTERS: usize = 5;
+
+// Bitmask array dimensions. These mirror the kernel's
+// `<linux/input-event-codes.h>` limits and match the array sizes used
+// by Nogitsune's `struct device_info` (and by twoyi's existing
+// `app/rs/src/input.rs::device_info`). They MUST match what the guest
+// (TWRP's `libminuitwrp` / Android's `EventHub`) reads on the wire —
+// otherwise the receiver will misparse the struct.
+const KEY_MAX: usize = 0x2ff; // → key_bitmask[96]
+const ABS_MAX: usize = 0x3f; // → abs_bitmask[8], ABS_CNT=64
+const REL_MAX: usize = 0x0f; // → rel_bitmask[2]
+const SW_MAX: usize = 0x0f; // → sw_bitmask[2]
+const LED_MAX: usize = 0x0f; // → led_bitmask[2]
+const FF_MAX: usize = 0x7f; // → ff_bitmask[16]
+const INPUT_PROP_MAX: usize = 0x1f; // → prop_bitmask[4]
+const ABS_CNT: usize = ABS_MAX + 1; // 64
+const INPUT_PROP_BUTTONPAD: u8 = 0x02;
+
+/// `struct input_id` from `<linux/input.h>` — identifies the device
+/// to the guest's EventHub. All fields are `u16`, so the struct is
+/// 8 bytes with 2-byte alignment, no padding.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct InputId {
+    pub bustype: u16,
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+/// `struct input_event` from `<linux/input.h>` — one input event
+/// record. Layout:
+///
+/// ```text
+/// offset  size  field
+/// ------  ----  -----
+///   0     8/16  time    (struct timeval — 8 B on 32-bit, 16 B on 64-bit)
+///  8/16     2   type    (u16)
+/// 10/18     2   code    (u16)
+/// 12/20     4   value   (i32)
+/// ------  ----
+/// total  16/24 bytes   (no padding)
+/// ```
+///
+/// The two size variants are intentional: they match the kernel ABI
+/// for the host arch. The guest always reads its OWN arch's
+/// `input_event` size, so the sender (us) must emit events of the
+/// matching size. We use `libc::timeval` so `repr(C)` gives the
+/// correct layout for whichever target this crate was compiled for.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InputEvent {
+    pub time: libc::timeval,
+    pub kind: u16,
+    pub code: u16,
+    pub value: i32,
+}
+
+impl InputEvent {
+    /// Returns the size of one `InputEvent` on the current target.
+    /// Used by tests to assert the layout matches the kernel ABI
+    /// (24 B on aarch64/x86_64, 16 B on armv7/x86).
+    pub const fn size() -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// `struct device_info` — the capabilities header that Nogitsune's
+/// `touch_server` (and our `create_touch_device` consumer) writes
+/// to the socket on `accept()`. The guest's EventHub reads exactly
+/// `size_of::<DeviceInfo>()` bytes before any `InputEvent` records.
+///
+/// Layout mirrors Nogitsune's `struct device_info` (`input.cpp:29-44`)
+/// and twoyi's existing `app/rs/src/input.rs::device_info`. The
+/// per-bitmask array sizes use the kernel's `(MAX+1)/8` formula.
+#[repr(C)]
+pub struct DeviceInfo {
+    pub name: [u8; 80],
+    pub driver_version: i32,
+    pub id: InputId,
+    pub physical_location: [u8; 80],
+    pub unique_id: [u8; 80],
+    pub key_bitmask: [u8; (KEY_MAX + 1) / 8],
+    pub abs_bitmask: [u8; (ABS_MAX + 1) / 8],
+    pub rel_bitmask: [u8; (REL_MAX + 1) / 8],
+    pub sw_bitmask: [u8; (SW_MAX + 1) / 8],
+    pub led_bitmask: [u8; (LED_MAX + 1) / 8],
+    pub ff_bitmask: [u8; (FF_MAX + 1) / 8],
+    pub prop_bitmask: [u8; (INPUT_PROP_MAX + 1) / 8],
+    pub abs_max: [u32; ABS_CNT],
+    pub abs_min: [u32; ABS_CNT],
+}
+
+impl Default for DeviceInfo {
+    fn default() -> Self {
+        // SAFETY: every field is a `[u8; N]`, `[u32; N]`, `i32`, or
+        // `InputId` (all `u16`). All-zero bytes is a valid value for
+        // every one of these — the kernel treats an all-zero bitmask
+        // as "no capabilities advertised".
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl DeviceInfo {
+    /// Returns the size of one `DeviceInfo` on the current target.
+    /// Used by tests to assert the layout matches the AOSP /
+    /// Nogitsune `struct device_info` byte-for-byte.
+    pub const fn size() -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+/// Set bit `n` in a capability bitmask (`bitmask[n/8] |= 1 << (n%8)`).
+/// Mirrors the kernel's `__set_bit()` macro and Nogitsune's
+/// `input.cpp:453-459` `set_key_bit` helper. Bounds-checked so an
+/// out-of-range axis code is a no-op rather than a panic.
+fn set_bit(bitmask: &mut [u8], n: usize) {
+    let byte = n / 8;
+    let bit = n % 8;
+    if byte < bitmask.len() {
+        bitmask[byte] |= 1 << bit;
+    }
+}
+
+/// Copy a Rust `&str` into a fixed-size `[u8; N]` C-string buffer
+/// (NUL-terminated, truncated if too long). Mirrors Nogitsune's
+/// `input.cpp:60-64` `copy_cstr`. The buffer's trailing bytes (after
+/// the NUL terminator) are zeroed by the caller via `Default`.
+fn copy_cstr<const N: usize>(src: &str, dst: &mut [u8; N]) {
+    let bytes = src.as_bytes();
+    // Truncate at the first interior NUL — defensive against
+    // malformed input that would otherwise leak past the terminator.
+    let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let max_len = if N == 0 { 0 } else { N - 1 };
+    let len = nul_pos.min(max_len);
+    if len > 0 {
+        dst[..len].copy_from_slice(&bytes[..len]);
+    }
+    if len < N {
+        dst[len] = 0;
+    }
+}
+
+/// Build the `DeviceInfo` header advertising the full multi-touch
+/// Type-B protocol that TWRP's `libminuitwrp` and Android's
+/// `EventHub` expect.
+///
+/// Capabilities advertised:
+///
+/// * **ABS axes** (`abs_bitmask`): `ABS_MT_SLOT`, `ABS_MT_TRACKING_ID`,
+///   `ABS_MT_POSITION_X`, `ABS_MT_POSITION_Y`, `ABS_MT_PRESSURE`.
+/// * **Key buttons** (`key_bitmask`): `BTN_TOUCH`, `BTN_TOOL_FINGER`.
+///   (Nogitsune's `make_touch_device` does NOT advertise these — that's
+///   a bug because the guest's `EventHub` may drop the EV_KEY events
+///   as "out of capability range". We fix that here.)
+/// * **abs_min/abs_max**: X=0..width, Y=0..height, PRESSURE=0..255,
+///   TRACKING_ID=0..65535, SLOT=0..(MAX_POINTERS-1).
+/// * **prop_bitmask**: `INPUT_PROP_BUTTONPAD` (matches Nogitsune).
+///
+/// `name` is `"vtouch"`, `physical_location` is the socket path, and
+/// `unique_id` is `"<vtouch 0>"` — these match Nogitsune exactly so
+/// the guest sees the same device identity regardless of which host
+/// (Nogitsune C++ or twoyi Rust) emits it.
+pub fn make_touch_device(width: i32, height: i32, socket_path: &str) -> DeviceInfo {
+    let mut info = DeviceInfo {
+        driver_version: 1,
+        id: InputId {
+            bustype: 0,
+            vendor: 0,
+            product: 1,
+            version: 0,
+        },
+        ..DeviceInfo::default()
+    };
+    copy_cstr("vtouch", &mut info.name);
+    copy_cstr(socket_path, &mut info.physical_location);
+    copy_cstr("<vtouch 0>", &mut info.unique_id);
+
+    // Advertise the touch keys. Without these bits, the guest's
+    // EventHub may drop BTN_TOUCH / BTN_TOOL_FINGER events as
+    // "out of capability range".
+    set_bit(&mut info.key_bitmask, btn::BTN_TOUCH as usize);
+    set_bit(&mut info.key_bitmask, btn::BTN_TOOL_FINGER as usize);
+
+    // Advertise the multi-touch axes.
+    set_bit(&mut info.abs_bitmask, abs::ABS_MT_SLOT as usize);
+    set_bit(&mut info.abs_bitmask, abs::ABS_MT_TRACKING_ID as usize);
+    set_bit(&mut info.abs_bitmask, abs::ABS_MT_POSITION_X as usize);
+    set_bit(&mut info.abs_bitmask, abs::ABS_MT_POSITION_Y as usize);
+    set_bit(&mut info.abs_bitmask, abs::ABS_MT_PRESSURE as usize);
+
+    // Per-axis ranges. The guest's InputReader uses these to:
+    //   * clamp incoming coordinates to [min, max]
+    //   * normalize pressure to [0, 1] for the Java-side MotionEvent
+    //   * pick a default tracking-ID range
+    info.abs_min[abs::ABS_MT_POSITION_X as usize] = 0;
+    info.abs_max[abs::ABS_MT_POSITION_X as usize] = width.max(0) as u32;
+
+    info.abs_min[abs::ABS_MT_POSITION_Y as usize] = 0;
+    info.abs_max[abs::ABS_MT_POSITION_Y as usize] = height.max(0) as u32;
+
+    info.abs_min[abs::ABS_MT_PRESSURE as usize] = 0;
+    info.abs_max[abs::ABS_MT_PRESSURE as usize] = 255;
+
+    info.abs_min[abs::ABS_MT_TRACKING_ID as usize] = 0;
+    info.abs_max[abs::ABS_MT_TRACKING_ID as usize] = 65535;
+
+    info.abs_min[abs::ABS_MT_SLOT as usize] = 0;
+    info.abs_max[abs::ABS_MT_SLOT as usize] = (MAX_POINTERS as u32) - 1;
+
+    // Buttonpad property — touch device with integrated buttons.
+    // Mirrors Nogitsune's `info.prop_bitmask[0] = INPUT_PROP_BUTTONPAD`.
+    info.prop_bitmask[0] = INPUT_PROP_BUTTONPAD;
+
+    info
+}
+
+/// Serialize one `InputEvent` into a `Vec<u8>`. Used by the
+/// `encode_touch_*` helpers below. Pure (no I/O) so it can be
+/// unit-tested against an expected byte sequence.
+///
+/// The output is exactly `InputEvent::size()` bytes long
+/// (24 on 64-bit, 16 on 32-bit).
+pub fn encode_input_event(time: libc::timeval, kind: u16, code: u16, value: i32) -> Vec<u8> {
+    let ev = InputEvent {
+        time,
+        kind,
+        code,
+        value,
+    };
+    // SAFETY: we're reading `size_of::<InputEvent>()` bytes from a
+    // valid `&InputEvent` that we own. The slice does not outlive the
+    // local `ev`, but we copy the bytes into a Vec immediately.
+    let ptr = &ev as *const InputEvent as *const u8;
+    let len = InputEvent::size();
+    let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    bytes
+}
+
+/// Encode the full multi-touch DOWN frame — the sequence the guest's
+/// `EventHub` expects when a finger first touches the screen.
+///
+/// Emits (in order, each as one `InputEvent`):
+///
+/// 1. `EV_ABS / ABS_MT_SLOT(slot)`
+/// 2. `EV_ABS / ABS_MT_TRACKING_ID(tracking_id)`
+/// 3. `EV_KEY / BTN_TOUCH(1)`
+/// 4. `EV_KEY / BTN_TOOL_FINGER(1)`
+/// 5. `EV_ABS / ABS_MT_POSITION_X(x)`
+/// 6. `EV_ABS / ABS_MT_POSITION_Y(y)`
+/// 7. `EV_ABS / ABS_MT_PRESSURE(pressure)`
+/// 8. `EV_SYN / SYN_REPORT(0)`
+///
+/// `time` is the `timeval` stamp to attach to every event in this
+/// frame (the guest's EventHub groups events by `time` + `SYN_REPORT`).
+///
+/// This is the same protocol Nogitsune's `input_handle_touch` emits
+/// on ACTION_DOWN (input.cpp:260-271), with two improvements:
+///
+/// 1. `BTN_TOUCH`/`BTN_TOOL_FINGER` use value 1 (not 108 — 108 is
+///    not a valid EV_KEY value; the kernel treats any nonzero value
+///    as press, but the wrong value is wrong).
+/// 2. The sequence is always 8 events (Nogitsune's is the same).
+pub fn encode_touch_down(
+    time: libc::timeval,
+    slot: i32,
+    tracking_id: i32,
+    x: i32,
+    y: i32,
+    pressure: i32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(InputEvent::size() * 8);
+    out.extend(encode_input_event(time, ev::EV_ABS, abs::ABS_MT_SLOT, slot));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_TRACKING_ID,
+        tracking_id,
+    ));
+    out.extend(encode_input_event(time, ev::EV_KEY, btn::BTN_TOUCH, 1));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_KEY,
+        btn::BTN_TOOL_FINGER,
+        1,
+    ));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_POSITION_X,
+        x,
+    ));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_POSITION_Y,
+        y,
+    ));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_PRESSURE,
+        pressure,
+    ));
+    out.extend(encode_input_event(time, ev::EV_SYN, syn::SYN_REPORT, 0));
+    out
+}
+
+/// Encode a multi-touch MOVE frame — the sequence the guest's
+/// `EventHub` expects when an existing finger moves.
+///
+/// Unlike DOWN, MOVE does NOT re-press `BTN_TOUCH`/`BTN_TOOL_FINGER`
+/// (they were pressed during DOWN and stay pressed until UP). Emits:
+///
+/// 1. `EV_ABS / ABS_MT_SLOT(slot)`
+/// 2. `EV_ABS / ABS_MT_POSITION_X(x)`
+/// 3. `EV_ABS / ABS_MT_POSITION_Y(y)`
+/// 4. `EV_ABS / ABS_MT_PRESSURE(pressure)`
+/// 5. `EV_SYN / SYN_REPORT(0)`
+///
+/// Matches Nogitsune's ACTION_MOVE path (input.cpp:272-279).
+pub fn encode_touch_move(time: libc::timeval, slot: i32, x: i32, y: i32, pressure: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(InputEvent::size() * 5);
+    out.extend(encode_input_event(time, ev::EV_ABS, abs::ABS_MT_SLOT, slot));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_POSITION_X,
+        x,
+    ));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_POSITION_Y,
+        y,
+    ));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_PRESSURE,
+        pressure,
+    ));
+    out.extend(encode_input_event(time, ev::EV_SYN, syn::SYN_REPORT, 0));
+    out
+}
+
+/// Encode the full multi-touch RELEASE frame — the sequence the
+/// guest's `EventHub` expects when a finger lifts off the screen.
+///
+/// Emits (in order, each as one `InputEvent`):
+///
+/// 1. `EV_ABS / ABS_MT_SLOT(slot)`
+/// 2. `EV_ABS / ABS_MT_TRACKING_ID(-1)`  (−1 = slot release)
+/// 3. `EV_KEY / BTN_TOUCH(0)`
+/// 4. `EV_KEY / BTN_TOOL_FINGER(0)`
+/// 5. `EV_SYN / SYN_REPORT(0)`
+///
+/// This is the protocol Nogitsune's `input_handle_touch` ACTION_UP
+/// path emits (input.cpp:280-288), with TWO improvements:
+///
+/// 1. `BTN_TOUCH=0` / `BTN_TOOL_FINGER=0` are emitted on release.
+///    Nogitsune's ACTION_UP path omits these, leaving the guest's
+///    InputReader in a stuck-press state after the last finger lifts.
+/// 2. The release is parameterized by `slot` (Nogitsune iterates ALL
+///    active slots in ACTION_UP; we expose a single-slot release so
+///    the caller can decide whether to emit one frame or many).
+pub fn encode_touch_release(time: libc::timeval, slot: i32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(InputEvent::size() * 5);
+    out.extend(encode_input_event(time, ev::EV_ABS, abs::ABS_MT_SLOT, slot));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_ABS,
+        abs::ABS_MT_TRACKING_ID,
+        -1,
+    ));
+    out.extend(encode_input_event(time, ev::EV_KEY, btn::BTN_TOUCH, 0));
+    out.extend(encode_input_event(
+        time,
+        ev::EV_KEY,
+        btn::BTN_TOOL_FINGER,
+        0,
+    ));
+    out.extend(encode_input_event(time, ev::EV_SYN, syn::SYN_REPORT, 0));
+    out
+}
+
 /// Create `{data_dir}/dev/event` — the event IPC socket.
 ///
 /// This is the channel the guest uses to signal lifecycle events back
@@ -888,5 +1357,317 @@ mod tests {
         create_graphics_device_stubs(&rootfs).expect("second call");
         assert!(Path::new(&format!("{}/dev/graphics/fb0", rootfs)).exists());
         let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    // ========================================================================
+    // Multi-touch input protocol tests.
+    //
+    // These tests verify the byte-level output of `encode_touch_down`
+    // / `encode_touch_release` / `encode_touch_move` against an
+    // expected sequence of `(kind, code, value)` tuples, AND verify
+    // the `InputEvent` / `DeviceInfo` struct sizes match the kernel
+    // ABI (24 B / 16 B for `InputEvent`, 896 B for `DeviceInfo`).
+    // ========================================================================
+
+    /// Parse a stream of `InputEvent` bytes into a list of
+    /// `(kind, code, value)` tuples, skipping the per-event `timeval`
+    /// stamp. Used by the tests below to assert event ordering and
+    /// values without hand-computing byte offsets.
+    fn parse_events(bytes: &[u8]) -> Vec<(u16, u16, i32)> {
+        let stride = InputEvent::size();
+        assert!(
+            bytes.len() % stride == 0,
+            "byte stream length {} is not a multiple of InputEvent size {}",
+            bytes.len(),
+            stride
+        );
+        let count = bytes.len() / stride;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = i * stride;
+            // Skip the timeval (its size is stride - 8, since the rest
+            // of the event is always 8 bytes: u16 kind + u16 code +
+            // i32 value).
+            let rest = &bytes[off + (stride - 8)..off + stride];
+            let kind = u16::from_le_bytes([rest[0], rest[1]]);
+            let code = u16::from_le_bytes([rest[2], rest[3]]);
+            let value = i32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]);
+            out.push((kind, code, value));
+        }
+        out
+    }
+
+    /// `InputEvent` must match the kernel `struct input_event` ABI
+    /// exactly: 24 bytes on 64-bit (timeval=16 + type=2 + code=2 +
+    /// value=4), 16 bytes on 32-bit (timeval=8 + type=2 + code=2 +
+    /// value=4). Mismatch would corrupt the guest's event stream.
+    #[test]
+    fn input_event_size_matches_kernel_abi() {
+        let size = InputEvent::size();
+        // timeval size = size_of::<libc::timeval> — differs by target.
+        let tv_size = std::mem::size_of::<libc::timeval>();
+        let expected = tv_size + 8; // + 2 (kind) + 2 (code) + 4 (value)
+        assert_eq!(
+            size, expected,
+            "InputEvent size {} != expected {} (timeval {} + 8)",
+            size, expected, tv_size
+        );
+        // Sanity-check the two known arches.
+        if cfg!(target_pointer_width = "64") {
+            assert_eq!(size, 24, "64-bit InputEvent must be 24 bytes");
+        } else if cfg!(target_pointer_width = "32") {
+            assert_eq!(size, 16, "32-bit InputEvent must be 16 bytes");
+        }
+    }
+
+    /// `DeviceInfo` must match the AOSP / Nogitsune `struct device_info`
+    /// byte layout exactly. The guest's EventHub reads
+    /// `sizeof(struct device_info)` bytes from the socket on connect —
+    /// any size mismatch would cause the receiver to misparse the
+    /// bitmasks / abs_min/max arrays and fail to register the device.
+    #[test]
+    fn device_info_size_matches_aosp_layout() {
+        // Computed by hand:
+        //   name[80] + driver_version(4) + id(8) + physical_location[80]
+        //   + unique_id[80] + key_bitmask[96] + abs_bitmask[8]
+        //   + rel_bitmask[2] + sw_bitmask[2] + led_bitmask[2]
+        //   + ff_bitmask[16] + prop_bitmask[4] + 2 bytes padding
+        //   (to 4-align abs_max) + abs_max[64]*4 + abs_min[64]*4
+        //   = 80+4+8+80+80+96+8+2+2+2+16+4+2+256+256 = 896
+        assert_eq!(DeviceInfo::size(), 896, "DeviceInfo must be 896 bytes");
+    }
+
+    /// Verify that `make_touch_device` advertises ALL the multi-touch
+    /// capabilities that TWRP's `libminuitwrp` and Android's
+    /// `EventHub` expect: ABS_MT_SLOT/TRACKING_ID/POSITION_X/Y/PRESSURE
+    /// in `abs_bitmask`, BTN_TOUCH/BTN_TOOL_FINGER in `key_bitmask`,
+    /// INPUT_PROP_BUTTONPAD in `prop_bitmask`, and the correct
+    /// abs_min/abs_max ranges.
+    #[test]
+    fn make_touch_device_advertises_full_capabilities() {
+        let info = make_touch_device(720, 1280, "/dev/input/touch");
+
+        // Identity fields.
+        assert_eq!(&info.name[..6], b"vtouch");
+        assert_eq!(info.name[6], 0u8, "name must be NUL-terminated");
+        assert_eq!(&info.unique_id[..10], b"<vtouch 0>");
+        assert_eq!(info.driver_version, 1);
+        assert_eq!(info.id.product, 1);
+        assert_eq!(&info.physical_location[..16], b"/dev/input/touch");
+        assert_eq!(
+            info.physical_location[16], 0u8,
+            "path must be NUL-terminated"
+        );
+
+        // ABS axes advertised.
+        let abs_axes = [
+            abs::ABS_MT_SLOT,
+            abs::ABS_MT_TRACKING_ID,
+            abs::ABS_MT_POSITION_X,
+            abs::ABS_MT_POSITION_Y,
+            abs::ABS_MT_PRESSURE,
+        ];
+        for &axis in &abs_axes {
+            let byte = (axis / 8) as usize;
+            let bit = axis % 8;
+            assert!(
+                info.abs_bitmask[byte] & (1 << bit) != 0,
+                "abs_bitmask should advertise axis 0x{:x}",
+                axis
+            );
+        }
+
+        // Key buttons advertised (Nogitsune's make_touch_device does NOT
+        // set these — that's a bug; we fix it here).
+        for &key in &[btn::BTN_TOUCH, btn::BTN_TOOL_FINGER] {
+            let byte = (key / 8) as usize;
+            let bit = key % 8;
+            assert!(
+                info.key_bitmask[byte] & (1 << bit) != 0,
+                "key_bitmask should advertise key 0x{:x}",
+                key
+            );
+        }
+
+        // Per-axis ranges.
+        assert_eq!(info.abs_min[abs::ABS_MT_POSITION_X as usize], 0);
+        assert_eq!(info.abs_max[abs::ABS_MT_POSITION_X as usize], 720);
+        assert_eq!(info.abs_min[abs::ABS_MT_POSITION_Y as usize], 0);
+        assert_eq!(info.abs_max[abs::ABS_MT_POSITION_Y as usize], 1280);
+        assert_eq!(info.abs_min[abs::ABS_MT_PRESSURE as usize], 0);
+        assert_eq!(info.abs_max[abs::ABS_MT_PRESSURE as usize], 255);
+        assert_eq!(info.abs_min[abs::ABS_MT_TRACKING_ID as usize], 0);
+        assert_eq!(info.abs_max[abs::ABS_MT_TRACKING_ID as usize], 65535);
+        assert_eq!(info.abs_min[abs::ABS_MT_SLOT as usize], 0);
+        assert_eq!(info.abs_max[abs::ABS_MT_SLOT as usize], 4); // MAX_POINTERS-1
+
+        // Buttonpad property.
+        assert_eq!(
+            info.prop_bitmask[0] & INPUT_PROP_BUTTONPAD,
+            INPUT_PROP_BUTTONPAD,
+            "prop_bitmask should advertise INPUT_PROP_BUTTONPAD"
+        );
+    }
+
+    /// Verify the full touch-DOWN frame: exactly 8 events in the
+    /// correct order with the correct values. This is the protocol
+    /// Nogitsune's `input_handle_touch` ACTION_DOWN path emits
+    /// (input.cpp:260-271), with the BTN_TOUCH/BTN_TOOL_FINGER value
+    /// corrected from 108 to 1 (the kernel treats any nonzero value
+    /// as press, but 1 is the canonical "pressed" value).
+    #[test]
+    fn test_touch_down_emits_full_protocol() {
+        let time = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let out = encode_touch_down(
+            time, /* slot */ 0, /* tracking_id */ 0, 100, 200, 128,
+        );
+
+        // Must be exactly 8 events.
+        assert_eq!(
+            out.len(),
+            8 * InputEvent::size(),
+            "touch-down frame must be 8 events"
+        );
+
+        let events = parse_events(&out);
+        assert_eq!(
+            events,
+            vec![
+                (ev::EV_ABS, abs::ABS_MT_SLOT, 0),
+                (ev::EV_ABS, abs::ABS_MT_TRACKING_ID, 0),
+                (ev::EV_KEY, btn::BTN_TOUCH, 1),
+                (ev::EV_KEY, btn::BTN_TOOL_FINGER, 1),
+                (ev::EV_ABS, abs::ABS_MT_POSITION_X, 100),
+                (ev::EV_ABS, abs::ABS_MT_POSITION_Y, 200),
+                (ev::EV_ABS, abs::ABS_MT_PRESSURE, 128),
+                (ev::EV_SYN, syn::SYN_REPORT, 0),
+            ],
+            "touch-down events must be in Nogitsune order with corrected BTN values"
+        );
+    }
+
+    /// Verify the full touch-RELEASE frame: exactly 5 events in the
+    /// correct order. This is the protocol Nogitsune's
+    /// `input_handle_touch` ACTION_UP path emits (input.cpp:280-288),
+    /// with TWO improvements:
+    ///   1. BTN_TOUCH=0 / BTN_TOOL_FINGER=0 are emitted (Nogitsune's
+    ///      ACTION_UP omits these, leaving the guest in a stuck-press).
+    ///   2. ABS_MT_TRACKING_ID is -1 (the canonical slot-release value).
+    #[test]
+    fn test_touch_release_emits_release_protocol() {
+        let time = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let out = encode_touch_release(time, /* slot */ 0);
+
+        // Must be exactly 5 events.
+        assert_eq!(
+            out.len(),
+            5 * InputEvent::size(),
+            "touch-release frame must be 5 events"
+        );
+
+        let events = parse_events(&out);
+        assert_eq!(
+            events,
+            vec![
+                (ev::EV_ABS, abs::ABS_MT_SLOT, 0),
+                (ev::EV_ABS, abs::ABS_MT_TRACKING_ID, -1),
+                (ev::EV_KEY, btn::BTN_TOUCH, 0),
+                (ev::EV_KEY, btn::BTN_TOOL_FINGER, 0),
+                (ev::EV_SYN, syn::SYN_REPORT, 0),
+            ],
+            "touch-release events must include BTN_TOUCH=0 / BTN_TOOL_FINGER=0"
+        );
+    }
+
+    /// Verify the touch-MOVE frame: exactly 5 events, NO re-press of
+    /// BTN_TOUCH/BTN_TOOL_FINGER (they're already pressed from DOWN).
+    /// Matches Nogitsune's ACTION_MOVE path (input.cpp:272-279).
+    #[test]
+    fn test_touch_move_emits_move_protocol() {
+        let time = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let out = encode_touch_move(time, /* slot */ 0, 150, 250, 200);
+
+        assert_eq!(
+            out.len(),
+            5 * InputEvent::size(),
+            "touch-move frame must be 5 events"
+        );
+
+        let events = parse_events(&out);
+        assert_eq!(
+            events,
+            vec![
+                (ev::EV_ABS, abs::ABS_MT_SLOT, 0),
+                (ev::EV_ABS, abs::ABS_MT_POSITION_X, 150),
+                (ev::EV_ABS, abs::ABS_MT_POSITION_Y, 250),
+                (ev::EV_ABS, abs::ABS_MT_PRESSURE, 200),
+                (ev::EV_SYN, syn::SYN_REPORT, 0),
+            ],
+            "touch-move events must NOT re-press BTN_TOUCH/BTN_TOOL_FINGER"
+        );
+    }
+
+    /// Verify that a multi-touch down + move + release sequence
+    /// concatenates cleanly into a single byte stream (the guest's
+    /// EventHub reads events as a continuous stream — there is no
+    /// length prefix or framing beyond SYN_REPORT).
+    #[test]
+    fn test_touch_down_move_release_concatenate() {
+        let time = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut stream = Vec::new();
+        stream.extend(encode_touch_down(time, 0, 0, 100, 200, 128));
+        stream.extend(encode_touch_move(time, 0, 150, 250, 200));
+        stream.extend(encode_touch_release(time, 0));
+
+        // 8 (down) + 5 (move) + 5 (release) = 18 events total.
+        assert_eq!(stream.len(), 18 * InputEvent::size());
+        let events = parse_events(&stream);
+        assert_eq!(events.len(), 18);
+        // First event of the down frame.
+        assert_eq!(events[0], (ev::EV_ABS, abs::ABS_MT_SLOT, 0));
+        // Last event of the release frame (SYN_REPORT).
+        assert_eq!(events[17], (ev::EV_SYN, syn::SYN_REPORT, 0));
+    }
+
+    /// Verify that `encode_input_event` produces exactly
+    /// `InputEvent::size()` bytes, all zero in the timeval stamp
+    /// when the input timeval is zero, and the kind/code/value
+    /// packed in little-endian at the correct offsets.
+    #[test]
+    fn test_encode_input_event_byte_layout() {
+        let time = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let bytes = encode_input_event(time, ev::EV_ABS, abs::ABS_MT_PRESSURE, 128);
+        assert_eq!(bytes.len(), InputEvent::size());
+
+        // The timeval prefix must be all-zero.
+        let tv_size = std::mem::size_of::<libc::timeval>();
+        for b in &bytes[..tv_size] {
+            assert_eq!(*b, 0, "timeval bytes must be zero");
+        }
+
+        // The trailing 8 bytes are: u16 kind (LE) + u16 code (LE) + i32 value (LE).
+        let rest = &bytes[tv_size..];
+        assert_eq!(rest.len(), 8);
+        assert_eq!(u16::from_le_bytes([rest[0], rest[1]]), ev::EV_ABS);
+        assert_eq!(u16::from_le_bytes([rest[2], rest[3]]), abs::ABS_MT_PRESSURE);
+        assert_eq!(
+            i32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]),
+            128
+        );
     }
 }
