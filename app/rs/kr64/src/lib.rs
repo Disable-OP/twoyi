@@ -4536,7 +4536,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 sig
             );
             // Run the ptrace loop — this blocks until the child exits.
-            let exit_code = ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs);
+            //
+            // We construct the Vfs here. For now every boot path uses
+            // new_twrp() (TWRP-mode entries — /dev/__properties__/... +
+            // /dev/__properties__ dir). Future boot modes (full Android
+            // guest) can populate additional entries (e.g. /proc/self/maps
+            // as a Dynamic node) by extending new_twrp() or adding a new
+            // constructor. The ptrace_emu's open/openat ENTRY-stop
+            // handler asks the Vfs to materialise synthetic files into
+            // rootfs before the real kernel open() runs, replacing the
+            // find_property binary patch (worklog 1-A F.1 + 1-B Task 3).
+            let vfs = vfs::Vfs::new_twrp();
+            let exit_code = ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs, &vfs);
             info!(
                 "[KR64][parent] ptrace emulation loop ended — child exit code: {}",
                 exit_code

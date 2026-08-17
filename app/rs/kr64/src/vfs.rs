@@ -108,6 +108,64 @@ impl Vfs {
     pub fn is_synthetic(&self, guest_path: &str) -> bool {
         self.entries.contains_key(guest_path)
     }
+
+    /// Materialize a VFS node's content into the host filesystem at
+    /// `{rootfs}{guest_path}` (creating parent dirs as needed) so a
+    /// subsequent real `open()` by the traced child finds the file.
+    ///
+    /// This is called from the ptrace ENTRY-stop path BEFORE
+    /// `translate_path()` runs: by the time the kernel's `open` actually
+    /// executes against the translated path (`{rootfs}{guest_path}` for
+    /// `/dev/*` paths), the file already exists with the right content.
+    ///
+    /// Behaviour per `VfsNode` variant:
+    /// - `Dynamic` / `Synthetic` — write the bytes to the file (overwrite).
+    /// - `SyntheticDir` — `create_dir_all` the path.
+    /// - `HostKernel` / `RootfsFile` — no-op (the host/rootfs file is
+    ///   already there, or will be created by another path).
+    /// - `Absent` — no-op. The caller should let the `open` fail
+    ///   naturally with `ENOENT` (the file does not exist).
+    ///
+    /// Returns `Ok(())` if the file system operation succeeded OR if the
+    /// node variant is a no-op. Returns `Err(...)` on actual I/O failure
+    /// so the caller can log it.
+    pub fn materialize(&self, guest_path: &str, rootfs: &str) -> std::io::Result<()> {
+        let Some(node) = self.entries.get(guest_path) else {
+            // Path is not a known VFS entry — nothing to materialize.
+            return Ok(());
+        };
+        // The host path where the file should land. For paths under
+        // /dev/*, translate_path() rewrites them to `{rootfs}/dev/...`,
+        // so we write to the same location. For other paths the caller
+        // must ensure the rootfs-relative layout matches.
+        let host_path = if guest_path.starts_with('/') {
+            format!("{}{}", rootfs, guest_path)
+        } else {
+            format!("{}/{}", rootfs, guest_path)
+        };
+        match node {
+            VfsNode::Synthetic(bytes) => {
+                if let Some(parent) = std::path::Path::new(&host_path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&host_path, bytes)?;
+            }
+            VfsNode::Dynamic(generator) => {
+                let bytes = generator();
+                if let Some(parent) = std::path::Path::new(&host_path).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&host_path, &bytes)?;
+            }
+            VfsNode::SyntheticDir(_entries) => {
+                std::fs::create_dir_all(&host_path)?;
+            }
+            VfsNode::HostKernel(_) | VfsNode::RootfsFile(_) | VfsNode::Absent => {
+                // No-op — see method doc.
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Build a minimal valid AOSP `__system_property_area__` header.
@@ -183,5 +241,40 @@ mod tests {
         assert!(vfs.is_synthetic("/dev/__properties__/properties_serial"));
         assert!(vfs.is_synthetic("/dev/__properties__"));
         assert!(!vfs.is_synthetic("/dev/null"));
+    }
+
+    #[test]
+    fn test_vfs_materialize_writes_properties_serial_file() {
+        // Materialize the property-area Dynamic node into a temp rootfs
+        // and verify the file content matches make_minimal_property_area().
+        let tmp = std::env::temp_dir().join(format!("kr64_vfs_test_{}", std::process::id()));
+        let rootfs = tmp.to_str().unwrap();
+        // Clean up any prior run + recreate
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let vfs = Vfs::new_twrp();
+        vfs.materialize("/dev/__properties__/properties_serial", rootfs)
+            .expect("materialize must succeed");
+        let written = std::fs::read(format!("{}/dev/__properties__/properties_serial", rootfs))
+            .expect("file must exist after materialize");
+        assert_eq!(written, make_minimal_property_area());
+        assert_eq!(written.len(), 128);
+        // The directory itself is registered as a SyntheticDir entry —
+        // materializing it must create_dir_all the dir at rootfs.
+        vfs.materialize("/dev/__properties__", rootfs)
+            .expect("SyntheticDir materialize must succeed");
+        let md = std::fs::metadata(format!("{}/dev/__properties__", rootfs))
+            .expect("dir must exist after SyntheticDir materialize");
+        assert!(md.is_dir());
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_vfs_materialize_no_op_for_unknown_path() {
+        let vfs = Vfs::new_twrp();
+        // A path that is NOT in the VFS must materialize as a no-op Ok.
+        vfs.materialize("/dev/null", "/tmp/nonexistent_rootfs")
+            .expect("materialize on unknown path must be Ok no-op");
     }
 }
