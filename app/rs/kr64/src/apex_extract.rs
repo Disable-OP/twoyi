@@ -457,15 +457,112 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
             std::io::Error::last_os_error()
         ));
     }
-    let loop_dev = format!("/dev/loop{}", n);
+    let preferred_loop_dev = format!("/dev/loop{}", n);
+
+    // 5-O's diagnosis + 5-P's fix: Android emulator userspace has NO udev.
+    // When the kernel allocates a loop device via LOOP_CTL_GET_FREE
+    // (returned `n`), the `/dev/loopN` device node is NOT auto-created on
+    // the filesystem. 5-O observed `open("/dev/loop28")` fail ENOENT after
+    // LOOP_CTL_GET_FREE returned 28 on bbc2849. Fix: mknod the device
+    // node ourselves (requires CAP_MKNOD — available via
+    // `cfg.use_namespaces=true`, which grants CAP_SYS_ADMIN to the
+    // parent; CAP_SYS_ADMIN is a superset of CAP_MKNOD on Linux). If
+    // mknod fails (e.g. EPERM, or the node already exists which is also
+    // OK), we fall through; the open below will retry + we also fall
+    // back to `/dev/loop0..31` in case init.rc mknod'd a small set at
+    // boot.
+    let dev_t = libc::makedev(7 as libc::c_uint, n as libc::c_uint);
+    // loop block device: major=7, minor=n (Linux ABI, see
+    // Documentation/admin-guide/devices.txt: "Loop block device" majors
+    // 7/0..255).
+    let preferred_c = CString::new(preferred_loop_dev.as_str())
+        .map_err(|_| "preferred_loop_dev path contains NUL".to_string())?;
+    let mknod_ret = unsafe { libc::mknod(preferred_c.as_ptr(), libc::S_IFBLK | 0o660, dev_t) };
+    if mknod_ret == 0 {
+        info!(
+            "[KR64][apex_extract] mknod {} (S_IFBLK | 0o660, dev=0x{:x}) succeeded",
+            preferred_loop_dev, dev_t
+        );
+    } else {
+        let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(0);
+        // EEXIST (17) is benign — the node already exists (from a prior
+        // run or from init.rc's static mknod pass) and the open below
+        // will just use it. Other errors (EPERM=1, ENOSYS=38, ENOMEM=12,
+        // etc.) mean CAP_MKNOD isn't available or mknod is otherwise
+        // blocked — we'll fall through to the /dev/loop0..31 fallback.
+        if errno == libc::EEXIST {
+            info!(
+                "[KR64][apex_extract] mknod {} returned EEXIST (node already exists) — open will reuse it",
+                preferred_loop_dev
+            );
+        } else {
+            warning!(
+                "[KR64][apex_extract] mknod {} (dev=0x{:x}) failed: {} (errno {}) — will try open anyway + fall back to /dev/loop0..31",
+                preferred_loop_dev, dev_t, err, errno
+            );
+        }
+    }
 
     // Open the loop device (read-write — LOOP_SET_FD requires write access
     // so the kernel can manage the backing file's page cache).
-    let loop_fd = std::fs::OpenOptions::new()
+    //
+    // Try the kernel-allocated preferred path first; if it fails (mknod
+    // wasn't permitted, the device driver rejected the open, or the node
+    // genuinely doesn't exist), fall back to iterating /dev/loop0..31
+    // with O_RDWR until one opens. init.rc may have mknod'd a small set
+    // (typically 0..7) at boot that we can reuse; LOOP_CTL_GET_FREE's
+    // index allocation is independent of the /dev/loopN filesystem nodes,
+    // so one of the pre-existing nodes may still be free.
+    let mut loop_dev = preferred_loop_dev.clone();
+    let loop_fd = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&loop_dev)
-        .map_err(|e| format!("open {}: {}", loop_dev, e))?;
+    {
+        Ok(fd) => fd,
+        Err(first_err) => {
+            warning!(
+                "[KR64][apex_extract] open {} failed: {} — falling back to /dev/loop0..31",
+                loop_dev,
+                first_err
+            );
+            let mut found: Option<std::fs::File> = None;
+            for i in 0..32u32 {
+                let p = format!("/dev/loop{}", i);
+                match std::fs::OpenOptions::new().read(true).write(true).open(&p) {
+                    Ok(fd) => {
+                        info!(
+                            "[KR64][apex_extract] fallback: opened {} (fd={})",
+                            p,
+                            fd.as_raw_fd()
+                        );
+                        loop_dev = p;
+                        found = Some(fd);
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            match found {
+                Some(fd) => fd,
+                None => {
+                    return Err(format!(
+                        "open {} (and /dev/loop0..31 fallback all failed): {} — \
+                         Android emulator has no udev to auto-create loop device nodes \
+                         (5-O's diagnosis on bbc2849; 5-P's mknod+fallback fix)",
+                        preferred_loop_dev, first_err
+                    ));
+                }
+            }
+        }
+    };
+    info!(
+        "[KR64][apex_extract] using loop device {} (fd={}) for LOOP_SET_FD (backing {})",
+        loop_dev,
+        loop_fd.as_raw_fd(),
+        ext4_path
+    );
 
     // Associate the loop device with the ext4 image file. After this,
     // reads/writes to /dev/loopN go to the backing file.
@@ -487,6 +584,12 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
             loop_dev, ext4_path, e
         ));
     }
+    info!(
+        "[KR64][apex_extract] LOOP_SET_FD succeeded: {} ↔ backing {} (img fd={})",
+        loop_dev,
+        ext4_path,
+        img.as_raw_fd()
+    );
 
     // mount the loop device as ext4, read-only + silent (suppress ext4
     // driver warnings about unsupported features — they go to dmesg
@@ -528,6 +631,10 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
             loop_dev, mount_dir, e
         ));
     }
+    info!(
+        "[KR64][apex_extract] mount succeeded: {} (ext4, MS_RDONLY|MS_SILENT) mounted on {}",
+        loop_dev, mount_dir
+    );
 
     // Read the file inside the mount. Trim leading '/' so the join
     // produces <apex_mount_dir>/lib64/bionic/libdl.so (not
@@ -1521,5 +1628,51 @@ mod tests {
         let err = result.unwrap_err();
         // The error should mention the open failure on the ext4 image.
         assert!(err.contains("open ext4 image"));
+    }
+
+    // ========================================================================
+    // Tests for the loop device mknod (5-P's fix for 5-O's diagnosis:
+    // /dev/loopN device node doesn't exist after LOOP_CTL_GET_FREE on
+    // Android emulator — no udev to auto-create).
+    // ========================================================================
+
+    #[test]
+    fn makedev_loop7_minor0_is_canonical_loop_dev_t() {
+        // /dev/loop0 is the canonical reference: major=7, minor=0.
+        // Both the Android (libc 0.2.189 android/mod.rs) and Linux
+        // (libc 0.2.189 linux/mod.rs) `makedev` formulas produce:
+        //   dev = (major & 0xfff) << 8 | (minor & 0xff) | (minor & 0xfff00) << 12
+        // For (7, 0): dev = 0x700 = 1792.
+        // (Linux's extended formula adds `(major & 0xfffff000) << 32` and
+        // `(minor & 0xffffff00) << 12`, both 0 for these small values.)
+        let dev = libc::makedev(7, 0);
+        assert_eq!(dev, 0x700, "makedev(7, 0) should be 0x700 = 1792");
+    }
+
+    #[test]
+    fn makedev_loop7_minor28_is_5o_observed_index() {
+        // 5-O observed LOOP_CTL_GET_FREE return n=28 on bbc2849. The
+        // mknod call uses makedev(7, 28) to construct the dev_t for
+        // /dev/loop28. Both Android and Linux formulas produce:
+        //   (7 & 0xfff) << 8  = 0x700
+        //   (28 & 0xff)       = 0x1c
+        //   (28 & 0xfff00) << 12 = 0
+        //   dev = 0x71c = 1820
+        let dev = libc::makedev(7, 28);
+        assert_eq!(dev, 0x71c, "makedev(7, 28) should be 0x71c = 1820");
+    }
+
+    #[test]
+    fn makedev_major_minor_round_trip_for_loop_indices() {
+        // For every loop index 0..255 (the valid minor range for block
+        // major 7), makedev/major/minor must round-trip. This catches any
+        // future libc signature drift that might break the mknod path.
+        for n in 0u32..256 {
+            let dev = libc::makedev(7, n);
+            let ma = libc::major(dev);
+            let mi = libc::minor(dev);
+            assert_eq!(ma, 7, "major(dev_t for n={}) should be 7", n);
+            assert_eq!(mi, n, "minor(dev_t for n={}) should be {}", n, n);
+        }
     }
 }
