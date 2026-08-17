@@ -75,6 +75,7 @@ pub mod ptrace_emu;
 pub mod qemu_pipe;
 pub mod seccomp;
 pub mod sensors;
+pub mod vfs;
 
 use std::ffi::CString;
 use std::os::unix::fs::symlink;
