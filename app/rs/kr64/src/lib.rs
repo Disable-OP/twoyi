@@ -64,6 +64,7 @@
 //! `error!` macros defined below (which expand to `eprintln!`), and
 //! lazy statics use `std::sync::OnceLock` (stabilised in Rust 1.70).
 
+pub mod apex_extract;
 pub mod audio;
 pub mod battery;
 pub mod binder;
@@ -2308,6 +2309,52 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     };
 
     // ---------------------------------------------------------------
+    // Step 3.7: extract the REAL libdl.so from the APEX ext4 image
+    // (BEFORE setup_mounts, while host paths are still accessible).
+    //
+    // 5-K's diagnosis (kr64-stderr.log line 81): the visible
+    // /apex/com.android.runtime/lib64/bionic/libdl.so is a 5848-byte
+    // bootstrap STUB — same size as /system/lib64/libdl.so. The hook
+    // libraries' DT_NEEDED:libdl.so (LIBC version) is NOT satisfied
+    // by this stub → linker64 segfault at offset 0xaf174 (faulting
+    // address 0x86 = NULL soinfo).
+    //
+    // The REAL libdl.so lives INSIDE the APEX ext4 image at
+    // /system/apex/com.android.runtime.apex (a ZIP file containing
+    // apex_payload.img — the ext4 image). We extract it via:
+    //   1. Detecting the .apex file at multiple candidate paths
+    //      (rom_dir/system/apex/..., rootfs/system/apex/...,
+    //       /system/apex/..., /apex/com.android.runtime.apex).
+    //   2. Parsing the ZIP central directory to find apex_payload.img
+    //      (STORED method only — DEFLATE entries are rejected because
+    //      we don't have zlib; APEX payloads are typically STORED).
+    //   3. Writing the ext4 image to /tmp/twoyi-apex-payload.img
+    //      (host's /tmp — accessible here, before pivot_root).
+    //   4. Loopback-mounting the ext4 image (via /dev/loop-control +
+    //      LOOP_SET_FD + mount("ext4")) and reading lib64/bionic/libdl.so.
+    //   5. Validating the bytes via is_real_libdl (ELF magic + > stub size).
+    //
+    // Fallback: scan /apex/com.android.runtime@*/lib64/bionic/libdl.so
+    // for any that's larger than the stub.
+    //
+    // If everything fails, the bytes Option is None — the LD_LIBRARY_PATH
+    // change (Step 5 below) still prepends /dev/ so a future fix can
+    // drop a real libdl.so at /dev/libdl.so without code changes.
+    //
+    // TWRP BOOT: skip extraction entirely — TWRP's init is statically
+    // linked and doesn't use LD_PRELOAD hooks (so it doesn't need
+    // libdl.so at all). The recovery service does need libdl.so (via
+    // LD_PRELOAD=/sbin/libtwrp_fb_hook.so), but the i686 libtwrp_fb_hook
+    // is built against the 32-bit bionic which doesn't have the
+    // stub-vs-real libdl.so problem on Android 11.
+    let real_libdl: Option<(String, Vec<u8>)> = if cfg.boot_recovery {
+        info!("[KR64] TWRP boot: skipping APEX libdl.so extraction (init is statically linked, doesn't need libdl.so)");
+        None
+    } else {
+        apex_extract::find_real_libdl_so(&cfg)
+    };
+
+    // ---------------------------------------------------------------
     // Step 4: set up mount namespace + bind mounts + tmpfs.
     // ---------------------------------------------------------------
     // The parent calls setup_mounts() BEFORE fork(). This does:
@@ -2626,6 +2673,47 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Step 4.6.1: write the REAL libdl.so (extracted in Step 3.7 before
+    // pivot_root) to /dev/libdl.so on the tmpfs.
+    //
+    // This is the CRITICAL fix for the linker64 segfault at offset
+    // 0xaf174 (faulting address 0x86 = NULL soinfo). The hook
+    // libraries' DT_NEEDED:libdl.so (LIBC version) was NOT satisfied
+    // by the 5848-byte bootstrap stub at both
+    // /system/lib64/libdl.so AND /apex/com.android.runtime/lib64/bionic/libdl.so.
+    //
+    // The LD_LIBRARY_PATH (built in Step 5 below) is modified to put
+    // /dev/ FIRST — so the linker finds /dev/libdl.so (the real one
+    // we extracted from the APEX ext4 image) before falling back to
+    // the stub at /apex/com.android.runtime/lib64/bionic/libdl.so.
+    //
+    // The bytes were extracted by `apex_extract::find_real_libdl_so`
+    // BEFORE setup_mounts (while host paths like
+    // /system/apex/com.android.runtime.apex were accessible). Now,
+    // AFTER setup_mounts (when /dev/ is the tmpfs), we write them to
+    // /dev/libdl.so — exactly the same pattern as the hook libraries
+    // above (write to /dev/ tmpfs which survives pivot_root).
+    //
+    // If extraction failed (e.g. loop device not available, .apex
+    // missing, or ext4 driver doesn't support the image), `real_libdl`
+    // is None and we skip the write. The LD_LIBRARY_PATH change (Step 5)
+    // still prepends /dev/ — that's safe because if /dev/libdl.so
+    // doesn't exist, the linker just falls through to the next entry
+    // (/apex/com.android.runtime/lib64/bionic/libdl.so = the stub).
+    if let Some((src, content)) = &real_libdl {
+        info!(
+            "[KR64] PARENT: writing real libdl.so ({} bytes, source: {}) to /dev/libdl.so (AFTER pivot_root, tmpfs)",
+            content.len(),
+            src
+        );
+        write_hook_library_to_dev("libdl.so", src, content, "/dev/libdl.so");
+    } else {
+        warning!(
+            "[KR64] PARENT: real libdl.so NOT extracted — guest init will use the 5848-byte stub at /apex/com.android.runtime/lib64/bionic/libdl.so and may crash at offset 0xaf174 in linker64 (5-K's diagnosis)"
+        );
+    }
+
     // Change SELinux label of /dev/lib*.so to system_file so that
     // vendor_init subcontexts can access them.
     //
@@ -2681,6 +2769,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         for lib_path in &[
             "/dev/libgetpid_hook.so",
             "/dev/libtwoyi_loader_shlib.so",
+            "/dev/libdl.so",
             "/sbin/libtwrp_fb_hook.so",
         ] {
             if Path::new(lib_path).exists() {
@@ -4112,6 +4201,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
+        // 5-L diagnostic: also check /dev/libdl.so (the REAL libdl.so we
+        // extracted from the APEX ext4 image in Step 3.7). If present, the
+        // linker will find it FIRST (because LD_LIBRARY_PATH prepends /dev/).
+        // If absent, the linker falls through to /apex/.../bionic/libdl.so
+        // (the 5848-byte stub) and likely crashes at offset 0xaf174.
+        let libdl_exists = unsafe { libc::access(c"/dev/libdl.so".as_ptr(), libc::F_OK) == 0 };
+        if libdl_exists {
+            unsafe {
+                safe_write_err(b"[KR64 CHILD] libdl.so (REAL, from APEX) found at /dev/libdl.so -- linker should resolve DT_NEEDED:libdl.so via /dev/ FIRST\n");
+            }
+        } else {
+            unsafe {
+                safe_write_err(b"[KR64 CHILD] libdl.so NOT found at /dev/libdl.so -- linker will fall through to /apex/.../bionic/libdl.so (the 5848-byte stub). EXPECT linker64 segfault at 0xaf174 (5-K's diagnosis).\n");
+            }
+        }
+
         // Build environment for the guest init. The CString::new calls
         // below use compile-time-constant strings (no NUL possible) and
         // format!() -- the format! allocation happens BEFORE execve, so
@@ -4312,7 +4417,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     //   - The apex directory has all 4 bionic libraries
                     //     (libc.so, libm.so, libdl.so, libdl_android.so), so
                     //     they can find each other.
+                    //
+                    // 5-K REFUTATION (kr64-stderr.log line 81): the above
+                    //   assumption is WRONG —
+                    //   /apex/com.android.runtime/lib64/bionic/libdl.so is
+                    //   ALSO the 5848-byte bootstrap stub (not the real
+                    //   one). Both paths return the SAME 5848-byte stub.
+                    //   The REAL libdl.so lives INSIDE the APEX ext4 image
+                    //   at /system/apex/com.android.runtime.apex (not
+                    //   extracted by `tar cf apex/`).
+                    //
+                    // 5-L FIX: extract the real libdl.so from the APEX
+                    //   ext4 image (see apex_extract.rs + Step 3.7 in
+                    //   run()) and write it to /dev/libdl.so BEFORE
+                    //   fork. Prepend /dev/ to LD_LIBRARY_PATH so the
+                    //   linker finds /dev/libdl.so (the real one) before
+                    //   falling back to the stub at
+                    //   /apex/com.android.runtime/lib64/bionic/libdl.so.
+                    //
+                    //   If extraction failed (real_libdl is None) and
+                    //   /dev/libdl.so doesn't exist, the linker just
+                    //   falls through to the next LD_LIBRARY_PATH entry
+                    //   (/apex/com.android.runtime/lib64/bionic = the
+                    //   stub) — same behavior as before this fix.
                     "LD_LIBRARY_PATH=\
+                /dev:\
                 /apex/com.android.runtime/lib64/bionic:\
                 /apex/com.android.runtime/lib64:\
                 /apex/com.android.runtime/lib64/bootstrap:\
