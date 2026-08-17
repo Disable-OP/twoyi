@@ -39,7 +39,10 @@
 //!    STORED (method 0) entries are supported — DEFLATE entries return
 //!    an error (decompression would require pulling in a zlib dependency,
 //!    which is against the crate's "std + libc only" policy).
-//! 3. **Write ext4 image to a temp file** at `/tmp/twoyi-apex-payload.img`.
+//! 3. **Write ext4 image to a temp file** at `<apex_temp_dir>/twoyi-apex-payload.img`
+//!    (the parent's `TMPDIR` env var, defaulting to `/data/data/io.twoyi/cache` —
+//!    NOT `/tmp/` which doesn't exist in the parent's Android-app-sandbox context
+//!    before `setup_mounts` bind-mounts tmpfs on `/tmp`; see [`apex_temp_dir`]).
 //! 4. **Loopback-mount the ext4 image** via the kernel's loop device
 //!    (`/dev/loop-control` + `LOOP_CTL_GET_FREE` + `LOOP_SET_FD` + `mount`
 //!    syscall with fstype `ext4`). This leverages the kernel's well-tested
@@ -111,6 +114,89 @@ const ZIP_EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
 const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4C82;
 const LOOP_SET_FD: libc::c_ulong = 0x4C00;
 const LOOP_CLR_FD: libc::c_ulong = 0x4C01;
+
+/// Returns the directory used for APEX extraction temp files (pure logic,
+/// no side effects — does NOT create the directory).
+///
+/// **Background (5-M's diagnosis of the 3b571fe failure)**: at Step 3.7
+/// (BEFORE `setup_mounts`), `/tmp/` does NOT exist in the parent process's
+/// Android-app-sandbox filesystem context. `setup_mounts` is what
+/// bind-mounts tmpfs on `/tmp/` inside the new mount namespace; before
+/// that, only the app's own data + cache dirs are writable. 5-L's
+/// original code hardcoded `/tmp/twoyi-apex-payload.img` and got
+/// `ENOENT` writing 6377472 bytes — the extraction algorithm was correct
+/// but the temp path was wrong.
+///
+/// **Resolution order (per 5-M's recommendation #1 — use the app cache dir)**:
+/// 1. `$TMPDIR` env var — Android's app sandbox sets this to the app's
+///    cache dir (e.g. `/data/data/io.twoyi/cache` or
+///    `/data/user/0/io.twoyi/cache`). Always writable, always exists.
+/// 2. Fallback: `/data/data/io.twoyi/cache` (the io.twoyi app's cache
+///    dir, matching the package name in app/build.gradle `applicationId`).
+///
+/// `getenv` is injected so unit tests can mock the env lookup without
+/// touching the process-global `std::env::set_var` (which would race
+/// with parallel tests in the same process).
+fn apex_temp_dir_from(getenv: impl Fn(&str) -> Option<String>) -> String {
+    getenv("TMPDIR")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/data/data/io.twoyi/cache".to_string())
+}
+
+/// Returns the directory used for APEX extraction temp files, with the
+/// directory created (recursively) if it doesn't already exist.
+///
+/// See [`apex_temp_dir_from`] for the resolution logic + rationale.
+///
+/// `create_dir_all` is a no-op if the directory already exists (the common
+/// case at runtime — Android creates the app's cache dir at install time,
+/// and `TMPDIR` points there). If creation fails, we log a warning but
+/// still return the path — the subsequent `std::fs::write` will produce
+/// a more specific error message that gets logged by the caller.
+fn apex_temp_dir() -> String {
+    let dir = apex_temp_dir_from(|k| std::env::var(k).ok());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warning!(
+            "[KR64][apex_extract] failed to create_dir_all({}): {} — extraction will likely fail",
+            dir,
+            e
+        );
+    }
+    dir
+}
+
+/// Returns the temp-file path for the extracted `apex_payload.img`
+/// (the ext4 image inside the .apex ZIP).
+///
+/// The path lives under [`apex_temp_dir`] so it's writable in the
+/// parent's pre-`setup_mounts` filesystem context. The filename is
+/// fixed (`twoyi-apex-payload.img`) because there's only one kr64
+/// daemon per app process — no concurrency concern.
+fn apex_payload_temp_path_in(base: &str) -> String {
+    format!("{}/twoyi-apex-payload.img", base)
+}
+
+/// Convenience wrapper: temp path under [`apex_temp_dir`] (which also
+/// ensures the directory exists via `create_dir_all`).
+fn apex_payload_temp_path() -> String {
+    apex_payload_temp_path_in(&apex_temp_dir())
+}
+
+/// Returns the mount-point path used by [`loopback_mount_and_read`] to
+/// mount the ext4 image read-only.
+///
+/// The path lives under [`apex_temp_dir`] so it's writable in the
+/// parent's pre-`setup_mounts` filesystem context. The directory is
+/// created (and cleaned up) by [`loopback_mount_and_read`].
+fn apex_mount_dir_in(base: &str) -> String {
+    format!("{}/twoyi-apex-mount", base)
+}
+
+/// Convenience wrapper: mount-point path under [`apex_temp_dir`] (which
+/// also ensures the parent directory exists via `create_dir_all`).
+fn apex_mount_dir() -> String {
+    apex_mount_dir_in(&apex_temp_dir())
+}
 
 /// Returns `true` if `bytes` looks like a real libdl.so (ELF magic +
 /// strictly larger than the 5848-byte bootstrap stub).
@@ -339,8 +425,10 @@ pub fn extract_apex_payload_img(apex_path: &str) -> Result<Vec<u8>, String> {
 ///
 /// Returns the file bytes on success, or an error string on failure.
 pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec<u8>, String> {
-    let mount_dir = "/tmp/twoyi-apex-mount";
-    let _ = std::fs::create_dir_all(mount_dir);
+    let mount_dir = apex_mount_dir();
+    // apex_temp_dir() already create_dir_all'd the parent; create the
+    // mount subdirectory itself. (Ignored if it already exists.)
+    let _ = std::fs::create_dir_all(&mount_dir);
 
     // Open the ext4 image file (the source for the loop device).
     let img = std::fs::File::open(ext4_path)
@@ -403,8 +491,17 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
     // mount the loop device as ext4, read-only + silent (suppress ext4
     // driver warnings about unsupported features — they go to dmesg
     // otherwise and clutter the KVM E2E log).
+    //
+    // CString::new takes ownership of the bytes; clone mount_dir so we
+    // can still use it for file_path + error messages below.
+    //
+    // We keep `tgt_c` around so umount (later) can use `tgt_c.as_ptr()` —
+    // passing `mount_dir.as_ptr()` directly would be a latent bug because
+    // String's internal buffer is NOT null-terminated (the umount syscall
+    // would walk memory looking for a NUL byte).
     let src_c = CString::new(loop_dev.as_str()).map_err(|_| "loop_dev contains NUL".to_string())?;
-    let tgt_c = CString::new(mount_dir).map_err(|_| "mount_dir contains NUL".to_string())?;
+    let tgt_c =
+        CString::new(mount_dir.clone()).map_err(|_| "mount_dir contains NUL".to_string())?;
     let fstype_c = CString::new("ext4").map_err(|_| "ext4 contains NUL".to_string())?;
     let mount_r = unsafe {
         libc::mount(
@@ -425,7 +522,7 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
                 0 as libc::c_int,
             );
         }
-        let _ = std::fs::remove_dir(mount_dir);
+        let _ = std::fs::remove_dir(&mount_dir);
         return Err(format!(
             "mount {} as ext4 on {}: {} (ext4 driver may not support image features — check dmesg)",
             loop_dev, mount_dir, e
@@ -433,8 +530,8 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
     }
 
     // Read the file inside the mount. Trim leading '/' so the join
-    // produces /tmp/twoyi-apex-mount/lib64/bionic/libdl.so (not
-    // /tmp/twoyi-apex-mount//lib64/...).
+    // produces <apex_mount_dir>/lib64/bionic/libdl.so (not
+    // <apex_mount_dir>//lib64/...).
     let rel = file_inside.trim_start_matches('/');
     let file_path = format!("{}/{}", mount_dir, rel);
     let bytes = std::fs::read(&file_path).map_err(|e| {
@@ -445,8 +542,11 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
     });
 
     // Cleanup: umount the mount (MNT_DETACH so it doesn't block if some
-    // file is still open — none should be, but defensive).
-    let _ = unsafe { libc::umount(mount_dir.as_ptr() as *const _) };
+    // file is still open — none should be, but defensive). Use
+    // `tgt_c.as_ptr()` (null-terminated) rather than `mount_dir.as_ptr()`
+    // (NOT null-terminated — String's internal buffer doesn't include
+    // a NUL byte, so the umount syscall would walk past the buffer).
+    let _ = unsafe { libc::umount(tgt_c.as_ptr() as *const _) };
     // Cleanup: detach the loop device from the backing file.
     unsafe {
         libc::ioctl(
@@ -456,7 +556,7 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
         );
     }
     // Cleanup: remove the mount dir (it's now empty).
-    let _ = std::fs::remove_dir(mount_dir);
+    let _ = std::fs::remove_dir(&mount_dir);
 
     bytes
 }
@@ -468,7 +568,7 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
 ///
 /// Steps:
 /// 1. Extract `apex_payload.img` (the ext4 image) from the .apex file.
-/// 2. Write it to a temp file at `/tmp/twoyi-apex-payload.img`.
+/// 2. Write it to a temp file at `<apex_temp_dir>/twoyi-apex-payload.img`.
 /// 3. Loopback-mount the temp file and read `lib64/bionic/libdl.so`.
 /// 4. Validate the bytes via [`is_real_libdl`].
 /// 5. Cleanup the temp file.
@@ -498,12 +598,18 @@ fn extract_real_libdl_from_apex(apex_path: &str) -> Option<Vec<u8>> {
         }
     };
 
-    // Step 2: write to a temp file. /tmp is on the host filesystem here
-    // (this function is called BEFORE setup_mounts which mounts tmpfs on
-    // /tmp). The file can be large (~50-100 MB for com.android.runtime),
-    // but tmpfs/ramdisk-backed so write is fast.
-    let tmp_img = "/tmp/twoyi-apex-payload.img";
-    if let Err(e) = std::fs::write(tmp_img, &ext4_bytes) {
+    // Step 2: write to a temp file. Use `apex_temp_dir()` (TMPDIR env
+    // var, fallback /data/data/io.twoyi/cache) — NOT /tmp/, because at
+    // Step 3.7 (BEFORE setup_mounts) /tmp/ does NOT exist in the
+    // parent's Android-app-sandbox filesystem context. 5-M's diagnosis
+    // of the 3b571fe failure: the original `let tmp_img = "/tmp/
+    // twoyi-apex-payload.img"` got ENOENT writing 6377472 bytes — the
+    // extraction algorithm was correct, only the temp path was wrong.
+    // The file can be large (~6 MB for com.android.runtime.apex's
+    // apex_payload.img), but the app's cache dir is on the user-data
+    // partition so write is fast.
+    let tmp_img = apex_payload_temp_path();
+    if let Err(e) = std::fs::write(&tmp_img, &ext4_bytes) {
         warning!(
             "[KR64][apex_extract] failed to write {} ({} bytes) to {}: {}",
             tmp_img,
@@ -520,10 +626,10 @@ fn extract_real_libdl_from_apex(apex_path: &str) -> Option<Vec<u8>> {
     );
 
     // Step 3: loopback-mount and read libdl.so.
-    let result = loopback_mount_and_read(tmp_img, "lib64/bionic/libdl.so");
+    let result = loopback_mount_and_read(&tmp_img, "lib64/bionic/libdl.so");
 
     // Step 4: cleanup the temp file regardless of mount result.
-    let _ = std::fs::remove_file(tmp_img);
+    let _ = std::fs::remove_file(&tmp_img);
 
     match result {
         Ok(b) => {
@@ -1157,6 +1263,130 @@ mod tests {
         let result = read_zip_entry_stored_from_bytes(&zip, "apex_payload.img");
         assert!(result.is_ok(), "extraction failed: {:?}", result.err());
         assert_eq!(result.unwrap(), content2);
+    }
+
+    // ========================================================================
+    // Tests for apex_temp_dir / apex_payload_temp_path / apex_mount_dir
+    // (the temp-path fix for 5-M's diagnosis: /tmp/ doesn't exist in
+    // the parent's Android-app-sandbox context before setup_mounts).
+    // ========================================================================
+
+    #[test]
+    fn apex_temp_dir_from_respects_tmpdir_env_var() {
+        // Mock env lookup that returns a custom TMPDIR. Verifies the
+        // helper prefers TMPDIR over the hardcoded fallback.
+        let d = apex_temp_dir_from(|k| {
+            if k == "TMPDIR" {
+                Some("/custom/tmp/dir".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(d, "/custom/tmp/dir");
+    }
+
+    #[test]
+    fn apex_temp_dir_from_falls_back_when_tmpdir_unset() {
+        // Mock env lookup that returns None for TMPDIR (i.e. unset).
+        // Verifies the fallback to /data/data/io.twoyi/cache.
+        let d = apex_temp_dir_from(|_| None);
+        assert_eq!(d, "/data/data/io.twoyi/cache");
+    }
+
+    #[test]
+    fn apex_temp_dir_from_ignores_empty_tmpdir() {
+        // Mock env lookup that returns Some("") for TMPDIR. Verifies
+        // the helper treats empty string as "unset" and falls back.
+        // (Android's app sandbox always sets TMPDIR to a non-empty
+        // path, but defensive coding is cheap.)
+        let d = apex_temp_dir_from(|k| {
+            if k == "TMPDIR" {
+                Some(String::new())
+            } else {
+                None
+            }
+        });
+        assert_eq!(d, "/data/data/io.twoyi/cache");
+    }
+
+    #[test]
+    fn apex_payload_temp_path_in_joins_correctly() {
+        // Pure path-construction test — no env var, no create_dir_all
+        // side effect. Verifies the base + filename join for the
+        // extracted apex_payload.img temp file.
+        assert_eq!(
+            apex_payload_temp_path_in("/data/data/io.twoyi/cache"),
+            "/data/data/io.twoyi/cache/twoyi-apex-payload.img"
+        );
+        assert_eq!(
+            apex_payload_temp_path_in("/custom/tmp"),
+            "/custom/tmp/twoyi-apex-payload.img"
+        );
+    }
+
+    #[test]
+    fn apex_mount_dir_in_joins_correctly() {
+        // Pure path-construction test — no env var, no create_dir_all
+        // side effect. Verifies the base + dirname join for the
+        // loopback-mount mount point.
+        assert_eq!(
+            apex_mount_dir_in("/data/data/io.twoyi/cache"),
+            "/data/data/io.twoyi/cache/twoyi-apex-mount"
+        );
+        assert_eq!(
+            apex_mount_dir_in("/custom/tmp"),
+            "/custom/tmp/twoyi-apex-mount"
+        );
+    }
+
+    #[test]
+    fn apex_payload_temp_path_uses_tmpdir_when_set() {
+        // Integration test: with TMPDIR set to a writable temp dir,
+        // apex_payload_temp_path() should return a path under TMPDIR
+        // and create_dir_all should make the parent exist.
+        // We set TMPDIR for this test only — Rust's test runner may
+        // run tests in parallel, so we use a per-test unique subdir
+        // to avoid races on the same env var.
+        use std::sync::Mutex;
+        static TMPDIR_LOCK: Mutex<()> = Mutex::new(());
+
+        let _guard = TMPDIR_LOCK.lock().unwrap();
+        let prev = std::env::var("TMPDIR").ok();
+        let test_tmp = std::env::temp_dir().join("twoyi-apex-test-tmpdir-5N");
+        std::fs::create_dir_all(&test_tmp).unwrap();
+        std::env::set_var("TMPDIR", &test_tmp);
+
+        let p = apex_payload_temp_path();
+        // Restore TMPDIR before any assert! that might panic — leaking
+        // the env var would break other tests.
+        match prev {
+            Some(v) => std::env::set_var("TMPDIR", v),
+            None => std::env::remove_var("TMPDIR"),
+        }
+        drop(_guard);
+
+        assert!(
+            p.starts_with(test_tmp.to_str().unwrap()),
+            "expected path under {:?}, got: {}",
+            test_tmp,
+            p
+        );
+        assert!(
+            p.ends_with("/twoyi-apex-payload.img"),
+            "expected path to end with /twoyi-apex-payload.img, got: {}",
+            p
+        );
+        // Parent must exist (create_dir_all was called).
+        let parent = std::path::Path::new(&p)
+            .parent()
+            .expect("temp path must have a parent");
+        assert!(
+            parent.exists(),
+            "parent directory {} must exist after apex_payload_temp_path() (create_dir_all was called)",
+            parent.display()
+        );
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&test_tmp);
     }
 
     // ========================================================================
