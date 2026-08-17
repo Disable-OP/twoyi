@@ -2328,8 +2328,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //   2. Parsing the ZIP central directory to find apex_payload.img
     //      (STORED method only — DEFLATE entries are rejected because
     //      we don't have zlib; APEX payloads are typically STORED).
-    //   3. Writing the ext4 image to /tmp/twoyi-apex-payload.img
-    //      (host's /tmp — accessible here, before pivot_root).
+    //   3. Writing the ext4 image to `<apex_temp_dir>/twoyi-apex-payload.img`
+    //      (parent's TMPDIR env var, fallback /data/data/io.twoyi/cache —
+    //      NOT /tmp/, which does NOT exist in the parent's Android-app-
+    //      sandbox context before setup_mounts; see apex_extract::apex_temp_dir).
     //   4. Loopback-mounting the ext4 image (via /dev/loop-control +
     //      LOOP_SET_FD + mount("ext4")) and reading lib64/bionic/libdl.so.
     //   5. Validating the bytes via is_real_libdl (ELF magic + > stub size).
