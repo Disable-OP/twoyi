@@ -999,13 +999,18 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
     // as symlinks to the host's /dev/* by the parent setup, so opens of
     // these still reach the real kernel devices.
     //
-    // EXCEPTION: /dev/__properties__ is a host-side tmpfs file used by
-    // Android's property service. It exists on the host but not in
-    // rootfs. Leave it untranslated so init can attempt to open it on
-    // the host (it may fail with EACCES, but that's not fatal).
-    if path == "/dev/__properties__" {
-        return path.to_string();
-    }
+    // /dev/__properties__/* is now ALSO translated to rootfs (and
+    // materialised there by the VFS layer — see vfs.rs::Vfs::materialize).
+    // Previously this path was left untranslated so init's open() hit
+    // the host's /dev/__properties__ (mode 0711, owned by root →
+    // EACCES for untrusted_app), which caused a SIGSEGV in find_property
+    // from an uninitialized property-area pointer. The SIGSEGV was being
+    // suppressed by the find_property binary patch (lib.rs:3404-3485,
+    // commits 9154e59+0a4be80+5d561cf) — that patch is removed in step 3
+    // of the VFS rollout. With a valid property area materialised at
+    // {rootfs}/dev/__properties__/properties_serial, find_property()
+    // iterates over 0 properties and returns NULL naturally — no binary
+    // mutation needed.
     if path.starts_with("/dev/") || path == "/dev" {
         return format!("{}{}", rootfs, path);
     }
@@ -1327,7 +1332,7 @@ pub fn ptrace_available() -> bool {
     false
 }
 
-pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
+pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) -> i32 {
     use std::io::Write;
     let log = |msg: &str| {
         let _ = writeln!(std::io::stderr(), "[KR64][ptrace] {}", msg);
@@ -1985,6 +1990,47 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str) -> i32 {
                             };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
+                                // ── VFS materialization ─────────────────
+                                //
+                                // BEFORE calling translate_path, ask the VFS
+                                // to materialise any synthetic / dynamic node
+                                // for this path into the host filesystem at
+                                // `{rootfs}{path}`. For TWRP boot this is
+                                // what writes the minimal valid
+                                // __system_property_area__ at
+                                // {rootfs}/dev/__properties__/properties_serial
+                                // so init's find_property() iterates over 0
+                                // properties and returns NULL naturally
+                                // (replacing the old binary patch — see
+                                // worklog 1-A F.1 + 1-B Task 3).
+                                //
+                                // translate_path() below will then rewrite
+                                // the open's path argument to that exact
+                                // `{rootfs}{path}` location (for /dev/* paths),
+                                // so the real kernel open() finds the freshly
+                                // materialised file.
+                                //
+                                // Materialization is a no-op for paths the VFS
+                                // does not know about, so non-synthetic opens
+                                // (e.g. /init.rc) proceed unchanged.
+                                if vfs.is_synthetic(&path) {
+                                    if let Err(e) = vfs.materialize(&path, rootfs) {
+                                        // Don't fail the open — log and let the
+                                        // kernel's open() report its own error
+                                        // (e.g. ENOENT) so we see both the
+                                        // materialization failure AND the open
+                                        // failure in the log.
+                                        log(&format!(
+                                            "VFS materialize FAILED for {}: {} — open() will see kernel's errno",
+                                            path, e
+                                        ));
+                                    } else if loop_count <= 500 {
+                                        log(&format!(
+                                            "VFS materialized synthetic node for {} into {}{}",
+                                            path, rootfs, path
+                                        ));
+                                    }
+                                }
                                 let translated = translate_path(rootfs, &path);
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
@@ -3129,11 +3175,18 @@ mod tests {
             translate_path(rootfs, "/dev/.booting"),
             format!("{}/dev/.booting", rootfs)
         );
-        // EXCEPTION: /dev/__properties__ is left untranslated (it's a
-        // host-side tmpfs file for Android's property service).
+        // /dev/__properties__ and its children now ALSO translate to
+        // rootfs — the VFS materialises a valid __system_property_area__
+        // at {rootfs}/dev/__properties__/properties_serial so init's
+        // find_property() iterates over 0 properties and returns NULL
+        // naturally (replacing the old find_property binary patch).
         assert_eq!(
             translate_path(rootfs, "/dev/__properties__"),
-            "/dev/__properties__"
+            format!("{}/dev/__properties__", rootfs)
+        );
+        assert_eq!(
+            translate_path(rootfs, "/dev/__properties__/properties_serial"),
+            format!("{}/dev/__properties__/properties_serial", rootfs)
         );
     }
 
