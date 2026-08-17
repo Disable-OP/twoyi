@@ -145,7 +145,110 @@ public final class RomManager {
             }
         }
 
+        // Option D (5-U's recommendation): extract the real libdl.so APK
+        // asset to {filesDir}/libdl.so so kr64 can read it via
+        // apex_extract::read_libdl_asset() (lib.rs Step 3.7 PRIMARY path).
+        // This bypasses the fragile APEX loopback-mount pipeline that hit
+        // 4 sequential failure modes in 5-L/5-N/5-O/5-P/5-U (temp-write
+        // ENOENT → loop_open ENOENT → mknod+fallback loop_open ENXIO for
+        // all N 0..31 → kernel has no registered gendisk). Each fix
+        // exposed the next layer; the loopback-mount approach depends on
+        // too many kernel/permission prerequisites (CAP_MKNOD +
+        // CAP_SYS_ADMIN + kernel loop driver + init.rc mknod + ext4 driver).
+        //
+        // The asset ships as app/src/main/assets/libdl.so. Until CI/dev
+        // runs scripts/extract_libdl_from_apex.sh to drop the REAL
+        // libdl.so in, the asset is a 5848-byte PLACEHOLDER (text +
+        // NUL padding). The kr64 Rust side's is_real_libdl() validator
+        // rejects the placeholder (> 5848 byte-size guard + ELF magic
+        // check) and falls through to find_real_libdl_so() (APEX
+        // extraction, still broken on the Android emulator per 5-U,
+        // but kept as a defensive fallback). So a placeholder asset
+        // degrades gracefully to the existing pre-Option-D behaviour.
+        //
+        // Always overwrite (idempotent + picks up the latest asset
+        // whenever the APK is updated). The file is small (~13KB max
+        // for the real libdl.so), so the I/O cost on every app start
+        // is negligible (~0.1ms).
+        extractLibdlAsset(context);
+
         saveLastKmsg(context);
+    }
+
+    /**
+     * Extract the {@code libdl.so} APK asset to the app's files dir
+     * ({@code /data/data/io.twoyi/files/libdl.so} or the work-profile
+     * equivalent). This is the Option D primary path (5-U's recommendation):
+     * instead of extracting libdl.so from the APEX ext4 image at runtime
+     * (which depends on CAP_MKNOD + CAP_SYS_ADMIN + kernel loop driver +
+     * ext4 driver — 4 sequential failure modes documented in 5-L/5-N/5-O/
+     * 5-P/5-U), we ship the real libdl.so as an APK asset + extract it on
+     * app init.
+     *
+     * <p>The kr64 daemon reads this file via
+     * {@code apex_extract::read_libdl_asset()} (lib.rs Step 3.7 Option D
+     * path) BEFORE falling back to {@code find_real_libdl_so()} (the APEX
+     * extraction pipeline). The Rust side validates the bytes via
+     * {@code is_real_libdl()} (&gt; 5848 bytes + ELF magic) so a
+     * placeholder asset is gracefully rejected and falls through to APEX
+     * extraction.
+     *
+     * <p>If the asset is missing from the APK (e.g. CI hasn't yet run
+     * {@code scripts/extract_libdl_from_apex.sh} to drop the real libdl.so
+     * in), this method logs + skips — kr64 will fall through to APEX
+     * extraction (which is broken on the Android emulator per 5-U, but
+     * kept as a defensive fallback).
+     *
+     * <p>This method is idempotent: always overwrites the destination so
+     * the latest asset is picked up whenever the APK is updated. The file
+     * is small (~13KB max for the real libdl.so), so the I/O cost on every
+     * app start is negligible (~0.1ms).
+     *
+     * @param context the application context (used to locate
+     *                {@code getFilesDir()} + {@code getAssets()})
+     */
+    private static void extractLibdlAsset(Context context) {
+        File target = new File(context.getFilesDir(), "libdl.so");
+        File parent = target.getParentFile();
+        if (parent != null && !parent.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            parent.mkdirs();
+        }
+
+        InputStream in = null;
+        FileOutputStream out = null;
+        try {
+            in = context.getAssets().open("libdl.so");
+            out = new FileOutputStream(target);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+            Log.i(TAG, "extractLibdlAsset: extracted libdl.so APK asset ("
+                    + target.length() + " bytes) to " + target
+                    + " — kr64 will use this if it passes is_real_libdl (> 5848 bytes + ELF magic)");
+        } catch (IOException e) {
+            // Asset missing — kr64 will fall through to APEX extraction.
+            // This is the expected state until CI/dev drops the real
+            // libdl.so into app/src/main/assets/ (via
+            // scripts/extract_libdl_from_apex.sh). The placeholder asset
+            // ALSO flows through this code path successfully — it just
+            // gets rejected by the Rust-side is_real_libdl() validator,
+            // which is exactly the graceful degradation we want.
+            if (target.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                target.delete();
+            }
+            Log.w(TAG, "extractLibdlAsset: libdl.so APK asset not readable"
+                    + " (expected until CI/dev runs scripts/extract_libdl_from_apex.sh"
+                    + " to drop the real one in) — kr64 will fall through to APEX"
+                    + " extraction (find_real_libdl_so): " + e.getMessage());
+        } finally {
+            IOUtils.closeSilently(in);
+            IOUtils.closeSilently(out);
+        }
     }
 
     private static void createLoaderSymlink(Context context) {
