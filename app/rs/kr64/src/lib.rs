@@ -4614,6 +4614,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         patch_file_contexts_delete(&rootfs_prefix);
     }
 
+    // TWRP BOOT: DELETE /init.firmware.rc from rootfs.
+    //
+    // Root cause (Task 6-V diagnostic): init reads /init.firmware.rc
+    // (90 bytes: "on boot\n    start intel_fw_props\n\nservice
+    // intel_fw_props /sbin/intel_fw_props\n    oneshot\n") right
+    // before SIGSEGV at si_addr=0x696e692f (ASCII "ini/"), rip=0x8052f65
+    // after 826 iterations. The file defines an Intel firmware property
+    // service (/sbin/intel_fw_props) that doesn't exist in the emulator.
+    // TWRP init's .rc parser crashes when processing this file — likely a
+    // function-pointer/struct-field confusion with the embedded pathname
+    // string. The KVM E2E (root+strace) doesn't hit this because the real
+    // strace doesn't trigger the same code path. FIX: delete the file.
+    // init tolerates missing .rc files (skips them). The intel_fw_props
+    // service is Intel-specific and unnecessary in the emulator.
+    if cfg.boot_recovery {
+        let rc_path = format!("{}/init.firmware.rc", rootfs_prefix);
+        if std::path::Path::new(&rc_path).exists() {
+            match std::fs::remove_file(&rc_path) {
+                Ok(()) => info!(
+                    "[KR64] PARENT: DELETED /init.firmware.rc (Intel firmware service — unnecessary in emulator, causes init parser SIGSEGV at si_addr=0x696e692f). Task 6-V diagnostic."
+                ),
+                Err(e) => info!(
+                    "[KR64] PARENT: /init.firmware.rc already absent or failed to delete: {}",
+                    e
+                ),
+            }
+        }
+    }
+
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
     // check in klog_init(). See `patch_twrp_init_klog_init` for the full
     // root-cause analysis.
