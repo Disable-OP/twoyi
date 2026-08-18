@@ -1629,6 +1629,75 @@ fn patch_property_contexts_delete(rootfs_prefix: &str) {
     }
 }
 
+/// DELETE `/file_contexts` (+ `/file_contexts.homedirs` + `/file_contexts.local`)
+/// entirely, mirroring `patch_property_contexts_delete` (6-O).
+///
+/// # Root cause (Task 6-V disassembly + DISPATCHER-SESSION-3-UPDATE-3)
+///
+/// After 6-T's stat64 path-translation fix (commit 3c184e2) eliminated the
+/// stat64-ENOENT polling loop, the recovery now reaches the `/file_contexts`
+/// parser (opened at post-execve syscall #77). `/file_contexts` has the SAME
+/// `#line 1 "external/sepolicy/file_contexts"` directive on line 1 that
+/// crashed `/property_contexts` (6-L/6-M/6-N/6-O). The recovery's parser
+/// processes the file, the `#line` directive (or a path like `/init` in the
+/// content) overflows a fixed-size buffer, and the corrupted bytes propagate
+/// into a `std::string` object pointer. The next `std::string::string(char
+/// const*, ...)` constructor (at rip=0x8052f65, file vaddr 0xaf65) is called
+/// with `this = 0x696e692f` (= "/ini" in ASCII — the first 4 bytes of
+/// "/init"), dereferences the bad pointer → SIGSEGV (si_code=1 MAPERR,
+/// exit code -11). Observed on the 476446f UI E2E run 32194676789 (826
+/// iterations, crash at post-execve #356 after the recovery read
+/// /file_contexts + variants 10s earlier).
+///
+/// # The fix
+///
+/// Same DATA fix as 6-O: DELETE the files ENTIRELY so the recovery's
+/// `open()` returns `-ENOENT` → the caller skips the context file → the
+/// parser is never invoked → no buffer overflow → no corrupted `this`
+/// pointer → no SIGSEGV. The recovery tolerates missing file contexts
+/// (SELinux file labeling disabled in sandbox — non-fatal for TWRP boot;
+/// the KVM E2E path has real SELinux + parses /file_contexts without
+/// crashing because the real kernel provides valid SELinux contexts).
+///
+/// Deletes all 3 variants the recovery opens (verified in the 476446f
+/// logcat: /file_contexts + /file_contexts.homedirs + /file_contexts.local).
+/// Idempotent (no-op if already missing). Non-fatal on failure (logs + continues).
+fn patch_file_contexts_delete(rootfs_prefix: &str) {
+    // The 3 file_contexts variants the recovery opens (verified in the
+    // 476446f UI E2E logcat path logs: "intercepted open(/file_contexts)" +
+    // "/file_contexts.homedirs" + "/file_contexts.local").
+    let files = [
+        "file_contexts",
+        "file_contexts.homedirs",
+        "file_contexts.local",
+    ];
+    for fname in &files {
+        let path = format!("{}/{}", rootfs_prefix, fname);
+        if !std::path::Path::new(&path).exists() {
+            info!(
+                "[KR64] PARENT: /{} already absent at {} (idempotent skip — caller will get -ENOENT on open)",
+                fname, path
+            );
+            continue;
+        }
+        // Read size + first line for diagnostic logging (matches 6-O's pattern).
+        let (prior_len, prior_first_line): (usize, String) = match std::fs::read_to_string(&path) {
+            Ok(c) => (c.len(), c.lines().next().unwrap_or("").to_string()),
+            Err(_) => (0, String::new()),
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(
+                "[KR64] PARENT: DELETED /{} — was {} bytes (first line: {:?}), now absent. recovery's open() will return -ENOENT → caller skips this context file → file_contexts parser never invoked → no buffer overflow → no corrupted std::string this-pointer → no SIGSEGV at rip=0x8052f65 (Task 6-V). SELinux file labeling disabled in sandbox (non-fatal for TWRP boot).",
+                fname, prior_len, prior_first_line
+            ),
+            Err(e) => warning!(
+                "[KR64] PARENT: failed to DELETE /{} at {}: {} (recovery may open it and SIGSEGV at rip=0x8052f65 with si_addr=0x696e692f — '/ini' corrupted std::string this-pointer from file_contexts parser buffer overflow)",
+                fname, path, e
+            ),
+        }
+    }
+}
+
 /// Pre-create a "fake sysfs" in the guest rootfs (`{rootfs}/sys/`) so the
 /// guest init's `open("/sys/...")` calls succeed against an empty, writable
 /// tree instead of returning `-EACCES` against the host's real kernel sysfs.
@@ -4529,6 +4598,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // root) and BEFORE the guest's init is exec'd in the child below.
         // Idempotent: a no-op if the file is already missing.
         patch_property_contexts_delete(&rootfs_prefix);
+
+        // TWRP BOOT: DELETE /file_contexts (+ .homedirs + .local) ENTIRELY.
+        // Same root-cause pattern as /property_contexts (6-O): the TWRP
+        // ramdisk's /file_contexts has `#line 1 "external/sepolicy/file_contexts"`
+        // on line 1. After 6-T's stat64 path-translation fix unmasked the
+        // recovery's /file_contexts parser (previously hidden behind the
+        // stat64-ENOENT polling loop), the parser's buffer overflow corrupts
+        // a std::string this-pointer → SIGSEGV at rip=0x8052f65 (si_addr=
+        // 0x696e692f = "/ini"). Deleting the files makes open() return -ENOENT
+        // → parser never invoked → no overflow. See `patch_file_contexts_delete`
+        // for the full disassembly-driven root-cause analysis (Task 6-V).
+        // Must run AFTER setup_mounts + AFTER patch_property_contexts_delete
+        // + BEFORE the guest's init is exec'd. Idempotent.
+        patch_file_contexts_delete(&rootfs_prefix);
     }
 
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
