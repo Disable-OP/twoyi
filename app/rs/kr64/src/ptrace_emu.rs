@@ -372,6 +372,34 @@ struct ChildAbi {
     // the doc on `compute_exit_return_value` for why mknod was added
     // in Task 5-X (the immediate next blocker after 5-T's mount fix).
     mknod: i64,
+    // Extended-attribute SET syscalls (setxattr / lsetxattr / fsetxattr) —
+    // TWRP recovery calls lsetxattr() to set security.selinux labels on
+    // files during its SELinux-restorecon phase. As untrusted_app the
+    // kernel returns -EPERM (no CAP_FSETID/CAP_DAC_OVERRIDE for
+    // security.* xattrs), and recovery treats EPERM as retryable →
+    // infinite spin → death → kr64 2s relaunch loop (Task 6-R;
+    // observed on e04dab6 UI E2E run 32181613036 as syscalls #123 +
+    // #135 both nr=227 -> -EPERM, with the parent relaunching every 2s
+    // from 20:29:56 to 20:30:10).
+    // We fake success (return 0) at syscall-EXIT — same pattern as
+    // chmod/mknod/mount. SELinux labeling is not enforced in the
+    // sandbox (non-fatal for TWRP boot).
+    //
+    // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h +
+    // unistd_64.h:
+    //   i386:   setxattr=226, lsetxattr=227, fsetxattr=228
+    //   x86_64: setxattr=188, lsetxattr=189, fsetxattr=190
+    //   aarch64 (upstream Linux kernel asm-generic, NOT this sandbox's
+    //     non-standard /usr/include/asm-generic/unistd.h which wrongly
+    //     lists 5/6/7): setxattr=188, lsetxattr=189, fsetxattr=190
+    //     — matching x86_64. (This sandbox's asm-generic/unistd.h has
+    //     setxattr=5/lsetxattr=6/fsetxattr=7, which are io_setup/
+    //     io_destroy/io_getevents in upstream Linux — the sandbox
+    //     header is non-standard. Real Android aarch64 bionic uses
+    //     188/189/190.)
+    setxattr: i64,
+    lsetxattr: i64,
+    fsetxattr: i64,
     // SysV shared-memory syscalls (shmget / shmat / shmctl). TWRP
     // init calls shmget() during early boot — Android's
     // __system_property_area_init uses a SysV shared memory segment
@@ -564,6 +592,19 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // but the EXIT handler's if-chain is ABI-aware so we lock the
     // x86_64 number in too (cheap insurance).
     mknod: 133,
+    // x86_64 setxattr / lsetxattr / fsetxattr (per /usr/include/x86_64-
+    // linux-gnu/asm/unistd_64.h: __NR_setxattr 188, __NR_lsetxattr 189,
+    // __NR_fsetxattr 190, verified directly against the kernel's UAPI
+    // header in Task 6-R). The host is x86_64 running an i386 child,
+    // so these x86_64 numbers do NOT currently fire at runtime (the
+    // guest uses i386 syscall 226/227/228). Locked in for ABI
+    // completeness + to keep the EXIT handler's ABI-aware if-chain
+    // correct if a future x86_64 guest is ever supported. See the doc
+    // on these fields in `ChildAbi` for the TWRP-restorecon EPERM
+    // retry-loop blocker (Task 6-R).
+    setxattr: 188,
+    lsetxattr: 189,
+    fsetxattr: 190,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. x86_64: shmget=29, shmat=30, shmctl=31
     // (asm/unistd_64.h).
@@ -667,6 +708,21 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // diagnostic label correctly says "[unknown]" for syscall 14
     // — and post-5-X it correctly says "mknod" (this addition).
     mknod: 14,
+    // i386 setxattr / lsetxattr / fsetxattr (per /usr/include/x86_64-
+    // linux-gnu/asm/unistd_32.h: __NR_setxattr 226, __NR_lsetxattr 227,
+    // __NR_fsetxattr 228, verified directly against the kernel's UAPI
+    // header in Task 6-R). THIS is the value that fires at runtime —
+    // TWRP recovery (an i386 binary) issues lsetxattr(path,
+    // "security.selinux", ctx, 44, 0) during its SELinux-restorecon
+    // phase. As untrusted_app the kernel returns -EPERM (no CAP for
+    // security.* xattrs), and recovery treats EPERM as retryable →
+    // infinite spin → death → kr64 2s relaunch loop (observed on
+    // e04dab6 UI E2E run 32181613036 as syscalls #123 + #135 both
+    // nr=227 -> -EPERM). See the doc on these fields in `ChildAbi`
+    // (Task 6-R) for the full root-cause analysis.
+    setxattr: 226,
+    lsetxattr: 227,
+    fsetxattr: 228,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. i386 (verified against
     // /usr/include/x86_64-linux-gnu/asm/unistd_32.h in Task 6-C):
@@ -820,6 +876,19 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // is currently dead code at runtime — the sentinel keeps the
     // compile happy and documents the aarch64 behaviour.
     mknod: -1,
+    // aarch64 setxattr / lsetxattr / fsetxattr. Real Android aarch64
+    // bionic uses the upstream Linux asm-generic numbers: setxattr=188,
+    // lsetxattr=189, fsetxattr=190 (matching x86_64). This sandbox's
+    // /usr/include/asm-generic/unistd.h NON-STANDARDLY lists these as
+    // 5/6/7, but those numbers are io_setup / io_destroy /
+    // io_getevents in upstream Linux — the sandbox header is wrong
+    // (verified directly in Task 6-R; see the doc on these fields in
+    // `ChildAbi` for the full discrepancy analysis). We use 188/189/190
+    // so that a real aarch64 TWRP recovery calling lsetxattr() will be
+    // correctly fake-succeeded.
+    setxattr: 188,
+    lsetxattr: 189,
+    fsetxattr: 190,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
     // shmget=194, shmctl=195, shmat=196.
@@ -1355,6 +1424,34 @@ fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 ///     aarch64 issues mknodat(AT_FDCWD, ...) under the hood. A future
 ///     aarch64-specific fix would need a dedicated mknodat field.)
 ///
+/// `setxattr` / `lsetxattr` / `fsetxattr` were ALSO MISSING until Task
+/// 6-R. After 6-Q's PTRACE_O_TRACEFORK machinery successfully traces
+/// the recovery child (post-6-Q UI E2E on e04dab6: recovery runs ~135
+/// post-execve syscalls, no longer untraced), the NEW blocker was
+/// recovery entering a retry loop at syscalls #123 + #135 — both
+/// nr=227 (lsetxattr on i386). TWRP recovery calls lsetxattr(path,
+/// "security.selinux", ctx, 44, 0) during its SELinux-restorecon
+/// phase; as untrusted_app the kernel returns -EPERM, recovery treats
+/// EPERM as retryable → infinite spin → death → kr64 relaunches every
+/// 2s (20:29:56 to 20:30:10). With these in the fake-success list,
+/// the EXIT handler writes rax=0 and recovery sees "lsetxattr
+/// returned 0 (success)". SELinux labeling is not enforced in the
+/// sandbox (same pragmatic pattern as chmod/mknod/mount).
+///
+/// The per-ABI setxattr/lsetxattr/fsetxattr numbers (verified against
+/// the kernel's UAPI headers in Task 6-R):
+///   i386:   setxattr=226, lsetxattr=227, fsetxattr=228
+///           (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h)
+///   x86_64: setxattr=188, lsetxattr=189, fsetxattr=190
+///           (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h)
+///   aarch64: setxattr=188, lsetxattr=189, fsetxattr=190
+///           (upstream Linux asm-generic — matches x86_64. NOTE:
+///           this sandbox's /usr/include/asm-generic/unistd.h
+///           NON-STANDARDLY lists these as 5/6/7, which are
+///           io_setup/io_destroy/io_getevents in upstream Linux —
+///           the sandbox header is wrong. Real Android aarch64
+///           bionic uses 188/189/190.)
+///
 /// Returns `Some(0)` for the faked-success syscalls, `None` for syscalls
 /// whose return value the caller should leave untouched. The value (0) is
 /// hard-coded because every faked-success syscall uses the same return
@@ -1381,6 +1478,23 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
     // iter 189 (UNCHANGED from 3b571fe — 5-T's mount fix advanced
     // mount but not mknod). With mknod in this list, the EXIT handler
     // writes rax=0 and init sees "mknod returned 0 (success)".
+    //
+    // Task 6-R added setxattr / lsetxattr / fsetxattr to this set:
+    // AFTER 6-Q's PTRACE_O_TRACEFORK machinery successfully traces
+    // the recovery child (post-6-Q UI E2E on e04dab6: recovery runs
+    // ~135 post-execve syscalls, no longer untraced), the NEW blocker
+    // was recovery entering a retry loop at syscalls #123 + #135 —
+    // both nr=227 (lsetxattr on i386, verified against
+    // /usr/include/x86_64-linux-gnu/asm/unistd_32.h). TWRP recovery
+    // calls lsetxattr(path, "security.selinux", ctx, 44, 0) during its
+    // SELinux-restorecon phase. As untrusted_app the kernel returns
+    // -EPERM (no CAP for security.* xattrs), recovery treats EPERM as
+    // retryable → infinite spin → death → kr64 relaunches every 2s
+    // (parent setup logs repeat 20:29:56 to 20:30:10). With these in
+    // the list, the EXIT handler writes rax=0 and recovery sees
+    // "lsetxattr returned 0 (success)". SELinux labeling is not
+    // enforced in the sandbox (same pragmatic fake-success pattern as
+    // chmod/mknod/mount — non-fatal for TWRP boot).
     if syscall_nr == abi.chmod
         || syscall_nr == abi.fchmod
         || syscall_nr == abi.fchown
@@ -1394,6 +1508,9 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.mount
         || syscall_nr == abi.rt_sigprocmask
         || syscall_nr == abi.mknod
+        || syscall_nr == abi.setxattr
+        || syscall_nr == abi.lsetxattr
+        || syscall_nr == abi.fsetxattr
     {
         Some(0)
     } else {
@@ -1692,6 +1809,26 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "ioprio_get"
     } else if nr == abi.ioprio_set {
         "ioprio_set"
+    } else if nr == abi.setxattr {
+        // Added in Task 6-R. Pre-6-R, i386 syscall 226 was labelled
+        // "[unknown]" because no field matched it. With this entry the
+        // diagnostic label correctly says "setxattr" so the next person
+        // debugging the recovery SELinux-restorecon phase can
+        // immediately identify it from the SIGSYS log without cross-
+        // referencing against /usr/include/x86_64-linux-gnu/asm/
+        // unistd_32.h.
+        "setxattr"
+    } else if nr == abi.lsetxattr {
+        // Added in Task 6-R. Pre-6-R, i386 syscall 227 was labelled
+        // "[unknown]" — this is THE syscall that caused the post-6-Q
+        // UI E2E blocker (recovery retry loop at syscalls #123 + #135,
+        // both nr=227 -> -EPERM, kr64 relaunching every 2s). With this
+        // entry the diagnostic label correctly says "lsetxattr".
+        "lsetxattr"
+    } else if nr == abi.fsetxattr {
+        // Added in Task 6-R (companion to setxattr/lsetxattr — same
+        // SELinux-restorecon code path, just the fd-based variant).
+        "fsetxattr"
     } else if nr == abi.execve {
         "execve"
     } else {
@@ -5431,6 +5568,195 @@ mod tests {
         // And 14 must NOT fall through to "unknown" (the previous
         // post-5-T behaviour).
         assert_ne!(syscall_name(14, &ABI_X86_32), "unknown");
+    }
+
+    // ── 6-R regression tests: xattr SET syscalls (setxattr / lsetxattr
+    //     / fsetxattr) — recovery's SELinux-restorecon EPERM retry
+    //     loop blocker. See the doc on these fields in `ChildAbi` for
+    //     the full root-cause analysis. ──────────────────────────────
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_lsetxattr_returns_zero() {
+        // i386 lsetxattr = 227. THIS is the exact syscall that was
+        // returning -EPERM (errno 1) at EXIT in the post-6-Q UI E2E
+        // logcat (artifact 9341289539, run 32181613036 on e04dab6),
+        // at syscalls #123 + #135 — the immediate next blocker after
+        // 6-Q's PTRACE_O_TRACEFORK machinery successfully traced the
+        // recovery child. TWRP recovery calls lsetxattr(path,
+        // "security.selinux", ctx, 44, 0) during its SELinux-
+        // restorecon phase; as untrusted_app the kernel returns
+        // -EPERM, recovery treats EPERM as retryable → infinite spin
+        // → death → kr64 relaunches every 2s (20:29:56 to 20:30:10).
+        // Framebuffer never renders (screenshots plateau 33361 bytes).
+        //
+        // Pre-6-R, lsetxattr was NOT in compute_exit_return_value's
+        // fake-success list, so the EXIT handler left rax = the
+        // kernel's -EPERM value. After 6-R the EXIT handler writes
+        // rax=0, so recovery sees "lsetxattr returned 0 (success)"
+        // and proceeds past the restorecon retry loop.
+        //
+        // Honest caveat: correct-by-inspection; needs ui-e2e-test.yml
+        // run + VLM screenshot analysis to confirm TWRP actually boots.
+        assert_eq!(compute_exit_return_value(227, &ABI_X86_32), Some(0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_setxattr_returns_zero() {
+        // i386 setxattr = 226 (per /usr/include/x86_64-linux-gnu/asm/
+        // unistd_32.h, verified directly in Task 6-R). Companion to
+        // lsetxattr — same SELinux-restorecon code path, just the
+        // path-following (symlink-deref) variant. Locked in to keep
+        // the EXIT handler's if-chain ABI-aware for the full xattr
+        // SET family (setxattr / lsetxattr / fsetxattr).
+        assert_eq!(compute_exit_return_value(226, &ABI_X86_32), Some(0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_i386_fsetxattr_returns_zero() {
+        // i386 fsetxattr = 228 (per /usr/include/x86_64-linux-gnu/asm/
+        // unistd_32.h, verified directly in Task 6-R). fd-based variant
+        // of setxattr — recovery uses it after open()ing a file. Locked
+        // in to keep the EXIT handler's if-chain ABI-aware for the full
+        // xattr SET family.
+        assert_eq!(compute_exit_return_value(228, &ABI_X86_32), Some(0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn compute_exit_return_value_x86_64_lsetxattr_returns_zero() {
+        // x86_64 lsetxattr = 189 (per /usr/include/x86_64-linux-gnu/asm/
+        // unistd_64.h, verified directly in Task 6-R). The host is
+        // x86_64 running an i386 child, so this x86_64 number does NOT
+        // currently fire at runtime (the guest uses i386 syscall 227).
+        // Locked in for ABI completeness + to keep the EXIT handler's
+        // ABI-aware if-chain correct if a future x86_64 guest is ever
+        // supported.
+        assert_eq!(compute_exit_return_value(189, &ABI_X86_64), Some(0));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn compute_exit_return_value_aarch64_lsetxattr_returns_zero() {
+        // aarch64 lsetxattr = 189 (upstream Linux asm-generic, matching
+        // x86_64 — verified in Task 6-R against the kernel's UAPI
+        // semantics). NOTE: this sandbox's /usr/include/asm-generic/
+        // unistd.h NON-STANDARDLY lists lsetxattr=6, which is
+        // io_destroy in upstream Linux — the sandbox header is wrong.
+        // Real Android aarch64 bionic uses 189. Locked in to keep the
+        // EXIT handler's ABI-aware if-chain correct for aarch64.
+        assert_eq!(compute_exit_return_value(189, &ABI_AARCH64), Some(0));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_i386_lsetxattr() {
+        // i386 lsetxattr = 227. Pre-6-R the diagnostic label for
+        // syscall 227 was "[unknown]" because no field matched it.
+        // The post-6-Q logcat showed "nr=227 -> -1 (-errno 1 = EPERM)"
+        // at syscalls #123 + #135 — the recovery retry loop blocker.
+        // With this entry the diagnostic label correctly says
+        // "lsetxattr" so the next person debugging the SELinux-
+        // restorecon phase can immediately identify it from the
+        // SIGSYS log without cross-referencing against
+        // /usr/include/x86_64-linux-gnu/asm/unistd_32.h.
+        assert_eq!(syscall_name(227, &ABI_X86_32), "lsetxattr");
+        // Converse negative-asserts: 227 must NOT fall through to
+        // "unknown" (the previous post-6-Q behaviour).
+        assert_ne!(syscall_name(227, &ABI_X86_32), "unknown");
+    }
+
+    #[test]
+    fn compute_exit_return_value_returns_none_for_unrelated_syscalls_6r() {
+        // Task 6-R regression guard: confirm that adding setxattr /
+        // lsetxattr / fsetxattr to the fake-success allowlist did
+        // NOT accidentally widen the list to nearby unrelated
+        // syscalls (e.g. setxattr=226 / lsetxattr=227 / fsetxattr=228
+        // on i386 — adjacent numbers like 224 (getxattr) or 225
+        // lgetxattr must NOT be faked, AND read nr=3 must continue
+        // returning None). Mirrors the existing
+        // `compute_exit_return_value_returns_none_for_unrelated_syscalls`
+        // test but with explicit 6-R-focused syscall numbers.
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+
+        // read (i386 nr=3) — must NOT be faked (mirrors the existing
+        // 5-A-era unrelated-syscall assertion).
+        assert_eq!(
+            compute_exit_return_value(3, &abi),
+            None,
+            "read must NOT be faked (6-R regression guard)"
+        );
+
+        // Adjacent-to-xattr numbers on i386 that must NOT be faked:
+        //   i386 nr=224 = getxattr (GET, not SET — never faked)
+        //   i386 nr=225 = lgetxattr (GET, not SET — never faked)
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(
+                compute_exit_return_value(224, &abi),
+                None,
+                "getxattr (nr=224) must NOT be faked — only the SET family"
+            );
+            assert_eq!(
+                compute_exit_return_value(225, &abi),
+                None,
+                "lgetxattr (nr=225) must NOT be faked — only the SET family"
+            );
+            // Also confirm setxattr (226) / lsetxattr (227) /
+            // fsetxattr (228) ARE faked (sanity-check the allowlist
+            // is exactly the SET family).
+            assert_eq!(compute_exit_return_value(226, &abi), Some(0));
+            assert_eq!(compute_exit_return_value(227, &abi), Some(0));
+            assert_eq!(compute_exit_return_value(228, &abi), Some(0));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_xattr_numbers_correct() {
+        // Regression guard (Task 6-R): the i386 setxattr/lsetxattr/
+        // fsetxattr syscall numbers MUST be 226/227/228 (per
+        // /usr/include/x86_64-linux-gnu/asm/unistd_32.h, verified
+        // directly). If anyone "fixes" these to different numbers
+        // (e.g. by accidentally copying the sandbox's non-standard
+        // asm-generic/unistd.h values 5/6/7), the EXIT handler would
+        // silently stop matching and the recovery retry loop would
+        // come back.
+        assert_eq!(ABI_X86_32.setxattr, 226, "i386 setxattr must be 226");
+        assert_eq!(ABI_X86_32.lsetxattr, 227, "i386 lsetxattr must be 227");
+        assert_eq!(ABI_X86_32.fsetxattr, 228, "i386 fsetxattr must be 228");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_xattr_numbers_correct() {
+        // Regression guard (Task 6-R): the x86_64 setxattr/lsetxattr/
+        // fsetxattr syscall numbers MUST be 188/189/190 (per
+        // /usr/include/x86_64-linux-gnu/asm/unistd_64.h, verified
+        // directly).
+        assert_eq!(ABI_X86_64.setxattr, 188, "x86_64 setxattr must be 188");
+        assert_eq!(ABI_X86_64.lsetxattr, 189, "x86_64 lsetxattr must be 189");
+        assert_eq!(ABI_X86_64.fsetxattr, 190, "x86_64 fsetxattr must be 190");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_xattr_numbers_correct() {
+        // Regression guard (Task 6-R): the aarch64 setxattr/lsetxattr/
+        // fsetxattr syscall numbers MUST be 188/189/190 (upstream
+        // Linux asm-generic, matching x86_64). NOTE: the sandbox's
+        // /usr/include/asm-generic/unistd.h NON-STANDARDLY lists
+        // these as 5/6/7 (which are io_setup/io_destroy/
+        // io_getevents in upstream Linux — wrong). Real Android
+        // aarch64 bionic uses 188/189/190.
+        assert_eq!(ABI_AARCH64.setxattr, 188, "aarch64 setxattr must be 188");
+        assert_eq!(ABI_AARCH64.lsetxattr, 189, "aarch64 lsetxattr must be 189");
+        assert_eq!(ABI_AARCH64.fsetxattr, 190, "aarch64 fsetxattr must be 190");
     }
 
     #[cfg(target_arch = "x86_64")]
