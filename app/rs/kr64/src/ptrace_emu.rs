@@ -547,6 +547,29 @@ struct ChildAbi {
     vfork_nr: i64,
     wait4_nr: i64,
     exit_group_nr: i64,
+    // write(fd, buf, count) — NOT intercepted or emulated; carried
+    // purely so the syscall-EXIT diagnostic (Task 6-U) can recognise
+    // a write() return + capture the buffer contents. TWRP init writes
+    // its KLOG via write(fd=3, "<N>init: ...\n", len) to /dev/__kmsg__.
+    // kr64 copies that file to /sdcard but the test harness never
+    // `adb pull`s it, so init's own diagnostic messages (WHY it bails
+    // before parsing init.rc) are stranded. The 6-U diagnostic captures
+    // the buffer contents inline in the logcat so the KLOG is visible
+    // without pulling /sdcard. Per-ABI numbers (verified against the
+    // kernel's UAPI headers — same source as `pause`):
+    //   i386:   write = 4   (per asm/unistd_32.h: __NR_write 4)
+    //   x86_64: write = 1   (per asm/unistd_64.h: __NR_write 1)
+    //   aarch64: write = 64 (per asm-generic/unistd.h: __NR_write 64)
+    // The host is x86_64 running an i386 child, so the i386 number (4)
+    // is the one that fires at runtime; the x86_64/aarch64 numbers are
+    // locked in for ABI completeness + so the EXIT handler's
+    // `== abi.write` comparison is correct if a future x86_64/aarch64
+    // guest is ever supported. Crucially the comparison is
+    // `syscall_num == abi.write` (NOT `matches!(syscall_num, 4 | 1)`)
+    // to avoid cross-ABI confusion: x86_64 nr=4 is `stat` and i386
+    // nr=1 is `exit`, so a naive `4 | 1` match would fire spuriously
+    // on the wrong ABI.
+    write: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -720,6 +743,16 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     vfork_nr: 58,
     wait4_nr: 61,
     exit_group_nr: 231,
+    // x86_64 write = 1 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+    // __NR_write 1). NOT intercepted — carried so the syscall-EXIT
+    // diagnostic (Task 6-U) can match `syscall_num == abi.write` for
+    // write() return-value + buffer capture. See the doc on `write` in
+    // `ChildAbi` for why the comparison must be ABI-aware (i386 nr=1 is
+    // `exit`, so a naive `matches!(syscall_num, 1 | 4)` would misfire
+    // cross-ABI). The host is x86_64 running an i386 child, so this
+    // x86_64 number does NOT currently fire at runtime (the guest uses
+    // i386 syscall 4). Locked in for ABI completeness.
+    write: 1,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -906,6 +939,15 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     vfork_nr: 190,
     wait4_nr: 114,
     exit_group_nr: 252,
+    // i386 write = 4 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+    // __NR_write 4). THIS is the value that fires at runtime — TWRP
+    // init (an i386 binary) issues write(fd, buf, count) as i386
+    // syscall 4 to push KLOG lines to /dev/__kmsg__. The 6-U syscall-
+    // EXIT diagnostic matches `syscall_num == abi.write` and captures
+    // `min(ret, 256)` bytes from the buffer pointer (arg2 = ecx on
+    // i386, which the kernel preserves across the syscall). See the
+    // doc on `write` in `ChildAbi` for the full rationale.
+    write: 4,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1093,6 +1135,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     vfork_nr: -1,
     wait4_nr: 260,
     exit_group_nr: 94,
+    // aarch64 write = 64 (per /usr/include/asm-generic/unistd.h:
+    // __NR_write 64). NOT intercepted — carried for ABI completeness
+    // so the 6-U syscall-EXIT diagnostic's `syscall_num == abi.write`
+    // comparison is correct if a future aarch64 guest is ever
+    // supported. The host is x86_64 running an i386 child, so this
+    // aarch64 number does NOT currently fire at runtime.
+    write: 64,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2200,6 +2249,81 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     }
 }
 
+/// Read exactly `len` bytes from the traced child's memory starting at
+/// `addr`, using `PTRACE_PEEKDATA` in word-sized chunks. Returns `None`
+/// if the very first PEEK fails (EIO / unmapped address); returns a
+/// possibly-shorter `Vec<u8>` if a later word fails (the partial read
+/// up to the faulting address is still useful for diagnostics).
+///
+/// This is the N-byte variant of [`read_child_string`] — used by the
+/// Task 6-U syscall-EXIT diagnostic to capture `write()` buffer
+/// contents. KLOG lines (e.g. `<3>init: failed to parse init.rc\n`)
+/// are NOT NUL-terminated within the write buffer (they end with
+/// `\n`), so `read_child_string` would overshoot past the buffer's
+/// intended length into adjacent memory. This helper reads exactly
+/// the byte count the kernel reported in the write's return value.
+///
+/// The write() buffer lives in the child's WRITABLE memory (it's the
+/// data the child just wrote), so PTRACE_PEEKDATA will succeed.
+fn read_child_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> {
+    if addr == 0 || len == 0 {
+        return Some(Vec::new());
+    }
+    let mut result = Vec::with_capacity(len);
+    let mut offset = 0i64;
+    while offset < len as i64 {
+        let word = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64 + offset, 0) };
+        if word == -1 {
+            // First-PEEK failure → no data at all → treat as unreadable
+            // (matches the existing `read_child_string` behaviour where
+            // the loop breaks on the first -1). Later failures yield a
+            // partial read (the bytes we DID get are still useful for
+            // the diagnostic).
+            if result.is_empty() {
+                return None;
+            }
+            break;
+        }
+        let bytes = word.to_ne_bytes();
+        let remaining = len - offset as usize;
+        let take = std::cmp::min(bytes.len(), remaining);
+        result.extend_from_slice(&bytes[..take]);
+        offset += std::mem::size_of::<libc::c_long>() as i64;
+    }
+    Some(result)
+}
+
+/// Classify whether an opened path is a kernel-message log destination
+/// whose writes should be tagged `DIAG KLOG` (vs the generic `DIAG
+/// write`) by the Task 6-U syscall-EXIT diagnostic. Matches:
+///   - `/dev/__kmsg__` (TWRP init's KLOG destination — opened as fd 3
+///     per the worklog 5-C twrp-init-fds.log analysis)
+///   - `/dev/kmsg`     (the standard Linux kernel log destination)
+///   - any ABSOLUTE path whose final component is `__kmsg__` (covers
+///     path-translated variants like `{rootfs}/dev/__kmsg__` once
+///     [`translate_path`] rewrites it, and the `__kmsg__` symlink that
+///     gets "(deleted)" after tmpfs mount on /dev)
+///
+/// Pulled out as a free function so it is unit-testable independently
+/// of the ptrace loop. Requires the path to be absolute (start with
+/// '/') because real open() calls in TWRP init always use absolute
+/// paths — relative paths are not produced by the open() ENTRY
+/// handler's `read_child_string` in practice, and requiring absolute
+/// keeps the matcher from spuriously matching unrelated relative
+/// strings that happen to end in `__kmsg__`.
+fn is_kmsg_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    if path == "/dev/__kmsg__" || path == "/dev/kmsg" {
+        return true;
+    }
+    // Final path component == "__kmsg__" (covers {rootfs}/dev/__kmsg__
+    // after translate_path rewrites /dev/__kmsg__, and the orphaned
+    // "(deleted)" variants).
+    path.rsplit('/').next() == Some("__kmsg__")
+}
+
 fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     if addr == 0 {
         return false;
@@ -2563,6 +2687,43 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     let mut in_syscall = false;
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
+
+    // ── Task 6-U diagnostic state ────────────────────────────────────
+    //
+    // TWRP init writes 339 write() calls (5820 bytes) to /dev/__kmsg__
+    // (its KLOG). kr64 copies that file to /sdcard but the test
+    // harness never `adb pull`s it, so init's own diagnostic messages
+    // (WHY it bails before parsing init.rc / forking recovery) are
+    // invisible. The 6-U diagnostic captures the write() buffer
+    // contents inline in the logcat so the KLOG is visible without
+    // pulling /sdcard.
+    //
+    // `kmsg_fd`: the file descriptor the open() syscall returned for
+    //   /dev/__kmsg__ (or /dev/kmsg). When a subsequent write() uses
+    //   this fd, we prefix the log line with "DIAG KLOG" instead of
+    //   "DIAG write" so init's KLOG lines are trivially greppable.
+    //   Loop-local shared across all traced children — per the brief.
+    //   The fd is process-local (different children have different fd
+    //   tables), so if recovery also opens __kmsg__ the tracked fd
+    //   will be overwritten with recovery's fd. This is an accepted
+    //   limitation of the shared-state architecture (see worklog
+    //   6-S/6-S3 — `current_pid` shadows init's pid, no per-pid map).
+    //   The PRIMARY subject (init's KLOG) is captured before recovery
+    //   runs, since init opens __kmsg__ early in its startup (well
+    //   before forking recovery).
+    // `pending_kmsg_open`: set at open()/openat()/openat2() ENTRY
+    //   when the (translated) path matches is_kmsg_path(). Consumed
+    //   + cleared at the matching open EXIT to record the returned
+    //   fd in `kmsg_fd`. Mirrors the existing `pending_getpid` pattern
+    //   (ENTRY-flag, EXIT-consume).
+    // `post_execve_write_count`: gate counter for the write() EXIT
+    //   diagnostic — only the first 800 post-execve writes are logged,
+    //   to bound log volume if init spins. (Init does ~339 writes total
+    //   per the strace, so 800 is a comfortable 2.4× headroom.)
+    let mut kmsg_fd: Option<i32> = None;
+    let mut pending_kmsg_open: bool = false;
+    let mut post_execve_write_count: u64 = 0;
+
     // Runtime-detected syscall/register layout for the child. `None`
     // until the first successful ptrace_getregs — at that point we
     // read /proc/<pid>/exe and inspect the ELF header to pick
@@ -3728,6 +3889,27 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     }
                                 }
                                 let translated = translate_path(rootfs, &path);
+                                // ── Task 6-U: KLOG fd tracking (ENTRY side) ──
+                                //
+                                // If this open()'s path (original OR
+                                // post-translation form) is a kernel-
+                                // message log destination, set the pending
+                                // flag so the matching open EXIT captures
+                                // the returned fd into `kmsg_fd`. Subsequent
+                                // write()s to that fd are then tagged
+                                // "DIAG KLOG" by the EXIT-side write
+                                // diagnostic below.
+                                //
+                                // Checked against BOTH the original `path`
+                                // (covers untranslated /dev/__kmsg__ paths)
+                                // AND `translated` (covers
+                                // {rootfs}/dev/__kmsg__ after translate_path
+                                // rewrites /dev/__kmsg__). The check is
+                                // cheap and idempotent — `pending_kmsg_open`
+                                // is cleared at the matching open EXIT.
+                                if is_kmsg_path(&path) || is_kmsg_path(&translated) {
+                                    pending_kmsg_open = true;
+                                }
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
@@ -3892,6 +4074,105 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             "DIAG fork-family EXIT: nr={} returned {} (0=child, >0=parent's-child-pid, <0=error)",
                             syscall_num, ret
                         ));
+                    }
+
+                    // ── DIAGNOSTIC (6-U): KLOG fd tracking + write() ──
+                    //
+                    // Surface TWRP init's stranded KLOG inline in the
+                    // logcat. init writes 339 write() calls (5820 bytes)
+                    // to /dev/__kmsg__ (its KLOG) — kr64 copies that
+                    // file to /sdcard but the test harness never pulls
+                    // it, so init's own diagnostic messages (WHY it
+                    // bails before parsing init.rc) are invisible. This
+                    // block captures the write() buffer contents inline
+                    // so the KLOG is visible without pulling /sdcard.
+                    //
+                    // Part A — open()/openat()/openat2() EXIT: consume
+                    // the `pending_kmsg_open` flag set at ENTRY. If the
+                    // kernel returned a valid fd (ret > 0), record it
+                    // in `kmsg_fd`. Subsequent write()s to that fd are
+                    // tagged "DIAG KLOG" by Part B below. The i386
+                    // syscall convention preserves arg registers
+                    // (ebx/ecx/edx) across the syscall, so the EXIT
+                    // snapshot's abi.reg_ret holds the new fd.
+                    if pending_kmsg_open
+                        && (syscall_num == abi.open
+                            || syscall_num == abi.openat
+                            || syscall_num == abi.openat2)
+                    {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret > 0 {
+                            kmsg_fd = Some(ret as i32);
+                            log(&format!(
+                                "DIAG KLOG fd captured: open() returned fd={} — subsequent write()s to this fd will be tagged 'DIAG KLOG'",
+                                ret
+                            ));
+                        } else {
+                            // open() failed (ret < 0 = -errno, or 0).
+                            // Keep the previous kmsg_fd (if any) — this
+                            // open might be a retry that failed; the
+                            // prior successful open's fd is still the
+                            // canonical KLOG fd.
+                            log(&format!(
+                                "DIAG KLOG fd capture: open() returned {} (failure) — kmsg_fd remains {:?}",
+                                ret, kmsg_fd
+                            ));
+                        }
+                        pending_kmsg_open = false;
+                    }
+                    // Part B — write(fd, buf, count) EXIT: capture
+                    // the buffer contents and log them. Gated to the
+                    // first 800 post-execve writes (init does ~339
+                    // total per the strace, so 800 is a 2.4× headroom
+                    // that bounds log volume if init spins). Only fires
+                    // when `past_first_execve` (the pre-execve kr64
+                    // writes are uninteresting setup noise).
+                    if past_first_execve && syscall_num == abi.write {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // Only capture successful writes with a
+                        // reasonable size (0 < ret <= 512). ret > 512
+                        // is almost certainly a non-KLOG bulk write
+                        // (e.g. property-area sync); ret <= 0 is a
+                        // failed write (nothing to capture).
+                        if ret > 0 && ret <= 512 {
+                            post_execve_write_count = post_execve_write_count.saturating_add(1);
+                            if post_execve_write_count <= 800 {
+                                // fd = arg1 (ebx on i386 / rdi on x86_64),
+                                // buf = arg2 (ecx on i386 / rsi on x86_64).
+                                // Both are preserved across the syscall
+                                // by the i386 + x86_64 calling convention
+                                // for syscalls (the kernel does NOT
+                                // clobber ebx/rcx/rdi/rsi in syscall
+                                // entry — only rax is overwritten with
+                                // the return value).
+                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                let buf_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                let to_read = std::cmp::min(ret as usize, 256);
+                                let captured = read_child_bytes(pid, buf_addr, to_read);
+                                let is_klog = kmsg_fd == Some(fd);
+                                let prefix = if is_klog { "DIAG KLOG" } else { "DIAG write" };
+                                match captured {
+                                    Some(bytes) => {
+                                        let captured_str = String::from_utf8_lossy(&bytes);
+                                        log(&format!(
+                                            "{}(fd={}, ret={}): {:?}",
+                                            prefix, fd, ret, captured_str
+                                        ));
+                                    }
+                                    None => {
+                                        // PTRACE_PEEKDATA failed on the
+                                        // very first word (EIO / unmapped
+                                        // address). Log the failure
+                                        // explicitly so it is greppable
+                                        // but do NOT crash the loop.
+                                        log(&format!(
+                                            "{}(fd={}, ret={}): <buffer read failed: EIO>",
+                                            prefix, fd, ret
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // ── Post-execve RETURN-VALUE logging ─────────────
@@ -7437,5 +7718,126 @@ mod tests {
             libc::SIGTRAP | 0x80,
             "PTRACE_EVENT_FORK stop must NOT look like a syscall stop (SIGTRAP|0x80)"
         );
+    }
+
+    // ── Task 6-U: KLOG inline-capture diagnostic tests ───────────────
+    //
+    // The 6-U diagnostic adds two new helpers + a new ChildAbi field:
+    //   - `is_kmsg_path(path)` — classifies open() paths as KLOG
+    //     destinations so the EXIT handler can record the returned fd
+    //   - `read_child_bytes(pid, addr, len)` — the N-byte variant of
+    //     `read_child_string` (KLOG lines are NOT NUL-terminated)
+    //   - `ChildAbi::write` — the write() syscall number per ABI, so
+    //     the EXIT handler can match `syscall_num == abi.write`
+    //     (ABI-aware — avoids cross-ABI confusion where i386 nr=1 is
+    //     `exit` and x86_64 nr=4 is `stat`)
+    // These tests lock in the per-ABI write numbers (regression
+    // guards mirroring the existing `pause` / `mknod` / `shmget`
+    // tests) and exercise `is_kmsg_path` against the realistic set of
+    // paths the open() ENTRY handler will see (raw /dev/__kmsg__,
+    // translated {rootfs}/dev/__kmsg__, /dev/kmsg, and non-KLOG
+    // paths that must NOT match).
+
+    #[test]
+    fn is_kmsg_path_matches_dev_kmsg_dunder() {
+        // TWRP init's primary KLOG destination — opened as fd 3 per
+        // the worklog 5-C twrp-init-fds.log analysis.
+        assert!(is_kmsg_path("/dev/__kmsg__"));
+    }
+
+    #[test]
+    fn is_kmsg_path_matches_dev_kmsg() {
+        // The standard Linux kernel log destination.
+        assert!(is_kmsg_path("/dev/kmsg"));
+    }
+
+    #[test]
+    fn is_kmsg_path_matches_translated_rootfs_variant() {
+        // After translate_path rewrites /dev/__kmsg__ →
+        // {rootfs}/dev/__kmsg__, the final component is still
+        // "__kmsg__" — the rsplit('/') fallback matches.
+        assert!(is_kmsg_path("/data/user/0/io.twoyi/rootfs/dev/__kmsg__"));
+    }
+
+    #[test]
+    fn is_kmsg_path_rejects_non_kmsg_paths() {
+        // Non-KLOG /dev/* paths must NOT match — otherwise the
+        // EXIT handler would mis-tag unrelated writes as "DIAG KLOG".
+        assert!(!is_kmsg_path("/dev/null"));
+        assert!(!is_kmsg_path("/dev/zero"));
+        assert!(!is_kmsg_path("/dev/__properties__"));
+        assert!(!is_kmsg_path("/dev/__null__"));
+        assert!(!is_kmsg_path("/init.rc"));
+        assert!(!is_kmsg_path("/proc/cmdline"));
+    }
+
+    #[test]
+    fn is_kmsg_path_rejects_empty_and_relative() {
+        // Empty + relative paths must not match (defensive).
+        assert!(!is_kmsg_path(""));
+        assert!(!is_kmsg_path("relative/__kmsg__"));
+    }
+
+    #[test]
+    fn is_kmsg_path_rejects_lookalikes() {
+        // Paths that CONTAIN "__kmsg__" as a substring but are NOT
+        // the final component must not match (e.g. /dev/__kmsg__foo
+        // or /dev/__kmsg__backup).
+        assert!(!is_kmsg_path("/dev/__kmsg__foo"));
+        assert!(!is_kmsg_path("/dev/__kmsg__backup"));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_write_number_matches_i386_unistd_32_h() {
+        // i386 write = 4 (per asm/unistd_32.h: __NR_write 4).
+        // THIS is the value that fires at runtime — TWRP init (an
+        // i386 binary) issues write() as syscall 4 to push KLOG
+        // lines to /dev/__kmsg__. Regression guard mirroring the
+        // existing `ABI_X86_32.pause == 29` test.
+        assert_eq!(ABI_X86_32.write, 4, "i386 write must be 4");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_write_number_matches_unistd_64_h() {
+        // x86_64 write = 1 (per asm/unistd_64.h: __NR_write 1).
+        // The host is x86_64 running an i386 child, so this number
+        // does NOT currently fire at runtime (the guest uses i386
+        // syscall 4). Locked in for ABI completeness + so the EXIT
+        // handler's `== abi.write` comparison is correct if a future
+        // x86_64 guest is ever supported.
+        assert_eq!(ABI_X86_64.write, 1, "x86_64 write must be 1");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_write_numbers_are_distinct_per_abi() {
+        // The i386 + x86_64 write numbers MUST be different (4 vs 1)
+        // — this is the entire point of the ABI-aware comparison.
+        // If a future refactor accidentally copies one ABI's number
+        // to the other, the EXIT handler would either miss real
+        // write() calls (false negative) or fire spuriously on the
+        // wrong syscall (false positive — e.g. x86_64 nr=4 is
+        // `stat`, i386 nr=1 is `exit`).
+        assert_ne!(
+            ABI_X86_32.write, ABI_X86_64.write,
+            "i386 + x86_64 write numbers must be distinct (4 vs 1) \
+             — same number would break the ABI-aware comparison"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_write_does_not_collide_with_i386_exit() {
+        // i386 syscall 1 is `exit` (NOT write). If the diagnostic
+        // used a naive `matches!(syscall_num, 1 | 4)` it would
+        // spuriously fire on i386 exit() calls (nr=1). The
+        // ABI-aware `syscall_num == abi.write` (where ABI_X86_32.write
+        // == 4) avoids this confusion. Lock in that ABI_X86_32.write
+        // is 4 (not 1) so the comparison correctly distinguishes
+        // write(4) from exit(1).
+        assert_eq!(ABI_X86_32.write, 4);
+        assert_ne!(ABI_X86_32.write, 1, "i386 nr=1 is exit, NOT write");
     }
 }
