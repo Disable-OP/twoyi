@@ -1547,6 +1547,63 @@ fn sigsys_ret_for_pause() -> i64 {
     -(libc::ENOSYS as i64)
 }
 
+/// Threshold for the pause() timeout (Task 6-G).
+///
+/// After this many CONSECUTIVE pause() SIGSYS calls, the SIGSYS handler
+/// returns `-ETIMEDOUT` instead of `-ENOSYS`. With Task 6-F's 100ms sleep,
+/// 50 pauses ≈ 5 seconds — a reasonable "give up" deadline for the
+/// missing property service's "ready" signal (which never arrives in
+/// kr64's sandboxed environment — kr64 has NO property service; 5-Y's
+/// find_property binary patch makes LOOKUPS return NULL, but there's no
+/// actual service to send the "ready" signal init's pause() loop waits
+/// for).
+///
+/// -ENOSYS (Task 6-E) was the right idea ("kernel doesn't implement
+/// pause → fall back to a non-pause wait") but the UI E2E test on
+/// 6e51920 showed init kept calling pause regardless of -ENOSYS (833
+/// pauses over 90s — reduced from 659k/sec by 6-F's sleep, but NOT
+/// broken). The deeper root cause is the missing property service — init
+/// doesn't care WHAT pause returns, it just keeps calling pause until
+/// the property service signals readiness. So -ENOSYS alone can't break
+/// the loop.
+///
+/// -ETIMEDOUT (-110) is a different signal: it tells init "the wait
+/// TIMED OUT" (not "the syscall is unimplemented"). Many init
+/// implementations treat timeout as "the dependency didn't start in
+/// time" and proceed with defaults instead of looping forever — which
+/// is exactly the behaviour we need to break the pause loop.
+///
+/// If -ETIMEDOUT doesn't break the loop either (init may treat it as
+/// retryable, like -EINTR), the next attempt should be -EIO (-5,
+/// "I/O error") or a direct property-service stub implementation (see
+/// the worklog DISPATCHER-FINAL-ASSESSMENT for the full analysis).
+const PAUSE_TIMEOUT_THRESHOLD: u32 = 50;
+
+/// The return value the SIGSYS handler writes for pause() AFTER
+/// `pause_count` consecutive pause() SIGSYS calls (Task 6-G).
+///
+/// Returns:
+///   - `-ETIMEDOUT` (-110) if `pause_count > PAUSE_TIMEOUT_THRESHOLD` —
+///     signals "the wait timed out", which should make init give up
+///     waiting for the missing property service and proceed (many init
+///     implementations treat timeout as non-fatal + proceed with
+///     defaults). This is the FALLBACK when -ENOSYS (Task 6-E) didn't
+///     break the loop.
+///   - `-ENOSYS` (-38) otherwise — the 6-E default, makes init fall
+///     back to a non-pause wait (mirrors 6-C's shmget -ENOSYS fallback).
+///
+/// Extracted as a named function so the threshold contract is
+/// unit-testable (the SIGSYS handler itself is inline ptrace code and
+/// not directly callable from tests — see the `pause_ret_after_*` tests
+/// below).
+fn pause_ret_after(pause_count: u32) -> i64 {
+    if pause_count > PAUSE_TIMEOUT_THRESHOLD {
+        -(libc::ETIMEDOUT as i64)
+    } else {
+        sigsys_ret_for_pause()
+    }
+}
+
 /// Set a syscall argument register to `val`.
 ///
 /// `arg` is a register index into the `Regs` buffer reinterpreted as a
@@ -2179,6 +2236,25 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     let mut last_sigsys_nr: i64 = -1;
     let mut sigsys_repeat_count: u64 = 0;
     let mut sigsys_suppressed_total: u64 = 0;
+    // ── Pause() consecutive-call counter (Task 6-G) ───────────────────
+    //
+    // Tracks CONSECUTIVE pause() SIGSYS calls so the SIGSYS handler can
+    // return -ETIMEDOUT after PAUSE_TIMEOUT_THRESHOLD (50) retries
+    // instead of -ENOSYS, to make init give up waiting for the missing
+    // property service.
+    //
+    // Reset to 0 on every NON-pause SIGSYS (so the counter only counts
+    // consecutive pause SIGSYS events). NOT reset on SIGTRAP|0x80 stops
+    // — pause is ALWAYS seccomp-blocked, so a SIGTRAP|0x80 between two
+    // pause SIGSYS events means init made real progress via an
+    // unblocked syscall (e.g. openat, read, write). Letting the
+    // counter carry over in that case is the right behaviour: if init
+    // re-enters the pause loop after that forward progress, we still
+    // want the timeout to fire eventually (the property service is
+    // STILL not running). Resetting on every SIGTRAP|0x80 would let
+    // init make trivial progress (e.g. a single getpid) between
+    // batches of pauses and NEVER hit the timeout — defeating the fix.
+    let mut pause_count: u32 = 0;
     // Rolling log of the last N syscall numbers — captures BOTH
     // seccomp-intercepted syscalls (recorded in the SIGSYS handler
     // below, because seccomp-blocked syscalls do NOT produce a
@@ -3522,6 +3598,20 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // faccessat instead), so the `access` branch is
                         // effectively dead on that architecture — the
                         // comparison still compiles and is harmless.
+                        //
+                        // Task 6-G: track CONSECUTIVE pause() SIGSYS calls
+                        // so the pause branch below can return -ETIMEDOUT
+                        // after PAUSE_TIMEOUT_THRESHOLD (50) retries
+                        // instead of -ENOSYS. Reset on every non-pause
+                        // SIGSYS so the counter only counts consecutive
+                        // pauses (see the doc on `pause_count` at the top
+                        // of run_ptrace_loop for why we do NOT also reset
+                        // on SIGTRAP|0x80 stops).
+                        if original_syscall == a.pause {
+                            pause_count = pause_count.saturating_add(1);
+                        } else {
+                            pause_count = 0;
+                        }
                         let ret_val: i64 = if original_syscall == a.access {
                             let path_display = access_path.as_deref().unwrap_or("?");
                             let path_arg2_display = access_path_from_arg2.as_deref().unwrap_or("?");
@@ -3841,11 +3931,41 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             // branch existed. 6-C's fix made this
                             // branch's setregs actually reachable in
                             // DESYNC mode.)
+                            //
+                            // Task 6-G: after PAUSE_TIMEOUT_THRESHOLD
+                            // (50) consecutive pause() SIGSYS calls,
+                            // return -ETIMEDOUT (-110) instead of
+                            // -ENOSYS. -ETIMEDOUT signals "the wait
+                            // timed out" — init's wait-loop should
+                            // treat this as "the property service
+                            // didn't start in time" and proceed with
+                            // defaults instead of looping forever. This
+                            // is the FALLBACK when -ENOSYS (6-E) didn't
+                            // break the loop (UI E2E on 6e51920 showed
+                            // 833 pauses over 90s — reduced from 659k
+                            // by 6-F's sleep, but NOT broken).
+                            //
+                            // The 6-F 100ms sleep (below this block)
+                            // still fires for both the -ENOSYS and
+                            // -ETIMEDOUT paths, so a tight retry loop
+                            // stays rate-limited even if -ETIMEDOUT
+                            // doesn't actually break the loop (init
+                            // may treat -ETIMEDOUT as retryable like
+                            // -EINTR — needs UI E2E + VLM to verify).
+                            let pause_ret = pause_ret_after(pause_count);
                             sigsys_log(&format!(
-                                "intercepted SIGSYS — pause() nr={} [{}] (NOT rewriting orig_rax — returning -ENOSYS so init falls back to a non-pause wait instead of looping on -EINTR + re-checking the never-ready property service)",
-                                original_syscall, name
+                                "intercepted SIGSYS — pause() nr={} [{}] (NOT rewriting orig_rax — pause_count={} → returning {} ({}))",
+                                original_syscall,
+                                name,
+                                pause_count,
+                                pause_ret,
+                                if pause_ret == -(libc::ETIMEDOUT as i64) {
+                                    "TIMEOUT after 50 retries — make init give up waiting for the missing property service"
+                                } else {
+                                    "-ENOSYS so init falls back to a non-pause wait"
+                                }
                             ));
-                            sigsys_ret_for_pause()
+                            pause_ret
                         } else {
                             sigsys_log(&format!(
                                 "intercepted SIGSYS — syscall nr={} [{}] (NOT rewriting orig_rax, returning 0) — NOTE: unexpected SIGSYS for this syscall",
@@ -5431,6 +5551,101 @@ mod tests {
             sigsys_ret_for_pause(),
             0,
             "pause SIGSYS handler must NOT return 0 (pre-6-D default) — caused the post-6-C infinite pause() retry loop (1,048,000+ repeats on commit 368f59b) because init interpreted 0 as 'pause completed without a signal' → re-checked its condition → retried pause forever."
+        );
+    }
+
+    // ── 6-G regression guard: pause_ret_after() threshold contract ──
+    //
+    // Task 6-G adds a `pause_count: u32` counter to run_ptrace_loop's
+    // per-child state. After PAUSE_TIMEOUT_THRESHOLD (50) CONSECUTIVE
+    // pause() SIGSYS calls, the SIGSYS handler returns -ETIMEDOUT
+    // (-110) instead of -ENOSYS (-38) to make init give up waiting for
+    // the missing property service. These tests lock in the threshold
+    // contract so a future "fix" can't silently regress it (e.g. by
+    // changing the threshold to u32::MAX, removing the -ETIMEDOUT
+    // branch, or breaking the boundary semantics).
+
+    #[test]
+    fn pause_timeout_threshold_is_50() {
+        // The threshold MUST be 50 — a deliberate choice documented in
+        // the const's doc comment:
+        //   - 50 pauses × 100ms sleep (6-F) = 5 seconds — a reasonable
+        //     "give up" deadline for the missing property service.
+        //   - Not so small that a legitimately-slow property service
+        //     startup would trigger a false timeout.
+        //   - Not so large that the UI E2E test (90s window) would be
+        //     dominated by the pause loop before the timeout fires.
+        assert_eq!(
+            PAUSE_TIMEOUT_THRESHOLD, 50,
+            "PAUSE_TIMEOUT_THRESHOLD must be 50 (50 × 100ms = 5s timeout for the missing property service — see the const's doc comment for the full rationale)"
+        );
+    }
+
+    #[test]
+    fn pause_ret_after_returns_enosys_below_threshold() {
+        // Below the threshold (1..=50), pause_ret_after MUST return
+        // -ENOSYS — the 6-E default. If this regressed (e.g. returned
+        // -ETIMEDOUT early), init would skip the "kernel doesn't
+        // implement pause" fallback path 6-E was designed to trigger,
+        // and might react unpredictably to an immediate timeout.
+        for count in [1u32, 5, 10, 25, 49, 50] {
+            assert_eq!(
+                pause_ret_after(count),
+                -(libc::ENOSYS as i64),
+                "pause_ret_after({}) must return -ENOSYS (not -ETIMEDOUT) — only counts STRICTLY GREATER than PAUSE_TIMEOUT_THRESHOLD (50) should time out. count={} is at-or-below the threshold.",
+                count, count
+            );
+        }
+        // The boundary case: count == PAUSE_TIMEOUT_THRESHOLD must NOT
+        // time out (only > threshold does). This is the standard
+        // off-by-one boundary — locking it in prevents future drift.
+        assert_eq!(
+            pause_ret_after(PAUSE_TIMEOUT_THRESHOLD),
+            -(libc::ENOSYS as i64),
+            "pause_ret_after(PAUSE_TIMEOUT_THRESHOLD={}) must return -ENOSYS (boundary — the timeout fires at STRICTLY-GREATER-THAN, not at-equal)",
+            PAUSE_TIMEOUT_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn pause_ret_after_returns_etimedout_above_threshold() {
+        // ABOVE the threshold (>50), pause_ret_after MUST return
+        // -ETIMEDOUT (-110) — the 6-G timeout signal. This is the
+        // actual fix: after 50 consecutive pauses (5s at 100ms each),
+        // tell init "the wait timed out" so it gives up waiting for
+        // the missing property service.
+        for count in [51u32, 52, 100, 1000, u32::MAX] {
+            assert_eq!(
+                pause_ret_after(count),
+                -(libc::ETIMEDOUT as i64),
+                "pause_ret_after({}) must return -ETIMEDOUT (not -ENOSYS) — counts STRICTLY GREATER than PAUSE_TIMEOUT_THRESHOLD (50) signal the pause loop has timed out waiting for the missing property service. count={} is above the threshold.",
+                count, count
+            );
+        }
+        // The boundary case: the FIRST count above the threshold (51)
+        // MUST return -ETIMEDOUT. This is the moment the timeout
+        // fires — locking it in prevents off-by-one regressions.
+        assert_eq!(
+            pause_ret_after(PAUSE_TIMEOUT_THRESHOLD + 1),
+            -(libc::ETIMEDOUT as i64),
+            "pause_ret_after(PAUSE_TIMEOUT_THRESHOLD+1={}) must return -ETIMEDOUT — this is the first count above the threshold, where the timeout fires",
+            PAUSE_TIMEOUT_THRESHOLD + 1
+        );
+    }
+
+    #[test]
+    fn pause_ret_after_zero_returns_enosys() {
+        // count == 0 should never happen at the call site (the SIGSYS
+        // handler increments pause_count BEFORE calling
+        // pause_ret_after, so the minimum value seen is 1). But the
+        // function must still be total and return -ENOSYS (NOT
+        // -ETIMEDOUT) for count=0 — defensively, an off-by-one in the
+        // call site that passes 0 should NOT accidentally trigger the
+        // timeout.
+        assert_eq!(
+            pause_ret_after(0),
+            -(libc::ENOSYS as i64),
+            "pause_ret_after(0) must return -ENOSYS (defensive — 0 is below the threshold so must not time out, even though the call site always passes >= 1)"
         );
     }
 
