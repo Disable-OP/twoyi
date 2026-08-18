@@ -3215,6 +3215,33 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     }
                     recent_all_syscalls.push_back(syscall_num);
 
+                    // ── DIAGNOSTIC (6-S3): unconditional fork-family + wait4 logging ──
+                    //
+                    // bceac63 showed ZERO PTRACE_EVENT_FORK/CLONE/VFORK despite
+                    // the options being set. init's last-10 buffer has wait4
+                    // (nr=114 i386) — so init DID wait4. This answers: does
+                    // init actually CALL fork/clone/vfork/clone3, or does it
+                    // skip forking entirely (→ wait4 -ECHILD → exit(1))?
+                    //
+                    // Raw numbers for BOTH i386 + x86_64 ABIs (init is i386
+                    // post-execve; the twoyi-app restart path is x86_64
+                    // pre-execve). UNCONDITIONAL — NOT gated by loop_count.
+                    let is_fork_family = matches!(syscall_num, 2 | 57 | 120 | 56 | 190 | 58 | 435);
+                    let is_wait4 = matches!(syscall_num, 114 | 61 | 247 | 290);
+                    if is_fork_family {
+                        log(&format!(
+                            "DIAG fork-family ENTRY: nr={} (pid={}), loop_count={}, in_syscall_was={}",
+                            syscall_num, pid, loop_count, in_syscall
+                        ));
+                    }
+                    if is_wait4 {
+                        let wait_pid = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        log(&format!(
+                            "DIAG wait4 ENTRY: nr={}, wait_pid={} (0=any, -1=any-block, >0=specific), loop_count={}",
+                            syscall_num, wait_pid, loop_count
+                        ));
+                    }
+
                     // Log every syscall number on entry for the first 50
                     // iterations so we can see exactly what TWRP's init
                     // is calling (and in what order) before it dies or
@@ -3588,6 +3615,19 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
+
+                    // ── DIAGNOSTIC (6-S3): unconditional fork-family EXIT ──
+                    //
+                    // Logs the kernel return value for every fork-family
+                    // syscall (nr=2/57/120/56/190/58/435), UNCONDITIONALLY
+                    // (not gated). 0=child, >0=parent's-child-pid, <0=error.
+                    if matches!(syscall_num, 2 | 57 | 120 | 56 | 190 | 58 | 435) {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        log(&format!(
+                            "DIAG fork-family EXIT: nr={} returned {} (0=child, >0=parent's-child-pid, <0=error)",
+                            syscall_num, ret
+                        ));
+                    }
 
                     // ── Post-execve RETURN-VALUE logging ─────────────
                     //
