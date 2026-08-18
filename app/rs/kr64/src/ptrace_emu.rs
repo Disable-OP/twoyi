@@ -408,24 +408,30 @@ struct ChildAbi {
     // post-6-C UI E2E blocker: the guest now loops on pause() (i386
     // syscall 29) 1,048,000+ times instead of looping on shmget.
     //
-    // Returning -EINTR (-4) tells init "a signal interrupted pause"
-    // — init's wait-loop checks its condition (property service
-    // ready? not yet) and either breaks out (if ready) or calls
-    // pause() again — but the property service, if running, will
-    // eventually signal readiness, so the loop terminates. If the
-    // property service is not running at all (the current state of
-    // the rootfs), init's pause() loop will still spin — BUT that
-    // spin is now CORRECT behaviour (init is correctly waiting for
-    // a signal that will never come), not a kr64 bug. The dispatcher
-    // is separately tracking the missing property service (see 6-C's
-    // honest caveats + 5-Y's find_property binary patch).
+    // 6-D (commit 2b073f8) tried returning -EINTR (-4): this made
+    // init think "interrupted by a signal" → check the condition
+    // (property service not ready) → call pause() again → INFINITE
+    // LOOP. The UI E2E test on 2b073f8 shows the pause loop is STILL
+    // there (992,000+ repeats) — -EINTR did NOT break the loop. The
+    // property service will NEVER signal readiness because kr64 has
+    // NO property service (5-Y's find_property binary patch makes
+    // lookups return NULL, but there's no actual service to send the
+    // "ready" signal).
+    //
+    // Task 6-E: return -ENOSYS (-38) instead. This tells init "this
+    // kernel does not implement pause()" → init falls back to a
+    // non-pause wait mechanism (or skips the wait entirely). This
+    // mirrors how 6-C's shmget -ENOSYS made init fall back to non-
+    // shared-memory property init (which WORKED — the shmget loop
+    // stopped). The same fallback pattern should break the pause
+    // loop here.
     //
     // pause() is NOT added to compute_exit_return_value's fake-
-    // success list — it returns -EINTR, not 0, via a dedicated branch
+    // success list — it returns -ENOSYS, not 0, via a dedicated branch
     // in the SIGSYS handler. This means 6-C's should_skip_sigsys_setregs
     // does NOT skip the SIGSYS handler's setregs for pause (the skip
     // fires only for syscalls in the fake-success list — pause isn't
-    // in it) → the SIGSYS handler's setregs MUST fire to write -EINTR.
+    // in it) → the SIGSYS handler's setregs MUST fire to write -ENOSYS.
     //
     // The per-ABI numbers (verified against the kernel's UAPI headers
     // in Task 6-D):
@@ -571,7 +577,10 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // i386 syscall 29 for pause). It is locked in for ABI completeness
     // and to keep the EXIT handler's ABI-aware if-chain correct if a
     // future x86_64 guest is ever supported. See the doc on `pause` in
-    // `ChildAbi` for why we return -EINTR (not 0) for pause.
+    // `ChildAbi` for why we return -ENOSYS (not 0, not -EINTR) for
+    // pause (Task 6-E: -ENOSYS makes init fall back to a non-pause
+    // wait instead of looping on -EINTR + re-checking the never-ready
+    // property service).
     pause: 34,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
@@ -685,10 +694,17 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // "NOT rewriting orig_rax, returning 0" branch) → init interpreted
     // return value 0 as "pause completed without a signal" → re-checked
     // its condition (property service not ready) → retried pause →
-    // INFINITE LOOP (1,048,000+ calls observed on commit 368f59b). The
-    // 6-D fix adds a dedicated SIGSYS branch returning -EINTR (-4),
-    // so init's wait-loop sees "interrupted by a signal" and can break
-    // out when the property service eventually becomes ready.
+    // INFINITE LOOP (1,048,000+ calls observed on commit 368f59b). 6-D
+    // (commit 2b073f8) tried returning -EINTR (-4) but the UI E2E test
+    // on 2b073f8 shows the pause loop is STILL there (992,000+
+    // repeats) — -EINTR makes init think "interrupted by a signal" →
+    // check the condition (property service not ready) → call pause()
+    // again → INFINITE LOOP, because the property service will NEVER
+    // signal readiness (kr64 has no property service). Task 6-E: return
+    // -ENOSYS (-38) instead — tells init "this kernel does not
+    // implement pause()" → init falls back to a non-pause wait (mirrors
+    // how 6-C's shmget -ENOSYS made init fall back to non-shared-memory
+    // property init, which worked — the shmget loop stopped).
     //
     // NOTE: this is the SAME number that the pre-6-C kr64 mistakenly
     // used for ABI_X86_32.shmget (because the i386 shm numbers were
@@ -829,7 +845,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     //     pause to it — aliasing would mislabel ppoll SIGSYS as
     //     "pause" in syscall_name() (mislabeled but harmless) AND
     //     would intercept a real ppoll in the SIGSYS handler (would
-    //     force -EINTR for any ppoll the guest makes, even legitimate
+    //     force -ENOSYS for any ppoll the guest makes, even legitimate
     //     ones that should return 0 — too risky). Mirrors the existing
     //     pattern for ABI_AARCH64.open / access / lchown / chown /
     //     mknod, which are also set to -1 for the same "asm-generic
@@ -1496,6 +1512,39 @@ fn should_skip_sigsys_setregs(in_syscall_at_sigsys: bool, syscall_nr: i64, abi: 
     // EXIT handler did NOT write rax, so the SIGSYS handler's setregs
     // is the ONLY writeback and MUST fire (Task 6-C).
     !in_syscall_at_sigsys && compute_exit_return_value(syscall_nr, abi).is_some()
+}
+
+/// The return value the SIGSYS handler writes for pause() (Task 6-E).
+///
+/// Returns `-ENOSYS` (-38) — NOT `-EINTR`, NOT 0. See the dedicated
+/// branch in the SIGSYS handler for the full rationale. Extracted as a
+/// named function so the contract is unit-testable (the SIGSYS handler
+/// itself is inline ptrace code and not directly callable from tests).
+///
+/// # Why -ENOSYS (Task 6-E), not -EINTR (6-D's attempt) or 0 (pre-6-D)
+///
+/// 6-D (commit 2b073f8) returned -EINTR (-4): this made init think
+/// "interrupted by a signal" → check the condition (property service
+/// not ready) → call pause() again → INFINITE LOOP. The UI E2E test on
+/// 2b073f8 showed the pause loop was STILL there (992,000+ repeats) —
+/// -EINTR did NOT break the loop. The property service will NEVER
+/// signal readiness because kr64 has NO property service (5-Y's
+/// find_property binary patch makes lookups return NULL, but there's
+/// no actual service to send the "ready" signal).
+///
+/// Returning 0 (the pre-6-D default) is ALSO wrong: init interprets 0
+/// as "pause completed WITHOUT a signal" → re-checks its condition →
+/// calls pause() again → INFINITE LOOP (the post-6-C UI E2E blocker,
+/// 1,048,000+ repeats on commit 368f59b).
+///
+/// -ENOSYS (-38) tells init "this kernel does not implement pause()"
+/// → init falls back to a non-pause wait mechanism (or skips the wait
+/// entirely). This mirrors how 6-C's shmget -ENOSYS made init fall
+/// back to non-shared-memory property init (which WORKED — the shmget
+/// loop stopped). The same fallback pattern should break the pause
+/// loop here.
+fn sigsys_ret_for_pause() -> i64 {
+    -(libc::ENOSYS as i64)
 }
 
 /// Set a syscall argument register to `val`.
@@ -3729,70 +3778,74 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             ));
                             -(libc::ENOSYS as i64)
                         } else if original_syscall == a.pause {
-                            // pause() — Task 6-D. TWRP init's
-                            // __system_property_area_init code calls
-                            // pause() in a loop while waiting for the
-                            // property service to signal it has set up
-                            // /dev/__properties__. On the host's
+                            // pause() — Task 6-D (initial -EINTR) +
+                            // Task 6-E (changed to -ENOSYS). TWRP
+                            // init's __system_property_area_init code
+                            // calls pause() in a loop while waiting for
+                            // the property service to signal it has set
+                            // up /dev/__properties__. On the host's
                             // untrusted_app seccomp filter pause() is
                             // blocked (i386 syscall 29), raising SIGSYS.
-                            //
                             // The kernel's own pause() can ONLY ever
                             // return -EINTR (errno 4) — there is no
                             // "successful" return from pause(); it
                             // blocks until interrupted by a signal.
                             //
-                            // Returning 0 for pause() (the SIGSYS
-                            // handler's pre-6-D default "NOT rewriting
-                            // orig_rax, returning 0" branch) is WRONG:
-                            // init interprets return value 0 as "pause
-                            // completed WITHOUT a signal" → re-checks
-                            // its condition (property service still
-                            // not ready) → calls pause() again →
-                            // INFINITE LOOP. This was the post-6-C UI
-                            // E2E blocker (commit 368f59b): the guest
-                            // now loops on pause() 1,048,000+ times
-                            // instead of looping on shmget (which 6-C
-                            // had just fixed).
+                            // 6-D (commit 2b073f8) tried returning
+                            // -EINTR (-4): this makes init think
+                            // "interrupted by a signal" → check the
+                            // condition (property service not ready) →
+                            // call pause() again → INFINITE LOOP. The
+                            // UI E2E test on 2b073f8 shows the pause
+                            // loop is STILL there (992,000+ repeats) —
+                            // -EINTR did NOT break the loop. The
+                            // property service will NEVER signal
+                            // readiness because kr64 has NO property
+                            // service (5-Y's find_property binary patch
+                            // makes lookups return NULL, but there's no
+                            // actual service to send the "ready"
+                            // signal). So -EINTR's "check + retry"
+                            // semantics are exactly the wrong shape:
+                            // they guarantee an infinite loop.
                             //
-                            // Returning -EINTR (-4) tells init "a
-                            // signal interrupted pause" — init's
-                            // wait-loop checks its condition (property
-                            // service ready? not yet) and either
-                            // breaks out (if ready) or calls pause()
-                            // again — but the property service, if
-                            // running, will eventually signal
-                            // readiness, so the loop terminates. If the
-                            // property service is not running at all
-                            // (the current state of the rootfs — see
-                            // 5-Y's find_property binary patch + 6-C's
-                            // honest caveats), init's pause() loop
-                            // will still spin — BUT that spin is now
-                            // CORRECT behaviour (init is correctly
-                            // waiting for a signal that will never
-                            // come), not a kr64 bug.
+                            // Task 6-E: return -ENOSYS (-38) instead.
+                            // This tells init "this kernel does not
+                            // implement pause()" → init falls back to
+                            // a non-pause wait mechanism (or skips the
+                            // wait entirely). This mirrors how 6-C's
+                            // shmget -ENOSYS made init fall back to
+                            // non-shared-memory property init (which
+                            // WORKED — the shmget loop stopped). The
+                            // same fallback pattern should break the
+                            // pause loop here. Returning 0 (the
+                            // pre-6-D default) is ALSO wrong: init
+                            // interprets 0 as "pause completed WITHOUT
+                            // a signal" → re-checks its condition →
+                            // calls pause() again → INFINITE LOOP (the
+                            // post-6-C UI E2E blocker, 1,048,000+
+                            // repeats on commit 368f59b).
                             //
                             // pause() is NOT in
                             // compute_exit_return_value's fake-success
-                            // list — it returns -EINTR via this
+                            // list — it returns -ENOSYS via this
                             // dedicated branch, not 0 via the EXIT
                             // handler. This means 6-C's
                             // should_skip_sigsys_setregs (which
                             // requires `compute_exit_return_value(
                             // ...).is_some()`) does NOT skip the
                             // SIGSYS handler's setregs for pause →
-                            // the setregs MUST fire to write -EINTR.
+                            // the setregs MUST fire to write -ENOSYS.
                             // (Pre-6-C the skip fired unconditionally
-                            // in DESYNC mode → pause's -EINTR would
+                            // in DESYNC mode → pause's -ENOSYS would
                             // never have been written even if this
                             // branch existed. 6-C's fix made this
                             // branch's setregs actually reachable in
                             // DESYNC mode.)
                             sigsys_log(&format!(
-                                "intercepted SIGSYS — pause() nr={} [{}] (NOT rewriting orig_rax — returning -EINTR so init's wait-loop checks its condition + breaks instead of spinning on a 'successful' pause return)",
+                                "intercepted SIGSYS — pause() nr={} [{}] (NOT rewriting orig_rax — returning -ENOSYS so init falls back to a non-pause wait instead of looping on -EINTR + re-checking the never-ready property service)",
                                 original_syscall, name
                             ));
-                            -(libc::EINTR as i64)
+                            sigsys_ret_for_pause()
                         } else {
                             sigsys_log(&format!(
                                 "intercepted SIGSYS — syscall nr={} [{}] (NOT rewriting orig_rax, returning 0) — NOTE: unexpected SIGSYS for this syscall",
@@ -3859,7 +3912,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         //     these need -ENOSYS at runtime in DESYNC
                         //     mode, add them to
                         //     compute_exit_return_value.)
-                        //   - pause returns -EINTR (Task 6-D) via a
+                        //   - pause returns -ENOSYS (Task 6-E, was
+                        //     -EINTR in 6-D commit 2b073f8) via a
                         //     dedicated SIGSYS handler branch (NOT in
                         //     compute_exit_return_value — pause has
                         //     its OWN non-zero return value, like
@@ -3869,14 +3923,22 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         //     should_skip_sigsys_setregs requires
                         //     compute_exit_return_value(...).is_some(),
                         //     which is None for pause → skip does NOT
-                        //     fire → setregs fires → -EINTR is written).
-                        //     Returning 0 (the pre-6-D default) caused
-                        //     the post-6-C infinite pause() retry loop
-                        //     (1M+ calls on commit 368f59b) because
-                        //     init interpreted 0 as "pause completed
-                        //     WITHOUT a signal" → re-checked its
-                        //     condition (property service still not
-                        //     ready) → retried pause forever.
+                        //     fire → setregs fires → -ENOSYS is
+                        //     written). Returning 0 (the pre-6-D
+                        //     default) caused the post-6-C infinite
+                        //     pause() retry loop (1M+ calls on commit
+                        //     368f59b) because init interpreted 0 as
+                        //     "pause completed WITHOUT a signal" →
+                        //     re-checked its condition (property
+                        //     service still not ready) → retried
+                        //     pause forever. Returning -EINTR (6-D
+                        //     commit 2b073f8) ALSO failed: init's
+                        //     "interrupted by a signal" → check +
+                        //     retry path loops forever because the
+                        //     property service never signals readiness
+                        //     (kr64 has no property service). -ENOSYS
+                        //     makes init fall back to a non-pause wait
+                        //     (mirrors shmget's -ENOSYS fallback).
                         //
                         // `set_syscall_ret` is still called on
                         // `sigsys_regs` so the readback log below can
@@ -5176,30 +5238,45 @@ mod tests {
         );
     }
 
-    // ── 6-D regression tests: pause() syscall numbers + SIGSYS branch ─
+    // ── 6-D + 6-E regression tests: pause() syscall numbers + SIGSYS branch ─
     //
-    // These guard the 6-D fix for the post-6-C infinite pause() retry
-    // loop (commit 368f59b — 6-C's shmget number correction): the
-    // guest now loops on pause() (i386 syscall 29) 1,048,000+ times
-    // because the SIGSYS handler returned 0 (the default
-    // "NOT rewriting orig_rax, returning 0" branch) for pause.
-    // Returning 0 is WRONG for pause() — the kernel's own pause()
-    // can ONLY ever return -EINTR (errno 4). Init's
-    // __system_property_area_init code interprets 0 as "pause
-    // completed WITHOUT a signal" → re-checks its condition (property
-    // service still not ready) → calls pause() again → INFINITE LOOP.
-    // The 6-D fix returns -EINTR via a dedicated SIGSYS branch so
-    // init's wait-loop sees "interrupted by a signal" and can break
-    // out when the property service eventually becomes ready.
+    // These guard the pause() fix path. Pre-6-D the SIGSYS handler
+    // returned 0 for pause (the default "NOT rewriting orig_rax,
+    // returning 0" branch) → init interpreted 0 as "pause completed
+    // WITHOUT a signal" → re-checked its condition (property service
+    // still not ready) → called pause() again → INFINITE LOOP (the
+    // post-6-C UI E2E blocker, 1,048,000+ repeats on commit 368f59b).
+    // The kernel's own pause() can ONLY ever return -EINTR (errno 4)
+    // — there is no "successful" return.
+    //
+    // 6-D (commit 2b073f8) tried returning -EINTR (-4): this made
+    // init think "interrupted by a signal" → check the condition
+    // (property service not ready) → call pause() again → INFINITE
+    // LOOP. The UI E2E test on 2b073f8 showed the pause loop was STILL
+    // there (992,000+ repeats) — -EINTR did NOT break the loop. The
+    // property service will NEVER signal readiness because kr64 has
+    // NO property service (5-Y's find_property binary patch makes
+    // lookups return NULL, but there's no actual service to send the
+    // "ready" signal).
+    //
+    // Task 6-E: return -ENOSYS (-38) instead — tells init "this
+    // kernel does not implement pause()" → init falls back to a
+    // non-pause wait mechanism (or skips the wait entirely). Mirrors
+    // how 6-C's shmget -ENOSYS made init fall back to non-shared-
+    // memory property init (which WORKED — the shmget loop stopped).
     //
     // These tests verify:
     //   (1) pause syscall numbers match the kernel's UAPI headers
     //       (i386=29, x86_64=34, aarch64=-1 sentinel).
     //   (2) compute_exit_return_value returns None for pause (pause
-    //       is NOT in the fake-success list — it has its own -EINTR
+    //       is NOT in the fake-success list — it has its own -ENOSYS
     //       branch in the SIGSYS handler).
     //   (3) should_skip_sigsys_setregs does NOT fire for pause (so
-    //       the SIGSYS handler's setregs MUST fire to write -EINTR).
+    //       the SIGSYS handler's setregs MUST fire to write -ENOSYS).
+    //   (4) sigsys_ret_for_pause() returns -ENOSYS (NOT -EINTR, NOT 0)
+    //       — the direct regression guard for the 6-E fix (locks in
+    //       the contract so a future "fix" can't regress it back to
+    //       -EINTR or 0).
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -5243,15 +5320,18 @@ mod tests {
     fn compute_exit_return_value_pause_returns_none() {
         // pause is NOT in compute_exit_return_value's fake-success
         // list — it returns None. The SIGSYS handler has its OWN
-        // dedicated branch for pause that returns -EINTR (-4, NOT 0).
-        // If pause were ever added to the fake-success list, the EXIT
-        // handler would write rax=0 for it, which would CAUSE the
-        // infinite pause() retry loop again (init would interpret 0
-        // as "pause completed without a signal" → re-check condition
-        // → retry pause forever). This test locks in the contract:
-        // pause returns None from compute_exit_return_value so the
-        // EXIT handler does NOT write rax=0 for pause; the SIGSYS
-        // handler's -EINTR writeback is the ONLY writeback.
+        // dedicated branch for pause that returns -ENOSYS (-38, NOT 0)
+        // via sigsys_ret_for_pause() (Task 6-E — was -EINTR in 6-D
+        // commit 2b073f8, but -EINTR caused an infinite loop because
+        // the property service never signals readiness). If pause were
+        // ever added to the fake-success list, the EXIT handler would
+        // write rax=0 for it, which would CAUSE the infinite pause()
+        // retry loop again (init would interpret 0 as "pause completed
+        // without a signal" → re-check condition → retry pause
+        // forever). This test locks in the contract: pause returns
+        // None from compute_exit_return_value so the EXIT handler does
+        // NOT write rax=0 for pause; the SIGSYS handler's -ENOSYS
+        // writeback is the ONLY writeback.
         #[cfg(target_arch = "x86_64")]
         let abi = ABI_X86_32; // i386 — the runtime-relevant ABI for TWRP.
         #[cfg(target_arch = "aarch64")]
@@ -5265,31 +5345,31 @@ mod tests {
         assert_eq!(
             compute_exit_return_value(pause_nr, &abi),
             None,
-            "pause must NOT be in compute_exit_return_value's fake-success list — the SIGSYS handler returns -EINTR for it via a dedicated branch (returning 0 would cause the infinite pause() retry loop)"
+            "pause must NOT be in compute_exit_return_value's fake-success list — the SIGSYS handler returns -ENOSYS for it via a dedicated branch (returning 0 would cause the infinite pause() retry loop)"
         );
     }
 
     #[test]
     fn should_skip_sigsys_setregs_false_for_pause() {
         // pause is NOT in compute_exit_return_value's fake-success
-        // list (it returns None — the SIGSYS handler returns -EINTR
+        // list (it returns None — the SIGSYS handler returns -ENOSYS
         // for pause via a dedicated branch, NOT 0 via the EXIT
         // handler). In DESYNC mode the EXIT handler did NOT write
         // rax for pause → the SIGSYS handler's setregs is the ONLY
-        // writeback and MUST execute to write -EINTR. Skip MUST NOT
+        // writeback and MUST execute to write -ENOSYS. Skip MUST NOT
         // fire. (If 6-C's should_skip_sigsys_setregs skipped pause
-        // too, the -EINTR writeback would never happen → rax would
+        // too, the -ENOSYS writeback would never happen → rax would
         // retain the kernel's leaked syscall-number value → init
         // would interpret that positive value as a "successful"
         // pause return → infinite pause() retry loop, same shape as
         // the pre-6-C shmget infinite loop.)
         //
-        // This test is the direct regression guard for the 6-D fix:
-        // it confirms 6-C's `compute_exit_return_value(...).is_some()`
-        // condition correctly excludes pause (which returns None)
-        // → the skip does NOT fire for pause → the SIGSYS handler's
-        // setregs fires → -EINTR is written → init's wait-loop can
-        // break out.
+        // This test is the direct regression guard for the 6-D/6-E
+        // fix: it confirms 6-C's `compute_exit_return_value(...)
+        // .is_some()` condition correctly excludes pause (which
+        // returns None) → the skip does NOT fire for pause → the
+        // SIGSYS handler's setregs fires → -ENOSYS is written →
+        // init falls back to a non-pause wait instead of looping.
         #[cfg(target_arch = "x86_64")]
         let abi = ABI_X86_32; // i386 — the runtime-relevant ABI for TWRP.
         #[cfg(target_arch = "aarch64")]
@@ -5299,12 +5379,44 @@ mod tests {
         assert_eq!(
             compute_exit_return_value(pause_nr, &abi),
             None,
-            "pause must NOT be in compute_exit_return_value's fake-success list (the SIGSYS handler returns -EINTR for it via a dedicated branch)"
+            "pause must NOT be in compute_exit_return_value's fake-success list (the SIGSYS handler returns -ENOSYS for it via a dedicated branch)"
         );
         // DESYNC + NOT fake-success → must NOT skip.
         assert!(
             !should_skip_sigsys_setregs(false, pause_nr, &abi),
-            "DESYNC + pause (NOT in fake-success list): skip MUST NOT fire — SIGSYS handler's setregs is the only writeback (writes -EINTR, NOT 0). If this skip fired, pause's -EINTR would never be written → rax would retain the kernel's leaked syscall number → init would see a positive 'pause returned' value → infinite pause() retry loop (same shape as pre-6-C shmget infinite loop)."
+            "DESYNC + pause (NOT in fake-success list): skip MUST NOT fire — SIGSYS handler's setregs is the only writeback (writes -ENOSYS, NOT 0). If this skip fired, pause's -ENOSYS would never be written → rax would retain the kernel's leaked syscall number → init would see a positive 'pause returned' value → infinite pause() retry loop (same shape as pre-6-C shmget infinite loop)."
+        );
+    }
+
+    // ── 6-E direct regression guard: sigsys_ret_for_pause() contract ─
+    //
+    // 6-D (commit 2b073f8) returned -EINTR for pause; the UI E2E test
+    // on 2b073f8 showed the pause loop was STILL there (992,000+
+    // repeats) — -EINTR makes init check + retry forever (property
+    // service never signals readiness). Task 6-E changed the return to
+    // -ENOSYS so init falls back to a non-pause wait (mirrors shmget's
+    // -ENOSYS fallback). This test locks in the -ENOSYS contract so a
+    // future "fix" can't regress it back to -EINTR or to 0.
+    #[test]
+    fn sigsys_ret_for_pause_is_enosys_not_eintr_not_zero() {
+        // The SIGSYS handler MUST return -ENOSYS for pause (Task 6-E).
+        assert_eq!(
+            sigsys_ret_for_pause(),
+            -(libc::ENOSYS as i64),
+            "pause SIGSYS handler must return -ENOSYS (Task 6-E) — not -EINTR (6-D commit 2b073f8 tried -EINTR; UI E2E test showed the pause loop was still there, 992k+ repeats, because -EINTR makes init check + retry forever), not 0 (pre-6-D default; caused the post-6-C infinite pause() retry loop, 1M+ repeats on commit 368f59b)"
+        );
+        // Explicitly assert it's NOT -EINTR (the 6-D value that failed).
+        assert_ne!(
+            sigsys_ret_for_pause(),
+            -(libc::EINTR as i64),
+            "pause SIGSYS handler must NOT return -EINTR — 6-D commit 2b073f8 tried this and the UI E2E test showed the pause loop was still there (992,000+ repeats). -EINTR makes init think 'interrupted by a signal' → check the condition (property service not ready) → call pause() again → INFINITE LOOP, because the property service never signals readiness (kr64 has no property service)."
+        );
+        // Explicitly assert it's NOT 0 (the pre-6-D default that caused
+        // the post-6-C infinite pause() retry loop).
+        assert_ne!(
+            sigsys_ret_for_pause(),
+            0,
+            "pause SIGSYS handler must NOT return 0 (pre-6-D default) — caused the post-6-C infinite pause() retry loop (1,048,000+ repeats on commit 368f59b) because init interpreted 0 as 'pause completed without a signal' → re-checked its condition → retried pause forever."
         );
     }
 
