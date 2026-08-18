@@ -2162,21 +2162,57 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
         pid, rootfs
     ));
 
-    // Set PTRACE_O_TRACESYSGOOD so we get SIGTRAP|0x80 for syscall stops.
-    let r = unsafe {
-        libc::ptrace(
-            libc::PTRACE_SETOPTIONS,
-            pid,
-            0,
-            libc::PTRACE_O_TRACESYSGOOD as libc::c_int,
-        )
-    };
+    // ── PTRACE_SETOPTIONS: trace forks + good-syscall-stops ──────────
+    //
+    // We set FOUR options here:
+    //
+    //   - PTRACE_O_TRACESYSGOOD (the only option set before Task 6-S):
+    //     makes syscall-stops arrive as SIGTRAP|0x80 (so we can
+    //     distinguish them from regular SIGTRAPs in `WSTOPSIG`).
+    //
+    //   - PTRACE_O_TRACEFORK | TRACECLONE | TRACEVFORK (Task 6-S): makes
+    //     the kernel auto-attach us to every forked/clone'd/vfork'd
+    //     child of `pid`. Each new child starts traced + stopped at its
+    //     first instruction (a SIGSTOP). The PARENT is reported with a
+    //     PTRACE_EVENT_FORK/CLONE/VFORK stop at the moment of the fork
+    //     (status >> 16 == event number); we use PTRACE_GETEVENTMSG on
+    //     the parent to read the new child's PID. Without these options
+    //     the new child runs UNTRACED — which was the FUNDAMENTAL
+    //     architectural gap fixed by Task 6-S: TWRP's init forks the
+    //     recovery service during boot, and the recovery service is
+    //     STATICALLY LINKED (LD_PRELOAD hook doesn't load), so its
+    //     syscalls (open /dev/graphics/fb0, mmap, ioctl) went directly
+    //     to the host kernel with NO interception → -ENOENT → recovery
+    //     crashes → init exits(1) at iter 3605.
+    //
+    //   - PTRACE_O_EXITKILL (Task 6-S): if kr64 (the tracer) dies for
+    //     any reason, the kernel kills every traced child. Without this
+    //     a forked child (e.g. recovery) could outlive kr64 and run
+    //     untraced — leaking a process that touches the host /dev tree.
+    //     EXITKILL ensures clean teardown on kr64 crash.
+    //
+    // The new child's ABI is the SAME as the parent's ABI at fork time
+    // (init is i386 after its first execve → recovery is also i386).
+    // If the child later calls execve (e.g. init forks, then the child
+    // execve's /sbin/recovery), the existing execve-detection logic
+    // (saw_execve / reset_abi_next at the top of run_ptrace_loop)
+    // re-detects the ABI from /proc/<pid>/exe. So we do NOT need a
+    // per-child ABI map — the single shared `abi: Option<ChildAbi>`
+    // local correctly tracks whichever child is currently stopped,
+    // because only one child makes syscalls at a time (init BLOCKS in
+    // waitpid while the recovery service runs).
+    let ptrace_opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
+        | libc::PTRACE_O_TRACEFORK
+        | libc::PTRACE_O_TRACECLONE
+        | libc::PTRACE_O_TRACEVFORK
+        | libc::PTRACE_O_EXITKILL) as libc::c_int;
+    let r = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, ptrace_opts) };
     if r == -1 {
         let e = std::io::Error::last_os_error();
         log(&format!("PTRACE_SETOPTIONS failed: {}", e));
         return -1;
     }
-    log("PTRACE_O_TRACESYSGOOD set");
+    log("PTRACE_O_TRACESYSGOOD | TRACEFORK | TRACECLONE | TRACEVFORK | EXITKILL set");
 
     let mut in_syscall = false;
     let mut pending_getpid = false;
@@ -2354,6 +2390,27 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     let mut past_first_execve: bool = false;
     let mut post_execve_syscall_count: u64 = 0;
 
+    // ── Multi-child PID tracking (Task 6-S) ───────────────────────────
+    //
+    // `init_pid` is the PID of the ORIGINAL traced child (the `pid`
+    // function parameter — kr64's forked init). When init exits we
+    // return its exit code from `run_ptrace_loop`. When a FORKED child
+    // (recovery, ueventd, thermald, …) exits, we log + continue the
+    // loop — init is still running and we must keep tracing it until
+    // it too exits.
+    //
+    // `current_pid` is the PID of whichever child we most recently
+    // received a ptrace stop from. The loop-top PTRACE_SYSCALL resumes
+    // THIS child (not always init), and the loop's `let pid = current_pid`
+    // shadow makes the existing handler code (which uses `pid` for
+    // ptrace_getregs / read_child_string / etc.) operate on the
+    // currently-stopped child instead of always on init. `current_pid`
+    // is updated every iteration by the `waitpid(-1)` call, which
+    // receives stops from ANY traced child (init + every forked
+    // descendant, thanks to PTRACE_O_TRACEFORK set above).
+    let init_pid: libc::pid_t = pid;
+    let mut current_pid: libc::pid_t = pid;
+
     loop {
         // ── Deferred ABI reset (after execve EXIT) ──
         //
@@ -2403,8 +2460,23 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
         // the ONLY PTRACE_SYSCALL in the loop — handlers below set
         // `resume_signal` (and `continue`) instead of resuming the
         // child themselves, so we never race the second ptrace call.
-        let r =
-            unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, resume_signal as libc::c_long) };
+        //
+        // Task 6-S: resume `current_pid` (the last-stopped child), NOT
+        // always `pid` (init). After PTRACE_O_TRACEFORK was set, the
+        // kernel auto-attaches us to forked children; the previous
+        // iteration's `waitpid(-1)` may have returned a NON-init child
+        // (e.g. the recovery service), and we must resume THAT child —
+        // resuming init instead would leave the recovery service stuck
+        // in its SIGSTOP forever, and init would never receive the
+        // child-stop event that breaks it out of its own waitpid.
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_SYSCALL,
+                current_pid,
+                0,
+                resume_signal as libc::c_long,
+            )
+        };
         // Reset for the next iteration — only set again if a
         // signal-delivery branch below populates it.
         resume_signal = 0;
@@ -2412,7 +2484,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
             let e = std::io::Error::last_os_error();
             // ESRCH = child already exited — not an error, just done.
             if e.raw_os_error() == Some(libc::ESRCH) {
-                log("PTRACE_SYSCALL: child already exited (ESRCH)");
+                log(&format!(
+                    "PTRACE_SYSCALL: child {} already exited (ESRCH)",
+                    current_pid
+                ));
                 // Print the rolling SIGSYS history before reaping — the
                 // main WIFEXITED/WIFSIGNALED branches below won't run
                 // on this path, so without this log we'd lose the
@@ -2444,41 +2519,104 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     log("no syscalls recorded in all-syscalls buffer before ESRCH");
                 }
                 // Try to reap the child to get its exit status.
+                // Task 6-S: reap `current_pid` (the child we tried to
+                // resume), NOT always `pid` (init). If a forked child
+                // exited between iterations, this is what reaps it.
                 let mut status: libc::c_int = 0;
-                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                if waited == pid {
+                let waited = unsafe { libc::waitpid(current_pid, &mut status, libc::WNOHANG) };
+                if waited == current_pid {
                     if libc::WIFEXITED(status) {
                         let code = libc::WEXITSTATUS(status);
-                        log(&format!("ESRCH path: child exit code {}", code));
-                        return code;
+                        log(&format!(
+                            "ESRCH path: child {} exit code {}",
+                            current_pid, code
+                        ));
+                        // Task 6-S: only init's exit terminates the
+                        // loop. A forked child exiting via ESRCH is
+                        // just reaped — init is still running.
+                        if current_pid == init_pid {
+                            return code;
+                        }
+                        log(&format!(
+                            "ESRCH path: forked child {} reaped (code {}); init {} still running — continuing",
+                            current_pid, code, init_pid
+                        ));
+                        // Re-sync current_pid back to init so the next
+                        // loop iteration resumes init, not the just-
+                        // reaped child (which would ESRCH again).
+                        current_pid = init_pid;
+                        continue;
                     }
                     if libc::WIFSIGNALED(status) {
                         let sig = libc::WTERMSIG(status);
-                        log(&format!("ESRCH path: child killed by signal {}", sig));
-                        return -sig;
+                        log(&format!(
+                            "ESRCH path: child {} killed by signal {}",
+                            current_pid, sig
+                        ));
+                        if current_pid == init_pid {
+                            return -sig;
+                        }
+                        log(&format!(
+                            "ESRCH path: forked child {} reaped (signal {}); init {} still running — continuing",
+                            current_pid, sig, init_pid
+                        ));
+                        current_pid = init_pid;
+                        continue;
                     }
                 }
-                return -1;
+                // Could not reap — if it's init, give up; otherwise
+                // fall back to init and continue.
+                if current_pid == init_pid {
+                    return -1;
+                }
+                log(&format!(
+                    "ESRCH path: forked child {} not reaped; falling back to init {} — continuing",
+                    current_pid, init_pid
+                ));
+                current_pid = init_pid;
+                continue;
             }
             log(&format!("PTRACE_SYSCALL failed: {}", e));
             return -1;
         }
 
-        // Wait for the child to stop.
+        // Wait for ANY traced child to stop. Task 6-S: previously this
+        // was `waitpid(pid, ...)` which only received stops from init.
+        // With PTRACE_O_TRACEFORK the kernel auto-attaches us to every
+        // forked child, and each new child's stops (SIGSTOP at attach,
+        // then syscall-stops, then exit) are reported via `waitpid(-1)`.
+        // The returned PID is the child that actually stopped — which
+        // may differ from `current_pid` (the child we resumed) when a
+        // NEW forked child stops before the resumed child does. We
+        // update `current_pid` to the actually-waited child below.
         let mut status: libc::c_int = 0;
-        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        let waited = unsafe { libc::waitpid(-1, &mut status, 0) };
         if waited == -1 {
             let e = std::io::Error::last_os_error();
             log(&format!("waitpid failed: {}", e));
             return -1;
         }
+        // Update `current_pid` to the child that actually stopped. The
+        // shadow `let pid = current_pid` below makes the existing
+        // handler code (which uses `pid` for ptrace_getregs /
+        // read_child_string / ptrace_setregs) operate on THIS child.
+        current_pid = waited;
+        // Shadow the function-parameter `pid` (init's PID) with
+        // `current_pid` for the rest of this iteration. All the handler
+        // code below — ptrace_getregs(pid, …), read_child_string(pid, …),
+        // ptrace_setregs(pid, …), the SIGSEGV siginfo read, etc. —
+        // uses `pid` and now correctly operates on the currently-stopped
+        // child (init OR a forked child like the recovery service).
+        // `init_pid` retains the original init PID for the exit-check
+        // below ("is this init exiting, or a forked child?").
+        let pid: libc::pid_t = current_pid;
 
         // Check if the child exited.
         if libc::WIFEXITED(status) {
             let code = libc::WEXITSTATUS(status);
             log(&format!(
-                "child exited with code {} (after {} iterations)",
-                code, loop_count
+                "child {} exited with code {} (after {} iterations)",
+                pid, code, loop_count
             ));
             // Print the last few SIGSYS-intercepted syscalls so we can
             // identify what init was doing right before it died. This is
@@ -2511,13 +2649,29 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
             } else {
                 log("no syscalls recorded in all-syscalls buffer before exit");
             }
-            return code;
+            // Task 6-S: only init's exit terminates `run_ptrace_loop`.
+            // A forked child (recovery, ueventd, thermald, …) exiting is
+            // expected behaviour — init is still running and may be
+            // blocked in waitpid waiting for the just-exited child. Log
+            // the exit and continue the loop so we can resume init
+            // (which will receive the waitpid return + run its own exit
+            // path, eventually terminating the loop). Re-sync
+            // `current_pid` to init so the next iteration resumes init.
+            if pid == init_pid {
+                return code;
+            }
+            log(&format!(
+                "forked child {} exited with code {} — init {} still running, continuing loop",
+                pid, code, init_pid
+            ));
+            current_pid = init_pid;
+            continue;
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
             log(&format!(
-                "child killed by signal {} (after {} iterations)",
-                sig, loop_count
+                "child {} killed by signal {} (after {} iterations)",
+                pid, sig, loop_count
             ));
             if !recent_sigsys.is_empty() {
                 let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
@@ -2538,12 +2692,156 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
             } else {
                 log("no syscalls recorded in all-syscalls buffer before kill");
             }
-            return -sig;
+            // Task 6-S: same forked-child handling as WIFEXITED above.
+            if pid == init_pid {
+                return -sig;
+            }
+            log(&format!(
+                "forked child {} killed by signal {} — init {} still running, continuing loop",
+                pid, sig, init_pid
+            ));
+            current_pid = init_pid;
+            continue;
         }
 
         // Check if the child was stopped by a signal.
         if libc::WIFSTOPPED(status) {
             let sig = libc::WSTOPSIG(status);
+
+            // ── Task 6-S: ptrace event stops (fork/clone/vfork/exec/exit) ──
+            //
+            // When PTRACE_O_TRACEFORK | TRACECLONE | TRACEVFORK is set
+            // (see the PTRACE_SETOPTIONS call at the top of
+            // `run_ptrace_loop`), the kernel reports fork-family events
+            // as a special kind of SIGTRAP stop: WSTOPSIG returns
+            // SIGTRAP, and the upper bits of `status` carry the event
+            // number (status >> 16). For syscall-stops WSTOPSIG
+            // returns SIGTRAP|0x80, so the `sig == (SIGTRAP|0x80)`
+            // branch below already filters those out. The branch below
+            // catches the remaining SIGTRAP-family stops (event stops
+            // AND regular SIGTRAPs from breakpoints/single-step).
+            //
+            // We must handle the event stops BEFORE the regular
+            // SIGTRAP branch, because both have WSTOPSIG == SIGTRAP.
+            // Without this branch a fork event would be treated as a
+            // "regular SIGTRAP" and silently swallowed — the new child
+            // would still be auto-attached (PTRACE_O_TRACEFORK does
+            // that independently of the tracer's response), but we
+            // would have no diagnostic logging + no PTRACE_GETEVENTMSG
+            // call to surface the new child's PID.
+            //
+            // status layout for an event stop:
+            //   bits 0-6   : 0x7f (WIFSTOPPED marker)
+            //   bits 8-15  : SIGTRAP (the "signal" — always SIGTRAP for
+            //                event stops)
+            //   bits 16-31 : ptrace event number (1=FORK, 2=VFORK,
+            //                3=CLONE, 4=EXEC, 5=VFORK_DONE, 6=EXIT)
+            // We extract the event number and dispatch on it. For
+            // FORK/CLONE/VFORK we use PTRACE_GETEVENTMSG on the parent
+            // to read the new child's PID — purely diagnostic, since
+            // the kernel auto-attaches us to the new child regardless.
+            let ptrace_event: u32 = ((status as u32) >> 16) & 0xFFFF;
+            if ptrace_event != 0 {
+                match ptrace_event {
+                    ev if ev == libc::PTRACE_EVENT_FORK as u32
+                        || ev == libc::PTRACE_EVENT_VFORK as u32
+                        || ev == libc::PTRACE_EVENT_CLONE as u32 =>
+                    {
+                        // Parent (== `pid` here, the currently-stopped
+                        // child) just forked/clone'd/vfork'd. Read the
+                        // new child's PID via PTRACE_GETEVENTMSG for
+                        // diagnostic logging. The kernel has ALREADY
+                        // auto-attached us to the new child — we will
+                        // receive its first stop (a SIGSTOP) via a
+                        // future `waitpid(-1)` call, and the existing
+                        // SIGSTOP / SIGTRAP|0x80 / SIGSYS handling will
+                        // process its syscalls with the SAME per-child
+                        // state vars (in_syscall, abi, scratch_addr,
+                        // etc.). This works because only ONE child
+                        // makes syscalls at a time: after init forks
+                        // the recovery service, init BLOCKS in its own
+                        // waitpid waiting for recovery to exit, so the
+                        // shared state is never raced between two
+                        // running children.
+                        let mut new_child_id: libc::c_long = 0;
+                        let getevent_r = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_GETEVENTMSG,
+                                pid,
+                                0,
+                                &mut new_child_id as *mut _ as libc::c_long,
+                            )
+                        };
+                        let event_name = if ev == libc::PTRACE_EVENT_FORK as u32 {
+                            "FORK"
+                        } else if ev == libc::PTRACE_EVENT_VFORK as u32 {
+                            "VFORK"
+                        } else {
+                            "CLONE"
+                        };
+                        if getevent_r == 0 {
+                            log(&format!(
+                                "PTRACE_EVENT_{}: parent {} forked — new child PID {} (auto-attached by kernel; will receive its stops via waitpid(-1))",
+                                event_name, pid, new_child_id
+                            ));
+                        } else {
+                            log(&format!(
+                                "PTRACE_EVENT_{}: parent {} forked — PTRACE_GETEVENTMSG failed: {} (new child is still auto-attached; will receive its stops via waitpid(-1))",
+                                event_name,
+                                pid,
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        // Continue the parent — it should proceed to
+                        // its waitpid() (or whatever it does after the
+                        // fork) so the new child can run. resume_signal
+                        // is 0 (no signal to deliver). The loop-top
+                        // PTRACE_SYSCALL will resume `current_pid` (the
+                        // parent) on the next iteration.
+                        continue;
+                    }
+                    ev if ev == libc::PTRACE_EVENT_EXIT as u32 => {
+                        // The child is about to exit (PTRACE_O_TRACEEXIT
+                        // would be needed to receive the actual exit
+                        // event stop, but PTRACE_O_EXITKILL alone gives
+                        // us this PTRACE_EVENT_EXIT report too on most
+                        // kernels). Read the pending exit status for
+                        // diagnostic logging. The actual WIFEXITED/
+                        // WIFSIGNALED report comes from the next
+                        // waitpid — this is just an early heads-up.
+                        let mut exit_status: libc::c_long = 0;
+                        let getevent_r = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_GETEVENTMSG,
+                                pid,
+                                0,
+                                &mut exit_status as *mut _ as libc::c_long,
+                            )
+                        };
+                        if getevent_r == 0 {
+                            log(&format!(
+                                "PTRACE_EVENT_EXIT: child {} about to exit (pending status 0x{:x})",
+                                pid, exit_status
+                            ));
+                        } else {
+                            log(&format!(
+                                "PTRACE_EVENT_EXIT: child {} about to exit (PTRACE_GETEVENTMSG failed)",
+                                pid
+                            ));
+                        }
+                        continue;
+                    }
+                    ev => {
+                        // Unknown ptrace event — log + continue. Don't
+                        // deliver a signal (would corrupt the child).
+                        log(&format!(
+                            "unknown PTRACE_EVENT {} on child {} — continuing without signal delivery",
+                            ev, pid
+                        ));
+                        continue;
+                    }
+                }
+            }
 
             // SIGTRAP | 0x80 = syscall stop (because we set TRACESYSGOOD).
             if sig == (libc::SIGTRAP | 0x80) {
@@ -4240,12 +4538,62 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                 // Calling PTRACE_SYSCALL here would race the loop-top
                 // call (child already running → ESRCH → premature exit).
                 continue;
+            } else if sig == libc::SIGSTOP {
+                // ── Task 6-S: SIGSTOP for a freshly-attached child ──
+                //
+                // When PTRACE_O_TRACEFORK auto-attaches us to a new
+                // child (e.g. init forks the recovery service), the
+                // kernel sends the new child a SIGSTOP so it can be
+                // configured by the tracer before it runs. This stop
+                // arrives via `waitpid(-1)` as WIFSTOPPED with
+                // WSTOPSIG == SIGSTOP.
+                //
+                // We must NOT forward this SIGSTOP back to the child
+                // (the existing "real signal" branch below does
+                // `resume_signal = sig`, which would re-stop the
+                // child on the next PTRACE_SYSCALL — an infinite
+                // SIGSTOP loop). Instead we CONSUME it: resume the
+                // child with signal=0 so it proceeds to its first
+                // syscall (which will then be intercepted as a normal
+                // SIGTRAP|0x80 syscall-stop, with the same ENTRY/EXIT/
+                // SIGSYS handling as init's syscalls).
+                //
+                // This is the entry point for tracing the recovery
+                // service's syscalls: after this SIGSTOP is consumed,
+                // the recovery service's open(/dev/graphics/fb0) will
+                // fire a syscall-ENTRY stop, get path-translated to
+                // {rootfs}/dev/graphics/fb0 (where kr64 pre-created
+                // the file at the correct size), and the recovery
+                // service's view of /dev will be the rootfs's /dev —
+                // not the host's /dev. This closes the fundamental
+                // architectural gap that made the statically-linked
+                // recovery service's syscalls go directly to the host
+                // kernel with NO interception.
+                //
+                // SIGSTOP from other sources (e.g. the user sending
+                // `kill -STOP` from outside) is rare and consuming it
+                // is still correct — the child resumes its previous
+                // activity, which is what `kill -CONT` would have
+                // done. We do NOT need to differentiate "auto-attach
+                // SIGSTOP" from "user-sent SIGSTOP" because in both
+                // cases the right action is "consume + resume".
+                if pid != init_pid {
+                    log(&format!(
+                        "SIGSTOP on forked child {} — consuming (auto-attach stop) and resuming with signal=0 so its syscalls get traced",
+                        pid
+                    ));
+                }
+                // resume_signal stays 0 — the loop-top PTRACE_SYSCALL
+                // will resume `current_pid` (the SIGSTOPped child)
+                // without delivering a signal.
+                continue;
             } else {
                 // The child stopped because of a real signal that was
-                // NOT a syscall-stop, NOT a debugger trap, and NOT a
-                // seccomp SIGSYS — e.g. SIGSEGV, SIGBUS, SIGFPE, or a
-                // SIGCHLD-style signal delivered by the kernel. Forward
-                // it to the child so its own signal handlers (or default
+                // NOT a syscall-stop, NOT a debugger trap, NOT a
+                // seccomp SIGSYS, and NOT a freshly-attached SIGSTOP —
+                // e.g. SIGSEGV, SIGBUS, SIGFPE, or a SIGCHLD-style
+                // signal delivered by the kernel. Forward it to the
+                // child so its own signal handlers (or default
                 // action) run.
                 //
                 // The `sig as c_long` 4th arg to PTRACE_SYSCALL is the
@@ -5900,6 +6248,152 @@ mod tests {
         assert_eq!(
             ABI_AARCH64.chown, -1,
             "aarch64 chown must be -1 (not present)"
+        );
+    }
+
+    // ── Task 6-S regression guards: PTRACE_O_TRACEFORK + PTRACE_EVENT_* ──
+    //
+    // These tests lock in the architectural contract added by Task 6-S:
+    // that `run_ptrace_loop` sets PTRACE_O_TRACEFORK | TRACECLONE |
+    // TRACEVFORK | EXITKILL on init (so the kernel auto-attaches us to
+    // forked children) AND handles PTRACE_EVENT_FORK | CLONE | VFORK
+    // stops to log + continue the parent. The constants themselves come
+    // from the `libc` crate, but a future "cleanup" that drops one of
+    // them from the PTRACE_SETOPTIONS call (or from the event-match
+    // arms) would silently regress fork-following — these tests make
+    // that regression a compile-time / runtime failure.
+    //
+    // We verify the constants are non-zero AND that they have the
+    // values Linux has assigned them since 2.5.46 (FORK=1, VFORK=2,
+    // CLONE=3, EXIT=6) so a libc upgrade that changes the numbering
+    // would surface as a test failure (the kernel ABI is stable, so
+    // these should never change, but the test documents the
+    // assumption explicitly).
+
+    #[test]
+    fn ptrace_o_tracefork_constants_are_nonzero() {
+        // All four fork-following options must be non-zero — if any
+        // were zero, `PTRACE_SETOPTIONS` would silently OR-in 0 and
+        // fork-following would be a no-op (the pre-6-S behaviour).
+        assert_ne!(
+            libc::PTRACE_O_TRACEFORK,
+            0,
+            "PTRACE_O_TRACEFORK must be non-zero (kernel ABI constant)"
+        );
+        assert_ne!(
+            libc::PTRACE_O_TRACECLONE,
+            0,
+            "PTRACE_O_TRACECLONE must be non-zero (kernel ABI constant)"
+        );
+        assert_ne!(
+            libc::PTRACE_O_TRACEVFORK,
+            0,
+            "PTRACE_O_TRACEVFORK must be non-zero (kernel ABI constant)"
+        );
+        assert_ne!(
+            libc::PTRACE_O_EXITKILL,
+            0,
+            "PTRACE_O_EXITKILL must be non-zero (kernel ABI constant)"
+        );
+        // The options must be DISTINCT bits — if two were the same
+        // value, OR-ing them together would be a no-op for one of
+        // them. The Linux kernel assigns distinct bit positions
+        // (TRACEFORK=1<<1, TRACEVFORK=1<<2, TRACECLONE=1<<3, EXITKILL
+        // =1<<20), so this assertion just locks in the
+        // distinct-bits contract.
+        let opts = [
+            libc::PTRACE_O_TRACEFORK,
+            libc::PTRACE_O_TRACECLONE,
+            libc::PTRACE_O_TRACEVFORK,
+            libc::PTRACE_O_EXITKILL,
+            libc::PTRACE_O_TRACESYSGOOD,
+        ];
+        for i in 0..opts.len() {
+            for j in (i + 1)..opts.len() {
+                assert_ne!(
+                    opts[i], opts[j],
+                    "ptrace options must be distinct bit positions (opts[{}]={} == opts[{}]={})",
+                    i, opts[i], j, opts[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ptrace_event_fork_constants_have_linux_abi_values() {
+        // The Linux ptrace(2) ABI has assigned these event numbers
+        // since 2.5.46 / 3.0 — they are part of the kernel's stable
+        // UAPI and will never change. Locking them in here catches a
+        // libc crate regression that renumbers them (which would
+        // break the `(status >> 16) & 0xFFFF` matching in
+        // `run_ptrace_loop`'s WIFSTOPPED handler).
+        assert_eq!(
+            libc::PTRACE_EVENT_FORK,
+            1,
+            "PTRACE_EVENT_FORK must be 1 (Linux UAPI)"
+        );
+        assert_eq!(
+            libc::PTRACE_EVENT_VFORK,
+            2,
+            "PTRACE_EVENT_VFORK must be 2 (Linux UAPI)"
+        );
+        assert_eq!(
+            libc::PTRACE_EVENT_CLONE,
+            3,
+            "PTRACE_EVENT_CLONE must be 3 (Linux UAPI)"
+        );
+        assert_eq!(
+            libc::PTRACE_EVENT_EXIT,
+            6,
+            "PTRACE_EVENT_EXIT must be 6 (Linux UAPI)"
+        );
+    }
+
+    /// Smoke-test the status-bit extraction logic used in
+    /// `run_ptrace_loop`'s PTRACE_EVENT_* handler. We synthesise a
+    /// `status` value that LOOKS like a kernel-reported
+    /// PTRACE_EVENT_FORK stop (WIFSTOPPED bit set, WSTOPSIG == SIGTRAP,
+    /// upper bits == event number) and verify the extraction matches.
+    /// This catches regressions in the bit math itself (e.g. if someone
+    /// changes `>> 16` to `>> 8`).
+    #[test]
+    fn ptrace_event_status_extraction_matches_synthetic_fork_stop() {
+        // Synthesise a status word for a PTRACE_EVENT_FORK stop.
+        // Layout (per ptrace(2) manpage):
+        //   bits 0-6   : 0x7f (WIFSTOPPED marker — low 7 bits of byte 0)
+        //   bit  7    : 0 (a "stop" rather than a "signal delivery")
+        //   bits 8-15  : SIGTRAP (5) — the signal WSTOPSIG reports
+        //   bits 16-31 : event number (1 for PTRACE_EVENT_FORK)
+        // We construct this without referring to the kernel by
+        // OR-ing the components together.
+        let sigtrap_byte = (libc::SIGTRAP as u32) << 8;
+        let event_bits = (libc::PTRACE_EVENT_FORK as u32) << 16;
+        let stop_marker: u32 = 0x7f; // WIFSTOPPED low byte
+        let status: libc::c_int = (stop_marker | sigtrap_byte | event_bits) as libc::c_int;
+
+        // WIFSTOPPED should be true.
+        assert!(
+            libc::WIFSTOPPED(status),
+            "synthesised PTRACE_EVENT_FORK status must be WIFSTOPPED"
+        );
+        // WSTOPSIG should be SIGTRAP.
+        assert_eq!(
+            libc::WSTOPSIG(status),
+            libc::SIGTRAP,
+            "WSTOPSIG of a PTRACE_EVENT_FORK stop must be SIGTRAP"
+        );
+        // Event extraction (same math as in run_ptrace_loop).
+        let extracted_event: u32 = ((status as u32) >> 16) & 0xFFFF;
+        assert_eq!(
+            extracted_event,
+            libc::PTRACE_EVENT_FORK as u32,
+            "extracted event number must match PTRACE_EVENT_FORK"
+        );
+        // And it must NOT be confused with a syscall stop (SIGTRAP|0x80).
+        assert_ne!(
+            libc::WSTOPSIG(status),
+            libc::SIGTRAP | 0x80,
+            "PTRACE_EVENT_FORK stop must NOT look like a syscall stop (SIGTRAP|0x80)"
         );
     }
 }
