@@ -1851,6 +1851,257 @@ enum KlogInitPatchResult {
     NotFound,
 }
 
+/// NOP the conditional jump after `selinux_android_load_policy()` so init
+/// never takes the failure path → the `while(1) pause();` loop becomes
+/// UNREACHABLE from main().
+///
+/// DEFINITIVE root-cause fix per 6-I's disassembly (worklog entry 6-I).
+///
+/// # Background — the pause() loop root cause
+///
+/// TWRP init's pause() loop at vaddr `0x08049103`-`0x08049108` is literally:
+///   ```text
+///   08049103: e8 08 10 02 00   call 806a110 <pause>
+///   08049108: eb f9            jmp  8049103 <main+0xb33>
+///   ```
+/// This is a TIGHT UNCONDITIONAL infinite spin: `while(1) pause();`. NO
+/// condition check, NO return-value check, NO global flag test, NO
+/// property read. The dispatcher's hypothesis ("init waits on an
+/// in-process flag/condition variable") was INCORRECT — there is no flag.
+///
+/// How init reaches that loop: main() at `0x08048fff` calls
+/// `selinux_android_load_policy()` (at `0x080a14f0`). That function's
+/// VERY FIRST syscall is `mount("selinuxfs", "/sys/fs/selinux",
+/// "selinuxfs", 0, NULL)`. In kr64's ptrace_emu sandbox the mount()
+/// syscall returns negative (no selinuxfs is mounted). The function's
+/// failure path checks errno (cmp `$0x13`/EINVAL, cmp `$0x2`/ENOENT); for
+/// any OTHER errno it logs an error and returns `-1`. main's `js
+/// 0x080490cf` at vaddr `0x08049006` (file offset `0x1006`) takes the
+/// failure path:
+///   ```text
+///   080490cf: klog "<3>init: SELinux: Failed to load policy; rebooting into recovery mode"
+///   080490fe: call android_reboot(0xDEAD0003 /*ANDROID_RB_RESTART2*/, 0, "recovery")
+///   08049103: call pause      ← LOOP START
+///   08049108: jmp  08049103   ← JMP BACK (infinite spin)
+///   ```
+/// The `android_reboot()` syscall is faked/intercepted by the sandbox —
+/// it returns instead of actually rebooting. So init spins in pause()
+/// forever, waiting for a reboot that never happens.
+///
+/// This explains why ALL prior fixes failed:
+///   * Return-value tricks (6-D `-EINTR`, 6-E/6-G `-ENOSYS`, 6-G
+///     `-ETIMEDOUT`): init NEVER READS pause's return value. The loop is
+///     unconditional — even if pause() returns `0`/`-1`/`-EINTR`/etc.,
+///     the `jmp` just calls pause() again.
+///   * Property service socket stub (6-H): init is NOT waiting on the
+///     property service socket — that hypothesis was wrong. The pause loop
+///     is the post-reboot spin-wait and has nothing to do with the
+///     property socket.
+///   * 100ms sleep (6-F): reduced the spin rate but the loop is
+///     unconditional, so it just kept spinning.
+///
+/// # The fix (6-I's Option A — 6-byte NOP patch)
+///
+/// File offset `0x1006` (vaddr `0x08049006`):
+///   * Original: `0f 88 c3 00 00 00` (`js 0x080490cf` — jump to failure path)
+///   * Patched:  `90 90 90 90 90 90` (6 × NOP — never take the failure path)
+///
+/// Displacement verification: `js` is `0F 88 + imm32`, where `imm32` is
+/// the signed displacement added to the address of the NEXT instruction.
+/// `js` at `0x08049006` is 6 bytes long → next instruction is at
+/// `0x0804900c`. Target is `0x080490cf`. Displacement = `0x080490cf −
+/// 0x0804900c` = `0xc3`. As 4-byte little-endian signed: `c3 00 00 00`.
+/// So bytes are `0f 88 c3 00 00 00` ✓.
+///
+/// Effect: even if `selinux_android_load_policy()` returns negative, init
+/// does NOT enter the failure path. Falls through to
+/// `selinux_init_all_handles()` (may fail non-fatally) →
+/// `__property_get("ro.boot.selinux")` (returns NULL → defaults to
+/// enforcing) → `security_setenforce(esi)` (may fail non-fatally) →
+/// `jmp main+0x317` → TWRP recovery boot path. The pause loop becomes
+/// UNREACHABLE from main().
+///
+/// # Honest caveat — this is a WORKAROUND, not a "fix"
+///
+/// This is a WORKAROUND for the missing selinuxfs mount in the sandboxed
+/// environment (NOT a crash suppression — the proper fix would be to
+/// provide a fake selinuxfs at `/sys/fs/selinux/{load,enforce,booleans,
+/// ...}` and intercept `mount("selinuxfs", ...)` in ptrace_emu to return
+/// 0, a larger effort that may still hit later failures in
+/// `selinux_android_load_policy()` when it tries to open
+/// `/sys/fs/selinux/load`). There is also residual risk that
+/// `selinux_init_all_handles()` or `security_setenforce()` aborts/crashes
+/// when called without a real selinux mount — if so, switch to Option C
+/// (skip the entire selinux block by converting the `jne` after
+/// `selinux_is_disabled()` into an unconditional `jmp`, file offset
+/// `0x0fe3`). Reference: 6-I's disassembly report (worklog entry 6-I).
+///
+/// # Pattern (8 bytes — 2 bytes of pre-context + 6 bytes of the jump)
+///
+/// ```text
+/// 85 c0                test eax, eax      (pre-context, unchanged)
+/// 0f 88 c3 00 00 00    js 0x080490cf      (PATCH SITE — 6 bytes)
+/// ```
+///
+/// The pre-context (`test eax, eax` — the result of
+/// `selinux_android_load_policy()` left in EAX) makes the 8-byte pattern
+/// unique: a bare 6-byte `0f 88 c3 00 00 00` could occur by coincidence
+/// elsewhere in the binary, but `85 c0` immediately preceding it is a
+/// strong signal we're at the right site. We additionally verify the
+/// match offset is `0x1004` (the expected file offset for vaddr
+/// `0x08049006` minus the 2-byte pre-context) as a safety net against
+/// coincidental matches in a different code path.
+///
+/// # Replacement (overwrite bytes 2..8 of the matched pattern with 6 NOPs)
+///
+/// ```text
+/// 85 c0                test eax, eax      (unchanged pre-context)
+/// 90 90 90 90 90 90    nop × 6            (patched)
+/// ```
+///
+/// # Idempotency
+///
+/// A prior application replaces the 6 `js`-bytes with 6 NOPs. We detect
+/// that by scanning for the patched signature (`85 c0 90 90 90 90 90 90`
+/// — pre-context + 6 NOPs) and return [`AlreadyApplied`]. Same idempotency
+/// scheme as [`patch_twrp_init_klog_init`] above and the inline
+/// find_property patch in [`run`].
+///
+/// On aarch64 the i386 byte pattern is irrelevant, so the function short-
+/// circuits to [`SelinuxLoadSkipPatchResult::Skipped`] (the same approach
+/// as [`patch_twrp_init_klog_init`]).
+///
+/// # Returns
+///
+/// See [`SelinuxLoadSkipPatchResult`] for the per-variant semantics.
+fn patch_twrp_init_selinux_load_skip(init_bytes: &mut [u8]) -> SelinuxLoadSkipPatchResult {
+    // The byte pattern we match (see PATTERN below) is specific to the
+    // i386 build of TWRP init. On aarch64 TWRP images, the binary uses
+    // an entirely different instruction encoding (AArch64), so the
+    // pattern will never match — and the selinux-load-failure code path
+    // this patch addresses is specific to the i386 init's main() anyway
+    // (aarch64 TWRP uses a different selinux setup flow). Skip the patch
+    // entirely on aarch64 to avoid the misleading "TWRP version
+    // mismatch?" warning that the caller would otherwise log on every
+    // arm64 boot.
+    #[cfg(target_arch = "aarch64")]
+    {
+        info!(
+            "[KR64] selinux_load_skip patch is x86-only; skipped on arm64 (aarch64 TWRP uses a different selinux setup flow)"
+        );
+        // Mark `init_bytes` as intentionally unused on aarch64 to silence
+        // the unused_variables lint without renaming the parameter (which
+        // is shared with the non-aarch64 branch below).
+        let _ = init_bytes;
+        SelinuxLoadSkipPatchResult::Skipped
+    }
+
+    // On non-aarch64 hosts (x86, x86_64, etc.), perform the actual
+    // i386-instruction-pattern match.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Pattern: 2 bytes of pre-context (`test eax, eax` — the result
+        // of `selinux_android_load_policy()` left in EAX) + the 6-byte
+        // `js` instruction whose signed 32-bit displacement (0x000000c3)
+        // points at the failure path at vaddr 0x080490cf.
+        const PATTERN: [u8; 8] = [
+            // test eax, eax
+            0x85, 0xc0, // js 0x080490cf (signed disp 0x000000c3, little-endian)
+            0x0f, 0x88, 0xc3, 0x00, 0x00, 0x00,
+        ];
+        const PATCH_OFF: usize = 2; // index of the js opcode within PATTERN
+        const PATCH_LEN: usize = 6; // length of the js instruction
+
+        // Patched signature: `test eax, eax` (unchanged) + 6 × NOP. Used to
+        // detect an already-applied patch so we skip the rewrite instead of
+        // (mis)matching nothing and returning NotFound.
+        const PATCHED_SIG: [u8; 8] = [
+            // test eax, eax (unchanged pre-context)
+            0x85, 0xc0, // 6 × NOP (patched)
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        ];
+        // Replacement bytes (6 NOPs).
+        const NOP_PATCH: [u8; PATCH_LEN] = [0x90; PATCH_LEN];
+
+        // Expected file offset where PATTERN should match. The `js`
+        // instruction itself is at file offset 0x1006 (vaddr 0x08049006);
+        // PATTERN starts 2 bytes earlier (at 0x1004) because of the
+        // `test eax, eax` pre-context.
+        const EXPECTED_MATCH_OFF: usize = 0x1004;
+
+        if init_bytes.len() < PATTERN.len() {
+            return SelinuxLoadSkipPatchResult::NotFound;
+        }
+
+        // 1. Idempotency check: scan for the patched signature. If present,
+        //    the patch was already applied in a previous boot — skip.
+        for i in 0..=(init_bytes.len() - PATCHED_SIG.len()) {
+            if init_bytes[i..i + PATCHED_SIG.len()] == PATCHED_SIG {
+                return SelinuxLoadSkipPatchResult::AlreadyApplied;
+            }
+        }
+
+        // 2. Find the unpatched pattern. We take the FIRST match; the
+        //    8-byte pattern (including the `test eax, eax` pre-context) is
+        //    unique enough that there should only be one match in the entire
+        //    binary.
+        for i in 0..=(init_bytes.len() - PATTERN.len()) {
+            if init_bytes[i..i + PATTERN.len()] == PATTERN {
+                // Sanity check: the match must be at the expected file
+                // offset (0x1004). If it isn't, refuse to patch — the
+                // 8-byte pattern matched by coincidence in a different code
+                // path, and patching there could brick the binary. Return
+                // NotFound so the caller logs the "TWRP version mismatch?"
+                // warning.
+                if i != EXPECTED_MATCH_OFF {
+                    return SelinuxLoadSkipPatchResult::NotFound;
+                }
+                // Apply the patch: overwrite the 6 js-bytes with 6 NOPs.
+                // The pre-context bytes [0..PATCH_OFF] are preserved.
+                init_bytes[i + PATCH_OFF..i + PATCH_OFF + PATCH_LEN].copy_from_slice(&NOP_PATCH);
+                return SelinuxLoadSkipPatchResult::Applied;
+            }
+        }
+        SelinuxLoadSkipPatchResult::NotFound
+    }
+}
+
+/// Result of attempting to apply the selinux-load-failure NOP patch.
+///
+/// See [`patch_twrp_init_selinux_load_skip`] for the full root-cause
+/// analysis and the per-variant semantics. Mirrors [`KlogInitPatchResult`]
+/// above: `Applied` and `AlreadyApplied` are successes, `Skipped` is an
+/// expected non-action (e.g. aarch64), and `NotFound` is a potential
+/// problem (TWRP version mismatch — the patch couldn't be applied, so
+/// init will still spin in the pause() loop forever after
+/// `selinux_android_load_policy()` fails).
+///
+/// `#[allow(dead_code)]` is needed for the same reason as
+/// [`KlogInitPatchResult`]: the variants are platform-conditional
+/// (`Skipped` is only constructed on aarch64, the other three are only
+/// constructed on non-aarch64 hosts). On any given host, the "other"
+/// platform's variants would otherwise be flagged as dead code by the
+/// compiler.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelinuxLoadSkipPatchResult {
+    /// Patch was applied to the bytes — caller should write them back.
+    Applied,
+    /// Patch was already applied in a previous boot — caller can skip
+    /// the write (no modification needed, idempotent).
+    AlreadyApplied,
+    /// Patch was intentionally skipped (e.g. on aarch64, where the
+    /// i386-only byte pattern is irrelevant). The skip reason has been
+    /// logged; the caller should NOT log a "version mismatch" warning
+    /// and should NOT write the bytes back.
+    Skipped,
+    /// Pattern was not found in the binary — caller should log a
+    /// warning because this likely indicates a TWRP version mismatch.
+    /// Without this patch, init will still spin in pause() forever after
+    /// `selinux_android_load_policy()` fails.
+    NotFound,
+}
+
 /// Set the SELinux security context of a file using the `lsetxattr(2)`
 /// syscall directly.
 ///
@@ -3679,6 +3930,97 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 }
                 Err(e) => warning!(
                     "[KR64] PARENT: failed to read /init for find_property patching: {} (init may crash with SIGSEGV at rip=0x809255d)",
+                    e
+                ),
+            }
+        }
+
+        // ── selinux-load-failure NOP patch — DEFINITIVE root-cause fix
+        // per 6-I's disassembly ──
+        //
+        // WORKAROUND (NOT a "suppressed crash"):
+        //
+        // 6-I's disassembly DEFINITIVELY identified the pause() loop root
+        // cause. The loop is NOT a wait-for-property-service loop — it's
+        // `while(1) pause();` reached after a FAILED SELinux policy load.
+        // `selinux_android_load_policy()` fails (mount("selinuxfs")
+        // returns negative in the ptrace_emu sandbox) → init takes the
+        // failure path → calls `android_reboot(RESTART2, "recovery")` →
+        // the reboot is faked/intercepted (returns instead of rebooting)
+        // → init falls into `while(1) pause();` forever.
+        //
+        // This explains why ALL prior fixes failed:
+        //   * Return-value tricks (6-D -EINTR, 6-E/6-G -ENOSYS, 6-G
+        //     -ETIMEDOUT): init never checks pause's return value (the
+        //     loop is unconditional).
+        //   * Property service socket stub (6-H): init isn't waiting on
+        //     a socket — that hypothesis was wrong.
+        //   * 100ms sleep (6-F): reduced the spin rate but the loop is
+        //     unconditional, so it just kept spinning.
+        //
+        // The fix (6-I's Option A): NOP the 6-byte conditional jump at
+        // file offset 0x1006 (vaddr 0x08049006):
+        //   Original: 0f 88 c3 00 00 00  (js 0x080490cf — failure path)
+        //   Patched:  90 90 90 90 90 90  (6 × NOP — never take the
+        //                                 failure path)
+        //
+        // Effect: Even if `selinux_android_load_policy()` returns
+        // negative, init does NOT enter the failure path. Falls through
+        // to `selinux_init_all_handles()` → `__property_get("ro.boot.
+        // selinux")` → `security_setenforce()` (all may fail non-fatally)
+        // → `jmp main+0x317` (TWRP recovery boot). The pause loop becomes
+        // UNREACHABLE from main().
+        //
+        // This is a WORKAROUND for the missing selinuxfs mount in the
+        // sandboxed environment (the proper fix would be to provide a
+        // fake selinuxfs at /sys/fs/selinux/{load,enforce,booleans,
+        // ...} — a larger effort that may still hit later failures).
+        // Reference: 6-I's disassembly report (worklog entry 6-I).
+        //
+        // Pattern (8 bytes — 2 bytes of pre-context + 6 bytes of the
+        // jump): see [`patch_twrp_init_selinux_load_skip`] above for the
+        // full root-cause analysis and pattern details. The function is
+        // IDEMPOTENT (skipped if already applied, returns a typed result
+        // for NotFound / Skipped / Applied / AlreadyApplied).
+        {
+            let init_path = format!("{}/init", rootfs_prefix);
+            match std::fs::read(&init_path) {
+                Ok(mut bytes) => {
+                    match patch_twrp_init_selinux_load_skip(&mut bytes) {
+                        SelinuxLoadSkipPatchResult::Applied => {
+                            match std::fs::write(&init_path, &bytes) {
+                                Ok(()) => info!(
+                                    "[KR64] PARENT: patched /init selinux-load-failure jump at file offset 0x1006 (vaddr 0x08049006) — replaced `js 0x080490cf` (6 bytes: 0f 88 c3 00 00 00) with 6 × NOP (90 90 90 90 90 90); failure path becomes unreachable, init proceeds to selinux_init_all_handles() → security_setenforce() → TWRP recovery boot (DEFINITIVE root-cause fix per 6-I disassembly)"
+                                ),
+                                Err(e) => warning!(
+                                    "[KR64] PARENT: patched /init selinux-load-failure jump in memory but failed to write back: {} (init will still spin in pause() forever — see worklog 6-I)",
+                                    e
+                                ),
+                            }
+                        }
+                        SelinuxLoadSkipPatchResult::AlreadyApplied => {
+                            info!(
+                                "[KR64] PARENT: /init selinux-load-failure jump already NOP'd (idempotent skip) — failure path unreachable (DEFINITIVE root-cause fix per 6-I disassembly)"
+                            );
+                        }
+                        SelinuxLoadSkipPatchResult::Skipped => {
+                            // Skip reason already logged inside
+                            // `patch_twrp_init_selinux_load_skip`
+                            // (currently fires only on aarch64, where the
+                            // i386-only byte pattern is irrelevant). Do
+                            // NOT log the "TWRP version mismatch?" warning
+                            // here — it would be misleading on arm64,
+                            // where the skip is expected and harmless.
+                        }
+                        SelinuxLoadSkipPatchResult::NotFound => {
+                            warning!(
+                                "[KR64] PARENT: could not find selinux-load-failure jump pattern in /init (TWRP version mismatch?) — init will spin in pause() forever after selinux_android_load_policy() fails (see worklog 6-I)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => warning!(
+                    "[KR64] PARENT: failed to read /init for selinux-load-failure patching: {} (init will spin in pause() forever — see worklog 6-I)",
                     e
                 ),
             }
@@ -7414,6 +7756,292 @@ mod tests {
             }
         }
         None
+    }
+
+    // ========================================================================
+    // Tests for `patch_twrp_init_selinux_load_skip` — the 6-byte NOP patch
+    // at file offset 0x1006 (vaddr 0x08049006) that makes init's
+    // selinux-load-failure path UNREACHABLE, so the `while(1) pause();`
+    // loop becomes unreachable from main() (DEFINITIVE root-cause fix per
+    // 6-I's disassembly — see worklog entry 6-I).
+    //
+    // The test set mirrors `patch_twrp_init_klog_init_*`:
+    //   * applies cleanly to an unpatched binary
+    //   * is IDEMPOTENT (applying twice == applying once)
+    //   * returns NotFound when the pattern is absent
+    //   * refuses to patch if the pattern matches at an UNEXPECTED offset
+    //     (safety check against coincidental matches in a different code
+    //     path)
+    //   * works on a real TWRP init binary extracted from the ramdisk
+    //     (regression test for TWRP version drift)
+    // ========================================================================
+
+    /// Build a binary containing the selinux-load-failure pattern at the
+    /// expected file offset 0x1004 (vaddr 0x08049004 — the `test eax, eax`
+    /// pre-context, with the `js 0x080490cf` at file offset 0x1006).
+    ///
+    /// Only built on non-aarch64 hosts — the pattern-matching tests below
+    /// are x86/i386-specific (they verify the i386 byte pattern) and the
+    /// function under test short-circuits to `Skipped` on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
+    fn build_selinux_load_skip_pattern_at_expected_offset() -> Vec<u8> {
+        // 8 KiB of NOP filler — a recognizable, neutral background that
+        // cannot accidentally contain the 8-byte pattern.
+        let mut v = vec![0x90u8; 8 * 1024];
+        // Place the pattern at file offset 0x1004 (the expected match offset
+        // for vaddr 0x08049006 = file offset 0x1006 for the `js` itself,
+        // minus the 2-byte `test eax, eax` pre-context at 0x1004).
+        let off: usize = 0x1004;
+        v[off] = 0x85; // test
+        v[off + 1] = 0xc0; // eax, eax
+        v[off + 2] = 0x0f; // js opcode byte 1
+        v[off + 3] = 0x88; // js opcode byte 2 (jump-if-sign)
+        v[off + 4] = 0xc3; // signed disp byte 0 (LSB)
+        v[off + 5] = 0x00; // signed disp byte 1
+        v[off + 6] = 0x00; // signed disp byte 2
+        v[off + 7] = 0x00; // signed disp byte 3 (MSB)
+        v
+    }
+
+    /// `patch_twrp_init_selinux_load_skip` must find the pattern at the
+    /// expected offset (0x1004) and replace the 6-byte `js` at offset
+    /// 0x1006 with 6 NOPs.
+    ///
+    /// Skipped on aarch64: the function short-circuits to `Skipped` there
+    /// (the i386 byte pattern is irrelevant), so the x86-specific assertions
+    /// below would never hold on arm64.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_selinux_load_skip_applies_to_unpatched_binary() {
+        let mut bytes = build_selinux_load_skip_pattern_at_expected_offset();
+        assert_eq!(
+            patch_twrp_init_selinux_load_skip(&mut bytes),
+            SelinuxLoadSkipPatchResult::Applied,
+            "patch should apply to unpatched binary"
+        );
+        // The 6 `js`-bytes at offset 0x1006 should now be 6 NOPs.
+        let off: usize = 0x1006;
+        assert_eq!(
+            &bytes[off..off + 6],
+            &[0x90; 6],
+            "`js` bytes should be NOP'd"
+        );
+        // The 2 pre-context bytes at 0x1004-0x1005 (`test eax, eax`) must be
+        // preserved unchanged.
+        assert_eq!(
+            &bytes[off - 2..off],
+            &[0x85, 0xc0],
+            "pre-context (`test eax, eax`) should be preserved"
+        );
+    }
+
+    /// `patch_twrp_init_selinux_load_skip` must be IDEMPOTENT: applying it
+    /// twice yields the same result as applying it once. The second call
+    /// must return `AlreadyApplied` (not `Applied`) and must NOT modify the
+    /// bytes.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_selinux_load_skip_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_selinux_load_skip_is_idempotent() {
+        let mut bytes = build_selinux_load_skip_pattern_at_expected_offset();
+        assert_eq!(
+            patch_twrp_init_selinux_load_skip(&mut bytes),
+            SelinuxLoadSkipPatchResult::Applied,
+            "first patch should be Applied"
+        );
+        let after_first = bytes.clone();
+        assert_eq!(
+            patch_twrp_init_selinux_load_skip(&mut bytes),
+            SelinuxLoadSkipPatchResult::AlreadyApplied,
+            "second patch should be AlreadyApplied (idempotent)"
+        );
+        assert_eq!(
+            bytes, after_first,
+            "second patch should not modify the binary"
+        );
+    }
+
+    /// `patch_twrp_init_selinux_load_skip` must return `NotFound` if the
+    /// pattern is absent (e.g., a different TWRP version where the binary
+    /// layout has shifted, or a binary with no selinux-load code path at
+    /// all).
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_selinux_load_skip_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_selinux_load_skip_returns_not_found_if_pattern_not_found() {
+        // 8 KiB of NOP filler — no pattern present.
+        let mut bytes = vec![0x90u8; 8 * 1024];
+        assert_eq!(
+            patch_twrp_init_selinux_load_skip(&mut bytes),
+            SelinuxLoadSkipPatchResult::NotFound,
+            "patch should return NotFound when pattern is absent"
+        );
+    }
+
+    /// `patch_twrp_init_selinux_load_skip` must refuse to patch if the
+    /// pattern matches at an UNEXPECTED offset (safety check against
+    /// coincidental matches in a different code path). Without this check,
+    /// a coincidental match in unrelated code could brick the binary.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_selinux_load_skip_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_selinux_load_skip_refuses_unexpected_offset() {
+        let mut bytes = vec![0x90u8; 8 * 1024];
+        // Place the pattern at an UNEXPECTED offset (0x500 instead of the
+        // expected 0x1004). The 8-byte pattern will match, but the offset
+        // check should refuse to patch (a coincidental match in unrelated
+        // code could brick the binary).
+        let off: usize = 0x500;
+        bytes[off] = 0x85;
+        bytes[off + 1] = 0xc0;
+        bytes[off + 2] = 0x0f;
+        bytes[off + 3] = 0x88;
+        bytes[off + 4] = 0xc3;
+        bytes[off + 5] = 0x00;
+        bytes[off + 6] = 0x00;
+        bytes[off + 7] = 0x00;
+        assert_eq!(
+            patch_twrp_init_selinux_load_skip(&mut bytes),
+            SelinuxLoadSkipPatchResult::NotFound,
+            "patch should refuse to apply at unexpected offset (safety check)"
+        );
+        // The bytes should be UNCHANGED (no patch applied).
+        assert_eq!(
+            &bytes[off..off + 8],
+            &[0x85, 0xc0, 0x0f, 0x88, 0xc3, 0x00, 0x00, 0x00],
+            "bytes should be unchanged when offset check refuses the patch"
+        );
+    }
+
+    /// `patch_twrp_init_selinux_load_skip` must work on a real TWRP init
+    /// binary extracted from `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`.
+    /// This is a regression test: if the TWRP version changes (and the
+    /// `js 0x080490cf` byte pattern is no longer at file offset 0x1006),
+    /// this test will fail (alerting us to update the pattern / offset).
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_selinux_load_skip_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_selinux_load_skip_works_on_real_twrp_init_binary() {
+        // The TWRP boot image is at `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`
+        // (relative to the repo root). We need to extract the ramdisk,
+        // decompress it, and read the /init file. This is the SAME extraction
+        // pipeline as `patch_twrp_init_klog_init_works_on_real_twrp_init_binary`
+        // above — we reuse the same `decompress_gzip` + `find_cpio_entry`
+        // helpers.
+        let boot_img_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img");
+        if !boot_img_path.exists() {
+            eprintln!(
+                "skip: TWRP boot image not found at {} (this is OK in CI without assets)",
+                boot_img_path.display()
+            );
+            return;
+        }
+        let boot_bytes = match std::fs::read(&boot_img_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: failed to read TWRP boot image: {}", e);
+                return;
+            }
+        };
+        if boot_bytes.len() < 0x1000 || &boot_bytes[..8] != b"ANDROID!" {
+            eprintln!("skip: TWRP boot image is not a valid Android boot image");
+            return;
+        }
+        // Parse Android boot image header (v0).
+        let kernel_size =
+            u32::from_le_bytes([boot_bytes[8], boot_bytes[9], boot_bytes[10], boot_bytes[11]])
+                as usize;
+        let ramdisk_size = u32::from_le_bytes([
+            boot_bytes[16],
+            boot_bytes[17],
+            boot_bytes[18],
+            boot_bytes[19],
+        ]) as usize;
+        let page_size = u32::from_le_bytes([
+            boot_bytes[36],
+            boot_bytes[37],
+            boot_bytes[38],
+            boot_bytes[39],
+        ]) as usize;
+        if page_size == 0 || kernel_size == 0 || ramdisk_size == 0 {
+            eprintln!("skip: TWRP boot image has invalid header");
+            return;
+        }
+        let ramdisk_off = page_size + kernel_size.div_ceil(page_size) * page_size;
+        if ramdisk_off + ramdisk_size > boot_bytes.len() {
+            eprintln!("skip: TWRP boot image ramdisk truncated");
+            return;
+        }
+        let ramdisk_gz = &boot_bytes[ramdisk_off..ramdisk_off + ramdisk_size];
+        if ramdisk_gz.len() < 2 || ramdisk_gz[0] != 0x1f || ramdisk_gz[1] != 0x8b {
+            eprintln!("skip: TWRP ramdisk is not gzip-compressed");
+            return;
+        }
+        let ramdisk_cpio = match decompress_gzip(ramdisk_gz) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: failed to decompress TWRP ramdisk: {}", e);
+                return;
+            }
+        };
+        let init_bytes = match find_cpio_entry(&ramdisk_cpio, b"init") {
+            Some(b) => b,
+            None => {
+                eprintln!("skip: /init not found in TWRP ramdisk cpio");
+                return;
+            }
+        };
+
+        // Sanity-check the binary is large enough to contain the patch site.
+        assert!(
+            init_bytes.len() >= 0x1006 + 6,
+            "init binary too small for selinux-load-failure patch site: {} bytes (need at least {})",
+            init_bytes.len(),
+            0x1006 + 6
+        );
+
+        // Verify the UNPATCHED pattern is present at file offset 0x1004.
+        // (`test eax, eax` at 0x1004-0x1005; `js 0x080490cf` at 0x1006-0x100b.)
+        assert_eq!(
+            &init_bytes[0x1004..0x1004 + 8],
+            &[0x85, 0xc0, 0x0f, 0x88, 0xc3, 0x00, 0x00, 0x00],
+            "selinux-load-failure pattern (`test eax, eax; js 0x080490cf`) should be present at file offset 0x1004 in real TWRP init binary (TWRP version may have changed — update patch_twrp_init_selinux_load_skip pattern / offset)"
+        );
+
+        // Apply the patch.
+        let mut init_bytes_mut = init_bytes.clone();
+        assert_eq!(
+            patch_twrp_init_selinux_load_skip(&mut init_bytes_mut),
+            SelinuxLoadSkipPatchResult::Applied,
+            "patch should apply to real TWRP init binary"
+        );
+        // Verify the 6 `js`-bytes at offset 0x1006 are now 6 NOPs.
+        assert_eq!(
+            &init_bytes_mut[0x1006..0x1006 + 6],
+            &[0x90; 6],
+            "js bytes at offset 0x1006 should be NOP'd after patch"
+        );
+        // Verify the 2 pre-context bytes at 0x1004-0x1005 are unchanged.
+        assert_eq!(
+            &init_bytes_mut[0x1004..0x1006],
+            &[0x85, 0xc0],
+            "pre-context (`test eax, eax`) should be preserved at offset 0x1004"
+        );
+        // Apply again — should be idempotent (AlreadyApplied).
+        assert_eq!(
+            patch_twrp_init_selinux_load_skip(&mut init_bytes_mut),
+            SelinuxLoadSkipPatchResult::AlreadyApplied,
+            "patch should be idempotent on real TWRP init binary"
+        );
     }
 
     // ========================================================================
