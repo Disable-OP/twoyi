@@ -2211,6 +2211,226 @@ enum SelinuxLoadSkipPatchResult {
     NotFound,
 }
 
+/// PRAGMATIC "make it not crash" patch — NOP the property_contexts parser
+/// crash instruction at vaddr 0x080a0b9e (file offset 0x58b9e).
+///
+/// # HONEST LABEL — this is NOT a proper fix
+///
+/// **This is a pragmatic "make it not crash" patch, NOT a proper fix.**
+///
+/// The proper fix would trace the caller of init's property_contexts
+/// parser (the function that iterates the SEPolicy context-table at
+/// 0x80ce270 + calls the parser with a context struct) and initialize
+/// the uninitialized field at offset 0x14 — but that's deep in AOSP 5.1
+/// libselinux internals (DISPATCHER-FINAL-5 + DISPATCHER-FINAL-6).
+/// That proper fix is out of scope for this session.
+///
+/// # Root cause (per 6-K + DISPATCHER-FINAL-3/4/5/6)
+///
+/// After 6-J's selinux-load-skip NOP patch (eliminating the pause() loop)
+/// and 6-L's `#line`-directive strip, the guest progresses to iteration
+/// 338 of the property_contexts parser and hits a SIGSEGV at:
+///
+/// ```text
+///   rip    = 0x080a0b9e
+///   si_addr= 0x74616433   (ASCII "3dat" — garbage, not a real pointer)
+///   eax    = 0x4
+///   edx    = 0x74616433   (the garbage pointer being written through)
+///   insn   = c7 42 04 00 00 00 00
+///            movl $0x0, 0x4(%edx)        ; <-- CRASH HERE
+/// ```
+///
+/// DISPATCHER-FINAL-5 traced edx back to its source:
+/// ```text
+///   80a0adc: mov 0x14(%eax),%eax       # eax = ctx->field_at_0x14
+///   80a0adf: mov %eax,-0xc98(%ebp)     # local_var = that pointer
+///   ...later...
+///   80a0b98: mov -0xc98(%ebp),%edx     # edx = local_var (garbage)
+///   80a0b9e: movl $0x0,0x4(%edx)       # CRASH: write to [edx+4]
+/// ```
+///
+/// So edx = `ctx->field_at_0x14` where `ctx` is the parser's FIRST
+/// ARGUMENT (the parser context struct). The garbage 0x74616433 lives in
+/// the CALLER's context struct — the CALLER (DISPATCHER-FINAL-6 found it
+/// is the function iterating the SEPolicy context table at 0x80ce270)
+/// passes a context whose field at offset 0x14 is uninitialized/garbage.
+/// This is a libselinux internal bug — NOT a file-content bug (6-L's
+/// `#line` removal was a wrong hypothesis; the file is fine).
+///
+/// # The patch
+///
+/// NOP the 7-byte crash instruction at file offset 0x58b9e:
+///
+/// ```text
+///   Original: c7 42 04 00 00 00 00    (movl $0x0, 0x4(%edx))
+///   Patched:  90 90 90 90 90 90 90    (7 × NOP)
+/// ```
+///
+/// The file offset is computed from the vaddr + the ELF load base:
+///   `0x080a0b9e - 0x08048000 = 0x58b9e`
+///
+/// # Effect (and honest caveats)
+///
+/// With the crash instruction NOP'd, the parser SKIPS the write to the
+/// garbage pointer and continues execution. The parser may produce
+/// wrong/missing results for the entry it was processing when it hit
+/// the crash — but it won't crash, and init proceeds further in the
+/// boot path.
+///
+/// **Honest caveats:**
+///   * This is a "make it not crash" patch, NOT a proper fix.
+///   * The parser's incorrect internal state MAY cause a LATER crash
+///     elsewhere in libselinux or in code consuming the parser output.
+///   * The only definitive proof that this unblocks the boot is a
+///     `ui-e2e-test.yml` run + VLM screenshot analysis. Do NOT claim
+///     "TWRP boots now" without that.
+///
+/// # Architecture notes
+///
+/// The byte pattern is specific to the **i386** build of TWRP init
+/// (TWRP 3.7.0_9-0). On **aarch64** TWRP images, the binary uses an
+/// entirely different instruction encoding (AArch64), so the crash
+/// instruction at vaddr 0x080a0b9e (an x86 i386 absolute address) is
+/// meaningless. We skip the patch entirely on aarch64 (returning
+/// [`PropertyContextsCrashNopPatchResult::Skipped`]) — same approach
+/// as [`patch_twrp_init_klog_init`] + [`patch_twrp_init_selinux_load_skip`].
+///
+/// # Idempotence
+///
+/// Direct offset-based check: if the 7 bytes at file offset 0x58b9e are
+/// already `90 90 90 90 90 90 90`, the patch was applied in a previous
+/// boot and we return [`PropertyContextsCrashNopPatchResult::AlreadyApplied`]
+/// without modifying the bytes.
+///
+/// # Safety check
+///
+/// Unlike [`patch_twrp_init_selinux_load_skip`] (which scans the whole
+/// binary for an 8-byte pattern), this patch directly checks the bytes
+/// at the EXPECTED file offset 0x58b9e. The 7-byte pattern
+/// `c7 42 04 00 00 00 00` (`movl $0, [edx+4]`) is a common instruction
+/// and could legitimately appear elsewhere in the binary — scanning for
+/// it would yield many coincidental matches. The direct-offset check
+/// is therefore both safer and unambiguous: we ONLY touch the exact
+/// crash site, never any other `movl $0, [edx+4]` instance in the binary.
+///
+/// # Arguments
+///
+/// * `init_bytes` - The init binary's bytes (read from `{rootfs}/init`).
+///
+/// # Returns
+///
+/// See [`PropertyContextsCrashNopPatchResult`] for the per-variant semantics.
+fn patch_twrp_init_property_contexts_crash_nop(
+    init_bytes: &mut [u8],
+) -> PropertyContextsCrashNopPatchResult {
+    // The byte pattern we match is specific to the i386 build of TWRP
+    // init. On aarch64 TWRP images, the binary uses an entirely different
+    // instruction encoding (AArch64), so the crash instruction at vaddr
+    // 0x080a0b9e (an i386 absolute address) is meaningless — and the
+    // libselinux internal bug this patch works around is specific to the
+    // i386 build of the property_contexts parser anyway. Skip the patch
+    // entirely on aarch64 to avoid the misleading "TWRP version
+    // mismatch?" warning that the caller would otherwise log on every
+    // arm64 boot.
+    #[cfg(target_arch = "aarch64")]
+    {
+        info!(
+            "[KR64] property_contexts crash-nop patch is x86-only; skipped on arm64 (aarch64 TWRP uses a different property_contexts parser)"
+        );
+        // Mark `init_bytes` as intentionally unused on aarch64 to silence
+        // the unused_variables lint without renaming the parameter (which
+        // is shared with the non-aarch64 branch below).
+        let _ = init_bytes;
+        PropertyContextsCrashNopPatchResult::Skipped
+    }
+
+    // On non-aarch64 hosts (x86, x86_64, etc.), perform the actual
+    // i386-instruction-pattern match at the expected file offset.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Pattern: `movl $0x0, 0x4(%edx)` = `c7 42 04 00 00 00 00`
+        //   c7            opcode (MOV r/m32, imm32)
+        //   42            ModR/M (mod=01 disp8, reg=000, rm=010 edx)
+        //   04            8-bit displacement: [edx + 0x4]
+        //   00 00 00 00   imm32 = 0
+        // Total: 7 bytes (matches the disassembly at vaddr 0x080a0b9e).
+        const PATTERN: [u8; 7] = [0xc7, 0x42, 0x04, 0x00, 0x00, 0x00, 0x00];
+        // Patched: 7 × NOP.
+        const NOP_PATCH: [u8; 7] = [0x90; 7];
+        // Expected file offset: 0x080a0b9e (vaddr) - 0x08048000 (ELF load
+        // base for this i386 PIE) = 0x58b9e. This is the file offset at
+        // which the crash instruction `movl $0x0, 0x4(%edx)` lives.
+        const EXPECTED_MATCH_OFF: usize = 0x58b9e;
+
+        if init_bytes.len() < EXPECTED_MATCH_OFF + PATTERN.len() {
+            // Binary is too small to contain the patch site — either
+            // not a TWRP init binary or a very different TWRP version.
+            return PropertyContextsCrashNopPatchResult::NotFound;
+        }
+
+        let target: &mut [u8] =
+            &mut init_bytes[EXPECTED_MATCH_OFF..EXPECTED_MATCH_OFF + PATTERN.len()];
+
+        // 1. Idempotency check: if the bytes are already 7 × NOP, the
+        //    patch was applied in a previous boot — skip.
+        if target == NOP_PATCH {
+            return PropertyContextsCrashNopPatchResult::AlreadyApplied;
+        }
+
+        // 2. Apply the patch: if the bytes at the expected offset match
+        //    the unpatched pattern, overwrite them with 7 × NOP.
+        if target == PATTERN {
+            target.copy_from_slice(&NOP_PATCH);
+            return PropertyContextsCrashNopPatchResult::Applied;
+        }
+
+        // 3. Neither the unpatched pattern nor the patched signature
+        //    matched at the expected offset. Either TWRP version drift
+        //    (the crash instruction moved) OR the binary was already
+        //    modified in some other way. Either way, refuse to patch —
+        //    the caller logs a "TWRP version mismatch?" warning.
+        PropertyContextsCrashNopPatchResult::NotFound
+    }
+}
+
+/// Result of attempting to apply the property_contexts parser crash-NOP
+/// patch (the pragmatic "make it not crash" patch at file offset 0x58b9e).
+///
+/// See [`patch_twrp_init_property_contexts_crash_nop`] for the full
+/// root-cause analysis and the per-variant semantics. Mirrors
+/// [`KlogInitPatchResult`] + [`SelinuxLoadSkipPatchResult`]: `Applied`
+/// and `AlreadyApplied` are successes, `Skipped` is an expected
+/// non-action (e.g. aarch64), and `NotFound` is a potential problem
+/// (TWRP version mismatch — the patch couldn't be applied, so init
+/// may SIGSEGV at rip=0x80a0b9e later in the boot path).
+///
+/// `#[allow(dead_code)]` is needed for the same reason as
+/// [`KlogInitPatchResult`] + [`SelinuxLoadSkipPatchResult`]: the
+/// variants are platform-conditional (`Skipped` is only constructed
+/// on aarch64, the other three are only constructed on non-aarch64
+/// hosts). On any given host, the "other" platform's variants would
+/// otherwise be flagged as dead code by the compiler.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyContextsCrashNopPatchResult {
+    /// Patch was applied to the bytes — caller should write them back.
+    Applied,
+    /// Patch was already applied in a previous boot — caller can skip
+    /// the write (no modification needed, idempotent).
+    AlreadyApplied,
+    /// Patch was intentionally skipped (e.g. on aarch64, where the
+    /// i386-only byte pattern is irrelevant). The skip reason has been
+    /// logged; the caller should NOT log a "version mismatch" warning
+    /// and should NOT write the bytes back.
+    Skipped,
+    /// Pattern was not found at the expected file offset — caller
+    /// should log a warning because this likely indicates a TWRP
+    /// version mismatch. Without this patch, init will SIGSEGV at
+    /// rip=0x80a0b9e (si_addr=0x74616433) when its property_contexts
+    /// parser dereferences the garbage `ctx->field_at_0x14` pointer.
+    NotFound,
+}
+
 /// Set the SELinux security context of a file using the `lsetxattr(2)`
 /// syscall directly.
 ///
@@ -4146,6 +4366,88 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 }
                 Err(e) => warning!(
                     "[KR64] PARENT: failed to read /init for selinux-load-failure patching: {} (init will spin in pause() forever — see worklog 6-I)",
+                    e
+                ),
+            }
+        }
+
+        // ── property_contexts parser crash-NOP patch — PRAGMATIC
+        // "make it not crash" patch (Task 6-M) ──
+        //
+        // HONEST LABEL: This is NOT a proper fix — it's a pragmatic
+        // "make it not crash" patch. The proper fix would trace the
+        // caller of init's property_contexts parser (the function that
+        // iterates the SEPolicy context-table at 0x80ce270) and
+        // initialize the uninitialized context field at offset 0x14 —
+        // but that's deep in AOSP 5.1 libselinux internals
+        // (DISPATCHER-FINAL-5 + DISPATCHER-FINAL-6).
+        //
+        // ROOT CAUSE (6-K + DISPATCHER-FINAL-3/4/5/6):
+        //   After 6-J (selinux-load-skip NOP) + 6-L (#line strip), the
+        //   guest progresses to iteration 338 of the property_contexts
+        //   parser and SIGSEGVs at rip=0x80a0b9e:
+        //     movl $0x0, 0x4(%edx)  (insn: c7 42 04 00 00 00 00)
+        //   where edx=0x74616433 (garbage from `ctx->field_at_0x14`,
+        //   uninitialized by the caller — NOT from file content).
+        //
+        // THE PATCH:
+        //   Original: c7 42 04 00 00 00 00  (movl $0x0, 0x4(%edx))
+        //   Patched:  90 90 90 90 90 90 90  (7 × NOP)
+        //   File offset: 0x080a0b9e - 0x08048000 = 0x58b9e
+        //
+        // EFFECT (honest caveats):
+        //   * The parser SKIPS the write to the garbage pointer and
+        //     continues. The parser MAY produce wrong results for the
+        //     entry being processed, but it won't crash.
+        //   * The parser's incorrect internal state MAY cause a LATER
+        //     crash elsewhere — this is a "make it not crash" patch,
+        //     NOT a proper fix.
+        //   * The ONLY definitive proof is a ui-e2e-test.yml run + VLM
+        //     screenshot analysis. Do NOT claim "TWRP boots now".
+        //
+        // Pattern + offset verified by 6-K's disassembly + DISPATCHER-
+        // FINAL-3/4/5/6. See [`patch_twrp_init_property_contexts_crash_nop`]
+        // for the full root-cause analysis. The function is IDEMPOTENT
+        // (skipped if already applied) and is safe to apply on every boot.
+        {
+            let init_path = format!("{}/init", rootfs_prefix);
+            match std::fs::read(&init_path) {
+                Ok(mut bytes) => {
+                    match patch_twrp_init_property_contexts_crash_nop(&mut bytes) {
+                        PropertyContextsCrashNopPatchResult::Applied => {
+                            match std::fs::write(&init_path, &bytes) {
+                                Ok(()) => info!(
+                                    "[KR64] PARENT: patched /init property_contexts parser crash instruction at file offset 0x58b9e (vaddr 0x80a0b9e) — replaced `movl $0x0, 0x4(%edx)` (7 bytes: c7 42 04 00 00 00 00) with 7 × NOP (90 90 90 90 90 90 90); parser will SKIP the write to the garbage `ctx->field_at_0x14` pointer + continue (PRAGMATIC 'make it not crash' patch per 6-M + DISPATCHER-FINAL-5/6 — NOT a proper fix; may hit a later crash if the parser's incorrect state propagates)"
+                                ),
+                                Err(e) => warning!(
+                                    "[KR64] PARENT: patched /init property_contexts crash instruction in memory but failed to write back: {} (init may SIGSEGV at rip=0x80a0b9e with si_addr=0x74616433)",
+                                    e
+                                ),
+                            }
+                        }
+                        PropertyContextsCrashNopPatchResult::AlreadyApplied => {
+                            info!(
+                                "[KR64] PARENT: /init property_contexts parser crash instruction already NOP'd (idempotent skip) — parser will skip the write to the garbage pointer + continue (PRAGMATIC 'make it not crash' patch per 6-M)"
+                            );
+                        }
+                        PropertyContextsCrashNopPatchResult::Skipped => {
+                            // Skip reason already logged inside
+                            // `patch_twrp_init_property_contexts_crash_nop`
+                            // (currently fires only on aarch64, where the
+                            // i386-only byte pattern is irrelevant). Do
+                            // NOT log the "TWRP version mismatch?" warning
+                            // here — it would be misleading on arm64,
+                            // where the skip is expected and harmless.
+                        }
+                        PropertyContextsCrashNopPatchResult::NotFound => {
+                            warning!(
+                                "[KR64] PARENT: could not find property_contexts parser crash instruction at file offset 0x58b9e in /init (TWRP version mismatch?) — init may SIGSEGV at rip=0x80a0b9e with si_addr=0x74616433 (garbage `ctx->field_at_0x14` from uninitialized context — see worklog 6-M + DISPATCHER-FINAL-5/6)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => warning!(
+                    "[KR64] PARENT: failed to read /init for property_contexts crash-nop patching: {} (init may SIGSEGV at rip=0x80a0b9e — see worklog 6-M)",
                     e
                 ),
             }
@@ -8165,6 +8467,286 @@ mod tests {
         assert_eq!(
             patch_twrp_init_selinux_load_skip(&mut init_bytes_mut),
             SelinuxLoadSkipPatchResult::AlreadyApplied,
+            "patch should be idempotent on real TWRP init binary"
+        );
+    }
+
+    // ========================================================================
+    // Tests for `patch_twrp_init_property_contexts_crash_nop` — the 7-byte
+    // NOP patch at file offset 0x58b9e (vaddr 0x080a0b9e) that makes init's
+    // property_contexts parser SKIP the write through the garbage
+    // `ctx->field_at_0x14` pointer instead of SIGSEGV'ing (PRAGMATIC
+    // "make it not crash" patch per Task 6-M + DISPATCHER-FINAL-5/6).
+    //
+    // The test set mirrors `patch_twrp_init_selinux_load_skip_*`:
+    //   * applies cleanly to an unpatched binary at the expected offset
+    //   * is IDEMPOTENT (applying twice == applying once)
+    //   * returns NotFound when the binary is too small / pattern absent
+    //     at the expected offset
+    //   * refuses to apply when the bytes at the expected offset are some
+    //     UNEXPECTED value (safety check against version drift / an
+    //     unrelated patch having been applied there)
+    //   * works on a real TWRP init binary extracted from the ramdisk
+    //     (regression test for TWRP version drift)
+    // ========================================================================
+
+    /// Build a binary containing the property_contexts crash instruction
+    /// (`movl $0x0, 0x4(%edx)` = `c7 42 04 00 00 00 00`) at the expected
+    /// file offset 0x58b9e (vaddr 0x080a0b9e).
+    ///
+    /// Only built on non-aarch64 hosts — the pattern-matching tests below
+    /// are x86/i386-specific (they verify the i386 byte pattern) and the
+    /// function under test short-circuits to `Skipped` on aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
+    fn build_property_contexts_crash_nop_pattern_at_expected_offset() -> Vec<u8> {
+        // 384 KiB of NOP filler — large enough to contain the expected
+        // match offset 0x58b9e (≈ 363 KiB) + 7 bytes of pattern. The
+        // filler is a recognizable, neutral background that cannot
+        // accidentally contain the 7-byte pattern.
+        let mut v = vec![0x90u8; 384 * 1024];
+        // Place the 7-byte `movl $0x0, 0x4(%edx)` instruction at the
+        // expected file offset 0x58b9e (vaddr 0x080a0b9e — the crash
+        // site identified by 6-K + DISPATCHER-FINAL-5).
+        let off: usize = 0x58b9e;
+        v[off] = 0xc7; // opcode (MOV r/m32, imm32)
+        v[off + 1] = 0x42; // ModR/M (mod=01 disp8, reg=000, rm=010 edx)
+        v[off + 2] = 0x04; // 8-bit displacement: [edx + 0x4]
+        v[off + 3] = 0x00; // imm32 byte 0 (LSB)
+        v[off + 4] = 0x00; // imm32 byte 1
+        v[off + 5] = 0x00; // imm32 byte 2
+        v[off + 6] = 0x00; // imm32 byte 3 (MSB)
+        v
+    }
+
+    /// `patch_twrp_init_property_contexts_crash_nop` must find the pattern
+    /// at the expected offset (0x58b9e) and replace the 7-byte
+    /// `movl $0x0, 0x4(%edx)` instruction with 7 NOPs.
+    ///
+    /// Skipped on aarch64: the function short-circuits to `Skipped` there
+    /// (the i386 byte pattern is irrelevant), so the x86-specific
+    /// assertions below would never hold on arm64.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_property_contexts_crash_nop_applies_to_unpatched_binary() {
+        let mut bytes = build_property_contexts_crash_nop_pattern_at_expected_offset();
+        assert_eq!(
+            patch_twrp_init_property_contexts_crash_nop(&mut bytes),
+            PropertyContextsCrashNopPatchResult::Applied,
+            "patch should apply to unpatched binary"
+        );
+        // The 7 bytes at offset 0x58b9e should now be 7 NOPs.
+        let off: usize = 0x58b9e;
+        assert_eq!(
+            &bytes[off..off + 7],
+            &[0x90; 7],
+            "`movl $0x0, 0x4(%edx)` bytes should be NOP'd"
+        );
+    }
+
+    /// `patch_twrp_init_property_contexts_crash_nop` must be IDEMPOTENT:
+    /// applying it twice yields the same result as applying it once. The
+    /// second call must return `AlreadyApplied` (not `Applied`) and must
+    /// NOT modify the bytes.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_property_contexts_crash_nop_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_property_contexts_crash_nop_is_idempotent() {
+        let mut bytes = build_property_contexts_crash_nop_pattern_at_expected_offset();
+        assert_eq!(
+            patch_twrp_init_property_contexts_crash_nop(&mut bytes),
+            PropertyContextsCrashNopPatchResult::Applied,
+            "first patch should be Applied"
+        );
+        let after_first = bytes.clone();
+        assert_eq!(
+            patch_twrp_init_property_contexts_crash_nop(&mut bytes),
+            PropertyContextsCrashNopPatchResult::AlreadyApplied,
+            "second patch should be AlreadyApplied (idempotent)"
+        );
+        assert_eq!(
+            bytes, after_first,
+            "second patch should not modify the binary"
+        );
+    }
+
+    /// `patch_twrp_init_property_contexts_crash_nop` must return
+    /// `NotFound` if the binary is too small to contain the patch site
+    /// at file offset 0x58b9e (e.g. a tiny test binary, or — in production
+    /// — a different binary that isn't TWRP init).
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_property_contexts_crash_nop_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_property_contexts_crash_nop_returns_not_found_when_binary_too_small() {
+        // 4 KiB of NOP filler — too small to contain the patch site at
+        // file offset 0x58b9e (≈ 363 KiB).
+        let mut bytes = vec![0x90u8; 4 * 1024];
+        assert_eq!(
+            patch_twrp_init_property_contexts_crash_nop(&mut bytes),
+            PropertyContextsCrashNopPatchResult::NotFound,
+            "patch should return NotFound when binary is too small"
+        );
+    }
+
+    /// `patch_twrp_init_property_contexts_crash_nop` must return
+    /// `NotFound` when the 7 bytes at file offset 0x58b9e are neither
+    /// the unpatched pattern (`c7 42 04 00 00 00 00`) nor the already-
+    /// patched signature (`90 90 90 90 90 90 90`). This is the safety
+    /// check against TWRP version drift (the crash instruction moved to
+    /// a different offset) OR an unrelated patch having been applied at
+    /// the same offset.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_property_contexts_crash_nop_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_property_contexts_crash_nop_refuses_unexpected_pattern_at_offset() {
+        let mut bytes = vec![0x90u8; 384 * 1024];
+        // Place an UNEXPECTED pattern at offset 0x58b9e (a `nop; int3`
+        // sequence: `90 cc 90 cc 90 cc 90`). The patch should refuse to
+        // apply (NotFound) — it doesn't know whether the bytes are an
+        // intentional unrelated patch or TWRP version drift.
+        let off: usize = 0x58b9e;
+        bytes[off] = 0x90;
+        bytes[off + 1] = 0xcc;
+        bytes[off + 2] = 0x90;
+        bytes[off + 3] = 0xcc;
+        bytes[off + 4] = 0x90;
+        bytes[off + 5] = 0xcc;
+        bytes[off + 6] = 0x90;
+        assert_eq!(
+            patch_twrp_init_property_contexts_crash_nop(&mut bytes),
+            PropertyContextsCrashNopPatchResult::NotFound,
+            "patch should refuse to apply when bytes at offset are unexpected"
+        );
+        // The bytes at offset 0x58b9e should be UNCHANGED.
+        assert_eq!(
+            &bytes[off..off + 7],
+            &[0x90, 0xcc, 0x90, 0xcc, 0x90, 0xcc, 0x90],
+            "bytes should be unchanged when offset check refuses the patch"
+        );
+    }
+
+    /// `patch_twrp_init_property_contexts_crash_nop` must work on a real
+    /// TWRP init binary extracted from
+    /// `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`. This is a regression
+    /// test: if the TWRP version changes (and the `movl $0x0, 0x4(%edx)`
+    /// byte pattern is no longer at file offset 0x58b9e), this test
+    /// will fail (alerting us to update the offset).
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_property_contexts_crash_nop_applies_to_unpatched_binary` above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_property_contexts_crash_nop_works_on_real_twrp_init_binary() {
+        // The TWRP boot image is at `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`
+        // (relative to the repo root). We extract the ramdisk, decompress
+        // it, and read the /init file. This is the SAME extraction
+        // pipeline as `patch_twrp_init_selinux_load_skip_works_on_real_twrp_init_binary`
+        // above — we reuse the same `decompress_gzip` + `find_cpio_entry`
+        // helpers.
+        let boot_img_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img");
+        if !boot_img_path.exists() {
+            eprintln!(
+                "skip: TWRP boot image not found at {} (this is OK in CI without assets)",
+                boot_img_path.display()
+            );
+            return;
+        }
+        let boot_bytes = match std::fs::read(&boot_img_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: failed to read TWRP boot image: {}", e);
+                return;
+            }
+        };
+        if boot_bytes.len() < 0x1000 || &boot_bytes[..8] != b"ANDROID!" {
+            eprintln!("skip: TWRP boot image is not a valid Android boot image");
+            return;
+        }
+        // Parse Android boot image header (v0).
+        let kernel_size =
+            u32::from_le_bytes([boot_bytes[8], boot_bytes[9], boot_bytes[10], boot_bytes[11]])
+                as usize;
+        let ramdisk_size = u32::from_le_bytes([
+            boot_bytes[16],
+            boot_bytes[17],
+            boot_bytes[18],
+            boot_bytes[19],
+        ]) as usize;
+        let page_size = u32::from_le_bytes([
+            boot_bytes[36],
+            boot_bytes[37],
+            boot_bytes[38],
+            boot_bytes[39],
+        ]) as usize;
+        if page_size == 0 || kernel_size == 0 || ramdisk_size == 0 {
+            eprintln!("skip: TWRP boot image has invalid header");
+            return;
+        }
+        let ramdisk_off = page_size + kernel_size.div_ceil(page_size) * page_size;
+        if ramdisk_off + ramdisk_size > boot_bytes.len() {
+            eprintln!("skip: TWRP boot image ramdisk truncated");
+            return;
+        }
+        let ramdisk_gz = &boot_bytes[ramdisk_off..ramdisk_off + ramdisk_size];
+        if ramdisk_gz.len() < 2 || ramdisk_gz[0] != 0x1f || ramdisk_gz[1] != 0x8b {
+            eprintln!("skip: TWRP ramdisk is not gzip-compressed");
+            return;
+        }
+        let ramdisk_cpio = match decompress_gzip(ramdisk_gz) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip: failed to decompress TWRP ramdisk: {}", e);
+                return;
+            }
+        };
+        let init_bytes = match find_cpio_entry(&ramdisk_cpio, b"init") {
+            Some(b) => b,
+            None => {
+                eprintln!("skip: /init not found in TWRP ramdisk cpio");
+                return;
+            }
+        };
+
+        // Sanity-check the binary is large enough to contain the patch site
+        // at file offset 0x58b9e (≈ 363 KiB + 7 bytes).
+        assert!(
+            init_bytes.len() >= 0x58b9e + 7,
+            "init binary too small for property_contexts crash-nop patch site: {} bytes (need at least {})",
+            init_bytes.len(),
+            0x58b9e + 7
+        );
+
+        // Verify the UNPATCHED pattern is present at file offset 0x58b9e
+        // (`movl $0x0, 0x4(%edx)` = `c7 42 04 00 00 00 00`).
+        assert_eq!(
+            &init_bytes[0x58b9e..0x58b9e + 7],
+            &[0xc7, 0x42, 0x04, 0x00, 0x00, 0x00, 0x00],
+            "property_contexts crash instruction (`movl $0x0, 0x4(%edx)`) should be present at file offset 0x58b9e in real TWRP init binary (TWRP version may have changed — update patch_twrp_init_property_contexts_crash_nop offset)"
+        );
+
+        // Apply the patch.
+        let mut init_bytes_mut = init_bytes.clone();
+        assert_eq!(
+            patch_twrp_init_property_contexts_crash_nop(&mut init_bytes_mut),
+            PropertyContextsCrashNopPatchResult::Applied,
+            "patch should apply to real TWRP init binary"
+        );
+        // Verify the 7 bytes at offset 0x58b9e are now 7 NOPs.
+        assert_eq!(
+            &init_bytes_mut[0x58b9e..0x58b9e + 7],
+            &[0x90; 7],
+            "`movl $0x0, 0x4(%edx)` bytes at offset 0x58b9e should be NOP'd after patch"
+        );
+        // Apply again — should be idempotent (AlreadyApplied).
+        assert_eq!(
+            patch_twrp_init_property_contexts_crash_nop(&mut init_bytes_mut),
+            PropertyContextsCrashNopPatchResult::AlreadyApplied,
             "patch should be idempotent on real TWRP init binary"
         );
     }
