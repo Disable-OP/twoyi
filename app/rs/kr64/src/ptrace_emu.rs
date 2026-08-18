@@ -236,6 +236,30 @@ struct ChildAbi {
     lstat: i64,
     newfstatat: i64,
     statx: i64,
+    // stat64 / lstat64 / fstat64 — the i386 64-bit-struct variants of
+    // stat/lstat/fstat. Modern i386 bionic (including TWRP's recovery)
+    // uses stat64 (nr=195) + lstat64 (nr=196) INSTEAD of the old stat
+    // (nr=106) + lstat (nr=107), because the old struct stat can't
+    // represent large files/inodes. Task 6-T: these were MISSING from
+    // ChildAbi, so the path-translation condition (which matches on
+    // abi.stat || abi.lstat) did NOT cover stat64/lstat64 → the recovery's
+    // stat64("/some/rootfs/path") checked the HOST filesystem (not the
+    // rootfs) → ENOENT for rootfs-only files → infinite polling loop
+    // (clock_gettime → stat64 → ENOENT → nanosleep → repeat ~3500× →
+    // recovery gives up → wait4 → exit_group(1); observed on the 3a77faf
+    // UI E2E run 32191877530 with the 5000-cap logging from Task 6-S).
+    //
+    // stat64 + lstat64 take a PATH (arg1) → need path translation (same
+    // as stat/lstat). fstat64 takes an fd (arg1) → NO path translation,
+    // but we add the field for syscall_name logging.
+    //
+    // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+    //   i386:   __NR_stat64 195, __NR_lstat64 196, __NR_fstat64 197
+    //   x86_64: (no stat64/lstat64/fstat64 — stat/lstat/fstat are already 64-bit)
+    //   aarch64: (asm-generic has no stat64/lstat64/fstat64 — uses statx/newfstatat)
+    stat64: i64,
+    lstat64: i64,
+    fstat64: i64,
     access: i64,
     faccessat: i64,
     rt_sigprocmask: i64,
@@ -589,6 +613,17 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     lstat: 6,
     newfstatat: 262,
     statx: 332,
+    // x86_64 stat/lstat/fstat are already 64-bit (struct stat carries
+    // 64-bit st_size + st_ino); there are NO stat64/lstat64/fstat64
+    // syscall numbers on x86_64 (verified: /usr/include/x86_64-linux-gnu/
+    // asm/unistd_64.h has NO __NR_stat64 / __NR_lstat64 / __NR_fstat64
+    // entries — they were a 32-bit-only workaround for the old small-
+    // field struct stat). Set to -1 (sentinels "not present on this
+    // ABI"), mirroring the existing ABI_AARCH64.open / ABI_X86_32.stat64
+    // precedent. Task 6-T.
+    stat64: -1,
+    lstat64: -1,
+    fstat64: -1,
     access: 21,
     faccessat: 48,
     rt_sigprocmask: 14,
@@ -706,6 +741,28 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     lstat: 107,
     newfstatat: 300,
     statx: 383,
+    // Task 6-T: i386 stat64/lstat64/fstat64. Verified directly against
+    // /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+    //   __NR_stat64  195
+    //   __NR_lstat64 196
+    //   __NR_fstat64 197
+    // THESE are the values that ACTUALLY fire at runtime — modern i386
+    // bionic (incl. TWRP's recovery) uses stat64/lstat64 INSTEAD of the
+    // old stat(106)/lstat(107) because the old struct stat can't carry
+    // 64-bit st_size/st_ino. Pre-6-T, the path-translation condition
+    // (which matched abi.stat || abi.lstat) did NOT cover stat64/lstat64
+    // → the recovery's stat64("/some/rootfs/path") hit the HOST fs
+    // (where rootfs files don't exist) → ENOENT → infinite polling loop
+    // (clock_gettime → stat64 → ENOENT → nanosleep → repeat ~3500×) →
+    // recovery gives up → wait4 → exit_group(1). Observed on 3a77faf UI
+    // E2E run 32191877530 (5000-cap logging from Task 6-S revealed the
+    // full polling loop: post-execve syscalls #294+ all nr=195 → -2
+    // ENOENT, repeating with nr=265 clock_gettime + nr=162 nanosleep).
+    // fstat64(197) takes an fd (NOT a path) → no path translation needed
+    // but added to ChildAbi for syscall_name diagnostic logging.
+    stat64: 195,
+    lstat64: 196,
+    fstat64: 197,
     access: 33,
     faccessat: 307,
     // i386 rt_sigprocmask = 175 (per /usr/include/x86_64-linux-gnu/
@@ -878,6 +935,18 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     lstat: -1,
     newfstatat: 79,
     statx: 291,
+    // asm-generic (aarch64) uses statx + newfstatat exclusively; there
+    // are NO stat64/lstat64/fstat64 syscall numbers on aarch64. Verified
+    // against /usr/include/asm-generic/unistd.h: __NR_stat64 /
+    // __NR_lstat64 / __NR_fstat64 are only defined when
+    // __ARCH_WANT_STAT64 is set, which aarch64 does NOT set (aarch64
+    // came after the stat64 era + mandates the statx/newfstatat API).
+    // Set to -1 (sentinels "not present on this ABI"), mirroring the
+    // existing ABI_AARCH64.open / ABI_AARCH64.access precedent.
+    // Task 6-T.
+    stat64: -1,
+    lstat64: -1,
+    fstat64: -1,
     access: -1,
     faccessat: 48,
     rt_sigprocmask: 135,
@@ -1930,6 +1999,25 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // Added in Task 6-R (companion to setxattr/lsetxattr — same
         // SELinux-restorecon code path, just the fd-based variant).
         "fsetxattr"
+    } else if nr == abi.stat64 {
+        // Task 6-T: i386 64-bit-struct variant of stat (nr=195). Pre-6-T
+        // these were labelled "[unknown]" in the diagnostic log — the
+        // post-6-S logcat showed hundreds of "nr=195 -> -2 ENOENT"
+        // lines that, without this label, required cross-referencing
+        // against /usr/include/x86_64-linux-gnu/asm/unistd_32.h to
+        // identify as stat64. This label makes the polling-loop root
+        // cause immediately readable.
+        "stat64"
+    } else if nr == abi.lstat64 {
+        // Task 6-T: i386 64-bit-struct variant of lstat (nr=196).
+        // Companion to stat64 above.
+        "lstat64"
+    } else if nr == abi.fstat64 {
+        // Task 6-T: i386 64-bit-struct variant of fstat (nr=197).
+        // fstat64 takes an fd (not a path) so it is NOT in the path-
+        // translation match arm — but we add the label here for
+        // diagnostic logging.
+        "fstat64"
     } else if nr == abi.execve {
         "execve"
     } else {
@@ -3674,17 +3762,32 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
                             }
                         }
+                        // Task 6-T: stat64 + lstat64 added to the
+                        // path-translation match arm — these are the
+                        // 64-bit-struct variants that modern i386 bionic
+                        // (incl. TWRP recovery) actually uses INSTEAD of
+                        // old stat/lstat. Same arg1-as-path semantics as
+                        // stat/lstat. fstat64 takes an fd (not a path)
+                        // and is intentionally NOT in this arm.
                         n if n == abi.stat
                             || n == abi.lstat
+                            || n == abi.stat64
+                            || n == abi.lstat64
                             || n == abi.newfstatat
                             || n == abi.statx =>
                         {
-                            let path_arg_index =
-                                if syscall_num == abi.stat || syscall_num == abi.lstat {
-                                    abi.reg_arg1
-                                } else {
-                                    abi.reg_arg2
-                                };
+                            // Task 6-T: stat64/lstat64 use arg1 as the
+                            // path (same as old stat/lstat); newfstatat
+                            // + statx use arg2 (the dirfd is arg1).
+                            let path_arg_index = if syscall_num == abi.stat
+                                || syscall_num == abi.lstat
+                                || syscall_num == abi.stat64
+                                || syscall_num == abi.lstat64
+                            {
+                                abi.reg_arg1
+                            } else {
+                                abi.reg_arg2
+                            };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
@@ -6251,6 +6354,125 @@ mod tests {
             ABI_AARCH64.exit_group_nr, 94,
             "aarch64 exit_group_nr must be 94 (NOT 93 — 93 is plain exit)"
         );
+    }
+
+    // ── Task 6-T regression guards: stat64/lstat64/fstat64 ──
+    //
+    // These tests lock in the architectural contract added by Task 6-T:
+    // that the ChildAbi struct carries stat64 / lstat64 / fstat64
+    // fields, used by BOTH the path-translation match arm (stat64 +
+    // lstat64 — fstat64 takes an fd, no path translation) AND the
+    // syscall_name diagnostic label (all three). Pre-6-T the recovery's
+    // stat64("/some/rootfs/path") checked the HOST filesystem (where
+    // rootfs files don't exist) → ENOENT → infinite polling loop
+    // (clock_gettime → stat64 → ENOENT → nanosleep → repeat ~3500×) →
+    // recovery gives up → wait4 → exit_group(1). Observed on 3a77faf
+    // UI E2E run 32191877530 (5000-cap logging from Task 6-S revealed
+    // the full polling loop: post-execve syscalls #294+ all nr=195 →
+    // -2 ENOENT, repeating with nr=265 clock_gettime + nr=162 nanosleep).
+    //
+    // Verified directly against the kernel's UAPI headers in Task 6-T:
+    //   i386 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h):
+    //     __NR_stat64 195, __NR_lstat64 196, __NR_fstat64 197
+    //   x86_64 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h):
+    //     NO __NR_stat64 / __NR_lstat64 / __NR_fstat64 entries — set to -1
+    //     (stat/lstat/fstat are already 64-bit on x86_64 — no need for the
+    //     64-bit-struct variant).
+    //   aarch64 (per /usr/include/asm-generic/unistd.h):
+    //     NO __NR_stat64 / __NR_lstat64 / __NR_fstat64 — set to -1 (aarch64
+    //     uses statx + newfstatat exclusively; the stat64 family was a
+    //     32-bit-only workaround for the old small-field struct stat).
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_task_6t_stat64_numbers_correct() {
+        // Regression guard (Task 6-T): the i386 stat64/lstat64/fstat64
+        // syscall numbers MUST be 195/196/197 (per
+        // /usr/include/x86_64-linux-gnu/asm/unistd_32.h, verified
+        // directly). THIS is the value set that ACTUALLY fires at
+        // runtime — TWRP init + recovery are i386 binaries built with
+        // modern bionic, which uses stat64/lstat64 INSTEAD of the old
+        // stat(106)/lstat(107). If anyone "fixes" these to different
+        // numbers (e.g. by accidentally copying the x86_64 -1 values
+        // — which would be WRONG for an i386 child), the path-
+        // translation match arm would silently stop matching stat64/
+        // lstat64 → the recovery's stat64("/some/rootfs/path") would
+        // hit the HOST fs again → ENOENT polling loop would come back.
+        assert_eq!(ABI_X86_32.stat64, 195, "i386 stat64 must be 195");
+        assert_eq!(ABI_X86_32.lstat64, 196, "i386 lstat64 must be 196");
+        assert_eq!(ABI_X86_32.fstat64, 197, "i386 fstat64 must be 197");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_task_6t_stat64_numbers_correct() {
+        // Regression guard (Task 6-T): the x86_64 stat64/lstat64/fstat64
+        // syscall numbers MUST be -1/-1/-1 (sentinels "not present on
+        // this ABI"). x86_64's stat/lstat/fstat are ALREADY 64-bit (the
+        // struct stat carries 64-bit st_size + st_ino), so the kernel
+        // does NOT expose separate stat64/lstat64/fstat64 syscall
+        // numbers — verified directly against
+        // /usr/include/x86_64-linux-gnu/asm/unistd_64.h (which has NO
+        // __NR_stat64 / __NR_lstat64 / __NR_fstat64 entries). The host
+        // is x86_64 running an i386 child, so these -1 values do NOT
+        // fire at runtime — locked in for ABI completeness + so the
+        // path-translation match arm + syscall_name label compile +
+        // behave correctly if a future x86_64 guest is ever supported
+        // (mirrors the mknod: 133 / setxattr: 188 / pause: 34 /
+        // fork_nr: -1 precedent on ABI_AARCH64).
+        assert_eq!(
+            ABI_X86_64.stat64, -1,
+            "x86_64 stat64 must be -1 (no variant)"
+        );
+        assert_eq!(
+            ABI_X86_64.lstat64, -1,
+            "x86_64 lstat64 must be -1 (no variant)"
+        );
+        assert_eq!(
+            ABI_X86_64.fstat64, -1,
+            "x86_64 fstat64 must be -1 (no variant)"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_i386_stat64() {
+        // Task 6-T: i386 stat64 = 195. Pre-6-T the diagnostic label
+        // for syscall 195 was "[unknown]" because no field matched it.
+        // The post-6-S 5000-cap logcat showed HUNDREDS of
+        // "nr=195 -> -2 (ENOENT)" lines that, without this label,
+        // required cross-referencing against
+        // /usr/include/x86_64-linux-gnu/asm/unistd_32.h to identify
+        // as stat64. THIS label makes the polling-loop root cause
+        // immediately readable: "post-execve syscall #294: stat64 ->
+        // -2 (ENOENT)" instead of "nr=195 [unknown] -> -2 (ENOENT)".
+        assert_eq!(syscall_name(195, &ABI_X86_32), "stat64");
+        // Converse negative-assert: 195 must NOT fall through to
+        // "unknown" (the previous pre-6-T behaviour).
+        assert_ne!(syscall_name(195, &ABI_X86_32), "unknown");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_i386_lstat64() {
+        // Task 6-T: i386 lstat64 = 196. Companion to syscall_name_i386_
+        // stat64 above — same diagnostic-label rationale.
+        assert_eq!(syscall_name(196, &ABI_X86_32), "lstat64");
+        assert_ne!(syscall_name(196, &ABI_X86_32), "unknown");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_i386_fstat64() {
+        // Task 6-T: i386 fstat64 = 197. fstat64 takes an fd (NOT a path)
+        // so it is intentionally NOT in the path-translation match arm
+        // — but we add the syscall_name label so the diagnostic log
+        // shows "fstat64" instead of "[unknown]" if/when the recovery
+        // calls fstat64 on a rootfs fd (the recovery DOES fstat
+        // /dev/null / /dev/urandom fds during init, which under modern
+        // bionic goes through fstat64).
+        assert_eq!(syscall_name(197, &ABI_X86_32), "fstat64");
+        assert_ne!(syscall_name(197, &ABI_X86_32), "unknown");
     }
 
     #[cfg(target_arch = "x86_64")]
