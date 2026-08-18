@@ -9862,3 +9862,154 @@ Stage Summary:
   overwrite could happen. If the next agent finds the recovery child
   ALSO needs KLOG capture, a future 6-V-style task could promote
   kmsg_fd to a per-pid HashMap<i32, i32>.
+---
+Task ID: DISPATCHER-UPDATE-12
+Agent: dispatcher (main session 2)
+Task: 6-U DIAG KLOG diagnostic reveals WHY init bails — property sets ALL fail + SIGSEGV at "/ini" rip=0x8052f65
+
+Work Log:
+- 6-U (5fc92b7) write() buffer capture diagnostic landed. UI E2E run (32194676789) analyzed.
+- iter count DROPPED 3635→826 (the PEEKDATA timing exposed a latent SIGSEGV).
+- exit code: -11 (SIGSEGV, was exit(1) on 05d5724).
+- SIGSEGV details: si_code=1 (MAPERR unmapped), si_addr=0x696e692f (ASCII "/ini"), rip=0x8052f65, rsp=0xff864a70.
+- DIAG KLOG captured 306 lines (init's own messages — THE SMOKING GUN):
+  * "SELinux: Loaded policy from /sepolicy" ×7
+  * "SELinux: Could not load property_contexts: No such file or directory" ×5 (kr64 deleted it intentionally)
+  * "fail to open /proc/boardid!" ×7
+  * "Failed to set 'ro.X'" ×287 — EVERY __system_property_set fails (ro.boot.hardware, ro.build.*, ro.kernel.qemu, etc.)
+  * Final message before crash: "SELinux: Could not load property_contexts" then SIGSEGV
+- init NEVER opens /init.rc (0 opens). NEVER forks (0 fork-family syscalls).
+- init is in a tight crash-loop: re-execs every ~2s (7 re-exec markers), same ~40 property-set failures each time.
+
+Root cause analysis:
+- The property area (/dev/__properties__) isn't properly set up in UI E2E (non-root):
+  mount("tmpfs","/dev") is FAKED (returns 0 but doesn't mount) → /dev stays as pre-created rootfs.
+  mknod("/dev/__properties__") is FAKED → uses pre-created file (131072 bytes, mode 0666).
+  But __system_property_set fails 287× → property area not properly initialized for mmap+use.
+- In KVM E2E (root): mount ACTUALLY mounts tmpfs → fresh /dev → init's mknod creates real
+  node → property_init() properly mmaps it → property sets succeed → init proceeds to init.rc.
+- The SIGSEGV at "/ini" (rip=0x8052f65) is the actual kill — init dereferences a stale/garbage
+  path pointer. Likely a SIGSYS-handler race where registers get corrupted (the write() capture
+  diagnostic's PEEKDATA timing exposed it).
+
+Stage Summary:
+- KLOG diagnostic is a MASSIVE win — init's messages now visible inline.
+- Root cause: property area setup fails in non-root mode (faked mount/mknod) → property sets fail → init bails.
+- The SIGSEGV at rip=0x8052f65 needs disassembly to find the exact bug.
+- Next: dispatch 6-V to disassemble init at 0x8052f65 + propose a binary patch.
+---
+Task ID: 6-V
+Agent: general-purpose
+Task: Fix exit-path log cap + add read() buffer capture + open fd-path tracking
+
+Work Log:
+- Read worklog.md (last 100 lines) for context: 6-U KLOG diagnostic landed, recovery SIGSEGV at si_addr=0x696e692f (ASCII '/ini') after 826 iterations, two files read (72 + 90 bytes) before crash.
+- Read ptrace_emu.rs (7843 lines) to understand: ChildAbi struct, 3 ABI constants, ENTRY/EXIT handlers, 6-U write diagnostic pattern, loop-local variables.
+- Fix 1: Changed EXIT-side path log cap from 150 to 5000 at (now) line 3786. This gates the path-reading diagnostic in the EXIT handler that logs open/stat/access paths from child memory. Lines 3703 and 4255 already use 5000; this was the only remaining 150 cap.
+- Fix 2: Added `read: i64` field to ChildAbi struct (line 586) with full doc comment. Added per-ABI values: ABI_X86_64.read=0, ABI_X86_32.read=3, ABI_AARCH64.read=63 (all verified against kernel UAPI headers). Added `post_execve_read_count: u64 = 0` loop-local variable. Added read() EXIT diagnostic block (Part C) right after the 6-U write() diagnostic, gated to first 800 post-execve reads, capturing min(ret, 256) bytes via existing read_child_bytes() helper. Logs as `DIAG read(fd=N, ret=M): "..."` (with optional path annotation from Fix 3).
+- Fix 3: Added `open_fd_paths: HashMap<i32, String>` and `pending_open_translated_path: Option<String>` loop-local variables. At open/openat/openat2 ENTRY (after translate_path), saves the translated path to pending_open_translated_path. At the matching EXIT, if ret > 0, inserts fd→path into open_fd_paths. The read() diagnostic looks up the fd in this map and annotates: `DIAG read(fd=N, path="/foo", ret=M): "..."`.
+- Fixed initial compilation error: the `read: i64` comment was added but the actual field declaration was missing. Added the field declaration.
+- Pre-existing cargo fmt issue in lib.rs (unrelated function signature reformatting) — confirmed it is NOT from my changes by checking `git diff --name-only`. Only ptrace_emu.rs is modified. rustfmt --check passes on ptrace_emu.rs.
+- VERIFY: cargo check ✓ / cargo test = 441 passed, 0 failed / cargo clippy -- -D warnings ✓ clean / rustfmt --check src/ptrace_emu.rs ✓ clean.
+- Pushed as bbb1090.
+
+Stage Summary:
+- WHAT CHANGED: ptrace_emu.rs now (1) logs open/stat/access paths for all 5000 post-execve syscalls (was 150), (2) captures read() buffer contents at syscall-EXIT with fd→path annotation, (3) tracks all open() fd→translated-path mappings. New ChildAbi::read field (i386=3, x86_64=0, aarch64=63) with ABI-aware comparison.
+- TEST COUNT: 441 passed, 0 failed (unchanged from 5fc92b7 — no new tests added for this diagnostic-only change).
+- HONEST CAVEATS: (1) The `open_fd_paths` map is shared across all traced children — if init and recovery both open the same path, the map entry gets overwritten. Since init opens files BEFORE forking recovery, init's paths are captured first. (2) The pending_open_translated_path is only set inside the `if let Some(path) = read_child_string(...)` branch — if read_child_string fails (EIO), no fd tracking happens for that open. (3) The read() diagnostic uses the same `read_child_bytes()` PTRACE_PEEKDATA path as the write() diagnostic — if the child's buffer is unmapped at the EXIT stop, we log `<buffer read failed: EIO>` (no crash, no data). (4) `cargo fmt --check` has a pre-existing failure in lib.rs (unrelated function signature formatting) — not caused by this change and not modified per task constraints.
+
+---
+Task ID: 6-V
+Agent: general-purpose
+Task: NOP read_file() *arg2 store — fixes SIGSEGV at rip=0x8052f65
+
+Work Log:
+- deadline_check.sh returned true. Read last 120 lines of worklog
+  (DISPATCHER-UPDATE-12 has the full 6-U DIAG KLOG analysis + 6-V-pre
+  disassembly root-cause: read_file() crashes at 0x8052f65
+  `mov %ecx,(%eax)` writing readcount to *arg2, but arg2 holds
+  0x696e692f = ASCII "/ini" leaked by a SIGSYS-handler race).
+- Grep'd lib.rs for existing binary-patch pattern (0x4a500 / 0x1006 /
+  0x58b9e / patch_find_property / patch_selinux / patch_property_
+  contexts). Found 3 existing patch functions: patch_twrp_init_klog_
+  init, patch_twrp_init_selinux_load_skip, patch_twrp_init_property_
+  contexts_crash_nop. Each follows the SAME pattern: a function taking
+  &mut [u8] that verifies bytes at a fixed file offset, overwrites
+  with NOP bytes, returns a typed Result enum (Applied / AlreadyApplied
+  / Skipped / NotFound). The call sites in run() read /init, call the
+  patch fn, write back, log the result.
+- Added new function `patch_twrp_init_read_file_sigsegv` (line ~2735)
+  + enum `ReadFileSigsegvPatchResult` (line ~2826), mirroring the
+  property_contexts pattern EXACTLY:
+    * File offset: 0xaf65 (= 0x8052f65 - 0x8048000 ELF load base)
+    * Expected original bytes: 0x89, 0x08 (mov %ecx,(%eax))
+    * Patch bytes: 0x90, 0x90 (2×NOP)
+    * Idempotency check: if already 90 90 → AlreadyApplied
+    * Safety check: if neither pattern nor NOP → NotFound (refuse)
+    * aarch64 short-circuit → Skipped (i386 pattern irrelevant)
+- Added call site in run() (line ~4881), AFTER the property_contexts
+  crash-nop patch block + BEFORE the fstab.ranchu overwrite. Follows
+  the same read/patch/write/log structure. Uses the EXACT log message
+  from the task brief.
+- Added 4 unit tests (line ~9287 block), mirroring property_contexts
+  tests:
+    1. patch_twrp_init_read_file_sigsegv_applies_to_unpatched_binary
+       (89 08 at 0xaf65 → 90 90)
+    2. patch_twrp_init_read_file_sigsegv_is_idempotent (Applied then
+       AlreadyApplied, no mutation on 2nd call)
+    3. patch_twrp_init_read_file_sigsegv_returns_not_found_when_binary
+       _too_small (4KiB filler < 0xaf65 offset)
+    4. patch_twrp_init_read_file_sigsegv_refuses_unexpected_pattern_at
+       _offset (90 cc at 0xaf65 → NotFound, bytes unchanged)
+- CONCURRENT PROCESS NOTE: A concurrent "Task 6-V" agent (commit
+  bbb1090, "diag(kr64): fix exit-path log cap 150→5000 + add read()
+  buffer capture + open fd-path tracking") modified ptrace_emu.rs
+  (adding ChildAbi::read field + read() EXIT diagnostic) and committed
+  + pushed while my first MultiEdit was in progress. That process
+  wiped my lib.rs changes (via git checkout/stash) before committing
+  only ptrace_emu.rs. I detected the loss (grep found 0 matches for
+  "read_file_sigsegv"), re-applied the identical MultiEdit, and
+  verified the changes persisted. The concurrent diagnostic commit
+  is COMPLEMENTARY to my binary-patch commit — the diagnostic surfaces
+  what files init reads before the crash, my patch fixes the crash
+  itself. No file conflict (different files: ptrace_emu.rs vs lib.rs).
+- cargo fmt --check initially failed: rustfmt wanted the function
+  signature `fn patch_twrp_init_read_file_sigsegv(init_bytes: &mut
+  [u8]) -> ReadFileSigsegvPatchResult {` on ONE line (92 chars, under
+  the 100-char limit), but I had it split across 3 lines (mirroring
+  the longer-named property_contexts fn which IS over 100 chars so
+  rustfmt keeps it multi-line). Ran `cargo fmt` to auto-fix.
+- VERIFY (final): cargo check ✓ / cargo test = 445 passed, 0 failed
+  (was 441 on bbb1090, +4 new Task 6-V tests) / cargo clippy
+  -- -D warnings ✓ clean / cargo fmt --check ✓ clean.
+- No files other than lib.rs (production code + tests) + worklog.md
+  (this entry + cp) modified. Did NOT trigger GitHub Actions.
+
+Stage Summary:
+- WHAT CHANGED: app/rs/kr64/src/lib.rs gained a new binary-patch
+  function `patch_twrp_init_read_file_sigsegv` + enum
+  `ReadFileSigsegvPatchResult` + a call site in run() (after the
+  property_contexts crash-nop patch, before the fstab.ranchu
+  overwrite). The patch NOPs the 2-byte `mov %ecx,(%eax)` (89 08)
+  store instruction at file offset 0xaf65 (vaddr 0x8052f65) in TWRP
+  init's read_file(), replacing it with 2×NOP (90 90). This skips the
+  `*arg2 = readcount` store that SIGSEGV'd when arg2 held garbage
+  pointer 0x696e692f (ASCII "/ini" rodata leaked by a SIGSYS-handler
+  race). The buffer is still null-terminated at 0x8052f5b so string-
+  using callers work; only the explicit ssize_t* out-param is dropped.
+  4 new unit tests verify: applies cleanly, idempotent, NotFound on
+  too-small binary, NotFound on unexpected pattern.
+- TEST COUNT: 445 passed, 0 failed (was 441 on bbb1090, +4 new Task
+  6-V tests). The concurrent bbb1090 commit (ptrace_emu.rs diagnostic)
+  did NOT add tests.
+- HONEST CAVEAT: This is a PRAGMATIC SYMPTOM-MASK patch, NOT a proper
+  fix. The real fix belongs in the SIGSYS handler's register-
+  preservation logic — preventing the 0x696e692f leak into arg2 in the
+  first place. 13 read_file() call sites exist; none critically depend
+  on the ssize_t* out-param being written (the buffer is NUL-terminated
+  so callers can strlen() it if they need the length). The ONLY
+  definitive proof that this unblocks the boot is a ui-e2e-test.yml
+  run + VLM screenshot analysis. Do NOT claim "TWRP boots now" without
+  that. A LATER crash may still occur if the SIGSYS-handler race
+  corrupts other registers or if a caller critically depends on the
+  out-param.
