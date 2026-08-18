@@ -2902,7 +2902,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
             if sig == libc::SIGTRAP {
                 log(&format!(
                     "SIGTRAP stop (no 0x80) on pid={}: status=0x{:08x}, ptrace_event={}",
-                    pid, status as u32, (status as u32) >> 16
+                    pid,
+                    status as u32,
+                    (status as u32) >> 16
                 ));
             }
 
