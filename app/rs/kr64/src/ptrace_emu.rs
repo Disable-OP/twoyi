@@ -1765,7 +1765,21 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
     if path == "/proc/cmdline" {
         return format!("{}/twrp-cmdline", rootfs);
     }
-    for prefix in &["/proc/", "/sys/", "/data/", "/apex/"] {
+    // /proc/, /data/, /apex/ — leave untranslated. The host's /proc
+    // is partially readable by untrusted_app (so /proc/self/* works);
+    // /data + /apex are either app-private (already accessible) or
+    // not needed by TWRP init.
+    //
+    // NOTE (Task 6-P): /sys/ used to be in this list (left untranslated
+    // → guest's open("/sys/...") hit the host's REAL kernel sysfs →
+    // EACCES for untrusted_app → init exit(1) at ptrace iteration
+    // ~3059). /sys/ was REMOVED from the untranslated list + moved to
+    // a dedicated translated branch below (mirror of /dev/* handling).
+    // The companion pre-creation in lib.rs::precreate_sysfs_stubs
+    // materialises {rootfs}/sys/class/ + {rootfs}/sys/fs/selinux/{
+    // enforce,load} so the translated opens succeed against an empty
+    // fake sysfs instead of the host's real one.
+    for prefix in &["/proc/", "/data/", "/apex/"] {
         if path.starts_with(prefix) {
             return path.to_string();
         }
@@ -1793,6 +1807,30 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
     // iterates over 0 properties and returns NULL naturally — no binary
     // mutation needed.
     if path.starts_with("/dev/") || path == "/dev" {
+        return format!("{}{}", rootfs, path);
+    }
+    // /sys/* — translate to rootfs/sys/* so init's sysfs enumeration +
+    // SELinux sysfs reads hit the pre-created FAKE sysfs (empty dirs +
+    // empty /sys/fs/selinux/{enforce,load} files materialised by
+    // lib.rs::precreate_sysfs_stubs). Without this translation, init's
+    // open("/sys/class") + open("/sys/fs/selinux/{enforce,load}") hit
+    // the host's REAL kernel sysfs, which untrusted_app can't read →
+    // -EACCES → init exit(1) at ptrace iteration ~3059 (the NEW
+    // post-56a5bd3 UI E2E blocker — Task 6-P).
+    //
+    // The fake sysfs is intentionally SPARSE — we only pre-create the
+    // paths init is known to open (/sys/class, /sys/fs/selinux/*).
+    // Opens of OTHER /sys/* paths will translate to {rootfs}/sys/* +
+    // return -ENOENT (acceptable — init treats unknown sysfs entries
+    // as "no such device" + proceeds, much better than -EACCES).
+    //
+    // SELinux note: this gives init a writable /sys/fs/selinux/load it
+    // can write its policy blob to (the write succeeds silently against
+    // a regular empty file — no kernel policy is actually loaded).
+    // /sys/fs/selinux/enforce is pre-seeded with "0" (permissive) by
+    // lib.rs::precreate_sysfs_stubs. Together these make SELinux appear
+    // permissive to init — non-fatal for TWRP boot in the sandbox.
+    if path.starts_with("/sys/") || path == "/sys" {
         return format!("{}{}", rootfs, path);
     }
     if path.starts_with("/system/") || path == "/system" {
@@ -4426,12 +4464,13 @@ mod tests {
     }
 
     #[test]
-    fn translate_path_leaves_proc_sys_data_untouched() {
+    fn translate_path_leaves_proc_data_untouched_but_translates_sys() {
         let rootfs = "/data/user/0/io.twoyi/rootfs";
-        // /proc, /sys, /data are left untranslated (they hit the host's
-        // real proc/sys/data, which is correct for a ptraced unprivileged
-        // child that can't mount a fresh proc/sysfs).
-        for p in &["/proc/self/status", "/sys/class/net", "/data/data"] {
+        // /proc + /data are still left untranslated (they hit the host's
+        // real proc/data, which is correct for a ptraced unprivileged
+        // child that can't mount a fresh proc). /proc/cmdline is handled
+        // by the special-case above (translates to {rootfs}/twrp-cmdline).
+        for p in &["/proc/self/status", "/data/data"] {
             assert_eq!(
                 translate_path(rootfs, p),
                 *p,
@@ -4462,6 +4501,31 @@ mod tests {
         assert_eq!(
             translate_path(rootfs, "/dev/__properties__/properties_serial"),
             format!("{}/dev/__properties__/properties_serial", rootfs)
+        );
+        // /sys/* is NOW translated to rootfs/sys/* (Task 6-P). Previously
+        // /sys was left untranslated → guest's open("/sys/class") hit the
+        // host's REAL kernel sysfs → EACCES → init exit(1) at iter ~3059.
+        // The companion lib.rs::precreate_sysfs_stubs pre-creates the
+        // expected dirs/files so the translated opens succeed.
+        assert_eq!(
+            translate_path(rootfs, "/sys/class"),
+            format!("{}/sys/class", rootfs)
+        );
+        assert_eq!(
+            translate_path(rootfs, "/sys/fs/selinux/enforce"),
+            format!("{}/sys/fs/selinux/enforce", rootfs)
+        );
+        assert_eq!(
+            translate_path(rootfs, "/sys/fs/selinux/load"),
+            format!("{}/sys/fs/selinux/load", rootfs)
+        );
+        // The bare "/sys" (no trailing slash) is also translated — init
+        // occasionally stats the directory itself.
+        assert_eq!(translate_path(rootfs, "/sys"), format!("{}/sys", rootfs));
+        // Subpaths of /sys are also translated (e.g. /sys/class/net).
+        assert_eq!(
+            translate_path(rootfs, "/sys/class/net"),
+            format!("{}/sys/class/net", rootfs)
         );
     }
 

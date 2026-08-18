@@ -1629,6 +1629,170 @@ fn patch_property_contexts_delete(rootfs_prefix: &str) {
     }
 }
 
+/// Pre-create a "fake sysfs" in the guest rootfs (`{rootfs}/sys/`) so the
+/// guest init's `open("/sys/...")` calls succeed against an empty, writable
+/// tree instead of returning `-EACCES` against the host's real kernel sysfs.
+///
+/// # Root cause (Task 6-P, dispatcher's analysis of 56a5bd3 UI E2E)
+///
+/// After 6-O's `property_contexts` deletion (56a5bd3), the guest now
+/// progresses to ptrace iteration **3059** (was 342 — ~9× improvement) before
+/// exiting with code 1. The exit happens right after:
+///
+/// ```text
+/// open("/sys/class")            -> -13 (-EACCES)
+/// open("/sys/fs/selinux/enforce") -> -13 (-EACCES)   (or -ENOENT)
+/// open("/sys/fs/selinux/load")    -> -13 (-EACCES)   (or -ENOENT)
+/// ```
+///
+/// **Why EACCES:** `/sys` is the host's real kernel sysfs (a `selinuxfs`
+/// and `sysfs` superblock owned by root). The guest runs as `untrusted_app`
+/// (no `CAP_SYS_ADMIN`, no `CAP_DAC_OVERRIDE`), so `open("/sys/class")`
+/// fails with `EACCES` on the directory itself and on most of its children.
+/// `selinux_android_load_policy()` ALSO opens
+/// `/sys/fs/selinux/{load,enforce,booleans}` — those don't exist in the
+/// sandbox at all (no real selinuxfs was mounted; the
+/// `mount("selinuxfs", ...)` syscall returns negative).
+///
+/// The EXIT handler IS correctly writing 0 for `mount`/`mknod`/`chmod`
+/// (confirmed by readback logs) — those fixes from prior tasks work. The
+/// `-EACCES` on `/sys/class` is a NEW, different blocker.
+///
+/// # The fix — fake sysfs + path translation
+///
+/// This function pre-creates in the rootfs:
+///   * `{rootfs}/sys/class/`                 (empty directory, mode 0755)
+///   * `{rootfs}/sys/fs/`                    (empty directory, mode 0755)
+///   * `{rootfs}/sys/fs/selinux/`            (empty directory, mode 0755)
+///   * `{rootfs}/sys/fs/selinux/enforce`     (empty file, mode 0666 — content "0")
+///   * `{rootfs}/sys/fs/selinux/load`        (empty file, mode 0666)
+///
+/// Companion change in `ptrace_emu::translate_path`: `/sys/*` opens are
+/// now redirected to `{rootfs}/sys/*` (previously they passed through to
+/// the host's real sysfs — the same fix that was applied to `/dev/*` in
+/// commit 9154e59 / the find_property binary patch removal). Without the
+/// translation, pre-creating the rootfs files alone would be useless —
+/// the guest's `open("/sys/class")` would still hit the host's `/sys/class`
+/// and get `EACCES`.
+///
+/// # Effect on init
+///
+/// init's `open("/sys/class")` now returns a valid fd (or `-ENOENT` if the
+/// directory wasn't pre-created for some reason — much better than `-EACCES`).
+/// If init then `readdir()`s it, it sees an EMPTY directory — no sysfs
+/// devices — and proceeds (init treats "no devices" as "no work to do").
+/// init's `open("/sys/fs/selinux/enforce")` returns a valid fd → `read()`
+/// returns 0 bytes (or the literal "0" we wrote) → init treats SELinux as
+/// permissive. init's `open("/sys/fs/selinux/load")` returns a valid fd →
+/// init's `write()` of the policy blob is silently dropped (the file is a
+/// regular empty file, the write extends it but no kernel policy is actually
+/// loaded — non-fatal for TWRP boot in the sandbox).
+///
+/// # Idempotence
+///
+/// `create_dir_all` + `OpenOptions::create(true).truncate(false)` mean a
+/// prior call's pre-creation is preserved (we do NOT clobber the `enforce`
+/// content with "0" on every call — only on first creation). Repeated calls
+/// are no-ops.
+///
+/// # Non-fatal
+///
+/// All errors are logged at `warning!` and swallowed — the boot proceeds.
+/// If pre-creation fails, the guest will hit the original `-EACCES` blocker
+/// at iteration ~3059 and exit(1), but at least the failure mode is
+/// diagnosable from the parent's log.
+fn precreate_sysfs_stubs(rootfs_prefix: &str) {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Helper: create a directory (idempotent) with a given mode.
+    let mkdir = |rel: &str, mode: u32| {
+        let path = format!("{}/{}", rootfs_prefix, rel);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            warning!(
+                "[KR64] PARENT: failed to pre-create {} (mode {:o}): {} (init's open(/sys/...) may hit EACCES on host's real sysfs — iteration ~3059 exit(1) will persist)",
+                path, mode, e
+            );
+            return;
+        }
+        if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+            warning!(
+                "[KR64] PARENT: created {} but chmod {:o} failed: {} (non-fatal — directory exists, mode may be wrong)",
+                path, mode, e
+            );
+        }
+        info!(
+            "[KR64] PARENT: pre-created {} (dir, mode {:o}) — fake sysfs entry for guest init's open()",
+            path, mode
+        );
+    };
+
+    // Helper: create an empty (or near-empty) file (idempotent). Does NOT
+    // truncate on subsequent calls — only writes the seed content when the
+    // file does not yet exist.
+    let touch = |rel: &str, mode: u32, seed: &str| {
+        let path = format!("{}/{}", rootfs_prefix, rel);
+        // Create-if-missing. We deliberately do NOT use .truncate(true) so
+        // a prior boot's content (e.g. a policy blob the guest wrote to
+        // /sys/fs/selinux/load) is preserved — only the FIRST pre-creation
+        // writes the seed bytes.
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(mode)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                // If the file is empty (just created), seed it with `seed`
+                // so init's read() returns that content instead of 0 bytes.
+                // For `enforce`, "0" means permissive — the safe default.
+                // For `load`, "" is fine (init writes its own policy blob).
+                if !seed.is_empty() {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        if meta.len() == 0 {
+                            use std::io::Write;
+                            let _ = f.write_all(seed.as_bytes());
+                        }
+                    }
+                }
+                let _ =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+                info!(
+                    "[KR64] PARENT: pre-created {} (file, mode {:o}, seed {:?}) — fake sysfs entry for guest init's open()",
+                    path, mode, seed
+                );
+            }
+            Err(e) => warning!(
+                "[KR64] PARENT: failed to pre-create {} (mode {:o}): {} (init's open(/sys/...) may hit EACCES on host's real sysfs — iteration ~3059 exit(1) will persist)",
+                path, mode, e
+            ),
+        }
+    };
+
+    // Create the directory tree first (parents before children).
+    // Note: `create_dir_all` is recursive so we could just call it on the
+    // leaf dirs, but we explicitly create each level so each gets its own
+    // log line + mode setting (diagnostic clarity).
+    mkdir("sys", 0o755);
+    mkdir("sys/class", 0o755);
+    mkdir("sys/fs", 0o755);
+    mkdir("sys/fs/selinux", 0o755);
+
+    // Then create the empty files. `enforce` is seeded with "0" (permissive)
+    // so init's read() interprets SELinux as off — safe default for TWRP in
+    // the sandbox. `load` is empty (init writes its policy blob to it; the
+    // write succeeds silently against the regular file — no kernel policy
+    // is actually loaded).
+    touch("sys/fs/selinux/enforce", 0o666, "0");
+    touch("sys/fs/selinux/load", 0o666, "");
+
+    info!(
+        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion)",
+        rootfs_prefix
+    );
+}
+
 /// Recursively collect .rc files imported by another .rc file.
 ///
 /// Parses `import <path>` lines (one per line, optionally quoted with
@@ -4999,6 +5163,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             ),
         }
     }
+
+    // ── Pre-create fake sysfs (/sys/class + /sys/fs/selinux/{enforce,load}) ──
+    //
+    // ROOT CAUSE (Task 6-P, dispatcher's analysis of 56a5bd3 UI E2E):
+    //   After 6-O's property_contexts deletion (56a5bd3), the guest now
+    //   progresses to iteration 3059 (was 342 — ~9× improvement) but
+    //   exits(1) right after `open("/sys/class") -> -13 (-EACCES)`. init
+    //   tries to enumerate sysfs devices + read SELinux sysfs files
+    //   (/sys/fs/selinux/{enforce,load}), but /sys is the host's REAL
+    //   kernel sysfs which untrusted_app can't read.
+    //
+    // FIX: pre-create these as empty dirs/files in the rootfs + redirect
+    //   /sys/* opens to {rootfs}/sys/* in ptrace_emu's translate_path
+    //   (companion change in ptrace_emu.rs — without it, the pre-creation
+    //   is useless because the guest's open() still hits the host /sys).
+    //   This gives init a "fake sysfs" with no devices — init reads it,
+    //   sees nothing, + proceeds. SELinux enforcement is effectively
+    //   disabled (non-fatal for TWRP boot in the sandbox).
+    //
+    // See `precreate_sysfs_stubs` for the full root-cause analysis +
+    // the per-file rationale (enforce seeded with "0" for permissive;
+    // load left empty so init's policy-blob write succeeds silently).
+    // Idempotent + non-fatal — runs BEFORE fork() so the child sees
+    // the pre-created tree immediately.
+    precreate_sysfs_stubs(&rootfs_prefix);
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -9608,6 +9797,167 @@ mod tests {
             "non-UTF8 file should be DELETED (remove_file works on bytes, not strings). Still exists at: {:?}",
             dir.join("property_contexts")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Tests for `precreate_sysfs_stubs` (Task 6-P).
+    //
+    // Verifies the fake sysfs is materialised in the rootfs with the
+    // expected paths + modes + (for `enforce`) the permissive "0" seed
+    // content. The companion `translate_path` tests in ptrace_emu.rs
+    // verify that `/sys/*` opens are redirected to `{rootfs}/sys/*` —
+    // together they ensure init's `open("/sys/class")` +
+    // `open("/sys/fs/selinux/{enforce,load}")` succeed instead of
+    // returning -EACCES (the iter-3059 exit(1) blocker).
+    // ──────────────────────────────────────────────────────────────────
+
+    fn make_sysfs_temp_rootfs() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "twoyi-kr64-test-sysfs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn precreate_sysfs_stubs_creates_all_expected_paths() {
+        let dir = make_sysfs_temp_rootfs();
+        let rootfs = dir.to_string_lossy().into_owned();
+        precreate_sysfs_stubs(&rootfs);
+        // Directories that init expects to exist + readdir.
+        for rel in &["sys", "sys/class", "sys/fs", "sys/fs/selinux"] {
+            let p = dir.join(rel);
+            assert!(
+                p.is_dir(),
+                "expected {} to be a directory after precreate_sysfs_stubs",
+                p.display()
+            );
+        }
+        // Empty files init opens (SELinux sysfs).
+        for rel in &["sys/fs/selinux/enforce", "sys/fs/selinux/load"] {
+            let p = dir.join(rel);
+            assert!(
+                p.is_file(),
+                "expected {} to be a regular file after precreate_sysfs_stubs",
+                p.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precreate_sysfs_stubs_seeds_enforce_with_zero() {
+        let dir = make_sysfs_temp_rootfs();
+        let rootfs = dir.to_string_lossy().into_owned();
+        precreate_sysfs_stubs(&rootfs);
+        // `enforce` is seeded with "0" (permissive) — init's read() returns
+        // that content + treats SELinux as off. Safe default for TWRP in
+        // the sandbox.
+        let enforce = dir.join("sys/fs/selinux/enforce");
+        let content = std::fs::read_to_string(&enforce).unwrap();
+        assert_eq!(
+            content,
+            "0",
+            "enforce should be seeded with '0' (permissive). Got: {:?} at {}",
+            content,
+            enforce.display()
+        );
+        // `load` is empty — init writes its own policy blob to it (the
+        // write succeeds silently against a regular empty file).
+        let load = dir.join("sys/fs/selinux/load");
+        let load_content = std::fs::read_to_string(&load).unwrap();
+        assert_eq!(
+            load_content,
+            "",
+            "load should be empty (init writes its own policy blob). Got: {:?} at {}",
+            load_content,
+            load.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precreate_sysfs_stubs_is_idempotent() {
+        let dir = make_sysfs_temp_rootfs();
+        let rootfs = dir.to_string_lossy().into_owned();
+        // First call materialises the fake sysfs.
+        precreate_sysfs_stubs(&rootfs);
+        // Capture the enforce content after the first call (should be "0").
+        let enforce = dir.join("sys/fs/selinux/enforce");
+        let after_first = std::fs::read_to_string(&enforce).unwrap();
+        assert_eq!(after_first, "0");
+        // Write something else to `load` (simulating init writing a policy
+        // blob on a prior boot). Idempotent pre-creation must NOT clobber
+        // it — only the FIRST pre-creation writes the (empty) seed.
+        let load = dir.join("sys/fs/selinux/load");
+        std::fs::write(&load, b"<fake-policy-blob-from-prior-boot>").unwrap();
+        // Second call should be a no-op on the existing files (no truncation,
+        // no re-seed of enforce).
+        precreate_sysfs_stubs(&rootfs);
+        let after_second_enforce = std::fs::read_to_string(&enforce).unwrap();
+        assert_eq!(
+            after_second_enforce, "0",
+            "idempotent pre-creation must NOT re-seed enforce (it was already created with '0')"
+        );
+        let after_second_load = std::fs::read_to_string(&load).unwrap();
+        assert_eq!(
+            after_second_load, "<fake-policy-blob-from-prior-boot>",
+            "idempotent pre-creation must NOT truncate an existing load file (init may have written a policy blob on a prior boot)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precreate_sysfs_stubs_sets_modes_correctly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = make_sysfs_temp_rootfs();
+        let rootfs = dir.to_string_lossy().into_owned();
+        precreate_sysfs_stubs(&rootfs);
+        // Dirs are 0755 (rwxr-xr-x — init can read/exec, only owner can write).
+        for rel in &["sys", "sys/class", "sys/fs", "sys/fs/selinux"] {
+            let p = dir.join(rel);
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o755,
+                "directory {} should be mode 0755, got {:o}",
+                p.display(),
+                mode
+            );
+        }
+        // Files are 0666 (rw-rw-rw- — init can read + write, regardless of UID).
+        for rel in &["sys/fs/selinux/enforce", "sys/fs/selinux/load"] {
+            let p = dir.join(rel);
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o666,
+                "file {} should be mode 0666 (init may run as different UID under TWRP's recovery policy), got {:o}",
+                p.display(),
+                mode
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn precreate_sysfs_stubs_creates_sys_root_when_missing() {
+        // If {rootfs}/sys does NOT exist at all (fresh extraction, no prior
+        // pre-creation), precreate_sysfs_stubs must create the whole tree
+        // (create_dir_all handles the recursive creation).
+        let dir = make_sysfs_temp_rootfs();
+        let rootfs = dir.to_string_lossy().into_owned();
+        // Sanity: no sys/ at all yet.
+        assert!(!dir.join("sys").exists());
+        precreate_sysfs_stubs(&rootfs);
+        assert!(dir.join("sys").is_dir());
+        assert!(dir.join("sys/class").is_dir());
+        assert!(dir.join("sys/fs/selinux/enforce").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
