@@ -599,11 +599,23 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // — and post-5-X it correctly says "mknod" (this addition).
     mknod: 14,
     // SysV shared-memory syscalls — see the comment on these fields
-    // in `ChildAbi`. i386: shmget=29, shmat=30, shmctl=31
-    // (asm-i386/unistd_32.h).
-    shmget: 29,
-    shmat: 30,
-    shmctl: 31,
+    // in `ChildAbi`. i386 (verified against
+    // /usr/include/x86_64-linux-gnu/asm/unistd_32.h in Task 6-C):
+    //   __NR_shmget = 395
+    //   __NR_shmat  = 397
+    //   __NR_shmctl = 396
+    // NOTE: the order is shmget=395, shmctl=396, shmat=397 — shmat is
+    // 397, NOT 396. The previous values (29/30/31) were copy-pasted
+    // from ABI_X86_64 and were WRONG: i386 syscall 29 is `pause` (not
+    // shmget), 30 is `utime` (not shmat), 31 is `stty` (not shmctl).
+    // That copy-paste caused the post-e6d85e1 UI E2E blocker where
+    // init's real shmget() calls (nr=395) were never intercepted by
+    // the SIGSYS handler, while `pause()` (nr=29) was misidentified
+    // as shmget and had -ENOSYS returned — yielding an infinite
+    // shmget-retry loop (790k+ calls/sec). Task 6-C.
+    shmget: 395,
+    shmat: 397,
+    shmctl: 396,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1337,12 +1349,44 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
 /// leave rax non-zero (the EXIT handler wrote 0). It only AVOIDS the
 /// race where the SIGSYS handler's whole-struct `setregs` clobbers
 /// the EXIT handler's rax=0 with a kernel-re-snapshotted value.
-fn should_skip_sigsys_setregs(in_syscall_at_sigsys: bool) -> bool {
-    // DESYNC = SIGSYS fired AFTER the EXIT handler. The EXIT handler
-    // already wrote rax=0, so the SIGSYS handler's setregs is
-    // redundant AND potentially racy with the kernel's signal-
-    // delivery-stop register snapshotting.
-    !in_syscall_at_sigsys
+///
+/// # Task 6-C refinement — do NOT skip for non-fake-success syscalls
+///
+/// 5-J's original implementation was a pure negation of
+/// `in_syscall_at_sigsys`: `!in_syscall_at_sigsys`. That fired
+/// unconditionally in DESYNC mode for EVERY syscall, including the
+/// SysV shared-memory syscalls (shmget/shmat/shmctl) whose return
+/// value the SIGSYS handler writes as -ENOSYS (-38) — NOT 0. Those
+/// syscalls are NOT in `compute_exit_return_value`'s fake-success
+/// list (it returns `None`, not `Some(0)`), so in DESYNC mode the
+/// EXIT handler does NOT write rax for them either. With 5-J's
+/// unconditional skip, the SIGSYS handler's `ptrace_setregs` was
+/// ALSO skipped → rax was left untouched → the child resumed with
+/// the kernel's leaked syscall-number value in rax (e.g. 395 for
+/// i386 shmget, post-6-C) → init saw a POSITIVE "shmid" → tried to
+/// use it → failed → retried shmget forever (790k+ calls/sec). The
+/// post-e6d85e1 UI E2E blocker. (Pre-6-C the same symptom manifested
+/// with rax=29 — the WRONG i386 shmget number — because the SIGSYS
+/// handler thought the guest's `pause()` syscall (nr=29) was
+/// shmget.)
+///
+/// The fix: the skip fires ONLY when the syscall is in
+/// `compute_exit_return_value`'s fake-success list (returns
+/// `Some(_)`). For syscalls NOT in that list (e.g. shmget, which
+/// returns -ENOSYS via the SIGSYS handler), the skip must NOT fire —
+/// the SIGSYS handler's `setregs` is the ONLY writeback and MUST
+/// execute to write the non-zero return value.
+fn should_skip_sigsys_setregs(in_syscall_at_sigsys: bool, syscall_nr: i64, abi: &ChildAbi) -> bool {
+    // DESYNC = SIGSYS fired AFTER the EXIT handler. The SIGSYS
+    // handler's setregs is redundant (the EXIT handler already wrote
+    // rax=0) AND potentially racy with the kernel's signal-delivery-
+    // stop register snapshotting — BUT ONLY for syscalls in
+    // `compute_exit_return_value`'s fake-success list, because only
+    // those have rax written by the EXIT handler. For other syscalls
+    // (e.g. shmget, which the SIGSYS handler returns -ENOSYS for), the
+    // EXIT handler did NOT write rax, so the SIGSYS handler's setregs
+    // is the ONLY writeback and MUST fire (Task 6-C).
+    !in_syscall_at_sigsys && compute_exit_return_value(syscall_nr, abi).is_some()
 }
 
 /// Set a syscall argument register to `val`.
@@ -3634,45 +3678,44 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // `sigsys_regs` so the readback log below can
                         // report what we WOULD have written.
                         set_syscall_ret(&mut sigsys_regs, &a, ret_val);
-                        if should_skip_sigsys_setregs(in_syscall_at_sigsys) {
-                            // DESYNC mode: SIGSYS fired AFTER the EXIT
-                            // stop. The EXIT handler may or may not have
-                            // already written rax=0 for this syscall —
-                            // it depends on whether the syscall is in
+                        if should_skip_sigsys_setregs(in_syscall_at_sigsys, original_syscall, &a) {
+                            // DESYNC mode (5-J) AND this syscall is in
                             // `compute_exit_return_value`'s fake-success
-                            // list. We skip setregs EITHER WAY to avoid
-                            // racing with the kernel's signal-delivery-
-                            // stop register snapshotting (5-J's fix).
+                            // list (6-C). SIGSYS fired AFTER the EXIT
+                            // stop, and the EXIT handler ALREADY wrote
+                            // rax=0 for this syscall — so the SIGSYS
+                            // handler's setregs is redundant AND would
+                            // race with the kernel's signal-delivery-
+                            // stop register snapshotting. Skip it.
+                            //
+                            // The 6-C refinement: `should_skip_sigsys_setregs`
+                            // now requires `compute_exit_return_value(...)
+                            // .is_some()`. For syscalls NOT in the fake-
+                            // success list (e.g. shmget, which the SIGSYS
+                            // handler returns -ENOSYS for), the skip does
+                            // NOT fire — the SIGSYS handler's setregs is
+                            // the ONLY writeback and MUST execute to
+                            // write the non-zero return value. (Pre-6-C
+                            // the skip fired unconditionally in DESYNC
+                            // mode → shmget's -ENOSYS was never written →
+                            // rax retained the kernel's leaked syscall-
+                            // number value → init saw a positive "shmid"
+                            // → infinite shmget-retry loop.)
                             //
                             // The fs op (mount/mkdir/mknod) has already
                             // been performed above; we just don't write
                             // regs back.
                             //
-                            // 5-X drive-by diagnostic fix: the original
-                            // message here unconditionally claimed
-                            // "EXIT handler already wrote rax=0" — which
-                            // was misleading for any syscall NOT in the
-                            // fake-success list (the kernel's leaked
-                            // rax = syscall-number value was left
-                            // untouched). Now the message is conditional:
-                            // only claim "EXIT handler already wrote rax=0"
-                            // when compute_exit_return_value actually
-                            // returned Some(0) for this syscall; otherwise
-                            // we explicitly note "did NOT write rax —
-                            // rax retains the kernel's leaked value".
-                            let exit_handler_wrote_zero =
-                                compute_exit_return_value(original_syscall, &a).is_some();
-                            if exit_handler_wrote_zero {
-                                sigsys_log(&format!(
-                                    "SIGSYS handler: DESYNC mode — skipping ptrace_setregs for nr={} [{}] (EXIT handler already wrote rax=0; would-have-written rax={})",
-                                    original_syscall, name, ret_val
-                                ));
-                            } else {
-                                sigsys_log(&format!(
-                                    "SIGSYS handler: DESYNC mode — skipping ptrace_setregs for nr={} [{}] (EXIT handler did NOT write rax for this syscall — NOT in compute_exit_return_value's fake-success list; rax retains the kernel's leaked syscall-number value; would-have-written rax={})",
-                                    original_syscall, name, ret_val
-                                ));
-                            }
+                            // Because the skip fires ONLY when
+                            // `compute_exit_return_value` returned Some,
+                            // we know the EXIT handler wrote rax=0 here.
+                            // No need for the 5-X conditional message
+                            // ("did NOT write rax") — that branch is now
+                            // structurally unreachable for skips.
+                            sigsys_log(&format!(
+                                "SIGSYS handler: DESYNC mode — skipping ptrace_setregs for nr={} [{}] (in compute_exit_return_value's fake-success list; EXIT handler already wrote rax=0; would-have-written rax={})",
+                                original_syscall, name, ret_val
+                            ));
                         } else if let Err(e) = ptrace_setregs(pid, &sigsys_regs, len) {
                             // PTRACE_SETREGS failed — the faked return
                             // value was NOT applied. The child will see
@@ -4031,17 +4074,31 @@ mod tests {
     // ── SysV shared-memory syscall number tests ─────────────────────
     //
     // These verify that the shmget / shmat / shmctl syscall numbers
-    // in each ChildAbi match the real kernel ABI. The 0a4be80 E2E run
-    // showed that init calls shmget (i386 nr=29) during early boot
-    // for __system_property_area_init; if our ABI table had the wrong
-    // number the SIGSYS handler would not recognise it and would fall
-    // through to the "unexpected SIGSYS" path (returning 0, causing
-    // the infinite shmget loop that OOM'd the Java FileLogger).
+    // in each ChildAbi match the real kernel ABI (verified directly
+    // against /usr/include/{x86_64-linux-gnu/asm/unistd_32.h,
+    // x86_64-linux-gnu/asm/unistd_64.h, asm-generic/unistd.h} in
+    // Task 6-C — see the comments on ABI_X86_32's shm fields).
+    //
+    // The post-e6d85e1 UI E2E blocker (Task 6-C): the i386 shm numbers
+    // were copy-pasted from ABI_X86_64 (29/30/31) — but those are the
+    // x86_64 numbers, NOT the i386 numbers. i386 syscall 29 is
+    // `pause`, 30 is `utime`, 31 is `stty`. The real i386 shm numbers
+    // are 395 (shmget) / 397 (shmat) / 396 (shmctl). With the wrong
+    // numbers, init's real shmget() calls (nr=395) were never
+    // intercepted by the SIGSYS handler; meanwhile `pause()` (nr=29)
+    // was misidentified as shmget and had -ENOSYS returned — yielding
+    // an infinite shmget-retry loop (790k+ calls/sec) because init's
+    // pause() loop never made forward progress. 6-C fixes the numbers
+    // AND the DESYNC-skip logic that was masking the SIGSYS handler's
+    // -ENOSYS writeback.
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn abi_x86_64_shm_numbers() {
-        // asm/unistd_64.h: shmget=29, shmat=30, shmctl=31
+    fn abi_x86_64_shm_numbers_correct() {
+        // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+        //   #define __NR_shmget 29
+        //   #define __NR_shmat  30
+        //   #define __NR_shmctl 31
         assert_eq!(ABI_X86_64.shmget, 29, "x86_64 shmget must be 29");
         assert_eq!(ABI_X86_64.shmat, 30, "x86_64 shmat must be 30");
         assert_eq!(ABI_X86_64.shmctl, 31, "x86_64 shmctl must be 31");
@@ -4049,19 +4106,34 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn abi_x86_32_shm_numbers() {
-        // asm-i386/unistd_32.h: shmget=29, shmat=30, shmctl=31
-        // (same as x86_64 — the i386 IPC syscalls are NOT multiplexed
-        // through ipc(5) on Linux; they have direct entry points.)
-        assert_eq!(ABI_X86_32.shmget, 29, "i386 shmget must be 29");
-        assert_eq!(ABI_X86_32.shmat, 30, "i386 shmat must be 30");
-        assert_eq!(ABI_X86_32.shmctl, 31, "i386 shmctl must be 31");
+    fn abi_x86_32_shm_numbers_correct() {
+        // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+        //   #define __NR_pause   29   ← what kr64 WRONGLY used as shmget pre-6-C
+        //   #define __NR_shmget 395
+        //   #define __NR_shmctl 396
+        //   #define __NR_shmat  397
+        // (Note the order: shmat=397, NOT 396 — easy to mis-order.)
+        assert_eq!(
+            ABI_X86_32.shmget, 395,
+            "i386 shmget must be 395 (NOT 29 — 29 is pause)"
+        );
+        assert_eq!(
+            ABI_X86_32.shmat, 397,
+            "i386 shmat must be 397 (NOT 30 — 30 is utime)"
+        );
+        assert_eq!(
+            ABI_X86_32.shmctl, 396,
+            "i386 shmctl must be 396 (NOT 31 — 31 is stty)"
+        );
     }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
-    fn abi_aarch64_shm_numbers() {
-        // asm-generic/unistd.h: shmget=194, shmctl=195, shmat=196
+    fn abi_aarch64_shm_numbers_correct() {
+        // Verified against /usr/include/asm-generic/unistd.h:
+        //   #define __NR_shmget 194
+        //   #define __NR_shmctl 195
+        //   #define __NR_shmat  196
         assert_eq!(ABI_AARCH64.shmget, 194, "aarch64 shmget must be 194");
         assert_eq!(ABI_AARCH64.shmat, 196, "aarch64 shmat must be 196");
         assert_eq!(ABI_AARCH64.shmctl, 195, "aarch64 shmctl must be 195");
@@ -4765,9 +4837,16 @@ mod tests {
     // then took the chmod-error path and dereferenced NULL+0x90.
     //
     // The fix: in DESYNC mode, the SIGSYS handler SKIPS its
-    // `ptrace_setregs` call (the EXIT handler already wrote rax=0).
-    // `should_skip_sigsys_setregs(in_syscall_at_sigsys)` returns true
-    // when `in_syscall_at_sigsys` is false (DESYNC).
+    // `ptrace_setregs` call (the EXIT handler already wrote rax=0) —
+    // BUT ONLY for syscalls in `compute_exit_return_value`'s fake-
+    // success list (Task 6-C refinement). For syscalls NOT in that
+    // list (e.g. shmget, which the SIGSYS handler returns -ENOSYS
+    // for), the skip must NOT fire — the SIGSYS handler's setregs is
+    // the ONLY writeback and MUST execute to write the non-zero
+    // return value. `should_skip_sigsys_setregs(in_syscall_at_sigsys,
+    // syscall_nr, abi)` returns true when `in_syscall_at_sigsys` is
+    // false (DESYNC) AND `compute_exit_return_value(syscall_nr, abi)`
+    // returns Some — i.e. the EXIT handler already wrote rax=0.
 
     #[test]
     fn should_skip_sigsys_setregs_in_desync_mode() {
@@ -4777,8 +4856,17 @@ mod tests {
         // already wrote rax=0 for the faked-success syscalls, so the
         // SIGSYS handler's `ptrace_setregs` is redundant AND
         // potentially racy — skip it.
+        //
+        // Use chmod — it's in `compute_exit_return_value`'s fake-
+        // success list, so the 6-C refinement's second condition
+        // (`compute_exit_return_value(...).is_some()`) is satisfied.
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+        let chmod_nr = abi.chmod;
         assert!(
-            should_skip_sigsys_setregs(false),
+            should_skip_sigsys_setregs(false, chmod_nr, &abi),
             "DESYNC: SIGSYS fired after EXIT — must skip setregs to avoid clobbering EXIT handler's rax=0"
         );
     }
@@ -4790,28 +4878,98 @@ mod tests {
         // replaces the syscall-exit-stop). `in_syscall` was true at
         // SIGSYS entry. The EXIT handler has NOT yet run, so the SIGSYS
         // handler's `ptrace_setregs` is the ONLY writeback — must NOT
-        // skip it.
+        // skip it, REGARDLESS of whether the syscall is in the fake-
+        // success list.
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+        // Test BOTH a fake-success syscall (chmod) AND a non-fake-
+        // success syscall (shmget) to verify NORMAL mode never skips.
+        let chmod_nr = abi.chmod;
+        let shmget_nr = abi.shmget;
         assert!(
-            !should_skip_sigsys_setregs(true),
-            "NORMAL: SIGSYS fired between ENTRY and EXIT — must NOT skip setregs (it's the only writeback)"
+            !should_skip_sigsys_setregs(true, chmod_nr, &abi),
+            "NORMAL: SIGSYS fired between ENTRY and EXIT — must NOT skip setregs for chmod (it's the only writeback)"
+        );
+        assert!(
+            !should_skip_sigsys_setregs(true, shmget_nr, &abi),
+            "NORMAL: SIGSYS fired between ENTRY and EXIT — must NOT skip setregs for shmget either (it's the only writeback, and shmget needs -ENOSYS)"
+        );
+    }
+
+    // ── 6-C regression tests: should_skip_sigsys_setregs honours ─
+    //   compute_exit_return_value's fake-success list
+    //
+    // These guard the 6-C fix for the infinite shmget-retry loop.
+    // The OLD contract (5-J) was a pure negation of
+    // `in_syscall_at_sigsys`: `!in_syscall_at_sigsys`. That fired
+    // unconditionally in DESYNC mode for EVERY syscall, including
+    // shmget/shmat/shmctl whose return value the SIGSYS handler writes
+    // as -ENOSYS (NOT 0). Since those syscalls are NOT in
+    // `compute_exit_return_value`'s fake-success list, the EXIT
+    // handler doesn't write rax for them either → with the unconditional
+    // skip, rax retained the kernel's leaked syscall-number value →
+    // init saw a positive "shmid" → retried shmget forever.
+    //
+    // The 6-C NEW contract: skip fires ONLY when (DESYNC mode) AND
+    // (syscall is in compute_exit_return_value's fake-success list).
+    // These two tests pin the contract for the two key representative
+    // syscalls: chmod (fake-success → skip fires) and shmget
+    // (non-fake-success → skip must NOT fire).
+
+    #[test]
+    fn should_skip_sigsys_setregs_true_for_chmod() {
+        // chmod IS in compute_exit_return_value's fake-success list
+        // (it returns Some(0)). In DESYNC mode the EXIT handler has
+        // ALREADY written rax=0 → the SIGSYS handler's setregs is
+        // redundant AND would race with the kernel's signal-delivery-
+        // stop register snapshotting. Skip MUST fire.
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+        let chmod_nr = abi.chmod;
+        // Sanity: chmod is in the fake-success list.
+        assert_eq!(
+            compute_exit_return_value(chmod_nr, &abi),
+            Some(0),
+            "chmod must be in compute_exit_return_value's fake-success list"
+        );
+        // DESYNC + fake-success → skip.
+        assert!(
+            should_skip_sigsys_setregs(false, chmod_nr, &abi),
+            "DESYNC + chmod (fake-success): skip MUST fire — EXIT handler already wrote rax=0"
         );
     }
 
     #[test]
-    fn should_skip_sigsys_setregs_is_pure_negation() {
-        // The helper is a pure negation of `in_syscall_at_sigsys`.
-        // This locks the contract: any future change that adds
-        // conditions (e.g. "skip only for chmod") must update this
-        // test deliberately, not accidentally.
-        for in_syscall in [true, false] {
-            assert_eq!(
-                should_skip_sigsys_setregs(in_syscall),
-                !in_syscall,
-                "should_skip_sigsys_setregs({}) must equal !{}",
-                in_syscall,
-                in_syscall
-            );
-        }
+    fn should_skip_sigsys_setregs_false_for_shmget() {
+        // shmget is NOT in compute_exit_return_value's fake-success
+        // list (it returns None — the SIGSYS handler returns -ENOSYS
+        // for shmget separately). In DESYNC mode the EXIT handler did
+        // NOT write rax for shmget → the SIGSYS handler's setregs is
+        // the ONLY writeback and MUST execute to write -ENOSYS. Skip
+        // MUST NOT fire. (Pre-6-C this fired unconditionally in DESYNC
+        // mode → -ENOSYS was never written → rax retained the kernel's
+        // leaked syscall-number value → init saw a positive "shmid" →
+        // infinite shmget-retry loop.)
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+        let shmget_nr = abi.shmget;
+        // Sanity: shmget is NOT in the fake-success list.
+        assert_eq!(
+            compute_exit_return_value(shmget_nr, &abi),
+            None,
+            "shmget must NOT be in compute_exit_return_value's fake-success list (the SIGSYS handler returns -ENOSYS for it)"
+        );
+        // DESYNC + NOT fake-success → must NOT skip.
+        assert!(
+            !should_skip_sigsys_setregs(false, shmget_nr, &abi),
+            "DESYNC + shmget (NOT in fake-success list): skip MUST NOT fire — SIGSYS handler's setregs is the only writeback (writes -ENOSYS)"
+        );
     }
 
     /// Simulate the DESYNC stop sequence for a single seccomp-trapped
@@ -4872,7 +5030,7 @@ mod tests {
         // and the child could resume with rax=15 (the syscall number
         // from syscall_rollback), causing the SIGSEGV at rip=0x809255d.
         let in_syscall_at_sigsys = in_syscall_after_exit;
-        let skip_setregs = should_skip_sigsys_setregs(in_syscall_at_sigsys);
+        let skip_setregs = should_skip_sigsys_setregs(in_syscall_at_sigsys, chmod_nr, &abi);
         assert!(
             skip_setregs,
             "DESYNC: must skip SIGSYS setregs (in_syscall_at_sigsys={})",
@@ -4918,7 +5076,7 @@ mod tests {
         // The EXIT handler has NOT yet run, so the SIGSYS handler's
         // `ptrace_setregs` is the ONLY writeback — must NOT skip it.
         let in_syscall_at_sigsys = in_syscall_after_entry;
-        let skip_setregs = should_skip_sigsys_setregs(in_syscall_at_sigsys);
+        let skip_setregs = should_skip_sigsys_setregs(in_syscall_at_sigsys, chmod_nr, &abi);
         assert!(
             !skip_setregs,
             "NORMAL: must NOT skip SIGSYS setregs (in_syscall_at_sigsys={}) — it's the only writeback",
