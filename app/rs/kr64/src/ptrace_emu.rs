@@ -477,6 +477,52 @@ struct ChildAbi {
     //     currently dead code at runtime — the sentinel keeps the
     //     compile happy and documents the aarch64 behaviour.)
     pause: i64,
+    // Task 6-S: fork / clone / vfork / wait4 / exit_group syscall numbers.
+    // Used ONLY by the dedicated always-log diagnostic blocks in the ENTRY
+    // + EXIT handlers of `run_ptrace_loop` (search for "Task-6-S ENTRY"
+    // + "Task-6-S EXIT" log strings). These 5 syscalls are the critical
+    // signals for diagnosing the post-6-R recovery exit(1):
+    //   - The recovery (post-6-R's lsetxattr fix) runs 3281 iterations
+    //     before exit(1), but the post-execve logging was capped at 150
+    //     — hiding the middle phase (iters 151-3271) where fork/clone
+    //     attempts + the exit trigger live.
+    //   - The bceac63 diagnostic showed ZERO fork/clone/vfork calls in
+    //     the entire visible logcat (neither i386 nr=2/120/190 nor x86_64
+    //     nr=56/57/58). The recovery's last-10 ALL syscalls include
+    //     wait4 (init waiting for a child) and exit_group. The child
+    //     is absent or dead → wait4 likely returns -ECHILD → recovery
+    //     exit_group(1). But we cannot tell whether recovery attempts
+    //     fork/clone in the middle phase because the cap hid it.
+    //   - The dedicated always-log block (NOT gated by the 5000 cap) for
+    //     these 5 syscalls ensures we ALWAYS see them, even past iter
+    //     5000 — so we can determine whether the guest ever creates
+    //     children + what wait4 returns.
+    //
+    // Verified directly against the kernel's UAPI headers in Task 6-S
+    // (NOT just taken from the task spec):
+    //   i386 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h):
+    //     __NR_fork 2, __NR_clone 120, __NR_vfork 190,
+    //     __NR_wait4 114, __NR_exit_group 252.
+    //   x86_64 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h):
+    //     __NR_fork 57, __NR_clone 56, __NR_vfork 58,
+    //     __NR_wait4 61, __NR_exit_group 231.
+    //   aarch64 (per /usr/include/asm-generic/unistd.h):
+    //     __NR_clone 220, __NR_wait4 260, __NR_exit_group 94.
+    //     NOTE: __NR_exit_group is 94 (NOT 93 — 93 is plain `exit`,
+    //     which exits just the calling thread; exit_group exits all
+    //     threads in the process and is what bionic's exit_group() /
+    //     _Exit() wrappers call). The task spec for 6-S said aarch64
+    //     exit_group=93 — that was WRONG. Verified: 94.
+    //     aarch64 (asm-generic) DROPPED plain `fork` and `vfork` —
+    //     bionic's fork() libc wrapper on aarch64 issues clone() under
+    //     the hood. fork_nr=-1 + vfork_nr=-1 (sentinels "not present
+    //     on this ABI"). Mirrors the existing pattern for
+    //     ABI_AARCH64.open / access / lchown / chown / mknod / pause.
+    clone_nr: i64,
+    fork_nr: i64,
+    vfork_nr: i64,
+    wait4_nr: i64,
+    exit_group_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -623,6 +669,22 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // wait instead of looping on -EINTR + re-checking the never-ready
     // property service).
     pause: 34,
+    // Task 6-S: fork / clone / vfork / wait4 / exit_group syscall numbers
+    // (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h, verified
+    // directly against the kernel's UAPI header in Task 6-S). Used by the
+    // dedicated always-log ENTRY/EXIT diagnostic block in run_ptrace_loop
+    // for these 5 critical syscalls (NOT gated by the 5000 post-execve
+    // cap, so we never miss them even past iter 5000). The host is x86_64
+    // running an i386 child, so these x86_64 numbers do NOT currently
+    // fire at runtime (the guest uses i386 syscall 2/120/190/114/252).
+    // Locked in for ABI completeness + so the always-log block compiles
+    // + works correctly if a future x86_64 guest is ever supported
+    // (mirrors the mknod: 133 / setxattr: 188 / pause: 34 precedent).
+    clone_nr: 56,
+    fork_nr: 57,
+    vfork_nr: 58,
+    wait4_nr: 61,
+    exit_group_nr: 231,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -769,6 +831,24 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // "unintercepted" by the shmget branch and falling through to the
     // default "returning 0" branch — exposing the pause() loop bug.
     pause: 29,
+    // Task 6-S: fork / clone / vfork / wait4 / exit_group syscall numbers
+    // (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h, verified
+    // directly against the kernel's UAPI header in Task 6-S). THIS is
+    // the value set that fires at runtime — TWRP init + recovery are
+    // i386 binaries. The dedicated always-log ENTRY/EXIT block for these
+    // 5 syscalls (NOT gated by the 5000 post-execve cap) is what will
+    // reveal whether the post-6-R recovery actually calls fork/clone/
+    // vfork in the middle phase (iters 151-3271) that the pre-6-S 150-
+    // cap was hiding. The bceac63 diagnostic showed ZERO such calls in
+    // the last-10 buffer + the entire visible logcat — but that's
+    // exactly the range that was hidden by the cap. With the always-log
+    // block in place + the cap raised to 5000, the next UI E2E run
+    // will tell us definitively whether recovery ever forks a service.
+    clone_nr: 120,
+    fork_nr: 2,
+    vfork_nr: 190,
+    wait4_nr: 114,
+    exit_group_nr: 252,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -923,6 +1003,27 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // is currently dead code at runtime — the sentinel keeps the
     // compile happy and documents the aarch64 behaviour.
     pause: -1,
+    // Task 6-S: fork / clone / vfork / wait4 / exit_group syscall numbers
+    // (per /usr/include/asm-generic/unistd.h, verified directly against
+    // the kernel's UAPI header in Task 6-S). aarch64 uses asm-generic,
+    // which DROPPED plain `fork` and `vfork` (bionic's fork() libc
+    // wrapper on aarch64 issues clone() under the hood — see the
+    // existing pattern for ABI_AARCH64.open / access / lchown / chown /
+    // mknod / pause). So fork_nr=-1 and vfork_nr=-1.
+    // NOTE: __NR_exit_group is 94 (NOT 93 — 93 is plain `exit`, which
+    // exits just the calling thread; exit_group exits all threads in the
+    // process and is what bionic's exit_group() / _Exit() wrappers call).
+    // The task spec for 6-S said aarch64 exit_group=93 — that was WRONG;
+    // verified: 94. __NR_clone is 220, __NR_wait4 is 260.
+    // The host is x86_64 running an i386 child, so this aarch64 path is
+    // currently dead code at runtime — locked in for ABI completeness
+    // + so the always-log block compiles + works correctly if a future
+    // aarch64 host is ever used.
+    clone_nr: 220,
+    fork_nr: -1,
+    vfork_nr: -1,
+    wait4_nr: 260,
+    exit_group_nr: 94,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2499,9 +2600,15 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     // ones that returned the error init is reacting to (an openat()
     // that returned -ENOENT, an fstat() that returned -EBADF, …), so
     // logging them is the single most useful next diagnostic. The
-    // cap (10) is small to keep the exit log line readable — we only
-    // need the last few to spot the failing syscall.
-    const RECENT_ALL_SYSCALLS_CAP: usize = 10;
+    // cap (50) is sized to show the recovery's full cleanup/exit path
+    // (Task 6-S: was 10 — bumped to 50 because the post-6-R recovery
+    // runs 3281 iterations before exit(1), and the last 10 was too
+    // short to see the context that led to exit_group(1). 50 captures
+    // roughly the final mprotect/munmap/wait4 sequence + the execve-
+    // time setup that preceded it, while still keeping the log line
+    // readable — `format_syscall_buffer` joins with ", " so a 50-elem
+    // buffer is one ~600-char line, well within logcat's 4 KiB cap).
+    const RECENT_ALL_SYSCALLS_CAP: usize = 50;
     let mut recent_all_syscalls: std::collections::VecDeque<i64> =
         std::collections::VecDeque::with_capacity(RECENT_ALL_SYSCALLS_CAP);
     // Signal to deliver to the child on the next PTRACE_SYSCALL resume.
@@ -3285,14 +3392,69 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // may already be large (kr64's pre-execve syscalls
                     // inflate it), so the existing "loop_count <= 50"
                     // log gate would suppress these.
+                    //
+                    // Task 6-S: increased from 150 to 5000 to capture the
+                    // full recovery phase (recovery runs ~3281 iterations
+                    // before exit(1); 150 hid the middle phase where
+                    // fork/clone attempts + the exit trigger live).
                     if past_first_execve {
                         post_execve_syscall_count = post_execve_syscall_count.saturating_add(1);
-                        if post_execve_syscall_count <= 150 {
+                        if post_execve_syscall_count <= 5000 {
                             log(&format!(
                                 "post-execve syscall #{}: nr={} [{}]",
                                 post_execve_syscall_count,
                                 syscall_num,
                                 syscall_name(syscall_num, &abi)
+                            ));
+                        }
+                    }
+
+                    // Task 6-S: always log fork/clone/vfork/wait4/exit_group
+                    // (critical for diagnosing the recovery exit(1) — these
+                    // reveal whether the guest attempts to fork services +
+                    // what wait4 returns). Not gated by the 5000 post-execve
+                    // cap so we never miss them even past iteration 5000.
+                    // The bceac63 diagnostic showed ZERO fork/clone/vfork
+                    // calls in the entire visible logcat (neither i386
+                    // nr=2/120/190 nor x86_64 nr=56/57/58) — but the post-
+                    // execve logging was capped at 150, hiding the middle
+                    // phase (iters 151-3271) where these attempts would
+                    // have lived. This block ensures we ALWAYS see them.
+                    //
+                    // NOTE: this fires on EVERY ENTRY stop (not just post-
+                    // execve), so kr64's own pre-execve fork/clone calls
+                    // (if any) are also captured. The post-6-R recovery's
+                    // exit(1) at iter 3281 with last-10 ALL syscalls
+                    // including wait4 + exit_group but ZERO fork/clone/
+                    // vfork is the immediate target of this log.
+                    {
+                        let nr = syscall_num;
+                        if nr == abi.clone_nr
+                            || nr == abi.fork_nr
+                            || nr == abi.vfork_nr
+                            || nr == abi.wait4_nr
+                            || nr == abi.exit_group_nr
+                        {
+                            let name = if nr == abi.clone_nr {
+                                "clone"
+                            } else if nr == abi.fork_nr {
+                                "fork"
+                            } else if nr == abi.vfork_nr {
+                                "vfork"
+                            } else if nr == abi.wait4_nr {
+                                "wait4"
+                            } else {
+                                "exit_group"
+                            };
+                            log(&format!(
+                                "Task-6-S ENTRY: pid={} {} nr={} args=0x{:x},0x{:x},0x{:x},0x{:x}",
+                                pid,
+                                name,
+                                nr,
+                                get_syscall_arg(&regs, abi.reg_arg1),
+                                get_syscall_arg(&regs, abi.reg_arg2),
+                                get_syscall_arg(&regs, abi.reg_arg3),
+                                get_syscall_arg(&regs, abi.reg_arg4),
                             ));
                         }
                     }
@@ -3632,7 +3794,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // ── Post-execve RETURN-VALUE logging ─────────────
                     //
                     // Logs the kernel's return value for every post-execve
-                    // syscall (first 150), so we can see EXACTLY which
+                    // syscall (first 5000), so we can see EXACTLY which
                     // open/mount/mkdir/mknod fails and with what errno.
                     // This is read from the `regs` snapshot taken at the
                     // TOP of this SIGTRAP|0x80 stop (BEFORE the
@@ -3647,7 +3809,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // here will be that faked 0, which is still useful
                     // (confirms the fake was applied) — the ENTRY-side
                     // path log above tells us WHAT was attempted.
-                    if past_first_execve && post_execve_syscall_count <= 150 {
+                    //
+                    // Task 6-S: increased from 150 to 5000 to capture the
+                    // full recovery phase (recovery runs ~3281 iterations
+                    // before exit(1); 150 hid the middle phase where
+                    // fork/clone attempts + the exit trigger live).
+                    if past_first_execve && post_execve_syscall_count <= 5000 {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
@@ -3661,6 +3828,50 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             syscall_num,
                             ret_desc
                         ));
+                    }
+
+                    // Task 6-S: log the return value for
+                    // fork/clone/vfork/wait4/exit_group (NOT gated by the
+                    // 5000 post-execve cap). This is the EXIT-side
+                    // companion to the ENTRY-side always-log above. For
+                    // fork/clone/vfork a positive return value is the
+                    // child PID (in the parent) or 0 (in the child); a
+                    // negative value is -errno (e.g. -ENOMEM, -EAGAIN).
+                    // For wait4 it is the reaped child's PID, or -ECHILD
+                    // (no children to wait for — the post-6-R recovery's
+                    // suspected failure mode), or -EINTR.
+                    // For exit_group the call never returns to the caller
+                    // (the process exits) — but if we somehow see this
+                    // fire it confirms exit_group was the syscall that
+                    // terminated the child. The pre-6-S 150-cap hid
+                    // whether recovery ever attempted these in the middle
+                    // phase (iters 151-3271) — this block ensures we see
+                    // the return values even past 5000 iterations.
+                    {
+                        let nr = syscall_num;
+                        if nr == abi.clone_nr
+                            || nr == abi.fork_nr
+                            || nr == abi.vfork_nr
+                            || nr == abi.wait4_nr
+                            || nr == abi.exit_group_nr
+                        {
+                            let name = if nr == abi.clone_nr {
+                                "clone"
+                            } else if nr == abi.fork_nr {
+                                "fork"
+                            } else if nr == abi.vfork_nr {
+                                "vfork"
+                            } else if nr == abi.wait4_nr {
+                                "wait4"
+                            } else {
+                                "exit_group"
+                            };
+                            let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            log(&format!(
+                                "Task-6-S EXIT: pid={} {} nr={} -> {} (0x{:x})",
+                                pid, name, nr, ret, ret as u64,
+                            ));
+                        }
                     }
 
                     // ── execve EXIT: schedule ABI reset ──
@@ -5943,6 +6154,103 @@ mod tests {
         assert_eq!(ABI_AARCH64.setxattr, 188, "aarch64 setxattr must be 188");
         assert_eq!(ABI_AARCH64.lsetxattr, 189, "aarch64 lsetxattr must be 189");
         assert_eq!(ABI_AARCH64.fsetxattr, 190, "aarch64 fsetxattr must be 190");
+    }
+
+    // ── Task 6-S regression guards: fork/clone/vfork/wait4/exit_group ──
+    //
+    // These tests lock in the architectural contract added by Task 6-S:
+    // that the ChildAbi struct carries clone_nr / fork_nr / vfork_nr /
+    // wait4_nr / exit_group_nr fields, used by the dedicated always-log
+    // ENTRY/EXIT diagnostic block in run_ptrace_loop (NOT gated by the
+    // 5000 post-execve cap) so we never miss fork/clone/vfork/wait4/
+    // exit_group calls — critical for diagnosing the post-6-R recovery's
+    // exit(1) at iter 3281 (the bceac63 diagnostic showed ZERO such
+    // calls in the entire visible logcat, but the post-execve cap of 150
+    // hid the middle phase iters 151-3271 where they would have lived).
+    //
+    // Verified directly against the kernel's UAPI headers in Task 6-S:
+    //   i386 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h):
+    //     __NR_fork 2, __NR_clone 120, __NR_vfork 190,
+    //     __NR_wait4 114, __NR_exit_group 252.
+    //   x86_64 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h):
+    //     __NR_fork 57, __NR_clone 56, __NR_vfork 58,
+    //     __NR_wait4 61, __NR_exit_group 231.
+    //   aarch64 (per /usr/include/asm-generic/unistd.h):
+    //     __NR_clone 220, __NR_wait4 260, __NR_exit_group 94.
+    //     (asm-generic DROPPED plain fork + vfork — set to -1.)
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_task_6s_fork_numbers_correct() {
+        // Regression guard (Task 6-S): the i386 fork/clone/vfork/wait4/
+        // exit_group syscall numbers MUST be 2/120/190/114/252 (per
+        // /usr/include/x86_64-linux-gnu/asm/unistd_32.h, verified
+        // directly). THIS is the value set that fires at runtime —
+        // TWRP init + recovery are i386 binaries. If anyone "fixes"
+        // these to different numbers (e.g. by copying the x86_64
+        // values 57/56/58/61/231 — which would be WRONG for an i386
+        // child), the always-log ENTRY/EXIT block would silently
+        // stop matching fork/clone/vfork/wait4/exit_group calls + the
+        // post-6-R recovery exit(1) diagnostic would go dark.
+        assert_eq!(ABI_X86_32.clone_nr, 120, "i386 clone_nr must be 120");
+        assert_eq!(ABI_X86_32.fork_nr, 2, "i386 fork_nr must be 2");
+        assert_eq!(ABI_X86_32.vfork_nr, 190, "i386 vfork_nr must be 190");
+        assert_eq!(ABI_X86_32.wait4_nr, 114, "i386 wait4_nr must be 114");
+        assert_eq!(
+            ABI_X86_32.exit_group_nr, 252,
+            "i386 exit_group_nr must be 252"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_task_6s_fork_numbers_correct() {
+        // Regression guard (Task 6-S): the x86_64 fork/clone/vfork/
+        // wait4/exit_group syscall numbers MUST be 57/56/58/61/231
+        // (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h, verified
+        // directly). The host is x86_64 running an i386 child, so
+        // these x86_64 numbers do NOT currently fire at runtime —
+        // locked in for ABI completeness + so the always-log block
+        // compiles + works correctly if a future x86_64 guest is
+        // ever supported (mirrors the mknod: 133 / setxattr: 188 /
+        // pause: 34 precedent).
+        assert_eq!(ABI_X86_64.clone_nr, 56, "x86_64 clone_nr must be 56");
+        assert_eq!(ABI_X86_64.fork_nr, 57, "x86_64 fork_nr must be 57");
+        assert_eq!(ABI_X86_64.vfork_nr, 58, "x86_64 vfork_nr must be 58");
+        assert_eq!(ABI_X86_64.wait4_nr, 61, "x86_64 wait4_nr must be 61");
+        assert_eq!(
+            ABI_X86_64.exit_group_nr, 231,
+            "x86_64 exit_group_nr must be 231"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_task_6s_fork_numbers_correct() {
+        // Regression guard (Task 6-S): the aarch64 (asm-generic)
+        // clone/wait4/exit_group numbers MUST be 220/260/94. NOTE:
+        // __NR_exit_group is 94 (NOT 93 — 93 is plain `exit` which
+        // exits just the calling thread; exit_group exits all threads
+        // in the process and is what bionic's exit_group() / _Exit()
+        // wrappers call). The task spec for 6-S said aarch64
+        // exit_group=93 — that was WRONG; verified: 94. fork + vfork
+        // were DROPPED in asm-generic (bionic's fork() libc wrapper
+        // on aarch64 issues clone() under the hood) — set to -1
+        // (sentinels "not present on this ABI").
+        assert_eq!(ABI_AARCH64.clone_nr, 220, "aarch64 clone_nr must be 220");
+        assert_eq!(
+            ABI_AARCH64.fork_nr, -1,
+            "aarch64 fork_nr must be -1 (dropped in asm-generic)"
+        );
+        assert_eq!(
+            ABI_AARCH64.vfork_nr, -1,
+            "aarch64 vfork_nr must be -1 (dropped in asm-generic)"
+        );
+        assert_eq!(ABI_AARCH64.wait4_nr, 260, "aarch64 wait4_nr must be 260");
+        assert_eq!(
+            ABI_AARCH64.exit_group_nr, 94,
+            "aarch64 exit_group_nr must be 94 (NOT 93 — 93 is plain exit)"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
