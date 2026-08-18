@@ -570,6 +570,20 @@ struct ChildAbi {
     // nr=1 is `exit`, so a naive `4 | 1` match would fire spuriously
     // on the wrong ABI.
     write: i64,
+    // read(fd, buf, count) — NOT intercepted or emulated; carried
+    // purely so the syscall-EXIT diagnostic (Task 6-V) can recognise
+    // a read() return + capture the buffer contents. TWRP recovery reads
+    // two files shortly before SIGSEGV (72 + 90 bytes); this diagnostic
+    // surfaces WHAT was read so we can identify the files. Per-ABI numbers
+    // (verified against the kernel's UAPI headers — same source as `write`):
+    //   i386:   read = 3   (per asm/unistd_32.h: __NR_read 3)
+    //   x86_64: read = 0   (per asm/unistd_64.h: __NR_read 0)
+    //   aarch64: read = 63  (per asm-generic/unistd.h: __NR_read 63)
+    // The host is x86_64 running an i386 child, so the i386 number (3)
+    // is the one that fires at runtime. The ABI-aware comparison
+    // `syscall_num == abi.read` avoids cross-ABI confusion (x86_64 nr=3
+    // is `close`, i386 nr=0 is `restart_syscall`).
+    read: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -753,6 +767,13 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // x86_64 number does NOT currently fire at runtime (the guest uses
     // i386 syscall 4). Locked in for ABI completeness.
     write: 1,
+    // x86_64 read = 0 (per asm/unistd_64.h: __NR_read 0).
+    // NOT intercepted — carried for ABI completeness so the 6-V
+    // syscall-EXIT diagnostic's `syscall_num == abi.read` comparison
+    // is correct if a future x86_64 guest is ever supported. The host
+    // is x86_64 running an i386 child, so this number does NOT
+    // currently fire at runtime.
+    read: 0,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -948,6 +969,13 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // i386, which the kernel preserves across the syscall). See the
     // doc on `write` in `ChildAbi` for the full rationale.
     write: 4,
+    // i386 read = 3 (per asm/unistd_32.h: __NR_read 3). THIS is the
+    // value that fires at runtime — TWRP recovery (an i386 binary)
+    // issues read(fd, buf, count) as i386 syscall 3. The 6-V syscall-
+    // EXIT diagnostic matches `syscall_num == abi.read` and captures
+    // `min(ret, 256)` bytes from the buffer pointer (arg2 = ecx on
+    // i386). See the doc on `read` in `ChildAbi` for the full rationale.
+    read: 3,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1142,6 +1170,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // supported. The host is x86_64 running an i386 child, so this
     // aarch64 number does NOT currently fire at runtime.
     write: 64,
+    // aarch64 read = 63 (per asm-generic/unistd.h: __NR_read 63).
+    // NOT intercepted — carried for ABI completeness so the 6-V
+    // syscall-EXIT diagnostic's `syscall_num == abi.read` comparison
+    // is correct if a future aarch64 guest is ever supported. The host
+    // is x86_64 running an i386 child, so this aarch64 number does NOT
+    // currently fire at runtime.
+    read: 63,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2724,6 +2759,24 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     let mut pending_kmsg_open: bool = false;
     let mut post_execve_write_count: u64 = 0;
 
+    // ── Task 6-V diagnostic state ────────────────────────────────────
+    //
+    // `post_execve_read_count`: gate counter for the read() EXIT
+    //   diagnostic — only the first 800 post-execve reads are logged,
+    //   to bound log volume. (Recovery does ~N reads before SIGSEGV,
+    //   800 is a comfortable headroom.)
+    // `open_fd_paths`: fd→(translated path) map for ALL open() calls.
+    //   Set at open EXIT (ret > 0 → insert), used in the read() EXIT
+    //   diagnostic to annotate which file was read.
+    // `pending_open_translated_path`: set at open/openat/openat2 ENTRY
+    //   with the translated path; consumed at the matching EXIT to
+    //   insert into `open_fd_paths`. Mirrors the existing
+    //   `pending_kmsg_open` pattern (ENTRY-flag, EXIT-consume).
+    let mut post_execve_read_count: u64 = 0;
+    let mut open_fd_paths: std::collections::HashMap<i32, String> =
+        std::collections::HashMap::new();
+    let mut pending_open_translated_path: Option<String> = None;
+
     // Runtime-detected syscall/register layout for the child. `None`
     // until the first successful ptrace_getregs — at that point we
     // read /proc/<pid>/exe and inspect the ELF header to pick
@@ -3731,7 +3784,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // For mount(source, target, fstype, flags, data) we
                     // additionally log arg2 (target) and arg3 (fstype) so
                     // we can see exactly what init is mounting where.
-                    if past_first_execve && post_execve_syscall_count <= 150 {
+                    if past_first_execve && post_execve_syscall_count <= 5000 {
                         let path_idx = match syscall_num {
                             n if n == abi.open => Some(abi.reg_arg1),
                             n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
@@ -3910,6 +3963,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 if is_kmsg_path(&path) || is_kmsg_path(&translated) {
                                     pending_kmsg_open = true;
                                 }
+                                // Task 6-V: save translated path for fd
+                                // tracking at the matching open EXIT.
+                                pending_open_translated_path = Some(translated.clone());
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
@@ -4120,6 +4176,22 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         }
                         pending_kmsg_open = false;
                     }
+                    // Task 6-V Part A2 — open()/openat()/openat2() EXIT:
+                    // record the returned fd → translated-path mapping into
+                    // `open_fd_paths` (used by the read() diagnostic below
+                    // to annotate which file was read).
+                    if syscall_num == abi.open
+                        || syscall_num == abi.openat
+                        || syscall_num == abi.openat2
+                    {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret > 0 {
+                            if let Some(ref p) = pending_open_translated_path {
+                                open_fd_paths.insert(ret as i32, p.clone());
+                            }
+                        }
+                        pending_open_translated_path = None;
+                    }
                     // Part B — write(fd, buf, count) EXIT: capture
                     // the buffer contents and log them. Gated to the
                     // first 800 post-execve writes (init does ~339
@@ -4168,6 +4240,48 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                         log(&format!(
                                             "{}(fd={}, ret={}): <buffer read failed: EIO>",
                                             prefix, fd, ret
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Task 6-V Part C — read(fd, buf, count) EXIT:
+                    // capture the buffer contents and log them. Mirrors
+                    // the 6-U write() diagnostic above. Gated to the
+                    // first 800 post-execve reads. Only fires for
+                    // read() syscalls (syscall_num == abi.read) to
+                    // avoid capturing buffers from unrelated syscalls.
+                    if past_first_execve && syscall_num == abi.read {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // Only capture successful reads with a
+                        // reasonable size (0 < ret <= 256). ret <= 0
+                        // is a failed/EOF read (nothing to capture).
+                        if ret > 0 && ret <= 256 {
+                            post_execve_read_count = post_execve_read_count.saturating_add(1);
+                            if post_execve_read_count <= 800 {
+                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                let buf_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                                let to_read = std::cmp::min(ret as usize, 256);
+                                let captured = read_child_bytes(pid, buf_addr, to_read);
+                                // Look up the path from open fd tracking
+                                let path_info = match open_fd_paths.get(&fd) {
+                                    Some(p) => format!(", path=\"{}\"", p),
+                                    None => String::new(),
+                                };
+                                match captured {
+                                    Some(bytes) => {
+                                        let captured_str = String::from_utf8_lossy(&bytes);
+                                        log(&format!(
+                                            "DIAG read(fd={}, ret={}{}): {:?}",
+                                            fd, ret, path_info, captured_str
+                                        ));
+                                    }
+                                    None => {
+                                        log(&format!(
+                                            "DIAG read(fd={}, ret={}{}): <buffer read failed: EIO>",
+                                            fd, ret, path_info
                                         ));
                                     }
                                 }
