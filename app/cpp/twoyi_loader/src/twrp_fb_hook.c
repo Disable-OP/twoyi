@@ -503,6 +503,37 @@ int open(const char *path, int flags, ...) {
             write_str(2, "\n");
         }
     }
+    // ALWAYS ftruncate the existing fb0 file to TWRP_FB_SMEM_LEN — even
+    // when open() SUCCEEDED. Root cause (6-Q's definitive diff of KVM
+    // strace vs UI E2E logcat):
+    //   - kr64 creates /dev/graphics/fb0 at cfg.width*cfg.height*4 =
+    //     320*640*4 = 819200 bytes (auto-detected screen size).
+    //   - But fill_fscreeninfo() hardcodes smem_len = 720*1280*4 =
+    //     3686400 (TWRP_FB_SMEM_LEN) in FBIOGET_FSCREENINFO.
+    //   - In KVM E2E (root): init's mount(tmpfs,/dev) REALLY wipes fb0 →
+    //     recovery's open returns ENOENT → the create branch above fires
+    //     + ftruncates to 3686400 (matching smem_len). OK.
+    //   - In UI E2E (ptrace_emu): the mount is fake-successed (no real
+    //     mount) → fb0 SURVIVES at 819200 bytes → open SUCCEEDS → the
+    //     create branch is SKIPPED → file stays at the wrong size.
+    //   - recovery then does mmap2(fb_fd, smem_len=3686400, ...) on the
+    //     819200-byte file. mmap succeeds, but writes past byte 819200
+    //     (libminuitwrp clears the whole framebuffer on init) → SIGBUS
+    //     → recovery crashes → init exits(1) at iter 3233.
+    // Fix: ftruncate to TWRP_FB_SMEM_LEN so the file size always matches
+    // the hardcoded smem_len that FBIOGET_FSCREENINFO returns. This
+    // makes both KVM + UI E2E paths converge on the correct file size.
+    // (We open a SEPARATE O_RDWR fd because the caller's fd may have
+    // been opened O_RDONLY, which forbids ftruncate on Linux.)
+    if (is_fb_path(path) && fd >= 0) {
+        int trunc_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
+            (long)path, O_RDWR, 0);
+        if (trunc_fd >= 0) {
+            raw_syscall3(SYS_ftruncate, trunc_fd, TWRP_FB_SMEM_LEN, 0);
+            raw_syscall1(SYS_close, trunc_fd);
+            write_str(2, "[twrp_fb_hook] ftruncated existing fb0 to TWRP_FB_SMEM_LEN\n");
+        }
+    }
     write_str(2, "[twrp_fb_hook] open(\"");
     write_str(2, path ? path : "(null)");
     write_str(2, "\", fl=0x"); write_hex(2, (unsigned int)flags);
@@ -538,6 +569,39 @@ int openat(int dirfd, const char *path, int flags, ...) {
             write_str(2, "[twrp_fb_hook] created virtual fb0 file, re-opened -> fd=");
             write_num(2, fd);
             write_str(2, "\n");
+        }
+    }
+    // ALWAYS ftruncate the existing fb0 file to TWRP_FB_SMEM_LEN — even
+    // when openat() SUCCEEDED. Root cause (6-Q's definitive diff of KVM
+    // strace vs UI E2E logcat):
+    //   - kr64 creates /dev/graphics/fb0 at cfg.width*cfg.height*4 =
+    //     320*640*4 = 819200 bytes (auto-detected screen size).
+    //   - But fill_fscreeninfo() hardcodes smem_len = 720*1280*4 =
+    //     3686400 (TWRP_FB_SMEM_LEN) in FBIOGET_FSCREENINFO.
+    //   - In KVM E2E (root): init's mount(tmpfs,/dev) REALLY wipes fb0 →
+    //     recovery's openat returns ENOENT → the create branch above
+    //     fires + ftruncates to 3686400 (matching smem_len). OK.
+    //   - In UI E2E (ptrace_emu): the mount is fake-successed (no real
+    //     mount) → fb0 SURVIVES at 819200 bytes → openat SUCCEEDS → the
+    //     create branch is SKIPPED → file stays at the wrong size.
+    //   - recovery then does mmap2(fb_fd, smem_len=3686400, ...) on the
+    //     819200-byte file. mmap succeeds, but writes past byte 819200
+    //     (libminuitwrp clears the whole framebuffer on init) → SIGBUS
+    //     → recovery crashes → init exits(1) at iter 3233.
+    // Fix: ftruncate to TWRP_FB_SMEM_LEN so the file size always matches
+    // the hardcoded smem_len that FBIOGET_FSCREENINFO returns. This
+    // makes both KVM + UI E2E paths converge on the correct file size.
+    // (We open a SEPARATE O_RDWR fd because the caller's fd may have
+    // been opened O_RDONLY, which forbids ftruncate on Linux. The path
+    // is absolute — /dev/graphics/fb0 or /dev/fb0 — so AT_FDCWD is
+    // correct regardless of the caller's dirfd.)
+    if (is_fb_path(path) && fd >= 0) {
+        int trunc_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
+            (long)path, O_RDWR, 0);
+        if (trunc_fd >= 0) {
+            raw_syscall3(SYS_ftruncate, trunc_fd, TWRP_FB_SMEM_LEN, 0);
+            raw_syscall1(SYS_close, trunc_fd);
+            write_str(2, "[twrp_fb_hook] ftruncated existing fb0 to TWRP_FB_SMEM_LEN\n");
         }
     }
     write_str(2, "[twrp_fb_hook] openat(df="); write_num(2, dirfd);
