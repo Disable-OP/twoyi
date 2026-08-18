@@ -4012,6 +4012,20 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
                             }
                         }
+                        // DIAGNOSTIC (Task 6-F): sleep 100ms after a
+                        // pause() SIGSYS to reduce the 659k/sec CPU
+                        // spin. This does NOT fix the loop — init will
+                        // still pause() ~900 times over a 90s test
+                        // window (vs 659k times). The deeper root cause
+                        // is the missing property service (see worklog
+                        // DISPATCHER-UPDATE-7: neither -EINTR nor
+                        // -ENOSYS broke the loop — init calls pause()
+                        // regardless of the return value). Remove this
+                        // sleep when a real property service is
+                        // implemented.
+                        if original_syscall == a.pause {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
                     }
                     Err(_) => {
                         // ptrace_getregs failed — we couldn't read the
