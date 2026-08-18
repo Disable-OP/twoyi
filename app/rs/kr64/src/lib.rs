@@ -1495,12 +1495,13 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
     }
 }
 
-/// EMPTY `/property_contexts` to a single comment line so init's parser
-/// reads the comment, skips it, and the next `fgets` returns NULL —
-/// letting the parser EXIT before reaching the corrupted-context code
-/// path (Task 6-N; see DISPATCHER-FINAL-7).
+/// DELETE `/property_contexts` entirely so init's `open()` returns
+/// `-ENOENT` → the caller (iterating the SEPolicy context table at
+/// `0x80ce270`) skips this context file → the parser is never invoked →
+/// no corrupted-context SIGSEGV (Task 6-O; supersedes 6-N's empty-file
+/// approach — see DISPATCHER-FINAL-8).
 ///
-/// # Root cause (DISPATCHER-FINAL-3 + 6-K + 6-M + 6-L analysis)
+/// # Root cause (DISPATCHER-FINAL-3 + 6-K + 6-M + 6-L + 6-N analysis)
 ///
 /// After 6-J's pause-loop fix (commit a171d62), the guest progressed from
 /// iteration 220 to iteration 338 before hitting a NEW SIGSEGV at
@@ -1539,86 +1540,91 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
 /// NOPed the crash instruction at `0x80a0b9e` (7 bytes:
 /// `c7 42 04 00 00 00 00` → `90 90 90 90 90 90 90`) — but the crash MOVED
 /// to `0x80a0bd8` (iteration 342, was 338) with the SAME garbage pointer
-/// `0x74616433`. The parser has MULTIPLE instructions that dereference
-/// the garbage `edx` from the corrupted `ctx->field_at_0x14`. NOPing each
-/// one individually is whack-a-mole — not sustainable.
+/// `0x74616433`. The crash instruction at `0x80a0bd8` is
+/// `mov 0x4(%ecx),%eax` — a READ from `[ecx+4]` where `ecx` is loaded from
+/// `ctx->field_0x14` (the SAME corrupted context field). The parser has
+/// MULTIPLE instructions that dereference the garbage `edx`/`ecx` from
+/// the corrupted `ctx->field_at_0x14`. NOPing each one individually is
+/// whack-a-mole — not sustainable.
 ///
-/// # The fix (Task 6-N)
+/// # Why 6-N's "empty to a comment line" didn't work (DISPATCHER-FINAL-8)
 ///
-/// This is a DATA fix: REPLACE the ENTIRE `/property_contexts` file with
-/// a single comment line. The parser's `fgets` loop reads the comment
-/// line → parser skips it (init's parser treats `#`-prefixed lines as
-/// comments) → next `fgets` returns NULL → parser exits cleanly WITHOUT
-/// hitting the corrupted-context code path.
+/// 6-N (aaedbe6) replaced the ENTIRE `/property_contexts` file with a
+/// single comment line. The hypothesis was: the parser's `fgets` loop
+/// reads the comment line → skips it (init's parser treats `#`-prefixed
+/// lines as comments) → next `fgets` returns NULL → parser exits cleanly
+/// WITHOUT hitting the corrupted-context code path. 407 tests passed.
+///
+/// UI E2E on aaedbe6 CONFIRMED the file was emptied (the log says "was
+/// 2920 bytes, now 173 bytes"). BUT the crash PERSISTED: same
+/// `rip=0x80a0bd8`, `si_addr=0x74616433`, iteration 342. This means the
+/// context field `0x14` is corrupted BEFORE the parser reads the file
+/// content. Even with a single comment line, `fgets` returns that line →
+/// the parser processes it → tries to read `ctx->field_0x14->field_at_4`
+/// (garbage pointer `0x74616433`) → SIGSEGV. Emptying the file does NOT
+/// help because the corruption is upstream, in the caller's context setup.
+///
+/// # The fix (Task 6-O)
+///
+/// This is a DATA fix: DELETE the `/property_contexts` file ENTIRELY. If
+/// the file does not exist, init's `open()` returns `-ENOENT`. The caller
+/// (which iterates the function pointer table at `0x80ce270`) is expected
+/// to handle `-ENOENT` gracefully by skipping that context file. This
+/// avoids the parser being invoked AT ALL → no corrupted-context crash.
 ///
 /// `init` tolerates missing property contexts — it's not fatal for TWRP
 /// boot (it just means SELinux property labeling won't work, which is OK
 /// in the sandboxed environment).
 ///
-/// Kept alongside 6-M's NOP patch as belt-and-suspenders (in case the
-/// parser still hits the corrupted context while processing the comment
-/// line). Replaces 6-L's `#line`-directive-only removal.
+/// Replaces 6-N's "empty to a comment line" (which still triggered the
+/// parser on the comment line and crashed). 6-M's NOP patch (on the init
+/// binary) is kept in the binary as belt-and-suspenders in case any
+/// context file path slips through un-deleted; we don't need to undo it
+/// here.
 ///
 /// # Idempotence
 ///
-/// If the file's content is already exactly the kr64 emptied-comment line
-/// (e.g. a previous boot already patched it), this function is a no-op
-/// and logs an idempotent skip.
+/// If the file is already missing (e.g. a previous boot already deleted
+/// it), this function is a no-op and logs an idempotent skip.
 ///
 /// # Non-fatal
 ///
-/// If the file is missing or unreadable, we log and continue — the
-/// guest may still crash later if init actually needs this file, but
+/// If the deletion fails (e.g. permission denied), we log and continue —
+/// the guest may still crash later if init actually opens this file, but
 /// the condition is surfaced in the log for diagnosis.
-fn patch_property_contexts_empty(rootfs_prefix: &str) {
+fn patch_property_contexts_delete(rootfs_prefix: &str) {
     let path = format!("{}/property_contexts", rootfs_prefix);
-    // The single comment line we replace the file's entire content with.
-    // The parser reads this line, skips it (comment), and the next `fgets`
-    // returns NULL — parser exits WITHOUT hitting the corrupted-context
-    // code path (DISPATCHER-FINAL-7).
-    const PATCHED_CONTENT: &str = "# emptied by kr64: property_contexts parser crashes on corrupted context field (DISPATCHER-FINAL-7); SELinux property labeling disabled in sandbox (non-fatal for TWRP boot)\n";
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            // The file may legitimately not exist on some TWRP variants
-            // or on full-Android boots (Android's /property_contexts is
-            // only loaded at boot). Non-fatal: the guest will fail later
-            // with a different error if init actually needs this file.
-            // We deliberately do NOT create the file here — if init's
-            // open() fails, the parser isn't invoked at all, which is
-            // also a clean exit from the corrupted-context path.
-            info!(
-                "[KR64] PARENT: /property_contexts not present at {} (skip empty): {}",
-                path, e
-            );
-            return;
-        }
-    };
-    // Idempotence: if the file is already exactly our emptied-comment
-    // line, skip without rewriting it (avoids touching mtime on every
-    // boot and keeps the log quiet on re-runs).
-    if content == PATCHED_CONTENT {
+    // Step 1: check existence. If the file is already gone (a previous
+    // boot deleted it), this is an idempotent no-op.
+    if !std::path::Path::new(&path).exists() {
         info!(
-            "[KR64] PARENT: /property_contexts already emptied by kr64 (idempotent skip): {}",
+            "[KR64] PARENT: /property_contexts already absent at {} (idempotent skip — caller will get -ENOENT on open)",
             path
         );
         return;
     }
-    // Replace the ENTIRE file with the single comment line. init's parser
-    // reads the comment line, skips it, and the next fgets returns NULL →
-    // parser exits WITHOUT hitting the corrupted-context code path. This
-    // avoids the whack-a-mole of NOPing each individual crash instruction
-    // (DISPATCHER-FINAL-7: 0x80a0b9e → 0x80a0bd8 → ???).
-    match std::fs::write(&path, PATCHED_CONTENT) {
+    // Step 2: read the existing file's size + first line for diagnostic
+    // logging only. We do NOT need the content for the patch itself (the
+    // fix is to DELETE, not to rewrite) — but logging the prior size
+    // helps confirm the deletion actually happened (matches 6-N's
+    // "was N bytes, now 0 bytes" log shape for grep parity).
+    let (prior_len, prior_first_line): (usize, String) = match std::fs::read_to_string(&path) {
+        Ok(c) => (c.len(), c.lines().next().unwrap_or("").to_string()),
+        // read_to_string can fail on non-UTF8 content; the file is
+        // still DELETABLE in that case (remove_file works on bytes).
+        Err(_) => (0, String::new()),
+    };
+    // Step 3: DELETE the file entirely. If init's open() returns -ENOENT,
+    // the caller (iterating the SEPolicy context table at 0x80ce270)
+    // skips this context file → the parser is never invoked → no crash.
+    match std::fs::remove_file(&path) {
         Ok(()) => info!(
-            "[KR64] PARENT: emptied /property_contexts to a single comment line — was {} bytes (first line: {:?}), now {} bytes. Avoids parser's corrupted-context crash path (DISPATCHER-FINAL-7).",
-            content.len(),
-            content.lines().next().unwrap_or(""),
-            PATCHED_CONTENT.len()
+            "[KR64] PARENT: DELETED /property_contexts — was {} bytes (first line: {:?}), now absent. init's open() will return -ENOENT → caller skips this context file → parser never invoked → no corrupted-context crash (DISPATCHER-FINAL-8). SELinux property labeling disabled in sandbox (non-fatal for TWRP boot).",
+            prior_len, prior_first_line
         ),
         Err(e) => warning!(
-            "[KR64] PARENT: failed to empty /property_contexts: {} (init may SIGSEGV at rip=0x80a0b9e/0x80a0bd8 with si_addr=0x74616433 — corrupted context field at 0x14)",
-            e
+            "[KR64] PARENT: failed to DELETE /property_contexts at {}: {} (init may open it and SIGSEGV at rip=0x80a0b9e/0x80a0bd8 with si_addr=0x74616433 — corrupted context field at 0x14)",
+            path, e
         ),
     }
 }
@@ -4110,7 +4116,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     if cfg.boot_recovery {
         patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs_prefix);
 
-        // TWRP BOOT: EMPTY /property_contexts to a single comment line.
+        // TWRP BOOT: DELETE /property_contexts ENTIRELY.
         // The TWRP ramdisk's /property_contexts file has `#line 1 "..."`
         // on line 1 (leftover from the AOSP build process). init's parser
         // doesn't understand the `#line` directive, mis-parses the
@@ -4120,18 +4126,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // context field at offset 0x14 stays corrupted, so 6-M NOPed the
         // crash instruction at 0x80a0b9e, but the crash MOVED to 0x80a0bd8
         // (DISPATCHER-FINAL-7: whack-a-mole — MULTIPLE instructions deref
-        // the garbage edx). The sustainable fix is a DATA fix: replace
-        // the ENTIRE file with a single comment line. init's parser reads
-        // the comment → skips it → next fgets returns NULL → parser exits
-        // WITHOUT hitting the corrupted-context code path. init tolerates
-        // missing property contexts (SELinux property labeling disabled in
-        // sandbox — non-fatal for TWRP boot). See
-        // `patch_property_contexts_empty` for the full root-cause analysis
-        // (DISPATCHER-FINAL-3/4/5/6/7). Must run AFTER setup_mounts (so
+        // the garbage edx/ecx from ctx->field_0x14). 6-N then EMPTIED the
+        // file to a single comment line, BUT DISPATCHER-FINAL-8 showed the
+        // crash PERSISTS at 0x80a0bd8 even with the emptied file: the
+        // context field 0x14 is corrupted BEFORE the parser reads the file
+        // content, so even a comment line still triggers fgets → the
+        // parser processes it → tries to read ctx->field_0x14->field_at_4
+        // → SIGSEGV. The sustainable fix is a DATA fix: DELETE the file
+        // ENTIRELY. init's open() returns -ENOENT → the caller (iterating
+        // the SEPolicy context table at 0x80ce270) skips this context
+        // file → the parser is never invoked → no corrupted-context crash.
+        // init tolerates missing property contexts (SELinux property
+        // labeling disabled in sandbox — non-fatal for TWRP boot). See
+        // `patch_property_contexts_delete` for the full root-cause analysis
+        // (DISPATCHER-FINAL-3/4/5/6/7/8). Must run AFTER setup_mounts (so
         // the property_contexts file is reachable on the post-pivot_root
         // root) and BEFORE the guest's init is exec'd in the child below.
-        // Idempotent: a no-op if the file is already emptied.
-        patch_property_contexts_empty(&rootfs_prefix);
+        // Idempotent: a no-op if the file is already missing.
+        patch_property_contexts_delete(&rootfs_prefix);
     }
 
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
@@ -9378,8 +9390,8 @@ mod tests {
     }
 
     // ====================================================================
-    // Tests for `patch_property_contexts_empty` (Task 6-N; supersedes
-    // 6-L's `strip_line_directive` variant).
+    // Tests for `patch_property_contexts_delete` (Task 6-O; supersedes
+    // 6-N's `patch_property_contexts_empty`).
     //
     // The TWRP ramdisk's /property_contexts has a C preprocessor `#line`
     // directive on line 1 — a leftover from the AOSP build process. init's
@@ -9388,19 +9400,19 @@ mod tests {
     // #line directive) was insufficient: the parser's context field at
     // offset 0x14 stays corrupted, so 6-M NOPed the crash instruction at
     // 0x80a0b9e, but the crash MOVED to 0x80a0bd8 (DISPATCHER-FINAL-7:
-    // whack-a-mole — MULTIPLE instructions deref the garbage edx). The
-    // sustainable fix is a DATA fix: replace the ENTIRE file with a single
-    // comment line so the parser's fgets loop reads the comment → skips it
-    // → next fgets returns NULL → parser exits WITHOUT hitting the
-    // corrupted-context code path. These tests verify the patcher empties
-    // the file to a single comment line, is idempotent, and handles
-    // missing/empty/edge-case files gracefully.
+    // whack-a-mole — MULTIPLE instructions deref the garbage edx/ecx from
+    // ctx->field_0x14). 6-N then EMPTIED the file to a single comment line,
+    // BUT DISPATCHER-FINAL-8 showed the crash PERSISTS at 0x80a0bd8 even
+    // with the emptied file: the context field 0x14 is corrupted BEFORE
+    // the parser reads the file content, so even a comment line still
+    // triggers fgets → the parser processes it → tries to read
+    // ctx->field_0x14->field_at_4 → SIGSEGV. The sustainable fix is a DATA
+    // fix: DELETE the file ENTIRELY. init's open() returns -ENOENT → the
+    // caller skips this context file → the parser is never invoked → no
+    // corrupted-context crash. These tests verify the patcher DELETES the
+    // file, is idempotent (a no-op when the file is already missing), and
+    // handles missing/edge-case content gracefully.
     // ====================================================================
-
-    /// The single comment line the patcher writes. MUST stay byte-for-byte
-    /// in sync with `PATCHED_CONTENT` inside `patch_property_contexts_empty`.
-    /// If you change one, change the other.
-    const PROPERTY_CONTEXTS_EMPTIED_CONTENT: &str = "# emptied by kr64: property_contexts parser crashes on corrupted context field (DISPATCHER-FINAL-7); SELinux property labeling disabled in sandbox (non-fatal for TWRP boot)\n";
 
     /// Helper: build a temp "rootfs" directory for property_contexts tests.
     fn make_property_contexts_temp_rootfs() -> std::path::PathBuf {
@@ -9416,13 +9428,15 @@ mod tests {
         dir
     }
 
-    /// The patcher must EMPTY the entire /property_contexts file to a
-    /// single comment line. This is the EXACT file shape shipped in the
-    /// TWRP ramdisk (verified by Step 1 of Task 6-L against the extracted
-    /// ramdisk at /tmp/twrp-ramdisk-extract/property_contexts): the `#line`
-    /// directive on line 1, followed by the real property-context entries.
+    /// The patcher must DELETE the entire /property_contexts file. This is
+    /// the EXACT file shape shipped in the TWRP ramdisk (verified by Step 1
+    /// of Task 6-L against the extracted ramdisk at
+    /// /tmp/twrp-ramdisk-extract/property_contexts): the `#line` directive
+    /// on line 1, followed by the real property-context entries. After
+    /// the patch runs, the file MUST NOT EXIST (so init's open() returns
+    /// -ENOENT → the caller skips this context file → parser never invoked).
     #[test]
-    fn property_contexts_patcher_empties_file_to_single_comment_line() {
+    fn property_contexts_patcher_deletes_file() {
         let dir = make_property_contexts_temp_rootfs();
         let rootfs = dir.to_string_lossy().into_owned();
         // The exact file content shipped in the TWRP ramdisk: the `#line`
@@ -9432,37 +9446,23 @@ mod tests {
                         # property service keys\n\
                         net.rmnet               u:object_r:net_radio_prop:s0\n";
         std::fs::write(dir.join("property_contexts"), original).unwrap();
-        patch_property_contexts_empty(&rootfs);
-        let patched = std::fs::read_to_string(dir.join("property_contexts")).unwrap();
-        // The ENTIRE file must be replaced with the single kr64 comment line.
-        assert_eq!(
-            patched, PROPERTY_CONTEXTS_EMPTIED_CONTENT,
-            "file should be emptied to a single comment line. Got:\n{}",
-            patched
-        );
-        // No `#line` directive should appear as the START of any line.
-        // (Defensive: the kr64 comment doesn't contain `#line` either, but
-        // we check per-line to be explicit about the contract.)
-        let any_directive = patched.lines().any(|l| l.starts_with("#line"));
+        assert!(dir.join("property_contexts").exists());
+        patch_property_contexts_delete(&rootfs);
+        // The file MUST be GONE — this is the whole point of the patch.
+        // If the file is absent, init's open() returns -ENOENT → the caller
+        // skips this context file → the parser is never invoked → no crash.
         assert!(
-            !any_directive,
-            "no line should start with `#line` (the directive). Got:\n{}",
-            patched
-        );
-        // The original real property-context entries must be GONE (this is
-        // the whole point — they're what trigger the corrupted-context
-        // crash after the #line directive).
-        assert!(
-            !patched.contains("net.rmnet"),
-            "original property entries must be GONE (emptied). Got:\n{}",
-            patched
+            !dir.join("property_contexts").exists(),
+            "file should be DELETED after patch runs. Still exists at: {:?}",
+            dir.join("property_contexts")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// IDEMPOTENCE: running the patcher twice must produce the same result
     /// as running it once. The second run must be a no-op because the first
-    /// run already emptied the file to the kr64 comment line.
+    /// run already deleted the file (the file is already absent → the
+    /// existence check returns false → log + return).
     #[test]
     fn property_contexts_patcher_is_idempotent() {
         let dir = make_property_contexts_temp_rootfs();
@@ -9471,40 +9471,33 @@ mod tests {
                         ##########################\n\
                         net.rmnet               u:object_r:net_radio_prop:s0\n";
         std::fs::write(dir.join("property_contexts"), original).unwrap();
-        patch_property_contexts_empty(&rootfs);
-        let after_first = std::fs::read_to_string(dir.join("property_contexts")).unwrap();
-        patch_property_contexts_empty(&rootfs);
-        let after_second = std::fs::read_to_string(dir.join("property_contexts")).unwrap();
-        assert_eq!(
-            after_first, after_second,
-            "second run should be a no-op (idempotent)"
-        );
-        assert_eq!(
-            after_first, PROPERTY_CONTEXTS_EMPTIED_CONTENT,
-            "first run should have emptied the file"
+        patch_property_contexts_delete(&rootfs);
+        let after_first_exists = dir.join("property_contexts").exists();
+        patch_property_contexts_delete(&rootfs);
+        let after_second_exists = dir.join("property_contexts").exists();
+        assert!(!after_first_exists, "file should be absent after first run");
+        assert!(
+            !after_second_exists,
+            "file should STILL be absent after second run (idempotent — already-missing is a no-op)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The patcher must be a no-op when the file is ALREADY emptied to the
-    /// kr64 comment line (e.g. a previous boot already patched it). This
-    /// is the idempotent-skip path for re-runs.
+    /// The patcher must be a no-op when the file is ALREADY MISSING (e.g.
+    /// a previous boot already deleted it). This is the idempotent-skip
+    /// path for re-runs: existence check returns false → log + return
+    /// without attempting remove_file (which would error on a missing
+    /// file).
     #[test]
-    fn property_contexts_patcher_skips_when_already_emptied() {
+    fn property_contexts_patcher_skips_when_already_absent() {
         let dir = make_property_contexts_temp_rootfs();
         let rootfs = dir.to_string_lossy().into_owned();
-        // The file is ALREADY in the emptied state (e.g. a previous boot
-        // already patched it). Must stay byte-for-byte identical.
-        std::fs::write(
-            dir.join("property_contexts"),
-            PROPERTY_CONTEXTS_EMPTIED_CONTENT,
-        )
-        .unwrap();
-        patch_property_contexts_empty(&rootfs);
-        let after = std::fs::read_to_string(dir.join("property_contexts")).unwrap();
-        assert_eq!(
-            after, PROPERTY_CONTEXTS_EMPTIED_CONTENT,
-            "already-emptied file should be UNCHANGED (idempotent skip)"
+        // Don't create the file — patcher must not panic and must not
+        // create it. The caller will get -ENOENT on open either way.
+        patch_property_contexts_delete(&rootfs);
+        assert!(
+            !dir.join("property_contexts").exists(),
+            "already-missing file should remain missing (idempotent skip — no spurious creation)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9513,12 +9506,14 @@ mod tests {
     /// log + return without panicking AND without creating the file. Some
     /// TWRP variants or full-Android boots don't ship this file; if init's
     /// open() fails, the parser isn't invoked at all (also a clean exit).
+    /// This is identical in behavior to the "already-absent" idempotent
+    /// skip above, but explicitly tests the missing-file-as-no-op contract.
     #[test]
     fn property_contexts_patcher_handles_missing_file_gracefully() {
         let dir = make_property_contexts_temp_rootfs();
         let rootfs = dir.to_string_lossy().into_owned();
         // Don't create the file — patcher must not panic.
-        patch_property_contexts_empty(&rootfs);
+        patch_property_contexts_delete(&rootfs);
         // File should still not exist (we deliberately don't create it —
         // if init's open() fails, the parser isn't invoked at all).
         assert!(
@@ -9529,76 +9524,89 @@ mod tests {
     }
 
     /// Edge case: a file containing ONLY the `#line` directive (no newline,
-    /// no body). The patcher must EMPTY it to the single kr64 comment line
-    /// and not panic on the empty/edge-case content.
+    /// no body). The patcher must DELETE it (not panic on the edge-case
+    /// content) — the file's content shape doesn't matter for the delete
+    /// path, only its existence.
     #[test]
-    fn property_contexts_patcher_empties_file_with_only_line_directive_no_newline() {
+    fn property_contexts_patcher_deletes_file_with_only_line_directive_no_newline() {
         let dir = make_property_contexts_temp_rootfs();
         let rootfs = dir.to_string_lossy().into_owned();
         // A file with only the directive and NO trailing newline.
         let original = "#line 1 \"external/sepolicy/property_contexts\"";
         std::fs::write(dir.join("property_contexts"), original).unwrap();
-        patch_property_contexts_empty(&rootfs);
-        let patched = std::fs::read_to_string(dir.join("property_contexts")).unwrap();
-        // No line in the patched file should START with `#line` (the
-        // directive). The kr64 comment line starts with `# emptied by kr64`.
-        let any_directive = patched.lines().any(|l| l.starts_with("#line"));
+        patch_property_contexts_delete(&rootfs);
         assert!(
-            !any_directive,
-            "no line should start with `#line` (the directive). Got:\n{}",
-            patched
-        );
-        assert_eq!(
-            patched, PROPERTY_CONTEXTS_EMPTIED_CONTENT,
-            "file should be emptied to a single comment line. Got:\n{}",
-            patched
+            !dir.join("property_contexts").exists(),
+            "file with only the #line directive should be DELETED. Still exists at: {:?}",
+            dir.join("property_contexts")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Edge case: a file with the `#line` directive followed by a newline
-    /// but no body (empty rest). The patcher must EMPTY it to the single
-    /// kr64 comment line (no trailing junk from the empty body).
+    /// but no body (empty rest). The patcher must DELETE it (no special
+    /// handling needed for the empty-body edge case).
     #[test]
-    fn property_contexts_patcher_empties_file_with_directive_and_empty_body() {
+    fn property_contexts_patcher_deletes_file_with_directive_and_empty_body() {
         let dir = make_property_contexts_temp_rootfs();
         let rootfs = dir.to_string_lossy().into_owned();
         let original = "#line 1 \"external/sepolicy/property_contexts\"\n";
         std::fs::write(dir.join("property_contexts"), original).unwrap();
-        patch_property_contexts_empty(&rootfs);
-        let patched = std::fs::read_to_string(dir.join("property_contexts")).unwrap();
-        assert_eq!(
-            patched, PROPERTY_CONTEXTS_EMPTIED_CONTENT,
-            "file should be emptied to a single comment line. Got:\n{}",
-            patched
+        patch_property_contexts_delete(&rootfs);
+        assert!(
+            !dir.join("property_contexts").exists(),
+            "file with directive + empty body should be DELETED. Still exists at: {:?}",
+            dir.join("property_contexts")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Robustness: even a file WITHOUT the `#line` directive (e.g. a future
-    /// TWRP version that removed it, or arbitrary content) must be EMPTIED
-    /// to the single kr64 comment line. This is the KEY behavioral
-    /// difference from 6-L's variant (which skipped files without the
-    /// #line directive). 6-N ALWAYS empties non-already-emptied files —
-    /// the parser's context field at offset 0x14 is corrupted regardless
-    /// of whether the #line directive is present (DISPATCHER-FINAL-7).
+    /// TWRP version that removed it, or arbitrary content) must be DELETED.
+    /// This is the KEY behavioral contract from 6-N (which ALWAYS emptied
+    /// non-already-emptied files) carried into 6-O: the parser's context
+    /// field at offset 0x14 is corrupted regardless of whether the #line
+    /// directive is present (DISPATCHER-FINAL-7), so the file MUST be
+    /// deleted regardless of its content.
     #[test]
-    fn property_contexts_patcher_empties_file_without_line_directive() {
+    fn property_contexts_patcher_deletes_file_without_line_directive() {
         let dir = make_property_contexts_temp_rootfs();
         let rootfs = dir.to_string_lossy().into_owned();
         // A file without the #line directive (e.g. a future TWRP version
-        // that removed it). 6-N must STILL empty it — the parser's context
+        // that removed it). 6-O must STILL delete it — the parser's context
         // field at offset 0x14 is corrupted regardless of the directive.
         let content = "##########################\n\
                         # property service keys\n\
                         net.rmnet               u:object_r:net_radio_prop:s0\n";
         std::fs::write(dir.join("property_contexts"), content).unwrap();
-        patch_property_contexts_empty(&rootfs);
-        let after = std::fs::read_to_string(dir.join("property_contexts")).unwrap();
-        assert_eq!(
-            after, PROPERTY_CONTEXTS_EMPTIED_CONTENT,
-            "file without #line directive should STILL be emptied (6-N behavior). Got:\n{}",
-            after
+        patch_property_contexts_delete(&rootfs);
+        assert!(
+            !dir.join("property_contexts").exists(),
+            "file without #line directive should STILL be DELETED (6-O behavior). Still exists at: {:?}",
+            dir.join("property_contexts")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-UTF8 content robustness: the patcher reads the file for
+    /// diagnostic logging only (size + first line), but read_to_string
+    /// fails on non-UTF8 bytes. The patcher must STILL delete the file in
+    /// that case (remove_file works on bytes, not strings). This guards
+    /// against a hypothetical TWRP variant whose /property_contexts is
+    /// mis-encoded.
+    #[test]
+    fn property_contexts_patcher_deletes_non_utf8_file() {
+        let dir = make_property_contexts_temp_rootfs();
+        let rootfs = dir.to_string_lossy().into_owned();
+        // Non-UTF8 bytes (invalid UTF-8 sequence 0xFF 0xFE 0xFD).
+        let original: [u8; 3] = [0xFF, 0xFE, 0xFD];
+        std::fs::write(dir.join("property_contexts"), original).unwrap();
+        // Must not panic on read_to_string failing.
+        patch_property_contexts_delete(&rootfs);
+        assert!(
+            !dir.join("property_contexts").exists(),
+            "non-UTF8 file should be DELETED (remove_file works on bytes, not strings). Still exists at: {:?}",
+            dir.join("property_contexts")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
