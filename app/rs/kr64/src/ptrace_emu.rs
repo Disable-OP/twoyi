@@ -392,6 +392,57 @@ struct ChildAbi {
     shmget: i64,
     shmat: i64,
     shmctl: i64,
+    // pause() — TWRP init's __system_property_area_init code calls
+    // pause() in a loop while waiting for the property service to
+    // signal that it has set up /dev/__properties__. On the host's
+    // untrusted_app seccomp filter pause() (i386 syscall 29) is
+    // blocked, raising SIGSYS. The kernel's own pause() can ONLY ever
+    // return -EINTR (errno 4) — there is no "successful" return from
+    // pause(); it blocks until interrupted by a signal.
+    //
+    // Returning 0 for pause() (the SIGSYS handler's pre-6-D default
+    // "NOT rewriting orig_rax, returning 0" branch) is WRONG: init
+    // interprets return value 0 as "pause completed WITHOUT a
+    // signal" → re-checks its condition (property service still not
+    // ready) → calls pause() again → INFINITE LOOP. This is the
+    // post-6-C UI E2E blocker: the guest now loops on pause() (i386
+    // syscall 29) 1,048,000+ times instead of looping on shmget.
+    //
+    // Returning -EINTR (-4) tells init "a signal interrupted pause"
+    // — init's wait-loop checks its condition (property service
+    // ready? not yet) and either breaks out (if ready) or calls
+    // pause() again — but the property service, if running, will
+    // eventually signal readiness, so the loop terminates. If the
+    // property service is not running at all (the current state of
+    // the rootfs), init's pause() loop will still spin — BUT that
+    // spin is now CORRECT behaviour (init is correctly waiting for
+    // a signal that will never come), not a kr64 bug. The dispatcher
+    // is separately tracking the missing property service (see 6-C's
+    // honest caveats + 5-Y's find_property binary patch).
+    //
+    // pause() is NOT added to compute_exit_return_value's fake-
+    // success list — it returns -EINTR, not 0, via a dedicated branch
+    // in the SIGSYS handler. This means 6-C's should_skip_sigsys_setregs
+    // does NOT skip the SIGSYS handler's setregs for pause (the skip
+    // fires only for syscalls in the fake-success list — pause isn't
+    // in it) → the SIGSYS handler's setregs MUST fire to write -EINTR.
+    //
+    // The per-ABI numbers (verified against the kernel's UAPI headers
+    // in Task 6-D):
+    //   i386:   pause = 29   (per asm/unistd_32.h: __NR_pause 29)
+    //   x86_64: pause = 34   (per asm/unistd_64.h: __NR_pause 34)
+    //   aarch64: pause = -1  (SENTINEL — no __NR_pause in
+    //     asm-generic/unistd.h; pause was REMOVED in the asm-generic
+    //     table — aarch64 callers use ppoll/nanosleep instead.
+    //     bionic's pause() libc wrapper on aarch64 issues ppoll(NULL,
+    //     0, NULL, NULL) under the hood — a future aarch64-specific
+    //     fix would need a dedicated ppoll field. Mirrors the existing
+    //     pattern for ABI_AARCH64.open / access / lchown / chown /
+    //     mknod, which are also set to -1 for the same reason. The host
+    //     is x86_64 running an i386 child, so this aarch64 path is
+    //     currently dead code at runtime — the sentinel keeps the
+    //     compile happy and documents the aarch64 behaviour.)
+    pause: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -513,6 +564,15 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     shmget: 29,
     shmat: 30,
     shmctl: 31,
+    // x86_64 pause = 34 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+    // __NR_pause 34, verified directly against the kernel's UAPI header
+    // in Task 6-D). The host is x86_64 running an i386 child, so this
+    // x86_64 number does NOT currently fire at runtime (the guest uses
+    // i386 syscall 29 for pause). It is locked in for ABI completeness
+    // and to keep the EXIT handler's ABI-aware if-chain correct if a
+    // future x86_64 guest is ever supported. See the doc on `pause` in
+    // `ChildAbi` for why we return -EINTR (not 0) for pause.
+    pause: 34,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -616,6 +676,27 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     shmget: 395,
     shmat: 397,
     shmctl: 396,
+    // i386 pause = 29 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+    // __NR_pause 29, verified directly against the kernel's UAPI header
+    // in Task 6-D). This is the value the guest's TWRP init uses when
+    // its __system_property_area_init code calls pause() in a loop
+    // waiting for the property service to signal readiness. Pre-6-D
+    // the SIGSYS handler returned 0 for pause (the default
+    // "NOT rewriting orig_rax, returning 0" branch) → init interpreted
+    // return value 0 as "pause completed without a signal" → re-checked
+    // its condition (property service not ready) → retried pause →
+    // INFINITE LOOP (1,048,000+ calls observed on commit 368f59b). The
+    // 6-D fix adds a dedicated SIGSYS branch returning -EINTR (-4),
+    // so init's wait-loop sees "interrupted by a signal" and can break
+    // out when the property service eventually becomes ready.
+    //
+    // NOTE: this is the SAME number that the pre-6-C kr64 mistakenly
+    // used for ABI_X86_32.shmget (because the i386 shm numbers were
+    // copy-pasted from ABI_X86_64, where shmget IS 29). 6-C moved
+    // shmget to 395 (the real i386 number), which left syscall 29
+    // "unintercepted" by the shmget branch and falling through to the
+    // default "returning 0" branch — exposing the pause() loop bug.
+    pause: 29,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -729,6 +810,34 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     shmget: 194,
     shmat: 196,
     shmctl: 195,
+    // aarch64 pause = -1 (SENTINEL "not present on this ABI"). The
+    // asm-generic/unistd.h table (used by aarch64) has NO __NR_pause
+    // — pause() was REMOVED in the asm-generic table (verified
+    // directly against /usr/include/asm-generic/unistd.h in Task 6-D
+    // — `grep __NR_pause` returned nothing). aarch64 callers use
+    // ppoll(NULL, 0, NULL, NULL) or nanosleep instead; bionic's
+    // pause() libc wrapper on aarch64 issues ppoll under the hood.
+    // With ABI_AARCH64.pause = -1:
+    //   - syscall_name(-1, &ABI_AARCH64) falls through to "unknown"
+    //     (the pause branch never matches — no real syscall is -1).
+    //   - compute_exit_return_value(-1, &ABI_AARCH64) returns None
+    //     (pause is not in the fake-success if-chain at all).
+    //   - The SIGSYS handler's pause branch (`original_syscall ==
+    //     a.pause`) never matches -1 — no real caller ever passes -1.
+    //   - A future aarch64-specific fix would add a dedicated
+    //     `ppoll: i64` field (= 73 in asm-generic) instead of aliasing
+    //     pause to it — aliasing would mislabel ppoll SIGSYS as
+    //     "pause" in syscall_name() (mislabeled but harmless) AND
+    //     would intercept a real ppoll in the SIGSYS handler (would
+    //     force -EINTR for any ppoll the guest makes, even legitimate
+    //     ones that should return 0 — too risky). Mirrors the existing
+    //     pattern for ABI_AARCH64.open / access / lchown / chown /
+    //     mknod, which are also set to -1 for the same "asm-generic
+    //     dropped it" reason.
+    // The host is x86_64 running an i386 child, so this aarch64 path
+    // is currently dead code at runtime — the sentinel keeps the
+    // compile happy and documents the aarch64 behaviour.
+    pause: -1,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -1447,6 +1556,18 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "shmat"
     } else if nr == abi.shmctl {
         "shmctl"
+    } else if nr == abi.pause {
+        // Added in Task 6-D. Pre-6-D, i386 syscall 29 was labelled
+        // "[unknown]" (after 6-C moved shmget from 29 to 395, syscall
+        // 29 was no longer matched by any branch). The post-6-C logcat
+        // showed "post-execve syscall #92: nr=29 [unknown]" + "NOTE:
+        // unexpected SIGSYS for this syscall" 1,048,000+ times — that
+        // is the infinite pause() retry loop. With this entry the
+        // diagnostic label correctly says "pause" so the next person
+        // debugging the loop can immediately identify it from the
+        // SIGSYS log without cross-referencing against the kernel's
+        // UAPI header.
+        "pause"
     } else if nr == abi.fchown {
         "fchown"
     } else if nr == abi.fchmod {
@@ -3607,6 +3728,71 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 name, original_syscall, name
                             ));
                             -(libc::ENOSYS as i64)
+                        } else if original_syscall == a.pause {
+                            // pause() — Task 6-D. TWRP init's
+                            // __system_property_area_init code calls
+                            // pause() in a loop while waiting for the
+                            // property service to signal it has set up
+                            // /dev/__properties__. On the host's
+                            // untrusted_app seccomp filter pause() is
+                            // blocked (i386 syscall 29), raising SIGSYS.
+                            //
+                            // The kernel's own pause() can ONLY ever
+                            // return -EINTR (errno 4) — there is no
+                            // "successful" return from pause(); it
+                            // blocks until interrupted by a signal.
+                            //
+                            // Returning 0 for pause() (the SIGSYS
+                            // handler's pre-6-D default "NOT rewriting
+                            // orig_rax, returning 0" branch) is WRONG:
+                            // init interprets return value 0 as "pause
+                            // completed WITHOUT a signal" → re-checks
+                            // its condition (property service still
+                            // not ready) → calls pause() again →
+                            // INFINITE LOOP. This was the post-6-C UI
+                            // E2E blocker (commit 368f59b): the guest
+                            // now loops on pause() 1,048,000+ times
+                            // instead of looping on shmget (which 6-C
+                            // had just fixed).
+                            //
+                            // Returning -EINTR (-4) tells init "a
+                            // signal interrupted pause" — init's
+                            // wait-loop checks its condition (property
+                            // service ready? not yet) and either
+                            // breaks out (if ready) or calls pause()
+                            // again — but the property service, if
+                            // running, will eventually signal
+                            // readiness, so the loop terminates. If the
+                            // property service is not running at all
+                            // (the current state of the rootfs — see
+                            // 5-Y's find_property binary patch + 6-C's
+                            // honest caveats), init's pause() loop
+                            // will still spin — BUT that spin is now
+                            // CORRECT behaviour (init is correctly
+                            // waiting for a signal that will never
+                            // come), not a kr64 bug.
+                            //
+                            // pause() is NOT in
+                            // compute_exit_return_value's fake-success
+                            // list — it returns -EINTR via this
+                            // dedicated branch, not 0 via the EXIT
+                            // handler. This means 6-C's
+                            // should_skip_sigsys_setregs (which
+                            // requires `compute_exit_return_value(
+                            // ...).is_some()`) does NOT skip the
+                            // SIGSYS handler's setregs for pause →
+                            // the setregs MUST fire to write -EINTR.
+                            // (Pre-6-C the skip fired unconditionally
+                            // in DESYNC mode → pause's -EINTR would
+                            // never have been written even if this
+                            // branch existed. 6-C's fix made this
+                            // branch's setregs actually reachable in
+                            // DESYNC mode.)
+                            sigsys_log(&format!(
+                                "intercepted SIGSYS — pause() nr={} [{}] (NOT rewriting orig_rax — returning -EINTR so init's wait-loop checks its condition + breaks instead of spinning on a 'successful' pause return)",
+                                original_syscall, name
+                            ));
+                            -(libc::EINTR as i64)
                         } else {
                             sigsys_log(&format!(
                                 "intercepted SIGSYS — syscall nr={} [{}] (NOT rewriting orig_rax, returning 0) — NOTE: unexpected SIGSYS for this syscall",
@@ -3673,6 +3859,24 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         //     these need -ENOSYS at runtime in DESYNC
                         //     mode, add them to
                         //     compute_exit_return_value.)
+                        //   - pause returns -EINTR (Task 6-D) via a
+                        //     dedicated SIGSYS handler branch (NOT in
+                        //     compute_exit_return_value — pause has
+                        //     its OWN non-zero return value, like
+                        //     shmget's -ENOSYS). Same reasoning as
+                        //     shmget: the SIGSYS handler's setregs is
+                        //     the ONLY writeback and MUST fire (6-C's
+                        //     should_skip_sigsys_setregs requires
+                        //     compute_exit_return_value(...).is_some(),
+                        //     which is None for pause → skip does NOT
+                        //     fire → setregs fires → -EINTR is written).
+                        //     Returning 0 (the pre-6-D default) caused
+                        //     the post-6-C infinite pause() retry loop
+                        //     (1M+ calls on commit 368f59b) because
+                        //     init interpreted 0 as "pause completed
+                        //     WITHOUT a signal" → re-checked its
+                        //     condition (property service still not
+                        //     ready) → retried pause forever.
                         //
                         // `set_syscall_ret` is still called on
                         // `sigsys_regs` so the readback log below can
@@ -4969,6 +5173,138 @@ mod tests {
         assert!(
             !should_skip_sigsys_setregs(false, shmget_nr, &abi),
             "DESYNC + shmget (NOT in fake-success list): skip MUST NOT fire — SIGSYS handler's setregs is the only writeback (writes -ENOSYS)"
+        );
+    }
+
+    // ── 6-D regression tests: pause() syscall numbers + SIGSYS branch ─
+    //
+    // These guard the 6-D fix for the post-6-C infinite pause() retry
+    // loop (commit 368f59b — 6-C's shmget number correction): the
+    // guest now loops on pause() (i386 syscall 29) 1,048,000+ times
+    // because the SIGSYS handler returned 0 (the default
+    // "NOT rewriting orig_rax, returning 0" branch) for pause.
+    // Returning 0 is WRONG for pause() — the kernel's own pause()
+    // can ONLY ever return -EINTR (errno 4). Init's
+    // __system_property_area_init code interprets 0 as "pause
+    // completed WITHOUT a signal" → re-checks its condition (property
+    // service still not ready) → calls pause() again → INFINITE LOOP.
+    // The 6-D fix returns -EINTR via a dedicated SIGSYS branch so
+    // init's wait-loop sees "interrupted by a signal" and can break
+    // out when the property service eventually becomes ready.
+    //
+    // These tests verify:
+    //   (1) pause syscall numbers match the kernel's UAPI headers
+    //       (i386=29, x86_64=34, aarch64=-1 sentinel).
+    //   (2) compute_exit_return_value returns None for pause (pause
+    //       is NOT in the fake-success list — it has its own -EINTR
+    //       branch in the SIGSYS handler).
+    //   (3) should_skip_sigsys_setregs does NOT fire for pause (so
+    //       the SIGSYS handler's setregs MUST fire to write -EINTR).
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_pause_number_correct() {
+        // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+        //   #define __NR_pause   29
+        // This is the SAME number that the pre-6-C kr64 WRONGLY used
+        // for ABI_X86_32.shmget (because the i386 shm numbers were
+        // copy-pasted from ABI_X86_64, where shmget IS 29). 6-C moved
+        // shmget to 395 (the real i386 number), which left syscall 29
+        // "unintercepted" by the shmget branch and falling through to
+        // the default "returning 0" branch — exposing the pause() loop
+        // bug that 6-D fixes.
+        assert_eq!(ABI_X86_32.pause, 29, "i386 pause must be 29");
+        // Sanity: pause ≠ shmget on i386 now (both were 29 pre-6-C).
+        assert_ne!(
+            ABI_X86_32.pause, ABI_X86_32.shmget,
+            "i386 pause ({}) must differ from i386 shmget ({}) — both were 29 pre-6-C",
+            ABI_X86_32.pause, ABI_X86_32.shmget
+        );
+        // syscall_name() must resolve i386 syscall 29 to "pause".
+        assert_eq!(syscall_name(29, &ABI_X86_32), "pause");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_pause_number_correct() {
+        // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+        //   #define __NR_pause  34
+        // The host is x86_64 running an i386 child, so this x86_64
+        // number does NOT currently fire at runtime (the guest uses
+        // i386 syscall 29 for pause). It is locked in for ABI
+        // completeness and to keep the EXIT handler's ABI-aware
+        // if-chain correct if a future x86_64 guest is ever supported.
+        assert_eq!(ABI_X86_64.pause, 34, "x86_64 pause must be 34");
+        // Sanity: syscall_name() resolves x86_64 syscall 34 to "pause".
+        assert_eq!(syscall_name(34, &ABI_X86_64), "pause");
+    }
+
+    #[test]
+    fn compute_exit_return_value_pause_returns_none() {
+        // pause is NOT in compute_exit_return_value's fake-success
+        // list — it returns None. The SIGSYS handler has its OWN
+        // dedicated branch for pause that returns -EINTR (-4, NOT 0).
+        // If pause were ever added to the fake-success list, the EXIT
+        // handler would write rax=0 for it, which would CAUSE the
+        // infinite pause() retry loop again (init would interpret 0
+        // as "pause completed without a signal" → re-check condition
+        // → retry pause forever). This test locks in the contract:
+        // pause returns None from compute_exit_return_value so the
+        // EXIT handler does NOT write rax=0 for pause; the SIGSYS
+        // handler's -EINTR writeback is the ONLY writeback.
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32; // i386 — the runtime-relevant ABI for TWRP.
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+        let pause_nr = abi.pause;
+        // Sanity: pause_nr is either a real syscall number (i386=29,
+        // x86_64=34) or the -1 sentinel (aarch64). We only assert the
+        // None contract for real syscall numbers — for -1 the contract
+        // is also None (no real caller ever passes -1) but the test
+        // value is meaningless.
+        assert_eq!(
+            compute_exit_return_value(pause_nr, &abi),
+            None,
+            "pause must NOT be in compute_exit_return_value's fake-success list — the SIGSYS handler returns -EINTR for it via a dedicated branch (returning 0 would cause the infinite pause() retry loop)"
+        );
+    }
+
+    #[test]
+    fn should_skip_sigsys_setregs_false_for_pause() {
+        // pause is NOT in compute_exit_return_value's fake-success
+        // list (it returns None — the SIGSYS handler returns -EINTR
+        // for pause via a dedicated branch, NOT 0 via the EXIT
+        // handler). In DESYNC mode the EXIT handler did NOT write
+        // rax for pause → the SIGSYS handler's setregs is the ONLY
+        // writeback and MUST execute to write -EINTR. Skip MUST NOT
+        // fire. (If 6-C's should_skip_sigsys_setregs skipped pause
+        // too, the -EINTR writeback would never happen → rax would
+        // retain the kernel's leaked syscall-number value → init
+        // would interpret that positive value as a "successful"
+        // pause return → infinite pause() retry loop, same shape as
+        // the pre-6-C shmget infinite loop.)
+        //
+        // This test is the direct regression guard for the 6-D fix:
+        // it confirms 6-C's `compute_exit_return_value(...).is_some()`
+        // condition correctly excludes pause (which returns None)
+        // → the skip does NOT fire for pause → the SIGSYS handler's
+        // setregs fires → -EINTR is written → init's wait-loop can
+        // break out.
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32; // i386 — the runtime-relevant ABI for TWRP.
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+        let pause_nr = abi.pause;
+        // Sanity: pause is NOT in the fake-success list.
+        assert_eq!(
+            compute_exit_return_value(pause_nr, &abi),
+            None,
+            "pause must NOT be in compute_exit_return_value's fake-success list (the SIGSYS handler returns -EINTR for it via a dedicated branch)"
+        );
+        // DESYNC + NOT fake-success → must NOT skip.
+        assert!(
+            !should_skip_sigsys_setregs(false, pause_nr, &abi),
+            "DESYNC + pause (NOT in fake-success list): skip MUST NOT fire — SIGSYS handler's setregs is the only writeback (writes -EINTR, NOT 0). If this skip fired, pause's -EINTR would never be written → rax would retain the kernel's leaked syscall number → init would see a positive 'pause returned' value → infinite pause() retry loop (same shape as pre-6-C shmget infinite loop)."
         );
     }
 
