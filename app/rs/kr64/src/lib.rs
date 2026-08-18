@@ -2620,6 +2620,227 @@ enum PropertyContextsCrashNopPatchResult {
     NotFound,
 }
 
+/// PRAGMATIC symptom-mask patch — NOP the read_file() *arg2 store at
+/// vaddr 0x8052f65 (file offset 0xaf65).
+///
+/// # HONEST LABEL — this is NOT a proper fix
+///
+/// **This is a pragmatic symptom-mask patch, NOT a proper fix.**
+///
+/// The proper fix belongs in the SIGSYS handler's register-preservation
+/// logic — the garbage value 0x696e692f (ASCII "/ini") leaked into
+/// arg2 because the SIGSYS handler raced with read_file()'s ABI
+/// register use. That proper fix is out of scope for this session.
+///
+/// # Root cause (per 6-U DIAG KLOG diagnostic + 6-V-pre disassembly)
+///
+/// 6-U's DIAG KLOG diagnostic captured init's own write() buffer
+/// contents inline, exposing a latent SIGSEGV. UI E2E run 32194676789
+/// analysis showed iter count DROP from 3635 to 826 (the PEEKDATA
+/// timing exposed a latent crash), with exit code -11 (SIGSEGV).
+///
+/// SIGSEGV details:
+///   * si_code = 1 (MAPERR unmapped)
+///   * si_addr = 0x696e692f (ASCII "/ini" — first 4 bytes of
+///     "/init.rc" rodata leaked by a SIGSYS-handler race)
+///   * rip    = 0x8052f65
+///   * rsp    = 0xff864a70
+///
+/// The crash instruction at vaddr 0x8052f65 (file offset 0xaf65) is:
+///
+/// ```text
+///   0x8052f5b: movb $0x0, 0x1(%edx,%ecx,1)   ; buffer[readcount] = 0
+///                                            ; (buffer is NUL-terminated)
+///   0x8052f60: test %eax,%eax                 ; if (arg2 != NULL)
+///   0x8052f60: je 8052f67                     ; (NULL-guard — SHOULD skip
+///                                            ; the store when arg2==NULL)
+///   0x8052f65: mov %ecx,(%eax)                ; *arg2 = readcount
+///                                            ; <-- CRASH HERE (89 08)
+/// ```
+///
+/// `eax` = arg2 (an optional `ssize_t*` out-param) SHOULD be NULL
+/// when the caller doesn't want the size back. The NULL-guard at
+/// 0x8052f60 (`je 8052f67`) is designed to skip the store when
+/// arg2==NULL — but arg2 is non-NULL GARBAGE (0x696e692f, leaked by
+/// a SIGSYS-handler race), so the guard falls through to the crashing
+/// store.
+///
+/// # The patch
+///
+/// NOP the 2-byte store instruction at file offset 0xaf65:
+///
+/// ```text
+///   Original: 89 08        (mov %ecx,(%eax))
+///   Patched:  90 90        (2 × NOP)
+/// ```
+///
+/// The file offset is computed from the vaddr + the ELF load base:
+///   `0x8052f65 - 0x8048000 = 0xaf65`
+///
+/// # Effect (and honest caveats)
+///
+/// With the store NOP'd, read_file() SKIPS writing the read byte-count
+/// to *arg2 — but the buffer is STILL null-terminated at 0x8052f5b
+/// (the `movb $0x0, 0x1(%edx,%ecx,1)` BEFORE the crash site is NOT
+/// touched), so callers that use the buffer as a C string still work.
+/// Only callers that explicitly depend on the ssize_t* out-param
+/// being written are affected — 13 call sites exist; none critically
+/// depend on the out-size being written (the buffer is NUL-terminated,
+/// so callers can strlen() it if they need the length).
+///
+/// **Honest caveats:**
+///   * This is a symptom-mask patch, NOT a proper fix.
+///   * The real fix belongs in the SIGSYS handler's register-
+///     preservation logic — preventing the 0x696e692f leak in the
+///     first place.
+///   * The ONLY definitive proof that this unblocks the boot is a
+///     `ui-e2e-test.yml` run + VLM screenshot analysis. Do NOT claim
+///     "TWRP boots now" without that.
+///
+/// # Architecture notes
+///
+/// The byte pattern is specific to the **i386** build of TWRP init
+/// (TWRP 3.7.0_9-0). On **aarch64** TWRP images, the binary uses an
+/// entirely different instruction encoding (AArch64), so the crash
+/// instruction at vaddr 0x8052f65 (an x86 i386 absolute address) is
+/// meaningless. We skip the patch entirely on aarch64 (returning
+/// [`ReadFileSigsegvPatchResult::Skipped`]) — same approach as
+/// [`patch_twrp_init_klog_init`] + [`patch_twrp_init_selinux_load_skip`]
+/// + [`patch_twrp_init_property_contexts_crash_nop`].
+///
+/// # Idempotence
+///
+/// Direct offset-based check: if the 2 bytes at file offset 0xaf65
+/// are already `90 90`, the patch was applied in a previous boot and
+/// we return [`ReadFileSigsegvPatchResult::AlreadyApplied`] without
+/// modifying the bytes.
+///
+/// # Safety check
+///
+/// Like [`patch_twrp_init_property_contexts_crash_nop`], this patch
+/// directly checks the bytes at the EXPECTED file offset 0xaf65. The
+/// 2-byte pattern `89 08` (`mov %ecx,(%eax)`) is a common instruction
+/// and could legitimately appear elsewhere in the binary — scanning
+/// for it would yield many coincidental matches. The direct-offset
+/// check is therefore both safer and unambiguous: we ONLY touch the
+/// exact crash site, never any other `mov %ecx,(%eax)` instance.
+///
+/// # Arguments
+///
+/// * `init_bytes` - The init binary's bytes (read from `{rootfs}/init`).
+///
+/// # Returns
+///
+/// See [`ReadFileSigsegvPatchResult`] for the per-variant semantics.
+fn patch_twrp_init_read_file_sigsegv(init_bytes: &mut [u8]) -> ReadFileSigsegvPatchResult {
+    // The byte pattern we match is specific to the i386 build of TWRP
+    // init. On aarch64 TWRP images, the binary uses an entirely
+    // different instruction encoding (AArch64), so the crash
+    // instruction at vaddr 0x8052f65 (an i386 absolute address) is
+    // meaningless — and the SIGSYS-handler race this patch works around
+    // is specific to the i386 build of read_file() anyway. Skip the
+    // patch entirely on aarch64 to avoid the misleading "TWRP version
+    // mismatch?" warning that the caller would otherwise log on every
+    // arm64 boot.
+    #[cfg(target_arch = "aarch64")]
+    {
+        info!(
+            "[KR64] read_file() SIGSEGV patch is x86-only; skipped on arm64 (aarch64 TWRP uses a different read_file() implementation)"
+        );
+        // Mark `init_bytes` as intentionally unused on aarch64 to
+        // silence the unused_variables lint without renaming the
+        // parameter (which is shared with the non-aarch64 branch below).
+        let _ = init_bytes;
+        ReadFileSigsegvPatchResult::Skipped
+    }
+
+    // On non-aarch64 hosts (x86, x86_64, etc.), perform the actual
+    // i386-instruction-pattern match at the expected file offset.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Pattern: `mov %ecx,(%eax)` = `89 08`
+        //   89            opcode (MOV r/m32, r32)
+        //   08            ModR/M (mod=00, reg=001 ecx, rm=000 eax)
+        // Total: 2 bytes (matches the disassembly at vaddr 0x8052f65).
+        const PATTERN: [u8; 2] = [0x89, 0x08];
+        // Patched: 2 × NOP.
+        const NOP_PATCH: [u8; 2] = [0x90; 2];
+        // Expected file offset: 0x8052f65 (vaddr) - 0x8048000 (ELF load
+        // base for this i386 PIE) = 0xaf65. This is the file offset at
+        // which the crash instruction `mov %ecx,(%eax)` lives.
+        const EXPECTED_MATCH_OFF: usize = 0xaf65;
+
+        if init_bytes.len() < EXPECTED_MATCH_OFF + PATTERN.len() {
+            // Binary is too small to contain the patch site — either
+            // not a TWRP init binary or a very different TWRP version.
+            return ReadFileSigsegvPatchResult::NotFound;
+        }
+
+        let target: &mut [u8] =
+            &mut init_bytes[EXPECTED_MATCH_OFF..EXPECTED_MATCH_OFF + PATTERN.len()];
+
+        // 1. Idempotency check: if the bytes are already 2 × NOP, the
+        //    patch was applied in a previous boot — skip.
+        if target == NOP_PATCH {
+            return ReadFileSigsegvPatchResult::AlreadyApplied;
+        }
+
+        // 2. Apply the patch: if the bytes at the expected offset match
+        //    the unpatched pattern, overwrite them with 2 × NOP.
+        if target == PATTERN {
+            target.copy_from_slice(&NOP_PATCH);
+            return ReadFileSigsegvPatchResult::Applied;
+        }
+
+        // 3. Neither the unpatched pattern nor the patched signature
+        //    matched at the expected offset. Either TWRP version drift
+        //    (the crash instruction moved) OR the binary was already
+        //    modified in some other way. Either way, refuse to patch —
+        //    the caller logs a "TWRP version mismatch?" warning.
+        ReadFileSigsegvPatchResult::NotFound
+    }
+}
+
+/// Result of attempting to apply the read_file() SIGSEGV-NOP patch
+/// (the pragmatic symptom-mask patch at file offset 0xaf65).
+///
+/// See [`patch_twrp_init_read_file_sigsegv`] for the full root-cause
+/// analysis and the per-variant semantics. Mirrors
+/// [`PropertyContextsCrashNopPatchResult`] + [`KlogInitPatchResult`] +
+/// [`SelinuxLoadSkipPatchResult`]: `Applied` and `AlreadyApplied` are
+/// successes, `Skipped` is an expected non-action (e.g. aarch64), and
+/// `NotFound` is a potential problem (TWRP version mismatch — the patch
+/// couldn't be applied, so init may SIGSEGV at rip=0x8052f65 later in
+/// the boot path).
+///
+/// `#[allow(dead_code)]` is needed for the same reason as
+/// [`PropertyContextsCrashNopPatchResult`]: the variants are
+/// platform-conditional (`Skipped` is only constructed on aarch64, the
+/// other three are only constructed on non-aarch64 hosts). On any
+/// given host, the "other" platform's variants would otherwise be
+/// flagged as dead code by the compiler.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadFileSigsegvPatchResult {
+    /// Patch was applied to the bytes — caller should write them back.
+    Applied,
+    /// Patch was already applied in a previous boot — caller can skip
+    /// the write (no modification needed, idempotent).
+    AlreadyApplied,
+    /// Patch was intentionally skipped (e.g. on aarch64, where the
+    /// i386-only byte pattern is irrelevant). The skip reason has
+    /// been logged; the caller should NOT log a "version mismatch"
+    /// warning and should NOT write the bytes back.
+    Skipped,
+    /// Pattern was not found at the expected file offset — caller
+    /// should log a warning because this likely indicates a TWRP
+    /// version mismatch. Without this patch, init will SIGSEGV at
+    /// rip=0x8052f65 (si_addr=0x696e692f) when read_file() writes the
+    /// read byte-count to the garbage `*arg2` pointer leaked by the
+    /// SIGSYS-handler race.
+    NotFound,
+}
+
 /// Set the SELinux security context of a file using the `lsetxattr(2)`
 /// syscall directly.
 ///
@@ -4650,6 +4871,89 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 }
                 Err(e) => warning!(
                     "[KR64] PARENT: failed to read /init for property_contexts crash-nop patching: {} (init may SIGSEGV at rip=0x80a0b9e — see worklog 6-M)",
+                    e
+                ),
+            }
+        }
+
+        // ── read_file() SIGSEGV NOP patch — PRAGMATIC symptom-mask
+        // patch (Task 6-V) ──
+        //
+        // HONEST LABEL: This is NOT a proper fix — it's a pragmatic
+        // symptom-mask patch. The proper fix belongs in the SIGSYS
+        // handler's register-preservation logic.
+        //
+        // ROOT CAUSE (6-U DIAG KLOG + 6-V-pre disassembly):
+        //   After 6-U's DIAG KLOG diagnostic landed (5fc92b7), the UI
+        //   E2E run 32194676789 analysis showed iter count DROP
+        //   3635→826 (PEEKDATA timing exposed a latent SIGSEGV), exit
+        //   code -11 (SIGSEGV):
+        //     mov %ecx,(%eax)  (insn: 89 08)
+        //   where eax=0x696e692f (ASCII "/ini" — first 4 bytes of
+        //   "/init.rc" rodata leaked by a SIGSYS-handler race).
+        //
+        // THE PATCH:
+        //   Original: 89 08  (mov %ecx,(%eax))
+        //   Patched:  90 90  (2 × NOP)
+        //   File offset: 0x8052f65 - 0x8048000 = 0xaf65
+        //
+        // EFFECT (honest caveats):
+        //   * read_file() SKIPS writing the read byte-count to *arg2.
+        //   * The buffer is STILL null-terminated at 0x8052f5b
+        //     (movb $0x0, 0x1(%edx,%ecx,1) BEFORE the crash site is
+        //     NOT touched), so callers that use the buffer as a C
+        //     string still work.
+        //   * Only callers that explicitly depend on the ssize_t*
+        //     out-param being written are affected — 13 call sites
+        //     exist; none critically depend on the out-size being
+        //     written (the buffer is NUL-terminated).
+        //   * The ONLY definitive proof is a ui-e2e-test.yml run + VLM
+        //     screenshot analysis. Do NOT claim "TWRP boots now".
+        //
+        // Pattern + offset verified by 6-V-pre's disassembly + 6-U's
+        // DIAG KLOG. See [`patch_twrp_init_read_file_sigsegv`] for the
+        // full root-cause analysis. The function is IDEMPOTENT (skipped
+        // if already applied) and is safe to apply on every boot.
+        {
+            let init_path = format!("{}/init", rootfs_prefix);
+            match std::fs::read(&init_path) {
+                Ok(mut bytes) => {
+                    match patch_twrp_init_read_file_sigsegv(&mut bytes) {
+                        ReadFileSigsegvPatchResult::Applied => {
+                            match std::fs::write(&init_path, &bytes) {
+                                Ok(()) => info!(
+                                    "[KR64] PARENT: patched /init read_file() at file offset 0xaf65 (vaddr 0x8052f65) — replaced `mov %ecx,(%eax)` (2 bytes: 89 08) with 2× NOP (90 90); skips the *arg2=readcount store that SIGSEGV'd when arg2 held garbage pointer 0x696e692f ('/ini' rodata leak from SIGSYS-handler race). The buffer is still null-terminated at 0x8052f5b so string-using callers work; only the explicit size out-param is dropped. (Task 6-V; pragmatic symptom-mask per disassembly — the real fix belongs in the SIGSYS handler's register-preservation logic.)"
+                                ),
+                                Err(e) => warning!(
+                                    "[KR64] PARENT: patched /init read_file() in memory but failed to write back: {} (init may SIGSEGV at rip=0x8052f65 with si_addr=0x696e692f)",
+                                    e
+                                ),
+                            }
+                        }
+                        ReadFileSigsegvPatchResult::AlreadyApplied => {
+                            info!(
+                                "[KR64] PARENT: /init read_file() *arg2 store already NOP'd (idempotent skip) — store skipped (PRAGMATIC symptom-mask per Task 6-V)"
+                            );
+                        }
+                        ReadFileSigsegvPatchResult::Skipped => {
+                            // Skip reason already logged inside
+                            // `patch_twrp_init_read_file_sigsegv`
+                            // (currently fires only on aarch64, where
+                            // the i386-only byte pattern is irrelevant).
+                            // Do NOT log the "TWRP version mismatch?"
+                            // warning here — it would be misleading on
+                            // arm64, where the skip is expected and
+                            // harmless.
+                        }
+                        ReadFileSigsegvPatchResult::NotFound => {
+                            warning!(
+                                "[KR64] PARENT: could not find read_file() *arg2 store instruction at file offset 0xaf65 in /init (TWRP version mismatch?) — init may SIGSEGV at rip=0x8052f65 with si_addr=0x696e692f (garbage `*arg2` from SIGSYS-handler race — see worklog 6-U + DISPATCHER-UPDATE-12)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => warning!(
+                    "[KR64] PARENT: failed to read /init for read_file() SIGSEGV patching: {} (init may SIGSEGV at rip=0x8052f65 — see worklog 6-U + DISPATCHER-UPDATE-12)",
                     e
                 ),
             }
@@ -8975,6 +9279,158 @@ mod tests {
             patch_twrp_init_property_contexts_crash_nop(&mut init_bytes_mut),
             PropertyContextsCrashNopPatchResult::AlreadyApplied,
             "patch should be idempotent on real TWRP init binary"
+        );
+    }
+
+    // ========================================================================
+    // Tests for `patch_twrp_init_read_file_sigsegv` — the 2-byte NOP
+    // patch at file offset 0xaf65 (vaddr 0x8052f65) that makes init's
+    // read_file() SKIP the *arg2 = readcount store through the garbage
+    // pointer (0x696e692f, ASCII "/ini" leaked by a SIGSYS-handler race)
+    // instead of SIGSEGV'ing (PRAGMATIC symptom-mask patch per Task 6-V
+    // + 6-U DIAG KLOG + DISPATCHER-UPDATE-12).
+    //
+    // The test set mirrors `patch_twrp_init_property_contexts_crash_nop_*`:
+    //   * applies cleanly to an unpatched binary at the expected offset
+    //   * is IDEMPOTENT (applying twice == applying once)
+    //   * returns NotFound when the binary is too small / pattern absent
+    //     at the expected offset
+    //   * refuses to apply when the bytes at the expected offset are some
+    //     UNEXPECTED value (safety check against version drift / an
+    //     unrelated patch having been applied there)
+    // ========================================================================
+
+    /// Build a binary containing the read_file() crash instruction
+    /// (`mov %ecx,(%eax)` = `89 08`) at the expected file offset 0xaf65
+    /// (vaddr 0x8052f65).
+    ///
+    /// Only built on non-aarch64 hosts — the pattern-matching tests
+    /// below are x86/i386-specific (they verify the i386 byte pattern)
+    /// and the function under test short-circuits to `Skipped` on
+    /// aarch64.
+    #[cfg(not(target_arch = "aarch64"))]
+    fn build_read_file_sigsegv_pattern_at_expected_offset() -> Vec<u8> {
+        // 48 KiB of NOP filler — large enough to contain the expected
+        // match offset 0xaf65 (≈ 45 KiB) + 2 bytes of pattern. The
+        // filler is a recognizable, neutral background that cannot
+        // accidentally contain the 2-byte pattern (a sequence of all
+        // 0x90 bytes has no 0x89).
+        let mut v = vec![0x90u8; 48 * 1024];
+        // Place the 2-byte `mov %ecx,(%eax)` instruction at the
+        // expected file offset 0xaf65 (vaddr 0x8052f65 — the crash
+        // site identified by 6-U DIAG KLOG + 6-V-pre disassembly).
+        let off: usize = 0xaf65;
+        v[off] = 0x89; // opcode (MOV r/m32, r32)
+        v[off + 1] = 0x08; // ModR/M (mod=00, reg=001 ecx, rm=000 eax)
+        v
+    }
+
+    /// `patch_twrp_init_read_file_sigsegv` must find the pattern at the
+    /// expected offset (0xaf65) and replace the 2-byte `mov %ecx,(%eax)`
+    /// instruction with 2 NOPs.
+    ///
+    /// Skipped on aarch64: the function short-circuits to `Skipped`
+    /// there (the i386 byte pattern is irrelevant), so the x86-specific
+    /// assertions below would never hold on arm64.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_read_file_sigsegv_applies_to_unpatched_binary() {
+        let mut bytes = build_read_file_sigsegv_pattern_at_expected_offset();
+        assert_eq!(
+            patch_twrp_init_read_file_sigsegv(&mut bytes),
+            ReadFileSigsegvPatchResult::Applied,
+            "patch should apply to unpatched binary"
+        );
+        // The 2 bytes at offset 0xaf65 should now be 2 NOPs.
+        let off: usize = 0xaf65;
+        assert_eq!(
+            &bytes[off..off + 2],
+            &[0x90; 2],
+            "`mov %ecx,(%eax)` bytes should be NOP'd"
+        );
+    }
+
+    /// `patch_twrp_init_read_file_sigsegv` must be IDEMPOTENT: applying
+    /// it twice yields the same result as applying it once. The second
+    /// call must return `AlreadyApplied` (not `Applied`) and must NOT
+    /// modify the bytes.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_read_file_sigsegv_applies_to_unpatched_binary`
+    /// above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_read_file_sigsegv_is_idempotent() {
+        let mut bytes = build_read_file_sigsegv_pattern_at_expected_offset();
+        assert_eq!(
+            patch_twrp_init_read_file_sigsegv(&mut bytes),
+            ReadFileSigsegvPatchResult::Applied,
+            "first patch should be Applied"
+        );
+        let after_first = bytes.clone();
+        assert_eq!(
+            patch_twrp_init_read_file_sigsegv(&mut bytes),
+            ReadFileSigsegvPatchResult::AlreadyApplied,
+            "second patch should be AlreadyApplied (idempotent)"
+        );
+        assert_eq!(
+            bytes, after_first,
+            "second patch should not modify the binary"
+        );
+    }
+
+    /// `patch_twrp_init_read_file_sigsegv` must return `NotFound` if
+    /// the binary is too small to contain the patch site at file offset
+    /// 0xaf65 (e.g. a tiny test binary, or — in production — a
+    /// different binary that isn't TWRP init).
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_read_file_sigsegv_applies_to_unpatched_binary`
+    /// above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_read_file_sigsegv_returns_not_found_when_binary_too_small() {
+        // 4 KiB of NOP filler — too small to contain the patch site at
+        // file offset 0xaf65 (≈ 45 KiB).
+        let mut bytes = vec![0x90u8; 4 * 1024];
+        assert_eq!(
+            patch_twrp_init_read_file_sigsegv(&mut bytes),
+            ReadFileSigsegvPatchResult::NotFound,
+            "patch should return NotFound when binary is too small"
+        );
+    }
+
+    /// `patch_twrp_init_read_file_sigsegv` must return `NotFound` when
+    /// the 2 bytes at file offset 0xaf65 are neither the unpatched
+    /// pattern (`89 08`) nor the already-patched signature (`90 90`).
+    /// This is the safety check against TWRP version drift (the crash
+    /// instruction moved to a different offset) OR an unrelated patch
+    /// having been applied at the same offset.
+    ///
+    /// Skipped on aarch64 — see
+    /// `patch_twrp_init_read_file_sigsegv_applies_to_unpatched_binary`
+    /// above.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn patch_twrp_init_read_file_sigsegv_refuses_unexpected_pattern_at_offset() {
+        let mut bytes = vec![0x90u8; 48 * 1024];
+        // Place an UNEXPECTED pattern at offset 0xaf65 (a `nop; int3`
+        // sequence: `90 cc`). The patch should refuse to apply
+        // (NotFound) — it doesn't know whether the bytes are an
+        // intentional unrelated patch or TWRP version drift.
+        let off: usize = 0xaf65;
+        bytes[off] = 0x90;
+        bytes[off + 1] = 0xcc;
+        assert_eq!(
+            patch_twrp_init_read_file_sigsegv(&mut bytes),
+            ReadFileSigsegvPatchResult::NotFound,
+            "patch should refuse to apply when bytes at offset are unexpected"
+        );
+        // The bytes at offset 0xaf65 should be UNCHANGED.
+        assert_eq!(
+            &bytes[off..off + 2],
+            &[0x90, 0xcc],
+            "bytes should be unchanged when offset check refuses the patch"
         );
     }
 
