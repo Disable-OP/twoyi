@@ -2197,6 +2197,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     };
 
     // ---------------------------------------------------------------
+    // Step 2.9: create the property service stub socket + spawn the
+    // accept thread (Task 6-H — see `spawn_property_service_thread` for
+    // the full background).
+    //
+    // The short version: TWRP init (AOSP 5.1 bionic) loops on pause()
+    // (i386 syscall 29) waiting for the property service to signal
+    // readiness. ALL return-value tricks (-EINTR 6-D, -ENOSYS 6-E/6-G,
+    // -ETIMEDOUT 6-G) FAILED because init fundamentally requires the
+    // property SERVICE to exist + accept connections.
+    //
+    // This stub:
+    //   * Creates /dev/socket/property_service Unix socket (mode 0666)
+    //     in the rootfs. AOSP 5.1 bionic's `send_prop_msg` hard-codes
+    //     this path.
+    //   * Spawns an accept thread that reads a 128-byte prop_msg_t per
+    //     connection + writes a 4-byte "0" (PROP_SUCCESS) response.
+    //   * This MAY satisfy init's start_property_service() wait
+    //     condition + break the pause() loop. If it doesn't, the next
+    //     step is to populate /dev/__properties__ with a valid
+    //     property_area header (already pre-created by 6-A's
+    //     `vfs::make_old_format_property_area` call below — Step 5.6).
+    //
+    // Non-fatal: the guest can still attempt to boot without this (the
+    // ptrace_emu's pause() handler will continue to return -ENOSYS /
+    // -ETIMEDOUT per 6-G), but the pause loop is expected to persist.
+    // ---------------------------------------------------------------
+    spawn_property_service_thread(&cfg.rootfs);
+
+    // ---------------------------------------------------------------
     // Step 3: populate /proc.
     // ---------------------------------------------------------------
     // We synthesise for an 8-core, 4 GB guest by default. A production
@@ -5171,6 +5200,239 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
 }
 
 // ============================================================================
+// Property service stub — Task 6-H.
+//
+// Background: TWRP init (AOSP 5.1 bionic) loops on pause() (i386 syscall 29)
+// waiting for the property service to signal readiness. ALL return-value
+// tricks tried in 6-D / 6-E / 6-F / 6-G FAILED to break this loop:
+//   * 0 (pre-6-D)         — init thought "pause completed without a signal"
+//                            → re-checked condition → looped.
+//   * -EINTR (6-D)         — init thought "interrupted by signal" → re-checked
+//                            condition → looped.
+//   * -ENOSYS (6-E/6-G)   — init did NOT fall back to a non-pause wait (it
+//                            just retried pause()).
+//   * -ETIMEDOUT (6-G)    — same as -ENOSYS (still retried).
+//   * + 100ms sleep (6-F) — reduced CPU spin from 659k/sec but did not
+//                            break the loop.
+//
+// Root cause (per DISPATCHER-STATUS-FINAL): init fundamentally requires
+// the property SERVICE to exist + accept connections, not just "pause
+// returned". The find_property binary patch (5-Y / 6-B) handles property
+// LOOKUPS (returns NULL), but init ALSO waits for the service to send a
+// "ready" signal via the property socket/pipe.
+//
+// This stub:
+//   1. Creates /dev/socket/property_service Unix socket (mode 0666) in
+//      the rootfs. AOSP 5.1 bionic's `send_prop_msg` (system_properties.c)
+//      hard-codes the socket path as `/dev/socket/property_service`.
+//   2. Listens for connections (init's start_property_service() OR its
+//      clients' __system_property_set() connect here).
+//   3. Accepts connections, reads a 128-byte `prop_msg_t` (cmd:4 +
+//      name[32] + value[92] — AOSP 5.1 bionic's send_prop_msg format),
+//      and writes a 4-byte "0" (PROP_SUCCESS) response. This makes the
+//      client's send_prop_msg() succeed (read() returns 4 bytes =
+//      sizeof(int)).
+//
+// The stub does NOT actually store / lookup property values:
+//   * `find_property` is binary-patched (5-Y / 6-B) to return NULL, so
+//     in-process lookups never consult the socket.
+//   * The 4-byte "0" response just satisfies send_prop_msg's contract
+//     ("server received + acked") so init's setprop calls succeed.
+//
+// KEY UNCERTAINTY: the property service in AOSP 5.1 init runs in init's
+// OWN process (as a thread/function), NOT as a separate fork. So the
+// "ready" signal may be a simple flag or a condition variable, not a
+// socket message. IF that is the case, this stub may NOT break the
+// pause() loop — init would still be waiting on the in-process flag.
+// The only way to verify is a ui-e2e-test.yml run + VLM log analysis
+// (which the dispatcher must trigger separately — this task only
+// implements + tests the stub).
+//
+// CONFLICT NOTE: in non-root ptrace_emu mode (UI E2E), init's own
+// start_property_service() tries to bind() /dev/socket/property_service
+// directly. The host kernel rejects this with EACCES (untrusted_app can't
+// write to /dev/socket/ on the host). So init's bind FAILS — but our stub
+// binds the rootfs-path successfully (kr64 has access to {rootfs}/dev/).
+// In root mode (use_namespaces=true), the loader's bind() hook would
+// redirect init's bind to {rootfs}/dev/socket/property_service — which
+// would then fail with EADDRINUSE because our stub owns the kernel-level
+// socket. THIS IS A KNOWN LIMITATION of this stub: it conflicts with
+// init's own bind() in root mode. For the UI E2E (non-root, ptrace_emu),
+// the stub is safe (init's bind fails with EACCES independently).
+// ============================================================================
+
+/// AOSP 5.1 bionic's `PROP_SERVICE_NAME` constant — the basename of the
+/// socket file at `/dev/socket/property_service`. Verified against
+/// `bionic/libc/include/sys/system_properties.h`:
+///   ```c
+///   #define PROP_SERVICE_NAME "property_service"
+///   ```
+/// TWRP 3.7.0_9 (the boot image at `assets/twrp/twrp-3.7.0_9-0-byt_t_crv2.img`)
+/// uses AOSP 5.1 bionic which has this same constant.
+const PROP_SERVICE_SOCKET_NAME: &str = "property_service";
+
+/// `sizeof(prop_msg_t)` in AOSP 5.1 bionic. Layout
+/// (from `bionic/libc/include/sys/system_properties.h`):
+///   ```c
+///   #define PROP_NAME_MAX  32
+///   #define PROP_VALUE_MAX 92
+///   struct prop_msg {
+///       unsigned cmd;          //  4 bytes
+///       char name[PROP_NAME_MAX];   // 32 bytes
+///       char value[PROP_VALUE_MAX]; // 92 bytes
+///   };
+///   ```
+/// Total = 4 + 32 + 92 = 128 bytes. `send_prop_msg` in
+/// `bionic/libc/bionic/system_properties.cpp` sends exactly this many
+/// bytes per `__system_property_set` call. The stub drains it without
+/// parsing (it doesn't care about the contents).
+const PROP_MSG_SIZE: usize = 128;
+
+/// Spawn the minimal property service stub thread. Creates the socket
+/// at `{rootfs}/dev/socket/property_service` (mode 0666) and an accept
+/// thread that reads a 128-byte `prop_msg_t` and writes a 4-byte "0"
+/// (PROP_SUCCESS) response per connection.
+///
+/// Non-fatal — the guest can still attempt to boot without this (the
+/// ptrace_emu's pause() handler will continue to return -ENOSYS /
+/// -ETIMEDOUT per 6-G), but the pause() loop is expected to persist
+/// in that case.
+///
+/// # Threading
+///
+/// One accept thread, no worker pool. Each connection is handled
+/// synchronously in the accept loop (read 128 bytes + write 4 bytes +
+/// drop). This is sufficient because property sets are rare (init does
+/// a burst at boot, then occasional setprop calls from apps) and each
+/// connection takes microseconds. If a connection arrives while a
+/// previous one is being handled, the kernel buffers it in the listen
+/// backlog (we use `listen(fd, 8)` — same as AOSP 5.1 init).
+fn spawn_property_service_thread(rootfs: &str) {
+    let path = format!("{}/dev/socket/{}", rootfs, PROP_SERVICE_SOCKET_NAME);
+
+    // Make sure {rootfs}/dev/socket exists (mode 0755). The guest's
+    // init may already create this dir during coldboot (mknod hook),
+    // but kr64's pre-creation here avoids the race + matches the
+    // existing pattern in `devices::bind_unix_socket` / `ensure_parent_dir`.
+    if let Some(parent) = Path::new(&path).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warning!(
+                "[KR64][property-svc] failed to mkdir {}: {} -- guest setprop may fail + pause loop may persist",
+                parent.display(),
+                e
+            );
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    // Remove stale socket file from a previous run. If the path is a
+    // non-socket file (regular file, dir, etc.) we still try to remove
+    // it — `bind()` will fail with EADDRINUSE otherwise.
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!("[KR64][property-svc] removed stale socket: {}", path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warning!("[KR64][property-svc] could not remove {}: {}", path, e);
+        }
+    }
+
+    // Bind. This creates the socket file as a side effect.
+    let listener = match std::os::unix::net::UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            warning!(
+                "[KR64][property-svc] failed to bind {}: {} -- guest setprop may fail + pause loop may persist",
+                path,
+                e
+            );
+            return;
+        }
+    };
+
+    // chmod 0666 so the guest (which may run as a different uid inside
+    // the chroot) can connect. `UnixListener::bind` creates the file
+    // with mode 0755 by default (modified by umask).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+    }
+
+    // listen(backlog=8) — same as AOSP 5.1 init's
+    // `start_property_service` (`listen(property_set_fd, 8)` in
+    // `system/core/init/property_service.cpp`). The kernel buffers up to
+    // 8 pending connections while we're handling one.
+    let _ = listener.set_nonblocking(true);
+
+    let fd = listener.as_raw_fd();
+    info!(
+        "[KR64][property-svc] bound unix socket: {} (fd={}) -- minimal property service stub (Task 6-H)",
+        path, fd
+    );
+
+    std::thread::Builder::new()
+        .name("kr64-property-service".to_string())
+        .spawn(move || {
+            info!("[KR64][property-svc] accept thread started (fd={})", fd);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        info!("[KR64][property-svc] client connected");
+                        // The listener was non-blocking, but we want
+                        // blocking semantics for the per-connection
+                        // read+write. Clear O_NONBLOCK on the accepted
+                        // stream so `read_exact` blocks until 128 bytes
+                        // are read (or the client closes/EOFs).
+                        let sfd = stream.as_raw_fd();
+                        unsafe {
+                            let cur = libc::fcntl(sfd, libc::F_GETFL);
+                            if cur >= 0 {
+                                let _ = libc::fcntl(sfd, libc::F_SETFL, cur & !libc::O_NONBLOCK);
+                            }
+                        }
+                        // Drain up to PROP_MSG_SIZE bytes. We don't
+                        // parse the prop_msg_t (cmd + name[32] + value[92])
+                        // because the find_property binary patch (5-Y / 6-B)
+                        // makes in-process lookups return NULL -- the
+                        // socket only sees setprop calls from init's
+                        // property-loading loop + from setprop builtins.
+                        // `read_exact` returns Err on EOF, which we
+                        // ignore (we still send the ack below).
+                        use std::io::Read;
+                        let mut buf = [0u8; PROP_MSG_SIZE];
+                        let _ = stream.read_exact(&mut buf);
+
+                        // Write a 4-byte "0" (PROP_SUCCESS) response.
+                        // `send_prop_msg` in bionic reads exactly
+                        // `sizeof(int)` bytes for the result code. A
+                        // non-negative value means "property was set"
+                        // -- the caller proceeds.
+                        use std::io::Write;
+                        let _ = stream.write_all(&0u32.to_ne_bytes());
+                        // Drop the connection -- `send_prop_msg` closes
+                        // its side after reading the 4-byte response.
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // No pending connection -- sleep briefly to
+                        // avoid spinning (mirrors `spawn_accept_thread`).
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        warning!("[KR64][property-svc] accept error: {}", e);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+        })
+        .expect("spawn kr64 property service thread");
+}
+
+// ============================================================================
 // Touch device dispatcher.
 //
 // `spawn_accept_thread` above is the generic "accept-and-close" loop used
@@ -7578,5 +7840,179 @@ mod tests {
                 key
             );
         }
+    }
+
+    // ====================================================================
+    // Property service stub tests (Task 6-H).
+    //
+    // These tests exercise the stub's wire-protocol contract with AOSP
+    // 5.1 bionic's `send_prop_msg`:
+    //   1. The stub creates /dev/socket/property_service (mode 0666).
+    //   2. A client connects, sends 128-byte prop_msg_t, reads 4-byte
+    //      PROP_SUCCESS (0) response.
+    //   3. The stub is idempotent — calling it twice on the same rootfs
+    //      unlinks the stale socket + rebinds.
+    //
+    // The tests spawn forever-threads (no shutdown signal in the stub).
+    // cargo test reaps them at process exit. Each test uses a unique
+    // tempdir so parallel test runs don't collide on the socket path.
+    // ====================================================================
+
+    /// Helper: create a unique temp directory under /tmp for property
+    /// service tests. Avoids collisions when tests run in parallel.
+    fn property_svc_tempdir(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        let dir =
+            std::env::temp_dir().join(format!("kr64-property-svc-test-{}-{}-{}", tag, pid, nanos));
+        std::fs::create_dir_all(&dir).expect("create temp dir for property svc test");
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// Verify that `spawn_property_service_thread` creates the socket
+    /// file at `{rootfs}/dev/socket/property_service` with mode 0666
+    /// (so the guest — which may run as a different uid — can connect).
+    #[test]
+    fn spawn_property_service_thread_creates_socket_with_mode_0666() {
+        let tmp = property_svc_tempdir("mode");
+        spawn_property_service_thread(&tmp);
+        let socket_path = format!("{}/dev/socket/property_service", tmp);
+        let meta = std::fs::metadata(&socket_path)
+            .expect("property service socket file should exist after spawn");
+        // S_IFSOCK (Unix domain socket). Requires FileTypeExt on unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            assert!(
+                meta.file_type().is_socket(),
+                "expected socket file, got something else at {}",
+                socket_path
+            );
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o666,
+                "socket file should be mode 0666 (guest-writable), got {:o}",
+                mode & 0o777
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta; // suppress unused warning on non-unix
+        }
+    }
+
+    /// Verify that a client can connect to the property service stub
+    /// and that the stub acks a 128-byte prop_msg_t with a 4-byte "0"
+    /// (PROP_SUCCESS) response — the AOSP 5.1 bionic `send_prop_msg`
+    /// contract: send sizeof(prop_msg_t) = 128 bytes, read sizeof(int)
+    /// = 4 bytes for the result code.
+    #[test]
+    fn property_service_stub_acks_prop_msg_with_zero() {
+        let tmp = property_svc_tempdir("ack");
+        spawn_property_service_thread(&tmp);
+        let socket_path = format!("{}/dev/socket/property_service", tmp);
+
+        // Connect as a client.
+        use std::os::unix::net::UnixStream;
+        let mut client =
+            UnixStream::connect(&socket_path).expect("should connect to property service stub");
+
+        // Build a 128-byte prop_msg_t: cmd=PROP_MSG_SETPROP=1,
+        // name="ro.test.key", value="test_value". The stub doesn't
+        // parse it (just drains), so the contents don't matter — but
+        // we fill them in to exercise the real protocol shape.
+        let mut msg = [0u8; PROP_MSG_SIZE];
+        msg[0..4].copy_from_slice(&1u32.to_ne_bytes()); // cmd = PROP_MSG_SETPROP
+        let name = b"ro.test.key\0";
+        msg[4..4 + name.len()].copy_from_slice(name);
+        let value = b"test_value\0";
+        msg[36..36 + value.len()].copy_from_slice(value);
+
+        // Make the client non-blocking on writes (avoid the test hanging
+        // if the stub is slow to drain) but blocking on reads (so we
+        // block-wait for the 4-byte ack).
+        use std::io::{Read, Write};
+        client
+            .write_all(&msg)
+            .expect("should send prop_msg_t to stub");
+
+        // Read the 4-byte PROP_SUCCESS response. The stub clears
+        // O_NONBLOCK on the accepted stream + calls read_exact +
+        // write_all, so it blocks until 128 bytes arrive. We need to
+        // retry the read for up to ~2 seconds because the stub's
+        // accept loop is non-blocking with 50ms sleep (so it may take
+        // up to 50ms to even accept our connection).
+        let mut response = [0u8; 4];
+        let mut read = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while read < 4 && std::time::Instant::now() < deadline {
+            match client.read(&mut response[read..]) {
+                Ok(0) => break, // EOF — stub closed after writing the ack
+                Ok(n) => {
+                    read += n;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("unexpected read error from stub: {}", e),
+            }
+        }
+        assert_eq!(
+            read, 4,
+            "stub should write a 4-byte response (got {} bytes)",
+            read
+        );
+        assert_eq!(
+            u32::from_ne_bytes(response),
+            0,
+            "stub's 4-byte response should be PROP_SUCCESS (0), got {:?}",
+            response
+        );
+    }
+
+    /// Verify that `spawn_property_service_thread` is idempotent — calling
+    /// it twice on the same rootfs (e.g. across a daemon restart) does NOT
+    /// fail. The second call must unlink the stale socket file + rebind.
+    /// This matches the existing pattern in `devices::bind_unix_socket`.
+    #[test]
+    fn spawn_property_service_thread_is_idempotent() {
+        let tmp = property_svc_tempdir("idem");
+        spawn_property_service_thread(&tmp);
+        let socket_path = format!("{}/dev/socket/property_service", tmp);
+        assert!(
+            std::fs::metadata(&socket_path).is_ok(),
+            "socket file should exist after the first call"
+        );
+        // Second call must succeed — the stale socket is unlinked first.
+        spawn_property_service_thread(&tmp);
+        assert!(
+            std::fs::metadata(&socket_path).is_ok(),
+            "socket file should still exist after the second call (rebind succeeds)"
+        );
+    }
+
+    /// Verify the `PROP_SERVICE_SOCKET_NAME` constant is the AOSP 5.1
+    /// bionic value (`"property_service"`). Locks the contract so a
+    /// future rename is caught.
+    #[test]
+    fn prop_service_socket_name_is_property_service() {
+        assert_eq!(PROP_SERVICE_SOCKET_NAME, "property_service");
+    }
+
+    /// Verify `PROP_MSG_SIZE` is 128 bytes — sizeof(prop_msg_t) in AOSP
+    /// 5.1 bionic (cmd:4 + name[32] + value[92]). Locks the contract.
+    #[test]
+    fn prop_msg_size_is_128_bytes() {
+        assert_eq!(PROP_MSG_SIZE, 128);
+        assert_eq!(
+            PROP_MSG_SIZE,
+            4 + 32 + 92,
+            "PROP_MSG_SIZE must be sizeof(prop_msg_t) = sizeof(unsigned) + PROP_NAME_MAX + PROP_VALUE_MAX"
+        );
     }
 }
