@@ -2897,6 +2897,15 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
             // FORK/CLONE/VFORK we use PTRACE_GETEVENTMSG on the parent
             // to read the new child's PID — purely diagnostic, since
             // the kernel auto-attaches us to the new child regardless.
+            // DIAGNOSTIC (6-R): log every SIGTRAP-family stop (with and without 0x80)
+            // to diagnose why PTRACE_EVENT_FORK is never observed.
+            if sig == libc::SIGTRAP {
+                log(&format!(
+                    "SIGTRAP stop (no 0x80) on pid={}: status=0x{:08x}, ptrace_event={}",
+                    pid, status as u32, (status as u32) >> 16
+                ));
+            }
+
             let ptrace_event: u32 = ((status as u32) >> 16) & 0xFFFF;
             if ptrace_event != 0 {
                 match ptrace_event {
