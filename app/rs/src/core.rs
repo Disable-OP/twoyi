@@ -423,7 +423,10 @@ pub fn init_renderer(
             .map(|s| s.to_string())
             .unwrap_or_default();
         if !native_lib_dir.is_empty() {
-            info!("[CORE] Passing TWOYI_NATIVE_LIB_DIR={} to kr64", native_lib_dir);
+            info!(
+                "[CORE] Passing TWOYI_NATIVE_LIB_DIR={} to kr64",
+                native_lib_dir
+            );
         } else {
             log::warn!(
                 "[CORE] Could not derive nativeLibraryDir from loader_path='{}' — \
@@ -494,7 +497,9 @@ pub fn init_renderer(
             // Fallback: exec rootfs linker + init directly.
             // This will fail with exit 31 (init not PID 1) but at least
             // we get diagnostic output.
-            info!("[CORE] libkr64.so not found, falling back to direct init (will fail with exit 31)");
+            info!(
+                "[CORE] libkr64.so not found, falling back to direct init (will fail with exit 31)"
+            );
             let bootstrap_linker = format!("{}/system/bin/bootstrap/linker64", working_dir);
             let legacy_linker = format!("{}/system/bin/linker64", working_dir);
             let linker_path = if Path::new(&bootstrap_linker).exists() {
@@ -671,7 +676,11 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
                 info!("[CORE] qemu_pipe: session {} channel = {}", sid, channel);
 
                 if channel != "opengles" && channel != "opengles2" && channel != "opengles3" {
-                    log::warn!("[CORE] qemu_pipe: session {} unknown channel '{}'", sid, channel);
+                    log::warn!(
+                        "[CORE] qemu_pipe: session {} unknown channel '{}'",
+                        sid,
+                        channel
+                    );
                     continue;
                 }
 
@@ -680,24 +689,40 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
                 let renderer = match UnixStream::connect(&renderer_path) {
                     Ok(r) => r,
                     Err(e) => {
-                        log::error!("[CORE] qemu_pipe: session {} connect to {} failed: {}", sid, renderer_path, e);
+                        log::error!(
+                            "[CORE] qemu_pipe: session {} connect to {} failed: {}",
+                            sid,
+                            renderer_path,
+                            e
+                        );
                         continue;
                     }
                 };
-                info!("[CORE] qemu_pipe: session {} connected to {}", sid, renderer_path);
+                info!(
+                    "[CORE] qemu_pipe: session {} connected to {}",
+                    sid, renderer_path
+                );
 
                 // Spawn two pump threads
                 let mut guest_w = match guest.try_clone() {
                     Ok(g) => g,
                     Err(e) => {
-                        log::error!("[CORE] qemu_pipe: session {} guest clone failed: {}", sid, e);
+                        log::error!(
+                            "[CORE] qemu_pipe: session {} guest clone failed: {}",
+                            sid,
+                            e
+                        );
                         continue;
                     }
                 };
                 let mut renderer_r = match renderer.try_clone() {
                     Ok(r) => r,
                     Err(e) => {
-                        log::error!("[CORE] qemu_pipe: session {} renderer clone failed: {}", sid, e);
+                        log::error!(
+                            "[CORE] qemu_pipe: session {} renderer clone failed: {}",
+                            sid,
+                            e
+                        );
                         continue;
                     }
                 };
@@ -822,7 +847,14 @@ fn twrp_fb_render_loop_wrapper(
     virtual_width: i32,
     virtual_height: i32,
 ) {
-    twrp_fb_render_loop(window.0, fb_path, surface_width, surface_height, virtual_width, virtual_height);
+    twrp_fb_render_loop(
+        window.0,
+        fb_path,
+        surface_width,
+        surface_height,
+        virtual_width,
+        virtual_height,
+    );
 }
 
 fn twrp_fb_render_loop(
@@ -890,7 +922,15 @@ fn twrp_fb_render_loop(
 
         // Blit the framebuffer to the ANativeWindow.
         unsafe {
-            twrp_blit_to_surface(window, &fb_buf, surface_width, surface_height, fb_w, fb_h, fb_bpp);
+            twrp_blit_to_surface(
+                window,
+                &fb_buf,
+                surface_width,
+                surface_height,
+                fb_w,
+                fb_h,
+                fb_bpp,
+            );
         }
 
         // ~30fps
