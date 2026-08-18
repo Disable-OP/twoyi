@@ -2328,6 +2328,24 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     //     untraced — leaking a process that touches the host /dev tree.
     //     EXITKILL ensures clean teardown on kr64 crash.
     //
+    //   - PTRACE_O_TRACEEXEC (Task 6-T): makes the kernel report a
+    //     PTRACE_EVENT_EXEC stop when ANY traced child calls execve.
+    //     This is a SEPARATE stop, distinct from the syscall-entry/exit
+    //     stops of the execve syscall itself, and is delivered even in
+    //     compat-mode (i386 child on x86_64 host) where syscall-stops
+    //     for fork-family syscalls can be missed (DISPATCHER-FINAL-15).
+    //     This may help catch the recovery service's execve of
+    //     /sbin/recovery that is currently invisible.
+    //
+    //   - PTRACE_O_TRACEVFORKDONE (Task 6-T): makes the kernel report a
+    //     PTRACE_EVENT_VFORK_DONE stop on the PARENT when a vforked
+    //     child releases the parent (i.e. after the child execve's OR
+    //     exits — the parent SUSPENDS until then). Without this option
+    //     the parent's vfork return is just a regular syscall-exit-stop
+    //     (or, in compat mode, may be missed entirely). This may help
+    //     catch the vfork completion that's currently invisible
+    //     (DISPATCHER-FINAL-15).
+    //
     // The new child's ABI is the SAME as the parent's ABI at fork time
     // (init is i386 after its first execve → recovery is also i386).
     // If the child later calls execve (e.g. init forks, then the child
@@ -2342,6 +2360,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
         | libc::PTRACE_O_TRACEFORK
         | libc::PTRACE_O_TRACECLONE
         | libc::PTRACE_O_TRACEVFORK
+        | libc::PTRACE_O_TRACEVFORKDONE
+        | libc::PTRACE_O_TRACEEXEC
         | libc::PTRACE_O_EXITKILL) as libc::c_int;
     let r = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, ptrace_opts) };
     if r == -1 {
@@ -2349,7 +2369,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
         log(&format!("PTRACE_SETOPTIONS failed: {}", e));
         return -1;
     }
-    log("PTRACE_O_TRACESYSGOOD | TRACEFORK | TRACECLONE | TRACEVFORK | EXITKILL set");
+    log("PTRACE_O_TRACESYSGOOD | TRACEFORK | TRACECLONE | TRACEVFORK | TRACEVFORKDONE | TRACEEXEC | EXITKILL set");
 
     let mut in_syscall = false;
     let mut pending_getpid = false;
@@ -2935,6 +2955,121 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // is 0 (no signal to deliver). The loop-top
                         // PTRACE_SYSCALL will resume `current_pid` (the
                         // parent) on the next iteration.
+                        continue;
+                    }
+                    ev if ev == libc::PTRACE_EVENT_EXEC as u32 => {
+                        // ── Task 6-T: PTRACE_EVENT_EXEC (event 4) ──
+                        //
+                        // A traced child just called execve (the new
+                        // program is now loaded into the child's image).
+                        // This is a SEPARATE ptrace stop, distinct from
+                        // the syscall-entry/exit stops of the execve
+                        // syscall itself — it's delivered after the
+                        // execve has fully completed (the old image is
+                        // gone, the new image is mapped). It's delivered
+                        // even in compat-mode (i386 child on x86_64 host)
+                        // where syscall-stops for fork-family + exec
+                        // syscalls can be missed (DISPATCHER-FINAL-15).
+                        //
+                        // We use this for TWO purposes:
+                        //   1. Diagnostic — log that the child execve'd
+                        //      (helps trace the recovery service's
+                        //      execve of /sbin/recovery that's currently
+                        //      invisible).
+                        //   2. Defensive ABI reset — even if our normal
+                        //      saw_execve / reset_abi_next path already
+                        //      handled the execve EXIT stop, set the
+                        //      reset flag here too in case the syscall-
+                        //      EXIT stop was skipped (which is exactly
+                        //      the DISPATCHER-FINAL-15 hypothesis). This
+                        //      guarantees we re-detect the ABI from
+                        //      /proc/<pid>/exe on the next syscall-stop.
+                        //
+                        // CRITICAL: reset `in_syscall = false` here —
+                        // the execve syscall-exit stop will NOT fire
+                        // (the EXEC event replaces it). If we left
+                        // `in_syscall = true`, the NEXT syscall stop
+                        // would be misinterpreted as an EXIT instead of
+                        // an ENTRY, completely breaking syscall
+                        // emulation for the new image.
+                        //
+                        // PTRACE_GETEVENTMSG on EXEC returns the tracee's
+                        // PID prior to the execve — for a non-vfork
+                        // execve this is the same PID; for a vfork+execve
+                        // in a child it's the parent's PID (the new child
+                        // took over the parent's address space until
+                        // vfork_done). Logged for diagnostics.
+                        let mut prev_pid: libc::c_long = 0;
+                        let getevent_r = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_GETEVENTMSG,
+                                pid,
+                                0,
+                                &mut prev_pid as *mut _ as libc::c_long,
+                            )
+                        };
+                        if getevent_r == 0 {
+                            log(&format!(
+                                "PTRACE_EVENT_EXEC: child {} execve'd (prev PID {}) — new image loaded; resetting in_syscall + ABI",
+                                pid, prev_pid
+                            ));
+                        } else {
+                            log(&format!(
+                                "PTRACE_EVENT_EXEC: child {} execve'd (PTRACE_GETEVENTMSG failed) — new image loaded; resetting in_syscall + ABI",
+                                pid
+                            ));
+                        }
+                        // Defensive: arm the deferred ABI reset so the
+                        // next syscall-stop re-detects bitness from
+                        // /proc/<pid>/exe (which now points to the new
+                        // binary). If the normal execve-EXIT path already
+                        // armed it, this is a harmless no-op.
+                        reset_abi_next = true;
+                        // CRITICAL: the execve syscall-exit stop is
+                        // suppressed by the EXEC event, so we MUST
+                        // clear `in_syscall` or the next stop is
+                        // misclassified as a syscall-exit.
+                        in_syscall = false;
+                        continue;
+                    }
+                    ev if ev == libc::PTRACE_EVENT_VFORK_DONE as u32 => {
+                        // ── Task 6-T: PTRACE_EVENT_VFORK_DONE (event 5) ──
+                        //
+                        // The PARENT (== `pid` here) just RESUMED after a
+                        // vforked child released it (the vforked child
+                        // either execve'd OR exited). Without
+                        // PTRACE_O_TRACEVFORKDONE this stop is NOT
+                        // delivered — the parent's vfork syscall-exit
+                        // would be just a regular syscall-exit-stop, BUT
+                        // in compat mode (i386 child on x86_64 host) that
+                        // exit-stop can be missed (DISPATCHER-FINAL-15),
+                        // leaving the parent SUSPENDED forever (and the
+                        // vforked child runs untraced until it execve's
+                        // or exits). With TRACEVFORKDONE we get this
+                        // explicit "vfork done" stop, which we use for:
+                        //   1. Diagnostic — log that the vfork completed
+                        //      (helps surface the currently-invisible
+                        //      vfork path).
+                        //   2. Defensive `in_syscall = false` reset —
+                        //      the vfork syscall-exit stop will NOT fire
+                        //      (the VFORK_DONE event replaces it). If we
+                        //      left `in_syscall = true`, the NEXT syscall
+                        //      stop would be misinterpreted as an EXIT
+                        //      instead of an ENTRY.
+                        //
+                        // No PTRACE_GETEVENTMSG payload is documented for
+                        // VFORK_DONE (the new child PID was already
+                        // reported at the preceding PTRACE_EVENT_VFORK
+                        // stop). We just log + continue the parent.
+                        log(&format!(
+                            "PTRACE_EVENT_VFORK_DONE: parent {} resumed after vforked child released it (child execve'd or exited) — resetting in_syscall",
+                            pid
+                        ));
+                        // CRITICAL: the vfork syscall-exit stop is
+                        // suppressed by the VFORK_DONE event, so we
+                        // MUST clear `in_syscall` or the next stop is
+                        // misclassified as a syscall-exit.
+                        in_syscall = false;
                         continue;
                     }
                     ev if ev == libc::PTRACE_EVENT_EXIT as u32 => {
