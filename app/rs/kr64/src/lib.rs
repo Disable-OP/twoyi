@@ -5633,6 +5633,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // the pre-created tree immediately.
     precreate_sysfs_stubs(&rootfs_prefix);
 
+    // Task 6-Z4: close stale inherited fds 13..1024 in the PARENT before
+    // fork. The twoyi app (grandparent) may have inherited a stale
+    // /dev/socket/property_service socket fd from a PREVIOUS kr64
+    // invocation's init (which bound it, then exited — the fd leaked into
+    // the app via fork). kr64 inherits it from the app. The child's close
+    // loop (fds 3..1024) closes the CHILD's copy, but the PARENT's copy
+    // keeps the socket bound → the new init's bind returns EADDRINUSE
+    // (-98). The socketcall fake-success (6-Z3) masks the EADDRINUSE to
+    // 0, but the socket ISN'T actually bound → the recovery polls on it
+    // → POLLERR → tight spin loop (4549 polls at #451-#5000, no
+    // framebuffer render). Closing fds 13..1024 in the parent frees the
+    // stale socket → the new init's bind ACTUALLY succeeds → the
+    // property service works → the recovery proceeds to the framebuffer.
+    // fds 3..12 are kr64's daemon sockets (qemu_pipe, touch, key, event,
+    // gb, gb2, dm-user, binder, audio, sensors) — preserved. close(2) is
+    // seccomp-allowed (unlike close_range).
+    for fd in 13..1024i32 {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+    info!(
+        "[KR64] PARENT: closed stale inherited fds 13..1024 (Task 6-Z4: frees stale property_service socket from previous cycle → new init's bind succeeds)"
+    );
+
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = std::io::Error::last_os_error();
