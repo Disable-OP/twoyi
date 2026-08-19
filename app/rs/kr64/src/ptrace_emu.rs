@@ -4461,31 +4461,44 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         n if n == abi.mmap || n == abi.mmap2 => {
                             let flags = get_syscall_arg(&regs, abi.reg_arg4) as i32;
                             let fd = get_syscall_arg(&regs, abi.reg_arg5) as i32;
-                            if let Some(prop_fd) = properties_fd {
-                                if fd == prop_fd && (flags & libc::MAP_SHARED) != 0 {
-                                    let new_flags =
-                                        rewrite_mmap_flags_shared_to_anonymous(flags) as u64;
-                                    set_syscall_arg(&mut regs, abi.reg_arg4, new_flags);
-                                    // fd = -1 (sign-extended to all-1s in
-                                    // the 64-bit slot — the kernel truncates
-                                    // to 0xFFFFFFFF in the 32-bit child's
-                                    // edi, which is -1 as i32, the canonical
-                                    // "no fd" sentinel for anonymous mmap).
-                                    set_syscall_arg(&mut regs, abi.reg_arg5, (-1i32) as i64 as u64);
-                                    // offset = 0 (anonymous mmap ignores
-                                    // offset, but we set it to 0 for
-                                    // cleanliness).
-                                    set_syscall_arg(&mut regs, abi.reg_arg6, 0);
-                                    match ptrace_setregs(pid, &regs, iov_len) {
-                                        Ok(()) => log(&format!(
-                                            "DIAG mmap2: rewrote fd={} (MAP_SHARED /dev/__properties__) → MAP_ANONYMOUS|MAP_PRIVATE fd=-1 (zygote seccomp blocks file-backed MAP_SHARED for i386 compat)",
-                                            fd
-                                        )),
-                                        Err(e) => log(&format!(
-                                            "DIAG mmap2: ptrace_setregs FAILED for nr={} fd={} (MAP_SHARED /dev/__properties__): {} — child will see -ENOSYS from zygote seccomp",
-                                            syscall_num, fd, e
-                                        )),
-                                    }
+                            // Task 6-Z2: ALWAYS log mmap2 args so we can see
+                            // what the early calls (that return -38 ENOSYS) are.
+                            log(&format!(
+                                "DIAG mmap2 ENTRY: nr={} flags=0x{:x} (MAP_SHARED={},MAP_PRIVATE={},MAP_ANONYMOUS={}) fd={} prop_fd={:?}",
+                                syscall_num,
+                                flags,
+                                (flags & libc::MAP_SHARED) != 0,
+                                (flags & libc::MAP_PRIVATE) != 0,
+                                (flags & libc::MAP_ANONYMOUS) != 0,
+                                fd,
+                                properties_fd
+                            ));
+                            // Task 6-Z2: rewrite ALL file-backed MAP_SHARED
+                            // mmap2 to MAP_ANONYMOUS (not just fd==prop_fd).
+                            // The early mmap2 calls (#3, #4, #14) happen
+                            // BEFORE init opens /dev/__properties__ →
+                            // properties_fd is None → the old fd==prop_fd
+                            // check meant the fix never fired for them →
+                            // they returned -38 (ENOSYS from zygote seccomp).
+                            // Since init is statically linked, /dev/__properties__
+                            // is the ONLY file-backed MAP_SHARED mmap — safe
+                            // to rewrite all MAP_SHARED to anonymous.
+                            if (flags & libc::MAP_SHARED) != 0 && (flags & libc::MAP_ANONYMOUS) == 0
+                            {
+                                let new_flags =
+                                    rewrite_mmap_flags_shared_to_anonymous(flags) as u64;
+                                set_syscall_arg(&mut regs, abi.reg_arg4, new_flags);
+                                set_syscall_arg(&mut regs, abi.reg_arg5, (-1i32) as i64 as u64);
+                                set_syscall_arg(&mut regs, abi.reg_arg6, 0);
+                                match ptrace_setregs(pid, &regs, iov_len) {
+                                    Ok(()) => log(&format!(
+                                        "DIAG mmap2 REWRITE: fd={} (MAP_SHARED file-backed) → MAP_ANONYMOUS|MAP_PRIVATE fd=-1 (zygote seccomp blocks file-backed MAP_SHARED for i386 compat)",
+                                        fd
+                                    )),
+                                    Err(e) => log(&format!(
+                                        "DIAG mmap2 REWRITE FAILED: ptrace_setregs for nr={} fd={}: {} — child will see -ENOSYS",
+                                        syscall_num, fd, e
+                                    )),
                                 }
                             }
                         }
