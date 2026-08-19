@@ -5642,21 +5642,54 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // keeps the socket bound → the new init's bind returns EADDRINUSE
     // (-98). The socketcall fake-success (6-Z3) masks the EADDRINUSE to
     // 0, but the socket ISN'T actually bound → the recovery polls on it
-    // → POLLERR → tight spin loop (4549 polls at #451-#5000, no
-    // framebuffer render). Closing fds 13..1024 in the parent frees the
-    // stale socket → the new init's bind ACTUALLY succeeds → the
-    // property service works → the recovery proceeds to the framebuffer.
+    // → POLLERR → tight spin loop (poll returns 1 every time, busy-wait).
+    //
     // fds 3..12 are kr64's daemon sockets (qemu_pipe, touch, key, event,
-    // gb, gb2, dm-user, binder, audio, sensors) — preserved. close(2) is
-    // seccomp-allowed (unlike close_range).
-    for fd in 13..1024i32 {
-        unsafe {
-            libc::close(fd);
+    // gb, gb2, dm-user, binder, audio, sensors) — must NOT be closed (the
+    // daemon threads need them). So we can't blindly close 3..1024.
+    //
+    // Approach: iterate fds 3..1024. For each, call getsockname() to check
+    // if it's a Unix socket bound to /dev/socket/property_service. If it
+    // matches, close ONLY that fd. This preserves the daemon sockets +
+    // frees the stale property_service socket.
+    let target_path = b"/dev/socket/property_service\0";
+    let mut closed_count = 0u32;
+    for fd in 3..1024i32 {
+        // getsockname on a non-socket fd returns ENOTSOCK (harmless).
+        // On a Unix socket, it fills the sockaddr_un with the bound path.
+        let mut storage: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len)
+        };
+        if ret == 0 && storage.sun_family == libc::AF_UNIX as u16 {
+            // Compare the sun_path with the target path.
+            // sun_path is [c_char; 108] = [i8; 108] in libc. Cast to u8
+            // for comparison with the target_path byte slice.
+            let sun_path = &storage.sun_path;
+            let sun_path_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(sun_path.as_ptr() as *const u8, sun_path.len())
+            };
+            let path_len = target_path.len(); // includes NUL
+            if sun_path_bytes.len() >= path_len
+                && &sun_path_bytes[..path_len] == target_path.as_slice()
+            {
+                unsafe {
+                    libc::close(fd);
+                }
+                closed_count += 1;
+                info!(
+                    "[KR64] PARENT: closed stale property_service socket at fd={} (Task 6-Z4: getsockname matched /dev/socket/property_service — freed stale binding → new init's bind will succeed)",
+                    fd
+                );
+            }
         }
     }
-    info!(
-        "[KR64] PARENT: closed stale inherited fds 13..1024 (Task 6-Z4: frees stale property_service socket from previous cycle → new init's bind succeeds)"
-    );
+    if closed_count == 0 {
+        info!(
+            "[KR64] PARENT: no stale property_service socket found in fds 3..1024 (Task 6-Z4: getsockname scan — the EADDRINUSE may be from a kernel-level stale binding or a different source)"
+        );
+    }
 
     let pid = unsafe { libc::fork() };
     if pid < 0 {
