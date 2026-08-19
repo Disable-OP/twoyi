@@ -5279,44 +5279,50 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
-    // Task 6-Z19: NOP the `call poll` + `test %eax,%eax` at the top of
-    // init's main poll loop (file offset 0xc59) to break the POLLERR
-    // busy-wait. Verified via objdump on the i386 TWRP init.
-    {
-        let init_path = format!("{}/init", rootfs_prefix);
-        match std::fs::read(&init_path) {
-            Ok(mut bytes) => {
-                match patch_twrp_init_poll_loop_nop(&mut bytes) {
-                    PollLoopNopPatchResult::Applied => {
-                        match std::fs::write(&init_path, &bytes) {
-                            Ok(()) => info!(
-                                "[KR64] PARENT: patched /init poll-loop NOP at file offset 0xc59 (vaddr 0x8048c59) — replaced `call poll` + `test %eax,%eax` (7 bytes: e8 f2 17 02 00 85 c0) with 7× NOP (90 90 90 90 90 90 90); breaks the POLLERR busy-wait by skipping the poll() call entirely (eax keeps its prior value → jle taken → loop body continues without re-polling). (Task 6-Z19; pragmatic symptom-mask per disassembly — the real fix is making the property_service socket functional.)"
-                            ),
-                            Err(e) => warning!(
-                                "[KR64] PARENT: patched /init poll-loop NOP in memory but failed to write back: {} (init may keep POLLERR-spinning at ~1000/sec)",
-                                e
-                            ),
-                        }
-                    }
-                    PollLoopNopPatchResult::AlreadyApplied => {
-                        info!(
-                            "[KR64] PARENT: /init poll-loop NOP already applied (idempotent skip) — poll call already NOP'd (Task 6-Z19)"
-                        );
-                    }
-                    PollLoopNopPatchResult::Skipped => {}
-                    PollLoopNopPatchResult::NotFound => {
-                        warning!(
-                            "[KR64] PARENT: could not find poll-loop `call poll`+`test` at file offset 0xc59 in /init (TWRP version mismatch?) — init may keep POLLERR-spinning"
-                        );
-                    }
-                }
-            }
-            Err(e) => warning!(
-                "[KR64] PARENT: failed to read /init for poll-loop NOP patching: {} (init may keep POLLERR-spinning)",
-                e
-            ),
-        }
-    }
+    // Task 6-Z28: REVERTED the 6-Z19 poll-loop NOP. The NOP made init skip
+    // poll() entirely → init's event loop busy-spun in userspace (no
+    // syscalls, no sleep, no events). init processed all actions up to the
+    // recovery service start (#457), failed ("could not get context"), and
+    // then spun forever waiting for events that never came (poll was NOP'd).
+    // NOW: poll() is called normally. The ptrace_emu intercepts poll() at
+    // the EXIT + fakes the return to 0 (timeout, no events) + sleeps 100ms
+    // at the ENTRY to prevent the POLLERR busy-spin. This gives init timer
+    // events to process (retry service starts, etc.) without busy-spinning.
+    // {
+    //     let init_path = format!("{}/init", rootfs_prefix);
+    //     match std::fs::read(&init_path) {
+    //         Ok(mut bytes) => {
+    //             match patch_twrp_init_poll_loop_nop(&mut bytes) {
+    //                 PollLoopNopPatchResult::Applied => {
+    //                     match std::fs::write(&init_path, &bytes) {
+    //                         Ok(()) => info!(
+    //                             "[KR64] PARENT: patched /init poll-loop NOP at file offset 0xc59 (vaddr 0x8048c59) — replaced `call poll` + `test %eax,%eax` (7 bytes: e8 f2 17 02 00 85 c0) with 7× NOP (90 90 90 90 90 90 90); breaks the POLLERR busy-wait by skipping the poll() call entirely (eax keeps its prior value → jle taken → loop body continues without re-polling). (Task 6-Z19; pragmatic symptom-mask per disassembly — the real fix is making the property_service socket functional.)"
+    //                         ),
+    //                         Err(e) => warning!(
+    //                             "[KR64] PARENT: patched /init poll-loop NOP in memory but failed to write back: {} (init may keep POLLERR-spinning at ~1000/sec)",
+    //                             e
+    //                         ),
+    //                     }
+    //                 }
+    //                 PollLoopNopPatchResult::AlreadyApplied => {
+    //                     info!(
+    //                         "[KR64] PARENT: /init poll-loop NOP already applied (idempotent skip) — poll call already NOP'd (Task 6-Z19)"
+    //                     );
+    //                 }
+    //                 PollLoopNopPatchResult::Skipped => {}
+    //                 PollLoopNopPatchResult::NotFound => {
+    //                     warning!(
+    //                         "[KR64] PARENT: could not find poll-loop `call poll`+`test` at file offset 0xc59 in /init (TWRP version mismatch?) — init may keep POLLERR-spinning"
+    //                     );
+    //                 }
+    //             }
+    //         }
+    //         Err(e) => warning!(
+    //             "[KR64] PARENT: failed to read /init for poll-loop NOP patching: {} (init may keep POLLERR-spinning)",
+    //             e
+    //         ),
+    //     }
+    // }
 
     // Always overwrite /vendor/etc/fstab.ranchu with a minimal stub.
     // The emulator's rootfs tar includes a real fstab.ranchu whose entries
