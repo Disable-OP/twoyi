@@ -1691,6 +1691,7 @@ fn patch_file_contexts_delete(rootfs_prefix: &str) {
     // essential entries + their absence is harmless).
     let minimal_file_contexts = "# Minimal file_contexts (Task 6-Z7: no #line directive)
 /sbin(/.*)?             u:object_r:rootfs:s0
+/sbin/recovery          u:object_r:rootfs:s0
 /init                   u:object_r:rootfs:s0
 /charger                u:object_r:rootfs:s0
 /file_contexts          u:object_r:rootfs:s0
