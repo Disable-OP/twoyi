@@ -6902,26 +6902,44 @@ const PROP_SERVICE_SOCKET_NAME: &str = "property_service";
 /// `bionic/libc/bionic/system_properties.cpp` sends exactly this many
 /// bytes per `__system_property_set` call.
 ///
-/// Task 6-X: the property service stub's accept thread (which drained
-/// PROP_MSG_SIZE bytes + acked with PROP_SUCCESS=0) was REMOVED — init now
-/// owns the property service socket. This constant is retained for the
-/// `prop_msg_size_is_128_bytes` contract-locking test + future use if a
-/// property-service-related feature is re-added.
-#[allow(dead_code)]
+/// Task 6-Z18: the property service accept thread (drains PROP_MSG_SIZE
+/// bytes + acks with PROP_SUCCESS=0) is RE-ADDED — the 6-X "don't bind"
+/// approach caused the POLLERR poll-spin. The accept thread makes init's
+/// setprop calls succeed (non-ro SET goes via the socket + needs the ACK).
 const PROP_MSG_SIZE: usize = 128;
 
-/// Create the `{rootfs}/dev/socket/` directory so init can create + bind
-/// the property_service socket itself. Task 6-X: the previous implementation
-/// (6-H) pre-bound the socket + spawned an accept thread — that was HARMFUL
-/// (init couldn't unlink + rebind the socket → "init startup failure" →
-/// exit(1)). See the body of this function for the full root-cause analysis.
+/// Create the `{rootfs}/dev/socket/` directory AND pre-bind the
+/// property_service socket + spawn an accept thread that drains prop_msg
+/// requests + ACKs with PROP_SUCCESS=0. This makes init's subsequent
+/// `poll(property_service_fd)` return 0 (no events — the socket is real +
+/// listening but no clients connect in the sandbox), breaking the POLLERR
+/// busy-wait that the 6-X "don't bind" + 6-Z3 "fake bind return" caused.
+///
+/// History:
+/// - 6-H: pre-bound + accept thread. REMOVED by 6-X because init couldn't
+///   `unlink` the socket (EACCES) → "init startup failure" → exit(1).
+/// - 6-X: "don't bind, let init own it". init's bind then failed (EADDRINUSE
+///   from stale old kr64, OR the socket wasn't actually functional).
+/// - 6-Z3: faked the socketcall bind return to 0 (hid EADDRINUSE). But the
+///   fake-bound socket isn't REALLY bound → poll returns POLLERR forever →
+///   busy-wait (verified on 5e0f157 + 58db439 E2E: 1000+ polls/sec, no
+///   framebuffer render).
+/// - 6-Z13: kill old kr64 before spawn — eliminates the EADDRINUSE that
+///   motivated 6-Z3's fake.
+/// - 6-Z18 (THIS): re-bind in the parent (the 6-Z13 fix makes it safe — no
+///   stale socket → bind succeeds), spawn the accept thread (drains prop_msg
+///   + ACKs PROP_SUCCESS=0 so init's setprop calls succeed), AND chmod the
+///   socket file 0666 so init's `unlink` succeeds (init may unlink+rebind
+///   during its start_property_service — that's fine, our accept thread
+///   keeps the ORIGINAL fd open; if init rebinds, init's own accept thread
+///   handles it, ours just sits idle). The KEY property: poll on the fd
+///   init gets from its OWN connect() returns 0 (no events) because no real
+///   client ever connects in the sandbox → init sleeps instead of spinning.
+#[allow(clippy::doc_lazy_continuation)]
 fn spawn_property_service_thread(rootfs: &str) {
     let path = format!("{}/dev/socket/{}", rootfs, PROP_SERVICE_SOCKET_NAME);
 
-    // Make sure {rootfs}/dev/socket exists (mode 0755). The guest's
-    // init may already create this dir during coldboot (mknod hook),
-    // but kr64's pre-creation here avoids the race + matches the
-    // existing pattern in `devices::bind_unix_socket` / `ensure_parent_dir`.
+    // Make sure {rootfs}/dev/socket exists (mode 0755).
     if let Some(parent) = Path::new(&path).parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warning!(
@@ -6938,33 +6956,64 @@ fn spawn_property_service_thread(rootfs: &str) {
         }
     }
 
-    // Task 6-X: DO NOT bind the socket. The previous implementation (6-H)
-    // pre-bound /dev/socket/property_service + spawned an accept thread that
-    // ACKed property-set requests with PROP_SUCCESS=0. This was added to
-    // break init's pause() loop (waiting for the property service to start).
-    // BUT 6-D (pause returns -ENOSYS) + 6-I (NOP the selinux-load-failure
-    // jump that led to the pause loop) have ELIMINATED the pause loop.
-    //
-    // The stub is now HARMFUL: init (PID 1) is SUPPOSED to own the property
-    // service — it creates + binds /dev/socket/property_service itself during
-    // start_property_service(). But kr64's pre-bound socket file blocks init:
-    // init's `unlink("/dev/socket/property_service")` returns EACCES (kr64 owns
-    // the file), init logs "Failed to unlink old socket 'property_service':
-    // Permission denied", init's property service fails to start, init's
-    // property-setting all fails ("Failed to set ro.build.X" × 162), init
-    // logs "init: init startup failure" + exit_group(1).
-    //
-    // FIX: don't bind. Just create the directory (above) so init can create
-    // the socket file there. init will bind + listen + accept itself. This
-    // matches the KVM E2E path (where init owns the property service + TWRP
-    // boots). Verified root cause: 5b4ef63 UI E2E run 32200030310, last
-    // syscalls before exit: read→EAGAIN, wait4→ECHILD, poll→0, write
-    // "init: init startup failure", exit_group(1). The "Failed to unlink
-    // old socket" error is the trigger.
-    info!(
-        "[KR64][property-svc] directory {} created — NOT binding socket (Task 6-X: let init own the property service; 6-H's pre-bind caused 'Failed to unlink old socket: Permission denied' → init startup failure → exit(1))",
-        path
-    );
+    // Task 6-Z18: pre-bind the socket + chmod 0666 so init's unlink
+    // succeeds (init may unlink+rebind during start_property_service).
+    // bind_unix_socket already removes stale socket + chmods 0666.
+    match devices::bind_unix_socket(&path) {
+        Ok(listener) => {
+            // Spawn the accept thread: drain PROP_MSG_SIZE bytes per
+            // connection + ACK with PROP_SUCCESS=0 (4 bytes). This makes
+            // init's setprop calls succeed (ro.* are written directly to
+            // the property area by init's property_init, NOT via the socket;
+            // non-ro SET goes via the socket + needs the ACK).
+            let fd = listener.as_raw_fd();
+            // Make the listening socket non-blocking so the thread can
+            // sleep between accepts (mirrors spawn_accept_thread).
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+            std::thread::Builder::new()
+                .name("kr64-prop-svc".to_string())
+                .spawn(move || {
+                    info!("[KR64][property-svc] accept thread started (fd={})", fd);
+                    let mut conn_buf = [0u8; PROP_MSG_SIZE];
+                    loop {
+                        match listener.accept() {
+                            Ok((mut stream, _addr)) => {
+                                // Drain the prop_msg (128 bytes) so the
+                                // guest's send doesn't block.
+                                use std::io::Read;
+                                let _ = stream.read(&mut conn_buf);
+                                // ACK with PROP_SUCCESS=0 (4 bytes).
+                                use std::io::Write;
+                                let _ = stream.write_all(&0u32.to_ne_bytes());
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            Err(e) => {
+                                warning!("[KR64][property-svc] accept error: {}", e);
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                        }
+                    }
+                })
+                .ok();
+            info!(
+                "[KR64][property-svc] socket BOUND + accept thread spawned at {} (Task 6-Z18: real bind so init's poll returns 0, not POLLERR; chmod 0666 so init's unlink succeeds; 6-Z13's old-kr64 kill eliminates the EADDRINUSE that motivated 6-Z3's fake-bind)",
+                path
+            );
+        }
+        Err(e) => {
+            // Bind failed (e.g. socket file exists + can't remove, or
+            // permissions). Fall back to the 6-X "directory only" path —
+            // init will try to bind itself (may hit EADDRINUSE, caught by
+            // the 6-Z3 socketcall fake-success, but that leads to the
+            // POLLERR spin). Log loudly so the failure is visible.
+            warning!(
+                "[KR64][property-svc] FAILED to bind {} ({}): falling back to directory-only (init will bind, but may POLLERR-spin). errno suggests stale socket or permission issue.",
+                path, e
+            );
+        }
+    }
 }
 
 // ============================================================================
@@ -10144,11 +10193,12 @@ mod tests {
             "dev/socket should be a directory, got something else at {}",
             dir_path
         );
-        // The socket FILE must NOT exist (init creates it itself).
+        // Task 6-Z18: the socket file SHOULD exist now (kr64 pre-binds it
+        // + runs an accept thread so init's poll returns 0, not POLLERR).
         let socket_path = format!("{}/dev/socket/property_service", tmp);
         assert!(
-            std::fs::metadata(&socket_path).is_err(),
-            "property_service socket file should NOT exist (Task 6-X: init owns the socket, not kr64)"
+            std::fs::metadata(&socket_path).is_ok(),
+            "property_service socket file SHOULD exist (Task 6-Z18: kr64 pre-binds so init's poll returns 0, not POLLERR)"
         );
         // Directory mode 0755 (init needs to create the socket file in it).
         #[cfg(unix)]
@@ -10165,23 +10215,25 @@ mod tests {
     }
 
     /// Verify that `spawn_property_service_thread` is idempotent — calling
-    /// it twice on the same rootfs (e.g. across a daemon restart) does NOT
-    /// fail + still does NOT bind the socket. Task 6-X: the function only
-    /// creates the directory now; idempotence is trivial (create_dir_all).
+    /// it twice on the same rootfs (e.g. across a daemon restart) succeeds
+    /// + re-binds the socket (bind_unix_socket removes the stale socket first).
+    /// Task 6-Z18: the function now BINDS the socket (re-added from 6-X's
+    /// "don't bind" approach which caused the POLLERR poll-spin).
     #[test]
     fn spawn_property_service_thread_is_idempotent() {
         let tmp = property_svc_tempdir("idem");
         spawn_property_service_thread(&tmp);
         let socket_path = format!("{}/dev/socket/property_service", tmp);
         assert!(
-            std::fs::metadata(&socket_path).is_err(),
-            "socket file should NOT exist after the first call (Task 6-X)"
+            std::fs::metadata(&socket_path).is_ok(),
+            "socket file SHOULD exist after the first call (Task 6-Z18)"
         );
-        // Second call must succeed (create_dir_all is idempotent).
+        // Second call must succeed (bind_unix_socket removes the stale
+        // socket + rebinds — create_dir_all is also idempotent).
         spawn_property_service_thread(&tmp);
         assert!(
-            std::fs::metadata(&socket_path).is_err(),
-            "socket file should still NOT exist after the second call (Task 6-X)"
+            std::fs::metadata(&socket_path).is_ok(),
+            "socket file SHOULD still exist after the second call (Task 6-Z18: re-bound)"
         );
         // Directory should still exist.
         let dir_path = format!("{}/dev/socket", tmp);
