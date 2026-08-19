@@ -2940,6 +2940,17 @@ fn write_translated_path(
     if scratch_addr == 0 {
         return false; // scratch page not yet allocated
     }
+    // Task 6-Z14: check for overflow BEFORE writing. The scratch area is
+    // 4096 bytes. If the translated path (including NUL) would extend past
+    // the end, wrap to 0 first. This prevents the path from overflowing
+    // into the child's stack frame (return addresses, saved registers),
+    // which caused the SIGSEGV at rip=0x6f722f69 ('i/ro' from the rootfs
+    // path '/data/user/0/io.twoyi/rootfs' leaking into a code pointer).
+    let path_len = translated.len() + 1; // include NUL
+    let aligned_len = (path_len + 7) & !7; // 8-byte aligned
+    if *scratch_offset + aligned_len > 4096 {
+        *scratch_offset = 0;
+    }
     let new_addr = scratch_addr + *scratch_offset as u64;
     if !write_child_string_unchecked(pid, new_addr, translated) {
         return false;
