@@ -565,6 +565,51 @@ pub fn init_renderer(
             cmd.stderr(Stdio::from(errors));
         }
 
+        // Task 6-Z13: Kill any existing kr64 process before spawning a new one.
+        // When Android kills + restarts the Render2Activity (OOM, ANR, config
+        // change), the old kr64 process is NOT cleaned up — it keeps running
+        // (it's a detached process). The new Activity calls init_renderer()
+        // again, which spawns a NEW kr64. The old kr64 holds the
+        // property_service socket (EADDRINUSE), /dev devices, etc. — the new
+        // kr64 conflicts with it.
+        //
+        // Fix: before spawning the new kr64, find and SIGKILL any existing
+        // kr64 process. We use `pgrep -f libkr64.so` to find it (the process
+        // name is the .so path because kr64 is exec'd as a PIE cdylib).
+        // This is safe because:
+        //   - We're about to spawn a NEW kr64 anyway
+        //   - The old kr64's child (init/guest) will be orphaned + reparented
+        //     to init (PID 1), which will reap it
+        //   - The old kr64's daemon threads (qemu_pipe, touch, etc.) will be
+        //     killed when the process dies
+        {
+            let pgrep = std::process::Command::new("pgrep")
+                .arg("-f")
+                .arg("libkr64.so")
+                .output();
+            if let Ok(output) = pgrep {
+                let pids_str = String::from_utf8_lossy(&output.stdout);
+                for pid_str in pids_str.split_whitespace() {
+                    if let Ok(old_pid) = pid_str.parse::<i32>() {
+                        // Don't kill ourselves
+                        let my_pid = unsafe { libc::getpid() };
+                        if old_pid != my_pid {
+                            info!(
+                                "[CORE] Killing existing kr64 process (PID={}) before spawning new one",
+                                old_pid
+                            );
+                            unsafe {
+                                libc::kill(old_pid, libc::SIGKILL);
+                            }
+                            // Wait briefly for the process to die + release
+                            // its resources (sockets, fds, etc.)
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
+                    }
+                }
+            }
+        }
+
         match cmd.spawn() {
             Ok(child) => {
                 info!("[CORE] Container init spawned, PID={}", child.id());
