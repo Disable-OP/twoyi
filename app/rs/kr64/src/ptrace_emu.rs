@@ -4289,7 +4289,14 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // fork/clone attempts + the exit trigger live).
                     if past_first_execve {
                         post_execve_syscall_count = post_execve_syscall_count.saturating_add(1);
-                        if post_execve_syscall_count <= 200 {
+                        // Task 6-Z26: raised from 200 to 500 to see what init
+                        // does after the SELinux/restorecon phase. The file
+                        // was static at 86540 bytes (#200) for 16+ sec — init
+                        // is BLOCKED on something past #200 that we can't see.
+                        // 500 shows syscalls #201-#500 (~200KB file, manageable
+                        // for the tee). This will reveal what init is blocked on
+                        // (poll/futex/read on a socket/FIFO).
+                        if post_execve_syscall_count <= 500 {
                             log(&format!(
                                 "post-execve syscall #{}: nr={} [{}]",
                                 post_execve_syscall_count,
@@ -4372,7 +4379,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // For mount(source, target, fstype, flags, data) we
                     // additionally log arg2 (target) and arg3 (fstype) so
                     // we can see exactly what init is mounting where.
-                    if past_first_execve && post_execve_syscall_count <= 200 {
+                    // Task 6-Z26: raised from 200 to 500 (see ENTRY gate above).
+                    if past_first_execve && post_execve_syscall_count <= 500 {
                         let path_idx = match syscall_num {
                             n if n == abi.open => Some(abi.reg_arg1),
                             n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
@@ -5348,7 +5356,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // full recovery phase (recovery runs ~3281 iterations
                     // before exit(1); 150 hid the middle phase where
                     // fork/clone attempts + the exit trigger live).
-                    if past_first_execve && post_execve_syscall_count <= 200 {
+                    // Task 6-Z26: raised from 200 to 500 (see ENTRY gate above).
+                    if past_first_execve && post_execve_syscall_count <= 500 {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
