@@ -187,7 +187,11 @@ fn renderer_thread_main(
                 "[CORE] startOpenGLRenderer returned {} (non-zero = failure)",
                 result
             );
-            RENDERER_STARTED.store(false, Ordering::Release);
+            // Task 6-Z23: do NOT reset RENDERER_STARTED here. Resetting
+            // causes the next surfaceCreated to re-spawn kr64 (the 2-sec
+            // re-fork cycle). The OpenGL renderer failure is non-fatal —
+            // we keep the guard true so subsequent calls just update the
+            // window. (Previously: RENDERER_STARTED.store(false, ...);)
         } else {
             info!("[CORE] Renderer started successfully");
         }
@@ -208,6 +212,12 @@ pub fn init_renderer(
     ydpi: i32,
     fps: i32,
 ) {
+    // Task 6-Z23: log to STDERR (visible in logcat) so we can see
+    // init_renderer calls + the guard state. The info! logs go to
+    // FileLogger only (not logcat). This stderr log is the only way
+    // to diagnose why kr64 is re-spawned 8 times (verified on 9c60d80
+    // E2E: 8 kr64 instances despite the RENDERER_STARTED guard).
+    eprintln!("[CORE] init_renderer called, RENDERER_STARTED={}", RENDERER_STARTED.load(Ordering::SeqCst));
     info!("[CORE] ========================================");
     info!("[CORE] init_renderer called");
     info!(
@@ -221,6 +231,7 @@ pub fn init_renderer(
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        eprintln!("[CORE] Renderer already started — updating window only (no kr64 re-spawn)");
         info!("[CORE] Renderer already started, updating window");
         // Renderer already started, just update window
         unsafe {
