@@ -4750,6 +4750,40 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
                             }
                         }
+                        // Task 6-Z6: poll — at the ENTRY stop, if the
+                        // timeout (arg3) is 0 (non-blocking) or negative
+                        // (infinite), set it to 100ms so the kernel SLEEPS
+                        // instead of returning immediately. This stops the
+                        // poll spin: the recovery retries every 100ms
+                        // instead of every microsecond. Combined with the
+                        // EXIT-side poll fake-success (6-Z5, which fakes
+                        // the return to 0), this lets the recovery proceed
+                        // past the setup poll loop.
+                        //
+                        // i386 poll(2): arg1=pollfd*, arg2=nfds, arg3=timeout(ms).
+                        // The timeout is a signed int: 0=non-blocking, -1=infinite,
+                        // >0=wait N ms. We set it to 100 (100ms) to reduce the
+                        // spin rate from ~1531 polls/s to ~10 polls/s.
+                        //
+                        // CAVEAT: the TWRP main UI loop also uses poll for input.
+                        // Forcing a 100ms timeout there would add 100ms input
+                        // latency. BUT the recovery is stuck BEFORE the UI loop
+                        // (in a setup poll spin). Once it reaches the framebuffer,
+                        // the poll behavior might differ. If this causes a
+                        // regression (input lag), a follow-up can make the timeout
+                        // conditional (only during setup).
+                        n if abi.poll_nr != -1 && n == abi.poll_nr => {
+                            let timeout = get_syscall_arg(&regs, abi.reg_arg3) as i32;
+                            if timeout <= 0 {
+                                set_syscall_arg(&mut regs, abi.reg_arg3, 100);
+                                if let Err(e) = ptrace_setregs(pid, &regs, iov_len) {
+                                    log(&format!(
+                                        "DIAG poll timeout-set FAILED: ptrace_setregs: {} — child will spin",
+                                        e
+                                    ));
+                                }
+                            }
+                        }
                         _ => {
                             // Not an intercepted syscall — let it through.
                         }
