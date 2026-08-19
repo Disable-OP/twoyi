@@ -605,6 +605,55 @@ struct ChildAbi {
     // `syscall_num == abi.read` avoids cross-ABI confusion (x86_64 nr=3
     // is `close`, i386 nr=0 is `restart_syscall`).
     read: i64,
+    // mmap / mmap2 — Task 6-Y. TWRP init (i386) calls
+    //   mmap2(NULL, 0x20000, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+    // on /dev/__properties__ to set up the property area. This returns
+    // -ENOSYS (-38): the Android zygote's seccomp filter (inherited by
+    // untrusted_app, can't be removed) blocks file-backed MAP_SHARED
+    // mmap2 for i386 compat syscalls. kr64's OWN seccomp is already
+    // skipped (install_seccomp=false, Task 6-X) — the zygote filter is
+    // the blocker. Anonymous mmap2 SUCCEEDS; only file-backed MAP_SHARED
+    // fails. Result: property area not mapped → all 383
+    // __system_property_set calls fail → init bails at iter 927 →
+    // exit(1). TWRP never boots.
+    //
+    // Fix: in the syscall-ENTRY handler, intercept mmap (x86_64 nr=9,
+    // aarch64 nr=222) and mmap2 (i386 nr=192). When the mmap is file-
+    // backed (MAP_SHARED, fd >= 0) AND the fd was opened as
+    // /dev/__properties__ (tracked via the loop-local `properties_fd`
+    // from open() EXIT), rewrite the mmap args to be anonymous:
+    //   flags: (flags & !MAP_SHARED) | MAP_ANONYMOUS | MAP_PRIVATE
+    //   fd:    -1
+    //   offset: 0
+    // The kernel then performs an anonymous mmap (which succeeds).
+    // init's property_init writes the property area header to this
+    // anonymous region. Since init is the only process in the sandbox
+    // (no fork), the lack of file-backing/sharing is fine.
+    //
+    // Per-ABI numbers (verified against the kernel's UAPI headers in
+    // Task 6-Y):
+    //   i386:   mmap2 = 192 (per asm/unistd_32.h: __NR_mmap2 192)
+    //           mmap  =  90 (per asm/unistd_32.h: __NR_mmap 90 — but
+    //           modern i386 bionic uses mmap2 EXCLUSIVELY; this is set
+    //           to -1 in ABI_X86_32 to mark it "not used at runtime"
+    //           so the ENTRY match arm only fires for mmap2=192).
+    //   x86_64: mmap  =   9 (per asm/unistd_64.h: __NR_mmap 9)
+    //           mmap2 =  -1 (x86_64 has no mmap2 — sentinel)
+    //   aarch64: mmap = 222 (per asm-generic/unistd.h: __NR_mmap 222)
+    //           mmap2 =  -1 (asm-generic has no mmap2 — sentinel)
+    // The host is x86_64 running an i386 child, so ABI_X86_32.mmap2
+    // (192) is the value that fires at runtime. ABI_X86_64.mmap (9) and
+    // ABI_AARCH64.mmap (222) are locked in for ABI completeness + so
+    // the ENTRY match arm works correctly if a future x86_64/aarch64
+    // guest is ever supported.
+    //
+    // NOTE on the -1 sentinels: when abi.mmap or abi.mmap2 is -1, the
+    // ENTRY match arm `n if n == abi.mmap || n == abi.mmap2` reduces to
+    // `n if n == <other>`, since real syscall numbers are never -1.
+    // This is the SAME pattern ABI_AARCH64 uses for `open`/`access`/
+    // `lchown`/`chown`/`mknod`/`pause` (all -1 on aarch64).
+    mmap: i64,
+    mmap2: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -620,6 +669,16 @@ struct ChildAbi {
     reg_arg3: usize,
     #[allow(dead_code)]
     reg_arg4: usize,
+    // Task 6-Y: arg5 + arg6 register indices — used ONLY by the mmap /
+    // mmap2 ENTRY handler to read the fd (arg5) + offset (arg6) args so
+    // we can rewrite them when the mmap is file-backed MAP_SHARED on
+    // /dev/__properties__. No other syscall in this file uses 6+ args
+    // (open/openat use 3-4, stat/lstat use 2, etc.), so these are
+    // dead-code-allowed everywhere except the mmap ENTRY arm.
+    #[allow(dead_code)]
+    reg_arg5: usize,
+    #[allow(dead_code)]
+    reg_arg6: usize,
     // Stack-pointer register index — used to reserve a scratch area
     // BELOW the child's current stack pointer for translated paths.
     // Translated paths are always longer than the originals (e.g.
@@ -800,13 +859,39 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // is x86_64 running an i386 child, so this number does NOT
     // currently fire at runtime.
     read: 0,
+    // x86_64 mmap = 9 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+    // __NR_mmap 9, verified directly against the kernel's UAPI header
+    // in Task 6-Y). x86_64 has NO mmap2 (the modern x86_64 mmap takes
+    // offset in BYTES directly, not in 4096-byte pages — there is no
+    // need for the mmap2 page-shift workaround that i386 needs because
+    // i386's orig_eax is only 32 bits and cannot pass a 64-bit byte
+    // offset). The host is x86_64 running an i386 child, so this x86_64
+    // number does NOT currently fire at runtime (the guest uses i386
+    // syscall 192). Locked in for ABI completeness + so the mmap ENTRY
+    // handler's `== abi.mmap || == abi.mmap2` comparison is correct if
+    // a future x86_64 guest is ever supported. See the doc on `mmap` /
+    // `mmap2` in `ChildAbi` for why we rewrite file-backed MAP_SHARED
+    // mmap of /dev/__properties__ to anonymous (Task 6-Y).
+    mmap: 9,
+    mmap2: -1,       // x86_64 has no mmap2 — sentinel.
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
     reg_arg2: 13,    // rsi
     reg_arg3: 12,    // rdx
     reg_arg4: 7,     // r10
-    reg_sp: 19,      // rsp
+    // Task 6-Y: arg5 + arg6 register indices — used by the mmap ENTRY
+    // handler to read the fd (arg5=r8) + offset (arg6=r9) args so we
+    // can rewrite them when the mmap is file-backed MAP_SHARED on
+    // /dev/__properties__. x86_64 user_regs_struct field order:
+    //   0:r15 1:r14 2:r13 3:r12 4:rbp 5:rbx 6:r11 7:r10 8:r9 9:r8
+    //   10:rax 11:rcx 12:rdx 13:rsi 14:rdi 15:orig_rax ...
+    // so r8=9, r9=8.
+    #[allow(dead_code)]
+    reg_arg5: 9, // r8
+    #[allow(dead_code)]
+    reg_arg6: 8, // r9
+    reg_sp: 19, // rsp
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -1008,6 +1093,30 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // `min(ret, 256)` bytes from the buffer pointer (arg2 = ecx on
     // i386). See the doc on `read` in `ChildAbi` for the full rationale.
     read: 3,
+    // i386 mmap2 = 192 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+    // __NR_mmap2 192, verified directly against the kernel's UAPI
+    // header in Task 6-Y). i386 has BOTH `mmap` (old, nr=90, takes a
+    // pointer to a struct mmap_arg_struct) and `mmap2` (nr=192, the
+    // modern 6-arg direct call with offset in 4096-byte pages).
+    // Modern i386 bionic (incl. TWRP init) uses mmap2 EXCLUSIVELY —
+    // it never issues plain mmap(nr=90). THIS is the value that fires
+    // at runtime: init's property_init calls
+    //   mmap2(NULL, 0x20000, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+    // on /dev/__properties__ to set up the property area.
+    //
+    // The Android zygote's seccomp filter (inherited by untrusted_app,
+    // can't be removed) blocks file-backed MAP_SHARED mmap2 for i386
+    // compat syscalls → returns -ENOSYS (-38). kr64's OWN seccomp is
+    // already skipped (install_seccomp=false, Task 6-X) — the zygote
+    // filter is the blocker. Anonymous mmap2 SUCCEEDS (the existing
+    // allow list permits it). The 6-Y fix: at mmap2 ENTRY, if fd is
+    // /dev/__properties__ AND flags & MAP_SHARED, rewrite the args to
+    // be anonymous (MAP_ANONYMOUS|MAP_PRIVATE, fd=-1, offset=0) so the
+    // kernel performs an anonymous mmap that succeeds.
+    // See the doc on `mmap` / `mmap2` in `ChildAbi` for the full
+    // root-cause analysis.
+    mmap: -1,   // i386 plain mmap (nr=90) — unused by modern bionic.
+    mmap2: 192, // i386 mmap2 — the value that fires at runtime.
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1020,6 +1129,17 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     reg_arg2: 11,    // rcx (NOT rsi which is 13)
     reg_arg3: 12,    // rdx (same)
     reg_arg4: 13,    // rsi (NOT r10 which is 7)
+    // Task 6-Y: arg5 + arg6 register indices — used by the mmap2
+    // ENTRY handler to read the fd (arg5=edi) + offset (arg6=ebp)
+    // args so we can rewrite them when the mmap is file-backed
+    // MAP_SHARED on /dev/__properties__. On a 32-bit child the kernel
+    // zero-extends edi into the 64-bit rdi slot (index 14) and ebp
+    // into the 64-bit rbp slot (index 4) when reporting registers
+    // via PTRACE_GETREGS — so we use those slot indices.
+    #[allow(dead_code)]
+    reg_arg5: 14, // rdi (zero-extended edi)
+    #[allow(dead_code)]
+    reg_arg6: 4, // rbp (zero-extended ebp)
     // On a 32-bit child the kernel zero-extends `esp` into the 64-bit
     // `rsp` slot when reporting registers via PTRACE_GETREGS, so we
     // use the same index as the 64-bit ABI (19).
@@ -1213,12 +1333,34 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // is x86_64 running an i386 child, so this aarch64 number does NOT
     // currently fire at runtime.
     read: 63,
+    // aarch64 mmap = 222 (per /usr/include/asm-generic/unistd.h:
+    // __NR_mmap 222, verified directly against the kernel's UAPI
+    // header in Task 6-Y). asm-generic has NO mmap2 (the modern
+    // asm-generic mmap takes offset in BYTES directly, not in 4096-
+    // byte pages — there is no need for the mmap2 page-shift
+    // workaround that i386 needs). The host is x86_64 running an i386
+    // child, so this aarch64 number does NOT currently fire at runtime.
+    // Locked in for ABI completeness + so the mmap ENTRY handler's
+    // `== abi.mmap || == abi.mmap2` comparison is correct if a future
+    // aarch64 host is ever used. See the doc on `mmap` / `mmap2` in
+    // `ChildAbi` for the full root-cause analysis (Task 6-Y).
+    mmap: 222,
+    mmap2: -1,      // asm-generic has no mmap2 — sentinel.
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
     reg_arg2: 1,    // x1
     reg_arg3: 2,    // x2
     reg_arg4: 3,    // x3
+    // Task 6-Y: arg5 + arg6 register indices — used by the mmap ENTRY
+    // handler to read the fd (arg5=x4) + offset (arg6=x5) args so we
+    // can rewrite them when the mmap is file-backed MAP_SHARED on
+    // /dev/__properties__. aarch64 user_pt_regs is `u64 regs[31]`
+    // (x0..x30), so x4=4, x5=5.
+    #[allow(dead_code)]
+    reg_arg5: 4, // x4
+    #[allow(dead_code)]
+    reg_arg6: 5, // x5
     // Aarch64 user_pt_regs is `u64 regs[31]` (x0..x30) followed by
     // `sp`, `pc`, `pstate`. The `sp` field is therefore at index 31
     // when reinterpreted as a flat `u64` array.
@@ -2389,6 +2531,42 @@ fn is_kmsg_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("__kmsg__")
 }
 
+/// Classify an open() path as the Android property-area file
+/// `/dev/__properties__`.
+///
+/// TWRP init's property_init opens `/dev/__properties__` and mmaps it
+/// with MAP_SHARED to set up the shared property area. The Android
+/// zygote's seccomp filter (inherited by untrusted_app, can't be
+/// removed) blocks file-backed MAP_SHARED mmap2 for i386 compat →
+/// -ENOSYS. The 6-Y fix rewrites that mmap to anonymous. To match the
+/// correct mmap, we record the fd returned by open() on this path in
+/// the loop-local `properties_fd` (mirrors the existing `kmsg_fd`
+/// pattern from Task 6-U) and check it at mmap/mmap2 ENTRY.
+///
+/// Matches:
+///   - `/dev/__properties__` — the canonical path init opens.
+///   - `{rootfs}/dev/__properties__` — after translate_path rewrites
+///     `/dev/__properties__` to the host-side rootfs path.
+///   - any path whose final component is `__properties__` (defensive —
+///     covers the orphaned "(deleted)" variants + future translate_path
+///     forms).
+///
+/// Rejects relative paths + paths whose final component is NOT exactly
+/// `__properties__` (e.g. `/dev/__properties__foo`, `/dev/null`,
+/// `/init.rc`). Mirrors `is_kmsg_path`'s structure for symmetry.
+fn is_properties_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    if path == "/dev/__properties__" {
+        return true;
+    }
+    // Final path component == "__properties__" (covers {rootfs}/dev/
+    // __properties__ after translate_path rewrites /dev/__properties__,
+    // and the orphaned "(deleted)" variants).
+    path.rsplit('/').next() == Some("__properties__")
+}
+
 fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     if addr == 0 {
         return false;
@@ -2806,6 +2984,34 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     let mut open_fd_paths: std::collections::HashMap<i32, String> =
         std::collections::HashMap::new();
     let mut pending_open_translated_path: Option<String> = None;
+
+    // ── Task 6-Y: __properties__ fd tracking state ────────────────────
+    //
+    // TWRP init's property_init opens `/dev/__properties__` and mmaps
+    // it with MAP_SHARED to set up the shared property area. The
+    // Android zygote's seccomp filter (inherited by untrusted_app,
+    // can't be removed) blocks file-backed MAP_SHARED mmap2 for i386
+    // compat syscalls → -ENOSYS (-38). Anonymous mmap2 SUCCEEDS; only
+    // the file-backed MAP_SHARED variant fails. Without the mmap
+    // succeeding, the property area is not mapped → all 383
+    // __system_property_set calls fail → init bails at iter 927 →
+    // exit(1). TWRP never boots.
+    //
+    // `properties_fd`: the file descriptor open() returned for
+    //   /dev/__properties__. Set at open EXIT when the translated path
+    //   matches is_properties_path(). Consumed at the next mmap/mmap2
+    //   ENTRY whose fd argument equals this value AND whose flags
+    //   include MAP_SHARED — at that point we rewrite the mmap args to
+    //   be anonymous (MAP_ANONYMOUS|MAP_PRIVATE, fd=-1, offset=0) so
+    //   the kernel performs an anonymous mmap that succeeds. Mirrors
+    //   the existing `kmsg_fd` pattern from Task 6-U (set at open EXIT,
+    //   used by a later syscall-ENTRY arm). Init is the only process
+    //   in the sandbox (no fork), so the single-Option-per-loop
+    //   trade-off (overwriting if init closes + reopens the file) is
+    //   acceptable — the latest fd is always the one the next mmap
+    //   will use. See the doc on `mmap` / `mmap2` in `ChildAbi` for
+    //   the full root-cause analysis.
+    let mut properties_fd: Option<i32> = None;
 
     // Runtime-detected syscall/register layout for the child. `None`
     // until the first successful ptrace_getregs — at that point we
@@ -4145,6 +4351,94 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
                             }
                         }
+                        // Task 6-Y: mmap (x86_64 nr=9, aarch64 nr=222) /
+                        // mmap2 (i386 nr=192) — rewrite file-backed
+                        // MAP_SHARED mmap of /dev/__properties__ to
+                        // anonymous so the zygote's seccomp filter
+                        // (inherited by untrusted_app, can't be removed)
+                        // does not block it with -ENOSYS (-38).
+                        //
+                        // i386 mmap2 layout (per kernel UAPI):
+                        //   arg1=addr (ebx), arg2=length (ecx),
+                        //   arg3=prot  (edx), arg4=flags (esi),
+                        //   arg5=fd    (edi), arg6=offset (ebp)
+                        // x86_64 mmap layout (per kernel UAPI):
+                        //   arg1=addr (rdi), arg2=length (rsi),
+                        //   arg3=prot  (rdx), arg4=flags (r10),
+                        //   arg5=fd    (r8),  arg6=offset (r9)
+                        // aarch64 mmap layout (per kernel UAPI):
+                        //   arg1=addr (x0), arg2=length (x1),
+                        //   arg3=prot  (x2), arg4=flags (x3),
+                        //   arg5=fd    (x4), arg6=offset (x5)
+                        //
+                        // We read arg4 (flags) + arg5 (fd) via the
+                        // ABI-aware register indices (reg_arg4 / reg_arg5
+                        // set per-ABI above). If fd matches the recorded
+                        // `properties_fd` (set by the open EXIT handler
+                        // when init opened /dev/__properties__) AND
+                        // flags & MAP_SHARED != 0, rewrite:
+                        //   flags: (flags & !MAP_SHARED) | MAP_ANONYMOUS
+                        //                                            | MAP_PRIVATE
+                        //   fd:    -1   (0xFFFFFFFF as i32 → sign-extended)
+                        //   offset: 0
+                        // Then ptrace_setregs writes the modified regs
+                        // back so the kernel sees an anonymous mmap when
+                        // it resumes the child. The kernel performs the
+                        // anonymous mmap (which succeeds — anonymous mmap2
+                        // is in the zygote's allow list). init's
+                        // property_init then writes the property area
+                        // header to this anonymous region and uses it as
+                        // the property area. Since init is the only
+                        // process in the sandbox (no fork), the lack of
+                        // file-backing/sharing is fine.
+                        //
+                        // We DO NOT rewrite:
+                        //   - anonymous mmaps (flags & MAP_SHARED == 0):
+                        //     they already succeed.
+                        //   - mmaps of OTHER files (sepolicy, etc.):
+                        //     only /dev/__properties__ is rewritten. Other
+                        //     MAP_SHARED mmaps either succeed (the zygote
+                        //     allows them) or fail with -ENOSYS (which we
+                        //     let propagate — the property area is the
+                        //     ONLY file-backed MAP_SHARED mmap init
+                        //     performs during early boot, per the strace).
+                        //   - mmaps where properties_fd has not yet been
+                        //     set (init hasn't opened /dev/__properties__
+                        //     yet): no fd to match against, so we let the
+                        //     kernel handle it normally.
+                        n if n == abi.mmap || n == abi.mmap2 => {
+                            let flags = get_syscall_arg(&regs, abi.reg_arg4) as i32;
+                            let fd = get_syscall_arg(&regs, abi.reg_arg5) as i32;
+                            if let Some(prop_fd) = properties_fd {
+                                if fd == prop_fd && (flags & libc::MAP_SHARED) != 0 {
+                                    let new_flags = ((flags & !libc::MAP_SHARED)
+                                        | libc::MAP_ANONYMOUS
+                                        | libc::MAP_PRIVATE)
+                                        as u64;
+                                    set_syscall_arg(&mut regs, abi.reg_arg4, new_flags);
+                                    // fd = -1 (sign-extended to all-1s in
+                                    // the 64-bit slot — the kernel truncates
+                                    // to 0xFFFFFFFF in the 32-bit child's
+                                    // edi, which is -1 as i32, the canonical
+                                    // "no fd" sentinel for anonymous mmap).
+                                    set_syscall_arg(&mut regs, abi.reg_arg5, (-1i32) as i64 as u64);
+                                    // offset = 0 (anonymous mmap ignores
+                                    // offset, but we set it to 0 for
+                                    // cleanliness).
+                                    set_syscall_arg(&mut regs, abi.reg_arg6, 0);
+                                    match ptrace_setregs(pid, &regs, iov_len) {
+                                        Ok(()) => log(&format!(
+                                            "DIAG mmap2: rewrote fd={} (MAP_SHARED /dev/__properties__) → MAP_ANONYMOUS|MAP_PRIVATE fd=-1 (zygote seccomp blocks file-backed MAP_SHARED for i386 compat)",
+                                            fd
+                                        )),
+                                        Err(e) => log(&format!(
+                                            "DIAG mmap2: ptrace_setregs FAILED for nr={} fd={} (MAP_SHARED /dev/__properties__): {} — child will see -ENOSYS from zygote seccomp",
+                                            syscall_num, fd, e
+                                        )),
+                                    }
+                                }
+                            }
+                        }
                         _ => {
                             // Not an intercepted syscall — let it through.
                         }
@@ -4214,6 +4508,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // record the returned fd → translated-path mapping into
                     // `open_fd_paths` (used by the read() diagnostic below
                     // to annotate which file was read).
+                    //
+                    // Task 6-Y extension: ALSO record the fd in
+                    // `properties_fd` when the translated path matches
+                    // is_properties_path() (i.e. /dev/__properties__). The
+                    // subsequent mmap2 ENTRY handler uses this fd to
+                    // recognise the file-backed MAP_SHARED mmap of the
+                    // property area and rewrite it to anonymous so the
+                    // zygote seccomp filter does not -ENOSYS it. Mirrors
+                    // the existing `pending_kmsg_open` → `kmsg_fd`
+                    // pattern from Task 6-U (set at open EXIT, consumed by
+                    // a later syscall-ENTRY arm).
                     if syscall_num == abi.open
                         || syscall_num == abi.openat
                         || syscall_num == abi.openat2
@@ -4222,6 +4527,22 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         if ret > 0 {
                             if let Some(ref p) = pending_open_translated_path {
                                 open_fd_paths.insert(ret as i32, p.clone());
+                                // Task 6-Y: track __properties__ fd for
+                                // the mmap2 MAP_SHARED → MAP_ANONYMOUS
+                                // rewrite. The translated path covers both
+                                // the raw `/dev/__properties__` (when
+                                // translate_path leaves it untouched) AND
+                                // `{rootfs}/dev/__properties__` (when
+                                // translate_path rewrites it) —
+                                // is_properties_path() matches the final
+                                // component `__properties__` in both cases.
+                                if is_properties_path(p) {
+                                    properties_fd = Some(ret as i32);
+                                    log(&format!(
+                                        "DIAG properties fd captured: open() returned fd={} for {} — subsequent mmap2 with MAP_SHARED on this fd will be rewritten to MAP_ANONYMOUS|MAP_PRIVATE",
+                                        ret, p
+                                    ));
+                                }
                             }
                         }
                         pending_open_translated_path = None;
