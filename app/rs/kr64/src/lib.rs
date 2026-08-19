@@ -4641,6 +4641,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 ),
             }
         }
+
+        // TWRP BOOT: DELETE /init.partlink.rc from rootfs.
+        //
+        // Root cause (Task 6-Z3 diagnostic): after the socketcall fake-success
+        // (b877d36) let init proceed past the bind EADDRINUSE, init tries to
+        // start the 'partlink' service (defined in /init.partlink.rc). The KLOG
+        // "could not get context while starting 'partlink'" appears, then
+        // SIGSEGV at rip=0x6f722f69 (ASCII "i/ro" — rodata-leak corruption, same
+        // pattern as 6-V's /file_contexts + 6-W's /init.firmware.rc). The
+        // partlink service (/sbin/partlink) is unnecessary in the emulator.
+        // init tolerates missing .rc files.
+        let partlink_path = format!("{}/init.partlink.rc", rootfs_prefix);
+        if std::path::Path::new(&partlink_path).exists() {
+            match std::fs::remove_file(&partlink_path) {
+                Ok(()) => info!(
+                    "[KR64] PARENT: DELETED /init.partlink.rc (partlink service — unnecessary in emulator, causes SIGSEGV at rip=0x6f722f69 after socketcall fake-success let init proceed). Task 6-Z3 diagnostic."
+                ),
+                Err(e) => info!(
+                    "[KR64] PARENT: /init.partlink.rc already absent or failed to delete: {}",
+                    e
+                ),
+            }
+        }
     }
 
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
