@@ -405,19 +405,23 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
                 FileLogger.boot("wait_boot_result", "success=" + success);
                 if (!success) {
-                    FileLogger.boot("boot_failed", "trackBootFailure + System.exit");
+                    FileLogger.boot("boot_failed", "trackBootFailure — NOT calling System.exit (Task 6-Z21: the 2-sec relaunch cycle was caused by System.exit(0) here → Android restarts the process → new kr64 → recovery never reaches framebuffer render. Now we keep the process alive so the existing kr64 can continue running.)");
                     LogEvents.trackBootFailure(getApplicationContext());
 
                     runOnUiThread(() -> Toast.makeText(getApplicationContext(), R.string.boot_failed, Toast.LENGTH_SHORT).show());
 
-                    // waiting for track
-                    SystemClock.sleep(3000);
-
-                    // finish() must be called on the main thread
-                    runOnUiThread(() -> {
-                        finish();
-                        System.exit(0);
-                    });
+                    // Task 6-Z21: do NOT call System.exit(0). The recovery
+                    // (kr64 ptrace emulation) is slow — the 60s waitBoot
+                    // timeout fires before BOOT_COMPLETED, triggering this
+                    // boot-failure path. Previously System.exit(0) killed
+                    // the whole process → Android restarted it → a NEW
+                    // kr64 was spawned → the recovery restarted from
+                    // scratch every ~2 sec, never reaching the framebuffer
+                    // render. Now we just log the failure + keep the
+                    // process (and the existing kr64) alive. The recovery
+                    // can continue running past the 60s timeout + may
+                    // eventually reach the framebuffer render.
+                    // (Removed: SystemClock.sleep(3000) + finish() + System.exit(0).)
                     return;
                 }
             }
