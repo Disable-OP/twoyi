@@ -9950,10 +9950,11 @@ mod tests {
 
     /// Verify that `spawn_property_service_thread` creates the
     /// `{rootfs}/dev/socket/` directory (mode 0755) so init can create
-    /// + bind the property_service socket itself. Task 6-X: the function
-    /// NO LONGER binds the socket (init owns it — 6-H's pre-bind caused
-    /// 'Failed to unlink old socket: Permission denied' → init startup
-    /// failure → exit(1)).
+    /// + bind the property_service socket itself.
+    ///
+    /// Task 6-X: the function NO LONGER binds the socket (init owns it —
+    /// 6-H's pre-bind caused 'Failed to unlink old socket: Permission denied'
+    /// → init startup failure → exit(1)).
     #[test]
     fn spawn_property_service_thread_creates_dev_socket_dir() {
         let tmp = property_svc_tempdir("mode");
