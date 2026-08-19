@@ -4675,23 +4675,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        // TWRP BOOT: /init.partlink.rc — Task 6-Z7 fix3: REPLACE with EMPTY.
+        // TWRP BOOT: /init.partlink.rc — Task 6-Z7 fix4: REPLACE with a
+        // COMMENT-ONLY file (not empty, not a service line).
         //
-        // The .rc parser crashes (SIGSEGV at rip=0x6f722f69, "i/ro" rodata
-        // leak) when processing the "service partlink /sbin/partlink" line.
-        // Deleting the file (1efd28c) caused ENOENT → SAME SIGSEGV. Restoring
-        // the file (cd2c718) caused the parser crash on the service line.
+        // The .rc parser crashes (SIGSEGV at rip=0x6f722f69) in 3 cases:
+        // 1. Original file: parser crashes on "service partlink /sbin/partlink"
+        // 2. Deleted file (1efd28c): ENOENT → read_file returns NULL → SIGSEGV
+        // 3. Empty file (62566f1): read() returns 0 (EOF) → read_file returns
+        //    NULL → "read_file: ERROR RETURNING NULL" KLOG → SIGSEGV
         //
-        // FIX: replace /init.partlink.rc with an EMPTY file. The parser reads
-        // 0 bytes → no service line to crash on → init proceeds. The partlink
-        // service doesn't start (no service definition) → init tolerates this.
+        // FIX: replace with a COMMENT-ONLY file (one line: "# partlink
+        // disabled (emulator)"). The parser reads 1 line, sees a comment,
+        // skips it, returns non-NULL (no service to start, no crash). init
+        // tolerates the missing service definition.
         let partlink_path = format!("{}/init.partlink.rc", rootfs_prefix);
-        match std::fs::write(&partlink_path, "") {
+        match std::fs::write(&partlink_path, "# partlink disabled (emulator) — Task 6-Z7 fix4\n") {
             Ok(()) => info!(
-                "[KR64] PARENT: REPLACED /init.partlink.rc with EMPTY file (Task 6-Z7 fix3: the .rc parser crashes on 'service partlink /sbin/partlink' → SIGSEGV at rip=0x6f722f69; empty file → no service line → no crash). Was: 'on init\\n    start partlink\\n\\nservice partlink /sbin/partlink\\n    oneshot\\n' (72 bytes)."
+                "[KR64] PARENT: REPLACED /init.partlink.rc with COMMENT-ONLY file (Task 6-Z7 fix4: empty file → read_file returns NULL → SIGSEGV; comment-only → parser reads 1 line, skips comment, returns non-NULL, no crash)."
             ),
             Err(e) => warning!(
-                "[KR64] PARENT: failed to REPLACE /init.partlink.rc at {}: {} (recovery may SIGSEGV at rip=0x6f722f69 if the original service line is parsed)",
+                "[KR64] PARENT: failed to REPLACE /init.partlink.rc at {}: {} (recovery may SIGSEGV at rip=0x6f722f69 if read_file returns NULL)",
                 partlink_path, e
             ),
         }
