@@ -10013,3 +10013,141 @@ Stage Summary:
   that. A LATER crash may still occur if the SIGSYS-handler race
   corrupts other registers or if a caller critically depends on the
   out-param.
+
+---
+Task ID: 6-W
+Agent: general-purpose
+Task: Fix SIGSYS DESYNC register-preservation — always getregs+setregs
+
+Work Log:
+- deadline_check.sh returned true. Read last 150 lines of worklog
+  (DISPATCHER-UPDATE-12 + 6-V-ANALYSIS): 6-V's NOP at 0xaf65 worked
+  (that site never re-crashed), but the SIGSEGV immediately re-
+  manifested at rip=0x6f722f69 (ASCII "i/ro" — a different rodata
+  leak into a control-flow register used as a jump target). Root
+  cause confirmed by 6-V-ANALYSIS: should_skip_sigsys_setregs returned
+  true in DESYNC mode (SIGSYS fires AFTER EXIT, in_syscall==false),
+  causing the SIGSYS handler to SKIP ptrace_setregs entirely — leaving
+  garbage rodata pointers in registers → init jumped to a rodata
+  address → SIGSEGV.
+- Read ptrace_emu.rs key sections:
+  * should_skip_sigsys_setregs (line ~1875): `!in_syscall_at_sigsys
+    && compute_exit_return_value(syscall_nr, abi).is_some()` — the
+    5-J/6-C skip predicate.
+  * SIGSYS handler entry (line ~4665): `let in_syscall_at_sigsys =
+    in_syscall;` then `ptrace_getregs(pid, &mut sigsys_regs)` reads
+    registers AT SIGSYS entry.
+  * SIGSYS handler setregs block (line ~5434): `set_syscall_ret(&mut
+    sigsys_regs, &a, ret_val);` then `if should_skip_sigsys_setregs(
+    ...) { log-skip } else if ptrace_setregs(...) { err } else {
+    readback-log }` — the skip branch that 6-W reverts.
+  * ptrace_getregs / ptrace_setregs / set_syscall_ret helpers (lines
+    ~1324 / ~1449 / ~1537): confirmed `ptrace_getregs(pid, &mut regs)
+    -> io::Result<usize>` returns the iovec length, `set_syscall_ret(
+    &mut regs, &abi, val)` writes `regs[abi.reg_ret] = val`, and
+    `ptrace_setregs(pid, &regs, iov_len)` writes back.
+- Fix 1 — should_skip_sigsys_setregs (line ~1854): Changed body to
+  ALWAYS return `false` (never skip). Renamed params to
+  `_in_syscall_at_sigsys` / `_syscall_nr` / `_abi` (unused). Added
+  `#[allow(dead_code)]` (the SIGSYS handler no longer calls this
+  function — it's kept as a testable contract + regression guard).
+  Rewrote the doc comment to document the full 5-J → 6-C → 6-W
+  evolution: 5-J introduced the skip (race concern), 6-C refined it
+  (only skip for fake-success syscalls), 6-W reverted it entirely
+  (the skip caused the rodata-leak SIGSEGV).
+- Fix 2 — SIGSYS handler setregs block (line ~5320): Replaced the
+  `if should_skip_sigsys_setregs(...) { skip-log } else if
+  ptrace_setregs(...) { err } else { readback-log }` structure with:
+    1. `set_syscall_ret(&mut sigsys_regs, &a, ret_val);` (kept —
+       applies rax=ret_val to the SIGSYS-entry buffer up-front so
+       the readback log can report what we wrote).
+    2. `let mut setregs_len = len;` (shadow the SIGSYS-entry iovec
+       length so the fresh getregs can update it).
+    3. `if !in_syscall_at_sigsys { ... }` — DESYNC mode: do a FRESH
+       `ptrace_getregs(pid, &mut sigsys_regs)` (re-reads CURRENT
+       post-signal-delivery register state — NOT stale pre-EXIT
+       values), then re-apply `set_syscall_ret(&mut sigsys_regs, &a,
+       ret_val)` (the fresh getregs overwrote the earlier
+       set_syscall_ret). On fresh-getregs failure, fall through with
+       the SIGSYS-entry buffer (which already has rax=ret_val).
+    4. `if let Err(e) = ptrace_setregs(pid, &sigsys_regs, setregs_len)
+       { err-log } else { readback-log }` — ALWAYS call setregs
+       (never skip). In DESYNC mode this writes rax=ret_val to the
+       signal frame AND re-writes the OTHER registers with their
+       current values (preventing the rodata-leak SIGSEGV).
+- Fix 3 — DESYNC diagnostic log (line ~4761): Updated the in_syscall
+  DESYNC message text from "SIGSYS setregs will be skipped per
+  should_skip_sigsys_setregs" to "6-W fix: fresh ptrace_getregs +
+  ptrace_setregs will run so rax=ret_val is written AND other
+  registers are re-written with current values, preventing the
+  rodata-leak SIGSEGV that the 5-J skip caused".
+- Fix 4 — historical comments: Updated 3 stale comments that
+  referenced the 5-J/6-C skip as if it were still active:
+    * ChildAbi::pause field comment (line ~481): added 6-W note that
+      should_skip_sigsys_setregs always returns false now.
+    * in_syscall_at_sigsys capture comment (line ~4637): rewrote to
+      explain 6-W uses the variable to gate the fresh-getregs branch
+      (not the skip).
+    * SIGSYS handler pause branch comment (line ~5286): added 6-W
+      update note that setregs fires unconditionally now.
+- Test updates:
+  * should_skip_sigsys_setregs_in_desync_mode (line ~7079): changed
+    assertion from `assert!(should_skip...)` to
+    `assert!(!should_skip...)` — now verifies the 6-W contract (never
+    skip, even for chmod in DESYNC mode).
+  * should_skip_sigsys_setregs_true_for_chmod → RENAMED to
+    should_skip_sigsys_setregs_false_for_chmod_in_desync_6w: changed
+    assertion to `!should_skip...` (was `should_skip...`).
+  * desync_stop_sequence_preserves_exit_handler_rax_zero → RENAMED
+    to desync_stop_sequence_always_setregs_writes_rax_zero_6w: rewrote
+    the Stop-3 simulation to assert `!skip_setregs` (was
+    `skip_setregs`) and model the fresh getregs + setregs writeback
+    (rax=ret_val=0 for chmod).
+  * NEW test should_skip_sigsys_setregs_always_false_6w (line ~7604):
+    sweeps 8 cases (DESYNC+chmod/shmget/pause/write,
+    NORMAL+chmod/shmget/pause/write) to lock in the 6-W contract that
+    should_skip_sigsys_setregs ALWAYS returns false for every
+    combination.
+  * should_not_skip_sigsys_setregs_in_normal_mode,
+    should_skip_sigsys_setregs_false_for_shmget,
+    should_skip_sigsys_setregs_false_for_pause,
+    normal_stop_sequence_calls_sigsys_setregs: UNCHANGED (already
+    asserted `!should_skip...` — still valid under 6-W, comments
+    updated to note 6-W made NORMAL-mode behavior unchanged).
+- VERIFY (final): cargo check ✓ / cargo test = 446 passed, 0 failed
+  (was 445 on eaf68c3; +1 net new test — should_skip_sigsys_setregs_
+  always_false_6w; 2 tests renamed with updated assertions, not net
+  new) / cargo clippy -- -D warnings ✓ clean / cargo fmt --check ✓
+  clean.
+
+Stage Summary:
+- WHAT CHANGED: app/rs/kr64/src/ptrace_emu.rs — (1) should_skip_sigsys_
+  setregs now ALWAYS returns false (never skip), with #[allow(dead_code)]
+  since the SIGSYS handler no longer calls it (kept as testable contract);
+  (2) SIGSYS handler's setregs block restructured: in DESYNC mode
+  (in_syscall_at_sigsys==false), does a FRESH ptrace_getregs to re-read
+  CURRENT post-signal-delivery register state, then re-applies
+  set_syscall_ret(rax=ret_val), then ALWAYS calls ptrace_setregs (never
+  skips). In NORMAL mode, the existing flow is unchanged (SIGSYS-entry
+  getregs + set_syscall_ret + setregs). (3) DESYNC diagnostic log +
+  3 historical comments updated to reflect 6-W. (4) 1 new test +
+  2 renamed/rewritten tests + 4 existing tests with updated comments.
+- TEST COUNT: 446 passed, 0 failed (was 445 on eaf68c3, +1 net new).
+- HONEST CAVEAT: This is the PROPER root-cause fix (not a symptom mask
+  like 6-V's NOP at 0xaf65). The fresh getregs re-reads the CURRENT
+  register state (the child is stopped — registers are stable while we
+  hold the ptrace stop), so we are NOT writing back stale pre-EXIT
+  values (which was the race 5-J originally worried about). The setregs
+  writes rax=ret_val to the signal frame so sigreturn restores it
+  correctly, AND re-writes ALL registers with their current values,
+  preventing the rodata-leak SIGSEGV. The ONLY definitive proof that
+  this unblocks the UI E2E TWRP boot is a ui-e2e-test.yml run + VLM
+  screenshot analysis. A LATER crash may still occur if (a) the kernel's
+  signal-delivery-stop modifies registers in a way that even the fresh
+  getregs doesn't capture, or (b) there's a DIFFERENT root cause for the
+  SIGSEGV beyond the register-preservation race. The 5-J race concern
+  (kernel re-snapshotting rax from syscall_rollback) is theoretically
+  still possible — if it manifests, the symptom would be rax=syscall_nr
+  (NOT rax=0) on resume, which is a DIFFERENT failure mode than the
+  rodata-leak SIGSEGV. Do NOT claim "TWRP boots now" without a UI E2E
+  run.
