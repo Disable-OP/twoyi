@@ -262,6 +262,38 @@ impl Vfs {
         } else {
             format!("{}/{}", rootfs, guest_path)
         };
+        // Task 6-Z: TWRP mode requires `/dev/__properties__` to be a regular
+        // FILE (the pre-created OLD-format 131072-byte property area header).
+        // The PARENT pre-creates this file before the ptrace loop starts
+        // (lib.rs:5156). At RUNTIME, `materialize()` is called on every
+        // `open("/dev/__properties__")` ENTRY. Without this guard, the
+        // `Synthetic` arm below would `std::fs::write` over the file on
+        // every open — which (a) clobbers init's runtime `ftruncate`/`mmap`
+        // modifications to the property area header, and (b) risks the
+        // host's real-Android `/dev/__properties__` directory (Android 11+)
+        // shadowing the file if a stale dir was left behind. init's
+        // `open("/dev/__properties__")` must return a valid fd (NOT
+        // -EISDIR) so `properties_fd` is recorded + the mmap2
+        // MAP_SHARED → MAP_ANONYMOUS rewrite (Task 6-Y) fires.
+        //
+        // Only applies to the `Synthetic` (file) variant — `SyntheticDir`
+        // (Android mode) keeps its `create_dir_all` behavior unchanged.
+        if matches!(node, VfsNode::Synthetic(_)) && is_dev_properties_path(guest_path) {
+            if let Ok(md) = std::fs::metadata(&host_path) {
+                if md.is_file() {
+                    // Pre-created file exists — SKIP materialization.
+                    return Ok(());
+                }
+                if md.is_dir() {
+                    // Stale directory (left over from a prior Android-mode
+                    // run on the same rootfs) — remove it so the file write
+                    // below succeeds instead of -EISDIR. The parent already
+                    // does this cleanup (lib.rs:5162); this is a defensive
+                    // belt-and-suspenders.
+                    let _ = std::fs::remove_dir_all(&host_path);
+                }
+            }
+        }
         match node {
             VfsNode::Synthetic(bytes) => {
                 if let Some(parent) = std::path::Path::new(&host_path).parent() {
@@ -285,6 +317,28 @@ impl Vfs {
         }
         Ok(())
     }
+}
+
+/// Check if a guest path is the Android property-area file
+/// `/dev/__properties__` (Task 6-Z).
+///
+/// In TWRP mode (AOSP 5.1 bionic), `/dev/__properties__` MUST be a regular
+/// FILE — the OLD single-file property area layout (131072 bytes, pre-created
+/// by the parent before the ptrace loop starts). The NEW Android 8+ layout
+/// uses a DIRECTORY at this path, which TWRP's bionic does NOT understand.
+/// `materialize()` uses this helper to decide whether to skip the write
+/// when a regular file already exists (so the parent's pre-created file is
+/// preserved + init's runtime `ftruncate`/`mmap` modifications are not
+/// clobbered).
+///
+/// Matches `/dev/__properties__` exactly. Mirrors `is_properties_path` in
+/// ptrace_emu.rs but kept private to vfs.rs (the lower-level layer should
+/// not depend on ptrace_emu). The materialize() call site always passes the
+/// raw guest path (pre-`translate_path`), so the exact-match check is
+/// sufficient — `translate_path`'s `{rootfs}/dev/__properties__` form is
+/// only used for the kernel `open()`, not for `materialize()`.
+fn is_dev_properties_path(guest_path: &str) -> bool {
+    guest_path == "/dev/__properties__"
 }
 
 /// Build a minimal valid AOSP `__system_property_area__` header.
@@ -942,6 +996,128 @@ mod tests {
             "/dev/__properties__ must NOT be a directory in new_twrp()"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_vfs_materialize_skips_when_properties_file_exists() {
+        // Task 6-Z: when /dev/__properties__ already exists as a regular file
+        // (pre-created by the parent in TWRP mode before the ptrace loop),
+        // materialize() must SKIP — must NOT overwrite the file (which would
+        // clobber init's runtime ftruncate/mmap modifications) and must NOT
+        // turn it into a directory. init's open("/dev/__properties__") must
+        // return a valid fd (not -EISDIR) so properties_fd is recorded and
+        // the mmap2 MAP_SHARED → MAP_ANONYMOUS rewrite (Task 6-Y) fires.
+        let tmp = std::env::temp_dir().join(format!(
+            "kr64_vfs_skip_prop_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rootfs = tmp.to_str().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Pre-create {rootfs}/dev/__properties__ as a regular file with
+        // sentinel content (simulating the parent's pre-creation, which
+        // writes the OLD-format 131072-byte header — the sentinel bytes
+        // here let us detect whether materialize overwrote the file).
+        let prop_path = format!("{}/dev/__properties__", rootfs);
+        std::fs::create_dir_all(format!("{}/dev", rootfs)).unwrap();
+        std::fs::write(&prop_path, b"PARENT PRE-CREATED SENTINEL").unwrap();
+        // Sanity: the file exists + is a regular file before materialize.
+        assert!(std::fs::metadata(&prop_path).unwrap().is_file());
+        // Call materialize — must SKIP (return Ok, leave the file untouched).
+        let vfs = Vfs::new_twrp();
+        vfs.materialize("/dev/__properties__", rootfs)
+            .expect("materialize must succeed (skip returns Ok)");
+        // The file content must be UNCHANGED (skip, not overwrite).
+        let written = std::fs::read(&prop_path).expect("file must still exist");
+        assert_eq!(
+            written, b"PARENT PRE-CREATED SENTINEL",
+            "materialize must NOT overwrite the pre-created file (Task 6-Z skip)"
+        );
+        // The file must still be a regular FILE (not turned into a directory).
+        let md = std::fs::metadata(&prop_path).expect("metadata must succeed");
+        assert!(
+            md.is_file(),
+            "/dev/__properties__ must remain a regular FILE after materialize (skip)"
+        );
+        assert!(
+            !md.is_dir(),
+            "/dev/__properties__ must NOT be a directory after materialize (Task 6-Z)"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_vfs_materialize_removes_stale_dir_at_properties_path() {
+        // Task 6-Z: if a stale DIRECTORY exists at {rootfs}/dev/__properties__
+        // (left over from a prior Android-mode run on the same rootfs, or
+        // mirrored from the host's real-Android /dev/__properties__ which IS
+        // a directory on Android 11+), materialize() must remove it and write
+        // the OLD-format file. Without this, std::fs::write would fail with
+        // -EISDIR and init's open() would hit the directory → -EISDIR →
+        // properties_fd never recorded → mmap2 rewrite (6-Y) never fires.
+        let tmp = std::env::temp_dir().join(format!(
+            "kr64_vfs_stale_dir_prop_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rootfs = tmp.to_str().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Pre-create {rootfs}/dev/__properties__ as a DIRECTORY (stale).
+        let prop_path = format!("{}/dev/__properties__", rootfs);
+        std::fs::create_dir_all(&prop_path).unwrap();
+        // Sanity: it's a directory before materialize.
+        assert!(std::fs::metadata(&prop_path).unwrap().is_dir());
+        // Call materialize — must remove the stale dir + write the file.
+        let vfs = Vfs::new_twrp();
+        vfs.materialize("/dev/__properties__", rootfs)
+            .expect("materialize must succeed (stale dir removed + file written)");
+        // The path must now be a regular FILE (not a directory).
+        let md = std::fs::metadata(&prop_path).expect("metadata must succeed");
+        assert!(
+            md.is_file(),
+            "/dev/__properties__ must be a regular FILE after stale-dir cleanup (Task 6-Z)"
+        );
+        assert!(
+            !md.is_dir(),
+            "/dev/__properties__ must NOT be a directory after stale-dir cleanup (Task 6-Z)"
+        );
+        // The file content must match the OLD-format property area.
+        let written = std::fs::read(&prop_path).expect("file must exist");
+        assert_eq!(written, make_old_format_property_area());
+        assert_eq!(written.len(), PROP_AREA_SIZE);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_is_dev_properties_path_matches_exact() {
+        // Task 6-Z: is_dev_properties_path() matches only the exact
+        // /dev/__properties__ path (the raw guest path passed to
+        // materialize() before translate_path rewrites it).
+        assert!(is_dev_properties_path("/dev/__properties__"));
+        // Subpaths (the NEW Android 8+ format) must NOT match — those
+        // are handled by the SyntheticDir / Dynamic arms, not the skip.
+        assert!(!is_dev_properties_path(
+            "/dev/__properties__/properties_serial"
+        ));
+        assert!(!is_dev_properties_path("/dev/__properties__/property_info"));
+        // Translated rootfs form must NOT match (materialize() is called
+        // with the raw guest path, not the translated one).
+        assert!(!is_dev_properties_path(
+            "/data/user/0/io.twoyi/rootfs/dev/__properties__"
+        ));
+        // Unrelated paths.
+        assert!(!is_dev_properties_path("/dev/null"));
+        assert!(!is_dev_properties_path("/dev/__kmsg__"));
+        assert!(!is_dev_properties_path("/init.rc"));
+        assert!(!is_dev_properties_path(""));
     }
 
     #[test]
