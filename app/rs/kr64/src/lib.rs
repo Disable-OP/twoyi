@@ -1219,11 +1219,7 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // setexeccon (ptrace fakes the write return). init can then fork
             // the recovery service → it opens fb0 → TWRP renders.
             result.push('\n');
-            // Task 6-Z34: TEMPORARILY disabling LD_PRELOAD to test if the
-            // libtwrp_fb_hook.so hook is causing the SIGSEGV at rip=0x809d7e9.
-            // If the crash goes away, the hook is the cause. If it persists,
-            // the crash is from the recovery binary itself or another library.
-            // result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
+            result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
             result.push_str("\n    seclabel u:r:recovery:s0");
             found = true;
         }
