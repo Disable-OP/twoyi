@@ -266,6 +266,23 @@ struct ChildAbi {
     readlink: i64,
     readlinkat: i64,
     chdir: i64,
+    // unlink / unlinkat — path-taking file-deletion syscalls. Task 6-Y:
+    // these were MISSING from ChildAbi, so the path-translation match
+    // arm did NOT cover them → init's unlink("/dev/socket/property_service")
+    // hit the HOST /dev/socket (not the rootfs) → EACCES → init logged
+    // "Failed to unlink old socket 'property_service': Permission denied"
+    // → init's property service failed to start → ALL property-setting
+    // failed → "init: init startup failure" → exit_group(1).
+    //
+    // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h +
+    // unistd_64.h + asm-generic/unistd.h:
+    //   i386:   unlink=10, unlinkat=301
+    //   x86_64: unlink=87, unlinkat=263
+    //   aarch64 (asm-generic): unlink=-1 (dropped; uses unlinkat=35)
+    // unlink takes a PATH (arg1) → needs path translation. unlinkat takes
+    // a dirfd (arg1) + a PATH (arg2) → arg2 is the path (same as openat).
+    unlink: i64,
+    unlinkat: i64,
     // Syscalls that TWRP init calls early in startup which return EPERM
     // as untrusted_app (capget — no capabilities; fchown/fchmod — can't
     // change ownership/permissions of fds; ioprio_get / ioprio_set —
@@ -671,6 +688,11 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     readlink: 89,
     readlinkat: 267,
     chdir: 80,
+    // x86_64 unlink=87, unlinkat=263 (Task 6-Y; verified against
+    // /usr/include/x86_64-linux-gnu/asm/unistd_64.h). Path-translated so
+    // init's unlink("/dev/socket/property_service") hits the rootfs.
+    unlink: 87,
+    unlinkat: 263,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. Real fchown on x86_64 is 93 (NOT 91, which
     // is fchmod — the diagnostic log that motivated this fix reported
@@ -836,6 +858,12 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     readlink: 85,
     readlinkat: 303,
     chdir: 12,
+    // i386 unlink=10, unlinkat=301 (Task 6-Y; verified against
+    // /usr/include/x86_64-linux-gnu/asm/unistd_32.h). Path-translated so
+    // init's unlink("/dev/socket/property_service") hits the rootfs, not
+    // the HOST /dev/socket (which gave EACCES → init startup failure).
+    unlink: 10,
+    unlinkat: 301,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. i386 fchown=95, fchmod=94, capget=184,
     // ioprio_get=290, ioprio_set=289 (per /usr/lib/linux/uapi/x86/
@@ -1027,6 +1055,10 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     readlink: -1,
     readlinkat: 78,
     chdir: 49,
+    // aarch64 (asm-generic): unlink=-1 (dropped; uses unlinkat=35).
+    // Task 6-Y; verified against /usr/include/asm-generic/unistd.h.
+    unlink: -1,
+    unlinkat: 35,
     // TWRP-init EPERM workaround — see the long comment on these
     // fields in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
     // fchown=55, fchmod=52, capget=90, ioprio_get=31, ioprio_set=30
@@ -2096,6 +2128,12 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "fstat64"
     } else if nr == abi.execve {
         "execve"
+    } else if nr == abi.unlink {
+        // Task 6-Y: path-taking file-deletion syscall. Pre-6-Y these were
+        // labelled "[unknown]" in the diagnostic log.
+        "unlink"
+    } else if nr == abi.unlinkat {
+        "unlinkat"
     } else {
         "unknown"
     }
@@ -3791,6 +3829,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             n if n == abi.chmod => Some(abi.reg_arg1),
                             n if n == abi.chroot => Some(abi.reg_arg1),
                             n if n == abi.execve => Some(abi.reg_arg1),
+                            // Task 6-Y: unlink takes path in arg1; unlinkat
+                            // takes dirfd in arg1 + path in arg2 (like openat).
+                            n if n == abi.unlink => Some(abi.reg_arg1),
+                            n if n == abi.unlinkat => Some(abi.reg_arg2),
                             // mount's arg1 is the SOURCE path (may be NULL
                             // for bind/virtual mounts) — logged below; we
                             // do NOT set path_idx here so the generic
