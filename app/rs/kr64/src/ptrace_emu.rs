@@ -1918,10 +1918,11 @@ fn set_syscall_ret(regs: &mut Regs, abi: &ChildAbi, val: i64) {
 /// Historically used by the SIGSYS handler to rewrite a seccomp-blocked
 /// syscall into a harmless one (getpid) before resuming. This rewrite
 /// was REMOVED in the "never rewrite orig_rax" fix — see the SIGSYS
-/// handler for the rationale. The function is retained for potential
-/// future use (e.g. if a different code path needs to rewrite the
-/// syscall number for a non-seccomp reason).
-#[allow(dead_code)]
+/// handler for the rationale. The function is now used by Task 6-Z9's
+/// ENTRY-side xattr-SET → getpid rewrite (a DIFFERENT code path that
+/// rewrites orig_rax BEFORE the kernel executes the syscall, which is
+/// safe — unlike the SIGSYS case where the kernel had already aborted
+/// the syscall).
 fn set_syscall_num(regs: &mut Regs, abi: &ChildAbi, val: i64) {
     let regs_ptr = regs as *mut Regs as *mut u64;
     unsafe {
@@ -3166,6 +3167,47 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     let mut in_syscall = false;
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
+
+    // ── Task 6-Z9: xattr-SET syscall-rewrite state ───────────────────
+    //
+    // `pending_xattr_fake`: set at the ENTRY stop for setxattr /
+    //   lsetxattr / fsetxattr (the *xattr SET family) when we rewrite
+    //   the syscall number to `getpid` so the kernel executes a
+    //   HARMLESS getpid instead of the xattr SET. As untrusted_app the
+    //   kernel returns -EPERM / -EACCES / -EOPNOTSUPP for these xattr
+    //   SETs (no CAP for security.* xattrs / filesystem doesn't
+    //   support xattrs). The post-6-R EXIT-side fake
+    //   (`compute_exit_return_value`) was SUPPOSED to overwrite rax=0
+    //   at the EXIT stop, but the dispatcher's evidence on b712639 UI
+    //   E2E run 32227786881 was inconclusive (the "faking success"
+    //   log is gated by `loop_count <= 200`, which is long past by the
+    //   time lsetxattr fires in the restorecon phase; the readback log
+    //   is gated by `loop_count <= 300` — also past). The recovery
+    //   was stuck in the restorecon loop (lstat64 → lsetxattr →
+    //   gettid → open attr/current → read → close → repeat).
+    //
+    //   Task 6-Z9 takes a MORE DIRECT approach (the "syscall rewrite"
+    //   pattern, mirroring how the SIGSYS handler conceptually rewrites
+    //   blocked syscalls to getpid): at the ENTRY stop we rewrite
+    //   orig_eax to `abi.getpid` BEFORE the kernel executes the syscall.
+    //   The kernel then executes getpid (always succeeds, returns the
+    //   PID) instead of the xattr SET (which would return EPERM/etc.).
+    //   At the matching EXIT stop, `pending_xattr_fake` is consumed:
+    //   we fake the return to 0 (success) regardless of what getpid
+    //   returned. This is belt-and-suspenders with the existing
+    //   `compute_exit_return_value` EXIT-side fake — if the ENTRY
+    //   rewrite succeeds, `syscall_num` at EXIT is `getpid` (not the
+    //   xattr number), so `compute_exit_return_value(getpid, abi)`
+    //   returns None and the existing block is a no-op. If the ENTRY
+    //   rewrite FAILS (ptrace_setregs error), `syscall_num` at EXIT is
+    //   still the original xattr number, `compute_exit_return_value`
+    //   returns Some(0), AND `pending_xattr_fake` ALSO fires — both
+    //   try to set rax=0 (redundant but harmless — both write 0 to
+    //   rax via fresh ptrace_getregs + set_syscall_ret + ptrace_setregs).
+    //   The legacy `compute_exit_return_value` block's "faking success"
+    //   log is gated by `loop_count <= 200` (long past by the time
+    //   xattr fires), so in practice NO double-logging occurs.
+    let mut pending_xattr_fake: bool = false;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
     //
@@ -4784,6 +4826,84 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
                             }
                         }
+                        // ── Task 6-Z9: xattr-SET ENTRY → rewrite to getpid ──
+                        //
+                        // setxattr / lsetxattr / fsetxattr (the *xattr SET
+                        // family) are called by TWRP recovery during its
+                        // SELinux-restorecon phase:
+                        //   lsetxattr(path, "security.selinux", ctx, 44, 0)
+                        // As untrusted_app the kernel returns -EPERM / -EACCES
+                        // / -EOPNOTSUPP (no CAP for security.* xattrs, or the
+                        // filesystem doesn't support xattrs). The post-6-R
+                        // EXIT-side fake (compute_exit_return_value) was
+                        // SUPPOSED to overwrite rax=0 at the EXIT stop, but
+                        // the dispatcher's evidence on b712639 UI E2E run
+                        // 32227786881 was inconclusive — the "faking success"
+                        // log is gated by `loop_count <= 200` (long past by
+                        // the time lsetxattr fires in the restorecon phase),
+                        // and the readback log is gated by
+                        // `loop_count <= 300` (also past). The recovery was
+                        // stuck in the restorecon loop.
+                        //
+                        // Task 6-Z9 takes a MORE DIRECT approach: at the
+                        // ENTRY stop, REWRITE orig_eax to `abi.getpid` BEFORE
+                        // the kernel executes the syscall. The kernel then
+                        // executes getpid (always succeeds, returns the PID)
+                        // instead of the xattr SET (which would return
+                        // EPERM/EACCES/EOPNOTSUPP). At the matching EXIT
+                        // stop, `pending_xattr_fake` is consumed: we fake
+                        // the return to 0 (success) regardless of what getpid
+                        // returned.
+                        //
+                        // This is SAFE (unlike the SIGSYS-handler's old
+                        // "rewrite orig_rax" which was reverted in the
+                        // "never rewrite orig_rax" fix) because here the
+                        // kernel has NOT yet executed the syscall — we are
+                        // at the ENTRY stop, and rewriting orig_rax BEFORE
+                        // resuming causes the kernel to execute the NEW
+                        // syscall (getpid) instead of the original. The
+                        // SIGSYS case was different: the kernel had ALREADY
+                        // aborted the syscall (seccomp fired), so rewriting
+                        // orig_rax there caused the kernel to RE-EXECUTE the
+                        // new syscall (getpid) and overwrite our faked return
+                        // value with getpid's real PID.
+                        //
+                        // We set `pending_xattr_fake = true` BEFORE the
+                        // ptrace_setregs call so that even if the rewrite
+                        // FAILS (ptrace_setregs error → the kernel still
+                        // executes the original xattr syscall), the EXIT
+                        // handler still fakes the return to 0 via the
+                        // `pending_xattr_fake` branch (belt-and-suspenders
+                        // with `compute_exit_return_value`, which would
+                        // ALSO match the original xattr number at EXIT in
+                        // the rewrite-failed case — both set rax=0,
+                        // redundant but harmless).
+                        //
+                        // UN-GATED log: the restorecon loop is the CURRENT
+                        // blocker, so we need to see EVERY xattr ENTRY
+                        // rewrite (not just the first N) to confirm the
+                        // fix is applied. The volume is bounded by the
+                        // number of files recovery tries to relabel (a few
+                        // hundred at most before it proceeds past the
+                        // restorecon phase).
+                        n if n == abi.setxattr || n == abi.lsetxattr || n == abi.fsetxattr => {
+                            pending_xattr_fake = true;
+                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                            match ptrace_setregs(pid, &regs, iov_len) {
+                                Ok(()) => log(&format!(
+                                    "DIAG xattr ENTRY: {} nr={} → rewritten to getpid nr={} (kernel will execute getpid; EXIT will fake return 0) — avoids kernel EPERM/EACCES/EOPNOTSUPP for security.* xattr SET as untrusted_app",
+                                    syscall_name(syscall_num, &abi),
+                                    syscall_num,
+                                    abi.getpid
+                                )),
+                                Err(e) => log(&format!(
+                                    "DIAG xattr ENTRY REWRITE FAILED: {} nr={} → getpid: ptrace_setregs: {} — kernel will execute the xattr syscall (EXIT will still fake return 0 via pending_xattr_fake)",
+                                    syscall_name(syscall_num, &abi),
+                                    syscall_num,
+                                    e
+                                )),
+                            }
+                        }
                         _ => {
                             // Not an intercepted syscall — let it through.
                         }
@@ -5146,6 +5266,82 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         pending_getpid = false;
                     }
 
+                    // ── Task 6-Z9: xattr-SET EXIT → fake return 0 ──────
+                    //
+                    // This consumes the `pending_xattr_fake` flag set at the
+                    // ENTRY stop for setxattr / lsetxattr / fsetxattr (where
+                    // we rewrote orig_eax to `getpid`). At this EXIT stop,
+                    // the kernel has just executed getpid (NOT the original
+                    // xattr SET) and rax holds getpid's return value (the
+                    // child's PID, a positive integer). We fake rax=0 so
+                    // recovery sees "lsetxattr returned 0 (success)" and
+                    // proceeds past the restorecon retry loop.
+                    //
+                    // This is the PRIMARY fake path for xattr SET syscalls
+                    // post-6-Z9. The legacy `compute_exit_return_value`
+                    // block below is belt-and-suspenders: it ONLY fires if
+                    // the ENTRY rewrite FAILED (so syscall_num at EXIT is
+                    // still the original xattr number, e.g. 227 for i386
+                    // lsetxattr). In that case BOTH this block AND the
+                    // `compute_exit_return_value` block set rax=0
+                    // (redundant but harmless — both write 0 to rax via
+                    // fresh ptrace_getregs + set_syscall_ret + ptrace_setregs).
+                    //
+                    // DIAGNOSTIC: the pre-6-Z9 dispatcher evidence on
+                    // b712639 UI E2E run 32227786881 was INCONCLUSIVE about
+                    // whether the legacy EXIT-side fake (compute_exit_return_value)
+                    // was actually being applied for lsetxattr — the
+                    // "intercepted ... faking success" log was gated by
+                    // `loop_count <= 200` (long past by the time lsetxattr
+                    // fires in the restorecon phase), and the 5-J readback
+                    // log was gated by `loop_count <= 300` (also past). The
+                    // 6-Z9 ENTRY-side rewrite makes the fake OBSERVABLE via
+                    // the UN-GATED "DIAG xattr ENTRY" + "DIAG xattr EXIT"
+                    // logs (which fire regardless of loop_count), so the
+                    // next UI E2E run will definitively show whether the
+                    // fake is applied.
+                    //
+                    // RE-READ syscall number at EXIT: `syscall_num` was
+                    // computed at the top of this SIGTRAP|0x80 block from
+                    // the EXIT-stop `regs` snapshot. If the ENTRY rewrite
+                    // succeeded, `syscall_num` here is `getpid` (NOT the
+                    // original xattr number) — the diagnostic logs both
+                    // so we can confirm the rewrite took effect.
+                    if pending_xattr_fake {
+                        pending_xattr_fake = false;
+                        let exit_syscall_num = syscall_num;
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        match ptrace_getregs(pid, &mut regs2) {
+                            Ok(len) => {
+                                let original_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                match ptrace_setregs(pid, &regs2, len) {
+                                    Ok(()) => log(&format!(
+                                        "DIAG xattr EXIT: faked return 0 (getpid returned {}; exit-syscall_num={} [{}] — if [getpid], the ENTRY rewrite succeeded) — child sees xattr-SET success",
+                                        original_ret,
+                                        exit_syscall_num,
+                                        syscall_name(exit_syscall_num, &abi)
+                                    )),
+                                    Err(e) => log(&format!(
+                                        "DIAG xattr EXIT FAKE FAILED: ptrace_setregs: {} — child will see getpid's return {} (NOT 0) for the xattr SET; recovery may spin",
+                                        e, original_ret
+                                    )),
+                                }
+                            }
+                            Err(e) => {
+                                // The pre-6-Z9 code had NO else branch here
+                                // — a silent ptrace_getregs failure would
+                                // skip the fake with NO log, leaving the
+                                // dispatcher unable to tell whether the
+                                // fake ran. 6-Z9 surfaces the failure.
+                                log(&format!(
+                                    "DIAG xattr EXIT: ptrace_getregs FAILED: {} — cannot fake return 0; child will see getpid's return for the xattr SET",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+
                     // ── TWRP-init EPERM / syscall-number-leak workaround ───
                     //
                     // chmod / fchmod / fchown / lchown / chown / fchmodat /
@@ -5210,81 +5406,153 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // We do NOT log this branch on every iteration
                     // (only for the first 200) to avoid log spam if
                     // init calls fchown/fchmod in a hot loop.
-                    if let Some(_forced_ret) = compute_exit_return_value(syscall_num, &abi) {
+                    //
+                    // Task 6-Z9 diagnostic: UN-GATED log for the xattr
+                    // SET family (setxattr/lsetxattr/fsetxattr) so we
+                    // can DEFINITIVELY confirm whether the legacy
+                    // `compute_exit_return_value` path is reached +
+                    // returns Some(0) for these syscalls. This fires
+                    // ONLY when the 6-Z9 ENTRY-side rewrite FAILED
+                    // (so syscall_num at EXIT is still the original
+                    // xattr number); when the rewrite succeeds,
+                    // syscall_num at EXIT is `getpid` and this block
+                    // is a no-op (compute_exit_return_value(getpid)=None).
+                    let _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
+                    if syscall_num == abi.setxattr
+                        || syscall_num == abi.lsetxattr
+                        || syscall_num == abi.fsetxattr
+                    {
+                        log(&format!(
+                            "DIAG compute_exit_return_value for xattr nr={} [{}] → {:?} (loop_count={}, in_syscall_was_exit=true) — this fires ONLY if the 6-Z9 ENTRY rewrite FAILED (otherwise syscall_num at EXIT would be getpid, not the xattr number)",
+                            syscall_num,
+                            syscall_name(syscall_num, &abi),
+                            _forced_ret_opt,
+                            loop_count
+                        ));
+                    }
+                    if let Some(_forced_ret) = _forced_ret_opt {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
-                            let name = syscall_name(syscall_num, &abi);
-                            if loop_count <= 200 {
-                                log(&format!(
-                                    "intercepted {}() nr={} at EXIT → faking success (return 0) — original return was EPERM as untrusted_app OR rax=nr leak on i386 compat seccomp-abort",
-                                    name, syscall_num
-                                ));
-                            }
-                            // ── capget: do NOT write to the data buffer.
-                            //
-                            // We previously tried to populate the
-                            // `cap_user_data_t` buffer in the child with
-                            // 0xFFFFFFFF via PTRACE_POKEDATA so init
-                            // would see "all caps granted". That 8-byte
-                            // poke corrupted the child's stack and
-                            // caused a SIGSEGV (signal 11). The buffer
-                            // pointer passed by init may not actually be
-                            // a writable mapped address we can safely
-                            // poke (alignment / stack layout
-                            // assumptions do not hold in practice).
-                            //
-                            // Instead we just fake success (return 0)
-                            // and leave the buffer untouched. The child
-                            // sees "success but no capabilities". This
-                            // may cause init to exit, but it will not
-                            // crash the process with SIGSEGV — which is
-                            // the strictly better failure mode.
-                            if syscall_num == abi.capget && loop_count <= 200 {
-                                log("capget: faking success (return 0) without writing data buffer — avoids stack-corrupting PTRACE_POKEDATA");
-                            }
-                            set_syscall_ret(&mut regs2, &abi, 0);
-                            let setregs_result = ptrace_setregs(pid, &regs2, len);
-                            if let Err(e) = setregs_result {
-                                // 5-J diagnostic: surface silent setregs failures
-                                // (previously discarded with `let _ =` — a
-                                // failed setregs here leaves rax = the kernel's
-                                // syscall-number leak value, e.g. 15 for i386
-                                // chmod, and init takes the chmod-error path
-                                // → SIGSEGV at rip=0x809255d).
-                                log(&format!(
-                                    "EXIT handler: ptrace_setregs FAILED for {} (nr={}): {} — child will see kernel's leaked rax, not our faked 0",
-                                    name, syscall_num, e
-                                ));
-                            }
-                            // ── 5-J diagnostic readback ──
-                            //
-                            // Re-read rax IMMEDIATELY after our setregs to
-                            // confirm the write stuck. If the kernel clobbers
-                            // rax between our setregs and this readback (e.g.
-                            // because the SIGSYS signal-delivery-stop is
-                            // already pending and the kernel re-snapshots
-                            // regs from `syscall_rollback` which sets
-                            // rax = orig_rax = the syscall number), we'll see
-                            // a non-zero value here. This is the smoking gun
-                            // 5-H asked the next investigation agent to look
-                            // for: "Add a log AFTER set_syscall_ret(...) and
-                            // after ptrace_setregs to confirm the writeback
-                            // happened".
-                            //
-                            // Gated by `loop_count <= 300` so we capture the
-                            // chmod(/proc/cmdline) at post-execve syscall #50
-                            // (iter ~216 per 5-H's log) without flooding
-                            // logcat for the later fchown/fchmod hot loop.
-                            if loop_count <= 300 {
-                                let mut readback: Regs = unsafe { std::mem::zeroed() };
-                                if ptrace_getregs(pid, &mut readback).is_ok() {
-                                    let readback_rax =
-                                        get_syscall_arg(&readback, abi.reg_ret) as i64;
+                        match ptrace_getregs(pid, &mut regs2) {
+                            Ok(len) => {
+                                let name = syscall_name(syscall_num, &abi);
+                                // Task 6-Z9 diagnostic: re-read the
+                                // syscall number from the FRESH EXIT-stop
+                                // regs2 + compare with `syscall_num`
+                                // (computed from the top-of-block `regs`
+                                // snapshot). A mismatch means the snapshot
+                                // diverged — e.g. a signal-delivery-stop
+                                // between ENTRY and EXIT re-snapshotted
+                                // regs, or the kernel clobbered orig_rax.
+                                let exit_stop_syscall_num = get_syscall_num(&regs2, &abi);
+                                if exit_stop_syscall_num != syscall_num {
                                     log(&format!(
-                                        "[KR64][ptrace] EXIT handler wrote rax=0 for {} (nr={}), readback rax={}",
-                                        name, syscall_num, readback_rax
+                                        "DIAG EXIT syscall_num mismatch: top-of-block syscall_num={} [{}] vs fresh-regs2 syscall_num={} [{}] — snapshot diverged (signal delivery / kernel clobber between ENTRY and EXIT?)",
+                                        syscall_num,
+                                        syscall_name(syscall_num, &abi),
+                                        exit_stop_syscall_num,
+                                        syscall_name(exit_stop_syscall_num, &abi)
                                     ));
                                 }
+                                if loop_count <= 200 {
+                                    log(&format!(
+                                        "intercepted {}() nr={} at EXIT → faking success (return 0) — original return was EPERM as untrusted_app OR rax=nr leak on i386 compat seccomp-abort",
+                                        name, syscall_num
+                                    ));
+                                }
+                                // ── capget: do NOT write to the data buffer.
+                                //
+                                // We previously tried to populate the
+                                // `cap_user_data_t` buffer in the child with
+                                // 0xFFFFFFFF via PTRACE_POKEDATA so init
+                                // would see "all caps granted". That 8-byte
+                                // poke corrupted the child's stack and
+                                // caused a SIGSEGV (signal 11). The buffer
+                                // pointer passed by init may not actually be
+                                // a writable mapped address we can safely
+                                // poke (alignment / stack layout
+                                // assumptions do not hold in practice).
+                                //
+                                // Instead we just fake success (return 0)
+                                // and leave the buffer untouched. The child
+                                // sees "success but no capabilities". This
+                                // may cause init to exit, but it will not
+                                // crash the process with SIGSEGV — which is
+                                // the strictly better failure mode.
+                                if syscall_num == abi.capget && loop_count <= 200 {
+                                    log("capget: faking success (return 0) without writing data buffer — avoids stack-corrupting PTRACE_POKEDATA");
+                                }
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                let setregs_result = ptrace_setregs(pid, &regs2, len);
+                                if let Err(e) = setregs_result {
+                                    // 5-J diagnostic: surface silent setregs failures
+                                    // (previously discarded with `let _ =` — a
+                                    // failed setregs here leaves rax = the kernel's
+                                    // syscall-number leak value, e.g. 15 for i386
+                                    // chmod, and init takes the chmod-error path
+                                    // → SIGSEGV at rip=0x809255d).
+                                    log(&format!(
+                                        "EXIT handler: ptrace_setregs FAILED for {} (nr={}): {} — child will see kernel's leaked rax, not our faked 0",
+                                        name, syscall_num, e
+                                    ));
+                                }
+                                // ── 5-J diagnostic readback ──
+                                //
+                                // Re-read rax IMMEDIATELY after our setregs to
+                                // confirm the write stuck. If the kernel clobbers
+                                // rax between our setregs and this readback (e.g.
+                                // because the SIGSYS signal-delivery-stop is
+                                // already pending and the kernel re-snapshots
+                                // regs from `syscall_rollback` which sets
+                                // rax = orig_rax = the syscall number), we'll see
+                                // a non-zero value here. This is the smoking gun
+                                // 5-H asked the next investigation agent to look
+                                // for: "Add a log AFTER set_syscall_ret(...) and
+                                // after ptrace_setregs to confirm the writeback
+                                // happened".
+                                //
+                                // Gated by `loop_count <= 300` so we capture the
+                                // chmod(/proc/cmdline) at post-execve syscall #50
+                                // (iter ~216 per 5-H's log) without flooding
+                                // logcat for the later fchown/fchmod hot loop.
+                                //
+                                // Task 6-Z9: UN-GATED for the xattr SET family
+                                // (the current restorecon-loop blocker) so the
+                                // readback fires regardless of loop_count.
+                                if loop_count <= 300
+                                    || syscall_num == abi.setxattr
+                                    || syscall_num == abi.lsetxattr
+                                    || syscall_num == abi.fsetxattr
+                                {
+                                    let mut readback: Regs = unsafe { std::mem::zeroed() };
+                                    if ptrace_getregs(pid, &mut readback).is_ok() {
+                                        let readback_rax =
+                                            get_syscall_arg(&readback, abi.reg_ret) as i64;
+                                        log(&format!(
+                                            "[KR64][ptrace] EXIT handler wrote rax=0 for {} (nr={}), readback rax={}",
+                                            name, syscall_num, readback_rax
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                // Task 6-Z9: surface the previously-SILENT
+                                // ptrace_getregs failure. Pre-6-Z9, if this
+                                // fresh getregs failed, the fake was skipped
+                                // with NO log — leaving the dispatcher unable
+                                // to tell whether the fake ran. This is the
+                                // most likely root cause of the pre-6-Z9
+                                // "fake not applied" symptom (if the legacy
+                                // path was the only fake): a transient
+                                // ptrace_getregs failure (e.g. the child was
+                                // briefly in an unrecoverable state) would
+                                // silently drop the fake, the child would
+                                // see the kernel's raw EPERM/EACCES/EOPNOTSUPP,
+                                // and the restorecon loop would spin.
+                                let name = syscall_name(syscall_num, &abi);
+                                log(&format!(
+                                    "DIAG compute_exit_return_value: ptrace_getregs FAILED for {} (nr={}): {} — fake SKIPPED, child will see kernel's raw return (EPERM/EACCES/EOPNOTSUPP for xattr SET)",
+                                    name, syscall_num, e
+                                ));
                             }
                         }
                     }
@@ -7505,6 +7773,96 @@ mod tests {
             assert_eq!(compute_exit_return_value(227, &abi), Some(0));
             assert_eq!(compute_exit_return_value(228, &abi), Some(0));
         }
+    }
+
+    // ── Task 6-Z9 tests: xattr-SET ENTRY rewrite → getpid ────────────
+
+    #[test]
+    fn compute_exit_return_value_returns_none_for_getpid_6z9() {
+        // Task 6-Z9 regression guard: at the EXIT stop, after the
+        // ENTRY-side rewrite changed orig_eax from the xattr number
+        // (e.g. 227 for i386 lsetxattr) to getpid (e.g. 20 for i386),
+        // `syscall_num` at the EXIT stop is `getpid`. The legacy
+        // `compute_exit_return_value` block must return None for
+        // getpid so it does NOT redundantly try to fake the return
+        // (the `pending_xattr_fake` branch already faked it). This
+        // test confirms that contract holds for ALL ABIs.
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(
+                compute_exit_return_value(ABI_X86_32.getpid, &ABI_X86_32),
+                None,
+                "i386 getpid (nr=20) must NOT be in the fake-success list — the 6-Z9 pending_xattr_fake branch handles the EXIT fake"
+            );
+            assert_eq!(
+                compute_exit_return_value(ABI_X86_64.getpid, &ABI_X86_64),
+                None,
+                "x86_64 getpid (nr=39) must NOT be in the fake-success list"
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(
+                compute_exit_return_value(ABI_AARCH64.getpid, &ABI_AARCH64),
+                None,
+                "aarch64 getpid (nr=172) must NOT be in the fake-success list"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn set_syscall_num_writes_orig_rax_slot_x86_64() {
+        // Task 6-Z9 regression guard: `set_syscall_num` writes the
+        // syscall-number register slot (orig_rax on x86_64, index 15).
+        // The 6-Z9 ENTRY-side xattr-rewrite relies on this to change
+        // the child's requested syscall from lsetxattr (i386 nr=227) to
+        // getpid (i386 nr=20) BEFORE the kernel executes the syscall.
+        // A regression here (e.g. writing the wrong slot) would make
+        // the kernel execute the ORIGINAL xattr syscall (returning
+        // EPERM/EACCES/EOPNOTSUPP) instead of getpid.
+        let mut regs: Regs = unsafe { std::mem::zeroed() };
+        // abi.reg_syscall for ABI_X86_32 is 15 (orig_rax), same slot
+        // as ABI_X86_64 — verified against the const ABI definitions.
+        set_syscall_num(&mut regs, &ABI_X86_32, ABI_X86_32.getpid);
+        let regs_ptr = &regs as *const Regs as *const u64;
+        let orig_rax = unsafe { *regs_ptr.add(ABI_X86_32.reg_syscall) };
+        assert_eq!(
+            orig_rax, ABI_X86_32.getpid as u64,
+            "set_syscall_num must write getpid to the orig_rax slot (index 15) for ABI_X86_32"
+        );
+        // Other slots should remain 0 (we only wrote the syscall slot).
+        let rax = unsafe { *regs_ptr.add(ABI_X86_32.reg_ret) };
+        assert_eq!(
+            rax, 0,
+            "set_syscall_num must NOT touch the return-value slot (rax, index 10)"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn set_syscall_ret_writes_rax_slot_x86_64() {
+        // Task 6-Z9 regression guard: `set_syscall_ret` writes the
+        // return-value register slot (rax on x86_64, index 10). The
+        // 6-Z9 EXIT-side pending_xattr_fake branch relies on this to
+        // set rax=0 (fake success) after the kernel executed getpid.
+        // A regression here would leave rax holding getpid's return
+        // (the child's PID, a positive integer) instead of 0, and the
+        // recovery would see a non-zero return for lsetxattr → spin.
+        let mut regs: Regs = unsafe { std::mem::zeroed() };
+        set_syscall_ret(&mut regs, &ABI_X86_32, 0);
+        let regs_ptr = &regs as *const Regs as *const u64;
+        let rax = unsafe { *regs_ptr.add(ABI_X86_32.reg_ret) };
+        assert_eq!(
+            rax, 0,
+            "set_syscall_ret(0) must write 0 to the rax slot (index 10) for ABI_X86_32"
+        );
+        // The syscall-number slot (orig_rax) must be untouched.
+        let orig_rax = unsafe { *regs_ptr.add(ABI_X86_32.reg_syscall) };
+        assert_eq!(
+            orig_rax, 0,
+            "set_syscall_ret must NOT touch the syscall-number slot (orig_rax, index 15)"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
