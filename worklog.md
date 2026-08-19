@@ -10377,3 +10377,115 @@ Stage Summary:
   blocker, or (d) some other init dependency is unsatisfied. The
   three 6-Y fixes (d2beb34 + ece6fac + a2a53b9) MAY individually
   unblock boot, or all three may be needed together.
+
+---
+
+## DISPATCHER-UPDATE-14 / Task 6-Z — VFS must NOT turn /dev/__properties__ into a directory in TWRP mode
+
+**Date:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+**Commit:** 8eb3866
+**Sub-agent:** 6-Z (general-purpose)
+
+### Root cause (6-Y didn't unblock the boot)
+
+Task 6-Y (commit a2a53b9) added the mmap2 MAP_SHARED → MAP_ANONYMOUS
+rewrite for the property area fd. But the rewrite only fires when
+`fd == properties_fd`, and `properties_fd` is set ONLY when init's
+`open("/dev/__properties__")` returns `ret > 0` (open EXIT handler at
+ptrace_emu.rs:4578). The VFS materialization (called at open ENTRY)
+was suspected of turning the pre-created FILE into a DIRECTORY —
+mirroring the host's real-Android `/dev/__properties__` (a directory on
+Android 11+). init's open would then return -EISDIR → ret <= 0 →
+properties_fd never recorded → mmap2 rewrite never fires → -38
+persists → 227+ `__system_property_set` failures → init exit(1).
+
+### Investigation
+
+- `Vfs::materialize()` lives in `app/rs/kr64/src/vfs.rs:251`. The
+  runtime Vfs is constructed via `Vfs::new_twrp()` at lib.rs:6337,
+  which registers `/dev/__properties__` as a `Synthetic` FILE (131072
+  bytes, OLD-format AOSP 5.1 prop_area header).
+- The materialize() call site is in `app/rs/kr64/src/ptrace_emu.rs:4187`
+  (open/openat/openat2 ENTRY-stop handler). Before the fix it
+  unconditionally called `vfs.materialize(&path, rootfs)` for any path
+  where `vfs.is_synthetic(&path)` returns true.
+- The parent pre-creates `{rootfs}/dev/__properties__` as a regular
+  FILE (lib.rs:5156-5188, OLD-format 131072 bytes, mode 0666) BEFORE
+  the ptrace loop starts — including a `remove_dir_all` cleanup for
+  any stale directory (lib.rs:5162-5169).
+
+### Fix (minimal + targeted)
+
+1. **vfs.rs::materialize()** (line 265-296, new Task 6-Z guard):
+   Before the `match node` that writes the file, added a check:
+   - Only applies when the node is `Synthetic` (file variant) AND
+     `is_dev_properties_path(guest_path)` is true (exact match on
+     `/dev/__properties__`).
+   - If a regular FILE already exists at `{rootfs}/dev/__properties__`,
+     return `Ok(())` early (SKIP materialization) — preserves the
+     parent's pre-created file + init's runtime ftruncate/mmap
+     modifications (avoids clobbering them on every re-open).
+   - If a stale DIRECTORY exists at the path (left over from a prior
+     Android-mode run OR mirrored from the host's real-Android dir),
+     `remove_dir_all` it so the subsequent `std::fs::write` succeeds
+     instead of failing with -EISDIR.
+   - `SyntheticDir` (Android mode) is NOT affected — keeps its
+     `create_dir_all` behavior.
+
+2. **vfs.rs::is_dev_properties_path()** (new free function, line 322):
+   Private helper — `guest_path == "/dev/__properties__"`. Mirrors
+   `is_properties_path` in ptrace_emu.rs but kept private to vfs.rs
+   (the lower-level layer should not depend on ptrace_emu). The
+   materialize() call site always passes the raw guest path (pre-
+   translate_path), so exact-match is sufficient.
+
+3. **ptrace_emu.rs** (open ENTRY handler, line 4187-4235): Added a
+   pre-check BEFORE calling `vfs.materialize()` — if
+   `is_properties_path(&path)` AND `std::fs::metadata("{rootfs}{path}")`
+   is a regular file, log the specific Task 6-Z skip message and skip
+   the materialize call. `materialize()` also has the skip internally
+   as a safety net (testable via unit test), but the caller log gives
+   runtime visibility. Log:
+   "VFS: /dev/__properties__ already exists as a regular file
+   (pre-created OLD-format) — skipping directory materialization
+   (TWRP mode requires FILE, not directory)".
+
+### Tests (3 new, +3 net = 465 total)
+
+- `test_vfs_materialize_skips_when_properties_file_exists`: pre-create
+  a regular file at `{rootfs}/dev/__properties__` with sentinel content
+  → call materialize → verify file content is UNCHANGED (skip, not
+  overwrite) + file is still a regular FILE (not a directory).
+- `test_vfs_materialize_removes_stale_dir_at_properties_path`: pre-create
+  a DIRECTORY at the path → call materialize → verify the stale dir
+  was removed + a regular FILE was written with the OLD-format content.
+- `test_is_dev_properties_path_matches_exact`: helper matches only
+  `/dev/__properties__` exactly; rejects subpaths, the translated
+  rootfs form, and unrelated paths.
+
+### Verification
+
+- `cargo check` ✓
+- `cargo test` ✓ — 465 passed, 0 failed (was 462 on a2a53b9, +3 new)
+- `cargo clippy -- -D warnings` ✓ clean
+- `cargo fmt --check` ✓ clean
+
+### Files changed
+
+- `app/rs/kr64/src/vfs.rs` (+176 lines): is_dev_properties_path helper,
+  materialize() skip/stale-dir guard, 3 unit tests.
+- `app/rs/kr64/src/ptrace_emu.rs` (+67 lines): open ENTRY handler
+  skip-pre-check + Task 6-Z log message.
+
+### Honest caveat
+
+This fix is DEFENSIVE — it ensures that IF a regular file exists at
+`/dev/__properties__` (pre-created by the parent), the VFS materialize
+will NOT clobber it or turn it into a directory. Whether this is the
+ACTUAL root cause of the -38 persistence (vs. some other issue like
+init never opening the file, or the host's /dev/__properties__ directory
+being bind-mounted over the rootfs copy) can only be confirmed by a CI
+run + VLM screenshot analysis. The three 6-Y fixes (d2beb34 + ece6fac +
+a2a53b9) PLUS this 6-Z fix MAY together unblock the TWRP boot, or
+further investigation may be needed. No CI run was triggered by this
+sub-agent (per instructions).
