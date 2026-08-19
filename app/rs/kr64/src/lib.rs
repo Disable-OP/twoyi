@@ -5708,17 +5708,38 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
 
         if cfg.install_seccomp {
-            if let Err(e) = seccomp::install() {
-                // Non-fatal: we explicitly continue so the guest can boot
-                // in a permissive-ish mode (the seccomp filter is a
-                // hardening layer, not a correctness requirement for the
-                // MVP). But the user must be told -- silent failure here
-                // would mask a misconfigured BPF program.
-                let errno = e.raw_os_error().unwrap_or(0);
+            if cfg.use_namespaces {
+                // Root mode (pivot_root): child stays x86_64, seccomp
+                // arch check matches. Install the filter for hardening.
+                if let Err(e) = seccomp::install() {
+                    // Non-fatal: we explicitly continue so the guest can boot
+                    // in a permissive-ish mode (the seccomp filter is a
+                    // hardening layer, not a correctness requirement for the
+                    // MVP). But the user must be told -- silent failure here
+                    // would mask a misconfigured BPF program.
+                    let errno = e.raw_os_error().unwrap_or(0);
+                    unsafe {
+                        safe_write_err_errno(
+                            b"[KR64 CHILD] WARN: seccomp::install failed (continuing without filter)",
+                            errno,
+                        );
+                    }
+                }
+            } else {
+                // Non-root ptrace-emulation mode: seccomp is intentionally
+                // SKIPPED. The BPF filter checks arch == AUDIT_ARCH_X86_64,
+                // but the guest init is an i386 binary (uses int $0x80 with
+                // AUDIT_ARCH_I386). The arch mismatch causes
+                // SECCOMP_RET_KILL_PROCESS for every i386 syscall, making
+                // mmap2 (nr=192) return ENOSYS → __system_property_area_init
+                // fails → ALL property_set calls fail → init exits(1) in a
+                // boot loop (7 iterations observed in 6-W UI E2E). The
+                // ptrace emulator handles all syscall interception (mount,
+                // chmod, mknod, path translation, etc.) — seccomp is redundant
+                // and harmful here. (Task 6-X)
                 unsafe {
-                    safe_write_err_errno(
-                        b"[KR64 CHILD] WARN: seccomp::install failed (continuing without filter)",
-                        errno,
+                    safe_write_err(
+                        b"[KR64 CHILD] skipping seccomp install in ptrace-emulation mode (i386 guest AUDIT_ARCH mismatch: mmap2 ENOSYS, property system failure)\n",
                     );
                 }
             }
