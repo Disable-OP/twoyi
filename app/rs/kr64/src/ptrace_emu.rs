@@ -5274,6 +5274,53 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                         ));
                                     }
                                 }
+
+                                // Task 6-Z25: fake the SELinux context read for
+                                // /proc/self/task/*/attr/current. PROBLEM (verified on
+                                // 4fdd2d5 E2E): init reads its OWN thread context
+                                // (/proc/self/task/<tid>/attr/current) + sees
+                                // "u:r:untrusted_app_27:s0:c167,c256,c512,c768" (the
+                                // REAL untrusted_app context). It expects a privileged
+                                // recovery/init context. It then tries lsetxattr
+                                // (faked return 0 but doesn't actually apply) +
+                                // re-reads (STILL untrusted_app_27) → retries forever
+                                // (the #87→#141 attr/current open loop, ~9 iterations,
+                                // blocking the recovery at the SELinux phase, never
+                                // reaching service-start + framebuffer render). FIX:
+                                // overwrite the read buffer with "u:r:recovery:s0" so
+                                // init thinks it's running as the privileged recovery
+                                // context → stops the retry loop → proceeds.
+                                if path_info.contains("attr/current") {
+                                    let fake_ctx = "u:r:recovery:s0";
+                                    // read() count includes the trailing NUL (the
+                                    // original returned 44 = 43 chars + NUL), so the
+                                    // faked return is len + 1 (NUL).
+                                    let fake_len = (fake_ctx.len() as i64) + 1;
+                                    if write_child_string_unchecked(pid, buf_addr, fake_ctx) {
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs(pid, &mut regs2) {
+                                            Ok(len) => {
+                                                set_syscall_ret(&mut regs2, &abi, fake_len);
+                                                match ptrace_setregs(pid, &regs2, len) {
+                                                    Ok(()) => log(&format!(
+                                                        "DIAG attr/current: faked context -> \"{}\" (ret {}->{}) — init sees privileged recovery context, retry loop should stop (Task 6-Z25)",
+                                                        fake_ctx, ret, fake_len
+                                                    )),
+                                                    Err(e) => log(&format!(
+                                                        "DIAG attr/current: ptrace_setregs FAILED: {} — init still sees untrusted_app_27, retry loop continues",
+                                                        e
+                                                    )),
+                                                }
+                                            }
+                                            Err(e) => log(&format!(
+                                                "DIAG attr/current: ptrace_getregs FAILED: {} — cannot fake return",
+                                                e
+                                            )),
+                                        }
+                                    } else {
+                                        log("DIAG attr/current: write_child_string_unchecked FAILED — buffer not overwritten, init still sees untrusted_app_27");
+                                    }
+                                }
                             }
                         }
                     }
