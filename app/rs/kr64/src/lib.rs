@@ -5709,6 +5709,40 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
     info!("[KR64] forking guest process");
 
+    // Task 6-Z31 diag: verify /sbin/recovery + /sbin/linker exist + are
+    // executable before forking. The recovery service child exits 127
+    // (execve failure) — this diagnostic will reveal whether the files
+    // are missing, not executable, or the interpreter is wrong.
+    {
+        let sbin_recovery = format!("{}/sbin/recovery", rootfs_prefix);
+        let sbin_linker = format!("{}/sbin/linker", rootfs_prefix);
+        for (name, path) in [("recovery", &sbin_recovery), ("linker", &sbin_linker)] {
+            match std::fs::metadata(&path) {
+                Ok(meta) => {
+                    let perms = meta.permissions();
+                    let mode = perms.mode();
+                    let is_exec = (mode & 0o100) != 0;
+                    info!(
+                        "[KR64] PRE-FORK DIAG: {} at {} — exists, size={}, mode=0{:o}, exec={}",
+                        name, path, meta.len(), mode, is_exec
+                    );
+                    if !is_exec {
+                        warning!(
+                            "[KR64] PRE-FORK DIAG: {} at {} is NOT executable (mode=0{:o}) — execve will EACCES → exit 127 (Task 6-Z31: RamdiskImporter should have set exec)",
+                            name, path, mode
+                        );
+                    }
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PRE-FORK DIAG: {} at {} MISSING: {} — execve will ENOENT → exit 127",
+                        name, path, e
+                    );
+                }
+            }
+        }
+    }
+
     // ── Pre-create essential /dev files in rootfs ──────────────────────
     //
     // TWRP init expects certain files in /dev to exist (or be creatable):
