@@ -5592,7 +5592,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // (verified on ceec1f2 UI E2E run 32231410279: open("/dev/hw_random")
             // -> -2 ENOENT, then SIGSEGV). Symlink to /dev/urandom (provides
             // random bytes — harmless substitute for hw RNG).
-            ("dev/hw_random", "/dev/urandom"),
+            ("dev/hw_random", "/dev/null"),
         ];
         for (rel, target) in symlinks {
             let link_path = format!("{}/{}", rootfs_prefix, rel);
