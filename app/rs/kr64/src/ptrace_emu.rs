@@ -4398,12 +4398,22 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // strings, so this is safe.
                     if scratch_addr == 0 {
                         let sp = get_syscall_arg(&regs, abi.reg_sp);
-                        // Reserve 4 KiB below the current stack pointer.
-                        // 8-byte align defensively in case the child's sp
-                        // happened to be unaligned at this stop.
-                        scratch_addr = (sp - 4096) & !7u64;
+                        // Task 6-Z15: use sp + 4096 (ABOVE the stack
+                        // pointer) instead of sp - 4096 (BELOW). The
+                        // child's stack grows DOWNWARD, so sp - 4096 is
+                        // in the ACTIVE stack region — the child's
+                        // function calls push frames into this area,
+                        // and write_translated_path overwrites return
+                        // addresses with rootfs path bytes → SIGSEGV at
+                        // rip=0x6f722f69 ('i/ro' from '/data/user/0/io.twoyi/rootfs').
+                        // Using sp + 4096 puts the scratch area in the
+                        // UNUSED region above the stack pointer, which
+                        // the child never touches (stack grows down,
+                        // not up). This is safe because the stack mapping
+                        // is typically much larger than 4 KiB above sp.
+                        scratch_addr = (sp + 4096) & !7u64;
                         log(&format!(
-                            "scratch area at {:#x} (below stack pointer {:#x})",
+                            "scratch area at {:#x} (above stack pointer {:#x})",
                             scratch_addr, sp
                         ));
                     }
