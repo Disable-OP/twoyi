@@ -2716,6 +2716,58 @@ fn read_child_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> 
     Some(result)
 }
 
+/// Zero the `revents` field of every `struct pollfd` in the child's pollfd
+/// array, so the caller sees "no events" in BOTH the syscall return value
+/// (faked to 0 separately) AND the pollfd struct's revents field.
+///
+/// `struct pollfd { int fd; short events; short revents; }` is 8 bytes on
+/// i386/x86_64 (sizeof = 8). `revents` is at offset 6 (2 bytes). The kernel
+/// writes POLLERR (0x0008) into revents for the fake-bound property_service
+/// socket BEFORE the EXIT stop fires, so even when we fake the return value
+/// to 0 (Task 6-Z5), init's property_service poll loop sees POLLERR in
+/// revents and retries immediately → busy-wait (verified on 5e0f157 E2E:
+/// poll returns 1, faked to 0, but init keeps spinning — it checks revents).
+///
+/// We read-modify-write each 8-byte pollfd word: PEEKDATA the word, mask
+/// bytes 6-7 (revents) to 0, POKEDATA it back. Capped at 32 fds to avoid
+/// runaway (TWRP init's property_service poll uses 1 fd).
+///
+/// Returns the number of pollfd entries zeroed (for logging).
+fn zero_pollfd_revents(pid: libc::pid_t, pollfd_ptr: u64, nfds: u64) -> usize {
+    if pollfd_ptr == 0 || nfds == 0 {
+        return 0;
+    }
+    let cap = std::cmp::min(nfds, 32) as usize;
+    let mut zeroed = 0usize;
+    for i in 0..cap {
+        let addr = pollfd_ptr.wrapping_add((i as u64) * 8);
+        let word = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64, 0) };
+        if word == -1 {
+            // PEEKDATA failed (bad addr or end of mapping) — stop.
+            break;
+        }
+        // Little-endian: bytes 6-7 are the high 2 bytes of the 8-byte word.
+        // Mask = 0x0000FFFFFFFFFFFF clears bits 48-63 (revents field).
+        let masked = word & 0x0000FFFFFFFFFFFFi64;
+        if masked != word {
+            let r = unsafe {
+                libc::ptrace(
+                    libc::PTRACE_POKEDATA,
+                    pid,
+                    addr as i64,
+                    masked as libc::c_long,
+                )
+            };
+            if r == -1 {
+                // POKEDATA failed — stop (don't keep trying a bad region).
+                break;
+            }
+            zeroed += 1;
+        }
+    }
+    zeroed
+}
+
 /// Classify whether an opened path is a kernel-message log destination
 /// whose writes should be tagged `DIAG KLOG` (vs the generic `DIAG
 /// write`) by the Task 6-U syscall-EXIT diagnostic. Matches:
@@ -4882,6 +4934,23 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // conditional (only during setup).
                         n if abi.poll_nr != -1 && n == abi.poll_nr => {
                             let timeout = get_syscall_arg(&regs, abi.reg_arg3) as i32;
+                            // Task 6-Z17 DIAG: log the poll timeout value +
+                            // whether the timeout-set fires. The 5e0f157
+                            // E2E showed 0 "DIAG poll timeout-set" logs but
+                            // the polls returned instantly (POLLERR busy-wait)
+                            // — need to know if the block is entered + what
+                            // the timeout is.
+                            if loop_count <= 100 {
+                                log(&format!(
+                                    "DIAG poll ENTRY: timeout={} (arg3) — {}",
+                                    timeout,
+                                    if timeout <= 0 {
+                                        "WILL set to 100ms"
+                                    } else {
+                                        "timeout already >0, no set"
+                                    }
+                                ));
+                            }
                             if timeout <= 0 {
                                 set_syscall_arg(&mut regs, abi.reg_arg3, 100);
                                 if let Err(e) = ptrace_setregs(pid, &regs, iov_len) {
@@ -5791,6 +5860,26 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                             ret
                                         ));
                                     }
+                                }
+                                // Task 6-Z17: ALSO zero the revents field
+                                // in each pollfd struct in the child's
+                                // pollfd array (arg1=pollfd*, arg2=nfds).
+                                // The kernel wrote POLLERR into revents
+                                // BEFORE the EXIT stop; faking the return
+                                // value to 0 (above) tells init "no fds
+                                // ready" but init ALSO reads revents from
+                                // the pollfd struct — if revents still has
+                                // POLLERR, init retries immediately →
+                                // busy-wait (verified on 5e0f157: poll
+                                // faked to 0 but init kept spinning).
+                                let pollfd_ptr = get_syscall_arg(&regs2, abi.reg_arg1);
+                                let nfds = get_syscall_arg(&regs2, abi.reg_arg2);
+                                let zeroed = zero_pollfd_revents(pid, pollfd_ptr, nfds);
+                                if zeroed > 0 && loop_count <= 6000 {
+                                    log(&format!(
+                                        "DIAG poll revents zeroed: cleared POLLERR from {} pollfd entr{} (pollfd_ptr={:#x}, nfds={}) — init will see no events in revents too",
+                                        zeroed, if zeroed == 1 { "y" } else { "ies" }, pollfd_ptr, nfds
+                                    ));
                                 }
                             }
                         }
