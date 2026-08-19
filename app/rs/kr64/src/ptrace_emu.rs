@@ -2534,15 +2534,6 @@ fn is_kmsg_path(path: &str) -> bool {
 /// Classify an open() path as the Android property-area file
 /// `/dev/__properties__`.
 ///
-/// TWRP init's property_init opens `/dev/__properties__` and mmaps it
-/// with MAP_SHARED to set up the shared property area. The Android
-/// zygote's seccomp filter (inherited by untrusted_app, can't be
-/// removed) blocks file-backed MAP_SHARED mmap2 for i386 compat →
-/// -ENOSYS. The 6-Y fix rewrites that mmap to anonymous. To match the
-/// correct mmap, we record the fd returned by open() on this path in
-/// the loop-local `properties_fd` (mirrors the existing `kmsg_fd`
-/// pattern from Task 6-U) and check it at mmap/mmap2 ENTRY.
-///
 /// Matches:
 ///   - `/dev/__properties__` — the canonical path init opens.
 ///   - `{rootfs}/dev/__properties__` — after translate_path rewrites
@@ -2565,6 +2556,36 @@ fn is_properties_path(path: &str) -> bool {
     // __properties__ after translate_path rewrites /dev/__properties__,
     // and the orphaned "(deleted)" variants).
     path.rsplit('/').next() == Some("__properties__")
+}
+
+/// Pure, testable core of the Task 6-Y mmap2 MAP_SHARED → MAP_ANONYMOUS
+/// flag rewrite.
+///
+/// TWRP init (i386) calls
+///   `mmap2(NULL, 0x20000, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)`
+/// on `/dev/__properties__` to set up the property area. The Android
+/// zygote's seccomp filter (inherited by untrusted_app) blocks file-
+/// backed MAP_SHARED mmap2 for i386 compat → `-ENOSYS(-38)`. To get
+/// the kernel to perform an anonymous mmap (which SUCCEEDS under the
+/// zygote's filter), we rewrite `flags` to clear MAP_SHARED and set
+/// MAP_ANONYMOUS|MAP_PRIVATE, then rewrite `fd` to -1 and `offset` to
+/// 0. This helper does ONLY the flags portion — `fd` and `offset` are
+/// constants handled inline at the call site.
+///
+/// Contract:
+///   - The MAP_SHARED bit (0x01) is CLEARED.
+///   - The MAP_ANONYMOUS bit (0x20) is SET.
+///   - The MAP_PRIVATE bit (0x02) is SET.
+///   - All OTHER bits the caller passed (e.g. MAP_FIXED, MAP_LOCKED,
+///     PROT-readability carried via upper bits — though prot is a
+///     separate arg) are PRESERVED.
+///
+/// Constants (per `<sys/mman.h>` + verified in libc):
+///   MAP_SHARED     = 0x01
+///   MAP_PRIVATE    = 0x02
+///   MAP_ANONYMOUS  = 0x20  (also exposed as MAP_ANON — same value)
+fn rewrite_mmap_flags_shared_to_anonymous(flags: i32) -> i32 {
+    (flags & !libc::MAP_SHARED) | libc::MAP_ANONYMOUS | libc::MAP_PRIVATE
 }
 
 fn write_child_string(pid: libc::pid_t, addr: u64, s: &str) -> bool {
@@ -4411,10 +4432,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             let fd = get_syscall_arg(&regs, abi.reg_arg5) as i32;
                             if let Some(prop_fd) = properties_fd {
                                 if fd == prop_fd && (flags & libc::MAP_SHARED) != 0 {
-                                    let new_flags = ((flags & !libc::MAP_SHARED)
-                                        | libc::MAP_ANONYMOUS
-                                        | libc::MAP_PRIVATE)
-                                        as u64;
+                                    let new_flags =
+                                        rewrite_mmap_flags_shared_to_anonymous(flags) as u64;
                                     set_syscall_arg(&mut regs, abi.reg_arg4, new_flags);
                                     // fd = -1 (sign-extended to all-1s in
                                     // the 64-bit slot — the kernel truncates
@@ -8374,5 +8393,280 @@ mod tests {
         // write(4) from exit(1).
         assert_eq!(ABI_X86_32.write, 4);
         assert_ne!(ABI_X86_32.write, 1, "i386 nr=1 is exit, NOT write");
+    }
+
+    // ── Task 6-Y: mmap2 MAP_SHARED → MAP_ANONYMOUS rewrite tests ────
+    //
+    // The 6-Y fix rewrites the file-backed MAP_SHARED mmap2 of
+    // /dev/__properties__ to anonymous so the zygote's seccomp filter
+    // does not -ENOSYS it. Three layers of testable surface:
+    //   (1) `is_properties_path(path)` — classifies open() paths as
+    //       the property-area file so the open EXIT handler records
+    //       the fd in `properties_fd`. Mirrors `is_kmsg_path`'s
+    //       tests.
+    //   (2) `rewrite_mmap_flags_shared_to_anonymous(flags)` — the
+    //       pure flag-arithmetic core of the mmap2 ENTRY handler.
+    //       Verifies MAP_SHARED is cleared, MAP_ANONYMOUS|MAP_PRIVATE
+    //       are set, and other bits are preserved.
+    //   (3) `ChildAbi::mmap` / `mmap2` per-ABI numbers — regression
+    //       guards mirroring the existing `pause` / `mknod` / `write`
+    //       / `read` per-ABI number tests.
+
+    #[test]
+    fn is_properties_path_matches_dev_properties_dunder() {
+        // The canonical path TWRP init opens to set up the property
+        // area. Without this match, the open EXIT handler would never
+        // record the fd in `properties_fd` and the mmap2 ENTRY handler
+        // would have nothing to match against.
+        assert!(is_properties_path("/dev/__properties__"));
+    }
+
+    #[test]
+    fn is_properties_path_matches_translated_rootfs_variant() {
+        // After translate_path rewrites /dev/__properties__ →
+        // {rootfs}/dev/__properties__, the final component is still
+        // "__properties__" — the rsplit('/') fallback matches. This
+        // is the path the open EXIT handler sees (the translated
+        // string is stored in pending_open_translated_path at ENTRY).
+        assert!(is_properties_path(
+            "/data/user/0/io.twoyi/rootfs/dev/__properties__"
+        ));
+    }
+
+    #[test]
+    fn is_properties_path_rejects_non_properties_paths() {
+        // Non-property /dev/* paths must NOT match — otherwise the
+        // open EXIT handler would mis-record an unrelated fd as the
+        // properties fd and the mmap2 ENTRY handler would rewrite an
+        // unrelated mmap (corrupting it).
+        assert!(!is_properties_path("/dev/null"));
+        assert!(!is_properties_path("/dev/zero"));
+        assert!(!is_properties_path("/dev/__kmsg__"));
+        assert!(!is_properties_path("/dev/socket/property_service"));
+        assert!(!is_properties_path("/init.rc"));
+        assert!(!is_properties_path("/proc/cmdline"));
+    }
+
+    #[test]
+    fn is_properties_path_rejects_empty_and_relative() {
+        // Empty + relative paths must not match (defensive — the
+        // kernel never hands us a relative open() path, but the
+        // matcher should still be robust).
+        assert!(!is_properties_path(""));
+        assert!(!is_properties_path("relative/__properties__"));
+    }
+
+    #[test]
+    fn is_properties_path_rejects_lookalikes() {
+        // Paths that CONTAIN "__properties__" as a substring but are
+        // NOT the final component must not match (e.g. backups,
+        // tempfiles, or sibling files in /dev).
+        assert!(!is_properties_path("/dev/__properties__foo"));
+        assert!(!is_properties_path("/dev/__properties__backup"));
+        assert!(!is_properties_path("/dev/__properties__/serial"));
+    }
+
+    #[test]
+    fn rewrite_mmap_flags_clears_shared_sets_anonymous_private() {
+        // The canonical case: TWRP init's property_init mmaps
+        // /dev/__properties__ with MAP_SHARED (and nothing else). The
+        // rewrite must clear MAP_SHARED and set MAP_ANONYMOUS|MAP_PRIVATE.
+        let orig = libc::MAP_SHARED;
+        let new = rewrite_mmap_flags_shared_to_anonymous(orig);
+        assert_eq!(new & libc::MAP_SHARED, 0, "MAP_SHARED must be cleared");
+        assert_ne!(new & libc::MAP_ANONYMOUS, 0, "MAP_ANONYMOUS must be set");
+        assert_ne!(new & libc::MAP_PRIVATE, 0, "MAP_PRIVATE must be set");
+    }
+
+    #[test]
+    fn rewrite_mmap_flags_preserves_other_bits() {
+        // If init passes MAP_FIXED (0x10) along with MAP_SHARED, the
+        // rewrite must preserve MAP_FIXED (the kernel still needs it
+        // to honour the requested address). Only MAP_SHARED is
+        // cleared; only MAP_ANONYMOUS|MAP_PRIVATE are added.
+        let orig = libc::MAP_SHARED | libc::MAP_FIXED;
+        let new = rewrite_mmap_flags_shared_to_anonymous(orig);
+        assert_eq!(new & libc::MAP_SHARED, 0, "MAP_SHARED must be cleared");
+        assert_ne!(new & libc::MAP_ANONYMOUS, 0, "MAP_ANONYMOUS must be set");
+        assert_ne!(new & libc::MAP_PRIVATE, 0, "MAP_PRIVATE must be set");
+        assert_ne!(new & libc::MAP_FIXED, 0, "MAP_FIXED must be preserved");
+    }
+
+    #[test]
+    fn rewrite_mmap_flags_idempotent_for_already_anonymous() {
+        // If the caller already passed MAP_ANONYMOUS|MAP_PRIVATE
+        // (without MAP_SHARED), the rewrite is a no-op — the helper
+        // must not corrupt already-anonymous flags. (In practice the
+        // mmap2 ENTRY handler only invokes the helper when
+        // `flags & MAP_SHARED != 0`, so this path is dead at runtime
+        // — but the helper's idempotency is still a useful contract.)
+        let orig = libc::MAP_ANONYMOUS | libc::MAP_PRIVATE;
+        let new = rewrite_mmap_flags_shared_to_anonymous(orig);
+        assert_eq!(new, orig, "already-anonymous flags must be unchanged");
+        assert_eq!(new & libc::MAP_SHARED, 0, "MAP_SHARED must remain clear");
+    }
+
+    #[test]
+    fn rewrite_mmap_flags_constant_values_lockdown() {
+        // Lock in the Linux UAPI values the rewrite depends on. If a
+        // future libc / kernel header change redefines these, the
+        // rewrite would silently corrupt the flags — this test
+        // catches that.
+        // Per <sys/mman.h> + verified in libc source:
+        //   MAP_SHARED     = 0x01
+        //   MAP_PRIVATE    = 0x02
+        //   MAP_ANONYMOUS  = 0x20  (also exposed as MAP_ANON)
+        assert_eq!(
+            libc::MAP_SHARED,
+            0x01,
+            "MAP_SHARED must be 0x01 (Linux UAPI)"
+        );
+        assert_eq!(
+            libc::MAP_PRIVATE,
+            0x02,
+            "MAP_PRIVATE must be 0x02 (Linux UAPI)"
+        );
+        assert_eq!(
+            libc::MAP_ANONYMOUS,
+            0x20,
+            "MAP_ANONYMOUS must be 0x20 (Linux UAPI)"
+        );
+        // MAP_ANON is the historical alias for MAP_ANONYMOUS — they
+        // MUST have the same value. On Linux they always do.
+        assert_eq!(
+            libc::MAP_ANONYMOUS,
+            libc::MAP_ANON,
+            "MAP_ANONYMOUS and MAP_ANON must be the same value on Linux"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_mmap2_number_matches_unistd_32_h() {
+        // i386 mmap2 = 192 (per asm/unistd_32.h: __NR_mmap2 192).
+        // THIS is the value that fires at runtime — TWRP init (an
+        // i386 binary) issues mmap2(NULL, 0x20000, PROT_READ|
+        // PROT_WRITE, MAP_SHARED, fd, 0) on /dev/__properties__ as
+        // i386 syscall 192 to set up the property area. The zygote's
+        // seccomp filter blocks it with -ENOSYS — the 6-Y fix
+        // rewrites it to MAP_ANONYMOUS. Regression guard mirroring
+        // the existing ABI_X86_32.pause / .write / .read tests.
+        assert_eq!(ABI_X86_32.mmap2, 192, "i386 mmap2 must be 192");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_mmap_is_sentinel_unused_by_modern_bionic() {
+        // ABI_X86_32.mmap is set to -1 (sentinel) — modern i386
+        // bionic (incl. TWRP init) uses mmap2 EXCLUSIVELY (nr=192),
+        // NEVER the legacy plain mmap (nr=90, which takes a pointer
+        // to a struct mmap_arg_struct rather than 6 direct args).
+        // Setting it to -1 ensures the ENTRY match arm
+        // `n if n == abi.mmap || n == abi.mmap2` reduces to
+        // `n if n == abi.mmap2` (i.e. `n if n == 192`) for i386 — no
+        // real syscall is ever -1, so abi.mmap is a dead branch at
+        // runtime. Mirrors the ABI_AARCH64.open / .access / .lchown /
+        // .chown / .mknod / .pause precedent (all -1 on aarch64).
+        assert_eq!(
+            ABI_X86_32.mmap, -1,
+            "i386 plain mmap (nr=90) is unused by modern bionic — sentinel -1"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_mmap_number_matches_unistd_64_h() {
+        // x86_64 mmap = 9 (per asm/unistd_64.h: __NR_mmap 9).
+        // The host is x86_64 running an i386 child, so this number
+        // does NOT currently fire at runtime (the guest uses i386
+        // syscall 192). Locked in for ABI completeness + so the mmap
+        // ENTRY handler's `== abi.mmap || == abi.mmap2` comparison
+        // is correct if a future x86_64 guest is ever supported.
+        // Regression guard mirroring the existing ABI_X86_64.write /
+        // .read tests.
+        assert_eq!(ABI_X86_64.mmap, 9, "x86_64 mmap must be 9");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_mmap2_is_sentinel_no_such_syscall() {
+        // x86_64 has NO mmap2 (the modern x86_64 mmap takes offset in
+        // BYTES directly, not in 4096-byte pages — there is no need
+        // for the mmap2 page-shift workaround that i386 needs because
+        // i386's orig_eax is only 32 bits and cannot pass a 64-bit
+        // byte offset). ABI_X86_64.mmap2 is set to -1 (sentinel).
+        assert_eq!(ABI_X86_64.mmap2, -1, "x86_64 has no mmap2 — sentinel -1");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_mmap_number_matches_asm_generic_unistd_h() {
+        // aarch64 mmap = 222 (per asm-generic/unistd.h: __NR_mmap 222).
+        // The host is x86_64 running an i386 child, so this number
+        // does NOT currently fire at runtime. Locked in for ABI
+        // completeness + so the mmap ENTRY handler's `== abi.mmap ||
+        // == abi.mmap2` comparison is correct if a future aarch64
+        // host is ever used.
+        assert_eq!(ABI_AARCH64.mmap, 222, "aarch64 mmap must be 222");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_mmap2_is_sentinel_no_such_syscall() {
+        // asm-generic has NO mmap2 — sentinel -1.
+        assert_eq!(ABI_AARCH64.mmap2, -1, "aarch64 has no mmap2 — sentinel -1");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_reg_arg5_is_rdi_zero_extended_edi() {
+        // i386 mmap2 layout (per kernel UAPI): arg5 = fd = edi.
+        // On a 32-bit child, PTRACE_GETREGS zero-extends edi into
+        // the 64-bit rdi slot (index 14 in user_regs_struct). The
+        // mmap2 ENTRY handler reads arg5 via this index to fetch the
+        // fd. Regression guard: if a future refactor accidentally
+        // changes reg_arg5 to point at the wrong slot (e.g. r10=7,
+        // which is the x86_64 arg4 slot — completely different
+        // register), the rewrite would read garbage and the fix
+        // would silently break.
+        assert_eq!(
+            ABI_X86_32.reg_arg5, 14,
+            "i386 arg5 must be rdi slot (index 14) — zero-extended edi"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_reg_arg6_is_rbp_zero_extended_ebp() {
+        // i386 mmap2 layout (per kernel UAPI): arg6 = offset = ebp.
+        // On a 32-bit child, PTRACE_GETREGS zero-extends ebp into
+        // the 64-bit rbp slot (index 4 in user_regs_struct). The
+        // mmap2 ENTRY handler writes arg6 via this index to zero
+        // the offset (anonymous mmap ignores offset, but we set it to
+        // 0 for cleanliness). Regression guard mirroring the
+        // reg_arg5 test above.
+        assert_eq!(
+            ABI_X86_32.reg_arg6, 4,
+            "i386 arg6 must be rbp slot (index 4) — zero-extended ebp"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_reg_arg5_is_r8() {
+        // x86_64 mmap layout (per kernel UAPI): arg5 = fd = r8.
+        // x86_64 user_regs_struct field order:
+        //   0:r15 1:r14 2:r13 3:r12 4:rbp 5:rbx 6:r11 7:r10 8:r9 9:r8
+        // so r8 = index 9. The mmap ENTRY handler reads arg5 via
+        // this index. Regression guard.
+        assert_eq!(ABI_X86_64.reg_arg5, 9, "x86_64 arg5 must be r8 (index 9)");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_reg_arg6_is_r9() {
+        // x86_64 mmap layout (per kernel UAPI): arg6 = offset = r9.
+        // r9 = index 8 (see comment on abi_x86_64_reg_arg5_is_r8).
+        assert_eq!(ABI_X86_64.reg_arg6, 8, "x86_64 arg6 must be r9 (index 8)");
     }
 }
