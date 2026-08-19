@@ -3343,6 +3343,13 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     // end-to-end, 8-byte aligned, and the cursor wraps to 0 when
     // the area is nearly full).
     let mut scratch_addr: u64 = 0;
+    // Task 6-Z16: `scratch_offset` is re-zeroed at every syscall ENTRY
+    // (the ENTRY block re-reserves the scratch area from the current sp).
+    // The initial `0` here is therefore a dead write (overwritten at the
+    // first ENTRY before any read), but Rust requires the binding be
+    // initialized. `#[allow(unused_assignments)]` silences the clippy
+    // lint for this known-dead init.
+    #[allow(unused_assignments)]
     let mut scratch_offset: usize = 0;
     // Rolling log of the last N SIGSYS-intercepted syscall numbers.
     // Used on child exit to print "the last few syscalls seccomp
@@ -3534,16 +3541,20 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
             // fail for EVERY post-execve open, making path translation
             // a no-op — init opened the UNTRANSLATED host paths
             // (/dev/.booting on host → EACCES, /dev/__null__ on host
-            // → ENOENT). By resetting scratch_addr to 0, the next
-            // syscall ENTRY stop will re-allocate the scratch area at
-            // the new (32-bit) stack address.
+            // → ENOENT).
+            //
+            // Task 6-Z16: scratch_addr + scratch_offset are now
+            // re-reserved at EVERY syscall ENTRY (see the ENTRY block
+            // below), so the post-execve reset is no longer needed for
+            // correctness — the very next ENTRY stop will re-read the
+            // (now 32-bit) sp and re-reserve. We keep the diagnostic
+            // log only (no assignments — clippy would flag them as
+            // dead writes, overwritten at the next ENTRY before read).
             if scratch_addr != 0 {
                 log(&format!(
-                    "execve completed — resetting scratch area (was {:#x}) — will re-allocate at new stack pointer",
+                    "execve completed — old scratch area {:#x} now stale (64-bit, pre-execve); will re-reserve at the next ENTRY stop from the new 32-bit sp",
                     scratch_addr
                 ));
-                scratch_addr = 0;
-                scratch_offset = 0;
             }
         }
 
@@ -4386,36 +4397,70 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // point the path-argument register at translated paths
                     // inside it.
                     //
-                    // We reserve the area LAZILY at the first syscall
-                    // ENTRY stop (any syscall — we do not need to hijack
-                    // a getpid here): we read the stack pointer via
-                    // `abi.reg_sp`, set `scratch_addr = sp - 4096`, and
-                    // log it. No syscall is required — we are just
-                    // picking a writable address inside the child's
-                    // existing stack mapping. Linux guarantees at least
-                    // 128 bytes of stack redzone below `rsp`/`sp`, and
-                    // we only need a few hundred bytes for short path
-                    // strings, so this is safe.
-                    if scratch_addr == 0 {
+                    // We re-reserve the area at EVERY syscall ENTRY
+                    // stop (not lazily once). The child's stack grows
+                    // DOWNWARD between syscalls (userspace function
+                    // calls push frames, decrementing sp). If we
+                    // cached the scratch area at the FIRST entry, the
+                    // child's subsequent stack growth would move sp
+                    // below the cached `sp - 4096`, putting the stale
+                    // scratch area in the ACTIVE stack region — the
+                    // next `write_translated_path` would then overwrite
+                    // the child's new stack frames (return addresses,
+                    // saved registers) with rootfs path bytes → SIGSEGV
+                    // at rip=0x6f722f69 ('i/ro' from
+                    // '/data/user/0/io.twoyi/rootfs'). This was the
+                    // 6-Z14 failure mode (cached sp-4096, SIGSEGV at
+                    // iter 786 after the child's stack grew into the
+                    // stale scratch page).
+                    //
+                    // Task 6-Z15 tried to dodge this by using sp + 4096
+                    // (ABOVE the stack pointer), reasoning that "stack
+                    // grows down, so above sp is unused". That reasoning
+                    // was BACKWARDS: on a downward-growing stack the
+                    // region ABOVE sp holds the LIVE caller frames
+                    // (return addresses, saved registers, locals), not
+                    // unused space. Worse, when sp is near the TOP of
+                    // the stack mapping (as it is early in init's boot),
+                    // sp + 4096 lands in an UNMAPPED page beyond the
+                    // mapping → PTRACE_POKEDATA fails (EIO) → path
+                    // translation becomes a no-op → open("/dev/__null__")
+                    // sees the untranslated host path → ENOENT → init
+                    // exit(1) at iter 187. This was the 6-Z15 failure
+                    // mode (verified on f973d7e UI E2E run 32252514166:
+                    // "WARNING: write_translated_path FAILED for
+                    // /dev/__null__ (scratch_addr=0xffc7a740, offset=0)
+                    // — falling back to in-place overwrite").
+                    //
+                    // Task 6-Z16 (THE REAL FIX): re-reserve at EVERY
+                    // syscall ENTRY, using sp - 4096 (BELOW the current
+                    // stack pointer, in the auto-growable region). Each
+                    // ENTRY reads the CURRENT sp, so the scratch area is
+                    // always in the FRESH region below the child's
+                    // current stack usage. The child is in the KERNEL
+                    // between ENTRY and EXIT (no userspace function
+                    // calls, no stack growth), so the scratch area is
+                    // stable + untouched during the path's lifetime
+                    // (ENTRY write → kernel reads path → EXIT). Between
+                    // EXIT and the next ENTRY the child runs userspace
+                    // and may grow its stack, but by then the path is
+                    // already consumed and the NEXT ENTRY will re-reserve
+                    // a fresh area at the new (lower) sp. sp - 4096 is in
+                    // the MAP_GROWSDOWN stack VMA, so PTRACE_POKEDATA
+                    // triggers a minor page fault + the kernel maps the
+                    // page on demand — the write succeeds. 8-byte-align
+                    // the address so POKEDATA word writes never straddle
+                    // an unmapped boundary.
+                    {
                         let sp = get_syscall_arg(&regs, abi.reg_sp);
-                        // Task 6-Z15: use sp + 4096 (ABOVE the stack
-                        // pointer) instead of sp - 4096 (BELOW). The
-                        // child's stack grows DOWNWARD, so sp - 4096 is
-                        // in the ACTIVE stack region — the child's
-                        // function calls push frames into this area,
-                        // and write_translated_path overwrites return
-                        // addresses with rootfs path bytes → SIGSEGV at
-                        // rip=0x6f722f69 ('i/ro' from '/data/user/0/io.twoyi/rootfs').
-                        // Using sp + 4096 puts the scratch area in the
-                        // UNUSED region above the stack pointer, which
-                        // the child never touches (stack grows down,
-                        // not up). This is safe because the stack mapping
-                        // is typically much larger than 4 KiB above sp.
-                        scratch_addr = (sp + 4096) & !7u64;
-                        log(&format!(
-                            "scratch area at {:#x} (above stack pointer {:#x})",
-                            scratch_addr, sp
-                        ));
+                        scratch_addr = (sp.wrapping_sub(4096)) & !7u64;
+                        scratch_offset = 0;
+                        if loop_count <= 30 {
+                            log(&format!(
+                                "scratch area at {:#x} (below stack pointer {:#x}, re-reserved this ENTRY)",
+                                scratch_addr, sp
+                            ));
+                        }
                     }
 
                     match syscall_num {
