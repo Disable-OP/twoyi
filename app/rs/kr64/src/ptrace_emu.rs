@@ -4458,6 +4458,38 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
                             }
                         }
+                        // Task 6-Y: unlink + unlinkat need the ACTUAL
+                        // translate_path + write-back (not just the logging
+                        // match above). Pre-6-Y-fix, unlink was in the path-idx
+                        // logging match but NOT in this write-back match → the
+                        // path was logged but NOT translated → init's unlink hit
+                        // the HOST /dev/socket → EACCES → 'init startup failure'.
+                        // unlink: path in arg1. unlinkat: dirfd in arg1, path in
+                        // arg2 (like openat).
+                        n if n == abi.unlink || n == abi.unlinkat => {
+                            let path_arg_index = if syscall_num == abi.unlink {
+                                abi.reg_arg1
+                            } else {
+                                abi.reg_arg2
+                            };
+                            let path_addr = get_syscall_arg(&regs, path_arg_index);
+                            if let Some(path) = read_child_string(pid, path_addr) {
+                                let translated = translate_path(rootfs, &path);
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        path_arg_index,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
+                                    write_child_string(pid, path_addr, &translated);
+                                }
+                            }
+                        }
                         _ => {
                             // Not an intercepted syscall — let it through.
                         }
