@@ -5560,7 +5560,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Minimal Android boot parameters that TWRP init expects.
         // androidboot.hardware is particularly important — init uses it
         // to find the right init.{hardware}.rc file.
-        let cmdline_content = "androidboot.hardware=ranchu androidboot.hardware.gralloc=ranchu androidboot.hardware.vulkan=ranchu androidboot.serialno=twoyi androidboot.boot_devices=pci0000:00/0000:00:03.0 androidboot.verifiedbootstate=orange androidboot.flash.locked=0 androidboot.slot_suffix= androidboot.vbmeta.size=0 qemu=1 qemu.avd_name=twoyi_test\n";
+        // CRITICAL: /proc/cmdline uses NUL (\0) as item separator,
+        // NOT spaces. AOSP init's process_kernel_cmdline() reads the
+        // file and splits on \0. With spaces, the entire file is one
+        // big string with no NUL → no key=value pairs found →
+        // ro.hardware='' (empty) → boot sequence failure (Task 6-Y).
+        let cmdline_content = "androidboot.hardware=ranchu\0androidboot.hardware.gralloc=ranchu\0androidboot.hardware.vulkan=ranchu\0androidboot.serialno=twoyi\0androidboot.boot_devices=pci0000:00/0000:00:03.0\0androidboot.verifiedbootstate=orange\0androidboot.flash.locked=0\0androidboot.slot_suffix=\0androidboot.vbmeta.size=0\0qemu=1\0qemu.avd_name=twoyi_test\0";
         match std::fs::write(&cmdline_path, cmdline_content) {
             Ok(_) => {
                 let _ =
