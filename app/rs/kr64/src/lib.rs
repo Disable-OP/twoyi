@@ -1220,6 +1220,13 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // the recovery service → it opens fb0 → TWRP renders.
             result.push('\n');
             result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
+            // Task 6-Z36: add LD_LIBRARY_PATH=/sbin so the 32-bit TWRP linker
+            // searches /sbin/ for the recovery binary's 23 NEEDED libraries
+            // (libaosprecovery.so, libblkid.so, libminuitwrp.so, etc.). Without
+            // this, the linker only searches /system/lib/ (default) → the
+            // libraries aren't found → the recovery binary exits 127 after
+            // 1163 iterations (lazy load failure on first call to a missing lib).
+            result.push_str("\n    setenv LD_LIBRARY_PATH /sbin:/system/lib:/system/lib64");
             result.push_str("\n    seclabel u:r:recovery:s0");
             found = true;
         }
