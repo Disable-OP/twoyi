@@ -2139,138 +2139,6 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
     }
 }
 
-/// Task 6-Z12: decide whether a syscall needs the ptrace loop to stop at
-/// its **EXIT** (i.e. `PTRACE_SYSCALL` must be used at ENTRY so we receive
-/// the EXIT stop), or whether it can be **skipped** via `PTRACE_CONT`
-/// (the child runs freely until the next SIGNAL — SIGSYS from seccomp,
-/// SIGSEGV, PTRACE_EVENT_EXEC, etc. — skipping ALL non-intercepted
-/// syscalls in between).
-///
-/// # Why this exists
-///
-/// Pre-6-Z12 the ptrace loop used `PTRACE_SYSCALL` for EVERY continuation,
-/// stopping at every syscall entry AND exit. The restorecon phase iterates
-/// over ~3000 files × ~6 syscalls each = ~18000 syscalls = ~36000 ptrace
-/// stops. At ~6ms per stop, this takes ~216 seconds — way too long (the
-/// recovery never completes within the watchdog timeout).
-///
-/// By using `PTRACE_CONT` for syscalls that do NOT need EXIT handling
-/// (read, write, close, gettid, brk, mprotect, munmap, lseek, fstat64,
-/// getdents64, clock_gettime, nanosleep, etc.), the child runs freely
-/// through them + we only stop for syscalls that ACTUALLY need
-/// interception. This reduces the number of ptrace stops from ~36000 to
-/// ~9000 (only path-translation + seccomp-trapped + fake-success
-/// syscalls stop) — a ~4x speedup.
-///
-/// # Which syscalls need EXIT handling
-///
-/// A syscall needs the EXIT stop if ANY of these are true:
-/// 1. A pending flag is set at ENTRY that must be consumed at EXIT
-///    (e.g. `pending_getpid` for getpid/getppid, `pending_xattr_fake`
-///    for setxattr/lsetxattr/fsetxattr, `pending_open_translated_path`
-///    + `pending_kmsg_open` for open/openat/openat2).
-/// 2. The EXIT handler fakes its return value via
-///    `compute_exit_return_value` (chmod, fchmod, fchown, lchown,
-///    chown, fchmodat, fchownat, capget, ioprio_get, ioprio_set,
-///    mount, rt_sigprocmask, mknod, setxattr, lsetxattr, fsetxattr).
-/// 3. The EXIT handler fakes its return value via a dedicated branch
-///    (socketcall fake-success, poll fake-success).
-/// 4. The EXIT handler consumes an ENTRY-side flag for ABI / state
-///    management (execve → `saw_execve` → ABI reset; the mmap/mmap2
-///    ENTRY rewrite is matched here too so we can observe its return).
-/// 5. The syscall is in the fork-family diagnostic always-log block
-///    (clone/fork/vfork/wait4/exit_group) — kept as PTRACE_SYSCALL to
-///    preserve diagnostic visibility into the recovery's fork/exit
-///    behaviour (these are low-frequency; not in the restorecon hot
-///    path, so keeping them does not hurt the speedup).
-///
-/// # Which syscalls use PTRACE_CONT
-///
-/// Everything else: read, write, close, gettid, brk, mprotect, munmap,
-/// lseek, fstat64, getdents64, clock_gettime, nanosleep, etc. These
-/// either take an fd (no path translation) or are pure runtime syscalls
-/// whose return value the kernel sets correctly without our intervention.
-/// Seccomp-trapped variants (mount/mknod/chmod if seccomp blocks them)
-/// stop naturally via SIGSYS regardless of PTRACE_CONT vs PTRACE_SYSCALL.
-fn syscall_needs_interception(syscall_nr: i64, abi: &ChildAbi) -> bool {
-    // (1) Path-translation syscalls — handled in the ENTRY match arm
-    // (translate_path + write_translated_path). Most of these also
-    // need the EXIT stop (open/openat/openat2 consume
-    // pending_open_translated_path + pending_kmsg_open; the *stat*
-    // family / access / readlink / chdir / unlink do not set pending
-    // flags but are kept as PTRACE_SYSCALL to preserve the post-execve
-    // return-value diagnostic).
-    if syscall_nr == abi.open
-        || syscall_nr == abi.openat
-        || syscall_nr == abi.openat2
-        || syscall_nr == abi.stat
-        || syscall_nr == abi.lstat
-        || syscall_nr == abi.stat64
-        || syscall_nr == abi.lstat64
-        || syscall_nr == abi.newfstatat
-        || syscall_nr == abi.statx
-        || syscall_nr == abi.access
-        || syscall_nr == abi.faccessat
-        || syscall_nr == abi.readlink
-        || syscall_nr == abi.readlinkat
-        || syscall_nr == abi.chdir
-        || syscall_nr == abi.unlink
-        || syscall_nr == abi.unlinkat
-    {
-        return true;
-    }
-    // (2) Fake-success at EXIT via compute_exit_return_value — this
-    // covers chmod / fchmod / fchown / lchown / chown / fchmodat /
-    // fchownat / capget / ioprio_get / ioprio_set / mount /
-    // rt_sigprocmask / mknod / setxattr / lsetxattr / fsetxattr.
-    if compute_exit_return_value(syscall_nr, abi).is_some() {
-        return true;
-    }
-    // (3) getpid / getppid — ENTRY sets pending_getpid; EXIT fakes
-    // return 1 (the intended fake-PID-1 behaviour).
-    if syscall_nr == abi.getpid || syscall_nr == abi.getppid {
-        return true;
-    }
-    // (4) mmap / mmap2 — ENTRY rewrites file-backed → MAP_ANONYMOUS;
-    // keep the EXIT stop so the post-execve return-value diagnostic
-    // can observe whether the (rewritten) anonymous mmap succeeded.
-    if syscall_nr == abi.mmap || syscall_nr == abi.mmap2 {
-        return true;
-    }
-    // (5) execve — ENTRY sets saw_execve; EXIT schedules the ABI
-    // re-detection (reset_abi_next). CRITICAL: without the EXIT stop
-    // the ABI would be permanently locked to the pre-execve binary's
-    // bitness.
-    if syscall_nr == abi.execve {
-        return true;
-    }
-    // (6) poll — ENTRY modifies the timeout (6-Z6); EXIT fakes positive
-    // returns to 0 (6-Z5). Both stops are needed.
-    if abi.poll_nr != -1 && syscall_nr == abi.poll_nr {
-        return true;
-    }
-    // (7) socketcall — EXIT fakes negative returns to 0 (6-Z3). The
-    // ENTRY match arm does not handle socketcall, but the EXIT-side
-    // fake-success branch needs the EXIT stop.
-    if abi.socketcall_nr != -1 && syscall_nr == abi.socketcall_nr {
-        return true;
-    }
-    // (8) fork / clone / vfork / wait4 / exit_group — Task-6-S
-    // always-log diagnostic block (ENTRY + EXIT). These are
-    // low-frequency (not in the restorecon hot path); keeping them
-    // as PTRACE_SYSCALL preserves diagnostic visibility into the
-    // recovery's fork/wait/exit behaviour without hurting the speedup.
-    if syscall_nr == abi.clone_nr
-        || syscall_nr == abi.fork_nr
-        || syscall_nr == abi.vfork_nr
-        || syscall_nr == abi.wait4_nr
-        || syscall_nr == abi.exit_group_nr
-    {
-        return true;
-    }
-    false
-}
-
 /// Decide whether the SIGSYS handler should skip its `ptrace_setregs`
 /// call. **Task 6-W: ALWAYS returns `false` (never skip).**
 ///
@@ -3297,14 +3165,6 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     log("PTRACE_O_TRACESYSGOOD | TRACEFORK | TRACECLONE | TRACEVFORK | TRACEVFORKDONE | TRACEEXEC | EXITKILL set");
 
     let mut in_syscall = false;
-    // Task 6-Z12: when true, the next loop-top ptrace call uses
-    // PTRACE_CONT (instead of PTRACE_SYSCALL) so the child runs freely
-    // until the next SIGNAL — skipping the EXIT stop for non-intercepted
-    // syscalls (read, write, close, gettid, brk, mprotect, munmap, lseek,
-    // fstat64, getdents64, clock_gettime, nanosleep, etc.). Set at the
-    // ENTRY stop by the `syscall_needs_interception` check; reset to false
-    // right after the ptrace call (same pattern as `resume_signal`).
-    let mut use_ptrace_cont: bool = false;
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
 
@@ -3676,12 +3536,10 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
             }
         }
 
-        // Continue the child to the next syscall entry/exit (or to the
-        // next signal if `use_ptrace_cont` was set at the previous ENTRY
-        // stop for a non-intercepted syscall). This is the ONLY ptrace
-        // resume in the loop — handlers below set `resume_signal` (and
-        // `continue`) instead of resuming the child themselves, so we
-        // never race the second ptrace call.
+        // Continue the child to the next syscall entry/exit. This is
+        // the ONLY PTRACE_SYSCALL in the loop — handlers below set
+        // `resume_signal` (and `continue`) instead of resuming the
+        // child themselves, so we never race the second ptrace call.
         //
         // Task 6-S: resume `current_pid` (the last-stopped child), NOT
         // always `pid` (init). After PTRACE_O_TRACEFORK was set, the
@@ -3691,45 +3549,23 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
         // resuming init instead would leave the recovery service stuck
         // in its SIGSTOP forever, and init would never receive the
         // child-stop event that breaks it out of its own waitpid.
-        //
-        // Task 6-Z12: when `use_ptrace_cont` is true (set at the ENTRY
-        // stop for a non-intercepted syscall — read/write/close/gettid/
-        // brk/mprotect/munmap/lseek/fstat64/getdents64/clock_gettime/
-        // nanosleep/etc.), use PTRACE_CONT instead of PTRACE_SYSCALL.
-        // PTRACE_CONT does NOT stop at syscall boundaries — the child
-        // runs freely until the next SIGNAL (SIGSYS from seccomp,
-        // SIGSEGV, PTRACE_EVENT_EXEC, etc.). This skips the EXIT stop
-        // for this non-intercepted syscall AND all subsequent
-        // non-intercepted syscalls until a signal fires. This is the
-        // ~4x speedup for the restorecon phase (18000 syscalls → ~9000
-        // ptrace stops). See `syscall_needs_interception` for the full
-        // rationale + the list of syscalls that still use PTRACE_SYSCALL.
-        let ptrace_op = if use_ptrace_cont {
-            libc::PTRACE_CONT
-        } else {
-            libc::PTRACE_SYSCALL
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_SYSCALL,
+                current_pid,
+                0,
+                resume_signal as libc::c_long,
+            )
         };
-        // Capture (for the ESRCH log below) whether THIS ptrace call was
-        // a PTRACE_CONT or a PTRACE_SYSCALL — `use_ptrace_cont` is reset
-        // to false right after the ptrace call (one-shot), so capture it
-        // here before the reset.
-        let was_ptrace_cont = use_ptrace_cont;
-        let r = unsafe { libc::ptrace(ptrace_op, current_pid, 0, resume_signal as libc::c_long) };
         // Reset for the next iteration — only set again if a
         // signal-delivery branch below populates it.
         resume_signal = 0;
-        // Task 6-Z12: `use_ptrace_cont` is a ONE-SHOT flag — it
-        // applies to exactly ONE loop-top ptrace call. Reset it here so
-        // the next iteration defaults to PTRACE_SYSCALL (stops at the
-        // next syscall boundary). A new ENTRY stop may set it again.
-        use_ptrace_cont = false;
         if r == -1 {
             let e = std::io::Error::last_os_error();
             // ESRCH = child already exited — not an error, just done.
             if e.raw_os_error() == Some(libc::ESRCH) {
                 log(&format!(
-                    "PTRACE_{}: child {} already exited (ESRCH)",
-                    if was_ptrace_cont { "CONT" } else { "SYSCALL" },
+                    "PTRACE_SYSCALL: child {} already exited (ESRCH)",
                     current_pid
                 ));
                 // Print the rolling SIGSYS history before reaping — the
@@ -4285,21 +4121,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
 
                 if !in_syscall {
                     // ── Syscall ENTRY ──
-                    //
-                    // Task 6-Z12: we do NOT set `in_syscall = true`
-                    // unconditionally here anymore. Instead, the match
-                    // block below decides whether this syscall needs its
-                    // EXIT stop (intercepted) or can be skipped via
-                    // PTRACE_CONT (non-intercepted). For intercepted
-                    // syscalls, `in_syscall = true` is set at the END of
-                    // the ENTRY block (after the match), so the next
-                    // SIGTRAP|0x80 stop is treated as EXIT. For non-
-                    // intercepted syscalls, `in_syscall` stays false
-                    // AND `use_ptrace_cont = true` is set — the next
-                    // loop-top ptrace call uses PTRACE_CONT (the child
-                    // runs freely until the next SIGNAL; the next
-                    // SIGTRAP|0x80 stop, if any, is treated as ENTRY).
-                    //
+                    in_syscall = true;
+
                     // Record the syscall number in the rolling "all
                     // syscalls" buffer. This captures UNintercepted
                     // syscalls — seccomp-blocked syscalls are recorded
@@ -5083,54 +4906,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         }
                         _ => {
                             // Not an intercepted syscall — let it through.
-                            // (The Task 6-Z12 PTRACE_CONT decision below
-                            // determines whether we stop at this syscall's
-                            // EXIT or skip it via PTRACE_CONT.)
                         }
-                    }
-
-                    // ── Task 6-Z12: PTRACE_CONT vs PTRACE_SYSCALL decision ──
-                    //
-                    // At this point the ENTRY-side match block has run
-                    // (path translation, mmap2 rewrite, xattr-rewrite,
-                    // pending-flag setup, etc. for the named match arms).
-                    // We now decide whether this syscall's EXIT stop is
-                    // needed:
-                    //
-                    //   - If `syscall_needs_interception` returns true,
-                    //     the EXIT handler has work to do (consume a
-                    //     pending flag, fake the return value, reset the
-                    //     ABI on execve, etc.). Set `in_syscall = true`
-                    //     so the next SIGTRAP|0x80 stop is treated as
-                    //     EXIT, and leave `use_ptrace_cont = false` so
-                    //     the next loop-top ptrace uses PTRACE_SYSCALL
-                    //     (stops at the EXIT boundary).
-                    //
-                    //   - If `syscall_needs_interception` returns false
-                    //     (read, write, close, gettid, brk, mprotect,
-                    //     munmap, lseek, fstat64, getdents64,
-                    //     clock_gettime, nanosleep, etc.), the EXIT
-                    //     handler has nothing to do for this syscall.
-                    //     Set `use_ptrace_cont = true` so the next
-                    //     loop-top ptrace uses PTRACE_CONT (the child
-                    //     runs freely until the next SIGNAL — SIGSYS
-                    //     from seccomp, SIGSEGV, PTRACE_EVENT_EXEC,
-                    //     etc. — skipping this syscall's EXIT stop AND
-                    //     all subsequent non-intercepted syscalls until
-                    //     a signal fires). Leave `in_syscall = false`
-                    //     so the next SIGTRAP|0x80 stop (which will
-                    //     only fire after the signal handler runs +
-                    //     PTRACE_SYSCALL resumes the child) is treated
-                    //     as ENTRY.
-                    //
-                    // This is the ~4x speedup for the restorecon phase:
-                    // ~27000 of ~36000 ptrace stops are skipped (only
-                    // path-translation + seccomp-trapped + fake-success
-                    // syscalls stop).
-                    if syscall_needs_interception(syscall_num, &abi) {
-                        in_syscall = true;
-                    } else {
-                        use_ptrace_cont = true;
                     }
                 } else {
                     // ── Syscall EXIT ──
@@ -8032,327 +7808,6 @@ mod tests {
                 "aarch64 getpid (nr=172) must NOT be in the fake-success list"
             );
         }
-    }
-
-    // ── Task 6-Z12 tests: syscall_needs_interception / PTRACE_CONT ────
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn syscall_needs_interception_true_for_intercepted_syscalls_i386() {
-        // Task 6-Z12 regression guard: confirm that all syscalls the
-        // ptrace loop actually INTERCEPTS (path translation, fake-
-        // success, ABI reset, mmap2 rewrite, poll/socketcall fake-success,
-        // fork-family diagnostic) return true from
-        // `syscall_needs_interception` — i.e. they keep using
-        // PTRACE_SYSCALL so we receive their EXIT stop. Uses the i386
-        // ABI (the runtime ABI — TWRP recovery is an i386 binary).
-        let abi = ABI_X86_32;
-
-        // Path-translation syscalls (ENTRY match arm + EXIT diagnostic):
-        assert!(
-            syscall_needs_interception(abi.open, &abi),
-            "open (nr=5) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.openat, &abi),
-            "openat (nr=295) must use PTRACE_SYSCALL (path translation + fd tracking)"
-        );
-        assert!(
-            syscall_needs_interception(abi.openat2, &abi),
-            "openat2 (nr=437) must use PTRACE_SYSCALL (path translation + fd tracking)"
-        );
-        assert!(
-            syscall_needs_interception(abi.stat, &abi),
-            "stat (nr=106) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.lstat, &abi),
-            "lstat (nr=107) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.stat64, &abi),
-            "stat64 (nr=195) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.lstat64, &abi),
-            "lstat64 (nr=196) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.newfstatat, &abi),
-            "newfstatat (nr=300) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.statx, &abi),
-            "statx (nr=383) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.access, &abi),
-            "access (nr=33) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.faccessat, &abi),
-            "faccessat (nr=307) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.readlink, &abi),
-            "readlink (nr=85) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.readlinkat, &abi),
-            "readlinkat (nr=303) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.chdir, &abi),
-            "chdir (nr=12) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.unlink, &abi),
-            "unlink (nr=10) must use PTRACE_SYSCALL (path translation)"
-        );
-        assert!(
-            syscall_needs_interception(abi.unlinkat, &abi),
-            "unlinkat (nr=301) must use PTRACE_SYSCALL (path translation)"
-        );
-
-        // Fake-success at EXIT via compute_exit_return_value:
-        assert!(
-            syscall_needs_interception(abi.chmod, &abi),
-            "chmod (nr=15) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.fchmod, &abi),
-            "fchmod (nr=94) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.fchown, &abi),
-            "fchown (nr=95) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.lchown, &abi),
-            "lchown (nr=16) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.chown, &abi),
-            "chown (nr=182) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.fchmodat, &abi),
-            "fchmodat (nr=306) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.fchownat, &abi),
-            "fchownat (nr=298) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.capget, &abi),
-            "capget (nr=184) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.ioprio_get, &abi),
-            "ioprio_get (nr=290) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.ioprio_set, &abi),
-            "ioprio_set (nr=289) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.mount, &abi),
-            "mount (nr=21) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.rt_sigprocmask, &abi),
-            "rt_sigprocmask (nr=175) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.mknod, &abi),
-            "mknod (nr=14) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.setxattr, &abi),
-            "setxattr (nr=226) must use PTRACE_SYSCALL (ENTRY rewrite + EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.lsetxattr, &abi),
-            "lsetxattr (nr=227) must use PTRACE_SYSCALL (ENTRY rewrite + EXIT fake-success)"
-        );
-        assert!(
-            syscall_needs_interception(abi.fsetxattr, &abi),
-            "fsetxattr (nr=228) must use PTRACE_SYSCALL (ENTRY rewrite + EXIT fake-success)"
-        );
-
-        // getpid / getppid — pending_getpid (EXIT fakes return 1):
-        assert!(
-            syscall_needs_interception(abi.getpid, &abi),
-            "getpid (nr=20) must use PTRACE_SYSCALL (pending_getpid → EXIT fakes return 1)"
-        );
-        assert!(
-            syscall_needs_interception(abi.getppid, &abi),
-            "getppid (nr=64) must use PTRACE_SYSCALL (pending_getpid → EXIT fakes return 1)"
-        );
-
-        // mmap / mmap2 — ENTRY rewrite (file-backed → MAP_ANONYMOUS):
-        assert!(
-            syscall_needs_interception(abi.mmap2, &abi),
-            "mmap2 (nr=192) must use PTRACE_SYSCALL (ENTRY rewrite + EXIT diagnostic)"
-        );
-
-        // execve — ABI reset on EXIT (CRITICAL):
-        assert!(
-            syscall_needs_interception(abi.execve, &abi),
-            "execve (nr=11) must use PTRACE_SYSCALL (ENTRY saw_execve + EXIT ABI reset)"
-        );
-
-        // poll — ENTRY timeout modification + EXIT fake-success:
-        assert!(
-            syscall_needs_interception(abi.poll_nr, &abi),
-            "poll (nr=168) must use PTRACE_SYSCALL (ENTRY timeout + EXIT fake-success)"
-        );
-
-        // socketcall — EXIT fake-success:
-        assert!(
-            syscall_needs_interception(abi.socketcall_nr, &abi),
-            "socketcall (nr=102) must use PTRACE_SYSCALL (EXIT fake-success)"
-        );
-
-        // fork-family diagnostic (Task-6-S always-log ENTRY + EXIT):
-        assert!(
-            syscall_needs_interception(abi.clone_nr, &abi),
-            "clone (nr=120) must use PTRACE_SYSCALL (Task-6-S diagnostic)"
-        );
-        assert!(
-            syscall_needs_interception(abi.fork_nr, &abi),
-            "fork (nr=2) must use PTRACE_SYSCALL (Task-6-S diagnostic)"
-        );
-        assert!(
-            syscall_needs_interception(abi.vfork_nr, &abi),
-            "vfork (nr=190) must use PTRACE_SYSCALL (Task-6-S diagnostic)"
-        );
-        assert!(
-            syscall_needs_interception(abi.wait4_nr, &abi),
-            "wait4 (nr=114) must use PTRACE_SYSCALL (Task-6-S diagnostic)"
-        );
-        assert!(
-            syscall_needs_interception(abi.exit_group_nr, &abi),
-            "exit_group (nr=252) must use PTRACE_SYSCALL (Task-6-S diagnostic)"
-        );
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn syscall_needs_interception_false_for_non_intercepted_syscalls_i386() {
-        // Task 6-Z12 regression guard: confirm that the syscalls the
-        // ptrace loop does NOT intercept (read, write, close, gettid,
-        // brk, mprotect, munmap, lseek, fstat64, getdents64,
-        // clock_gettime, nanosleep, etc.) return false from
-        // `syscall_needs_interception` — i.e. they use PTRACE_CONT so
-        // the child runs freely until the next SIGNAL, skipping their
-        // EXIT stop. These are the EXACT syscalls that flood the
-        // restorecon loop (each iterates ~6× per file across ~3000
-        // files = ~18000 syscalls). PTRACE_CONT skips ~27000 of the
-        // ~36000 ptrace stops → ~4x speedup. Uses the i386 ABI (the
-        // runtime ABI — TWRP recovery is an i386 binary). i386 syscall
-        // numbers per /usr/include/x86_64-linux-gnu/asm/unistd_32.h.
-        let abi = ABI_X86_32;
-
-        // The canonical "DON'T need interception" list from the 6-Z12
-        // task spec (i386 numbers):
-        assert!(
-            !syscall_needs_interception(3, &abi),
-            "read (nr=3) must use PTRACE_CONT — floods restorecon loop"
-        );
-        assert!(!syscall_needs_interception(4, &abi), "write (nr=4) must use PTRACE_CONT — floods restorecon loop (the KLOG diagnostic at EXIT is sacrificed for the ~4x speedup)");
-        assert!(!syscall_needs_interception(6, &abi), "close (nr=6) must use PTRACE_CONT — floods restorecon loop (close fds after each open/read)");
-        assert!(!syscall_needs_interception(224, &abi), "gettid (nr=224) must use PTRACE_CONT — floods restorecon loop (recovery calls gettid before each lsetxattr)");
-        assert!(
-            !syscall_needs_interception(45, &abi),
-            "brk (nr=45) must use PTRACE_CONT — runtime heap mgmt"
-        );
-        assert!(
-            !syscall_needs_interception(125, &abi),
-            "mprotect (nr=125) must use PTRACE_CONT — runtime memory protection"
-        );
-        assert!(
-            !syscall_needs_interception(91, &abi),
-            "munmap (nr=91) must use PTRACE_CONT — runtime memory mgmt"
-        );
-        assert!(
-            !syscall_needs_interception(19, &abi),
-            "lseek (nr=19) must use PTRACE_CONT — fd positioning (no path)"
-        );
-        assert!(!syscall_needs_interception(197, &abi), "fstat64 (nr=197) must use PTRACE_CONT — takes fd (no path translation); NOT in compute_exit_return_value");
-        assert!(
-            !syscall_needs_interception(220, &abi),
-            "getdents64 (nr=220) must use PTRACE_CONT — directory enumeration (takes fd)"
-        );
-        assert!(
-            !syscall_needs_interception(265, &abi),
-            "clock_gettime (nr=265) must use PTRACE_CONT — runtime time query"
-        );
-        assert!(
-            !syscall_needs_interception(162, &abi),
-            "nanosleep (nr=162) must use PTRACE_CONT — runtime sleep (recovery's retry backoff)"
-        );
-
-        // Additional sanity: a few syscall numbers that should also be
-        // non-intercepted (not in the canonical list but clearly not
-        // needing interception):
-        assert!(
-            !syscall_needs_interception(243, &abi),
-            "set_thread_area (nr=243) must use PTRACE_CONT — runtime TLS setup"
-        );
-        assert!(
-            !syscall_needs_interception(252 + 1, &abi),
-            "nr=253 (i386 unused) must use PTRACE_CONT — never intercepted"
-        );
-
-        // CRITICAL cross-check: fstat64 (nr=197) is NON-intercepted
-        // (PTRACE_CONT) but stat64/lstat64 (nr=195/196) ARE intercepted
-        // (PTRACE_SYSCALL). The difference: stat64/lstat64 take a PATH
-        // (need translate_path); fstat64 takes an fd (no path). A
-        // regression here (e.g. accidentally including fstat64 in the
-        // path-translation list) would negate the speedup for the
-        // restorecon loop (which calls fstat64 on every fd).
-        assert!(
-            syscall_needs_interception(195, &abi),
-            "stat64 (nr=195) must use PTRACE_SYSCALL (takes a PATH)"
-        );
-        assert!(
-            syscall_needs_interception(196, &abi),
-            "lstat64 (nr=196) must use PTRACE_SYSCALL (takes a PATH)"
-        );
-        assert!(
-            !syscall_needs_interception(197, &abi),
-            "fstat64 (nr=197) must use PTRACE_CONT (takes an fd — NO path translation)"
-        );
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn syscall_needs_interception_aarch64_sentinels_safe() {
-        // Task 6-Z12 regression guard for aarch64: the -1 sentinels
-        // (poll_nr, socketcall_nr, mmap2, open, access, lchown, chown,
-        // mknod, fork_nr, vfork_nr, etc.) must NOT cause
-        // `syscall_needs_interception` to spuriously return true for
-        // syscall number -1 (which is never a real syscall number, but
-        // the comparison `syscall_nr == abi.poll_nr` where poll_nr=-1
-        // would match if syscall_nr were ever -1). The explicit
-        // `abi.poll_nr != -1` and `abi.socketcall_nr != -1` gates
-        // prevent this. This test confirms the gates work.
-        let abi = ABI_AARCH64;
-        assert!(!syscall_needs_interception(-1, &abi), "sentinel -1 must NOT match (aarch64 poll_nr/socketcall_nr are -1; the != -1 gates prevent spurious match)");
-        // aarch64 still intercepts the syscalls it does have:
-        assert!(
-            syscall_needs_interception(abi.openat, &abi),
-            "aarch64 openat must use PTRACE_SYSCALL"
-        );
-        assert!(
-            syscall_needs_interception(abi.execve, &abi),
-            "aarch64 execve must use PTRACE_SYSCALL (ABI reset)"
-        );
-        assert!(
-            syscall_needs_interception(abi.getpid, &abi),
-            "aarch64 getpid must use PTRACE_SYSCALL (pending_getpid)"
-        );
     }
 
     #[cfg(target_arch = "x86_64")]
