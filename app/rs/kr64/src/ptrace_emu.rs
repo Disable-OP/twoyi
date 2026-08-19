@@ -707,6 +707,56 @@ struct ChildAbi {
     // (only present on i386 — x86_64 and asm-generic have no
     // socketcall). Verified directly in Task 6-Z3.
     socketcall_nr: i64,
+    // poll — Task 6-Z5. The legacy `poll` syscall (single syscall, not
+    // ppoll). TWRP's recovery (an i386 binary) calls poll() in its
+    // property_service startup loop after the bind has been faked to
+    // 0 (Task 6-Z3). The faked bind hid the EADDRINUSE but the socket
+    // is NOT actually bound (concurrent kr64 invocations — the twoyi
+    // app relaunches kr64 every 2s without killing the old one → the
+    // old init's socket is still bound → new init's bind fails → faked
+    // to 0 → the socket isn't bound → poll returns POLLERR=1 every
+    // call → busy-wait). Verified on a76b677 UI E2E run 32218145762:
+    // poll (i386 nr=168) × 101 at syscalls #4900-5000, each returns 1
+    // (a fd is ALWAYS ready with POLLERR). The recovery is alive but
+    // stuck in a TIGHT POLL SPIN — it never proceeds to open
+    // /dev/graphics/fb0 (no framebuffer render, no TWRP UI).
+    //
+    // FIX (PRAGMATIC): at the syscall-EXIT stop, if
+    // syscall_num == abi.poll_nr AND the return value is POSITIVE
+    // (N fds ready), fake the return to 0 (no fds ready — equivalent
+    // to a timeout). This stops the busy-wait: the recovery thinks
+    // no events are pending + either sleeps (if the poll timeout is
+    // non-zero) or retries less aggressively.
+    //
+    // CAVEAT: the TWRP main UI loop ALSO uses poll (for input events).
+    // Faking ALL poll returns to 0 would prevent the TWRP UI from
+    // processing input. BUT the recovery is currently stuck BEFORE
+    // the TWRP UI loop (in a setup/property-service poll spin).
+    // Faking poll to 0 should let it proceed PAST the setup loop.
+    // Once the recovery reaches the framebuffer phase, the poll
+    // behaviour might differ. If this fix causes a regression (the
+    // TWRP UI can't process input), a follow-up fix can make the fake
+    // conditional (only during the setup phase, not the main loop).
+    //
+    // Per-ABI numbers (verified against /usr/include/x86_64-linux-gnu/
+    // asm/unistd_32.h + unistd_64.h + asm-generic/unistd.h in 6-Z5):
+    //   i386:   poll = 168 (per asm/unistd_32.h: __NR_poll 168 —
+    //     THIS is the value that fires at runtime; TWRP recovery is
+    //     an i386 binary that issues poll() as i386 syscall 168).
+    //   x86_64: poll =   7 (per asm/unistd_64.h: __NR_poll 7 — does
+    //     NOT currently fire at runtime; the host runs an i386 child.
+    //     Locked in for ABI completeness + so the EXIT handler's
+    //     `== abi.poll_nr` comparison is correct if a future x86_64
+    //     guest is ever supported).
+    //   aarch64: poll = -1 (SENTINEL — asm-generic/unistd.h has NO
+    //     __NR_poll; aarch64 callers use ppoll/nanosleep instead.
+    //     bionic's poll() libc wrapper on aarch64 issues ppoll under
+    //     the hood. A future aarch64-specific fix would need a
+    //     dedicated ppoll field. Mirrors the existing pattern for
+    //     ABI_AARCH64.open / access / lchown / chown / mknod / pause
+    //     / socketcall, which are all set to -1 for the same "asm-
+    //     generic dropped it" reason.)
+    poll_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -939,6 +989,15 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // guest is ever supported. Mirrors the existing
     // ABI_X86_64.mmap2 = -1 precedent. Task 6-Z3.
     socketcall_nr: -1,
+    // x86_64 poll = 7 (per /usr/include/x86_64-linux-gnu/asm/unistd_64.h:
+    // __NR_poll 7, verified directly against the kernel's UAPI header
+    // in Task 6-Z5). The host is x86_64 running an i386 child, so this
+    // x86_64 number does NOT currently fire at runtime (the guest uses
+    // i386 syscall 168). Locked in for ABI completeness + so the EXIT
+    // handler's `== abi.poll_nr` comparison is correct if a future
+    // x86_64 guest is ever supported. See the doc on `poll_nr` in
+    // `ChildAbi` for the full root-cause analysis (Task 6-Z5).
+    poll_nr: 7,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -1204,6 +1263,19 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // positive fd (success), so it's NOT faked. See the doc on
     // `socketcall_nr` in `ChildAbi` for the full root-cause analysis.
     socketcall_nr: 102,
+    // i386 poll = 168 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+    // __NR_poll 168, verified directly against the kernel's UAPI header
+    // in Task 6-Z5). THIS is the value that fires at runtime — TWRP
+    // recovery (an i386 binary) issues poll() as i386 syscall 168 in
+    // its property_service startup loop after the bind has been faked
+    // to 0 (Task 6-Z3). The faked bind hid the EADDRINUSE but the
+    // socket is NOT actually bound → poll returns POLLERR=1 every call
+    // → busy-wait. The Task 6-Z5 fix: at the syscall-EXIT stop, if
+    // syscall_num == abi.poll_nr AND the return is positive (N fds
+    // ready), fake the return to 0 (no fds ready). This stops the
+    // busy-wait. See the doc on `poll_nr` in `ChildAbi` for the full
+    // root-cause analysis (Task 6-Z5).
+    poll_nr: 168,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1444,6 +1516,24 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // correct if a future aarch64 guest is ever supported. Mirrors
     // the existing ABI_AARCH64.mmap2 = -1 precedent. Task 6-Z3.
     socketcall_nr: -1,
+    // aarch64 poll = -1 (SENTINEL — asm-generic/unistd.h has NO
+    // __NR_poll; aarch64 callers use ppoll/nanosleep instead, per
+    // /usr/include/asm-generic/unistd.h. bionic's poll() libc wrapper
+    // on aarch64 issues ppoll(NULL, n, timeout, NULL) under the hood.
+    // A future aarch64-specific fix would need a dedicated `ppoll: i64`
+    // field (= 73 in asm-generic) instead of aliasing poll to it —
+    // aliasing would mislabel ppoll SIGSYS as "poll" in
+    // syscall_name() (mislabeled but harmless) AND would intercept a
+    // real ppoll in the EXIT handler (would force return to 0 for any
+    // ppoll the guest makes, even legitimate ones that should return
+    // N>0 — too risky). Mirrors the existing pattern for
+    // ABI_AARCH64.mmap2 / .open / .access / .lchown / .chown / .mknod /
+    // .pause / .socketcall, which are all set to -1 for the same
+    // "asm-generic dropped it" reason. The host is x86_64 running an
+    // i386 child, so this aarch64 path is currently dead code at
+    // runtime — the sentinel keeps the compile happy + documents the
+    // aarch64 behaviour. Task 6-Z5.
+    poll_nr: -1,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2386,6 +2476,21 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // (sentinel) so no real syscall ever matches this branch on
         // those ABIs.
         "socketcall"
+    } else if nr == abi.poll_nr {
+        // Task 6-Z5: legacy poll syscall (i386 nr=168, x86_64 nr=7).
+        // Pre-6-Z5 this was labelled "[unknown]" because no field
+        // matched it. With this entry the diagnostic label correctly
+        // says "poll" so the next person debugging the property-service
+        // POLLERR busy-wait (after the 6-Z3 bind fake-success masked
+        // the EADDRINUSE but the socket isn't actually bound) can
+        // immediately identify it from the EXIT log without cross-
+        // referencing against /usr/include/x86_64-linux-gnu/asm/
+        // unistd_32.h. NOTE: on aarch64 poll_nr is -1 (sentinel) so no
+        // real syscall ever matches this branch on that ABI; the EXIT
+        // handler's `== abi.poll_nr` comparison is also gated by
+        // `abi.poll_nr != -1` so the branch is fully skipped on
+        // aarch64.
+        "poll"
     } else {
         "unknown"
     }
@@ -5233,6 +5338,91 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                         "DIAG socketcall fake-success: socketcall (nr={}) returned {} (-errno {}) — faked to 0 (stale socket from previous cycle; init will proceed)",
                                         syscall_num, ret, -ret
                                     ));
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Task 6-Z5: poll positive-return fake-success ───
+                    //
+                    // Legacy poll() syscall (i386 nr=168, x86_64 nr=7,
+                    // aarch64 sentinel -1). TWRP's recovery (an i386
+                    // binary) calls poll() in its property_service
+                    // startup loop AFTER the bind has been faked to 0
+                    // (Task 6-Z3). The 6-Z3 socketcall fake-success
+                    // masked the bind EADDRINUSE to 0, but the socket
+                    // is NOT actually bound (concurrent kr64 invocations
+                    // — the twoyi app relaunches kr64 every 2s without
+                    // killing the old one → the old init's socket is
+                    // still bound → new init's bind fails → faked to 0
+                    // → the socket isn't bound → poll returns POLLERR=1
+                    // → busy-wait). Verified on a76b677 UI E2E run
+                    // 32218145762: poll (i386 nr=168) × 101 at syscalls
+                    // #4900-5000, each returns 1 (a fd is ALWAYS ready
+                    // with POLLERR). The recovery is alive but stuck in
+                    // a TIGHT POLL SPIN — it never proceeds to open
+                    // /dev/graphics/fb0 (no framebuffer render).
+                    //
+                    // FIX (PRAGMATIC): at the syscall-EXIT stop, if
+                    // syscall_num == abi.poll_nr AND the return value
+                    // is POSITIVE (N fds ready), fake the return to 0
+                    // (no fds ready — equivalent to a timeout). This
+                    // stops the busy-wait: the recovery thinks no
+                    // events are pending + either sleeps (if the poll
+                    // timeout is non-zero) or retries less aggressively.
+                    //
+                    // CAVEAT: the TWRP main UI loop ALSO uses poll (for
+                    // input events). Faking ALL poll returns to 0 would
+                    // prevent the TWRP UI from processing input. BUT
+                    // the recovery is currently stuck BEFORE the TWRP
+                    // UI loop (in a setup/property-service poll spin).
+                    // Faking poll to 0 should let it proceed PAST the
+                    // setup loop. Once the recovery reaches the
+                    // framebuffer phase, the poll behaviour might
+                    // differ. If this fix causes a regression (the TWRP
+                    // UI can't process input), a follow-up fix can make
+                    // the fake conditional (only during the setup phase,
+                    // not the main loop).
+                    //
+                    // NOTE on the -1 sentinel: on aarch64 poll_nr is -1.
+                    // No real syscall is ever -1, so the explicit
+                    // `abi.poll_nr != -1` gate keeps the
+                    // `syscall_num == abi.poll_nr` check from spuriously
+                    // matching -1 on aarch64. Mirrors the existing
+                    // socketcall block's gate (see Task 6-Z3 comment
+                    // above) + the existing ABI_AARCH64.mknod = -1 /
+                    // .open = -1 / .access = -1 precedent.
+                    if abi.poll_nr != -1 && syscall_num == abi.poll_nr {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret > 0 {
+                            // Positive return = N fds ready — fake it to
+                            // 0 (no fds ready — timeout). Use a FRESH
+                            // ptrace_getregs so we write to the live
+                            // register state (mirrors the
+                            // compute_exit_return_value block + the
+                            // 6-Z3 socketcall fake-success block above +
+                            // the 6-W SIGSYS-handler pattern — avoids
+                            // the stale-value race).
+                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                    log(&format!(
+                                        "DIAG poll fake-success FAILED: ptrace_setregs for nr={} (ret={}): {} — child will see the positive return",
+                                        syscall_num, ret, e
+                                    ));
+                                } else {
+                                    // Log every poll fake so we can see
+                                    // the busy-wait being broken. Gated
+                                    // by loop_count to avoid log
+                                    // flooding (the spin can be 100s of
+                                    // thousands of polls/sec).
+                                    if loop_count <= 6000 {
+                                        log(&format!(
+                                            "DIAG poll fake-success: poll returned {} (fds ready) → faked to 0 (no events; stops POLLERR busy-wait from faked property_service socket)",
+                                            ret
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -9076,5 +9266,67 @@ mod tests {
         assert_ne!(syscall_name(50, &ABI_X86_64), "socketcall");
         assert_ne!(syscall_name(42, &ABI_X86_64), "socketcall");
         assert_ne!(syscall_name(43, &ABI_X86_64), "socketcall");
+    }
+
+    // ── Task 6-Z5: poll_nr per-ABI regression guards ───────────────
+    //
+    // The 6-Z5 fix fakes the poll return to 0 (no events) when the
+    // return is POSITIVE (N fds ready), so the recovery's property-
+    // service poll spin stops (the 6-Z3 socketcall fake-success
+    // masked the bind EADDRINUSE to 0, but the socket isn't actually
+    // bound → poll returns POLLERR=1 → busy-wait). The fix matches on
+    // `syscall_num == abi.poll_nr` (an ABI-aware comparison gated by
+    // `abi.poll_nr != -1`), so the per-ABI numbers MUST match the
+    // kernel's UAPI header or the fix silently misses the real
+    // syscall on the wrong ABI.
+    //
+    // Verified directly against /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h + unistd_64.h + asm-generic/unistd.h in Task 6-Z5:
+    //   i386:   __NR_poll 168
+    //   x86_64: __NR_poll   7
+    //   aarch64 (asm-generic): NO __NR_poll — poll() libc wrapper
+    //     issues ppoll under the hood; sentinel -1.
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_poll_number_matches_unistd_32_h() {
+        // i386 poll = 168 (per /usr/include/x86_64-linux-gnu/asm/
+        // unistd_32.h: __NR_poll 168, verified directly against the
+        // kernel's UAPI header in Task 6-Z5). THIS is the value that
+        // fires at runtime — TWRP recovery (an i386 binary) issues
+        // poll() as i386 syscall 168 in its property_service startup
+        // loop. The bind has been faked to 0 (Task 6-Z3) but the
+        // socket is NOT actually bound → poll returns POLLERR=1 every
+        // call → busy-wait. The 6-Z5 fix fakes the positive return to
+        // 0 to break the spin. Regression guard mirroring the existing
+        // ABI_X86_32.pause / .write / .read / .mmap2 / .socketcall_nr
+        // per-ABI number tests.
+        assert_eq!(ABI_X86_32.poll_nr, 168, "i386 poll must be 168");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_poll_number() {
+        // x86_64 poll = 7 (per /usr/include/x86_64-linux-gnu/asm/
+        // unistd_64.h: __NR_poll 7, verified directly against the
+        // kernel's UAPI header in Task 6-Z5). The host is x86_64
+        // running an i386 child, so this x86_64 number does NOT
+        // currently fire at runtime (the guest uses i386 syscall
+        // 168). Locked in for ABI completeness + so the EXIT handler's
+        // `== abi.poll_nr` comparison is correct if a future x86_64
+        // guest is ever supported. Mirrors the existing
+        // ABI_X86_64.mmap / .write / .read precedent (real values, not
+        // sentinels — x86_64 has a real __NR_poll).
+        assert_eq!(ABI_X86_64.poll_nr, 7, "x86_64 poll must be 7");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_resolves_poll_on_i386() {
+        // Verify that syscall_name() recognises poll on i386 (so the
+        // EXIT diagnostic log says "poll" instead of "[unknown]" when
+        // the recovery trips the POLLERR busy-wait). Mirrors the
+        // existing syscall_name_resolves_socketcall_on_i386 guard.
+        assert_eq!(syscall_name(168, &ABI_X86_32), "poll");
     }
 }
