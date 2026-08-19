@@ -152,7 +152,7 @@ fn ensure_parent_dir(path: &str) -> std::io::Result<()> {
 /// Internal helper: bind a `UnixListener` to `path`, removing any
 /// stale socket file first. This is the common implementation behind
 /// every public `create_*` function.
-fn bind_unix_socket(path: &str) -> std::io::Result<UnixListener> {
+pub(crate) fn bind_unix_socket(path: &str) -> std::io::Result<UnixListener> {
     ensure_parent_dir(path)?;
 
     // Remove stale socket file from a previous run. If the path is a
