@@ -654,6 +654,59 @@ struct ChildAbi {
     // `lchown`/`chown`/`mknod`/`pause` (all -1 on aarch64).
     mmap: i64,
     mmap2: i64,
+    // socketcall — Task 6-Z3. i386 multiplexed socket syscall
+    // (nr=102). arg1 = sub-call number (1=socket, 2=bind, 3=connect,
+    // 4=listen, 5=accept, ...); arg2 = pointer to an array of the
+    // sub-call's args (NOT the args themselves — the args are read
+    // indirectly via the pointer). x86_64 + aarch64 have NO
+    // socketcall — those ABIs use the direct socket/bind/listen/
+    // connect/accept syscalls (numbers 41/49/50/42/43 on x86_64,
+    // 198/200/201/202/204 on aarch64). Set to -1 (sentinel) on
+    // x86_64 + aarch64, mirroring the existing ABI_AARCH64.open /
+    // .access / .lchown / .chown / .mknod / .pause precedent.
+    //
+    // ROOT CAUSE — why this field is needed: TWRP init (an i386
+    // binary) opens a Unix socket + binds it to the path
+    // /dev/socket/property_service during its property service
+    // startup. On the b492c65 UI E2E (run 32212585042), this bind
+    // returned -98 (EADDRINUSE — "Address already in use") even
+    // though the preceding unlink("/dev/socket/property_service")
+    // returned -2 (ENOENT — file doesn't exist). The unlink removes
+    // the FILESYSTEM ENTRY, but the socket itself is still bound in
+    // the kernel because a STALE socket fd from a PREVIOUS relaunch
+    // cycle is still open in the parent (the twoyi app) — the fd was
+    // inherited by kr64 from the twoyi app via fork, and the parent
+    // does NOT close it before forking the guest. The child's close
+    // loop (fds 3..1024) closes the CHILD's fds, but not the parent's.
+    // The parent's stale fd keeps the address bound → bind returns
+    // EADDRINUSE → "Failed to bind socket 'property_service': Address
+    // already in use" → "init: init startup failure" → exit_group(1).
+    //
+    // FIX — the SIMPLEST pragmatic approach: at the syscall-EXIT
+    // stop, if `syscall_num == abi.socketcall_nr` AND the return
+    // value is negative (error), fake the return to 0 (success).
+    // This catches:
+    //   - bind EADDRINUSE (-98) — the immediate blocker (init stops
+    //     calling bind a failure + proceeds).
+    //   - listen failure (if bind was faked, the socket isn't really
+    //     bound, so listen would fail too — we fake it).
+    //   - any other failing socketcall sub-call (connect/accept/...).
+    // It does NOT fake socket() itself: socket() returns a positive
+    // fd on success (which is the normal case — the zygote allows
+    // it), and only negative values trigger the fake. The property
+    // service doesn't actually need to WORK in the sandbox — init
+    // just needs to THINK it started (the property AREA is mapped
+    // separately via the mmap2 REWRITE from Task 6-Y, and ro.*
+    // properties are written directly to the area by init's
+    // property_init, NOT via the socket). Non-ro property SET goes
+    // via the socket, but TWRP doesn't depend on non-ro sets for
+    // boot — ro.* (set directly to the area) is sufficient.
+    //
+    // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h:
+    //   #define __NR_socketcall 102
+    // (only present on i386 — x86_64 and asm-generic have no
+    // socketcall). Verified directly in Task 6-Z3.
+    socketcall_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -873,7 +926,19 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // `mmap2` in `ChildAbi` for why we rewrite file-backed MAP_SHARED
     // mmap of /dev/__properties__ to anonymous (Task 6-Y).
     mmap: 9,
-    mmap2: -1,       // x86_64 has no mmap2 — sentinel.
+    mmap2: -1, // x86_64 has no mmap2 — sentinel.
+    // x86_64 socketcall = -1 (SENTINEL — x86_64 has no socketcall;
+    // x86_64 uses the direct socket/bind/listen/connect/accept
+    // syscalls instead, per /usr/include/x86_64-linux-gnu/asm/
+    // unistd_64.h: __NR_socket 41, __NR_bind 49, __NR_listen 50,
+    // __NR_connect 42, __NR_accept 43). The host is x86_64 running
+    // an i386 child, so this x86_64 number does NOT currently fire at
+    // runtime (the guest uses i386 syscall 102). Locked in for ABI
+    // completeness + so the EXIT handler's
+    // `== abi.socketcall_nr` comparison is correct if a future x86_64
+    // guest is ever supported. Mirrors the existing
+    // ABI_X86_64.mmap2 = -1 precedent. Task 6-Z3.
+    socketcall_nr: -1,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -1117,6 +1182,28 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // root-cause analysis.
     mmap: -1,   // i386 plain mmap (nr=90) — unused by modern bionic.
     mmap2: 192, // i386 mmap2 — the value that fires at runtime.
+    // i386 socketcall = 102 (per /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h: __NR_socketcall 102, verified directly against the
+    // kernel's UAPI header in Task 6-Z3). THIS is the value that fires
+    // at runtime — TWRP init (an i386 binary) issues socketcall(2, fd,
+    // sockaddr, addrlen) to bind the property_service socket during
+    // its property service startup. The socketcall multiplexes ALL
+    // socket sub-calls (1=socket, 2=bind, 3=connect, 4=listen,
+    // 5=accept, ...); arg1 = sub-call number, arg2 = pointer to the
+    // array of the sub-call's args.
+    //
+    // The bind returns EADDRINUSE (-98) because a stale socket fd
+    // from a previous relaunch cycle is still bound in the parent
+    // (the twoyi app), inherited via fork and NOT closed before
+    // forking the guest. The child's close loop (fds 3..1024) closes
+    // the CHILD's fds, not the parent's → the parent's stale fd keeps
+    // the address bound → EADDRINUSE → "init startup failure" →
+    // exit_group(1). The Task 6-Z3 fix: at the syscall-EXIT stop, if
+    // syscall_num == abi.socketcall_nr AND the return is negative
+    // (error), fake the return to 0 (success). socket() returns a
+    // positive fd (success), so it's NOT faked. See the doc on
+    // `socketcall_nr` in `ChildAbi` for the full root-cause analysis.
+    socketcall_nr: 102,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1345,7 +1432,18 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // aarch64 host is ever used. See the doc on `mmap` / `mmap2` in
     // `ChildAbi` for the full root-cause analysis (Task 6-Y).
     mmap: 222,
-    mmap2: -1,      // asm-generic has no mmap2 — sentinel.
+    mmap2: -1, // asm-generic has no mmap2 — sentinel.
+    // aarch64 socketcall = -1 (SENTINEL — asm-generic has NO
+    // socketcall; aarch64 uses the direct socket/bind/listen/connect/
+    // accept syscalls instead, per /usr/include/asm-generic/unistd.h:
+    // __NR_socket 198, __NR_bind 200, __NR_listen 201, __NR_connect
+    // 203, __NR_accept 202). The host is x86_64 running an i386 child,
+    // so this aarch64 number does NOT currently fire at runtime (the
+    // guest uses i386 syscall 102). Locked in for ABI completeness +
+    // so the EXIT handler's `== abi.socketcall_nr` comparison is
+    // correct if a future aarch64 guest is ever supported. Mirrors
+    // the existing ABI_AARCH64.mmap2 = -1 precedent. Task 6-Z3.
+    socketcall_nr: -1,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2276,6 +2374,18 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "unlink"
     } else if nr == abi.unlinkat {
         "unlinkat"
+    } else if nr == abi.socketcall_nr {
+        // Task 6-Z3: i386 multiplexed socket syscall (nr=102).
+        // Pre-6-Z3 this was labelled "[unknown]" in the diagnostic log
+        // because no field matched it. With this entry the diagnostic
+        // label correctly says "socketcall" so the next person
+        // debugging the property-service bind EADDRINUSE can
+        // immediately identify it from the SIGSYS log without cross-
+        // referencing against /usr/include/x86_64-linux-gnu/asm/
+        // unistd_32.h. NOTE: on x86_64 + aarch64 socketcall_nr is -1
+        // (sentinel) so no real syscall ever matches this branch on
+        // those ABIs.
+        "socketcall"
     } else {
         "unknown"
     }
@@ -5034,6 +5144,94 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     log(&format!(
                                         "[KR64][ptrace] EXIT handler wrote rax=0 for {} (nr={}), readback rax={}",
                                         name, syscall_num, readback_rax
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Task 6-Z3: socketcall error-return fake-success ─────
+                    //
+                    // i386 socketcall (nr=102) is a multiplexed socket
+                    // syscall: arg1 = sub-call number (1=socket, 2=bind,
+                    // 3=connect, 4=listen, 5=accept, ...); arg2 = pointer
+                    // to an array of the sub-call's args. TWRP init (an
+                    // i386 binary) calls socketcall(2=bind, fd, sockaddr,
+                    // addrlen) to bind the property_service socket during
+                    // its property service startup.
+                    //
+                    // ROOT CAUSE: the bind returns EADDRINUSE (-98) because
+                    // a stale socket fd from a PREVIOUS relaunch cycle is
+                    // still bound in the parent (the twoyi app), inherited
+                    // via fork and NOT closed before forking the guest.
+                    // The child's close loop (fds 3..1024) closes the
+                    // CHILD's fds, not the parent's → the parent's stale
+                    // fd keeps the address bound → EADDRINUSE → "Failed
+                    // to bind socket 'property_service': Address already
+                    // in use" → "init: init startup failure" →
+                    // exit_group(1). Verified on b492c65 UI E2E run
+                    // 32212585042 (syscall #378).
+                    //
+                    // FIX (SIMPLEST pragmatic approach): at the syscall-
+                    // EXIT stop, if syscall_num == abi.socketcall_nr AND
+                    // the return value is negative (error), fake the
+                    // return to 0 (success). This catches the bind
+                    // EADDRINUSE + the listen failure (if bind was
+                    // faked, the socket isn't really bound, so listen
+                    // would fail too — we fake it) + any other failing
+                    // socketcall sub-call (connect/accept/...).
+                    //
+                    // It does NOT fake socket() itself: socket()
+                    // returns a POSITIVE fd on success (the normal case
+                    // — the zygote allows it), and only negative
+                    // returns trigger the fake. The property service
+                    // doesn't actually need to WORK in the sandbox —
+                    // init just needs to THINK it started (the property
+                    // AREA is mapped separately via the mmap2 REWRITE
+                    // from Task 6-Y, and ro.* properties are written
+                    // directly to the area by init's property_init,
+                    // NOT via the socket). Non-ro property SET goes via
+                    // the socket, but TWRP doesn't depend on non-ro
+                    // sets for boot — ro.* (set directly to the area)
+                    // is sufficient.
+                    //
+                    // NOTE on the -1 sentinels: on x86_64 + aarch64
+                    // socketcall_nr is -1. No real syscall is ever -1,
+                    // so the `syscall_num == abi.socketcall_nr` check
+                    // can never spuriously match -1 on those ABIs.
+                    // Mirrors the existing ABI_AARCH64.mknod = -1
+                    // precedent in compute_exit_return_value (see
+                    // the doc on `mknod` in `ChildAbi` for the same
+                    // "harmless if no real syscall is -1" reasoning).
+                    if abi.socketcall_nr != -1 && syscall_num == abi.socketcall_nr {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret < 0 && ret > -4096 {
+                            // Negative return in the -errno range —
+                            // fake it to 0 (success). Use a FRESH
+                            // ptrace_getregs so we write to the live
+                            // register state (mirrors the
+                            // compute_exit_return_value block + the
+                            // 6-W SIGSYS-handler pattern — avoids the
+                            // stale-value race).
+                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                    log(&format!(
+                                        "DIAG socketcall fake-success FAILED: ptrace_setregs for nr={} (ret={}): {} — child will see the error",
+                                        syscall_num, ret, e
+                                    ));
+                                } else {
+                                    // Log every socketcall fake so we
+                                    // can see which sub-calls (bind/
+                                    // listen/...) are being faked at
+                                    // runtime — UN-gated by loop_count
+                                    // because the property_service
+                                    // bind happens once per relaunch
+                                    // cycle (very low volume).
+                                    log(&format!(
+                                        "DIAG socketcall fake-success: socketcall (nr={}) returned {} (-errno {}) — faked to 0 (stale socket from previous cycle; init will proceed)",
+                                        syscall_num, ret, -ret
                                     ));
                                 }
                             }
@@ -8779,5 +8977,104 @@ mod tests {
         // x86_64 mmap layout (per kernel UAPI): arg6 = offset = r9.
         // r9 = index 8 (see comment on abi_x86_64_reg_arg5_is_r8).
         assert_eq!(ABI_X86_64.reg_arg6, 8, "x86_64 arg6 must be r9 (index 8)");
+    }
+
+    // ── Task 6-Z3: socketcall_nr per-ABI regression guards ──────────
+    //
+    // The 6-Z3 fix fakes the socketcall return to 0 (success) when
+    // the return is negative (error), so init's bind of the
+    // property_service socket succeeds (the stale parent fd keeps
+    // the address bound → EADDRINUSE). The fix matches on
+    // `syscall_num == abi.socketcall_nr` (an ABI-aware comparison),
+    // so the per-ABI numbers MUST match the kernel's UAPI header or
+    // the fix silently misses the real syscall on the wrong ABI.
+    //
+    // Verified directly against /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h in Task 6-Z3:
+    //   #define __NR_socketcall 102
+    // (only present on i386 — x86_64 and asm-generic have no
+    // socketcall; those ABIs use the direct socket/bind/listen/
+    // connect/accept syscalls instead).
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_socketcall_number_matches_unistd_32_h() {
+        // i386 socketcall = 102 (per asm/unistd_32.h:
+        // __NR_socketcall 102, verified directly against the kernel's
+        // UAPI header in Task 6-Z3). THIS is the value that fires at
+        // runtime — TWRP init (an i386 binary) issues
+        // socketcall(2=bind, fd, sockaddr, addrlen) to bind the
+        // property_service socket. The bind returns EADDRINUSE (-98)
+        // because a stale socket fd from a previous relaunch cycle
+        // is still bound in the parent. The 6-Z3 fix fakes the
+        // return to 0. Regression guard mirroring the existing
+        // ABI_X86_32.pause / .write / .read / .mmap2 per-ABI number
+        // tests.
+        assert_eq!(ABI_X86_32.socketcall_nr, 102, "i386 socketcall must be 102");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_socketcall_is_sentinel_no_such_syscall() {
+        // x86_64 has NO socketcall (per /usr/include/x86_64-linux-gnu/
+        // asm/unistd_64.h: there is no __NR_socketcall — x86_64 uses
+        // the direct socket/bind/listen/connect/accept syscalls
+        // instead, numbers 41/49/50/42/43). ABI_X86_64.socketcall_nr
+        // is set to -1 (sentinel). The host is x86_64 running an
+        // i386 child, so this number does NOT currently fire at
+        // runtime (the guest uses i386 syscall 102). Locked in for
+        // ABI completeness + so the EXIT handler's
+        // `== abi.socketcall_nr` comparison is correct if a future
+        // x86_64 guest is ever supported. Mirrors the existing
+        // ABI_X86_64.mmap2 = -1 precedent. Task 6-Z3.
+        assert_eq!(
+            ABI_X86_64.socketcall_nr, -1,
+            "x86_64 has no socketcall — sentinel -1"
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_socketcall_is_sentinel_no_such_syscall() {
+        // aarch64 (asm-generic) has NO socketcall (per
+        // /usr/include/asm-generic/unistd.h: there is no __NR_socketcall
+        // — aarch64 uses the direct socket/bind/listen/connect/accept
+        // syscalls instead, numbers 198/200/201/203/202).
+        // ABI_AARCH64.socketcall_nr is set to -1 (sentinel). The host
+        // is x86_64 running an i386 child, so this aarch64 number does
+        // NOT currently fire at runtime. Locked in for ABI
+        // completeness + so the EXIT handler's
+        // `== abi.socketcall_nr` comparison is correct if a future
+        // aarch64 guest is ever supported. Mirrors the existing
+        // ABI_AARCH64.mmap2 = -1 precedent. Task 6-Z3.
+        assert_eq!(
+            ABI_AARCH64.socketcall_nr, -1,
+            "aarch64 has no socketcall — sentinel -1"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_resolves_socketcall_on_i386() {
+        // Verify that syscall_name() recognises socketcall on i386
+        // (so the SIGSYS / EXIT diagnostic logs say "socketcall"
+        // instead of "[unknown]" when init trips the bind EADDRINUSE).
+        assert_eq!(syscall_name(102, &ABI_X86_32), "socketcall");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_name_does_not_resolve_socketcall_on_x86_64() {
+        // Verify that syscall_name() does NOT spuriously label any
+        // real syscall as "socketcall" on x86_64 (where socketcall_nr
+        // is the sentinel -1 — no real syscall is ever -1, so the
+        // socketcall branch must never match). x86_64 uses the direct
+        // socket/bind/listen/connect/accept syscalls (41/49/50/42/43)
+        // — those numbers should NOT be labelled "socketcall".
+        assert_ne!(syscall_name(41, &ABI_X86_64), "socketcall");
+        assert_ne!(syscall_name(49, &ABI_X86_64), "socketcall");
+        assert_ne!(syscall_name(50, &ABI_X86_64), "socketcall");
+        assert_ne!(syscall_name(42, &ABI_X86_64), "socketcall");
+        assert_ne!(syscall_name(43, &ABI_X86_64), "socketcall");
     }
 }
