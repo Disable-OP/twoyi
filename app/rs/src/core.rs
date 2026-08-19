@@ -25,6 +25,161 @@ use crate::renderer_bindings;
 
 static RENDERER_STARTED: AtomicBool = AtomicBool::new(false);
 
+// ──────────────────────────────────────────────────────────────────────────
+// Task 6-Z24: direct `__android_log_print` diagnostics + file-based guard.
+//
+// PROBLEM (verified on a864395 E2E): kr64 re-spawns every ~2 sec (10
+// "starting daemon with config" entries in 60s). Each re-spawn kills the
+// previous kr64 child (via the pgrep/SIGKILL below) → the recovery
+// restarts from scratch every 2 sec, never reaching the framebuffer
+// render. The `RENDERER_STARTED` AtomicBool guard SHOULD prevent
+// re-spawn, but it demonstrably doesn't (10 spawns observed) — and we
+// CAN'T see why because libtwoyi.so's `info!` (android_logger, tag
+// "CLIENT_EGL") is INVISIBLE in logcat on release builds (0 CLIENT_EGL
+// lines in the a864395 logcat), and the 6-Z23 `eprintln!` diagnostic
+// goes to stderr which is also not captured for release apps.
+//
+// FIX (two-pronged):
+//   (1) `alog!` — direct `__android_log_print` FFI call that BYPASSES
+//       the `log` crate + android_logger entirely, going straight to
+//       logd with a distinct tag ("TWOYI_DIAG"). This GUARANTEES the
+//       init_renderer call count + guard state are visible in the next
+//       E2E logcat, so we can finally see whether init_renderer is
+//       called 10× (guard failed) or 1× (different spawn path).
+//   (2) File-based PID-checked guard at the TOP of init_renderer. The
+//       `RENDERER_STARTED` Rust static resets if libtwoyi.so is reloaded
+//       (the only remaining explanation for the guard not holding). A
+//       FILE persists across library reload — so this guard is
+//       bulletproof. It stores the app PID; if the lock exists with OUR
+//       PID, we skip the kr64 spawn entirely (just update the window).
+//       This stops the pgrep-kill + re-spawn cycle so the FIRST kr64
+//       child runs uninterrupted for the full boot window → the recovery
+//       can finally progress to the framebuffer render.
+// ──────────────────────────────────────────────────────────────────────────
+
+extern "C" {
+    // Direct FFI to Android's logd. `__android_log_print` is in liblog.so,
+    // which is always loaded for Android apps (android_logger already
+    // links it). Declaring it extern "C" (no #[link]) resolves at runtime.
+    fn __android_log_print(
+        prio: libc::c_int,
+        tag: *const libc::c_char,
+        fmt: *const libc::c_char,
+        ...
+    ) -> libc::c_int;
+}
+
+/// ANDROID_LOG_INFO priority constant for `__android_log_print`.
+const ALOG_PRIO_INFO: libc::c_int = 4;
+/// ANDROID_LOG_ERROR priority constant for `__android_log_print`.
+const ALOG_PRIO_ERROR: libc::c_int = 6;
+
+/// Log a message DIRECTLY to Android logcat (logd), bypassing the `log`
+/// crate + `android_logger` (which is invisible on release builds).
+///
+/// Tag: `TWOYI_DIAG`. Priority: INFO. This is the ONLY reliable way to
+/// get a diagnostic from libtwoyi.so into logcat on a release APK —
+/// `eprintln!` goes to stderr (not captured for release) and `info!`
+/// via android_logger with tag "CLIENT_EGL" produced 0 lines in the
+/// a864395 E2E logcat (android_logger init_once appears to not take).
+///
+/// # Safety
+/// Safe wrapper — constructs CStrings + calls the FFI.
+fn alog(msg: &str) {
+    use std::ffi::CString;
+    let tag = match CString::new("TWOYI_DIAG") {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    // Replace any NUL bytes (CString::new would fail on them) so the
+    // log line is never silently dropped.
+    let sanitized: String = msg.replace('\u{0000}', "\\0");
+    let msg_c = match CString::new(sanitized) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // "%s" → the message string (no user-controlled format specifiers).
+    let fmt = match CString::new("%s") {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    unsafe {
+        __android_log_print(
+            ALOG_PRIO_INFO,
+            tag.as_ptr(),
+            fmt.as_ptr(),
+            msg_c.as_ptr(),
+        );
+    }
+}
+
+/// Log an ERROR-priority message directly to Android logcat. Same as
+/// [`alog`] but at ANDROID_LOG_ERROR priority (visible as `E` in logcat
+/// and flagged by logcat filters). Used for spawn-failure diagnostics.
+fn alog_error(msg: &str) {
+    use std::ffi::CString;
+    let tag = match CString::new("TWOYI_DIAG") {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let sanitized: String = msg.replace('\u{0000}', "\\0");
+    let msg_c = match CString::new(sanitized) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let fmt = match CString::new("%s") {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    unsafe {
+        __android_log_print(
+            ALOG_PRIO_ERROR,
+            tag.as_ptr(),
+            fmt.as_ptr(),
+            msg_c.as_ptr(),
+        );
+    }
+}
+
+/// Path to the file-based renderer-init lock. Lives in the app's private
+/// data dir (same place as kr64-app-stderr.log). The lock stores the PID
+/// of the app process that initialized the renderer.
+fn renderer_lock_path() -> String {
+    format!("{}/.renderer_init.lock", get_data_dir())
+}
+
+/// Check whether THIS app process has already initialized the renderer.
+///
+/// Returns `true` if the lock file exists AND contains the current
+/// process's PID (meaning init_renderer already ran to completion for
+/// this process). A stale lock (different, now-dead PID) is removed.
+///
+/// This is the bulletproof guard that survives libtwoyi.so reload (which
+/// resets the `RENDERER_STARTED` Rust static but NOT a file on disk).
+fn renderer_init_done_for_this_process() -> bool {
+    let lock = renderer_lock_path();
+    let my_pid = unsafe { libc::getpid() };
+    if let Ok(content) = std::fs::read_to_string(&lock) {
+        if let Ok(lock_pid) = content.trim().parse::<i32>() {
+            if lock_pid == my_pid {
+                return true; // same process already initialized
+            }
+            // Different PID — the process that wrote the lock is dead.
+            // Remove the stale lock so this process can initialize.
+            let _ = std::fs::remove_file(&lock);
+        }
+    }
+    false
+}
+
+/// Mark the renderer as initialized for THIS process (write the PID to
+/// the lock file). Called once, right after the kr64 child is spawned.
+fn mark_renderer_initialized_for_this_process() {
+    let lock = renderer_lock_path();
+    let my_pid = unsafe { libc::getpid() };
+    let _ = std::fs::write(&lock, my_pid.to_string());
+}
+
 /// When true, the next container launch passes `--boot-recovery` to
 /// kr64, booting a TWRP recovery image instead of full Android. Set
 /// from Java via `Renderer.setBootRecovery(boolean)` before
@@ -212,12 +367,41 @@ pub fn init_renderer(
     ydpi: i32,
     fps: i32,
 ) {
-    // Task 6-Z23: log to STDERR (visible in logcat) so we can see
-    // init_renderer calls + the guard state. The info! logs go to
-    // FileLogger only (not logcat). This stderr log is the only way
-    // to diagnose why kr64 is re-spawned 8 times (verified on 9c60d80
-    // E2E: 8 kr64 instances despite the RENDERER_STARTED guard).
-    eprintln!("[CORE] init_renderer called, RENDERER_STARTED={}", RENDERER_STARTED.load(Ordering::SeqCst));
+    // Task 6-Z24: file-based PID-checked guard. This is the BULLETPROOF
+    // guard that survives libtwoyi.so reload (which resets the
+    // RENDERER_STARTED Rust static — the only remaining explanation for
+    // the 10 re-spawns observed on a864395). A file on disk persists
+    // across library reload. If THIS process already initialized the
+    // renderer, skip the kr64 spawn entirely — just refresh the window.
+    // This stops the pgrep-kill + re-spawn cycle so the FIRST kr64 child
+    // runs uninterrupted for the full boot window.
+    let app_pid = unsafe { libc::getpid() };
+    alog(&format!(
+        "init_renderer called, app_pid={}, RENDERER_STARTED={}",
+        app_pid,
+        RENDERER_STARTED.load(Ordering::SeqCst)
+    ));
+    if renderer_init_done_for_this_process() {
+        alog("init_renderer: file-guard HOLDS for this PID — refreshing window only, NO kr64 spawn (Task 6-Z24)");
+        // The first kr64 child is still running (it's blocked in the
+        // ptrace loop). Just update the window so the surface is fresh.
+        unsafe {
+            renderer_bindings::setNativeWindow(window);
+            renderer_bindings::resetSubWindow(
+                window,
+                0,
+                0,
+                surface_width,
+                surface_height,
+                virtual_width,
+                virtual_height,
+                1.0,
+                0.0,
+            );
+        }
+        return;
+    }
+    alog("init_renderer: file-guard does NOT hold — proceeding with full init (first call for this PID)");
     info!("[CORE] ========================================");
     info!("[CORE] init_renderer called");
     info!(
@@ -624,9 +808,20 @@ pub fn init_renderer(
         match cmd.spawn() {
             Ok(child) => {
                 info!("[CORE] Container init spawned, PID={}", child.id());
+                alog(&format!(
+                    "kr64 child SPAWNED, child_pid={} (Task 6-Z24: this should appear EXACTLY ONCE per app session — if it appears >1×, the file-guard is also failing)",
+                    child.id()
+                ));
+                // Task 6-Z24: write the PID lock so subsequent init_renderer
+                // calls (surface recreation) skip the spawn + pgrep-kill.
+                mark_renderer_initialized_for_this_process();
             }
             Err(e) => {
                 log::error!("[CORE] FAILED to spawn container init: {}", e);
+                alog_error(&format!(
+                    "kr64 child spawn FAILED: {} (errno path; will NOT write lock so a retry can happen)",
+                    e
+                ));
                 log::error!(
                     "[CORE]   kr64_path: {} (exists: {})",
                     kr64_path,
