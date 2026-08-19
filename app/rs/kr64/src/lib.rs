@@ -4675,28 +4675,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        // TWRP BOOT: DELETE /init.partlink.rc from rootfs.
+        // TWRP BOOT: /init.partlink.rc — Task 6-Z7 fix2: DO NOT DELETE.
         //
-        // Root cause (Task 6-Z3 diagnostic): after the socketcall fake-success
-        // (b877d36) let init proceed past the bind EADDRINUSE, init tries to
-        // start the 'partlink' service (defined in /init.partlink.rc). The KLOG
-        // "could not get context while starting 'partlink'" appears, then
-        // SIGSEGV at rip=0x6f722f69 (ASCII "i/ro" — rodata-leak corruption, same
-        // pattern as 6-V's /file_contexts + 6-W's /init.firmware.rc). The
-        // partlink service (/sbin/partlink) is unnecessary in the emulator.
-        // init tolerates missing .rc files.
-        let partlink_path = format!("{}/init.partlink.rc", rootfs_prefix);
-        if std::path::Path::new(&partlink_path).exists() {
-            match std::fs::remove_file(&partlink_path) {
-                Ok(()) => info!(
-                    "[KR64] PARENT: DELETED /init.partlink.rc (partlink service — unnecessary in emulator, causes SIGSEGV at rip=0x6f722f69 after socketcall fake-success let init proceed). Task 6-Z3 diagnostic."
-                ),
-                Err(e) => info!(
-                    "[KR64] PARENT: /init.partlink.rc already absent or failed to delete: {}",
-                    e
-                ),
-            }
-        }
+        // The deletion (1efd28c) was added because the partlink service start
+        // caused SIGSEGV at rip=0x6f722f69. BUT after the minimal /file_contexts
+        // fix (5d4b8d0), init now reads file_contexts successfully + tries to
+        // open /init.partlink.rc. The ENOENT (file deleted) causes the SAME
+        // SIGSEGV at rip=0x6f722f69 (verified on 5d4b8d0 UI E2E run 32222009285:
+        // last syscall before SIGSEGV is open("/init.partlink.rc") -> -2 ENOENT).
+        //
+        // The /init.partlink.rc file is simple (no #line directive):
+        //   "on init\n    start partlink\n\nservice partlink /sbin/partlink\n    oneshot\n"
+        // It should NOT crash the parser. The original SIGSEGV (1efd28c) was
+        // likely from a different cause (the rodata-leak corruption from the
+        // SIGSYS DESYNC, which 5b4ef63 fixed). With 5b4ef63 + the minimal
+        // file_contexts, keeping /init.partlink.rc should be safe.
+        //
+        // FIX: leave /init.partlink.rc in place (no deletion). The partlink
+        // service (/sbin/partlink) may not exist in the emulator, but init
+        // tolerates missing service binaries (logs "service not found" + continues).
+        info!(
+            "[KR64] PARENT: /init.partlink.rc left in place (Task 6-Z7 fix2: deletion caused SIGSEGV at rip=0x6f722f69 via ENOENT after minimal file_contexts let init proceed; the file is simple, no #line directive, safe to keep)"
+        );
     }
 
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
