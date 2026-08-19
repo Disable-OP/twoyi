@@ -2978,6 +2978,7 @@ enum PollLoopNopPatchResult {
 /// (parent) are NOT patched (they're different loops — ueventd needs real
 /// poll for device events, parent's poll is a different context).
 #[allow(clippy::doc_lazy_continuation)]
+#[allow(dead_code)] // Task 6-Z28: call site commented out (reverted 6-Z19 NOP), kept for reference
 fn patch_twrp_init_poll_loop_nop(init_bytes: &mut [u8]) -> PollLoopNopPatchResult {
     #[cfg(target_arch = "aarch64")]
     {
