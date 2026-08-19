@@ -6951,7 +6951,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                 // those syscalls are NOT seccomp-blocked (they execute
                 // and return EPERM, handled by the EXIT handler without
                 // SIGSYS). So this risk is acceptable for now.
-                in_syscall = false;
+                //
+                // Task 6-Z12 fix: when the SIGSYS fired after PTRACE_CONT
+                // (was_ptrace_cont == true), the SIGSYS REPLACES the ENTRY
+                // stop — the next stop should be the EXIT of the
+                // seccomp-trapped syscall. So in_syscall must be TRUE
+                // (so the next SIGTRAP|0x80 is treated as EXIT). When
+                // the SIGSYS fired after PTRACE_SYSCALL (DESYNC mode on
+                // i386 compat — SIGSYS fires AFTER the EXIT stop was
+                // already handled), in_syscall must be FALSE (next stop
+                // is ENTRY of the next syscall).
+                in_syscall = was_ptrace_cont;
                 // Do NOT call PTRACE_SYSCALL here — the loop top will
                 // do it with resume_signal = 0 (already reset), which
                 // resumes the child WITHOUT forwarding the signal.
