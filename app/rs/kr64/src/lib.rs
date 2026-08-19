@@ -4698,6 +4698,56 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 partlink_path, e
             ),
         }
+
+        // Task 6-Z8: REMOVE the 'import /init.partlink.rc' + 'import /init.firmware.rc'
+        // + 'start partlink' lines from /init.rc. Even with the comment-only
+        // /init.partlink.rc (6-Z7 fix4), the parser STILL crashes (SIGSEGV at
+        // rip=0x6f722f69) after reading the file. The root cause is the init
+        // binary's .rc parser corrupting a pointer during the import processing.
+        // Removing the import lines from /init.rc means init never tries to
+        // parse /init.partlink.rc (or /init.firmware.rc) at all → no crash.
+        // The 'start partlink' line in the 'on init' section is also removed
+        // (it references the partlink service that no longer exists).
+        let init_rc_path = format!("{}/init.rc", rootfs_prefix);
+        match std::fs::read_to_string(&init_rc_path) {
+            Ok(content) => {
+                let mut new_content = String::new();
+                let mut removed_count = 0u32;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed == "import /init.partlink.rc"
+                        || trimmed == "import /init.firmware.rc"
+                        || trimmed == "start partlink"
+                    {
+                        removed_count += 1;
+                        // Skip this line (don't add to new_content).
+                        continue;
+                    }
+                    new_content.push_str(line);
+                    new_content.push('\n');
+                }
+                if removed_count > 0 {
+                    match std::fs::write(&init_rc_path, &new_content) {
+                        Ok(()) => info!(
+                            "[KR64] PARENT: REMOVED {} import/start lines from /init.rc (Task 6-Z8: 'import /init.partlink.rc', 'import /init.firmware.rc', 'start partlink' — prevents the .rc parser SIGSEGV at rip=0x6f722f69 during import processing)",
+                            removed_count
+                        ),
+                        Err(e) => warning!(
+                            "[KR64] PARENT: failed to write patched /init.rc at {}: {} (recovery may SIGSEGV at rip=0x6f722f69 during import processing)",
+                            init_rc_path, e
+                        ),
+                    }
+                } else {
+                    info!(
+                        "[KR64] PARENT: /init.rc has no partlink/firmware import lines to remove (Task 6-Z8: idempotent skip)"
+                    );
+                }
+            }
+            Err(e) => warning!(
+                "[KR64] PARENT: failed to read /init.rc for import removal: {} (recovery may SIGSEGV at rip=0x6f722f69 during import processing)",
+                e
+            ),
+        }
     }
 
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
