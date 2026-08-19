@@ -1209,22 +1209,18 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // NOTE: do NOT add `seclabel u:r:recovery:s0` here — see the
             // function-level doc comment above (Task ID 24). The host
             // kernel's SELinux policy doesn't have the recovery context,
-            // so setexeccon returns EINVAL/EPERM and aborts the service start.
+            // so setexeccon returns EINVAL and aborts the service start.
             //
-            // Task 6-Z29 added seclabel back (reasoning: the attr/exec write
-            // fake would handle setexeccon). Task 6-Z32 REVERTS this: the
-            // E2E logcat showed "init: cannot setexeccon('u:r:recovery:s0'):
-            // Permission denied" — the setexeccon fake (6-Z29) checks
-            // open_fd_paths for "attr/exec", but the setexeccon syscall on
-            // i386 TWRP init uses a DIFFERENT mechanism (security_compute_create
-            // or a direct ioctl, not a write to /proc/self/attr/exec). The
-            // seclabel aborts the service start BEFORE the fork. Removing it
-            // lets init fork the recovery service with the DEFAULT exec context
-            // (untrusted_app) — the recovery binary runs + opens fb0 + renders.
-            // (The 6-Z25 attr/current read-fake makes init think it has a
-            // privileged recovery context, so it proceeds.)
+            // Task 6-Z29: NOW adding seclabel u:r:recovery:s0 AGAIN. The
+            // setexeccon EINVAL is handled by a NEW ptrace_emu fake: writes
+            // to /proc/self/attr/exec (setexeccon's implementation) are
+            // intercepted at the EXIT + faked to return success. This bypasses
+            // both selabel_lookup (seclabel provides the context directly) AND
+            // setexeccon (ptrace fakes the write return). init can then fork
+            // the recovery service → it opens fb0 → TWRP renders.
             result.push('\n');
             result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
+            result.push_str("\n    seclabel u:r:recovery:s0");
             found = true;
         }
         // Preserve the original line ending (lines() strips \n, so we add
