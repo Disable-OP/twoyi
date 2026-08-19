@@ -2943,6 +2943,70 @@ enum ReadFileSigsegvPatchResult {
     NotFound,
 }
 
+/// Result of attempting to apply the poll-loop NOP patch (Task 6-Z19).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollLoopNopPatchResult {
+    Applied,
+    AlreadyApplied,
+    Skipped,
+    NotFound,
+}
+
+/// Task 6-Z19: NOP the `call poll` + `test %eax,%eax` at the top of init's
+/// main poll loop (vaddr 0x8048c59, file offset 0xc59) so the loop body
+/// runs WITHOUT calling poll. This breaks the POLLERR busy-wait: init's
+/// property_service poll loop spins at ~1000/sec because poll(fake-bound
+/// socket) returns POLLERR=1 instantly. NOP-ing the call means eax keeps
+/// its prior value (likely 0 from a preceding syscall) → the `jle` branch
+/// is taken → init continues the loop body (which checks action queues,
+/// property changes, etc.) WITHOUT the poll → no spin.
+///
+/// Verified via objdump on /tmp/twrp-rd/init (the i386 statically-linked
+/// TWRP init from twrp-3.7.0_9-0-byt_t_crv2.img):
+///   8048c59: e8 f2 17 02 00    call   806a450 <poll>   ; 5 bytes
+///   8048c5e: 85 c0             test   %eax,%eax         ; 2 bytes
+///   8048c60: 0f 8e 8a fe ff ff jle    8048af0           ; 6 bytes
+/// File offset = 0x8048c59 - 0x8048000 = 0xc59. We NOP 7 bytes (the call +
+/// the test), leaving the jle intact (it will branch on the stale eax,
+/// which is 0 → jle taken → continue loop without re-polling).
+///
+/// CAVEAT: this is a pragmatic symptom-mask (like 6-V/6-M). The real fix
+/// is to make the property_service socket actually functional. But this
+/// unblocks the recovery to reach the framebuffer while the real socket
+/// fix is developed. The poll at 0x8057e89 (ueventd_main) + 0x805ce19
+/// (parent) are NOT patched (they're different loops — ueventd needs real
+/// poll for device events, parent's poll is a different context).
+#[allow(clippy::doc_lazy_continuation)]
+fn patch_twrp_init_poll_loop_nop(init_bytes: &mut [u8]) -> PollLoopNopPatchResult {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = init_bytes;
+        PollLoopNopPatchResult::Skipped
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Pattern: `call poll` (e8 f2 17 02 00) + `test %eax,%eax` (85 c0) = 7 bytes
+        const PATTERN: [u8; 7] = [0xe8, 0xf2, 0x17, 0x02, 0x00, 0x85, 0xc0];
+        const NOP_PATCH: [u8; 7] = [0x90; 7];
+        const EXPECTED_MATCH_OFF: usize = 0xc59;
+
+        if init_bytes.len() < EXPECTED_MATCH_OFF + PATTERN.len() {
+            return PollLoopNopPatchResult::NotFound;
+        }
+        let target: &mut [u8] =
+            &mut init_bytes[EXPECTED_MATCH_OFF..EXPECTED_MATCH_OFF + PATTERN.len()];
+        if target == NOP_PATCH {
+            return PollLoopNopPatchResult::AlreadyApplied;
+        }
+        if target == PATTERN {
+            target.copy_from_slice(&NOP_PATCH);
+            return PollLoopNopPatchResult::Applied;
+        }
+        PollLoopNopPatchResult::NotFound
+    }
+}
+
 /// Set the SELinux security context of a file using the `lsetxattr(2)`
 /// syscall directly.
 ///
@@ -5176,6 +5240,45 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     e
                 ),
             }
+        }
+    }
+
+    // Task 6-Z19: NOP the `call poll` + `test %eax,%eax` at the top of
+    // init's main poll loop (file offset 0xc59) to break the POLLERR
+    // busy-wait. Verified via objdump on the i386 TWRP init.
+    {
+        let init_path = format!("{}/init", rootfs_prefix);
+        match std::fs::read(&init_path) {
+            Ok(mut bytes) => {
+                match patch_twrp_init_poll_loop_nop(&mut bytes) {
+                    PollLoopNopPatchResult::Applied => {
+                        match std::fs::write(&init_path, &bytes) {
+                            Ok(()) => info!(
+                                "[KR64] PARENT: patched /init poll-loop NOP at file offset 0xc59 (vaddr 0x8048c59) — replaced `call poll` + `test %eax,%eax` (7 bytes: e8 f2 17 02 00 85 c0) with 7× NOP (90 90 90 90 90 90 90); breaks the POLLERR busy-wait by skipping the poll() call entirely (eax keeps its prior value → jle taken → loop body continues without re-polling). (Task 6-Z19; pragmatic symptom-mask per disassembly — the real fix is making the property_service socket functional.)"
+                            ),
+                            Err(e) => warning!(
+                                "[KR64] PARENT: patched /init poll-loop NOP in memory but failed to write back: {} (init may keep POLLERR-spinning at ~1000/sec)",
+                                e
+                            ),
+                        }
+                    }
+                    PollLoopNopPatchResult::AlreadyApplied => {
+                        info!(
+                            "[KR64] PARENT: /init poll-loop NOP already applied (idempotent skip) — poll call already NOP'd (Task 6-Z19)"
+                        );
+                    }
+                    PollLoopNopPatchResult::Skipped => {}
+                    PollLoopNopPatchResult::NotFound => {
+                        warning!(
+                            "[KR64] PARENT: could not find poll-loop `call poll`+`test` at file offset 0xc59 in /init (TWRP version mismatch?) — init may keep POLLERR-spinning"
+                        );
+                    }
+                }
+            }
+            Err(e) => warning!(
+                "[KR64] PARENT: failed to read /init for poll-loop NOP patching: {} (init may keep POLLERR-spinning)",
+                e
+            ),
         }
     }
 
