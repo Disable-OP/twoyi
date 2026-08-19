@@ -3271,6 +3271,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     //   log is gated by `loop_count <= 200` (long past by the time
     //   xattr fires), so in practice NO double-logging occurs.
     let mut pending_xattr_fake: bool = false;
+    // Task 6-Z28: pending flag for poll() return fake. Set at the ENTRY
+    // stop (when init calls poll), consumed at the EXIT stop (fake return 0).
+    let mut pending_poll_fake: bool = false;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
     //
@@ -5051,6 +5054,28 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             // Not an intercepted syscall — let it through.
                         }
                     }
+
+                    // Task 6-Z28: poll() interception. init's main event
+                    // loop calls poll() which returns POLLERR immediately
+                    // (fake property_service socket). The 6-Z19 NOP prevented
+                    // the call entirely but caused a userspace busy-spin (no
+                    // syscalls, no sleep, no events → init stuck at #457).
+                    // NOW: let poll execute (returns POLLERR), sleep 100ms to
+                    // prevent busy-spin, set pending flag for EXIT fake.
+                    if syscall_num == abi.poll_nr {
+                        pending_poll_fake = true;
+                        // Sleep 100ms to give init timer-event processing time
+                        // + prevent the POLLERR busy-spin. The child is stopped
+                        // at the ENTRY (before poll executes) — the sleep doesn't
+                        // block the child, only the ptrace parent.
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if post_execve_syscall_count <= 500 {
+                            log(&format!(
+                                "DIAG poll ENTRY: nr={} — sleeping 100ms + will fake return 0 at EXIT (Task 6-Z28: prevents POLLERR busy-spin, gives init timer events)",
+                                syscall_num
+                            ));
+                        }
+                    }
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
@@ -5530,6 +5555,41 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     e
                                 ));
                             }
+                        }
+                    }
+
+                    // Task 6-Z28: poll() EXIT fake. The kernel's poll returned
+                    // POLLERR (1) because the property_service socket is fake.
+                    // Fake the return to 0 (timeout, no events) so init's event
+                    // loop processes the timeout + retries actions (instead of
+                    // seeing POLLERR + busy-spinning). Combined with the 100ms
+                    // sleep at the ENTRY, this gives init ~10 timer events/sec.
+                    if pending_poll_fake {
+                        pending_poll_fake = false;
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        match ptrace_getregs(pid, &mut regs2) {
+                            Ok(len) => {
+                                let original_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                match ptrace_setregs(pid, &regs2, len) {
+                                    Ok(()) => {
+                                        if post_execve_syscall_count <= 500 {
+                                            log(&format!(
+                                                "DIAG poll EXIT: faked return 0 (was {} — POLLERR) — init sees timeout, processes timer events (Task 6-Z28)",
+                                                original_ret
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => log(&format!(
+                                        "DIAG poll EXIT FAKE FAILED: ptrace_setregs: {} — init sees POLLERR, may busy-spin",
+                                        e
+                                    )),
+                                }
+                            }
+                            Err(e) => log(&format!(
+                                "DIAG poll EXIT: ptrace_getregs FAILED: {} — cannot fake return",
+                                e
+                            )),
                         }
                     }
 
