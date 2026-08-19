@@ -1210,8 +1210,17 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // function-level doc comment above (Task ID 24). The host
             // kernel's SELinux policy doesn't have the recovery context,
             // so setexeccon returns EINVAL and aborts the service start.
+            //
+            // Task 6-Z29: NOW adding seclabel u:r:recovery:s0 AGAIN. The
+            // setexeccon EINVAL is handled by a NEW ptrace_emu fake: writes
+            // to /proc/self/attr/exec (setexeccon's implementation) are
+            // intercepted at the EXIT + faked to return success. This bypasses
+            // both selabel_lookup (seclabel provides the context directly) AND
+            // setexeccon (ptrace fakes the write return). init can then fork
+            // the recovery service → it opens fb0 → TWRP renders.
             result.push('\n');
             result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
+            result.push_str("\n    seclabel u:r:recovery:s0");
             found = true;
         }
         // Preserve the original line ending (lines() strips \n, so we add

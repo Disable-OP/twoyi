@@ -5269,6 +5269,49 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         }
                     }
 
+                    // Task 6-Z29: fake setexeccon (write to /proc/self/attr/exec).
+                    // init's Service::Start() calls setexeccon(seclabel) which is
+                    // implemented as write(fd, context, len) to /proc/self/attr/exec.
+                    // The kernel rejects the write (EINVAL — context not in loaded
+                    // policy, or EPERM — untrusted_app lacks MAC_ADMIN). This
+                    // aborts the service start → recovery service never forks.
+                    // FIX: if the write fd was opened from an attr/exec path AND
+                    // the write failed (ret < 0), fake the return to the write
+                    // count (success). init thinks setexeccon succeeded → forks
+                    // the recovery service → TWRP renders.
+                    if past_first_execve && syscall_num == abi.write {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret < 0 {
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            if let Some(path) = open_fd_paths.get(&fd) {
+                                if path.contains("attr/exec") {
+                                    let count = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                    let fake_ret = if count > 0 { count } else { 0 };
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    match ptrace_getregs(pid, &mut regs2) {
+                                        Ok(len) => {
+                                            set_syscall_ret(&mut regs2, &abi, fake_ret);
+                                            match ptrace_setregs(pid, &regs2, len) {
+                                                Ok(()) => log(&format!(
+                                                    "DIAG attr/exec: faked setexeccon write success (ret {}->{}) — init thinks context was set, will fork recovery service (Task 6-Z29)",
+                                                    ret, fake_ret
+                                                )),
+                                                Err(e) => log(&format!(
+                                                    "DIAG attr/exec: ptrace_setregs FAILED: {} — setexeccon fails, service start aborts",
+                                                    e
+                                                )),
+                                            }
+                                        }
+                                        Err(e) => log(&format!(
+                                            "DIAG attr/exec: ptrace_getregs FAILED: {}",
+                                            e
+                                        )),
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Task 6-V Part C — read(fd, buf, count) EXIT:
                     // capture the buffer contents and log them. Mirrors
                     // the 6-U write() diagnostic above. Gated to the
