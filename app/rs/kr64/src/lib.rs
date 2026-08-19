@@ -1663,35 +1663,68 @@ fn patch_property_contexts_delete(rootfs_prefix: &str) {
 /// logcat: /file_contexts + /file_contexts.homedirs + /file_contexts.local).
 /// Idempotent (no-op if already missing). Non-fatal on failure (logs + continues).
 fn patch_file_contexts_delete(rootfs_prefix: &str) {
-    // The 3 file_contexts variants the recovery opens (verified in the
-    // 476446f UI E2E logcat path logs: "intercepted open(/file_contexts)" +
-    // "/file_contexts.homedirs" + "/file_contexts.local").
-    let files = [
-        "file_contexts",
-        "file_contexts.homedirs",
-        "file_contexts.local",
-    ];
-    for fname in &files {
+    // Task 6-Z7: REPLACE /file_contexts with a MINIMAL version (no #line
+    // directive) instead of DELETING it. The deletion (6-V) fixed the
+    // SIGSEGV (the #line directive crashed the parser), but the ABSENCE
+    // prevents init from looking up the SELinux context for /sbin/recovery
+    // → "could not get context while starting 'recovery'" → init can't
+    // start the recovery service → no TWRP UI (verified on 8857048 UI E2E
+    // run 32220797873).
+    //
+    // The MINIMAL file_contexts provides the essential entries init needs
+    // (especially `/sbin(/.*)? u:object_r:rootfs:s0` for the recovery
+    // service) WITHOUT the `#line 1 "external/sepolicy/file_contexts"`
+    // directive that crashes the parser. The parser processes the minimal
+    // file successfully → init gets the context for /sbin/recovery → init
+    // starts the recovery service → TWRP UI boots.
+    //
+    // The .homedirs + .local variants are still DELETED (they don't contain
+    // essential entries + their absence is harmless).
+    let minimal_file_contexts = "# Minimal file_contexts (Task 6-Z7: no #line directive)
+/sbin(/.*)?             u:object_r:rootfs:s0
+/init                   u:object_r:rootfs:s0
+/charger                u:object_r:rootfs:s0
+/file_contexts          u:object_r:rootfs:s0
+/property_contexts      u:object_r:rootfs:s0
+/sepolicy               u:object_r:rootfs:s0
+/system(/.*)?           u:object_r:system_file:s0
+/vendor(/.*)?           u:object_r:system_file:s0
+/data(/.*)?             u:object_r:system_data_file:s0
+/dev(/.*)?              u:object_r:device:s0
+/proc(/.*)?             u:object_r:proc:s0
+/sys(/.*)?              u:object_r:sysfs:s0
+";
+
+    // Replace /file_contexts with the minimal version.
+    let fc_path = format!("{}/file_contexts", rootfs_prefix);
+    let (prior_len, prior_first_line): (usize, String) = match std::fs::read_to_string(&fc_path) {
+        Ok(c) => (c.len(), c.lines().next().unwrap_or("").to_string()),
+        Err(_) => (0, String::new()),
+    };
+    match std::fs::write(&fc_path, minimal_file_contexts) {
+        Ok(()) => info!(
+            "[KR64] PARENT: REPLACED /file_contexts with minimal version (was {} bytes, first line: {:?}, now {} bytes — no #line directive, provides /sbin context for recovery service start). Task 6-Z7: fixes 'could not get context while starting recovery' (8857048 UI E2E).",
+            prior_len, prior_first_line, minimal_file_contexts.len()
+        ),
+        Err(e) => warning!(
+            "[KR64] PARENT: failed to REPLACE /file_contexts at {}: {} (recovery may SIGSEGV at rip=0x8052f65 if the original #line directive is parsed, OR fail to start the recovery service if the file is absent)",
+            fc_path, e
+        ),
+    }
+
+    // Delete the .homedirs + .local variants (not essential).
+    for fname in &["file_contexts.homedirs", "file_contexts.local"] {
         let path = format!("{}/{}", rootfs_prefix, fname);
         if !std::path::Path::new(&path).exists() {
-            info!(
-                "[KR64] PARENT: /{} already absent at {} (idempotent skip — caller will get -ENOENT on open)",
-                fname, path
-            );
             continue;
         }
-        // Read size + first line for diagnostic logging (matches 6-O's pattern).
-        let (prior_len, prior_first_line): (usize, String) = match std::fs::read_to_string(&path) {
-            Ok(c) => (c.len(), c.lines().next().unwrap_or("").to_string()),
-            Err(_) => (0, String::new()),
-        };
         match std::fs::remove_file(&path) {
             Ok(()) => info!(
-                "[KR64] PARENT: DELETED /{} — was {} bytes (first line: {:?}), now absent. recovery's open() will return -ENOENT → caller skips this context file → file_contexts parser never invoked → no buffer overflow → no corrupted std::string this-pointer → no SIGSEGV at rip=0x8052f65 (Task 6-V). SELinux file labeling disabled in sandbox (non-fatal for TWRP boot).",
-                fname, prior_len, prior_first_line
+                "[KR64] PARENT: DELETED /{} (not essential — no #line directive issue, but not needed for TWRP boot). Task 6-Z7.",
+                fname
             ),
             Err(e) => warning!(
-                "[KR64] PARENT: failed to DELETE /{} at {}: {} (recovery may open it and SIGSEGV at rip=0x8052f65 with si_addr=0x696e692f — '/ini' corrupted std::string this-pointer from file_contexts parser buffer overflow)",
+                "[KR64] PARENT: failed to DELETE /{} at {}: {}",
                 fname, path, e
             ),
         }
