@@ -3181,6 +3181,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     info!("[KR64] starting daemon with config: {:?}", cfg);
+    // Task 6-Z24: log the kr64 child's OWN pid so the FileLogger tee
+    // surfaces it in logcat. This distinguishes "10 separate kr64
+    // children (10 different PIDs = re-spawn)" from "1 kr64 child
+    // re-execve'ing itself (same PID = re-execve)". On a864395 the
+    // "same PID 3988" in logcat was the tee thread (app PID), not kr64's
+    // PID — so we never knew kr64's actual PID. This fixes that.
+    info!(
+        "[KR64] run() entered, kr64 child pid={}, parent_pid={}",
+        unsafe { libc::getpid() },
+        unsafe { libc::getppid() }
+    );
 
     // ---------------------------------------------------------------
     // Step 1.5: reap leftover zombie children from a previous run.
