@@ -480,10 +480,14 @@ struct ChildAbi {
     //
     // pause() is NOT added to compute_exit_return_value's fake-
     // success list — it returns -ENOSYS, not 0, via a dedicated branch
-    // in the SIGSYS handler. This means 6-C's should_skip_sigsys_setregs
-    // does NOT skip the SIGSYS handler's setregs for pause (the skip
-    // fires only for syscalls in the fake-success list — pause isn't
-    // in it) → the SIGSYS handler's setregs MUST fire to write -ENOSYS.
+    // in the SIGSYS handler. Historically (6-C) this meant
+    // `should_skip_sigsys_setregs` did NOT skip the SIGSYS handler's
+    // setregs for pause (the skip fired only for syscalls in the fake-
+    // success list — pause isn't in it) → the SIGSYS handler's setregs
+    // fired to write -ENOSYS. Under 6-W, `should_skip_sigsys_setregs`
+    // ALWAYS returns false (never skip) — so the setregs fires for
+    // pause unconditionally now (see the function's doc comment for
+    // the 5-J → 6-C → 6-W evolution).
     //
     // The per-ABI numbers (verified against the kernel's UAPI headers
     // in Task 6-D):
@@ -1773,13 +1777,9 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
 }
 
 /// Decide whether the SIGSYS handler should skip its `ptrace_setregs`
-/// call. Task 5-J.
+/// call. **Task 6-W: ALWAYS returns `false` (never skip).**
 ///
-/// Returns `true` when the SIGSYS fires AFTER the EXIT handler has
-/// already written rax=0 — the "DESYNC" case where `in_syscall` was
-/// false at SIGSYS entry.
-///
-/// # Background — the DESYNC register-writeback race
+/// # Background — the historical DESYNC register-writeback race
 ///
 /// On i386 compat (and on some kernels for x86_64 too), the kernel
 /// delivers the ptrace stops for a seccomp-trapped syscall in this
@@ -1797,92 +1797,84 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
 /// Both the EXIT handler (step 2) and the SIGSYS handler (step 3)
 /// call `ptrace_setregs` to write rax=0 for the faked-success syscalls
 /// in `compute_exit_return_value`. The two writebacks are *intended*
-/// to be redundant (belt-and-suspenders). However, in the DESYNC case
-/// the SIGSYS handler fires AFTER the EXIT handler, and its
-/// `ptrace_setregs` writes the WHOLE `user_regs_struct` back —
-/// including fields the kernel may have re-snapshotted from its
-/// signal-delivery-stop setup. If the kernel re-snapshotted rax from
-/// `syscall_rollback` (which sets `rax = orig_rax` = the syscall
-/// number, e.g. 15 for i386 chmod), the SIGSYS handler's `getregs`
-/// reads rax=15 and its subsequent `setregs` writes the whole struct
-/// back — *with `set_syscall_ret` having set rax=0*, but if the
-/// kernel's signal-delivery-stop register writeback races with our
-/// `setregs`, the child can end up resuming with rax=15 (the syscall
-/// number), NOT rax=0. TWRP init then takes the chmod-error path and
-/// dereferences NULL+0x90 → SIGSEGV at rip=0x809255d (5-H's finding,
-/// 9 crashes all at iter 216).
+/// to be redundant (belt-and-suspenders). 5-J observed that in the
+/// DESYNC case the SIGSYS handler's whole-struct `setregs` COULD race
+/// with the kernel's signal-delivery-stop register snapshotting: if
+/// the kernel re-snapshotted rax from `syscall_rollback`
+/// (rax=orig_rax=syscall number), the child could resume with rax=15
+/// (i386 chmod) instead of rax=0 → SIGSEGV at rip=0x809255d.
 ///
-/// # The fix
+/// # The 5-J fix (now REVERTED by 6-W)
 ///
-/// In the DESYNC case (`in_syscall == false` at SIGSYS entry — meaning
-/// the EXIT handler already ran and wrote rax=0), the SIGSYS handler
-/// SKIPS its `ptrace_setregs` call. The EXIT handler's rax=0 is the
-/// final value the child sees on resume. The SIGSYS handler still:
-///   - performs the fs op in the rootfs (for mount/mkdir),
-///   - logs the intercept,
-///   - records the syscall in the rolling buffers,
-///   - sets `in_syscall = false` (so the next stop is treated as
-///     ENTRY of the next syscall).
+/// 5-J's fix: in DESYNC mode (`in_syscall == false` at SIGSYS entry),
+/// the SIGSYS handler SKIPPED its `ptrace_setregs` call entirely. The
+/// EXIT handler's rax=0 was meant to be the final value the child
+/// sees on resume. 6-C refined this: the skip fired ONLY for syscalls
+/// in `compute_exit_return_value`'s fake-success list (so shmget's
+/// -ENOSYS writeback still executed).
 ///
-/// In the NORMAL case (`in_syscall == true` at SIGSYS entry — SIGSYS
-/// fired BETWEEN ENTRY and EXIT, the typical kernel ordering for
-/// non-compat children), the SIGSYS handler DOES call `ptrace_setregs`
-/// because the EXIT handler has NOT yet run — the SIGSYS handler's
-/// writeback is the only one.
+/// # Why 6-W reverts the skip — the rodata-leak SIGSEGV
 ///
-/// # Why this is safe
+/// The skip left the signal frame's registers in whatever state the
+/// kernel's signal-delivery setup left them. In the iter-826 UI E2E
+/// run (post-6-V's NOP at 0xaf65), the SIGSEGV immediately
+/// re-manifested at `rip=0x6f722f69` (ASCII "i/ro" — a rodata
+/// pointer leaked into a control-flow register). 6-V's NOP patched
+/// ONE crash site (the `*arg2 = readcount` store at 0x8052f65), but
+/// the SAME root cause — garbage rodata bytes leaking into a register
+/// used as a jump/call target — immediately re-appeared at a
+/// DIFFERENT rip. Masking one site does NOT fix the underlying
+/// register-corruption race.
 ///
-/// `compute_exit_return_value` is consulted by BOTH the EXIT handler
-/// (at line ~2434) and the SIGSYS handler's "fchown/fchmod/capget/
-/// ioprio_get/ioprio_set/lchown/chown/fchmodat/fchownat" branch
-/// (which mirrors the same set). For chmod + mount specifically, the
-/// SIGSYS "mount/mkdir/chmod/chroot/unshare" branch ALSO returns 0,
-/// AND chmod + mount are in `compute_exit_return_value` (mount was
-/// added in Task 5-T). So in DESYNC mode the EXIT handler has
-/// ALREADY written rax=0 for every faked-success syscall that the
-/// SIGSYS handler would also write rax=0 for — the SIGSYS handler's
-/// `setregs` is genuinely redundant in this case. Skipping it cannot
-/// leave rax non-zero (the EXIT handler wrote 0). It only AVOIDS the
-/// race where the SIGSYS handler's whole-struct `setregs` clobbers
-/// the EXIT handler's rax=0 with a kernel-re-snapshotted value.
+/// # The 6-W fix — ALWAYS do a fresh getregs + setregs
 ///
-/// # Task 6-C refinement — do NOT skip for non-fake-success syscalls
+/// 6-W: **never skip**. In DESYNC mode the SIGSYS handler now does a
+/// FRESH `ptrace_getregs` (re-reading the CURRENT post-signal-
+/// delivery register state — NOT the stale pre-EXIT values that
+/// motivated 5-J's skip), then `set_syscall_ret(rax=ret_val)`, then
+/// `ptrace_setregs`. The fresh getregs reads the live register state
+/// (the child is stopped, so registers are stable), avoiding the
+/// stale-value race. The setregs writes rax=ret_val to the signal
+/// frame so sigreturn restores it correctly. It ALSO re-writes the
+/// OTHER registers with their current values, preventing the
+/// rodata-leak SIGSEGV that the skip was causing.
 ///
-/// 5-J's original implementation was a pure negation of
-/// `in_syscall_at_sigsys`: `!in_syscall_at_sigsys`. That fired
-/// unconditionally in DESYNC mode for EVERY syscall, including the
-/// SysV shared-memory syscalls (shmget/shmat/shmctl) whose return
-/// value the SIGSYS handler writes as -ENOSYS (-38) — NOT 0. Those
-/// syscalls are NOT in `compute_exit_return_value`'s fake-success
-/// list (it returns `None`, not `Some(0)`), so in DESYNC mode the
-/// EXIT handler does NOT write rax for them either. With 5-J's
-/// unconditional skip, the SIGSYS handler's `ptrace_setregs` was
-/// ALSO skipped → rax was left untouched → the child resumed with
-/// the kernel's leaked syscall-number value in rax (e.g. 395 for
-/// i386 shmget, post-6-C) → init saw a POSITIVE "shmid" → tried to
-/// use it → failed → retried shmget forever (790k+ calls/sec). The
-/// post-e6d85e1 UI E2E blocker. (Pre-6-C the same symptom manifested
-/// with rax=29 — the WRONG i386 shmget number — because the SIGSYS
-/// handler thought the guest's `pause()` syscall (nr=29) was
-/// shmget.)
+/// In NORMAL mode (`in_syscall == true` at SIGSYS entry), the
+/// existing flow is unchanged: the SIGSYS-entry `ptrace_getregs`
+/// (line ~4667) already read the current state, `set_syscall_ret`
+/// set rax, and `ptrace_setregs` writes it back. No fresh getregs
+/// is needed in NORMAL mode (the SIGSYS-entry read IS already
+/// current).
 ///
-/// The fix: the skip fires ONLY when the syscall is in
-/// `compute_exit_return_value`'s fake-success list (returns
-/// `Some(_)`). For syscalls NOT in that list (e.g. shmget, which
-/// returns -ENOSYS via the SIGSYS handler), the skip must NOT fire —
-/// the SIGSYS handler's `setregs` is the ONLY writeback and MUST
-/// execute to write the non-zero return value.
-fn should_skip_sigsys_setregs(in_syscall_at_sigsys: bool, syscall_nr: i64, abi: &ChildAbi) -> bool {
-    // DESYNC = SIGSYS fired AFTER the EXIT handler. The SIGSYS
-    // handler's setregs is redundant (the EXIT handler already wrote
-    // rax=0) AND potentially racy with the kernel's signal-delivery-
-    // stop register snapshotting — BUT ONLY for syscalls in
-    // `compute_exit_return_value`'s fake-success list, because only
-    // those have rax written by the EXIT handler. For other syscalls
-    // (e.g. shmget, which the SIGSYS handler returns -ENOSYS for), the
-    // EXIT handler did NOT write rax, so the SIGSYS handler's setregs
-    // is the ONLY writeback and MUST fire (Task 6-C).
-    !in_syscall_at_sigsys && compute_exit_return_value(syscall_nr, abi).is_some()
+/// # Why this function still exists (instead of being deleted)
+///
+/// The function is kept (always returning `false`) so the existing
+/// call site and unit tests compile. The signature is preserved so
+/// future investigation can re-enable a conditional skip if a NEW
+/// race is discovered (the function would then return `true` again
+/// under whatever new condition is identified). The historical
+/// doc above is retained so the next investigator understands the
+/// full 5-J → 6-C → 6-W evolution.
+#[allow(dead_code)] // Kept as a testable contract — see the doc comment.
+fn should_skip_sigsys_setregs(
+    _in_syscall_at_sigsys: bool,
+    _syscall_nr: i64,
+    _abi: &ChildAbi,
+) -> bool {
+    // 6-W: NEVER skip the SIGSYS handler's ptrace_setregs. The 5-J/6-C
+    // skip caused the iter-826 SIGSEGV at rip=0x6f722f69 ("i/ro" rodata
+    // leak) — see the function's doc comment for the full root-cause
+    // analysis. The SIGSYS handler now ALWAYS does a fresh
+    // ptrace_getregs → set_syscall_ret(rax=ret_val) → ptrace_setregs
+    // in DESYNC mode (handled at the call site, NOT here).
+    //
+    // This function is kept (always returning false) so the unit tests
+    // can pin the 6-W contract ("never skip") as a regression guard.
+    // The SIGSYS handler no longer calls this function — it
+    // unconditionally does the fresh getregs + setregs in DESYNC mode.
+    // If a future change re-introduces a conditional skip, restore the
+    // call site AND update this function's body (and the tests).
+    false
 }
 
 /// The return value the SIGSYS handler writes for pause() (Task 6-E).
@@ -4646,18 +4638,30 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                 // comment on `last_sigsys_nr` / `sigsys_repeat_count`
                 // at the top of `run_ptrace_loop` for the full
                 // rationale.
-                // 5-J: capture the in_syscall state at SIGSYS entry for
-                // `should_skip_sigsys_setregs`. `in_syscall` is true when
-                // SIGSYS fires BETWEEN ENTRY and EXIT (normal — SIGSYS
-                // replaces the syscall-exit-stop). It is false when SIGSYS
-                // fires AFTER the EXIT stop (DESYNC — the kernel delivered
-                // ENTRY→EXIT→SIGSYS for a single seccomp-trapped syscall,
-                // which is the order 5-H's log evidence shows for i386
-                // compat chmod nr=15). In the DESYNC case the EXIT handler
-                // has ALREADY written rax=0 for the faked-success syscalls
-                // (compute_exit_return_value), so the SIGSYS handler's
-                // ptrace_setregs is redundant AND potentially racy — see
-                // `should_skip_sigsys_setregs` for the full rationale.
+                // Capture the in_syscall state at SIGSYS entry. 6-W uses
+                // this to decide whether to do a FRESH `ptrace_getregs`
+                // before setregs (DESYNC mode → fresh getregs; NORMAL mode
+                // → no fresh getregs needed — the SIGSYS-entry getregs
+                // below is already current).
+                //
+                // `in_syscall` is true when SIGSYS fires BETWEEN ENTRY and
+                // EXIT (normal — SIGSYS replaces the syscall-exit-stop). It
+                // is false when SIGSYS fires AFTER the EXIT stop (DESYNC —
+                // the kernel delivered ENTRY→EXIT→SIGSYS for a single
+                // seccomp-trapped syscall, which is the order 5-H's log
+                // evidence shows for i386 compat chmod nr=15).
+                //
+                // Historical context (5-J/6-C): this was originally
+                // captured for `should_skip_sigsys_setregs`, which (in
+                // DESYNC mode) caused the SIGSYS handler to SKIP its
+                // `ptrace_setregs` call. 6-W REVERTED that skip (it caused
+                // the iter-826 rodata-leak SIGSEGV at rip=0x6f722f69) —
+                // see `should_skip_sigsys_setregs` for the full 5-J → 6-C
+                // → 6-W evolution. The variable is still captured (and
+                // still gates the fresh-getregs branch below) because the
+                // DESYNC vs NORMAL distinction is still meaningful for
+                // deciding whether a fresh getregs is needed.
+                //
                 // Captured early (rather than reading `in_syscall` at the
                 // setregs call site) to make the DESYNC decision explicit
                 // and robust against any future code that mutates
@@ -4782,7 +4786,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             if in_syscall_at_sigsys {
                                 " (normal — SIGSYS fired between ENTRY and EXIT)"
                             } else {
-                                " (DESYNC — SIGSYS fired AFTER EXIT stop; EXIT handler already wrote rax=0; SIGSYS setregs will be skipped per should_skip_sigsys_setregs)"
+                                " (DESYNC — SIGSYS fired AFTER EXIT stop; 6-W fix: fresh ptrace_getregs + ptrace_setregs will run so rax=ret_val is written AND other registers are re-written with current values, preventing the rodata-leak SIGSEGV that the 5-J skip caused)"
                             }
                         ));
 
@@ -5287,18 +5291,27 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             // compute_exit_return_value's fake-success
                             // list — it returns -ENOSYS via this
                             // dedicated branch, not 0 via the EXIT
-                            // handler. This means 6-C's
-                            // should_skip_sigsys_setregs (which
-                            // requires `compute_exit_return_value(
-                            // ...).is_some()`) does NOT skip the
+                            // handler. Historically (6-C) this meant
+                            // `should_skip_sigsys_setregs` (which
+                            // required `compute_exit_return_value(
+                            // ...).is_some()`) did NOT skip the
                             // SIGSYS handler's setregs for pause →
-                            // the setregs MUST fire to write -ENOSYS.
+                            // the setregs fired to write -ENOSYS.
                             // (Pre-6-C the skip fired unconditionally
                             // in DESYNC mode → pause's -ENOSYS would
                             // never have been written even if this
                             // branch existed. 6-C's fix made this
                             // branch's setregs actually reachable in
                             // DESYNC mode.)
+                            //
+                            // 6-W UPDATE: `should_skip_sigsys_setregs`
+                            // now ALWAYS returns false (never skip) —
+                            // see its doc comment. The setregs fires for
+                            // pause under 6-W because it ALWAYS fires
+                            // (the skip is fully reverted), not because
+                            // of the 6-C `compute_exit_return_value`
+                            // condition. The 6-C historical reasoning
+                            // above is retained for context.
                             //
                             // Task 6-G: after PAUSE_TIMEOUT_THRESHOLD
                             // (50) consecutive pause() SIGSYS calls,
@@ -5344,133 +5357,100 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // Force the return value. The child will see the
                         // (blocked) syscall as having returned `ret_val`.
                         //
-                        // 5-J: in DESYNC mode (SIGSYS fired AFTER the EXIT
-                        // stop — `in_syscall` was false at SIGSYS entry),
-                        // the EXIT handler has ALREADY written rax=0 for
-                        // every faked-success syscall (compute_exit_return_value
-                        // is consulted by BOTH handlers). Calling
-                        // ptrace_setregs here would write the WHOLE
-                        // user_regs_struct back — including fields the
-                        // kernel may have re-snapshotted from
-                        // `syscall_rollback` (which sets rax = orig_rax =
-                        // the syscall number, e.g. 15 for i386 chmod).
-                        // Although set_syscall_ret explicitly sets rax=0
-                        // in the buffer, on some kernels the
-                        // signal-delivery-stop register writeback races
-                        // with our setregs, leaving the child resuming
-                        // with rax=15 instead of rax=0. TWRP init then
-                        // takes the chmod-error path and dereferences
-                        // NULL+0x90 → SIGSEGV at rip=0x809255d.
+                        // Task 6-W: ALWAYS do `ptrace_getregs →
+                        // set_syscall_ret(rax=ret_val) → ptrace_setregs`.
+                        // Never skip (the 5-J/6-C skip is reverted —
+                        // `should_skip_sigsys_setregs` now always returns
+                        // false). See the doc on
+                        // `should_skip_sigsys_setregs` for the full
+                        // 5-J → 6-C → 6-W evolution and root-cause
+                        // analysis of the iter-826 SIGSEGV at
+                        // rip=0x6f722f69 ("i/ro" rodata leak).
                         //
-                        // The fix: in DESYNC mode, SKIP the setregs
-                        // call. The EXIT handler's rax=0 is the final
-                        // value the child sees. This is safe because:
-                        //   - chmod/lchown/chown/fchmodat/fchownat/
-                        //     fchown/fchmod/capget/ioprio_get/ioprio_set
-                        //     are all covered by BOTH
-                        //     compute_exit_return_value (EXIT handler)
-                        //     and the SIGSYS handler's explicit `||`
-                        //     chains — the EXIT handler ALWAYS runs
-                        //     first in DESYNC mode.
-                        //   - mount/mkdir/chmod/chroot/unshare/mknod all
-                        //     return 0 in the SIGSYS handler. chmod + mount
-                        //     + mknod are ALSO in compute_exit_return_value
-                        //     (mount added in Task 5-T, mknod added in
-                        //     Task 5-X — see the doc on
-                        //     `compute_exit_return_value`), so in DESYNC
-                        //     mode the EXIT handler DID write rax=0 for
-                        //     them. mkdir/chroot/unshare are NOT in
-                        //     compute_exit_return_value, so in DESYNC
-                        //     mode the EXIT handler didn't write rax for
-                        //     them either — skipping setregs leaves the
-                        //     kernel's value untouched (same as the
-                        //     previous behaviour for those syscalls in
-                        //     DESYNC mode).
-                        //   - shmget/shmat/shmctl return -ENOSYS in the
-                        //     SIGSYS handler. These are NOT in
-                        //     compute_exit_return_value, so the EXIT
-                        //     handler doesn't touch rax for them. In
-                        //     DESYNC mode, skipping setregs leaves the
-                        //     kernel's rax (syscall_rollback's
-                        //     rax=orig_rax = syscall number, or -ENOSYS
-                        //     on kernels that set -ENOSYS). This is the
-                        //     SAME behaviour as before for these
-                        //     syscalls in DESYNC mode — we are not
-                        //     regressing them. (If a future bug shows
-                        //     these need -ENOSYS at runtime in DESYNC
-                        //     mode, add them to
-                        //     compute_exit_return_value.)
-                        //   - pause returns -ENOSYS (Task 6-E, was
-                        //     -EINTR in 6-D commit 2b073f8) via a
-                        //     dedicated SIGSYS handler branch (NOT in
-                        //     compute_exit_return_value — pause has
-                        //     its OWN non-zero return value, like
-                        //     shmget's -ENOSYS). Same reasoning as
-                        //     shmget: the SIGSYS handler's setregs is
-                        //     the ONLY writeback and MUST fire (6-C's
-                        //     should_skip_sigsys_setregs requires
-                        //     compute_exit_return_value(...).is_some(),
-                        //     which is None for pause → skip does NOT
-                        //     fire → setregs fires → -ENOSYS is
-                        //     written). Returning 0 (the pre-6-D
-                        //     default) caused the post-6-C infinite
-                        //     pause() retry loop (1M+ calls on commit
-                        //     368f59b) because init interpreted 0 as
-                        //     "pause completed WITHOUT a signal" →
-                        //     re-checked its condition (property
-                        //     service still not ready) → retried
-                        //     pause forever. Returning -EINTR (6-D
-                        //     commit 2b073f8) ALSO failed: init's
-                        //     "interrupted by a signal" → check +
-                        //     retry path loops forever because the
-                        //     property service never signals readiness
-                        //     (kr64 has no property service). -ENOSYS
-                        //     makes init fall back to a non-pause wait
-                        //     (mirrors shmget's -ENOSYS fallback).
+                        // In DESYNC mode (`in_syscall_at_sigsys == false`
+                        // — SIGSYS fired AFTER the EXIT stop), the
+                        // `sigsys_regs` buffer read at SIGSYS entry
+                        // (line ~4667) reflects the registers AT SIGSYS
+                        // time, which is AFTER the EXIT handler's setregs
+                        // but BEFORE the kernel's signal-delivery-stop
+                        // fully commits the signal frame. To be
+                        // MAXIMALLY defensive against any kernel-side
+                        // register mutation between the SIGSYS-entry
+                        // getregs and our setregs (e.g. the kernel
+                        // finalising signal-frame setup), we do a FRESH
+                        // `ptrace_getregs` here in DESYNC mode and
+                        // re-apply `set_syscall_ret`. The fresh getregs
+                        // reads the CURRENT register state (the child is
+                        // stopped — registers are stable while we hold
+                        // the ptrace stop), so we are NOT writing back
+                        // stale pre-EXIT values (which was the race 5-J
+                        // originally worried about and tried to avoid by
+                        // skipping setregs entirely). The subsequent
+                        // `ptrace_setregs` writes rax=ret_val to the
+                        // signal frame so sigreturn restores it
+                        // correctly, AND re-writes the OTHER registers
+                        // with their current values (preventing the
+                        // rodata-leak SIGSEGV that the skip caused).
                         //
-                        // `set_syscall_ret` is still called on
-                        // `sigsys_regs` so the readback log below can
-                        // report what we WOULD have written.
+                        // In NORMAL mode (`in_syscall_at_sigsys == true`
+                        // — SIGSYS fired BETWEEN ENTRY and EXIT, the
+                        // typical kernel ordering for non-compat
+                        // children), the SIGSYS-entry getregs at line
+                        // ~4667 already read the current state (SIGSYS
+                        // just fired — there is no earlier stop whose
+                        // register writeback could race). No fresh
+                        // getregs is needed; the existing buffer +
+                        // set_syscall_ret + setregs is correct.
+                        //
+                        // `set_syscall_ret` is applied to `sigsys_regs`
+                        // up-front (so the readback log below can report
+                        // what we wrote). In DESYNC mode the fresh
+                        // getregs below overwrites this — we re-apply
+                        // `set_syscall_ret` after the fresh getregs.
                         set_syscall_ret(&mut sigsys_regs, &a, ret_val);
-                        if should_skip_sigsys_setregs(in_syscall_at_sigsys, original_syscall, &a) {
-                            // DESYNC mode (5-J) AND this syscall is in
-                            // `compute_exit_return_value`'s fake-success
-                            // list (6-C). SIGSYS fired AFTER the EXIT
-                            // stop, and the EXIT handler ALREADY wrote
-                            // rax=0 for this syscall — so the SIGSYS
-                            // handler's setregs is redundant AND would
-                            // race with the kernel's signal-delivery-
-                            // stop register snapshotting. Skip it.
-                            //
-                            // The 6-C refinement: `should_skip_sigsys_setregs`
-                            // now requires `compute_exit_return_value(...)
-                            // .is_some()`. For syscalls NOT in the fake-
-                            // success list (e.g. shmget, which the SIGSYS
-                            // handler returns -ENOSYS for), the skip does
-                            // NOT fire — the SIGSYS handler's setregs is
-                            // the ONLY writeback and MUST execute to
-                            // write the non-zero return value. (Pre-6-C
-                            // the skip fired unconditionally in DESYNC
-                            // mode → shmget's -ENOSYS was never written →
-                            // rax retained the kernel's leaked syscall-
-                            // number value → init saw a positive "shmid"
-                            // → infinite shmget-retry loop.)
-                            //
-                            // The fs op (mount/mkdir/mknod) has already
-                            // been performed above; we just don't write
-                            // regs back.
-                            //
-                            // Because the skip fires ONLY when
-                            // `compute_exit_return_value` returned Some,
-                            // we know the EXIT handler wrote rax=0 here.
-                            // No need for the 5-X conditional message
-                            // ("did NOT write rax") — that branch is now
-                            // structurally unreachable for skips.
+                        // `len` is the iovec length returned by the
+                        // SIGSYS-entry getregs (line ~4667). In DESYNC
+                        // mode the fresh getregs below may return a
+                        // (theoretically) different length; we shadow it
+                        // into `setregs_len` so the setregs call uses
+                        // the matching length.
+                        let mut setregs_len = len;
+                        if !in_syscall_at_sigsys {
+                            // DESYNC mode (6-W): re-read the CURRENT
+                            // registers before setregs, so we write back
+                            // live (post-signal-delivery) values with
+                            // rax=ret_val — NOT stale pre-EXIT values and
+                            // NOT the kernel's potentially-garbage
+                            // signal-frame setup that the 5-J skip left
+                            // in place.
                             sigsys_log(&format!(
-                                "SIGSYS handler: DESYNC mode — skipping ptrace_setregs for nr={} [{}] (in compute_exit_return_value's fake-success list; EXIT handler already wrote rax=0; would-have-written rax={})",
-                                original_syscall, name, ret_val
+                                "SIGSYS handler: DESYNC mode — fresh ptrace_getregs before setregs for nr={} [{}] (6-W fix: was skipping setregs, which left garbage rodata pointers in control-flow registers → SIGSEGV at rip=0x6f722f69 'i/ro')",
+                                original_syscall, name
                             ));
-                        } else if let Err(e) = ptrace_setregs(pid, &sigsys_regs, len) {
+                            match ptrace_getregs(pid, &mut sigsys_regs) {
+                                Ok(fresh_len) => {
+                                    setregs_len = fresh_len;
+                                    // Re-apply rax=ret_val to the fresh
+                                    // buffer (the fresh getregs overwrote
+                                    // the set_syscall_ret we did above).
+                                    set_syscall_ret(&mut sigsys_regs, &a, ret_val);
+                                }
+                                Err(e) => {
+                                    // The fresh getregs failed — fall
+                                    // through to setregs with the
+                                    // SIGSYS-entry buffer (which already
+                                    // has rax=ret_val from the
+                                    // set_syscall_ret above). This is the
+                                    // SAME buffer the NORMAL-mode path
+                                    // uses, so it's a safe fallback.
+                                    sigsys_log(&format!(
+                                        "SIGSYS handler (DESYNC): FRESH ptrace_getregs FAILED for nr={} [{}]: {} — falling back to SIGSYS-entry registers (rax={} already applied)",
+                                        original_syscall, name, e, ret_val
+                                    ));
+                                }
+                            }
+                        }
+                        if let Err(e) = ptrace_setregs(pid, &sigsys_regs, setregs_len) {
                             // PTRACE_SETREGS failed — the faked return
                             // value was NOT applied. The child will see
                             // whatever rax the kernel set (typically
@@ -5482,13 +5462,14 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 original_syscall, name, e
                             ));
                         } else {
-                            // NORMAL mode (SIGSYS fired BETWEEN ENTRY and
-                            // EXIT — the typical kernel ordering for non-
-                            // compat children). setregs succeeded — the
-                            // faked return value was applied. Log a
-                            // readback to confirm (5-J diagnostic, gated
-                            // by sigsys_repeat_count <= 5 to avoid log
-                            // flooding in tight SIGSYS loops).
+                            // setregs succeeded — the faked return value
+                            // was applied (and, in DESYNC mode, the OTHER
+                            // registers were re-written with their
+                            // current values, preventing the rodata-leak
+                            // SIGSEGV). Log a readback to confirm (5-J
+                            // diagnostic, gated by sigsys_repeat_count
+                            // <= 5 to avoid log flooding in tight SIGSYS
+                            // loops).
                             if sigsys_repeat_count <= 5 {
                                 let mut readback: Regs = unsafe { std::mem::zeroed() };
                                 if ptrace_getregs(pid, &mut readback).is_ok() {
@@ -7069,54 +7050,57 @@ mod tests {
         assert_eq!(compute_exit_return_value(15, &abi), Some(0));
     }
 
-    // ── 5-J regression tests: SIGSYS/EXIT handler register-writeback race ─
+    // ── 5-J / 6-C / 6-W regression tests: SIGSYS/EXIT handler
+    //   register-writeback ─
     //
-    // These tests verify the DESYNC-detection helper that the SIGSYS
-    // handler uses to decide whether to skip its `ptrace_setregs` call.
-    // See `should_skip_sigsys_setregs` for the full rationale.
+    // These tests verify `should_skip_sigsys_setregs`, the helper the
+    // SIGSYS handler historically used to decide whether to skip its
+    // `ptrace_setregs` call. See `should_skip_sigsys_setregs` for the
+    // full 5-J → 6-C → 6-W evolution.
     //
-    // The bug (5-H's finding, 9 SIGSEGVs at iter 216, all at
-    // rip=0x809255d, si_addr=0x90): 5-A's EXIT handler correctly wrote
-    // rax=0 for fake-success syscalls, but in DESYNC mode (where the
-    // kernel delivers ENTRY→EXIT→SIGSYS for a single seccomp-trapped
-    // syscall) the SIGSYS handler fired AFTER the EXIT handler and its
-    // `ptrace_setregs` clobbered the EXIT handler's rax=0 writeback
-    // with a kernel-re-snapshotted value (rax=15 = the syscall number,
-    // from `syscall_rollback` which sets rax = orig_rax). TWRP init
-    // then took the chmod-error path and dereferenced NULL+0x90.
+    // The 5-J bug (9 SIGSEGVs at iter 216, all at rip=0x809255d,
+    // si_addr=0x90): the SIGSYS handler's whole-struct `ptrace_setregs`
+    // could race with the kernel's signal-delivery-stop register
+    // snapshotting in DESYNC mode, clobbering rax=0 with rax=15 (the
+    // syscall number from `syscall_rollback`).
     //
-    // The fix: in DESYNC mode, the SIGSYS handler SKIPS its
-    // `ptrace_setregs` call (the EXIT handler already wrote rax=0) —
-    // BUT ONLY for syscalls in `compute_exit_return_value`'s fake-
-    // success list (Task 6-C refinement). For syscalls NOT in that
-    // list (e.g. shmget, which the SIGSYS handler returns -ENOSYS
-    // for), the skip must NOT fire — the SIGSYS handler's setregs is
-    // the ONLY writeback and MUST execute to write the non-zero
-    // return value. `should_skip_sigsys_setregs(in_syscall_at_sigsys,
-    // syscall_nr, abi)` returns true when `in_syscall_at_sigsys` is
-    // false (DESYNC) AND `compute_exit_return_value(syscall_nr, abi)`
-    // returns Some — i.e. the EXIT handler already wrote rax=0.
+    // The 5-J fix: in DESYNC mode, SKIP the setregs (the EXIT handler
+    // already wrote rax=0). The 6-C refinement: skip ONLY for syscalls
+    // in `compute_exit_return_value`'s fake-success list (so shmget's
+    // -ENOSYS writeback still executed).
+    //
+    // The 6-W REVERSAL: the 5-J/6-C skip LEFT garbage rodata pointers
+    // in control-flow registers → SIGSEGV at rip=0x6f722f69 ("i/ro"
+    // leak, iter-826, post-6-V's NOP). 6-W makes
+    // `should_skip_sigsys_setregs` ALWAYS return `false` (never skip).
+    // The SIGSYS handler now ALWAYS does a fresh `ptrace_getregs` (in
+    // DESYNC mode) + `set_syscall_ret(rax=ret_val)` + `ptrace_setregs`
+    // — re-reading the CURRENT register state so we're not writing
+    // stale values, and re-writing ALL registers with their current
+    // values so no rodata leak survives into a control-flow register.
 
     #[test]
     fn should_skip_sigsys_setregs_in_desync_mode() {
-        // DESYNC case (5-H's scenario): SIGSYS fires AFTER the EXIT
-        // stop. `in_syscall` was false at SIGSYS entry (the EXIT
-        // handler set it to false at line ~2307). The EXIT handler
-        // already wrote rax=0 for the faked-success syscalls, so the
-        // SIGSYS handler's `ptrace_setregs` is redundant AND
-        // potentially racy — skip it.
+        // 6-W: `should_skip_sigsys_setregs` ALWAYS returns false now.
+        // In DESYNC mode (SIGSYS fired AFTER the EXIT stop, so
+        // `in_syscall_at_sigsys == false`) the SIGSYS handler does a
+        // FRESH `ptrace_getregs` + `set_syscall_ret` + `ptrace_setregs`
+        // at the call site — it does NOT skip. This test pins the new
+        // 6-W contract: even for a fake-success syscall (chmod) in
+        // DESYNC mode, the skip MUST NOT fire.
         //
-        // Use chmod — it's in `compute_exit_return_value`'s fake-
-        // success list, so the 6-C refinement's second condition
-        // (`compute_exit_return_value(...).is_some()`) is satisfied.
+        // (Pre-6-W this test asserted the skip MUST fire — the 5-J/6-C
+        // contract. The iter-826 rodata-leak SIGSEGV at rip=0x6f722f69
+        // proved that contract was wrong: skipping left garbage in
+        // control-flow registers.)
         #[cfg(target_arch = "x86_64")]
         let abi = ABI_X86_32;
         #[cfg(target_arch = "aarch64")]
         let abi = ABI_AARCH64;
         let chmod_nr = abi.chmod;
         assert!(
-            should_skip_sigsys_setregs(false, chmod_nr, &abi),
-            "DESYNC: SIGSYS fired after EXIT — must skip setregs to avoid clobbering EXIT handler's rax=0"
+            !should_skip_sigsys_setregs(false, chmod_nr, &abi),
+            "6-W: DESYNC + chmod (fake-success) — must NOT skip setregs (always returns false). The SIGSYS handler does a fresh getregs + setregs instead, re-writing ALL registers with current values to prevent the rodata-leak SIGSEGV."
         );
     }
 
@@ -7128,7 +7112,10 @@ mod tests {
         // SIGSYS entry. The EXIT handler has NOT yet run, so the SIGSYS
         // handler's `ptrace_setregs` is the ONLY writeback — must NOT
         // skip it, REGARDLESS of whether the syscall is in the fake-
-        // success list.
+        // success list. (6-W: this was already the contract in NORMAL
+        // mode under 5-J/6-C — the 6-W change only affects DESYNC mode,
+        // but the function now returns false unconditionally so NORMAL
+        // mode is unchanged.)
         #[cfg(target_arch = "x86_64")]
         let abi = ABI_X86_32;
         #[cfg(target_arch = "aarch64")]
@@ -7150,45 +7137,52 @@ mod tests {
     // ── 6-C regression tests: should_skip_sigsys_setregs honours ─
     //   compute_exit_return_value's fake-success list
     //
-    // These guard the 6-C fix for the infinite shmget-retry loop.
-    // The OLD contract (5-J) was a pure negation of
-    // `in_syscall_at_sigsys`: `!in_syscall_at_sigsys`. That fired
-    // unconditionally in DESYNC mode for EVERY syscall, including
-    // shmget/shmat/shmctl whose return value the SIGSYS handler writes
-    // as -ENOSYS (NOT 0). Since those syscalls are NOT in
-    // `compute_exit_return_value`'s fake-success list, the EXIT
-    // handler doesn't write rax for them either → with the unconditional
-    // skip, rax retained the kernel's leaked syscall-number value →
-    // init saw a positive "shmid" → retried shmget forever.
+    // Historical context (6-C): these tests originally guarded the 6-C
+    // fix for the infinite shmget-retry loop. The OLD contract (5-J)
+    // was a pure negation of `in_syscall_at_sigsys`:
+    // `!in_syscall_at_sigsys`. That fired unconditionally in DESYNC
+    // mode for EVERY syscall, including shmget/shmat/shmctl whose
+    // return value the SIGSYS handler writes as -ENOSYS (NOT 0).
     //
-    // The 6-C NEW contract: skip fires ONLY when (DESYNC mode) AND
-    // (syscall is in compute_exit_return_value's fake-success list).
-    // These two tests pin the contract for the two key representative
-    // syscalls: chmod (fake-success → skip fires) and shmget
-    // (non-fake-success → skip must NOT fire).
+    // 6-W UPDATE: `should_skip_sigsys_setregs` now ALWAYS returns
+    // false (never skip). The 6-C distinction between "fake-success"
+    // (chmod → skip) and "non-fake-success" (shmget → no skip) is no
+    // longer relevant to this function — BOTH now return false. The
+    // tests below are KEPT (with updated assertions) as regression
+    // guards so a future change that re-enables the skip cannot
+    // silently regress the 6-W contract. They also double as
+    // documentation of WHY the 6-C distinction existed (so a future
+    // investigator can re-introduce a conditional skip correctly if a
+    // NEW race is discovered).
 
     #[test]
-    fn should_skip_sigsys_setregs_true_for_chmod() {
-        // chmod IS in compute_exit_return_value's fake-success list
-        // (it returns Some(0)). In DESYNC mode the EXIT handler has
-        // ALREADY written rax=0 → the SIGSYS handler's setregs is
-        // redundant AND would race with the kernel's signal-delivery-
-        // stop register snapshotting. Skip MUST fire.
+    fn should_skip_sigsys_setregs_false_for_chmod_in_desync_6w() {
+        // 6-W: chmod IS in compute_exit_return_value's fake-success
+        // list (it returns Some(0)). Pre-6-W, in DESYNC mode the 5-J/6-C
+        // skip fired for chmod (because the EXIT handler already wrote
+        // rax=0). 6-W REVERTS this: the skip caused the iter-826
+        // rodata-leak SIGSEGV at rip=0x6f722f69 ("i/ro"). Now the
+        // SIGSYS handler ALWAYS does a fresh getregs + setregs for
+        // chmod in DESYNC mode, re-writing ALL registers with their
+        // current values (preventing the rodata leak) and re-applying
+        // rax=ret_val=0 to the signal frame.
         #[cfg(target_arch = "x86_64")]
         let abi = ABI_X86_32;
         #[cfg(target_arch = "aarch64")]
         let abi = ABI_AARCH64;
         let chmod_nr = abi.chmod;
-        // Sanity: chmod is in the fake-success list.
+        // Sanity: chmod IS in the fake-success list (kept from the
+        // pre-6-W test — confirms the syscall that USED to trigger
+        // the skip is still a fake-success syscall).
         assert_eq!(
             compute_exit_return_value(chmod_nr, &abi),
             Some(0),
             "chmod must be in compute_exit_return_value's fake-success list"
         );
-        // DESYNC + fake-success → skip.
+        // 6-W: DESYNC + fake-success → must NOT skip (always false).
         assert!(
-            should_skip_sigsys_setregs(false, chmod_nr, &abi),
-            "DESYNC + chmod (fake-success): skip MUST fire — EXIT handler already wrote rax=0"
+            !should_skip_sigsys_setregs(false, chmod_nr, &abi),
+            "6-W: DESYNC + chmod (fake-success): must NOT skip — the 5-J/6-C skip caused the rodata-leak SIGSEGV. The SIGSYS handler now does fresh getregs + setregs instead."
         );
     }
 
@@ -7499,17 +7493,23 @@ mod tests {
     }
 
     /// Simulate the DESYNC stop sequence for a single seccomp-trapped
-    /// chmod(nr=15) on i386 compat, and assert that the SIGSYS handler's
-    /// decision to skip setregs leaves rax=0 (the EXIT handler's
-    /// writeback) as the final value.
+    /// chmod(nr=15) on i386 compat, and assert that the 6-W fix —
+    /// ALWAYS doing a fresh `ptrace_getregs` + `set_syscall_ret` +
+    /// `ptrace_setregs` (never skipping) — leaves rax=0 as the final
+    /// value AND re-writes the other registers with their current
+    /// values (preventing the rodata-leak SIGSEGV that the 5-J/6-C
+    /// skip caused at rip=0x6f722f69).
     ///
     /// This is a SIMULATION — it doesn't fork a real child or invoke
-    /// ptrace. It models the register state transitions and verifies
-    /// that `should_skip_sigsys_setregs` returns the right value at
-    /// each stop, so the final rax is 0 (not the leaked syscall
-    /// number 15 that `syscall_rollback` would set).
+    /// ptrace. It models the register-state transitions and verifies
+    /// that `should_skip_sigsys_setregs` returns `false` (the 6-W
+    /// contract: never skip), so the SIGSYS handler's setregs MUST
+    /// fire. The simulation then models the fresh getregs + setregs
+    /// writeback: rax is set to ret_val (0 for chmod, a fake-success
+    /// syscall), and the other registers are re-written with their
+    /// current (post-signal-delivery) values.
     #[test]
-    fn desync_stop_sequence_preserves_exit_handler_rax_zero() {
+    fn desync_stop_sequence_always_setregs_writes_rax_zero_6w() {
         // Model the register state across the three ptrace stops for a
         // single seccomp-trapped chmod(nr=15) on i386 compat.
         #[cfg(target_arch = "x86_64")]
@@ -7548,37 +7548,95 @@ mod tests {
         assert_eq!(rax_after_exit, 0, "after EXIT handler: rax must be 0");
 
         // ── Stop 3: SIGSYS signal-delivery-stop ──
-        // in_syscall is false here → DESYNC. `should_skip_sigsys_setregs`
-        // must return true → SIGSYS handler SKIPS its `ptrace_setregs`.
-        // rax stays at 0 (the EXIT handler's writeback). This is the
-        // FIX — without it, the SIGSYS handler's setregs would race
-        // with the kernel's signal-delivery-stop register snapshotting
-        // and the child could resume with rax=15 (the syscall number
-        // from syscall_rollback), causing the SIGSEGV at rip=0x809255d.
+        // in_syscall is false here → DESYNC. 6-W contract:
+        // `should_skip_sigsys_setregs` MUST return false (never skip).
+        // The SIGSYS handler does a FRESH `ptrace_getregs` (re-reading
+        // the CURRENT post-signal-delivery register state — NOT stale
+        // pre-EXIT values), then `set_syscall_ret(rax=ret_val=0)`,
+        // then `ptrace_setregs`. This writes rax=0 to the signal frame
+        // so sigreturn restores it correctly, AND re-writes the OTHER
+        // registers with their current values (preventing the
+        // rodata-leak SIGSEGV at rip=0x6f722f69 that the 5-J/6-C skip
+        // caused by leaving garbage in control-flow registers).
         let in_syscall_at_sigsys = in_syscall_after_exit;
         let skip_setregs = should_skip_sigsys_setregs(in_syscall_at_sigsys, chmod_nr, &abi);
         assert!(
-            skip_setregs,
-            "DESYNC: must skip SIGSYS setregs (in_syscall_at_sigsys={})",
+            !skip_setregs,
+            "6-W: DESYNC + chmod — must NOT skip setregs (always returns false). The SIGSYS handler does a fresh getregs + setregs instead, re-writing ALL registers with current values to prevent the rodata-leak SIGSEGV. (in_syscall_at_sigsys={})",
             in_syscall_at_sigsys
         );
-        // SIGSYS handler skips setregs → rax stays at 0 (EXIT handler's value)
-        let rax_after_sigsys: i64 = rax_after_exit;
+        // The ret_val the SIGSYS handler computes for chmod (a
+        // fake-success syscall) is 0 — see the SIGSYS handler's
+        // "mount/mkdir/chmod/chroot/unshare" branch.
+        let ret_val: i64 = 0;
+        // SIGSYS handler does fresh getregs → set_syscall_ret(rax=ret_val) → setregs.
+        // The fresh getregs reads the CURRENT rax (which the kernel's
+        // signal-delivery setup may have left at the EXIT handler's 0,
+        // OR at syscall_rollback's 15 — we don't care, because we
+        // OVERWRITE rax with ret_val=0 via set_syscall_ret). The
+        // setregs writes rax=0 to the signal frame.
+        let rax_after_sigsys: i64 = ret_val;
         assert_eq!(
             rax_after_sigsys, 0,
-            "after SIGSYS handler (DESYNC, skipped setregs): rax must STILL be 0 — this is the fix"
+            "after SIGSYS handler (DESYNC, fresh getregs + setregs): rax must be ret_val=0 — this is the 6-W fix"
         );
 
         // ── Child resumes ──
         // rax=0 → init sees chmod returned 0 (success) → does NOT take
         // the chmod-error path → does NOT dereference NULL+0x90 → no
-        // SIGSEGV at rip=0x809255d. This is the behaviour 5-A's commit
-        // ee93ac0 intended but didn't achieve at runtime because the
-        // SIGSYS handler clobbered the EXIT handler's writeback.
+        // SIGSEGV. AND, because the SIGSYS handler's setregs re-wrote
+        // ALL registers with their current values, no rodata pointer
+        // leaks into a control-flow register → no SIGSEGV at
+        // rip=0x6f722f69 either. (The 5-J/6-C skip left the kernel's
+        // signal-frame setup untouched, which is what caused the
+        // rodata-leak SIGSEGV.)
         assert_eq!(
             rax_after_sigsys, 0,
-            "child resumes with rax=0 — chmod reported success"
+            "child resumes with rax=0 — chmod reported success (6-W: fresh getregs + setregs, NOT skipped)"
         );
+    }
+
+    /// 6-W direct regression guard: `should_skip_sigsys_setregs` MUST
+    /// return `false` for EVERY combination of (in_syscall_at_sigsys,
+    /// syscall_nr) — the function unconditionally returns false now.
+    /// This test sweeps representative cases (DESYNC + fake-success,
+    /// DESYNC + non-fake-success, NORMAL + fake-success, NORMAL +
+    /// non-fake-success) to lock in the 6-W contract so a future
+    /// change cannot silently re-introduce the 5-J/6-C skip (which
+    /// caused the iter-826 rodata-leak SIGSEGV at rip=0x6f722f69).
+    #[test]
+    fn should_skip_sigsys_setregs_always_false_6w() {
+        #[cfg(target_arch = "x86_64")]
+        let abi = ABI_X86_32;
+        #[cfg(target_arch = "aarch64")]
+        let abi = ABI_AARCH64;
+        // Representative syscalls spanning the fake-success vs
+        // non-fake-success distinction that 6-C introduced (and 6-W
+        // made irrelevant to this function):
+        //   - chmod: fake-success (compute_exit_return_value == Some(0))
+        //   - shmget: non-fake-success (returns None; SIGSYS handler
+        //     writes -ENOSYS)
+        //   - pause: non-fake-success (returns None; SIGSYS handler
+        //     writes -ENOSYS via dedicated branch)
+        //   - a totally unrelated syscall (e.g. write=4) that is NOT
+        //     in any SIGSYS/EXIT handler branch.
+        let cases: [(bool, i64, &str); 8] = [
+            (false, abi.chmod, "DESYNC + chmod (fake-success)"),
+            (false, abi.shmget, "DESYNC + shmget (non-fake-success)"),
+            (false, abi.pause, "DESYNC + pause (non-fake-success)"),
+            (false, abi.write, "DESYNC + write (unrelated)"),
+            (true, abi.chmod, "NORMAL + chmod (fake-success)"),
+            (true, abi.shmget, "NORMAL + shmget (non-fake-success)"),
+            (true, abi.pause, "NORMAL + pause (non-fake-success)"),
+            (true, abi.write, "NORMAL + write (unrelated)"),
+        ];
+        for (in_syscall_at_sigsys, syscall_nr, label) in cases {
+            assert!(
+                !should_skip_sigsys_setregs(in_syscall_at_sigsys, syscall_nr, &abi),
+                "6-W: {} — should_skip_sigsys_setregs must ALWAYS return false (never skip). The 5-J/6-C skip caused the iter-826 rodata-leak SIGSEGV at rip=0x6f722f69. The SIGSYS handler now ALWAYS does fresh getregs + setregs.",
+                label
+            );
+        }
     }
 
     /// Simulate the NORMAL stop sequence (SIGSYS between ENTRY and EXIT)
