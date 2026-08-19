@@ -5589,10 +5589,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             ("dev/kmsg", "/dev/kmsg"),
             // Task 6-Z10: /dev/hw_random — init opens this for hardware
             // RNG entropy. Missing → ENOENT → SIGSEGV at rip=0x6f722f69
-            // (verified on ceec1f2 UI E2E run 32231410279: open("/dev/hw_random")
-            // -> -2 ENOENT, then SIGSEGV). Symlink to /dev/urandom (provides
-            // random bytes — harmless substitute for hw RNG).
-            ("dev/hw_random", "/dev/null"),
+            // (verified on ceec1f2 UI E2E run 32231410279). Symlinks to
+            // /dev/urandom or /dev/null cause ELOOP (errno 40) on Android
+            // (verified on d2963a8 + 0e19c57 UI E2E). Fix: pre-create as
+            // a regular empty file (like /dev/.booting, /dev/__null__).
+            // init reads 0 bytes → no crash. The hw_random read returns
+            // EOF → init treats it as "no hw RNG available" → continues.
         ];
         for (rel, target) in symlinks {
             let link_path = format!("{}/{}", rootfs_prefix, rel);
@@ -5617,7 +5619,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Use OpenOptions (same pattern as /dev/__kmsg__ creation above)
         // and log success/failure for each file.
         use std::os::unix::fs::OpenOptionsExt;
-        let regular_files: &[(&str, u32)] = &[("dev/.booting", 0o666), ("dev/__null__", 0o666)];
+        let regular_files: &[(&str, u32)] = &[
+            ("dev/.booting", 0o666),
+            ("dev/__null__", 0o666),
+            ("dev/hw_random", 0o666),
+        ];
         for (rel, mode) in regular_files {
             let file_path = format!("{}/{}", rootfs_prefix, rel);
             // Remove existing file first (in case it was unlinked by a
