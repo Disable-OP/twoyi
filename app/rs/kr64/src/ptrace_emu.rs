@@ -4185,7 +4185,38 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 // does not know about, so non-synthetic opens
                                 // (e.g. /init.rc) proceed unchanged.
                                 if vfs.is_synthetic(&path) {
-                                    if let Err(e) = vfs.materialize(&path, rootfs) {
+                                    // Task 6-Z: if /dev/__properties__ already
+                                    // exists as a regular file (pre-created by
+                                    // the parent in TWRP mode before the ptrace
+                                    // loop), SKIP VFS materialization to avoid
+                                    // (a) clobbering the file (which would
+                                    // destroy init's runtime
+                                    // ftruncate/mmap modifications to the
+                                    // property area header), and (b) any risk
+                                    // of the host's real-Android
+                                    // /dev/__properties__ directory (Android
+                                    // 11+) shadowing the file. TWRP's AOSP 5.1
+                                    // bionic requires /dev/__properties__ to be
+                                    // a FILE (the OLD single-file property
+                                    // area), NOT the NEW Android 8+ directory
+                                    // format. materialize() also has this check
+                                    // internally as a safety net, but we log it
+                                    // here for runtime visibility.
+                                    //
+                                    // Without this skip, init's
+                                    // open("/dev/__properties__") could hit a
+                                    // directory → -EISDIR → properties_fd never
+                                    // recorded → the mmap2 MAP_SHARED →
+                                    // MAP_ANONYMOUS rewrite (Task 6-Y) never
+                                    // fires → -38 persists → init exit(1).
+                                    let skip_for_properties = is_properties_path(&path)
+                                        && matches!(
+                                            std::fs::metadata(format!("{}{}", rootfs, path)),
+                                            Ok(ref md) if md.is_file()
+                                        );
+                                    if skip_for_properties {
+                                        log("VFS: /dev/__properties__ already exists as a regular file (pre-created OLD-format) — skipping directory materialization (TWRP mode requires FILE, not directory)");
+                                    } else if let Err(e) = vfs.materialize(&path, rootfs) {
                                         // Don't fail the open — log and let the
                                         // kernel's open() report its own error
                                         // (e.g. ENOENT) so we see both the
@@ -4591,6 +4622,40 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     properties_fd = Some(ret as i32);
                                     log(&format!(
                                         "DIAG properties fd captured: open() returned fd={} for {} — subsequent mmap2 with MAP_SHARED on this fd will be rewritten to MAP_ANONYMOUS|MAP_PRIVATE",
+                                        ret, p
+                                    ));
+                                }
+                            }
+                        } else if let Some(ref p) = pending_open_translated_path {
+                            // Task 6-Y fix 2: when open(/dev/__properties__)
+                            // fails (ret <= 0), fake a successful return
+                            // (fd=42) so init gets a valid fd. The
+                            // subsequent mmap2 ENTRY handler will
+                            // rewrite the fd=42 MAP_SHARED mmap to
+                            // anonymous anyway, so the fd never needs
+                            // to be a real kernel fd.
+                            //
+                            // Root cause: the zygote's seccomp filter
+                            // blocks i386 open() on some paths →
+                            // ENOSYS (-38) or EEXIST (-17) when init
+                            // uses O_CREAT|O_EXCL on the pre-created
+                            // file. Without this fake, properties_fd
+                            // is never set → the mmap2 rewrite never
+                            // fires → property area not mapped →
+                            // all property_set calls fail → init
+                            // exits(1).
+                            if is_properties_path(p) {
+                                let fake_fd: i64 = 42;
+                                set_syscall_ret(&mut regs, &abi, fake_fd);
+                                properties_fd = Some(fake_fd as i32);
+                                if let Err(e) = ptrace_setregs(pid, &regs, iov_len) {
+                                    log(&format!(
+                                        "DIAG properties fd FAKE FAILED: ptrace_setregs for fd=42: {} — open returned {}, init will see the error",
+                                        e, ret
+                                    ));
+                                } else {
+                                    log(&format!(
+                                        "DIAG properties fd FAKE: open() returned {} for {} — faked fd=42 (zygote seccomp blocks i386 open on this path); mmap2 with MAP_SHARED on fd=42 will be rewritten to MAP_ANONYMOUS|MAP_PRIVATE",
                                         ret, p
                                     ));
                                 }
