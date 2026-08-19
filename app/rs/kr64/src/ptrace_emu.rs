@@ -5662,10 +5662,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     if ptrace_getregs(pid, &mut readback).is_ok() {
                                         let readback_rax =
                                             get_syscall_arg(&readback, abi.reg_ret) as i64;
-                                        log(&format!(
-                                            "[KR64][ptrace] EXIT handler wrote rax=0 for {} (nr={}), readback rax={}",
-                                            name, syscall_num, readback_rax
-                                        ));
+                                        if loop_count <= 200 {
+                                            log(&format!(
+                                                "[KR64][ptrace] EXIT handler wrote rax=0 for {} (nr={}), readback rax={}",
+                                                name, syscall_num, readback_rax
+                                            ));
+                                        }
                                     }
                                 }
                             }
