@@ -466,6 +466,21 @@ public class RamdiskImporter {
                         int n;
                         while ((n = tais.read(buf)) > 0) fos.write(buf, 0, n);
                     }
+                    // Task 6-Z31: set executable permission from the tar mode.
+                    // Java's FileOutputStream creates files with mode 0644 (NOT
+                    // executable). Without this, /sbin/recovery + /sbin/linker
+                    // are created without the execute bit → execve fails with
+                    // EACCES → exit 127 → TWRP recovery service never starts.
+                    int mode = entry.getMode();
+                    if ((mode & 0100) != 0) {
+                        f.setExecutable(true, false); // owner + group + other exec
+                    }
+                    if ((mode & 0400) != 0) {
+                        f.setReadable(true, false);
+                    }
+                    if ((mode & 0200) != 0) {
+                        f.setWritable(true, true);
+                    }
                     count++;
                 }
             }
@@ -557,6 +572,29 @@ public class RamdiskImporter {
                             remaining -= n;
                             pos += n;
                         }
+                    }
+                    // Task 6-Z31: set executable permission from the cpio mode.
+                    // Java's FileOutputStream creates files with mode 0644 (NOT
+                    // executable). Without this, /sbin/recovery + /sbin/linker
+                    // are created without the execute bit → execve fails with
+                    // EACCES → exit 127 → TWRP recovery service never starts.
+                    // The cpio mode's 0o100 bit (S_IXUSR) is the owner-execute
+                    // bit. setExecutable(true) sets it (and group/other exec
+                    // via setExecutable(true, false) if we want world-exec, but
+                    // owner-exec is sufficient for execve).
+                    boolean isExec = (mode & 0100) != 0;
+                    if (isExec) {
+                        file.setExecutable(true, false); // owner + group + other exec
+                    }
+                    // Also set readable (cpio mode 0o400 = S_IRUSR). Java's
+                    // FileOutputStream creates files readable by owner by
+                    // default, but be explicit to match the cpio mode.
+                    if ((mode & 0400) != 0) {
+                        file.setReadable(true, false);
+                    }
+                    // Also set writable for owner (cpio mode 0o200 = S_IWUSR).
+                    if ((mode & 0200) != 0) {
+                        file.setWritable(true, true); // owner-write only
                     }
                     fileCount++;
                 } else if (modeType == 0xA000) {
