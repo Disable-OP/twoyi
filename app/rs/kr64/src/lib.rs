@@ -4675,28 +4675,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        // TWRP BOOT: /init.partlink.rc — Task 6-Z7 fix2: DO NOT DELETE.
+        // TWRP BOOT: /init.partlink.rc — Task 6-Z7 fix3: REPLACE with EMPTY.
         //
-        // The deletion (1efd28c) was added because the partlink service start
-        // caused SIGSEGV at rip=0x6f722f69. BUT after the minimal /file_contexts
-        // fix (5d4b8d0), init now reads file_contexts successfully + tries to
-        // open /init.partlink.rc. The ENOENT (file deleted) causes the SAME
-        // SIGSEGV at rip=0x6f722f69 (verified on 5d4b8d0 UI E2E run 32222009285:
-        // last syscall before SIGSEGV is open("/init.partlink.rc") -> -2 ENOENT).
+        // The .rc parser crashes (SIGSEGV at rip=0x6f722f69, "i/ro" rodata
+        // leak) when processing the "service partlink /sbin/partlink" line.
+        // Deleting the file (1efd28c) caused ENOENT → SAME SIGSEGV. Restoring
+        // the file (cd2c718) caused the parser crash on the service line.
         //
-        // The /init.partlink.rc file is simple (no #line directive):
-        //   "on init\n    start partlink\n\nservice partlink /sbin/partlink\n    oneshot\n"
-        // It should NOT crash the parser. The original SIGSEGV (1efd28c) was
-        // likely from a different cause (the rodata-leak corruption from the
-        // SIGSYS DESYNC, which 5b4ef63 fixed). With 5b4ef63 + the minimal
-        // file_contexts, keeping /init.partlink.rc should be safe.
-        //
-        // FIX: leave /init.partlink.rc in place (no deletion). The partlink
-        // service (/sbin/partlink) may not exist in the emulator, but init
-        // tolerates missing service binaries (logs "service not found" + continues).
-        info!(
-            "[KR64] PARENT: /init.partlink.rc left in place (Task 6-Z7 fix2: deletion caused SIGSEGV at rip=0x6f722f69 via ENOENT after minimal file_contexts let init proceed; the file is simple, no #line directive, safe to keep)"
-        );
+        // FIX: replace /init.partlink.rc with an EMPTY file. The parser reads
+        // 0 bytes → no service line to crash on → init proceeds. The partlink
+        // service doesn't start (no service definition) → init tolerates this.
+        let partlink_path = format!("{}/init.partlink.rc", rootfs_prefix);
+        match std::fs::write(&partlink_path, "") {
+            Ok(()) => info!(
+                "[KR64] PARENT: REPLACED /init.partlink.rc with EMPTY file (Task 6-Z7 fix3: the .rc parser crashes on 'service partlink /sbin/partlink' → SIGSEGV at rip=0x6f722f69; empty file → no service line → no crash). Was: 'on init\\n    start partlink\\n\\nservice partlink /sbin/partlink\\n    oneshot\\n' (72 bytes)."
+            ),
+            Err(e) => warning!(
+                "[KR64] PARENT: failed to REPLACE /init.partlink.rc at {}: {} (recovery may SIGSEGV at rip=0x6f722f69 if the original service line is parsed)",
+                partlink_path, e
+            ),
+        }
     }
 
     // TWRP BOOT: patch {rootfs}/init binary to skip the mknod-failure
