@@ -3155,6 +3155,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     };
 
+    // Task 6-Z22: once-guard. The Activity's surfaceCreated callback
+    // fires repeatedly (surface recreated every ~2 sec), and despite the
+    // RENDERER_STARTED guard in core.rs, kr64::run() was being re-invoked
+    // 11 times (verified on 9c91ce0 E2E: 11 "starting ptrace emulation
+    // loop" entries, same PID). Each re-invocation forks a NEW init child
+    // + kills the previous (6-Z13's old-kr64 kill) → the recovery
+    // restarts from scratch every 2 sec, never reaching the framebuffer.
+    // This static guard ensures run() executes ONLY ONCE per process —
+    // subsequent calls log + return immediately, letting the first init
+    // child run to completion (reach the framebuffer render + BOOT_COMPLETED).
+    static KR64_RUN_STARTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if KR64_RUN_STARTED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        info!("[KR64] run() already called once this process — skipping re-init (Task 6-Z22: prevents the 2-sec re-fork cycle that restarts the recovery from scratch)");
+        return 0;
+    }
+
     info!("[KR64] starting daemon with config: {:?}", cfg);
 
     // ---------------------------------------------------------------
