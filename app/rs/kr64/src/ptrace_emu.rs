@@ -4289,7 +4289,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // fork/clone attempts + the exit trigger live).
                     if past_first_execve {
                         post_execve_syscall_count = post_execve_syscall_count.saturating_add(1);
-                        if post_execve_syscall_count <= 5000 {
+                        if post_execve_syscall_count <= 200 {
                             log(&format!(
                                 "post-execve syscall #{}: nr={} [{}]",
                                 post_execve_syscall_count,
@@ -4372,7 +4372,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // For mount(source, target, fstype, flags, data) we
                     // additionally log arg2 (target) and arg3 (fstype) so
                     // we can see exactly what init is mounting where.
-                    if past_first_execve && post_execve_syscall_count <= 5000 {
+                    if past_first_execve && post_execve_syscall_count <= 200 {
                         let path_idx = match syscall_num {
                             n if n == abi.open => Some(abi.reg_arg1),
                             n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
@@ -5301,7 +5301,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                     // full recovery phase (recovery runs ~3281 iterations
                     // before exit(1); 150 hid the middle phase where
                     // fork/clone attempts + the exit trigger live).
-                    if past_first_execve && post_execve_syscall_count <= 5000 {
+                    if past_first_execve && post_execve_syscall_count <= 200 {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
