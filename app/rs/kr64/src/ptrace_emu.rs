@@ -5267,9 +5267,19 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         match ptrace_getregs(pid, &mut regs2) {
                             Ok(len2) => {
+                                let current_rax = get_syscall_arg(&regs2, 10);
                                 set_syscall_arg(&mut regs2, 10, 59); // rax = 59 (x86_64 execve)
                                 match ptrace_setregs(pid, &regs2, len2) {
-                                    Ok(()) => log("DIAG 64-bit execve: EXIT stop — re-set rax=59 after skip (Task 6-Z45)"),
+                                    Ok(()) => {
+                                        // Verify the SETREGS worked
+                                        let mut verify_regs: Regs = unsafe { std::mem::zeroed() };
+                                        if ptrace_getregs(pid, &mut verify_regs).is_ok() {
+                                            let verify_rax = get_syscall_arg(&verify_regs, 10);
+                                            log(&format!("DIAG 64-bit execve: EXIT stop — re-set rax 0→59 (was {}, verify={}) (Task 6-Z45)", current_rax, verify_rax));
+                                        } else {
+                                            log("DIAG 64-bit execve: EXIT stop — re-set rax=59 (verify failed) (Task 6-Z45)");
+                                        }
+                                    }
                                     Err(e) => log(&format!("DIAG 64-bit execve: EXIT re-set FAILED: {} (Task 6-Z45)", e)),
                                 }
                             }
