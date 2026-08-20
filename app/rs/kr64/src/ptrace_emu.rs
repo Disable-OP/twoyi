@@ -4411,7 +4411,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                                 // 5=rbx, 10=rax, 11=rcx, 12=rdx,
                                                 // 13=rsi, 14=rdi, 15=orig_rax,
                                                 // 16=rip, 17=cs, 20=ss
-                                                let path_val = get_syscall_arg(&regs2, 5);   // rbx (i386 path)
+                                                let _path_val = get_syscall_arg(&regs2, 5);   // rbx (i386 path) — not used directly (path is at scratch_addr)
                                                 let argv_val = get_syscall_arg(&regs2, 11); // rcx (i386 argv)
                                                 let envp_val = get_syscall_arg(&regs2, 12); // rdx (i386 envp)
                                                 // Set x86_64 args: rdi=path, rsi=argv, rdx=envp
