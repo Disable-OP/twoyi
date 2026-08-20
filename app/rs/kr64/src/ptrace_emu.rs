@@ -4301,7 +4301,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                         match ptrace_getregs(pid, &mut regs2) {
                                             Ok(len2) => {
-                                                set_syscall_arg(&mut regs2, &abi, abi.reg_arg1, scratch_addr as u64);
+                                                set_syscall_arg(&mut regs2, abi.reg_arg1, scratch_addr as u64);
                                                 match ptrace_setregs(pid, &regs2, len2) {
                                                     Ok(()) => log(&format!(
                                                         "DIAG execve ENTRY: translated path '{}' -> '{}' (Task 6-Z41)",
