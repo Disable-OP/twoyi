@@ -1118,9 +1118,16 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
     use std::os::unix::fs::PermissionsExt;
     match std::fs::write(dst, content) {
         Ok(_) => {
-            let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644));
+            // Task 6-Z40: set mode 0755 (executable), NOT 0644. The
+            // libtwrp_fb_hook.so is loaded via LD_PRELOAD by the 32-bit
+            // bionic linker during execve of /sbin/recovery. The linker
+            // checks the file's execute permission — if it's 0644 (not
+            // executable), the kernel rejects the execve with EACCES
+            // before the ptrace syscall-stop fires → exit 127.
+            // PRE-FORK DIAG confirmed: hook was mode 0100644, exec=false.
+            let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755));
             info!(
-                "[KR64] PARENT: wrote {} ({} bytes) {} -> {} (AFTER pivot_root, tmpfs)",
+                "[KR64] PARENT: wrote {} ({} bytes) {} -> {} (AFTER pivot_root, tmpfs, mode 0755) (Task 6-Z40: executable for LD_PRELOAD)",
                 lib_name,
                 content.len(),
                 src,
