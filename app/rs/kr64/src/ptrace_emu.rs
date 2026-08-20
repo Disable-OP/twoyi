@@ -4405,17 +4405,34 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                         match ptrace_getregs(pid, &mut regs2) {
                                             Ok(len2) => {
-                                                // x86_64 user_regs_struct indices:
-                                                // 10=rax, 12=rdx, 13=rsi, 14=rdi,
-                                                // 15=orig_rax, 16=rip, 17=cs, 20=ss
-                                                set_syscall_arg(&mut regs2, 14, scratch_addr);          // rdi = path (on stack, readable)
-                                                set_syscall_arg(&mut regs2, 13, argv_addr_i386);       // rsi = argv
-                                                set_syscall_arg(&mut regs2, 12, envp_addr_i386);       // rdx = envp
-                                                set_syscall_arg(&mut regs2, 10, 59);                   // rax = 59 (x86_64 execve)
-                                                set_syscall_arg(&mut regs2, 16, code_addr);            // rip = syscall instruction in .text
-                                                set_syscall_arg(&mut regs2, 15, (-1i64) as u64);      // orig_rax = -1 (skip i386)
-                                                set_syscall_arg(&mut regs2, 17, 0x33);                 // cs = 0x33 (64-bit code segment — switches to 64-bit mode so 'syscall' uses x86_64 table, bypassing i386 seccomp)
-                                                set_syscall_arg(&mut regs2, 20, 0x2b);                 // ss = 0x2b (64-bit data segment)
+                                                // Task 6-Z43 fix4: the child is in i386
+                                                // compat mode, so PTRACE_GETREGS returns
+                                                // the i386 user_regs_struct. The i386
+                                                // layout is:
+                                                // 0=ebx, 1=ecx, 2=edx, 3=esi, 4=edi,
+                                                // 5=ebp, 6=eax, 7=xds, 8=xes, 9=xfs,
+                                                // 10=xgs, 11=orig_eax, 12=eip, 13=xcs,
+                                                // 14=eflags, 15=esp, 16=xss
+                                                //
+                                                // For the 64-bit syscall, we need:
+                                                // eax=59 (x86_64 execve nr)
+                                                // ebx=path, ecx=argv, edx=envp (i386 syscall convention)
+                                                // eip=0x8048c59 (syscall instruction in .text)
+                                                // orig_eax=-1 (skip the i386 syscall)
+                                                // xcs=0x33 (64-bit code segment)
+                                                // xss=0x2b (64-bit data segment)
+                                                set_syscall_arg(&mut regs2, 6, 59);                    // eax = 59 (x86_64 execve)
+                                                // path is in ebx (already set by init's code)
+                                                // argv is in ecx (already set by init's code)
+                                                // envp is in edx (already set by init's code)
+                                                // But we need to set ebx=scratch_addr (translated path)
+                                                set_syscall_arg(&mut regs2, 0, scratch_addr);           // ebx = path (translated, on stack)
+                                                set_syscall_arg(&mut regs2, 1, argv_addr_i386);        // ecx = argv
+                                                set_syscall_arg(&mut regs2, 2, envp_addr_i386);        // edx = envp
+                                                set_syscall_arg(&mut regs2, 12, code_addr);            // eip = syscall instruction in .text
+                                                set_syscall_arg(&mut regs2, 11, (-1i64) as u64);       // orig_eax = -1 (skip i386)
+                                                set_syscall_arg(&mut regs2, 13, 0x33);                 // xcs = 0x33 (64-bit mode)
+                                                set_syscall_arg(&mut regs2, 16, 0x2b);                 // xss = 0x2b (64-bit data)
                                                 match ptrace_setregs(pid, &regs2, len2) {
                                                     Ok(()) => {
                                                         pending_64bit_execve = true;
