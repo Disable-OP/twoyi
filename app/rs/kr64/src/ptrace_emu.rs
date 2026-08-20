@@ -7160,6 +7160,21 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     "SIGSEGV details: si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, rip={:#x}, rsp={:#x}",
                                     si_code, si_addr, rip, rsp
                                 ));
+                                // Task 6-Z37: dump /proc/<pid>/maps to identify
+                                // which library contains the crash address.
+                                let maps_path = format!("/proc/{}/maps", pid);
+                                if let Ok(maps) = std::fs::read_to_string(&maps_path) {
+                                    log("=== /proc/<pid>/maps (crash diagnostic) ===");
+                                    for line in maps.lines() {
+                                        // Log ALL entries — we need to see the full
+                                        // memory map to find which library contains
+                                        // the crash address rip.
+                                        log(&format!("  MAPS: {}", line));
+                                    }
+                                    log("=== end /proc/<pid>/maps ===");
+                                } else {
+                                    log("SIGSEGV: could not read /proc/<pid>/maps");
+                                }
                             }
                         }
                     }
