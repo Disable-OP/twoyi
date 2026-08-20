@@ -4330,8 +4330,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             if scratch_addr != 0 {
                             // Read path, argv, envp from i386 regs
                             let path_addr_i386 = get_syscall_arg(&regs, abi.reg_arg1);
-                            let argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
-                            let envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
+                            let _argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
+                            let _envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
 
                             // Translate the path
                             let orig_path = if path_addr_i386 != 0 {
@@ -4398,7 +4398,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     // execve args (i386): ebx=path, ecx=argv, edx=envp
                                     //
                                     // Shift: ebx→ecx, ecx→edx, edx→esi, ebx=AT_FDCWD, edi=0
-                                    let code_addr: u64 = 0x08048c59;
+                                    let _code_addr: u64 = 0x08048c59;
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                     match ptrace_getregs(pid, &mut regs2) {
                                         Ok(len2) => {
