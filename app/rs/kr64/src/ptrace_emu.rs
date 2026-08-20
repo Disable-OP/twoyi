@@ -4411,6 +4411,15 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         }
                     }
 
+                    // Task 6-Z42: when the 64-bit execve from the scratch
+                    // area fires (after our injection), clear the pending
+                    // flag and let it execute without path translation
+                    // (the path was already translated when we injected it).
+                    if pending_64bit_execve {
+                        pending_64bit_execve = false;
+                        log("DIAG 64-bit execve: ENTRY caught from scratch area — letting it execute (Task 6-Z42)");
+                    }
+
                     // Log the first 50 post-execve syscalls so we can
                     // see exactly what the new binary (TWRP init) does
                     // after execve. This is critical because loop_count
