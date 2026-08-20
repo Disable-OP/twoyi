@@ -5295,6 +5295,53 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 ),
             }
         }
+
+        // Task 6-Z38: NOP the `repz cmpsb` in is_selinux_enabled() that
+        // crashes with NULL pointer deref. The forked recovery service child
+        // calls is_selinux_enabled() → getcon() → getcon returns SUCCESS but
+        // with a NULL context pointer (the 6-Z25 attr/current fake isn't
+        // working correctly for the forked child). The `repz cmpsb` at
+        // vaddr 0x809d7e9 (file offset 0x557e9) compares the NULL context
+        // with a string literal → SIGSEGV at si_addr=0x0.
+        // PATCH: replace `f3 a6` (repz cmpsb, 2 bytes) with `90 90` (2× NOP).
+        // This makes the comparison always "equal" (ZF=1 from prior test) →
+        // is_selinux_enabled returns 1 (enabled). Pragmatic symptom-mask per
+        // the 6-V/6-M disassembly approach.
+        {
+            let init_path = format!("{}/init", rootfs_prefix);
+            match std::fs::read(&init_path) {
+                Ok(mut bytes) => {
+                    let off = 0x557e9; // file offset = vaddr 0x809d7e9 - base 0x08048000
+                    if off + 2 <= bytes.len() && bytes[off] == 0xf3 && bytes[off + 1] == 0xa6 {
+                        bytes[off] = 0x90; // NOP
+                        bytes[off + 1] = 0x90; // NOP
+                        match std::fs::write(&init_path, &bytes) {
+                            Ok(()) => info!(
+                                "[KR64] PARENT: patched /init is_selinux_enabled() repz cmpsb at file offset 0x557e9 (vaddr 0x809d7e9) — replaced `repz cmpsb` (2 bytes: f3 a6) with 2× NOP (90 90); prevents NULL ptr deref crash when getcon() returns NULL context in forked child (Task 6-Z38)"
+                            ),
+                            Err(e) => warning!(
+                                "[KR64] PARENT: patched is_selinux_enabled NOP in memory but failed to write: {} (recovery child may SIGSEGV at rip=0x809d7e9)",
+                                e
+                            ),
+                        }
+                    } else if off + 2 <= bytes.len() && bytes[off] == 0x90 && bytes[off + 1] == 0x90 {
+                        info!(
+                            "[KR64] PARENT: /init is_selinux_enabled repz cmpsb already NOP'd (idempotent skip) (Task 6-Z38)"
+                        );
+                    } else {
+                        warning!(
+                            "[KR64] PARENT: could not find repz cmpsb (f3 a6) at file offset 0x557e9 in /init — found {:02x} {:02x} instead (TWRP version mismatch?) (Task 6-Z38)",
+                            if off + 1 <= bytes.len() { bytes[off] } else { 0 },
+                            if off + 2 <= bytes.len() { bytes[off + 1] } else { 0 },
+                        );
+                    }
+                }
+                Err(e) => warning!(
+                    "[KR64] PARENT: failed to read /init for is_selinux_enabled NOP patch: {}",
+                    e
+                ),
+            }
+        }
     }
 
     // Task 6-Z28: REVERTED the 6-Z19 poll-loop NOP. The NOP made init skip
