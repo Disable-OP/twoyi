@@ -5770,7 +5770,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     {
         let sbin_recovery = format!("{}/sbin/recovery", rootfs_prefix);
         let sbin_linker = format!("{}/sbin/linker", rootfs_prefix);
-        for (name, path) in [("recovery", &sbin_recovery), ("linker", &sbin_linker)] {
+        let sbin_hook = format!("{}/sbin/libtwrp_fb_hook.so", rootfs_prefix);
+        for (name, path) in [
+            ("recovery", &sbin_recovery),
+            ("linker", &sbin_linker),
+            ("libtwrp_fb_hook.so", &sbin_hook),
+        ] {
             match std::fs::metadata(&path) {
                 Ok(meta) => {
                     let perms = meta.permissions();
