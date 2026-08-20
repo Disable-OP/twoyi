@@ -4371,7 +4371,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     // The translated PATH stays on the stack
                                     // (readable, not executable — that's fine).
                                     let code_addr: u64 = 0x08048c59;
-                                    let syscall_word: libc::c_long = 0xcc050f00i32 as libc::c_long; // 0f 05 cc 00 (LE)
+                                    let syscall_word: libc::c_long = 0x00cc050f; // LE bytes: 0f 05 cc 00 (syscall + int3 + pad)
                                     let r2 = unsafe {
                                         libc::ptrace(libc::PTRACE_POKEDATA, pid, code_addr as i64, syscall_word)
                                     };
