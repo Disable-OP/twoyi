@@ -4303,7 +4303,21 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // regardless of the current CS register. So even though
                         // the child is in 32-bit compat mode, the `syscall`
                         // instruction bypasses the i386 seccomp filter.
-                        if abi.execve == 11 && scratch_addr != 0 {
+                        if abi.execve == 11 {
+                            // Task 6-Z43: reserve scratch area inline if not
+                            // already set. The scratch reservation at line 4662
+                            // happens AFTER this handler, so scratch_addr is 0
+                            // for the first execve after ABI re-detection.
+                            if scratch_addr == 0 {
+                                let sp = get_syscall_arg(&regs, abi.reg_sp);
+                                scratch_addr = (sp.wrapping_sub(4096)) & !7u64;
+                                scratch_offset = 0;
+                                log(&format!(
+                                    "DIAG execve: inline scratch reservation at {:#x} (sp={:#x}) (Task 6-Z43)",
+                                    scratch_addr, sp
+                                ));
+                            }
+                            if scratch_addr != 0 {
                             // Read path, argv, envp from i386 regs
                             let path_addr_i386 = get_syscall_arg(&regs, abi.reg_arg1);
                             let argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
@@ -4412,6 +4426,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     }
                                 }
                             }
+                            } // close if scratch_addr != 0
                         }
                     }
 
