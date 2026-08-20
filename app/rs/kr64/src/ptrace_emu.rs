@@ -4304,6 +4304,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // the child is in 32-bit compat mode, the `syscall`
                         // instruction bypasses the i386 seccomp filter.
                         if abi.execve == 11 {
+                            log(&format!("DIAG execve ENTRY: abi.execve=11, scratch_addr={:#x}, pid={}", scratch_addr, pid));
                             // Task 6-Z43: reserve scratch area inline if not
                             // already set. The scratch reservation at line 4662
                             // happens AFTER this handler, so scratch_addr is 0
