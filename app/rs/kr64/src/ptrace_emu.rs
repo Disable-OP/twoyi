@@ -4332,6 +4332,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             let path_addr_i386 = get_syscall_arg(&regs, abi.reg_arg1);
                             let _argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
                             let _envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
+                            log(&format!("DIAG execve: path_addr={:#x}, reading path...", path_addr_i386));
 
                             // Translate the path
                             let orig_path = if path_addr_i386 != 0 {
@@ -4339,6 +4340,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             } else {
                                 None
                             };
+                            log(&format!("DIAG execve: orig_path={:?}", orig_path));
 
                             if let Some(ref orig) = orig_path {
                                 let translated = translate_path(rootfs, orig);
