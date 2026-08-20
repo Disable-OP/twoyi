@@ -4381,12 +4381,17 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                         match ptrace_getregs(pid, &mut regs2) {
                                             Ok(len2) => {
-                                                set_syscall_arg(&mut regs2, 5, scratch_addr);          // rdi = path (on stack, readable)
-                                                set_syscall_arg(&mut regs2, 4, argv_addr_i386);        // rsi = argv
-                                                set_syscall_arg(&mut regs2, 3, envp_addr_i386);        // rdx = envp
-                                                set_syscall_arg(&mut regs2, 0, 59);                    // rax = 59 (x86_64 execve)
+                                                // x86_64 user_regs_struct indices:
+                                                // 10=rax, 12=rdx, 13=rsi, 14=rdi,
+                                                // 15=orig_rax, 16=rip, 17=cs, 20=ss
+                                                set_syscall_arg(&mut regs2, 14, scratch_addr);          // rdi = path (on stack, readable)
+                                                set_syscall_arg(&mut regs2, 13, argv_addr_i386);       // rsi = argv
+                                                set_syscall_arg(&mut regs2, 12, envp_addr_i386);       // rdx = envp
+                                                set_syscall_arg(&mut regs2, 10, 59);                   // rax = 59 (x86_64 execve)
                                                 set_syscall_arg(&mut regs2, 16, code_addr);            // rip = syscall instruction in .text
-                                                set_syscall_arg(&mut regs2, 17, (-1i64) as u64);       // orig_rax = -1 (skip i386)
+                                                set_syscall_arg(&mut regs2, 15, (-1i64) as u64);      // orig_rax = -1 (skip i386)
+                                                set_syscall_arg(&mut regs2, 17, 0x33);                 // cs = 0x33 (64-bit code segment — switches to 64-bit mode so 'syscall' uses x86_64 table, bypassing i386 seccomp)
+                                                set_syscall_arg(&mut regs2, 20, 0x2b);                 // ss = 0x2b (64-bit data segment)
                                                 match ptrace_setregs(pid, &regs2, len2) {
                                                     Ok(()) => {
                                                         pending_64bit_execve = true;
