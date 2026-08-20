@@ -4304,8 +4304,16 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // the child is in 32-bit compat mode, the `syscall`
                         // instruction bypasses the i386 seccomp filter.
                         if abi.execve == 11 {
-                            log(&format!("DIAG execve ENTRY: abi.execve=11, scratch_addr={:#x}, pid={}", scratch_addr, pid));
-                            // Task 6-Z43: reserve scratch area inline if not
+                            // Task 6-Z43: ALWAYS reset scratch_addr to 0 at
+                            // the i386 execve ENTRY. The scratch_addr might be
+                            // a stale 64-bit address from before the ABI switch
+                            // (x86_64 → i386). The stale address is outside
+                            // the i386 child's usable address space → POKEDATA
+                            // fails silently → injection doesn't proceed.
+                            // Force a fresh reservation from the current sp.
+                            scratch_addr = 0;
+                            log(&format!("DIAG execve ENTRY: abi.execve=11, scratch_addr reset to 0 (was stale), pid={}", pid));
+                            // Task 6-Z43: reserve scratch area inline.
                             // already set. The scratch reservation at line 4662
                             // happens AFTER this handler, so scratch_addr is 0
                             // for the first execve after ABI re-detection.
