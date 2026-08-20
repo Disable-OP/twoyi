@@ -4291,9 +4291,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // to the scratch area, and update the path register.
                         let path_addr = get_syscall_arg(&regs, abi.reg_arg1);
                         if path_addr != 0 {
-                            let orig_path = read_child_string(pid, path_addr, 256);
+                            let orig_path = read_child_string(pid, path_addr);
                             if let Some(ref orig) = orig_path {
-                                let translated = translate_path(orig, rootfs);
+                                let translated = translate_path(rootfs, orig);
                                 if translated != *orig {
                                     // Write the translated path to the scratch area
                                     if write_child_string_unchecked(pid, scratch_addr, &translated) {
