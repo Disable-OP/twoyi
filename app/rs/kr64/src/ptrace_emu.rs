@@ -4312,6 +4312,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 let sp = get_syscall_arg(&regs, abi.reg_sp);
                                 scratch_addr = (sp.wrapping_sub(4096)) & !7u64;
                                 scratch_offset = 0;
+                                let _ = scratch_offset; // suppress dead_code warning
                                 log(&format!(
                                     "DIAG execve: inline scratch reservation at {:#x} (sp={:#x}) (Task 6-Z43)",
                                     scratch_addr, sp
