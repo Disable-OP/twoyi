@@ -4277,6 +4277,53 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             "execve ENTRY (nr={}) — will reset ABI after EXIT to re-detect child bitness",
                             syscall_num
                         ));
+
+                        // Task 6-Z41: translate the execve path at ENTRY.
+                        // The recovery service child calls execve('/sbin/recovery')
+                        // but the binary is at {rootfs}/sbin/recovery on the HOST.
+                        // The kernel can't find /sbin/recovery on the host filesystem
+                        // → ENOENT or ENOSYS (-38 from seccomp). We translate the
+                        // path to the rootfs path so the kernel finds it.
+                        //
+                        // On i386: path is in ebx (abi.reg_arg1), argv in ecx,
+                        // envp in edx. We read the path string from the child's
+                        // memory, translate it (prepend rootfs prefix), write it
+                        // to the scratch area, and update the path register.
+                        let path_addr = get_syscall_arg(&regs, abi.reg_arg1);
+                        if path_addr != 0 {
+                            let orig_path = read_child_string(pid, path_addr, 256);
+                            if let Some(ref orig) = orig_path {
+                                let translated = translate_path(orig, rootfs);
+                                if translated != *orig {
+                                    // Write the translated path to the scratch area
+                                    if write_child_string_unchecked(pid, scratch_addr, &translated) {
+                                        // Update the path register to point to the translated path
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs(pid, &mut regs2) {
+                                            Ok(len2) => {
+                                                set_syscall_arg(&mut regs2, &abi, abi.reg_arg1, scratch_addr as u64);
+                                                match ptrace_setregs(pid, &regs2, len2) {
+                                                    Ok(()) => log(&format!(
+                                                        "DIAG execve ENTRY: translated path '{}' -> '{}' (Task 6-Z41)",
+                                                        orig, translated
+                                                    )),
+                                                    Err(e) => log(&format!(
+                                                        "DIAG execve ENTRY: ptrace_setregs FAILED for path translate: {} (Task 6-Z41)",
+                                                        e
+                                                    )),
+                                                }
+                                            }
+                                            Err(e) => log(&format!(
+                                                "DIAG execve ENTRY: ptrace_getregs FAILED for path translate: {} (Task 6-Z41)",
+                                                e
+                                            )),
+                                        }
+                                    } else {
+                                        log("DIAG execve ENTRY: write_child_string_unchecked FAILED for path translate (Task 6-Z41)");
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Log the first 50 post-execve syscalls so we can
