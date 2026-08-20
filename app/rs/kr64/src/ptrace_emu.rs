@@ -4361,31 +4361,55 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
 
                                 if written {
-                                    // Set x86_64 registers:
-                                    // - orig_rax = -1 (skip the i386 syscall)
-                                    // - rax = 59 (x86_64 execve)
-                                    // - rdi = scratch_addr (translated path)
-                                    // - rsi = argv_addr_i386 (shared address space)
-                                    // - rdx = envp_addr_i386 (shared address space)
-                                    // - rip = scratch_addr + code_offset (syscall instruction)
-                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    match ptrace_getregs(pid, &mut regs2) {
-                                        Ok(len2) => {
-                                            // On x86_64, user_regs_struct fields are:
-                                            // rax, rbx, rcx, rdx, rsi, rdi, ...
-                                            // orig_rax is at a specific offset.
-                                            // We set the fields directly.
-                                            // For i386 compat, the registers are in the lower 32 bits.
-                                            // rdi = path, rsi = argv, rdx = envp (x86_64 calling convention)
-                                            set_syscall_arg(&mut regs2, 5, scratch_addr);          // rdi (arg index 5 on x86_64 user_regs)
-                                            set_syscall_arg(&mut regs2, 4, argv_addr_i386);        // rsi (arg index 4)
-                                            set_syscall_arg(&mut regs2, 3, envp_addr_i386);        // rdx (arg index 3)
-                                            // Set rax = 59 (x86_64 execve)
-                                            set_syscall_arg(&mut regs2, 0, 59);                    // rax
-                                            // Set rip = scratch_addr + code_offset (syscall instruction)
-                                            set_syscall_arg(&mut regs2, 16, scratch_addr + code_offset as u64); // rip (index 16)
-                                            // Set orig_rax = -1 (skip the i386 syscall)
-                                            set_syscall_arg(&mut regs2, 17, (-1i64) as u64);        // orig_rax
+                                    // Task 6-Z42 fix: the scratch area is on the
+                                    // STACK which is non-executable (NX bit).
+                                    // The `syscall` instruction can't execute from
+                                    // there → SIGSEGV (si_code=128 ACCERR).
+                                    // FIX: write the `syscall` instruction to the
+                                    // init binary's .text section (r-xp) instead.
+                                    // The 6-Z19 NOP area at vaddr 0x08048c59
+                                    // (7 bytes of NOP) is in .text and unused.
+                                    // We overwrite the first 3 bytes with
+                                    // 0x0f 0x05 0xcc (syscall + int3).
+                                    let code_addr: u64 = 0x08048c59;
+                                    let code_bytes: [u8; 3] = [0x0f, 0x05, 0xcc];
+                                    let mut code_written = false;
+                                    // Write the syscall instruction to .text
+                                    let word: libc::c_long = i32::from_ne_bytes([code_bytes[0], code_bytes[1], code_bytes[2], 0]) as libc::c_long;
+                                    let r = unsafe {
+                                        libc::ptrace(
+                                            libc::PTRACE_POKEDATA,
+                                            pid,
+                                            code_addr as i64,
+                                            word,
+                                        )
+                                    };
+                                    if r == -1 {
+                                        log(&format!(
+                                            "DIAG 64-bit execve: POKEDATA for syscall instruction at {:#x} FAILED (Task 6-Z42)",
+                                            code_addr
+                                        ));
+                                    } else {
+                                        code_written = true;
+                                    }
+
+                                    if code_written {
+                                        // Set x86_64 registers:
+                                        // - orig_rax = -1 (skip the i386 syscall)
+                                        // - rax = 59 (x86_64 execve)
+                                        // - rdi = scratch_addr (translated path, on stack — readable)
+                                        // - rsi = argv_addr_i386
+                                        // - rdx = envp_addr_i386
+                                        // - rip = code_addr (syscall instruction in .text)
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        match ptrace_getregs(pid, &mut regs2) {
+                                            Ok(len2) => {
+                                                set_syscall_arg(&mut regs2, 5, scratch_addr);          // rdi = path
+                                                set_syscall_arg(&mut regs2, 4, argv_addr_i386);        // rsi = argv
+                                                set_syscall_arg(&mut regs2, 3, envp_addr_i386);        // rdx = envp
+                                                set_syscall_arg(&mut regs2, 0, 59);                    // rax = 59 (x86_64 execve)
+                                                set_syscall_arg(&mut regs2, 16, code_addr);             // rip = syscall instruction in .text
+                                                set_syscall_arg(&mut regs2, 17, (-1i64) as u64);        // orig_rax = -1 (skip i386)
 
                                             match ptrace_setregs(pid, &regs2, len2) {
                                                 Ok(()) => {
