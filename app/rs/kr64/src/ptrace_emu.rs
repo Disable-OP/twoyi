@@ -6216,6 +6216,45 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                 // re-injected. We must NOT forward SIGTRAP back to the
                 // child — that would loop forever (the same breakpoint
                 // would fire again immediately).
+
+                // Task 6-Z43: check if this SIGTRAP is from our injected
+                // int3 at 0x8048c5b (after the 64-bit execve syscall).
+                // If so, the 64-bit execve was attempted (either succeeded
+                // or failed). If PTRACE_EVENT_EXEC didn't fire, execve
+                // failed — restore the child to 32-bit mode so init's
+                // code can handle the failure (call _exit(127)).
+                if pending_64bit_execve {
+                    let mut crash_regs: Regs = unsafe { std::mem::zeroed() };
+                    if ptrace_getregs(pid, &mut crash_regs).is_ok() {
+                        let rip_val = get_syscall_arg(&crash_regs, 16);
+                        if rip_val == 0x8048c5b || rip_val == 0x8048c5c {
+                            log(&format!(
+                                "DIAG 64-bit execve: int3 caught at rip={:#x} — execve was attempted. Restoring 32-bit mode (Task 6-Z43)",
+                                rip_val
+                            ));
+                            // Read the execve return value from rax
+                            let execve_ret = get_syscall_arg(&crash_regs, 10) as i64;
+                            log(&format!(
+                                "DIAG 64-bit execve: return value = {} ({})",
+                                execve_ret,
+                                if execve_ret == 0 { "SUCCESS" } else { format!("FAILED (errno={})", -execve_ret) }
+                            ));
+                            // Restore CS=0x23 (32-bit) + SS=0x2b
+                            set_syscall_arg(&mut crash_regs, 17, 0x23); // cs
+                            set_syscall_arg(&mut crash_regs, 20, 0x2b); // ss
+                            // Set rip to the instruction after init's
+                            // `call execve` (0x804ca14 = the _exit(127) call)
+                            set_syscall_arg(&mut crash_regs, 16, 0x804ca14);
+                            // Set rax to the errno (so init sees execve failed)
+                            if execve_ret != 0 {
+                                set_syscall_arg(&mut crash_regs, 10, execve_ret as u64);
+                            }
+                            let _ = ptrace_setregs(pid, &crash_regs, std::mem::size_of::<Regs>());
+                            pending_64bit_execve = false;
+                            continue;
+                        }
+                    }
+                }
             } else if sig == libc::SIGSYS {
                 // SIGSYS (signal 31) is raised by the kernel when the
                 // child calls a syscall blocked by a SECCOMP_RET_TRAP
