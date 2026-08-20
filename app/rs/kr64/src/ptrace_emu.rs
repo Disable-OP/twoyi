@@ -4399,9 +4399,18 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     //    mode → execve(nr=59) → seccomp sees
                                     //    AUDIT_ARCH_X86_64 → allows execve → SUCCESS
                                     let code_addr: u64 = 0x08048c59;
-                                    let syscall_word: libc::c_long = 0x00cc050f;
+                                    // Task 6-Z45 fix2: write "mov eax,59; syscall; int3"
+                                    // (8 bytes) to .text. This sets rax=59 inline,
+                                    // so we don't need the EXIT stop re-set (which
+                                    // the kernel may override).
+                                    // Bytes: b8 3b 00 00 00 0f 05 cc
+                                    // b8 3b 00 00 00 = mov eax, 59 (5 bytes)
+                                    // 0f 05           = syscall (2 bytes)
+                                    // cc              = int3 (1 byte)
+                                    let code_bytes: [u8; 8] = [0xb8, 0x3b, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xcc];
+                                    let code_word: libc::c_long = i64::from_ne_bytes(code_bytes);
                                     let r2 = unsafe {
-                                        libc::ptrace(libc::PTRACE_POKEDATA, pid, code_addr as i64, syscall_word)
+                                        libc::ptrace(libc::PTRACE_POKEDATA, pid, code_addr as i64, code_word)
                                     };
                                     if r2 == -1 {
                                         log("DIAG 64-bit execve: POKEDATA to .text FAILED (Task 6-Z45)");
