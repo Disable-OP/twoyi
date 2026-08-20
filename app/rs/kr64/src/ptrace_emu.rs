@@ -6237,7 +6237,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             log(&format!(
                                 "DIAG 64-bit execve: return value = {} ({})",
                                 execve_ret,
-                                if execve_ret == 0 { "SUCCESS" } else { format!("FAILED (errno={})", -execve_ret) }
+                                if execve_ret == 0 { "SUCCESS".to_string() } else { format!("FAILED (errno={})", -execve_ret) }
                             ));
                             // Restore CS=0x23 (32-bit) + SS=0x2b
                             set_syscall_arg(&mut crash_regs, 17, 0x23); // cs
