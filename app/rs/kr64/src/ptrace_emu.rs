@@ -3541,6 +3541,13 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     // own syscalls — the most useful diagnostic for "what does TWRP
     // init do after execve?").
     let mut past_first_execve: bool = false;
+    // Task 6-Z42: flag set when we inject a 64-bit execve via the
+    // scratch area. When the ptrace loop catches the next syscall
+    // ENTRY (the 64-bit execve from the scratch area), we clear this
+    // flag and let the 64-bit execve execute normally (it's not blocked
+    // by the zygote's seccomp filter because the filter whitelists
+    // x86_64 execve nr=59 but blocks i386 execve nr=11).
+    let mut pending_64bit_execve: bool = false;
     let mut post_execve_syscall_count: u64 = 0;
 
     // ── Multi-child PID tracking (Task 6-S) ───────────────────────────
@@ -4278,48 +4285,126 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             syscall_num
                         ));
 
-                        // Task 6-Z41: translate the execve path at ENTRY.
-                        // The recovery service child calls execve('/sbin/recovery')
-                        // but the binary is at {rootfs}/sbin/recovery on the HOST.
-                        // The kernel can't find /sbin/recovery on the host filesystem
-                        // → ENOENT or ENOSYS (-38 from seccomp). We translate the
-                        // path to the rootfs path so the kernel finds it.
+                        // Task 6-Z42: inject a 64-bit execve to bypass seccomp.
+                        // The zygote's seccomp filter blocks i386 execve (nr=11)
+                        // → returns -38 (ENOSYS). But it ALLOWS x86_64 execve
+                        // (nr=59) — init's own first execve (nr=59) succeeds.
                         //
-                        // On i386: path is in ebx (abi.reg_arg1), argv in ecx,
-                        // envp in edx. We read the path string from the child's
-                        // memory, translate it (prepend rootfs prefix), write it
-                        // to the scratch area, and update the path register.
-                        let path_addr = get_syscall_arg(&regs, abi.reg_arg1);
-                        if path_addr != 0 {
-                            let orig_path = read_child_string(pid, path_addr);
+                        // FIX: at the i386 execve ENTRY, skip the i386 syscall
+                        // (set orig_rax=-1), write a `syscall` instruction
+                        // (0x0f 0x05) to the scratch area, set the x86_64
+                        // registers (rax=59, rdi=path, rsi=argv, rdx=envp),
+                        // set rip to the scratch area, and resume. The child
+                        // executes the `syscall` instruction → 64-bit execve
+                        // (nr=59) → not blocked by seccomp → SUCCESS.
+                        //
+                        // The `syscall` instruction (0x0f 0x05) always uses
+                        // the x86_64 syscall table on a 64-bit kernel,
+                        // regardless of the current CS register. So even though
+                        // the child is in 32-bit compat mode, the `syscall`
+                        // instruction bypasses the i386 seccomp filter.
+                        if abi.execve == 11 && scratch_addr != 0 {
+                            // Read path, argv, envp from i386 regs
+                            let path_addr_i386 = get_syscall_arg(&regs, abi.reg_arg1);
+                            let argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
+                            let envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
+
+                            // Translate the path
+                            let orig_path = if path_addr_i386 != 0 {
+                                read_child_string(pid, path_addr_i386)
+                            } else {
+                                None
+                            };
+
                             if let Some(ref orig) = orig_path {
                                 let translated = translate_path(rootfs, orig);
-                                if translated != *orig {
-                                    // Write the translated path to the scratch area
-                                    if write_child_string_unchecked(pid, scratch_addr, &translated) {
-                                        // Update the path register to point to the translated path
-                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                        match ptrace_getregs(pid, &mut regs2) {
-                                            Ok(len2) => {
-                                                set_syscall_arg(&mut regs2, abi.reg_arg1, scratch_addr as u64);
-                                                match ptrace_setregs(pid, &regs2, len2) {
-                                                    Ok(()) => log(&format!(
-                                                        "DIAG execve ENTRY: translated path '{}' -> '{}' (Task 6-Z41)",
-                                                        orig, translated
-                                                    )),
-                                                    Err(e) => log(&format!(
-                                                        "DIAG execve ENTRY: ptrace_setregs FAILED for path translate: {} (Task 6-Z41)",
-                                                        e
-                                                    )),
+
+                                // Write the translated path to the scratch area
+                                // (NUL-terminated)
+                                let path_bytes = format!("{}\0", translated);
+                                let path_len = path_bytes.len();
+                                // 8-byte align
+                                let aligned_len = (path_len + 7) & !7;
+                                let code_offset = aligned_len;
+
+                                // Write path + padding + syscall instruction + int3
+                                let mut scratch_content = path_bytes.into_bytes();
+                                // Pad to 8-byte alignment
+                                while scratch_content.len() < code_offset {
+                                    scratch_content.push(0);
+                                }
+                                // syscall instruction (0x0f 0x05) + int3 (0xcc)
+                                scratch_content.push(0x0f);
+                                scratch_content.push(0x05);
+                                scratch_content.push(0xcc);
+
+                                // Write to child's memory
+                                let mut written = false;
+                                for (offset, &byte) in scratch_content.iter().enumerate() {
+                                    let word = byte as libc::c_long;
+                                    let r = unsafe {
+                                        libc::ptrace(
+                                            libc::PTRACE_POKEDATA,
+                                            pid,
+                                            (scratch_addr + offset as u64) as i64,
+                                            word,
+                                        )
+                                    };
+                                    if r == -1 {
+                                        log(&format!(
+                                            "DIAG 64-bit execve: POKEDATA failed at offset {} (Task 6-Z42)",
+                                            offset
+                                        ));
+                                        break;
+                                    }
+                                    written = offset == scratch_content.len() - 1;
+                                }
+
+                                if written {
+                                    // Set x86_64 registers:
+                                    // - orig_rax = -1 (skip the i386 syscall)
+                                    // - rax = 59 (x86_64 execve)
+                                    // - rdi = scratch_addr (translated path)
+                                    // - rsi = argv_addr_i386 (shared address space)
+                                    // - rdx = envp_addr_i386 (shared address space)
+                                    // - rip = scratch_addr + code_offset (syscall instruction)
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    match ptrace_getregs(pid, &mut regs2) {
+                                        Ok(len2) => {
+                                            // On x86_64, user_regs_struct fields are:
+                                            // rax, rbx, rcx, rdx, rsi, rdi, ...
+                                            // orig_rax is at a specific offset.
+                                            // We set the fields directly.
+                                            // For i386 compat, the registers are in the lower 32 bits.
+                                            // rdi = path, rsi = argv, rdx = envp (x86_64 calling convention)
+                                            set_syscall_arg(&mut regs2, 5, scratch_addr);          // rdi (arg index 5 on x86_64 user_regs)
+                                            set_syscall_arg(&mut regs2, 4, argv_addr_i386);        // rsi (arg index 4)
+                                            set_syscall_arg(&mut regs2, 3, envp_addr_i386);        // rdx (arg index 3)
+                                            // Set rax = 59 (x86_64 execve)
+                                            set_syscall_arg(&mut regs2, 0, 59);                    // rax
+                                            // Set rip = scratch_addr + code_offset (syscall instruction)
+                                            set_syscall_arg(&mut regs2, 16, scratch_addr + code_offset as u64); // rip (index 16)
+                                            // Set orig_rax = -1 (skip the i386 syscall)
+                                            set_syscall_arg(&mut regs2, 17, (-1i64) as u64);        // orig_rax
+
+                                            match ptrace_setregs(pid, &regs2, len2) {
+                                                Ok(()) => {
+                                                    pending_64bit_execve = true;
+                                                    log(&format!(
+                                                        "DIAG 64-bit execve INJECTED: path='{}' → '{}' (scratch at {:#x}, syscall at {:#x}) — bypassing i386 seccomp block (Task 6-Z42)",
+                                                        orig, translated, scratch_addr, scratch_addr + code_offset as u64
+                                                    ));
                                                 }
+                                                Err(e) => log(&format!(
+                                                    "DIAG 64-bit execve: ptrace_setregs FAILED: {} (Task 6-Z42)",
+                                                    e
+                                                )),
                                             }
-                                            Err(e) => log(&format!(
-                                                "DIAG execve ENTRY: ptrace_getregs FAILED for path translate: {} (Task 6-Z41)",
-                                                e
-                                            )),
                                         }
-                                    } else {
-                                        log("DIAG execve ENTRY: write_child_string_unchecked FAILED for path translate (Task 6-Z41)");
+                                        Err(e) => log(&format!(
+                                            "DIAG 64-bit execve: ptrace_getregs FAILED: {} (Task 6-Z42)",
+                                            e
+                                        )),
                                     }
                                 }
                             }
