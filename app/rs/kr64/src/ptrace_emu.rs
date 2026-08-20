@@ -4361,74 +4361,49 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
 
                                 if written {
-                                    // Task 6-Z42 fix: the scratch area is on the
-                                    // STACK which is non-executable (NX bit).
-                                    // The `syscall` instruction can't execute from
-                                    // there → SIGSEGV (si_code=128 ACCERR).
-                                    // FIX: write the `syscall` instruction to the
-                                    // init binary's .text section (r-xp) instead.
-                                    // The 6-Z19 NOP area at vaddr 0x08048c59
-                                    // (7 bytes of NOP) is in .text and unused.
-                                    // We overwrite the first 3 bytes with
-                                    // 0x0f 0x05 0xcc (syscall + int3).
+                                    // Task 6-Z42 fix: the syscall instruction
+                                    // was written to the scratch area (stack)
+                                    // which is NX (non-executable) → SIGSEGV.
+                                    // FIX: write the syscall instruction (0x0f 0x05)
+                                    // to the init binary's .text section at
+                                    // vaddr 0x08048c59 (the 6-Z19 NOP area,
+                                    // which is r-xp executable + unused).
+                                    // The translated PATH stays on the stack
+                                    // (readable, not executable — that's fine).
                                     let code_addr: u64 = 0x08048c59;
-                                    let code_bytes: [u8; 3] = [0x0f, 0x05, 0xcc];
-                                    let mut code_written = false;
-                                    // Write the syscall instruction to .text
-                                    let word: libc::c_long = i32::from_ne_bytes([code_bytes[0], code_bytes[1], code_bytes[2], 0]) as libc::c_long;
-                                    let r = unsafe {
-                                        libc::ptrace(
-                                            libc::PTRACE_POKEDATA,
-                                            pid,
-                                            code_addr as i64,
-                                            word,
-                                        )
+                                    let syscall_word: libc::c_long = 0xcc050f00i32 as libc::c_long; // 0f 05 cc 00 (LE)
+                                    let r2 = unsafe {
+                                        libc::ptrace(libc::PTRACE_POKEDATA, pid, code_addr as i64, syscall_word)
                                     };
-                                    if r == -1 {
-                                        log(&format!(
-                                            "DIAG 64-bit execve: POKEDATA for syscall instruction at {:#x} FAILED (Task 6-Z42)",
-                                            code_addr
-                                        ));
+                                    if r2 == -1 {
+                                        log("DIAG 64-bit execve: POKEDATA to .text FAILED (Task 6-Z42)");
                                     } else {
-                                        code_written = true;
-                                    }
-
-                                    if code_written {
-                                        // Set x86_64 registers:
-                                        // - orig_rax = -1 (skip the i386 syscall)
-                                        // - rax = 59 (x86_64 execve)
-                                        // - rdi = scratch_addr (translated path, on stack — readable)
-                                        // - rsi = argv_addr_i386
-                                        // - rdx = envp_addr_i386
-                                        // - rip = code_addr (syscall instruction in .text)
                                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                                         match ptrace_getregs(pid, &mut regs2) {
                                             Ok(len2) => {
-                                                set_syscall_arg(&mut regs2, 5, scratch_addr);          // rdi = path
+                                                set_syscall_arg(&mut regs2, 5, scratch_addr);          // rdi = path (on stack, readable)
                                                 set_syscall_arg(&mut regs2, 4, argv_addr_i386);        // rsi = argv
                                                 set_syscall_arg(&mut regs2, 3, envp_addr_i386);        // rdx = envp
                                                 set_syscall_arg(&mut regs2, 0, 59);                    // rax = 59 (x86_64 execve)
-                                                set_syscall_arg(&mut regs2, 16, code_addr);             // rip = syscall instruction in .text
-                                                set_syscall_arg(&mut regs2, 17, (-1i64) as u64);        // orig_rax = -1 (skip i386)
-
-                                            match ptrace_setregs(pid, &regs2, len2) {
-                                                Ok(()) => {
-                                                    pending_64bit_execve = true;
-                                                    log(&format!(
-                                                        "DIAG 64-bit execve INJECTED: path='{}' → '{}' (scratch at {:#x}, syscall at {:#x}) — bypassing i386 seccomp block (Task 6-Z42)",
-                                                        orig, translated, scratch_addr, scratch_addr + code_offset as u64
-                                                    ));
+                                                set_syscall_arg(&mut regs2, 16, code_addr);            // rip = syscall instruction in .text
+                                                set_syscall_arg(&mut regs2, 17, (-1i64) as u64);       // orig_rax = -1 (skip i386)
+                                                match ptrace_setregs(pid, &regs2, len2) {
+                                                    Ok(()) => {
+                                                        pending_64bit_execve = true;
+                                                        log(&format!(
+                                                            "DIAG 64-bit execve INJECTED: path='{}' → '{}' (path at {:#x}, syscall at {:#x}) — bypassing i386 seccomp block (Task 6-Z42)",
+                                                            orig, translated, scratch_addr, code_addr
+                                                        ));
+                                                    }
+                                                    Err(e) => log(&format!(
+                                                        "DIAG 64-bit execve: ptrace_setregs FAILED: {} (Task 6-Z42)", e
+                                                    )),
                                                 }
-                                                Err(e) => log(&format!(
-                                                    "DIAG 64-bit execve: ptrace_setregs FAILED: {} (Task 6-Z42)",
-                                                    e
-                                                )),
                                             }
+                                            Err(e) => log(&format!(
+                                                "DIAG 64-bit execve: ptrace_getregs FAILED: {} (Task 6-Z42)", e
+                                            )),
                                         }
-                                        Err(e) => log(&format!(
-                                            "DIAG 64-bit execve: ptrace_getregs FAILED: {} (Task 6-Z42)",
-                                            e
-                                        )),
                                     }
                                 }
                             }
