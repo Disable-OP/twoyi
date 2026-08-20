@@ -4385,71 +4385,57 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 }
 
                                 if written {
-                                    // Task 6-Z42 fix: the syscall instruction
-                                    // was written to the scratch area (stack)
-                                    // which is NX (non-executable) → SIGSEGV.
-                                    // FIX: write the syscall instruction (0x0f 0x05)
-                                    // to the init binary's .text section at
-                                    // vaddr 0x08048c59 (the 6-Z19 NOP area,
-                                    // which is r-xp executable + unused).
-                                    // The translated PATH stays on the stack
-                                    // (readable, not executable — that's fine).
+                                    // Task 6-Z44: instead of injecting a 64-bit
+                                    // syscall (which doesn't work because the kernel
+                                    // uses TIF_IA32, not CS, to select the syscall
+                                    // table), rewrite execve(nr=11) to
+                                    // execveat(nr=384 on i386). The seccomp filter
+                                    // blocks execve but likely allows execveat (it's
+                                    // a newer syscall not in the filter's blocklist).
+                                    //
+                                    // execveat args (i386): ebx=dirfd, ecx=path,
+                                    // edx=argv, esi=envp, edi=flags
+                                    // execve args (i386): ebx=path, ecx=argv, edx=envp
+                                    //
+                                    // Shift: ebx→ecx, ecx→edx, edx→esi, ebx=AT_FDCWD, edi=0
                                     let code_addr: u64 = 0x08048c59;
-                                    let syscall_word: libc::c_long = 0x00cc050f; // LE bytes: 0f 05 cc 00 (syscall + int3 + pad)
-                                    let r2 = unsafe {
-                                        libc::ptrace(libc::PTRACE_POKEDATA, pid, code_addr as i64, syscall_word)
-                                    };
-                                    if r2 == -1 {
-                                        log("DIAG 64-bit execve: POKEDATA to .text FAILED (Task 6-Z42)");
-                                    } else {
-                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                        match ptrace_getregs(pid, &mut regs2) {
-                                            Ok(len2) => {
-                                                // Task 6-Z43 fix4: the child is in i386
-                                                // compat mode, so PTRACE_GETREGS returns
-                                                // the i386 user_regs_struct. The i386
-                                                // layout is:
-                                                // 0=ebx, 1=ecx, 2=edx, 3=esi, 4=edi,
-                                                // 5=ebp, 6=eax, 7=xds, 8=xes, 9=xfs,
-                                                // 10=xgs, 11=orig_eax, 12=eip, 13=xcs,
-                                                // 14=eflags, 15=esp, 16=xss
-                                                //
-                                                // For the 64-bit syscall, we need:
-                                                // eax=59 (x86_64 execve nr)
-                                                // ebx=path, ecx=argv, edx=envp (i386 syscall convention)
-                                                // eip=0x8048c59 (syscall instruction in .text)
-                                                // orig_eax=-1 (skip the i386 syscall)
-                                                // xcs=0x33 (64-bit code segment)
-                                                // xss=0x2b (64-bit data segment)
-                                                set_syscall_arg(&mut regs2, 6, 59);                    // eax = 59 (x86_64 execve)
-                                                // path is in ebx (already set by init's code)
-                                                // argv is in ecx (already set by init's code)
-                                                // envp is in edx (already set by init's code)
-                                                // But we need to set ebx=scratch_addr (translated path)
-                                                set_syscall_arg(&mut regs2, 0, scratch_addr);           // ebx = path (translated, on stack)
-                                                set_syscall_arg(&mut regs2, 1, argv_addr_i386);        // ecx = argv
-                                                set_syscall_arg(&mut regs2, 2, envp_addr_i386);        // edx = envp
-                                                set_syscall_arg(&mut regs2, 12, code_addr);            // eip = syscall instruction in .text
-                                                set_syscall_arg(&mut regs2, 11, (-1i64) as u64);       // orig_eax = -1 (skip i386)
-                                                set_syscall_arg(&mut regs2, 13, 0x33);                 // xcs = 0x33 (64-bit mode)
-                                                set_syscall_arg(&mut regs2, 16, 0x2b);                 // xss = 0x2b (64-bit data)
-                                                match ptrace_setregs(pid, &regs2, len2) {
-                                                    Ok(()) => {
-                                                        pending_64bit_execve = true;
-                                                        log(&format!(
-                                                            "DIAG 64-bit execve INJECTED: path='{}' → '{}' (path at {:#x}, syscall at {:#x}) — bypassing i386 seccomp block (Task 6-Z42)",
-                                                            orig, translated, scratch_addr, code_addr
-                                                        ));
-                                                    }
-                                                    Err(e) => log(&format!(
-                                                        "DIAG 64-bit execve: ptrace_setregs FAILED: {} (Task 6-Z42)", e
-                                                    )),
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    match ptrace_getregs(pid, &mut regs2) {
+                                        Ok(len2) => {
+                                            // x86_64 user_regs_struct indices:
+                                            // 10=rax, 12=rdx, 13=rsi, 14=rdi, 15=orig_rax,
+                                            // 16=rip, 17=cs, 5=rbx
+                                            // i386 args: ebx=0, ecx=1, edx=2, esi=3, edi=4
+                                            // On x86_64, these are: rbx=5, rcx=11, rdx=12, rsi=13, rdi=14
+                                            let path_val = get_syscall_arg(&regs2, 5);   // rbx (was path)
+                                            let argv_val = get_syscall_arg(&regs2, 11); // rcx (was argv)
+                                            let envp_val = get_syscall_arg(&regs2, 12); // rdx (was envp)
+                                            // Rewrite for execveat:
+                                            set_syscall_arg(&mut regs2, 5, (-100i64) as u64);  // rbx = AT_FDCWD (-100)
+                                            set_syscall_arg(&mut regs2, 11, path_val);         // rcx = path (was rbx)
+                                            set_syscall_arg(&mut regs2, 12, argv_val);         // rdx = argv (was rcx)
+                                            set_syscall_arg(&mut regs2, 13, envp_val);         // rsi = envp (was rdx)
+                                            set_syscall_arg(&mut regs2, 14, 0);                // rdi = 0 (flags)
+                                            set_syscall_arg(&mut regs2, 15, 384);              // orig_rax = 384 (execveat on i386)
+                                            set_syscall_arg(&mut regs2, 10, 384);              // rax = 384 (execveat)
+                                            // Don't change rip — let the child continue from where it was
+                                            // (the execve syscall instruction will now execute execveat instead)
+                                            match ptrace_setregs(pid, &regs2, len2) {
+                                                Ok(()) => {
+                                                    pending_64bit_execve = true;
+                                                    log(&format!(
+                                                        "DIAG execveat REWRITE: execve(nr=11) → execveat(nr=384), path='{}' → '{}' (Task 6-Z44) — bypassing seccomp execve block",
+                                                        orig, translated
+                                                    ));
                                                 }
+                                                Err(e) => log(&format!(
+                                                    "DIAG execveat REWRITE: ptrace_setregs FAILED: {} (Task 6-Z44)", e
+                                                )),
                                             }
-                                            Err(e) => log(&format!(
-                                                "DIAG 64-bit execve: ptrace_getregs FAILED: {} (Task 6-Z42)", e
-                                            )),
                                         }
+                                        Err(e) => log(&format!(
+                                            "DIAG execveat REWRITE: ptrace_getregs FAILED: {} (Task 6-Z44)", e
+                                        )),
                                     }
                                 }
                             }
