@@ -6828,12 +6828,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     } else {
                                         // Doesn't fit — APPEND the new interp at the end of the file
                                         // and update the PT_INTERP program header to point to it.
+                                        //
+                                        // Task 6-Z65 (Agent G flag): the patch runs on EVERY kr64
+                                        // relaunch (~2s apart). Previously it blindly re-appended
+                                        // 41 bytes each cycle — growing the file every time AND
+                                        // silently swallowing write errors (`let _ =`). Two fixes:
+                                        //   1. IDEMPOTENCY: if the interp ALREADY points at the
+                                        //      full rootfs path, skip the append entirely.
+                                        //   2. READ-BACK VERIFICATION: after writing, re-read the
+                                        //      phdr + interp and log what's ACTUALLY on disk —
+                                        //      a swallowed write failure is now visible.
+                                        let already_patched = interp_str.trim_end_matches('\0') == new_interp_path;
+                                        if already_patched {
+                                            info!("[KR64] Task 6-Z65: PT_INTERP already patched to the rootfs path — skipping re-append (idempotent)");
+                                        } else {
                                         let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
                                         let new_offset = file_size;
                                         let new_filesz = new_interp.len();
                                         // Append the new interp string
-                                        let _ = file.seek(std::io::SeekFrom::End(0));
-                                        let _ = file.write_all(new_interp.as_bytes());
+                                        let append_res = {
+                                            let _ = file.seek(std::io::SeekFrom::End(0));
+                                            file.write_all(new_interp.as_bytes())
+                                        };
+                                        if let Err(e) = append_res {
+                                            error!("[KR64] Task 6-Z65: PT_INTERP append WRITE FAILED: {} — execve will likely fail with ENOENT", e);
+                                        } else {
                                         info!("[KR64] Task 6-Z50: appended new PT_INTERP at offset {} ({} bytes)",
                                             new_offset, new_filesz);
                                         // Update the PT_INTERP program header's p_offset and p_filesz
@@ -6849,13 +6868,55 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                         }
                                         if let Some(phdr_off) = pt_interp_phdr_off {
                                             // Write new p_offset (at phdr_off + 4)
-                                            let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 4));
-                                            let _ = file.write_all(&(new_offset as u32).to_le_bytes());
+                                            let w1 = {
+                                                let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 4));
+                                                file.write_all(&(new_offset as u32).to_le_bytes())
+                                            };
                                             // Write new p_filesz (at phdr_off + 16)
-                                            let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 16));
-                                            let _ = file.write_all(&(new_filesz as u32).to_le_bytes());
+                                            let w2 = {
+                                                let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 16));
+                                                file.write_all(&(new_filesz as u32).to_le_bytes())
+                                            };
+                                            if w1.is_err() || w2.is_err() {
+                                                error!("[KR64] Task 6-Z65: PT_INTERP phdr update FAILED (w1={:?}, w2={:?}) — kernel will use the OLD interpreter path", w1.err(), w2.err());
+                                            } else {
                                             info!("[KR64] Task 6-Z50: updated PT_INTERP phdr: p_offset={}, p_filesz={}",
                                                 new_offset, new_filesz);
+                                            // Task 6-Z65: READ-BACK verification — re-read the
+                                            // phdr + interp from disk (bypassing the File's buffer
+                                            // via a fresh open) and log exactly what a subsequent
+                                            // execve would see.
+                                            let verify = std::fs::read(&recovery_path).ok().and_then(|bytes| {
+                                                let v_e_phoff = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as u64;
+                                                let v_e_phentsize = u16::from_le_bytes([bytes[42], bytes[43]]) as usize;
+                                                let v_e_phnum = u16::from_le_bytes([bytes[44], bytes[45]]) as usize;
+                                                for i in 0..v_e_phnum {
+                                                    let off = i * v_e_phentsize;
+                                                    let p_type = u32::from_le_bytes([bytes[v_e_phoff as usize + off], bytes[v_e_phoff as usize + off + 1], bytes[v_e_phoff as usize + off + 2], bytes[v_e_phoff as usize + off + 3]]);
+                                                    if p_type == 3 {
+                                                        let v_off = u32::from_le_bytes([bytes[v_e_phoff as usize + off + 4], bytes[v_e_phoff as usize + off + 5], bytes[v_e_phoff as usize + off + 6], bytes[v_e_phoff as usize + off + 7]]) as usize;
+                                                        let v_sz = u32::from_le_bytes([bytes[v_e_phoff as usize + off + 16], bytes[v_e_phoff as usize + off + 17], bytes[v_e_phoff as usize + off + 18], bytes[v_e_phoff as usize + off + 19]]) as usize;
+                                                        let end = (v_off + v_sz).min(bytes.len());
+                                                        return Some((v_off, v_sz, String::from_utf8_lossy(&bytes[v_off..end]).trim_end_matches('\0').to_string(), bytes.len()));
+                                                    }
+                                                }
+                                                None
+                                            });
+                                            match verify {
+                                                Some((v_off, v_sz, v_str, v_len)) => {
+                                                    if v_str == new_interp_path {
+                                                        info!("[KR64] Task 6-Z65: READ-BACK VERIFIED — PT_INTERP @{} ({} bytes) = {:?} (file size {}) — execve will find the rootfs linker",
+                                                            v_off, v_sz, v_str, v_len);
+                                                    } else {
+                                                        error!("[KR64] Task 6-Z65: READ-BACK MISMATCH — PT_INTERP @{} ({} bytes) = {:?} (expected {:?}, file size {}) — the patch did NOT persist!",
+                                                            v_off, v_sz, v_str, new_interp_path, v_len);
+                                                    }
+                                                }
+                                                None => error!("[KR64] Task 6-Z65: read-back verification FAILED — could not re-parse the patched ELF"),
+                                            }
+                                            }
+                                            }
+                                        }
                                         }
                                     }
                                 } else {
