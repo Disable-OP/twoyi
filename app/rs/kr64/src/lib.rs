@@ -6816,16 +6816,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     info!("[KR64] Task 6-Z50: PT_INTERP offset={}, filesz={}, path={:?}",
                                         p_offset, p_filesz, interp_str.trim_end_matches('\0'));
                                     let new_interp = format!("{}/sbin/linker\0", cfg.rootfs);
+                                    let new_interp_path = new_interp.trim_end_matches('\0').to_string();
                                     if new_interp.len() <= p_filesz {
                                         let _ = file.seek(std::io::SeekFrom::Start(p_offset));
                                         let mut nb = new_interp.into_bytes();
                                         while nb.len() < p_filesz { nb.push(0); }
                                         let _ = file.write_all(&nb);
                                         info!("[KR64] Task 6-Z50: patched PT_INTERP to {} ({} bytes)",
-                                            new_interp.trim_end_matches('\0'), p_filesz);
+                                            new_interp_path, p_filesz);
                                     } else {
                                         error!("[KR64] Task 6-Z50: new interp {} doesn't fit in {} bytes (need {})",
-                                            new_interp.trim_end_matches('\0'), p_filesz, new_interp.len());
+                                            new_interp_path, p_filesz, new_interp.len());
                                         let host_linker = "/system/bin/linker\0";
                                         if host_linker.len() <= p_filesz {
                                             let _ = file.seek(std::io::SeekFrom::Start(p_offset));
