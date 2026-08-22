@@ -4048,6 +4048,55 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // clear `in_syscall` or the next stop is
                         // misclassified as a syscall-exit.
                         in_syscall = false;
+
+                        // Task 6-Z47: BOOT_COMPLETED synthesis. TWRP (recovery
+                        // image) doesn't have system_server or a sys.boot_completed
+                        // setter, so it NEVER sends BOOT_COMPLETED to the twoyi app.
+                        // Without BOOT_COMPLETED, the app's BootCompletionServer
+                        // times out after 60s → loadingLayout stays visible → the
+                        // BootLogTexture logcat overlay covers the real SurfaceView
+                        // forever. Even a perfectly-rendering TWRP would be hidden.
+                        //
+                        // When the 64-bit execve injection succeeds (pending_64bit_execve
+                        // is true + PTRACE_EVENT_EXEC fired = the recovery binary's
+                        // execve completed + new image loaded), kr64 synthesizes
+                        // BOOT_COMPLETED by connecting to the app's @TWOYI_SOCK
+                        // abstract socket and writing "BOOT_COMPLETED\n". The app's
+                        // TwoyiSocketServer receives it → BootCompletionServer.markCompleted()
+                        // → loadingLayout hidden → SurfaceView visible → TWRP framebuffer shown.
+                        if pending_64bit_execve {
+                            pending_64bit_execve = false;
+                            log("[KR64] BOOT_COMPLETED synthesis: 64-bit execve SUCCEEDED (PTRACE_EVENT_EXEC) — sending BOOT_COMPLETED to @TWOYI_SOCK (Task 6-Z47)");
+                            // Connect to the app's abstract socket @TWOYI_SOCK and
+                            // write "BOOT_COMPLETED\n". The app's TwoyiSocketServer
+                            // handles this message and calls BootCompletionServer.markCompleted().
+                            // Also try @TWOYI_BOOT_SOCK (the dedicated boot socket).
+                            for sock_name in &["\0TWOYI_SOCK", "\0TWOYI_BOOT_SOCK"] {
+                                use std::os::unix::net::UnixStream;
+                                use std::io::Write;
+                                match UnixStream::connect(sock_name) {
+                                    Ok(mut stream) => {
+                                        match stream.write_all(b"BOOT_COMPLETED\n") {
+                                            Ok(()) => log(&format!(
+                                                "[KR64] BOOT_COMPLETED sent to @{} (Task 6-Z47)",
+                                                &sock_name[1..]
+                                            )),
+                                            Err(e) => log(&format!(
+                                                "[KR64] BOOT_COMPLETED: write to @{} failed: {} (Task 6-Z47)",
+                                                &sock_name[1..], e
+                                            )),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log(&format!(
+                                            "[KR64] BOOT_COMPLETED: connect to @{} failed: {} (non-fatal; trying next) (Task 6-Z47)",
+                                            &sock_name[1..], e
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
                         continue;
                     }
                     ev if ev == libc::PTRACE_EVENT_VFORK_DONE as u32 => {
@@ -4330,9 +4379,9 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             if scratch_addr != 0 {
                             // Read path, argv, envp from i386 regs
                             let path_addr_i386 = get_syscall_arg(&regs, abi.reg_arg1);
-                            let _argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
-                            let _envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
-                            log(&format!("DIAG execve: path_addr={:#x}, reading path...", path_addr_i386));
+                            let argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
+                            let envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
+                            log(&format!("DIAG execve: path_addr={:#x}, argv_addr={:#x}, envp_addr={:#x}", path_addr_i386, argv_addr_i386, envp_addr_i386));
 
                             // Translate the path
                             let orig_path = if path_addr_i386 != 0 {
@@ -4351,18 +4400,68 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                 let path_len = path_bytes.len();
                                 // 8-byte align
                                 let aligned_len = (path_len + 7) & !7;
-                                let code_offset = aligned_len;
 
-                                // Write path + padding + syscall instruction + int3
+                                // Task 6-Z47: Read the 32-bit argv/envp arrays from
+                                // the child and convert to 64-bit arrays. The 64-bit
+                                // execve (nr=59) reads argv/envp as arrays of 64-bit
+                                // pointers (char**), but the i386 child's argv/envp are
+                                // arrays of 32-bit pointers. Without conversion, the
+                                // 64-bit kernel reads garbage pointers → EFAULT.
+                                let mut argv_64: Vec<u64> = Vec::new();
+                                if argv_addr_i386 != 0 {
+                                    let mut off = 0u64;
+                                    while argv_64.len() < 64 {
+                                        let word = unsafe {
+                                            libc::ptrace(libc::PTRACE_PEEKDATA, pid,
+                                                (argv_addr_i386 + off) as i64, 0)
+                                        };
+                                        if word == -1 { break; }
+                                        let ptr32 = (word as u32) as u64;
+                                        if ptr32 == 0 { break; }
+                                        argv_64.push(ptr32);
+                                        off += 4;
+                                    }
+                                }
+                                argv_64.push(0); // NULL terminator
+
+                                let mut envp_64: Vec<u64> = Vec::new();
+                                if envp_addr_i386 != 0 {
+                                    let mut off = 0u64;
+                                    while envp_64.len() < 64 {
+                                        let word = unsafe {
+                                            libc::ptrace(libc::PTRACE_PEEKDATA, pid,
+                                                (envp_addr_i386 + off) as i64, 0)
+                                        };
+                                        if word == -1 { break; }
+                                        let ptr32 = (word as u32) as u64;
+                                        if ptr32 == 0 { break; }
+                                        envp_64.push(ptr32);
+                                        off += 4;
+                                    }
+                                }
+                                envp_64.push(0); // NULL terminator
+
+                                log(&format!("DIAG execve: argv {} entries, envp {} entries (Task 6-Z47)",
+                                    argv_64.len() - 1, envp_64.len() - 1));
+
+                                // Scratch area layout:
+                                // [path + padding] [64-bit argv array] [64-bit envp array]
+                                let argv_offset = aligned_len;
+                                let envp_offset = argv_offset + argv_64.len() * 8;
+
                                 let mut scratch_content = path_bytes.into_bytes();
-                                // Pad to 8-byte alignment
-                                while scratch_content.len() < code_offset {
+                                while scratch_content.len() < argv_offset {
                                     scratch_content.push(0);
                                 }
-                                // syscall instruction (0x0f 0x05) + int3 (0xcc)
-                                scratch_content.push(0x0f);
-                                scratch_content.push(0x05);
-                                scratch_content.push(0xcc);
+                                for &ptr in &argv_64 {
+                                    scratch_content.extend_from_slice(&ptr.to_le_bytes());
+                                }
+                                for &ptr in &envp_64 {
+                                    scratch_content.extend_from_slice(&ptr.to_le_bytes());
+                                }
+
+                                let scratch_argv_addr = scratch_addr + argv_offset as u64;
+                                let scratch_envp_addr = scratch_addr + envp_offset as u64;
 
                                 // Write to child's memory
                                 let mut written = false;
@@ -4422,13 +4521,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                                 // 5=rbx, 10=rax, 11=rcx, 12=rdx,
                                                 // 13=rsi, 14=rdi, 15=orig_rax,
                                                 // 16=rip, 17=cs, 20=ss
-                                                let _path_val = get_syscall_arg(&regs2, 5);   // rbx (i386 path) — not used directly (path is at scratch_addr)
-                                                let argv_val = get_syscall_arg(&regs2, 11); // rcx (i386 argv)
-                                                let envp_val = get_syscall_arg(&regs2, 12); // rdx (i386 envp)
-                                                // Set x86_64 args: rdi=path, rsi=argv, rdx=envp
-                                                set_syscall_arg(&mut regs2, 14, scratch_addr);  // rdi = translated path
-                                                set_syscall_arg(&mut regs2, 13, argv_val);      // rsi = argv
-                                                set_syscall_arg(&mut regs2, 12, envp_val);      // rdx = envp
+                                                // Set x86_64 args: rdi=path, rsi=64-bit argv, rdx=64-bit envp
+                                                // Task 6-Z47: rsi/rdx point to the converted 64-bit arrays in
+                                                // the scratch area (NOT the child's original 32-bit arrays).
+                                                set_syscall_arg(&mut regs2, 14, scratch_addr);         // rdi = translated path
+                                                set_syscall_arg(&mut regs2, 13, scratch_argv_addr);     // rsi = 64-bit argv array
+                                                set_syscall_arg(&mut regs2, 12, scratch_envp_addr);     // rdx = 64-bit envp array
                                                 set_syscall_arg(&mut regs2, 10, 59);             // rax = 59 (x86_64 execve)
                                                 set_syscall_arg(&mut regs2, 16, code_addr);      // rip = syscall instruction in .text
                                                 set_syscall_arg(&mut regs2, 15, (-1i64) as u64); // orig_rax = -1 (skip i386)
@@ -4438,8 +4536,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                                 pending_64bit_execve = true;
                                                 match ptrace_setregs(pid, &regs2, len2) {
                                                     Ok(()) => log(&format!(
-                                                        "DIAG 64-bit execve INJECTED: skip i386 + set rip={:#x} CS=0x33 rax=59 rdi={:#x} (Task 6-Z45)",
-                                                        code_addr, scratch_addr
+                                                        "DIAG 64-bit execve INJECTED: rip={:#x} CS=0x33 rax=59 rdi={:#x} rsi={:#x} (argv64) rdx={:#x} (envp64) (Task 6-Z47)",
+                                                        code_addr, scratch_addr, scratch_argv_addr, scratch_envp_addr
                                                     )),
                                                     Err(e) => log(&format!(
                                                         "DIAG 64-bit execve: ptrace_setregs FAILED: {} (Task 6-Z45)", e
