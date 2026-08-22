@@ -7445,7 +7445,7 @@ pub fn run_ptrace_loop(
                         // (theoretically) different length; we shadow it
                         // into `setregs_len` so the setregs call uses
                         // the matching length.
-                        let mut setregs_len = len;
+                        let setregs_len = len;
                         if !in_syscall_at_sigsys {
                             // Task 6-Z59: DESYNC mode — instead of doing a full
                             // "fresh ptrace_getregs + setregs" (which corrupts
@@ -7462,7 +7462,6 @@ pub fn run_ptrace_loop(
                             ));
                             // Set orig_rax=-1 to skip the syscall. Only modify
                             // this one register via PTRACE_POKEUSER.
-                            let regs_ptr = &sigsys_regs as *const Regs as *const u64;
                             let orig_rax_offset = std::mem::size_of::<u64>() * a.reg_syscall;
                             let _ = unsafe {
                                 libc::ptrace(
