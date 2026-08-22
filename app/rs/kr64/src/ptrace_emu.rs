@@ -3247,6 +3247,10 @@ pub fn run_ptrace_loop(
     log("PTRACE_O_TRACESYSGOOD | TRACEFORK | TRACECLONE | TRACEVFORK | TRACEVFORKDONE | TRACEEXEC | EXITKILL set");
 
     let mut in_syscall = false;
+    // Task 6-Z54: per-child in_syscall tracking. The global `in_syscall` flag
+    // causes DESYNC when switching between init and the recovery child. This
+    // map saves/restores `in_syscall` per child PID on each waitpid switch.
+    let mut in_syscall_map: std::collections::HashMap<libc::pid_t, bool> = std::collections::HashMap::new();
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
 
@@ -3793,20 +3797,20 @@ pub fn run_ptrace_loop(
         // shadow `let pid = current_pid` below makes the existing
         // handler code (which uses `pid` for ptrace_getregs /
         // read_child_string / ptrace_setregs) operate on THIS child.
-        // Task 6-Z53: reset `in_syscall` when switching to a DIFFERENT child.
-        // The `in_syscall` flag is per-loop, not per-child. If init was in
-        // ENTRY state (in_syscall=true) and then the recovery child's first
-        // syscall arrives, it's incorrectly treated as EXIT (DESYNC). Fix:
-        // when the child PID changes, reset in_syscall=false so the new
-        // child's first syscall is correctly treated as ENTRY.
+        // Task 6-Z54: track in_syscall PER CHILD. The global in_syscall
+        // flag causes DESYNC when switching between init and the recovery
+        // child. Use a per-child map instead.
         if waited != current_pid {
-            if in_syscall {
+            // Save the current child's in_syscall state
+            in_syscall_map.insert(current_pid, in_syscall);
+            // Restore the new child's in_syscall state (default false for new children)
+            in_syscall = *in_syscall_map.get(&waited).unwrap_or(&false);
+            if waited != init_pid && !in_syscall_map.contains_key(&waited) {
                 log(&format!(
-                    "DIAG child switch: {} → {} — resetting in_syscall=false (was true from previous child, Task 6-Z53)",
+                    "DIAG child switch: {} → {} — new child, in_syscall=false (Task 6-Z54)",
                     current_pid, waited
                 ));
             }
-            in_syscall = false;
         }
         current_pid = waited;
         // Shadow the function-parameter `pid` (init's PID) with
