@@ -2194,6 +2194,16 @@ fn i386_enosys_fake_value(nr: i64) -> i64 {
                                        // separately by the SIGSYS handler)
         191 => -1,                     // ugetrlimit → error (buffer would be
                                        // untouched garbage on fake success)
+        11 => -2,                       // execve → -ENOENT (Task 6-Z66): init's
+                                       // i386 execve is ENTRY-skipped (6-Z49) or
+                                       // seccomp-blocked; -ENOENT makes the
+                                       // forked service child take init's clean
+                                       // exec-failure path (_exit(127), parent
+                                       // applies restart backoff). Returning 0
+                                       // (the old blanket) left the child running
+                                       // INIT'S IMAGE post-fork → duplicate-init
+                                       // corruption; -1 (EPERM) also works but
+                                       // -ENOENT matches AOSP's expected errno.
         1 | 252 => 0,                  // exit/exit_group — never reaches the
                                        // fake path (gated above), placeholder
         _ => -1,                       // generic -EPERM error
@@ -5439,13 +5449,22 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
-                        // Task 6-Z49: if the recovery child was already forked
-                        // proactively (from lib.rs), just skip init's i386 execve
-                        // for /sbin/recovery. Seccomp would block it anyway (SIGSYS).
+                        // Task 6-Z49/6-Z66: if the recovery child was already
+                        // forked proactively (from lib.rs), skip init's i386
+                        // execve entirely — seccomp would SIGSYS-kill it anyway.
+                        // The skipped syscall's EXIT shows -ENOSYS, which the
+                        // 6-Z60 EXIT gate converts via i386_enosys_fake_value
+                        // (11 → -ENOENT): the forked service child then takes
+                        // init's STANDARD exec-failure path (_exit(127), the
+                        // parent's service manager applies its restart backoff).
+                        // The pre-6-Z66 version faked return 0 — the child then
+                        // kept running INIT'S OWN IMAGE after the fork, acting
+                        // as a duplicate init (re-parsing .rc, re-forking) and
+                        // corrupting the boot state.
                         if abi.execve == 11 && recovery_child_pid.is_some() {
-                            log("DIAG execve: recovery child already forked — skipping i386 execve (Task 6-Z49)");
+                            log("DIAG execve: skipping init's i386 execve (6-Z49; recovery child forked separately) — child will see -ENOENT and take the clean service-spawn failure path (6-Z66)");
                             set_syscall_arg(&mut regs, abi.reg_syscall, (-1i64) as u64);
-                            set_syscall_ret(&mut regs, &abi, 0);
+                            set_syscall_ret(&mut regs, &abi, -2);
                             let _ = ptrace_setregs(pid, &regs, std::mem::size_of::<Regs>());
                         }
                     }
