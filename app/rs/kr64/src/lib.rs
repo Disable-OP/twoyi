@@ -6818,22 +6818,44 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     let new_interp = format!("{}/sbin/linker\0", cfg.rootfs);
                                     let new_interp_path = new_interp.trim_end_matches('\0').to_string();
                                     if new_interp.len() <= p_filesz {
+                                        // Fits in place — overwrite
                                         let _ = file.seek(std::io::SeekFrom::Start(p_offset));
                                         let mut nb = new_interp.into_bytes();
                                         while nb.len() < p_filesz { nb.push(0); }
                                         let _ = file.write_all(&nb);
-                                        info!("[KR64] Task 6-Z50: patched PT_INTERP to {} ({} bytes)",
+                                        info!("[KR64] Task 6-Z50: patched PT_INTERP in-place to {} ({} bytes)",
                                             new_interp_path, p_filesz);
                                     } else {
-                                        error!("[KR64] Task 6-Z50: new interp {} doesn't fit in {} bytes (need {})",
-                                            new_interp_path, p_filesz, new_interp.len());
-                                        let host_linker = "/system/bin/linker\0";
-                                        if host_linker.len() <= p_filesz {
-                                            let _ = file.seek(std::io::SeekFrom::Start(p_offset));
-                                            let mut nb = host_linker.as_bytes().to_vec();
-                                            while nb.len() < p_filesz { nb.push(0); }
-                                            let _ = file.write_all(&nb);
-                                            info!("[KR64] Task 6-Z50: patched PT_INTERP to HOST's /system/bin/linker ({} bytes)", p_filesz);
+                                        // Doesn't fit — APPEND the new interp at the end of the file
+                                        // and update the PT_INTERP program header to point to it.
+                                        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+                                        let new_offset = file_size;
+                                        let new_filesz = new_interp.len();
+                                        // Append the new interp string
+                                        let _ = file.seek(std::io::SeekFrom::End(0));
+                                        let _ = file.write_all(new_interp.as_bytes());
+                                        info!("[KR64] Task 6-Z50: appended new PT_INTERP at offset {} ({} bytes)",
+                                            new_offset, new_filesz);
+                                        // Update the PT_INTERP program header's p_offset and p_filesz
+                                        // 32-bit ELF: p_offset at phdr+4 (4 bytes), p_filesz at phdr+16 (4 bytes)
+                                        let mut pt_interp_phdr_off = None;
+                                        for i in 0..e_phnum {
+                                            let off = i * e_phentsize;
+                                            let p_type = u32::from_le_bytes([phdrs[off], phdrs[off+1], phdrs[off+2], phdrs[off+3]]);
+                                            if p_type == 3 {
+                                                pt_interp_phdr_off = Some(e_phoff as u64 + off as u64);
+                                                break;
+                                            }
+                                        }
+                                        if let Some(phdr_off) = pt_interp_phdr_off {
+                                            // Write new p_offset (at phdr_off + 4)
+                                            let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 4));
+                                            let _ = file.write_all(&(new_offset as u32).to_le_bytes());
+                                            // Write new p_filesz (at phdr_off + 16)
+                                            let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 16));
+                                            let _ = file.write_all(&(new_filesz as u32).to_le_bytes());
+                                            info!("[KR64] Task 6-Z50: updated PT_INTERP phdr: p_offset={}, p_filesz={}",
+                                                new_offset, new_filesz);
                                         }
                                     }
                                 } else {
