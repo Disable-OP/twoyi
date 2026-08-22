@@ -4183,6 +4183,12 @@ pub fn run_ptrace_loop(
     // The original init child is set to an infinite loop (so init's waitpid
     // blocks — init thinks the service is "running").
     let mut recovery_child_pid: Option<libc::pid_t> = recovery_pid;
+    // Task 6-Z67: set when init exits/dies but the loop keeps running to
+    // serve the recovery child. When a forked child then exits and
+    // init_dead is already true (and the exit was the recovery child),
+    // the loop RETURNS — otherwise waitpid(-1) would spin on ECHILD
+    // forever.
+    let mut init_dead = false;
 
     // ── Multi-child PID tracking (Task 6-S) ───────────────────────────
     //
@@ -4470,13 +4476,51 @@ pub fn run_ptrace_loop(
             // (which will receive the waitpid return + run its own exit
             // path, eventually terminating the loop). Re-sync
             // `current_pid` to init so the next iteration resumes init.
+            //
+            // Task 6-Z67 (Agent G flag): EXCEPTION — if init dies while
+            // the RECOVERY child is still alive, keep the loop running.
+            // The recovery child is the whole point of the boot (it is
+            // the TWRP binary rendering the UI); init's death must not
+            // kill it. Previously the `return code` here ended the loop,
+            // kr64 exited, and PTRACE_O_EXITKILL murdered the recovery
+            // child mid-linker. Now: mark init dead, resume the recovery
+            // child, and only return when every traced child is gone.
             if pid == init_pid {
+                if let Some(rec_pid) = recovery_child_pid {
+                    if rec_pid != pid {
+                        // Is the recovery child still alive? kill(pid,0)
+                        // returns 0 for a live (possibly stopped) process
+                        // and -1/ESRCH once it is reaped.
+                        let alive = unsafe { libc::kill(rec_pid, 0) } == 0;
+                        if alive {
+                            log(&format!(
+                                "init {} exited with code {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67)",
+                                pid, code, rec_pid
+                            ));
+                            init_dead = true;
+                            // Re-point current_pid at the recovery child —
+                            // the loop-top PTRACE_SYSCALL(current_pid)
+                            // resumes it WITH syscall tracing (we must NOT
+                            // PTRACE_CONT here: that resumes without
+                            // tracing and the top PTRACE_SYSCALL would
+                            // then ESRCH on a running tracee).
+                            current_pid = rec_pid;
+                            continue;
+                        }
+                    }
+                }
                 return code;
             }
             log(&format!(
                 "forked child {} exited with code {} — init {} still running, continuing loop",
                 pid, code, init_pid
             ));
+            // Task 6-Z67: if init is ALREADY dead, this forked-child exit
+            // was (most likely) the recovery child — the last traced
+            // process. Nothing remains to serve: return.
+            if init_dead {
+                return code;
+            }
             current_pid = init_pid;
             continue;
         }
@@ -4507,12 +4551,34 @@ pub fn run_ptrace_loop(
             }
             // Task 6-S: same forked-child handling as WIFEXITED above.
             if pid == init_pid {
+                // Task 6-Z67: init died by signal but the recovery child
+                // lives → keep serving the recovery child (see the
+                // WIFEXITED branch for the full rationale).
+                if let Some(rec_pid) = recovery_child_pid {
+                    if rec_pid != pid {
+                        let alive = unsafe { libc::kill(rec_pid, 0) } == 0;
+                        if alive {
+                            log(&format!(
+                                "init {} killed by signal {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67)",
+                                pid, sig, rec_pid
+                            ));
+                            init_dead = true;
+                            current_pid = rec_pid;
+                            continue;
+                        }
+                    }
+                }
                 return -sig;
             }
             log(&format!(
                 "forked child {} killed by signal {} — init {} still running, continuing loop",
                 pid, sig, init_pid
             ));
+            // Task 6-Z67: same as the WIFEXITED branch — if init is
+            // already dead, this was the last traced process: return.
+            if init_dead {
+                return -sig;
+            }
             current_pid = init_pid;
             continue;
         }
