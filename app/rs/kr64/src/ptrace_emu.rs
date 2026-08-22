@@ -3331,7 +3331,27 @@ fn process_vm_writev_chunk(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> isize {
         iov_base: addr as *mut libc::c_void,
         iov_len: bytes.len(),
     };
-    unsafe { libc::process_vm_writev(pid, &local, 1, &remote, 1, 0) }
+    // Task 6-Z65 fix2: bionic at android21 (kr64's min SDK) does NOT
+    // export a `process_vm_writev` wrapper symbol — linking against it
+    // fails with `ld.lld: error: undefined symbol: process_vm_writev`
+    // (E2E run 32604634988, Build APK step). Call it via the raw
+    // syscall(2) instead: process_vm_writev is x86_64 nr 311 (process_vm_
+    // readv is 310). libc::syscall is variadic and available since API 1.
+    #[cfg(target_arch = "x86_64")]
+    const SYS_PROCESS_VM_WRITEV: libc::c_long = 311;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_PROCESS_VM_WRITEV: libc::c_long = 271;
+    unsafe {
+        libc::syscall(
+            SYS_PROCESS_VM_WRITEV,
+            pid,
+            &local,
+            1usize,
+            &remote,
+            1usize,
+            0usize,
+        ) as isize
+    }
 }
 
 /// Task 6-Z62: write `bytes` into the child at `addr` with
