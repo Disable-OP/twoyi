@@ -21,6 +21,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.twoyi.ui.SettingsActivity;
+import io.twoyi.utils.FileLogger;
 import io.twoyi.utils.IOUtils;
 import io.twoyi.utils.UIHelper;
 
@@ -192,6 +193,10 @@ public class TwoyiSocketServer {
             // BootStatus.kt + NogitsuneSocketServer.kt pattern).
             // BootCompletionServer.markCompleted() will in turn call
             // TwoyiStatusManager.markStarted() so switchOs() still works.
+            // Task 6-Z62: kr64's SEQPACKET client hits @TWOYI_SOCK first
+            // (bound in attachBaseContext) — log the receipt so E2E
+            // logcat shows the delivery on the legacy path too.
+            FileLogger.boot("boot_completed_received_via_twoyi_sock", null);
             BootCompletionServer.getInstance().markCompleted();
         } else if (msg.startsWith(JUMP_HOST_SETTINGS)) {
             // UIHelper.startActivity(mContext, AboutActivity.class);
