@@ -324,12 +324,21 @@ public class BootCompletionServer {
             FileLogger.boot("wait_boot_success", null);
             return true;
         } catch (TimeoutException e) {
+            // Task 6-Z62: a timed-out await BREAKS the barrier — re-arm it
+            // so the caller can poll with further waitBoot() slices (see
+            // Render2Activity.showBootingProcedure). Without reset(), every
+            // subsequent waitBoot() would fail instantly with
+            // BrokenBarrierException and the UI could never be woken by a
+            // late BOOT_COMPLETED.
+            mBootLatch.reset();
             FileLogger.boot("wait_boot_timeout", null);
             return false;
         } catch (BrokenBarrierException e) {
             // Barrier was reset() out from under us — treat as "not
             // booted yet" so the caller falls through to the boot-failure
             // path (which is the safer default for a re-launch race).
+            // Task 6-Z62: re-arm here too so slice-polling keeps working.
+            mBootLatch.reset();
             FileLogger.boot("wait_boot_broken_barrier", null);
             LogEvents.trackError(e);
             return false;
