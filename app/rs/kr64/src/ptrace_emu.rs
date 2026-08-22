@@ -4105,7 +4105,7 @@ pub fn run_ptrace_loop(
                                 let name_bytes = sock_name.as_bytes();
                                 let copy_len = name_bytes.len().min(addr.sun_path.len() - 1);
                                 for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
-                                    addr.sun_path[i + 1] = b as i8;
+                                    addr.sun_path[i + 1] = b as libc::c_char;
                                 }
                                 let addr_len = (std::mem::size_of::<u16>() + 1 + copy_len) as u32;
                                 let ret = unsafe {
