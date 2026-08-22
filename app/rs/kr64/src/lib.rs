@@ -6768,7 +6768,58 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // rootfs before the real kernel open() runs, replacing the
             // find_property binary patch (worklog 1-A F.1 + 1-B Task 3).
             let vfs = vfs::Vfs::new_twrp();
-            let exit_code = ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs, &vfs);
+
+            // Task 6-Z49: proactively fork the recovery child BEFORE the
+            // ptrace loop starts. The re-spawn cycle (kr64 re-forks every
+            // ~2s) kills kr64 before init reaches the recovery service
+            // execve (at syscall #466). By forking the recovery child
+            // directly, we don't need init to start the service.
+            let recovery_pid = {
+                let recovery_path = format!("{}/sbin/recovery", cfg.rootfs);
+                let ld_preload = format!("{}/sbin/libtwrp_fb_hook.so", cfg.rootfs);
+                let ld_library_path = format!(
+                    "{}/sbin:{}/system/lib:{}/system/lib64",
+                    cfg.rootfs, cfg.rootfs, cfg.rootfs
+                );
+                info!("[KR64] Task 6-Z49: proactively forking recovery child at {}", recovery_path);
+
+                let path_c = std::ffi::CString::new(recovery_path.as_str()).unwrap_or_default();
+                let argv_c: Vec<std::ffi::CString> = vec![
+                    std::ffi::CString::new("/sbin/recovery").unwrap_or_default(),
+                ];
+                let envp_c: Vec<std::ffi::CString> = vec![
+                    std::ffi::CString::new(format!("LD_PRELOAD={}", ld_preload)).unwrap_or_default(),
+                    std::ffi::CString::new(format!("LD_LIBRARY_PATH={}", ld_library_path)).unwrap_or_default(),
+                    std::ffi::CString::new("PATH=/sbin:/system/bin").unwrap_or_default(),
+                ];
+                let mut argv_ptr: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
+                argv_ptr.push(std::ptr::null());
+                let mut envp_ptr: Vec<*const libc::c_char> = envp_c.iter().map(|s| s.as_ptr()).collect();
+                envp_ptr.push(std::ptr::null());
+
+                let new_pid = unsafe { libc::fork() };
+                if new_pid == 0 {
+                    // Child — 64-bit, async-signal-safe only
+                    unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0); }
+                    unsafe { libc::raise(libc::SIGSTOP); }
+                    unsafe {
+                        libc::execve(
+                            path_c.as_ptr(),
+                            argv_ptr.as_ptr(),
+                            envp_ptr.as_ptr(),
+                        );
+                    }
+                    unsafe { libc::_exit(127); }
+                } else if new_pid > 0 {
+                    info!("[KR64] Task 6-Z49: forked recovery child PID={}", new_pid);
+                    Some(new_pid)
+                } else {
+                    error!("[KR64] Task 6-Z49: fork FAILED for recovery child");
+                    None
+                }
+            };
+
+            let exit_code = ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs, &vfs, recovery_pid);
             info!(
                 "[KR64][parent] ptrace emulation loop ended — child exit code: {}",
                 exit_code
