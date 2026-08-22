@@ -7447,39 +7447,43 @@ pub fn run_ptrace_loop(
                         // the matching length.
                         let mut setregs_len = len;
                         if !in_syscall_at_sigsys {
-                            // DESYNC mode (6-W): re-read the CURRENT
-                            // registers before setregs, so we write back
-                            // live (post-signal-delivery) values with
-                            // rax=ret_val — NOT stale pre-EXIT values and
-                            // NOT the kernel's potentially-garbage
-                            // signal-frame setup that the 5-J skip left
-                            // in place.
+                            // Task 6-Z59: DESYNC mode — instead of doing a full
+                            // "fresh ptrace_getregs + setregs" (which corrupts
+                            // registers by writing stale values), SKIP the
+                            // syscall entirely by setting orig_rax=-1. The
+                            // kernel will skip the syscall and return 0 (the
+                            // default for skipped syscalls). This avoids
+                            // writing any registers except orig_rax, preventing
+                            // the register corruption that caused SIGSEGV at
+                            // rip=0x807cd64.
                             sigsys_log(&format!(
-                                "SIGSYS handler: DESYNC mode — fresh ptrace_getregs before setregs for nr={} [{}] (6-W fix: was skipping setregs, which left garbage rodata pointers in control-flow registers → SIGSEGV at rip=0x6f722f69 'i/ro')",
+                                "SIGSYS handler: DESYNC mode — skipping syscall nr={} [{}] via orig_rax=-1 (Task 6-Z59: avoids register corruption from full setregs)",
                                 original_syscall, name
                             ));
-                            match ptrace_getregs(pid, &mut sigsys_regs) {
-                                Ok(fresh_len) => {
-                                    setregs_len = fresh_len;
-                                    // Re-apply rax=ret_val to the fresh
-                                    // buffer (the fresh getregs overwrote
-                                    // the set_syscall_ret we did above).
-                                    set_syscall_ret(&mut sigsys_regs, &a, ret_val);
-                                }
-                                Err(e) => {
-                                    // The fresh getregs failed — fall
-                                    // through to setregs with the
-                                    // SIGSYS-entry buffer (which already
-                                    // has rax=ret_val from the
-                                    // set_syscall_ret above). This is the
-                                    // SAME buffer the NORMAL-mode path
-                                    // uses, so it's a safe fallback.
-                                    sigsys_log(&format!(
-                                        "SIGSYS handler (DESYNC): FRESH ptrace_getregs FAILED for nr={} [{}]: {} — falling back to SIGSYS-entry registers (rax={} already applied)",
-                                        original_syscall, name, e, ret_val
-                                    ));
-                                }
-                            }
+                            // Set orig_rax=-1 to skip the syscall. Only modify
+                            // this one register via PTRACE_POKEUSER.
+                            let regs_ptr = &sigsys_regs as *const Regs as *const u64;
+                            let orig_rax_offset = std::mem::size_of::<u64>() * a.reg_syscall;
+                            let _ = unsafe {
+                                libc::ptrace(
+                                    libc::PTRACE_POKEUSER,
+                                    pid,
+                                    orig_rax_offset as i64,
+                                    (-1i64) as libc::c_long,
+                                )
+                            };
+                            // Also set rax=0 via POKEUSER (the return value)
+                            let rax_offset = std::mem::size_of::<u64>() * a.reg_ret;
+                            let _ = unsafe {
+                                libc::ptrace(
+                                    libc::PTRACE_POKEUSER,
+                                    pid,
+                                    rax_offset as i64,
+                                    0i64 as libc::c_long,
+                                )
+                            };
+                            // Skip the full setregs below
+                            continue;
                         }
                         if let Err(e) = ptrace_setregs(pid, &sigsys_regs, setregs_len) {
                             // PTRACE_SETREGS failed — the faked return
