@@ -5153,14 +5153,94 @@ pub fn run_ptrace_loop(
 
                 let syscall_num = get_syscall_num(&regs, &abi);
 
-                // Task 6-Z57: ENOSYS early override. The DESYNC issue means
-                // some EXIT stops are treated as ENTRY, so the EXIT handler's
-                // ENOSYS fallback doesn't run. Fix: at the TOP of the handler,
-                // BEFORE the in_syscall branch, check if the return value (rax)
-                // is -38 (ENOSYS) and the child is i386. If so, override it to
-                // 0 (or -12 for mmap2) via ptrace_setregs. This is independent
-                // of the in_syscall flag, so DESYNC doesn't matter.
-                if abi.execve == 11 {
+                // ── Task 6-Z68: DEFINITIVE syscall ENTRY/EXIT classification ──
+                //
+                // ROOT CAUSE this fixes (E2E run 32604929372): the recovery
+                // child's EVERY mmap2 returned -38 — INCLUDING calls that were
+                // ALREADY anonymous (seccomp-allowed) and calls whose flags we
+                // rewrote to anonymous at the "ENTRY" stop — while init's
+                // IDENTICAL rewritten calls SUCCEEDED (the sepolicy injection
+                // got a real mapping). The log's smoking gun: "post-execve
+                // syscall #110: nr=180" paired with "return #110: nr=192" —
+                // the ENTRY/EXIT parity (`in_syscall`) is FLIPPED by ONE stop
+                // for the recovery child, so our mmap2-flag rewrite ran at
+                // what was actually an EXIT stop (a no-op for the syscall
+                // that had just executed with the ORIGINAL file-backed args).
+                //
+                // Why the parity flips: seccomp-ERRNO-aborted syscalls do not
+                // produce a clean ENTRY+EXIT stop pair, so the toggle-based
+                // parity drifts. It stayed correct for init by luck of its
+                // syscall mix.
+                //
+                // THE FIX: ask the kernel. PTRACE_GET_SYSCALL_INFO (0x420e,
+                // Linux 5.3+) reports the stop's phase DEFINITIVELY:
+                //   op: 0=UNKNOWN 1=ENTRY 2=EXIT 3=SECCOMP
+                // On success (returns bytes copied > 0) we use the kernel's
+                // answer; on failure (EIO on <5.3 kernels) we fall back to
+                // the legacy in_syscall parity. op==3 (SECCOMP stop, args
+                // phase — SECCOMP_RET_TRACE) is treated as ENTRY.
+                #[repr(C)]
+                struct PtraceSyscallInfo {
+                    op: u8,
+                    pad: [u8; 3],
+                    arch: u32,
+                    instruction_pointer: u64,
+                    stack_pointer: u64,
+                    // union { entry{nr,args[6]}; exit{rval,is_error}; ... }
+                    payload: [u64; 7],
+                }
+                const PTRACE_GET_SYSCALL_INFO_REQ: libc::c_uint = 0x420e;
+                const SYSCALL_INFO_OP_ENTRY: u8 = 1;
+                const SYSCALL_INFO_OP_EXIT: u8 = 2;
+                const SYSCALL_INFO_OP_SECCOMP: u8 = 3;
+                let mut sc_info: PtraceSyscallInfo = unsafe { std::mem::zeroed() };
+                let gsi_result = unsafe {
+                    libc::ptrace(
+                        PTRACE_GET_SYSCALL_INFO_REQ,
+                        pid,
+                        std::mem::size_of::<PtraceSyscallInfo>(),
+                        &mut sc_info as *mut PtraceSyscallInfo,
+                    )
+                };
+                let stop_phase: Option<bool> = if gsi_result > 0 {
+                    match sc_info.op {
+                        SYSCALL_INFO_OP_ENTRY | SYSCALL_INFO_OP_SECCOMP => Some(true),
+                        SYSCALL_INFO_OP_EXIT => Some(false),
+                        _ => None, // UNKNOWN — fall back to parity
+                    }
+                } else {
+                    None // EIO / old kernel — fall back to parity
+                };
+                // Use the definitive phase when available; keep `in_syscall`
+                // in sync (the SIGSYS handler's DESYNC heuristic + the
+                // per-child switch map still read it).
+                let is_entry: bool = match stop_phase {
+                    Some(e) => {
+                        if in_syscall == e {
+                            // Parity disagreed with the kernel — log the
+                            // correction (each occurrence explains a lost
+                            // rewrite / lost fake). Rate-limited via the
+                            // loop_count gate to keep logcat sane.
+                            if loop_count <= 500 {
+                                log(&format!(
+                                    "6-Z68: syscall-stop phase CORRECTION for pid {} (nr={}) — kernel says {}, in_syscall parity said {} (correcting; this was silently corrupting ENTRY/EXIT handling)",
+                                    pid,
+                                    syscall_num,
+                                    if e { "ENTRY" } else { "EXIT" },
+                                    if in_syscall { "EXIT" } else { "ENTRY" }
+                                ));
+                            }
+                        }
+                        in_syscall = !e;
+                        e
+                    }
+                    None => !in_syscall, // legacy parity fallback
+                };
+
+                // Task 6-Z57: ENOSYS early override (6-Z68: EXIT stops ONLY —
+                // writing rax at an ENTRY stop is a no-op that the syscall
+                // execution then overwrites).
+                if !is_entry && abi.execve == 11 {
                     let rax_val = get_syscall_arg(&regs, abi.reg_ret) as i64;
                     if rax_val == -38 {
                         // This is an ENOSYS return. Override it.
@@ -5194,7 +5274,7 @@ pub fn run_ptrace_loop(
                     }
                 }
 
-                if !in_syscall {
+                if is_entry {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
 
