@@ -2134,29 +2134,90 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.fsetxattr
     {
         Some(0)
-    } else if abi.execve == 11 {
-        // Task 6-Z52: The forked 64-bit recovery child inherits the app's
-        // seccomp filter (DEFAULT-DENY). Almost ALL i386 syscalls return ENOSYS.
-        // Fake-success ALL i386 syscalls EXCEPT exit (1) and exit_group (252).
-        // The existing EXIT handler already overrides read/write/open returns
-        // with proper values (fd, byte count, etc.) — this just prevents
-        // the ENOSYS leak for syscalls that don't have a dedicated handler.
-        // Init was crashing with SIGSEGV at si_addr=0xc because ENOSYS returns
-        // leaked into init's code paths as NULL pointers.
-        if syscall_nr == 1 || syscall_nr == 252 {
-            None // exit / exit_group — don't fake
-        } else if syscall_nr == 45 {
-            Some(0x80000000) // brk → non-zero
-        } else if syscall_nr == 186 || syscall_nr == 20
-            || syscall_nr == 102 || syscall_nr == 104
-            || syscall_nr == 105 || syscall_nr == 106 {
-            Some(1) // gettid/getpid/getuid/getgid → valid positive ID
-        } else {
-            Some(-1) // generic error (-EPERM) — caller handles via error path
-        }
     } else {
+        // Task 6-Z60: the 6-Z52 "fake-success ALL i386 syscalls" blanket is
+        // REMOVED from this table. The blanket made the generic EXIT handler
+        // unconditionally overwrite rax=0 for EVERY i386 syscall — including
+        // REAL kernel successes: open()'s returned fd=4 became 0, the
+        // properties fd fake (42) became 0, and mmap2's real mapping address
+        // (0xEE981000) became 0 == NULL. init's init_property_area() checks
+        // `pa == MAP_FAILED` — NULL passes that check — then writes the
+        // property-area header to address 0 → SIGSEGV si_addr=0x0 at
+        // rip=0x807cd64 (deterministic, after exactly 203 ptrace iterations;
+        // verified on E2E run 32599481734, commit b889666).
+        //
+        // ENOSYS-faking for seccomp-blocked i386 syscalls now lives at the
+        // CALL SITE (the generic EXIT handler), gated on the FRESH return
+        // value read from regs2 (see Task 6-Z60 block there +
+        // i386_enosys_fake_value()).
         None
     }
+}
+
+/// Task 6-Z60: syscall-aware fake return values for i386 syscalls that
+/// seccomp blocked with -ENOSYS (-38) — the syscall never executed, so the
+/// child would otherwise see the raw -38 leak.
+///
+/// CRITICAL RULES learned from the 6-Z52 blanket (which wrote 0 for
+/// everything):
+///   - mmap2 (192) must NEVER return 0: 0 is NULL, which passes init's
+///     `pa == MAP_FAILED` check and then NULL-derefs. Return -ENOMEM.
+///   - ftruncate (93) must return 0: init_property_area() treats a non-zero
+///     ftruncate as fatal and skips the property-area setup entirely.
+///   - brk (45) must be non-zero: 0 means "the program break is at NULL"
+///     and makes early malloc bail out.
+///   - identity getters (getpid family) return 1 — a valid positive id.
+///   - everything else returns -1 (-EPERM): callers take their OWN error
+///     path, which is strictly safer than a fake success with no side
+///     effects actually performed (e.g. a fake-success mkdir with no
+///     directory created).
+fn i386_enosys_fake_value(nr: i64) -> i64 {
+    match nr {
+        192 => -12,                    // mmap2 → -ENOMEM (never NULL!)
+        219 => 0,                      // madvise → success
+        125 => 0,                      // mprotect → success
+        45 => 0x80000000,              // brk → non-zero "current break"
+        3 => 0,                        // read → 0 == EOF
+        4 => 0,                        // write → 0 bytes written
+        6 => 0,                        // close → success
+        93 => 0,                       // ftruncate → success (properties!)
+        221 => 0,                      // fcntl64 → success
+        5 | 295 => -1,                 // open/openat → error (dedicated
+                                       // handlers cover kmsg/properties)
+        186 | 20 | 224 | 199 | 200 | 201 | 202 => 1, // gettid/getpid/uid32/gid32
+        243 => 0,                      // set_thread_area → success
+        78 => 0,                       // gettimeofday → success
+        265 | 264 => 0,                // clock_getres/clock_gettime → success
+        60 => 0,                       // umask → success (mask 0)
+        21 => 0,                       // access → success (path exists)
+        39 => 0,                       // mkdir → success (rootfs op done
+                                       // separately by the SIGSYS handler)
+        191 => -1,                     // ugetrlimit → error (buffer would be
+                                       // untouched garbage on fake success)
+        1 | 252 => 0,                  // exit/exit_group — never reaches the
+                                       // fake path (gated above), placeholder
+        _ => -1,                       // generic -EPERM error
+    }
+}
+
+/// Task 6-Z60: is this i386 syscall number one whose FIRST argument is a
+/// file descriptor? Used to detect fcntl64/ftruncate/dup2/close calls that
+/// target the FAKE properties fd (42) — the synthetic fd the properties
+/// open-fallback hands to init when the real open() fails. Those calls
+/// return -EBADF from the kernel (fd 42 was never really opened) and must
+/// be faked to 0 so init_property_area() proceeds past its fcntl64 /
+/// ftruncate sequence.
+fn is_fd_op_syscall(nr: i64) -> bool {
+    matches!(
+        nr,
+        221 // fcntl64 (arg1=fd)
+            | 93 // ftruncate (arg1=fd)
+            | 6 // close (arg1=fd)
+            | 63 // dup2 (arg1=fd)
+            | 197 // fstat64 (arg1=fd)
+            | 94 // fchmod (arg1=fd)
+            | 95 // fchown (arg1=fd)
+    )
 }
 
 /// Decide whether the SIGSYS handler should skip its `ptrace_setregs`
@@ -5079,6 +5140,62 @@ pub fn run_ptrace_loop(
                                 if is_kmsg_path(&path) || is_kmsg_path(&translated) {
                                     pending_kmsg_open = true;
                                 }
+                                // ── Task 6-Z61: strip O_EXCL on the
+                                // properties open ──
+                                //
+                                // TWRP init opens /dev/__properties__ with
+                                // O_CREAT|O_EXCL (exclusive create). twoyi
+                                // PRE-CREATES the file (OLD-format, 131072
+                                // bytes) so the exclusive create fails with
+                                // -EEXIST (-17) — the failure that motivated
+                                // the fd=42 fake fallback (6-Y fix 2).
+                                //
+                                // A REAL fd is strictly better than the fake
+                                // 42: every subsequent fd-op (fcntl64,
+                                // ftruncate, mmap2, fstat64, close) works
+                                // naturally against the real kernel fd
+                                // instead of needing per-syscall EBADF
+                                // faking. The mmap2 ENTRY handler still
+                                // rewrites the MAP_SHARED file-backed mmap
+                                // to MAP_ANONYMOUS (seccomp blocks
+                                // file-backed mmap2), so init gets a
+                                // zeroed private mapping — which is exactly
+                                // what init_property_area() wants: it
+                                // memsets the area and writes its own
+                                // header (magic/version/count).
+                                //
+                                // O_EXCL is 0x80 on both i386 and x86_64
+                                // Linux. open(): flags = arg2. openat():
+                                // flags = arg3.
+                                if is_properties_path(&path)
+                                    || is_properties_path(&translated)
+                                {
+                                    let flags_reg = if syscall_num == abi.open {
+                                        abi.reg_arg2
+                                    } else {
+                                        abi.reg_arg3
+                                    };
+                                    let flags =
+                                        get_syscall_arg(&regs, flags_reg) as i32;
+                                    if flags & 0x80 != 0 {
+                                        let new_flags = flags & !0x80;
+                                        set_syscall_arg(
+                                            &mut regs,
+                                            flags_reg,
+                                            new_flags as i32 as i64 as u64,
+                                        );
+                                        match ptrace_setregs(pid, &regs, iov_len) {
+                                            Ok(()) => log(&format!(
+                                                "6-Z61: stripped O_EXCL from properties open (flags 0x{:x} → 0x{:x}) — open will SUCCEED on the pre-created file and return a REAL fd",
+                                                flags, new_flags
+                                            )),
+                                            Err(e) => log(&format!(
+                                                "6-Z61: O_EXCL strip FAILED (setregs): {} — open may still fail with EEXIST (fd=42 fallback will engage)",
+                                                e
+                                            )),
+                                        }
+                                    }
+                                }
                                 // Task 6-V: save translated path for fd
                                 // tracking at the matching open EXIT.
                                 pending_open_translated_path = Some(translated.clone());
@@ -6180,31 +6297,21 @@ pub fn run_ptrace_loop(
                     // syscall_num at EXIT is `getpid` and this block
                     // is a no-op (compute_exit_return_value(getpid)=None).
                     let _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
-                    // Task 6-Z53: ENOSYS fallback. The DESYNC issue means the
-                    // EXIT handler sometimes sees the wrong syscall number
-                    // (ENTRY says nr=125, EXIT says nr=191). compute_exit_return_value
-                    // uses the wrong number and doesn't fake it. Fix: if the
-                    // actual return value is -38 (ENOSYS) and the child is i386,
-                    // override it to 0 (except exit/exit_group). This catches
-                    // ALL ENOSYS returns regardless of DESYNC.
-                    let _enosys_fallback: Option<i64> = if abi.execve == 11 {
-                        let actual_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        if actual_ret == -38 && syscall_num != 1 && syscall_num != 252 {
-                            // Task 6-Z56: mmap2 returns -ENOMEM (not 0 or fake address).
-                            if syscall_num == 192 || syscall_num == 219 {
-                                Some(-12) // ENOMEM — can't actually create mapping
-                            } else if syscall_num == 45 {
-                                Some(0x80000000) // brk — non-zero = current break
-                            } else {
-                                Some(0)
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let _forced_ret_opt = _forced_ret_opt.or(_enosys_fallback);
+                    // Task 6-Z53/6-Z60: ENOSYS fallback. The DESYNC issue
+                    // means the EXIT handler sometimes sees the wrong syscall
+                    // number (ENTRY says nr=125, EXIT says nr=191).
+                    // compute_exit_return_value uses the wrong number and
+                    // doesn't fake it.
+                    //
+                    // 6-Z60 REWRITE: the decision is now made INSIDE the
+                    // `if let Some` block below, gated on the FRESH return
+                    // value read from regs2 (a fresh ptrace_getregs). The old
+                    // pre-computed _enosys_fallback read the STALE `regs`
+                    // snapshot — which still held the PRE-dedicated-handler
+                    // value, so the properties fd fake (42, written by the
+                    // dedicated handler above) was invisible to the gate and
+                    // the blanket rax=0 write below stomped it. The fresh
+                    // regs2 read sees the 42 and leaves it alone.
                     if syscall_num == abi.setxattr
                         || syscall_num == abi.lsetxattr
                         || syscall_num == abi.fsetxattr
@@ -6217,11 +6324,80 @@ pub fn run_ptrace_loop(
                             loop_count
                         ));
                     }
-                    if let Some(_forced_ret) = _forced_ret_opt {
+                    if _forced_ret_opt.is_some()
+                        || (abi.execve == 11
+                            && syscall_num != 1
+                            && syscall_num != 252)
+                    {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         match ptrace_getregs(pid, &mut regs2) {
                             Ok(len) => {
                                 let name = syscall_name(syscall_num, &abi);
+                                // ── Task 6-Z60: fresh-return-gated fake ──
+                                //
+                                // The fake now fires ONLY when the syscall
+                                // actually FAILED. Read the return value from
+                                // the FRESH regs2 (post dedicated handlers)
+                                // and decide:
+                                //   1. permission-blocked family (chmod/
+                                //      chown/mount/mknod/xattr… from
+                                //      compute_exit_return_value) → always
+                                //      fake 0 (pre-6-Z52 behaviour, tuned over
+                                //      5-T..6-R; these return EPERM/
+                                //      EACCES legitimately as untrusted_app
+                                //      and init needs to see success).
+                                //   2. fresh_ret == -38 (ENOSYS) → seccomp
+                                //      arch-mismatch artifact — the syscall
+                                //      NEVER executed; fake the
+                                //      syscall-aware value from
+                                //      i386_enosys_fake_value().
+                                //   3. fresh_ret == -9 (EBADF) on the FAKE
+                                //      properties fd (42) → fake 0 so
+                                //      init_property_area()'s fcntl64 /
+                                //      ftruncate / dup2 / close on the
+                                //      synthetic fd "succeed".
+                                //   4. anything else (real success: fd,
+                                //      address, byte count — or a legitimate
+                                //      errno like -ENOENT/-EEXIST/-EACCES)
+                                //      → DO NOT TOUCH rax. The 6-Z52 blanket
+                                //      overwrote these with 0, which is how
+                                //      open() returned 0 instead of fd=4,
+                                //      and mmap2 returned NULL instead of
+                                //      0xEE981000 → init wrote the property
+                                //      header to address 0 → SIGSEGV.
+                                let fresh_ret =
+                                    get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                let forced_value: Option<i64> = if abi.execve == 11 {
+                                    if _forced_ret_opt.is_some() {
+                                        _forced_ret_opt
+                                    } else if syscall_num == 1 || syscall_num == 252 {
+                                        None // exit / exit_group — never fake
+                                    } else if fresh_ret == -38 {
+                                        Some(i386_enosys_fake_value(syscall_num))
+                                    } else if fresh_ret == -9
+                                        && properties_fd == Some(42)
+                                        && is_fd_op_syscall(syscall_num)
+                                        && get_syscall_arg(&regs2, abi.reg_arg1) as i32
+                                            == 42
+                                    {
+                                        Some(0)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    _forced_ret_opt
+                                };
+                                if forced_value.is_none() {
+                                    // Task 6-Z60: real success or legitimate
+                                    // error — preserve the kernel's value.
+                                    if loop_count <= 200 {
+                                        log(&format!(
+                                            "intercepted {}() nr={} at EXIT → PRESERVING real return {} (6-Z60: no fake — real success or legitimate errno)",
+                                            name, syscall_num, fresh_ret
+                                        ));
+                                    }
+                                }
+                                let _forced_ret = forced_value;
                                 // Task 6-Z9 diagnostic: re-read the
                                 // syscall number from the FRESH EXIT-stop
                                 // regs2 + compare with `syscall_num`
@@ -6240,11 +6416,13 @@ pub fn run_ptrace_loop(
                                         syscall_name(exit_stop_syscall_num, &abi)
                                     ));
                                 }
-                                if loop_count <= 200 {
-                                    log(&format!(
-                                        "intercepted {}() nr={} at EXIT → faking success (return 0) — original return was EPERM as untrusted_app OR rax=nr leak on i386 compat seccomp-abort",
-                                        name, syscall_num
-                                    ));
+                                if let Some(fake_val) = _forced_ret {
+                                    if loop_count <= 200 {
+                                        log(&format!(
+                                            "intercepted {}() nr={} at EXIT → faking return {} (6-Z60: syscall failed — fresh_ret={})",
+                                            name, syscall_num, fake_val, fresh_ret
+                                        ));
+                                    }
                                 }
                                 // ── capget: do NOT write to the data buffer.
                                 //
@@ -6268,8 +6446,21 @@ pub fn run_ptrace_loop(
                                 if syscall_num == abi.capget && loop_count <= 200 {
                                     log("capget: faking success (return 0) without writing data buffer — avoids stack-corrupting PTRACE_POKEDATA");
                                 }
-                                set_syscall_ret(&mut regs2, &abi, 0);
-                                let setregs_result = ptrace_setregs(pid, &regs2, len);
+                                // Task 6-Z60: write the syscall-aware fake
+                                // value (NOT the hardcoded 0 the 6-Z52 blanket
+                                // wrote — that is what turned mmap2's real
+                                // 0xEE981000 into NULL and killed init at
+                                // iteration 203). When _forced_ret is None we
+                                // skip the write entirely and PRESERVE the
+                                // kernel's real return value.
+                                if let Some(fake_val) = _forced_ret {
+                                    set_syscall_ret(&mut regs2, &abi, fake_val);
+                                }
+                                let setregs_result = if _forced_ret.is_some() {
+                                    ptrace_setregs(pid, &regs2, len)
+                                } else {
+                                    Ok(()) // nothing to write — preserve
+                                };
                                 if let Err(e) = setregs_result {
                                     // 5-J diagnostic: surface silent setregs failures
                                     // (previously discarded with `let _ =` — a
@@ -6310,15 +6501,17 @@ pub fn run_ptrace_loop(
                                     || syscall_num == abi.lsetxattr
                                     || syscall_num == abi.fsetxattr
                                 {
-                                    let mut readback: Regs = unsafe { std::mem::zeroed() };
-                                    if ptrace_getregs(pid, &mut readback).is_ok() {
-                                        let readback_rax =
-                                            get_syscall_arg(&readback, abi.reg_ret) as i64;
-                                        if loop_count <= 200 {
-                                            log(&format!(
-                                                "[KR64][ptrace] EXIT handler wrote rax=0 for {} (nr={}), readback rax={}",
-                                                name, syscall_num, readback_rax
-                                            ));
+                                    if _forced_ret.is_some() {
+                                        let mut readback: Regs = unsafe { std::mem::zeroed() };
+                                        if ptrace_getregs(pid, &mut readback).is_ok() {
+                                            let readback_rax =
+                                                get_syscall_arg(&readback, abi.reg_ret) as i64;
+                                            if loop_count <= 200 {
+                                                log(&format!(
+                                                    "[KR64][ptrace] EXIT handler wrote rax={} for {} (nr={}), readback rax={}",
+                                                    _forced_ret.unwrap_or(0), name, syscall_num, readback_rax
+                                                ));
+                                            }
                                         }
                                     }
                                 }
