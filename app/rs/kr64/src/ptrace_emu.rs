@@ -2146,20 +2146,27 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         if syscall_nr == 1 || syscall_nr == 252 {
             None // exit / exit_group — don't fake
         } else if syscall_nr == 192 {
-            // Task 6-Z55: mmap2 must NOT return 0 (NULL). Returning 0 causes
-            // a NULL pointer dereference → SIGSEGV at si_addr=0x0. Return a
-            // non-NULL address instead. Use 0x40000000 (1GB) as a safe
-            // mapping address (above the 256MB TWRP binary, below the stack).
-            // The caller will use this as a valid mapped address.
-            Some(0x40000000)
+            // Task 6-Z56: mmap2 — the seccomp filter blocks ALL mmap2 for i386.
+            // Returning a fake non-NULL address (0x40000000) causes SIGSEGV
+            // when the child accesses it (the mapping doesn't actually exist).
+            // Return -ENOMEM (-12) instead — the caller's error path may handle
+            // it gracefully (fall back to a different allocation strategy, or
+            // skip the operation). This is safer than returning a non-existent
+            // pointer that the child will dereference.
+            Some(-12)
         } else if syscall_nr == 45 {
-            // brk: return the requested break address (from ebx). But we
-            // don't have the regs here. Return a large value that init
-            // treats as "brk is at this address" (non-zero = success).
+            // brk: return the current break (non-zero = success). Use a
+            // large value that init treats as "brk is at this address".
             Some(0x80000000)
+        } else if syscall_nr == 91 {
+            // munmap: return 0 (success) — no side effects
+            Some(0)
         } else if syscall_nr == 125 {
             // mprotect: return 0 (success) — no side effects
             Some(0)
+        } else if syscall_nr == 219 {
+            // mremap: return -ENOMEM — same as mmap2, can't actually remap
+            Some(-12)
         } else {
             Some(0)
         }
@@ -6158,11 +6165,11 @@ pub fn run_ptrace_loop(
                     let _enosys_fallback: Option<i64> = if abi.execve == 11 {
                         let actual_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if actual_ret == -38 && syscall_num != 1 && syscall_num != 252 {
-                            // Task 6-Z55: mmap2 must return non-NULL.
-                            if syscall_num == 192 {
-                                Some(0x40000000)
+                            // Task 6-Z56: mmap2 returns -ENOMEM (not 0 or fake address).
+                            if syscall_num == 192 || syscall_num == 219 {
+                                Some(-12) // ENOMEM — can't actually create mapping
                             } else if syscall_num == 45 {
-                                Some(0x80000000)
+                                Some(0x80000000) // brk — non-zero = current break
                             } else {
                                 Some(0)
                             }
