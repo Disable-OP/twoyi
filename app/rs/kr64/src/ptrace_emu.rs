@@ -2145,6 +2145,21 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         // leaked into init's code paths as NULL pointers.
         if syscall_nr == 1 || syscall_nr == 252 {
             None // exit / exit_group — don't fake
+        } else if syscall_nr == 192 {
+            // Task 6-Z55: mmap2 must NOT return 0 (NULL). Returning 0 causes
+            // a NULL pointer dereference → SIGSEGV at si_addr=0x0. Return a
+            // non-NULL address instead. Use 0x40000000 (1GB) as a safe
+            // mapping address (above the 256MB TWRP binary, below the stack).
+            // The caller will use this as a valid mapped address.
+            Some(0x40000000)
+        } else if syscall_nr == 45 {
+            // brk: return the requested break address (from ebx). But we
+            // don't have the regs here. Return a large value that init
+            // treats as "brk is at this address" (non-zero = success).
+            Some(0x80000000)
+        } else if syscall_nr == 125 {
+            // mprotect: return 0 (success) — no side effects
+            Some(0)
         } else {
             Some(0)
         }
@@ -6143,7 +6158,14 @@ pub fn run_ptrace_loop(
                     let _enosys_fallback: Option<i64> = if abi.execve == 11 {
                         let actual_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if actual_ret == -38 && syscall_num != 1 && syscall_num != 252 {
-                            Some(0)
+                            // Task 6-Z55: mmap2 must return non-NULL.
+                            if syscall_num == 192 {
+                                Some(0x40000000)
+                            } else if syscall_num == 45 {
+                                Some(0x80000000)
+                            } else {
+                                Some(0)
+                            }
                         } else {
                             None
                         }
