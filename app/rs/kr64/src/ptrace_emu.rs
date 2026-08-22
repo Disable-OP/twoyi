@@ -3023,6 +3023,420 @@ fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     true
 }
 
+// ============================================================================
+// Task 6-Z62: mmap2 CONTENT INJECTION — module-level helpers
+// ============================================================================
+//
+// PROBLEM (the Wave-1 predicted next blocker): the Task 6-Z2 ENTRY rewrite
+// converts every file-backed mmap2 into an ANONYMOUS mmap so the inherited
+// app seccomp filter does not -ENOSYS(-38) it. That gets the child a REAL,
+// page-aligned mapping address — but the mapping CONTENT IS ALL ZEROS.
+// This is fine for init's /dev/__properties__ area (init memsets it and
+// writes its own header, see 6-Z61), but it is FATAL for the recovery
+// binary's dynamic linker (the 32-bit bionic linker at {rootfs}/sbin/
+// linker): the linker file-mmaps libc.so / libm.so / libstdc++.so etc. and
+// parses the ELF headers + dynamic sections DIRECTLY out of the mapping.
+// Reading zeros → e_ident mismatch / garbage phdrs → "library is invalid"
+// or a SIGSEGV inside the linker → recovery exits 127 before ever opening
+// fb0. TWRP never renders.
+//
+// FIX: inject the REAL file content into the zeroed anonymous mapping at
+// the mmap2 EXIT stop. The kernel has already created the mapping when the
+// EXIT stop fires, so the tracer (kr64) can write the file's bytes into it
+// through the SAME ptrace facility it already uses for path translation
+// (PTRACE_POKEDATA), or — much faster — through process_vm_writev(2).
+//
+// The helpers below are deliberately PURE or SELF-CONTAINED so they can be
+// unit-tested without a traced child (mirroring the 6-Y style of
+// `rewrite_mmap_flags_shared_to_anonymous`): the offset-unit conversion,
+// the return-address sanity check, the read-slice clamp, and the file-slice
+// loader are all testable; only the POKEDATA / process_vm_writev loops need
+// a live child and are exercised by E2E runs instead.
+//
+// ── SIGSYS catcher for the TRACER itself ─────────────────────────────────
+//
+// kr64 runs INSIDE the app's inherited seccomp filter. Evidence from lib.rs
+// (the lsetxattr / mount guards: "untrusted_app — calling it sends SIGSYS
+// (signal 31) which kills the process") shows that syscalls the inherited
+// filter TRAPs are LETHAL for kr64: kr64 has no SIGSYS handler in
+// ptrace-emulation mode (seccomp::install() — which installs one — is
+// intentionally skipped, see lib.rs Task 6-X), so the default SIGSYS
+// disposition (core dump) would terminate the whole VM.
+//
+// process_vm_writev (x86_64 nr=311) may or may not be in the app filter's
+// allow list — we cannot introspect the filter from userspace. The 6-Z62
+// design therefore installs a MINIMAL SIGSYS catcher in kr64 BEFORE the
+// first process_vm_writev probe: the handler only bumps an atomic counter
+// (async-signal-safe) and returns. With the catcher installed:
+//   - If the filter ALLOWS process_vm_writev → the syscall executes
+//     normally; the counter never moves.
+//   - If the filter ERRNOs it (SECCOMP_RET_ERRNO(ENOSYS), the observed
+//     default for the i386 side) → the call returns -1/ENOSYS; the
+//     counter never moves; we fall back to POKEDATA.
+//   - If the filter TRAPs it (SECCOMP_RET_TRAP) → SIGSYS is caught by our
+//     handler, the counter bumps, and the kernel's syscall_rollback has
+//     already restored rax = orig_rax = the syscall NUMBER (311) — so
+//     process_vm_writev "returns" 311, which we detect explicitly. kr64
+//     SURVIVES and we permanently fall back to POKEDATA.
+//
+// SA_RESTART matters: kr64 spends most of its life blocked in waitpid(-1).
+// If SIGSYS fires while blocked, SA_RESTART makes the kernel auto-restart
+// waitpid instead of returning EINTR — without it, the loop's
+// `waitpid == -1 → return -1` path would tear down the whole VM on a
+// signal that is now purely informational.
+//
+// This handler does NOT affect the CHILDREN: the children's SIGSYS events
+// arrive at the tracer as ptrace signal-delivery-stops handled by the
+// waitpid loop below; the tracer's own signal disposition is irrelevant to
+// them (verified reasoning: the loop already relies on the child's SIGSYS
+// stops arriving via waitpid, not via any tracer-side handler).
+static KR64_SIGSYS_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Minimal async-signal-safe SIGSYS catcher for kr64 itself. See the
+/// Task 6-Z62 block comment above for the full rationale.
+extern "C" fn kr64_sigsys_catcher(
+    _sig: libc::c_int,
+    _info: *mut libc::siginfo_t,
+    _ctx: *mut libc::c_void,
+) {
+    KR64_SIGSYS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Task 6-Z62: the mmap2 ENTRY→EXIT handoff record. Created at the mmap2
+/// ENTRY stop in the SAME block that performs the anonymous rewrite, so
+/// the fields snapshot the ORIGINAL (pre-rewrite) arguments — the rewrite
+/// itself clobbers arg5 (fd→-1) and arg6 (offset→0) in the child's
+/// registers, so by the time the EXIT stop fires those values are GONE
+/// from the register file and must be carried in this struct.
+///
+/// `pid` guards against the cross-child confusion the codebase has been
+/// bitten by before (DESYNC, Task 6-Z54): if a DIFFERENT child's stop
+/// consumes this record, the mapping address would belong to the wrong
+/// address space and the injection would corrupt an unrelated mapping.
+/// The EXIT-side consumer drops the record (with a log) when the pids
+/// disagree.
+///
+/// `offset_bytes` is the mmap offset converted to BYTES at ENTRY time
+/// (i386 mmap2 takes the offset in 4096-byte PAGES; x86_64/aarch64 mmap
+/// takes bytes — see `mmap_syscall_offset_to_bytes`).
+///
+/// `length` is the FULL requested mapping length in bytes (the linker
+/// typically passes the whole file size for the initial whole-file map
+/// and p_filesz-rounded lengths for the per-segment maps).
+struct PendingMmap2Content {
+    pid: libc::pid_t,
+    fd: i32,
+    length: u64,
+    offset_bytes: u64,
+}
+
+/// Task 6-Z62: convert the mmap-offset argument to BYTES.
+///
+/// i386 `mmap2` (nr=192) takes the offset in 4096-byte units — the
+/// "mmap2 page-shift workaround" (the i386 kernel multiplies the arg by
+/// PAGE_SIZE internally because old mmap could not express 64-bit byte
+/// offsets in a 32-bit register). x86_64 `mmap` (nr=9) and aarch64 `mmap`
+/// (nr=222) take the offset in plain bytes.
+///
+/// The `abi.mmap2 != -1` guard keeps the sentinel ABIs (x86_64/aarch64
+/// have no mmap2) from matching `nr == -1` (no real syscall is -1 — the
+/// same "harmless sentinel" precedent as `socketcall_nr` / `mknod` in
+/// ChildAbi).
+fn mmap_syscall_offset_to_bytes(nr: i64, abi: &ChildAbi, offset_arg: u64) -> u64 {
+    if abi.mmap2 != -1 && nr == abi.mmap2 {
+        offset_arg.wrapping_mul(4096)
+    } else {
+        offset_arg
+    }
+}
+
+/// Task 6-Z62: is the mmap EXIT return value a usable mapping address?
+///
+/// mmap never returns 0 for a non-MAP_FIXED-at-0 call (Linux honours
+/// mmap_min_addr), never returns a non-page-aligned value, and returns
+/// errors as -errno in the (-4096, 0) range. On i386 the user space tops
+/// out at TASK_SIZE = 0xfffff000; on 64-bit ABIs at 0x7ffffffff000
+/// (x86_64 TASK_SIZE_MAX; aarch64 is higher but the ELF loaders stay far
+/// below it). The page-alignment check also rejects the two register
+/// "leak" values this codebase has observed on seccomp-TRAP'd i386
+/// syscalls — rax = the syscall number (192 is not page-aligned) and
+/// rax = a stale code address — before we write anything to them.
+///
+/// `abi.execve == 11` is the established i386-ABI marker in this file
+/// (used by the 6-Z57 ENOSYS override and the 6-Z60 fresh-return gate).
+fn mmap_return_is_valid_mapping_address(ret: i64, abi: &ChildAbi) -> bool {
+    if ret <= 0 || (ret & 0xfff) != 0 {
+        return false;
+    }
+    if abi.execve == 11 {
+        ret < 0xffff_f000
+    } else {
+        ret < 0x7fff_ffff_f000
+    }
+}
+
+/// Task 6-Z62: how many bytes of [offset_bytes, offset_bytes+length) of a
+/// file of `file_len` bytes actually EXIST and therefore need injecting.
+///
+/// The linker routinely asks for `length` = p_filesz ROUNDED UP to a page
+/// (and the kernel rounds the mapping up anyway), so the requested window
+/// can run past EOF — the tail beyond EOF must stay ZERO, and it already
+/// IS zero in the fresh anonymous mapping, so we simply do not write it
+/// (this also keeps the POKEDATA tail word from straddling the mapping
+/// end for the clamped final chunk).
+fn mmap2_injectable_slice(file_len: u64, offset_bytes: u64, length: u64) -> usize {
+    if length == 0 || offset_bytes >= file_len {
+        return 0;
+    }
+    let avail = file_len - offset_bytes;
+    std::cmp::min(avail, length) as usize
+}
+
+/// Task 6-Z62 budget: total bytes we are willing to inject per traced
+/// process. The bionic linker maps each library TWICE (a whole-file
+/// PROT_READ map, then per-PT_LOAD segment maps that alias the same
+/// bytes), so the injected volume is roughly 2× the .so sizes. TWRP's
+/// recovery pulls in libc/libm/libstdc++/liblog/libcrypto/… ≈ 6-10 MiB
+/// of files → ≈ 12-20 MiB of injected bytes; 32 MiB leaves headroom
+/// without letting a runaway loop write unbounded data.
+const MMAP2_INJECT_BUDGET_PER_PID: u64 = 32 * 1024 * 1024;
+
+/// Task 6-Z62 cache: whole files ≤ this size are cached in kr64's memory
+/// so the per-segment mmap2s of the SAME library do not re-read it from
+/// disk (page-cache hits, but the cache also makes the slices trivial).
+/// libc.so ≈ 1-2 MiB; anything bigger than 8 MiB is read slice-by-slice
+/// without caching.
+const MMAP2_FILE_CACHE_MAX_FILE: u64 = 8 * 1024 * 1024;
+
+/// Task 6-Z62 cache: total bytes cached across all files. When a new file
+/// would push the cache past this, the whole cache is dropped (simple
+/// evict-all — the injection phase is short and the rebuild cost is a
+/// page-cache-warm re-read).
+const MMAP2_FILE_CACHE_MAX_TOTAL: u64 = 32 * 1024 * 1024;
+
+/// Task 6-Z62: load [offset_bytes, offset_bytes+len) of a HOST file,
+/// through the whole-file cache. Returns None when the file cannot be
+/// opened/read (ENOENT, permissions, vanished mid-boot, …) — the caller
+/// treats that as "skip injection" and the zeroed mapping remains, which
+/// is strictly better than crashing the ptrace loop.
+///
+/// `len` MUST already be clamped by `mmap2_injectable_slice` against the
+/// file's real length (the caller does metadata first for the clamp, so
+/// by the time we get here the slice is guaranteed in-bounds — a TOCTOU
+/// shrink of the file between the two reads surfaces as a read error and
+/// yields None, the documented skip path).
+fn mmap2_read_file_slice(
+    path: &str,
+    offset_bytes: u64,
+    len: usize,
+    cache: &mut std::collections::HashMap<String, std::rc::Rc<Vec<u8>>>,
+    cache_bytes: &mut u64,
+) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    // Fast path: whole file already cached.
+    if let Some(data) = cache.get(path) {
+        let start = offset_bytes as usize;
+        return Some(data[start..start + len].to_vec());
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if file_len <= MMAP2_FILE_CACHE_MAX_FILE {
+        // Small file: read it whole into the cache, then slice.
+        let mut buf = Vec::with_capacity(file_len as usize);
+        file.read_to_end(&mut buf).ok()?;
+        if buf.len() as u64 != file_len {
+            // File changed size between metadata and read — distrust it.
+            return None;
+        }
+        let rc = std::rc::Rc::new(buf);
+        if *cache_bytes + file_len > MMAP2_FILE_CACHE_MAX_TOTAL {
+            cache.clear();
+            *cache_bytes = 0;
+        }
+        *cache_bytes += file_len;
+        cache.insert(path.to_string(), rc.clone());
+        let start = offset_bytes as usize;
+        return Some(rc[start..start + len].to_vec());
+    }
+    // Big file: positioned read of just the slice (no caching).
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; len];
+    file.read_exact_at(&mut buf, offset_bytes).ok()?;
+    Some(buf)
+}
+
+/// Task 6-Z62: write `bytes` into the child's memory at `addr` via a
+/// PTRACE_POKEDATA loop, 8 bytes (one `c_long`) per call.
+///
+/// This is the PROVEN mechanism in this codebase (`write_child_string`,
+/// `write_child_string_unchecked`, `poke_capget_data` all use it), but it
+/// costs one ptrace syscall per word ≈ 3 µs → ≈ 0.8 s per MiB — several
+/// seconds per library. It is the FALLBACK for when process_vm_writev is
+/// unavailable (see `write_child_bytes_injection`).
+///
+/// The final partial word is zero-padded; those padding bytes always land
+/// inside the mapping's last page (mmap rounds the mapping up to a page,
+/// and a page boundary is 8-byte aligned), and they are zeros the mapping
+/// already had, so nothing observable changes.
+///
+/// Returns the number of content bytes successfully poked (stops at the
+/// first EIO — typically an unmapped address).
+fn write_child_bytes_pokedata(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> usize {
+    if addr == 0 || bytes.is_empty() {
+        return 0;
+    }
+    let word_size = std::mem::size_of::<libc::c_long>();
+    let mut written = 0usize;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let mut word_bytes = [0u8; 8];
+        let chunk_len = std::cmp::min(word_size, bytes.len() - offset);
+        word_bytes[..chunk_len].copy_from_slice(&bytes[offset..offset + chunk_len]);
+        let word = libc::c_long::from_ne_bytes(word_bytes);
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKEDATA,
+                pid,
+                addr.wrapping_add(offset as u64) as i64,
+                word,
+            )
+        };
+        if r == -1 {
+            break;
+        }
+        offset += word_size;
+        written += chunk_len;
+    }
+    written
+}
+
+/// Task 6-Z62: one process_vm_writev(2) call carrying one local→remote
+/// iovec pair. Exposed as its own fn so the probe/orchestrator logic stays
+/// readable. Cross-bitness (64-bit tracer → 32-bit tracee) is supported by
+/// the kernel — the remote iovec's base is just a userspace address in the
+/// tracee's mm.
+fn process_vm_writev_chunk(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> isize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let local = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    unsafe { libc::process_vm_writev(pid, &local, 1, &remote, 1, 0) }
+}
+
+/// Task 6-Z62: write `bytes` into the child at `addr` with
+/// process_vm_writev, in 1 MiB calls (the syscall accepts up to
+/// MAX_RW_COUNT ≈ 2 GiB per call; 1 MiB keeps each call's kernel-side
+/// pinning short so a partial failure wastes little).
+///
+/// Returns `(bytes_written, blocked)` where `blocked == true` means the
+/// inherited app seccomp filter refused the SYSCALL ITSELF (ERRNO action,
+/// or a TRAP that our SIGSYS catcher survived — see the 6-Z62 block
+/// comment). On `blocked` the caller must permanently fall back to
+/// POKEDATA; on `blocked == false` with a short write the failure is
+/// address-specific (EFAULT — mapping vanished) and process_vm_writev
+/// remains usable for other regions.
+///
+/// The TRAP detection is belt-and-suspenders:
+///   (a) the KR64_SIGSYS_HITS counter moved across the call, or
+///   (b) the call "returned" exactly SYS_process_vm_writev (311 on
+///       x86_64) — the kernel's syscall_rollback for SECCOMP_RET_TRAP
+///       restores rax = orig_rax = the syscall number, so a trapped call
+///       shows up as a bogus positive "311 bytes written".
+fn write_child_bytes_process_vm(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> (usize, bool) {
+    const CHUNK: usize = 1024 * 1024;
+    let mut written = 0usize;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let end = std::cmp::min(off + CHUNK, bytes.len());
+        let before = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let n = process_vm_writev_chunk(pid, addr.wrapping_add(off as u64), &bytes[off..end]);
+        let sigsys_fired =
+            KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed) > before;
+        if sigsys_fired || n == libc::SYS_process_vm_writev as isize {
+            return (written, true);
+        }
+        if n < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e == libc::ENOSYS || e == libc::EPERM || e == libc::EACCES {
+                // Seccomp ERRNO action — the syscall itself is refused.
+                return (written, true);
+            }
+            // EFAULT / EINVAL / … — address-specific failure: fall back to
+            // POKEDATA for the remainder WITHOUT condemning process_vm_writev.
+            return (written, false);
+        }
+        if n == 0 {
+            // Should not happen (writev makes progress or errors), but a
+            // 0-return would otherwise spin this loop forever.
+            return (written, false);
+        }
+        written += n as usize;
+        off += n as usize;
+    }
+    (written, false)
+}
+
+/// Task 6-Z62: best-effort write of the injected slice into the child.
+///
+/// `vm_writev_usable` is the loop-level capability cache:
+///   - `None`      — never probed. Probe NOW with the real payload: if the
+///                   inherited seccomp filter blocks process_vm_writev,
+///                   remember `Some(false)` and never spend a syscall on it
+///                   again.
+///   - `Some(true)` — a previous call (partially) succeeded.
+///   - `Some(false)`— a previous call was BLOCKED; go straight to POKEDATA.
+///
+/// Returns `(bytes_written, method)` where `method` names the winning
+/// mechanism for the diagnostic log ("vm_writev", "poke", or
+/// "vm_writev+poke" when a partial vm write had to be finished by pokes).
+fn write_child_bytes_injection(
+    pid: libc::pid_t,
+    addr: u64,
+    bytes: &[u8],
+    vm_writev_usable: &mut Option<bool>,
+) -> (usize, &'static str) {
+    if bytes.is_empty() {
+        return (0, "vm_writev");
+    }
+    if *vm_writev_usable != Some(false) {
+        let (n, blocked) = write_child_bytes_process_vm(pid, addr, bytes);
+        if blocked {
+            *vm_writev_usable = Some(false);
+            if n == 0 {
+                let poked = write_child_bytes_pokedata(pid, addr, bytes);
+                return (poked, "poke");
+            }
+            let poked =
+                write_child_bytes_pokedata(pid, addr.wrapping_add(n as u64), &bytes[n..]);
+            return (n + poked, "vm_writev+poke");
+        }
+        if n == bytes.len() {
+            if vm_writev_usable.is_none() {
+                // First successful probe — lock the capability in.
+                *vm_writev_usable = Some(true);
+            }
+            return (n, "vm_writev");
+        }
+        // Address-specific short write (EFAULT mid-region): finish the
+        // remainder with POKEDATA, keep process_vm_writev usable.
+        let poked = write_child_bytes_pokedata(pid, addr.wrapping_add(n as u64), &bytes[n..]);
+        return (n + poked, "vm_writev+poke");
+    }
+    let poked = write_child_bytes_pokedata(pid, addr, bytes);
+    (poked, "poke")
+}
+
 /// Write a translated path into the child's scratch page and rewrite the
 /// path-argument register to point at it.
 ///
@@ -3241,6 +3655,46 @@ pub fn run_ptrace_loop(
         pid, rootfs
     ));
 
+    // ── Task 6-Z62: install the protective SIGSYS catcher BEFORE anything
+    //    in this loop calls process_vm_writev ─────────────────────────────
+    //
+    // kr64 itself lives under the app's inherited seccomp filter, and that
+    // filter TRAPs syscalls outside its allow list — for an UNGUARDED
+    // process SIGSYS's default disposition (core dump) is lethal (see the
+    // lib.rs guards that skip lsetxattr/mount for exactly this reason).
+    // The 6-Z62 content injection wants to use process_vm_writev (x86_64
+    // nr=311) for speed, but we cannot know from userspace whether the
+    // filter allows it. Installing this catcher FIRST makes the probe
+    // SURVIVABLE: a trapped process_vm_writev bumps KR64_SIGSYS_HITS and
+    // leaves rax = the syscall number (syscall_rollback), both of which
+    // write_child_bytes_process_vm detects → permanent POKEDATA fallback.
+    //
+    // SA_RESTART is required: kr64 blocks in waitpid(-1) in this loop, and
+    // without SA_RESTART a SIGSYS arriving mid-waitpid would surface as
+    // EINTR → the loop's `waitpid == -1 → return -1` teardown path.
+    //
+    // This sigaction ONLY affects kr64's own thread — the traced
+    // children's SIGSYS events are ptrace signal-delivery-stops consumed
+    // by the waitpid loop below and never consult the tracer's
+    // dispositions.
+    {
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_sigaction = kr64_sigsys_catcher as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+            if libc::sigaction(libc::SIGSYS, &sa, std::ptr::null_mut()) != 0 {
+                let e = std::io::Error::last_os_error();
+                log(&format!(
+                    "6-Z62: SIGSYS catcher install FAILED: {} — if the inherited seccomp filter TRAPs process_vm_writev, kr64 may be killed by the first injection attempt",
+                    e
+                ));
+            } else {
+                log("6-Z62: SIGSYS catcher installed for the tracer — the process_vm_writev probe is now survivable (a trapped call falls back to PTRACE_POKEDATA)");
+            }
+        }
+    }
+
     // ── PTRACE_SETOPTIONS: trace forks + good-syscall-stops ──────────
     //
     // We set FOUR options here:
@@ -3446,6 +3900,56 @@ pub fn run_ptrace_loop(
     //   will use. See the doc on `mmap` / `mmap2` in `ChildAbi` for
     //   the full root-cause analysis.
     let mut properties_fd: Option<i32> = None;
+
+    // ── Task 6-Z62: mmap2 CONTENT INJECTION state ──────────────────────
+    //
+    // `pending_mmap2_content`: ENTRY→EXIT handoff for the anonymous
+    //   rewrite (mirrors the pending_kmsg_open / pending_xattr_fake /
+    //   pending_open_translated_path ENTRY-flag → EXIT-consume pattern).
+    //   Set at the mmap2 ENTRY stop in the same block that performs the
+    //   6-Z2 file-backed → MAP_ANONYMOUS rewrite, carrying the ORIGINAL
+    //   fd/length/offset (the rewrite clobbers fd→-1 and offset→0 in the
+    //   child's registers, so the values cannot be recovered at EXIT).
+    //   Consumed at the mmap2 EXIT stop to copy the file's real bytes
+    //   into the freshly-created zeroed anonymous mapping — without
+    //   this, the recovery binary's bionic linker parses ZEROS instead
+    //   of libc.so/libm.so ELF headers and dies before opening fb0.
+    //
+    // `open_fd_owner_paths`: (pid, fd) → translated host path. The
+    //   existing `open_fd_paths` map is keyed by fd ONLY; fd tables are
+    //   per-process, so init's fd=4 and the recovery child's fd=4 are
+    //   DIFFERENT files that collide in the fd-only map (last writer
+    //   wins — fine for the read/write diagnostics it was built for,
+    //   NOT fine for content injection, where the wrong path means the
+    //   wrong bytes in the wrong mapping). This second map is keyed by
+    //   the (child pid, fd) pair and is the PRIMARY lookup for the
+    //   injection; `open_fd_paths` remains the fallback (and keeps the
+    //   6-V/6-Z25/6-Z29 diagnostics untouched).
+    //
+    // `mmap2_injected_bytes`: per-pid budget accounting, capped at
+    //   MMAP2_INJECT_BUDGET_PER_PID (32 MiB — the linker maps each
+    //   library twice: whole-file + per-segment, so ~2× the .so bytes;
+    //   TWRP's dependency set is ≈ 6-10 MiB of files).
+    //
+    // `mmap2_file_cache` + `mmap2_file_cache_bytes`: whole-file content
+    //   cache so the per-segment mmap2s of the same library don't
+    //   re-read it from disk (see mmap2_read_file_slice for the caps).
+    //
+    // `vm_writev_usable`: process_vm_writev capability cache. `None`
+    //   until the first injection probes it; `Some(false)` after the
+    //   inherited app seccomp filter refused it (ENOSYS/EPERM errno, or
+    //   a SIGSYS trap survived by the 6-Z62 catcher) — from then on the
+    //   POKEDATA loop is used directly, so a blocked filter costs ONE
+    //   failed call per boot instead of one per mmap2.
+    let mut pending_mmap2_content: Option<PendingMmap2Content> = None;
+    let mut open_fd_owner_paths: std::collections::HashMap<(libc::pid_t, i32), String> =
+        std::collections::HashMap::new();
+    let mut mmap2_injected_bytes: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
+    let mut mmap2_file_cache: std::collections::HashMap<String, std::rc::Rc<Vec<u8>>> =
+        std::collections::HashMap::new();
+    let mut mmap2_file_cache_bytes: u64 = 0;
+    let mut vm_writev_usable: Option<bool> = None;
 
     // Runtime-detected syscall/register layout for the child. `None`
     // until the first successful ptrace_getregs — at that point we
@@ -4185,60 +4689,216 @@ pub fn run_ptrace_loop(
                                 "[KR64] BOOT_COMPLETED synthesis: execve SUCCEEDED for PID={} (PTRACE_EVENT_EXEC) — sending BOOT_COMPLETED to @TWOYI_SOCK (Task 6-Z48)",
                                 pid
                             ));
-                            // Connect to the app's abstract socket @TWOYI_SOCK and
-                            // write "BOOT_COMPLETED\n". Use raw libc calls because
-                            // Rust's UnixStream::connect rejects abstract socket
-                            // paths (NUL-prefixed) with "paths must not contain
-                            // interior null bytes".
-                            for sock_name in &["TWOYI_SOCK", "TWOYI_BOOT_SOCK"] {
-                                let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-                                if sock < 0 {
-                                    log(&format!(
-                                        "[KR64] BOOT_COMPLETED: socket() failed for @{} (Task 6-Z50)",
-                                        sock_name
-                                    ));
-                                    continue;
-                                }
-                                let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-                                addr.sun_family = libc::AF_UNIX as u16;
-                                // Abstract socket: sun_path[0] = 0, then the name
-                                let name_bytes = sock_name.as_bytes();
-                                let copy_len = name_bytes.len().min(addr.sun_path.len() - 1);
-                                for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
-                                    addr.sun_path[i + 1] = b as libc::c_char;
-                                }
-                                let addr_len = (std::mem::size_of::<u16>() + 1 + copy_len) as u32;
-                                let ret = unsafe {
-                                    libc::connect(
-                                        sock,
-                                        &addr as *const _ as *const libc::sockaddr,
-                                        addr_len,
-                                    )
-                                };
-                                if ret == 0 {
-                                    let msg = b"BOOT_COMPLETED\n";
-                                    let written = unsafe {
-                                        libc::write(sock, msg.as_ptr() as *const libc::c_void, msg.len())
-                                    };
-                                    if written == msg.len() as isize {
-                                        log(&format!(
-                                            "[KR64] BOOT_COMPLETED sent to @{} (Task 6-Z50)",
-                                            sock_name
+                            // Task 6-Z62: connect with SOCK_SEQPACKET, on a
+                            // detached retry thread. The app binds BOTH
+                            // @TWOYI_SOCK and @TWOYI_BOOT_SOCK as SEQPACKET
+                            // (TwoyiSocketServer.start0() and
+                            // BootCompletionServer.start0() both use
+                            // `new LocalSocket(LocalSocket.SOCKET_SEQPACKET)`).
+                            // The previous SOCK_STREAM connect ALWAYS failed
+                            // with "Connection refused (os error 111)": on
+                            // Linux the abstract-socket hash bucket is keyed
+                            // by `hash ^ sk_type` (kernel af_unix.c binds with
+                            // `addr->hash ^= sk->sk_type` and looks up in
+                            // `unix_socket_table[hash ^ type]`), so a
+                            // SOCK_STREAM connect cannot even SEE a
+                            // SOCK_SEQPACKET listener — unix_find_other()
+                            // returns ECONNREFUSED exactly as if the name did
+                            // not exist. (Verified empirically on kernel
+                            // 5.10: stream→seqpacket abstract connect =
+                            // errno 111; seqpacket→seqpacket = success.)
+                            // This was previously misdiagnosed as a
+                            // connect-before-bind race, but the b889666
+                            // logcat timing rules that out: the app binds
+                            // @TWOYI_SOCK at Application.attachBaseContext
+                            // (~21:29:39) and @TWOYI_BOOT_SOCK in
+                            // bootSystem() (~21:30:32), while kr64's first
+                            // connect fires >= 21:32:30 — three minutes
+                            // later. TwoyiMessenger.java (the reference
+                            // host-side client) also uses SOCKET_SEQPACKET.
+                            //
+                            // The send runs on a DETACHED thread because this
+                            // code is inside the ptrace event loop — blocking
+                            // here (retrying for up to 120 s) would freeze the
+                            // traced recovery mid-syscall. The thread retries
+                            // every 250 ms for up to 120 s (defense in depth:
+                            // covers a hypothetical early-boot guest racing
+                            // the app's bind, and the app's own 5-attempt
+                            // bind-retry backoff). The app side is idempotent
+                            // (BootCompletionServer.markCompleted is a
+                            // compare-and-set), so ONE successful delivery is
+                            // sufficient; the process-wide AtomicBool below
+                            // prevents stacking sender threads if this
+                            // synthesis fires more than once per process.
+                            static BOOT_COMPLETED_SENDER_STARTED:
+                                std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if BOOT_COMPLETED_SENDER_STARTED
+                                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                log("[KR64] BOOT_COMPLETED: sender thread already started — not spawning another (Task 6-Z62)");
+                            } else {
+                                let trigger_pid = pid;
+                                match std::thread::Builder::new()
+                                    .name("boot-completed-sender".to_string())
+                                    .spawn(move || {
+                                        use std::io::Write;
+                                        let tlog = |msg: &str| {
+                                            let _ = writeln!(
+                                                std::io::stderr(),
+                                                "[KR64][ptrace] {}",
+                                                msg
+                                            );
+                                        };
+                                        tlog(&format!(
+                                            "[KR64] BOOT_COMPLETED sender thread started (recovery execve PID={}, will retry every 250 ms for up to 120 s) (Task 6-Z62)",
+                                            trigger_pid
                                         ));
-                                    } else {
+                                        // Socket names + abstract-namespace
+                                        // encoding are UNCHANGED from Task
+                                        // 6-Z50 (both were correct); only the
+                                        // socket TYPE changed
+                                        // (SOCK_STREAM → SOCK_SEQPACKET).
+                                        const SOCK_NAMES: [&str; 2] =
+                                            ["TWOYI_SOCK", "TWOYI_BOOT_SOCK"];
+                                        const RETRY_INTERVAL_MS: u64 = 250;
+                                        const RETRY_TOTAL_MS: u64 = 120_000;
+                                        let started_at = std::time::Instant::now();
+                                        let mut attempt: u64 = 0;
+                                        loop {
+                                            attempt += 1;
+                                            let mut delivered = false;
+                                            for sock_name in SOCK_NAMES {
+                                                let sock = unsafe {
+                                                    libc::socket(
+                                                        libc::AF_UNIX,
+                                                        libc::SOCK_SEQPACKET,
+                                                        0,
+                                                    )
+                                                };
+                                                if sock < 0 {
+                                                    let e =
+                                                        std::io::Error::last_os_error();
+                                                    tlog(&format!(
+                                                        "[KR64] BOOT_COMPLETED: socket(SOCK_SEQPACKET) failed for @{} (attempt {}): {} (Task 6-Z62)",
+                                                        sock_name, attempt, e
+                                                    ));
+                                                    continue;
+                                                }
+                                                let mut addr: libc::sockaddr_un =
+                                                    unsafe { std::mem::zeroed() };
+                                                addr.sun_family =
+                                                    libc::AF_UNIX as u16;
+                                                // Abstract socket:
+                                                // sun_path[0] = 0, then the name.
+                                                let name_bytes = sock_name.as_bytes();
+                                                let copy_len = name_bytes
+                                                    .len()
+                                                    .min(addr.sun_path.len() - 1);
+                                                for (i, &b) in
+                                                    name_bytes[..copy_len].iter().enumerate()
+                                                {
+                                                    addr.sun_path[i + 1] =
+                                                        b as libc::c_char;
+                                                }
+                                                let addr_len =
+                                                    (std::mem::size_of::<u16>()
+                                                        + 1
+                                                        + copy_len)
+                                                        as u32;
+                                                let ret = unsafe {
+                                                    libc::connect(
+                                                        sock,
+                                                        &addr as *const _
+                                                            as *const libc::sockaddr,
+                                                        addr_len,
+                                                    )
+                                                };
+                                                if ret == 0 {
+                                                    let msg = b"BOOT_COMPLETED\n";
+                                                    let written = unsafe {
+                                                        libc::write(
+                                                            sock,
+                                                            msg.as_ptr()
+                                                                as *const libc::c_void,
+                                                            msg.len(),
+                                                        )
+                                                    };
+                                                    if written
+                                                        == msg.len() as isize
+                                                    {
+                                                        tlog(&format!(
+                                                            "[KR64] BOOT_COMPLETED sent to @{} via SOCK_SEQPACKET on attempt {} ({} ms elapsed) (Task 6-Z62)",
+                                                            sock_name,
+                                                            attempt,
+                                                            started_at
+                                                                .elapsed()
+                                                                .as_millis()
+                                                        ));
+                                                        delivered = true;
+                                                    } else {
+                                                        let e =
+                                                            std::io::Error::last_os_error();
+                                                        tlog(&format!(
+                                                            "[KR64] BOOT_COMPLETED: write to @{} failed (ret={}, errno={}) (Task 6-Z62)",
+                                                            sock_name, written, e
+                                                        ));
+                                                    }
+                                                } else {
+                                                    let e =
+                                                        std::io::Error::last_os_error();
+                                                    tlog(&format!(
+                                                        "[KR64] BOOT_COMPLETED: connect(SOCK_SEQPACKET) to @{} failed on attempt {} ({} ms elapsed): {} (Task 6-Z62)",
+                                                        sock_name,
+                                                        attempt,
+                                                        started_at
+                                                            .elapsed()
+                                                            .as_millis(),
+                                                        e
+                                                    ));
+                                                }
+                                                unsafe { libc::close(sock); }
+                                                if delivered {
+                                                    break;
+                                                }
+                                            }
+                                            if delivered {
+                                                tlog("[KR64] BOOT_COMPLETED delivery confirmed — sender thread exiting (Task 6-Z62)");
+                                                return;
+                                            }
+                                            let elapsed_ms = started_at
+                                                .elapsed()
+                                                .as_millis() as u64;
+                                            if elapsed_ms + RETRY_INTERVAL_MS
+                                                >= RETRY_TOTAL_MS
+                                            {
+                                                tlog(&format!(
+                                                    "[KR64] BOOT_COMPLETED: giving up after {} attempts / {} ms — @TWOYI_SOCK and @TWOYI_BOOT_SOCK unreachable (Task 6-Z62)",
+                                                    attempt, elapsed_ms
+                                                ));
+                                                return;
+                                            }
+                                            std::thread::sleep(
+                                                std::time::Duration::from_millis(
+                                                    RETRY_INTERVAL_MS,
+                                                ),
+                                            );
+                                        }
+                                    })
+                                {
+                                    Ok(_join_handle) => {
+                                        // Detached: dropping the JoinHandle
+                                        // lets the sender thread outlive this
+                                        // scope (kr64 keeps ptracing while it
+                                        // retries in the background).
+                                    }
+                                    Err(e) => {
                                         log(&format!(
-                                            "[KR64] BOOT_COMPLETED: write to @{} failed (ret={}) (Task 6-Z50)",
-                                            sock_name, written
+                                            "[KR64] BOOT_COMPLETED: failed to spawn sender thread: {} (Task 6-Z62)",
+                                            e
                                         ));
                                     }
-                                } else {
-                                    let e = std::io::Error::last_os_error();
-                                    log(&format!(
-                                        "[KR64] BOOT_COMPLETED: connect to @{} failed: {} (non-fatal) (Task 6-Z50)",
-                                        sock_name, e
-                                    ));
                                 }
-                                unsafe { libc::close(sock); }
                             }
                         }
 
@@ -5426,6 +6086,60 @@ pub fn run_ptrace_loop(
                             // /dev/__properties__ — safe to rewrite all
                             // file-backed to anonymous.
                             if (flags & libc::MAP_ANONYMOUS) == 0 {
+                                // ── Task 6-Z62: snapshot the ORIGINAL mmap
+                                // args for the EXIT-side content injection.
+                                //
+                                // MUST happen BEFORE the set_syscall_arg
+                                // rewrites below: the rewrite clobbers
+                                // arg5 (fd → -1) and arg6 (offset → 0) in
+                                // the child's register file, so by the
+                                // EXIT stop the original values are
+                                // unrecoverable from registers (arg2 /
+                                // length survives, but we snapshot it
+                                // here too so the handoff is one record).
+                                //
+                                // Skipped (no pending record created) for:
+                                //   - fd < 0: an fd-less "file-backed" mmap
+                                //     (weird legacy pattern) — nothing to
+                                //     look up at EXIT.
+                                //   - length == 0: nothing to inject.
+                                //   - prot == 0 (PROT_NONE): the bionic
+                                //     linker's address-space RESERVATION
+                                //     for the library's total span — no
+                                //     content ever lives there (segments
+                                //     are mapped over it later).
+                                //   - prot without PROT_READ: a write/exec-
+                                //     only mapping has no file content to
+                                //     parse (bionic always maps content
+                                //     segments at least PROT_READ).
+                                //
+                                // The record is set BEFORE the
+                                // ptrace_setregs match below (the
+                                // pending_xattr_fake pattern: even if the
+                                // rewrite itself FAILS, the EXIT consumer
+                                // still runs — it just sees a non-address
+                                // return (-38/-12) and drops the record
+                                // with a log, so the belt-and-suspenders
+                                // ordering costs nothing).
+                                let mmap2_length = get_syscall_arg(&regs, abi.reg_arg2);
+                                let mmap2_prot = get_syscall_arg(&regs, abi.reg_arg3) as i32;
+                                let mmap2_offset_arg = get_syscall_arg(&regs, abi.reg_arg6);
+                                let mmap2_offset_bytes = mmap_syscall_offset_to_bytes(
+                                    syscall_num,
+                                    &abi,
+                                    mmap2_offset_arg,
+                                );
+                                if fd >= 0
+                                    && mmap2_length > 0
+                                    && (mmap2_prot & libc::PROT_READ) != 0
+                                {
+                                    pending_mmap2_content = Some(PendingMmap2Content {
+                                        pid,
+                                        fd,
+                                        length: mmap2_length,
+                                        offset_bytes: mmap2_offset_bytes,
+                                    });
+                                }
                                 let new_flags =
                                     rewrite_mmap_flags_shared_to_anonymous(flags) as u64;
                                 set_syscall_arg(&mut regs, abi.reg_arg4, new_flags);
@@ -5745,6 +6459,19 @@ pub fn run_ptrace_loop(
                         if ret > 0 {
                             if let Some(ref p) = pending_open_translated_path {
                                 open_fd_paths.insert(ret as i32, p.clone());
+                                // Task 6-Z62: per-(pid, fd) copy of the same
+                                // mapping. fd tables are PER-PROCESS, so the
+                                // fd-only map above collides between init
+                                // and the recovery child when both hold the
+                                // same fd NUMBER for different files (last
+                                // writer wins). The content injector needs
+                                // the path that THIS child's fd actually
+                                // refers to, so it looks here FIRST and only
+                                // falls back to `open_fd_paths` (kept for the
+                                // 6-V read/write diagnostics) when this map
+                                // has no entry (e.g. an fd opened before the
+                                // loop attached — those are skipped anyway).
+                                open_fd_owner_paths.insert((pid, ret as i32), p.clone());
                                 // Task 6-Y: track __properties__ fd for
                                 // the mmap2 MAP_SHARED → MAP_ANONYMOUS
                                 // rewrite. The translated path covers both
@@ -5798,6 +6525,295 @@ pub fn run_ptrace_loop(
                             }
                         }
                         pending_open_translated_path = None;
+                    }
+
+                    // ── Task 6-Z62: mmap2 content injection (EXIT side) ──
+                    //
+                    // The ENTRY rewrite (6-Z2) turned the file-backed mmap2
+                    // into an anonymous one; the kernel has now executed it
+                    // and rax holds a REAL page-aligned mapping address —
+                    // over a page of ZEROS. This block copies the file's
+                    // actual bytes into that mapping so the recovery
+                    // binary's bionic linker can parse libc.so / libm.so /
+                    // libstdc++.so / … out of it (the whole reason the
+                    // recovery exits 127 today).
+                    //
+                    // The record was created at ENTRY and carries the
+                    // ORIGINAL fd/length/offset (the register copies were
+                    // clobbered by the rewrite). Gates, cheapest first:
+                    //
+                    //   1. syscall number must still be mmap/mmap2 — the
+                    //      syscall-number register is preserved across the
+                    //      syscall (the same property pending_xattr_fake
+                    //      relies on). A mismatch means ENTRY/EXIT DESYNC
+                    //      (6-Z54 class): DROP the record rather than
+                    //      inject into an unrelated syscall's "address".
+                    //   2. the record's pid must equal the currently
+                    //      stopped child — the single-record handoff can
+                    //      otherwise be consumed by a different child's
+                    //      stop, and the mapping address would point into
+                    //      the WRONG address space. DROP on mismatch.
+                    //   3. fresh rax must be a valid mapping address
+                    //      (positive, page-aligned, under the ABI's
+                    //      TASK_SIZE). A failed rewritten mmap shows up as
+                    //      -errno (e.g. -12/-38) and leaves nothing
+                    //      injected — the zeroed mapping simply never
+                    //      existed. LOG + drop.
+                    //   4. the fd must resolve to a host path via the
+                    //      per-(pid, fd) map (fallback: the fd-only map).
+                    //      Unknown fds (stdin, fds inherited before the
+                    //      loop attached) are skipped — usually silently,
+                    //      because the linker only mmaps fds IT opened
+                    //      through the tracked open/openat path.
+                    //   5. /dev/__properties__ is EXCLUDED by design: init
+                    //      memsets the property area and writes its own
+                    //      header (6-Z61 analysis) — injecting the stale
+                    //      pre-created file's bytes there would be pure
+                    //      waste (128 KiB per boot) and could resurrect
+                    //      stale property data.
+                    //   6. a per-pid byte budget (32 MiB) bounds a runaway
+                    //      loop; each injection logs path/offset/length/
+                    //      address/method/elapsed so the E2E logcat shows
+                    //      exactly what was linked.
+                    //
+                    // Failure modes are all SOFT: a failed file read or a
+                    // short write leaves part (or all) of the mapping
+                    // zeroed — the linker then fails on THAT library the
+                    // way it fails today, which is strictly no worse than
+                    // the status quo, and the log pinpoints which file to
+                    // investigate next.
+                    if pending_mmap2_content.is_some() {
+                        let pending = pending_mmap2_content.take().unwrap();
+                        if syscall_num != abi.mmap && syscall_num != abi.mmap2 {
+                            // Gate 1 — DESYNC: this EXIT stop belongs to a
+                            // different syscall than the mmap2 ENTRY that
+                            // armed the record. Injecting at whatever rax
+                            // holds now would target an unrelated address;
+                            // drop the record and say so.
+                            log(&format!(
+                                "6-Z62: mmap2 content injection SKIPPED (DESYNC) — pending mmap2 nr={} but this EXIT is nr={} [{}] (pid={})",
+                                if abi.mmap2 != -1 { abi.mmap2 } else { abi.mmap },
+                                syscall_num,
+                                syscall_name(syscall_num, &abi),
+                                pending.pid
+                            ));
+                        } else if pending.pid != pid {
+                            // Gate 2 — cross-child confusion: the record was
+                            // armed by a different child's mmap2 ENTRY. The
+                            // mapping address we would read below belongs
+                            // to THAT child, not to this one.
+                            log(&format!(
+                                "6-Z62: mmap2 content injection SKIPPED (pid mismatch) — armed by pid={} but this stop is pid={} (fd={}, len={})",
+                                pending.pid, pid, pending.fd, pending.length
+                            ));
+                        } else {
+                            // Fresh register read (the 6-Z60 pattern — the
+                            // top-of-block `regs` snapshot may predate the
+                            // dedicated handlers above; the fresh read is
+                            // authoritative for rax).
+                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                            match ptrace_getregs(pid, &mut regs2) {
+                                Ok(len2) => {
+                                    let mmap_ret =
+                                        get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                    if !mmap_return_is_valid_mapping_address(
+                                        mmap_ret,
+                                        &abi,
+                                    ) {
+                                        // Gate 3 — the rewritten anonymous
+                                        // mmap FAILED (or rax is a leak
+                                        // value). The child will see the
+                                        // error return; nothing to inject.
+                                        log(&format!(
+                                            "6-Z62: mmap2 content injection SKIPPED — mmap returned {} (not a valid mapping address) for fd={} len={} off={}",
+                                            mmap_ret, pending.fd, pending.length,
+                                            pending.offset_bytes
+                                        ));
+                                    } else {
+                                        // Gate 4 — resolve the fd to a HOST
+                                        // path. Per-(pid, fd) first (6-Z62),
+                                        // fd-only fallback (6-V).
+                                        let host_path = open_fd_owner_paths
+                                            .get(&(pid, pending.fd))
+                                            .or_else(|| {
+                                                open_fd_paths.get(&pending.fd)
+                                            })
+                                            .cloned();
+                                        match host_path {
+                                            None => {
+                                                // Unknown fd: inherited or
+                                                // opened before the loop
+                                                // attached. Skip quietly (the
+                                                // linker only mmaps fds it
+                                                // opened through the tracked
+                                                // open path; a stray unknown
+                                                // fd is diagnostic noise, not
+                                                // an error).
+                                                log(&format!(
+                                                    "6-Z62: mmap2 content injection SKIPPED — fd={} not in the fd→path map (inherited/pre-attach fd), len={} off={}",
+                                                    pending.fd, pending.length,
+                                                    pending.offset_bytes
+                                                ));
+                                            }
+                                            Some(path) => {
+                                                if is_properties_path(&path) {
+                                                    // Gate 5 — see the block
+                                                    // comment: init memsets
+                                                    // this area itself.
+                                                } else {
+                                                    // Gate 6 — per-pid budget.
+                                                    let injected_so_far =
+                                                        *mmap2_injected_bytes
+                                                            .entry(pid)
+                                                            .or_insert(0);
+                                                    if injected_so_far
+                                                        >= MMAP2_INJECT_BUDGET_PER_PID
+                                                    {
+                                                        log(&format!(
+                                                            "6-Z62: mmap2 content injection BUDGET EXHAUSTED for pid={} ({} MiB) — fd={} ({}) stays ZEROED",
+                                                            pid,
+                                                            injected_so_far
+                                                                / (1024 * 1024),
+                                                            pending.fd,
+                                                            path
+                                                        ));
+                                                    } else {
+                                                        let started =
+                                                            std::time::Instant::now();
+                                                        // Clamp the slice to
+                                                        // what the file actually
+                                                        // holds (metadata first
+                                                        // — the requested length
+                                                        // routinely runs past
+                                                        // EOF because the linker
+                                                        // page-rounds it).
+                                                        let file_len = std::fs::metadata(
+                                                            &path,
+                                                        )
+                                                        .map(|m| m.len())
+                                                        .unwrap_or(0);
+                                                        let injectable =
+                                                            mmap2_injectable_slice(
+                                                                file_len,
+                                                                pending.offset_bytes,
+                                                                pending.length,
+                                                            );
+                                                        if injectable == 0 {
+                                                            log(&format!(
+                                                                "6-Z62: mmap2 content injection SKIPPED — {} [{}..{}] is past EOF (file_len={})",
+                                                                path,
+                                                                pending.offset_bytes,
+                                                                pending.offset_bytes
+                                                                    .wrapping_add(
+                                                                        pending.length,
+                                                                    ),
+                                                                file_len
+                                                            ));
+                                                        } else {
+                                                            match mmap2_read_file_slice(
+                                                                &path,
+                                                                pending.offset_bytes,
+                                                                injectable,
+                                                                &mut mmap2_file_cache,
+                                                                &mut mmap2_file_cache_bytes,
+                                                            ) {
+                                                                Some(content) => {
+                                                                    let (written, method) =
+                                                                        write_child_bytes_injection(
+                                                                            pid,
+                                                                            mmap_ret as u64,
+                                                                            &content,
+                                                                            &mut vm_writev_usable,
+                                                                        );
+                                                                    *mmap2_injected_bytes
+                                                                        .entry(
+                                                                            pid,
+                                                                        )
+                                                                        .or_insert(
+                                                                            0,
+                                                                        ) +=
+                                                                        written as u64;
+                                                                    let elapsed_ms =
+                                                                        started
+                                                                            .elapsed()
+                                                                            .as_millis();
+                                                                    if written
+                                                                        == content.len()
+                                                                    {
+                                                                        log(&format!(
+                                                                            "6-Z62: mmap2 content INJECTED {} bytes from {} [off={}, len={}] into pid={} @{:#x} via {} in {} ms (budget: {}/{} MiB)",
+                                                                            written,
+                                                                            path,
+                                                                            pending.offset_bytes,
+                                                                            pending.length,
+                                                                            pid,
+                                                                            mmap_ret,
+                                                                            method,
+                                                                            elapsed_ms,
+                                                                            (*mmap2_injected_bytes
+                                                                                .get(
+                                                                                    &pid,
+                                                                                )
+                                                                                .unwrap_or(
+                                                                                    &0,
+                                                                                )
+                                                                                + 1024
+                                                                                    * 1024
+                                                                                    - 1)
+                                                                                / (1024
+                                                                                    * 1024),
+                                                                            MMAP2_INJECT_BUDGET_PER_PID
+                                                                                / (1024
+                                                                                    * 1024)
+                                                                        ));
+                                                                    } else {
+                                                                        log(&format!(
+                                                                            "6-Z62: mmap2 content injection PARTIAL — wrote {}/{} bytes from {} into pid={} @{:#x} via {} in {} ms (mapping stays part-zeroed; the linker may fail on this library)",
+                                                                            written,
+                                                                            content.len(),
+                                                                            path,
+                                                                            pid,
+                                                                            mmap_ret,
+                                                                            method,
+                                                                            elapsed_ms
+                                                                        ));
+                                                                    }
+                                                                }
+                                                                None => {
+                                                                    // ENOENT /
+                                                                    // permission /
+                                                                    // read error —
+                                                                    // the zeroed
+                                                                    // mapping
+                                                                    // remains.
+                                                                    log(&format!(
+                                                                        "6-Z62: mmap2 content injection SKIPPED — file read FAILED for {} [off={}, len={}] (the zeroed mapping remains)",
+                                                                        path,
+                                                                        pending.offset_bytes,
+                                                                        injectable
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let _ = len2; // iov_len unused here (no
+                                                  // setregs in this block) —
+                                                  // silence the unused-var
+                                                  // lint while keeping the
+                                                  // 6-Z60 fresh-read pattern.
+                                }
+                                Err(e) => {
+                                    log(&format!(
+                                        "6-Z62: mmap2 content injection SKIPPED — ptrace_getregs FAILED: {} (fd={}, len={})",
+                                        e, pending.fd, pending.length
+                                    ));
+                                }
+                            }
+                        }
                     }
                     // Part B — write(fd, buf, count) EXIT: capture
                     // the buffer contents and log them. Gated to the
@@ -6017,12 +7033,36 @@ pub fn run_ptrace_loop(
                         } else {
                             format!("{}", ret)
                         };
+                        // Task 6-Z63 diagnostic: when a syscall returns
+                        // -ENOSYS, also log orig_rax. orig_ax == -1 means
+                        // THE SYSCALL WAS SKIPPED (the classic tracer skip
+                        // mechanism — something previously wrote orig_rax=-1
+                        // and the kernel's ni_syscall path produced the -38).
+                        // orig_ax == the syscall number means the seccomp
+                        // FILTER genuinely blocked it (SECCOMP_RET_ERRNO |
+                        // ENOSYS). This distinguishes the two -38 sources
+                        // that were indistinguishable in the aeaecbd E2E
+                        // (where even ALREADY-ANONYMOUS mmap2s returned -38).
+                        let orig_rax_note: String = if ret == -38 {
+                            format!(
+                                " [orig_rax={} — {}]",
+                                get_syscall_num(&regs, &abi),
+                                if get_syscall_num(&regs, &abi) == -1 {
+                                    "SKIPPED by tracer orig_rax=-1!"
+                                } else {
+                                    "seccomp filter block"
+                                }
+                            )
+                        } else {
+                            String::new()
+                        };
                         log(&format!(
-                            "post-execve return #{}: {} nr={} -> {}",
+                            "post-execve return #{}: {} nr={} -> {}{}",
                             post_execve_syscall_count,
                             syscall_name(syscall_num, &abi),
                             syscall_num,
-                            ret_desc
+                            ret_desc,
+                            orig_rax_note
                         ));
                     }
 
@@ -7640,41 +8680,99 @@ pub fn run_ptrace_loop(
                         // the matching length.
                         let setregs_len = len;
                         if !in_syscall_at_sigsys {
-                            // Task 6-Z59: DESYNC mode — instead of doing a full
-                            // "fresh ptrace_getregs + setregs" (which corrupts
-                            // registers by writing stale values), SKIP the
-                            // syscall entirely by setting orig_rax=-1. The
-                            // kernel will skip the syscall and return 0 (the
-                            // default for skipped syscalls). This avoids
-                            // writing any registers except orig_rax, preventing
-                            // the register corruption that caused SIGSEGV at
-                            // rip=0x807cd64.
+                            // Task 6-Z62 (Agent D, Wave 1): DESYNC mode — write
+                            // ONLY rax via PTRACE_POKEUSER, with the per-syscall
+                            // `ret_val` (NOT a hardcoded 0), and drop the
+                            // 6-Z59 orig_rax=-1 poke entirely.
+                            //
+                            // WHY orig_rax=-1 IS DROPPED: the orig_rax=-1
+                            // "syscall skip" only has kernel semantics at a
+                            // syscall-ENTRY stop — after the entry-stop is
+                            // resumed, the kernel re-reads the syscall number
+                            // from orig_ax (x86's syscall_trace_enter returns
+                            // syscall_get_nr(current, regs)) and an invalid nr
+                            // takes the ni_syscall path → rax=-ENOSYS at the
+                            // EXIT stop. At a SIGSYS signal-delivery-stop the
+                            // syscall dispatch has ALREADY happened (seccomp
+                            // aborted it before execution; the ENTRY and EXIT
+                            // stops have already been delivered). Nothing in
+                            // the kernel re-reads orig_ax on the resume path:
+                            // the suppressed signal means no signal frame, no
+                            // handler, no rt_sigreturn, and the return-to-user
+                            // iret simply uses pt_regs as-is. The 6-Z59
+                            // orig_rax=-1 poke was therefore inert — the rax=0
+                            // poke (the last write to pt_regs.ax before the
+                            // resume) was the only thing that determined what
+                            // the child saw.
+                            //
+                            // WHY ret_val AND NOT 0: the 6-Z59 hardcode made
+                            // every DESYNC-skipped syscall return 0 regardless
+                            // of the ret_val computed above — silently
+                            // defeating the 6-C shmget -ENOSYS fallback and
+                            // the 6-E/6-G pause -ENOSYS/-ETIMEDOUT fallbacks
+                            // (returning 0 for pause() is the exact
+                            // pre-6-D infinite-loop shape: "pause completed
+                            // without a signal" → re-check → retry). In the
+                            // b889666 E2E every DESYNC event happened to have
+                            // ret_val == 0 (mount/mknod/ftruncate), so the
+                            // bug was latent — this restores the intended
+                            // semantics before a shmget/pause ever TRAPs.
+                            //
+                            // WHY POKEUSER AND NOT setregs: a single-word
+                            // pt_regs write cannot corrupt any other register
+                            // (the 6-W/6-Z59 register-corruption concern was
+                            // specifically about whole-struct setregs
+                            // writeback). It writes exactly one u64 at the
+                            // user_regs_struct rax offset (index 10 → byte
+                            // offset 80 on x86_64 ptrace, for BOTH 64-bit and
+                            // 32-bit children — the native putreg() path uses
+                            // the 64-bit user_regs_struct layout regardless
+                            // of the tracee's bitness; for a 32-bit child the
+                            // low 32 bits become eax on the iret back to
+                            // userspace).
                             sigsys_log(&format!(
-                                "SIGSYS handler: DESYNC mode — skipping syscall nr={} [{}] via orig_rax=-1 (Task 6-Z59: avoids register corruption from full setregs)",
-                                original_syscall, name
+                                "SIGSYS handler: DESYNC mode — writing rax={} for nr={} [{}] via PTRACE_POKEUSER (Task 6-Z62: rax-only write of ret_val; orig_rax poke dropped — inert at a signal-delivery-stop; avoids full-setregs register corruption)",
+                                ret_val, original_syscall, name
                             ));
-                            // Set orig_rax=-1 to skip the syscall. Only modify
-                            // this one register via PTRACE_POKEUSER.
-                            let orig_rax_offset = std::mem::size_of::<u64>() * a.reg_syscall;
-                            let _ = unsafe {
-                                libc::ptrace(
-                                    libc::PTRACE_POKEUSER,
-                                    pid,
-                                    orig_rax_offset as i64,
-                                    (-1i64) as libc::c_long,
-                                )
-                            };
-                            // Also set rax=0 via POKEUSER (the return value)
                             let rax_offset = std::mem::size_of::<u64>() * a.reg_ret;
-                            let _ = unsafe {
+                            let poke = unsafe {
                                 libc::ptrace(
                                     libc::PTRACE_POKEUSER,
                                     pid,
                                     rax_offset as i64,
-                                    0i64 as libc::c_long,
+                                    ret_val as libc::c_long,
                                 )
                             };
-                            // Skip the full setregs below
+                            if poke == -1 {
+                                // Un-gated `log` (NOT sigsys_log): a failed
+                                // poke means the child will see the kernel's
+                                // leaked rax (the syscall number, from
+                                // seccomp's syscall_rollback — e.g. 93 for
+                                // i386 ftruncate), which historically sent
+                                // init down fatal error paths. This MUST be
+                                // visible even under SIGSYS rate-limiting.
+                                log(&format!(
+                                    "SIGSYS handler: DESYNC PTRACE_POKEUSER(rax) FAILED for nr={} [{}]: {} — child will see the leaked rax, not ret_val={}",
+                                    original_syscall,
+                                    name,
+                                    std::io::Error::last_os_error(),
+                                    ret_val
+                                ));
+                            } else if sigsys_repeat_count <= 5 {
+                                // Readback verification, mirroring the NORMAL
+                                // branch's 5-J diagnostic below.
+                                let mut readback: Regs = unsafe { std::mem::zeroed() };
+                                if ptrace_getregs(pid, &mut readback).is_ok() {
+                                    let readback_rax =
+                                        get_syscall_arg(&readback, a.reg_ret) as i64;
+                                    sigsys_log(&format!(
+                                        "[KR64][ptrace] SIGSYS DESYNC POKEUSER wrote rax={} for nr={} [{}], readback rax={}",
+                                        ret_val, original_syscall, name, readback_rax
+                                    ));
+                                }
+                            }
+                            // Skip the full setregs below — rax was already
+                            // written via the single-register poke above.
                             continue;
                         }
                         if let Err(e) = ptrace_setregs(pid, &sigsys_regs, setregs_len) {
@@ -10806,5 +11904,260 @@ mod tests {
         // the recovery trips the POLLERR busy-wait). Mirrors the
         // existing syscall_name_resolves_socketcall_on_i386 guard.
         assert_eq!(syscall_name(168, &ABI_X86_32), "poll");
+    }
+
+    // ── Task 6-Z62: mmap2 content injection tests ─────────────────────
+    //
+    // The 6-Z62 fix has the same three-layer testable surface as the
+    // 6-Y rewrite it builds on:
+    //   (1) the pure arg-massaging helpers — offset-unit conversion
+    //       (mmap2 pages → bytes), return-address sanity
+    //       (mmap_return_is_valid_mapping_address), and the EOF clamp
+    //       (mmap2_injectable_slice);
+    //   (2) the I/O helpers — mmap2_read_file_slice against real temp
+    //       files (slice exactness, caching, missing-file → None);
+    //   (3) the write-orchestration fallback — a bogus target pid makes
+    //       process_vm_writev fail with ESRCH (NOT a seccomp block), so
+    //       write_child_bytes_injection must fall through to POKEDATA
+    //       (which also fails, ESRCH) WITHOUT condemning the vm_writev
+    //       capability — proving the fallback wiring is exercised
+    //       end-to-end without a live tracee.
+
+    #[test]
+    fn mmap_syscall_offset_to_bytes_multiplies_pages_for_i386_mmap2() {
+        // i386 mmap2's offset argument is in 4096-byte UNITS (the
+        // page-shift workaround). offset=1 page → 4096 bytes; offset=0x123
+        // pages → 0x123000 bytes. The EXIT-side injector reads file
+        // [offset_bytes, offset_bytes+length) — a missing ×4096 would
+        // inject the WRONG SLICE of the library (off by 4095 bytes).
+        assert_eq!(mmap_syscall_offset_to_bytes(192, &ABI_X86_32, 1), 4096);
+        assert_eq!(
+            mmap_syscall_offset_to_bytes(192, &ABI_X86_32, 0x123),
+            0x123 * 4096
+        );
+        assert_eq!(mmap_syscall_offset_to_bytes(192, &ABI_X86_32, 0), 0);
+    }
+
+    #[test]
+    fn mmap_syscall_offset_to_bytes_passes_bytes_for_64bit_mmap() {
+        // x86_64 mmap (nr=9) and aarch64 mmap (nr=222) take the offset
+        // in plain BYTES — no multiplication. ABI_X86_32.mmap is the -1
+        // sentinel (old i386 mmap is unused by modern bionic), and the
+        // `abi.mmap2 != -1` guard keeps the sentinel from ever matching
+        // a real syscall number.
+        assert_eq!(mmap_syscall_offset_to_bytes(9, &ABI_X86_64, 0x5678), 0x5678);
+        // The aarch64 mmap case is exercised on aarch64 hosts only
+        // (ABI_AARCH64 is cfg-gated to that target, mirroring the
+        // existing per-ABI number tests).
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(mmap_syscall_offset_to_bytes(222, &ABI_AARCH64, 0x9abc), 0x9abc);
+    }
+
+    #[test]
+    fn mmap_return_is_valid_accepts_realistic_mapping_addresses() {
+        // The addresses observed in the E2E logs for the rewritten
+        // anonymous mmap2 (0xEE981000 for init's property area) and a
+        // typical bionic-linker load bias (0xF5D00000 range on i386).
+        assert!(mmap_return_is_valid_mapping_address(0xEE98_1000, &ABI_X86_32));
+        assert!(mmap_return_is_valid_mapping_address(0xF5D0_0000, &ABI_X86_32));
+        // A 64-bit child's mmap returns high addresses (well above the
+        // i386 TASK_SIZE) — the check must accept those on the 64-bit ABI.
+        assert!(mmap_return_is_valid_mapping_address(0x7f12_3400_0000, &ABI_X86_64));
+    }
+
+    #[test]
+    fn mmap_return_is_valid_rejects_errors_zero_and_misaligned() {
+        // -errno returns: the rewritten mmap failing with -38 (ENOSYS,
+        // seccomp artifact) or -12 (ENOMEM, the i386_enosys_fake_value
+        // for mmap2) must NEVER be treated as an address — writing to
+        // 0xFFFF_FFDA would corrupt/crash.
+        assert!(!mmap_return_is_valid_mapping_address(-38, &ABI_X86_32));
+        assert!(!mmap_return_is_valid_mapping_address(-12, &ABI_X86_32));
+        // 0 is NULL (and the post-6-Z52 bug class the worklog records).
+        assert!(!mmap_return_is_valid_mapping_address(0, &ABI_X86_32));
+        // Non-page-aligned: mmap results are always page-aligned, and the
+        // two i386 register-leak values observed in this codebase
+        // (rax = the syscall number 192, rax = a stale code address like
+        // 0x807cd64) are both unaligned — rejected before any write.
+        assert!(!mmap_return_is_valid_mapping_address(192, &ABI_X86_32));
+        assert!(!mmap_return_is_valid_mapping_address(0x807c_d64, &ABI_X86_32));
+        // Above the i386 TASK_SIZE (0xfffff000): rejected for the i386
+        // ABI even though it is page-aligned.
+        assert!(!mmap_return_is_valid_mapping_address(0x1_0000_0000, &ABI_X86_32));
+    }
+
+    #[test]
+    fn mmap2_injectable_slice_clamps_at_eof() {
+        // The linker asks for page-rounded lengths that run past EOF:
+        // a 4096-byte request over a 3000-byte file at offset 0 injects
+        // only the 3000 real bytes; the 96-byte tail stays zero (which
+        // the fresh anonymous mapping already provides).
+        assert_eq!(mmap2_injectable_slice(3000, 0, 4096), 3000);
+        // In-bounds request is satisfied in full.
+        assert_eq!(mmap2_injectable_slice(8192, 4096, 2048), 2048);
+        // Slice straddling EOF is clamped.
+        assert_eq!(mmap2_injectable_slice(5000, 4096, 2048), 904);
+    }
+
+    #[test]
+    fn mmap2_injectable_slice_rejects_empty_and_past_eof() {
+        // length == 0 (nothing to inject), offset >= file_len (the
+        // whole window is past EOF — e.g. a zero-filesz segment).
+        assert_eq!(mmap2_injectable_slice(4096, 0, 0), 0);
+        assert_eq!(mmap2_injectable_slice(4096, 4096, 4096), 0);
+        assert_eq!(mmap2_injectable_slice(0, 0, 4096), 0);
+        assert_eq!(mmap2_injectable_slice(100, 200, 4096), 0);
+    }
+
+    #[test]
+    fn mmap2_read_file_slice_reads_exact_slice_and_caches() {
+        // Real temp file: write 3 pages of distinct bytes, then request
+        // the second page. The slice must be byte-exact (the linker
+        // parses ELF structures out of it) and the second request must
+        // come from the cache (the file is re-written on disk between
+        // the two reads — the cached result must NOT see the change).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "kr64_z62_slice_test_{}_{}.bin",
+            std::process::id(),
+            line!()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+        let mut page0 = vec![0xAAu8; 4096];
+        let mut page1 = vec![0xBBu8; 4096];
+        let page2 = vec![0xCCu8; 4096];
+        page0[0] = b'!';
+        page1[0] = b'#';
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&page0).unwrap();
+            f.write_all(&page1).unwrap();
+            f.write_all(&page2).unwrap();
+        }
+        let mut cache = std::collections::HashMap::new();
+        let mut cache_bytes = 0u64;
+        let got = mmap2_read_file_slice(&path_str, 4096, 4096, &mut cache, &mut cache_bytes)
+            .expect("first slice read must succeed");
+        assert_eq!(got.len(), 4096);
+        assert_eq!(&got[..8], &page1[..8]);
+        assert_eq!(cache.len(), 1, "small file must be cached whole");
+        assert_eq!(cache_bytes, 3 * 4096);
+        // Mutate the file on disk — the cached copy must win.
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&vec![0x00u8; 4096]).unwrap();
+        }
+        let got2 = mmap2_read_file_slice(&path_str, 4096, 4096, &mut cache, &mut cache_bytes)
+            .expect("cached slice read must succeed");
+        assert_eq!(&got2[..8], &page1[..8], "cache must be used, not re-read");
+        // EOF CLAMPING CONTRACT: mmap2_read_file_slice itself serves
+        // whatever the (possibly cached) file holds — the EOF clamp is
+        // mmap2_injectable_slice's job, and the runtime caller ALWAYS
+        // applies it against FRESH metadata before calling (see the EXIT
+        // block). Verify that composition: with the on-disk file now
+        // only 4096 bytes, a 4096-byte request at offset 4096 clamps to
+        // ZERO injectable bytes even though the STALE cache still holds
+        // three pages.
+        let fresh_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(fresh_len, 4096, "test setup: mutated file must be 1 page");
+        assert_eq!(
+            mmap2_injectable_slice(fresh_len, 4096, 4096),
+            0,
+            "past-EOF request must clamp to zero via the caller-side gate"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mmap2_read_file_slice_missing_file_returns_none() {
+        // ENOENT (the rootfs library was not extracted / was deleted)
+        // must yield None → the EXIT block logs + skips, leaving the
+        // zeroed mapping (soft failure, never a crash of the loop).
+        let mut cache = std::collections::HashMap::new();
+        let mut cache_bytes = 0u64;
+        assert!(mmap2_read_file_slice(
+            "/nonexistent/kr64_z62/does_not_exist.so",
+            0,
+            4096,
+            &mut cache,
+            &mut cache_bytes
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn write_child_bytes_injection_falls_back_without_condemning_on_esrch() {
+        // Hermetic wiring test: target pid -1 makes process_vm_writev
+        // fail with ESRCH — an ADDRESS/TARGET failure, not a seccomp
+        // block — so the orchestrator must (a) fall through to the
+        // POKEDATA path (which also fails: 0 bytes written) and (b) NOT
+        // condemn process_vm_writev (vm_writev_usable stays None), so a
+        // later REAL injection still probes it. This is exactly the
+        // EFAULT/EINVAL branch of the runtime path.
+        let payload = [0x5Au8; 64];
+        let mut usable: Option<bool> = None;
+        let (written, method) =
+            write_child_bytes_injection(-1, 0x1000_0000, &payload, &mut usable);
+        assert_eq!(written, 0, "both write paths must fail against pid -1");
+        assert!(
+            method == "vm_writev+poke" || method == "poke",
+            "must have attempted the poke fallback (got {})",
+            method
+        );
+        assert_eq!(usable, None, "ESRCH must NOT condemn process_vm_writev");
+    }
+
+    #[test]
+    fn write_child_bytes_injection_pokeys_when_condemned() {
+        // With the capability already condemned (Some(false) — the
+        // seccomp-blocked case), the orchestrator must go STRAIGHT to
+        // POKEDATA without spending a process_vm_writev syscall: against
+        // pid -1 the poke fails, and the method label must be "poke".
+        let payload = [0xA5u8; 32];
+        let mut usable: Option<bool> = Some(false);
+        let (written, method) =
+            write_child_bytes_injection(-1, 0x1000_0000, &payload, &mut usable);
+        assert_eq!(written, 0);
+        assert_eq!(method, "poke");
+        assert_eq!(usable, Some(false), "must stay condemned");
+    }
+
+    #[test]
+    fn mmap2_budget_and_cache_constants_are_sane() {
+        // Lock the knobs: the budget must cover the linker's double
+        // mapping of TWRP's dependency set with headroom (≥ 16 MiB, the
+        // dispatcher's suggested floor) but stay bounded (≤ 64 MiB so a
+        // runaway loop cannot write unbounded data or OOM logcat with
+        // per-injection lines). The per-file cache cap must cover
+        // libc.so (~1-2 MiB) and the total cache must exceed the
+        // per-file cap (otherwise every cached file would immediately
+        // evict itself).
+        assert!(MMAP2_INJECT_BUDGET_PER_PID >= 16 * 1024 * 1024);
+        assert!(MMAP2_INJECT_BUDGET_PER_PID <= 64 * 1024 * 1024);
+        assert!(MMAP2_FILE_CACHE_MAX_FILE >= 2 * 1024 * 1024);
+        assert!(MMAP2_FILE_CACHE_MAX_TOTAL > MMAP2_FILE_CACHE_MAX_FILE);
+        assert_eq!(MMAP2_FILE_CACHE_MAX_FILE % 4096, 0);
+        assert_eq!(MMAP2_INJECT_BUDGET_PER_PID % 4096, 0);
+    }
+
+    #[test]
+    fn pending_mmap2_content_is_not_send_but_loop_local() {
+        // Documentation-as-test: the handoff record (and the whole 6-Z62
+        // state) is loop-local single-threaded state; we only assert the
+        // field layout compiles and the pid guard is settable, guarding
+        // against accidental future restructuring that drops the pid
+        // (the cross-child DESYNC protection).
+        let rec = PendingMmap2Content {
+            pid: 4242,
+            fd: 7,
+            length: 0x1000,
+            offset_bytes: 0x2000,
+        };
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.fd, 7);
+        assert_eq!(rec.length, 0x1000);
+        assert_eq!(rec.offset_bytes, 0x2000);
     }
 }
