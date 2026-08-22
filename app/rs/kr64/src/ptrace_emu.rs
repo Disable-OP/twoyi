@@ -4451,7 +4451,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
 
                                 // Skip the i386 syscall (orig_rax=-1, return 0)
                                 set_syscall_arg(&mut regs, abi.reg_syscall, (-1i64) as u64);
-                                set_syscall_ret(&mut regs, abi, 0);
+                                set_syscall_ret(&mut regs, &abi, 0);
 
                                 // Set the original child to an infinite loop
                                 // (jmp -2 = 0xeb 0xfe) so init's waitpid blocks
