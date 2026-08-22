@@ -3144,7 +3144,12 @@ pub fn ptrace_available() -> bool {
     false
 }
 
-pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) -> i32 {
+pub fn run_ptrace_loop(
+    pid: libc::pid_t,
+    rootfs: &str,
+    vfs: &crate::vfs::Vfs,
+    recovery_pid: Option<libc::pid_t>,
+) -> i32 {
     use std::io::Write;
     let log = |msg: &str| {
         let _ = writeln!(std::io::stderr(), "[KR64][ptrace] {}", msg);
@@ -3558,7 +3563,7 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     // execve(nr=59, allowed by seccomp). The new child becomes /sbin/recovery.
     // The original init child is set to an infinite loop (so init's waitpid
     // blocks — init thinks the service is "running").
-    let mut recovery_child_pid: Option<libc::pid_t> = None;
+    let mut recovery_child_pid: Option<libc::pid_t> = recovery_pid;
 
     // ── Multi-child PID tracking (Task 6-S) ───────────────────────────
     //
@@ -4585,6 +4590,15 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     log("[KR64] fork FAILED for recovery binary (Task 6-Z48)");
                                 }
                             }
+                        }
+                        // Task 6-Z49: if the recovery child was already forked
+                        // proactively (from lib.rs), just skip init's i386 execve
+                        // for /sbin/recovery. Seccomp would block it anyway (SIGSYS).
+                        if abi.execve == 11 && recovery_child_pid.is_some() {
+                            log("DIAG execve: recovery child already forked — skipping i386 execve (Task 6-Z49)");
+                            set_syscall_arg(&mut regs, abi.reg_syscall, (-1i64) as u64);
+                            set_syscall_ret(&mut regs, &abi, 0);
+                            let _ = ptrace_setregs(pid, &regs, std::mem::size_of::<Regs>());
                         }
                     }
 
