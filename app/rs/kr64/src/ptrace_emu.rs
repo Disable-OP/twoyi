@@ -3550,6 +3550,16 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
     let mut pending_64bit_execve: bool = false;
     let mut post_execve_syscall_count: u64 = 0;
 
+    // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
+    // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
+    // because the kernel uses TIF_IA32 (set at exec time), not CS, to select
+    // the syscall table — a 32-bit process always uses the i386 table (nr=59=ENOSYS).
+    // Instead, kr64 forks a NEW 64-bit child (TIF_IA32=0) that calls x86_64
+    // execve(nr=59, allowed by seccomp). The new child becomes /sbin/recovery.
+    // The original init child is set to an infinite loop (so init's waitpid
+    // blocks — init thinks the service is "running").
+    let mut recovery_child_pid: Option<libc::pid_t> = None;
+
     // ── Multi-child PID tracking (Task 6-S) ───────────────────────────
     //
     // `init_pid` is the PID of the ORIGINAL traced child (the `pid`
@@ -4064,9 +4074,12 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // abstract socket and writing "BOOT_COMPLETED\n". The app's
                         // TwoyiSocketServer receives it → BootCompletionServer.markCompleted()
                         // → loadingLayout hidden → SurfaceView visible → TWRP framebuffer shown.
-                        if pending_64bit_execve {
+                        if recovery_child_pid == Some(pid) || pending_64bit_execve {
                             pending_64bit_execve = false;
-                            log("[KR64] BOOT_COMPLETED synthesis: 64-bit execve SUCCEEDED (PTRACE_EVENT_EXEC) — sending BOOT_COMPLETED to @TWOYI_SOCK (Task 6-Z47)");
+                            log(&format!(
+                                "[KR64] BOOT_COMPLETED synthesis: execve SUCCEEDED for PID={} (PTRACE_EVENT_EXEC) — sending BOOT_COMPLETED to @TWOYI_SOCK (Task 6-Z48)",
+                                pid
+                            ));
                             // Connect to the app's abstract socket @TWOYI_SOCK and
                             // write "BOOT_COMPLETED\n". The app's TwoyiSocketServer
                             // handles this message and calls BootCompletionServer.markCompleted().
@@ -4352,206 +4365,183 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         // regardless of the current CS register. So even though
                         // the child is in 32-bit compat mode, the `syscall`
                         // instruction bypasses the i386 seccomp filter.
-                        if abi.execve == 11 {
-                            // Task 6-Z43: ALWAYS reset scratch_addr to 0 at
-                            // the i386 execve ENTRY. The scratch_addr might be
-                            // a stale 64-bit address from before the ABI switch
-                            // (x86_64 → i386). The stale address is outside
-                            // the i386 child's usable address space → POKEDATA
-                            // fails silently → injection doesn't proceed.
-                            // Force a fresh reservation from the current sp.
-                            scratch_addr = 0;
-                            log(&format!("DIAG execve ENTRY: abi.execve=11, scratch_addr reset to 0 (was stale), pid={}", pid));
-                            // Task 6-Z43: reserve scratch area inline.
-                            // already set. The scratch reservation at line 4662
-                            // happens AFTER this handler, so scratch_addr is 0
-                            // for the first execve after ABI re-detection.
-                            if scratch_addr == 0 {
-                                let sp = get_syscall_arg(&regs, abi.reg_sp);
-                                scratch_addr = (sp.wrapping_sub(4096)) & !7u64;
-                                scratch_offset = 0;
-                                let _ = scratch_offset; // suppress dead_code warning
-                                log(&format!(
-                                    "DIAG execve: inline scratch reservation at {:#x} (sp={:#x}) (Task 6-Z43)",
-                                    scratch_addr, sp
-                                ));
-                            }
-                            if scratch_addr != 0 {
-                            // Read path, argv, envp from i386 regs
+                        // Task 6-Z48: kr64 forks a NEW 64-bit child.
+                        // The 64-bit syscall injection (6-Z45 fix2) doesn't work
+                        // because the kernel uses TIF_IA32 (set at exec time),
+                        // not CS, to select the syscall table. A 32-bit process
+                        // always uses the i386 table (nr=59=ENOSYS).
+                        // Instead: skip the i386 execve, set the original child
+                        // to an infinite loop (init's waitpid blocks — init thinks
+                        // the service is "running"), and kr64 forks a NEW 64-bit
+                        // child that calls x86_64 execve(nr=59, allowed by seccomp).
+                        if abi.execve == 11 && recovery_child_pid.is_none() {
                             let path_addr_i386 = get_syscall_arg(&regs, abi.reg_arg1);
                             let argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
                             let envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
-                            log(&format!("DIAG execve: path_addr={:#x}, argv_addr={:#x}, envp_addr={:#x}", path_addr_i386, argv_addr_i386, envp_addr_i386));
 
-                            // Translate the path
                             let orig_path = if path_addr_i386 != 0 {
                                 read_child_string(pid, path_addr_i386)
                             } else {
                                 None
                             };
-                            log(&format!("DIAG execve: orig_path={:?}", orig_path));
+
+                            log(&format!(
+                                "DIAG execve ENTRY: abi.execve=11, orig_path={:?} (Task 6-Z48)",
+                                orig_path
+                            ));
 
                             if let Some(ref orig) = orig_path {
                                 let translated = translate_path(rootfs, orig);
+                                log(&format!(
+                                    "[KR64] Forking 64-bit child for {} -> {} (Task 6-Z48)",
+                                    orig, translated
+                                ));
 
-                                // Write the translated path to the scratch area
-                                // (NUL-terminated)
-                                let path_bytes = format!("{}\0", translated);
-                                let path_len = path_bytes.len();
-                                // 8-byte align
-                                let aligned_len = (path_len + 7) & !7;
-
-                                // Task 6-Z47: Read the 32-bit argv/envp arrays from
-                                // the child and convert to 64-bit arrays. The 64-bit
-                                // execve (nr=59) reads argv/envp as arrays of 64-bit
-                                // pointers (char**), but the i386 child's argv/envp are
-                                // arrays of 32-bit pointers. Without conversion, the
-                                // 64-bit kernel reads garbage pointers → EFAULT.
-                                let mut argv_64: Vec<u64> = Vec::new();
+                                // Read argv (32-bit pointer array)
+                                let mut argv_vec: Vec<String> = Vec::new();
                                 if argv_addr_i386 != 0 {
                                     let mut off = 0u64;
-                                    while argv_64.len() < 64 {
+                                    while argv_vec.len() < 64 {
                                         let word = unsafe {
-                                            libc::ptrace(libc::PTRACE_PEEKDATA, pid,
-                                                (argv_addr_i386 + off) as i64, 0)
+                                            libc::ptrace(
+                                                libc::PTRACE_PEEKDATA,
+                                                pid,
+                                                (argv_addr_i386 + off) as i64,
+                                                0,
+                                            )
                                         };
                                         if word == -1 { break; }
                                         let ptr32 = (word as u32) as u64;
                                         if ptr32 == 0 { break; }
-                                        argv_64.push(ptr32);
+                                        if let Some(s) = read_child_string(pid, ptr32) {
+                                            argv_vec.push(s);
+                                        }
                                         off += 4;
                                     }
                                 }
-                                argv_64.push(0); // NULL terminator
 
-                                let mut envp_64: Vec<u64> = Vec::new();
+                                // Read envp (32-bit pointer array)
+                                let mut envp_vec: Vec<String> = Vec::new();
                                 if envp_addr_i386 != 0 {
                                     let mut off = 0u64;
-                                    while envp_64.len() < 64 {
+                                    while envp_vec.len() < 64 {
                                         let word = unsafe {
-                                            libc::ptrace(libc::PTRACE_PEEKDATA, pid,
-                                                (envp_addr_i386 + off) as i64, 0)
+                                            libc::ptrace(
+                                                libc::PTRACE_PEEKDATA,
+                                                pid,
+                                                (envp_addr_i386 + off) as i64,
+                                                0,
+                                            )
                                         };
                                         if word == -1 { break; }
                                         let ptr32 = (word as u32) as u64;
                                         if ptr32 == 0 { break; }
-                                        envp_64.push(ptr32);
+                                        if let Some(s) = read_child_string(pid, ptr32) {
+                                            envp_vec.push(s);
+                                        }
                                         off += 4;
                                     }
                                 }
-                                envp_64.push(0); // NULL terminator
 
-                                log(&format!("DIAG execve: argv {} entries, envp {} entries (Task 6-Z47)",
-                                    argv_64.len() - 1, envp_64.len() - 1));
+                                log(&format!(
+                                    "DIAG execve: argv {} entries, envp {} entries (Task 6-Z48)",
+                                    argv_vec.len(),
+                                    envp_vec.len()
+                                ));
 
-                                // Scratch area layout:
-                                // [path + padding] [64-bit argv array] [64-bit envp array]
-                                let argv_offset = aligned_len;
-                                let envp_offset = argv_offset + argv_64.len() * 8;
+                                // Skip the i386 syscall (orig_rax=-1, return 0)
+                                set_syscall_arg(&mut regs, abi.reg_syscall, (-1i64) as u64);
+                                set_syscall_ret(&mut regs, abi, 0);
 
-                                let mut scratch_content = path_bytes.into_bytes();
-                                while scratch_content.len() < argv_offset {
-                                    scratch_content.push(0);
+                                // Set the original child to an infinite loop
+                                // (jmp -2 = 0xeb 0xfe) so init's waitpid blocks
+                                let code_addr: u64 = 0x08048c59;
+                                let infinite_loop: [u8; 2] = [0xeb, 0xfe];
+                                let loop_word: libc::c_long =
+                                    i16::from_ne_bytes(infinite_loop) as libc::c_long;
+                                unsafe {
+                                    libc::ptrace(
+                                        libc::PTRACE_POKEDATA,
+                                        pid,
+                                        code_addr as i64,
+                                        loop_word,
+                                    );
                                 }
-                                for &ptr in &argv_64 {
-                                    scratch_content.extend_from_slice(&ptr.to_le_bytes());
-                                }
-                                for &ptr in &envp_64 {
-                                    scratch_content.extend_from_slice(&ptr.to_le_bytes());
-                                }
+                                set_syscall_arg(&mut regs, 16, code_addr); // rip = index 16 in user_regs_struct
+                                let _ = ptrace_setregs(
+                                    pid,
+                                    &regs,
+                                    std::mem::size_of::<Regs>(),
+                                );
 
-                                let scratch_argv_addr = scratch_addr + argv_offset as u64;
-                                let scratch_envp_addr = scratch_addr + envp_offset as u64;
+                                // Prepare C strings for execve (before fork)
+                                let path_c = std::ffi::CString::new(translated.as_str())
+                                    .unwrap_or_default();
+                                let argv_c: Vec<std::ffi::CString> = argv_vec
+                                    .iter()
+                                    .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
+                                    .collect();
+                                let envp_c: Vec<std::ffi::CString> = envp_vec
+                                    .iter()
+                                    .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
+                                    .collect();
+                                let mut argv_ptr: Vec<*const libc::c_char> = argv_c
+                                    .iter()
+                                    .map(|s| s.as_ptr())
+                                    .collect();
+                                argv_ptr.push(std::ptr::null());
+                                let mut envp_ptr: Vec<*const libc::c_char> = envp_c
+                                    .iter()
+                                    .map(|s| s.as_ptr())
+                                    .collect();
+                                envp_ptr.push(std::ptr::null());
 
-                                // Write to child's memory
-                                let mut written = false;
-                                for (offset, &byte) in scratch_content.iter().enumerate() {
-                                    let word = byte as libc::c_long;
-                                    let r = unsafe {
+                                // Fork a NEW 64-bit child (TIF_IA32=0)
+                                let new_pid = unsafe { libc::fork() };
+                                if new_pid == 0 {
+                                    // Child — 64-bit, async-signal-safe only
+                                    unsafe {
+                                        libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                                    }
+                                    unsafe { libc::raise(libc::SIGSTOP); }
+                                    unsafe {
+                                        libc::execve(
+                                            path_c.as_ptr(),
+                                            argv_ptr.as_ptr(),
+                                            envp_ptr.as_ptr(),
+                                        );
+                                    }
+                                    unsafe { libc::_exit(127); }
+                                } else if new_pid > 0 {
+                                    // Parent (kr64) — new child will SIGSTOP
+                                    log(&format!(
+                                        "[KR64] Forked new 64-bit child PID={} for /sbin/recovery (Task 6-Z48)",
+                                        new_pid
+                                    ));
+                                    recovery_child_pid = Some(new_pid);
+                                    // Set PTRACE_SETOPTIONS for the new child
+                                    let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
+                                        | libc::PTRACE_O_TRACEFORK
+                                        | libc::PTRACE_O_TRACECLONE
+                                        | libc::PTRACE_O_TRACEVFORK
+                                        | libc::PTRACE_O_TRACEEXEC
+                                        | libc::PTRACE_O_EXITKILL) as libc::c_int;
+                                    unsafe {
                                         libc::ptrace(
-                                            libc::PTRACE_POKEDATA,
-                                            pid,
-                                            (scratch_addr + offset as u64) as i64,
-                                            word,
-                                        )
-                                    };
-                                    if r == -1 {
-                                        log(&format!(
-                                            "DIAG 64-bit execve: POKEDATA failed at offset {} (Task 6-Z42)",
-                                            offset
-                                        ));
-                                        break;
+                                            libc::PTRACE_SETOPTIONS,
+                                            new_pid,
+                                            0,
+                                            opts,
+                                        );
                                     }
-                                    written = offset == scratch_content.len() - 1;
-                                }
-
-                                if written {
-                                    // Task 6-Z45: inject 64-bit execve via `syscall`
-                                    // instruction. The approach:
-                                    // 1. Skip the i386 execve (orig_rax=-1)
-                                    // 2. Write `syscall; int3` to .text at 0x8048c59
-                                    // 3. Set rip=0x8048c59, CS=0x33 (64-bit mode),
-                                    //    SS=0x2b, rax=59, rdi=path, rsi=argv, rdx=envp
-                                    // 4. At the EXIT stop (after skip), re-set rax=59
-                                    //    (kernel resets it to 0 on skip)
-                                    // 5. Child resumes → executes `syscall` in 64-bit
-                                    //    mode → execve(nr=59) → seccomp sees
-                                    //    AUDIT_ARCH_X86_64 → allows execve → SUCCESS
-                                    let code_addr: u64 = 0x08048c59;
-                                    // Task 6-Z45 fix2: write "mov eax,59; syscall; int3"
-                                    // (8 bytes) to .text. This sets rax=59 inline,
-                                    // so we don't need the EXIT stop re-set (which
-                                    // the kernel may override).
-                                    // Bytes: b8 3b 00 00 00 0f 05 cc
-                                    // b8 3b 00 00 00 = mov eax, 59 (5 bytes)
-                                    // 0f 05           = syscall (2 bytes)
-                                    // cc              = int3 (1 byte)
-                                    let code_bytes: [u8; 8] = [0xb8, 0x3b, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xcc];
-                                    let code_word: libc::c_long = i64::from_ne_bytes(code_bytes);
-                                    let r2 = unsafe {
-                                        libc::ptrace(libc::PTRACE_POKEDATA, pid, code_addr as i64, code_word)
-                                    };
-                                    if r2 == -1 {
-                                        log("DIAG 64-bit execve: POKEDATA to .text FAILED (Task 6-Z45)");
-                                    } else {
-                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                        match ptrace_getregs(pid, &mut regs2) {
-                                            Ok(len2) => {
-                                                // x86_64 user_regs_struct indices:
-                                                // 5=rbx, 10=rax, 11=rcx, 12=rdx,
-                                                // 13=rsi, 14=rdi, 15=orig_rax,
-                                                // 16=rip, 17=cs, 20=ss
-                                                // Set x86_64 args: rdi=path, rsi=64-bit argv, rdx=64-bit envp
-                                                // Task 6-Z47: rsi/rdx point to the converted 64-bit arrays in
-                                                // the scratch area (NOT the child's original 32-bit arrays).
-                                                set_syscall_arg(&mut regs2, 14, scratch_addr);         // rdi = translated path
-                                                set_syscall_arg(&mut regs2, 13, scratch_argv_addr);     // rsi = 64-bit argv array
-                                                set_syscall_arg(&mut regs2, 12, scratch_envp_addr);     // rdx = 64-bit envp array
-                                                set_syscall_arg(&mut regs2, 10, 59);             // rax = 59 (x86_64 execve)
-                                                set_syscall_arg(&mut regs2, 16, code_addr);      // rip = syscall instruction in .text
-                                                set_syscall_arg(&mut regs2, 15, (-1i64) as u64); // orig_rax = -1 (skip i386)
-                                                set_syscall_arg(&mut regs2, 17, 0x33);           // cs = 0x33 (64-bit mode)
-                                                set_syscall_arg(&mut regs2, 20, 0x2b);           // ss = 0x2b (64-bit data)
-                                                // Save the values for the EXIT stop handler
-                                                pending_64bit_execve = true;
-                                                match ptrace_setregs(pid, &regs2, len2) {
-                                                    Ok(()) => log(&format!(
-                                                        "DIAG 64-bit execve INJECTED: rip={:#x} CS=0x33 rax=59 rdi={:#x} rsi={:#x} (argv64) rdx={:#x} (envp64) (Task 6-Z47)",
-                                                        code_addr, scratch_addr, scratch_argv_addr, scratch_envp_addr
-                                                    )),
-                                                    Err(e) => log(&format!(
-                                                        "DIAG 64-bit execve: ptrace_setregs FAILED: {} (Task 6-Z45)", e
-                                                    )),
-                                                }
-                                            }
-                                            Err(e) => log(&format!(
-                                                "DIAG 64-bit execve: ptrace_getregs FAILED: {} (Task 6-Z45)", e
-                                            )),
-                                        }
-                                    }
+                                    log(&format!(
+                                        "[KR64] PTRACE_SETOPTIONS set on new child PID={} (Task 6-Z48)",
+                                        new_pid
+                                    ));
+                                } else {
+                                    log("[KR64] fork FAILED for recovery binary (Task 6-Z48)");
                                 }
                             }
-                            } // close if scratch_addr != 0
                         }
                     }
 
