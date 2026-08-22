@@ -380,16 +380,28 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             if (true) {
                 boolean success = false;
                 try {
-                    // Allow extra time for a Zygote crash-and-restart cycle: after a host
-                    // reboot the guest ART often needs one Zygote restart to regenerate a
-                    // stale dalvik-cache (~14 s), followed by a full system_server boot
-                    // (~30 s).  60 s comfortably covers both in sequence.
-                    //
-                    // The wait now goes through BootCompletionServer (ported from
-                    // cyanmint/Nogitsune's BootStatus.kt), which owns the boot latch.
-                    // TwoyiStatusManager.markStarted() is still called (by
-                    // BootCompletionServer.markCompleted()) so switchOs() works.
-                    success = BootCompletionServer.getInstance().waitBoot(60, TimeUnit.SECONDS);
+                    // Task 6-Z62: kr64's synthesized BOOT_COMPLETED fires when
+                    // the recovery child's execve completes — observed at
+                    // T+118 s after Activity start in the b889666 E2E
+                    // (Render2Activity 21:30:32 → kr64 daemon 21:32:30), i.e.
+                    // AFTER the old single 60 s waitBoot deadline. A
+                    // CyclicBarrier await that times out BREAKS the barrier,
+                    // so a late markCompleted() could never wake the UI.
+                    // Poll in 5 s slices instead: waitBoot() now re-arms the
+                    // latch after each timed-out slice (BootCompletionServer,
+                    // Task 6-Z62), and the isCompleted() fallback catches the
+                    // broken-barrier race (BOOT_COMPLETED arrived while we
+                    // were between slices). Total window 300 s to match the
+                    // E2E boot_wait.
+                    long bootDeadlineMs = SystemClock.elapsedRealtime() + 300_000L;
+                    while (!success && SystemClock.elapsedRealtime() < bootDeadlineMs) {
+                        success = BootCompletionServer.getInstance().waitBoot(5, TimeUnit.SECONDS);
+                        if (!success && BootCompletionServer.getInstance().isCompleted()) {
+                            // BOOT_COMPLETED arrived during a broken-barrier
+                            // window — boot DID complete; treat as success.
+                            success = true;
+                        }
+                    }
                 } catch (Throwable ignored) {
                     // BootCompletionServer.waitBoot() catches InterruptedException /
                     // BrokenBarrierException internally and returns false, so this
