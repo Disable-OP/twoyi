@@ -4379,16 +4379,25 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             let argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
                             let envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
 
+                            // Task 6-Z48 diag: log ALL register values to find the path
+                            let regs_ptr = &regs as *const Regs as *const u64;
+                            let mut reg_dump = String::new();
+                            for i in 0..21u64 {
+                                let val = unsafe { *regs_ptr.add(i as usize) };
+                                if val != 0 {
+                                    reg_dump.push_str(&format!("[{}]={:#x} ", i, val));
+                                }
+                            }
+                            log(&format!(
+                                "DIAG execve ENTRY: abi.execve=11, path_addr={:#x}, argv_addr={:#x}, envp_addr={:#x}, regs: {} (Task 6-Z48)",
+                                path_addr_i386, argv_addr_i386, envp_addr_i386, reg_dump
+                            ));
+
                             let orig_path = if path_addr_i386 != 0 {
                                 read_child_string(pid, path_addr_i386)
                             } else {
                                 None
                             };
-
-                            log(&format!(
-                                "DIAG execve ENTRY: abi.execve=11, orig_path={:?} (Task 6-Z48)",
-                                orig_path
-                            ));
 
                             if let Some(ref orig) = orig_path {
                                 let translated = translate_path(rootfs, orig);
