@@ -3793,6 +3793,21 @@ pub fn run_ptrace_loop(
         // shadow `let pid = current_pid` below makes the existing
         // handler code (which uses `pid` for ptrace_getregs /
         // read_child_string / ptrace_setregs) operate on THIS child.
+        // Task 6-Z53: reset `in_syscall` when switching to a DIFFERENT child.
+        // The `in_syscall` flag is per-loop, not per-child. If init was in
+        // ENTRY state (in_syscall=true) and then the recovery child's first
+        // syscall arrives, it's incorrectly treated as EXIT (DESYNC). Fix:
+        // when the child PID changes, reset in_syscall=false so the new
+        // child's first syscall is correctly treated as ENTRY.
+        if waited != current_pid {
+            if in_syscall {
+                log(&format!(
+                    "DIAG child switch: {} → {} — resetting in_syscall=false (was true from previous child, Task 6-Z53)",
+                    current_pid, waited
+                ));
+            }
+            in_syscall = false;
+        }
         current_pid = waited;
         // Shadow the function-parameter `pid` (init's PID) with
         // `current_pid` for the rest of this iteration. All the handler
