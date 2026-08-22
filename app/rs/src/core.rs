@@ -1282,14 +1282,21 @@ unsafe fn twrp_blit_to_surface(
             let sx = (dx as u64 * src_w as u64 / dst_w.max(1) as u64) as usize;
             let sx = sx.min(fb_w.saturating_sub(1));
 
-            // Source pixel (RGBA → BGRA for Android's RGBA_8888 format).
+            // Source pixel — fb0 is written by TWRP as in-memory
+            // [B,G,R,A]: the hook's FBIOGET_VSCREENINFO declares
+            // red.offset=16 / green.offset=8 / blue.offset=0 (exactly
+            // what the real byt_t_crv2 Bay Trail panel reports and what
+            // this TWRP image renders for). Android's
+            // WINDOW_FORMAT_RGBA_8888 buffer wants in-memory [R,G,B,A],
+            // so swap R and B here (Task 6-Z64 — otherwise the orange
+            // TWRP logo would render blue).
             let src_idx = (sy * fb_w + sx) * fb_bpp;
             if src_idx + 3 >= fb.len() {
                 continue;
             }
-            let r = fb[src_idx] as u32;
+            let b = fb[src_idx] as u32;
             let g = fb[src_idx + 1] as u32;
-            let b = fb[src_idx + 2] as u32;
+            let r = fb[src_idx + 2] as u32;
             let a = fb[src_idx + 3] as u32;
             // Pack as 0xAABBGGRR (little-endian RGBA_8888)
             let pixel = (a << 24) | (b << 16) | (g << 8) | r;
