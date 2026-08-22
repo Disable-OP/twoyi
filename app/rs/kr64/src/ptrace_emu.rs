@@ -4072,8 +4072,8 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                             // handles this message and calls BootCompletionServer.markCompleted().
                             // Also try @TWOYI_BOOT_SOCK (the dedicated boot socket).
                             for sock_name in &["\0TWOYI_SOCK", "\0TWOYI_BOOT_SOCK"] {
-                                use std::os::unix::net::UnixStream;
                                 use std::io::Write;
+                                use std::os::unix::net::UnixStream;
                                 match UnixStream::connect(sock_name) {
                                     Ok(mut stream) => {
                                         match stream.write_all(b"BOOT_COMPLETED\n") {
