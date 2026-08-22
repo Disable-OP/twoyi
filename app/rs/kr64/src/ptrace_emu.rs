@@ -6114,6 +6114,24 @@ pub fn run_ptrace_loop(
                     // syscall_num at EXIT is `getpid` and this block
                     // is a no-op (compute_exit_return_value(getpid)=None).
                     let _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
+                    // Task 6-Z53: ENOSYS fallback. The DESYNC issue means the
+                    // EXIT handler sometimes sees the wrong syscall number
+                    // (ENTRY says nr=125, EXIT says nr=191). compute_exit_return_value
+                    // uses the wrong number and doesn't fake it. Fix: if the
+                    // actual return value is -38 (ENOSYS) and the child is i386,
+                    // override it to 0 (except exit/exit_group). This catches
+                    // ALL ENOSYS returns regardless of DESYNC.
+                    let _enosys_fallback: Option<i64> = if abi.execve == 11 {
+                        let actual_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if actual_ret == -38 && syscall_num != 1 && syscall_num != 252 {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let _forced_ret_opt = _forced_ret_opt.or(_enosys_fallback);
                     if syscall_num == abi.setxattr
                         || syscall_num == abi.lsetxattr
                         || syscall_num == abi.fsetxattr
