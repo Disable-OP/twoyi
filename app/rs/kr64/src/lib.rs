@@ -6776,12 +6776,81 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // directly, we don't need init to start the service.
             let recovery_pid = {
                 let recovery_path = format!("{}/sbin/recovery", cfg.rootfs);
+
+                // Task 6-Z50: Read the recovery binary's PT_INTERP and patch it
+                // to use the HOST's linker. The recovery binary is dynamically
+                // linked with PT_INTERP = /sbin/linker (rootfs-relative). The
+                // kernel can't find /sbin/linker on the HOST. The HOST has
+                // /system/bin/linker (the emulator's 32-bit bionic linker).
+                // We patch the binary's PT_INTERP to the full rootfs path
+                // ({rootfs}/sbin/linker) so the kernel finds the TWRP linker.
+                let patched_path = {
+                    // Open the recovery binary for read+write to patch PT_INTERP
+                    match std::fs::OpenOptions::new().read(true).write(true).open(&recovery_path) {
+                        Ok(mut file) => {
+                            use std::io::{Read, Seek, Write};
+                            let mut ehdr = [0u8; 64];
+                            if file.read_exact(&mut ehdr).is_ok() && &ehdr[0..4] == b"\x7fELF" {
+                                let e_phoff = u32::from_le_bytes([ehdr[28], ehdr[29], ehdr[30], ehdr[31]]) as u64;
+                                let e_phentsize = u16::from_le_bytes([ehdr[42], ehdr[43]]) as usize;
+                                let e_phnum = u16::from_le_bytes([ehdr[44], ehdr[45]]) as usize;
+                                let mut phdrs = vec![0u8; e_phentsize * e_phnum];
+                                let _ = file.seek(std::io::SeekFrom::Start(e_phoff));
+                                let _ = file.read_exact(&mut phdrs);
+                                let mut interp_offset = None;
+                                let mut interp_filesz = None;
+                                for i in 0..e_phnum {
+                                    let off = i * e_phentsize;
+                                    let p_type = u32::from_le_bytes([phdrs[off], phdrs[off+1], phdrs[off+2], phdrs[off+3]]);
+                                    if p_type == 3 {
+                                        interp_offset = Some(u32::from_le_bytes([phdrs[off+4], phdrs[off+5], phdrs[off+6], phdrs[off+7]]) as u64);
+                                        interp_filesz = Some(u32::from_le_bytes([phdrs[off+16], phdrs[off+17], phdrs[off+18], phdrs[off+19]]) as usize);
+                                        break;
+                                    }
+                                }
+                                if let (Some(p_offset), Some(p_filesz)) = (interp_offset, interp_filesz) {
+                                    let _ = file.seek(std::io::SeekFrom::Start(p_offset));
+                                    let mut interp_buf = vec![0u8; p_filesz];
+                                    let _ = file.read_exact(&mut interp_buf);
+                                    let interp_str = String::from_utf8_lossy(&interp_buf);
+                                    info!("[KR64] Task 6-Z50: PT_INTERP offset={}, filesz={}, path={:?}",
+                                        p_offset, p_filesz, interp_str.trim_end_matches('\0'));
+                                    let new_interp = format!("{}/sbin/linker\0", cfg.rootfs);
+                                    if new_interp.len() <= p_filesz {
+                                        let _ = file.seek(std::io::SeekFrom::Start(p_offset));
+                                        let mut nb = new_interp.into_bytes();
+                                        while nb.len() < p_filesz { nb.push(0); }
+                                        let _ = file.write_all(&nb);
+                                        info!("[KR64] Task 6-Z50: patched PT_INTERP to {} ({} bytes)",
+                                            new_interp.trim_end_matches('\0'), p_filesz);
+                                    } else {
+                                        error!("[KR64] Task 6-Z50: new interp {} doesn't fit in {} bytes (need {})",
+                                            new_interp.trim_end_matches('\0'), p_filesz, new_interp.len());
+                                        let host_linker = "/system/bin/linker\0";
+                                        if host_linker.len() <= p_filesz {
+                                            let _ = file.seek(std::io::SeekFrom::Start(p_offset));
+                                            let mut nb = host_linker.as_bytes().to_vec();
+                                            while nb.len() < p_filesz { nb.push(0); }
+                                            let _ = file.write_all(&nb);
+                                            info!("[KR64] Task 6-Z50: patched PT_INTERP to HOST's /system/bin/linker ({} bytes)", p_filesz);
+                                        }
+                                    }
+                                } else {
+                                    error!("[KR64] Task 6-Z50: no PT_INTERP found");
+                                }
+                            }
+                        }
+                        Err(e) => error!("[KR64] Task 6-Z50: can't open recovery binary: {}", e),
+                    }
+                    recovery_path.clone()
+                };
+
                 let ld_preload = format!("{}/sbin/libtwrp_fb_hook.so", cfg.rootfs);
                 let ld_library_path = format!(
                     "{}/sbin:{}/system/lib:{}/system/lib64",
                     cfg.rootfs, cfg.rootfs, cfg.rootfs
                 );
-                info!("[KR64] Task 6-Z49: proactively forking recovery child at {}", recovery_path);
+                info!("[KR64] Task 6-Z49: proactively forking recovery child at {}", patched_path);
 
                 let path_c = std::ffi::CString::new(recovery_path.as_str()).unwrap_or_default();
                 let argv_c: Vec<std::ffi::CString> = vec![
