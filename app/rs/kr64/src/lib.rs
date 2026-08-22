@@ -6802,12 +6802,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     // Child — 64-bit, async-signal-safe only
                     unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0); }
                     unsafe { libc::raise(libc::SIGSTOP); }
-                    unsafe {
+                    let execve_ret = unsafe {
                         libc::execve(
                             path_c.as_ptr(),
                             argv_ptr.as_ptr(),
                             envp_ptr.as_ptr(),
-                        );
+                        )
+                    };
+                    // execve returned → it FAILED. Log the errno via write(2,...) — async-signal-safe.
+                    let errno = unsafe { *libc::__errno_location() };
+                    let msg = format!("EXECVE FAILED: ret={}, errno={} ({}), path={}\n",
+                        execve_ret, errno, std::io::Error::from_raw_os_error(errno),
+                        recovery_path);
+                    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+                    // Also check if the interpreter (PT_INTERP) exists
+                    // Common 32-bit interpreter paths: /sbin/linker, /system/bin/linker
+                    for interp in &["/sbin/linker", "/system/bin/linker"] {
+                        let interp_c = std::ffi::CString::new(*interp).unwrap_or_default();
+                        let access_ret = unsafe { libc::access(interp_c.as_ptr(), libc::F_OK) };
+                        let msg2 = format!("INTERP check: {} exists={}\n", interp, access_ret == 0);
+                        unsafe { libc::write(2, msg2.as_ptr() as *const libc::c_void, msg2.len()); }
                     }
                     unsafe { libc::_exit(127); }
                 } else if new_pid > 0 {
