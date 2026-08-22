@@ -312,22 +312,27 @@ static int is_fb_path(const char *path) {
 // ---------------------------------------------------------------------------
 // Virtual screen configuration.
 //
-// 720x1280 @ 32bpp (RGBA8888). This matches the byt_t_crv2 (Minix Z64)
-// TWRP image's expected display resolution. libminuitwrp reads these
-// values from FBIOGET_VSCREENINFO and uses them to size its framebuffer.
+// 320x640 @ 32bpp (BGRA8888 in memory). MUST MATCH the E2E profile's
+// virtual display dims AND kr64's devices::create_twrp_framebuffer()
+// file size (320*640*4 = 819200) AND the app reader's read size
+// (core.rs twrp_fb_render_loop reads virtual_width*virtual_height*4).
+// The OLD 720x1280/3686400 hardcode ftruncated the fb0 file to 3686400
+// while the app still read only the first 819200 bytes = the top 320
+// rows of a 720-wide frame, reinterpreted as a 320x640 image → garbage
+// (Task 6-Z64: found by Agent E, Wave 1).
 //
-// The framebuffer memory is 720*1280*4 = 3,686,400 bytes. kr64 pre-
-// creates /dev/graphics/fb0 as a regular file of exactly this size, so
-// mmap() on the fd works naturally via bionic's native mmap() — no
-// mmap hook needed (see the "mmap() — NOT HOOKED" comment at the
-// bottom of this file for why the previous safety-net hook was removed).
+// libminuitwrp reads these values from FBIOGET_VSCREENINFO and uses
+// them to size its framebuffer. Channel offsets (red=16/green=8/blue=0)
+// declare in-memory [B,G,R,A] — exactly what the real byt_t_crv2 Bay
+// Trail device reports and what this TWRP image was built for; the app
+// side swaps R/B when blitting (core.rs, Task 6-Z64).
 // ---------------------------------------------------------------------------
-#define TWRP_FB_WIDTH          720
-#define TWRP_FB_HEIGHT         1280
+#define TWRP_FB_WIDTH          320
+#define TWRP_FB_HEIGHT         640
 #define TWRP_FB_BPP            32
 #define TWRP_FB_BYTES_PER_PIX  4
-#define TWRP_FB_LINE_LENGTH    (TWRP_FB_WIDTH * TWRP_FB_BYTES_PER_PIX)  /* 2880 */
-#define TWRP_FB_SMEM_LEN       (TWRP_FB_WIDTH * TWRP_FB_HEIGHT * TWRP_FB_BYTES_PER_PIX)  /* 3686400 */
+#define TWRP_FB_LINE_LENGTH    (TWRP_FB_WIDTH * TWRP_FB_BYTES_PER_PIX)  /* 1280 */
+#define TWRP_FB_SMEM_LEN       (TWRP_FB_WIDTH * TWRP_FB_HEIGHT * TWRP_FB_BYTES_PER_PIX)  /* 819200 */
 
 // FB_ACTIVATE_NOW = 0 (see linux/fb.h)
 #define TWRP_FB_ACTIVATE_NOW   0
@@ -353,16 +358,16 @@ static void fill_vscreeninfo(struct fb_var_screeninfo *v) {
     v->transp.offset = 24; v->transp.length = 8; v->transp.msb_right = 0;
     v->nonstd = 0;
     v->activate = TWRP_FB_ACTIVATE_NOW;
-    // Physical dimensions in mm (for DPI calculation). 720x1280 at
-    // ~250 DPI is ~73x130mm — we use round numbers close to a 5" phone.
-    v->height = 130;
-    v->width = 73;
+    // Physical dimensions in mm (for DPI calculation). 320x640 at
+    // ~250 DPI is ~32x65mm — a phone-sized portrait panel.
+    v->height = 65;
+    v->width = 32;
     v->accel_flags = 0;
-    // Pixclock in picoseconds. For 60Hz refresh of 720x1280:
-    //   pixclock = 1 / (60 * 720 * 1280) = ~18ns = ~18100ps
+    // Pixclock in picoseconds. For 60Hz refresh of 320x640:
+    //   pixclock = 1 / (60 * 320 * 640) = ~82ns = ~82000ps
     // libminuitwrp doesn't use this for the software renderer, but we
     // provide a sane value anyway.
-    v->pixclock = 18100;
+    v->pixclock = 82000;
     v->left_margin = 24;
     v->right_margin = 24;
     v->upper_margin = 4;
@@ -487,13 +492,13 @@ int open(const char *path, int flags, ...) {
     if (fd < 0 && is_fb_path(path)) {
         // Create /dev/graphics/ directory if needed
         mkdir_raw("/dev/graphics", 0755);
-        // Create the fb0 file with the right size (720*1280*4 = 3686400)
+        // Create the fb0 file with the right size (320*640*4 = 819200)
         int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
             (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
             O_CREAT | O_RDWR, 0644);
         if (create_fd >= 0) {
             // Truncate to framebuffer size
-            raw_syscall3(SYS_ftruncate, create_fd, 3686400, 0);
+            raw_syscall3(SYS_ftruncate, create_fd, TWRP_FB_SMEM_LEN, 0);
             raw_syscall1(SYS_close, create_fd);
             // Re-open with the original flags
             fd = real_open ? real_open(path, flags, mode)
@@ -562,7 +567,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
             (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
             O_CREAT | O_RDWR, 0644);
         if (create_fd >= 0) {
-            raw_syscall3(SYS_ftruncate, create_fd, 3686400, 0);
+            raw_syscall3(SYS_ftruncate, create_fd, TWRP_FB_SMEM_LEN, 0);
             raw_syscall1(SYS_close, create_fd);
             fd = real_openat ? real_openat(dirfd, path, flags, mode)
                              : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
