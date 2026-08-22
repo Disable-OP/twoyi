@@ -2134,6 +2134,20 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.fsetxattr
     {
         Some(0)
+    } else if abi.execve == 11 {
+        // Task 6-Z51: The forked 64-bit recovery child inherits the app's
+        // seccomp filter (DEFAULT-DENY). The i386 recovery binary's syscalls
+        // that are NOT in the allow list return ENOSYS. The recovery binary
+        // (and its dynamic linker) needs these to "succeed" to proceed past
+        // early init. Fake-success them here.
+        // i386 syscall numbers (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h):
+        //   125 = mprotect (linker uses this to set up memory protections)
+        //   67  = sigaction (linker + TWRP init set up signal handlers)
+        //   192 = mmap2 (already handled, but blocked → needs faking)
+        //   91  = munmap (already handled, but blocked → needs faking)
+        //   125, 67, 192, 91, 125, 219, 186, 191, 268, 78, 45, 60, 295
+        matches!(syscall_nr, 125 | 67 | 192 | 91 | 219 | 186 | 191 | 268 | 78 | 45 | 60 | 295 | 14 | 90)
+            .then_some(0)
     } else {
         None
     }
