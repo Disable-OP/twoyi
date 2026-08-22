@@ -4086,32 +4086,59 @@ pub fn run_ptrace_loop(
                                 pid
                             ));
                             // Connect to the app's abstract socket @TWOYI_SOCK and
-                            // write "BOOT_COMPLETED\n". The app's TwoyiSocketServer
-                            // handles this message and calls BootCompletionServer.markCompleted().
-                            // Also try @TWOYI_BOOT_SOCK (the dedicated boot socket).
-                            for sock_name in &["\0TWOYI_SOCK", "\0TWOYI_BOOT_SOCK"] {
-                                use std::io::Write;
-                                use std::os::unix::net::UnixStream;
-                                match UnixStream::connect(sock_name) {
-                                    Ok(mut stream) => {
-                                        match stream.write_all(b"BOOT_COMPLETED\n") {
-                                            Ok(()) => log(&format!(
-                                                "[KR64] BOOT_COMPLETED sent to @{} (Task 6-Z47)",
-                                                &sock_name[1..]
-                                            )),
-                                            Err(e) => log(&format!(
-                                                "[KR64] BOOT_COMPLETED: write to @{} failed: {} (Task 6-Z47)",
-                                                &sock_name[1..], e
-                                            )),
-                                        }
-                                    }
-                                    Err(e) => {
+                            // write "BOOT_COMPLETED\n". Use raw libc calls because
+                            // Rust's UnixStream::connect rejects abstract socket
+                            // paths (NUL-prefixed) with "paths must not contain
+                            // interior null bytes".
+                            for sock_name in &["TWOYI_SOCK", "TWOYI_BOOT_SOCK"] {
+                                let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+                                if sock < 0 {
+                                    log(&format!(
+                                        "[KR64] BOOT_COMPLETED: socket() failed for @{} (Task 6-Z50)",
+                                        sock_name
+                                    ));
+                                    continue;
+                                }
+                                let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+                                addr.sun_family = libc::AF_UNIX as u16;
+                                // Abstract socket: sun_path[0] = 0, then the name
+                                let name_bytes = sock_name.as_bytes();
+                                let copy_len = name_bytes.len().min(addr.sun_path.len() - 1);
+                                for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
+                                    addr.sun_path[i + 1] = b as i8;
+                                }
+                                let addr_len = (std::mem::size_of::<u16>() + 1 + copy_len) as u32;
+                                let ret = unsafe {
+                                    libc::connect(
+                                        sock,
+                                        &addr as *const _ as *const libc::sockaddr,
+                                        addr_len,
+                                    )
+                                };
+                                if ret == 0 {
+                                    let msg = b"BOOT_COMPLETED\n";
+                                    let written = unsafe {
+                                        libc::write(sock, msg.as_ptr() as *const libc::c_void, msg.len())
+                                    };
+                                    if written == msg.len() as isize {
                                         log(&format!(
-                                            "[KR64] BOOT_COMPLETED: connect to @{} failed: {} (non-fatal; trying next) (Task 6-Z47)",
-                                            &sock_name[1..], e
+                                            "[KR64] BOOT_COMPLETED sent to @{} (Task 6-Z50)",
+                                            sock_name
+                                        ));
+                                    } else {
+                                        log(&format!(
+                                            "[KR64] BOOT_COMPLETED: write to @{} failed (ret={}) (Task 6-Z50)",
+                                            sock_name, written
                                         ));
                                     }
+                                } else {
+                                    let e = std::io::Error::last_os_error();
+                                    log(&format!(
+                                        "[KR64] BOOT_COMPLETED: connect to @{} failed: {} (non-fatal) (Task 6-Z50)",
+                                        sock_name, e
+                                    ));
                                 }
+                                unsafe { libc::close(sock); }
                             }
                         }
 
