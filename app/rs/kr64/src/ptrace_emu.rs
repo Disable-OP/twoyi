@@ -4490,7 +4490,41 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                                     .iter()
                                     .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
                                     .collect();
-                                let envp_c: Vec<std::ffi::CString> = envp_vec
+                                // Task 6-Z48: rewrite envp paths to use full rootfs prefix.
+                                // The new child runs with the HOST's root (not chrooted into
+                                // the rootfs). LD_PRELOAD=/sbin/libtwrp_fb_hook.so and
+                                // LD_LIBRARY_PATH=/sbin:/system/lib need to be prefixed with
+                                // the rootfs path so the dynamic linker finds the libraries.
+                                let envp_modified: Vec<String> = envp_vec
+                                    .iter()
+                                    .map(|s| {
+                                        if s.starts_with("LD_PRELOAD=") {
+                                            let val = &s["LD_PRELOAD=".len()..];
+                                            if val.starts_with('/') && !val.starts_with("/data") {
+                                                format!("LD_PRELOAD={}/{}", rootfs, val)
+                                            } else {
+                                                s.clone()
+                                            }
+                                        } else if s.starts_with("LD_LIBRARY_PATH=") {
+                                            let val = &s["LD_LIBRARY_PATH=".len()..];
+                                            let parts: Vec<String> = val.split(':').map(|p| {
+                                                if p.starts_with('/') && !p.starts_with("/data") && !p.is_empty() {
+                                                    format!("{}/{}", rootfs, p)
+                                                } else {
+                                                    p.to_string()
+                                                }
+                                            }).collect();
+                                            format!("LD_LIBRARY_PATH={}", parts.join(":"))
+                                        } else {
+                                            s.clone()
+                                        }
+                                    })
+                                    .collect();
+                                log(&format!(
+                                    "DIAG execve: envp (modified): {:?} (Task 6-Z48)",
+                                    envp_modified
+                                ));
+                                let envp_c: Vec<std::ffi::CString> = envp_modified
                                     .iter()
                                     .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
                                     .collect();
@@ -7446,6 +7480,33 @@ pub fn run_ptrace_loop(pid: libc::pid_t, rootfs: &str, vfs: &crate::vfs::Vfs) ->
                         "SIGSTOP on forked child {} — consuming (auto-attach stop) and resuming with signal=0 so its syscalls get traced",
                         pid
                     ));
+                    // Task 6-Z48: set PTRACE_SETOPTIONS for the recovery child.
+                    // The PTRACE_SETOPTIONS call after fork() (in the execve handler)
+                    // may fail because the child hasn't called PTRACE_TRACEME yet
+                    // (race condition). Here, the child IS stopped (we just received
+                    // its SIGSTOP from PTRACE_TRACEME + raise), so SETOPTIONS works.
+                    if recovery_child_pid == Some(pid) {
+                        let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
+                            | libc::PTRACE_O_TRACEFORK
+                            | libc::PTRACE_O_TRACECLONE
+                            | libc::PTRACE_O_TRACEVFORK
+                            | libc::PTRACE_O_TRACEEXEC
+                            | libc::PTRACE_O_EXITKILL) as libc::c_int;
+                        let r = unsafe {
+                            libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts)
+                        };
+                        if r == -1 {
+                            log(&format!(
+                                "[KR64] PTRACE_SETOPTIONS on recovery child {} FAILED: {} (Task 6-Z48)",
+                                pid, std::io::Error::last_os_error()
+                            ));
+                        } else {
+                            log(&format!(
+                                "[KR64] PTRACE_SETOPTIONS set on recovery child {} at SIGSTOP (Task 6-Z48)",
+                                pid
+                            ));
+                        }
+                    }
                 }
                 // resume_signal stays 0 — the loop-top PTRACE_SYSCALL
                 // will resume `current_pid` (the SIGSTOPped child)
