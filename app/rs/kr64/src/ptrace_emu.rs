@@ -4352,6 +4352,36 @@ pub fn run_ptrace_loop(
 
                 let syscall_num = get_syscall_num(&regs, &abi);
 
+                // Task 6-Z57: ENOSYS early override. The DESYNC issue means
+                // some EXIT stops are treated as ENTRY, so the EXIT handler's
+                // ENOSYS fallback doesn't run. Fix: at the TOP of the handler,
+                // BEFORE the in_syscall branch, check if the return value (rax)
+                // is -38 (ENOSYS) and the child is i386. If so, override it to
+                // 0 (or -12 for mmap2) via ptrace_setregs. This is independent
+                // of the in_syscall flag, so DESYNC doesn't matter.
+                if abi.execve == 11 {
+                    let rax_val = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                    if rax_val == -38 {
+                        // This is an ENOSYS return. Override it.
+                        let new_ret: i64 = if syscall_num == 192 || syscall_num == 219 {
+                            -12 // mmap2/mremap → ENOMEM
+                        } else if syscall_num == 45 {
+                            0x80000000 // brk → non-zero
+                        } else if syscall_num == 1 || syscall_num == 252 {
+                            -38 // exit/exit_group → don't fake
+                        } else {
+                            0 // success
+                        };
+                        if new_ret != -38 {
+                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                            if ptrace_getregs(pid, &mut regs2).is_ok() {
+                                set_syscall_ret(&mut regs2, &abi, new_ret);
+                                let _ = ptrace_setregs(pid, &regs2, std::mem::size_of::<Regs>());
+                            }
+                        }
+                    }
+                }
+
                 if !in_syscall {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
