@@ -2145,30 +2145,14 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         // leaked into init's code paths as NULL pointers.
         if syscall_nr == 1 || syscall_nr == 252 {
             None // exit / exit_group — don't fake
-        } else if syscall_nr == 192 {
-            // Task 6-Z56: mmap2 — the seccomp filter blocks ALL mmap2 for i386.
-            // Returning a fake non-NULL address (0x40000000) causes SIGSEGV
-            // when the child accesses it (the mapping doesn't actually exist).
-            // Return -ENOMEM (-12) instead — the caller's error path may handle
-            // it gracefully (fall back to a different allocation strategy, or
-            // skip the operation). This is safer than returning a non-existent
-            // pointer that the child will dereference.
-            Some(-12)
         } else if syscall_nr == 45 {
-            // brk: return the current break (non-zero = success). Use a
-            // large value that init treats as "brk is at this address".
-            Some(0x80000000)
-        } else if syscall_nr == 91 {
-            // munmap: return 0 (success) — no side effects
-            Some(0)
-        } else if syscall_nr == 125 {
-            // mprotect: return 0 (success) — no side effects
-            Some(0)
-        } else if syscall_nr == 219 {
-            // mremap: return -ENOMEM — same as mmap2, can't actually remap
-            Some(-12)
+            Some(0x80000000) // brk → non-zero
+        } else if syscall_nr == 186 || syscall_nr == 20
+            || syscall_nr == 102 || syscall_nr == 104
+            || syscall_nr == 105 || syscall_nr == 106 {
+            Some(1) // gettid/getpid/getuid/getgid → valid positive ID
         } else {
-            Some(0)
+            Some(-1) // generic error (-EPERM) — caller handles via error path
         }
     } else {
         None
@@ -4363,14 +4347,25 @@ pub fn run_ptrace_loop(
                     let rax_val = get_syscall_arg(&regs, abi.reg_ret) as i64;
                     if rax_val == -38 {
                         // This is an ENOSYS return. Override it.
-                        let new_ret: i64 = if syscall_num == 192 || syscall_num == 219 {
-                            -12 // mmap2/mremap → ENOMEM
-                        } else if syscall_num == 45 {
-                            0x80000000 // brk → non-zero
-                        } else if syscall_num == 1 || syscall_num == 252 {
+                        // Task 6-Z58: return -1 (generic error) instead of 0.
+                        // Returning 0 causes NULL pointer dereferences when the
+                        // caller uses the return value as a pointer. -1 is a
+                        // valid error return that the caller handles via
+                        // `if (ret < 0) { errno = -ret; handle_error; }`.
+                        // For mmap2/mremap, -1 = MAP_FAILED (correct failure).
+                        let new_ret: i64 = if syscall_num == 1 || syscall_num == 252 {
                             -38 // exit/exit_group → don't fake
+                        } else if syscall_num == 45 {
+                            0x80000000 // brk → non-zero (current break)
+                        } else if syscall_num == 186 || syscall_num == 20
+                                || syscall_num == 102 || syscall_num == 104
+                                || syscall_num == 105 || syscall_num == 106
+                                || syscall_num == 107 || syscall_num == 108 {
+                            // gettid(186), getpid(20), getuid(102), getgid(104),
+                            // geteuid(105), getegid(106), getuid32, getgid32 → return 1 (a valid positive ID)
+                            1
                         } else {
-                            0 // success
+                            -1 // generic error (-EPERM) — caller handles via error path
                         };
                         if new_ret != -38 {
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
