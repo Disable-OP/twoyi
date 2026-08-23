@@ -5749,6 +5749,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // between fork() and execve().
     use std::os::unix::fs::PermissionsExt;
     let twrp_log_path_str: String = format!("{}/twrp-init.log", rootfs_prefix);
+    // NOTE (Task 6-Z88): the CString is built unconditionally because the
+    // child branch below references it inside its own `cfg.boot_recovery`
+    // runtime check (construction is side-effect-free — just format! +
+    // CString::new). Only the FILE pre-create + its logging is gated:
+    // in normal (AOSP) mode there is no TWRP init to redirect, so the
+    // pre-create + info!/warning! chatter was pure noise (run 32632668179).
     let twrp_log_path_cstr: CString =
         CString::new(twrp_log_path_str.as_str()).unwrap_or_else(|_| {
             // Path contained an interior NUL — extremely unlikely for
@@ -5757,33 +5763,35 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // then fail and the existing WARN branch will fire.
             CString::new("/twrp-init.log").unwrap()
         });
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&twrp_log_path_str)
-    {
-        Ok(_) => {
-            // World-readable so init (which may run as a different
-            // UID under TWRP's recovery policy) can still append.
-            let _ = std::fs::set_permissions(
-                &twrp_log_path_str,
-                std::fs::Permissions::from_mode(0o666),
-            );
-            info!(
-                "[KR64] PARENT: pre-created {} (mode 0666, truncated)",
-                twrp_log_path_str
-            );
-        }
-        Err(e) => {
-            // Don't make this fatal — the child's open() will still
-            // try and produce its own diagnostic. We just lose the
-            // pre-creation guarantee.
-            warning!(
-                "[KR64] PARENT: failed to pre-create {}: {} — child redirect may fail",
-                twrp_log_path_str,
-                e
-            );
+    if cfg.boot_recovery {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&twrp_log_path_str)
+        {
+            Ok(_) => {
+                // World-readable so init (which may run as a different
+                // UID under TWRP's recovery policy) can still append.
+                let _ = std::fs::set_permissions(
+                    &twrp_log_path_str,
+                    std::fs::Permissions::from_mode(0o666),
+                );
+                info!(
+                    "[KR64] PARENT: pre-created {} (mode 0666, truncated)",
+                    twrp_log_path_str
+                );
+            }
+            Err(e) => {
+                // Don't make this fatal — the child's open() will still
+                // try and produce its own diagnostic. We just lose the
+                // pre-creation guarantee.
+                warning!(
+                    "[KR64] PARENT: failed to pre-create {}: {} — child redirect may fail",
+                    twrp_log_path_str,
+                    e
+                );
+            }
         }
     }
 
@@ -6886,23 +6894,38 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             );
             // Run the ptrace loop — this blocks until the child exits.
             //
-            // We construct the Vfs here. For now every boot path uses
-            // new_twrp() (TWRP-mode entries — /dev/__properties__/... +
-            // /dev/__properties__ dir). Future boot modes (full Android
-            // guest) can populate additional entries (e.g. /proc/self/maps
-            // as a Dynamic node) by extending new_twrp() or adding a new
-            // constructor. The ptrace_emu's open/openat ENTRY-stop
-            // handler asks the Vfs to materialise synthetic files into
-            // rootfs before the real kernel open() runs, replacing the
+            // We construct the Vfs here. Task 6-Z88: TWRP boots use
+            // new_twrp() (the AOSP 5.1 single-file /dev/__properties__
+            // override); NORMAL (AOSP) boots use new_android(pid) — the
+            // Android-guest entries (/dev/__properties__/properties_serial
+            // + /proc/self/* Dynamic nodes) keyed to the ACTUAL guest pid
+            // (init), which is what the 8.1 bionic linker + zygote will
+            // look up. The ptrace_emu's open/openat ENTRY-stop handler
+            // asks the Vfs to materialise synthetic files into rootfs
+            // before the real kernel open() runs, replacing the
             // find_property binary patch (worklog 1-A F.1 + 1-B Task 3).
-            let vfs = vfs::Vfs::new_twrp();
+            let vfs = if cfg.boot_recovery {
+                vfs::Vfs::new_twrp()
+            } else {
+                info!("[KR64] PARENT: normal (AOSP) boot — using Vfs::new_android(pid={}) (Task 6-Z88)", pid);
+                vfs::Vfs::new_android(pid as u32)
+            };
 
             // Task 6-Z49: proactively fork the recovery child BEFORE the
             // ptrace loop starts. The re-spawn cycle (kr64 re-forks every
             // ~2s) kills kr64 before init reaches the recovery service
             // execve (at syscall #466). By forking the recovery child
             // directly, we don't need init to start the service.
-            let recovery_pid = {
+            //
+            // Task 6-Z88: TWRP-ONLY. The whole block (PT_INTERP patching
+            // of {rootfs}/sbin/recovery + the fork itself) is gated behind
+            // cfg.boot_recovery: in normal (AOSP) mode the guest boots via
+            // init + zygote — there is no /sbin/recovery, and the fork
+            // just execve-failed + exit(127)'d on EVERY attempt (a second
+            // doomed child, pid 5993, in run 32632668179) while the
+            // PT_INTERP patcher was mutating the Android rootfs's
+            // binaries. Normal mode gets recovery_pid = None.
+            let recovery_pid = if cfg.boot_recovery {
                 let recovery_path = format!("{}/sbin/recovery", cfg.rootfs);
 
                 // Task 6-Z50: Read the recovery binary's PT_INTERP and patch it
@@ -7109,6 +7132,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     error!("[KR64] Task 6-Z49: fork FAILED for recovery child");
                     None
                 }
+            } else {
+                // Task 6-Z88: normal (AOSP) mode — no /sbin/recovery, no
+                // PT_INTERP patching, no doomed fork. recovery_pid = None.
+                info!("[KR64] PARENT: boot_recovery=false — skipping TWRP recovery child fork + PT_INTERP patch (Task 6-Z88)");
+                None
             };
 
             let exit_code = ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs, &vfs, recovery_pid);
