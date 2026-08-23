@@ -4830,6 +4830,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!(
             "[KR64] PARENT: pre-created /dev/input/event0+event1 probe files (the fb hook's input bridge intercepts their open)"
         );
+        // 6-Z96b: also write the ABSOLUTE host path of the touch socket
+        // into {rootfs}/dev/.touch-sock — the fb hook's INPUT bridge reads
+        // this file (its openat is intercepted + translated to the real
+        // file) and connects to that absolute path. Replaces the
+        // getenv-based resolution: the ancient bionic linker inside the
+        // TWRP recovery binary leaves the hook's weak getenv PLT
+        // unresolved (run 32654424163: ncands=1, only the RELATIVE
+        // candidate was tried; relative sun_path resolves against the
+        // exec'd child's HOST CWD — not the rootfs — so it ENOENT'd).
+        {
+            let touch_sock = format!("{}/dev/touch-events", cfg.data_dir);
+            let sock_hint = format!("{}/dev/.touch-sock", cfg.rootfs);
+            if let Err(e) = std::fs::write(&sock_hint, touch_sock.as_bytes()) {
+                warning!("[KR64] PARENT: failed to write {}: {}", sock_hint, e);
+            } else {
+                info!(
+                    "[KR64] PARENT: wrote {} ({} bytes) — the fb hook's input bridge reads it for the absolute socket path",
+                    sock_hint,
+                    touch_sock.len()
+                );
+            }
+        }
     }
 
     // TWRP BOOT: create /dev/kmsg as a symlink to /twrp-kmsg.log so TWRP's
