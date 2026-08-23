@@ -4605,12 +4605,14 @@ pub fn run_ptrace_loop(
     // (init is i386 after its first execve → recovery is also i386).
     // If the child later calls execve (e.g. init forks, then the child
     // execve's /sbin/recovery), the existing execve-detection logic
-    // (saw_execve / reset_abi_next at the top of run_ptrace_loop)
-    // re-detects the ABI from /proc/<pid>/exe. So we do NOT need a
-    // per-child ABI map — the single shared `abi: Option<ChildAbi>`
-    // local correctly tracks whichever child is currently stopped,
-    // because only one child makes syscalls at a time (init BLOCKS in
-    // waitpid while the recovery service runs).
+    // (saw_execve_pid / reset_abi_pid at the top of run_ptrace_loop)
+    // re-detects the ABI from /proc/<pid>/exe. The ABI cache is PER
+    // CHILD (Task 6-Z75: `abi_map: HashMap<pid, ChildAbi>`) — the old
+    // single shared `abi: Option<ChildAbi>` slot meant whichever child
+    // stopped first after ANY child's execve re-detected bitness for
+    // EVERYONE (run 32610013970: init's 64-bit stop poisoned the
+    // recovery child's entire linker phase → 0 library injections →
+    // CANNOT LINK). Each child now detects + caches its own bitness.
     let ptrace_opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
         | libc::PTRACE_O_TRACEFORK
         | libc::PTRACE_O_TRACECLONE
@@ -4868,6 +4870,18 @@ pub fn run_ptrace_loop(
     // ABI_AARCH64 (on aarch64). Until then we have no registers to
     // look at, so there is nothing to dispatch on.
     let mut abi: Option<ChildAbi> = None;
+    // Task 6-Z75: PER-CHILD ABI cache. `abi` above is now only the
+    // CURRENT STOP's cached copy (refreshed from `abi_map` at every
+    // syscall stop), kept so the ~100 downstream `abi.unwrap()` sites
+    // keep working unchanged. The authoritative per-child bitness
+    // lives in this map — the previous single shared slot let
+    // whichever child stopped first after an execve define the ABI
+    // for EVERY child (the 4th cross-child single-slot bug; same
+    // pattern as pending_mmap2_content / pending_open_translated_path
+    // before their per-pid fixes). ChildAbi is Copy (plain struct of
+    // i64 fields), so per-stop copies are cheap.
+    let mut abi_map: std::collections::HashMap<libc::pid_t, ChildAbi> =
+        std::collections::HashMap::new();
     // ── Scratch area for translated paths ───────────────────────────
     //
     // Translated paths (e.g. `/init.rc` →
@@ -5029,17 +5043,21 @@ pub fn run_ptrace_loop(
     // compat child rdi actually holds edi, the 5th arg — so the ptrace
     // emulator reads "mode=0755" instead of the mount source path).
     //
-    // FIX: track execve explicitly. When we see an execve ENTRY, set
-    // `saw_execve`. At the execve EXIT, set `reset_abi_next`. At the
-    // top of the next loop iteration (before any handler runs), reset
-    // `abi = None` so the NEXT syscall stop re-reads /proc/<pid>/exe
-    // — which now points to the new binary (i386 init).
+    // FIX: track execve explicitly. When we see an execve ENTRY, record
+    // `saw_execve_pid` (WHICH child exec'd). At the execve EXIT, arm
+    // `reset_abi_pid`. At the top of the next loop iteration (before
+    // any handler runs), remove ONLY that pid's entry from `abi_map`
+    // so THAT child's next syscall stop re-reads /proc/<pid>/exe —
+    // which now points to the new binary (i386 init). Other children's
+    // cached ABIs are untouched (Task 6-Z75: the previous global
+    // `abi = None` reset let whichever child stopped NEXT define the
+    // ABI for everyone).
     //
     // We check the execve number for ALL ABIs the child could be at
     // that point (x86_64=59, i386=11, aarch64=221) so we catch execve
     // regardless of the child's current bitness.
-    let mut saw_execve: bool = false;
-    let mut reset_abi_next: bool = false;
+    let mut saw_execve_pid: Option<libc::pid_t> = None;
+    let mut reset_abi_pid: Option<libc::pid_t> = None;
     // True once we've processed the first execve's ABI reset. Used to
     // log the first N post-execve syscalls (which are the new binary's
     // own syscalls — the most useful diagnostic for "what does TWRP
@@ -5092,24 +5110,27 @@ pub fn run_ptrace_loop(
     let mut current_pid: libc::pid_t = pid;
 
     loop {
-        // ── Deferred ABI reset (after execve EXIT) ──
+        // ── Deferred ABI reset (after execve EXIT) — PER CHILD ──
         //
-        // If the previous iteration was an execve EXIT, reset `abi`
-        // here so the CURRENT iteration's handler re-detects the
-        // child's bitness from /proc/<pid>/exe (which now points to
-        // the new binary). This runs BEFORE waitpid, so both the
-        // SIGTRAP|0x80 path and the SIGSYS path will see abi=None
-        // and re-detect.
-        if reset_abi_next {
-            if abi.is_some() {
-                let prev_label = abi_label(abi.unwrap());
+        // If the previous iteration armed `reset_abi_pid` (that child
+        // completed an execve), remove ONLY that child's entry from
+        // the per-pid ABI cache here, so THAT child's next syscall
+        // stop re-detects its bitness from its own /proc/<pid>/exe
+        // (which now points to the new binary). This runs BEFORE
+        // waitpid, so both the SIGTRAP|0x80 path and the SIGSYS path
+        // re-detect for the exec'ing child. Other children keep their
+        // cached ABIs — a global reset here is exactly the
+        // cross-child race that poisoned the recovery child's linker
+        // phase in run 32610013970 (Task 6-Z75).
+        if let Some(reset_pid) = reset_abi_pid.take() {
+            if let Some(prev) = abi_map.remove(&reset_pid) {
                 log(&format!(
-                    "execve completed — resetting ABI (was {}) to re-detect child bitness from /proc/{}/exe",
-                    prev_label, pid
+                    "execve completed — resetting cached ABI of pid {} (was {}) to re-detect child bitness from /proc/{}/exe at its next stop",
+                    reset_pid,
+                    abi_label(prev),
+                    reset_pid
                 ));
-                abi = None;
             }
-            reset_abi_next = false;
             past_first_execve = true;
             post_execve_syscall_count = 0;
             // CRITICAL: reset the scratch area. The scratch area was
@@ -5317,6 +5338,9 @@ pub fn run_ptrace_loop(
                 "child {} exited with code {} (after {} iterations)",
                 pid, code, loop_count
             ));
+            // Task 6-Z75 hygiene: drop the exited child's cached ABI so
+            // a later fork can never inherit a stale entry via pid reuse.
+            abi_map.remove(&pid);
             // Print the last few SIGSYS-intercepted syscalls so we can
             // identify what init was doing right before it died. This is
             // critical for diagnosing the "init exits with code 1 at
@@ -5410,6 +5434,9 @@ pub fn run_ptrace_loop(
                 "child {} killed by signal {} (after {} iterations)",
                 pid, sig, loop_count
             ));
+            // Task 6-Z75 hygiene: same as the WIFEXITED branch above —
+            // drop the killed child's cached ABI entry.
+            abi_map.remove(&pid);
             if !recent_sigsys.is_empty() {
                 let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                 log(&format!(
@@ -5590,9 +5617,9 @@ pub fn run_ptrace_loop(
                         //      execve of /sbin/recovery that's currently
                         //      invisible).
                         //   2. Defensive ABI reset — even if our normal
-                        //      saw_execve / reset_abi_next path already
-                        //      handled the execve EXIT stop, set the
-                        //      reset flag here too in case the syscall-
+                        //      saw_execve_pid / reset_abi_pid path already
+                        //      handled the execve EXIT stop, arm the
+                        //      per-pid reset here too in case the syscall-
                         //      EXIT stop was skipped (which is exactly
                         //      the DISPATCHER-FINAL-15 hypothesis). This
                         //      guarantees we re-detect the ABI from
@@ -5632,12 +5659,13 @@ pub fn run_ptrace_loop(
                                 pid
                             ));
                         }
-                        // Defensive: arm the deferred ABI reset so the
-                        // next syscall-stop re-detects bitness from
-                        // /proc/<pid>/exe (which now points to the new
-                        // binary). If the normal execve-EXIT path already
-                        // armed it, this is a harmless no-op.
-                        reset_abi_next = true;
+                        // Defensive: arm the deferred PER-PID ABI reset
+                        // (Task 6-Z75) so THIS child's next syscall-stop
+                        // re-detects bitness from its /proc/<pid>/exe
+                        // (which now points to the new binary). If the
+                        // normal execve-EXIT path already armed it for
+                        // this pid, this is a harmless overwrite.
+                        reset_abi_pid = Some(pid);
                         // CRITICAL: the execve syscall-exit stop is
                         // suppressed by the EXEC event, so we MUST
                         // clear `in_syscall` or the next stop is
@@ -6005,15 +6033,18 @@ pub fn run_ptrace_loop(
                     }
                 };
 
-                // Lazily initialize the per-child ABI on the first
-                // successful register read. On x86_64 we read the
-                // child's ELF header via /proc/<pid>/exe to detect
-                // bitness (PTRACE_GETREGS, which is the fallback path
-                // on the x86_64 Android emulator, does not expose
-                // iov_len — so iov_len-based detection no longer
-                // works there). On aarch64 the child is always 64-bit
-                // so we use ABI_AARCH64 unconditionally.
-                if abi.is_none() {
+                // Lazily initialize the PER-CHILD ABI (Task 6-Z75) on
+                // the first successful register read FOR THIS PID. On
+                // x86_64 we read the child's ELF header via
+                // /proc/<pid>/exe to detect bitness (PTRACE_GETREGS,
+                // which is the fallback path on the x86_64 Android
+                // emulator, does not expose iov_len — so iov_len-based
+                // detection no longer works there). On aarch64 the
+                // child is always 64-bit so we use ABI_AARCH64
+                // unconditionally. Each traced child gets its OWN
+                // cached entry in `abi_map`; the local `abi` below is
+                // just this stop's copy of the CURRENT child's entry.
+                if !abi_map.contains_key(&pid) {
                     #[cfg(target_arch = "x86_64")]
                     let (picked, bitness_label) = match detect_child_is_64bit(pid) {
                         Some(true) => (ABI_X86_64, "64-bit (x86_64)"),
@@ -6025,10 +6056,16 @@ pub fn run_ptrace_loop(
                     };
                     #[cfg(target_arch = "aarch64")]
                     let (picked, bitness_label) = (ABI_AARCH64, "64-bit (aarch64)");
-                    log(&format!("detected child bitness: {}", bitness_label));
-                    abi = Some(picked);
+                    log(&format!(
+                        "detected child bitness: {} (pid={})",
+                        bitness_label, pid
+                    ));
+                    abi_map.insert(pid, picked);
                 }
-                // Safe to unwrap: we just set `abi` if it was None.
+                // Refresh the current-stop cache from the per-pid map
+                // (ChildAbi is Copy). Safe to unwrap: we just inserted
+                // an entry for `pid` if it was missing.
+                abi = Some(*abi_map.get(&pid).unwrap());
                 let abi = abi.unwrap();
 
                 let syscall_num = get_syscall_num(&regs, &abi);
@@ -6226,8 +6263,9 @@ pub fn run_ptrace_loop(
                     // When the child calls execve, its memory image is
                     // about to be replaced. /proc/<pid>/exe currently
                     // still points to the OLD binary, but at execve EXIT
-                    // it will point to the NEW binary. We set `saw_execve`
-                    // here so the EXIT handler can schedule an ABI reset.
+                    // it will point to the NEW binary. We record
+                    // `saw_execve_pid` (THIS child) here so the EXIT
+                    // handler can schedule a per-pid ABI reset.
                     //
                     // We compare against `abi.execve` (the current ABI's
                     // execve number). This is correct because:
@@ -6239,10 +6277,10 @@ pub fn run_ptrace_loop(
                     //     number, so a second execve (e.g. init →
                     //     recovery) is also caught.
                     if syscall_num == abi.execve {
-                        saw_execve = true;
+                        saw_execve_pid = Some(pid);
                         log(&format!(
-                            "execve ENTRY (nr={}) — will reset ABI after EXIT to re-detect child bitness",
-                            syscall_num
+                            "execve ENTRY (nr={}, pid {}) — will reset its cached ABI after EXIT to re-detect child bitness",
+                            syscall_num, pid
                         ));
 
                         // Task 6-Z42: inject a 64-bit execve to bypass seccomp.
@@ -8572,26 +8610,31 @@ pub fn run_ptrace_loop(
                         }
                     }
 
-                    // ── execve EXIT: schedule ABI reset ──
+                    // ── execve EXIT: schedule PER-PID ABI reset ──
                     //
-                    // If the ENTRY for this syscall was an execve (flag
-                    // set above), the child's image has now been
+                    // If the ENTRY for this syscall was an execve (pid
+                    // recorded above), the child's image has now been
                     // replaced. /proc/<pid>/exe points to the new
-                    // binary. We set `reset_abi_next` so the TOP of the
-                    // next loop iteration resets `abi = None`, forcing
-                    // a fresh bitness detection at the next syscall
-                    // stop. This is what actually fixes the
-                    // "permanently locked to x86_64" bug.
+                    // binary. We arm `reset_abi_pid` so the TOP of the
+                    // next loop iteration removes THAT pid's entry
+                    // from `abi_map`, forcing a fresh bitness
+                    // detection at THAT child's next syscall stop.
+                    // This is what actually fixes the "permanently
+                    // locked to x86_64" bug — and scoping it to the
+                    // exec'ing pid (Task 6-Z75) keeps OTHER children's
+                    // cached ABIs valid.
                     //
                     // We do the reset at the TOP of the next iteration
                     // (not here) so the SIGSYS handler — which also
-                    // checks `abi.is_none()` and re-detects — sees the
+                    // consults `abi_map` and re-detects — sees the
                     // reset state if a SIGSYS fires before the next
                     // SIGTRAP|0x80 stop.
-                    if saw_execve {
-                        saw_execve = false;
-                        reset_abi_next = true;
-                        log("execve EXIT — will reset ABI at next stop");
+                    if let Some(exec_pid) = saw_execve_pid.take() {
+                        reset_abi_pid = Some(exec_pid);
+                        log(&format!(
+                            "execve EXIT (pid {}) — will reset its cached ABI at next loop top",
+                            exec_pid
+                        ));
                     }
 
                     if pending_getpid {
@@ -9858,16 +9901,18 @@ pub fn run_ptrace_loop(
                 let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
                 match ptrace_getregs(pid, &mut sigsys_regs) {
                     Ok(len) => {
-                        // Initialize the ABI on the first successful
-                        // register read — seccomp can fire on the very
-                        // first syscall after execve, before any
+                        // Initialize the PER-CHILD ABI (Task 6-Z75) on
+                        // the first successful register read FOR THIS
+                        // PID — seccomp can fire on the very first
+                        // syscall after execve, before any
                         // SIGTRAP|0x80 syscall-stop has had a chance
                         // to set it. We use the same ELF-based
-                        // detection as the SIGTRAP|0x80 path so the
-                        // two paths agree on the child's bitness even
-                        // when PTRACE_GETREGSET returns EIO (and we
+                        // detection + the same `abi_map` as the
+                        // SIGTRAP|0x80 path so the two paths agree on
+                        // each child's bitness even when
+                        // PTRACE_GETREGSET returns EIO (and we
                         // silently fell through to PTRACE_GETREGS).
-                        if abi.is_none() {
+                        if !abi_map.contains_key(&pid) {
                             #[cfg(target_arch = "x86_64")]
                             let (picked, bitness_label) = match detect_child_is_64bit(pid) {
                                 Some(true) => (ABI_X86_64, "64-bit (x86_64)"),
@@ -9880,11 +9925,14 @@ pub fn run_ptrace_loop(
                             #[cfg(target_arch = "aarch64")]
                             let (picked, bitness_label) = (ABI_AARCH64, "64-bit (aarch64)");
                             log(&format!(
-                                "detected child bitness (SIGSYS path): {}",
-                                bitness_label
+                                "detected child bitness (SIGSYS path): {} (pid={})",
+                                bitness_label, pid
                             ));
-                            abi = Some(picked);
+                            abi_map.insert(pid, picked);
                         }
+                        // Refresh the current-stop cache from the
+                        // per-pid map (same as the SIGTRAP|0x80 path).
+                        abi = Some(*abi_map.get(&pid).unwrap());
                         let a = abi.unwrap();
 
                         // Read the ORIGINAL syscall number BEFORE rewriting
