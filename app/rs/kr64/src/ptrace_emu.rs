@@ -260,6 +260,24 @@ struct ChildAbi {
     stat64: i64,
     lstat64: i64,
     fstat64: i64,
+    // pread64 — reads at an explicit 64-bit offset. Task 6-Z71: the
+    // recovery child's bionic linker loads ELF headers + DT_* entries
+    // with pread64; the app's seccomp filter blocks the i386 variant
+    // (nr=180, 53x in E2E run 32604929372) with -ENOSYS. The dedicated
+    // ENTRY arm snapshots (fd, buf, count, offset-pair) and the EXIT
+    // consumer services the read from the HOST copy of the file.
+    //
+    // i386 pread64 passes the 64-bit offset as a REGISTER PAIR (a 32-bit
+    // register cannot hold it): arg4 = pos_lo, arg5 = pos_hi — verified
+    // against arch/x86/kernel/sys_ia32.c sys_ia32_pread64("..., u32, poslo,
+    // u32, poshi") and bionic android-5.1.0_r1's libc/arch-x86/syscalls/
+    // pread64.S (mov 36(%esp),%esi / mov 40(%esp),%edi — the by-value
+    // off64_t stack arg lands LO-first in esi=arg4, HI in edi=arg5).
+    // Numbers per the kernel UAPI headers:
+    //   i386:   __NR_pread64 180
+    //   x86_64: __NR_pread64 17
+    //   aarch64 (asm-generic): __NR_pread64 67
+    pread64: i64,
     access: i64,
     faccessat: i64,
     rt_sigprocmask: i64,
@@ -866,6 +884,12 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     stat64: -1,
     lstat64: -1,
     fstat64: -1,
+    // x86_64 pread64 = 17 (asm/unistd_64.h). The dedicated 6-Z71 arms
+    // only ever FAKE a read when the fresh return is -38 (seccomp
+    // filter block) — x86_64 pread64 executes normally under the
+    // filter's allow list, so this number never actually triggers
+    // emulation; it is carried for correctness/logging parity.
+    pread64: 17,
     access: 21,
     faccessat: 48,
     rt_sigprocmask: 14,
@@ -1078,6 +1102,18 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     stat64: 195,
     lstat64: 196,
     fstat64: 197,
+    // Task 6-Z71: i386 pread64 = 180 (per
+    // /usr/include/x86_64-linux-gnu/asm/unistd_32.h: __NR_pread64 180,
+    // cross-checked against arch/x86/entry/syscalls/syscall_32.tbl:
+    // "180 i386 pread64 sys_ia32_pread64"). THIS is the value that fires
+    // at runtime — the recovery child's bionic linker issues pread64
+    // (fd, buf, count, offset_lo=arg4/esi, offset_hi=arg5/edi) to read
+    // ELF headers + DT_* entries of each library; the app's seccomp
+    // filter blocks it 53x with -ENOSYS in E2E run 32604929372. The
+    // dedicated 6-Z71 ENTRY arm snapshots the args and the EXIT
+    // consumer services the read from the HOST file into the child's
+    // buffer (see the pending_pread64 block).
+    pread64: 180,
     access: 33,
     faccessat: 307,
     // i386 rt_sigprocmask = 175 (per /usr/include/x86_64-linux-gnu/
@@ -1359,6 +1395,12 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     stat64: -1,
     lstat64: -1,
     fstat64: -1,
+    // aarch64 (asm-generic) pread64 = 67. The dedicated 6-Z71 arms only
+    // ever FAKE a read when the fresh return is -38 (seccomp filter
+    // block) — aarch64 pread64 executes normally under the filter's
+    // allow list, so this number never actually triggers emulation; it
+    // is carried for correctness/logging parity with the other fields.
+    pread64: 67,
     access: -1,
     faccessat: 48,
     rt_sigprocmask: 135,
@@ -2228,6 +2270,47 @@ fn i386_enosys_fake_value(nr: i64) -> i64 {
                                        // separately by the SIGSYS handler)
         191 => -1,                     // ugetrlimit → error (buffer would be
                                        // untouched garbage on fake success)
+        67 | 174 => 0,                 // sigaction/rt_sigaction → success
+                                       // (Task 6-Z70: the linker + libc
+                                       // install SIGSEGV/SIGABRT handlers
+                                       // during early init; a -1 return makes
+                                       // libc-style wrappers retry in a loop
+                                       // — 40x observed in run 32604929372.
+                                       // 0 = "handler installed" (we do NOT
+                                       // record it: the ptrace loop already
+                                       // forwards signals itself).
+        175 => 0,                      // rt_sigprocmask → success
+        91 => 0,                       // munmap → success (the mapping stays
+                                       // resident = a leak, but 32MB budget
+                                       // headroom covers the linker's churn)
+        240 => 0,                      // futex → success (spurious wake)
+        253 => 0,                      // set_tid_address → success (Agent I
+                                       // flag: fires right before 243 in
+                                       // __libc_init_tls)
+        195 | 196 | 197 => -1,         // stat64/lstat64/fstat64 → error.
+                                       // Task 6-Z71: these WRITE a 96-byte
+                                       // struct into the caller's buffer;
+                                       // faking success here (0) with an
+                                       // untouched buffer hands the linker
+                                       // GARBAGE (uninitialized stack bytes
+                                       // read as st_size → insane mmap
+                                       // lengths). The dedicated 6-Z71 arms
+                                       // build the REAL struct from the host
+                                       // file's metadata + write it via
+                                       // POKEDATA/vm_writev, then force 0.
+                                       // This table entry is only the
+                                       // fallback for when the dedicated
+                                       // arm never ran (phase DESYNC /
+                                       // unreadable args) — an honest -1
+                                       // beats a fake struct full of stack
+                                       // garbage.
+        180 => -1,                     // pread64 → error. Same 6-Z71
+                                       // reasoning: the dedicated arm
+                                       // copies REAL bytes into the child's
+                                       // buffer and returns the byte count;
+                                       // the table fallback stays -1 because
+                                       // a fake byte count with an untouched
+                                       // buffer = garbage read.
         11 => -2,                       // execve → -ENOENT (Task 6-Z66): init's
                                        // i386 execve is ENTRY-skipped (6-Z49) or
                                        // seccomp-blocked; -ENOENT makes the
@@ -2617,6 +2700,20 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // `abi.poll_nr != -1` so the branch is fully skipped on
         // aarch64.
         "poll"
+    } else if abi.open != -1 && nr == abi.open {
+        // Task 6-Z71: open/openat/openat2 + pread64 labels — the
+        // linker-rescue syscalls. Pre-6-Z71 these were "[unknown]" in
+        // the post-execve syscall logs (e.g. "nr=295 [unknown]" for
+        // EVERY library openat, 54x per boot), which made the linker's
+        // syscall profile needlessly hard to read. No behavioural
+        // change — labels only.
+        "open"
+    } else if abi.openat != -1 && nr == abi.openat {
+        "openat"
+    } else if abi.openat2 != -1 && nr == abi.openat2 {
+        "openat2"
+    } else if abi.pread64 != -1 && nr == abi.pread64 {
+        "pread64"
     } else {
         "unknown"
     }
@@ -2840,6 +2937,251 @@ fn read_child_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> 
     }
     Some(result)
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Task 6-Z71: stat64/lstat64/fstat64 (i386 nr=195/196/197) + pread64
+// (i386 nr=180) — REAL emulation via ptrace.
+//
+// The app's seccomp filter blocks these with -ENOSYS (E2E run
+// 32604929372: fstat64 54x, openat 54x, pread64 53x, close 52x). The
+// 6-Z60 fake table can only FAKE A RETURN VALUE — but the stat family
+// WRITES a 96-byte struct into the caller's buffer and pread64 WRITES
+// up to `count` bytes into it. Faking return 0 with an untouched
+// buffer hands the bionic linker uninitialized stack bytes it reads
+// as st_size → insane mmap lengths → "CANNOT LINK" → exit 255.
+//
+// The emulation: at ENTRY snapshot the args (fd / path + statbuf, or
+// fd+buf+count+offset-pair), at EXIT — when the GENUINE kernel return
+// is -38 (the syscall never executed, the buffer is untouched) — do
+// the work in the TRACER against the HOST copy of the file and write
+// the result into the child with POKEDATA/process_vm_writev (the
+// proven 6-Z62 injection machinery), then force the return value.
+//
+// ── struct stat64 layout verification (Task 6-Z71) ──────────────────
+//
+// The ONLY authoritative source is the kernel UAPI header
+// arch/x86/include/uapi/asm/stat.h (`#ifdef __i386__`); bionic's copy
+// (android-5.1.0_r1 libc/kernel/uapi/asm-x86/asm/stat.h) is VERBATIM
+// identical (fetched copies in agents/agentJ/). With i386 natural
+// alignment (long long is 4-BYTE aligned on i386 — NOT 8):
+//
+//   offset  size  field
+//        0     8  st_dev        (u64, huge_encode_dev == new_encode_dev)
+//        8     4  __pad0[4]     (kernel leaves STALE — we zero it)
+//       12     4  __st_ino      (32-bit truncation; STAT64_HAS_BROKEN_ST_INO)
+//       16     4  st_mode       (full mode incl. S_IFMT bits)
+//       20     4  st_nlink
+//       24     4  st_uid
+//       28     4  st_gid
+//       32     8  st_rdev       (u64)
+//       40     4  __pad3[4]     (kernel leaves STALE — we zero it)
+//       44     8  st_size       (SIGNED long long!)
+//       52     4  st_blksize
+//       56     8  st_blocks     (512-byte units, u64)
+//       64     4  st_atime      (unsigned long = 32-bit seconds)
+//       68     4  st_atime_nsec
+//       72     4  st_mtime
+//       76     4  st_mtime_nsec
+//       80     4  st_ctime
+//       84     4  st_ctime_nsec
+//       88     8  st_ino        (FULL 64-bit inode)
+//   total 96 bytes.
+//
+// NOTE: the dispatcher's task brief carried a subtly WRONG tail (a
+// phantom __pad4 at 64 shifting atime..st_ino +4). The kernel header
+// + arch/x86/kernel/sys_ia32.c cp_stat64() (which writes exactly the
+// fields above and NOTHING else — the two __pad arrays are never
+// written by the kernel) win, as instructed.
+//
+// st_dev/st_rdev encoding: cp_stat64 uses huge_encode_dev(), which is
+// literally new_encode_dev() (include/linux/kdev_t.h) — i.e. the same
+// userspace makedev encoding that stat(2) reports, which is what Rust's
+// MetadataExt::dev()/rdev() return. Copying those verbatim is exact.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Total size of the i386 `struct stat64` (kernel uapi asm/stat.h).
+const I386_STAT64_STRUCT_SIZE: usize = 96;
+
+/// The stat fields the i386 stat64 ABI exposes, in tracer-native form.
+/// Split from `std::fs::Metadata` so the layout builder is unit-testable
+/// without touching the filesystem.
+struct Stat64Fields {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    /// SIGNED on the wire (`long long st_size`) — a negative value is
+    /// representable and must round-trip as two's-complement LE bytes.
+    st_size: i64,
+    st_blksize: u32,
+    st_blocks: u64,
+    st_atime_sec: i64,
+    st_atime_nsec: i64,
+    st_mtime_sec: i64,
+    st_mtime_nsec: i64,
+    st_ctime_sec: i64,
+    st_ctime_nsec: i64,
+}
+
+/// Extract the stat64-relevant fields from host metadata. Every value
+/// maps 1:1 to what the kernel's cp_stat64() would put_user() for the
+/// same file (see the block comment above for the dev/ino caveats).
+fn stat64_fields_from_metadata(md: &std::fs::Metadata) -> Stat64Fields {
+    use std::os::unix::fs::MetadataExt;
+    Stat64Fields {
+        st_dev: md.dev(),
+        st_ino: md.ino(),
+        st_mode: md.mode(),
+        st_nlink: md.nlink() as u32,
+        st_uid: md.uid(),
+        st_gid: md.gid(),
+        st_rdev: md.rdev(),
+        st_size: md.size() as i64,
+        st_blksize: md.blksize() as u32,
+        st_blocks: md.blocks(),
+        st_atime_sec: md.atime(),
+        st_atime_nsec: md.atime_nsec(),
+        st_mtime_sec: md.mtime(),
+        st_mtime_nsec: md.mtime_nsec(),
+        st_ctime_sec: md.ctime(),
+        st_ctime_nsec: md.ctime_nsec(),
+    }
+}
+
+/// Build the exact 96-byte little-endian i386 `struct stat64` image the
+/// kernel's compat_sys_ia32_{f}stat64 would have written. The two pad
+/// arrays are zeroed (the kernel leaves them stale; deterministic zeros
+/// are strictly safer for any caller memcmp-ing the struct).
+fn build_i386_stat64_bytes(f: &Stat64Fields) -> [u8; I386_STAT64_STRUCT_SIZE] {
+    let mut b = [0u8; I386_STAT64_STRUCT_SIZE];
+    // st_dev @0 (u64)
+    b[0..8].copy_from_slice(&f.st_dev.to_le_bytes());
+    // __pad0 @8 already zero
+    // __st_ino @12 — 32-bit truncation of the full ino (matches
+    // put_user(stat->ino, &ubuf->__st_ino) storing into an
+    // `unsigned long` field on i386; STAT64_HAS_BROKEN_ST_INO).
+    b[12..16].copy_from_slice(&(f.st_ino as u32).to_le_bytes());
+    b[16..20].copy_from_slice(&f.st_mode.to_le_bytes());
+    b[20..24].copy_from_slice(&f.st_nlink.to_le_bytes());
+    b[24..28].copy_from_slice(&f.st_uid.to_le_bytes());
+    b[28..32].copy_from_slice(&f.st_gid.to_le_bytes());
+    b[32..40].copy_from_slice(&f.st_rdev.to_le_bytes());
+    // __pad3 @40 already zero
+    // st_size @44 — signed long long, low dword first (LE).
+    b[44..52].copy_from_slice(&f.st_size.to_le_bytes());
+    b[52..56].copy_from_slice(&f.st_blksize.to_le_bytes());
+    b[56..64].copy_from_slice(&f.st_blocks.to_le_bytes());
+    // 32-bit truncating casts mirror the put_user into `unsigned long`
+    // (32-bit) fields: tv_sec values beyond 2106 wrap exactly like the
+    // kernel's store would.
+    b[64..68].copy_from_slice(&(f.st_atime_sec as u32).to_le_bytes());
+    b[68..72].copy_from_slice(&(f.st_atime_nsec as u32).to_le_bytes());
+    b[72..76].copy_from_slice(&(f.st_mtime_sec as u32).to_le_bytes());
+    b[76..80].copy_from_slice(&(f.st_mtime_nsec as u32).to_le_bytes());
+    b[80..84].copy_from_slice(&(f.st_ctime_sec as u32).to_le_bytes());
+    b[84..88].copy_from_slice(&(f.st_ctime_nsec as u32).to_le_bytes());
+    // st_ino @88 — FULL 64-bit inode.
+    b[88..96].copy_from_slice(&f.st_ino.to_le_bytes());
+    b
+}
+
+/// Task 6-Z71: reassemble the i386 pread64 64-bit offset from its
+/// register pair. The kernel's `sys_ia32_pread64(fd, buf, count, poslo,
+/// poshi)` takes arg4=LO, arg5=HI (arch/x86/kernel/sys_ia32.c:
+/// `((loff_t)poshi << 32) | poslo`); bionic's i386 stub loads exactly
+/// those two registers from the low/high dwords of the by-value off64_t
+/// stack argument (libc/arch-x86/syscalls/pread64.S). The register
+/// slots may carry high garbage (the kernel zero-extends 32-bit regs,
+/// but be defensive) — mask both halves to 32 bits before combining.
+fn i386_compat_pread64_offset(pos_lo_arg: u64, pos_hi_arg: u64) -> u64 {
+    ((pos_hi_arg & 0xffff_ffff) << 32) | (pos_lo_arg & 0xffff_ffff)
+}
+
+/// Task 6-Z71: resolve a REAL kernel fd of the traced child to its host
+/// path via /proc/<pid>/fd/<fd> readlink. Works for fds the loop never
+/// saw opened (inherited stdio, pre-attach fds). `readlink(2)` appends
+/// " (deleted)" for unlinked files — strip it (statting the stripped
+/// path then simply fails, which the caller handles).
+fn readlink_proc_fd(pid: libc::pid_t, fd: i32) -> Option<String> {
+    let p = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)).ok()?;
+    let mut s = p.to_string_lossy().into_owned();
+    const DELETED: &str = " (deleted)";
+    if s.ends_with(DELETED) {
+        s.truncate(s.len() - DELETED.len());
+    }
+    Some(s)
+}
+
+/// Task 6-Z71: service a pread64 for the tracer — read up to `max`
+/// bytes of the HOST file at byte `offset`. `None` = open/seek/read
+/// failed (caller leaves the syscall's error return in place). A `Some`
+/// with 0 bytes = clean EOF (offset at/past end) — exactly what a real
+/// pread64 returns there.
+fn host_pread_slice(path: &str, offset: u64, max: usize) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if max == 0 {
+        return Some(Vec::new());
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    // Seeking past EOF is legal; the read below then returns 0 (EOF).
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; max];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Task 6-Z71: ENTRY→EXIT handoff record for one stat-family syscall
+/// (mirrors `PendingMmap2Content`). `nr` distinguishes
+/// stat64(195)/lstat64(196)/fstat64(197) — it is re-checked at the EXIT
+/// stop (DESYNC gate, same as 6-Z62's gate 1).
+struct PendingStat64 {
+    pid: libc::pid_t,
+    nr: i64,
+    /// Child address of the 96-byte `struct stat64` buffer (arg2 for
+    /// all three variants).
+    statbuf: u64,
+    /// Where the target file lives. stat64/lstat64 carry the ALREADY
+    /// path-translated host path (recorded at ENTRY, before the child's
+    /// path register is redirected to the scratch copy); fstat64 carries
+    /// the fd for the open_fd_paths lookup (+ /proc readlink fallback).
+    source: Stat64Source,
+}
+
+enum Stat64Source {
+    Path { path: String, follow: bool },
+    Fd(i32),
+}
+
+/// Task 6-Z71: ENTRY→EXIT handoff record for one pread64 (nr=180).
+struct PendingPread64 {
+    pid: libc::pid_t,
+    fd: i32,
+    buf: u64,
+    /// Count already clamped to PREAD64_EMU_MAX_BYTES (a short return is
+    /// legal pread semantics; the caller loops for the remainder).
+    count: u64,
+    /// Full 64-bit byte offset, reassembled from the arg4/arg5 pair.
+    offset: u64,
+}
+
+/// Task 6-Z71: per-call cap on emulated pread64 payload (bounds the
+/// POKEDATA fallback cost — 64 KiB ≈ 8k words ≈ 25 ms worst case, and
+/// the linker's header/DT reads are all far smaller).
+const PREAD64_EMU_MAX_BYTES: u64 = 64 * 1024;
+
+/// Task 6-Z71: base of the synthetic-fd range handed to filter-blocked
+/// openat calls. Chosen far above anything the kernel can allocate
+/// (RLIMIT_NOFILE is capped far below 2^31/2 in practice — even the
+/// theoretical max is 2^20-ish per process on Android) and far below
+/// i32::MAX, so the value is always a positive i32 that no REAL kernel
+/// fd can ever collide with. Only the tracer's own
+/// open_fd_owner_paths map ever resolves it.
+const SYNTHETIC_FD_BASE: i32 = 0x7e00_0000;
+
 
 // ─────────────────────────────────────────────────────────────────────
 // Task 6-Z69: set_thread_area (i386 nr=243) — REAL TLS/GDT emulation
@@ -4142,6 +4484,37 @@ pub fn run_ptrace_loop(
     // getpid too — must not leak into bionic's __set_tls, which treats
     // any rc == -1 as failure and would SKIP loading %gs).
     let mut pending_set_thread_area_fake: bool = false;
+
+    // ── Task 6-Z71: stat64/lstat64/fstat64/pread64/openat emulation ──
+    //
+    // `pending_stat64` / `pending_pread64`: ENTRY→EXIT handoff records
+    //   (mirrors pending_mmap2_content / pending_set_thread_area_fake).
+    //   Armed at the dedicated ENTRY arms, consumed at the matching EXIT
+    //   stop BEFORE the 6-Z60 generic gate (which then re-reads FRESH
+    //   registers, sees the emulated success, and preserves it — the
+    //   same belt-and-suspenders relationship the other pending-*
+    //   consumers have). Both records are single-Options per the
+    //   established house pattern; cross-child interleave (init armed,
+    //   recovery consumes) is caught by the pid gate and DROPPED with a
+    //   loud log rather than corrupting the wrong child.
+    //
+    // `synthetic_fd_next`: per-pid allocator for the openat fake-fd
+    //   emulation. When the filter blocks an openat whose TRANSLATED
+    //   host path EXISTS, we hand the linker a synthetic fd (base far
+    //   above any real kernel fd — RLIMIT_NOFILE can never reach it)
+    //   and record synthetic_fd → host path in the SAME per-(pid, fd)
+    //   map the 6-Z62 mmap2 injector + these 6-Z71 consumers use. The
+    //   whole linker chain then works without a real kernel fd:
+    //   openat → fstat64(size) → pread64(ELF/DT_*) → mmap2(content
+    //   injection) → close (generic fake-0).
+    let mut pending_stat64: Option<PendingStat64> = None;
+    let mut pending_pread64: Option<PendingPread64> = None;
+    let mut synthetic_fd_next: std::collections::HashMap<libc::pid_t, i32> =
+        std::collections::HashMap::new();
+    // Shared rate-limit for 6-Z71 SKIP-path logs (init's stat64-poll
+    // loops fire thousands of legitimate ENOENTs — those must not flood
+    // logcat). EMULATED / FAILED lines are NOT counted.
+    let mut z71_skip_logs: u32 = 0;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
     //
@@ -5529,7 +5902,12 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         }
-                        in_syscall = !e;
+                        // NOTE: do NOT write `in_syscall` here — the ENTRY
+                        // branch below assigns `in_syscall = true` and the
+                        // EXIT branch assigns `in_syscall = false` on every
+                        // path, so a sync write at this point is dead code
+                        // (unused_assignments; the android CI denies
+                        // warnings — run 32607020470's build failure).
                         e
                     }
                     None => !in_syscall, // legacy parity fallback
@@ -6405,6 +6783,41 @@ pub fn run_ptrace_loop(
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
+                                // ── Task 6-Z71: arm the EXIT-side
+                                // stat64/lstat64 EMULATION record ──
+                                //
+                                // The 6-Z60 fake table returns -1 for
+                                // these (see i386_enosys_fake_value) —
+                                // faking 0 with an UNTOUCHED 96-byte
+                                // statbuf is the original garbage-size
+                                // bug. The record carries the
+                                // path-TRANSLATED host path (what the
+                                // write-back below just redirected the
+                                // child's register to — if the filter
+                                // happens to ALLOW the syscall, the
+                                // kernel stats the right file AND the
+                                // EXIT consumer sees a non-(-38) return
+                                // and leaves it alone). stat64 follows
+                                // symlinks (vfs_stat); lstat64 does NOT
+                                // (vfs_lstat) — the consumer picks
+                                // metadata vs symlink_metadata
+                                // accordingly.
+                                if (abi.stat64 != -1 && syscall_num == abi.stat64)
+                                    || (abi.lstat64 != -1 && syscall_num == abi.lstat64)
+                                {
+                                    let statbuf = get_syscall_arg(&regs, abi.reg_arg2);
+                                    if statbuf != 0 {
+                                        pending_stat64 = Some(PendingStat64 {
+                                            pid,
+                                            nr: syscall_num,
+                                            statbuf,
+                                            source: Stat64Source::Path {
+                                                path: translated.clone(),
+                                                follow: syscall_num == abi.stat64,
+                                            },
+                                        });
+                                    }
+                                }
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
@@ -6418,6 +6831,61 @@ pub fn run_ptrace_loop(
                                 {
                                     write_child_string(pid, path_addr, &translated);
                                 }
+                            }
+                        }
+                        // ── Task 6-Z71: fstat64 (i386 nr=197) ENTRY →
+                        // snapshot (fd, statbuf) for the EXIT-side real
+                        // emulation ──
+                        //
+                        // fstat64(fd, statbuf): arg1=fd (ebx), arg2=
+                        // statbuf (ecx). NO path translation here (the
+                        // fd is process state, not a path) — the EXIT
+                        // consumer resolves fd → host path via the
+                        // per-(pid,fd) open_fd_owner_paths map (6-Z62),
+                        // the fd-only open_fd_paths fallback (6-V), or
+                        // /proc/<pid>/fd/<fd> readlink (real inherited
+                        // fds). See the fstat64 consumer near the other
+                        // pending_* EXIT blocks for the full design.
+                        n if abi.fstat64 != -1 && n == abi.fstat64 => {
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let statbuf = get_syscall_arg(&regs, abi.reg_arg2);
+                            if statbuf != 0 && fd >= 0 {
+                                pending_stat64 = Some(PendingStat64 {
+                                    pid,
+                                    nr: syscall_num,
+                                    statbuf,
+                                    source: Stat64Source::Fd(fd),
+                                });
+                            }
+                        }
+                        // ── Task 6-Z71: pread64 (i386 nr=180) ENTRY →
+                        // snapshot (fd, buf, count, offset-pair) ──
+                        //
+                        // i386 layout (verified against kernel
+                        // sys_ia32_pread64 + bionic's pread64.S):
+                        //   arg1=fd (ebx), arg2=buf (ecx), arg3=count
+                        //   (edx), arg4=pos_LO (esi), arg5=pos_HI (edi).
+                        // The 64-bit offset is the REGISTER PAIR — ebp/
+                        // arg6 is UNUSED by this syscall. Count is
+                        // clamped to PREAD64_EMU_MAX_BYTES: a short
+                        // return is legal pread semantics and the
+                        // linker's read loop re-preads the remainder at
+                        // offset+returned (bionic linker tempfile.cpp
+                        // reads in a loop, exactly like read()).
+                        n if abi.pread64 != -1 && n == abi.pread64 => {
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let buf = get_syscall_arg(&regs, abi.reg_arg2);
+                            let count = get_syscall_arg(&regs, abi.reg_arg3);
+                            let pos_lo = get_syscall_arg(&regs, abi.reg_arg4);
+                            let pos_hi = get_syscall_arg(&regs, abi.reg_arg5);
+                            if fd >= 0 && buf != 0 && count > 0 {
+                                pending_pread64 = Some(PendingPread64 {
+                                    pid,
+                                    fd,
+                                    buf,
+                                    count: std::cmp::min(count, PREAD64_EMU_MAX_BYTES),
+                                    offset: i386_compat_pread64_offset(pos_lo, pos_hi),
+                                });
                             }
                         }
                         n if n == abi.access || n == abi.faccessat => {
@@ -7159,6 +7627,94 @@ pub fn run_ptrace_loop(
                                     log(&format!(
                                         "DIAG properties fd FAKE: open() returned {} for {} — faked fd=42 (zygote seccomp blocks i386 open on this path); mmap2 with MAP_SHARED on fd=42 will be rewritten to MAP_ANONYMOUS|MAP_PRIVATE",
                                         ret, p
+                                    ));
+                                }
+                            } else if ret == -38 {
+                                // ── Task 6-Z71: openat filter-blocked →
+                                // SYNTHETIC FD emulation ──
+                                //
+                                // E2E 32604929372: the recovery child's
+                                // bionic linker opens each library with
+                                // openat (i386 nr=295) and the filter
+                                // blocks it 54x with -ENOSYS — the open
+                                // NEVER EXECUTED, the linker sees (via
+                                // the 6-Z57 override) -1 and aborts the
+                                // library load. `ret` here comes from
+                                // the TOP-of-block `regs` snapshot, so
+                                // it still holds the GENUINE kernel
+                                // value (-38), not the 6-Z57-rewritten
+                                // -1.
+                                //
+                                // We can't create a REAL kernel fd in
+                                // the child — but we don't need one:
+                                // allocate a SYNTHETIC fd (far above
+                                // any real fd: RLIMIT_NOFILE tops out
+                                // ~1M; our base is 0x7E00_0000) and
+                                // record synthetic_fd → host path in
+                                // the SAME per-(pid,fd) map the 6-Z62
+                                // mmap2 injector + the 6-Z71
+                                // fstat64/pread64 consumers use. The
+                                // whole linker chain then runs in the
+                                // tracer:
+                                //   openat → fd=N (this branch)
+                                //   fstat64(N) → real stat64 struct
+                                //   pread64(N,…) → real bytes
+                                //   mmap2(N,…) → anonymous rewrite +
+                                //     content injection (6-Z62 resolves
+                                //     N in the same map)
+                                //   close(N) → generic fake-0
+                                //
+                                // HONESTY GATE: only fake when the
+                                // translated path EXISTS on the host
+                                // (metadata follows symlinks — the
+                                // pre-created /dev/null-style stubs are
+                                // symlinks to host devices). A missing
+                                // file keeps the error return, so the
+                                // linker sees a plain open failure for
+                                // genuinely absent libraries.
+                                if let Ok(md) = std::fs::metadata(p.as_str()) {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let base = synthetic_fd_next
+                                        .entry(pid)
+                                        .or_insert(SYNTHETIC_FD_BASE);
+                                    let fd = *base;
+                                    // Stay inside positive i32 range; the
+                                    // wrap only fires after ~33M opens.
+                                    *base = if fd >= 0x7fff_fff0 {
+                                        SYNTHETIC_FD_BASE
+                                    } else {
+                                        fd + 1
+                                    };
+                                    open_fd_paths.insert(fd, p.clone());
+                                    open_fd_owner_paths.insert((pid, fd), p.clone());
+                                    let fake_ret = fd as i64;
+                                    set_syscall_ret(&mut regs, &abi, fake_ret);
+                                    match ptrace_setregs(pid, &regs, iov_len) {
+                                        Ok(()) => log(&format!(
+                                            "6-Z71: {} EMULATED fd={} for {} ({} bytes, mode {:#o}) — filter blocked nr={} with -ENOSYS; synthetic fd recorded for fstat64/pread64/mmap2-inject (Task 6-Z71)",
+                                            syscall_name(syscall_num, &abi),
+                                            fd,
+                                            p,
+                                            md.len(),
+                                            md.permissions().mode() & 0o7777,
+                                            syscall_num
+                                        )),
+                                        Err(e) => {
+                                            // Roll the map inserts back so
+                                            // a half-installed synthetic fd
+                                            // can't be picked up later.
+                                            open_fd_paths.remove(&fd);
+                                            open_fd_owner_paths.remove(&(pid, fd));
+                                            log(&format!(
+                                                "6-Z71: openat EMULATION FAILED: ptrace_setregs: {} — open for {} stays at {} (Task 6-Z71)",
+                                                e, p, ret
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    log(&format!(
+                                        "6-Z71: openat EMULATION SKIPPED — filter-blocked (ret=-38) but host path {} does not exist; caller sees the error (Task 6-Z71)",
+                                        p
                                     ));
                                 }
                             }
@@ -7947,6 +8503,397 @@ pub fn run_ptrace_loop(
                                 "DIAG set_thread_area EXIT: ptrace_getregs FAILED: {} — cannot fake return 0 (Task 6-Z69)",
                                 e
                             )),
+                        }
+                    }
+
+                    // ── Task 6-Z71: stat64/lstat64/fstat64 EXIT → REAL
+                    // emulation (consume `pending_stat64`) ──
+                    //
+                    // Gates, cheapest first (mirrors the 6-Z62 mmap2
+                    // injection gates):
+                    //   1. pid match — a single-Option handoff armed by
+                    //      another child's ENTRY must not be consumed by
+                    //      this child's EXIT (init ↔ recovery interleave).
+                    //   2. syscall number still equals the armed nr —
+                    //      ENTRY/EXIT DESYNC protection.
+                    //   3. The GENUINE kernel return (read from the
+                    //      TOP-of-block `regs` snapshot, which PREDATES
+                    //      the 6-Z57 -38→-1 override further down the
+                    //      register pipeline) decides:
+                    //        >= 0  → the filter ALLOWED it; the compat
+                    //                kernel wrote the correct struct
+                    //                itself — leave everything alone.
+                    //        -38   → filter-blocked, syscall never ran,
+                    //                statbuf untouched → EMULATE.
+                    //        other → legitimate errno (-EBADF on a bad
+                    //                fd, -EFAULT on a bad statbuf…) —
+                    //                preserve it (faking success would
+                    //                mask real bugs).
+                    // Emulation: stat the HOST file (metadata for
+                    // stat64/fstat64 = vfs_stat/vfs_fstat follow
+                    // semantics; symlink_metadata for lstat64 =
+                    // vfs_lstat), build the 96-byte i386 struct stat64
+                    // (see build_i386_stat64_bytes for the verified
+                    // layout), write it with the 6-Z62 injection
+                    // machinery, and force rax=0 on a FULL write only —
+                    // a partial write leaves a half-garbage buffer, so
+                    // the error return stays (safer for the caller).
+                    //
+                    // fstat64's fd → host path resolution:
+                    //   open_fd_owner_paths[(pid,fd)] (6-Z62, covers
+                    //   synthetic fds too) → open_fd_paths[fd] (6-V
+                    //   fallback) → /proc/<pid>/fd/<fd> readlink (real
+                    //   inherited fds).
+                    //
+                    // Ordering vs the 6-Z60 generic gate below: same as
+                    // the other pending_* consumers — this block writes
+                    // the final rax FIRST; the gate then re-reads FRESH
+                    // registers, sees 0 (not -38), and preserves it.
+                    if pending_stat64.is_some() {
+                        let pending = pending_stat64.take().unwrap();
+                        let which = if pending.nr == abi.fstat64 {
+                            "fstat64"
+                        } else if pending.nr == abi.lstat64 {
+                            "lstat64"
+                        } else {
+                            "stat64"
+                        };
+                        // Human-readable target for the log lines ("fd=4"
+                        // / "path=/data/…/libc.so").
+                        let target_desc = match &pending.source {
+                            Stat64Source::Path { path, .. } => {
+                                format!("path={}", path)
+                            }
+                            Stat64Source::Fd(fd) => format!("fd={}", fd),
+                        };
+                        // Skip-logs are RATE-LIMITED (init's
+                        // stat64-poll loops fire thousands of legit
+                        // ENOENTs); EMULATED lines stay un-gated —
+                        // they are the point of 6-Z71 and bounded by
+                        // the linker's library count.
+                        let mut skip_log = |msg: String| {
+                            if z71_skip_logs < 300 {
+                                z71_skip_logs += 1;
+                                log(&msg);
+                            }
+                        };
+                        if pending.pid != pid {
+                            skip_log(format!(
+                                "6-Z71: {} emulation SKIPPED (pid mismatch) — armed by pid={} but this stop is pid={} (statbuf={:#x}) (Task 6-Z71)",
+                                which, pending.pid, pid, pending.statbuf
+                            ));
+                        } else if syscall_num != pending.nr {
+                            skip_log(format!(
+                                "6-Z71: {} emulation SKIPPED (DESYNC) — pending nr={} but this EXIT is nr={} [{}] (Task 6-Z71)",
+                                which,
+                                pending.nr,
+                                syscall_num,
+                                syscall_name(syscall_num, &abi)
+                            ));
+                        } else {
+                            // GENUINE kernel return (pre-6-Z57 value).
+                            let orig_ret =
+                                get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            if orig_ret >= 0 {
+                                // Filter allowed it — the kernel's own
+                                // compat handler wrote the struct.
+                                skip_log(format!(
+                                    "6-Z71: {} returned {} (filter allowed — kernel wrote its own struct; no emulation needed) (Task 6-Z71)",
+                                    which, orig_ret
+                                ));
+                            } else if orig_ret != -38 {
+                                skip_log(format!(
+                                    "6-Z71: {} emulation SKIPPED — legitimate errno {} (not the -38 filter artifact); caller sees the real error (Task 6-Z71)",
+                                    which, orig_ret
+                                ));
+                            } else {
+                                // Resolve (path, metadata) per the source.
+                                let resolved: Option<(String, std::fs::Metadata)> =
+                                    match pending.source {
+                                        Stat64Source::Path { path, follow } => {
+                                            let md = if follow {
+                                                std::fs::metadata(&path)
+                                            } else {
+                                                std::fs::symlink_metadata(&path)
+                                            };
+                                            md.ok().map(|m| (path, m))
+                                        }
+                                        Stat64Source::Fd(fd) => {
+                                            let path = open_fd_owner_paths
+                                                .get(&(pid, fd))
+                                                .cloned()
+                                                .or_else(|| {
+                                                    open_fd_paths.get(&fd).cloned()
+                                                })
+                                                .or_else(|| readlink_proc_fd(pid, fd));
+                                            match path {
+                                                None => {
+                                                    skip_log(format!(
+                                                        "6-Z71: fstat64 emulation SKIPPED — fd={} not in the fd→path maps and /proc readlink failed (Task 6-Z71)",
+                                                        fd
+                                                    ));
+                                                    None
+                                                }
+                                                Some(p) => std::fs::metadata(&p)
+                                                    .ok()
+                                                    .map(|m| (p, m)),
+                                            }
+                                        }
+                                    };
+                                match resolved {
+                                    None => {
+                                        // Fd-source resolution failures log
+                                        // above; Path-source stat failures
+                                        // land here.
+                                        skip_log(format!(
+                                            "6-Z71: {} emulation SKIPPED — host stat FAILED (path vanished / permission); error return preserved (Task 6-Z71)",
+                                            which
+                                        ));
+                                    }
+                                    Some((host_path, md)) => {
+                                        let fields =
+                                            stat64_fields_from_metadata(&md);
+                                        let bytes =
+                                            build_i386_stat64_bytes(&fields);
+                                        let (written, method) =
+                                            write_child_bytes_injection(
+                                                pid,
+                                                pending.statbuf,
+                                                &bytes,
+                                                &mut vm_writev_usable,
+                                            );
+                                        if written == bytes.len() {
+                                            let mut regs2: Regs =
+                                                unsafe { std::mem::zeroed() };
+                                            match ptrace_getregs(
+                                                pid,
+                                                &mut regs2,
+                                            ) {
+                                                Ok(len) => {
+                                                    set_syscall_ret(
+                                                        &mut regs2,
+                                                        &abi,
+                                                        0,
+                                                    );
+                                                    match ptrace_setregs(
+                                                        pid, &regs2, len,
+                                                    ) {
+                                                        Ok(()) => log(&format!(
+                                                            "6-Z71: {} EMULATED {} size={} mode={:#07o} ino={} blksize={} blocks={} into statbuf @ {:#x} via {} (host path: {}) (Task 6-Z71)",
+                                                            which,
+                                                            target_desc,
+                                                            fields.st_size,
+                                                            fields.st_mode,
+                                                            fields.st_ino,
+                                                            fields.st_blksize,
+                                                            fields.st_blocks,
+                                                            pending.statbuf,
+                                                            method,
+                                                            host_path
+                                                        )),
+                                                        Err(e) => log(&format!(
+                                                            "6-Z71: {} EMULATION PARTIAL — struct written but return-force FAILED: ptrace_setregs: {} (child sees -1; Task 6-Z71)",
+                                                            which, e
+                                                        )),
+                                                    }
+                                                }
+                                                Err(e) => log(&format!(
+                                                    "6-Z71: {} EMULATION PARTIAL — struct written but ptrace_getregs FAILED: {} (child sees -1; Task 6-Z71)",
+                                                    which, e
+                                                )),
+                                            }
+                                        } else {
+                                            log(&format!(
+                                                "6-Z71: {} emulation FAILED PARTIAL WRITE — {}/{} bytes into statbuf @ {:#x} via {}; error return preserved (half-written struct is worse than an error) (Task 6-Z71)",
+                                                which,
+                                                written,
+                                                bytes.len(),
+                                                pending.statbuf,
+                                                method
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Task 6-Z71: pread64 EXIT → REAL emulation
+                    // (consume `pending_pread64`) ──
+                    //
+                    // Same gate ladder as the stat64 consumer (pid → nr
+                    // → genuine-return == -38). The read is serviced
+                    // from the HOST copy of the file the fd maps to:
+                    //   open_fd_owner_paths[(pid,fd)] → open_fd_paths[fd]
+                    //   → /proc/<pid>/fd/<fd> readlink.
+                    // Returns:
+                    //   - bytes written == bytes read (incl. 0 == clean
+                    //     EOF at/past end-of-file) → force rax = byte
+                    //     count. A short count is LEGAL pread semantics
+                    //     (the 64 KiB clamp + EOF both produce one);
+                    //     bionic's linker read-loop re-preads the rest.
+                    //   - partial WRITE into the child (vm_writev+poke
+                    //     both fell short) → leave the error return;
+                    //     the caller must not see a byte count whose
+                    //     tail is garbage.
+                    if pending_pread64.is_some() {
+                        let pending = pending_pread64.take().unwrap();
+                        let mut skip_log = |msg: String| {
+                            if z71_skip_logs < 300 {
+                                z71_skip_logs += 1;
+                                log(&msg);
+                            }
+                        };
+                        if pending.pid != pid {
+                            skip_log(format!(
+                                "6-Z71: pread64 emulation SKIPPED (pid mismatch) — armed by pid={} but this stop is pid={} (Task 6-Z71)",
+                                pending.pid, pid
+                            ));
+                        } else if syscall_num != abi.pread64 {
+                            skip_log(format!(
+                                "6-Z71: pread64 emulation SKIPPED (DESYNC) — pending nr={} but this EXIT is nr={} [{}] (Task 6-Z71)",
+                                abi.pread64,
+                                syscall_num,
+                                syscall_name(syscall_num, &abi)
+                            ));
+                        } else {
+                            // GENUINE kernel return (pre-6-Z57 value).
+                            let orig_ret =
+                                get_syscall_arg(&regs, abi.reg_ret) as i64;
+                            if orig_ret >= 0 {
+                                skip_log(format!(
+                                    "6-Z71: pread64 returned {} (filter allowed — kernel performed the read; no emulation needed) (Task 6-Z71)",
+                                    orig_ret
+                                ));
+                            } else if orig_ret != -38 {
+                                skip_log(format!(
+                                    "6-Z71: pread64 emulation SKIPPED — legitimate errno {} (not the -38 filter artifact) (Task 6-Z71)",
+                                    orig_ret
+                                ));
+                            } else {
+                                let host_path = open_fd_owner_paths
+                                    .get(&(pid, pending.fd))
+                                    .cloned()
+                                    .or_else(|| {
+                                        open_fd_paths.get(&pending.fd).cloned()
+                                    })
+                                    .or_else(|| readlink_proc_fd(pid, pending.fd));
+                                let read: Option<Vec<u8>> = host_path
+                                    .as_ref()
+                                    .and_then(|p| {
+                                        host_pread_slice(
+                                            p,
+                                            pending.offset,
+                                            pending.count as usize,
+                                        )
+                                    });
+                                match read {
+                                    None => skip_log(format!(
+                                        "6-Z71: pread64 emulation SKIPPED — fd={} (host path {:?}) unreadable at offset {} — error return preserved (Task 6-Z71)",
+                                        pending.fd, host_path, pending.offset
+                                    )),
+                                    Some(data) => {
+                                        if data.is_empty() {
+                                            // Clean EOF: a real pread64 at
+                                            // or past end-of-file returns 0.
+                                            let mut regs2: Regs = unsafe {
+                                                std::mem::zeroed()
+                                            };
+                                            match ptrace_getregs(pid, &mut regs2) {
+                                                Ok(len) => {
+                                                    set_syscall_ret(
+                                                        &mut regs2,
+                                                        &abi,
+                                                        0,
+                                                    );
+                                                    match ptrace_setregs(
+                                                        pid,
+                                                        &regs2,
+                                                        len,
+                                                    ) {
+                                                        Ok(()) => log(&format!(
+                                                            "6-Z71: pread64 EMULATED EOF fd={} off={} count={} via {} — returned 0, exactly what a real pread at/past EOF does (Task 6-Z71)",
+                                                            pending.fd,
+                                                            pending.offset,
+                                                            pending.count,
+                                                            host_path
+                                                                .as_deref()
+                                                                .unwrap_or("?")
+                                                        )),
+                                                        Err(e) => log(&format!(
+                                                            "6-Z71: pread64 EMULATION PARTIAL — EOF but return-force FAILED: ptrace_setregs: {} (Task 6-Z71)",
+                                                            e
+                                                        )),
+                                                    }
+                                                }
+                                                Err(e) => log(&format!(
+                                                    "6-Z71: pread64 EMULATION PARTIAL — EOF but ptrace_getregs FAILED: {} (Task 6-Z71)",
+                                                    e
+                                                )),
+                                            }
+                                        } else {
+                                            let (written, method) =
+                                                write_child_bytes_injection(
+                                                    pid,
+                                                    pending.buf,
+                                                    &data,
+                                                    &mut vm_writev_usable,
+                                                );
+                                            if written == data.len() {
+                                                let mut regs2: Regs = unsafe {
+                                                    std::mem::zeroed()
+                                                };
+                                                match ptrace_getregs(
+                                                    pid,
+                                                    &mut regs2,
+                                                ) {
+                                                    Ok(len) => {
+                                                        set_syscall_ret(
+                                                            &mut regs2,
+                                                            &abi,
+                                                            written as i64,
+                                                        );
+                                                        match ptrace_setregs(
+                                                            pid,
+                                                            &regs2,
+                                                            len,
+                                                        ) {
+                                                            Ok(()) => log(&format!(
+                                                                "6-Z71: pread64 EMULATED fd={} off={} want={} → {} bytes into buf @ {:#x} via {} from {} (Task 6-Z71)",
+                                                                pending.fd,
+                                                                pending.offset,
+                                                                pending.count,
+                                                                written,
+                                                                pending.buf,
+                                                                method,
+                                                                host_path
+                                                                    .as_deref()
+                                                                    .unwrap_or("?")
+                                                            )),
+                                                            Err(e) => log(&format!(
+                                                                "6-Z71: pread64 EMULATION PARTIAL — bytes written but return-force FAILED: ptrace_setregs: {} (Task 6-Z71)",
+                                                                e
+                                                            )),
+                                                        }
+                                                    }
+                                                    Err(e) => log(&format!(
+                                                        "6-Z71: pread64 EMULATION PARTIAL — bytes written but ptrace_getregs FAILED: {} (Task 6-Z71)",
+                                                        e
+                                                    )),
+                                                }
+                                            } else {
+                                                log(&format!(
+                                                    "6-Z71: pread64 emulation FAILED PARTIAL WRITE — {}/{} bytes into buf @ {:#x} via {}; error return preserved (Task 6-Z71)",
+                                                    written,
+                                                    data.len(),
+                                                    pending.buf,
+                                                    method
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -12998,5 +13945,252 @@ mod tests {
         assert_eq!(ABI_X86_32.set_thread_area_nr, 243);
         assert_eq!(ABI_X86_64.set_thread_area_nr, -1);
         assert_eq!(i386_enosys_fake_value(243), 0);
+    }
+
+    // ── Task 6-Z71 tests: stat64/pread64 emulation ─────────────────────
+
+    #[test]
+    fn i386_stat64_struct_is_96_bytes_with_kernel_field_offsets() {
+        // The layout contract from arch/x86/include/uapi/asm/stat.h
+        // (`#ifdef __i386__`, i386 natural alignment — long long is
+        // 4-byte aligned) + arch/x86/kernel/sys_ia32.c cp_stat64().
+        // The task brief's variant (phantom __pad4@64, atime@68..ino@92)
+        // was WRONG from st_atime on — the kernel header wins.
+        assert_eq!(I386_STAT64_STRUCT_SIZE, 96);
+        let f = Stat64Fields {
+            st_dev: 0x0809_1234_5678_9abc,
+            st_ino: 0x1234_5678_9abc_def0,
+            st_mode: 0x81a4,
+            st_nlink: 3,
+            st_uid: 10233,
+            st_gid: 10233,
+            st_rdev: 0,
+            st_size: 0x1234_5678,
+            st_blksize: 4096,
+            st_blocks: 42,
+            st_atime_sec: 1_700_000_000,
+            st_atime_nsec: 111_222_333,
+            st_mtime_sec: 1_700_000_001,
+            st_mtime_nsec: 444_555_666,
+            st_ctime_sec: 1_700_000_002,
+            st_ctime_nsec: 777_888_999,
+        };
+        let b = build_i386_stat64_bytes(&f);
+        assert_eq!(b.len(), 96);
+        let u64at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+        let u32at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        assert_eq!(u64at(0), f.st_dev, "st_dev @0");
+        assert_eq!(&b[8..12], &[0; 4], "__pad0 @8 zeroed");
+        assert_eq!(
+            u32at(12),
+            f.st_ino as u32,
+            "__st_ino @12 = 32-bit truncation (STAT64_HAS_BROKEN_ST_INO)"
+        );
+        assert_eq!(u32at(16), f.st_mode, "st_mode @16");
+        assert_eq!(u32at(20), f.st_nlink, "st_nlink @20");
+        assert_eq!(u32at(24), f.st_uid, "st_uid @24");
+        assert_eq!(u32at(28), f.st_gid, "st_gid @28");
+        assert_eq!(u64at(32), f.st_rdev, "st_rdev @32");
+        assert_eq!(&b[40..44], &[0; 4], "__pad3 @40 zeroed");
+        assert_eq!(
+            i64::from_le_bytes(b[44..52].try_into().unwrap()),
+            f.st_size,
+            "st_size @44 (SIGNED long long, LE)"
+        );
+        assert_eq!(u32at(52), f.st_blksize, "st_blksize @52");
+        assert_eq!(u64at(56), f.st_blocks, "st_blocks @56");
+        assert_eq!(u32at(64), f.st_atime_sec as u32, "st_atime @64");
+        assert_eq!(u32at(68), f.st_atime_nsec as u32, "st_atime_nsec @68");
+        assert_eq!(u32at(72), f.st_mtime_sec as u32, "st_mtime @72");
+        assert_eq!(u32at(76), f.st_mtime_nsec as u32, "st_mtime_nsec @76");
+        assert_eq!(u32at(80), f.st_ctime_sec as u32, "st_ctime @80");
+        assert_eq!(u32at(84), f.st_ctime_nsec as u32, "st_ctime_nsec @84");
+        assert_eq!(u64at(88), f.st_ino, "st_ino @88 (FULL 64-bit inode)");
+    }
+
+    #[test]
+    fn i386_stat64_size_is_signed_and_roundtrips_negative() {
+        // st_size is `long long` — a negative value must survive the
+        // LE encode as two's complement (the struct consumer on the
+        // child side reads a signed 64-bit).
+        let f = Stat64Fields {
+            st_dev: 0,
+            st_ino: 0,
+            st_mode: 0,
+            st_nlink: 0,
+            st_uid: 0,
+            st_gid: 0,
+            st_rdev: 0,
+            st_size: -2,
+            st_blksize: 0,
+            st_blocks: 0,
+            st_atime_sec: 0,
+            st_atime_nsec: 0,
+            st_mtime_sec: 0,
+            st_mtime_nsec: 0,
+            st_ctime_sec: 0,
+            st_ctime_nsec: 0,
+        };
+        let b = build_i386_stat64_bytes(&f);
+        assert_eq!(
+            i64::from_le_bytes(b[44..52].try_into().unwrap()),
+            -2
+        );
+        // and the u64 view of the same bytes is 0xFFFF...FE.
+        assert_eq!(u64::from_le_bytes(b[44..52].try_into().unwrap()), u64::MAX - 1);
+    }
+
+    #[test]
+    fn stat64_fields_from_metadata_matches_a_real_file() {
+        // Round-trip against the HOST stat of a temp file with known
+        // content — the same metadata the EXIT consumer stats when the
+        // filter blocks the child's fstat64.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kr64_z71_stat64_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let payload = vec![0xa5u8; 0x1234]; // 4660 bytes
+        std::fs::write(&path, &payload).expect("write temp file");
+        let md = std::fs::metadata(&path).expect("stat temp file");
+        let f = stat64_fields_from_metadata(&md);
+        let b = build_i386_stat64_bytes(&f);
+        let size =
+            i64::from_le_bytes(b[44..52].try_into().unwrap());
+        assert_eq!(size, 0x1234, "st_size must be the real file size");
+        let mode = u32::from_le_bytes(b[16..20].try_into().unwrap());
+        assert_ne!(mode & 0o170000, 0, "st_mode must carry S_IFMT bits");
+        assert_ne!(mode & 0o100000, 0, "temp file must be S_IFREG");
+        let ino64 = u64::from_le_bytes(b[88..96].try_into().unwrap());
+        assert_ne!(ino64, 0, "st_ino must carry the real inode");
+        let _ = std::fs::remove_file(&path);
+        let _ = payload.len();
+    }
+
+    #[test]
+    fn i386_pread64_offset_pair_is_lo_arg4_hi_arg5() {
+        // kernel sys_ia32_pread64(fd, buf, count, poslo=arg4, poshi=arg5):
+        // offset = (poshi << 32) | poslo. The pair combines as LE halves.
+        assert_eq!(i386_compat_pread64_offset(0x1000, 0), 0x1000);
+        assert_eq!(i386_compat_pread64_offset(0xffff_ffff, 1), 0x1_ffff_ffff);
+        assert_eq!(i386_compat_pread64_offset(0, 0x20), 0x20_0000_0000);
+        // High garbage above bit 31 in either register slot is masked.
+        assert_eq!(
+            i386_compat_pread64_offset(0x4141_0000_1000, 0x0000_0003),
+            0x3_0000_1000
+        );
+    }
+
+    #[test]
+    fn host_pread_slice_reads_exact_window_and_past_eof_is_empty() {
+        // The EXIT consumer's data source: byte-exact window reads at
+        // arbitrary 64-bit offsets; at/past EOF a real pread returns 0
+        // bytes (which the consumer surfaces as return 0).
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "kr64_z71_pread_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"0123456789abcdefghij").expect("write temp file");
+        assert_eq!(
+            host_pread_slice(path.to_str().unwrap(), 4, 6).unwrap(),
+            b"456789"
+        );
+        assert_eq!(
+            host_pread_slice(path.to_str().unwrap(), 0, 100).unwrap(),
+            b"0123456789abcdefghij",
+            "short read at EOF is the whole file"
+        );
+        assert_eq!(
+            host_pread_slice(path.to_str().unwrap(), 20, 8)
+                .unwrap()
+                .len(),
+            0,
+            "pread at EOF returns 0 bytes"
+        );
+        assert!(
+            host_pread_slice("/nonexistent/z71/nope", 0, 8).is_none(),
+            "missing file → None → consumer preserves the error return"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn i386_stat_family_and_pread64_abi_numbers() {
+        // ABI_X86_32 carries the exact i386 numbers (verified against
+        // arch/x86/entry/syscalls/syscall_32.tbl:
+        //   180 pread64, 195 stat64, 196 lstat64, 197 fstat64, 295 openat).
+        assert_eq!(ABI_X86_32.stat64, 195);
+        assert_eq!(ABI_X86_32.lstat64, 196);
+        assert_eq!(ABI_X86_32.fstat64, 197);
+        assert_eq!(ABI_X86_32.pread64, 180);
+        assert_eq!(ABI_X86_32.openat, 295);
+        // x86_64/aarch64 have no stat64 family (sentinels) but a real
+        // pread64; those arms never emulate (no -38 under the filter).
+        assert_eq!(ABI_X86_64.stat64, -1);
+        assert_eq!(ABI_X86_64.lstat64, -1);
+        assert_eq!(ABI_X86_64.fstat64, -1);
+        assert_eq!(ABI_X86_64.pread64, 17);
+        // The aarch64 table only exists on aarch64 builds (const is
+        // cfg-gated); its stat64 sentinels + pread64=67 are asserted
+        // there. On x86_64 hosts (where the unit suite runs) we can
+        // only check that the NUMBER never matches a real i386 arm —
+        // 67 is not any i386 number this file intercepts.
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(ABI_AARCH64.stat64, -1);
+            assert_eq!(ABI_AARCH64.lstat64, -1);
+            assert_eq!(ABI_AARCH64.fstat64, -1);
+            assert_eq!(ABI_AARCH64.pread64, 67);
+        }
+    }
+
+    #[test]
+    fn stat_family_fake_table_fallback_stays_an_honest_error() {
+        // 6-Z71 wiring: the dedicated arms write the REAL struct/payload
+        // before forcing success; the i386_enosys_fake_value fallback
+        // must therefore stay -1 (a fake 0 with an untouched buffer is
+        // the original garbage-st_size bug).
+        assert_eq!(i386_enosys_fake_value(195), -1);
+        assert_eq!(i386_enosys_fake_value(196), -1);
+        assert_eq!(i386_enosys_fake_value(197), -1);
+        assert_eq!(i386_enosys_fake_value(180), -1);
+    }
+
+    #[test]
+    fn synthetic_fd_base_is_positive_and_above_real_fd_range() {
+        // The synthetic-fd base must be a positive i32 no kernel fd can
+        // collide with (RLIMIT_NOFILE is orders of magnitude below).
+        assert!(SYNTHETIC_FD_BASE > 0);
+        assert!(SYNTHETIC_FD_BASE > 1_000_000);
+        assert!(SYNTHETIC_FD_BASE < i32::MAX);
+        assert!(PREAD64_EMU_MAX_BYTES > 0);
+    }
+
+    #[test]
+    fn readlink_proc_fd_none_for_garbage_pid() {
+        // A nonexistent pid/fd yields None (the consumer then skips —
+        // no emulation with an unknown path).
+        assert!(readlink_proc_fd(-1, -1).is_none());
+    }
+
+    #[test]
+    fn syscall_name_resolves_linker_rescue_calls_6z71() {
+        // The 6-Z71 label additions: the linker's core syscalls are no
+        // longer "[unknown]" in the post-execve logs.
+        assert_eq!(syscall_name(ABI_X86_32.open, &ABI_X86_32), "open");
+        assert_eq!(syscall_name(295, &ABI_X86_32), "openat");
+        assert_eq!(syscall_name(ABI_X86_32.openat2, &ABI_X86_32), "openat2");
+        assert_eq!(syscall_name(180, &ABI_X86_32), "pread64");
+        // x86_64 numbers resolve too (pre-execve kr64-side diagnostics).
+        assert_eq!(syscall_name(ABI_X86_64.pread64, &ABI_X86_64), "pread64");
     }
 }
