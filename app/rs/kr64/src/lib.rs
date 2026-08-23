@@ -4066,6 +4066,181 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         );
     }
 
+    // ---------------------------------------------------------------
+    // Step 4.6.2 (Task 6-Z92): stage RELATIVE library symlinks
+    // {rootfs}/dev/<lib>.so -> ../system/lib64/<lib>.so for EVERY *.so
+    // in the ROM's {rootfs}/system/lib64/ (plus
+    // {rootfs}/dev/<lib>.so -> ../system/lib/<lib>.so for the 32-bit
+    // tree if the ROM ships one).
+    //
+    // ROOT CAUSE (aosp4, E2E run 32638925300, commit c7cf36a): the
+    // translated arm64 init — running as the host's binfmt_misc
+    // ndk_translation_program_runner — linked a 55-library / 2.4 MB
+    // DT_NEEDED closure (220 anonymous-mmap content injections, hooks
+    // ACTIVE) and then died exactly ONE library short:
+    //
+    //   CANNOT LINK EXECUTABLE
+    //   "/system/bin/ndk_translation_program_runner_binfmt_misc_arm64":
+    //   library "libandroidicu.so" not found: needed by
+    //   /system/lib64/libharfbuzz_ng.so
+    //
+    // The ROM HAS libandroidicu.so at {rootfs}/system/lib64/ — but the
+    // linker's search resolves /system/** against the HOST
+    // (ptrace_emu::translate_path only maps /dev, /sys, /system_ext,
+    // /product and /odm onto the rootfs; /system and /vendor are
+    // deliberately passed through). /system CANNOT be intercepted for
+    // the child: ndk_translation's runner needs its HOST API-30 arm64
+    // libs from the host's /system + /apex trees (that is precisely how
+    // it got 55 libraries deep).
+    //
+    // THE FIX: LD_LIBRARY_PATH's FIRST entry is /dev (see the child env
+    // build in Step 8), and the interceptor maps the guest's /dev/*
+    // onto {rootfs}/dev/*. So we stage a RELATIVE symlink
+    // {rootfs}/dev/<lib>.so -> ../system/lib64/<lib>.so for every ROM
+    // library. The kernel resolves the relative target within the
+    // rootfs at open time:
+    //
+    //   openat("/dev/libX.so")            (linker probe, LD_LIBRARY_PATH[0])
+    //     → intercepted → {rootfs}/dev/libX.so
+    //     → kernel follows the relative symlink
+    //     → {rootfs}/system/lib64/libX.so
+    //     → the mmap2 rewrite+inject machinery serves the ROM's REAL
+    //       8.1 library content.
+    //
+    // Any DT_NEEDED name the linker probes via LD_LIBRARY_PATH[0]=/dev
+    // now resolves to the ROM's own copy — including the missing
+    // libandroidicu.so. (RELATIVE targets are mandatory: an absolute
+    // /system/lib64/... target would resolve on the HOST filesystem —
+    // the exact bug class the binderfs /dev/binder symlinks already
+    // avoid by using "binderfs/binder"-style relative targets.)
+    //
+    // CONFLICT RULE: if {rootfs}/dev/<name> already exists it WINS and
+    // is NEVER overwritten — the staged hooks (libgetpid_hook.so,
+    // libtwoyi_loader_shlib.so, the real libdl.so written above) must
+    // keep priority over the ROM's same-named libraries. If the
+    // existing entry is already exactly the right symlink, we count it
+    // as staged (restaging is idempotent).
+    //
+    // GATING: normal (AOSP) boot only. TWRP (boot_recovery=true) does
+    // not need it — its init is statically linked and its
+    // LD_LIBRARY_PATH is /sbin:/system/lib. Root mode
+    // (use_namespaces=true) does not need it either: after pivot_root
+    // the guest's /system/lib64 IS the ROM's, so the linker already
+    // finds the ROM's libs without any /dev indirection.
+    if cfg.boot_recovery {
+        info!("[KR64] TWRP boot: skipping /dev ROM library symlinks (TWRP init is statically linked; LD_LIBRARY_PATH=/sbin)");
+    } else if cfg.use_namespaces {
+        info!("[KR64] PARENT: root mode — skipping /dev ROM library symlinks (pivot_root already serves the ROM's /system/lib64 to the guest)");
+    } else {
+        let mut staged_lib64 = 0usize;
+        let mut staged_lib32 = 0usize;
+        let mut kept_existing = 0usize;
+        let mut failures = 0usize;
+        // (guest-relative source dir, is-the-64-bit-tree). The symlink
+        // target is always "../<source dir>/<name>" so the kernel
+        // resolves it inside the rootfs at open time.
+        for (src_subdir, is_lib64) in [("system/lib64", true), ("system/lib", false)] {
+            let src_dir = format!("{}/{}", rootfs_prefix, src_subdir);
+            let entries = match std::fs::read_dir(&src_dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    // The 32-bit tree is commonly absent on 64-bit-only
+                    // ROMs — silently skip it. A missing lib64 tree is
+                    // worth a warning (the whole fix stages nothing then).
+                    if is_lib64 {
+                        warning!(
+                            "[KR64] PARENT: read_dir {} failed: {} — no ROM library symlinks staged (linker /dev probes will fall through to the host trees)",
+                            src_dir,
+                            e
+                        );
+                    }
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = match entry.file_name().into_string() {
+                    Ok(name) => name,
+                    Err(_) => continue, // non-UTF-8 name — nothing to link
+                };
+                if !name.ends_with(".so") {
+                    continue;
+                }
+                // Only REGULAR files: symlinks already inside the ROM
+                // tree (e.g. vendor-redirected libs) are skipped so the
+                // /dev farm never chains link→link.
+                match entry.file_type() {
+                    Ok(ft) if ft.is_file() => {}
+                    _ => continue,
+                }
+                let link_path = format!("{}/{}", dev_stage_dir, name);
+                let target = format!("../{}/{}", src_subdir, name);
+                match std::os::unix::fs::symlink(&target, &link_path) {
+                    Ok(()) => {
+                        if is_lib64 {
+                            staged_lib64 += 1;
+                        } else {
+                            staged_lib32 += 1;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // NEVER overwrite: a real staged file (the
+                        // hooks / real libdl.so) or a foreign symlink at
+                        // {rootfs}/dev/<name> wins over the ROM's copy.
+                        let existing_is_right_symlink =
+                            match std::fs::symlink_metadata(&link_path) {
+                                Ok(md) if md.file_type().is_symlink() => {
+                                    match std::fs::read_link(&link_path) {
+                                        Ok(t) => t == Path::new(&target),
+                                        Err(_) => false,
+                                    }
+                                }
+                                _ => false,
+                            };
+                        if existing_is_right_symlink {
+                            // Idempotent restage — already exactly what
+                            // we wanted to create.
+                            if is_lib64 {
+                                staged_lib64 += 1;
+                            } else {
+                                staged_lib32 += 1;
+                            }
+                        } else {
+                            kept_existing += 1;
+                        }
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        // One warning for the first failure is enough —
+                        // the farm is ~hundreds of links and per-link
+                        // spam would drown the bootlog.
+                        if failures == 1 {
+                            warning!(
+                                "[KR64] PARENT: symlink {} -> {} failed: {} (further symlink failures suppressed)",
+                                link_path,
+                                target,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mut summary = format!(
+            "[KR64] PARENT: staged {} library symlinks into {}/dev -> ../system/lib64 (LD_LIBRARY_PATH[0] resolution of the ROM's own libs)",
+            staged_lib64, dev_stage_dir
+        );
+        if staged_lib32 > 0 {
+            summary = format!("{}; +{} -> ../system/lib (32-bit)", summary, staged_lib32);
+        }
+        if kept_existing > 0 || failures > 0 {
+            summary = format!(
+                "{} [{} pre-existing /dev entries kept — hooks win; {} failures]",
+                summary, kept_existing, failures
+            );
+        }
+        info!("{}", summary);
+    }
+
     // Change SELinux label of /dev/lib*.so to system_file so that
     // vendor_init subcontexts can access them.
     //
