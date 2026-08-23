@@ -455,6 +455,35 @@ struct ChildAbi {
     mount: i64,
     chroot: i64,
     mkdir: i64,
+    // mkdirat(dirfd, path, mode) — mkdirfix FIX A. TWRP's partition
+    // manager mkdirs rootfs paths (/cache/recovery, /sdcard,
+    // /external_sd …) during "Updating partition details". Plain mkdir
+    // was carried in ChildAbi but had NO ENTRY path translation (only
+    // the SIGSYS-side rootfs mkdir when the seccomp filter blocks it),
+    // and mkdirat was MISSING entirely — so any mkdir/mkdirat the
+    // filter ALLOWS executed against the HOST filesystem (run
+    // 32612016071 / DEATH_CHAIN.md §10b: TWRP's mkdir("/external_sd")
+    // hit the host / → EACCES/EROFS; lib.rs bootfix FIX 2 pre-creates
+    // the five known dirs but a translated arm generalises it). The
+    // dedicated ENTRY arm below translates the path AND creates the
+    // dir in the rootfs; the SIGSYS mkdir branch (which prefixes
+    // {rootfs} itself) is kept unchanged.
+    //
+    // mkdir takes the path in arg1; mkdirat takes dirfd in arg1 + the
+    // path in arg2 (same as openat/unlinkat).
+    //
+    // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h +
+    // unistd_64.h + /usr/include/asm-generic/unistd.h:
+    //   i386:   mkdir=39, mkdirat=296
+    //   x86_64: mkdir=83, mkdirat=258
+    //   aarch64 (asm-generic): mkdir=-1 (DROPPED — only mkdirat=34
+    //     survives; bionic's mkdir() wrapper issues mkdirat(
+    //     AT_FDCWD, …) under the hood), mirroring the unlink=-1 /
+    //     unlinkat=35 + mknod=-1 / mknodat=33 precedents. (The
+    //     pre-mkdirfix ABI_AARCH64.initialiser had mkdir: 34 — a
+    //     mislabel: asm-generic syscall 34 is __NR_mkdirat. Same class
+    //     of bug as the aarch64 mount=165 mislabel fixed in Task 5-T.)
+    mkdirat: i64,
     unshare: i64,
     // mknod(pathname, mode, dev) — TWRP init calls this for /dev/null,
     // /dev/zero, /dev/urandom etc. during early boot. As untrusted_app
@@ -977,6 +1006,13 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     mount: 165,
     chroot: 161,
     mkdir: 83,
+    // x86_64 mkdirat = 258 (per asm/unistd_64.h: __NR_mkdirat 258 —
+    // verified for mkdirfix FIX A). The host is x86_64 running an
+    // i386 child, so this number does NOT fire at runtime (the guest
+    // issues i386 mkdir 39 / mkdirat 296); locked in for ABI
+    // completeness + so the FIX A ENTRY arm + syscall_name label work
+    // if a future x86_64 guest is ever supported.
+    mkdirat: 258,
     unshare: 272,
     // x86_64 mknod = 133 (per /usr/include/x86_64-linux-gnu/asm/
     // unistd_64.h, verified directly against the kernel's UAPI
@@ -1224,6 +1260,14 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     mount: 21,
     chroot: 61,
     mkdir: 39,
+    // i386 mkdirat = 296 (per asm/unistd_32.h: __NR_mkdirat 296 —
+    // verified for mkdirfix FIX A). THIS is the value that fires at
+    // runtime for the *at variant: TWRP init/recovery are i386
+    // binaries, and bionic's mkdir(path, mode) wrapper issues plain
+    // mkdir (39) while lower-level code (corecutils-style helpers,
+    // selinux restorecon) may issue mkdirat(AT_FDCWD, …) directly.
+    // Both numbers are matched by the FIX A ENTRY translation arm.
+    mkdirat: 296,
     unshare: 310,
     // i386 mknod = 14 (per /usr/include/x86_64-linux-gnu/asm/
     // unistd_32.h: __NR_mknod 14, verified directly against the
@@ -1520,7 +1564,21 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // (and worse, would have spurious-matched any getrusage SIGSYS).
     mount: 40,
     chroot: 51,
-    mkdir: 34,
+    // aarch64 (asm-generic): mkdir=-1 (SENTINEL "not present on this
+    // ABI" — the asm-generic table DROPPED plain mkdir; only
+    // __NR_mkdirat 34 survives, verified directly against
+    // /usr/include/asm-generic/unistd.h for mkdirfix FIX A; mirrors
+    // the unlink=-1/unlinkat=35 + mknod=-1/mknodat=33 precedents).
+    // PRE-mkdirfix this field was 34 — a MISLABEL: asm-generic
+    // syscall 34 is __NR_mkdirat, so the old value would have made
+    // the SIGSYS mkdir branch read arg1 (a dirfd, not a pointer) as
+    // the path. Same class of bug as the aarch64 mount=165 mislabel
+    // fixed in Task 5-T. bionic's mkdir() wrapper on aarch64 issues
+    // mkdirat(AT_FDCWD, …) under the hood, so -1 here + 34 in
+    // mkdirat is the correct pairing. (Dead code at runtime — the
+    // host is x86_64 running an i386 child.)
+    mkdir: -1,
+    mkdirat: 34,
     unshare: 97,
     // aarch64 mknod = -1 (SENTINEL "not present on this ABI"). The
     // asm-generic/unistd.h table (used by aarch64) has NO plain
@@ -2653,8 +2711,14 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "mknod"
     } else if nr == abi.chroot {
         "chroot"
-    } else if nr == abi.mkdir {
+    } else if abi.mkdir != -1 && nr == abi.mkdir {
         "mkdir"
+    } else if abi.mkdirat != -1 && nr == abi.mkdirat {
+        // mkdirfix FIX A: label the *at variant (previously no field
+        // matched i386 nr=296 → "[unknown]"). The `!= -1` guard keeps
+        // nr=-1 SIGSYS-desync events labelled "[unknown]" (mirrors the
+        // bootfix FIX 1 statfs labels).
+        "mkdirat"
     } else if nr == abi.chmod {
         "chmod"
     } else if nr == abi.unshare {
@@ -3684,6 +3748,43 @@ fn fb0_log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "[KR64][ptrace] {}", msg);
 }
 
+/// Task 6-Z78: TRUE liveness for a TRACED child. kill(pid,0)==0 is TRUE
+/// for ZOMBIES (a dead-but-unreaped tracee still has a /proc entry — kill()
+/// only fails with ESRCH once the entry is GONE) — which caused run
+/// 32614181978's ESRCH LIVELOCK: init's ESRCH handed the loop to recovery
+/// child 6069 ("STILL ALIVE" per kill(pid,0)==0) even though 6069 was a
+/// dead ZOMBIE, and the loop ping-ponged 6064↔6069 for 2+ minutes until the
+/// run ended with exit code 127.
+///
+/// We deliberately do NOT probe with waitpid(pid, WNOHANG): the main
+/// loop's waitpid(-1) is the sole consumer of stop events, and a WNOHANG
+/// waitpid on a traced child with a PENDING stop-event would CONSUME that
+/// stop (it returns the pid with WIFSTOPPED status set), racing the main
+/// dispatcher. Instead we read the state char (field 3) of
+/// /proc/<pid>/stat — zero side effects on waitpid:
+///   'Z' (zombie — died, un-reaped) or 'X' (exiting)  => DEAD
+///   anything else (R,S,T,t,D,I,…)                     => ALIVE
+///   no /proc entry at all                              => DEAD + reaped
+/// (The comm field in parentheses can itself contain ')' and spaces, so we
+/// anchor on the LAST ')' — rfind — before reading the state char.)
+fn traced_child_alive(pid: libc::pid_t) -> bool {
+    match std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+        Ok(stat) => {
+            // field 3 (state) is the char after the comm field ") "
+            if let Some(pos) = stat.rfind(')') {
+                let state = stat
+                    .get(pos + 2..)
+                    .and_then(|s| s.chars().next())
+                    .unwrap_or('Z');
+                state != 'Z' && state != 'X'
+            } else {
+                false
+            }
+        }
+        Err(_) => false, // no /proc entry = dead + reaped
+    }
+}
+
 /// Shared registry the bridge thread drains. `Mutex` (not `RwLock`) — the
 /// loop thread inserts at fb0-injection time (rare) and the bridge reads
 /// the whole vec each tick (also rare), so contention is nil.
@@ -4684,6 +4785,18 @@ pub fn run_ptrace_loop(
     //     catch the vfork completion that's currently invisible
     //     (DISPATCHER-FINAL-15).
     //
+    //   - PTRACE_O_TRACEEXIT (Task 6-Z78): makes the kernel report a
+    //     PTRACE_EVENT_EXIT stop the moment ANY traced child enters its
+    //     FINAL exit (exit_group / fatal signal) — BEFORE the true
+    //     WIFEXITED/WIFSIGNALED waitpid report, and even when the death
+    //     would otherwise be silent. Run 32614181978: TWRP (pid 6069)
+    //     died at T+118 s with NO traced exit stop, NO signal report —
+    //     the loop only learned of the death via ESRCH 2 minutes later
+    //     and then livelocked on kill(pid,0)==0 (true for a ZOMBIE).
+    //     With TRACEEXIT the handler logs the pending wait-status word
+    //     (decoded) + the last syscalls, so even a seccomp-kill that
+    //     skips every other stop leaves a loud trail.
+    //
     // The new child's ABI is the SAME as the parent's ABI at fork time
     // (init is i386 after its first execve → recovery is also i386).
     // If the child later calls execve (e.g. init forks, then the child
@@ -4702,6 +4815,7 @@ pub fn run_ptrace_loop(
         | libc::PTRACE_O_TRACEVFORK
         | libc::PTRACE_O_TRACEVFORKDONE
         | libc::PTRACE_O_TRACEEXEC
+        | libc::PTRACE_O_TRACEEXIT
         | libc::PTRACE_O_EXITKILL) as libc::c_int;
     let r = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, ptrace_opts) };
     if r == -1 {
@@ -5315,9 +5429,11 @@ pub fn run_ptrace_loop(
                 // then SIGKILLed it and the whole VM tore down at T+4 s
                 // (DEATH_CHAIN §0 steps 3-6). Mirror the 6-Z67 WIFEXITED
                 // logic below: if the ESRCH child is init but the
-                // recovery child is still alive (kill(rec,0)==0 — 0 for
-                // a live/possibly-stopped process, -1/ESRCH once
-                // reaped), mark init dead, re-point current_pid at the
+                // recovery child is still alive (Task 6-Z78:
+                // traced_child_alive — /proc stat state char, NOT
+                // kill(rec,0) which is TRUE for zombies and livelocked
+                // run 32614181978 for 2+ minutes), mark init dead,
+                // re-point current_pid at the
                 // recovery child (the loop-top PTRACE_SYSCALL resumes it
                 // WITH syscall tracing), and keep serving it. If init is
                 // an un-reaped zombie, the next waitpid(-1) reports its
@@ -5328,7 +5444,7 @@ pub fn run_ptrace_loop(
                 if current_pid == init_pid {
                     if let Some(rec_pid) = recovery_child_pid {
                         if rec_pid != current_pid {
-                            let rec_alive = unsafe { libc::kill(rec_pid, 0) } == 0;
+                            let rec_alive = traced_child_alive(rec_pid);
                             if rec_alive {
                                 log(&format!(
                                     "ESRCH on init {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67 ESRCH path, bootfix FIX 4)",
@@ -5338,6 +5454,10 @@ pub fn run_ptrace_loop(
                                 current_pid = rec_pid;
                                 continue;
                             }
+                            log(&format!(
+                                "6-Z78: liveness probe says recovery child {} is a ZOMBIE/dead (not reaped by us) — NOT keeping the loop for it; falling through to reap/return",
+                                rec_pid
+                            ));
                         }
                     }
                 }
@@ -5510,10 +5630,11 @@ pub fn run_ptrace_loop(
             if pid == init_pid {
                 if let Some(rec_pid) = recovery_child_pid {
                     if rec_pid != pid {
-                        // Is the recovery child still alive? kill(pid,0)
-                        // returns 0 for a live (possibly stopped) process
-                        // and -1/ESRCH once it is reaped.
-                        let alive = unsafe { libc::kill(rec_pid, 0) } == 0;
+                        // Is the recovery child still alive? Task 6-Z78:
+                        // traced_child_alive — kill(pid,0) is TRUE for
+                        // zombies too (run 32614181978 livelocked on
+                        // exactly that); /proc stat's state char is not.
+                        let alive = traced_child_alive(rec_pid);
                         if alive {
                             log(&format!(
                                 "init {} exited with code {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67)",
@@ -5581,7 +5702,7 @@ pub fn run_ptrace_loop(
                 // WIFEXITED branch for the full rationale).
                 if let Some(rec_pid) = recovery_child_pid {
                     if rec_pid != pid {
-                        let alive = unsafe { libc::kill(rec_pid, 0) } == 0;
+                        let alive = traced_child_alive(rec_pid);
                         if alive {
                             log(&format!(
                                 "init {} killed by signal {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67)",
@@ -5713,6 +5834,94 @@ pub fn run_ptrace_loop(
                         // is 0 (no signal to deliver). The loop-top
                         // PTRACE_SYSCALL will resume `current_pid` (the
                         // parent) on the next iteration.
+                        continue;
+                    }
+                    ev if ev == libc::PTRACE_EVENT_EXIT as u32 => {
+                        // ── Task 6-Z78: PTRACE_EVENT_EXIT (event 6) ──
+                        //
+                        // Run 32614181978: TWRP (pid 6069) died SILENTLY at
+                        // T+118 s (mid partition-details) — no traced exit
+                        // stop, no "killed by signal" line; the loop only
+                        // learned of the death via ESRCH 2 minutes later and
+                        // then LIVELOCKED on kill(pid,0)==0 being TRUE for a
+                        // ZOMBIE. PTRACE_O_TRACEEXIT (now set in every
+                        // SETOPTIONS bitmask) makes the kernel stop the
+                        // child here at its FINAL exit — BEFORE the true
+                        // WIFEXITED/WIFSIGNALED waitpid report — so even a
+                        // seccomp-kill that skips every other stop leaves a
+                        // loud trail. (The old comment claiming
+                        // "PTRACE_O_EXITKILL alone gives us this report too"
+                        // was WRONG: PTRACE_EVENT_EXIT is delivered ONLY
+                        // when PTRACE_O_TRACEEXIT is set — the old arm was
+                        // dead code.)
+                        //
+                        // PTRACE_GETEVENTMSG returns the pending wait-status
+                        // word: WIFEXITED / WIFSIGNALED decode on the low 16
+                        // bits; for signal deaths the upper bits of the
+                        // word carry si_code/si_addr — logged raw alongside
+                        // the decoded basics.
+                        //
+                        // This stop is NOT the exit itself: we log LOUDLY,
+                        // then fall through to the standard resume (the
+                        // `continue` below → loop-top PTRACE_SYSCALL resumes
+                        // `current_pid`, which is this pid) — the child then
+                        // truly exits and the normal WIFEXITED/WIFSIGNALED
+                        // branches below do the reap + bookkeeping. The
+                        // handler deliberately does NOT consume/return.
+                        let mut exit_status: libc::c_long = 0;
+                        let getevent_r = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_GETEVENTMSG,
+                                pid,
+                                0,
+                                &mut exit_status as *mut _ as libc::c_long,
+                            )
+                        };
+                        if getevent_r == 0 {
+                            let ws = exit_status as libc::c_int;
+                            let decoded = if libc::WIFSIGNALED(ws) {
+                                format!(
+                                    "killed by signal {} (si_code/si_addr bits: {:#x})",
+                                    libc::WTERMSIG(ws),
+                                    (exit_status as u64) >> 16
+                                )
+                            } else if libc::WIFEXITED(ws) {
+                                format!("exit code {}", libc::WEXITSTATUS(ws))
+                            } else {
+                                "unknown status encoding".to_string()
+                            };
+                            log(&format!(
+                                "6-Z78: PTRACE_EVENT_EXIT pid={} status={:#x} ({}) — child entering exit now; falling through to standard resume",
+                                pid, exit_status, decoded
+                            ));
+                        } else {
+                            log(&format!(
+                                "6-Z78: PTRACE_EVENT_EXIT pid={} status=? (PTRACE_GETEVENTMSG failed: {}) — child entering exit now; falling through to standard resume",
+                                pid,
+                                std::io::Error::last_os_error()
+                            ));
+                        }
+                        // Tail of the rolling ALL-syscalls ring (the ring is
+                        // shared across children — the last entries are this
+                        // pid's final syscalls, exactly what the silent-death
+                        // forensics of 32614181978 needed: the ring was frozen
+                        // with 6079's exit_group while 6069's true last
+                        // syscalls were never attributed).
+                        let tail: std::collections::VecDeque<i64> =
+                            recent_all_syscalls.iter().rev().take(5).rev().cloned().collect();
+                        if tail.is_empty() {
+                            log(&format!(
+                                "6-Z78: no syscalls in all-syscalls ring at EXIT of pid {}",
+                                pid
+                            ));
+                        } else {
+                            log(&format!(
+                                "last {} ALL syscalls at EXIT of pid {} (oldest->newest): {}",
+                                tail.len(),
+                                pid,
+                                format_syscall_buffer(&tail, abi)
+                            ));
+                        }
                         continue;
                     }
                     ev if ev == libc::PTRACE_EVENT_EXEC as u32 => {
@@ -6064,37 +6273,6 @@ pub fn run_ptrace_loop(
                         // MUST clear `in_syscall` or the next stop is
                         // misclassified as a syscall-exit.
                         in_syscall = false;
-                        continue;
-                    }
-                    ev if ev == libc::PTRACE_EVENT_EXIT as u32 => {
-                        // The child is about to exit (PTRACE_O_TRACEEXIT
-                        // would be needed to receive the actual exit
-                        // event stop, but PTRACE_O_EXITKILL alone gives
-                        // us this PTRACE_EVENT_EXIT report too on most
-                        // kernels). Read the pending exit status for
-                        // diagnostic logging. The actual WIFEXITED/
-                        // WIFSIGNALED report comes from the next
-                        // waitpid — this is just an early heads-up.
-                        let mut exit_status: libc::c_long = 0;
-                        let getevent_r = unsafe {
-                            libc::ptrace(
-                                libc::PTRACE_GETEVENTMSG,
-                                pid,
-                                0,
-                                &mut exit_status as *mut _ as libc::c_long,
-                            )
-                        };
-                        if getevent_r == 0 {
-                            log(&format!(
-                                "PTRACE_EVENT_EXIT: child {} about to exit (pending status 0x{:x})",
-                                pid, exit_status
-                            ));
-                        } else {
-                            log(&format!(
-                                "PTRACE_EVENT_EXIT: child {} about to exit (PTRACE_GETEVENTMSG failed)",
-                                pid
-                            ));
-                        }
                         continue;
                     }
                     ev => {
@@ -6616,12 +6794,17 @@ pub fn run_ptrace_loop(
                                         new_pid
                                     ));
                                     recovery_child_pid = Some(new_pid);
-                                    // Set PTRACE_SETOPTIONS for the new child
+                                    // Set PTRACE_SETOPTIONS for the new child.
+                                    // Task 6-Z78: TRACEEXIT included — a
+                                    // silent death (like 6069 in 32614181978)
+                                    // must at minimum leave a
+                                    // PTRACE_EVENT_EXIT trail.
                                     let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
                                         | libc::PTRACE_O_TRACEFORK
                                         | libc::PTRACE_O_TRACECLONE
                                         | libc::PTRACE_O_TRACEVFORK
                                         | libc::PTRACE_O_TRACEEXEC
+                                        | libc::PTRACE_O_TRACEEXIT
                                         | libc::PTRACE_O_EXITKILL) as libc::c_int;
                                     unsafe {
                                         libc::ptrace(
@@ -6811,7 +6994,19 @@ pub fn run_ptrace_loop(
                             n if n == abi.newfstatat || n == abi.statx => Some(abi.reg_arg2),
                             n if n == abi.access => Some(abi.reg_arg1),
                             n if n == abi.faccessat => Some(abi.reg_arg2),
-                            n if n == abi.mkdir => Some(abi.reg_arg1),
+                            // mkdirfix FIX A: the `!= -1` guards
+                            // (new for mkdir: aarch64 mkdir is now the
+                            // -1 sentinel) keep a nr=-1 SIGSYS-desync
+                            // stop from matching sentinel fields.
+                            n if abi.mkdir != -1 && n == abi.mkdir => Some(abi.reg_arg1),
+                            // mkdirfix FIX A: mkdirat(dirfd, path,
+                            // mode) — dirfd in arg1, path in arg2 (like
+                            // openat/unlinkat). The `!= -1` guard keeps
+                            // a nr=-1 SIGSYS-desync stop from matching
+                            // the sentinel on ABIs that dropped mkdirat.
+                            n if abi.mkdirat != -1 && n == abi.mkdirat => {
+                                Some(abi.reg_arg2)
+                            }
                             n if n == abi.chdir => Some(abi.reg_arg1),
                             n if n == abi.readlink => Some(abi.reg_arg1),
                             n if n == abi.readlinkat => Some(abi.reg_arg2),
@@ -7593,6 +7788,129 @@ pub fn run_ptrace_loop(
                                     )
                                 {
                                     write_child_string(pid, path_addr, &translated);
+                                }
+                            }
+                        }
+                        // ── mkdirfix FIX A: mkdir (i386 nr=39) / mkdirat
+                        // (i386 nr=296) ENTRY path translation + real
+                        // rootfs dir creation ──
+                        //
+                        // Root cause (DEATH_CHAIN.md §10b residual, run
+                        // 32612016071): plain mkdir had NO ENTRY path
+                        // translation (only the SIGSYS-side rootfs mkdir
+                        // for seccomp-BLOCKED calls) and mkdirat had NO
+                        // handler at all — so any mkdir/mkdirat the
+                        // seccomp filter ALLOWS executed the RAW guest
+                        // path against the HOST filesystem. TWRP's
+                        // partition manager mkdirs rootfs paths during
+                        // "Updating partition details" (/cache/recovery,
+                        // /sdcard, /external_sd, /usb-otg …) → host / is
+                        // EACCES/EROFS for untrusted_app → TWRP logs
+                        // "Can not create … folder". lib.rs bootfix FIX 2
+                        // pre-creates the five KNOWN dirs; this arm
+                        // generalises it to any path.
+                        //
+                        // Two-pronged, mirroring the SIGSYS mkdir branch:
+                        // 1. Point the path register at the rootfs-
+                        //    translated path (same write_translated_path
+                        //    scratch-area mechanism as the statfs arm
+                        //    above, with the in-place write_child_string
+                        //    fallback) so the kernel mkdir/mkdirat
+                        //    executes inside {rootfs}.
+                        // 2. ALSO create the directory in the HOST
+                        //    rootfs ourselves (std::fs::create_dir_all,
+                        //    errors ignored — best-effort). This makes
+                        //    the subsequent open/statfs/stat of the new
+                        //    dir succeed even if the kernel-side mkdir
+                        //    itself fails (EEXIST is fine — dir exists
+                        //    either way; that is also why "created: 0"
+                        //    vs "created: 1" is logged: 1 = newly
+                        //    created by us, 0 = already existed or the
+                        //    create failed).
+                        //
+                        // mkdir(path, mode): path in arg1. mkdirat(dirfd,
+                        // path, mode): dirfd in arg1, path in arg2 (same
+                        // as openat/unlinkat — the FIX A path arg index
+                        // picks arg2 for mkdirat). The dirfd is NOT
+                        // resolved (AT_FDCWD-relative mkdirats from the
+                        // guest are rare; TWRP's partition manager uses
+                        // absolute paths — translate_path only rewrites
+                        // absolute paths anyway, so an AT_FDCWD-relative
+                        // path is left untouched, exactly like the
+                        // openat arm). The `!= -1` guards keep a
+                        // hypothetical nr=-1 SIGSYS-desync stop from
+                        // matching a sentinel field.
+                        //
+                        // NOTE: the SIGSYS mkdir handler (for seccomp-
+                        // BLOCKED mkdirs — the fake table returns 0 and
+                        // the mount/mkdir block creates {rootfs}{path})
+                        // is deliberately KEPT unchanged: this ENTRY arm
+                        // covers filter-ALLOWED mkdirs; the two paths are
+                        // mutually exclusive for a given call. The
+                        // "mkdir translated" log is NOT gated by
+                        // loop_count <= 500 (unlike the statfs log)
+                        // because TWRP's partition-manager mkdirs fire at
+                        // loop_count ~5800+ — well past 500 — and mkdirs
+                        // are rare enough (a few dozen per boot) that
+                        // un-gated logging is cheap + diagnostically
+                        // valuable.
+                        n if (abi.mkdir != -1 && n == abi.mkdir)
+                            || (abi.mkdirat != -1 && n == abi.mkdirat) =>
+                        {
+                            // mkdir → path in arg1; mkdirat → dirfd in
+                            // arg1, path in arg2 (like openat).
+                            let (name, path_arg_index) =
+                                if abi.mkdirat != -1 && n == abi.mkdirat {
+                                    ("mkdirat", abi.reg_arg2)
+                                } else {
+                                    ("mkdir", abi.reg_arg1)
+                                };
+                            let path_addr = get_syscall_arg(&regs, path_arg_index);
+                            if path_addr != 0 {
+                                if let Some(path) = read_child_string(pid, path_addr) {
+                                    let translated = translate_path(rootfs, &path);
+                                    if translated != path {
+                                        // 1. Rewrite the path register so
+                                        //    the kernel mkdir/mkdirat
+                                        //    executes against {rootfs}.
+                                        if !write_translated_path(
+                                            pid,
+                                            &mut regs,
+                                            iov_len,
+                                            path_arg_index,
+                                            scratch_addr,
+                                            &mut scratch_offset,
+                                            &translated,
+                                        ) {
+                                            write_child_string(
+                                                pid,
+                                                path_addr,
+                                                &translated,
+                                            );
+                                        }
+                                        // 2. Actually create the dir in
+                                        //    the HOST rootfs (ignore
+                                        //    errors — EEXIST from a
+                                        //    concurrent kernel-side
+                                        //    create, EACCES on weird
+                                        //    parents, … all acceptable:
+                                        //    the kernel-side mkdir above
+                                        //    is the primary path).
+                                        let existed = std::path::Path::new(&translated)
+                                            .is_dir();
+                                        let _ = std::fs::create_dir_all(&translated);
+                                        let created = if !existed
+                                            && std::path::Path::new(&translated).is_dir()
+                                        {
+                                            1
+                                        } else {
+                                            0
+                                        };
+                                        log(&format!(
+                                            "{} translated: {} -> {} (created: {})",
+                                            name, path, translated, created
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -8787,6 +9105,49 @@ pub fn run_ptrace_loop(
                     // whether recovery ever attempted these in the middle
                     // phase (iters 151-3271) — this block ensures we see
                     // the return values even past 5000 iterations.
+                    //
+                    // ── mkdirfix FIX B: why there is NO synthetic wait4
+                    // EXIT arm (bootfix residual / DEATH_CHAIN.md §6+§10
+                    // — "TWRP 6289 frozen in wait4 for helper 6306") ──
+                    //
+                    // The death run's freeze was NOT a wait4 emulation
+                    // gap. TWRP (6289) was stopped at its wait4
+                    // syscall-ENTRY ptrace stop; the loop then DIED on
+                    // init's ESRCH and never resumed 6289 at all (fixed
+                    // by bootfix FIX 4's ESRCH handoff). Once the tracer
+                    // resumes the child past the ENTRY stop, the kernel
+                    // executes wait4 FOR REAL, and ptrace semantics make
+                    // a synthetic-EXIT unnecessary:
+                    //
+                    //   * PTRACE does NOT change parentage. The tracer
+                    //     (kr64) is the PTRACER of 6289/6306, but 6289
+                    //     remains 6306's REAL PARENT (getppid(6306) ==
+                    //     6289 even while traced).
+                    //   * When a traced child exits, the kernel offers
+                    //     the exit notification to BOTH waiters: the
+                    //     tracer's waitpid(-1) sees the ptrace stop
+                    //     (PTRACE_EVENT_EXIT / signal-delivery stop) and
+                    //     the REAL parent's wait/wait4/waitpid ALSO gets
+                    //     the child's WIFEXITED/WIFSTOPPED status — the
+                    //     tracer reaping ITS notification does NOT
+                    //     consume or steal the real parent's wait4
+                    //     result (kernel wait_task_zombie reports a
+                    //     ptraced zombie to both; ptrace(2) "Death of
+                    //     the tracee" + wait(2) notes).
+                    //   * Therefore: TWRP's BLOCKING wait4(6306) blocks
+                    //     in the kernel and wakes naturally when 6306
+                    //     dies (SIGCHLD to the real parent + wait4
+                    //     returns the true exit status, e.g. 127). No
+                    //     synthetic status injection is needed — and
+                    //     injecting one (e.g. faking EXIT with status
+                    //     127 at our EXIT stop) would be WRONG on top of
+                    //     the kernel's own answer.
+                    //
+                    // The only residual diagnosis gap is a wait4 that
+                    // returns -ECHILD (-10): that means the caller has no
+                    // unwaited children (none forked, or already reaped).
+                    // TWRP handles ECHILD properly ("helper gone"), so we
+                    // just log it (below) rather than emulating anything.
                     {
                         let nr = syscall_num;
                         if nr == abi.clone_nr
@@ -8811,6 +9172,21 @@ pub fn run_ptrace_loop(
                                 "Task-6-S EXIT: pid={} {} nr={} -> {} (0x{:x})",
                                 pid, name, nr, ret, ret as u64,
                             ));
+                            // ── mkdirfix FIX B: wait4 -ECHILD diagnostic ──
+                            //
+                            // A -ECHILD (-10) return here means the waiter
+                            // has no unwaited children at all (none forked,
+                            // or every child was already reaped by ITS OWN
+                            // wait). TWRP treats that as "helper gone" and
+                            // takes a clean recovery path — log it so the
+                            // next E2E run distinguishes "wait4 returned
+                            // ECHILD" from "wait4 never returned".
+                            if nr == abi.wait4_nr && ret == -(libc::ECHILD as i64) {
+                                log(&format!(
+                                    "wait4 ECHILD (no unwaited children) — pid={} wait4 nr={} returned -ECHILD",
+                                    pid, nr
+                                ));
+                            }
                         }
                     }
 
@@ -11102,11 +11478,14 @@ pub fn run_ptrace_loop(
                     // (race condition). Here, the child IS stopped (we just received
                     // its SIGSTOP from PTRACE_TRACEME + raise), so SETOPTIONS works.
                     if recovery_child_pid == Some(pid) {
+                        // Task 6-Z78: TRACEEXIT included — see the initial
+                        // SETOPTIONS comment block (silent-death trail).
                         let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
                             | libc::PTRACE_O_TRACEFORK
                             | libc::PTRACE_O_TRACECLONE
                             | libc::PTRACE_O_TRACEVFORK
                             | libc::PTRACE_O_TRACEEXEC
+                            | libc::PTRACE_O_TRACEEXIT
                             | libc::PTRACE_O_EXITKILL) as libc::c_int;
                         let r = unsafe {
                             libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts)
@@ -12365,6 +12744,57 @@ mod tests {
         );
     }
 
+    // ── mkdirfix FIX A regression guards: mkdir / mkdirat ──
+    //
+    // These tests lock in the architectural contract added by mkdirfix
+    // FIX A: that ChildAbi carries mkdir + mkdirat numbers used by the
+    // ENTRY path-translation arm (mkdir path in arg1; mkdirat dirfd in
+    // arg1 + path in arg2), the syscall_name "mkdir"/"mkdirat" labels,
+    // and the post-execve path-logging match. Pre-FIX-A any
+    // filter-ALLOWED mkdir executed the RAW guest path against the HOST
+    // filesystem (DEATH_CHAIN.md §10b residual).
+    //
+    // Verified directly against the kernel's UAPI headers:
+    //   i386 (per /usr/include/x86_64-linux-gnu/asm/unistd_32.h):
+    //     __NR_mkdir 39, __NR_mkdirat 296 — THIS is the value set that
+    //     fires at runtime (TWRP init/recovery are i386 binaries).
+    //   x86_64 (per unistd_64.h): __NR_mkdir 83, __NR_mkdirat 258
+    //     (does not fire at runtime — locked in for completeness).
+    //   aarch64 (per /usr/include/asm-generic/unistd.h): NO plain
+    //     __NR_mkdir (dropped; only __NR_mkdirat 34) → mkdir=-1
+    //     sentinel. PRE-mkdirfix ABI_AARCH64.mkdir was 34 — a MISLABEL
+    //     (34 is mkdirat); this guard pins the corrected pairing.
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_32_mkdirfix_mkdir_numbers_correct() {
+        // THIS is the value set that fires at runtime — TWRP's
+        // partition-manager mkdir("/cache/recovery")-style calls are
+        // i386 mkdir (39) / mkdirat (296). If anyone "fixes" these to
+        // the x86_64 numbers (83/258), the FIX A ENTRY arm would
+        // silently stop matching → raw guest paths hit the HOST fs
+        // again → "Can not create … folder" returns.
+        assert_eq!(ABI_X86_32.mkdir, 39, "i386 mkdir must be 39");
+        assert_eq!(ABI_X86_32.mkdirat, 296, "i386 mkdirat must be 296");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn abi_x86_64_mkdirfix_mkdir_numbers_correct() {
+        assert_eq!(ABI_X86_64.mkdir, 83, "x86_64 mkdir must be 83");
+        assert_eq!(ABI_X86_64.mkdirat, 258, "x86_64 mkdirat must be 258");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn abi_aarch64_mkdirfix_mkdir_numbers_correct() {
+        assert_eq!(
+            ABI_AARCH64.mkdir, -1,
+            "aarch64 mkdir must be -1 (dropped in asm-generic; 34 is mkdirat)"
+        );
+        assert_eq!(ABI_AARCH64.mkdirat, 34, "aarch64 mkdirat must be 34");
+    }
+
     // ── Task 6-T regression guards: stat64/lstat64/fstat64 ──
     //
     // These tests lock in the architectural contract added by Task 6-T:
@@ -13423,18 +13853,27 @@ mod tests {
             0,
             "PTRACE_O_EXITKILL must be non-zero (kernel ABI constant)"
         );
+        // Task 6-Z78: TRACEEXIT must be non-zero too — without it the
+        // PTRACE_EVENT_EXIT handler is dead code and silent deaths
+        // (run 32614181978, TWRP 6069 at T+118 s) leave no trace.
+        assert_ne!(
+            libc::PTRACE_O_TRACEEXIT,
+            0,
+            "PTRACE_O_TRACEEXIT must be non-zero (kernel ABI constant)"
+        );
         // The options must be DISTINCT bits — if two were the same
         // value, OR-ing them together would be a no-op for one of
         // them. The Linux kernel assigns distinct bit positions
-        // (TRACEFORK=1<<1, TRACEVFORK=1<<2, TRACECLONE=1<<3, EXITKILL
-        // =1<<20), so this assertion just locks in the
-        // distinct-bits contract.
+        // (TRACEFORK=1<<1, TRACEVFORK=1<<2, TRACECLONE=1<<3,
+        // TRACEEXIT=1<<6, EXITKILL=1<<20), so this assertion just
+        // locks in the distinct-bits contract.
         let opts = [
             libc::PTRACE_O_TRACEFORK,
             libc::PTRACE_O_TRACECLONE,
             libc::PTRACE_O_TRACEVFORK,
             libc::PTRACE_O_EXITKILL,
             libc::PTRACE_O_TRACESYSGOOD,
+            libc::PTRACE_O_TRACEEXIT,
         ];
         for i in 0..opts.len() {
             for j in (i + 1)..opts.len() {
