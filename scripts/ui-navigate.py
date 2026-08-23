@@ -955,9 +955,26 @@ def main():
     print("=" * 60)
     print(f"  Step 7: Wait for boot ({boot_wait}s) — screenshots every 5s")
     print("=" * 60)
+    # ── 6-Z87 FIX 4: feed TWRP input during the wait ──
+    # TWRP's UI thread (PagesManager → ev loop) may need INPUT events to
+    # advance from the splash to the main package — with zero input events
+    # the package switch can stall waiting on its event pipeline. Every
+    # 30 s (every 6th iteration of this 5 s loop) tap the screen center
+    # (160,320 on the 320x640 AVD). A periodic center tap is harmless on
+    # any screen: on the splash it merely wakes the input path, on the
+    # TWRP grid the center cell is an empty label, on the app's own UI a
+    # stray tap just re-focuses. tap_count lets us log "feeding input
+    # tap" only once per minute (every 2nd tap) to keep the console
+    # readable; the tap itself still fires every 30 s.
+    tap_count = 0
     for i in range(boot_wait // 5):
         wait(5)
         elapsed = (i + 1) * 5
+        if elapsed % 30 == 0:
+            adb_shell("input tap 160 320")
+            tap_count += 1
+            if tap_count % 2 == 1:
+                print(f"  feeding input tap 160 320 (#{tap_count} at {elapsed}s; next log at +60s)")
         screenshot(f"07_boot_{elapsed}s")
         activity = get_current_activity()
         # Don't break on "left Render2Activity" — the TWRP screen might
