@@ -2428,7 +2428,43 @@ fn i386_enosys_fake_value(nr: i64) -> i64 {
         78 => 0,                       // gettimeofday → success
         265 | 264 => 0,                // clock_getres/clock_gettime → success
         60 => 0,                       // umask → success (mask 0)
-        21 => 0,                       // access → success (path exists)
+        21 => -(libc::ENODEV as i64),  // mount → -ENODEV (Task 6-Z91).
+                                       // NOTE: on i386 syscall 21 is MOUNT,
+                                       // not access (access is 33 on i386;
+                                       // 21 is access only on x86_64 — the
+                                       // old "access → success" comment was
+                                       // a mislabel). This entry is the EXIT
+                                       // fallback for filter-blocked-but-not-
+                                       // SIGSYS mounts: the rootless sandbox
+                                       // has NO real block devices, so a
+                                       // storage mount (vfat/ext4/…) must be
+                                       // DENIED with -ENODEV — the guest
+                                       // (TWRP) then marks the partition
+                                       // unmountable and proceeds, instead
+                                       // of fake-succeeding, retrying
+                                       // forever and exhausting its stack
+                                       // (run 32637775917: 6,141 mount
+                                       // SIGSYS retries → SIGSEGV at
+                                       // recovery+0xaff3). Pseudo-filesystem
+                                       // mounts (tmpfs/proc/sysfs/…) that
+                                       // reach the SIGSYS handler still get
+                                       // the fake success + real rootfs
+                                       // side-effect ops there — see the
+                                       // dedicated mount arm +
+                                       // is_pseudo_fs_type() (6-Z91).
+                                       // NOTE: while mount stays in
+                                       // compute_exit_return_value's
+                                       // fake-success set (the 5-T fix
+                                       // init's Phase A pseudo mounts
+                                       // depend on in DESYNC mode), that
+                                       // Some(0) takes priority over this
+                                       // entry at the EXIT call site —
+                                       // and the SIGSYS arm's per-fstype
+                                       // write lands AFTER it and wins.
+                                       // This entry exists so the ENODEV
+                                       // semantics survive any future
+                                       // removal of mount from the
+                                       // compute table.
         39 => 0,                       // mkdir → success (rootfs op done
                                        // separately by the SIGSYS handler)
         191 => -1,                     // ugetrlimit → error (buffer would be
@@ -2488,6 +2524,57 @@ fn i386_enosys_fake_value(nr: i64) -> i64 {
                                        // fake path (gated above), placeholder
         _ => -1,                       // generic -EPERM error
     }
+}
+
+/// Task 6-Z91: is this filesystem type a KERNEL-PSEUDO filesystem (one that
+/// needs NO backing block device)?
+///
+/// Used by the SIGSYS mount() arm to decide between the two mount-failure
+/// semantics that run 32637775917 proved we must distinguish:
+///
+/// - **Pseudo fs** (tmpfs, devpts, proc, sysfs, selinuxfs, rootfs, cgroup,
+///   cgroup2, debugfs, tracefs, configfs, pstore, binderfs, functionfs,
+///   usbfs, mqueue) — these are exactly what TWRP init mounts during Phase A
+///   (tmpfs→/dev, devpts→/dev/pts, proc, sysfs, selinuxfs). Fake success
+///   (rax=0) is CORRECT for them: the guest only needs the mount to "exist"
+///   and our rootfs side-effect ops (creating {rootfs}/dev, {rootfs}/dev/pts)
+///   keep later opens working. KEEP the historical fake-success behaviour.
+///
+/// - **Block-storage fs** (vfat, exfat, ntfs, ext4, ext2, f2fs, msdos, auto,
+///   …) — TWRP recovery's recovery.fstab mounts (/system, /cache, /s and the
+///   /external_sd vfat). The rootless sandbox has NO real block devices, so
+///   faking success (the pre-6-Z91 behaviour) made TWRP's statfs verification
+///   fail and RE-MOUNT in a loop: ~6,141 mount() SIGSYS events over 630 s
+///   (~10/s), each retry nesting a stack frame, until the 8 MB i386 stack was
+///   exhausted → SIGSEGV si_addr=0xff6effcc (0x34 below the stack mapping
+///   ff6f0000-ffef0000) at rip=recovery+0xaff3. Denying with **-ENODEV** is
+///   what TWRP handles GRACEFULLLY: it marks the partition unmountable and
+///   moves on — exactly how /usb-otg (skipped via TW_NO_USB_STORAGE) never
+///   causes a loop ("Unable to mount" + proceed).
+///
+/// An unknown/EMPTY fstype (bind mounts, MS_REMOUNT, "auto") is NOT in the
+/// pseudo set and is therefore denied — an honest "no such device" beats a
+/// fake success that can never be verified by the guest.
+fn is_pseudo_fs_type(fstype: &str) -> bool {
+    matches!(
+        fstype,
+        "tmpfs"
+            | "devpts"
+            | "proc"
+            | "sysfs"
+            | "selinuxfs"
+            | "rootfs"
+            | "cgroup"
+            | "cgroup2"
+            | "debugfs"
+            | "tracefs"
+            | "configfs"
+            | "pstore"
+            | "binderfs"
+            | "functionfs"
+            | "usbfs"
+            | "mqueue"
+    )
 }
 
 /// Task 6-Z60: is this i386 syscall number one whose FIRST argument is a
@@ -5372,6 +5459,21 @@ pub fn run_ptrace_loop(
     // events past the cap).
     const MOUNT_SIGSYS_LOG_CAP: u64 = 40;
     let mut mount_sigsys_logged: u64 = 0;
+    // ── 6-Z91: storage-mount DENIAL counter ────────────────────────────
+    //
+    // The SIGSYS mount() arm now DENIES block-storage mounts (vfat/ext4/
+    // exfat/ntfs/ext2/f2fs/msdos/auto/…) with -ENODEV instead of faking
+    // success (see is_pseudo_fs_type + the dedicated mount arm for the
+    // full run-32637775917 rationale: the fake success caused TWRP's
+    // 6,141x /external_sd re-mount storm and the 8 MB stack exhaustion).
+    // The FIRST MOUNT_DENY_LOG_CAP denials are logged via `log` (bypassing
+    // `sigsys_log`, same un-suppressed pattern as the 6-Z89 evidence log
+    // above) so the next E2E can confirm each denied fstab mount exactly
+    // once per target — a HEALTHY post-6-Z91 run shows a handful of these
+    // lines (Phase B: /s, /cache, /system ×3, /external_sd) and then TWRP
+    // moving on ("Unable to mount" + proceed), NOT a retry storm.
+    const MOUNT_DENY_LOG_CAP: u64 = 40;
+    let mut mount_denied_logged: u64 = 0;
     // ── Pause() consecutive-call counter (Task 6-G) ───────────────────
     //
     // Tracks CONSECUTIVE pause() SIGSYS calls so the SIGSYS handler can
@@ -11423,8 +11525,110 @@ pub fn run_ptrace_loop(
                                 name, original_syscall, name
                             ));
                             0
-                        } else if original_syscall == a.mount
-                            || original_syscall == a.mkdir
+                        } else if original_syscall == a.mount {
+                            // ── Task 6-Z91: mount() gets its OWN arm — the
+                            // return value now depends on the FSTYPE (arg3):
+                            //
+                            //   * PSEUDO fs (tmpfs/devpts/proc/sysfs/
+                            //     selinuxfs/… — see is_pseudo_fs_type()):
+                            //     KEEP the historical fake success (rax=0)
+                            //     AND the real rootfs side-effect ops
+                            //     (creating {rootfs}/dev, {rootfs}/dev/pts
+                            //     for tmpfs/devpts) that Phase A of run
+                            //     32637775917 showed working (the "real fs
+                            //     op" this block has always performed).
+                            //
+                            //   * BLOCK-STORAGE fs (vfat/ext4/exfat/ntfs/
+                            //     ext2/f2fs/msdos/auto/… — everything else,
+                            //     including NULL/empty fstype): return
+                            //     -ENODEV. The rootless sandbox has NO real
+                            //     block devices; faking success made TWRP's
+                            //     statfs verification fail and re-mount in a
+                            //     retry loop — 6,141 mount() SIGSYS events
+                            //     over 630 s in run 32637775917, each retry
+                            //     nesting ~1.3 KB of stack, until the 8 MB
+                            //     i386 stack was exhausted (SIGSEGV at
+                            //     rip=recovery+0xaff3, rsp 0x34 below the
+                            //     stack mapping ff6f0000-ffef0000). -ENODEV
+                            //     is the errno TWRP handles GRACEFULLY: it
+                            //     marks the partition unmountable and MOVES
+                            //     ON — exactly the pattern that already
+                            //     works for /usb-otg (skipped via
+                            //     TW_NO_USB_STORAGE): "Unable to mount" +
+                            //     proceed. Phase B targets: /s, /cache ×2,
+                            //     /system ×3, /external_sd (the storm).
+                            //
+                            // i386 mount(src, target, fstype, flags, data):
+                            //   src=arg1, target=arg2, fstype=arg3.
+                            let src_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
+                            let tgt_addr = get_syscall_arg(&sigsys_regs, a.reg_arg2);
+                            let fs_addr = get_syscall_arg(&sigsys_regs, a.reg_arg3);
+                            let src = if src_addr != 0 {
+                                read_child_string(pid, src_addr)
+                            } else {
+                                None
+                            };
+                            let tgt = if tgt_addr != 0 {
+                                read_child_string(pid, tgt_addr)
+                            } else {
+                                None
+                            };
+                            let fstype = if fs_addr != 0 {
+                                read_child_string(pid, fs_addr).unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
+                            if is_pseudo_fs_type(&fstype) {
+                                // Pseudo fs — preserve the pre-6-Z91
+                                // behaviour EXACTLY: for tmpfs/devpts
+                                // create the mount-point directory in the
+                                // rootfs (init expects a fresh tmpfs to
+                                // exist at the mount point; the host
+                                // already has proc/sysfs), then fake
+                                // success.
+                                if let Some(tgt) = tgt.as_ref() {
+                                    let real_tgt = if tgt.starts_with('/') {
+                                        format!("{}{}", rootfs, tgt)
+                                    } else {
+                                        tgt.clone()
+                                    };
+                                    if fstype == "tmpfs" || fstype == "devpts" {
+                                        match std::fs::create_dir_all(&real_tgt) {
+                                            Ok(()) => sigsys_log(&format!(
+                                                "SIGSYS mount: created directory {} (fstype={}) in rootfs",
+                                                real_tgt, fstype
+                                            )),
+                                            Err(e) => sigsys_log(&format!(
+                                                "SIGSYS mount: FAILED to create {} (fstype={}): {}",
+                                                real_tgt, fstype, e
+                                            )),
+                                        }
+                                    }
+                                }
+                                sigsys_log(&format!(
+                                    "intercepted SIGSYS — mount() nr={} [{}] fstype={} target={:?} (NOT rewriting orig_rax — seccomp aborted, returning 0 — fake success for PSEUDO fs + performed fs op in rootfs)",
+                                    original_syscall, name, fstype, tgt
+                                ));
+                                0
+                            } else {
+                                // Block-storage fs — DENY with -ENODEV
+                                // (first MOUNT_DENY_LOG_CAP denials are
+                                // logged un-suppressed via `log`).
+                                if mount_denied_logged < MOUNT_DENY_LOG_CAP {
+                                    mount_denied_logged =
+                                        mount_denied_logged.saturating_add(1);
+                                    log(&format!(
+                                        "6-Z91: storage mount DENIED {}->{} {} -> -ENODEV (no real block devices; the guest marks it unmountable and proceeds — fake-success caused a 6141x retry storm + stack exhaustion in run 32637775917) [deny #{}/{}]",
+                                        src.as_deref().unwrap_or("(null)"),
+                                        tgt.as_deref().unwrap_or("(null)"),
+                                        fstype,
+                                        mount_denied_logged,
+                                        MOUNT_DENY_LOG_CAP
+                                    ));
+                                }
+                                -(libc::ENODEV as i64)
+                            }
+                        } else if original_syscall == a.mkdir
                             || original_syscall == a.chmod
                             || original_syscall == a.chroot
                             || original_syscall == a.unshare
@@ -11433,7 +11637,14 @@ pub fn run_ptrace_loop(
                             // Filesystem-related seccomp-blocked syscalls.
                             // These are the ones TWRP init calls during
                             // early boot (mount tmpfs/proc/sysfs, mkdir
-                            // /dev/pts, mknod /dev/null etc.).
+                            // /dev/pts, mknod /dev/null etc.). Task 6-Z91
+                            // moved `mount` OUT of this block into its own
+                            // fstype-aware arm directly above (pseudo →
+                            // fake success + rootfs op, block-storage →
+                            // -ENODEV): this block's blanket fake success
+                            // for EVERY mount was the root cause of TWRP's
+                            // 6,141x /external_sd re-mount storm + stack
+                            // exhaustion in run 32637775917.
                             //
                             // TWO-PRONGED FIX:
                             // 1. Fake success (return 0) WITHOUT rewriting
@@ -11475,45 +11686,11 @@ pub fn run_ptrace_loop(
                             // Perform the actual filesystem operation in
                             // the rootfs. We read the path argument(s) from
                             // the child's memory and translate them to
-                            // rootfs-relative paths.
-                            if original_syscall == a.mount {
-                                // mount(source, target, fstype, flags, data)
-                                // arg1=source, arg2=target, arg3=fstype
-                                let tgt_addr = get_syscall_arg(&sigsys_regs, a.reg_arg2);
-                                let fs_addr = get_syscall_arg(&sigsys_regs, a.reg_arg3);
-                                if tgt_addr != 0 {
-                                    if let Some(tgt) = read_child_string(pid, tgt_addr) {
-                                        let fstype = if fs_addr != 0 {
-                                            read_child_string(pid, fs_addr).unwrap_or_default()
-                                        } else {
-                                            String::new()
-                                        };
-                                        // Translate target to rootfs-relative
-                                        let real_tgt = if tgt.starts_with('/') {
-                                            format!("{}{}", rootfs, tgt)
-                                        } else {
-                                            tgt.clone()
-                                        };
-                                        // For tmpfs mounts, create the target
-                                        // directory (init expects a fresh
-                                        // tmpfs to exist at the mount point).
-                                        // For proc/sysfs/devpts, the host
-                                        // already has these — skip.
-                                        if fstype == "tmpfs" || fstype == "devpts" {
-                                            match std::fs::create_dir_all(&real_tgt) {
-                                                Ok(()) => sigsys_log(&format!(
-                                                    "SIGSYS mount: created directory {} (fstype={}) in rootfs",
-                                                    real_tgt, fstype
-                                                )),
-                                                Err(e) => sigsys_log(&format!(
-                                                    "SIGSYS mount: FAILED to create {} (fstype={}): {}",
-                                                    real_tgt, fstype, e
-                                                )),
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if original_syscall == a.mkdir {
+                            // rootfs-relative paths. (mount used to have
+                            // its rootfs side-effect op HERE — that op now
+                            // lives in the dedicated 6-Z91 mount arm above,
+                            // preserved verbatim for pseudo filesystems.)
+                            if original_syscall == a.mkdir {
                                 // mkdir(path, mode) — arg1=path
                                 let path_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
                                 if path_addr != 0 {
@@ -12757,13 +12934,90 @@ mod tests {
         // handler writes rax=0, so init sees "mount returned 0 (success)"
         // and proceeds past the mount-sequence-failed check.
         //
-        // The mount SIGSYS handler already returns 0 via the
-        // mount/mkdir/chmod/chroot/unshare block — but in DESYNC mode
-        // that writeback is skipped, so the EXIT handler's write is
-        // the only one. This test verifies the EXIT handler will now
-        // fake-success mount.
+        // The mount SIGSYS handler returns 0 for PSEUDO filesystems via
+        // the dedicated 6-Z91 fstype-aware arm (and -ENODEV for block-
+        // storage mounts — tmpfs/devpts/proc/sysfs fake success, vfat/
+        // ext4/… denied). In the ENTRY→EXIT→SIGSYS stop order the SIGSYS
+        // handler's write lands LAST and wins, so this EXIT-handler
+        // Some(0) is the belt-and-suspenders write that keeps init's
+        // Phase A pseudo mounts (tmpfs→/dev, proc, sysfs, …) succeeding
+        // even in DESYNC mode. It must NOT be changed to an errno — that
+        // would re-break init's mount-sequence-failed path (5-T).
         assert_eq!(compute_exit_return_value(21, &ABI_X86_32), Some(0));
         assert_eq!(syscall_name(21, &ABI_X86_32), "mount");
+    }
+
+    // ── Task 6-Z91 regression guards: mount-failure semantics ─────────
+    //
+    // Run 32637775917 proved that fake-successing EVERY mount() is fatal:
+    // TWRP's statfs verification of the (non-)mounted /external_sd vfat
+    // failed → 6,141 re-mount SIGSYS retries over 630 s → 8 MB i386 stack
+    // exhaustion → SIGSEGV at recovery+0xaff3. The fix denies block-storage
+    // mounts with -ENODEV (TWRP then marks the partition unmountable and
+    // proceeds — the graceful /usb-otg pattern) while KEEPING fake success
+    // + the rootfs side-effect ops for kernel-pseudo filesystems.
+
+    #[test]
+    fn pseudo_fs_type_classification_6z91() {
+        // Every kernel-pseudo fs (no backing block device needed) must be
+        // fake-successed — this is exactly TWRP init's Phase A mount set
+        // (run 32637775917 events #1–#5: tmpfs→/dev, devpts→/dev/pts,
+        // proc, sysfs, selinuxfs) plus the rest of the standard pseudo
+        // family.
+        for pseudo in [
+            "tmpfs",
+            "devpts",
+            "proc",
+            "sysfs",
+            "selinuxfs",
+            "rootfs",
+            "cgroup",
+            "cgroup2",
+            "debugfs",
+            "tracefs",
+            "configfs",
+            "pstore",
+            "binderfs",
+            "functionfs",
+            "usbfs",
+            "mqueue",
+        ] {
+            assert!(
+                is_pseudo_fs_type(pseudo),
+                "{pseudo} must be classified PSEUDO (fake success)"
+            );
+        }
+        // Every block-storage fs must be DENIED with -ENODEV — this is
+        // TWRP recovery's Phase B/C mount set (events #6–#40: /s, /cache,
+        // /system ext4 + the /external_sd vfat storm).
+        for storage in [
+            "vfat", "exfat", "ntfs", "ext4", "ext2", "f2fs", "msdos", "auto", "vfat ",
+        ] {
+            assert!(
+                !is_pseudo_fs_type(storage),
+                "{storage} must be classified STORAGE (deny -ENODEV)"
+            );
+        }
+        // Unknown/empty fstype (bind mounts, MS_REMOUNT, unreadable
+        // arg3) is denied too — an honest ENODEV beats an unverifiable
+        // fake success.
+        assert!(!is_pseudo_fs_type(""));
+        assert!(!is_pseudo_fs_type("Tmpfs")); // case-sensitive on purpose
+    }
+
+    #[test]
+    fn i386_enosys_fake_value_mount_returns_enodev_6z91() {
+        // i386 syscall 21 is MOUNT (access is 33 on i386 — the old
+        // "access → success" table comment was a mislabel). This table
+        // entry is the EXIT fallback for filter-blocked-but-not-SIGSYS
+        // mounts: it must agree with the SIGSYS mount arm's storage
+        // semantics (-ENODEV, run 32637775917) so that a storage mount
+        // can never see fake success from EITHER path.
+        assert_eq!(i386_enosys_fake_value(21), -(libc::ENODEV as i64));
+        // ENODEV is 19 on every Linux ABI — lock the raw errno too, so a
+        // bad libc constant would fail loudly here rather than silently
+        // returning some other errno to the guest.
+        assert_eq!(libc::ENODEV, 19);
     }
 
     #[cfg(target_arch = "x86_64")]
