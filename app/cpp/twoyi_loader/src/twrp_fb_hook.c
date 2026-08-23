@@ -901,7 +901,15 @@ int poll(struct pollfd *fds, unsigned long nfds, int timeout_ms) {
             real_poll = (int (*)(struct pollfd *, unsigned long, int))dlsym(RTLD_NEXT, "poll");
         }
         if (real_poll) return real_poll(fds, nfds, timeout_ms);
+#if defined(__i386__)
         return (int)raw_syscall3(SYS_poll, (long)fds, (long)nfds, timeout_ms);
+#else
+        // aarch64 has no poll syscall (ppoll only) — and the input bridge
+        // is i386-only (TWRP). On other arches without a real_poll symbol
+        // report a plain timeout; harmless for the fb-only build.
+        (void)fds; (void)nfds;
+        return 0;
+#endif
     }
 
     for (;;) {
