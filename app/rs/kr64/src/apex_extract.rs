@@ -1782,8 +1782,10 @@ mod tests {
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
         // With the gate ON, the host path is appended last.
-        let cands_gated =
-            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()), &cfg);
+        let cands_gated = apex_candidate_paths_with(
+            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()),
+            &cfg,
+        );
         assert!(cands_gated
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
@@ -1808,8 +1810,10 @@ mod tests {
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
         // Gated ON: host paths reappear.
-        let cands_gated =
-            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()), &cfg);
+        let cands_gated = apex_candidate_paths_with(
+            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()),
+            &cfg,
+        );
         assert!(cands_gated
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
@@ -1835,8 +1839,10 @@ mod tests {
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
         assert!(!cands.iter().any(|p| p == "/apex/com.android.runtime.apex"));
         // Gate ON → both host paths included.
-        let cands_gated =
-            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()), &cfg);
+        let cands_gated = apex_candidate_paths_with(
+            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()),
+            &cfg,
+        );
         assert!(cands_gated
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
@@ -1844,8 +1850,10 @@ mod tests {
             .iter()
             .any(|p| p == "/apex/com.android.runtime.apex"));
         // The gate is value-strict: "0"/"true"/etc. do NOT enable it.
-        let cands_zero =
-            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "true".to_string()), &cfg);
+        let cands_zero = apex_candidate_paths_with(
+            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "true".to_string()),
+            &cfg,
+        );
         assert!(!cands_zero
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
