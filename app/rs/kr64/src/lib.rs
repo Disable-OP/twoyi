@@ -5979,6 +5979,67 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
+    // ── Pre-create TWRP's expected mount-point dirs (bootfix FIX 2) ────
+    //
+    // TWRP's partition manager stats/opens these paths during
+    // "Updating partition details...": `/cache/.` (statfs64 — the fatal
+    // "E:Unable to statfs '/cache/.`" of run 32612016071), `/cache/recovery`
+    // (its log/settings folder — "I:Recreating /cache/recovery folder" →
+    // "E:Could not create /cache/recovery"), `/sdcard` (data/media
+    // emulated storage — "I:Can not create '/sdcard' folder."),
+    // `/external_sd` + `/usb-otg` ("Can not create '/external_sd' folder
+    // (Read-only file system)." — the mkdir resolved against the HOST /,
+    // not the rootfs). NONE of them existed in the rootfs that run
+    // (DEATH_CHAIN §9), so every layer failed. Combined with the statfs
+    // path translation (ptrace_emu.rs bootfix FIX 1), statfs64("/cache/.")
+    // now resolves to {rootfs}/cache/. — a real dir on the app's own
+    // ext4, giving sane f_type/f_bfree/f_blocks instead of host-EACCES.
+    // All are 0755 dirs; already-exists is NOT an error (idempotent —
+    // matches the precreate_sysfs_stubs pattern below).
+    {
+        let twrp_dirs: &[&str] = &[
+            "cache",
+            "cache/recovery",
+            "sdcard",
+            "external_sd",
+            "usb-otg",
+        ];
+        for rel in twrp_dirs {
+            let dir_path = format!("{}/{}", rootfs_prefix, rel);
+            match std::fs::create_dir(&dir_path) {
+                Ok(()) => {
+                    let _ = std::fs::set_permissions(
+                        &dir_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    );
+                    info!(
+                        "[KR64] PARENT: pre-created TWRP dir {} (mode 0755)",
+                        dir_path
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = std::fs::set_permissions(
+                        &dir_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    );
+                    info!(
+                        "[KR64] PARENT: TWRP dir {} already exists — re-asserting mode 0755",
+                        dir_path
+                    );
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PARENT: FAILED to pre-create TWRP dir {}: {} (errno={}) — TWRP's statfs/mkdir on /{} may fail",
+                        dir_path,
+                        e,
+                        e.raw_os_error().unwrap_or(0),
+                        rel
+                    );
+                }
+            }
+        }
+    }
+
     // ── Pre-create fake sysfs (/sys/class + /sys/fs/selinux/{enforce,load}) ──
     //
     // ROOT CAUSE (Task 6-P, dispatcher's analysis of 56a5bd3 UI E2E):
