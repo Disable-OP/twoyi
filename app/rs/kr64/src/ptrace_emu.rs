@@ -260,6 +260,38 @@ struct ChildAbi {
     stat64: i64,
     lstat64: i64,
     fstat64: i64,
+    // ── bootfix FIX 1: statfs / fstatfs / statfs64 / fstatfs64 ──────
+    //
+    // statfs was the ONE path-taking syscall family with NO handler in
+    // the emulator (rg 'statfs' twoyi/ptrace_emu.rs → 0 matches before
+    // this). translate_path() was called for execve, open/openat,
+    // stat64/lstat64/fstatat-family, access/faccessat, readlink, chdir,
+    // and unlink — but NOT statfs/statfs64 → TWRP recovery's
+    // statfs64("/cache/.") (i386 nr=268, NOT seccomp-blocked — the
+    // kernel executes it for real; verified in run 32612016071 where
+    // init's earlier statfs64 returned a genuine 0) resolved against
+    // the HOST filesystem, where untrusted_app cannot use /cache →
+    // EACCES → "E:Unable to statfs '/cache/.`" → TWRP fell back to
+    // Exec_Cmd("/sbin/sh -c …") → helper fork → exit-127 → VM teardown
+    // at T+4 s (DEATH_CHAIN.md §8).
+    //
+    // statfs + statfs64 take a PATH (arg1) → need path translation
+    // (same as stat/lstat). fstatfs + fstatfs64 take an fd (arg1) → NO
+    // path translation; carried for ABI completeness + syscall_name
+    // diagnostic logging (mirrors the fstat64 precedent above).
+    //
+    // Verified against /usr/include/x86_64-linux-gnu/asm/unistd_32.h +
+    // unistd_64.h + asm-generic/unistd.h:
+    //   i386:   statfs=99, fstatfs=100, statfs64=268, fstatfs64=269
+    //   x86_64: statfs=137, fstatfs=138 (x86_64's statfs is already
+    //     64-bit-clean — there are NO statfs64/fstatfs64 numbers → -1
+    //     sentinels, mirroring the stat64 precedent)
+    //   aarch64 (asm-generic): statfs=43, fstatfs=44 (asm-generic also
+    //     has no statfs64/fstatfs64 → -1 sentinels)
+    statfs_nr: i64,
+    fstatfs_nr: i64,
+    statfs64_nr: i64,
+    fstatfs64_nr: i64,
     // pread64 — reads at an explicit 64-bit offset. Task 6-Z71: the
     // recovery child's bionic linker loads ELF headers + DT_* entries
     // with pread64; the app's seccomp filter blocks the i386 variant
@@ -884,6 +916,18 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     stat64: -1,
     lstat64: -1,
     fstat64: -1,
+    // x86_64 statfs=137, fstatfs=138 (per asm/unistd_64.h: __NR_statfs
+    // 137, __NR_fstatfs 138 — verified for bootfix FIX 1). x86_64 has NO
+    // statfs64/fstatfs64 (its statfs is already 64-bit-clean) → -1
+    // sentinels, mirroring the stat64 precedent. The host is x86_64
+    // running an i386 child, so these numbers do NOT fire at runtime
+    // (the guest uses i386 syscall 99/268); locked in for ABI
+    // completeness + so the FIX 1 ENTRY arm + syscall_name labels work
+    // correctly if a future x86_64 guest is ever supported.
+    statfs_nr: 137,
+    fstatfs_nr: 138,
+    statfs64_nr: -1,
+    fstatfs64_nr: -1,
     // x86_64 pread64 = 17 (asm/unistd_64.h). The dedicated 6-Z71 arms
     // only ever FAKE a read when the fresh return is -38 (seccomp
     // filter block) — x86_64 pread64 executes normally under the
@@ -1102,6 +1146,20 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     stat64: 195,
     lstat64: 196,
     fstat64: 197,
+    // bootfix FIX 1: i386 statfs=99, fstatfs=100, statfs64=268,
+    // fstatfs64=269 (per /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h: __NR_statfs 99, __NR_fstatfs 100, __NR_statfs64 268,
+    // __NR_fstatfs64 269). 268 is the number TWRP recovery ACTUALLY
+    // issues for statfs64("/cache/.") in run 32612016071 (DEATH_CHAIN
+    // §4: “nr=268 [statfs64 ← the failing /cache statfs]” in the last-50
+    // list, right before the nr=4 write of "E:Unable to statfs").
+    // statfs + statfs64 take the path in arg1 → the two numbers the
+    // FIX 1 ENTRY arm path-translates; the fstatfs pair is carried for
+    // syscall_name logging only (fd, not path).
+    statfs_nr: 99,
+    fstatfs_nr: 100,
+    statfs64_nr: 268,
+    fstatfs64_nr: 269,
     // Task 6-Z71: i386 pread64 = 180 (per
     // /usr/include/x86_64-linux-gnu/asm/unistd_32.h: __NR_pread64 180,
     // cross-checked against arch/x86/entry/syscalls/syscall_32.tbl:
@@ -1395,6 +1453,17 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     stat64: -1,
     lstat64: -1,
     fstat64: -1,
+    // bootfix FIX 1: aarch64 (asm-generic) statfs=43, fstatfs=44 (per
+    // asm-generic/unistd.h: __NR_statfs 43, __NR_fstatfs 44). asm-generic
+    // has NO statfs64/fstatfs64 (its statfs is already 64-bit) → -1
+    // sentinels, mirroring the stat64 precedent. The host is x86_64
+    // running an i386 child, so this aarch64 path is dead code at
+    // runtime — the sentinels keep the compile happy + document the
+    // aarch64 behaviour.
+    statfs_nr: 43,
+    fstatfs_nr: 44,
+    statfs64_nr: -1,
+    fstatfs64_nr: -1,
     // aarch64 (asm-generic) pread64 = 67. The dedicated 6-Z71 arms only
     // ever FAKE a read when the fresh return is -38 (seccomp filter
     // block) — aarch64 pread64 executes normally under the filter's
@@ -2665,6 +2734,20 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // translation match arm — but we add the label here for
         // diagnostic logging.
         "fstat64"
+    } else if abi.statfs_nr != -1 && nr == abi.statfs_nr {
+        // bootfix FIX 1: label the filesystem-stat syscalls (run
+        // 32612016071 logged the fatal TWRP call as “nr=268 [unknown]”
+        // — identifying it as statfs64("/cache/.") required manual
+        // cross-referencing). The `!= -1` guards keep nr=-1 SIGSYS
+        // desync events labelled "[unknown]" on ABIs where the field
+        // is a sentinel.
+        "statfs"
+    } else if abi.fstatfs_nr != -1 && nr == abi.fstatfs_nr {
+        "fstatfs"
+    } else if abi.statfs64_nr != -1 && nr == abi.statfs64_nr {
+        "statfs64"
+    } else if abi.fstatfs64_nr != -1 && nr == abi.fstatfs64_nr {
+        "fstatfs64"
     } else if nr == abi.execve {
         "execve"
     } else if nr == abi.unlink {
@@ -5223,6 +5306,41 @@ pub fn run_ptrace_loop(
                 } else {
                     log("no syscalls recorded in all-syscalls buffer before ESRCH");
                 }
+                // bootfix FIX 4 (run 32612016071): init hit ESRCH here —
+                // it died WITHOUT the tracer ever seeing an exit stop
+                // (silently, 10 ms after the TWRP helper's exit-127) —
+                // and the `return -1` at the bottom of this branch
+                // ENDED the ptrace loop while the recovery child (6289)
+                // was still ALIVE, frozen mid-wait4; PTRACE_O_EXITKILL
+                // then SIGKILLed it and the whole VM tore down at T+4 s
+                // (DEATH_CHAIN §0 steps 3-6). Mirror the 6-Z67 WIFEXITED
+                // logic below: if the ESRCH child is init but the
+                // recovery child is still alive (kill(rec,0)==0 — 0 for
+                // a live/possibly-stopped process, -1/ESRCH once
+                // reaped), mark init dead, re-point current_pid at the
+                // recovery child (the loop-top PTRACE_SYSCALL resumes it
+                // WITH syscall tracing), and keep serving it. If init is
+                // an un-reaped zombie, the next waitpid(-1) reports its
+                // exit and the WIFEXITED branch's own 6-Z67 check routes
+                // it here again — this path just must not END the loop.
+                // The existing reap/return paths below are preserved
+                // verbatim for every non-recovery case.
+                if current_pid == init_pid {
+                    if let Some(rec_pid) = recovery_child_pid {
+                        if rec_pid != current_pid {
+                            let rec_alive = unsafe { libc::kill(rec_pid, 0) } == 0;
+                            if rec_alive {
+                                log(&format!(
+                                    "ESRCH on init {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67 ESRCH path, bootfix FIX 4)",
+                                    current_pid, rec_pid
+                                ));
+                                init_dead = true;
+                                current_pid = rec_pid;
+                                continue;
+                            }
+                        }
+                    }
+                }
                 // Try to reap the child to get its exit status.
                 // Task 6-S: reap `current_pid` (the child we tried to
                 // resume), NOT always `pid` (init). If a forked child
@@ -6535,7 +6653,38 @@ pub fn run_ptrace_loop(
                         // as a duplicate init (re-parsing .rc, re-forking) and
                         // corrupting the boot state.
                         if abi.execve == 11 && recovery_child_pid.is_some() {
-                            log("DIAG execve: skipping init's i386 execve (6-Z49; recovery child forked separately) — child will see -ENOENT and take the clean service-spawn failure path (6-Z66)");
+                            // bootfix FIX 3: read + ALWAYS log the execve
+                            // pathname BEFORE the skip decision. In run
+                            // 32612016071 the TWRP helper's (pid 6306)
+                            // execve target was NEVER recorded (the skip
+                            // branch forced -ENOENT without reading the
+                            // arg1 pathname — DEATH_CHAIN §2: "the target
+                            // binary is unrecorded"), which was the single
+                            // biggest evidence gap of the death chain.
+                            // Distinguish init's service-spawn execve
+                            // (pid == init_pid — the INTENDED 6-Z49 target)
+                            // from TWRP's OWN helper forks (Exec_Cmd
+                            // "/sbin/sh -c …" — collateral denial;
+                            // /sbin/sh is absent from this rootfs anyway
+                            // so a transparent execve would ENOENT too.
+                            // The FIX 1 statfs translation removes the
+                            // E:statfs trigger, so this helper path should
+                            // no longer fire at all).
+                            let execve_path_addr = get_syscall_arg(&regs, abi.reg_arg1);
+                            let execve_path = if execve_path_addr != 0 {
+                                read_child_string(pid, execve_path_addr)
+                            } else {
+                                None
+                            };
+                            log(&format!("DIAG execve: pid={} path={:?}", pid, execve_path));
+                            if pid == init_pid {
+                                log("DIAG execve: skipping init's i386 execve (6-Z49; recovery child forked separately) — child will see -ENOENT and take the clean service-spawn failure path (6-Z66)");
+                            } else {
+                                log(&format!(
+                                    "TWRP-helper execve denied: path={:?} — child will see -ENOENT (6-Z66; /sbin/sh is absent from this rootfs so a transparent execve would ENOENT too — FIX 1 statfs translation should prevent this fallback from firing)",
+                                    execve_path
+                                ));
+                            }
                             set_syscall_arg(&mut regs, abi.reg_syscall, (-1i64) as u64);
                             set_syscall_ret(&mut regs, &abi, -2);
                             let _ = ptrace_setregs(pid, &regs, std::mem::size_of::<Regs>());
@@ -7377,6 +7526,61 @@ pub fn run_ptrace_loop(
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
+                                if translated != path
+                                    && !write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        path_arg_index,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &translated,
+                                    )
+                                {
+                                    write_child_string(pid, path_addr, &translated);
+                                }
+                            }
+                        }
+                        // ── bootfix FIX 1: statfs (i386 nr=99) /
+                        // statfs64 (i386 nr=268) ENTRY path translation ──
+                        //
+                        // Root cause (DEATH_CHAIN.md §8, run 32612016071):
+                        // statfs was the one path-taking syscall with NO
+                        // translate_path coverage, so TWRP recovery's
+                        // statfs64("/cache/.") executed against the HOST
+                        // /cache → EACCES → "E:Unable to statfs '/cache/.`"
+                        // → Exec_Cmd fallback → helper fork → exit-127 →
+                        // loop teardown at T+4 s. The syscall itself is NOT
+                        // seccomp-blocked (the kernel runs it for real —
+                        // init's earlier statfs64 returned a genuine 0), so
+                        // all that is needed is to point arg1 at the
+                        // rootfs-translated path (→ {rootfs}/cache/., a real
+                        // dir pre-created by lib.rs bootfix FIX 2) before the
+                        // kernel executes it. The kernel then fills the
+                        // caller's statfs/statfs64 buffer itself (sane
+                        // f_type/f_bfree/f_blocks from the app's own ext4) —
+                        // no struct synthesis needed. fstatfs/fstatfs64 take
+                        // an fd (arg1) and are intentionally NOT here.
+                        //
+                        // Mirrors the unlink arm above: same read →
+                        // translate → write_translated_path (scratch-area)
+                        // with in-place write_child_string fallback. Path is
+                        // arg1 for BOTH statfs and statfs64 (arg2 = buf).
+                        // The `!= -1` guards keep a hypothetical nr=-1
+                        // SIGSYS-desync stop from matching a sentinel field.
+                        n if (abi.statfs_nr != -1 && n == abi.statfs_nr)
+                            || (abi.statfs64_nr != -1 && n == abi.statfs64_nr) =>
+                        {
+                            let path_arg_index = abi.reg_arg1;
+                            let path_addr = get_syscall_arg(&regs, path_arg_index);
+                            if let Some(path) = read_child_string(pid, path_addr) {
+                                let translated = translate_path(rootfs, &path);
+                                if translated != path && loop_count <= 500 {
+                                    log(&format!(
+                                        "intercepted statfs({}) -> {}",
+                                        path, translated
+                                    ));
+                                }
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
