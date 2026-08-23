@@ -301,11 +301,15 @@ jobs:
 
           # Honest verification: the guest init must exist.
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/ | head -20"
-          # init is a SYMLINK (init -> /system/bin/init) — test -f follows
-          # it and fails on a dangling-looking chain; test -e matches the
-          # link itself. Also verify the actual target exists.
-          if ! $ADB shell "run-as io.twoyi.debug test -e profiles/default/rootfs/init"; then
-              echo "✗ guest init (symlink) NOT found after extraction"; exit 1
+          # init is an ABSOLUTE symlink (init -> /system/bin/init): test -f
+          # AND test -e both FOLLOW it, resolving /system/bin/init against
+          # the EMULATOR's root as the app uid — SELinux denies the stat
+          # (init_exec label vs untrusted_app) -> false negative (runs
+          # 32654425160 + 32657293755: the listing shows init right there).
+          # Only test -L (lstat) matches the link itself. The real target
+          # check is the rootfs-relative path below.
+          if ! $ADB shell "run-as io.twoyi.debug test -L profiles/default/rootfs/init"; then
+              echo "✗ guest init symlink NOT found after extraction"; exit 1
           fi
           if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/system/bin/init"; then
               echo "✗ guest init TARGET /system/bin/init not found"; exit 1
