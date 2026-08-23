@@ -726,8 +726,25 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
         }
         /* connect verification failed on this candidate — close and try
          * the next path */
+        if (g_inbr_log_open < 8) {
+            g_inbr_log_open++;
+            write_str(2, "[twrp_fb_hook] INPUT bridge: connect candidate FAILED: ");
+            write_str(2, cands[i] != 0 ? cands[i] : "(null)");
+            write_str(2, " (read verify=");
+            write_num(2, (int)v);
+            write_str(2, ")\n");
+        }
         (void)raw_syscall1(SYS_close, fd);
         fd = -1;
+    }
+
+    if (g_inbr_log_open < 8) {
+        g_inbr_log_open++;
+        write_str(2, "[twrp_fb_hook] INPUT bridge: ALL candidates failed (ncands=");
+        write_num(2, ncands);
+        write_str(2, ") — TWOYI_ROOTFS env set? ");
+        write_str(2, (getenv && getenv("TWOYI_ROOTFS")) ? "yes" : "NO");
+        write_str(2, "\n");
     }
 
     return -1;
