@@ -7454,6 +7454,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     std::ffi::CString::new(format!("LD_PRELOAD={}", ld_preload)).unwrap_or_default(),
                     std::ffi::CString::new(format!("LD_LIBRARY_PATH={}", ld_library_path)).unwrap_or_default(),
                     std::ffi::CString::new("PATH=/sbin:/system/bin").unwrap_or_default(),
+                    // 6-Z96: the fb hook's INPUT bridge computes the host
+                    // touch socket path as $TWOYI_ROOTFS/../dev/touch-events —
+                    // without this env its connect() ENOENTs (run 32652894955:
+                    // 'INPUT bridge connect FAILED for "event0"' all 600s while
+                    // the socket was bound the whole time).
+                    std::ffi::CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs)).unwrap_or_default(),
                 ];
                 let mut argv_ptr: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
                 argv_ptr.push(std::ptr::null());
