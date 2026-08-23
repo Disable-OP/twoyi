@@ -7176,7 +7176,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // helpers added by 2-B (commit `370b8ee`) to send the DeviceInfo
     // header (896 bytes) on accept, then forward encoded InputEvents
     // from the host's `{data_dir}/dev/touch-events` IPC socket.
-    spawn_touch_accept_thread(device_set.touch, cfg.clone());
+    // 6-Z94: TWRP mode — the fb hook's INPUT bridge is the sole client of
+    // the host touch socket (last-accept-wins would starve it)
+    if !cfg.boot_recovery {
+        spawn_touch_accept_thread(device_set.touch, cfg.clone());
+    }
 
     // ── PTRACE SYSCALL EMULATION (non-root TWRP boot) ──
     //
