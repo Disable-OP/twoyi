@@ -14,10 +14,11 @@
 #     which we need to (a) preload the guest rootfs and (b) pull the
 #     app's FileLogger logs (the TWRP E2E's app-logs were always empty
 #     because the release build rejects run-as).
-#   - The guest rootfs is EXTRACTED FROM THE AVD SYSTEM IMAGE
-#     (API-30 google_apis x86_64 — NATIVE arch, no translation):
-#     scripts/extract-rootfs.sh (simg2img → loop mount → tar + ramdisk
-#     overlay) → preloaded into profiles/default/rootfs via run-as.
+#   - The guest rootfs is TARRTED OUT OF THE RUNNING EMULATOR
+#     (API-30 google_apis x86_64 — NATIVE arch, no translation; the
+#     KVM E2E's proven 'emulator' source: system/ vendor/ init
+#     default.prop apex/ — apex is REQUIRED, linker64 is a symlink
+#     into it) → preloaded into profiles/default/rootfs via run-as.
 #     The app's first launch auto-creates the rootfs symlink
 #     (ProfileManager.initializeProfiles → updateRootfsSymlink) and
 #     romExist() sees rootfs/init.
@@ -250,32 +251,26 @@ jobs:
           $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
           echo "  ✓ APK installed"
 
-          # ── Extract the x86_64 rootfs from the AVD system image ──────
-          # NATIVE ARCHITECTURE: the API-30 google_apis x86_64 image IS
-          # the same arch as the emulator — the guest runs natively, no
-          # ndk_translation, no arm64 quirks. (The old cyanmint 8.1 ROM
-          # is arm64 and needed translation; this replaces it entirely.)
-          # This is the same extraction the KVM E2E does
-          # (scripts/extract-rootfs.sh: simg2img -> loop mount -> tar +
-          # ramdisk overlay) — but WITHOUT the KVM test's root+permissive
-          # kernel: this run stays the unrooted-user simulation.
-          sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils
-
-          SDK_SYSIMG="$ANDROID_HOME/system-images/android-30/google_apis/x86_64"
-          ls -la "$SDK_SYSIMG" || { echo "✗ system image not found"; exit 1; }
-
-          chmod +x scripts/extract-rootfs.sh
-          scripts/extract-rootfs.sh \
-              --system-img "$SDK_SYSIMG/system.img" \
-              --ramdisk-img "$SDK_SYSIMG/ramdisk.img" \
-              --output /tmp/profile_rootfs.tar || { echo "✗ extract-rootfs.sh failed"; exit 1; }
-          ls -la /tmp/profile_rootfs.tar
-
-          # Compress for the push (device-side toybox tar reads gzip
-          # natively; -1 keeps runner CPU time low).
-          gzip -1 -c /tmp/profile_rootfs.tar > /tmp/profile_rootfs.tar.gz
-          rm -f /tmp/profile_rootfs.tar
+          # ── Extract the x86_64 rootfs FROM THE RUNNING EMULATOR ───────
+          # NATIVE ARCHITECTURE: the API-30 google_apis x86_64 guest IS
+          # the same arch as the emulator — no translation. This is the
+          # KVM E2E's proven 'emulator' rootfs source
+          # (X86_64_BREAKTHROUGH.md): tar system/ vendor/ init* default.prop
+          # apex/ straight out of the booted emulator. All those paths are
+          # world-readable — plain `adb shell` works, NO adb root needed
+          # (staying the unrooted-user simulation).
+          # NOTE: apex/ is REQUIRED — API-30's linker64/libc.so are
+          # symlinks into /apex/com.android.runtime/; without it the
+          # linker SIGSEGVs (0x86 NULL deref).
+          # exec-out is binary-safe; gzip on the runner (-1: speed).
+          adb -s emulator-5554 wait-for-device
+          echo "── Tarring the rootfs out of the booted emulator (system+vendor+init+apex) ──"
+          adb -s emulator-5554 exec-out \
+              "cd / && tar cf - system/ vendor/ init default.prop apex/ 2>/dev/null" \
+              | gzip -1 > /tmp/profile_rootfs.tar.gz
           ls -la /tmp/profile_rootfs.tar.gz
+          [ -s /tmp/profile_rootfs.tar.gz ] || { echo "✗ rootfs tar is empty"; exit 1; }
+          gzip -t /tmp/profile_rootfs.tar.gz || { echo "✗ corrupt gzip"; exit 1; }
           $ADB push /tmp/profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
 
           # ── Preload into the app's private profile dir via run-as ────
