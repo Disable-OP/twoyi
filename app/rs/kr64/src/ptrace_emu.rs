@@ -3828,6 +3828,89 @@ fn traced_child_alive(pid: libc::pid_t) -> bool {
     }
 }
 
+/// Task 6-Z89 FIX 1a: the precise outcome of [`reap_child`].
+enum Reaped {
+    /// Reaped — the status word carries WIFEXITED/WIFSIGNALED. The
+    /// zombie (if any) is now OURS and cleared.
+    Dead(libc::c_int),
+    /// The WNOHANG loop CONSUMED a pending ptrace stop of a STILL-ALIVE
+    /// child (the race `traced_child_alive`'s doc warns about — only
+    /// reachable when the pid was actually alive and entering a stop).
+    /// The child is now in ptrace-stop; it stays tracked and any later
+    /// loop-top PTRACE_SYSCALL resumes it (a consumed stop EVENT is not
+    /// lost — the child remains stopped and restartable).
+    AliveStopped(libc::c_int),
+    /// waitpid persistently returned 0: the pid exists as OUR child but
+    /// has no reportable state change — an ALIVE, RUNNING tracee
+    /// (PTRACE_SYSCALL had returned ESRCH because a restart request on
+    /// a non-stopped tracee fails, not only on a dead one).
+    Running,
+    /// waitpid failed with ECHILD: nothing left for US to reap — the
+    /// exit was already reaped elsewhere (reparented), or the number
+    /// now belongs to a pid-recycled NON-tracee. As a TRACEE it is
+    /// gone either way.
+    Gone,
+}
+
+/// Task 6-Z89 FIX 1a: REALLY reap a (presumed-dead) traced child.
+///
+/// Run 32634683464 spent 590 s in the 6-Z67 ESRCH ping-pong
+/// ("child 6034 already exited (ESRCH)" ↔ "recovery child STILL ALIVE")
+/// WITHOUT ever reaping anything — the top container child sat as a
+/// ZOMBIE for exactly 600 s until the kernel's livelock detector
+/// SIGKILLed the whole app. The ESRCH branch only ever issued a SINGLE
+/// `waitpid(pid, WNOHANG)`; when that one call returned 0/ECHILD
+/// (transient exit finalisation, or the pid was already reaped
+/// elsewhere) the branch just `continue`d with STALE bookkeeping and
+/// never tried again.
+///
+/// This helper loops `waitpid(pid, &status, WNOHANG)` (1 ms sleeps, so
+/// a running tracee gets a real window to hit its next syscall stop)
+/// until it returns `pid` (state change — decoded into Dead or
+/// AliveStopped), fails with ECHILD (Gone), or exhausts the retry
+/// budget while the pid still exists (Running).
+fn reap_child(pid: libc::pid_t) -> Reaped {
+    let mut status: libc::c_int = 0;
+    for _ in 0..128 {
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid {
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                return Reaped::Dead(status);
+            }
+            // WIFSTOPPED (or WCONTINUED-style) status: we consumed a
+            // pending stop of a child that is STILL ALIVE.
+            return Reaped::AliveStopped(status);
+        }
+        if r == -1 {
+            return Reaped::Gone; // ECHILD: nothing (left) for us to reap
+        }
+        // r == 0 → the pid exists as our child but nothing to report
+        // yet. For a presumed-dead child this is transient; for a
+        // running tracee this is the window in which its next syscall
+        // stop may land. Sleep 1 ms and retry (bounded).
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Reaped::Running
+}
+
+/// Task 6-Z89 FIX 1b: the first pid in `known_pids` that is ALIVE per
+/// the /proc stat state-char probe ([`traced_child_alive`] — 'Z'/'X'/
+/// missing = dead), or None when every tracked traced child is gone.
+///
+/// Used by the ESRCH and WIFEXITED/WIFSIGNALED "keep the loop running?"
+/// checks so the decision is made against a FRESH, COMPLETE picture of
+/// ALL traced children instead of a single possibly-stale (pid-recycled)
+/// recovery-child probe — the exact defect that fuelled run
+/// 32634683464's livelock ("STILL ALIVE" judged from a stale pid).
+fn any_traced_child_alive(known_pids: &[libc::pid_t]) -> Option<libc::pid_t> {
+    for &p in known_pids {
+        if traced_child_alive(p) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Shared registry the bridge thread drains. `Mutex` (not `RwLock`) — the
 /// loop thread inserts at fb0-injection time (rare) and the bridge reads
 /// the whole vec each tick (also rare), so contention is nil.
@@ -5275,6 +5358,20 @@ pub fn run_ptrace_loop(
     let mut last_sigsys_nr: i64 = -1;
     let mut sigsys_repeat_count: u64 = 0;
     let mut sigsys_suppressed_total: u64 = 0;
+    // ── 6-Z89 FIX 2: mount() SIGSYS evidence counter ──────────────────
+    //
+    // Run 32634683464: TWRP's mount() retry storm right after "Data
+    // backup size" was INVISIBLE — the general rate limiter above
+    // suppressed 2201 events (nr=21) and we never learned WHICH mounts
+    // TWRP keeps re-issuing (suspects: the /data/media emulated-storage
+    // setup, or the SAR mount("/", …) remount check). The FIRST
+    // MOUNT_SIGSYS_LOG_CAP mount SIGSYS events are therefore logged
+    // UN-SUPPRESSED (via `log`, bypassing `sigsys_log`) with all three
+    // string args read from the child — see the SIGSYS handler. General
+    // suppression is untouched for everything else (including mount
+    // events past the cap).
+    const MOUNT_SIGSYS_LOG_CAP: u64 = 40;
+    let mut mount_sigsys_logged: u64 = 0;
     // ── Pause() consecutive-call counter (Task 6-G) ───────────────────
     //
     // Tracks CONSECUTIVE pause() SIGSYS calls so the SIGSYS handler can
@@ -5381,12 +5478,14 @@ pub fn run_ptrace_loop(
     // The original init child is set to an infinite loop (so init's waitpid
     // blocks — init thinks the service is "running").
     let mut recovery_child_pid: Option<libc::pid_t> = recovery_pid;
-    // Task 6-Z67: set when init exits/dies but the loop keeps running to
-    // serve the recovery child. When a forked child then exits and
-    // init_dead is already true (and the exit was the recovery child),
-    // the loop RETURNS — otherwise waitpid(-1) would spin on ECHILD
-    // forever.
-    let mut init_dead = false;
+    // Task 6-Z67 used to keep an `init_dead` flag here ("set when init
+    // exits/dies but the loop keeps running to serve the recovery
+    // child") — 6-Z89 REMOVED it: the flag was only ever read by the
+    // forked-child exit paths' "if init_dead → return" checks, which
+    // are now expressed as the `any_traced_child_alive(&tracked_pids)`
+    // scan (a fresh /proc probe over EVERY traced pid, which finds init
+    // alive or not — strictly more information than the boolean, and
+    // immune to the stale-probe livelock of run 32634683464).
 
     // ── Multi-child PID tracking (Task 6-S) ───────────────────────────
     //
@@ -5408,6 +5507,39 @@ pub fn run_ptrace_loop(
     // descendant, thanks to PTRACE_O_TRACEFORK set above).
     let init_pid: libc::pid_t = pid;
     let mut current_pid: libc::pid_t = pid;
+
+    // ── Task 6-Z89 FIX 1c: the tracked-pid set + last-exit memory ────
+    //
+    // `tracked_pids` is EVERY traced pid this loop has ever seen a stop
+    // from (init, the recovery child, and every auto-attached fork via
+    // the 6-Z54 switch handler below). The 6-Z89 ESRCH / exit branches
+    // scan exactly this set with `any_traced_child_alive` to decide
+    // "switch to a live child" vs "ALL TRACED CHILDREN GONE — end the
+    // loop", and reap dead members with `reap_child` so no child can
+    // ever sit as an un-reaped zombie again (run 32634683464: the top
+    // container child was a zombie for exactly 600 s while the loop
+    // ping-ponged ESRCH branches, until the kernel's livelock detector
+    // killed the whole app).
+    //
+    // `in_syscall_map`'s keys alone are NOT sufficient as the tracked
+    // set (a child is only inserted there when we first switch AWAY
+    // from it), so this Vec is maintained explicitly: seeded with init +
+    // the recovery child here, appended at every child-attach/switch
+    // point, and pruned the moment a pid is reaped (so a pid-RECYCLED
+    // process — a fresh non-tracee reusing a dead child's number — can
+    // never be mistaken for one of ours; that stale-probe confusion is
+    // precisely what livelocked 32634683464).
+    let mut tracked_pids: Vec<libc::pid_t> = vec![init_pid];
+    if let Some(rec_pid) = recovery_child_pid {
+        if rec_pid != init_pid {
+            tracked_pids.push(rec_pid);
+        }
+    }
+    // The most recent traced child's exit value (WIFEXITED → code,
+    // WIFSIGNALED → -sig). Used by the 6-Z89 ALL-GONE path to derive a
+    // sensible `run_ptrace_loop` return value when the LAST child dies
+    // through a path that has no natural return of its own.
+    let mut last_child_exit: Option<i32> = None;
 
     loop {
         // ── Deferred ABI reset (after execve EXIT) — PER CHILD ──
@@ -5523,104 +5655,142 @@ pub fn run_ptrace_loop(
                 } else {
                     log("no syscalls recorded in all-syscalls buffer before ESRCH");
                 }
-                // bootfix FIX 4 (run 32612016071): init hit ESRCH here —
-                // it died WITHOUT the tracer ever seeing an exit stop
-                // (silently, 10 ms after the TWRP helper's exit-127) —
-                // and the `return -1` at the bottom of this branch
-                // ENDED the ptrace loop while the recovery child (6289)
-                // was still ALIVE, frozen mid-wait4; PTRACE_O_EXITKILL
-                // then SIGKILLed it and the whole VM tore down at T+4 s
-                // (DEATH_CHAIN §0 steps 3-6). Mirror the 6-Z67 WIFEXITED
-                // logic below: if the ESRCH child is init but the
-                // recovery child is still alive (Task 6-Z78:
-                // traced_child_alive — /proc stat state char, NOT
-                // kill(rec,0) which is TRUE for zombies and livelocked
-                // run 32614181978 for 2+ minutes), mark init dead,
-                // re-point current_pid at the
-                // recovery child (the loop-top PTRACE_SYSCALL resumes it
-                // WITH syscall tracing), and keep serving it. If init is
-                // an un-reaped zombie, the next waitpid(-1) reports its
-                // exit and the WIFEXITED branch's own 6-Z67 check routes
-                // it here again — this path just must not END the loop.
-                // The existing reap/return paths below are preserved
-                // verbatim for every non-recovery case.
-                if current_pid == init_pid {
-                    if let Some(rec_pid) = recovery_child_pid {
-                        if rec_pid != current_pid {
-                            let rec_alive = traced_child_alive(rec_pid);
-                            if rec_alive {
-                                log(&format!(
-                                    "ESRCH on init {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67 ESRCH path, bootfix FIX 4)",
-                                    current_pid, rec_pid
-                                ));
-                                init_dead = true;
-                                current_pid = rec_pid;
-                                continue;
-                            }
-                            log(&format!(
-                                "6-Z78: liveness probe says recovery child {} is a ZOMBIE/dead (not reaped by us) — NOT keeping the loop for it; falling through to reap/return",
-                                rec_pid
-                            ));
-                        }
-                    }
-                }
-                // Try to reap the child to get its exit status.
-                // Task 6-S: reap `current_pid` (the child we tried to
-                // resume), NOT always `pid` (init). If a forked child
-                // exited between iterations, this is what reaps it.
-                let mut status: libc::c_int = 0;
-                let waited = unsafe { libc::waitpid(current_pid, &mut status, libc::WNOHANG) };
-                if waited == current_pid {
-                    if libc::WIFEXITED(status) {
+                // ── Task 6-Z89 FIX 1d: REAL reaping + all-children-gone ──
+                //
+                // History this path accumulated, and why it is now ONE
+                // unified flow instead of the 6-Z67/bootfix-FIX-4
+                // recovery-only probe + single-shot waitpid:
+                //
+                // - bootfix FIX 4 (run 32612016071): a bare `return -1`
+                //   here ended the loop while the recovery child was
+                //   still alive → keep the loop when SOMETHING traced is
+                //   still alive.
+                // - 6-Z78 (run 32614181978): kill(pid,0) is TRUE for
+                //   zombies → probe liveness via the /proc stat state
+                //   char (traced_child_alive).
+                // - 6-Z89 (run 32634683464): even the /proc probe
+                //   LIVELOCKED for 590 s — "ESRCH on init 6032 but
+                //   recovery child 6034 is STILL ALIVE" ping-ponged
+                //   against "child 6034 already exited (ESRCH)" because
+                //   (a) the ESRCH'd pid was NEVER reaped (single-shot
+                //   WNOHANG; on ECHILD the branch just fell back to
+                //   init, so the top container child stayed a ZOMBIE for
+                //   exactly 600 s until the kernel's livelock detector
+                //   killed the whole app), and (b) the STILL-ALIVE
+                //   decision was made against a STALE pid — the number
+                //   had been recycled by a NON-traced process whose
+                //   /proc state is 'R'/'S', i.e. "alive" forever.
+                //
+                // The fix, in order:
+                //   1. REAP the ESRCH'd pid (reap_child — a WNOHANG
+                //      loop, not one shot) and log its final status.
+                //   2. Drop it from `tracked_pids` ONLY when the reap
+                //      says Dead/Gone — those are the only cases where
+                //      it is truly no longer a tracee of ours (a later
+                //      pid-recycled holder of the same number must never
+                //      be mistaken for it). AliveStopped/Running mean
+                //      the ESRCH was the restart-of-a-non-stopped-tracee
+                //      kind and the child stays tracked + gets resumed.
+                //   3. Probe EVERY tracked pid
+                //      (any_traced_child_alive): switch to the first
+                //      live one (6-Z67 semantics, generalised to all
+                //      children) — else declare ALL TRACED CHILDREN
+                //      GONE and END the loop with a sensible exit
+                //      status. No more ping-pong: every iteration of
+                //      this branch that ends in Dead/Gone permanently
+                //      removes one dead pid from the tracked set, so the
+                //      dead-children case strictly converges.
+                let esrch_pid = current_pid;
+                let reaped = reap_child(esrch_pid);
+                // Only a definitively-DEAD or GONE outcome drops the pid
+                // from the tracked set — AliveStopped/Running mean the
+                // ESRCH was the "restart of a non-stopped tracee" kind,
+                // and that child must stay tracked (and get resumed).
+                let esrch_pid_dead = matches!(reaped, Reaped::Dead(_) | Reaped::Gone);
+                match reaped {
+                    Reaped::Dead(status) if libc::WIFEXITED(status) => {
                         let code = libc::WEXITSTATUS(status);
+                        last_child_exit = Some(code);
                         log(&format!(
-                            "ESRCH path: child {} exit code {}",
-                            current_pid, code
+                            "6-Z89: ESRCH pid {} REAPED — exited with code {} (zombie cleared)",
+                            esrch_pid, code
                         ));
-                        // Task 6-S: only init's exit terminates the
-                        // loop. A forked child exiting via ESRCH is
-                        // just reaped — init is still running.
-                        if current_pid == init_pid {
-                            return code;
-                        }
-                        log(&format!(
-                            "ESRCH path: forked child {} reaped (code {}); init {} still running — continuing",
-                            current_pid, code, init_pid
-                        ));
-                        // Re-sync current_pid back to init so the next
-                        // loop iteration resumes init, not the just-
-                        // reaped child (which would ESRCH again).
-                        current_pid = init_pid;
-                        continue;
                     }
-                    if libc::WIFSIGNALED(status) {
+                    Reaped::Dead(status) => {
+                        // WIFSIGNALED
                         let sig = libc::WTERMSIG(status);
+                        last_child_exit = Some(-sig);
                         log(&format!(
-                            "ESRCH path: child {} killed by signal {}",
-                            current_pid, sig
+                            "6-Z89: ESRCH pid {} REAPED — killed by signal {} (zombie cleared)",
+                            esrch_pid, sig
                         ));
-                        if current_pid == init_pid {
-                            return -sig;
-                        }
+                    }
+                    Reaped::AliveStopped(status) => {
                         log(&format!(
-                            "ESRCH path: forked child {} reaped (signal {}); init {} still running — continuing",
-                            current_pid, sig, init_pid
+                            "6-Z89: ESRCH pid {} is ALIVE — the reap loop consumed a pending ptrace stop (status {:#x}); keeping it tracked and resuming it via the scan below",
+                            esrch_pid, status
                         ));
-                        current_pid = init_pid;
-                        continue;
+                    }
+                    Reaped::Running => {
+                        log(&format!(
+                            "6-Z89: ESRCH pid {} is ALIVE and RUNNING (restart-of-a-running-tracee ESRCH); keeping it tracked — its next stop will be picked up",
+                            esrch_pid
+                        ));
+                    }
+                    Reaped::Gone => {
+                        // ECHILD: already reaped elsewhere (reparented)
+                        // or the number was recycled to a NON-tracee.
+                        log(&format!(
+                            "6-Z89: ESRCH pid {} NOT reapable by us (waitpid ECHILD — already reaped elsewhere, or pid recycled to a non-tracee); dropping it from the tracked set",
+                            esrch_pid
+                        ));
                     }
                 }
-                // Could not reap — if it's init, give up; otherwise
-                // fall back to init and continue.
-                if current_pid == init_pid {
-                    return -1;
+                if esrch_pid_dead {
+                    // The ESRCH'd TRACEE is gone — never switch back to
+                    // it, and never let a recycled holder of its number
+                    // re-enter the liveness scan.
+                    tracked_pids.retain(|&p| p != esrch_pid);
                 }
+
+                // Any tracked child still alive? Switch to the first
+                // live one (fresh /proc probe over the WHOLE tracked
+                // set — the 6-Z67 recovery-only probe could validate a
+                // stale, pid-recycled entry forever).
+                if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
+                    // (Task 6-Z67 semantics, generalised: even when the
+                    // ESRCH'd pid was init, the loop keeps serving the
+                    // surviving traced sibling — the 6-Z67 `init_dead`
+                    // flag is gone; the tracked-set scan carries this.)
+                    log(&format!(
+                        "6-Z89: ESRCH on pid {} but traced child {} is STILL ALIVE (fresh /proc probe over {} tracked pids) — switching the ptrace loop to it{}",
+                        esrch_pid,
+                        live_pid,
+                        tracked_pids.len(),
+                        if esrch_pid == init_pid && esrch_pid_dead {
+                            " (init dead — Task 6-Z67 semantics, generalised to all children)"
+                        } else {
+                            ""
+                        }
+                    ));
+                    current_pid = live_pid;
+                    continue;
+                }
+
+                // ALL TRACED CHILDREN GONE — end the loop. Return the
+                // just-reaped child's exit value when we have it, else
+                // the last remembered child exit, else -1.
+                let loop_exit: i32 = match reaped {
+                    Reaped::Dead(status) if libc::WIFEXITED(status) => libc::WEXITSTATUS(status),
+                    Reaped::Dead(status) => -libc::WTERMSIG(status),
+                    _ => last_child_exit.unwrap_or(-1),
+                };
                 log(&format!(
-                    "ESRCH path: forked child {} not reaped; falling back to init {} — continuing",
-                    current_pid, init_pid
+                    "6-Z89: ALL TRACED CHILDREN GONE ({} tracked, all dead) — ending the ptrace loop (return {})",
+                    tracked_pids.len(),
+                    loop_exit
                 ));
-                current_pid = init_pid;
-                continue;
+                return loop_exit;
             }
             log(&format!("PTRACE_SYSCALL failed: {}", e));
             return -1;
@@ -5659,6 +5829,20 @@ pub fn run_ptrace_loop(
                     "DIAG child switch: {} → {} — new child, in_syscall=false (Task 6-Z54)",
                     current_pid, waited
                 ));
+            }
+            // 6-Z89 FIX 1c: remember BOTH pids of every child switch in
+            // the tracked set — `waited` is a child we just received a
+            // stop from (a brand-new auto-attached fork has NO entry in
+            // in_syscall_map yet, so the map's keys alone undercount),
+            // and `current_pid` (the previously-stopped child) is made
+            // explicit here too. Every pid this loop has ever served is
+            // therefore in `tracked_pids`, which the 6-Z89 ESRCH/exit
+            // branches scan for liveness and reap.
+            if !tracked_pids.contains(&waited) {
+                tracked_pids.push(waited);
+            }
+            if !tracked_pids.contains(&current_pid) {
+                tracked_pids.push(current_pid);
             }
         }
         current_pid = waited;
@@ -5727,62 +5911,52 @@ pub fn run_ptrace_loop(
             } else {
                 log("no syscalls recorded in all-syscalls buffer before exit");
             }
-            // Task 6-S: only init's exit terminates `run_ptrace_loop`.
-            // A forked child (recovery, ueventd, thermald, …) exiting is
-            // expected behaviour — init is still running and may be
-            // blocked in waitpid waiting for the just-exited child. Log
-            // the exit and continue the loop so we can resume init
-            // (which will receive the waitpid return + run its own exit
-            // path, eventually terminating the loop). Re-sync
-            // `current_pid` to init so the next iteration resumes init.
+            // Task 6-S (original policy): only init's exit terminates
+            // `run_ptrace_loop`; a forked child (recovery, ueventd,
+            // thermald, …) exiting is expected behaviour — log it and
+            // keep serving the survivors.
             //
-            // Task 6-Z67 (Agent G flag): EXCEPTION — if init dies while
-            // the RECOVERY child is still alive, keep the loop running.
-            // The recovery child is the whole point of the boot (it is
-            // the TWRP binary rendering the UI); init's death must not
-            // kill it. Previously the `return code` here ended the loop,
-            // kr64 exited, and PTRACE_O_EXITKILL murdered the recovery
-            // child mid-linker. Now: mark init dead, resume the recovery
-            // child, and only return when every traced child is gone.
+            // ── Task 6-Z89 FIX 1e: any-traced-child check (supersedes the
+            //     6-Z67 recovery-only probe) ──
+            //
+            // waitpid(-1) just reaped THIS child, so it is definitively
+            // gone: drop it from the tracked set and remember its exit
+            // value. Then ask the tracked set — not just the recovery
+            // child — whether anything traced is still alive
+            // (any_traced_child_alive: fresh /proc probe over EVERY
+            // tracked pid), and switch to the first live one (the
+            // recovery child keeps its 6-Z67 protection, and so does
+            // every other traced child — the recovery-only probe could
+            // validate a STALE, pid-recycled entry forever, run
+            // 32634683464). When nothing is left, END the loop (this
+            // also covers the old "init_dead → return" case: if init
+            // were alive the scan would have found it).
+            tracked_pids.retain(|&p| p != pid);
+            last_child_exit = Some(code);
+            if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
+                // Task 6-Z67 semantics, generalised: init may be dead
+                // but a traced child (e.g. the recovery child — the
+                // whole point of the boot) is still alive. The
+                // loop-top PTRACE_SYSCALL(current_pid) resumes it
+                // WITH syscall tracing (we must NOT PTRACE_CONT
+                // here: that resumes without tracing and the top
+                // PTRACE_SYSCALL would then ESRCH on a running
+                // tracee).
+                log(&format!(
+                    "child {} exited with code {} but traced child {} is STILL ALIVE — keeping the ptrace loop running for it (6-Z89: fresh /proc probe over {} tracked pids, supersedes the 6-Z67 recovery-only check)",
+                    pid, code, live_pid, tracked_pids.len()
+                ));
+                current_pid = live_pid;
+                continue;
+            }
             if pid == init_pid {
-                if let Some(rec_pid) = recovery_child_pid {
-                    if rec_pid != pid {
-                        // Is the recovery child still alive? Task 6-Z78:
-                        // traced_child_alive — kill(pid,0) is TRUE for
-                        // zombies too (run 32614181978 livelocked on
-                        // exactly that); /proc stat's state char is not.
-                        let alive = traced_child_alive(rec_pid);
-                        if alive {
-                            log(&format!(
-                                "init {} exited with code {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67)",
-                                pid, code, rec_pid
-                            ));
-                            init_dead = true;
-                            // Re-point current_pid at the recovery child —
-                            // the loop-top PTRACE_SYSCALL(current_pid)
-                            // resumes it WITH syscall tracing (we must NOT
-                            // PTRACE_CONT here: that resumes without
-                            // tracing and the top PTRACE_SYSCALL would
-                            // then ESRCH on a running tracee).
-                            current_pid = rec_pid;
-                            continue;
-                        }
-                    }
-                }
                 return code;
             }
             log(&format!(
-                "forked child {} exited with code {} — init {} still running, continuing loop",
-                pid, code, init_pid
+                "6-Z89: ALL TRACED CHILDREN GONE ({} tracked, all dead) after child {} exited with code {} — ending the ptrace loop (return {})",
+                tracked_pids.len(), pid, code, code
             ));
-            // Task 6-Z67: if init is ALREADY dead, this forked-child exit
-            // was (most likely) the recovery child — the last traced
-            // process. Nothing remains to serve: return.
-            if init_dead {
-                return code;
-            }
-            current_pid = init_pid;
-            continue;
+            return code;
         }
         if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
@@ -5824,38 +5998,33 @@ pub fn run_ptrace_loop(
             } else {
                 log("no syscalls recorded in all-syscalls buffer before kill");
             }
-            // Task 6-S: same forked-child handling as WIFEXITED above.
+            // ── Task 6-Z89 FIX 1e (WIFSIGNALED mirror): any-traced-child
+            //     check, same as the WIFEXITED branch above ──
+            //
+            // waitpid(-1) just reaped THIS child: drop it from the
+            // tracked set, remember its exit value (-sig), probe EVERY
+            // tracked pid for liveness, switch to the first live one,
+            // and end the loop when nothing traced remains.
+            tracked_pids.retain(|&p| p != pid);
+            last_child_exit = Some(-sig);
+            if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
+                // Task 6-Z67 semantics, generalised (see the WIFEXITED
+                // branch for the full rationale).
+                log(&format!(
+                    "child {} killed by signal {} but traced child {} is STILL ALIVE — keeping the ptrace loop running for it (6-Z89: fresh /proc probe over {} tracked pids, supersedes the 6-Z67 recovery-only check)",
+                    pid, sig, live_pid, tracked_pids.len()
+                ));
+                current_pid = live_pid;
+                continue;
+            }
             if pid == init_pid {
-                // Task 6-Z67: init died by signal but the recovery child
-                // lives → keep serving the recovery child (see the
-                // WIFEXITED branch for the full rationale).
-                if let Some(rec_pid) = recovery_child_pid {
-                    if rec_pid != pid {
-                        let alive = traced_child_alive(rec_pid);
-                        if alive {
-                            log(&format!(
-                                "init {} killed by signal {} but recovery child {} is STILL ALIVE — keeping the ptrace loop running for it (Task 6-Z67)",
-                                pid, sig, rec_pid
-                            ));
-                            init_dead = true;
-                            current_pid = rec_pid;
-                            continue;
-                        }
-                    }
-                }
                 return -sig;
             }
             log(&format!(
-                "forked child {} killed by signal {} — init {} still running, continuing loop",
-                pid, sig, init_pid
+                "6-Z89: ALL TRACED CHILDREN GONE ({} tracked, all dead) after child {} killed by signal {} — ending the ptrace loop (return {})",
+                tracked_pids.len(), pid, sig, -sig
             ));
-            // Task 6-Z67: same as the WIFEXITED branch — if init is
-            // already dead, this was the last traced process: return.
-            if init_dead {
-                return -sig;
-            }
-            current_pid = init_pid;
-            continue;
+            return -sig;
         }
 
         // Check if the child was stopped by a signal.
@@ -10933,6 +11102,60 @@ pub fn run_ptrace_loop(
                                 log(msg);
                             }
                         };
+
+                        // ── 6-Z89 FIX 2: un-suppress mount() SIGSYS evidence ──
+                        //
+                        // The rate limiter above exists for tight
+                        // SIGSYS loops — but for nr == abi.mount (i386
+                        // mount = 21) the ARGS are exactly the evidence
+                        // the next E2E needs (see the counter's comment
+                        // at the top of run_ptrace_loop). Log the first
+                        // MOUNT_SIGSYS_LOG_CAP mount SIGSYS events with
+                        // ALL THREE string args, bypassing `sigsys_log`
+                        // (i.e. even while the general per-SIGSYS logs
+                        // are suppressed):
+                        //   i386 mount(src, target, fstype, flags, data)
+                        //        src=arg1, target=arg2, fstype=arg3
+                        // Unreadable/NULL pointers print as None — that
+                        // distinction is itself diagnostic (a NULL src
+                        // + MS_REMOUNT, for instance, is the SAR
+                        // remount pattern; flags bit 32 = MS_REMOUNT).
+                        if original_syscall == a.mount
+                            && mount_sigsys_logged < MOUNT_SIGSYS_LOG_CAP
+                        {
+                            mount_sigsys_logged = mount_sigsys_logged.saturating_add(1);
+                            let src_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
+                            let tgt_addr = get_syscall_arg(&sigsys_regs, a.reg_arg2);
+                            let fs_addr = get_syscall_arg(&sigsys_regs, a.reg_arg3);
+                            let flags_raw = get_syscall_arg(&sigsys_regs, a.reg_arg4);
+                            let src = if src_addr != 0 {
+                                read_child_string(pid, src_addr)
+                            } else {
+                                None
+                            };
+                            let tgt = if tgt_addr != 0 {
+                                read_child_string(pid, tgt_addr)
+                            } else {
+                                None
+                            };
+                            let fstype = if fs_addr != 0 {
+                                read_child_string(pid, fs_addr)
+                            } else {
+                                None
+                            };
+                            log(&format!(
+                                "6-Z89: mount SIGSYS #{}/{} UN-SUPPRESSED: src={:?} target={:?} fstype={:?} flags={:#x} (pid={}, repeat_count={}, suppressed_total={})",
+                                mount_sigsys_logged,
+                                MOUNT_SIGSYS_LOG_CAP,
+                                src,
+                                tgt,
+                                fstype,
+                                flags_raw,
+                                pid,
+                                sigsys_repeat_count,
+                                sigsys_suppressed_total
+                            ));
+                        }
 
                         // in_syscall DESYNC diagnostic — moved here from
                         // before the ptrace_getregs call so it can be
