@@ -682,6 +682,17 @@ pub fn init_renderer(
             if is_boot_recovery_enabled() {
                 info!("[CORE] Boot Recovery (TWRP) enabled — passing --boot-recovery to kr64");
                 cmd.arg("--boot-recovery");
+            } else {
+                // Task 6-Z88: NORMAL (AOSP) mode — pass the init path
+                // explicitly. The cyanmint 8.1 profile is a ramdisk-style
+                // rootfs whose init lives at {rootfs}/init; there is NO
+                // /system/bin/init (kr64's Config::default()). Without
+                // this, the guest child's first fs::read of
+                // "{rootfs}/system/bin/init" gets ENOENT and _exit(127)'s
+                // on every attempt (244× in E2E run 32632668179 — zero
+                // guest instructions ever executed).
+                info!("[CORE] NORMAL (AOSP) boot — passing --init /init to kr64 (ramdisk-style profile)");
+                cmd.arg("--init").arg("/init");
             }
             // Use the HOST system lib64 for kr64's own dependencies
             // (libc.so, libdl.so, etc.) — NOT the rootfs's versions.
@@ -722,6 +733,12 @@ pub fn init_renderer(
         cmd.env_remove("LD_PRELOAD");
         cmd.env("TYLD_PRELOAD", "");
         cmd.env("TWOYI_ROOTFS", &working_dir);
+        // Task 6-Z88: pass the app's data dir so kr64's helpers (e.g.
+        // apex_extract's temp-dir resolution) can derive package-correct
+        // paths (io.twoyi.debug, work profiles) instead of falling back
+        // to the hardcoded /data/data/io.twoyi/cache (Permission denied
+        // for any other package — run 32632668179).
+        cmd.env("TWOYI_DATA_DIR", get_data_dir());
         cmd.env("TYLOADER", &loader_path);
         // Pass the app's nativeLibraryDir (derived from loader_path above)
         // so kr64 can find hook libraries (libtwrp_fb_hook.so, libgetpid_hook.so,
