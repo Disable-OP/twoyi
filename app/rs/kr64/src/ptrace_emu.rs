@@ -4832,6 +4832,14 @@ pub fn run_ptrace_loop(
     let mut in_syscall_map: std::collections::HashMap<libc::pid_t, bool> = std::collections::HashMap::new();
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
+    // ── Task 6-Z83: rolling last-16-stops ring (stop forensics) ──
+    // Every waitpid stop (syscall entry/exit, ptrace event, SIGSYS,
+    // SIGSTOP, forwarded signal) appends one "(loop,pid,kind,nr)" entry;
+    // the 6-Z83 LOST-ENTRY/EPERM tripwire dumps the ring so a lost or
+    // misrouted stop is identifiable from ONE E2E logcat.
+    const RECENT_STOPS_CAP: usize = 16;
+    let mut recent_stops: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
 
     // ── Task 6-Z9: xattr-SET syscall-rewrite state ───────────────────
     //
@@ -4872,10 +4880,34 @@ pub fn run_ptrace_loop(
     //   The legacy `compute_exit_return_value` block's "faking success"
     //   log is gated by `loop_count <= 200` (long past by the time
     //   xattr fires), so in practice NO double-logging occurs.
-    let mut pending_xattr_fake: bool = false;
+    // ── Task 6-Z83: the four GLOBAL `pending_*_fake` bools below are now
+    // PER-PID (Option<pid>). ROOT CAUSE of run 32621758534's deterministic
+    // "couldn't map libblkid.so segment 2: Operation not permitted":
+    // `pending_poll_fake` was a GLOBAL bool armed at INIT's poll() ENTRY
+    // (which also sleeps the tracer 100 ms) and consumed at the NEXT
+    // EXIT stop OF ANY CHILD — with init (6447) blocked in its in-kernel
+    // poll, the RECOVERY child's (6450) very next mmap2 EXIT (the bionic
+    // linker's ANON reservation for libblkid) consumed the flag and had
+    // its return value FORCED TO 0. The linker then mapped the library's
+    // segments MAP_FIXED at base(0)+p_vaddr — below mmap_min_addr — and
+    // the kernel returned -EPERM even though our anonymous REWRITE had
+    // correctly run at the ENTRY stop. (Log proof, cycles 06:11:25.195 /
+    // 06:11:39.339: "DIAG poll EXIT: faked return 0 (was 3969019904 —
+    // POLLERR)" fires between the linker's own mmap2 ENTRY and the
+    // following "post-execve return #304: nr=192 -> -1 (-errno 1)".)
+    // ALL FOUR flags get the same per-pid treatment; the arm sites store
+    // the arming pid and the consumers require a pid match (the poll
+    // consumer additionally requires the poll syscall number + expires
+    // after 2000 loop iterations).
+    let mut pending_xattr_fake_pid: Option<libc::pid_t> = None;
     // Task 6-Z28: pending flag for poll() return fake. Set at the ENTRY
     // stop (when init calls poll), consumed at the EXIT stop (fake return 0).
-    let mut pending_poll_fake: bool = false;
+    // 6-Z83: PER-PID (see the block comment above) + arming loop_count for
+    // expiry (the armed pid could die in its poll, or its EXIT stop could
+    // be suppressed by a seccomp abort — a stale flag must not fake a much
+    // later, unrelated EXIT of the same/reused pid).
+    let mut pending_poll_fake_pid: Option<libc::pid_t> = None;
+    let mut pending_poll_fake_armed_at: u64 = 0;
     // Task 6-Z69: pending flag for set_thread_area() return fake. Set at
     // the ENTRY stop when the dedicated TLS arm installs the GDT
     // descriptor + rewrites the syscall to getpid; consumed at the
@@ -4883,7 +4915,7 @@ pub fn run_ptrace_loop(
     // getpid, whose return — the pid, or -38 if seccomp blocks i386
     // getpid too — must not leak into bionic's __set_tls, which treats
     // any rc == -1 as failure and would SKIP loading %gs).
-    let mut pending_set_thread_area_fake: bool = false;
+    let mut pending_set_thread_area_fake_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
 
     // ── Task 6-Z71: stat64/lstat64/fstat64/pread64/openat emulation ──
     //
@@ -4949,7 +4981,7 @@ pub fn run_ptrace_loop(
     //   to bound log volume if init spins. (Init does ~339 writes total
     //   per the strace, so 800 is a comfortable 2.4× headroom.)
     let mut kmsg_fd: Option<i32> = None;
-    let mut pending_kmsg_open: bool = false;
+    let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
     let mut post_execve_write_count: u64 = 0;
 
     // ── Task 6-V diagnostic state ────────────────────────────────────
@@ -5579,6 +5611,20 @@ pub fn run_ptrace_loop(
             // Task 6-Z75 hygiene: drop the exited child's cached ABI so
             // a later fork can never inherit a stale entry via pid reuse.
             abi_map.remove(&pid);
+            // 6-Z83: drop any pending-fake flag armed by THIS pid so a
+            // later pid-reuse can never inherit a stale fake.
+            if pending_poll_fake_pid == Some(pid) {
+                pending_poll_fake_pid = None;
+            }
+            if pending_xattr_fake_pid == Some(pid) {
+                pending_xattr_fake_pid = None;
+            }
+            if pending_set_thread_area_fake_pid == Some(pid) {
+                pending_set_thread_area_fake_pid = None;
+            }
+            if pending_kmsg_open_pid == Some(pid) {
+                pending_kmsg_open_pid = None;
+            }
             // Print the last few SIGSYS-intercepted syscalls so we can
             // identify what init was doing right before it died. This is
             // critical for diagnosing the "init exits with code 1 at
@@ -5676,6 +5722,19 @@ pub fn run_ptrace_loop(
             // Task 6-Z75 hygiene: same as the WIFEXITED branch above —
             // drop the killed child's cached ABI entry.
             abi_map.remove(&pid);
+            // 6-Z83: same stale-flag hygiene as the WIFEXITED branch.
+            if pending_poll_fake_pid == Some(pid) {
+                pending_poll_fake_pid = None;
+            }
+            if pending_xattr_fake_pid == Some(pid) {
+                pending_xattr_fake_pid = None;
+            }
+            if pending_set_thread_area_fake_pid == Some(pid) {
+                pending_set_thread_area_fake_pid = None;
+            }
+            if pending_kmsg_open_pid == Some(pid) {
+                pending_kmsg_open_pid = None;
+            }
             if !recent_sigsys.is_empty() {
                 let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                 log(&format!(
@@ -5778,6 +5837,14 @@ pub fn run_ptrace_loop(
 
             let ptrace_event: u32 = ((status as u32) >> 16) & 0xFFFF;
             if ptrace_event != 0 {
+                // ── 6-Z83 rolling last-16-stops ring (stop forensics) ──
+                if recent_stops.len() == RECENT_STOPS_CAP {
+                    recent_stops.pop_front();
+                }
+                recent_stops.push_back(format!(
+                    "(loop={},pid={},event{},sig={})",
+                    loop_count, pid, ptrace_event, sig
+                ));
                 match ptrace_event {
                     ev if ev == libc::PTRACE_EVENT_FORK as u32
                         || ev == libc::PTRACE_EVENT_VFORK as u32
@@ -6325,6 +6392,13 @@ pub fn run_ptrace_loop(
                         // bug) the loop still terminates via the child exiting,
                         // not via state corruption.
                         in_syscall = !in_syscall;
+                        if recent_stops.len() == RECENT_STOPS_CAP {
+                            recent_stops.pop_front();
+                        }
+                        recent_stops.push_back(format!(
+                            "(loop={},pid={},syscall?,getregs-FAILED)",
+                            loop_count, pid
+                        ));
                         continue;
                     }
                 };
@@ -6456,8 +6530,44 @@ pub fn run_ptrace_loop(
                         // warnings — run 32607020470's build failure).
                         e
                     }
-                    None => !in_syscall, // legacy parity fallback
+                    None => {
+                        // ── 6-Z83 H4 hardening: rax == -ENOSYS heuristic ──
+                        // Fires ONLY when PTRACE_GET_SYSCALL_INFO failed or
+                        // returned op==UNKNOWN (on the 5.10+ emulator kernel
+                        // neither should happen at a real syscall stop; this
+                        // replaces blind parity so a drifted `in_syscall`
+                        // can never silently flip ENTRY↔EXIT). At a true
+                        // ENTRY rax still holds -ENOSYS (-38) on x86; at a
+                        // true EXIT it holds the real return value.
+                        let rax_val = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        let heur_is_entry = rax_val == -38;
+                        if heur_is_entry != !in_syscall && loop_count <= 500 {
+                            log(&format!(
+                                "6-Z83: GSI unavailable — rax heuristic says {}, parity said {} for pid {} nr={} (following the heuristic)",
+                                if heur_is_entry { "ENTRY" } else { "EXIT" },
+                                if !in_syscall { "ENTRY" } else { "EXIT" },
+                                pid, syscall_num
+                            ));
+                        }
+                        heur_is_entry
+                    }
                 };
+
+                // ── 6-Z83 rolling last-16-stops ring (stop forensics) ──
+                // Every classified syscall stop lands here; event stops,
+                // SIGSYS, SIGSTOP and forwarded signals push their own
+                // entries at their branch heads. Dumped verbatim by the
+                // 6-Z83 LOST-ENTRY/EPERM tripwire below.
+                if recent_stops.len() == RECENT_STOPS_CAP {
+                    recent_stops.pop_front();
+                }
+                recent_stops.push_back(format!(
+                    "(loop={},pid={},{},nr={})",
+                    loop_count,
+                    pid,
+                    if is_entry { "entry" } else { "exit" },
+                    syscall_num
+                ));
 
                 // Task 6-Z57: ENOSYS early override (6-Z68: EXIT stops ONLY —
                 // writing rax at an ENTRY stop is a no-op that the syscall
@@ -6799,10 +6909,15 @@ pub fn run_ptrace_loop(
                                     // silent death (like 6069 in 32614181978)
                                     // must at minimum leave a
                                     // PTRACE_EVENT_EXIT trail.
+                                    // 6-Z83: TRACEVFORKDONE added — keep this
+                                    // mask IDENTICAL to the loop's initial
+                                    // SETOPTIONS (the omission was an
+                                    // inconsistency, now flagged by audit).
                                     let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
                                         | libc::PTRACE_O_TRACEFORK
                                         | libc::PTRACE_O_TRACECLONE
                                         | libc::PTRACE_O_TRACEVFORK
+                                        | libc::PTRACE_O_TRACEVFORKDONE
                                         | libc::PTRACE_O_TRACEEXEC
                                         | libc::PTRACE_O_TRACEEXIT
                                         | libc::PTRACE_O_EXITKILL) as libc::c_int;
@@ -7254,7 +7369,7 @@ pub fn run_ptrace_loop(
                                 // cheap and idempotent — `pending_kmsg_open`
                                 // is cleared at the matching open EXIT.
                                 if is_kmsg_path(&path) || is_kmsg_path(&translated) {
-                                    pending_kmsg_open = true;
+                                    pending_kmsg_open_pid = Some(pid); // 6-Z83: per-pid
                                 }
                                 // ── Task 6-Z61: strip O_EXCL on the
                                 // properties open ──
@@ -8034,7 +8149,7 @@ pub fn run_ptrace_loop(
                         // hundred at most before it proceeds past the
                         // restorecon phase).
                         n if n == abi.setxattr || n == abi.lsetxattr || n == abi.fsetxattr => {
-                            pending_xattr_fake = true;
+                            pending_xattr_fake_pid = Some(pid); // 6-Z83: per-pid
                             set_syscall_num(&mut regs, &abi, abi.getpid);
                             match ptrace_setregs(pid, &regs, iov_len) {
                                 Ok(()) => log(&format!(
@@ -8174,7 +8289,7 @@ pub fn run_ptrace_loop(
                                             }
                                             // (6) rewrite to getpid; the pending
                                             // EXIT fake below forces return 0.
-                                            pending_set_thread_area_fake = true;
+                                            pending_set_thread_area_fake_pid = Some(pid); // 6-Z83: per-pid
                                             set_syscall_num(&mut regs, &abi, abi.getpid);
                                             match ptrace_setregs(pid, &regs, iov_len) {
                                                 Ok(()) => log(&format!(
@@ -8220,7 +8335,8 @@ pub fn run_ptrace_loop(
                     // NOW: let poll execute (returns POLLERR), sleep 100ms to
                     // prevent busy-spin, set pending flag for EXIT fake.
                     if syscall_num == abi.poll_nr {
-                        pending_poll_fake = true;
+                        pending_poll_fake_pid = Some(pid); // 6-Z83: per-pid
+                        pending_poll_fake_armed_at = loop_count;
                         // Sleep 100ms to give init timer-event processing time
                         // + prevent the POLLERR busy-spin. The child is stopped
                         // at the ENTRY (before poll executes) — the sleep doesn't
@@ -8299,7 +8415,7 @@ pub fn run_ptrace_loop(
                     // syscall convention preserves arg registers
                     // (ebx/ecx/edx) across the syscall, so the EXIT
                     // snapshot's abi.reg_ret holds the new fd.
-                    if pending_kmsg_open
+                    if pending_kmsg_open_pid == Some(pid) // 6-Z83: per-pid
                         && (syscall_num == abi.open
                             || syscall_num == abi.openat
                             || syscall_num == abi.openat2)
@@ -8322,7 +8438,7 @@ pub fn run_ptrace_loop(
                                 ret, kmsg_fd
                             ));
                         }
-                        pending_kmsg_open = false;
+                        pending_kmsg_open_pid = None;
                     }
                     // Task 6-V Part A2 — open()/openat()/openat2() EXIT:
                     // record the returned fd → translated-path mapping into
@@ -8577,6 +8693,73 @@ pub fn run_ptrace_loop(
                     // stop still drops the record (Gate 1's true DESYNC
                     // protection) — a single child cannot legitimately run
                     // another syscall between its own mmap2 ENTRY and EXIT.
+                    // ── 6-Z83 DIAGNOSTIC: file-backed mmap2 EXIT with an
+                    // errno return (LOST-ENTRY / rewrite-defeated tripwire) ──
+                    //
+                    // Run 32621758534 died deterministically with
+                    // "couldn't map libblkid.so segment 2: Operation not
+                    // permitted". The z82 analysis assumed the mmap2's ENTRY
+                    // stop never arrived; the surviving (non-chatty-expired)
+                    // cycles PROVE otherwise — ENTRY arrived, the anonymous
+                    // REWRITE ran, and the syscall STILL returned -EPERM
+                    // because the global pending_poll_fake flag let init's
+                    // armed poll fake fire at the recovery child's mmap2 EXIT
+                    // (see the 6-Z83 block at the flag declarations). This
+                    // tripwire catches EVERY residual class: a truly lost
+                    // ENTRY stop, a failed rewrite, or a sibling bug — and
+                    // dumps the rolling last-16-stops ring so one E2E pins
+                    // the mechanism.
+                    if syscall_num == abi.mmap || syscall_num == abi.mmap2 {
+                        let mut regs_le: Regs = unsafe { std::mem::zeroed() };
+                        if ptrace_getregs(pid, &mut regs_le).is_ok() {
+                            let le_ret = get_syscall_arg(&regs_le, abi.reg_ret) as i64;
+                            if le_ret == -1 || le_ret == -38 {
+                                // i386 preserves arg registers across
+                                // int 0x80, so edi (arg5) still holds the
+                                // ORIGINAL fd when the ENTRY rewrite never
+                                // ran; when it DID run, fd reads -1 and the
+                                // pending record (if any) carries the
+                                // original fd instead.
+                                let le_fd =
+                                    get_syscall_arg(&regs_le, abi.reg_arg5) as i32;
+                                let le_pending_fd =
+                                    pending_mmap2_content.get(&pid).map(|r| r.fd);
+                                let le_path = if le_fd >= 0 {
+                                    open_fd_owner_paths
+                                        .get(&(pid, le_fd))
+                                        .or_else(|| open_fd_paths.get(&le_fd))
+                                        .cloned()
+                                } else {
+                                    le_pending_fd.and_then(|fd| {
+                                        open_fd_owner_paths
+                                            .get(&(pid, fd))
+                                            .or_else(|| open_fd_paths.get(&fd))
+                                            .cloned()
+                                    })
+                                };
+                                let is_sbin_so = le_path
+                                    .as_deref()
+                                    .map(|p| p.contains("sbin/") && p.ends_with(".so"))
+                                    .unwrap_or(false);
+                                if is_sbin_so {
+                                    log(&format!(
+                                        "6-Z83: LOST-ENTRY/EPERM mmap2 caught: fd={} ({}), fresh_ret={} ({}), pending-record fd={:?} — last 16 stops: {}",
+                                        le_fd,
+                                        le_path.as_deref().unwrap_or("?"),
+                                        le_ret,
+                                        if le_ret == -1 { "-EPERM" } else { "-ENOSYS" },
+                                        le_pending_fd,
+                                        recent_stops
+                                            .iter()
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join(" | ")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
                     if pending_mmap2_content.contains_key(&pid) {
                         // 6-Z72 fix2: per-pid slots — a foreign child's stop
                         // can't even see this pid's record now (lookup is by
@@ -9284,8 +9467,8 @@ pub fn run_ptrace_loop(
                     // succeeded, `syscall_num` here is `getpid` (NOT the
                     // original xattr number) — the diagnostic logs both
                     // so we can confirm the rewrite took effect.
-                    if pending_xattr_fake {
-                        pending_xattr_fake = false;
+                    if pending_xattr_fake_pid == Some(pid) { // 6-Z83: per-pid
+                        pending_xattr_fake_pid = None;
                         let exit_syscall_num = syscall_num;
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         match ptrace_getregs(pid, &mut regs2) {
@@ -9325,32 +9508,50 @@ pub fn run_ptrace_loop(
                     // loop processes the timeout + retries actions (instead of
                     // seeing POLLERR + busy-spinning). Combined with the 100ms
                     // sleep at the ENTRY, this gives init ~10 timer events/sec.
-                    if pending_poll_fake {
-                        pending_poll_fake = false;
-                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        match ptrace_getregs(pid, &mut regs2) {
-                            Ok(len) => {
-                                let original_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
-                                set_syscall_ret(&mut regs2, &abi, 0);
-                                match ptrace_setregs(pid, &regs2, len) {
-                                    Ok(()) => {
-                                        if post_execve_syscall_count <= 500 {
-                                            log(&format!(
-                                                "DIAG poll EXIT: faked return 0 (was {} — POLLERR) — init sees timeout, processes timer events (Task 6-Z28)",
-                                                original_ret
-                                            ));
+                    // 6-Z83: consume ONLY at the arming pid's own poll EXIT
+                    // (was: ANY child's next EXIT stop — that global-flag bug
+                    // zeroed the recovery linker's mmap2 returns and caused
+                    // the deterministic libblkid EPERM death of 32621758534).
+                    // A different child's EXIT leaves the flag armed; the
+                    // flag expires after 2000 loop iterations (armed pid may
+                    // have died in its poll or lost its EXIT stop to a
+                    // seccomp abort — a stale flag must not fake an
+                    // unrelated much-later EXIT, e.g. after pid reuse).
+                    if let Some(poll_armed_pid) = pending_poll_fake_pid {
+                        if poll_armed_pid == pid && syscall_num == abi.poll_nr {
+                            pending_poll_fake_pid = None;
+                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                            match ptrace_getregs(pid, &mut regs2) {
+                                Ok(len) => {
+                                    let original_ret =
+                                        get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                    set_syscall_ret(&mut regs2, &abi, 0);
+                                    match ptrace_setregs(pid, &regs2, len) {
+                                        Ok(()) => {
+                                            if post_execve_syscall_count <= 500 {
+                                                log(&format!(
+                                                    "DIAG poll EXIT: faked return 0 (was {} — POLLERR) — init sees timeout, processes timer events (Task 6-Z28; 6-Z83: consumed by the ARMING pid {} only)",
+                                                    original_ret, pid
+                                                ));
+                                            }
                                         }
+                                        Err(e) => log(&format!(
+                                            "DIAG poll EXIT FAKE FAILED: ptrace_setregs: {} — init sees POLLERR, may busy-spin",
+                                            e
+                                        )),
                                     }
-                                    Err(e) => log(&format!(
-                                        "DIAG poll EXIT FAKE FAILED: ptrace_setregs: {} — init sees POLLERR, may busy-spin",
-                                        e
-                                    )),
                                 }
+                                Err(e) => log(&format!(
+                                    "DIAG poll EXIT: ptrace_getregs FAILED: {} — cannot fake return",
+                                    e
+                                )),
                             }
-                            Err(e) => log(&format!(
-                                "DIAG poll EXIT: ptrace_getregs FAILED: {} — cannot fake return",
-                                e
-                            )),
+                        } else if loop_count.saturating_sub(pending_poll_fake_armed_at) > 2000 {
+                            pending_poll_fake_pid = None;
+                            log(&format!(
+                                "6-Z83: poll fake EXPIRED — armed for pid {} at loop {}, now pid {} at loop {}; dropped without faking (per-pid poll pending)",
+                                poll_armed_pid, pending_poll_fake_armed_at, pid, loop_count
+                            ));
                         }
                     }
 
@@ -9375,8 +9576,8 @@ pub fn run_ptrace_loop(
                     // return (0), and preserves it — no interference
                     // (same belt-and-suspenders relationship the
                     // pending_xattr_fake block has).
-                    if pending_set_thread_area_fake {
-                        pending_set_thread_area_fake = false;
+                    if pending_set_thread_area_fake_pid == Some(pid) { // 6-Z83: per-pid
+                        pending_set_thread_area_fake_pid = None;
                         let exit_syscall_num = syscall_num;
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         match ptrace_getregs(pid, &mut regs2) {
@@ -10328,6 +10529,11 @@ pub fn run_ptrace_loop(
                     }
                 }
             } else if sig == libc::SIGTRAP {
+                // ── 6-Z83 rolling stop ring ──
+                if recent_stops.len() == RECENT_STOPS_CAP {
+                    recent_stops.pop_front();
+                }
+                recent_stops.push_back(format!("(loop={},pid={},sigtrap)", loop_count, pid));
                 // Regular SIGTRAP (breakpoint, single-step without 0x80
                 // marker, etc.). We did NOT request delivery of any signal
                 // so falling through to the next PTRACE_SYSCALL (with a
@@ -10485,6 +10691,11 @@ pub fn run_ptrace_loop(
                 // setregs call site) to make the DESYNC decision explicit
                 // and robust against any future code that mutates
                 // `in_syscall` between SIGSYS entry and setregs.
+                // ── 6-Z83 rolling stop ring ──
+                if recent_stops.len() == RECENT_STOPS_CAP {
+                    recent_stops.pop_front();
+                }
+                recent_stops.push_back(format!("(loop={},pid={},sigsys)", loop_count, pid));
                 let in_syscall_at_sigsys = in_syscall;
                 let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
                 match ptrace_getregs(pid, &mut sigsys_regs) {
@@ -11437,6 +11648,11 @@ pub fn run_ptrace_loop(
                 // call (child already running → ESRCH → premature exit).
                 continue;
             } else if sig == libc::SIGSTOP {
+                // ── 6-Z83 rolling stop ring ──
+                if recent_stops.len() == RECENT_STOPS_CAP {
+                    recent_stops.pop_front();
+                }
+                recent_stops.push_back(format!("(loop={},pid={},sigstop)", loop_count, pid));
                 // ── Task 6-S: SIGSTOP for a freshly-attached child ──
                 //
                 // When PTRACE_O_TRACEFORK auto-attaches us to a new
@@ -11488,10 +11704,13 @@ pub fn run_ptrace_loop(
                     if recovery_child_pid == Some(pid) {
                         // Task 6-Z78: TRACEEXIT included — see the initial
                         // SETOPTIONS comment block (silent-death trail).
+                        // 6-Z83: TRACEVFORKDONE added — identical to the
+                        // initial SETOPTIONS mask (consistency).
                         let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
                             | libc::PTRACE_O_TRACEFORK
                             | libc::PTRACE_O_TRACECLONE
                             | libc::PTRACE_O_TRACEVFORK
+                            | libc::PTRACE_O_TRACEVFORKDONE
                             | libc::PTRACE_O_TRACEEXEC
                             | libc::PTRACE_O_TRACEEXIT
                             | libc::PTRACE_O_EXITKILL) as libc::c_int;
@@ -11534,6 +11753,14 @@ pub fn run_ptrace_loop(
                 // so the next stop will be the same phase (entry if we
                 // were heading to an entry, exit if we were heading to
                 // an exit) as it would have been without the signal.
+                // ── 6-Z83 rolling stop ring ──
+                if recent_stops.len() == RECENT_STOPS_CAP {
+                    recent_stops.pop_front();
+                }
+                recent_stops.push_back(format!(
+                    "(loop={},pid={},sig{})",
+                    loop_count, pid, sig
+                ));
                 log(&format!("forwarding signal {} to child", sig));
 
                 // For SIGSEGV (signal 11), log the crash address and
