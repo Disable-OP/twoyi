@@ -14,11 +14,13 @@
 #     which we need to (a) preload the guest rootfs and (b) pull the
 #     app's FileLogger logs (the TWRP E2E's app-logs were always empty
 #     because the release build rejects run-as).
-#   - The guest rootfs is PRELOADED (not UI-imported): cyanmint's
-#     profile_default_export.tar.xz (release 3.5.5) is extracted into
-#     profiles/default/rootfs via run-as. The app's first launch
-#     auto-creates the rootfs symlink (ProfileManager.initializeProfiles
-#     → updateRootfsSymlink) and romExist() sees rootfs/init.
+#   - The guest rootfs is EXTRACTED FROM THE AVD SYSTEM IMAGE
+#     (API-30 google_apis x86_64 — NATIVE arch, no translation):
+#     scripts/extract-rootfs.sh (simg2img → loop mount → tar + ramdisk
+#     overlay) → preloaded into profiles/default/rootfs via run-as.
+#     The app's first launch auto-creates the rootfs symlink
+#     (ProfileManager.initializeProfiles → updateRootfsSymlink) and
+#     romExist() sees rootfs/init.
 #   - The container boots in NORMAL mode (Boot to Recovery stays OFF).
 #
 # Like the TWRP E2E this is the unrooted-user simulation: no adb root,
@@ -232,7 +234,7 @@ jobs:
               exit 1
           fi
 
-      - name: Install APK + preload AOSP rootfs profile
+      - name: Install APK + preload AOSP rootfs from the AVD system image
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
@@ -248,18 +250,35 @@ jobs:
           $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
           echo "  ✓ APK installed"
 
-          # ── Download the AOSP guest rootfs (cyanmint's profile export) ──
-          # 218 MB xz, contains the full Android 8.1 x86 rootfs (init,
-          # init.rc, system/, ...) plus a preference.xml (ignored — the
-          # default profile is active out of the box).
-          cd /tmp
-          curl -sL --retry 3 -o profile_default_export.tar.xz \
-              "https://github.com/cyanmint/twoyi/releases/download/3.5.5/profile_default_export.tar.xz"
-          ls -la profile_default_export.tar.xz
+          # ── Extract the x86_64 rootfs from the AVD system image ──────
+          # NATIVE ARCHITECTURE: the API-30 google_apis x86_64 image IS
+          # the same arch as the emulator — the guest runs natively, no
+          # ndk_translation, no arm64 quirks. (The old cyanmint 8.1 ROM
+          # is arm64 and needed translation; this replaces it entirely.)
+          # This is the same extraction the KVM E2E does
+          # (scripts/extract-rootfs.sh: simg2img -> loop mount -> tar +
+          # ramdisk overlay) — but WITHOUT the KVM test's root+permissive
+          # kernel: this run stays the unrooted-user simulation.
+          sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils
 
-          # ── Push + extract into the app's private profile dir via run-as ──
-          $ADB push profile_default_export.tar.xz /sdcard/Download/ 2>&1 | tail -1
+          SDK_SYSIMG="$ANDROID_HOME/system-images/android-30/google_apis/x86_64"
+          ls -la "$SDK_SYSIMG" || { echo "✗ system image not found"; exit 1; }
 
+          chmod +x scripts/extract-rootfs.sh
+          scripts/extract-rootfs.sh \
+              --system-img "$SDK_SYSIMG/system.img" \
+              --ramdisk-img "$SDK_SYSIMG/ramdisk.img" \
+              --output /tmp/profile_rootfs.tar || { echo "✗ extract-rootfs.sh failed"; exit 1; }
+          ls -la /tmp/profile_rootfs.tar
+
+          # Compress for the push (device-side toybox tar reads gzip
+          # natively; -1 keeps runner CPU time low).
+          gzip -1 -c /tmp/profile_rootfs.tar > /tmp/profile_rootfs.tar.gz
+          rm -f /tmp/profile_rootfs.tar
+          ls -la /tmp/profile_rootfs.tar.gz
+          $ADB push /tmp/profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
+
+          # ── Preload into the app's private profile dir via run-as ────
           # The app must have RUN ONCE for its data dir to exist with the
           # right SELinux context. Launch + stop it once.
           $ADB shell monkey -p io.twoyi.debug -c android.intent.category.LAUNCHER 1
@@ -268,27 +287,20 @@ jobs:
           sleep 2
 
           $ADB shell "run-as io.twoyi.debug mkdir -p profiles/default/rootfs"
-
-          # Device-side xz does NOT work (toybox tar -J shells out to an
-          # `xz` binary the emulator does not ship — run 32628477296:
-          # 'tar: exec xz: No such file or directory'). Repack to GZIP on
-          # the runner (toybox tar -z is built-in).
-          echo "  repacking xz -> gzip on the runner..."
-          xz -dc profile_default_export.tar.xz | gzip -6 > profile_rootfs.tar.gz
-          ls -la profile_rootfs.tar.gz
-          $ADB push profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
-
           # Scoped storage: the app uid cannot READ /sdcard/Download
           # (owned by shell). Pipe through the SHELL uid — cat runs as
           # shell (allowed), run-as tar reads STDIN.
           $ADB shell "cat /sdcard/Download/profile_rootfs.tar.gz | run-as io.twoyi.debug tar -xz -C profiles/default/rootfs"
+          $ADB shell "rm /sdcard/Download/profile_rootfs.tar.gz"
 
           # Honest verification: the guest init must exist.
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/ | head -20"
           if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/init"; then
               echo "✗ guest init NOT found after extraction"; exit 1
           fi
-          echo "  ✓ AOSP rootfs preloaded"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/bin/linker64" || \
+              echo "  (no linker64 — checking x86 linker)"
+          echo "  ✓ AOSP x86_64 rootfs preloaded from the AVD system image"
 
       - name: UI navigation — boot AOSP container
         env:
