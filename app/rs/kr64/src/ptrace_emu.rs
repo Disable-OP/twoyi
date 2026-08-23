@@ -292,6 +292,26 @@ struct ChildAbi {
     fstatfs_nr: i64,
     statfs64_nr: i64,
     fstatfs64_nr: i64,
+    // fstatat64 — the dirfd-relative 64-bit-struct stat (Task 6-Z86).
+    // TWRP's partition-details loop probes storage with
+    // fstatat64(AT_FDCWD, "/dev/block/mmcblk1p1", …) (i386 nr=300) and
+    // fstatat64(AT_FDCWD, "/external_sd/.", …) — E2E run 32627986281
+    // logged the splash-freeze as a "unknown nr=300 -> -2 (-errno 2)"
+    // retry storm against exactly those paths. NOTE: i386 300 was
+    // ALREADY aliased by `newfstatat: 300` below (i386 has no separate
+    // newfstatat — syscall 300 IS fstatat64), so ENTRY path translation
+    // fired through that field; this EXPLICIT field makes the coverage
+    // unconditional for ABIs where the numbers diverge + gives
+    // syscall_name a proper "fstatat64" label instead of "[unknown]".
+    //
+    // fstatat64(dirfd, path, statbuf, flags): arg1=dirfd, arg2=PATH
+    // (same layout as openat), arg3=statbuf, arg4=flags
+    // (AT_SYMLINK_NOFOLLOW etc. — NEVER touched by the translator).
+    // Numbers per the kernel UAPI headers:
+    //   i386:   __NR_fstatat64 300 (per asm/unistd_32.h)
+    //   x86_64: __NR_newfstatat 262 (x86_64's only dirfd-stat — same slot)
+    //   aarch64: __NR_fstatat 79 (asm-generic newfstatat)
+    fstatat64_nr: i64,
     // pread64 — reads at an explicit 64-bit offset. Task 6-Z71: the
     // recovery child's bionic linker loads ELF headers + DT_* entries
     // with pread64; the app's seccomp filter blocks the i386 variant
@@ -957,6 +977,10 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     fstatfs_nr: 138,
     statfs64_nr: -1,
     fstatfs64_nr: -1,
+    // Task 6-Z86: x86_64's fstatat64 slot IS newfstatat (262) — the
+    // 64-bit ABI never grew a separate fstatat64; aliases
+    // ABI_X86_64.newfstatat.
+    fstatat64_nr: 262,
     // x86_64 pread64 = 17 (asm/unistd_64.h). The dedicated 6-Z71 arms
     // only ever FAKE a read when the fresh return is -38 (seccomp
     // filter block) — x86_64 pread64 executes normally under the
@@ -1196,6 +1220,14 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     fstatfs_nr: 100,
     statfs64_nr: 268,
     fstatfs64_nr: 269,
+    // Task 6-Z86: i386 fstatat64 = 300 — THE number TWRP's
+    // partition-details loop issues (run 32627986281: the splash froze
+    // in a "unknown nr=300 -> -2 (-errno 2)" retry storm probing
+    // /dev/block/mmcblk1p1 + /external_sd/.). Aliases
+    // ABI_X86_32.newfstatat (300) — i386 never had a separate
+    // newfstatat number; that alias is why ENTRY translation already
+    // fired for these calls. Path is in arg2 (dirfd in arg1).
+    fstatat64_nr: 300,
     // Task 6-Z71: i386 pread64 = 180 (per
     // /usr/include/x86_64-linux-gnu/asm/unistd_32.h: __NR_pread64 180,
     // cross-checked against arch/x86/entry/syscalls/syscall_32.tbl:
@@ -1508,6 +1540,10 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     fstatfs_nr: 44,
     statfs64_nr: -1,
     fstatfs64_nr: -1,
+    // Task 6-Z86: aarch64's fstatat64 slot IS fstatat/newfstatat (79,
+    // asm-generic) — aarch64 never grew a separate fstatat64; aliases
+    // ABI_AARCH64.newfstatat.
+    fstatat64_nr: 79,
     // aarch64 (asm-generic) pread64 = 67. The dedicated 6-Z71 arms only
     // ever FAKE a read when the fresh return is -38 (seccomp filter
     // block) — aarch64 pread64 executes normally under the filter's
@@ -2798,6 +2834,13 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // translation match arm — but we add the label here for
         // diagnostic logging.
         "fstat64"
+    } else if abi.fstatat64_nr != -1 && nr == abi.fstatat64_nr {
+        // Task 6-Z86: dirfd-relative 64-bit stat (i386 nr=300). E2E run
+        // 32627986281 logged TWRP's partition-probe loop as
+        // "unknown nr=300 -> -2 (-errno 2)" — this label makes it read
+        // "fstatat64" at a glance. The `!= -1` guard keeps nr=-1
+        // SIGSYS-desync events labelled "[unknown]".
+        "fstatat64"
     } else if abi.statfs_nr != -1 && nr == abi.statfs_nr {
         // bootfix FIX 1: label the filesystem-stat syscalls (run
         // 32612016071 logged the fatal TWRP call as “nr=268 [unknown]”
@@ -7117,6 +7160,16 @@ pub fn run_ptrace_loop(
                             n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
                             n if n == abi.stat || n == abi.lstat => Some(abi.reg_arg1),
                             n if n == abi.newfstatat || n == abi.statx => Some(abi.reg_arg2),
+                            // Task 6-Z86: fstatat64 takes the PATH in
+                            // arg2 (arg1=dirfd, same as openat). Run
+                            // 32627986281 surfaced TWRP's probes here
+                            // via the newfstatat(300) alias — make the
+                            // coverage explicit. The `!= -1` guard
+                            // keeps a nr=-1 SIGSYS-desync stop from
+                            // matching a sentinel field.
+                            n if abi.fstatat64_nr != -1 && n == abi.fstatat64_nr => {
+                                Some(abi.reg_arg2)
+                            }
                             n if n == abi.access => Some(abi.reg_arg1),
                             n if n == abi.faccessat => Some(abi.reg_arg2),
                             // mkdirfix FIX A: the `!= -1` guards
@@ -7481,16 +7534,28 @@ pub fn run_ptrace_loop(
                         // old stat/lstat. Same arg1-as-path semantics as
                         // stat/lstat. fstat64 takes an fd (not a path)
                         // and is intentionally NOT in this arm.
+                        // Task 6-Z86: fstatat64 (i386 nr=300) added
+                        // EXPLICITLY — TWRP's partition-details loop
+                        // probes /dev/block/mmcblk* + /external_sd/. with
+                        // it (run 32627986281 splash freeze); on i386 it
+                        // aliases newfstatat(300), on x86_64/aarch64 it
+                        // IS the newfstatat/fstatat slot, so the explicit
+                        // `!= -1`-guarded condition is a no-op alias
+                        // today + future-proof if an ABI ever diverges.
                         n if n == abi.stat
                             || n == abi.lstat
                             || n == abi.stat64
                             || n == abi.lstat64
                             || n == abi.newfstatat
+                            || (abi.fstatat64_nr != -1 && n == abi.fstatat64_nr)
                             || n == abi.statx =>
                         {
                             // Task 6-T: stat64/lstat64 use arg1 as the
                             // path (same as old stat/lstat); newfstatat
                             // + statx use arg2 (the dirfd is arg1).
+                            // 6-Z86: fstatat64 also takes the path in
+                            // arg2 (arg1=dirfd, arg3=statbuf, arg4=flags
+                            // — AT_SYMLINK_NOFOLLOW etc., untouched).
                             let path_arg_index = if syscall_num == abi.stat
                                 || syscall_num == abi.lstat
                                 || syscall_num == abi.stat64
@@ -8342,20 +8407,37 @@ pub fn run_ptrace_loop(
                     // (fake property_service socket). The 6-Z19 NOP prevented
                     // the call entirely but caused a userspace busy-spin (no
                     // syscalls, no sleep, no events → init stuck at #457).
-                    // NOW: let poll execute (returns POLLERR), sleep 100ms to
+                    // NOW: let poll execute (returns POLLERR), sleep to
                     // prevent busy-spin, set pending flag for EXIT fake.
+                    //
+                    // Task 6-Z86 GUEST-THROTTLE DISCOVERY (run 32627986281):
+                    // this handler slept 100ms for EVERY poll from ANY traced
+                    // child — but the tracer is single-threaded, so the sleep
+                    // throttles the WHOLE guest, not just the poller. TWRP's
+                    // own event loops (UI/input/timer) poll at high rates, so
+                    // post-splash TWRP ran at ≤~10Hz wall-clock and the splash
+                    // never advanced. The 100ms is only needed for INIT itself
+                    // (the original POLLERR busy-spin culprit — it gives
+                    // init's timer-event processing wall-clock time to fire);
+                    // every other child gets 10ms — still prevents a pure
+                    // spin, but lets TWRP's loops run at ~100Hz.
                     if syscall_num == abi.poll_nr {
                         pending_poll_fake_pid = Some(pid); // 6-Z83: per-pid
                         pending_poll_fake_armed_at = loop_count;
-                        // Sleep 100ms to give init timer-event processing time
-                        // + prevent the POLLERR busy-spin. The child is stopped
-                        // at the ENTRY (before poll executes) — the sleep doesn't
-                        // block the child, only the ptrace parent.
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        // 6-Z86: 100ms ONLY for init (POLLERR busy-spin
+                        // culprit); 10ms for every forked child (TWRP's
+                        // event loops). The child is stopped at the ENTRY
+                        // (before poll executes) — the sleep doesn't block
+                        // the child, only the ptrace parent.
+                        let poll_sleep_ms: u64 = if pid == init_pid { 100 } else { 10 };
+                        std::thread::sleep(std::time::Duration::from_millis(poll_sleep_ms));
                         if post_execve_syscall_count <= 500 {
                             log(&format!(
-                                "DIAG poll ENTRY: nr={} — sleeping 100ms + will fake return 0 at EXIT (Task 6-Z28: prevents POLLERR busy-spin, gives init timer events)",
-                                syscall_num
+                                "DIAG poll ENTRY: nr={} pid={} (init={}) — sleeping {}ms + will fake return 0 at EXIT (Task 6-Z28/6-Z86: init keeps the 100ms POLLERR throttle; forked children (TWRP event loops) get 10ms so the guest runs at ~100Hz instead of ~10Hz)",
+                                syscall_num,
+                                pid,
+                                pid == init_pid,
+                                poll_sleep_ms
                             ));
                         }
                     }
