@@ -301,8 +301,14 @@ jobs:
 
           # Honest verification: the guest init must exist.
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/ | head -20"
-          if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/init"; then
-              echo "✗ guest init NOT found after extraction"; exit 1
+          # init is a SYMLINK (init -> /system/bin/init) — test -f follows
+          # it and fails on a dangling-looking chain; test -e matches the
+          # link itself. Also verify the actual target exists.
+          if ! $ADB shell "run-as io.twoyi.debug test -e profiles/default/rootfs/init"; then
+              echo "✗ guest init (symlink) NOT found after extraction"; exit 1
+          fi
+          if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/system/bin/init"; then
+              echo "✗ guest init TARGET /system/bin/init not found"; exit 1
           fi
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/bin/linker64" || \
               echo "  (no linker64 — checking x86 linker)"
