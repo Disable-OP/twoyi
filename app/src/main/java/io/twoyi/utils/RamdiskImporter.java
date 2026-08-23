@@ -199,6 +199,12 @@ public class RamdiskImporter {
                 if (n < 0) break;
                 read += n;
             }
+            if (read != ramdiskSize) {
+                // A short read here used to feed a truncated ramdisk to the
+                // decompressor, which may not always fail loudly. Fail here.
+                throw new IOException("Boot image ramdisk short read: got " + read
+                    + " of " + ramdiskSize + " bytes (corrupt source or I/O failure)");
+            }
 
             // Decompress ramdisk -> cpio temp file
             File cpioTemp = new File(targetDir.getParentFile(), "ramdisk.cpio");
@@ -498,6 +504,7 @@ public class RamdiskImporter {
             int fileCount = 0;
             long fileLength = cpioFile.length();
             long pos = 0;
+            boolean sawTrailer = false;
 
             while (pos + 110 <= fileLength) {
                 byte[] header = new byte[110];
@@ -547,6 +554,7 @@ public class RamdiskImporter {
 
                 if (name.equals("TRAILER!!!") || name.isEmpty()) {
                     Log.i(TAG, "Reached cpio trailer");
+                    sawTrailer = true;
                     break;
                 }
 
@@ -572,6 +580,24 @@ public class RamdiskImporter {
                             remaining -= n;
                             pos += n;
                         }
+                    }
+                    // Per-entry size verification: a short/failed stream read used
+                    // to silently `break` out of the loop above, leaving this file
+                    // at whatever had been written so far (e.g. 0 bytes) while the
+                    // import still reported SUCCESS (E2E run 32616016488:
+                    // sbin/libminuitwrp.so = 0 bytes -> guest linker died "too
+                    // small to be an ELF"). Fail loudly instead and do not leave
+                    // the partially-written file behind.
+                    if (file.length() != filesize) {
+                        String msg = "CORRUPT cpio: entry '" + name + "' short write: want="
+                            + filesize + " got=" + file.length() + " (stopped at " + pos
+                            + "/" + fileLength + ")";
+                        Log.e(TAG, msg);
+                        FileLogger.e(TAG, msg);
+                        if (!file.delete()) {
+                            Log.e(TAG, "Failed to delete partially-written " + file);
+                        }
+                        throw new IOException(msg);
                     }
                     // Task 6-Z31: set executable permission from the cpio mode.
                     // Java's FileOutputStream creates files with mode 0644 (NOT
@@ -636,14 +662,89 @@ public class RamdiskImporter {
                 }
             }
 
-            Log.i(TAG, "Extracted " + fileCount + " entries from cpio");
+            Log.i(TAG, "Extracted " + fileCount + " entries from cpio (sawTrailer=" + sawTrailer + ")");
             if (fileCount == 0) {
                 throw new IOException("CPIO archive contained 0 entries (parsed magic="
                     + (fileLength > 0 ? "valid" : "empty")
                     + ", fileLength=" + fileLength + ")");
             }
+            if (!sawTrailer) {
+                // The stream ended (or desynced) before the cpio TRAILER!!!
+                // marker: every silent `break` above (EOF mid-header,
+                // mid-name or mid-data) lands here. A truncated import must
+                // never be reported as SUCCESS.
+                String msg = "CORRUPT cpio: no TRAILER!!! entry — archive truncated (extracted "
+                    + fileCount + " entries, stopped at " + pos + "/" + fileLength + ")";
+                Log.e(TAG, msg);
+                FileLogger.e(TAG, msg);
+                throw new IOException(msg);
+            }
+            // Second-layer defense: verify the critical payload actually landed
+            // on disk with the expected sizes before reporting success.
+            verifyCriticalPayload(targetDir);
             return true;
         }
+    }
+
+    /**
+     * Post-import verification pass (flake E2E run 32616016488): a
+     * TWRP-style payload must contain the critical sbin/ files at their
+     * exact expected sizes (from the cpio headers of the bundled
+     * twrp-3.7.0_9-0-byt_t_crv2.img). Extraction-loop accounting can miss
+     * on-disk state (e.g. silent write loss), so re-check the real files.
+     *
+     * Exact sizes are only enforced when this is the known bundled payload
+     * (detected via sbin/recovery == 1271264); any other recovery image
+     * merely gets a non-zero sanity check so unrelated imports cannot
+     * false-fail on build-specific size differences.
+     */
+    private static void verifyCriticalPayload(File targetDir) throws IOException {
+        File recovery = new File(targetDir, "sbin/recovery");
+        if (!recovery.exists()) {
+            return; // not a recovery-style payload (e.g. plain rootfs) — nothing to verify
+        }
+
+        StringBuilder problems = new StringBuilder();
+        long recoveryLen = recovery.length();
+
+        if (recoveryLen == 1271264L) {
+            // Known bundled payload — enforce the exact manifest.
+            String[][] exact = {
+                {"sbin/recovery", "1271264"},
+                {"sbin/linker", "148291"},
+                {"sbin/libminuitwrp.so", "129364"},
+                {"sbin/libtwrp_fb_hook.so", "40716"},
+            };
+            for (String[] spec : exact) {
+                File f = new File(targetDir, spec[0]);
+                long want = Long.parseLong(spec[1]);
+                if (!f.exists()) {
+                    problems.append(spec[0]).append(" MISSING; ");
+                } else if (f.length() != want) {
+                    problems.append(spec[0]).append(" size=").append(f.length())
+                        .append(" want=").append(want).append("; ");
+                }
+            }
+        }
+
+        // For any recovery payload: critical files must at least be non-zero
+        // (libtwrp.so / libguitwrp.so are build-specific — only when present).
+        String[] nonZero = {"sbin/recovery", "sbin/linker", "sbin/libminuitwrp.so",
+            "sbin/libtwrp_fb_hook.so", "sbin/libtwrp.so", "sbin/libguitwrp.so"};
+        for (String n : nonZero) {
+            File f = new File(targetDir, n);
+            if (f.exists() && f.length() <= 0) {
+                problems.append(n).append(" size=0; ");
+            }
+        }
+
+        if (problems.length() > 0) {
+            String msg = "CORRUPT import — payload verification failed: " + problems;
+            Log.e(TAG, msg);
+            FileLogger.e(TAG, msg);
+            throw new IOException(msg);
+        }
+        Log.i(TAG, "Payload verification OK (recovery=" + recoveryLen + " bytes)");
     }
 
     private static int readFully(InputStream is, byte[] buf) throws IOException {
