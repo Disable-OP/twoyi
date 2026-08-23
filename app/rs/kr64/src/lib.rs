@@ -4237,16 +4237,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                         // NEVER overwrite: a real staged file (the
                         // hooks / real libdl.so) or a foreign symlink at
                         // {rootfs}/dev/<name> wins over the ROM's copy.
-                        let existing_is_right_symlink =
-                            match std::fs::symlink_metadata(&link_path) {
-                                Ok(md) if md.file_type().is_symlink() => {
-                                    match std::fs::read_link(&link_path) {
-                                        Ok(t) => t == Path::new(&target),
-                                        Err(_) => false,
-                                    }
+                        let existing_is_right_symlink = match std::fs::symlink_metadata(&link_path)
+                        {
+                            Ok(md) if md.file_type().is_symlink() => {
+                                match std::fs::read_link(&link_path) {
+                                    Ok(t) => t == Path::new(&target),
+                                    Err(_) => false,
                                 }
-                                _ => false,
-                            };
+                            }
+                            _ => false,
+                        };
                         if existing_is_right_symlink {
                             // Idempotent restage — already exactly what
                             // we wanted to create.
@@ -4814,10 +4814,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             let path = format!("{}/dev/input/{}", rootfs_prefix, name);
             match std::fs::write(&path, b"") {
                 Ok(()) => {
-                    let _ = std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(0o644),
-                    );
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
                 }
                 Err(e) => {
                     warning!(
@@ -5697,7 +5694,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 e
                             ),
                         }
-                    } else if off + 2 <= bytes.len() && bytes[off] == 0x90 && bytes[off + 1] == 0x90 {
+                    } else if off + 2 <= bytes.len() && bytes[off] == 0x90 && bytes[off + 1] == 0x90
+                    {
                         info!(
                             "[KR64] PARENT: /init is_selinux_enabled repz cmpsb already NOP'd (idempotent skip) (Task 6-Z38)"
                         );
@@ -6164,7 +6162,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     let is_exec = (mode & 0o100) != 0;
                     info!(
                         "[KR64] PRE-FORK DIAG: {} at {} — exists, size={}, mode=0{:o}, exec={}",
-                        name, path, meta.len(), mode, is_exec
+                        name,
+                        path,
+                        meta.len(),
+                        mode,
+                        is_exec
                     );
                     if !is_exec {
                         warning!(
@@ -6363,20 +6365,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             let dir_path = format!("{}/{}", rootfs_prefix, rel);
             match std::fs::create_dir(&dir_path) {
                 Ok(()) => {
-                    let _ = std::fs::set_permissions(
-                        &dir_path,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
+                    let _ =
+                        std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o755));
                     info!(
                         "[KR64] PARENT: pre-created TWRP dir {} (mode 0755)",
                         dir_path
                     );
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = std::fs::set_permissions(
-                        &dir_path,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
+                    let _ =
+                        std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o755));
                     info!(
                         "[KR64] PARENT: TWRP dir {} already exists — re-asserting mode 0755",
                         dir_path
@@ -6422,10 +6420,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let block_dir = format!("{}/dev/block", rootfs_prefix);
         match std::fs::create_dir(&block_dir) {
             Ok(()) => {
-                let _ = std::fs::set_permissions(
-                    &block_dir,
-                    std::fs::Permissions::from_mode(0o755),
-                );
+                let _ =
+                    std::fs::set_permissions(&block_dir, std::fs::Permissions::from_mode(0o755));
                 info!(
                     "[KR64] PARENT: pre-created TWRP block dir {} (mode 0755; 6-Z87: no mmcblk node stubs — ENOENT lets TWRP skip absent media fast, a stubbed node ENOTTYs BLKGETSIZE64 and retry-loops)",
                     block_dir
@@ -7318,12 +7314,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 // ({rootfs}/sbin/linker) so the kernel finds the TWRP linker.
                 let patched_path = {
                     // Open the recovery binary for read+write to patch PT_INTERP
-                    match std::fs::OpenOptions::new().read(true).write(true).open(&recovery_path) {
+                    match std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&recovery_path)
+                    {
                         Ok(mut file) => {
                             use std::io::{Read, Seek, Write};
                             let mut ehdr = [0u8; 64];
                             if file.read_exact(&mut ehdr).is_ok() && &ehdr[0..4] == b"\x7fELF" {
-                                let e_phoff = u32::from_le_bytes([ehdr[28], ehdr[29], ehdr[30], ehdr[31]]) as u64;
+                                let e_phoff =
+                                    u32::from_le_bytes([ehdr[28], ehdr[29], ehdr[30], ehdr[31]])
+                                        as u64;
                                 let e_phentsize = u16::from_le_bytes([ehdr[42], ehdr[43]]) as usize;
                                 let e_phnum = u16::from_le_bytes([ehdr[44], ehdr[45]]) as usize;
                                 let mut phdrs = vec![0u8; e_phentsize * e_phnum];
@@ -7333,14 +7335,33 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 let mut interp_filesz = None;
                                 for i in 0..e_phnum {
                                     let off = i * e_phentsize;
-                                    let p_type = u32::from_le_bytes([phdrs[off], phdrs[off+1], phdrs[off+2], phdrs[off+3]]);
+                                    let p_type = u32::from_le_bytes([
+                                        phdrs[off],
+                                        phdrs[off + 1],
+                                        phdrs[off + 2],
+                                        phdrs[off + 3],
+                                    ]);
                                     if p_type == 3 {
-                                        interp_offset = Some(u32::from_le_bytes([phdrs[off+4], phdrs[off+5], phdrs[off+6], phdrs[off+7]]) as u64);
-                                        interp_filesz = Some(u32::from_le_bytes([phdrs[off+16], phdrs[off+17], phdrs[off+18], phdrs[off+19]]) as usize);
+                                        interp_offset = Some(u32::from_le_bytes([
+                                            phdrs[off + 4],
+                                            phdrs[off + 5],
+                                            phdrs[off + 6],
+                                            phdrs[off + 7],
+                                        ])
+                                            as u64);
+                                        interp_filesz = Some(u32::from_le_bytes([
+                                            phdrs[off + 16],
+                                            phdrs[off + 17],
+                                            phdrs[off + 18],
+                                            phdrs[off + 19],
+                                        ])
+                                            as usize);
                                         break;
                                     }
                                 }
-                                if let (Some(p_offset), Some(p_filesz)) = (interp_offset, interp_filesz) {
+                                if let (Some(p_offset), Some(p_filesz)) =
+                                    (interp_offset, interp_filesz)
+                                {
                                     let _ = file.seek(std::io::SeekFrom::Start(p_offset));
                                     let mut interp_buf = vec![0u8; p_filesz];
                                     let _ = file.read_exact(&mut interp_buf);
@@ -7348,12 +7369,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     info!("[KR64] Task 6-Z50: PT_INTERP offset={}, filesz={}, path={:?}",
                                         p_offset, p_filesz, interp_str.trim_end_matches('\0'));
                                     let new_interp = format!("{}/sbin/linker\0", cfg.rootfs);
-                                    let new_interp_path = new_interp.trim_end_matches('\0').to_string();
+                                    let new_interp_path =
+                                        new_interp.trim_end_matches('\0').to_string();
                                     if new_interp.len() <= p_filesz {
                                         // Fits in place — overwrite
                                         let _ = file.seek(std::io::SeekFrom::Start(p_offset));
                                         let mut nb = new_interp.into_bytes();
-                                        while nb.len() < p_filesz { nb.push(0); }
+                                        while nb.len() < p_filesz {
+                                            nb.push(0);
+                                        }
                                         let _ = file.write_all(&nb);
                                         info!("[KR64] Task 6-Z50: patched PT_INTERP in-place to {} ({} bytes)",
                                             new_interp_path, p_filesz);
@@ -7370,55 +7394,71 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                         //   2. READ-BACK VERIFICATION: after writing, re-read the
                                         //      phdr + interp and log what's ACTUALLY on disk —
                                         //      a swallowed write failure is now visible.
-                                        let already_patched = interp_str.trim_end_matches('\0') == new_interp_path;
+                                        let already_patched =
+                                            interp_str.trim_end_matches('\0') == new_interp_path;
                                         if already_patched {
                                             info!("[KR64] Task 6-Z65: PT_INTERP already patched to the rootfs path — skipping re-append (idempotent)");
                                         } else {
-                                        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                                        let new_offset = file_size;
-                                        let new_filesz = new_interp.len();
-                                        // Append the new interp string
-                                        let append_res = {
-                                            let _ = file.seek(std::io::SeekFrom::End(0));
-                                            file.write_all(new_interp.as_bytes())
-                                        };
-                                        if let Err(e) = append_res {
-                                            error!("[KR64] Task 6-Z65: PT_INTERP append WRITE FAILED: {} — execve will likely fail with ENOENT", e);
-                                        } else {
-                                        info!("[KR64] Task 6-Z50: appended new PT_INTERP at offset {} ({} bytes)",
-                                            new_offset, new_filesz);
-                                        // Update the PT_INTERP program header's p_offset and p_filesz
-                                        // 32-bit ELF: p_offset at phdr+4 (4 bytes), p_filesz at phdr+16 (4 bytes)
-                                        let mut pt_interp_phdr_off = None;
-                                        for i in 0..e_phnum {
-                                            let off = i * e_phentsize;
-                                            let p_type = u32::from_le_bytes([phdrs[off], phdrs[off+1], phdrs[off+2], phdrs[off+3]]);
-                                            if p_type == 3 {
-                                                pt_interp_phdr_off = Some(e_phoff as u64 + off as u64);
-                                                break;
-                                            }
-                                        }
-                                        if let Some(phdr_off) = pt_interp_phdr_off {
-                                            // Write new p_offset (at phdr_off + 4)
-                                            let w1 = {
-                                                let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 4));
-                                                file.write_all(&(new_offset as u32).to_le_bytes())
+                                            let file_size =
+                                                file.metadata().map(|m| m.len()).unwrap_or(0);
+                                            let new_offset = file_size;
+                                            let new_filesz = new_interp.len();
+                                            // Append the new interp string
+                                            let append_res = {
+                                                let _ = file.seek(std::io::SeekFrom::End(0));
+                                                file.write_all(new_interp.as_bytes())
                                             };
-                                            // Write new p_filesz (at phdr_off + 16)
-                                            let w2 = {
-                                                let _ = file.seek(std::io::SeekFrom::Start(phdr_off + 16));
-                                                file.write_all(&(new_filesz as u32).to_le_bytes())
-                                            };
-                                            if w1.is_err() || w2.is_err() {
-                                                error!("[KR64] Task 6-Z65: PT_INTERP phdr update FAILED (w1={:?}, w2={:?}) — kernel will use the OLD interpreter path", w1.err(), w2.err());
+                                            if let Err(e) = append_res {
+                                                error!("[KR64] Task 6-Z65: PT_INTERP append WRITE FAILED: {} — execve will likely fail with ENOENT", e);
                                             } else {
-                                            info!("[KR64] Task 6-Z50: updated PT_INTERP phdr: p_offset={}, p_filesz={}",
+                                                info!("[KR64] Task 6-Z50: appended new PT_INTERP at offset {} ({} bytes)",
+                                            new_offset, new_filesz);
+                                                // Update the PT_INTERP program header's p_offset and p_filesz
+                                                // 32-bit ELF: p_offset at phdr+4 (4 bytes), p_filesz at phdr+16 (4 bytes)
+                                                let mut pt_interp_phdr_off = None;
+                                                for i in 0..e_phnum {
+                                                    let off = i * e_phentsize;
+                                                    let p_type = u32::from_le_bytes([
+                                                        phdrs[off],
+                                                        phdrs[off + 1],
+                                                        phdrs[off + 2],
+                                                        phdrs[off + 3],
+                                                    ]);
+                                                    if p_type == 3 {
+                                                        pt_interp_phdr_off =
+                                                            Some(e_phoff as u64 + off as u64);
+                                                        break;
+                                                    }
+                                                }
+                                                if let Some(phdr_off) = pt_interp_phdr_off {
+                                                    // Write new p_offset (at phdr_off + 4)
+                                                    let w1 = {
+                                                        let _ = file.seek(
+                                                            std::io::SeekFrom::Start(phdr_off + 4),
+                                                        );
+                                                        file.write_all(
+                                                            &(new_offset as u32).to_le_bytes(),
+                                                        )
+                                                    };
+                                                    // Write new p_filesz (at phdr_off + 16)
+                                                    let w2 = {
+                                                        let _ = file.seek(
+                                                            std::io::SeekFrom::Start(phdr_off + 16),
+                                                        );
+                                                        file.write_all(
+                                                            &(new_filesz as u32).to_le_bytes(),
+                                                        )
+                                                    };
+                                                    if w1.is_err() || w2.is_err() {
+                                                        error!("[KR64] Task 6-Z65: PT_INTERP phdr update FAILED (w1={:?}, w2={:?}) — kernel will use the OLD interpreter path", w1.err(), w2.err());
+                                                    } else {
+                                                        info!("[KR64] Task 6-Z50: updated PT_INTERP phdr: p_offset={}, p_filesz={}",
                                                 new_offset, new_filesz);
-                                            // Task 6-Z65: READ-BACK verification — re-read the
-                                            // phdr + interp from disk (bypassing the File's buffer
-                                            // via a fresh open) and log exactly what a subsequent
-                                            // execve would see.
-                                            let verify = std::fs::read(&recovery_path).ok().and_then(|bytes| {
+                                                        // Task 6-Z65: READ-BACK verification — re-read the
+                                                        // phdr + interp from disk (bypassing the File's buffer
+                                                        // via a fresh open) and log exactly what a subsequent
+                                                        // execve would see.
+                                                        let verify = std::fs::read(&recovery_path).ok().and_then(|bytes| {
                                                 let v_e_phoff = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as u64;
                                                 let v_e_phentsize = u16::from_le_bytes([bytes[42], bytes[43]]) as usize;
                                                 let v_e_phnum = u16::from_le_bytes([bytes[44], bytes[45]]) as usize;
@@ -7434,7 +7474,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                                 }
                                                 None
                                             });
-                                            match verify {
+                                                        match verify {
                                                 Some((v_off, v_sz, v_str, v_len)) => {
                                                     if v_str == new_interp_path {
                                                         info!("[KR64] Task 6-Z65: READ-BACK VERIFIED — PT_INTERP @{} ({} bytes) = {:?} (file size {}) — execve will find the rootfs linker",
@@ -7446,9 +7486,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                                 }
                                                 None => error!("[KR64] Task 6-Z65: read-back verification FAILED — could not re-parse the patched ELF"),
                                             }
+                                                    }
+                                                }
                                             }
-                                            }
-                                        }
                                         }
                                     }
                                 } else {
@@ -7466,52 +7506,71 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     "{}/sbin:{}/system/lib:{}/system/lib64",
                     cfg.rootfs, cfg.rootfs, cfg.rootfs
                 );
-                info!("[KR64] Task 6-Z49: proactively forking recovery child at {}", patched_path);
+                info!(
+                    "[KR64] Task 6-Z49: proactively forking recovery child at {}",
+                    patched_path
+                );
 
                 let path_c = std::ffi::CString::new(recovery_path.as_str()).unwrap_or_default();
-                let argv_c: Vec<std::ffi::CString> = vec![
-                    std::ffi::CString::new("/sbin/recovery").unwrap_or_default(),
-                ];
+                let argv_c: Vec<std::ffi::CString> =
+                    vec![std::ffi::CString::new("/sbin/recovery").unwrap_or_default()];
                 let envp_c: Vec<std::ffi::CString> = vec![
-                    std::ffi::CString::new(format!("LD_PRELOAD={}", ld_preload)).unwrap_or_default(),
-                    std::ffi::CString::new(format!("LD_LIBRARY_PATH={}", ld_library_path)).unwrap_or_default(),
+                    std::ffi::CString::new(format!("LD_PRELOAD={}", ld_preload))
+                        .unwrap_or_default(),
+                    std::ffi::CString::new(format!("LD_LIBRARY_PATH={}", ld_library_path))
+                        .unwrap_or_default(),
                     std::ffi::CString::new("PATH=/sbin:/system/bin").unwrap_or_default(),
                     // 6-Z96: the fb hook's INPUT bridge computes the host
                     // touch socket path as $TWOYI_ROOTFS/../dev/touch-events —
                     // without this env its connect() ENOENTs (run 32652894955:
                     // 'INPUT bridge connect FAILED for "event0"' all 600s while
                     // the socket was bound the whole time).
-                    std::ffi::CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs)).unwrap_or_default(),
+                    std::ffi::CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs))
+                        .unwrap_or_default(),
                 ];
-                let mut argv_ptr: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
+                let mut argv_ptr: Vec<*const libc::c_char> =
+                    argv_c.iter().map(|s| s.as_ptr()).collect();
                 argv_ptr.push(std::ptr::null());
-                let mut envp_ptr: Vec<*const libc::c_char> = envp_c.iter().map(|s| s.as_ptr()).collect();
+                let mut envp_ptr: Vec<*const libc::c_char> =
+                    envp_c.iter().map(|s| s.as_ptr()).collect();
                 envp_ptr.push(std::ptr::null());
 
                 let new_pid = unsafe { libc::fork() };
                 if new_pid == 0 {
                     // Child — 64-bit, async-signal-safe only
-                    unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0); }
-                    unsafe { libc::raise(libc::SIGSTOP); }
+                    unsafe {
+                        libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                    }
+                    unsafe {
+                        libc::raise(libc::SIGSTOP);
+                    }
                     let execve_ret = unsafe {
-                        libc::execve(
-                            path_c.as_ptr(),
-                            argv_ptr.as_ptr(),
-                            envp_ptr.as_ptr(),
-                        )
+                        libc::execve(path_c.as_ptr(), argv_ptr.as_ptr(), envp_ptr.as_ptr())
                     };
                     // execve returned → it FAILED. Log via write(2,...) — async-signal-safe.
-                    let msg = format!("EXECVE FAILED: ret={}, path={}\n", execve_ret, recovery_path);
-                    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()); }
+                    let msg = format!(
+                        "EXECVE FAILED: ret={}, path={}\n",
+                        execve_ret, recovery_path
+                    );
+                    unsafe {
+                        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                    }
                     // Check if the interpreter (PT_INTERP) exists on the HOST
-                    for interp in &["/sbin/linker", "/system/bin/linker",
-                                    "/data/user/0/io.twoyi/rootfs/sbin/linker"] {
+                    for interp in &[
+                        "/sbin/linker",
+                        "/system/bin/linker",
+                        "/data/user/0/io.twoyi/rootfs/sbin/linker",
+                    ] {
                         let interp_c = std::ffi::CString::new(*interp).unwrap_or_default();
                         let access_ret = unsafe { libc::access(interp_c.as_ptr(), libc::F_OK) };
                         let msg2 = format!("INTERP check: {} exists={}\n", interp, access_ret == 0);
-                        unsafe { libc::write(2, msg2.as_ptr() as *const libc::c_void, msg2.len()); }
+                        unsafe {
+                            libc::write(2, msg2.as_ptr() as *const libc::c_void, msg2.len());
+                        }
                     }
-                    unsafe { libc::_exit(127); }
+                    unsafe {
+                        libc::_exit(127);
+                    }
                 } else if new_pid > 0 {
                     info!("[KR64] Task 6-Z49: forked recovery child PID={}", new_pid);
                     Some(new_pid)
