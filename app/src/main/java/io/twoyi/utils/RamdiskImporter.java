@@ -709,11 +709,14 @@ public class RamdiskImporter {
 
         if (recoveryLen == 1271264L) {
             // Known bundled payload — enforce the exact manifest.
+            // sbin/libtwrp_fb_hook.so is deliberately NOT in this manifest:
+            // it is staged into the rootfs by the app AFTER import (from the
+            // APK native lib dir) — not part of the stock ramdisk; run
+            // 32619179713 aborted because this was required at import time.
             String[][] exact = {
                 {"sbin/recovery", "1271264"},
                 {"sbin/linker", "148291"},
                 {"sbin/libminuitwrp.so", "129364"},
-                {"sbin/libtwrp_fb_hook.so", "40716"},
             };
             for (String[] spec : exact) {
                 File f = new File(targetDir, spec[0]);
@@ -729,6 +732,10 @@ public class RamdiskImporter {
 
         // For any recovery payload: critical files must at least be non-zero
         // (libtwrp.so / libguitwrp.so are build-specific — only when present).
+        // libtwrp_fb_hook.so is OPTIONAL here too: staged into the rootfs by
+        // the app AFTER import (from the APK native lib dir) — not part of
+        // the stock ramdisk; run 32619179713 aborted because this was
+        // required at import time. If present, require >0; if absent, skip.
         String[] nonZero = {"sbin/recovery", "sbin/linker", "sbin/libminuitwrp.so",
             "sbin/libtwrp_fb_hook.so", "sbin/libtwrp.so", "sbin/libguitwrp.so"};
         for (String n : nonZero) {
