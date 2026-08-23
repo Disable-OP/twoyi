@@ -23,6 +23,9 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+import os
+
+PACKAGE = os.environ.get("TWOYI_PACKAGE", "io.twoyi")
 
 ADB = ["adb", "-s", "emulator-5554"]
 ART = "/tmp/ui-e2e-artifacts"
@@ -58,7 +61,7 @@ def pull_via_run_as(remote_path, local_path, timeout=10):
     logs are diagnostic aids, not required artifacts.
     """
     try:
-        r = subprocess.run(ADB + ["shell", "run-as", "io.twoyi",
+        r = subprocess.run(ADB + ["shell", "run-as", PACKAGE,
                                   "cat", remote_path],
                            capture_output=True, timeout=timeout)
         if r.returncode == 0 and r.stdout:
@@ -83,7 +86,7 @@ def pull_with_fallback(external_path, internal_path, local_path, timeout=10):
     partial write, timeout, non-zero exit), any empty/partial local
     file is removed and we fall back to `pull_via_run_as`, which reads
     the original copy under /data/user/0/io.twoyi/rootfs/ via
-    `run-as io.twoyi cat`. This keeps the script working on debuggable
+    `run-as {PACKAGE} cat`. This keeps the script working on debuggable
     builds where run-as still functions, and on devices where the
     external mirror hasn't landed yet.
 
@@ -681,7 +684,7 @@ def main():
     print("=" * 60)
     print("  Step 1: Launch app via launcher (monkey -p)")
     print("=" * 60)
-    adb_shell("monkey -p io.twoyi -c android.intent.category.LAUNCHER 1")
+    adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
     wait(5)
     xml = dump_ui("01_app_launched")
     root = parse_ui(xml)
@@ -990,6 +993,24 @@ def main():
     subprocess.run(ADB + ["pull", "/data/data/io.twoyi/kr64-app-stderr.log",
                          os.path.join(ART, "kr64-app-stderr.log")],
                   capture_output=True, timeout=10)
+
+    # ── 6-Z85: pull the app's FileLogger logs + kr64 stderr via run-as ──
+    # These hold the APP-SIDE boot story (waitBoot polling, markCompleted
+    # receipts, the TWRP-FB render-loop lifecycle) that logcat never sees
+    # on release builds. Works when the debuggable variant is installed
+    # (TWOYI_PACKAGE=io.twoyi.debug); silently no-ops otherwise.
+    for remote, local in [
+        ("cache/log/app.log", "app.log"),
+        ("cache/log/boot.log", "boot.log"),
+        ("cache/log/crash.log", "crash.log"),
+        ("cache/log/logcat.log", "logcat-guest.log"),
+        ("kr64-app-stderr.log", "kr64-app-stderr.log"),
+    ]:
+        out = adb_shell(f"run-as {PACKAGE} cat {remote}", timeout=60)
+        if out:
+            with open(os.path.join(ART, local), "w", errors="replace") as f:
+                f.write(out)
+            print(f"  pulled via run-as: {remote} -> {local}")
 
     # Pull the TWRP diagnostic logs.
     #
