@@ -7777,29 +7777,56 @@ pub fn run_ptrace_loop(
                     // way it fails today, which is strictly no worse than
                     // the status quo, and the log pinpoints which file to
                     // investigate next.
+                    // ── Task 6-Z72: pid-aware pending consumption ──
+                    //
+                    // RUN 32608385454 EVIDENCE: the recovery child's mmap2
+                    // ENTRY (fd=3, libtwrp_fb_hook.so) armed the record, then
+                    // init's unlink EXIT (a DIFFERENT pid) arrived before the
+                    // recovery child's own mmap2 EXIT. The old code `.take()`d
+                    // the record on ANY stop and Gate 1 (nr mismatch vs the
+                    // foreign stop's unlink) DROPPED it — the subsequent
+                    // successful mmap2 EXIT (real address 0xEB05BC40) had
+                    // nothing pending → the mapping stayed ZEROED → the
+                    // linker read zero phdrs → "has no loadable segments" →
+                    // CANNOT LINK → exit(1). That is THE remaining blocker.
+                    //
+                    // FIX: a stop from a DIFFERENT pid must LEAVE the record
+                    // armed (children interleave; the record's own child will
+                    // produce its EXIT stop soon). A pid-matching non-mmap2
+                    // stop still drops the record (Gate 1's true DESYNC
+                    // protection) — a single child cannot legitimately run
+                    // another syscall between its own mmap2 ENTRY and EXIT.
                     if pending_mmap2_content.is_some() {
+                        let pending_pid = pending_mmap2_content.as_ref().unwrap().pid;
+                        if pending_pid != pid {
+                            // Foreign child's stop — LEAVE ARMED for the
+                            // record's own child (6-Z72). Log sparsely so
+                            // interleave frequency is visible without
+                            // flooding (first 200 loops only).
+                            if loop_count <= 200 {
+                                log(&format!(
+                                    "6-Z72: mmap2 pending survives cross-child stop (armed by pid={}, this stop is pid={} nr={} [{}]) — record stays armed",
+                                    pending_pid,
+                                    pid,
+                                    syscall_num,
+                                    syscall_name(syscall_num, &abi)
+                                ));
+                            }
+                        } else {
                         let pending = pending_mmap2_content.take().unwrap();
                         if syscall_num != abi.mmap && syscall_num != abi.mmap2 {
-                            // Gate 1 — DESYNC: this EXIT stop belongs to a
-                            // different syscall than the mmap2 ENTRY that
-                            // armed the record. Injecting at whatever rax
-                            // holds now would target an unrelated address;
-                            // drop the record and say so.
+                            // Gate 1 — DESYNC (same pid): this EXIT stop
+                            // belongs to a different syscall than the mmap2
+                            // ENTRY that armed the record. A single child
+                            // cannot run another syscall between its own
+                            // ENTRY and EXIT, so this means our phase model
+                            // desynced — drop the record and say so.
                             log(&format!(
                                 "6-Z62: mmap2 content injection SKIPPED (DESYNC) — pending mmap2 nr={} but this EXIT is nr={} [{}] (pid={})",
                                 if abi.mmap2 != -1 { abi.mmap2 } else { abi.mmap },
                                 syscall_num,
                                 syscall_name(syscall_num, &abi),
                                 pending.pid
-                            ));
-                        } else if pending.pid != pid {
-                            // Gate 2 — cross-child confusion: the record was
-                            // armed by a different child's mmap2 ENTRY. The
-                            // mapping address we would read below belongs
-                            // to THAT child, not to this one.
-                            log(&format!(
-                                "6-Z62: mmap2 content injection SKIPPED (pid mismatch) — armed by pid={} but this stop is pid={} (fd={}, len={})",
-                                pending.pid, pid, pending.fd, pending.length
                             ));
                         } else {
                             // Fresh register read (the 6-Z60 pattern — the
@@ -8008,6 +8035,7 @@ pub fn run_ptrace_loop(
                                     ));
                                 }
                             }
+                        }
                         }
                     }
                     // Part B — write(fd, buf, count) EXIT: capture
@@ -8550,6 +8578,22 @@ pub fn run_ptrace_loop(
                     // the final rax FIRST; the gate then re-reads FRESH
                     // registers, sees 0 (not -38), and preserves it.
                     if pending_stat64.is_some() {
+                        // 6-Z72: a stop from a DIFFERENT pid must LEAVE the
+                        // record armed (children interleave — see the
+                        // pending_mmap2_content 6-Z72 block for the full
+                        // evidence). Only the arming pid's own stops consume
+                        // or drop the record.
+                        if pending_stat64.as_ref().unwrap().pid != pid {
+                            if loop_count <= 200 {
+                                log(&format!(
+                                    "6-Z72: stat64 pending survives cross-child stop (armed by pid={}, this stop is pid={} nr={} [{}]) — record stays armed",
+                                    pending_stat64.as_ref().unwrap().pid,
+                                    pid,
+                                    syscall_num,
+                                    syscall_name(syscall_num, &abi)
+                                ));
+                            }
+                        } else {
                         let pending = pending_stat64.take().unwrap();
                         let which = if pending.nr == abi.fstat64 {
                             "fstat64"
@@ -8577,12 +8621,7 @@ pub fn run_ptrace_loop(
                                 log(&msg);
                             }
                         };
-                        if pending.pid != pid {
-                            skip_log(format!(
-                                "6-Z71: {} emulation SKIPPED (pid mismatch) — armed by pid={} but this stop is pid={} (statbuf={:#x}) (Task 6-Z71)",
-                                which, pending.pid, pid, pending.statbuf
-                            ));
-                        } else if syscall_num != pending.nr {
+                        if syscall_num != pending.nr {
                             skip_log(format!(
                                 "6-Z71: {} emulation SKIPPED (DESYNC) — pending nr={} but this EXIT is nr={} [{}] (Task 6-Z71)",
                                 which,
@@ -8716,6 +8755,7 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                        }
                     }
 
                     // ── Task 6-Z71: pread64 EXIT → REAL emulation
@@ -8737,6 +8777,19 @@ pub fn run_ptrace_loop(
                     //     the caller must not see a byte count whose
                     //     tail is garbage.
                     if pending_pread64.is_some() {
+                        // 6-Z72: cross-child stops leave the record armed
+                        // (same rationale as the stat64 consumer above).
+                        if pending_pread64.as_ref().unwrap().pid != pid {
+                            if loop_count <= 200 {
+                                log(&format!(
+                                    "6-Z72: pread64 pending survives cross-child stop (armed by pid={}, this stop is pid={} nr={} [{}]) — record stays armed",
+                                    pending_pread64.as_ref().unwrap().pid,
+                                    pid,
+                                    syscall_num,
+                                    syscall_name(syscall_num, &abi)
+                                ));
+                            }
+                        } else {
                         let pending = pending_pread64.take().unwrap();
                         let mut skip_log = |msg: String| {
                             if z71_skip_logs < 300 {
@@ -8744,12 +8797,7 @@ pub fn run_ptrace_loop(
                                 log(&msg);
                             }
                         };
-                        if pending.pid != pid {
-                            skip_log(format!(
-                                "6-Z71: pread64 emulation SKIPPED (pid mismatch) — armed by pid={} but this stop is pid={} (Task 6-Z71)",
-                                pending.pid, pid
-                            ));
-                        } else if syscall_num != abi.pread64 {
+                        if syscall_num != abi.pread64 {
                             skip_log(format!(
                                 "6-Z71: pread64 emulation SKIPPED (DESYNC) — pending nr={} but this EXIT is nr={} [{}] (Task 6-Z71)",
                                 abi.pread64,
@@ -8894,6 +8942,7 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
+                        }
                         }
                     }
 
