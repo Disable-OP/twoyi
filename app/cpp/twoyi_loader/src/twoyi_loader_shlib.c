@@ -2500,7 +2500,11 @@ static int is_init_process(void) {
     // Strip trailing newline
     char *nl = strchr(comm, '\n');
     if (nl) *nl = 0;
-    return (strcmp(comm, "init") == 0);
+    // 6-Z98: also accept "twoyi_init" — kr64 stages the guest init as
+    // cache/twoyi_init (the noexec workaround) and execs that copy, so the
+    // process comm is "twoyi_init", not "init". Without this the init-only
+    // protections (fstab block) silently disarmed.
+    return (strcmp(comm, "init") == 0) || (strcmp(comm, "twoyi_init") == 0);
 }
 
 // Block fstab opens for init only.
