@@ -4875,7 +4875,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //
     // This is a DIAGNOSTIC aid — it doesn't fix the recovery-not-starting
     // issue, but it lets us see the next error message from TWRP init.
-    if cfg.boot_recovery {
+    //
+    // Task 6-Z98 (run 32663728329, head fb89bfba): this section now runs
+    // for ALL boots — NOT just TWRP. The 6-Z97 translate_path mapping
+    // open("/dev/kmsg") → {rootfs}/dev/__kmsg__ (ptrace_emu.rs) is
+    // mode-independent, and Android 11's first-stage init calls
+    // InitKernelLogging() → open("/dev/kmsg", O_WRONLY|O_CLOEXEC) within
+    // its first ~20 post-execve syscalls. With the creation still gated
+    // behind boot_recovery (aosp15, boot_recovery=false) the translated
+    // open hit a file that was never created → ENOENT (-2, "DIAG KLOG fd
+    // capture: open() returned -2") → the guest stayed completely mute:
+    // no init.rc parse results, no service starts, no property sets in
+    // kr64-app-stderr.log. The post-run "failed to copy diagnostic log
+    // …/rootfs/dev/__kmsg__: No such file or directory" (×2) confirmed
+    // the backing file never existed. Hoisting the gate gives EVERY boot
+    // a kmsg backing file so BOTH TWRP init's log_init() and AOSP 11
+    // init's InitKernelLogging() write KLOG output somewhere kr64 can
+    // mirror + copy out.
+    {
         let kmsg_log_path = format!("{}/twrp-kmsg.log", rootfs_prefix);
         // Create the target file (empty) on the ext4 rootfs.
         match std::fs::write(&kmsg_log_path, b"") {
