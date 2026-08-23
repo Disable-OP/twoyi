@@ -45,10 +45,9 @@
 //     socket (action+pointer_id+x+y+pressure, all LE s32/u32) and
 //     synthesize 16-byte i386 struct input_event frames (EV_ABS
 //     ABS_MT_* + ABS_X/Y, EV_KEY BTN_TOUCH, EV_SYN SYN_REPORT).
-//   - The constructor pre-creates /dev/input/event0|event1 as regular
-//     files (guest paths — the ptrace interceptor maps them into
-//     {rootfs}/dev/input/) so minui's /dev/input scan finds openable
-//     "event*" names in the first place.
+//   - /dev/input/event0|event1 are pre-created as regular files by
+//     kr64 itself (devices phase, parent-side) so minui's /dev/input
+//     scan finds openable "event*" names in the first place.
 //
 // WHAT THIS DOES NOT HOOK:
 //   - mmap() — REMOVED. kr64 pre-creates /dev/graphics/fb0 as a regular
@@ -378,9 +377,10 @@ static int is_fb_path(const char *path) {
 //     to minui — our poll() interposition decides readability purely in
 //     userspace (drain socket -> pending buffer -> revents=POLLIN).
 //   - Guest paths (/dev/input/event0) are translated by the tracer to
-//     {rootfs}/dev/input/event0 — which is why the constructor can
-//     pre-create the probe targets with a plain O_CREAT openat, and why
-//     the connect fallback path is RELATIVE ("../dev/touch-events"):
+//     {rootfs}/dev/input/event0 — which is why kr64 pre-creates the
+//     probe targets in its devices phase (parent-side, no guest
+//     syscalls), and why the connect fallback path is RELATIVE
+//     ("../dev/touch-events"):
 //     sockaddr_un paths are NOT translated, and the guest's cwd is the
 //     rootfs (kr64 spawns the guest with cwd=working_dir; nothing chdirs
 //     before recovery's minui runs).
@@ -1200,32 +1200,20 @@ static void twrp_fb_hook_init(void) {
     write_str(2, "[twrp_fb_hook] loaded (i686 LD_PRELOAD for /dev/graphics/fb0)\n");
 
     // INPUT BRIDGE: initialize the slot table (bss-zeroed fd==0 would
-    // otherwise alias stdin!), then pre-create /dev/input/event0|event1 as
-    // empty regular files so minui's /dev/input scan (readdir and/or stat
-    // probes — the E2E DIAG showed 15x fstatat64 probes finding nothing)
-    // sees openable "event*" names. The guest paths are translated by
-    // kr64's ptrace interceptor to {rootfs}/dev/input/eventN; kr64's
-    // touch/key0 sockets live in the same directory but don't match the
-    // "event" prefix, so minui ignores them. When minui then OPENS one
-    // of these, our open() hook swaps the fd for the touch-events socket.
+    // otherwise alias stdin!). NO raw staging of /dev/input here:
+    //
+    //   the probe files are pre-created by kr64 (devices phase) — raw
+    //   staging here crashed the guest (run 32649156523)
+    //
+    // Run 32649156523 showed the constructor's mkdir_raw("/dev/input") +
+    // openat(O_CREAT) loop passing through the tracer's interception
+    // path and corrupting the resume state (recovery SIGSEGV'd,
+    // si_code=128 SI_KERNEL, rip inside this hook's text, ~20s in and
+    // BEFORE minui ran). kr64 now pre-creates {rootfs}/dev/input/
+    // event0+event1 parent-side before the guest is even forked; when
+    // minui OPENS one of them, our open() hook swaps the fd for the
+    // touch-events socket.
     for (i = 0; i < INBR_MAX_SLOTS; i++) g_inbr[i].fd = -1;
-    mkdir_raw("/dev/input", 0755);
-    for (i = 0; i < 2; i++) {
-        char path[24];
-        int j = 0;
-        const char *base = "/dev/input/event0";
-        while (base[j]) { path[j] = base[j]; j++; }
-        path[j - 1] = (char)('0' + i);
-        path[j] = 0;
-        {
-            int cfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path,
-                                        O_CREAT | O_RDWR, 0644);
-            if (cfd >= 0) {
-                raw_syscall1(SYS_close, cfd);
-            }
-        }
-    }
-    write_str(2, "[twrp_fb_hook] INPUT bridge: staged /dev/input/event0+event1 probe targets\n");
     // Log hook function addresses to confirm they're defined and to
     // correlate with any future PLT-resolution diagnostics. These are
     // the addresses of OUR definitions; if bionic's linker resolves
