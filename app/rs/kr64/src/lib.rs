@@ -3912,41 +3912,68 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
-    // Write hook libraries to /dev/ (tmpfs) so the child can use
+    // Write hook libraries to the GUEST's /dev so the child can use
     // LD_PRELOAD=/dev/libgetpid_hook.so.
     //
     // The library CONTENT was read into memory BEFORE setup_mounts
     // (Step 3.6 above), while host filesystem paths were still
-    // accessible. Now, AFTER setup_mounts (pivot_root), /dev/ is the
-    // tmpfs mounted by setup_mounts — writing here places the libraries
-    // on the tmpfs that survives pivot_root and is visible inside the
-    // jail at /dev/libgetpid_hook.so (exactly where LD_PRELOAD expects).
+    // accessible. The write TARGET depends on the mode (rootfs_prefix,
+    // defined in Step 4.4 above):
     //
-    // IMPORTANT: Always write to /dev/ (tmpfs), NOT to {rootfs}/dev/
-    // (app_data_file on ext4). This is critical for SELinux:
-    //   - Init second stage forks subcontexts running as u:r:vendor_init:s0
-    //   - vendor_init is DENIED search access to app_data_file directories
-    //     (per SELinux policy: avc denied { search } for name="io.twoyi"
-    //      tcontext=u:object_r:app_data_file:s0 permissive=0)
-    //   - If the libraries are in /data/data/io.twoyi/rootfs/dev/, the
-    //     subcontext's linker can't find them → "CANNOT LINK EXECUTABLE"
-    //   - /dev/ (tmpfs) is accessible to ALL domains (labeled tmpfs)
+    //   * use_namespaces=true (root, pivot_root): rootfs_prefix == "" so
+    //     the target is /dev/libgetpid_hook.so — the tmpfs mounted by
+    //     setup_mounts, which survives pivot_root and is visible inside
+    //     the jail at /dev/ (exactly where LD_PRELOAD expects). /dev/
+    //     (tmpfs) is also critical for SELinux: init second stage forks
+    //     subcontexts running as u:r:vendor_init:s0, which is DENIED
+    //     search on app_data_file directories
+    //     (avc denied { search } for name="io.twoyi"
+    //      tcontext=u:object_r:app_data_file:s0), while tmpfs is
+    //     accessible to ALL domains.
+    //
+    //   * use_namespaces=false (non-root, NO pivot_root): rootfs_prefix
+    //     == cfg.rootfs, so the target is {cfg.rootfs}/dev/…. The bare
+    //     "/dev/" would be the HOST's devtmpfs — unwritable for
+    //     untrusted_app (EACCES, E2E run 32635971098) and never visible
+    //     to the guest. The ptrace interceptor (ptrace_emu
+    //     ::translate_path) maps every guest /dev/* access onto
+    //     {rootfs}/dev/*, and the linker's openat()s are intercepted,
+    //     so LD_PRELOAD=/dev/libgetpid_hook.so resolves to exactly this
+    //     staged file (previously the hook went to the HOST /dev →
+    //     EACCES, {rootfs}/dev stayed empty, and the translated init's
+    //     linker died: "CANNOT LINK EXECUTABLE … library
+    //     /dev/libgetpid_hook.so not found" → exit(1) after 427 ptrace
+    //     iterations — the aosp3 blocker).
     //
     // If a library was not found in the pre-pivot read, the
     // corresponding Option is None and we skip the write (the error
     // was already logged by find_and_read_hook_library with the full
     // list of checked paths). LD_PRELOAD will still reference the path
-    // — the child will log "libgetpid_hook.so NOT found at /dev/" and
-    // init will crash, but with clear diagnostics.
+    // — the child will log "libgetpid_hook.so NOT found at staged /dev
+    // path" and init will crash, but with clear diagnostics.
+    let dev_stage_dir = format!("{}/dev", rootfs_prefix);
+    if let Err(e) = std::fs::create_dir_all(&dev_stage_dir) {
+        warning!(
+            "[KR64] PARENT: failed to create dev dir {} for hook libraries: {} (errno={})",
+            dev_stage_dir,
+            e,
+            e.raw_os_error().unwrap_or(0)
+        );
+    }
     if let Some((src, content)) = &hook_lib_getpid {
-        write_hook_library_to_dev("libgetpid_hook.so", src, content, "/dev/libgetpid_hook.so");
+        write_hook_library_to_dev(
+            "libgetpid_hook.so",
+            src,
+            content,
+            &format!("{}/libgetpid_hook.so", dev_stage_dir),
+        );
     }
     if let Some((src, content)) = &hook_lib_loader {
         write_hook_library_to_dev(
             "libtwoyi_loader_shlib.so",
             src,
             content,
-            "/dev/libtwoyi_loader_shlib.so",
+            &format!("{}/libtwoyi_loader_shlib.so", dev_stage_dir),
         );
     }
     // TWRP BOOT: write the i686 libtwrp_fb_hook.so to /sbin/libtwrp_fb_hook.so
@@ -4022,11 +4049,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // (/apex/com.android.runtime/lib64/bionic/libdl.so = the stub).
     if let Some((src, content)) = &real_libdl {
         info!(
-            "[KR64] PARENT: writing real libdl.so ({} bytes, source: {}) to /dev/libdl.so (AFTER pivot_root, tmpfs)",
+            "[KR64] PARENT: writing real libdl.so ({} bytes, source: {}) to {}/libdl.so (guest /dev staging dir)",
             content.len(),
-            src
+            src,
+            dev_stage_dir
         );
-        write_hook_library_to_dev("libdl.so", src, content, "/dev/libdl.so");
+        write_hook_library_to_dev(
+            "libdl.so",
+            src,
+            content,
+            &format!("{}/libdl.so", dev_stage_dir),
+        );
     } else {
         warning!(
             "[KR64] PARENT: real libdl.so NOT extracted — guest init will use the 5848-byte stub at /apex/com.android.runtime/lib64/bionic/libdl.so and may crash at offset 0xaf174 in linker64 (5-K's diagnosis)"
@@ -4085,12 +4118,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     if !cfg.use_namespaces {
         info!("[KR64] PARENT: non-root mode — skipping lsetxattr (seccomp blocks it, would cause SIGSYS)");
     } else {
-        for lib_path in &[
-            "/dev/libgetpid_hook.so",
-            "/dev/libtwoyi_loader_shlib.so",
-            "/dev/libdl.so",
-            "/sbin/libtwrp_fb_hook.so",
-        ] {
+        // NOTE: this loop only runs when use_namespaces=true (see the
+        // `if !cfg.use_namespaces` skip above), where rootfs_prefix == ""
+        // and dev_stage_dir == "/dev" — i.e. exactly the staged paths.
+        // Built from dev_stage_dir so the relabel targets can never
+        // drift from the staging targets above.
+        let staged_hook_libs = [
+            format!("{}/libgetpid_hook.so", dev_stage_dir),
+            format!("{}/libtwoyi_loader_shlib.so", dev_stage_dir),
+            format!("{}/libdl.so", dev_stage_dir),
+            format!("{}/sbin/libtwrp_fb_hook.so", rootfs_prefix),
+        ];
+        for lib_path in &staged_hook_libs {
             if Path::new(lib_path).exists() {
                 match set_selinux_context(lib_path, "u:object_r:system_file:s0") {
                     Ok(()) => {
@@ -4140,9 +4179,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         info!("[KR64] TWRP boot: skipping /dev/twoyi-bin/ copy (TWRP only needs /sbin/*)");
     } else {
         use std::os::unix::fs::PermissionsExt;
-        let dev_bin_dir = "/dev/twoyi-bin";
-        let _ = std::fs::create_dir_all(dev_bin_dir);
-        let _ = std::fs::set_permissions(dev_bin_dir, std::fs::Permissions::from_mode(0o755));
+        // Guest-visible /dev/twoyi-bin. use_namespaces=true → rootfs_prefix
+        // == "" → the post-pivot_root tmpfs /dev/twoyi-bin (unchanged).
+        // use_namespaces=false → {cfg.rootfs}/dev/twoyi-bin: the bare
+        // "/dev/twoyi-bin" would be the HOST's /dev, which is unwritable
+        // for untrusted_app (E2E run 32635971098: every /dev/twoyi-bin/*
+        // service copy ENOENT'd because the dir was never created there).
+        // The interceptor maps the guest's /dev/twoyi-bin/* execs onto
+        // {rootfs}/dev/twoyi-bin/*, so staging under rootfs_prefix/dev
+        // makes those exec-redirect targets resolvable.
+        let dev_bin_dir = format!("{}/dev/twoyi-bin", rootfs_prefix);
+        let _ = std::fs::create_dir_all(&dev_bin_dir);
+        let _ = std::fs::set_permissions(&dev_bin_dir, std::fs::Permissions::from_mode(0o755));
 
         let critical_binaries = [
             "system/bin/logd",
@@ -6449,26 +6497,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         };
         let argv: [*const libc::c_char; 2] = [argv0.as_ptr(), std::ptr::null()];
 
-        // Debug: check if libgetpid_hook.so exists at the expected path.
-        // After pivot_root (use_namespaces=true): /dev/libgetpid_hook.so
-        // Without pivot_root: {rootfs}/dev/libgetpid_hook.so
-        // In both cases, the chroot-relative path /dev/libgetpid_hook.so
-        // works -- after pivot_root it's the tmpfs, without pivot_root
-        // the parent copied it to {rootfs}/dev/ which IS /dev/ relative
-        // to the chroot... actually no, without pivot_root there's no
-        // chroot, so /dev/ refers to the HOST's /dev. We need to check
-        // the full path in that case. But we can't use format! here
-        // (async-signal-unsafe). So just check the chroot-relative path
-        // and log the result -- it's only diagnostic.
-        let hook_exists =
-            unsafe { libc::access(c"/dev/libgetpid_hook.so".as_ptr(), libc::F_OK) == 0 };
+        // Debug: check that libgetpid_hook.so exists where the PARENT
+        // staged it (see the hook-staging block in run()):
+        //   * use_namespaces=true (post-pivot_root): /dev/libgetpid_hook.so
+        //     (the tmpfs mounted by setup_mounts)
+        //   * use_namespaces=false (no pivot_root): {cfg.rootfs}/dev/
+        //     libgetpid_hook.so — the bare /dev/libgetpid_hook.so is NOT
+        //     on the host filesystem in this mode; the GUEST-relative
+        //     LD_PRELOAD path only resolves because the ptrace
+        //     interceptor maps guest /dev/* onto {rootfs}/dev/*. So we
+        //     check the host-side staged path, not the guest path.
+        //
+        // format! + CString::new are safe here: single-threaded
+        // post-fork code running BEFORE execve (the same pattern is
+        // already used for TWOYI_ROOTFS below).
+        let hook_staged_path = if cfg.use_namespaces {
+            "/dev/libgetpid_hook.so".to_string()
+        } else {
+            format!("{}/dev/libgetpid_hook.so", cfg.rootfs)
+        };
+        let hook_exists = match CString::new(hook_staged_path.as_str()) {
+            Ok(p) => unsafe { libc::access(p.as_ptr(), libc::F_OK) == 0 },
+            Err(_) => false, // staged path contains NUL -- treat as missing
+        };
         if hook_exists {
             unsafe {
-                safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at /dev/\n");
+                safe_write_err(b"[KR64 CHILD] libgetpid_hook.so found at staged /dev path\n");
             }
         } else {
             unsafe {
-                safe_write_err(b"[KR64 CHILD] libgetpid_hook.so NOT found at /dev/\n");
+                safe_write_err(b"[KR64 CHILD] libgetpid_hook.so NOT found at staged /dev path -- LD_PRELOAD=/dev/libgetpid_hook.so will fail to link\n");
             }
         }
 
@@ -6477,7 +6535,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // linker will find it FIRST (because LD_LIBRARY_PATH prepends /dev/).
         // If absent, the linker falls through to /apex/.../bionic/libdl.so
         // (the 5848-byte stub) and likely crashes at offset 0xaf174.
-        let libdl_exists = unsafe { libc::access(c"/dev/libdl.so".as_ptr(), libc::F_OK) == 0 };
+        // Same host-side staging-path logic as the libgetpid_hook.so check
+        // above (in non-root mode the file lives at {cfg.rootfs}/dev/).
+        let libdl_staged_path = if cfg.use_namespaces {
+            "/dev/libdl.so".to_string()
+        } else {
+            format!("{}/dev/libdl.so", cfg.rootfs)
+        };
+        let libdl_exists = match CString::new(libdl_staged_path.as_str()) {
+            Ok(p) => unsafe { libc::access(p.as_ptr(), libc::F_OK) == 0 },
+            Err(_) => false,
+        };
         if libdl_exists {
             unsafe {
                 safe_write_err(b"[KR64 CHILD] libdl.so (REAL, from APEX) found at /dev/libdl.so -- linker should resolve DT_NEEDED:libdl.so via /dev/ FIRST\n");
@@ -6527,20 +6595,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 libc::_exit(127);
             },
         };
-        // LD_PRELOAD path: ALWAYS use /dev/libgetpid_hook.so and
-        // /dev/libtwoyi_loader_shlib.so (not {rootfs}/dev/).
+        // LD_PRELOAD path: ALWAYS use the GUEST-RELATIVE
+        // /dev/libgetpid_hook.so and /dev/libtwoyi_loader_shlib.so
+        // (never an absolute HOST path like {cfg.rootfs}/dev/...).
         //
-        // WHY: Init second stage forks subcontexts running as
-        // u:r:vendor_init:s0. vendor_init is DENIED search access to
-        // app_data_file directories (per SELinux policy). If the libraries
-        // are at /data/data/io.twoyi/rootfs/dev/, the subcontext's linker
-        // can't find them. /dev/ (tmpfs) is accessible to ALL domains.
+        // WHY guest-relative works in BOTH modes: every syscall of the
+        // traced child goes through the ptrace loop, and
+        // ptrace_emu::translate_path maps guest /dev/* onto
+        // {rootfs}/dev/* — including the linker's openat()s during
+        // LD_PRELOAD resolution (E2E run 32635971098 syscall #152:
+        // openat "/dev/libgetpid_hook.so" → intercepted →
+        // {rootfs}/dev/libgetpid_hook.so). The parent now stages the
+        // hooks at exactly that translated location
+        // ({rootfs_prefix}/dev/), so the env path resolves in both
+        // modes. (Before the aosp3 fix the parent wrote to the HOST
+        // /dev — EACCES — while {rootfs}/dev stayed empty →
+        // "CANNOT LINK EXECUTABLE … library /dev/libgetpid_hook.so not
+        // found" → exit(1).)
         //
-        // When use_namespaces=true, pivot_root has happened, so /dev/
-        // refers to the new root's /dev/ (tmpfs mounted by setup_mounts).
-        // When use_namespaces=false, /dev/ refers to the HOST's /dev/
-        // (also tmpfs). In both cases, kr64 copies the libraries to /dev/
-        // before forking, so the paths resolve correctly.
+        // use_namespaces=true: pivot_root has happened, /dev/ is the
+        // tmpfs mounted by setup_mounts — required for SELinux too:
+        // vendor_init subcontexts are denied search on app_data_file,
+        // while tmpfs is accessible to ALL domains.
+        // use_namespaces=false: /dev/ resolves via the interceptor to
+        // {cfg.rootfs}/dev/ where the parent staged the libraries.
         //
         // If TWOYI_SKIP_PRELOAD is set in the parent env, skip LD_PRELOAD
         // entirely -- this is a diagnostic mode to check if the init binary
