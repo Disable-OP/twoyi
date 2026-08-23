@@ -4067,11 +4067,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     // ---------------------------------------------------------------
-    // Step 4.6.2 (Task 6-Z92): stage RELATIVE library symlinks
-    // {rootfs}/dev/<lib>.so -> ../system/lib64/<lib>.so for EVERY *.so
-    // in the ROM's {rootfs}/system/lib64/ (plus
-    // {rootfs}/dev/<lib>.so -> ../system/lib/<lib>.so for the 32-bit
-    // tree if the ROM ships one).
+    // Step 4.6.2 (Task 6-Z92, narrowed by 6-Z93): stage RELATIVE
+    // library symlinks {rootfs}/dev/<lib>.so ->
+    // ../system/lib64/<lib>.so for every *.so in the ROM's
+    // {rootfs}/system/lib64/ that the HOST cannot already provide
+    // (plus {rootfs}/dev/<lib>.so -> ../system/lib/<lib>.so for the
+    // 32-bit tree if the ROM ships one).
     //
     // ROOT CAUSE (aosp4, E2E run 32638925300, commit c7cf36a): the
     // translated arm64 init — running as the host's binfmt_misc
@@ -4107,12 +4108,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //     → the mmap2 rewrite+inject machinery serves the ROM's REAL
     //       8.1 library content.
     //
-    // Any DT_NEEDED name the linker probes via LD_LIBRARY_PATH[0]=/dev
-    // now resolves to the ROM's own copy — including the missing
-    // libandroidicu.so. (RELATIVE targets are mandatory: an absolute
-    // /system/lib64/... target would resolve on the HOST filesystem —
-    // the exact bug class the binderfs /dev/binder symlinks already
-    // avoid by using "binderfs/binder"-style relative targets.)
+    // Any host-ABSENT DT_NEEDED name the linker probes via
+    // LD_LIBRARY_PATH[0]=/dev now resolves to the ROM's own copy —
+    // including the missing libandroidicu.so. (RELATIVE targets are
+    // mandatory: an absolute /system/lib64/... target would resolve on
+    // the HOST filesystem — the exact bug class the binderfs /dev/binder
+    // symlinks already avoid by using "binderfs/binder"-style relative
+    // targets.)
     //
     // CONFLICT RULE: if {rootfs}/dev/<name> already exists it WINS and
     // is NEVER overwritten — the staged hooks (libgetpid_hook.so,
@@ -4120,6 +4122,33 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // keep priority over the ROM's same-named libraries. If the
     // existing entry is already exactly the right symlink, we count it
     // as staged (restaging is idempotent).
+    //
+    // OVERREACH (Task 6-Z93, E2E run 32643008745): staging EVERY ROM
+    // library backfired, because LD_LIBRARY_PATH[0]=/dev is probed
+    // FIRST for EVERY DT_NEEDED name — including names the
+    // ndk_translation RUNNER must resolve NATIVELY (it is a HOST
+    // x86_64 bionic executable). At iteration 527 the runner's own
+    // linker opened /dev/liblog.so → the relative symlink handed it
+    // the ROM's ARM64 ELF, and host bionic does NOT skip
+    // incompatible-ELF candidates — machine mismatch is FATAL:
+    //
+    //   CANNOT LINK EXECUTABLE
+    //   "/system/bin/ndk_translation_program_runner_binfmt_misc_arm64":
+    //   "…/rootfs/system/lib64/liblog.so" is for EM_AARCH64 (183)
+    //   instead of EM_X86_64 (62)
+    //
+    // → exit(1) EARLIER than before the farm existed (iter 527 vs
+    // 2,353 — it died at the FIRST probe). THE NARROWING: only stage a
+    // name the HOST CANNOT provide itself. If /system/lib64/<name>,
+    // /system/lib/<name> or /apex/com.android.runtime/lib64/<name>
+    // exists on the HOST, the runner's linker resolves that name
+    // through its own x86_64 trees (LD_LIBRARY_PATH[0] miss → next
+    // entry → host /system + /apex) — exactly how it got 55 libraries
+    // deep before. Only host-ABSENT names (libandroidicu.so) get the
+    // /dev symlink to the ROM's ARM64 copy, which the mmap2
+    // rewrite+inject machinery then translates. Path::exists is
+    // best-effort: any error (perm, ENOENT, …) reads as "absent" →
+    // stage the symlink (the safe default for a host-lacking name).
     //
     // GATING: normal (AOSP) boot only. TWRP (boot_recovery=true) does
     // not need it — its init is statically linked and its
@@ -4136,6 +4165,20 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let mut staged_lib32 = 0usize;
         let mut kept_existing = 0usize;
         let mut failures = 0usize;
+        let mut rom_libs = 0usize;
+        let mut host_present_skipped = 0usize;
+        // Task 6-Z93 host-presence filter: the host trees the
+        // ndk_translation runner resolves names from natively (its own
+        // x86_64 bionic /system trees + the runtime APEX). Path::exists
+        // is best-effort — any error counts as "absent", which stages
+        // the symlink (safe default: the host lacks the name).
+        let host_provides = |name: &str| {
+            Path::new("/system/lib64").join(name).exists()
+                || Path::new("/system/lib").join(name).exists()
+                || Path::new("/apex/com.android.runtime/lib64")
+                    .join(name)
+                    .exists()
+        };
         // (guest-relative source dir, is-the-64-bit-tree). The symlink
         // target is always "../<source dir>/<name>" so the kernel
         // resolves it inside the rootfs at open time.
@@ -4171,6 +4214,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 match entry.file_type() {
                     Ok(ft) if ft.is_file() => {}
                     _ => continue,
+                }
+                rom_libs += 1;
+                // Task 6-Z93: names the HOST can resolve itself must NOT
+                // be symlinked into /dev — see the OVERREACH note above
+                // (the EM_AARCH64-vs-EM_X86_64 fatal on /dev/liblog.so).
+                if host_provides(&name) {
+                    host_present_skipped += 1;
+                    continue;
                 }
                 let link_path = format!("{}/{}", dev_stage_dir, name);
                 let target = format!("../{}/{}", src_subdir, name);
@@ -4226,11 +4277,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
         let mut summary = format!(
-            "[KR64] PARENT: staged {} library symlinks into {}/dev -> ../system/lib64 (LD_LIBRARY_PATH[0] resolution of the ROM's own libs)",
-            staged_lib64, dev_stage_dir
+            "[KR64] PARENT: staged {} library symlinks into {} -> ../system/lib64 (host-absent only, of {} ROM libs; LD_LIBRARY_PATH[0] resolution of the ROM's own libs)",
+            staged_lib64, dev_stage_dir, rom_libs
         );
         if staged_lib32 > 0 {
             summary = format!("{}; +{} -> ../system/lib (32-bit)", summary, staged_lib32);
+        }
+        if host_present_skipped > 0 {
+            summary = format!(
+                "{} [{} host-present names left to the host's x86_64 trees]",
+                summary, host_present_skipped
+            );
         }
         if kept_existing > 0 || failures > 0 {
             summary = format!(
