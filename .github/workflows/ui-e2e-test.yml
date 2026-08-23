@@ -189,8 +189,8 @@ jobs:
               echo "hw.keyboard=yes"
               echo "hw.gpu.enabled=yes"
               echo "hw.gpu.mode=swiftshader_indirect"
-              echo "hw.ramSize=2048"
-              echo "disk.dataPartition.size=4096"
+              echo "hw.ramSize=4096"
+              echo "disk.dataPartition.size=6144"
               echo "vm.heapSize=256"
           } >> "$AVD_CONFIG"
           echo "✓ AVD created"
@@ -202,7 +202,7 @@ jobs:
           chmod +x app/rs/loader/build.sh || true
 
       - name: Build APK (x86_64 only)
-        run: ./gradlew assembleRelease -Pabis=x86_64
+        run: ./gradlew assembleDebuggable -Pabis=x86_64
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_HOME: /usr/local/lib/android/sdk
@@ -264,7 +264,7 @@ jobs:
           ADB="adb -s emulator-5554"
 
           # Install the APK normally (like a user would from the Play Store)
-          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
           echo "── Installing APK: $APK ──"
           $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
           echo "  ✓ APK installed"
@@ -299,6 +299,7 @@ jobs:
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
           BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '60' }}
+          TWOYI_PACKAGE: io.twoyi.debug
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
