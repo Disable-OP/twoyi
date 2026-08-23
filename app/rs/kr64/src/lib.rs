@@ -6040,22 +6040,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
-    // ── Pre-create TWRP's expected block-device nodes (6-Z86 FIX 3) ────
+    // ── TWRP block-device nodes — 6-Z87 FIX 1: mmcblk stubs REVERTED ──
     //
-    // TWRP's partition-details loop probes the removable media with
-    // fstatat64/open/pread on /dev/block/mmcblk1p1, /dev/block/mmcblk1
-    // and /dev/block/mmcblk0. E2E run 32627986281 froze on the splash
-    // in exactly that probe: the ptrace tracer path-translates /dev/*
-    // to {rootfs}/dev/* (ptrace_emu.rs 6-Z86 FIX 1 covers the fstatat64
-    // i386 nr=300 leg), but NOTHING materialised the nodes — every
-    // probe ENOENT'd ("unknown nr=300 -> -2 (-errno 2)" retry storm)
-    // and TWRP re-scanned forever. Pre-creating them as EMPTY regular
-    // files breaks the loop: the open succeeds, pread64 hits immediate
-    // EOF (no MBR signature) → "no media" → TWRP skips the device FAST
-    // instead of retrying. Mode 0600 (mode is irrelevant — the guest
-    // only opens + preads; block-device semantics are emulated by
-    // emptiness). Idempotent, non-fatal, mirrors the twrp_dirs block
-    // above + the precreate_sysfs_stubs pattern below.
+    // 6-Z86 pre-created {rootfs}/dev/block/{mmcblk0,mmcblk1,mmcblk1p1}
+    // as EMPTY regular files, betting on "open ok → pread EOF →
+    // 'no media' → TWRP skips the device fast". E2E run 32631901109
+    // (z86 analysis) disproved that bet: with the stubs, open()
+    // SUCCEEDS, so TWRP proceeds to ioctl(BLKGETSIZE64) on the "block
+    // device" — a regular file answers that ioctl with ENOTTY — and
+    // TWRP treats a failed size probe as RETRYABLE: "Can't probe
+    // device /dev/block/mmcblk1p1" looped 202+ times per boot (~15×/
+    // cycle) and TWRP never finished "Updating partition details..."
+    // (stuck mid-partition-details for the whole 600s window).
+    //
+    // WITHOUT the stubs (the z83 behaviour), the open ENOENTs, TWRP
+    // logs "Can't probe" ~5 times and MOVES ON — z83 actually reached
+    // the backup-folder/settings pages past that point. ENOENT is the
+    // correct, fast answer for absent removable media; a stub that
+    // opens-but-can't-answer-ioctls is strictly worse.
+    //
+    // 6-Z87 therefore deletes the three mmcblk FILES. The /dev/block
+    // DIRECTORY below stays (harmless, idempotent, and other code may
+    // legitimately expect the directory to exist).
     {
         // {rootfs}/dev/block — create_dir_all-style: EEXIST is fine.
         let block_dir = format!("{}/dev/block", rootfs_prefix);
@@ -6066,7 +6072,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     std::fs::Permissions::from_mode(0o755),
                 );
                 info!(
-                    "[KR64] PARENT: pre-created TWRP block dir {} (mode 0755)",
+                    "[KR64] PARENT: pre-created TWRP block dir {} (mode 0755; 6-Z87: no mmcblk node stubs — ENOENT lets TWRP skip absent media fast, a stubbed node ENOTTYs BLKGETSIZE64 and retry-loops)",
                     block_dir
                 );
             }
@@ -6078,44 +6084,6 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     e,
                     e.raw_os_error().unwrap_or(0)
                 );
-            }
-        }
-        // The three nodes TWRP actually probes (mmcblk1p1 = the vfat
-        // external_sd partition, mmcblk1 = its device, mmcblk0 = the
-        // internal eMMC). Empty files: open ok → pread EOF → skip.
-        for rel in &["mmcblk1p1", "mmcblk1", "mmcblk0"] {
-            let node_path = format!("{}/dev/block/{}", rootfs_prefix, rel);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&node_path)
-            {
-                Ok(f) => {
-                    drop(f);
-                    let _ = std::fs::set_permissions(
-                        &node_path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                    info!(
-                        "[KR64] PARENT: pre-created TWRP block dev {} (empty file, mode 0600 — pread EOF → 'no media' → fast skip)",
-                        node_path
-                    );
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    info!(
-                        "[KR64] PARENT: TWRP block dev {} already exists — leaving as-is",
-                        node_path
-                    );
-                }
-                Err(e) => {
-                    warning!(
-                        "[KR64] PARENT: FAILED to pre-create TWRP block dev {}: {} (errno={}) — TWRP's /dev/block/{} probes may ENOENT-retry",
-                        node_path,
-                        e,
-                        e.raw_os_error().unwrap_or(0),
-                        rel
-                    );
-                }
             }
         }
     }
