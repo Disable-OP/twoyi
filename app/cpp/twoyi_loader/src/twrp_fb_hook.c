@@ -776,7 +776,13 @@ int ioctl(int fd, int request, ...) {
     switch (req) {
         case 0x4600u: {  // FBIOGET_VSCREENINFO
             if (argp) fill_vscreeninfo((struct fb_var_screeninfo *)argp);
-            write_str(2, "[twrp_fb_hook] ioctl(FBIOGET_VSCREENINFO) -> 720x1280@32bpp\n");
+            // 6-Z84: log the ACTUAL configured values (the old hardcoded
+            // "720x1280" string survived the 6-Z64 geometry fix and
+            // misdirected run analysis for hours — TWRP's own prints had
+            // the truth: 320 x 640).
+            write_str(2, "[twrp_fb_hook] ioctl(FBIOGET_VSCREENINFO) -> ");
+            write_num(2, TWRP_FB_WIDTH); write_str(2, "x"); write_num(2, TWRP_FB_HEIGHT);
+            write_str(2, "@"); write_num(2, TWRP_FB_BPP); write_str(2, "bpp\n");
             return 0;
         }
         case 0x4601u: {  // FBIOPUT_VSCREENINFO — accept the mode change
@@ -785,7 +791,11 @@ int ioctl(int fd, int request, ...) {
         }
         case 0x4602u: {  // FBIOGET_FSCREENINFO
             if (argp) fill_fscreeninfo((struct fb_fix_screeninfo *)argp);
-            write_str(2, "[twrp_fb_hook] ioctl(FBIOGET_FSCREENINFO) -> smem_len=3686400 line_length=2880\n");
+            write_str(2, "[twrp_fb_hook] ioctl(FBIOGET_FSCREENINFO) -> smem_len=");
+            write_num(2, TWRP_FB_SMEM_LEN);
+            write_str(2, " line_length=");
+            write_num(2, TWRP_FB_LINE_LENGTH);
+            write_str(2, "\n");
             return 0;
         }
         case 0x4606u: {  // FBIOPAN_DISPLAY — page flip, accept
