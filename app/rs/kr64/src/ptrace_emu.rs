@@ -10798,7 +10798,20 @@ pub fn run_ptrace_loop(
                     // "harmless if no real syscall is -1" reasoning).
                     if abi.socketcall_nr != -1 && syscall_num == abi.socketcall_nr {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        if ret < 0 && ret > -4096 {
+                        // 6-Z96c: read the SUBCALL number (arg1 = ebx,
+                        // preserved across the syscall) — only BIND
+                        // (subcall 2) keeps the fake-success treatment
+                        // (the original 6-Z3 property-service EADDRINUSE
+                        // fix). Everything else (socket=1, connect=3,
+                        // accept=5, ...) returns its REAL error now: the
+                        // blanket fake masked the fb hook's input-bridge
+                        // connect failures (run 32654424163 — the hook's
+                        // read-verify caught the fake, but a REAL failure
+                        // would have been silently hidden too).
+                        let subcall = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        if subcall != 2 {
+                            // Non-bind socketcall: leave the real return.
+                        } else if ret < 0 && ret > -4096 {
                             // Negative return in the -errno range —
                             // fake it to 0 (success). Use a FRESH
                             // ptrace_getregs so we write to the live
