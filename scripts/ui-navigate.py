@@ -955,26 +955,36 @@ def main():
     print("=" * 60)
     print(f"  Step 7: Wait for boot ({boot_wait}s) — screenshots every 5s")
     print("=" * 60)
-    # ── 6-Z87 FIX 4: feed TWRP input during the wait ──
-    # TWRP's UI thread (PagesManager → ev loop) may need INPUT events to
-    # advance from the splash to the main package — with zero input events
-    # the package switch can stall waiting on its event pipeline. Every
-    # 30 s (every 6th iteration of this 5 s loop) tap the screen center
-    # (160,320 on the 320x640 AVD). A periodic center tap is harmless on
-    # any screen: on the splash it merely wakes the input path, on the
-    # TWRP grid the center cell is an empty label, on the app's own UI a
-    # stray tap just re-focuses. tap_count lets us log "feeding input
-    # tap" only once per minute (every 2nd tap) to keep the console
-    # readable; the tap itself still fires every 30 s.
-    tap_count = 0
+    # ── 6-Z88: dismiss the TWRP welcome gate during the wait ──
+    # Run 32640227105 proved TWRP renders the welcome gate LIVE:
+    # "Unmounted System Partition — Keep Read Only?" with buttons
+    # Keep Read Only / Select Language / Swipe to Allow Modifications.
+    # A plain center tap does NOT dismiss this gate — it needs a BUTTON
+    # TAP or a SLIDER SWIPE. So every 30 s (every 6th iteration of this
+    # 5 s loop) fire the next gesture from a rotating sequence
+    # (gesture_index % 4):
+    #   0: tap 160 320    — center (generic input, harmless everywhere)
+    #   1: tap 80 570     — the 'Keep Read Only' button (bottom-left)
+    #   2: swipe 60→280 @ y=570 — the 'Swipe to Allow Modifications'
+    #                              slider (bottom, swipe right)
+    #   3: tap 160 570    — bottom center (the slider area)
+    # The rotation covers every dismissal path; once the gate is gone
+    # the gestures are harmless on the TWRP grid / splash / app UI.
+    gestures = [
+        "input tap 160 320",               # 0: center — generic
+        "input tap 80 570",                # 1: 'Keep Read Only' button (bottom-left)
+        "input swipe 60 570 280 570 400",  # 2: 'Swipe to Allow Modifications' slider (bottom, swipe right)
+        "input tap 160 570",               # 3: bottom center — the slider area
+    ]
+    gesture_index = 0
     for i in range(boot_wait // 5):
         wait(5)
         elapsed = (i + 1) * 5
         if elapsed % 30 == 0:
-            adb_shell("input tap 160 320")
-            tap_count += 1
-            if tap_count % 2 == 1:
-                print(f"  feeding input tap 160 320 (#{tap_count} at {elapsed}s; next log at +60s)")
+            g = gesture_index % 4
+            adb_shell(gestures[g])
+            print(f"  feeding gesture {g}: {gestures[g]} (at {elapsed}s)")
+            gesture_index += 1
         screenshot(f"07_boot_{elapsed}s")
         activity = get_current_activity()
         # Don't break on "left Render2Activity" — the TWRP screen might
