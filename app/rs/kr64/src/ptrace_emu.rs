@@ -4769,7 +4769,14 @@ pub fn run_ptrace_loop(
     let mut post_execve_read_count: u64 = 0;
     let mut open_fd_paths: std::collections::HashMap<i32, String> =
         std::collections::HashMap::new();
-    let mut pending_open_translated_path: Option<String> = None;
+    // 6-Z74: PER-PID — the single Option slot let init's open ENTRY
+    // (e.g. /proc/cmdline) OVERWRITE the recovery child's pending openat
+    // path between its ENTRY and EXIT, so fd=3 got tagged with the WRONG
+    // path (twrp-cmdline instead of libmtdutils.so) and the content
+    // injector seeded the lib's mapping with cmdline bytes (run
+    // 32609342976: "libmtdutils.so has no loadable segments").
+    let mut pending_open_translated_path: std::collections::HashMap<libc::pid_t, String> =
+        std::collections::HashMap::new();
 
     // ── Task 6-Y: __properties__ fd tracking state ────────────────────
     //
@@ -6925,7 +6932,7 @@ pub fn run_ptrace_loop(
                                 }
                                 // Task 6-V: save translated path for fd
                                 // tracking at the matching open EXIT.
-                                pending_open_translated_path = Some(translated.clone());
+                                pending_open_translated_path.insert(pid, translated.clone());
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
@@ -7770,7 +7777,7 @@ pub fn run_ptrace_loop(
                     {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if ret > 0 {
-                            if let Some(ref p) = pending_open_translated_path {
+                            if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                                 open_fd_paths.insert(ret as i32, p.clone());
                                 // Task 6-Z62: per-(pid, fd) copy of the same
                                 // mapping. fd tables are PER-PROCESS, so the
@@ -7794,7 +7801,7 @@ pub fn run_ptrace_loop(
                                 // translate_path rewrites it) —
                                 // is_properties_path() matches the final
                                 // component `__properties__` in both cases.
-                                if is_properties_path(p) {
+                                if is_properties_path(&p) {
                                     properties_fd = Some(ret as i32);
                                     log(&format!(
                                         "DIAG properties fd captured: open() returned fd={} for {} — subsequent mmap2 with MAP_SHARED on this fd will be rewritten to MAP_ANONYMOUS|MAP_PRIVATE",
@@ -7802,7 +7809,7 @@ pub fn run_ptrace_loop(
                                     ));
                                 }
                             }
-                        } else if let Some(ref p) = pending_open_translated_path {
+                        } else if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                             // Task 6-Y fix 2: when open(/dev/__properties__)
                             // fails (ret <= 0), fake a successful return
                             // (fd=42) so init gets a valid fd. The
@@ -7820,7 +7827,7 @@ pub fn run_ptrace_loop(
                             // fires → property area not mapped →
                             // all property_set calls fail → init
                             // exits(1).
-                            if is_properties_path(p) {
+                            if is_properties_path(&p) {
                                 let fake_fd: i64 = 42;
                                 set_syscall_ret(&mut regs, &abi, fake_fd);
                                 properties_fd = Some(fake_fd as i32);
@@ -7925,7 +7932,7 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
-                        pending_open_translated_path = None;
+                        pending_open_translated_path.remove(&pid);
                     }
 
                     // ── Task 6-Z62: mmap2 content injection (EXIT side) ──
