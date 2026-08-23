@@ -3816,7 +3816,7 @@ fn fb0_bridge_read_child_mem(
     const SYS_PROCESS_VM_READV: libc::c_long = 310;
     #[cfg(target_arch = "aarch64")]
     const SYS_PROCESS_VM_READV: libc::c_long = 270;
-    unsafe {
+    let raw = unsafe {
         libc::syscall(
             SYS_PROCESS_VM_READV,
             pid,
@@ -3826,7 +3826,17 @@ fn fb0_bridge_read_child_mem(
             1usize,
             0usize,
         ) as isize
+    };
+    // 6-Z84 guard: if the inherited seccomp filter TRAPS process_vm_readv
+    // (SECCOMP_RET_TRAP), the kernel's syscall_rollback restores
+    // rax = orig_rax = the SYSCALL NUMBER (310/270) — a POSITIVE value the
+    // caller's `n <= 0` check would misread as "310 bytes read", writing
+    // garbage/zeros and silently continuing forever. Treat the syscall
+    // number itself as failure so the bridge drops the mapping loudly.
+    if raw == SYS_PROCESS_VM_READV as isize {
+        return -1;
     }
+    raw
 }
 
 /// The bridge thread body: every 100 ms, for every registered mapping,
@@ -8421,7 +8431,12 @@ pub fn run_ptrace_loop(
                             || syscall_num == abi.openat2)
                     {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        if ret > 0 {
+                        if ret >= 0 {
+                            // 6-Z84: fd 0 is a VALID fd. TWRP's recovery
+                            // child runs with stdin closed, so its FIRST
+                            // open — /dev/graphics/fb0 — legitimately
+                            // returns fd 0. The old `ret > 0` guard treated
+                            // that as failure. Same for kmsg: track fd 0.
                             kmsg_fd = Some(ret as i32);
                             log(&format!(
                                 "DIAG KLOG fd captured: open() returned fd={} — subsequent write()s to this fd will be tagged 'DIAG KLOG'",
@@ -8460,7 +8475,21 @@ pub fn run_ptrace_loop(
                         || syscall_num == abi.openat2
                     {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        if ret > 0 {
+                        if ret >= 0 {
+                            // ── Task 6-Z84: fd 0 IS A VALID FD ──
+                            // Run 32624216832 smoking gun: TWRP's recovery
+                            // child runs with stdin CLOSED, so its first
+                            // open — /dev/graphics/fb0 — returned fd 0. The
+                            // old `ret > 0` guard skipped recording it, the
+                            // subsequent mmap2(fd=0, MAP_SHARED, len=819200)
+                            // failed Gate-4 path resolution ("fd=0 not in
+                            // the fd→path map"), the fb0 pixel bridge never
+                            // registered — and TWRP rendered its whole UI
+                            // into an anonymous mapping nobody reads while
+                            // the fb0 FILE (what the app displays) stayed
+                            // zeros = permanent black screen. fd 0 is a
+                            // perfectly valid open(2) result; only NEGATIVE
+                            // returns are errors.
                             if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                                 open_fd_paths.insert(ret as i32, p.clone());
                                 // Task 6-Z62: per-(pid, fd) copy of the same
@@ -8495,8 +8524,9 @@ pub fn run_ptrace_loop(
                             }
                         } else if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                             // Task 6-Y fix 2: when open(/dev/__properties__)
-                            // fails (ret <= 0), fake a successful return
-                            // (fd=42) so init gets a valid fd. The
+                            // fails (ret < 0 — 6-Z84: fd 0 is now correctly
+                            // treated as success above), fake a successful
+                            // return (fd=42) so init gets a valid fd. The
                             // subsequent mmap2 ENTRY handler will
                             // rewrite the fd=42 MAP_SHARED mmap to
                             // anonymous anyway, so the fd never needs
