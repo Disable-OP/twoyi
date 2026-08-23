@@ -512,20 +512,32 @@ public class SettingsActivity extends AppCompatActivity {
                 String activeProfile = ProfileManager.getActiveProfile(activity);
                 File profileRootfsDir = ProfileManager.getProfileRootfsDir(activity, activeProfile);
 
-                // Clear existing rootfs
-                if (profileRootfsDir.exists()) {
-                    io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
-                }
-                profileRootfsDir.mkdirs();
-
-                // Use RamdiskImporter which supports .tar, .img, .cpio, .zip formats
+                // Use RamdiskImporter which supports .tar, .img, .cpio, .zip formats.
+                // Retry once on failure: a short stream read during extraction used
+                // to leave a silently-corrupt rootfs that still reported SUCCESS
+                // (E2E run 32616016488: sbin/libminuitwrp.so = 0 bytes). The
+                // importer now detects and fails loudly; the retry re-imports
+                // from the same Uri into a freshly-cleared directory.
+                final int MAX_IMPORT_ATTEMPTS = 2;
                 boolean success = false;
                 String errorMsg = null;
-                try {
-                    success = io.twoyi.utils.RamdiskImporter.importRamdisk(activity, uri, profileRootfsDir);
-                } catch (Exception e) {
-                    errorMsg = e.getMessage();
-                    Log.e("SettingsActivity", "Import failed", e);
+                for (int attempt = 1; attempt <= MAX_IMPORT_ATTEMPTS && !success; attempt++) {
+                    // Clear existing rootfs (also wipes any partial state from a failed attempt)
+                    if (profileRootfsDir.exists()) {
+                        io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
+                    }
+                    profileRootfsDir.mkdirs();
+
+                    try {
+                        success = io.twoyi.utils.RamdiskImporter.importRamdisk(activity, uri, profileRootfsDir);
+                    } catch (Exception e) {
+                        errorMsg = e.getMessage();
+                        Log.e("SettingsActivity", "Import attempt " + attempt + "/" + MAX_IMPORT_ATTEMPTS + " failed", e);
+                    }
+                    if (!success && attempt < MAX_IMPORT_ATTEMPTS) {
+                        Log.w("SettingsActivity", "Import attempt " + attempt + " failed ("
+                            + (errorMsg != null ? errorMsg : "unknown") + ") — retrying once");
+                    }
                 }
 
                 if (success) {
