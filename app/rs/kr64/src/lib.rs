@@ -1199,10 +1199,17 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
     // Find the "service recovery" line. It may be "service recovery /sbin/recovery"
     // or "service recovery /sbin/recovery\r" (CRLF). We match the prefix
     // "service recovery " at the start of a line.
-    let mut lines = content.lines().peekable();
-    let mut result = String::with_capacity(content.len() + 64);
+    //
+    // Task 6-Z76: collect the lines into a Vec ONCE so we can LOOK AHEAD
+    // past the `service recovery` line — the recovery service block
+    // sometimes ALREADY declares `seclabel u:r:recovery:s0`, and blindly
+    // appending ours produced a DUPLICATED option line (init accepts a
+    // duplicate seclabel — last one wins — but it is sloppy and broke the
+    // insert-before-existing-options test).
+    let all_lines: Vec<&str> = content.lines().collect();
+    let mut result = String::with_capacity(content.len() + 96);
     let mut found = false;
-    while let Some(line) = lines.next() {
+    for (idx, line) in all_lines.iter().enumerate() {
         result.push_str(line);
         // Check if this line starts the recovery service definition.
         // We check the trimmed start to handle leading whitespace (shouldn't
@@ -1218,13 +1225,15 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // kernel's SELinux policy doesn't have the recovery context,
             // so setexeccon returns EINVAL and aborts the service start.
             //
-            // Task 6-Z29: NOW adding seclabel u:r:recovery:s0 AGAIN. The
-            // setexeccon EINVAL is handled by a NEW ptrace_emu fake: writes
-            // to /proc/self/attr/exec (setexeccon's implementation) are
-            // intercepted at the EXIT + faked to return success. This bypasses
-            // both selabel_lookup (seclabel provides the context directly) AND
-            // setexeccon (ptrace fakes the write return). init can then fork
-            // the recovery service → it opens fb0 → TWRP renders.
+            // Task 6-Z76: scan THIS service's option block (the indented
+            // option lines + blank lines that follow, terminated by the next
+            // section header at column 0, e.g. `service ...` / `on ...`) for
+            // an existing seclabel declaration. Only append ours when the
+            // block doesn't already have one.
+            let block_has_seclabel = all_lines[idx + 1..]
+                .iter()
+                .take_while(|l| l.starts_with(' ') || l.starts_with('\t') || l.trim().is_empty())
+                .any(|l| l.trim_start().starts_with("seclabel"));
             result.push('\n');
             result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
             // Task 6-Z36: add LD_LIBRARY_PATH=/sbin so the 32-bit TWRP linker
@@ -1234,12 +1243,22 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
             // libraries aren't found → the recovery binary exits 127 after
             // 1163 iterations (lazy load failure on first call to a missing lib).
             result.push_str("\n    setenv LD_LIBRARY_PATH /sbin:/system/lib:/system/lib64");
-            result.push_str("\n    seclabel u:r:recovery:s0");
+            // Task 6-Z29: NOW adding seclabel u:r:recovery:s0 AGAIN. The
+            // setexeccon EINVAL is handled by a NEW ptrace_emu fake: writes
+            // to /proc/self/attr/exec (setexeccon's implementation) are
+            // intercepted at the EXIT + faked to return success. This bypasses
+            // both selabel_lookup (seclabel provides the context directly) AND
+            // setexeccon (ptrace fakes the write return). init can then fork
+            // the recovery service → it opens fb0 → TWRP renders.
+            // (Task 6-Z76: skipped when the block already declares one.)
+            if !block_has_seclabel {
+                result.push_str("\n    seclabel u:r:recovery:s0");
+            }
             found = true;
         }
         // Preserve the original line ending (lines() strips \n, so we add
         // it back). For the last line (no trailing \n), we don't add one.
-        if lines.peek().is_some() {
+        if idx + 1 < all_lines.len() {
             result.push('\n');
         }
     }
@@ -8745,15 +8764,24 @@ mod tests {
     }
 
     /// `patch_twrp_init_rc_recovery_service` must handle the case where
-    /// recovery has existing options (like seclabel) — the setenv line
-    /// is inserted BEFORE the existing options.
+    /// recovery has existing options (like seclabel) — the setenv lines
+    /// (LD_PRELOAD from 6-Z29 + LD_LIBRARY_PATH from 6-Z36) are inserted
+    /// BEFORE the existing options, and the pre-existing seclabel is
+    /// preserved EXACTLY once (6-Z76: no duplicate).
     #[test]
     fn patch_twrp_init_rc_inserts_before_existing_options() {
         let input = "service recovery /sbin/recovery\n    seclabel u:r:recovery:s0\n";
         let patched = patch_twrp_init_rc_recovery_service(input).expect("should patch");
         assert!(
-            patched.contains("service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so\n    seclabel u:r:recovery:s0"),
-            "setenv should be inserted before seclabel. Patched:\n{}",
+            patched.contains("service recovery /sbin/recovery\n    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so\n    setenv LD_LIBRARY_PATH /sbin:/system/lib:/system/lib64\n    seclabel u:r:recovery:s0"),
+            "setenv lines should be inserted before seclabel. Patched:\n{}",
+            patched
+        );
+        // Task 6-Z76: an existing seclabel option must NOT be duplicated.
+        assert_eq!(
+            patched.matches("seclabel").count(),
+            1,
+            "seclabel must appear exactly once. Patched:\n{}",
             patched
         );
     }
