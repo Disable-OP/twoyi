@@ -40,7 +40,8 @@
 //!    an error (decompression would require pulling in a zlib dependency,
 //!    which is against the crate's "std + libc only" policy).
 //! 3. **Write ext4 image to a temp file** at `<apex_temp_dir>/twoyi-apex-payload.img`
-//!    (the parent's `TMPDIR` env var, defaulting to `/data/data/io.twoyi/cache` —
+//!    (the parent's `TMPDIR` env var, else `$TWOYI_DATA_DIR/cache`, else the
+//!    `/data/data/io.twoyi/cache` compatibility fallback —
 //!    NOT `/tmp/` which doesn't exist in the parent's Android-app-sandbox context
 //!    before `setup_mounts` bind-mounts tmpfs on `/tmp`; see [`apex_temp_dir`]).
 //! 4. **Loopback-mount the ext4 image** via the kernel's loop device
@@ -127,20 +128,34 @@ const LOOP_CLR_FD: libc::c_ulong = 0x4C01;
 /// `ENOENT` writing 6377472 bytes — the extraction algorithm was correct
 /// but the temp path was wrong.
 ///
-/// **Resolution order (per 5-M's recommendation #1 — use the app cache dir)**:
+/// **Resolution order (Task 6-Z88)**:
 /// 1. `$TMPDIR` env var — Android's app sandbox sets this to the app's
 ///    cache dir (e.g. `/data/data/io.twoyi/cache` or
 ///    `/data/user/0/io.twoyi/cache`). Always writable, always exists.
-/// 2. Fallback: `/data/data/io.twoyi/cache` (the io.twoyi app's cache
-///    dir, matching the package name in app/build.gradle `applicationId`).
+/// 2. `$TWOYI_DATA_DIR` + `/cache` — set by the app launcher (core.rs,
+///    next to TWOYI_ROOTFS) from Java's `getApplicationInfo().dataDir`.
+///    This is package-correct for `io.twoyi.debug` and work-profile
+///    installs, where the hardcoded path in step 3 is WRONG (run
+///    32632668179: `create_dir_all(/data/data/io.twoyi/cache): Permission
+///    denied` on an io.twoyi.debug build).
+/// 3. Last-resort fallback: `/data/data/io.twoyi/cache` (kept for
+///    compatibility with launches that set neither env var).
 ///
 /// `getenv` is injected so unit tests can mock the env lookup without
 /// touching the process-global `std::env::set_var` (which would race
 /// with parallel tests in the same process).
 fn apex_temp_dir_from(getenv: impl Fn(&str) -> Option<String>) -> String {
-    getenv("TMPDIR")
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/data/data/io.twoyi/cache".to_string())
+    if let Some(dir) = getenv("TMPDIR").filter(|s| !s.is_empty()) {
+        return dir;
+    }
+    // Task 6-Z88: package-correct fallback via TWOYI_DATA_DIR (covers
+    // io.twoyi.debug + work profiles). Trim a trailing '/' so we never
+    // produce a "//cache" double slash.
+    if let Some(data_dir) = getenv("TWOYI_DATA_DIR").filter(|s| !s.is_empty()) {
+        return format!("{}/cache", data_dir.trim_end_matches('/'));
+    }
+    // Last resort — hardcoded package path, kept for compatibility.
+    "/data/data/io.twoyi/cache".to_string()
 }
 
 /// Returns the directory used for APEX extraction temp files, with the
@@ -769,11 +784,34 @@ fn extract_real_libdl_from_apex(apex_path: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Returns `true` when probing the HOST's own APEX/libdl paths (bare
+/// `/system/apex/...`, `/apex/...`) is allowed. Gated behind the
+/// `TWOYI_ALLOW_HOST_APEX=1` env var — **default OFF** (Task 6-Z88).
+///
+/// Why: kr64 runs unprivileged inside the host emulator's app sandbox
+/// with NO chroot in non-root mode. Bare host paths resolve against the
+/// HOST's filesystem, so run 32632668179 extracted the API-34 EMULATOR's
+/// own `com.android.runtime.apex` into the Android-8.1 guest — a
+/// guaranteed ABI mismatch (and the temp-dir write failed anyway because
+/// of the hardcoded package path). With the gate OFF, only the
+/// rom_dir/rootfs candidates are used, which is always what the GUEST
+/// actually needs.
+fn host_apex_allowed_from(getenv: impl Fn(&str) -> Option<String>) -> bool {
+    matches!(getenv("TWOYI_ALLOW_HOST_APEX").as_deref(), Some("1"))
+}
+
+/// Runtime wrapper around [`host_apex_allowed_from`] using the real
+/// process environment.
+fn host_apex_allowed() -> bool {
+    host_apex_allowed_from(|k| std::env::var(k).ok())
+}
+
 /// Scan alternative host paths for a non-stub libdl.so. This is the
 /// fallback when APEX ext4 extraction fails (e.g. loop device not
 /// available).
 ///
-/// Tries, in order:
+/// Tries, in order (ALL are bare HOST paths — see [`host_apex_allowed_from`];
+/// the entire scan is skipped unless `TWOYI_ALLOW_HOST_APEX=1`):
 /// 1. `/apex/com.android.runtime@1/lib64/bionic/libdl.so` (versioned APEX)
 /// 2. `/apex/com.android.runtime@2/lib64/bionic/libdl.so`
 /// 3. `/apex/com.android.runtime@3/lib64/bionic/libdl.so`
@@ -783,6 +821,16 @@ fn extract_real_libdl_from_apex(apex_path: &str) -> Option<Vec<u8>> {
 /// Returns the file bytes (validated by [`is_real_libdl`]) on success,
 /// or `None` if all candidates are stubs or missing.
 fn scan_alternative_libdl_paths() -> Option<(String, Vec<u8>)> {
+    // Task 6-Z88: every candidate below is a BARE HOST path. In the
+    // emulator sandbox those resolve to the HOST's (API-34) runtime —
+    // never what the guest needs. Default OFF; opt-in via env for
+    // debugging on rooted setups.
+    if !host_apex_allowed() {
+        info!(
+            "[KR64][apex_extract] TWOYI_ALLOW_HOST_APEX unset — skipping host /apex/ libdl scan (guest rootfs candidates are used exclusively)"
+        );
+        return None;
+    }
     // Try the common versioned APEX paths first (apexd mounts the
     // versioned APEX at /apex/com.android.runtime@N/ and symlinks
     // /apex/com.android.runtime/ -> /apex/com.android.runtime@N/).
@@ -841,12 +889,25 @@ fn scan_alternative_libdl_paths() -> Option<(String, Vec<u8>)> {
 ///    is set — this is the GSI's .apex file, the most reliable source).
 /// 2. `{cfg.rootfs}/system/apex/com.android.runtime.apex` (in case the
 ///    .apex was extracted into the rootfs directly).
-/// 3. `/system/apex/com.android.runtime.apex` (host path — only
-///    accessible BEFORE pivot_root, when the host's /system is still
-///    visible at /system).
+/// 3. `/system/apex/com.android.runtime.apex` (BARE HOST path — see
+///    [`host_apex_allowed_from`]; only included when
+///    `TWOYI_ALLOW_HOST_APEX=1`. In the non-root emulator sandbox this
+///    resolves to the HOST's OWN APEX (API-34), which was extracted into
+///    the 8.1 guest in run 32632668179 — default OFF, Task 6-Z88).
 /// 4. `/apex/com.android.runtime.apex` (uncommon — usually the .apex
-///    is under /system/apex/, but check just in case).
+///    is under /system/apex/; same host gate as #3).
 pub fn apex_candidate_paths(cfg: &crate::Config) -> Vec<String> {
+    apex_candidate_paths_with(&|k| std::env::var(k).ok(), cfg)
+}
+
+/// Injected-env variant of [`apex_candidate_paths`] (mirrors the
+/// `apex_temp_dir_from(getenv)` pattern so unit tests can mock the
+/// `TWOYI_ALLOW_HOST_APEX` lookup without racing on the process-global
+/// environment).
+fn apex_candidate_paths_with(
+    getenv: &dyn Fn(&str) -> Option<String>,
+    cfg: &crate::Config,
+) -> Vec<String> {
     let mut v = Vec::new();
     if let Some(rom_dir) = &cfg.rom_dir {
         v.push(format!("{}/system/apex/com.android.runtime.apex", rom_dir));
@@ -855,8 +916,11 @@ pub fn apex_candidate_paths(cfg: &crate::Config) -> Vec<String> {
         "{}/system/apex/com.android.runtime.apex",
         cfg.rootfs
     ));
-    v.push("/system/apex/com.android.runtime.apex".to_string());
-    v.push("/apex/com.android.runtime.apex".to_string());
+    // Task 6-Z88: bare-HOST candidates only when explicitly allowed.
+    if host_apex_allowed_from(|k| getenv(k)) {
+        v.push("/system/apex/com.android.runtime.apex".to_string());
+        v.push("/apex/com.android.runtime.apex".to_string());
+    }
     v
 }
 
@@ -1562,13 +1626,12 @@ mod tests {
     #[test]
     fn apex_temp_dir_from_respects_tmpdir_env_var() {
         // Mock env lookup that returns a custom TMPDIR. Verifies the
-        // helper prefers TMPDIR over the hardcoded fallback.
-        let d = apex_temp_dir_from(|k| {
-            if k == "TMPDIR" {
-                Some("/custom/tmp/dir".to_string())
-            } else {
-                None
-            }
+        // helper prefers TMPDIR over BOTH the TWOYI_DATA_DIR fallback
+        // and the hardcoded fallback (Task 6-Z88 chain).
+        let d = apex_temp_dir_from(|k| match k {
+            "TMPDIR" => Some("/custom/tmp/dir".to_string()),
+            "TWOYI_DATA_DIR" => Some("/data/data/io.twoyi.debug".to_string()),
+            _ => None,
         });
         assert_eq!(d, "/custom/tmp/dir");
     }
@@ -1576,19 +1639,40 @@ mod tests {
     #[test]
     fn apex_temp_dir_from_falls_back_when_tmpdir_unset() {
         // Mock env lookup that returns None for TMPDIR (i.e. unset).
-        // Verifies the fallback to /data/data/io.twoyi/cache.
-        let d = apex_temp_dir_from(|_| None);
-        assert_eq!(d, "/data/data/io.twoyi/cache");
+        // Verifies the Task 6-Z88 chain: TWOYI_DATA_DIR+"/cache" wins
+        // over the hardcoded io.twoyi path, and with BOTH unset we
+        // still land on the compatibility fallback.
+        let d = apex_temp_dir_from(|k| {
+            if k == "TWOYI_DATA_DIR" {
+                Some("/data/user/0/io.twoyi.debug".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(d, "/data/user/0/io.twoyi.debug/cache");
+        // Trailing '/' on TWOYI_DATA_DIR must not produce "//cache".
+        let d2 = apex_temp_dir_from(|k| {
+            if k == "TWOYI_DATA_DIR" {
+                Some("/data/user/0/io.twoyi.debug/".to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(d2, "/data/user/0/io.twoyi.debug/cache");
+        // Everything unset → hardcoded last resort.
+        let d3 = apex_temp_dir_from(|_| None);
+        assert_eq!(d3, "/data/data/io.twoyi/cache");
     }
 
     #[test]
     fn apex_temp_dir_from_ignores_empty_tmpdir() {
-        // Mock env lookup that returns Some("") for TMPDIR. Verifies
-        // the helper treats empty string as "unset" and falls back.
+        // Mock env lookup that returns Some("") for TMPDIR (and for
+        // TWOYI_DATA_DIR). Verifies the helper treats empty strings
+        // as "unset" and falls through the whole chain.
         // (Android's app sandbox always sets TMPDIR to a non-empty
         // path, but defensive coding is cheap.)
         let d = apex_temp_dir_from(|k| {
-            if k == "TMPDIR" {
+            if k == "TMPDIR" || k == "TWOYI_DATA_DIR" {
                 Some(String::new())
             } else {
                 None
@@ -1688,12 +1772,19 @@ mod tests {
             rom_dir: Some("/data/data/io.twoyi/rom".to_string()),
             ..crate::Config::default()
         };
-        let cands = apex_candidate_paths(&cfg);
+        // Default (TWOYI_ALLOW_HOST_APEX unset — Task 6-Z88): rom_dir +
+        // rootfs candidates ONLY; no bare host paths.
+        let cands = apex_candidate_paths_with(&|_| None, &cfg);
         // First candidate should be the rom_dir path.
         assert!(cands[0].contains("/data/data/io.twoyi/rom/"));
         assert!(cands[0].ends_with("/system/apex/com.android.runtime.apex"));
-        // Should include the host path /system/apex/com.android.runtime.apex.
-        assert!(cands
+        assert!(!cands
+            .iter()
+            .any(|p| p == "/system/apex/com.android.runtime.apex"));
+        // With the gate ON, the host path is appended last.
+        let cands_gated =
+            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()), &cfg);
+        assert!(cands_gated
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
     }
@@ -1705,27 +1796,59 @@ mod tests {
             rom_dir: None,
             ..crate::Config::default()
         };
-        let cands = apex_candidate_paths(&cfg);
+        let cands = apex_candidate_paths_with(&|_| None, &cfg);
         // Should NOT include any path containing "/rom/".
         assert!(cands.iter().all(|p| !p.contains("/rom/system/apex/")));
-        // Should include the rootfs path and the host path.
+        // Should include the rootfs path — and NOT the bare host path
+        // (default-off gate, Task 6-Z88).
         assert!(cands
             .iter()
             .any(|p| p == "/data/data/io.twoyi/rootfs/system/apex/com.android.runtime.apex"));
-        assert!(cands
+        assert!(!cands
+            .iter()
+            .any(|p| p == "/system/apex/com.android.runtime.apex"));
+        // Gated ON: host paths reappear.
+        let cands_gated =
+            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()), &cfg);
+        assert!(cands_gated
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
     }
 
     #[test]
     fn apex_candidate_paths_always_includes_host_paths() {
-        let cfg = crate::Config::default();
-        let cands = apex_candidate_paths(&cfg);
-        // The host paths are always included regardless of rom_dir/rootfs.
-        assert!(cands
+        // Task 6-Z88 RENAMED SEMANTICS (was "always includes"): host
+        // paths are now DEFAULT-OFF and only included when
+        // TWOYI_ALLOW_HOST_APEX=1 — the emulator's own APEX must never
+        // leak into the guest by default (run 32632668179).
+        //
+        // NOTE: rootfs must be NON-empty here — with the empty default
+        // the rootfs candidate formats to the same string as the bare
+        // host path and the two become indistinguishable.
+        let cfg = crate::Config {
+            rootfs: "/data/data/io.twoyi/rootfs".to_string(),
+            ..crate::Config::default()
+        };
+        let cands = apex_candidate_paths_with(&|_| None, &cfg);
+        assert!(!cands
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
-        assert!(cands.iter().any(|p| p == "/apex/com.android.runtime.apex"));
+        assert!(!cands.iter().any(|p| p == "/apex/com.android.runtime.apex"));
+        // Gate ON → both host paths included.
+        let cands_gated =
+            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()), &cfg);
+        assert!(cands_gated
+            .iter()
+            .any(|p| p == "/system/apex/com.android.runtime.apex"));
+        assert!(cands_gated
+            .iter()
+            .any(|p| p == "/apex/com.android.runtime.apex"));
+        // The gate is value-strict: "0"/"true"/etc. do NOT enable it.
+        let cands_zero =
+            apex_candidate_paths_with(&|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "true".to_string()), &cfg);
+        assert!(!cands_zero
+            .iter()
+            .any(|p| p == "/system/apex/com.android.runtime.apex"));
     }
 
     // ========================================================================
