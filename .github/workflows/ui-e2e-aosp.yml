@@ -270,13 +270,16 @@ jobs:
           $ADB shell "run-as io.twoyi.debug mkdir -p profiles/default/rootfs"
           # Try device-side xz extraction first (toybox tar -J on API 30).
           EXTRACT_OK=0
-          $ADB shell "cd /sdcard/Download && run-as io.twoyi.debug sh -c 'tar -xJf /sdcard/Download/profile_default_export.tar.xz -C profiles/default/rootfs'" && EXTRACT_OK=1 || EXTRACT_OK=0
+          # Scoped storage: the app uid cannot READ /sdcard/Download
+          # (owned by shell). Pipe through the SHELL uid instead — cat
+          # runs as shell (can read), run-as tar reads STDIN.
+          $ADB shell "cat /sdcard/Download/profile_default_export.tar.xz | run-as io.twoyi.debug tar -xJ -C profiles/default/rootfs" && EXTRACT_OK=1 || EXTRACT_OK=0
           if [ "$EXTRACT_OK" != "1" ]; then
               echo "  device tar -xJf failed — falling back to runner-side gzip repack"
               xz -dc profile_default_export.tar.xz | gzip -6 > profile_rootfs.tar.gz
               ls -la profile_rootfs.tar.gz
               $ADB push profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
-              $ADB shell "run-as io.twoyi.debug sh -c 'tar -xzf /sdcard/Download/profile_rootfs.tar.gz -C profiles/default/rootfs'"
+              $ADB shell "cat /sdcard/Download/profile_rootfs.tar.gz | run-as io.twoyi.debug tar -xz -C profiles/default/rootfs"
           fi
 
           # Verify the guest init landed.
