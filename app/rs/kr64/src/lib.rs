@@ -4787,6 +4787,51 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
+    // TWRP BOOT: pre-create {rootfs}/dev/input/event0 + event1 as EMPTY
+    // regular files (0644). minui's /dev/input scan (readdir + fstatat
+    // probes) needs openable "event*" names to exist; when one of them
+    // is subsequently OPENED, the i686 fb hook's input bridge intercepts
+    // the open and hands back the connected touch-events socket instead
+    // — so the files themselves never need contents.
+    //
+    // This REPLACES the fb hook constructor's raw staging (mkdir_raw +
+    // openat(O_CREAT) issued from inside the guest): those raw syscalls
+    // passed through the tracer's interception path and corrupted the
+    // resume state — KVM run 32649156523: recovery SIGSEGV'd
+    // (si_code=128 SI_KERNEL, rip inside the hook's text) ~20s in,
+    // BEFORE minui ran; all 600s stayed solid black. Staging here is
+    // purely parent-side — no guest syscalls are involved.
+    if cfg.boot_recovery {
+        use std::os::unix::fs::PermissionsExt;
+        let input_dir = format!("{}/dev/input", rootfs_prefix);
+        if let Err(e) = std::fs::create_dir_all(&input_dir) {
+            warning!(
+                "[KR64] PARENT: failed to create {} for event probe files: {} (minui's /dev/input scan may find nothing)",
+                input_dir, e
+            );
+        }
+        for name in &["event0", "event1"] {
+            let path = format!("{}/dev/input/{}", rootfs_prefix, name);
+            match std::fs::write(&path, b"") {
+                Ok(()) => {
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o644),
+                    );
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PARENT: failed to pre-create probe file {}: {} (minui's evdev scan will skip it)",
+                        path, e
+                    );
+                }
+            }
+        }
+        info!(
+            "[KR64] PARENT: pre-created /dev/input/event0+event1 probe files (the fb hook's input bridge intercepts their open)"
+        );
+    }
+
     // TWRP BOOT: create /dev/kmsg as a symlink to /twrp-kmsg.log so TWRP's
     // init can write kernel log messages to a file we can retrieve.
     //
