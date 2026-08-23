@@ -1,30 +1,18 @@
 #!/usr/bin/env python3
 """UI navigation for the AOSP (normal Android container) E2E test.
 
-Differences from the TWRP variant (ui-navigate.py):
-  - The guest rootfs is PRELOADED by the workflow (extracted from
-    cyanmint/twoyi release profile_default_export.tar.xz into
-    profiles/default/rootfs via run-as on the debuggable variant,
-    io.twoyi.debug) — there is NO in-app ROM import step.
-  - The container boots in NORMAL mode (Boot to Recovery OFF): the
-    guest is a full Android 8.1 x86 system; rendering goes through
-    the emugl OpenGL renderer (NOT the fb0 file reader).
-  - The app's launcher activity (SelectAppActivity) lists host apps
-    that can boot inside the container. We tap the FIRST enabled row
-    (the "normal phone user" flow). Fallback: am start Render2Activity.
-
-Steps:
-  1. Launch app via monkey -p io.twoyi.debug
-  2. Dump UI; find + tap the first app row (or fallback am start)
-  3. Wait for boot, screenshot every 5s (BOOT_WAIT_SECONDS, default 600)
-  4. Pull ALL app logs via run-as (the debuggable variant makes this
-     work — the TWRP E2E's app-logs were always empty because the
-     release build rejects run-as):
-       - cache/log/{app,boot,crash,logcat}.log
-       - dataDir/kr64-app-stderr.log
-       - /sdcard/Download/twoyi-logs/ (kr64's post-mortem mirror)
-  5. Print a ground-truth summary (SurfaceView visibility, boot
-     completion markers, screenshot md5 variation).
+v2 (fixes from run 32628825953 — the run that never launched the container):
+  - The app's LAUNCHER activity is SettingsActivity (a PreferenceScreen),
+    NOT SelectAppActivity with app rows. The container boots by tapping
+    the "Launch Container" preference (found by text, with scroll).
+  - The `am start` fallback now ASSERTS the activity switched to
+    Render2Activity and aborts early (the old script discarded the
+    output and produced a green run with zero boot).
+  - Log pulls fixed: FileLogger writes to /sdcard/Android/data/<pkg>/
+    files/log/ (EXTERNAL — adb-pullable directly, no run-as needed),
+    and kr64-app-stderr.log rotates to kr64.log. Full `adb logcat -d`
+    is captured before the emulator dies.
+  - The KR64-line count uses a real regex (not the logcat headers).
 """
 
 import hashlib
@@ -40,20 +28,16 @@ ART = "/tmp/ui-e2e-artifacts"
 BOOT_WAIT = int(os.environ.get("BOOT_WAIT_SECONDS", "600"))
 SCREENSHOT_EVERY = 5
 
+ADB = ["adb", "-s", "emulator-5554"]
+
 
 def adb(*args, timeout=30):
-    return subprocess.run(
-        ["adb", "-s", "emulator-5554"] + list(args),
-        capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(ADB + list(args), capture_output=True, text=True,
+                          timeout=timeout)
 
 
 def adb_shell(cmd, timeout=30):
     return adb("shell", cmd, timeout=timeout)
-
-
-def run_as(cmd, timeout=30):
-    """Run a command as the app via run-as (debuggable variant only)."""
-    return adb_shell(f"run-as {PACKAGE} {cmd}", timeout=timeout)
 
 
 def screenshot(name):
@@ -88,23 +72,34 @@ def parse_ui(xml_path):
         return None
 
 
-def find_tappable_rows(root):
-    """Find clickable node bounds in document order (the app list rows)."""
-    rows = []
+def find_by_text(root, text, exact=False):
     if root is None:
-        return rows
+        return None
     for node in root.iter("node"):
-        if node.get("clickable") == "true":
-            bounds = node.get("bounds", "")
-            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        label = node.get("text", "") or node.get("content-desc", "")
+        ok = (label == text) if exact else (text.lower() in label.lower())
+        if ok:
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", node.get("bounds", ""))
             if m:
                 x1, y1, x2, y2 = map(int, m.groups())
-                w, h = x2 - x1, y2 - y1
-                # Skip tiny controls (checkboxes etc.) — want list rows
-                if h >= 60 and w >= 200:
-                    rows.append(((x1 + x2) // 2, (y1 + y2) // 2,
-                                 node.get("text", "") or node.get("content-desc", "")))
-    return rows
+                return ((x1 + x2) // 2, (y1 + y2) // 2)
+    return None
+
+
+def scroll_down():
+    adb_shell("input swipe 160 500 160 150 300", timeout=15)
+
+
+def scroll_to_find(text, max_scrolls=6, exact=False):
+    for _ in range(max_scrolls):
+        path = dump_ui("scroll_probe")
+        root = parse_ui(path)
+        pos = find_by_text(root, text, exact)
+        if pos:
+            return pos
+        scroll_down()
+        time.sleep(1)
+    return None
 
 
 def tap(x, y):
@@ -119,23 +114,40 @@ def get_current_activity():
     return m.group(1) if m else "<unknown>"
 
 
-def pull_run_as(remote, local):
-    """Pull a file from the app's private dir via run-as cat."""
-    r = adb_shell(f"run-as {PACKAGE} cat {remote}", timeout=60)
-    if r.returncode == 0 and r.stdout:
-        with open(local, "w", errors="replace") as f:
-            f.write(r.stdout)
-        return True
-    return False
+def capture_logs():
+    print("\n  Capturing logs...")
+    r = adb_shell("logcat -d", timeout=60)
+    with open(f"{ART}/logcat-full.txt", "w", errors="replace") as f:
+        f.write(r.stdout)
+    print(f"    logcat-full.txt: {len(r.stdout)} bytes")
+    adb("pull", f"/sdcard/Android/data/{PACKAGE}/files/log",
+        f"{ART}/app-logs", timeout=60)
+    for remote, local in [
+        ("cache/log/app.log", "app-internal.log"),
+        ("cache/log/boot.log", "boot-internal.log"),
+        ("cache/log/crash.log", "crash.log"),
+        ("kr64-app-stderr.log", "kr64-app-stderr.log"),
+        ("cache/kr64.log", "kr64.log"),
+        ("files/kr64.log", "kr64-ext.log"),
+    ]:
+        rr = adb_shell(f"run-as {PACKAGE} cat {remote}", timeout=60)
+        if rr.stdout:
+            with open(f"{ART}/{local}", "w", errors="replace") as f:
+                f.write(rr.stdout)
+            print(f"    run-as {remote} -> {local} ({len(rr.stdout)} bytes)")
+    os.makedirs(f"{ART}/twoyi-logs", exist_ok=True)
+    adb_shell("cp -r /sdcard/Download/twoyi-logs /sdcard/twoyi-logs-copy 2>/dev/null; "
+              "chmod -R 777 /sdcard/twoyi-logs-copy 2>/dev/null", timeout=15)
+    adb("pull", "/sdcard/twoyi-logs-copy", f"{ART}/twoyi-logs", timeout=60)
+    adb_shell("rm -rf /sdcard/twoyi-logs-copy", timeout=10)
 
 
 def main():
     os.makedirs(ART, exist_ok=True)
     print("=" * 60)
-    print(f"  AOSP E2E navigation (package {PACKAGE})")
+    print(f"  AOSP E2E navigation v2 (package {PACKAGE})")
     print("=" * 60)
 
-    # ── Step 1: Launch the app ─────────────────────────────────────
     print("\n  Step 1: Launch app via launcher")
     adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
     time.sleep(6)
@@ -143,30 +155,41 @@ def main():
     print(f"  Current activity: {activity}")
     dump_ui("01_app_launched")
 
-    # ── Step 2: Boot the container ────────────────────────────────
-    # Normal flow: SelectAppActivity lists host apps; tapping one boots
-    # the container. Tap the first substantial row.
-    root = parse_ui(f"{ART}/01_app_launched.xml")
-    rows = find_tappable_rows(root)
-    booted_via = None
-    if rows:
-        cx, cy, label = rows[0]
-        print(f"\n  Step 2: Tapping first app row at ({cx},{cy}) label={label!r}")
-        tap(cx, cy)
+    print("\n  Step 2: Tap 'Launch Container'")
+    pos = scroll_to_find("Launch Container", max_scrolls=6)
+    launched = False
+    if pos:
+        print(f"  Tapping 'Launch Container' at {pos}")
+        tap(*pos)
         time.sleep(5)
-        booted_via = "ui-row-tap"
+        activity = get_current_activity()
+        print(f"  Current activity: {activity}")
+        launched = "Render2Activity" in activity
     else:
-        print("\n  Step 2: No app rows found — falling back to am start Render2Activity")
-        adb_shell(f"am start -n {PACKAGE}/io.twoyi.Render2Activity")
-        time.sleep(5)
-        booted_via = "am-start-fallback"
+        print("  ✗ 'Launch Container' not found after scrolling")
 
-    activity = get_current_activity()
-    print(f"  Current activity: {activity} (boot via {booted_via})")
-    dump_ui("02_after_boot_tap")
+    if not launched:
+        print("  Fallback: am start Render2Activity (output asserted)")
+        r = adb_shell(f"am start -n {PACKAGE}/io.twoyi.Render2Activity", timeout=20)
+        print(f"  am start stdout: {r.stdout.strip()!r}")
+        print(f"  am start stderr: {r.stderr.strip()!r}")
+        time.sleep(6)
+        activity = get_current_activity()
+        print(f"  Current activity: {activity}")
 
-    # ── Step 3: Boot wait + screenshots ───────────────────────────
-    print(f"\n  Step 3: Waiting {BOOT_WAIT}s for guest boot (screenshots every {SCREENSHOT_EVERY}s)")
+    if "Render2Activity" not in activity:
+        print("\n  ✗✗✗ CONTAINER NEVER LAUNCHED — activity is still "
+              f"{activity!r}. Aborting early.")
+        dump_ui("02_launch_failed")
+        screenshot("08_launch_failed")
+        capture_logs()
+        sys.exit(1)
+
+    dump_ui("02_after_launch_tap")
+    print("  ✓ Render2Activity is foreground — the container is booting")
+
+    print(f"\n  Step 3: Waiting {BOOT_WAIT}s for guest boot "
+          f"(screenshots every {SCREENSHOT_EVERY}s)")
     t0 = time.time()
     shot = 0
     md5s = {}
@@ -175,66 +198,39 @@ def main():
         p = screenshot(f"07_boot_{shot * SCREENSHOT_EVERY}s")
         h = md5(p)
         md5s[h] = md5s.get(h, 0) + 1
-        # every 60s: note the activity + grab a UI dump
         if shot % (60 // SCREENSHOT_EVERY) == 0:
-            print(f"    t={int(time.time() - t0)}s activity={get_current_activity()} shots={shot}")
+            print(f"    t={int(time.time() - t0)}s "
+                  f"activity={get_current_activity()} shots={shot}")
             dump_ui(f"08_progress_{int(time.time() - t0)}s")
         time.sleep(SCREENSHOT_EVERY)
 
     dump_ui("09_final")
+    capture_logs()
 
-    # ── Step 4: Pull logs via run-as ──────────────────────────────
-    print("\n  Step 4: Pulling app logs via run-as")
-    pulls = [
-        ("cache/log/app.log", "app.log"),
-        ("cache/log/boot.log", "boot.log"),
-        ("cache/log/crash.log", "crash.log"),
-        ("cache/log/logcat.log", "logcat-guest.log"),
-        ("kr64-app-stderr.log", "kr64-app-stderr.log"),
-    ]
-    for remote, local in pulls:
-        if pull_run_as(remote, f"{ART}/{local}"):
-            print(f"    pulled {remote} -> {local} ({os.path.getsize(f'{ART}/{local}')} bytes)")
-        else:
-            print(f"    (no {remote})")
-
-    # kr64's post-mortem mirror (public dir — works on any variant)
-    adb_shell("ls -la /sdcard/Download/twoyi-logs/ 2>/dev/null", timeout=10)
-    os.makedirs(f"{ART}/twoyi-logs", exist_ok=True)
-    adb_shell("cp -r /sdcard/Download/twoyi-logs /sdcard/twoyi-logs-copy 2>/dev/null; chmod -R 777 /sdcard/twoyi-logs-copy 2>/dev/null", timeout=15)
-    adb("pull", "/sdcard/twoyi-logs-copy", f"{ART}/twoyi-logs", timeout=60)
-    adb_shell("rm -rf /sdcard/twoyi-logs-copy", timeout=10)
-
-    # ── Step 5: Ground truth summary ──────────────────────────────
     print("\n" + "=" * 60)
     print("  GROUND TRUTH SUMMARY")
     print("=" * 60)
     print(f"  screenshot md5 distribution: {md5s}")
-    identical = len(md5s) == 1
-    print(f"  PIXELS {'FROZEN (all identical — nothing rendered!)' if identical else 'CHANGED over time!'}")
 
-    # SurfaceView / UI checks in the final dump
+    kr64_count = 0
     try:
-        final = open(f"{ART}/09_final.xml", errors="replace").read()
-        print(f"  SurfaceView in final UI dump: {'SurfaceView' in final}")
-        print(f"  loadingLayout in final UI dump: {'loadingLayout' in final}")
+        with open(f"{ART}/logcat-full.txt", errors="replace") as f:
+            kr64_count = sum(1 for line in f if re.search(r"\bKR64\b", line))
     except OSError:
-        print("  (no final UI dump)")
+        pass
+    print(f"  KR64 lines in full logcat: {kr64_count}")
+    if kr64_count == 0:
+        print("  ✗✗✗ ZERO KR64 lines — the container daemon never ran. FAILED run.")
+        sys.exit(1)
 
-    # Boot completion markers from the pulled logs
-    for logf in ("kr64-app-stderr.log", "boot.log", "app.log"):
+    for logf in ("kr64.log", "kr64-app-stderr.log", "boot-internal.log",
+                 "app-internal.log"):
         try:
             content = open(f"{ART}/{logf}", errors="replace").read()
             n = content.count("BOOT_COMPLETED")
             print(f"  BOOT_COMPLETED mentions in {logf}: {n}")
         except OSError:
             pass
-
-    logcat = adb_shell("logcat -d -s KR64:I 2>/dev/null", timeout=30).stdout
-    print(f"  KR64 lines in live logcat: {len(logcat.splitlines())}")
-    with open(f"{ART}/kr64-logcat-tail.txt", "w") as f:
-        f.write(logcat[-200000:])
-
     print("\n  Done.")
 
 
