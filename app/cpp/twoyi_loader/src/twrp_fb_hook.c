@@ -659,7 +659,7 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
     struct inbr_sockaddr_un addr;
     char rootbuf[128];
     char relbuf[24];
-    char *cands[2];
+    char *cands[3];
     unsigned cand_lens[2];
     int ncands = 0;
     long fd, i;
@@ -667,7 +667,35 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
     *init_len = 0;
     *out_slot = 0;
 
-    /* candidate 0: $TWOYI_ROOTFS/../dev/touch-events (absolute host path) */
+    /* 6-Z96b candidate 0: /dev/.touch-sock — a file kr64 writes with the
+     * ABSOLUTE host path of the touch socket. Reading it via openat is
+     * intercepted + translated by the tracer to the real file, so this
+     * needs NO getenv (whose weak PLT the recovery binary's ancient
+     * bionic linker leaves unresolved — run 32654424163 tried only the
+     * relative candidate and ENOENT'd). */
+    {
+        int tf = (int)raw_syscall4(SYS_openat, -100 /*AT_FDCWD*/,
+                                   (long)"/dev/.touch-sock", 0 /*O_RDONLY*/, 0);
+        if (tf >= 0) {
+            char pbuf[136];
+            long pr = raw_syscall3(SYS_read, tf, (long)pbuf, (long)(sizeof(pbuf) - 1));
+            (void)raw_syscall1(SYS_close, tf);
+            if (pr > 0 && pr < 128) {
+                long k;
+                pbuf[pr] = 0;
+                for (k = pr - 1; k >= 0; k--) {
+                    if (pbuf[k] == '\n' || pbuf[k] == '\r' || pbuf[k] == ' ') pbuf[k] = 0;
+                    else break;
+                }
+                for (k = 0; pbuf[k]; k++) rootbuf[k] = pbuf[k];
+                rootbuf[k] = 0;
+                if (k > 0 && rootbuf[0] == '/') {
+                    cands[ncands] = rootbuf; cand_lens[ncands] = (unsigned)k; ncands++;
+                }
+            }
+        }
+    }
+    /* candidate 1: $TWOYI_ROOTFS/../dev/touch-events (absolute host path) */
     if (getenv) {
         const char *root = getenv("TWOYI_ROOTFS");
         if (root && root[0] && my_strcmp(root, "/") != 0) {
