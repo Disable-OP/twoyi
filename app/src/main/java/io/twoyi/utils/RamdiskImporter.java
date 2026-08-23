@@ -25,6 +25,11 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -505,6 +510,10 @@ public class RamdiskImporter {
             long fileLength = cpioFile.length();
             long pos = 0;
             boolean sawTrailer = false;
+            // Task 6-Z82: hardlink bookkeeping — see the regular-file arm below.
+            // Key "ino:devmajor:devminor" -> absolute path of the first
+            // data-carrying extraction of that (c_ino, c_dev) identity.
+            Map<String, String> hardlinkOwners = new HashMap<>();
 
             while (pos + 110 <= fileLength) {
                 byte[] header = new byte[110];
@@ -531,6 +540,12 @@ public class RamdiskImporter {
                 int mode = parseHex(header, 14, 8);
                 long filesize = parseHexLong(header, 54, 8);
                 int namesize = parseHex(header, 94, 8);
+                // Task 6-Z82: hardlink identity fields (newc, 8 hex chars
+                // each): c_ino @6, c_nlink @38, c_devmajor @62, c_devminor @70.
+                int ino = parseHex(header, 6, 8);
+                int nlink = parseHex(header, 38, 8);
+                int devmajor = parseHex(header, 62, 8);
+                int devminor = parseHex(header, 70, 8);
 
                 if (namesize <= 0 || namesize > 4096) {
                     Log.w(TAG, "Invalid namesize: " + namesize);
@@ -569,35 +584,83 @@ public class RamdiskImporter {
                     // Regular file
                     File file = new File(targetDir, name);
                     file.getParentFile().mkdirs();
-                    try (FileOutputStream fos = new FileOutputStream(file)) {
-                        byte[] buf = new byte[8192];
-                        long remaining = filesize;
-                        while (remaining > 0) {
-                            int toRead = (int) Math.min(buf.length, remaining);
-                            int n = fis.read(buf, 0, toRead);
-                            if (n < 0) break;
-                            fos.write(buf, 0, n);
-                            remaining -= n;
-                            pos += n;
+
+                    // Task 6-Z82: cpio newc hardlink handling. Hardlinked
+                    // files appear as multiple entries sharing (c_ino, c_dev);
+                    // only the FIRST carries data, repeats have filesize=0
+                    // (nlink>1 corroborates). The kernel's initramfs extractor
+                    // materializes repeats via link(); this Java extractor used
+                    // to write them as EMPTY regular files — leaving e.g.
+                    // sbin/libcrecovery.so at 0 bytes -> guest linker
+                    // "libcrecovery.so is too small to be an ELF" -> CANNOT
+                    // LINK -> exit(1) x6 (E2E run 32619835085). Materialize
+                    // repeats as real byte copies of the first data-carrying
+                    // entry (Files.copy): identical content, safe on every
+                    // filesystem, no link() permission requirements.
+                    String linkKey = ino + ":" + devmajor + ":" + devminor;
+                    boolean materializedHardlink = false;
+                    if (filesize == 0 && nlink > 1) {
+                        String firstPath = hardlinkOwners.get(linkKey);
+                        File firstFile = firstPath != null ? new File(firstPath) : null;
+                        if (firstFile != null && firstFile.isFile() && firstFile.length() > 0) {
+                            Files.copy(firstFile.toPath(), file.toPath(),
+                                StandardCopyOption.REPLACE_EXISTING);
+                            materializedHardlink = true;
+                            String msg = "hardlink materialized: " + name + " -> " + firstPath
+                                + " (" + file.length() + " bytes)";
+                            Log.i(TAG, msg);
+                            FileLogger.i(TAG, msg);
+                        } else {
+                            // cpio convention is data-first (GNU cpio /
+                            // gen_init_cpio never emit data-last); a repeat
+                            // with no seen owner means a malformed archive.
+                            // Keep the legacy empty-file behavior but say so —
+                            // the post-import sbin/lib*.so scan in
+                            // verifyCriticalPayload will fail loudly if this
+                            // file matters.
+                            Log.w(TAG, "hardlink entry '" + name + "' (nlink=" + nlink
+                                + ", ino=" + ino + ") has no data-carrying first entry;"
+                                + " writing empty file");
                         }
                     }
-                    // Per-entry size verification: a short/failed stream read used
-                    // to silently `break` out of the loop above, leaving this file
-                    // at whatever had been written so far (e.g. 0 bytes) while the
-                    // import still reported SUCCESS (E2E run 32616016488:
-                    // sbin/libminuitwrp.so = 0 bytes -> guest linker died "too
-                    // small to be an ELF"). Fail loudly instead and do not leave
-                    // the partially-written file behind.
-                    if (file.length() != filesize) {
-                        String msg = "CORRUPT cpio: entry '" + name + "' short write: want="
-                            + filesize + " got=" + file.length() + " (stopped at " + pos
-                            + "/" + fileLength + ")";
-                        Log.e(TAG, msg);
-                        FileLogger.e(TAG, msg);
-                        if (!file.delete()) {
-                            Log.e(TAG, "Failed to delete partially-written " + file);
+
+                    if (!materializedHardlink) {
+                        try (FileOutputStream fos = new FileOutputStream(file)) {
+                            byte[] buf = new byte[8192];
+                            long remaining = filesize;
+                            while (remaining > 0) {
+                                int toRead = (int) Math.min(buf.length, remaining);
+                                int n = fis.read(buf, 0, toRead);
+                                if (n < 0) break;
+                                fos.write(buf, 0, n);
+                                remaining -= n;
+                                pos += n;
+                            }
                         }
-                        throw new IOException(msg);
+                        // Per-entry size verification: a short/failed stream read used
+                        // to silently `break` out of the loop above, leaving this file
+                        // at whatever had been written so far (e.g. 0 bytes) while the
+                        // import still reported SUCCESS (E2E run 32616016488:
+                        // sbin/libminuitwrp.so = 0 bytes -> guest linker died "too
+                        // small to be an ELF"). Fail loudly instead and do not leave
+                        // the partially-written file behind.
+                        // NOTE (6-Z82): this assertion is skipped for a
+                        // materialized hardlink on purpose — the copy has the
+                        // SOURCE entry's size, not this entry's declared
+                        // filesize (0); Files.copy's success is its own
+                        // verification (plus the post-import sbin/lib*.so ELF
+                        // scan in verifyCriticalPayload).
+                        if (file.length() != filesize) {
+                            String msg = "CORRUPT cpio: entry '" + name + "' short write: want="
+                                + filesize + " got=" + file.length() + " (stopped at " + pos
+                                + "/" + fileLength + ")";
+                            Log.e(TAG, msg);
+                            FileLogger.e(TAG, msg);
+                            if (!file.delete()) {
+                                Log.e(TAG, "Failed to delete partially-written " + file);
+                            }
+                            throw new IOException(msg);
+                        }
                     }
                     // Task 6-Z31: set executable permission from the cpio mode.
                     // Java's FileOutputStream creates files with mode 0644 (NOT
@@ -621,6 +684,12 @@ public class RamdiskImporter {
                     // Also set writable for owner (cpio mode 0o200 = S_IWUSR).
                     if ((mode & 0200) != 0) {
                         file.setWritable(true, true); // owner-write only
+                    }
+                    // 6-Z82: remember this data-carrying entry as the copy
+                    // source for any later hardlink repeats sharing
+                    // (c_ino, c_dev).
+                    if (filesize > 0) {
+                        hardlinkOwners.put(linkKey, file.getAbsolutePath());
                     }
                     fileCount++;
                 } else if (modeType == 0xA000) {
@@ -737,11 +806,45 @@ public class RamdiskImporter {
         // the stock ramdisk; run 32619179713 aborted because this was
         // required at import time. If present, require >0; if absent, skip.
         String[] nonZero = {"sbin/recovery", "sbin/linker", "sbin/libminuitwrp.so",
+            "sbin/libcrecovery.so",
             "sbin/libtwrp_fb_hook.so", "sbin/libtwrp.so", "sbin/libguitwrp.so"};
         for (String n : nonZero) {
             File f = new File(targetDir, n);
             if (f.exists() && f.length() <= 0) {
                 problems.append(n).append(" size=0; ");
+            }
+        }
+
+        // Task 6-Z82: scan EVERY sbin/lib*.so — the guest linker DT_NEEDED-
+        // loads these; any 0-byte or non-ELF lib aborts linking before main()
+        // ("too small to be an ELF", E2E run 32619835085: sbin/libcrecovery.so
+        // = 0 bytes slipped past the fixed manifest above). Require length>0
+        // AND first 4 bytes == ELF magic (0x7F 'E' 'L' 'F'). Fail loudly
+        // listing EVERY bad file (sorted for deterministic messages).
+        File sbinDir = new File(targetDir, "sbin");
+        File[] sbinFiles = sbinDir.listFiles();
+        if (sbinFiles != null) {
+            Arrays.sort(sbinFiles);
+            for (File f : sbinFiles) {
+                String fname = f.getName();
+                if (!f.isFile() || !fname.startsWith("lib") || !fname.endsWith(".so")) {
+                    continue;
+                }
+                long len = f.length();
+                if (len <= 0) {
+                    problems.append("sbin/").append(fname).append(" size=0; ");
+                    continue;
+                }
+                byte[] magic = new byte[4];
+                int magicRead;
+                try (FileInputStream efis = new FileInputStream(f)) {
+                    magicRead = readFully(efis, magic);
+                }
+                if (magicRead < 4 || (magic[0] & 0xFF) != 0x7F || magic[1] != 'E'
+                    || magic[2] != 'L' || magic[3] != 'F') {
+                    problems.append("sbin/").append(fname).append(" not-ELF (")
+                        .append(len).append(" bytes); ");
+                }
             }
         }
 
