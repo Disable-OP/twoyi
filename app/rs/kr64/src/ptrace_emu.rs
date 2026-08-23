@@ -3081,6 +3081,20 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
             return path.to_string();
         }
     }
+    // /dev/kmsg — EXACT map to {rootfs}/dev/__kmsg__ (Task 6-Z97). The
+    // guest init's InitKernelLogging() opens "/dev/kmsg" (AOSP) and the
+    // host's /dev/kmsg is root-only (open → EACCES for untrusted_app —
+    // run 32661231764's "DIAG KLOG fd capture: open() returned -13"),
+    // while the generic /dev/* branch below would map it to
+    // {rootfs}/dev/kmsg, a file nothing ever creates (ENOENT). kr64's
+    // parent setup pre-creates {rootfs}/dev/__kmsg__ (regular file in
+    // non-root mode, symlink → /twrp-kmsg.log in root mode — lib.rs),
+    // and is_kmsg_path() already recognises both the raw and the
+    // translated form, so the open succeeds and the guest's kernel
+    // logging (plus every DIAG KLOG tag) works.
+    if path == "/dev/kmsg" {
+        return format!("{}/dev/__kmsg__", rootfs);
+    }
     // /dev/* — translate to rootfs/dev/* so init finds the pre-created
     // device stubs and files (e.g., /dev/.booting, /dev/__null__).
     // The host's /dev is read-only for untrusted_app, so opens of
@@ -5596,7 +5610,15 @@ pub fn run_ptrace_loop(
     // is updated every iteration by the `waitpid(-1)` call, which
     // receives stops from ANY traced child (init + every forked
     // descendant, thanks to PTRACE_O_TRACEFORK set above).
-    let init_pid: libc::pid_t = pid;
+    // Task 6-Z97: `init_pid` is MUTABLE — when the twoyi loader
+    // DAEMONIZES (its constructor forks a child, then the parent
+    // _exit(0)s), the WIFEXITED/WIFSIGNALED branches re-anchor
+    // `init_pid` to the live forked child: THAT child is the real
+    // init, and every `pid == init_pid` check in the loop (poll
+    // throttle, execve handling, the exit policy itself) must follow
+    // it across the hand-off instead of pointing at the dead
+    // disposable parent (run 32661231764).
+    let mut init_pid: libc::pid_t = pid;
     let mut current_pid: libc::pid_t = pid;
 
     // ── Task 6-Z89 FIX 1c: the tracked-pid set + last-exit memory ────
@@ -6007,13 +6029,69 @@ pub fn run_ptrace_loop(
             // thermald, …) exiting is expected behaviour — log it and
             // keep serving the survivors.
             //
-            // ── Task 6-Z89 FIX 1e: any-traced-child check (supersedes the
-            //     6-Z67 recovery-only probe) ──
-            //
             // waitpid(-1) just reaped THIS child, so it is definitively
             // gone: drop it from the tracked set and remember its exit
-            // value. Then ask the tracked set — not just the recovery
-            // child — whether anything traced is still alive
+            // value.
+            tracked_pids.retain(|&p| p != pid);
+            last_child_exit = Some(code);
+            // ── Task 6-Z97: the DAEMONIZE re-anchor (WIFEXITED) ──
+            //
+            // Run 32661231764 (aosp14): the twoyi LD_PRELOAD loader's
+            // constructor finishes the runtime setup ("runtime ready —
+            // guest can boot"), then FORKS
+            // (clone(SIGCHLD|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID) →
+            // child) and the PARENT _exit(0)s — classic daemonize. The
+            // CHILD is the real init; kr64's exec'd parent is a
+            // disposable launcher. The pre-6-Z97 `pid == init_pid →
+            // return code` ended the VM exactly there: teardown +
+            // PTRACE_O_EXITKILL killed the real init before its first
+            // syscall, and the app saw a clean "boot ok" exit 0. So
+            // when INIT exits but another traced child is ALIVE, adopt
+            // that child as the new `init_pid` and CONTINUE — the exact
+            // inverse of the forked-child-exits case below (which keeps
+            // serving init). The child already saw fork()==0 from the
+            // kernel, so no return-value synthesis is needed; the
+            // loop-top PTRACE_SYSCALL(current_pid) resumes it with
+            // syscall tracing (it is STOPPED — at its auto-attach
+            // SIGSTOP or its latest syscall stop, never running — the
+            // same invariant the 6-Z89 switch below relies on).
+            if pid == init_pid {
+                let alive: Vec<libc::pid_t> = tracked_pids
+                    .iter()
+                    .copied()
+                    .filter(|&p| traced_child_alive(p))
+                    .collect();
+                if let Some(&new_init) = alive.first() {
+                    log(&format!(
+                        "6-Z97: init_pid {} exited {} but traced child(ren) {:?} ALIVE — the loader DAEMONIZED (parent exits, child is the real init). Re-anchoring init_pid to {} and CONTINUING",
+                        pid, code, alive, new_init
+                    ));
+                    init_pid = new_init;
+                    current_pid = new_init;
+                    // Per-old-pid hygiene (6-Z97): the dead parent's
+                    // state must never leak into the new init through a
+                    // later pid reuse. (pending_poll_fake / pending_*
+                    // were already cleared for `pid` above; these are
+                    // the NOT-pid-keyed leftovers.)
+                    in_syscall_map.remove(&pid);
+                    kmsg_fd = None; // the captured kmsg fd belongs to
+                                    // the dead parent's fd table
+                    if recovery_child_pid == Some(pid) {
+                        recovery_child_pid = None;
+                    }
+                    continue;
+                }
+                log(&format!(
+                    "6-Z97: init_pid {} exited {} and no traced child is alive — genuine init exit, ending the ptrace loop (return {})",
+                    pid, code, code
+                ));
+                return code;
+            }
+            // ── Task 6-Z89 FIX 1e: any-traced-child check (supersedes the
+            //     6-Z67 recovery-only probe) — for a NON-init child ──
+            //
+            // Ask the tracked set — not just the recovery child —
+            // whether anything traced is still alive
             // (any_traced_child_alive: fresh /proc probe over EVERY
             // tracked pid), and switch to the first live one (the
             // recovery child keeps its 6-Z67 protection, and so does
@@ -6022,8 +6100,6 @@ pub fn run_ptrace_loop(
             // 32634683464). When nothing is left, END the loop (this
             // also covers the old "init_dead → return" case: if init
             // were alive the scan would have found it).
-            tracked_pids.retain(|&p| p != pid);
-            last_child_exit = Some(code);
             if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
                 // Task 6-Z67 semantics, generalised: init may be dead
                 // but a traced child (e.g. the recovery child — the
@@ -6039,9 +6115,6 @@ pub fn run_ptrace_loop(
                 ));
                 current_pid = live_pid;
                 continue;
-            }
-            if pid == init_pid {
-                return code;
             }
             log(&format!(
                 "6-Z89: ALL TRACED CHILDREN GONE ({} tracked, all dead) after child {} exited with code {} — ending the ptrace loop (return {})",
@@ -6098,6 +6171,40 @@ pub fn run_ptrace_loop(
             // and end the loop when nothing traced remains.
             tracked_pids.retain(|&p| p != pid);
             last_child_exit = Some(-sig);
+            // ── Task 6-Z97 (WIFSIGNALED mirror): the DAEMONIZE re-anchor ──
+            //
+            // Same as the WIFEXITED branch above: if INIT was killed
+            // but a traced child is still alive, the loader daemonized
+            // (or the guest re-exec'd itself) — re-anchor init_pid to
+            // the survivor and CONTINUE instead of returning -sig and
+            // tearing the VM down with PTRACE_O_EXITKILL (the killshot
+            // shape of run 32661231764).
+            if pid == init_pid {
+                let alive: Vec<libc::pid_t> = tracked_pids
+                    .iter()
+                    .copied()
+                    .filter(|&p| traced_child_alive(p))
+                    .collect();
+                if let Some(&new_init) = alive.first() {
+                    log(&format!(
+                        "6-Z97: init_pid {} killed by signal {} but traced child(ren) {:?} ALIVE — the loader DAEMONIZED (parent exits, child is the real init). Re-anchoring init_pid to {} and CONTINUING",
+                        pid, sig, alive, new_init
+                    ));
+                    init_pid = new_init;
+                    current_pid = new_init;
+                    in_syscall_map.remove(&pid);
+                    kmsg_fd = None;
+                    if recovery_child_pid == Some(pid) {
+                        recovery_child_pid = None;
+                    }
+                    continue;
+                }
+                log(&format!(
+                    "6-Z97: init_pid {} killed by signal {} and no traced child is alive — genuine init death, ending the ptrace loop (return {})",
+                    pid, sig, -sig
+                ));
+                return -sig;
+            }
             if let Some(live_pid) = any_traced_child_alive(&tracked_pids) {
                 // Task 6-Z67 semantics, generalised (see the WIFEXITED
                 // branch for the full rationale).
@@ -6107,9 +6214,6 @@ pub fn run_ptrace_loop(
                 ));
                 current_pid = live_pid;
                 continue;
-            }
-            if pid == init_pid {
-                return -sig;
             }
             log(&format!(
                 "6-Z89: ALL TRACED CHILDREN GONE ({} tracked, all dead) after child {} killed by signal {} — ending the ptrace loop (return {})",
@@ -6224,6 +6328,37 @@ pub fn run_ptrace_loop(
                                 pid,
                                 std::io::Error::last_os_error()
                             ));
+                        }
+                        // ── Task 6-Z97: track the new child NOW ──
+                        //
+                        // The 6-Z89 switch handler inserts a pid into
+                        // `tracked_pids` when waitpid(-1) first reports
+                        // a stop FROM it — but a daemonizing parent
+                        // (the twoyi loader: fork + immediate _exit) can
+                        // be reaped by waitpid(-1) BEFORE the new
+                        // child's auto-attach stop is drained, leaving
+                        // the child invisible to the 6-Z97/6-Z89
+                        // liveness scans exactly when the re-anchor
+                        // needs it. Registering it here (the event
+                        // carries its pid) closes that race. A fork-like
+                        // clone(0x1200011) (no CLONE_VM —
+                        // SIGCHLD|CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID)
+                        // is reported as PTRACE_EVENT_FORK; thread clones
+                        // as PTRACE_EVENT_CLONE — both land in this arm
+                        // and both get tracked. Auto-attached children
+                        // inherit the parent's ptrace options from the
+                        // kernel, so no SETOPTIONS is needed here (the
+                        // SIGSTOP branch below only re-sets them for the
+                        // 6-Z48 recovery child).
+                        if getevent_r == 0 {
+                            let new_child_pid = new_child_id as libc::pid_t;
+                            if new_child_pid > 0 && !tracked_pids.contains(&new_child_pid) {
+                                tracked_pids.push(new_child_pid);
+                                log(&format!(
+                                    "6-Z97: PTRACE_EVENT_{} — new child PID {} registered in the tracked set ({} tracked) before its first waitpid stop",
+                                    event_name, new_child_pid, tracked_pids.len()
+                                ));
+                            }
                         }
                         // Continue the parent — it should proceed to
                         // its waitpid() (or whatever it does after the
@@ -6972,11 +7107,21 @@ pub fn run_ptrace_loop(
                     // init actually CALL fork/clone/vfork/clone3, or does it
                     // skip forking entirely (→ wait4 -ECHILD → exit(1))?
                     //
-                    // Raw numbers for BOTH i386 + x86_64 ABIs (init is i386
-                    // post-execve; the twoyi-app restart path is x86_64
-                    // pre-execve). UNCONDITIONAL — NOT gated by loop_count.
-                    let is_fork_family = matches!(syscall_num, 2 | 57 | 120 | 56 | 190 | 58 | 435);
-                    let is_wait4 = matches!(syscall_num, 114 | 61 | 247 | 290);
+                    // Task 6-Z97: gate on THIS child's ABI (abi.clone_nr /
+                    // fork_nr / vfork_nr / wait4_nr — x86_64 fork_nr is 57,
+                    // i386 is 2), NOT a hardcoded i386 + x86_64 union: the
+                    // union mislabelled the x86_64 loader's open(2) calls
+                    // as "fork-family" in run 32661231764 (30 false lines
+                    // that nearly derailed the daemonize analysis — on
+                    // x86_64 nr=2 is OPEN, and 114 is not wait4). clone3
+                    // keeps its literal: __NR_clone3 is 435 on BOTH i386
+                    // and x86_64 (no cross-ABI collision). UNCONDITIONAL —
+                    // NOT gated by loop_count.
+                    let is_fork_family = syscall_num == abi.clone_nr
+                        || syscall_num == abi.fork_nr
+                        || syscall_num == abi.vfork_nr
+                        || syscall_num == 435;
+                    let is_wait4 = syscall_num == abi.wait4_nr;
                     if is_fork_family {
                         log(&format!(
                             "DIAG fork-family ENTRY: nr={} (pid={}), loop_count={}, in_syscall_was={}",
@@ -8763,9 +8908,17 @@ pub fn run_ptrace_loop(
                     // ── DIAGNOSTIC (6-S3): unconditional fork-family EXIT ──
                     //
                     // Logs the kernel return value for every fork-family
-                    // syscall (nr=2/57/120/56/190/58/435), UNCONDITIONALLY
-                    // (not gated). 0=child, >0=parent's-child-pid, <0=error.
-                    if matches!(syscall_num, 2 | 57 | 120 | 56 | 190 | 58 | 435) {
+                    // syscall, UNCONDITIONALLY (not gated). 0=child,
+                    // >0=parent's-child-pid, <0=error. Task 6-Z97: gated on
+                    // THIS child's ABI — the old hardcoded i386 + x86_64
+                    // union mislabelled x86_64 open(2) as "fork-family"
+                    // (run 32661231764); clone3 (435) is identical on both
+                    // ABIs and stays a literal.
+                    if syscall_num == abi.clone_nr
+                        || syscall_num == abi.fork_nr
+                        || syscall_num == abi.vfork_nr
+                        || syscall_num == 435
+                    {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         log(&format!(
                             "DIAG fork-family EXIT: nr={} returned {} (0=child, >0=parent's-child-pid, <0=error)",
@@ -12550,6 +12703,33 @@ mod tests {
     fn translate_path_leaves_relative_untouched() {
         // Relative paths are returned as-is (no rootfs prefix).
         assert_eq!(translate_path("/r", "relative/path"), "relative/path");
+    }
+
+    #[test]
+    fn translate_path_maps_dev_kmsg_to_dunder_kmsg_mirror() {
+        // Task 6-Z97: the guest init's open("/dev/kmsg") (AOSP
+        // InitKernelLogging) must reach kr64's pre-created
+        // {rootfs}/dev/__kmsg__ mirror. The host's /dev/kmsg is
+        // root-only (open → EACCES for untrusted_app — run
+        // 32661231764's "DIAG KLOG fd capture: open() returned -13"),
+        // and the generic /dev/* branch would map it to
+        // {rootfs}/dev/kmsg, which nothing ever creates (ENOENT).
+        let rootfs = "/data/user/0/io.twoyi/rootfs";
+        assert_eq!(
+            translate_path(rootfs, "/dev/kmsg"),
+            format!("{}/dev/__kmsg__", rootfs)
+        );
+        // /dev/__kmsg__ itself still lands on the same mirror via the
+        // generic /dev/* branch.
+        assert_eq!(
+            translate_path(rootfs, "/dev/__kmsg__"),
+            format!("{}/dev/__kmsg__", rootfs)
+        );
+        // Other /dev/* paths are unaffected by the exact map.
+        assert_eq!(
+            translate_path(rootfs, "/dev/kmsgx"),
+            format!("{}/dev/kmsgx", rootfs)
+        );
     }
 
     // ── SysV shared-memory syscall number tests ─────────────────────
