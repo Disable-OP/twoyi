@@ -3545,6 +3545,207 @@ fn is_properties_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("__properties__")
 }
 
+/// Task 6-Z73: is this HOST path the TWRP framebuffer file? Matches both
+/// `{rootfs}/dev/graphics/fb0` and `{rootfs}/dev/fb0` (the two paths kr64
+/// pre-creates + the two the fb hook can create).
+fn is_fb0_host_path(path: &str) -> bool {
+    path == "/dev/graphics/fb0"
+        || path == "/dev/fb0"
+        || path.ends_with("/dev/graphics/fb0")
+        || path.ends_with("/dev/fb0")
+}
+
+// ── Task 6-Z73: the fb0 pixel bridge ──────────────────────────────────
+//
+// THE PROBLEM: TWRP's libminuitwrp mmaps fb0 with MAP_SHARED (file-backed)
+// to render its UI. The zygote seccomp filter blocks file-backed mmap2 for
+// i386 → the 6-Y rewrite converts it to MAP_ANONYMOUS → the kernel hands
+// TWRP REAL memory (and the 6-Z62 injection seeds it with the file's
+// current content — zeros). TWRP then renders its pixels INTO THAT
+// ANONYMOUS MAPPING — and they never reach the fb0 FILE that the app-side
+// render loop (core.rs twrp_fb_render_loop) polls at ~30fps. Without a
+// bridge the screen stays black forever.
+//
+// THE FIX: kr64 — the tracer, the mapping's creator, and the child's
+// parent — runs a bridge thread that periodically reads the child's fb0
+// mapping (process_vm_readv, syscall 310 on x86_64; the writev sibling at
+// 311 is proven to work under the filter) and pwrites the bytes into the
+// fb0 file. One-way (child-mem → file) is sufficient: TWRP only reads the
+// fb for pan/ioctls, not for content.
+//
+// The bridge is registered at the fb0 mmap2's injection EXIT (we know the
+// mapping address there) and torn down when the child dies (readv ESRCH).
+struct Fb0Mapping {
+    pid: libc::pid_t,
+    addr: u64,
+    len: usize,
+    host_file: String,
+}
+
+impl Clone for Fb0Mapping {
+    fn clone(&self) -> Self {
+        Fb0Mapping {
+            pid: self.pid,
+            addr: self.addr,
+            len: self.len,
+            host_file: self.host_file.clone(),
+        }
+    }
+}
+
+/// Module-level logger for the bridge thread (the loop's `log` closure is
+/// loop-local and not callable from a spawned thread — the closure writes
+/// to stderr, which is where kr64's stderr → logcat tee picks it up).
+fn fb0_log(msg: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "[KR64][ptrace] {}", msg);
+}
+
+/// Shared registry the bridge thread drains. `Mutex` (not `RwLock`) — the
+/// loop thread inserts at fb0-injection time (rare) and the bridge reads
+/// the whole vec each tick (also rare), so contention is nil.
+static FB0_MAPPINGS: std::sync::Mutex<Vec<Fb0Mapping>> = std::sync::Mutex::new(Vec::new());
+/// Ensures the bridge thread is spawned exactly once per kr64 process.
+static FB0_BRIDGE_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One process_vm_readv(2) call into the child. Returns bytes read (may be
+/// short) or -1 on failure (ESRCH when the child died, EPERM if the filter
+/// refuses — then the bridge self-disables for that mapping).
+fn fb0_bridge_read_child_mem(
+    pid: libc::pid_t,
+    addr: u64,
+    buf: &mut [u8],
+) -> isize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let local = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: addr as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    #[cfg(target_arch = "x86_64")]
+    const SYS_PROCESS_VM_READV: libc::c_long = 310;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_PROCESS_VM_READV: libc::c_long = 270;
+    unsafe {
+        libc::syscall(
+            SYS_PROCESS_VM_READV,
+            pid,
+            &local,
+            1usize,
+            &remote,
+            1usize,
+            0usize,
+        ) as isize
+    }
+}
+
+/// The bridge thread body: every 100 ms, for every registered mapping,
+/// child-mem → fb0 file. Self-cleans dead mappings (readv ESRCH/EPERM).
+fn fb0_bridge_thread() {
+    let mut tick: u64 = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        tick = tick.saturating_add(1);
+        let snapshot: Vec<Fb0Mapping> = match FB0_MAPPINGS.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => continue,
+        };
+        if snapshot.is_empty() {
+            continue;
+        }
+        let mut dead: Vec<libc::pid_t> = Vec::new();
+        for m in &snapshot {
+            let mut buf = vec![0u8; m.len];
+            let n = fb0_bridge_read_child_mem(m.pid, m.addr, &mut buf);
+            if n <= 0 {
+                // ESRCH: child gone. EPERM/other: bridge can't serve this
+                // mapping — drop it either way (log on the first ticks).
+                if tick <= 30 {
+                    fb0_log(&format!(
+                        "6-Z73: fb0 bridge read FAILED (pid={} addr={:#x} len={}) -> {} — dropping mapping (child died or filter refused readv)",
+                        m.pid, m.addr, m.len, n
+                    ));
+                }
+                dead.push(m.pid);
+                continue;
+            }
+            let got = n as usize;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .open(&m.host_file)
+            {
+                Ok(mut f) => {
+                    if let Err(e) = std::io::Write::write_all(&mut f, &buf[..got]) {
+                        if tick <= 30 {
+                            fb0_log(&format!(
+                                "6-Z73: fb0 bridge write FAILED to {}: {}",
+                                m.host_file, e
+                            ));
+                        }
+                    } else if tick == 1 || tick % 600 == 0 {
+                        // First copy + once a minute: visibility without
+                        // logcat flooding.
+                        fb0_log(&format!(
+                            "6-Z73: fb0 bridge ACTIVE — copied {} bytes pid={} @ {:#x} -> {} (tick {})",
+                            got, m.pid, m.addr, m.host_file, tick
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if tick <= 30 {
+                        fb0_log(&format!(
+                            "6-Z73: fb0 bridge can't open {}: {} — dropping mapping",
+                            m.host_file, e
+                        ));
+                        dead.push(m.pid);
+                    }
+                }
+            }
+        }
+        if !dead.is_empty() {
+            if let Ok(mut guard) = FB0_MAPPINGS.lock() {
+                guard.retain(|m| !dead.contains(&m.pid));
+            }
+        }
+    }
+}
+
+/// Register an fb0 mapping + spawn the bridge thread (once). Called from
+/// the mmap2 injection EXIT for fb0 host paths.
+fn fb0_bridge_register(pid: libc::pid_t, addr: u64, len: usize, host_file: String) {
+    if let Ok(mut guard) = FB0_MAPPINGS.lock() {
+        // Refresh-in-place: TWRP may remap fb0 (double buffer, reinit).
+        if let Some(existing) = guard.iter_mut().find(|m| m.pid == pid) {
+            existing.addr = addr;
+            existing.len = len;
+            existing.host_file = host_file.clone();
+        } else {
+            guard.push(Fb0Mapping {
+                pid,
+                addr,
+                len,
+                host_file: host_file.clone(),
+            });
+        }
+    }
+    if !FB0_BRIDGE_STARTED.load(std::sync::atomic::Ordering::SeqCst) {
+        FB0_BRIDGE_STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::Builder::new()
+            .name("fb0-bridge".to_string())
+            .spawn(fb0_bridge_thread)
+            .map(|_| fb0_log("6-Z73: fb0 pixel bridge thread spawned (100ms tick)"))
+            .unwrap_or_else(|e| {
+                fb0_log(&format!("6-Z73: fb0 bridge thread spawn FAILED: {}", e));
+            });
+    }
+}
+
 /// Pure, testable core of the Task 6-Y mmap2 MAP_SHARED → MAP_ANONYMOUS
 /// flag rewrite.
 ///
@@ -7878,6 +8079,44 @@ pub fn run_ptrace_loop(
                                                 ));
                                             }
                                             Some(path) => {
+                                                // ── Task 6-Z73: fb0 pixel
+                                                // bridge registration ──
+                                                // The fb0 mapping got REAL
+                                                // kernel memory (address
+                                                // validated at Gate 3) —
+                                                // but it is ANONYMOUS:
+                                                // TWRP's pixels land HERE
+                                                // and would never reach
+                                                // the fb0 FILE the app
+                                                // polls. Register the
+                                                // (pid, addr, len) with
+                                                // the bridge thread which
+                                                // copies child-mem → file
+                                                // every 100ms. Done for
+                                                // EVERY fb0 mapping
+                                                // regardless of the
+                                                // injection gates below.
+                                                if is_fb0_host_path(&path) {
+                                                    fb0_bridge_register(
+                                                        pid,
+                                                        get_syscall_arg(
+                                                            &regs2,
+                                                            abi.reg_ret,
+                                                        ) as u64,
+                                                        pending.length as usize,
+                                                        path.clone(),
+                                                    );
+                                                    log(&format!(
+                                                        "6-Z73: fb0 mapping REGISTERED — pid={} @ {:#x} len={} ({}) — bridge thread will mirror child memory into the file",
+                                                        pid,
+                                                        get_syscall_arg(
+                                                            &regs2,
+                                                            abi.reg_ret,
+                                                        ) as u64,
+                                                        pending.length,
+                                                        path
+                                                    ));
+                                                }
                                                 if is_properties_path(&path) {
                                                     // Gate 5 — see the block
                                                     // comment: init memsets
