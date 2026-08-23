@@ -740,6 +740,15 @@ static int is_input_path(const char *path) {
     if (my_strcmp(path, "/dev/input/event1") == 0) return 1;
     if (my_strcmp(path, "/dev/input/event2") == 0) return 1;
     if (my_strcmp(path, "/dev/input/touch") == 0) return 1;
+    // Run 32651067502: minui opens the evdev node RELATIVE via
+    // openat(dirfd, "event0") — the absolute matches above never fired,
+    // the hook handed back the pre-created probe FILE (fd=4) and the
+    // bridge never connected. Also match the bare base names (minui
+    // chdir's to /dev/input or passes the last component).
+    if (my_strcmp(path, "event0") == 0) return 1;
+    if (my_strcmp(path, "event1") == 0) return 1;
+    if (my_strcmp(path, "event2") == 0) return 1;
+    if (my_strcmp(path, "touch") == 0) return 1;
     return 0;
 }
 
