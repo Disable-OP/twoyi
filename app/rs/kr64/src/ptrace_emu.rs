@@ -7675,9 +7675,17 @@ pub fn run_ptrace_loop(
                                     &abi,
                                     mmap2_offset_arg,
                                 );
+                                // Task 6-Z81: was `(prot & PROT_READ) != 0` —
+                                // EXEC-ONLY segments (e.g. libcutils.so segment 2
+                                // in run 32617050947) skipped the arm → no
+                                // anonymous rewrite → the kernel did a REAL
+                                // file-backed PROT_EXEC mmap → SELinux denied
+                                // executing app_data files → EPERM → "couldn't
+                                // map segment 2: Operation not permitted" →
+                                // CANNOT LINK. Arm for ANY non-PROT_NONE access.
                                 if fd >= 0
                                     && mmap2_length > 0
-                                    && (mmap2_prot & libc::PROT_READ) != 0
+                                    && mmap2_prot != 0
                                 {
                                     pending_mmap2_content.insert(pid, PendingMmap2Content {
                                         pid,
