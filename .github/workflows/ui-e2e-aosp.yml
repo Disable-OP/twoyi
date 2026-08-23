@@ -299,6 +299,17 @@ jobs:
           $ADB shell "cat /sdcard/Download/profile_rootfs.tar.gz | run-as io.twoyi.debug tar -xz -C profiles/default/rootfs"
           $ADB shell "rm /sdcard/Download/profile_rootfs.tar.gz"
 
+          # The tar was created by ROOT — it preserved root-owned 0700/0750
+          # modes (init is root:root 0750). The app uid then can't even READ
+          # its own rootfs (run 32658149322: 'FATAL: failed to read init
+          # binary: Permission denied'). Normalize: everything under the
+          # profile dir -> app-owned, dirs 0755, files 0644; then re-exec
+          # init (it must be executable). run-as executes as the app uid
+          # within its own data dir — chown -R to itself works, and chmod
+          # fixes the modes.
+          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && chmod -R u+rwX,go+rX,go-w . && chmod 0755 init system/bin/init 2>/dev/null; chmod -R u+x system/bin 2>/dev/null; true'"
+          echo "  ✓ normalized rootfs ownership/modes (dirs 755, files 644, exec bits on init + system/bin)"
+
           # Honest verification: the guest init must exist.
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/ | head -20"
           # init is an ABSOLUTE symlink (init -> /system/bin/init): test -f
