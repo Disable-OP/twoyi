@@ -6040,6 +6040,86 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
+    // ── Pre-create TWRP's expected block-device nodes (6-Z86 FIX 3) ────
+    //
+    // TWRP's partition-details loop probes the removable media with
+    // fstatat64/open/pread on /dev/block/mmcblk1p1, /dev/block/mmcblk1
+    // and /dev/block/mmcblk0. E2E run 32627986281 froze on the splash
+    // in exactly that probe: the ptrace tracer path-translates /dev/*
+    // to {rootfs}/dev/* (ptrace_emu.rs 6-Z86 FIX 1 covers the fstatat64
+    // i386 nr=300 leg), but NOTHING materialised the nodes — every
+    // probe ENOENT'd ("unknown nr=300 -> -2 (-errno 2)" retry storm)
+    // and TWRP re-scanned forever. Pre-creating them as EMPTY regular
+    // files breaks the loop: the open succeeds, pread64 hits immediate
+    // EOF (no MBR signature) → "no media" → TWRP skips the device FAST
+    // instead of retrying. Mode 0600 (mode is irrelevant — the guest
+    // only opens + preads; block-device semantics are emulated by
+    // emptiness). Idempotent, non-fatal, mirrors the twrp_dirs block
+    // above + the precreate_sysfs_stubs pattern below.
+    {
+        // {rootfs}/dev/block — create_dir_all-style: EEXIST is fine.
+        let block_dir = format!("{}/dev/block", rootfs_prefix);
+        match std::fs::create_dir(&block_dir) {
+            Ok(()) => {
+                let _ = std::fs::set_permissions(
+                    &block_dir,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+                info!(
+                    "[KR64] PARENT: pre-created TWRP block dir {} (mode 0755)",
+                    block_dir
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                warning!(
+                    "[KR64] PARENT: FAILED to pre-create TWRP block dir {}: {} (errno={}) — TWRP's /dev/block probes will ENOENT",
+                    block_dir,
+                    e,
+                    e.raw_os_error().unwrap_or(0)
+                );
+            }
+        }
+        // The three nodes TWRP actually probes (mmcblk1p1 = the vfat
+        // external_sd partition, mmcblk1 = its device, mmcblk0 = the
+        // internal eMMC). Empty files: open ok → pread EOF → skip.
+        for rel in &["mmcblk1p1", "mmcblk1", "mmcblk0"] {
+            let node_path = format!("{}/dev/block/{}", rootfs_prefix, rel);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&node_path)
+            {
+                Ok(f) => {
+                    drop(f);
+                    let _ = std::fs::set_permissions(
+                        &node_path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                    info!(
+                        "[KR64] PARENT: pre-created TWRP block dev {} (empty file, mode 0600 — pread EOF → 'no media' → fast skip)",
+                        node_path
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    info!(
+                        "[KR64] PARENT: TWRP block dev {} already exists — leaving as-is",
+                        node_path
+                    );
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] PARENT: FAILED to pre-create TWRP block dev {}: {} (errno={}) — TWRP's /dev/block/{} probes may ENOENT-retry",
+                        node_path,
+                        e,
+                        e.raw_os_error().unwrap_or(0),
+                        rel
+                    );
+                }
+            }
+        }
+    }
+
     // ── Pre-create fake sysfs (/sys/class + /sys/fs/selinux/{enforce,load}) ──
     //
     // ROOT CAUSE (Task 6-P, dispatcher's analysis of 56a5bd3 UI E2E):
