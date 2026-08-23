@@ -757,6 +757,28 @@ struct ChildAbi {
     //     / socketcall, which are all set to -1 for the same "asm-
     //     generic dropped it" reason.)
     poll_nr: i64,
+    // ── Task 6-Z69: set_thread_area (TLS install) ──────────────────
+    //
+    // i386 set_thread_area = 243 (per /usr/include/x86_64-linux-gnu/
+    // asm/unistd_32.h: __NR_set_thread_area 243). x86_64 has NO
+    // set_thread_area syscall (64-bit processes use arch_prctl
+    // ARCH_SET_GS instead) and neither does aarch64 — both get -1
+    // sentinels ("not present on this ABI").
+    //
+    // Bionic calls it from __libc_init_tls → __set_tls — the dynamic
+    // linker invokes __libc_init_tls in __linker_init (bionic/linker/
+    // linker.cpp: `__libc_init_tls(args);` runs BEFORE the linker loads
+    // libc.so, so the recovery child's FIRST set_thread_area comes from
+    // the LINKER), and the statically-linked init does the same in its
+    // post-execve __libc_init. Verified 28× nr=243 → -38 (seccomp
+    // filter block) in E2E run 32604929372.
+    //
+    // The dedicated ENTRY handler for this syscall installs a REAL GDT
+    // TLS entry via PTRACE_SET_THREAD_AREA and rewrites the syscall to
+    // getpid (the proven 6-Z9 xattr pattern) so seccomp's -38 can never
+    // hide the install. See the Task 6-Z69 block near the ENTRY match
+    // for the full design.
+    set_thread_area_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -998,6 +1020,10 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // x86_64 guest is ever supported. See the doc on `poll_nr` in
     // `ChildAbi` for the full root-cause analysis (Task 6-Z5).
     poll_nr: 7,
+    // Task 6-Z69: x86_64 has no set_thread_area syscall (64-bit
+    // processes install TLS via arch_prctl ARCH_SET_GS) → sentinel -1,
+    // mirroring the ABI_AARCH64.open precedent.
+    set_thread_area_nr: -1,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -1276,6 +1302,11 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // busy-wait. See the doc on `poll_nr` in `ChildAbi` for the full
     // root-cause analysis (Task 6-Z5).
     poll_nr: 168,
+    // i386 set_thread_area = 243 (asm/unistd_32.h: __NR_set_thread_area
+    // 243). THIS is the value that fires at runtime — both TWRP init
+    // (static bionic) and the recovery child's dynamic linker call it
+    // to install the %gs-based TLS thread pointer (Task 6-Z69).
+    set_thread_area_nr: 243,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1534,6 +1565,9 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // runtime — the sentinel keeps the compile happy + documents the
     // aarch64 behaviour. Task 6-Z5.
     poll_nr: -1,
+    // Task 6-Z69: aarch64 has no set_thread_area syscall (TLS is set
+    // via tpidr_el0, configured by clone()) → sentinel -1.
+    set_thread_area_nr: -1,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2807,6 +2841,258 @@ fn read_child_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> 
     Some(result)
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Task 6-Z69: set_thread_area (i386 nr=243) — REAL TLS/GDT emulation
+//
+// The child's bionic (both the static init and the dynamic linker's
+// __libc_init_tls) installs its %gs-based thread pointer with the
+// set_thread_area(2) syscall. The app's seccomp filter blocks it with
+// -ENOSYS, and the old fake (return 0 with NOTHING installed) leaves
+// every %gs-relative access in libc (errno, stack protector, pthread)
+// doomed. The helpers below let the tracer do exactly what the real
+// syscall does — install a GDT TLS descriptor in the child via
+// PTRACE_SET_THREAD_AREA — plus the two things the syscall's CALLER
+// relies on: the chosen entry_number written back into the user_desc
+// (bionic builds its %gs selector from the RETURNED entry number, not
+// from a constant) and the %gs selector itself.
+// ─────────────────────────────────────────────────────────────────────
+
+/// PTRACE_GET_THREAD_AREA / PTRACE_SET_THREAD_AREA request numbers.
+/// Same values on i386 and x86_64 (arch/x86/include/uapi/asm/ptrace-abi.h:
+/// PTRACE_GET_THREAD_AREA 25, PTRACE_SET_THREAD_AREA 26 — the x86 ptrace
+/// ABI shares these numbers across bitnesses). NOT exposed by the `libc`
+/// crate for x86_64 targets (verified: libc-0.2.189's
+/// unix/linux_like/linux/gnu/b64/x86_64/mod.rs defines PTRACE_GETFPXREGS
+/// but not the THREAD_AREA pair), so we bind them as literals — the same
+/// pattern this file already uses for PTRACE_GETREGS = 12.
+const PTRACE_GET_THREAD_AREA: libc::c_long = 25;
+const PTRACE_SET_THREAD_AREA: libc::c_long = 26;
+
+/// The x86_64 kernel's per-task TLS GDT entry range (arch/x86/include/
+/// asm/segment.h, the `#else /* 64-bit: */` block):
+///   GDT_ENTRY_TLS_MIN 12, GDT_ENTRY_TLS_MAX 14 → selectors 0x63/0x6b/0x73.
+///
+/// i386 KERNELS use 6..8 — but kr64 is a 64-bit binary, so the host
+/// kernel is ALWAYS x86_64, and do_set_thread_area() validates every
+/// entry index (syscall AND ptrace path) against the KERNEL's range:
+/// `if (idx < GDT_ENTRY_TLS_MIN || idx > GDT_ENTRY_TLS_MAX) return
+/// -EINVAL;` (arch/x86/kernel/tls.c). A 32-bit child on an x86_64 kernel
+/// therefore CANNOT use the i386-classic entry 6 — and selector 0x33
+/// (6*8+3) on an x86_64 kernel is __USER_CS (the 64-bit CODE segment,
+/// base 0), NOT a TLS entry. Loading %gs=0x33 there makes every
+/// %gs-relative access hit absolute address 0 + offset → the classic
+/// SIGSEGV at si_addr≈0x3c/0x0 failure mode.
+const X86_64_GDT_ENTRY_TLS_MIN: i64 = 12;
+const X86_64_GDT_ENTRY_TLS_MAX: i64 = 14;
+
+/// Byte offset of the `gs` selector slot inside the 64-bit
+/// `user_regs_struct` pt-reg area (index 26 of the 27 u64 slots — see
+/// the field-order comment above ABI_X86_64). Used with
+/// PTRACE_POKEUSER to load the child's %gs WITHOUT a full SETREGS: an
+/// invalid-segment rejection on a full SETREGS would also roll back the
+/// syscall-number rewrite in the same register buffer, while POKEUSER
+/// isolates the segment write (and putreg() truncates the value to
+/// 16 bits + validates it as a user selector).
+const REG_X86_64_GS_BYTE_OFFSET: libc::c_long = 26 * 8;
+
+/// Bit positions inside the flags word (offset 12) of `struct user_desc`
+/// (arch/x86/include/uapi/asm/ldt.h):
+///   bit 0 seg_32bit, bits 1-2 contents, bit 3 read_exec_only,
+///   bit 4 limit_in_pages, bit 5 seg_not_present, bit 6 useable,
+///   bit 7 lm (x86_64 kernels only — for a 32-bit program this bit is
+///   UNINITIALIZED PADDING).
+///
+/// The x86_64 kernel's fill_ldt() copies `lm` straight into the GDT
+/// descriptor's L bit; a stray 1 there makes the descriptor a 64-bit
+/// segment, which a 32-bit process cannot use as a data segment. The
+/// uapi header itself states the kernel "must act as though lm == 0"
+/// for user_descs that come from 32-bit programs — the tracer enforces
+/// exactly that by masking to the 7 documented i386 bits in every
+/// descriptor it synthesizes.
+const USER_DESC_FLAGS_VALID_MASK: u32 = 0x7f;
+
+/// The 16-byte `struct user_desc` as handed to set_thread_area(2) and
+/// PTRACE_{GET,SET}_THREAD_AREA.
+///
+/// THE MAKE-OR-BREAK DETAIL (verified against /usr/include/x86_64-
+/// linux-gnu/asm/ldt.h, the kernel's own uapi header): the layout is
+/// IDENTICAL for i386 and x86_64 — entry_number@0, base_addr@4, limit@8,
+/// flags@12, four u32 fields, sizeof == 16 on BOTH. `base_addr` is
+/// `unsigned int` (u32) even in the x86_64 build — NOT `unsigned long`.
+/// The ONLY 64-bit addition is the lm:1 bit inside the existing flags
+/// word (masked off, see USER_DESC_FLAGS_VALID_MASK). This is why the
+/// tracer can copy the child's 16 bytes verbatim (entry_number fixed
+/// up) and pass them to the kernel as the TRACER's own user_desc —
+/// arch/x86/kernel/ptrace.c does copy_from_user(&info, user_desc,
+/// sizeof(info)) against the TRACER's address space, and a 16-byte
+/// buffer satisfies both bitnesses' struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildUserDesc {
+    entry_number: u32,
+    base_addr: u32,
+    limit: u32,
+    flags: u32,
+}
+
+impl ChildUserDesc {
+    fn from_le_bytes(b: &[u8]) -> Option<ChildUserDesc> {
+        if b.len() < 16 {
+            return None;
+        }
+        Some(ChildUserDesc {
+            entry_number: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            base_addr: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            limit: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            flags: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+        })
+    }
+
+    /// seg_not_present (flags bit 5). A GDT TLS slot whose stored
+    /// descriptor reads back with seg_not_present == 1 is FREE: the
+    /// kernel's fill_user_desc() sets it from `!desc->p` and empty
+    /// tls_array slots report not-present. This is the userspace-visible
+    /// mirror of get_free_idx()/desc_empty() in arch/x86/kernel/tls.c,
+    /// which is what the REAL syscall uses to auto-allocate.
+    fn seg_not_present(&self) -> bool {
+        (self.flags >> 5) & 1 == 1
+    }
+}
+
+/// Choose the GDT TLS entry index for a set_thread_area install.
+///
+/// Mirrors arch/x86/kernel/tls.c do_set_thread_area():
+///   1. If the child's user_desc.entry_number is already a valid
+///      KERNEL-side entry (12..=14 on the x86_64 host kernel), honour
+///      it — bionic's pthread code re-installs TLS this way after
+///      reading the entry number back out of %gs
+///      (`__init_user_desc(&td, false /*allocate*/, …)`).
+///   2. Otherwise — bionic's __set_tls passes entry_number = -1
+///      (auto-allocate), and a legacy-32-bit caller may hardcode 6/7/8,
+///      which the x86_64 kernel rejects with -EINVAL — pick the FIRST
+///      FREE slot of 12..=14, probing each with PTRACE_GET_THREAD_AREA
+///      exactly like the kernel's get_free_idx() walks t->tls_array.
+///      Because the probe reads the same kernel-maintained array the
+///      real syscall would, this stays correct even across exec cycles
+///      (a stale occupied slot is skipped, mirroring the kernel).
+///   3. If the probe is unavailable (request rejected) assume the first
+///      slot is free; if every slot is occupied, reuse slot 12 (the
+///      traced children are effectively single-threaded at TLS-install
+///      time, so 3 slots is 3 installs deep).
+fn choose_tls_entry(child_entry: u32, probe: impl Fn(i64) -> Option<ChildUserDesc>) -> i64 {
+    let e = child_entry as i32 as i64;
+    if (X86_64_GDT_ENTRY_TLS_MIN..=X86_64_GDT_ENTRY_TLS_MAX).contains(&e) {
+        return e;
+    }
+    for idx in X86_64_GDT_ENTRY_TLS_MIN..=X86_64_GDT_ENTRY_TLS_MAX {
+        match probe(idx) {
+            Some(d) => {
+                if d.seg_not_present() {
+                    return idx; // free — the desc_empty() equivalent
+                }
+            }
+            None => {
+                // PTRACE_GET_THREAD_AREA rejected — treat the first slot
+                // as free (a fresh child that never installed TLS).
+                return X86_64_GDT_ENTRY_TLS_MIN;
+            }
+        }
+    }
+    X86_64_GDT_ENTRY_TLS_MIN
+}
+
+/// PTRACE_GET_THREAD_AREA(pid, entry_index, &user_desc) — the kernel
+/// fills a 16-byte `struct user_desc` IN THE TRACER'S MEMORY
+/// (arch/x86/kernel/ptrace.c:
+///   `do_get_thread_area(child, addr, (struct user_desc __user *)data)`).
+/// Returns None on any rejection (EINVAL out-of-range index, EIO
+/// unsupported request, ESRCH dead child).
+fn ptrace_get_child_tls_desc(pid: libc::pid_t, entry_index: i64) -> Option<ChildUserDesc> {
+    let mut buf = [0u8; 16];
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            PTRACE_GET_THREAD_AREA,
+            pid as libc::c_long,
+            entry_index as libc::c_long,
+            buf.as_mut_ptr() as *mut libc::c_void,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    ChildUserDesc::from_le_bytes(&buf)
+}
+
+/// PTRACE_SET_THREAD_AREA(pid, entry_index, &user_desc) — install a GDT
+/// TLS descriptor in the CHILD. The kernel copy_from_user()s the 16-byte
+/// user_desc FROM THE TRACER, validates it with tls_desc_okay() — which
+/// requires seg_32bit=1, contents<=1 (data), seg_not_present=0 for
+/// non-empty descriptors (bionic's descriptor passes all three) — then
+/// writes child->thread.tls_array[entry-12]. The per-CPU GDT copy is
+/// loaded by load_TLS() when the ptrace-stopped child is context-
+/// switched back in (set_tls_desc() only loads immediately for
+/// `t == current`, which is the TRACER here, not the child).
+///
+/// NOTE: the ptrace path passes can_allocate = 0
+/// (arch/x86/kernel/ptrace.c:
+///   `do_set_thread_area(child, addr, (struct user_desc __user *)data, 0)`)
+/// so the entry index comes from the `addr` ARGUMENT — never from
+/// user_desc.entry_number — and NO auto-allocation happens and NO
+/// entry_number is written back anywhere by the kernel. That is why the
+/// tracer must compute the index itself (choose_tls_entry) and write it
+/// back into the child's user_desc (the real syscall does that with
+/// put_user()).
+fn ptrace_set_child_tls_desc(
+    pid: libc::pid_t,
+    entry_index: i64,
+    desc: &ChildUserDesc,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&desc.entry_number.to_le_bytes());
+    buf[4..8].copy_from_slice(&desc.base_addr.to_le_bytes());
+    buf[8..12].copy_from_slice(&desc.limit.to_le_bytes());
+    buf[12..16].copy_from_slice(&(desc.flags & USER_DESC_FLAGS_VALID_MASK).to_le_bytes());
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            PTRACE_SET_THREAD_AREA,
+            pid as libc::c_long,
+            entry_index as libc::c_long,
+            buf.as_ptr() as *const libc::c_void,
+        )
+    };
+    if r == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// PTRACE_POKEUSER a 16-bit %gs selector into the stopped child's
+/// register file (64-bit user_regs_struct view; gs slot byte offset
+/// 26*8). putreg() → set_segment_reg() stores it into
+/// child->thread.gsindex, and load_seg_legacy() in __switch_to loads
+/// ONLY the selector for a real GDT segment (index > 3) — "Loading the
+/// selector is sufficient" (arch/x86/kernel/process_64.c) — after
+/// load_TLS() has written our descriptor into the per-CPU GDT in the
+/// same context switch. The CPU then resolves the %gs base from the GDT
+/// entry itself, so the (possibly stale) thread.gsbase is irrelevant
+/// for a real-segment selector.
+fn poke_child_gs_selector(pid: libc::pid_t, selector: u16) -> std::io::Result<()> {
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            libc::PTRACE_POKEUSER,
+            pid as libc::c_long,
+            REG_X86_64_GS_BYTE_OFFSET,
+            selector as libc::c_long,
+        )
+    };
+    if r == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Zero the `revents` field of every `struct pollfd` in the child's pollfd
 /// array, so the caller sees "no events" in BOTH the syscall return value
 /// (faked to 0 separately) AND the pollfd struct's revents field.
@@ -3848,6 +4134,14 @@ pub fn run_ptrace_loop(
     // Task 6-Z28: pending flag for poll() return fake. Set at the ENTRY
     // stop (when init calls poll), consumed at the EXIT stop (fake return 0).
     let mut pending_poll_fake: bool = false;
+    // Task 6-Z69: pending flag for set_thread_area() return fake. Set at
+    // the ENTRY stop when the dedicated TLS arm installs the GDT
+    // descriptor + rewrites the syscall to getpid; consumed at the
+    // matching EXIT stop to force return 0 (the kernel just executed
+    // getpid, whose return — the pid, or -38 if seccomp blocks i386
+    // getpid too — must not leak into bionic's __set_tls, which treats
+    // any rc == -1 as failure and would SKIP loading %gs).
+    let mut pending_set_thread_area_fake: bool = false;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
     //
@@ -5189,6 +5483,10 @@ pub fn run_ptrace_loop(
                     // union { entry{nr,args[6]}; exit{rval,is_error}; ... }
                     payload: [u64; 7],
                 }
+                // NOTE: the libc crate types ptrace's `request` param
+                // per-target — c_uint on glibc, c_int on android. The
+                // `as _` cast satisfies BOTH (the android build's E0308
+                // found by Agent K after run 32605836915 failed to build).
                 const PTRACE_GET_SYSCALL_INFO_REQ: libc::c_uint = 0x420e;
                 const SYSCALL_INFO_OP_ENTRY: u8 = 1;
                 const SYSCALL_INFO_OP_EXIT: u8 = 2;
@@ -5196,7 +5494,7 @@ pub fn run_ptrace_loop(
                 let mut sc_info: PtraceSyscallInfo = unsafe { std::mem::zeroed() };
                 let gsi_result = unsafe {
                     libc::ptrace(
-                        PTRACE_GET_SYSCALL_INFO_REQ,
+                        PTRACE_GET_SYSCALL_INFO_REQ as _,
                         pid,
                         std::mem::size_of::<PtraceSyscallInfo>(),
                         &mut sc_info as *mut PtraceSyscallInfo,
@@ -6504,6 +6802,162 @@ pub fn run_ptrace_loop(
                                 )),
                             }
                         }
+                        // ── Task 6-Z69: set_thread_area ENTRY → REAL TLS
+                        // install via PTRACE_SET_THREAD_AREA ──
+                        //
+                        // Bionic installs its %gs-based thread pointer
+                        // with set_thread_area(2): the dynamic linker
+                        // does it in __linker_init → __libc_init_tls →
+                        // __set_tls(main_thread.tls) BEFORE loading
+                        // libc.so, and the static init does the same in
+                        // its post-execve __libc_init. E2E run
+                        // 32604929372: nr=243 fired 28×, every return
+                        // -38 (seccomp filter block).
+                        //
+                        // The old fake (i386_enosys_fake_value 243 → 0)
+                        // returns "success" WITHOUT installing anything.
+                        // Bionic's __set_tls then reads the STILL-(-1)
+                        // entry_number back out of its user_desc (the
+                        // kernel normally writes the allocated entry
+                        // there via put_user), computes selector
+                        // (u16)((-1 << 3) | 3) == 0xfffb, and its
+                        // `movw %w0, %%gs` faults — or, if the return
+                        // leaks as -1, bionic skips the %gs load
+                        // entirely and every later %gs-relative access
+                        // (errno, stack protector, pthread) SIGSEGVs.
+                        //
+                        // This arm does what the REAL syscall does:
+                        //   1. read the child's 16-byte struct user_desc
+                        //      (ebx = arg1; layout verified identical for
+                        //      i386 child + x86_64 kernel, see
+                        //      ChildUserDesc);
+                        //   2. choose the GDT TLS entry: 12..=14 on the
+                        //      x86_64 host kernel (the i386-classic 6 is
+                        //      REJECTED with -EINVAL there — see
+                        //      X86_64_GDT_ENTRY_TLS_MIN);
+                        //   3. PTRACE_SET_THREAD_AREA installs the
+                        //      descriptor into child->thread.tls_array;
+                        //      load_TLS() publishes it into the per-CPU
+                        //      GDT when the child is resumed;
+                        //   4. write the chosen entry_number back into
+                        //      the child's user_desc — bionic REQUIRES
+                        //      it: it builds the %gs selector from the
+                        //      RETURNED entry number, never from a
+                        //      constant;
+                        //   5. PTRACE_POKEUSER %gs = entry*8|3 (0x63 for
+                        //      entry 12) — belt-and-suspenders; bionic
+                        //      also executes its own `movw %w0, %%gs`
+                        //      right after the syscall returns;
+                        //   6. rewrite the syscall to getpid (the proven
+                        //      6-Z9 xattr pattern) so seccomp evaluates
+                        //      getpid instead of 243 — even if getpid is
+                        //      itself blocked, the pending EXIT fake
+                        //      forces return 0.
+                        n if abi.set_thread_area_nr != -1
+                            && n == abi.set_thread_area_nr =>
+                        {
+                            let u_info_addr = get_syscall_arg(&regs, abi.reg_arg1);
+                            let desc_read = read_child_bytes(pid, u_info_addr, 16);
+                            match desc_read
+                                .as_deref()
+                                .and_then(ChildUserDesc::from_le_bytes)
+                            {
+                                Some(child_desc) => {
+                                    let entry = choose_tls_entry(
+                                        child_desc.entry_number,
+                                        |idx| ptrace_get_child_tls_desc(pid, idx),
+                                    );
+                                    let mut kernel_desc = child_desc;
+                                    kernel_desc.entry_number = entry as u32;
+                                    // Keep the 7 documented i386 flag bits;
+                                    // drop lm + any stack garbage above bit 6.
+                                    kernel_desc.flags &= USER_DESC_FLAGS_VALID_MASK;
+                                    match ptrace_set_child_tls_desc(pid, entry, &kernel_desc) {
+                                        Ok(()) => {
+                                            // (4) entry_number write-back:
+                                            // single PEEK/POKE word RMW at the
+                                            // (≥4-byte-aligned) struct address;
+                                            // only the struct's own first 4
+                                            // bytes change.
+                                            let mut wrote_back = false;
+                                            let word = unsafe {
+                                                libc::ptrace(
+                                                    libc::PTRACE_PEEKDATA,
+                                                    pid,
+                                                    u_info_addr as i64,
+                                                    0,
+                                                )
+                                            };
+                                            if word != -1 {
+                                                let merged = ((word as u64
+                                                    & 0xFFFF_FFFF_0000_0000)
+                                                    | entry as u64)
+                                                    as libc::c_long;
+                                                let poke_r = unsafe {
+                                                    libc::ptrace(
+                                                        libc::PTRACE_POKEDATA,
+                                                        pid,
+                                                        u_info_addr as i64,
+                                                        merged,
+                                                    )
+                                                };
+                                                wrote_back = poke_r != -1;
+                                            }
+                                            if !wrote_back {
+                                                log(&format!(
+                                                    "DIAG set_thread_area ENTRY: entry_number write-back to {:#x} FAILED — bionic will build a bogus %gs selector from the stale entry_number {} (Task 6-Z69)",
+                                                    u_info_addr,
+                                                    child_desc.entry_number as i32
+                                                ));
+                                            }
+                                            // (5) %gs selector — ONLY after a
+                                            // successful install, so %gs can
+                                            // never point at a not-present
+                                            // GDT entry.
+                                            let selector = ((entry << 3) | 3) as u16;
+                                            if let Err(e) =
+                                                poke_child_gs_selector(pid, selector)
+                                            {
+                                                log(&format!(
+                                                    "DIAG set_thread_area ENTRY: POKEUSER gs={:#06x} FAILED: {} — relying on bionic's own movw %gs (Task 6-Z69)",
+                                                    selector, e
+                                                ));
+                                            }
+                                            // (6) rewrite to getpid; the pending
+                                            // EXIT fake below forces return 0.
+                                            pending_set_thread_area_fake = true;
+                                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                                            match ptrace_setregs(pid, &regs, iov_len) {
+                                                Ok(()) => log(&format!(
+                                                    "DIAG set_thread_area ENTRY: TLS INSTALLED — GDT entry {} (selector {:#06x}) base={:#x} limit={:#x} flags={:#04x}; entry_number written back to child user_desc @ {:#x}; syscall {} rewritten to getpid {} (EXIT fakes return 0) (Task 6-Z69)",
+                                                    entry,
+                                                    selector,
+                                                    kernel_desc.base_addr,
+                                                    kernel_desc.limit,
+                                                    kernel_desc.flags,
+                                                    u_info_addr,
+                                                    syscall_num,
+                                                    abi.getpid
+                                                )),
+                                                Err(e) => log(&format!(
+                                                    "DIAG set_thread_area ENTRY: REWRITE FAILED: ptrace_setregs: {} — kernel will execute the blocked 243 (TLS entry {} IS installed; the pending EXIT fake still forces 0) (Task 6-Z69)",
+                                                    e, entry
+                                                )),
+                                            }
+                                        }
+                                        Err(e) => log(&format!(
+                                            "DIAG set_thread_area ENTRY: PTRACE_SET_THREAD_AREA(entry {}) FAILED: {} — no TLS installed, no rewrite; the -38 EXIT path (fake 0) is the pre-6-Z69 behaviour (Task 6-Z69)",
+                                            entry, e
+                                        )),
+                                    }
+                                }
+                                None => log(&format!(
+                                    "DIAG set_thread_area ENTRY: user_desc @ {:#x} unreadable ({}/16 bytes) — no TLS installed (pre-6-Z69 fake-0 behaviour) (Task 6-Z69)",
+                                    u_info_addr,
+                                    desc_read.map(|b| b.len()).unwrap_or(0)
+                                )),
+                            }
+                        }
                         _ => {
                             // Not an intercepted syscall — let it through.
                         }
@@ -7441,6 +7895,56 @@ pub fn run_ptrace_loop(
                             }
                             Err(e) => log(&format!(
                                 "DIAG poll EXIT: ptrace_getregs FAILED: {} — cannot fake return",
+                                e
+                            )),
+                        }
+                    }
+
+                    // ── Task 6-Z69: set_thread_area EXIT → fake return 0 ──
+                    //
+                    // Consumes the `pending_set_thread_area_fake` flag set
+                    // at the ENTRY stop (where the dedicated TLS arm
+                    // installed the GDT descriptor via
+                    // PTRACE_SET_THREAD_AREA and rewrote the syscall to
+                    // getpid). At this EXIT stop the kernel has executed
+                    // getpid — whose return is either the pid (positive)
+                    // or -38 (seccomp blocks i386 getpid too). Neither
+                    // may leak into bionic's __set_tls: the real
+                    // set_thread_area returns 0 on success, and bionic's
+                    // raw syscall wrapper turns any negative into
+                    // rc == -1, which makes __set_tls SKIP the
+                    // `movw %w0, %%gs` entirely. Force rax = 0.
+                    //
+                    // Ordering vs the 6-Z60 generic EXIT gate below: this
+                    // block runs FIRST and writes rax=0; the generic gate
+                    // then re-reads FRESH registers, sees a non-error
+                    // return (0), and preserves it — no interference
+                    // (same belt-and-suspenders relationship the
+                    // pending_xattr_fake block has).
+                    if pending_set_thread_area_fake {
+                        pending_set_thread_area_fake = false;
+                        let exit_syscall_num = syscall_num;
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        match ptrace_getregs(pid, &mut regs2) {
+                            Ok(len) => {
+                                let original_ret =
+                                    get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                match ptrace_setregs(pid, &regs2, len) {
+                                    Ok(()) => log(&format!(
+                                        "DIAG set_thread_area EXIT: faked return 0 (getpid returned {}; exit-syscall_num={} [{}] — if [getpid], the ENTRY rewrite succeeded) — GDT TLS entry was installed at ENTRY; bionic loads %gs from the written-back entry_number (Task 6-Z69)",
+                                        original_ret,
+                                        exit_syscall_num,
+                                        syscall_name(exit_syscall_num, &abi)
+                                    )),
+                                    Err(e) => log(&format!(
+                                        "DIAG set_thread_area EXIT FAKE FAILED: ptrace_setregs: {} — child sees {} for set_thread_area; bionic may skip loading %gs (Task 6-Z69)",
+                                        e, original_ret
+                                    )),
+                                }
+                            }
+                            Err(e) => log(&format!(
+                                "DIAG set_thread_area EXIT: ptrace_getregs FAILED: {} — cannot fake return 0 (Task 6-Z69)",
                                 e
                             )),
                         }
@@ -12344,5 +12848,155 @@ mod tests {
         assert_eq!(rec.fd, 7);
         assert_eq!(rec.length, 0x1000);
         assert_eq!(rec.offset_bytes, 0x2000);
+    }
+
+    // ── Task 6-Z69 tests: set_thread_area TLS/GDT emulation ──────────
+
+    #[test]
+    fn child_user_desc_roundtrip_is_16_bytes_same_layout_both_bitnesses() {
+        // The i386 child's user_desc AND the x86_64 kernel's user_desc are
+        // both 16 bytes with identical field offsets (uapi asm/ldt.h:
+        // entry_number@0, base_addr@4, limit@8, flags@12 — base_addr is
+        // u32 in BOTH builds). This is what lets the tracer hand the
+        // child's bytes to PTRACE_SET_THREAD_AREA as its own struct.
+        let d = ChildUserDesc {
+            entry_number: 0xffff_ffff, // bionic __set_tls passes -1
+            base_addr: 0xa000_1234,
+            limit: 0x1000,             // bionic uses PAGE_SIZE as limit
+            flags: 0x7f,               // seg_32bit|contents|limit_in_pages|useable
+        };
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&d.entry_number.to_le_bytes());
+        b[4..8].copy_from_slice(&d.base_addr.to_le_bytes());
+        b[8..12].copy_from_slice(&d.limit.to_le_bytes());
+        b[12..16].copy_from_slice(&d.flags.to_le_bytes());
+        let parsed = ChildUserDesc::from_le_bytes(&b).unwrap();
+        assert_eq!(parsed, d);
+        // A short buffer must be rejected — the handler must not guess.
+        assert!(ChildUserDesc::from_le_bytes(&b[..15]).is_none());
+    }
+
+    #[test]
+    fn choose_tls_entry_honours_valid_kernel_entries() {
+        // An entry already inside the x86_64 kernel's 12..=14 TLS range
+        // is honoured (bionic's pthread code re-installs this way after
+        // reading the entry number back out of %gs).
+        for valid in [12i64, 13, 14] {
+            assert_eq!(
+                choose_tls_entry(valid as u32, |_| None),
+                valid,
+                "entry {} is kernel-valid and must be honoured",
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn choose_tls_entry_auto_alloc_picks_first_free_x86_64_slot() {
+        // bionic passes entry_number = -1 (0xffffffff). With every slot
+        // free (probes report not-present descriptors), the kernel's
+        // get_free_idx() would return GDT_ENTRY_TLS_MIN = 12.
+        let free = |_: i64| {
+            Some(ChildUserDesc {
+                entry_number: 0,
+                base_addr: 0,
+                limit: 0,
+                flags: 1 << 5, // seg_not_present → slot is FREE
+            })
+        };
+        assert_eq!(choose_tls_entry(0xffff_ffff, free), 12);
+    }
+
+    #[test]
+    fn choose_tls_entry_skips_occupied_slots() {
+        // Slot 12 occupied (present descriptor), slot 13 free → 13,
+        // mirroring get_free_idx()'s first-free walk over tls_array.
+        let probe = |idx: i64| {
+            Some(ChildUserDesc {
+                entry_number: idx as u32,
+                base_addr: if idx == 12 { 0xa000_0000 } else { 0 },
+                limit: 0,
+                flags: if idx == 12 { 0x51 } else { 1 << 5 },
+                // 0x51 = bionic's live descriptor (seg_32bit |
+                // limit_in_pages | useable — PRESENT); 1<<5 =
+                // seg_not_present (FREE).
+            })
+        };
+        assert_eq!(choose_tls_entry(0xffff_ffff, probe), 13);
+    }
+
+    #[test]
+    fn choose_tls_entry_maps_legacy_i386_six_to_kernel_range() {
+        // A legacy 32-bit caller hardcoding i386 TLS entry 6 gets EINVAL
+        // from the x86_64 kernel (valid range 12..=14); selector 0x33 on
+        // x86_64 is __USER_CS, NOT a TLS entry. The handler must
+        // re-allocate instead of honouring 6.
+        let free = |_: i64| {
+            Some(ChildUserDesc {
+                entry_number: 0,
+                base_addr: 0,
+                limit: 0,
+                flags: 1 << 5,
+            })
+        };
+        assert_eq!(choose_tls_entry(6, free), 12);
+    }
+
+    #[test]
+    fn choose_tls_entry_falls_back_to_slot_12_when_probe_unavailable() {
+        // PTRACE_GET_THREAD_AREA rejected (None) → assume the first slot
+        // is free (a fresh child that never installed TLS).
+        assert_eq!(choose_tls_entry(0xffff_ffff, |_| None), 12);
+    }
+
+    #[test]
+    fn choose_tls_entry_reuses_slot_12_when_all_occupied() {
+        // Every slot reports a present descriptor → reuse slot 12
+        // (single-threaded child, best-effort overwrite).
+        let occupied = |_: i64| {
+            Some(ChildUserDesc {
+                entry_number: 0,
+                base_addr: 0xa000_0000,
+                limit: 0x1000,
+                flags: 0x51, // PRESENT (seg_32bit | limit_in_pages | useable)
+            })
+        };
+        assert_eq!(choose_tls_entry(0xffff_ffff, occupied), 12);
+    }
+
+    #[test]
+    fn user_desc_flags_mask_drops_lm_bit_and_garbage() {
+        // The child's flags word can carry stack garbage in the bits
+        // above the 7 documented i386 flag bits — including bit 7, which
+        // the x86_64 kernel reads as `lm`. fill_ldt() copies lm into the
+        // GDT descriptor's L bit, which would make the segment 64-bit
+        // (unloadable as a 32-bit data segment). The mask must keep
+        // exactly bits 0..=6.
+        let mut d = ChildUserDesc {
+            entry_number: 12,
+            base_addr: 0xa000_0000,
+            limit: 0x1000,
+            flags: 0xff, // all documented bits + lm (0x80)
+        };
+        d.flags &= USER_DESC_FLAGS_VALID_MASK;
+        assert_eq!(d.flags, 0x7f);
+    }
+
+    #[test]
+    fn tls_selector_math_matches_kernel_gdt_entry_twelve() {
+        // GDT entry 12 → selector 12*8 | 3 = 0x63 (TI=GDT, RPL=3).
+        assert_eq!(((12i64 << 3) | 3) as u16, 0x63);
+    }
+
+    #[test]
+    fn i386_set_thread_area_is_243_and_keeps_fake_fallback() {
+        // __NR_set_thread_area = 243 on i386; the ABI fields must carry
+        // it only for i386 (x86_64/aarch64 sentinels). The ENOSYS
+        // fake-value fallback stays 0 for the rare path where the
+        // dedicated ENTRY arm never ran (phase DESYNC or unreadable
+        // user_desc) — pre-6-Z69 behaviour, better than a leaked -38.
+        assert_eq!(ABI_X86_32.set_thread_area_nr, 243);
+        assert_eq!(ABI_X86_64.set_thread_area_nr, -1);
+        assert_eq!(i386_enosys_fake_value(243), 0);
     }
 }
