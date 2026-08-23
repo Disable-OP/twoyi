@@ -7507,7 +7507,18 @@ pub fn run_ptrace_loop(
                         // 500 shows syscalls #201-#500 (~200KB file, manageable
                         // for the tee). This will reveal what init is blocked on
                         // (poll/futex/read on a socket/FIFO).
-                        if post_execve_syscall_count <= 500 {
+                        //
+                        // Task 6-Z98 (run 32663728329): raised 500 → 3000. The
+                        // 500-cap ended EXACTLY at the AOSP-11 dynamic-linker
+                        // storm (#500 was still openat on staged /dev libs), so
+                        // everything after — the loader constructor tail, init's
+                        // FirstStageMain, the daemonize fork and the re-anchored
+                        // child's full 209-iteration stillborn story (49×
+                        // mprotect + exit_group(0)) — was DARK. 3000 covers the
+                        // whole exec'd lifetime (~4839 iterations ≈ 2400 syscall
+                        // pairs) so the next run captures the child's path
+                        // verbatim (including every mprotect ENTRY).
+                        if post_execve_syscall_count <= 3000 {
                             log(&format!(
                                 "post-execve syscall #{}: nr={} [{}]",
                                 post_execve_syscall_count,
@@ -7567,6 +7578,49 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // Task 6-Z98: exit_group DIAG for the CURRENT init child
+                    // (the possibly re-anchored "real init").
+                    //
+                    // Run 32663728329 (head fb89bfba): after the 6-Z97
+                    // re-anchor the adopted child 7049 lived only 209
+                    // iterations (49× mprotect + exit_group(0), NO execve, no
+                    // AOSP first-stage signature) — the stillborn-real-init
+                    // case. Its tail only surfaced at REAP time via the shared
+                    // "last 50 ALL syscalls" dump, with no syscall ARGS and
+                    // no ENTRY-time attribution. When the CURRENT init_pid
+                    // calls exit_group with a small code, dump its last
+                    // RECENT_ALL_SYSCALLS_CAP ALL-syscalls ring UNCONDITIONALLY
+                    // at ENTRY — before the reaper can misattribute anything —
+                    // together with the exit code and PC, so the forensics of
+                    // the silent exit(0) (which syscalls preceded the mprotect
+                    // sweep) are always on record.
+                    if pid == init_pid && syscall_num == abi.exit_group_nr {
+                        let exit_code = get_syscall_arg(&regs, abi.reg_arg1);
+                        if exit_code < 128 {
+                            // x86_64 user_regs_struct: RIP is u64 index 16
+                            // (same raw-index read the SIGSEGV forensics
+                            // uses below). Tells us WHERE in the (closed
+                            // ROM) binary the exit_group was issued.
+                            let regs_ptr = &regs as *const Regs as *const u64;
+                            let rip = unsafe { *regs_ptr.add(16) };
+                            let tail: std::collections::VecDeque<i64> = recent_all_syscalls
+                                .iter()
+                                .rev()
+                                .take(RECENT_ALL_SYSCALLS_CAP)
+                                .rev()
+                                .cloned()
+                                .collect();
+                            log(&format!(
+                                "6-Z98 DIAG: init child pid={} exit_group({}) at ENTRY (rip={:#x}) — last {} ALL syscalls (unconditional, oldest->newest): {}",
+                                pid,
+                                exit_code,
+                                rip,
+                                tail.len(),
+                                format_syscall_buffer(&tail, Some(abi))
+                            ));
+                        }
+                    }
+
                     // ── Post-execve PATH logging ──────────────────────
                     //
                     // The existing "intercepted open({}) -> {}" log below
@@ -7591,7 +7645,12 @@ pub fn run_ptrace_loop(
                     // additionally log arg2 (target) and arg3 (fstype) so
                     // we can see exactly what init is mounting where.
                     // Task 6-Z26: raised from 200 to 500 (see ENTRY gate above).
-                    if past_first_execve && post_execve_syscall_count <= 500 {
+                    // Task 6-Z98: raised 500 → 3000 in lockstep with the
+                    // "post-execve syscall #N" ENTRY gate above — the path
+                    // lines identified the re-anchored child's /proc/self/comm
+                    // + fstab probes in run 32663728329, and the #500 cutoff
+                    // landed mid-linker-storm.
+                    if past_first_execve && post_execve_syscall_count <= 3000 {
                         let path_idx = match syscall_num {
                             n if n == abi.open => Some(abi.reg_arg1),
                             n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
