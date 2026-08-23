@@ -268,24 +268,26 @@ jobs:
           sleep 2
 
           $ADB shell "run-as io.twoyi.debug mkdir -p profiles/default/rootfs"
-          # Try device-side xz extraction first (toybox tar -J on API 30).
-          EXTRACT_OK=0
-          # Scoped storage: the app uid cannot READ /sdcard/Download
-          # (owned by shell). Pipe through the SHELL uid instead — cat
-          # runs as shell (can read), run-as tar reads STDIN.
-          $ADB shell "cat /sdcard/Download/profile_default_export.tar.xz | run-as io.twoyi.debug tar -xJ -C profiles/default/rootfs" && EXTRACT_OK=1 || EXTRACT_OK=0
-          if [ "$EXTRACT_OK" != "1" ]; then
-              echo "  device tar -xJf failed — falling back to runner-side gzip repack"
-              xz -dc profile_default_export.tar.xz | gzip -6 > profile_rootfs.tar.gz
-              ls -la profile_rootfs.tar.gz
-              $ADB push profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
-              $ADB shell "cat /sdcard/Download/profile_rootfs.tar.gz | run-as io.twoyi.debug tar -xz -C profiles/default/rootfs"
-          fi
 
-          # Verify the guest init landed.
+          # Device-side xz does NOT work (toybox tar -J shells out to an
+          # `xz` binary the emulator does not ship — run 32628477296:
+          # 'tar: exec xz: No such file or directory'). Repack to GZIP on
+          # the runner (toybox tar -z is built-in).
+          echo "  repacking xz -> gzip on the runner..."
+          xz -dc profile_default_export.tar.xz | gzip -6 > profile_rootfs.tar.gz
+          ls -la profile_rootfs.tar.gz
+          $ADB push profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
+
+          # Scoped storage: the app uid cannot READ /sdcard/Download
+          # (owned by shell). Pipe through the SHELL uid — cat runs as
+          # shell (allowed), run-as tar reads STDIN.
+          $ADB shell "cat /sdcard/Download/profile_rootfs.tar.gz | run-as io.twoyi.debug tar -xz -C profiles/default/rootfs"
+
+          # Honest verification: the guest init must exist.
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/ | head -20"
-          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/init" || {
-              echo "✗ guest init NOT found after extraction"; exit 1; }
+          if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/init"; then
+              echo "✗ guest init NOT found after extraction"; exit 1
+          fi
           echo "  ✓ AOSP rootfs preloaded"
 
       - name: UI navigation — boot AOSP container
