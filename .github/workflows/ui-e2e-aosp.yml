@@ -319,12 +319,26 @@ jobs:
           # 32654425160 + 32657293755: the listing shows init right there).
           # Only test -L (lstat) matches the link itself. The real target
           # check is the rootfs-relative path below.
-          if ! $ADB shell "run-as io.twoyi.debug test -L profiles/default/rootfs/init"; then
-              echo "✗ guest init symlink NOT found after extraction"; exit 1
+          # init is an ABSOLUTE symlink (init -> /system/bin/init): any
+          # reader in the app process resolves it against the EMULATOR's
+          # root — the emulator's /system/bin/init carries the init_exec
+          # SELinux label and untrusted_app CANNOT read it (run 32659738836:
+          # 'FATAL: failed to read init binary: Permission denied' even
+          # though the rootfs copy was right there). REPLACE the symlink
+          # with a hard COPY of the rootfs's own binary.
+          if $ADB shell "run-as io.twoyi.debug test -L profiles/default/rootfs/init"; then
+              $ADB shell "run-as io.twoyi.debug sh -c 'cp profiles/default/rootfs/system/bin/init profiles/default/rootfs/init.real && rm profiles/default/rootfs/init && mv profiles/default/rootfs/init.real profiles/default/rootfs/init && chmod 0755 profiles/default/rootfs/init'"
+              echo "  ✓ replaced the absolute init symlink with a real copy (0755)"
           fi
-          if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/system/bin/init"; then
-              echo "✗ guest init TARGET /system/bin/init not found"; exit 1
+          if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/init" || \
+             ! $ADB shell "run-as io.twoyi.debug sh -c 'test -s profiles/default/rootfs/init'"; then
+              echo "✗ guest init (real file) not found/empty after replacement"; exit 1
           fi
+          # The same absolute-symlink hazard exists across the tree (bin/sh,
+          # etc -> /system/...). Rewrite every ABSOLUTE symlink pointing
+          # into /system or /apex into RELATIVE links rooted at the rootfs.
+          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && find . -type l | while read l; do t=\$(readlink "\$l"); case "\$t" in /system/*|/apex/*|/vendor/*) d=\$(dirname "\$l"); r=\$(realpath --relative-to="\$d" ".\$t" 2>/dev/null); [ -n "\$r" ] && ln -sfn "\$r" "\$l" 2>/dev/null;; esac; done; true'"
+          echo "  ✓ rewrote absolute /system|/apex|/vendor symlinks to relative"
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/bin/linker64" || \
               echo "  (no linker64 — checking x86 linker)"
           echo "  ✓ AOSP x86_64 rootfs preloaded from the AVD system image"
