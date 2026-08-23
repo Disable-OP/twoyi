@@ -4959,8 +4959,26 @@ pub fn run_ptrace_loop(
     // expiry (the armed pid could die in its poll, or its EXIT stop could
     // be suppressed by a seccomp abort — a stale flag must not fake a much
     // later, unrelated EXIT of the same/reused pid).
-    let mut pending_poll_fake_pid: Option<libc::pid_t> = None;
-    let mut pending_poll_fake_armed_at: u64 = 0;
+    //
+    // ── 6-Z87: the single Option<pid> slot above was STILL wrong — it is
+    // now a per-pid MAP (pid → arming loop_count), mirroring the other
+    // per-pid pendings below. ROOT CAUSE of run 32631901109's silent
+    // 2.05 s hang cycles: init armed the ONE slot at its poll ENTRY and
+    // then blocked in its in-kernel poll (the fake property socket never
+    // becomes ready, so init's poll has no timeout → no EXIT stop, ever).
+    // The stale slot then made every OTHER child's poll EXIT hit the
+    // 6-Z83 expiry branch — "dropped without faking (per-pid poll
+    // pending)" fired 37× — and, worse, init's re-arms CLOBBERED TWRP's
+    // own arms (last-arm-wins in a single slot), so TWRP's event-loop
+    // poll EXITs frequently found the slot empty or holding init's pid
+    // and lost their return-0 fake → TWRP saw POLLERR, stopped issuing
+    // syscalls, and the app's 2 s watchdog reaped the container. With
+    // the MAP each pid owns its arm: ENTRY inserts/refreshes (pid,
+    // loop_count); a poll EXIT consumes ONLY its own pid's entry (an
+    // entry for a blocked pid stays armed and harmless); the
+    // 2000-iteration expiry uses the map's stored armed_at.
+    let mut pending_poll_fake: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
     // Task 6-Z69: pending flag for set_thread_area() return fake. Set at
     // the ENTRY stop when the dedicated TLS arm installs the GDT
     // descriptor + rewrites the syscall to getpid; consumed at the
@@ -5666,9 +5684,9 @@ pub fn run_ptrace_loop(
             abi_map.remove(&pid);
             // 6-Z83: drop any pending-fake flag armed by THIS pid so a
             // later pid-reuse can never inherit a stale fake.
-            if pending_poll_fake_pid == Some(pid) {
-                pending_poll_fake_pid = None;
-            }
+            // 6-Z87: the poll fake is now a per-pid map entry — same
+            // hygiene, keyed removal.
+            pending_poll_fake.remove(&pid);
             if pending_xattr_fake_pid == Some(pid) {
                 pending_xattr_fake_pid = None;
             }
@@ -5776,9 +5794,8 @@ pub fn run_ptrace_loop(
             // drop the killed child's cached ABI entry.
             abi_map.remove(&pid);
             // 6-Z83: same stale-flag hygiene as the WIFEXITED branch.
-            if pending_poll_fake_pid == Some(pid) {
-                pending_poll_fake_pid = None;
-            }
+            // 6-Z87: keyed removal from the per-pid poll map.
+            pending_poll_fake.remove(&pid);
             if pending_xattr_fake_pid == Some(pid) {
                 pending_xattr_fake_pid = None;
             }
@@ -8422,8 +8439,11 @@ pub fn run_ptrace_loop(
                     // every other child gets 10ms — still prevents a pure
                     // spin, but lets TWRP's loops run at ~100Hz.
                     if syscall_num == abi.poll_nr {
-                        pending_poll_fake_pid = Some(pid); // 6-Z83: per-pid
-                        pending_poll_fake_armed_at = loop_count;
+                        // 6-Z87: insert/refresh THIS pid's arm in the
+                        // per-pid map (was: single Option<pid> slot that
+                        // init's re-arms clobbered — see the 6-Z87 block
+                        // at the declaration).
+                        pending_poll_fake.insert(pid, loop_count);
                         // 6-Z86: 100ms ONLY for init (POLLERR busy-spin
                         // culprit); 10ms for every forked child (TWRP's
                         // event loops). The child is stopped at the ENTRY
@@ -9624,14 +9644,19 @@ pub fn run_ptrace_loop(
                     // (was: ANY child's next EXIT stop — that global-flag bug
                     // zeroed the recovery linker's mmap2 returns and caused
                     // the deterministic libblkid EPERM death of 32621758534).
-                    // A different child's EXIT leaves the flag armed; the
-                    // flag expires after 2000 loop iterations (armed pid may
-                    // have died in its poll or lost its EXIT stop to a
-                    // seccomp abort — a stale flag must not fake an
-                    // unrelated much-later EXIT, e.g. after pid reuse).
-                    if let Some(poll_armed_pid) = pending_poll_fake_pid {
-                        if poll_armed_pid == pid && syscall_num == abi.poll_nr {
-                            pending_poll_fake_pid = None;
+                    // 6-Z87: the single slot is now a per-pid MAP (see the
+                    // 6-Z87 block at the declaration): this EXIT consults
+                    // ONLY its own pid's entry, so a STALE entry armed by a
+                    // pid that blocked in its poll (init) can neither be
+                    // consumed by nor expire-bomb another pid's EXIT — the
+                    // z86 "dropped without faking" ×37 failure mode. An
+                    // entry for a different pid stays armed (that pid's own
+                    // EXIT will consume or expire it); the >2000-loop expiry
+                    // uses the map's stored armed_at (guard vs a lost EXIT
+                    // stop / seccomp abort / pid reuse).
+                    if let Some(&poll_armed_at) = pending_poll_fake.get(&pid) {
+                        if syscall_num == abi.poll_nr {
+                            pending_poll_fake.remove(&pid);
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
                             match ptrace_getregs(pid, &mut regs2) {
                                 Ok(len) => {
@@ -9642,7 +9667,7 @@ pub fn run_ptrace_loop(
                                         Ok(()) => {
                                             if post_execve_syscall_count <= 500 {
                                                 log(&format!(
-                                                    "DIAG poll EXIT: faked return 0 (was {} — POLLERR) — init sees timeout, processes timer events (Task 6-Z28; 6-Z83: consumed by the ARMING pid {} only)",
+                                                    "DIAG poll EXIT: faked return 0 (was {} — POLLERR) — init sees timeout, processes timer events (Task 6-Z28; 6-Z83: consumed by the ARMING pid {} only; 6-Z87: per-pid map entry)",
                                                     original_ret, pid
                                                 ));
                                             }
@@ -9658,11 +9683,11 @@ pub fn run_ptrace_loop(
                                     e
                                 )),
                             }
-                        } else if loop_count.saturating_sub(pending_poll_fake_armed_at) > 2000 {
-                            pending_poll_fake_pid = None;
+                        } else if loop_count.saturating_sub(poll_armed_at) > 2000 {
+                            pending_poll_fake.remove(&pid);
                             log(&format!(
-                                "6-Z83: poll fake EXPIRED — armed for pid {} at loop {}, now pid {} at loop {}; dropped without faking (per-pid poll pending)",
-                                poll_armed_pid, pending_poll_fake_armed_at, pid, loop_count
+                                "6-Z87: poll fake EXPIRED — armed for pid {} at loop {}, same pid's non-poll EXIT at loop {}; dropped without faking (per-pid poll pending map)",
+                                pid, poll_armed_at, loop_count
                             ));
                         }
                     }
