@@ -2412,117 +2412,117 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
 ///     directory created).
 fn i386_enosys_fake_value(nr: i64) -> i64 {
     match nr {
-        192 => -12,                    // mmap2 → -ENOMEM (never NULL!)
-        219 => 0,                      // madvise → success
-        125 => 0,                      // mprotect → success
-        45 => 0x80000000,              // brk → non-zero "current break"
-        3 => 0,                        // read → 0 == EOF
-        4 => 0,                        // write → 0 bytes written
-        6 => 0,                        // close → success
-        93 => 0,                       // ftruncate → success (properties!)
-        221 => 0,                      // fcntl64 → success
-        5 | 295 => -1,                 // open/openat → error (dedicated
-                                       // handlers cover kmsg/properties)
+        192 => -12,       // mmap2 → -ENOMEM (never NULL!)
+        219 => 0,         // madvise → success
+        125 => 0,         // mprotect → success
+        45 => 0x80000000, // brk → non-zero "current break"
+        3 => 0,           // read → 0 == EOF
+        4 => 0,           // write → 0 bytes written
+        6 => 0,           // close → success
+        93 => 0,          // ftruncate → success (properties!)
+        221 => 0,         // fcntl64 → success
+        5 | 295 => -1,    // open/openat → error (dedicated
+        // handlers cover kmsg/properties)
         186 | 20 | 224 | 199 | 200 | 201 | 202 => 1, // gettid/getpid/uid32/gid32
-        243 => 0,                      // set_thread_area → success
-        78 => 0,                       // gettimeofday → success
-        265 | 264 => 0,                // clock_getres/clock_gettime → success
-        60 => 0,                       // umask → success (mask 0)
-        21 => -(libc::ENODEV as i64),  // mount → -ENODEV (Task 6-Z91).
-                                       // NOTE: on i386 syscall 21 is MOUNT,
-                                       // not access (access is 33 on i386;
-                                       // 21 is access only on x86_64 — the
-                                       // old "access → success" comment was
-                                       // a mislabel). This entry is the EXIT
-                                       // fallback for filter-blocked-but-not-
-                                       // SIGSYS mounts: the rootless sandbox
-                                       // has NO real block devices, so a
-                                       // storage mount (vfat/ext4/…) must be
-                                       // DENIED with -ENODEV — the guest
-                                       // (TWRP) then marks the partition
-                                       // unmountable and proceeds, instead
-                                       // of fake-succeeding, retrying
-                                       // forever and exhausting its stack
-                                       // (run 32637775917: 6,141 mount
-                                       // SIGSYS retries → SIGSEGV at
-                                       // recovery+0xaff3). Pseudo-filesystem
-                                       // mounts (tmpfs/proc/sysfs/…) that
-                                       // reach the SIGSYS handler still get
-                                       // the fake success + real rootfs
-                                       // side-effect ops there — see the
-                                       // dedicated mount arm +
-                                       // is_pseudo_fs_type() (6-Z91).
-                                       // NOTE: while mount stays in
-                                       // compute_exit_return_value's
-                                       // fake-success set (the 5-T fix
-                                       // init's Phase A pseudo mounts
-                                       // depend on in DESYNC mode), that
-                                       // Some(0) takes priority over this
-                                       // entry at the EXIT call site —
-                                       // and the SIGSYS arm's per-fstype
-                                       // write lands AFTER it and wins.
-                                       // This entry exists so the ENODEV
-                                       // semantics survive any future
-                                       // removal of mount from the
-                                       // compute table.
-        39 => 0,                       // mkdir → success (rootfs op done
-                                       // separately by the SIGSYS handler)
-        191 => -1,                     // ugetrlimit → error (buffer would be
-                                       // untouched garbage on fake success)
-        67 | 174 => 0,                 // sigaction/rt_sigaction → success
-                                       // (Task 6-Z70: the linker + libc
-                                       // install SIGSEGV/SIGABRT handlers
-                                       // during early init; a -1 return makes
-                                       // libc-style wrappers retry in a loop
-                                       // — 40x observed in run 32604929372.
-                                       // 0 = "handler installed" (we do NOT
-                                       // record it: the ptrace loop already
-                                       // forwards signals itself).
-        175 => 0,                      // rt_sigprocmask → success
-        91 => 0,                       // munmap → success (the mapping stays
-                                       // resident = a leak, but 32MB budget
-                                       // headroom covers the linker's churn)
-        240 => 0,                      // futex → success (spurious wake)
-        253 => 0,                      // set_tid_address → success (Agent I
-                                       // flag: fires right before 243 in
-                                       // __libc_init_tls)
-        195 | 196 | 197 => -1,         // stat64/lstat64/fstat64 → error.
-                                       // Task 6-Z71: these WRITE a 96-byte
-                                       // struct into the caller's buffer;
-                                       // faking success here (0) with an
-                                       // untouched buffer hands the linker
-                                       // GARBAGE (uninitialized stack bytes
-                                       // read as st_size → insane mmap
-                                       // lengths). The dedicated 6-Z71 arms
-                                       // build the REAL struct from the host
-                                       // file's metadata + write it via
-                                       // POKEDATA/vm_writev, then force 0.
-                                       // This table entry is only the
-                                       // fallback for when the dedicated
-                                       // arm never ran (phase DESYNC /
-                                       // unreadable args) — an honest -1
-                                       // beats a fake struct full of stack
-                                       // garbage.
-        180 => -1,                     // pread64 → error. Same 6-Z71
-                                       // reasoning: the dedicated arm
-                                       // copies REAL bytes into the child's
-                                       // buffer and returns the byte count;
-                                       // the table fallback stays -1 because
-                                       // a fake byte count with an untouched
-                                       // buffer = garbage read.
-        11 => -2,                       // execve → -ENOENT (Task 6-Z66): init's
-                                       // i386 execve is ENTRY-skipped (6-Z49) or
-                                       // seccomp-blocked; -ENOENT makes the
-                                       // forked service child take init's clean
-                                       // exec-failure path (_exit(127), parent
-                                       // applies restart backoff). Returning 0
-                                       // (the old blanket) left the child running
-                                       // INIT'S IMAGE post-fork → duplicate-init
-                                       // corruption; -1 (EPERM) also works but
-                                       // -ENOENT matches AOSP's expected errno.
-        1 | 252 => 0,                  // exit/exit_group — never reaches the
-                                       // fake path (gated above), placeholder
-        _ => -1,                       // generic -EPERM error
+        243 => 0,                                    // set_thread_area → success
+        78 => 0,                                     // gettimeofday → success
+        265 | 264 => 0,                              // clock_getres/clock_gettime → success
+        60 => 0,                                     // umask → success (mask 0)
+        21 => -(libc::ENODEV as i64),                // mount → -ENODEV (Task 6-Z91).
+        // NOTE: on i386 syscall 21 is MOUNT,
+        // not access (access is 33 on i386;
+        // 21 is access only on x86_64 — the
+        // old "access → success" comment was
+        // a mislabel). This entry is the EXIT
+        // fallback for filter-blocked-but-not-
+        // SIGSYS mounts: the rootless sandbox
+        // has NO real block devices, so a
+        // storage mount (vfat/ext4/…) must be
+        // DENIED with -ENODEV — the guest
+        // (TWRP) then marks the partition
+        // unmountable and proceeds, instead
+        // of fake-succeeding, retrying
+        // forever and exhausting its stack
+        // (run 32637775917: 6,141 mount
+        // SIGSYS retries → SIGSEGV at
+        // recovery+0xaff3). Pseudo-filesystem
+        // mounts (tmpfs/proc/sysfs/…) that
+        // reach the SIGSYS handler still get
+        // the fake success + real rootfs
+        // side-effect ops there — see the
+        // dedicated mount arm +
+        // is_pseudo_fs_type() (6-Z91).
+        // NOTE: while mount stays in
+        // compute_exit_return_value's
+        // fake-success set (the 5-T fix
+        // init's Phase A pseudo mounts
+        // depend on in DESYNC mode), that
+        // Some(0) takes priority over this
+        // entry at the EXIT call site —
+        // and the SIGSYS arm's per-fstype
+        // write lands AFTER it and wins.
+        // This entry exists so the ENODEV
+        // semantics survive any future
+        // removal of mount from the
+        // compute table.
+        39 => 0, // mkdir → success (rootfs op done
+        // separately by the SIGSYS handler)
+        191 => -1, // ugetrlimit → error (buffer would be
+        // untouched garbage on fake success)
+        67 | 174 => 0, // sigaction/rt_sigaction → success
+        // (Task 6-Z70: the linker + libc
+        // install SIGSEGV/SIGABRT handlers
+        // during early init; a -1 return makes
+        // libc-style wrappers retry in a loop
+        // — 40x observed in run 32604929372.
+        // 0 = "handler installed" (we do NOT
+        // record it: the ptrace loop already
+        // forwards signals itself).
+        175 => 0, // rt_sigprocmask → success
+        91 => 0,  // munmap → success (the mapping stays
+        // resident = a leak, but 32MB budget
+        // headroom covers the linker's churn)
+        240 => 0, // futex → success (spurious wake)
+        253 => 0, // set_tid_address → success (Agent I
+        // flag: fires right before 243 in
+        // __libc_init_tls)
+        195 | 196 | 197 => -1, // stat64/lstat64/fstat64 → error.
+        // Task 6-Z71: these WRITE a 96-byte
+        // struct into the caller's buffer;
+        // faking success here (0) with an
+        // untouched buffer hands the linker
+        // GARBAGE (uninitialized stack bytes
+        // read as st_size → insane mmap
+        // lengths). The dedicated 6-Z71 arms
+        // build the REAL struct from the host
+        // file's metadata + write it via
+        // POKEDATA/vm_writev, then force 0.
+        // This table entry is only the
+        // fallback for when the dedicated
+        // arm never ran (phase DESYNC /
+        // unreadable args) — an honest -1
+        // beats a fake struct full of stack
+        // garbage.
+        180 => -1, // pread64 → error. Same 6-Z71
+        // reasoning: the dedicated arm
+        // copies REAL bytes into the child's
+        // buffer and returns the byte count;
+        // the table fallback stays -1 because
+        // a fake byte count with an untouched
+        // buffer = garbage read.
+        11 => -2, // execve → -ENOENT (Task 6-Z66): init's
+        // i386 execve is ENTRY-skipped (6-Z49) or
+        // seccomp-blocked; -ENOENT makes the
+        // forked service child take init's clean
+        // exec-failure path (_exit(127), parent
+        // applies restart backoff). Returning 0
+        // (the old blanket) left the child running
+        // INIT'S IMAGE post-fork → duplicate-init
+        // corruption; -1 (EPERM) also works but
+        // -ENOENT matches AOSP's expected errno.
+        1 | 252 => 0, // exit/exit_group — never reaches the
+        // fake path (gated above), placeholder
+        _ => -1, // generic -EPERM error
     }
 }
 
@@ -3459,7 +3459,6 @@ const PREAD64_EMU_MAX_BYTES: u64 = 64 * 1024;
 /// open_fd_owner_paths map ever resolves it.
 const SYNTHETIC_FD_BASE: i32 = 0x7e00_0000;
 
-
 // ─────────────────────────────────────────────────────────────────────
 // Task 6-Z69: set_thread_area (i386 nr=243) — REAL TLS/GDT emulation
 //
@@ -4009,11 +4008,7 @@ static FB0_BRIDGE_STARTED: std::sync::atomic::AtomicBool =
 /// One process_vm_readv(2) call into the child. Returns bytes read (may be
 /// short) or -1 on failure (ESRCH when the child died, EPERM if the filter
 /// refuses — then the bridge self-disables for that mapping).
-fn fb0_bridge_read_child_mem(
-    pid: libc::pid_t,
-    addr: u64,
-    buf: &mut [u8],
-) -> isize {
+fn fb0_bridge_read_child_mem(pid: libc::pid_t, addr: u64, buf: &mut [u8]) -> isize {
     if buf.is_empty() {
         return 0;
     }
@@ -4083,10 +4078,7 @@ fn fb0_bridge_thread() {
                 continue;
             }
             let got = n as usize;
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .open(&m.host_file)
-            {
+            match std::fs::OpenOptions::new().write(true).open(&m.host_file) {
                 Ok(mut f) => {
                     if let Err(e) = std::io::Write::write_all(&mut f, &buf[..got]) {
                         if tick <= 30 {
@@ -4336,8 +4328,7 @@ fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
 // waitpid loop below; the tracer's own signal disposition is irrelevant to
 // them (verified reasoning: the loop already relies on the child's SIGSYS
 // stops arriving via waitpid, not via any tracer-side handler).
-static KR64_SIGSYS_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static KR64_SIGSYS_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Minimal async-signal-safe SIGSYS catcher for kr64 itself. See the
 /// Task 6-Z62 block comment above for the full rationale.
@@ -4627,8 +4618,7 @@ fn write_child_bytes_process_vm(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> (u
         let end = std::cmp::min(off + CHUNK, bytes.len());
         let before = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed);
         let n = process_vm_writev_chunk(pid, addr.wrapping_add(off as u64), &bytes[off..end]);
-        let sigsys_fired =
-            KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed) > before;
+        let sigsys_fired = KR64_SIGSYS_HITS.load(std::sync::atomic::Ordering::Relaxed) > before;
         if sigsys_fired || n == libc::SYS_process_vm_writev as isize {
             return (written, true);
         }
@@ -4683,8 +4673,7 @@ fn write_child_bytes_injection(
                 let poked = write_child_bytes_pokedata(pid, addr, bytes);
                 return (poked, "poke");
             }
-            let poked =
-                write_child_bytes_pokedata(pid, addr.wrapping_add(n as u64), &bytes[n..]);
+            let poked = write_child_bytes_pokedata(pid, addr.wrapping_add(n as u64), &bytes[n..]);
             return (n + poked, "vm_writev+poke");
         }
         if n == bytes.len() {
@@ -5052,7 +5041,8 @@ pub fn run_ptrace_loop(
     // Task 6-Z54: per-child in_syscall tracking. The global `in_syscall` flag
     // causes DESYNC when switching between init and the recovery child. This
     // map saves/restores `in_syscall` per child PID on each waitpid switch.
-    let mut in_syscall_map: std::collections::HashMap<libc::pid_t, bool> = std::collections::HashMap::new();
+    let mut in_syscall_map: std::collections::HashMap<libc::pid_t, bool> =
+        std::collections::HashMap::new();
     let mut pending_getpid = false;
     let mut loop_count: u64 = 0;
     // ── Task 6-Z83: rolling last-16-stops ring (stop forensics) ──
@@ -5061,8 +5051,7 @@ pub fn run_ptrace_loop(
     // the 6-Z83 LOST-ENTRY/EPERM tripwire dumps the ring so a lost or
     // misrouted stop is identifiable from ONE E2E logcat.
     const RECENT_STOPS_CAP: usize = 16;
-    let mut recent_stops: std::collections::VecDeque<String> =
-        std::collections::VecDeque::new();
+    let mut recent_stops: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     // ── Task 6-Z9: xattr-SET syscall-rewrite state ───────────────────
     //
@@ -6315,8 +6304,13 @@ pub fn run_ptrace_loop(
                         // forensics of 32614181978 needed: the ring was frozen
                         // with 6079's exit_group while 6069's true last
                         // syscalls were never attributed).
-                        let tail: std::collections::VecDeque<i64> =
-                            recent_all_syscalls.iter().rev().take(5).rev().cloned().collect();
+                        let tail: std::collections::VecDeque<i64> = recent_all_syscalls
+                            .iter()
+                            .rev()
+                            .take(5)
+                            .rev()
+                            .cloned()
+                            .collect();
                         if tail.is_empty() {
                             log(&format!(
                                 "6-Z78: no syscalls in all-syscalls ring at EXIT of pid {}",
@@ -6469,8 +6463,7 @@ pub fn run_ptrace_loop(
                             // sufficient; the process-wide AtomicBool below
                             // prevents stacking sender threads if this
                             // synthesis fires more than once per process.
-                            static BOOT_COMPLETED_SENDER_STARTED:
-                                std::sync::atomic::AtomicBool =
+                            static BOOT_COMPLETED_SENDER_STARTED: std::sync::atomic::AtomicBool =
                                 std::sync::atomic::AtomicBool::new(false);
                             if BOOT_COMPLETED_SENDER_STARTED
                                 .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -6927,10 +6920,15 @@ pub fn run_ptrace_loop(
                             -38 // exit/exit_group → don't fake
                         } else if syscall_num == 45 {
                             0x80000000 // brk → non-zero (current break)
-                        } else if syscall_num == 186 || syscall_num == 20
-                                || syscall_num == 102 || syscall_num == 104
-                                || syscall_num == 105 || syscall_num == 106
-                                || syscall_num == 107 || syscall_num == 108 {
+                        } else if syscall_num == 186
+                            || syscall_num == 20
+                            || syscall_num == 102
+                            || syscall_num == 104
+                            || syscall_num == 105
+                            || syscall_num == 106
+                            || syscall_num == 107
+                            || syscall_num == 108
+                        {
                             // gettid(186), getpid(20), getuid(102), getgid(104),
                             // geteuid(105), getegid(106), getuid32, getgid32 → return 1 (a valid positive ID)
                             1
@@ -7102,9 +7100,13 @@ pub fn run_ptrace_loop(
                                                 0,
                                             )
                                         };
-                                        if word == -1 { break; }
+                                        if word == -1 {
+                                            break;
+                                        }
                                         let ptr32 = (word as u32) as u64;
-                                        if ptr32 == 0 { break; }
+                                        if ptr32 == 0 {
+                                            break;
+                                        }
                                         if let Some(s) = read_child_string(pid, ptr32) {
                                             argv_vec.push(s);
                                         }
@@ -7125,9 +7127,13 @@ pub fn run_ptrace_loop(
                                                 0,
                                             )
                                         };
-                                        if word == -1 { break; }
+                                        if word == -1 {
+                                            break;
+                                        }
                                         let ptr32 = (word as u32) as u64;
-                                        if ptr32 == 0 { break; }
+                                        if ptr32 == 0 {
+                                            break;
+                                        }
                                         if let Some(s) = read_child_string(pid, ptr32) {
                                             envp_vec.push(s);
                                         }
@@ -7160,15 +7166,11 @@ pub fn run_ptrace_loop(
                                     );
                                 }
                                 set_syscall_arg(&mut regs, 16, code_addr); // rip = index 16 in user_regs_struct
-                                let _ = ptrace_setregs(
-                                    pid,
-                                    &regs,
-                                    std::mem::size_of::<Regs>(),
-                                );
+                                let _ = ptrace_setregs(pid, &regs, std::mem::size_of::<Regs>());
 
                                 // Prepare C strings for execve (before fork)
-                                let path_c = std::ffi::CString::new(translated.as_str())
-                                    .unwrap_or_default();
+                                let path_c =
+                                    std::ffi::CString::new(translated.as_str()).unwrap_or_default();
                                 let argv_c: Vec<std::ffi::CString> = argv_vec
                                     .iter()
                                     .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
@@ -7190,13 +7192,19 @@ pub fn run_ptrace_loop(
                                             }
                                         } else if s.starts_with("LD_LIBRARY_PATH=") {
                                             let val = &s["LD_LIBRARY_PATH=".len()..];
-                                            let parts: Vec<String> = val.split(':').map(|p| {
-                                                if p.starts_with('/') && !p.starts_with("/data") && !p.is_empty() {
-                                                    format!("{}/{}", rootfs, p)
-                                                } else {
-                                                    p.to_string()
-                                                }
-                                            }).collect();
+                                            let parts: Vec<String> = val
+                                                .split(':')
+                                                .map(|p| {
+                                                    if p.starts_with('/')
+                                                        && !p.starts_with("/data")
+                                                        && !p.is_empty()
+                                                    {
+                                                        format!("{}/{}", rootfs, p)
+                                                    } else {
+                                                        p.to_string()
+                                                    }
+                                                })
+                                                .collect();
                                             format!("LD_LIBRARY_PATH={}", parts.join(":"))
                                         } else {
                                             s.clone()
@@ -7211,15 +7219,11 @@ pub fn run_ptrace_loop(
                                     .iter()
                                     .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
                                     .collect();
-                                let mut argv_ptr: Vec<*const libc::c_char> = argv_c
-                                    .iter()
-                                    .map(|s| s.as_ptr())
-                                    .collect();
+                                let mut argv_ptr: Vec<*const libc::c_char> =
+                                    argv_c.iter().map(|s| s.as_ptr()).collect();
                                 argv_ptr.push(std::ptr::null());
-                                let mut envp_ptr: Vec<*const libc::c_char> = envp_c
-                                    .iter()
-                                    .map(|s| s.as_ptr())
-                                    .collect();
+                                let mut envp_ptr: Vec<*const libc::c_char> =
+                                    envp_c.iter().map(|s| s.as_ptr()).collect();
                                 envp_ptr.push(std::ptr::null());
 
                                 // Fork a NEW 64-bit child (TIF_IA32=0)
@@ -7229,7 +7233,9 @@ pub fn run_ptrace_loop(
                                     unsafe {
                                         libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
                                     }
-                                    unsafe { libc::raise(libc::SIGSTOP); }
+                                    unsafe {
+                                        libc::raise(libc::SIGSTOP);
+                                    }
                                     unsafe {
                                         libc::execve(
                                             path_c.as_ptr(),
@@ -7237,7 +7243,9 @@ pub fn run_ptrace_loop(
                                             envp_ptr.as_ptr(),
                                         );
                                     }
-                                    unsafe { libc::_exit(127); }
+                                    unsafe {
+                                        libc::_exit(127);
+                                    }
                                 } else if new_pid > 0 {
                                     // Parent (kr64) — new child will SIGSTOP
                                     log(&format!(
@@ -7261,14 +7269,10 @@ pub fn run_ptrace_loop(
                                         | libc::PTRACE_O_TRACEVFORKDONE
                                         | libc::PTRACE_O_TRACEEXEC
                                         | libc::PTRACE_O_TRACEEXIT
-                                        | libc::PTRACE_O_EXITKILL) as libc::c_int;
+                                        | libc::PTRACE_O_EXITKILL)
+                                        as libc::c_int;
                                     unsafe {
-                                        libc::ptrace(
-                                            libc::PTRACE_SETOPTIONS,
-                                            new_pid,
-                                            0,
-                                            opts,
-                                        );
+                                        libc::ptrace(libc::PTRACE_SETOPTIONS, new_pid, 0, opts);
                                     }
                                     log(&format!(
                                         "[KR64] PTRACE_SETOPTIONS set on new child PID={} (Task 6-Z48)",
@@ -7470,9 +7474,7 @@ pub fn run_ptrace_loop(
                             // openat/unlinkat). The `!= -1` guard keeps
                             // a nr=-1 SIGSYS-desync stop from matching
                             // the sentinel on ABIs that dropped mkdirat.
-                            n if abi.mkdirat != -1 && n == abi.mkdirat => {
-                                Some(abi.reg_arg2)
-                            }
+                            n if abi.mkdirat != -1 && n == abi.mkdirat => Some(abi.reg_arg2),
                             n if n == abi.chdir => Some(abi.reg_arg1),
                             n if n == abi.readlink => Some(abi.reg_arg1),
                             n if n == abi.readlinkat => Some(abi.reg_arg2),
@@ -7749,16 +7751,13 @@ pub fn run_ptrace_loop(
                                 // O_EXCL is 0x80 on both i386 and x86_64
                                 // Linux. open(): flags = arg2. openat():
                                 // flags = arg3.
-                                if is_properties_path(&path)
-                                    || is_properties_path(&translated)
-                                {
+                                if is_properties_path(&path) || is_properties_path(&translated) {
                                     let flags_reg = if syscall_num == abi.open {
                                         abi.reg_arg2
                                     } else {
                                         abi.reg_arg3
                                     };
-                                    let flags =
-                                        get_syscall_arg(&regs, flags_reg) as i32;
+                                    let flags = get_syscall_arg(&regs, flags_reg) as i32;
                                     if flags & 0x80 != 0 {
                                         let new_flags = flags & !0x80;
                                         set_syscall_arg(
@@ -8161,16 +8160,16 @@ pub fn run_ptrace_loop(
                                 // executing app_data files → EPERM → "couldn't
                                 // map segment 2: Operation not permitted" →
                                 // CANNOT LINK. Arm for ANY non-PROT_NONE access.
-                                if fd >= 0
-                                    && mmap2_length > 0
-                                    && mmap2_prot != 0
-                                {
-                                    pending_mmap2_content.insert(pid, PendingMmap2Content {
+                                if fd >= 0 && mmap2_length > 0 && mmap2_prot != 0 {
+                                    pending_mmap2_content.insert(
                                         pid,
-                                        fd,
-                                        length: mmap2_length,
-                                        offset_bytes: mmap2_offset_bytes,
-                                    });
+                                        PendingMmap2Content {
+                                            pid,
+                                            fd,
+                                            length: mmap2_length,
+                                            offset_bytes: mmap2_offset_bytes,
+                                        },
+                                    );
                                 }
                                 let new_flags =
                                     rewrite_mmap_flags_shared_to_anonymous(flags) as u64;
@@ -8257,10 +8256,7 @@ pub fn run_ptrace_loop(
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
                                 if translated != path && loop_count <= 500 {
-                                    log(&format!(
-                                        "intercepted statfs({}) -> {}",
-                                        path, translated
-                                    ));
+                                    log(&format!("intercepted statfs({}) -> {}", path, translated));
                                 }
                                 if translated != path
                                     && !write_translated_path(
@@ -8345,12 +8341,11 @@ pub fn run_ptrace_loop(
                         {
                             // mkdir → path in arg1; mkdirat → dirfd in
                             // arg1, path in arg2 (like openat).
-                            let (name, path_arg_index) =
-                                if abi.mkdirat != -1 && n == abi.mkdirat {
-                                    ("mkdirat", abi.reg_arg2)
-                                } else {
-                                    ("mkdir", abi.reg_arg1)
-                                };
+                            let (name, path_arg_index) = if abi.mkdirat != -1 && n == abi.mkdirat {
+                                ("mkdirat", abi.reg_arg2)
+                            } else {
+                                ("mkdir", abi.reg_arg1)
+                            };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if path_addr != 0 {
                                 if let Some(path) = read_child_string(pid, path_addr) {
@@ -8368,11 +8363,7 @@ pub fn run_ptrace_loop(
                                             &mut scratch_offset,
                                             &translated,
                                         ) {
-                                            write_child_string(
-                                                pid,
-                                                path_addr,
-                                                &translated,
-                                            );
+                                            write_child_string(pid, path_addr, &translated);
                                         }
                                         // 2. Actually create the dir in
                                         //    the HOST rootfs (ignore
@@ -8382,8 +8373,7 @@ pub fn run_ptrace_loop(
                                         //    parents, … all acceptable:
                                         //    the kernel-side mkdir above
                                         //    is the primary path).
-                                        let existed = std::path::Path::new(&translated)
-                                            .is_dir();
+                                        let existed = std::path::Path::new(&translated).is_dir();
                                         let _ = std::fs::create_dir_all(&translated);
                                         let created = if !existed
                                             && std::path::Path::new(&translated).is_dir()
@@ -8580,9 +8570,7 @@ pub fn run_ptrace_loop(
                         //      getpid instead of 243 — even if getpid is
                         //      itself blocked, the pending EXIT fake
                         //      forces return 0.
-                        n if abi.set_thread_area_nr != -1
-                            && n == abi.set_thread_area_nr =>
-                        {
+                        n if abi.set_thread_area_nr != -1 && n == abi.set_thread_area_nr => {
                             let u_info_addr = get_syscall_arg(&regs, abi.reg_arg1);
                             let desc_read = read_child_bytes(pid, u_info_addr, 16);
                             match desc_read
@@ -8759,10 +8747,16 @@ pub fn run_ptrace_loop(
                                             log("DIAG 64-bit execve: EXIT stop — re-set rax=59 (verify failed) (Task 6-Z45)");
                                         }
                                     }
-                                    Err(e) => log(&format!("DIAG 64-bit execve: EXIT re-set FAILED: {} (Task 6-Z45)", e)),
+                                    Err(e) => log(&format!(
+                                        "DIAG 64-bit execve: EXIT re-set FAILED: {} (Task 6-Z45)",
+                                        e
+                                    )),
                                 }
                             }
-                            Err(e) => log(&format!("DIAG 64-bit execve: EXIT getregs FAILED: {} (Task 6-Z45)", e)),
+                            Err(e) => log(&format!(
+                                "DIAG 64-bit execve: EXIT getregs FAILED: {} (Task 6-Z45)",
+                                e
+                            )),
                         }
                     }
 
@@ -8974,9 +8968,8 @@ pub fn run_ptrace_loop(
                                 // genuinely absent libraries.
                                 if let Ok(md) = std::fs::metadata(p.as_str()) {
                                     use std::os::unix::fs::PermissionsExt;
-                                    let base = synthetic_fd_next
-                                        .entry(pid)
-                                        .or_insert(SYNTHETIC_FD_BASE);
+                                    let base =
+                                        synthetic_fd_next.entry(pid).or_insert(SYNTHETIC_FD_BASE);
                                     let fd = *base;
                                     // Stay inside positive i32 range; the
                                     // wrap only fires after ~33M opens.
@@ -9123,10 +9116,8 @@ pub fn run_ptrace_loop(
                                 // ran; when it DID run, fd reads -1 and the
                                 // pending record (if any) carries the
                                 // original fd instead.
-                                let le_fd =
-                                    get_syscall_arg(&regs_le, abi.reg_arg5) as i32;
-                                let le_pending_fd =
-                                    pending_mmap2_content.get(&pid).map(|r| r.fd);
+                                let le_fd = get_syscall_arg(&regs_le, abi.reg_arg5) as i32;
+                                let le_pending_fd = pending_mmap2_content.get(&pid).map(|r| r.fd);
                                 let le_path = if le_fd >= 0 {
                                     open_fd_owner_paths
                                         .get(&(pid, le_fd))
@@ -9192,12 +9183,8 @@ pub fn run_ptrace_loop(
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
                             match ptrace_getregs(pid, &mut regs2) {
                                 Ok(len2) => {
-                                    let mmap_ret =
-                                        get_syscall_arg(&regs2, abi.reg_ret) as i64;
-                                    if !mmap_return_is_valid_mapping_address(
-                                        mmap_ret,
-                                        &abi,
-                                    ) {
+                                    let mmap_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                    if !mmap_return_is_valid_mapping_address(mmap_ret, &abi) {
                                         // Gate 3 — the rewritten anonymous
                                         // mmap FAILED (or rax is a leak
                                         // value). The child will see the
@@ -9213,9 +9200,7 @@ pub fn run_ptrace_loop(
                                         // fd-only fallback (6-V).
                                         let host_path = open_fd_owner_paths
                                             .get(&(pid, pending.fd))
-                                            .or_else(|| {
-                                                open_fd_paths.get(&pending.fd)
-                                            })
+                                            .or_else(|| open_fd_paths.get(&pending.fd))
                                             .cloned();
                                         match host_path {
                                             None => {
@@ -9254,10 +9239,7 @@ pub fn run_ptrace_loop(
                                                 if is_fb0_host_path(&path) {
                                                     fb0_bridge_register(
                                                         pid,
-                                                        get_syscall_arg(
-                                                            &regs2,
-                                                            abi.reg_ret,
-                                                        ) as u64,
+                                                        get_syscall_arg(&regs2, abi.reg_ret) as u64,
                                                         pending.length as usize,
                                                         path.clone(),
                                                     );
@@ -9278,10 +9260,9 @@ pub fn run_ptrace_loop(
                                                     // this area itself.
                                                 } else {
                                                     // Gate 6 — per-pid budget.
-                                                    let injected_so_far =
-                                                        *mmap2_injected_bytes
-                                                            .entry(pid)
-                                                            .or_insert(0);
+                                                    let injected_so_far = *mmap2_injected_bytes
+                                                        .entry(pid)
+                                                        .or_insert(0);
                                                     if injected_so_far
                                                         >= MMAP2_INJECT_BUDGET_PER_PID
                                                     {
@@ -9294,8 +9275,7 @@ pub fn run_ptrace_loop(
                                                             path
                                                         ));
                                                     } else {
-                                                        let started =
-                                                            std::time::Instant::now();
+                                                        let started = std::time::Instant::now();
                                                         // Clamp the slice to
                                                         // what the file actually
                                                         // holds (metadata first
@@ -9303,17 +9283,14 @@ pub fn run_ptrace_loop(
                                                         // routinely runs past
                                                         // EOF because the linker
                                                         // page-rounds it).
-                                                        let file_len = std::fs::metadata(
-                                                            &path,
-                                                        )
-                                                        .map(|m| m.len())
-                                                        .unwrap_or(0);
-                                                        let injectable =
-                                                            mmap2_injectable_slice(
-                                                                file_len,
-                                                                pending.offset_bytes,
-                                                                pending.length,
-                                                            );
+                                                        let file_len = std::fs::metadata(&path)
+                                                            .map(|m| m.len())
+                                                            .unwrap_or(0);
+                                                        let injectable = mmap2_injectable_slice(
+                                                            file_len,
+                                                            pending.offset_bytes,
+                                                            pending.length,
+                                                        );
                                                         if injectable == 0 {
                                                             log(&format!(
                                                                 "6-Z62: mmap2 content injection SKIPPED — {} [{}..{}] is past EOF (file_len={})",
@@ -9342,20 +9319,13 @@ pub fn run_ptrace_loop(
                                                                             &mut vm_writev_usable,
                                                                         );
                                                                     *mmap2_injected_bytes
-                                                                        .entry(
-                                                                            pid,
-                                                                        )
-                                                                        .or_insert(
-                                                                            0,
-                                                                        ) +=
+                                                                        .entry(pid)
+                                                                        .or_insert(0) +=
                                                                         written as u64;
-                                                                    let elapsed_ms =
-                                                                        started
-                                                                            .elapsed()
-                                                                            .as_millis();
-                                                                    if written
-                                                                        == content.len()
-                                                                    {
+                                                                    let elapsed_ms = started
+                                                                        .elapsed()
+                                                                        .as_millis();
+                                                                    if written == content.len() {
                                                                         log(&format!(
                                                                             "6-Z62: mmap2 content INJECTED {} bytes from {} [off={}, len={}] into pid={} @{:#x} via {} in {} ms (budget: {}/{} MiB)",
                                                                             written,
@@ -9870,7 +9840,8 @@ pub fn run_ptrace_loop(
                     // succeeded, `syscall_num` here is `getpid` (NOT the
                     // original xattr number) — the diagnostic logs both
                     // so we can confirm the rewrite took effect.
-                    if pending_xattr_fake_pid == Some(pid) { // 6-Z83: per-pid
+                    if pending_xattr_fake_pid == Some(pid) {
+                        // 6-Z83: per-pid
                         pending_xattr_fake_pid = None;
                         let exit_syscall_num = syscall_num;
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
@@ -9984,7 +9955,8 @@ pub fn run_ptrace_loop(
                     // return (0), and preserves it — no interference
                     // (same belt-and-suspenders relationship the
                     // pending_xattr_fake block has).
-                    if pending_set_thread_area_fake_pid == Some(pid) { // 6-Z83: per-pid
+                    if pending_set_thread_area_fake_pid == Some(pid) {
+                        // 6-Z83: per-pid
                         pending_set_thread_area_fake_pid = None;
                         let exit_syscall_num = syscall_num;
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
@@ -10073,117 +10045,110 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         } else {
-                        let pending = pending_stat64.take().unwrap();
-                        let which = if pending.nr == abi.fstat64 {
-                            "fstat64"
-                        } else if pending.nr == abi.lstat64 {
-                            "lstat64"
-                        } else {
-                            "stat64"
-                        };
-                        // Human-readable target for the log lines ("fd=4"
-                        // / "path=/data/…/libc.so").
-                        let target_desc = match &pending.source {
-                            Stat64Source::Path { path, .. } => {
-                                format!("path={}", path)
-                            }
-                            Stat64Source::Fd(fd) => format!("fd={}", fd),
-                        };
-                        // Skip-logs are RATE-LIMITED (init's
-                        // stat64-poll loops fire thousands of legit
-                        // ENOENTs); EMULATED lines stay un-gated —
-                        // they are the point of 6-Z71 and bounded by
-                        // the linker's library count.
-                        let mut skip_log = |msg: String| {
-                            if z71_skip_logs < 300 {
-                                z71_skip_logs += 1;
-                                log(&msg);
-                            }
-                        };
-                        if syscall_num != pending.nr {
-                            skip_log(format!(
+                            let pending = pending_stat64.take().unwrap();
+                            let which = if pending.nr == abi.fstat64 {
+                                "fstat64"
+                            } else if pending.nr == abi.lstat64 {
+                                "lstat64"
+                            } else {
+                                "stat64"
+                            };
+                            // Human-readable target for the log lines ("fd=4"
+                            // / "path=/data/…/libc.so").
+                            let target_desc = match &pending.source {
+                                Stat64Source::Path { path, .. } => {
+                                    format!("path={}", path)
+                                }
+                                Stat64Source::Fd(fd) => format!("fd={}", fd),
+                            };
+                            // Skip-logs are RATE-LIMITED (init's
+                            // stat64-poll loops fire thousands of legit
+                            // ENOENTs); EMULATED lines stay un-gated —
+                            // they are the point of 6-Z71 and bounded by
+                            // the linker's library count.
+                            let mut skip_log = |msg: String| {
+                                if z71_skip_logs < 300 {
+                                    z71_skip_logs += 1;
+                                    log(&msg);
+                                }
+                            };
+                            if syscall_num != pending.nr {
+                                skip_log(format!(
                                 "6-Z71: {} emulation SKIPPED (DESYNC) — pending nr={} but this EXIT is nr={} [{}] (Task 6-Z71)",
                                 which,
                                 pending.nr,
                                 syscall_num,
                                 syscall_name(syscall_num, &abi)
                             ));
-                        } else {
-                            // GENUINE kernel return (pre-6-Z57 value).
-                            let orig_ret =
-                                get_syscall_arg(&regs, abi.reg_ret) as i64;
-                            if orig_ret >= 0 {
-                                // Filter allowed it — the kernel's own
-                                // compat handler wrote the struct.
-                                skip_log(format!(
+                            } else {
+                                // GENUINE kernel return (pre-6-Z57 value).
+                                let orig_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                                if orig_ret >= 0 {
+                                    // Filter allowed it — the kernel's own
+                                    // compat handler wrote the struct.
+                                    skip_log(format!(
                                     "6-Z71: {} returned {} (filter allowed — kernel wrote its own struct; no emulation needed) (Task 6-Z71)",
                                     which, orig_ret
                                 ));
-                            } else if orig_ret != -38 {
-                                skip_log(format!(
+                                } else if orig_ret != -38 {
+                                    skip_log(format!(
                                     "6-Z71: {} emulation SKIPPED — legitimate errno {} (not the -38 filter artifact); caller sees the real error (Task 6-Z71)",
                                     which, orig_ret
                                 ));
-                            } else {
-                                // Resolve (path, metadata) per the source.
-                                let resolved: Option<(String, std::fs::Metadata)> =
-                                    match pending.source {
-                                        Stat64Source::Path { path, follow } => {
-                                            let md = if follow {
-                                                std::fs::metadata(&path)
-                                            } else {
-                                                std::fs::symlink_metadata(&path)
-                                            };
-                                            md.ok().map(|m| (path, m))
-                                        }
-                                        Stat64Source::Fd(fd) => {
-                                            let path = open_fd_owner_paths
-                                                .get(&(pid, fd))
-                                                .cloned()
-                                                .or_else(|| {
-                                                    open_fd_paths.get(&fd).cloned()
-                                                })
-                                                .or_else(|| readlink_proc_fd(pid, fd));
-                                            match path {
-                                                None => {
-                                                    skip_log(format!(
+                                } else {
+                                    // Resolve (path, metadata) per the source.
+                                    let resolved: Option<(String, std::fs::Metadata)> =
+                                        match pending.source {
+                                            Stat64Source::Path { path, follow } => {
+                                                let md = if follow {
+                                                    std::fs::metadata(&path)
+                                                } else {
+                                                    std::fs::symlink_metadata(&path)
+                                                };
+                                                md.ok().map(|m| (path, m))
+                                            }
+                                            Stat64Source::Fd(fd) => {
+                                                let path = open_fd_owner_paths
+                                                    .get(&(pid, fd))
+                                                    .cloned()
+                                                    .or_else(|| open_fd_paths.get(&fd).cloned())
+                                                    .or_else(|| readlink_proc_fd(pid, fd));
+                                                match path {
+                                                    None => {
+                                                        skip_log(format!(
                                                         "6-Z71: fstat64 emulation SKIPPED — fd={} not in the fd→path maps and /proc readlink failed (Task 6-Z71)",
                                                         fd
                                                     ));
-                                                    None
+                                                        None
+                                                    }
+                                                    Some(p) => {
+                                                        std::fs::metadata(&p).ok().map(|m| (p, m))
+                                                    }
                                                 }
-                                                Some(p) => std::fs::metadata(&p)
-                                                    .ok()
-                                                    .map(|m| (p, m)),
                                             }
-                                        }
-                                    };
-                                match resolved {
-                                    None => {
-                                        // Fd-source resolution failures log
-                                        // above; Path-source stat failures
-                                        // land here.
-                                        skip_log(format!(
+                                        };
+                                    match resolved {
+                                        None => {
+                                            // Fd-source resolution failures log
+                                            // above; Path-source stat failures
+                                            // land here.
+                                            skip_log(format!(
                                             "6-Z71: {} emulation SKIPPED — host stat FAILED (path vanished / permission); error return preserved (Task 6-Z71)",
                                             which
                                         ));
-                                    }
-                                    Some((host_path, md)) => {
-                                        let fields =
-                                            stat64_fields_from_metadata(&md);
-                                        let bytes =
-                                            build_i386_stat64_bytes(&fields);
-                                        let (written, method) =
-                                            write_child_bytes_injection(
+                                        }
+                                        Some((host_path, md)) => {
+                                            let fields = stat64_fields_from_metadata(&md);
+                                            let bytes = build_i386_stat64_bytes(&fields);
+                                            let (written, method) = write_child_bytes_injection(
                                                 pid,
                                                 pending.statbuf,
                                                 &bytes,
                                                 &mut vm_writev_usable,
                                             );
-                                        if written == bytes.len() {
-                                            let mut regs2: Regs =
-                                                unsafe { std::mem::zeroed() };
-                                            match ptrace_getregs(
+                                            if written == bytes.len() {
+                                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                                match ptrace_getregs(
                                                 pid,
                                                 &mut regs2,
                                             ) {
@@ -10220,8 +10185,8 @@ pub fn run_ptrace_loop(
                                                     which, e
                                                 )),
                                             }
-                                        } else {
-                                            log(&format!(
+                                            } else {
+                                                log(&format!(
                                                 "6-Z71: {} emulation FAILED PARTIAL WRITE — {}/{} bytes into statbuf @ {:#x} via {}; error return preserved (half-written struct is worse than an error) (Task 6-Z71)",
                                                 which,
                                                 written,
@@ -10229,11 +10194,11 @@ pub fn run_ptrace_loop(
                                                 pending.statbuf,
                                                 method
                                             ));
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
                         }
                     }
 
@@ -10269,52 +10234,43 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         } else {
-                        let pending = pending_pread64.take().unwrap();
-                        let mut skip_log = |msg: String| {
-                            if z71_skip_logs < 300 {
-                                z71_skip_logs += 1;
-                                log(&msg);
-                            }
-                        };
-                        if syscall_num != abi.pread64 {
-                            skip_log(format!(
+                            let pending = pending_pread64.take().unwrap();
+                            let mut skip_log = |msg: String| {
+                                if z71_skip_logs < 300 {
+                                    z71_skip_logs += 1;
+                                    log(&msg);
+                                }
+                            };
+                            if syscall_num != abi.pread64 {
+                                skip_log(format!(
                                 "6-Z71: pread64 emulation SKIPPED (DESYNC) — pending nr={} but this EXIT is nr={} [{}] (Task 6-Z71)",
                                 abi.pread64,
                                 syscall_num,
                                 syscall_name(syscall_num, &abi)
                             ));
-                        } else {
-                            // GENUINE kernel return (pre-6-Z57 value).
-                            let orig_ret =
-                                get_syscall_arg(&regs, abi.reg_ret) as i64;
-                            if orig_ret >= 0 {
-                                skip_log(format!(
+                            } else {
+                                // GENUINE kernel return (pre-6-Z57 value).
+                                let orig_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                                if orig_ret >= 0 {
+                                    skip_log(format!(
                                     "6-Z71: pread64 returned {} (filter allowed — kernel performed the read; no emulation needed) (Task 6-Z71)",
                                     orig_ret
                                 ));
-                            } else if orig_ret != -38 {
-                                skip_log(format!(
+                                } else if orig_ret != -38 {
+                                    skip_log(format!(
                                     "6-Z71: pread64 emulation SKIPPED — legitimate errno {} (not the -38 filter artifact) (Task 6-Z71)",
                                     orig_ret
                                 ));
-                            } else {
-                                let host_path = open_fd_owner_paths
-                                    .get(&(pid, pending.fd))
-                                    .cloned()
-                                    .or_else(|| {
-                                        open_fd_paths.get(&pending.fd).cloned()
-                                    })
-                                    .or_else(|| readlink_proc_fd(pid, pending.fd));
-                                let read: Option<Vec<u8>> = host_path
-                                    .as_ref()
-                                    .and_then(|p| {
-                                        host_pread_slice(
-                                            p,
-                                            pending.offset,
-                                            pending.count as usize,
-                                        )
+                                } else {
+                                    let host_path = open_fd_owner_paths
+                                        .get(&(pid, pending.fd))
+                                        .cloned()
+                                        .or_else(|| open_fd_paths.get(&pending.fd).cloned())
+                                        .or_else(|| readlink_proc_fd(pid, pending.fd));
+                                    let read: Option<Vec<u8>> = host_path.as_ref().and_then(|p| {
+                                        host_pread_slice(p, pending.offset, pending.count as usize)
                                     });
-                                match read {
+                                    match read {
                                     None => skip_log(format!(
                                         "6-Z71: pread64 emulation SKIPPED — fd={} (host path {:?}) unreadable at offset {} — error return preserved (Task 6-Z71)",
                                         pending.fd, host_path, pending.offset
@@ -10420,8 +10376,8 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                                }
                             }
-                        }
                         }
                     }
 
@@ -10529,9 +10485,7 @@ pub fn run_ptrace_loop(
                         ));
                     }
                     if _forced_ret_opt.is_some()
-                        || (abi.execve == 11
-                            && syscall_num != 1
-                            && syscall_num != 252)
+                        || (abi.execve == 11 && syscall_num != 1 && syscall_num != 252)
                     {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         match ptrace_getregs(pid, &mut regs2) {
@@ -10569,8 +10523,7 @@ pub fn run_ptrace_loop(
                                 //      and mmap2 returned NULL instead of
                                 //      0xEE981000 → init wrote the property
                                 //      header to address 0 → SIGSEGV.
-                                let fresh_ret =
-                                    get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                let fresh_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
                                 let forced_value: Option<i64> = if abi.execve == 11 {
                                     if _forced_ret_opt.is_some() {
                                         _forced_ret_opt
@@ -10581,8 +10534,7 @@ pub fn run_ptrace_loop(
                                     } else if fresh_ret == -9
                                         && properties_fd == Some(42)
                                         && is_fd_op_syscall(syscall_num)
-                                        && get_syscall_arg(&regs2, abi.reg_arg1) as i32
-                                            == 42
+                                        && get_syscall_arg(&regs2, abi.reg_arg1) as i32 == 42
                                     {
                                         Some(0)
                                     } else {
@@ -10984,13 +10936,17 @@ pub fn run_ptrace_loop(
                             log(&format!(
                                 "DIAG 64-bit execve: return value = {} ({})",
                                 execve_ret,
-                                if execve_ret == 0 { "SUCCESS".to_string() } else { format!("FAILED (errno={})", -execve_ret) }
+                                if execve_ret == 0 {
+                                    "SUCCESS".to_string()
+                                } else {
+                                    format!("FAILED (errno={})", -execve_ret)
+                                }
                             ));
                             // Restore CS=0x23 (32-bit) + SS=0x2b
                             set_syscall_arg(&mut crash_regs, 17, 0x23); // cs
                             set_syscall_arg(&mut crash_regs, 20, 0x2b); // ss
-                            // Set rip to the instruction after init's
-                            // `call execve` (0x804ca14 = the _exit(127) call)
+                                                                        // Set rip to the instruction after init's
+                                                                        // `call execve` (0x804ca14 = the _exit(127) call)
                             set_syscall_arg(&mut crash_regs, 16, 0x804ca14);
                             // Set rax to the errno (so init sees execve failed)
                             if execve_ret != 0 {
@@ -11235,8 +11191,7 @@ pub fn run_ptrace_loop(
                         // distinction is itself diagnostic (a NULL src
                         // + MS_REMOUNT, for instance, is the SAR
                         // remount pattern; flags bit 32 = MS_REMOUNT).
-                        if original_syscall == a.mount
-                            && mount_sigsys_logged < MOUNT_SIGSYS_LOG_CAP
+                        if original_syscall == a.mount && mount_sigsys_logged < MOUNT_SIGSYS_LOG_CAP
                         {
                             mount_sigsys_logged = mount_sigsys_logged.saturating_add(1);
                             let src_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
@@ -11628,8 +11583,7 @@ pub fn run_ptrace_loop(
                                 // (first MOUNT_DENY_LOG_CAP denials are
                                 // logged un-suppressed via `log`).
                                 if mount_denied_logged < MOUNT_DENY_LOG_CAP {
-                                    mount_denied_logged =
-                                        mount_denied_logged.saturating_add(1);
+                                    mount_denied_logged = mount_denied_logged.saturating_add(1);
                                     log(&format!(
                                         "6-Z91: storage mount DENIED {}->{} {} -> -ENODEV (no real block devices; the guest marks it unmountable and proceeds — fake-success caused a 6141x retry storm + stack exhaustion in run 32637775917) [deny #{}/{}]",
                                         src.as_deref().unwrap_or("(null)"),
@@ -12084,8 +12038,7 @@ pub fn run_ptrace_loop(
                                 // branch's 5-J diagnostic below.
                                 let mut readback: Regs = unsafe { std::mem::zeroed() };
                                 if ptrace_getregs(pid, &mut readback).is_ok() {
-                                    let readback_rax =
-                                        get_syscall_arg(&readback, a.reg_ret) as i64;
+                                    let readback_rax = get_syscall_arg(&readback, a.reg_ret) as i64;
                                     sigsys_log(&format!(
                                         "[KR64][ptrace] SIGSYS DESYNC POKEUSER wrote rax={} for nr={} [{}], readback rax={}",
                                         ret_val, original_syscall, name, readback_rax
@@ -12263,10 +12216,9 @@ pub fn run_ptrace_loop(
                             | libc::PTRACE_O_TRACEVFORKDONE
                             | libc::PTRACE_O_TRACEEXEC
                             | libc::PTRACE_O_TRACEEXIT
-                            | libc::PTRACE_O_EXITKILL) as libc::c_int;
-                        let r = unsafe {
-                            libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts)
-                        };
+                            | libc::PTRACE_O_EXITKILL)
+                            as libc::c_int;
+                        let r = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts) };
                         if r == -1 {
                             log(&format!(
                                 "[KR64] PTRACE_SETOPTIONS on recovery child {} FAILED: {} (Task 6-Z48)",
@@ -12307,10 +12259,7 @@ pub fn run_ptrace_loop(
                 if recent_stops.len() == RECENT_STOPS_CAP {
                     recent_stops.pop_front();
                 }
-                recent_stops.push_back(format!(
-                    "(loop={},pid={},sig{})",
-                    loop_count, pid, sig
-                ));
+                recent_stops.push_back(format!("(loop={},pid={},sig{})", loop_count, pid, sig));
                 log(&format!("forwarding signal {} to child", sig));
 
                 // For SIGSEGV (signal 11), log the crash address and
@@ -15427,7 +15376,10 @@ mod tests {
         // (ABI_AARCH64 is cfg-gated to that target, mirroring the
         // existing per-ABI number tests).
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(mmap_syscall_offset_to_bytes(222, &ABI_AARCH64, 0x9abc), 0x9abc);
+        assert_eq!(
+            mmap_syscall_offset_to_bytes(222, &ABI_AARCH64, 0x9abc),
+            0x9abc
+        );
     }
 
     #[test]
@@ -15435,11 +15387,20 @@ mod tests {
         // The addresses observed in the E2E logs for the rewritten
         // anonymous mmap2 (0xEE981000 for init's property area) and a
         // typical bionic-linker load bias (0xF5D00000 range on i386).
-        assert!(mmap_return_is_valid_mapping_address(0xEE98_1000, &ABI_X86_32));
-        assert!(mmap_return_is_valid_mapping_address(0xF5D0_0000, &ABI_X86_32));
+        assert!(mmap_return_is_valid_mapping_address(
+            0xEE98_1000,
+            &ABI_X86_32
+        ));
+        assert!(mmap_return_is_valid_mapping_address(
+            0xF5D0_0000,
+            &ABI_X86_32
+        ));
         // A 64-bit child's mmap returns high addresses (well above the
         // i386 TASK_SIZE) — the check must accept those on the 64-bit ABI.
-        assert!(mmap_return_is_valid_mapping_address(0x7f12_3400_0000, &ABI_X86_64));
+        assert!(mmap_return_is_valid_mapping_address(
+            0x7f12_3400_0000,
+            &ABI_X86_64
+        ));
     }
 
     #[test]
@@ -15457,10 +15418,16 @@ mod tests {
         // (rax = the syscall number 192, rax = a stale code address like
         // 0x807cd64) are both unaligned — rejected before any write.
         assert!(!mmap_return_is_valid_mapping_address(192, &ABI_X86_32));
-        assert!(!mmap_return_is_valid_mapping_address(0x807c_d64, &ABI_X86_32));
+        assert!(!mmap_return_is_valid_mapping_address(
+            0x807c_d64,
+            &ABI_X86_32
+        ));
         // Above the i386 TASK_SIZE (0xfffff000): rejected for the i386
         // ABI even though it is page-aligned.
-        assert!(!mmap_return_is_valid_mapping_address(0x1_0000_0000, &ABI_X86_32));
+        assert!(!mmap_return_is_valid_mapping_address(
+            0x1_0000_0000,
+            &ABI_X86_32
+        ));
     }
 
     #[test]
@@ -15575,8 +15542,7 @@ mod tests {
         // EFAULT/EINVAL branch of the runtime path.
         let payload = [0x5Au8; 64];
         let mut usable: Option<bool> = None;
-        let (written, method) =
-            write_child_bytes_injection(-1, 0x1000_0000, &payload, &mut usable);
+        let (written, method) = write_child_bytes_injection(-1, 0x1000_0000, &payload, &mut usable);
         assert_eq!(written, 0, "both write paths must fail against pid -1");
         assert!(
             method == "vm_writev+poke" || method == "poke",
@@ -15594,8 +15560,7 @@ mod tests {
         // pid -1 the poke fails, and the method label must be "poke".
         let payload = [0xA5u8; 32];
         let mut usable: Option<bool> = Some(false);
-        let (written, method) =
-            write_child_bytes_injection(-1, 0x1000_0000, &payload, &mut usable);
+        let (written, method) = write_child_bytes_injection(-1, 0x1000_0000, &payload, &mut usable);
         assert_eq!(written, 0);
         assert_eq!(method, "poke");
         assert_eq!(usable, Some(false), "must stay condemned");
@@ -15650,8 +15615,8 @@ mod tests {
         let d = ChildUserDesc {
             entry_number: 0xffff_ffff, // bionic __set_tls passes -1
             base_addr: 0xa000_1234,
-            limit: 0x1000,             // bionic uses PAGE_SIZE as limit
-            flags: 0x7f,               // seg_32bit|contents|limit_in_pages|useable
+            limit: 0x1000, // bionic uses PAGE_SIZE as limit
+            flags: 0x7f,   // seg_32bit|contents|limit_in_pages|useable
         };
         let mut b = [0u8; 16];
         b[0..4].copy_from_slice(&d.entry_number.to_le_bytes());
@@ -15873,12 +15838,12 @@ mod tests {
             st_ctime_nsec: 0,
         };
         let b = build_i386_stat64_bytes(&f);
-        assert_eq!(
-            i64::from_le_bytes(b[44..52].try_into().unwrap()),
-            -2
-        );
+        assert_eq!(i64::from_le_bytes(b[44..52].try_into().unwrap()), -2);
         // and the u64 view of the same bytes is 0xFFFF...FE.
-        assert_eq!(u64::from_le_bytes(b[44..52].try_into().unwrap()), u64::MAX - 1);
+        assert_eq!(
+            u64::from_le_bytes(b[44..52].try_into().unwrap()),
+            u64::MAX - 1
+        );
     }
 
     #[test]
@@ -15900,8 +15865,7 @@ mod tests {
         let md = std::fs::metadata(&path).expect("stat temp file");
         let f = stat64_fields_from_metadata(&md);
         let b = build_i386_stat64_bytes(&f);
-        let size =
-            i64::from_le_bytes(b[44..52].try_into().unwrap());
+        let size = i64::from_le_bytes(b[44..52].try_into().unwrap());
         assert_eq!(size, 0x1234, "st_size must be the real file size");
         let mode = u32::from_le_bytes(b[16..20].try_into().unwrap());
         assert_ne!(mode & 0o170000, 0, "st_mode must carry S_IFMT bits");
