@@ -4839,7 +4839,12 @@ pub fn run_ptrace_loop(
     //   a SIGSYS trap survived by the 6-Z62 catcher) — from then on the
     //   POKEDATA loop is used directly, so a blocked filter costs ONE
     //   failed call per boot instead of one per mmap2.
-    let mut pending_mmap2_content: Option<PendingMmap2Content> = None;
+    // 6-Z72 fix2: PER-PID slots — init AND the recovery child both mmap
+    // files concurrently (init: sepolicy/properties; recovery: libc.so et
+    // al.). A single Option slot meant the second child's ENTRY overwrote
+    // the first's pending record, silently losing its injection.
+    let mut pending_mmap2_content: std::collections::HashMap<libc::pid_t, PendingMmap2Content> =
+        std::collections::HashMap::new();
     let mut open_fd_owner_paths: std::collections::HashMap<(libc::pid_t, i32), String> =
         std::collections::HashMap::new();
     let mut mmap2_injected_bytes: std::collections::HashMap<libc::pid_t, u64> =
@@ -7285,7 +7290,7 @@ pub fn run_ptrace_loop(
                                     && mmap2_length > 0
                                     && (mmap2_prot & libc::PROT_READ) != 0
                                 {
-                                    pending_mmap2_content = Some(PendingMmap2Content {
+                                    pending_mmap2_content.insert(pid, PendingMmap2Content {
                                         pid,
                                         fd,
                                         length: mmap2_length,
@@ -7997,24 +8002,13 @@ pub fn run_ptrace_loop(
                     // stop still drops the record (Gate 1's true DESYNC
                     // protection) — a single child cannot legitimately run
                     // another syscall between its own mmap2 ENTRY and EXIT.
-                    if pending_mmap2_content.is_some() {
-                        let pending_pid = pending_mmap2_content.as_ref().unwrap().pid;
-                        if pending_pid != pid {
-                            // Foreign child's stop — LEAVE ARMED for the
-                            // record's own child (6-Z72). Log sparsely so
-                            // interleave frequency is visible without
-                            // flooding (first 200 loops only).
-                            if loop_count <= 200 {
-                                log(&format!(
-                                    "6-Z72: mmap2 pending survives cross-child stop (armed by pid={}, this stop is pid={} nr={} [{}]) — record stays armed",
-                                    pending_pid,
-                                    pid,
-                                    syscall_num,
-                                    syscall_name(syscall_num, &abi)
-                                ));
-                            }
-                        } else {
-                        let pending = pending_mmap2_content.take().unwrap();
+                    if pending_mmap2_content.contains_key(&pid) {
+                        // 6-Z72 fix2: per-pid slots — a foreign child's stop
+                        // can't even see this pid's record now (lookup is by
+                        // the STOP's pid), so the cross-child-survival guard
+                        // is inherent. Only the arming pid's own stops reach
+                        // this branch.
+                        let pending = pending_mmap2_content.remove(&pid).unwrap();
                         if syscall_num != abi.mmap && syscall_num != abi.mmap2 {
                             // Gate 1 — DESYNC (same pid): this EXIT stop
                             // belongs to a different syscall than the mmap2
@@ -8274,7 +8268,6 @@ pub fn run_ptrace_loop(
                                     ));
                                 }
                             }
-                        }
                         }
                     }
                     // Part B — write(fd, buf, count) EXIT: capture
