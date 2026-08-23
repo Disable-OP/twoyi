@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
+import java.io.RandomAccessFile;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
@@ -523,9 +524,19 @@ public final class FileLogger {
      * core.rs redirects the kr64 binary's stdout+stderr to
      * {@code <dataDir>/kr64-app-stderr.log} (see app/rs/src/core.rs line 422).
      * This pump copies that file to the external log dir every 2 s so the
-     * user can read it without root. We do a full copy each time (not an
-     * incremental tail) because kr64 truncates the file on each launch,
-     * so an incremental offset would be wrong after a relaunch.
+     * user can read it without root. The FILE COPY stays a full copy each
+     * time (not an incremental tail) because kr64 truncates the file on
+     * each launch, so an incremental offset would be wrong after a
+     * relaunch.
+     * <p>
+     * 6-Z87 FIX 3: the LOGCAT tee leg is now INCREMENTAL (see
+     * {@link #logcatTeeIncremental}). Pre-Z87 it re-logged the ENTIRE file
+     * via {@code Log.i("KR64", …)} every 2 s — an O(N²) logcat flood (the
+     * file only grows, so pass N re-logs N passes' worth of lines, and
+     * chatty collapsed them into the illusion of a "2 s relaunch loop").
+     * There is NO relaunch loop: one container runs continuously and the
+     * 2 s "metronome" was this tee. A truncation (the real relaunch
+     * signature) now logs exactly one notice line and resets the offset.
      */
     private void startKr64LogTee(Context context) {
         final File src = new File(context.getApplicationInfo().dataDir, "kr64-app-stderr.log");
@@ -533,6 +544,11 @@ public final class FileLogger {
         // Also tee the fallback linker path log (log.txt) into the same file.
         final File src2 = new File(context.getApplicationInfo().dataDir, "log.txt");
         Thread t = new Thread(() -> {
+            // 6-Z87 FIX 3: incremental logcat offsets, PRIVATE to this pump
+            // thread (next unread byte; 0 = nothing logged yet). Reset to 0
+            // by logcatTeeIncremental when the file shrinks (fresh launch).
+            long teeOffset = 0;   // kr64-app-stderr.log (primary)
+            long tee2Offset = 0;  // log.txt (fallback linker path)
             while (true) {
                 try {
                     StringBuilder sb = new StringBuilder();
@@ -567,17 +583,16 @@ public final class FileLogger {
                                 fos.write(bytes);
                             }
                         }
-                        // ALSO log each line to logcat so kr64's output is
-                        // visible even if the external storage file write
-                        // fails. This is critical for debugging: without this,
-                        // we can't see what kr64 is doing on devices where
-                        // the external storage isn't writable.
-                        for (String line : sb.toString().split("\n")) {
-                            if (!line.isEmpty()) {
-                                Log.i("KR64", line);
-                            }
-                        }
                     }
+                    // 6-Z87 FIX 3: the logcat tee now logs only the NEW
+                    // lines since the last pass (full-file re-logging was
+                    // the O(N²) flood that fabricated the "2 s relaunch
+                    // loop" myth — see the method javadoc). The kr64.log
+                    // FILE COPY above stays full-file on purpose.
+                    teeOffset = logcatTeeIncremental(src, teeOffset,
+                            "-- kr64 log truncated (fresh container launch) --");
+                    tee2Offset = logcatTeeIncremental(src2, tee2Offset,
+                            "-- log.txt truncated (fresh container launch) --");
                 } catch (IOException ignored) {
                     // Source file may be briefly locked by kr64's write —
                     // try again next cycle.
@@ -592,6 +607,63 @@ public final class FileLogger {
         }, "FileLogger-Kr64Tee");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * 6-Z87 FIX 3: incremental logcat leg of the kr64 tee. Reads only the
+     * bytes past {@code offset} (RandomAccessFile seek → read to EOF), logs
+     * each NEW complete line via {@code Log.i("KR64", line)}, and returns
+     * the new offset. Only complete lines (up to the last '\n' in the new
+     * chunk) are logged + consumed, so a mid-write partial line is never
+     * split across two logcat entries. If the file shrank below
+     * {@code offset} it was truncated — the REAL relaunch signature (kr64
+     * truncates the log at container start) — so the offset resets to 0 and
+     * exactly one {@code truncatedMsg} notice is logged.
+     *
+     * @return the updated offset (file position after the last logged line)
+     */
+    private static long logcatTeeIncremental(File src, long offset, String truncatedMsg) {
+        if (src == null || !src.exists()) {
+            return offset;
+        }
+        long len = src.length();
+        if (len == 0 || len == offset) {
+            return offset; // nothing new
+        }
+        if (len < offset) {
+            Log.i("KR64", truncatedMsg);
+            offset = 0;
+        }
+        String chunk;
+        try (RandomAccessFile raf = new RandomAccessFile(src, "r")) {
+            raf.seek(offset);
+            long remaining = raf.length() - offset;
+            if (remaining <= 0) {
+                return offset;
+            }
+            byte[] buf = new byte[(int) Math.min(remaining, 1 << 20)];
+            int n = raf.read(buf);
+            if (n <= 0) {
+                return offset;
+            }
+            chunk = new String(buf, 0, n, StandardCharsets.UTF_8);
+        } catch (IOException ignored) {
+            // Briefly locked/rotated by kr64's writer — retry next pass.
+            return offset;
+        }
+        // Consume only COMPLETE lines; a trailing partial line stays
+        // un-logged (its offset is not advanced past it) until its '\n'
+        // arrives in a later pass.
+        int lastNl = chunk.lastIndexOf('\n');
+        if (lastNl < 0) {
+            return offset;
+        }
+        for (String line : chunk.substring(0, lastNl).split("\n")) {
+            if (!line.isEmpty()) {
+                Log.i("KR64", line);
+            }
+        }
+        return offset + lastNl + 1;
     }
 
     // -------------------------------------------------------------------------
