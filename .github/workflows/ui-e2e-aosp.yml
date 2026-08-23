@@ -264,10 +264,21 @@ jobs:
           # linker SIGSEGVs (0x86 NULL deref).
           # exec-out is binary-safe; gzip on the runner (-1: speed).
           adb -s emulator-5554 wait-for-device
+          # /init is root-owned 0750 — the shell-user tar omitted it (run
+          # 32653066364: 537MB tar, no init, the honest gate caught it).
+          # `adb root` is used ONLY for this CI-side artifact preparation
+          # (the google_apis image is rootable); the TEST itself stays the
+          # unrooted-user simulation (adb unroot right after).
+          adb -s emulator-5554 root
+          sleep 3
+          adb -s emulator-5554 wait-for-device
           echo "── Tarring the rootfs out of the booted emulator (system+vendor+init+apex) ──"
           adb -s emulator-5554 exec-out \
               "cd / && tar cf - system/ vendor/ init default.prop apex/ 2>/dev/null" \
               | gzip -1 > /tmp/profile_rootfs.tar.gz
+          adb -s emulator-5554 unroot || true
+          sleep 2
+          adb -s emulator-5554 wait-for-device
           ls -la /tmp/profile_rootfs.tar.gz
           [ -s /tmp/profile_rootfs.tar.gz ] || { echo "✗ rootfs tar is empty"; exit 1; }
           gzip -t /tmp/profile_rootfs.tar.gz || { echo "✗ corrupt gzip"; exit 1; }
