@@ -601,8 +601,8 @@ def verify_rom_imported(root):
     # screen — return False so the test aborts instead of pretending a
     # ROM was imported.
     activity = get_current_activity()
-    if "io.twoyi" not in (activity or "").lower():
-        print(f"  ✗ ROM import verification failed: not on io.twoyi (activity={activity!r})")
+    if PACKAGE not in (activity or "").lower():
+        print(f"  ✗ ROM import verification failed: not on {PACKAGE} (activity={activity!r})")
         return False
     if root is None:
         print("  ✗ ROM import verification failed: no UI hierarchy available")
@@ -797,7 +797,7 @@ def main():
     am_cmd = ('am start -a android.intent.action.VIEW '
               '-d "file:///sdcard/Download/recovery.img" '
               '-t "*/*" '
-              '-n io.twoyi/.ui.SettingsActivity')
+              f'-n {PACKAGE}/io.twoyi.ui.SettingsActivity')
     print(f"  $ adb shell {am_cmd}")
     out = adb_shell(am_cmd)
     if out:
@@ -820,11 +820,11 @@ def main():
     activity = get_current_activity()
     print(f"  Step 3 current activity: {activity}")
 
-    found_file = "io.twoyi" in (activity or "").lower()
+    found_file = PACKAGE in (activity or "").lower()
     if found_file:
         print("  ✓ am start delivered recovery.img to SettingsActivity — import should be running")
     else:
-        print(f"  ⚠ Not on io.twoyi after am start (activity={activity!r})")
+        print(f"  ⚠ Not on {PACKAGE} after am start (activity={activity!r})")
         print(f"     Step 4 will verify whether a ROM was actually imported and abort if not.")
 
     # Step 4 will wait for the import to complete (up to 120s) and verify
@@ -888,7 +888,7 @@ def main():
         # Pull app logs too — they may show why the import didn't start.
         try:
             os.makedirs(os.path.join(ART, "app-logs"), exist_ok=True)
-            subprocess.run(ADB + ["pull", "/sdcard/Android/data/io.twoyi/files/log/",
+            subprocess.run(ADB + ["pull", f"/sdcard/Android/data/{PACKAGE}/files/log/",
                                  os.path.join(ART, "app-logs/")],
                           capture_output=True, timeout=30)
         except Exception:
@@ -985,12 +985,12 @@ def main():
     # Pull app's FileLogger logs
     print("  Pulling app file logs...")
     os.makedirs(os.path.join(ART, "app-logs"), exist_ok=True)
-    subprocess.run(ADB + ["pull", "/sdcard/Android/data/io.twoyi/files/log/",
+    subprocess.run(ADB + ["pull", f"/sdcard/Android/data/{PACKAGE}/files/log/",
                          os.path.join(ART, "app-logs/")],
                   capture_output=True, timeout=30)
 
     # Try to pull kr64 logs
-    subprocess.run(ADB + ["pull", "/data/data/io.twoyi/kr64-app-stderr.log",
+    subprocess.run(ADB + ["pull", f"/data/data/{PACKAGE}/kr64-app-stderr.log",
                          os.path.join(ART, "kr64-app-stderr.log")],
                   capture_output=True, timeout=10)
 
