@@ -120,6 +120,15 @@ def capture_logs():
     with open(f"{ART}/logcat-full.txt", "w", errors="replace") as f:
         f.write(r.stdout)
     print(f"    logcat-full.txt: {len(r.stdout)} bytes")
+    # 6-Z123c: post-boot ground truth for the security-sysctl trio —
+    # the actual file modes after the guest ran (the EACCES hunt).
+    for d in ("proc/sys/kernel", "proc/sys/vm", "dev/__properties__"):
+        rr = adb_shell(f"run-as {PACKAGE} ls -la profiles/default/rootfs/{d}",
+                       timeout=30)
+        with open(f"{ART}/rootfs-{d.replace('/', '-')}.txt", "w",
+                  errors="replace") as f:
+            f.write(rr.stdout or "")
+        print(f"    rootfs/{d}: {len(rr.stdout or '')} bytes")
     adb("pull", f"/sdcard/Android/data/{PACKAGE}/files/log",
         f"{ART}/app-logs", timeout=60)
     for remote, local in [
