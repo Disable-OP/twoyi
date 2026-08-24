@@ -9,9 +9,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
 
-//! Binder virtualisation skeleton — per-VM `/vm%d/dev/binder` Unix socket
-//! plus a userspace proxy that forwards binder transactions between the
-//! guest and the host's real `/dev/binder` driver.
+//! Binder virtualisation — per-VM `/vm%d/dev/binder` Unix socket plus a
+//! userspace proxy that acts as the guest's binder driver **and** its
+//! servicemanager (6-Z114 / strategy S1b of the 6-Z112 design).
 //!
 //! # What this mirrors
 //!
@@ -32,70 +32,139 @@
 //! process. A future task can split it out into a per-VM `libvm.so`
 //! analogue if the latency becomes a problem.
 //!
-//! # Skeleton status
+//! # What this module implements (6-Z114 / S1b)
 //!
-//! This is a **skeleton**: it compiles, has the right protocol constants,
-//! creates the device, accepts connections, and dispatches the standard
-//! ioctl set. What it does NOT do yet:
+//! * **Kernel-truth protocol constants** — every `BINDER_*` ioctl uses
+//!   ioctl type `'b'`, every `BC_*` command uses type `'c'`, every `BR_*`
+//!   return uses type `'r'` (verified against
+//!   `/usr/include/linux/android/binder.h` AND bionic's
+//!   `android-11.0.0_r1` mirror — zero differences across all 38 shared
+//!   definitions; see the `bc_br_constants_match_kernel_values` test for
+//!   the full locked table and 6-Z114 §CHANGES for the audit trail — the
+//!   pre-Z114 table used `'b'` for everything and was wrong in every
+//!   BC_/BR_ entry).
+//! * **A proxy-side servicemanager** — `BC_TRANSACTION` to handle 0 is
+//!   answered by the proxy itself, speaking the exact wire protocol of
+//!   AOSP-11's `frameworks/native/cmds/servicemanager` (the AIDL
+//!   `android.os.IServiceManager`: descriptor token
+//!   `[i32 strict][i32 worksource][i32 'SYST'][string16]`, transaction
+//!   codes getService=1/checkService=2/addService=3/listServices=4,
+//!   replies `[i32 exception=0] + payload` — all verified from the
+//!   fetched android-11 sources; see `servicemanager_transaction`).
+//! * **A real name→handle registry** — addService records
+//!   (name, guest binder ptr/cookie, owning connection); getService
+//!   answers with a `flat_binder_object{BINDER_TYPE_HANDLE}` carrying a
+//!   proxy-allocated fake handle (`0xF0000000 + n`); a miss answers with
+//!   a null binder, exactly like the native servicemanager's reply shape.
+//! * **`BR_TRANSACTION` delivery** — transactions aimed at a registered
+//!   fake handle are queued for the owning guest connection and
+//!   delivered (with the owner's ptr/cookie stamped into the target)
+//!   on its next `BINDER_WRITE_READ` with read capacity; the server's
+//!   `BC_REPLY` is routed back to the requester as `BR_REPLY`.
+//! * **Blocking idle** — a pure-read `BINDER_WRITE_READ` blocks on the
+//!   connection's queue (250 ms tick, then `BR_NOOP`) instead of
+//!   busy-answering, mirroring the kernel's blocking read.
 //!
-//! * **Parcel parsing** for `SVC_MGR_GET_SERVICE` / `SVC_MGR_ADD_SERVICE`.
-//!   The guest sends a parcelled interface-descriptor + service-name
-//!   string; we'd need to follow the `binder_transaction_data.data.ptr`
-//!   pointer into the guest's write buffer to read it. The skeleton just
-//!   logs the request and returns `BR_FAILED_REPLY`.
-//! * **Handle translation.** When the guest does `BC_TRANSACTION` to
-//!   handle 5 (e.g. `activity`), we'd need to look up the *host's*
-//!   binder handle for `activity` (looked up earlier via
-//!   `SVC_MGR_GET_SERVICE` on the host's `/dev/binder`), patch the
-//!   transaction_data.target.handle, and forward via a real
-//!   `BINDER_WRITE_READ` ioctl on the host. The skeleton's
-//!   `forward_transaction_to_host` opens `/dev/binder` lazily and issues
-//!   the ioctl but does NOT yet translate handles or patch the offsets /
-//!   `flat_binder_object` array — that's the hard part and is left for
-//!   the next task (proposed: `BINDER-3`).
-//! * **Death notifications**, **BC_ACQUIRE_DONE** / **BC_INCREFS_DONE**
-//!   acknowledgements, **file-descriptor passing**, **async (one-way)
-//!   transactions**, **BC_TRANSACTION_SG** scatter-gather offsets. All
-//!   are accepted and logged but not actually processed.
+//! # What is still NOT here (the honest list)
+//!
+//! * **Parcel bytes on the wire need the v2 client.** The 6-Z113 loader
+//!   forwards the guest's `BC_*` stream verbatim but cannot (yet)
+//!   inline the parcel buffers that `binder_transaction_data.data.ptr`
+//!   points at — see "Wire v2" below. Until the loader learns v2
+//!   (proposed: 6-Z115), handle-0 transactions arrive parcel-less and
+//!   the servicemanager answers the *legacy* synthetic shapes (GET →
+//!   null binder, ADD → status 0): correct enough to keep the ROM's
+//!   libbinder loops terminating, registry inert.
+//! * **Host forwarding** (`forward_transaction_to_host`) still does no
+//!   handle translation / flat-object patching (the old `BINDER-3`
+//!   TODO). It now at least emits the kernel-true `BC_TRANSACTION`
+//!   number when it talks to a real host `/dev/binder`.
+//! * No death notifications, no fd passing, no `BC_ACQUIRE/…DONE`
+//!   refcount pairs delivered to servers, one `BC_REPLY` per connection
+//!   matched FIFO (the wire carries no thread identity — see
+//!   `route_transaction`), sender pid/euid stamped as 0/0 pending a
+//!   v2+ loader extension.
 //!
 //! # Wire framing
 //!
 //! The guest's `libbinder.so` cannot call `ioctl()` on a Unix socket —
-//! `ioctl` on a `SOCK_STREAM` returns ENOTTY for binder ioctls. So
-//! either:
+//! `ioctl` on a `SOCK_STREAM` returns ENOTTY for binder ioctls. The
+//! 6-Z113 loader hooks `ioctl` in-process and speaks the frame protocol
+//! below over the socket (`twoyi_loader_shlib.c`, binder-proxy block).
 //!
-//! 1. The guest's `libbinder.so` is patched (via LD_PRELOAD or a custom
-//!    `libc.so` shim) to translate `ioctl(fd, BINDER_*, arg)` calls into
-//!    framed socket messages on `/dev/binder`. This is what VM does
-//!    (the patching happens in `libvm.so` via shadowhook — see
-//!    `VM_KR64_ANALYSIS.md` §11), OR
-//! 2. The daemon creates `/dev/binder` as a real char device via
-//!    `mknodat(S_IFCHR, …)` and uses `binderfs` / a kernel module to
-//!    actually handle the ioctls. This is the "real driver" approach
-//!    and requires `CAP_MKNOD` + a per-VM binder context in the kernel.
+//! ## Frames
 //!
-//! This skeleton uses approach (1). The wire format is documented in
-//! the [`Frame`] / [`Resp`] docs below. The guest-side patching code is
-//! a separate task (proposed: `BINDER-4`).
+//! ```text
+//! guest → host : [u32 cmd][u32 arg_len][arg_len bytes]
+//! host → guest : [i32 ret][u32 arg_len][arg_len bytes]
+//! ```
+//!
+//! `cmd` is the binder ioctl number (the 6-Z113 loader normalises
+//! `BINDER_SET_CONTEXT_MGR` from the kernel's `_IOW('b',7,__s32)`
+//! spelling to the legacy `_IO('b',7)` one; the dispatcher here accepts
+//! both). `arg_len` is capped at 1 MiB.
+//!
+//! ## BINDER_WRITE_READ payloads — v1 (6-Z113) and v2 (parcels)
+//!
+//! The kernel `binder_write_read` struct carries user pointers that are
+//! meaningless across a socket, so the wire form is our own:
+//!
+//! ```text
+//! v1 request : [u32 write_size][u32 read_capacity][write_size BC_* bytes]
+//! v1 response: [u32 read_size][read_size BR_* bytes]
+//!
+//! v2 request : [u32 write_size][u32 read_capacity][write_size BC_* bytes]
+//!              [u32 WIRE_V2_MAGIC][u32 blob_count]
+//!              (blob_count ×) [u32 data_len][u32 offsets_len][data][offsets]
+//! v2 response: [u32 read_size][read_size BR_* bytes]
+//!              [u32 WIRE_V2_MAGIC][u32 blob_count]
+//!              (blob_count ×) [u32 data_len][u32 offsets_len][data][offsets]
+//! ```
+//!
+//! * A payload that ends exactly after the BC stream is v1 (6-Z113
+//!   clients — byte-compatible, and the extra v2 response tail is only
+//!   ever appended when the request was v2).
+//! * The i-th blob belongs to the i-th `BC_TRANSACTION`/`BC_REPLY`/`*_SG`
+//!   command in the BC stream, in order — the client walks the same
+//!   stream to collect `data.ptr`/`offsets.ptr`, so both sides agree
+//!   without offsets bookkeeping on the wire.
+//! * In the response, blobs pair in order with the `BR_REPLY`/
+//!   `BR_TRANSACTION` records in the BR stream. The v2 client stashes
+//!   each blob in guest-addressable memory, patches the corresponding
+//!   `binder_transaction_data.data_ptr`/`offsets_ptr` (0 on the wire)
+//!   inside the BR bytes **before** copying them into the guest's
+//!   read_buffer, and later answers `BC_FREE_BUFFER` for those blocks.
+//! * v1 requests are answered without a trailer, so the 6-Z113 client
+//!   (which ignores everything past `[u32 read_size][read_size bytes]`)
+//!   and its mock stay byte-compatible.
 //!
 //! # Module layout
 //!
 //! * [`create_binder_device`] — creates `{rootfs}/vm{id}/dev/binder` as
 //!   a Unix socket plus a `{rootfs}/dev/binder` symlink to it.
 //! * [`BinderProxy`] / [`BinderProxyHandle`] — owns the listener and
-//!   spawns the accept + worker threads.
-//! * [`ThreadPool`] — minimal fixed-size thread pool used by
-//!   `BinderProxy` for concurrent connection handling.
-//! * [`HandleTable`] — guest-handle ↔ host-handle ↔ service-name map.
+//!   spawns one thread per guest connection (bounded by
+//!   [`MAX_PROXY_CONNECTIONS`]).
+//! * `ProxyShared` / `ConnState` — the shared servicemanager state:
+//!   the name registry, per-connection delivery queues, and the
+//!   pending-reply correlation map.
+//! * `ParcelReader` / `ParcelWriter` — the libbinder Parcel codec
+//!   (interface token, string16, flat_binder_object).
 //! * `dispatch_request` / `handle_*` — per-ioctls handlers.
-//! * `servicemanager_proxy` / `forward_transaction_to_host` — the two
-//!   transaction dispatch paths (handle 0 → servicemanager, else → host).
+//! * `servicemanager_transaction` / `route_transaction` /
+//!   `forward_transaction_to_host` — the three transaction dispatch
+//!   paths (handle 0 → proxy servicemanager, fake handle → guest owner
+//!   connection, anything else → the host's real `/dev/binder`).
+//! * [`ThreadPool`] — kept from the skeleton era (no longer used by the
+//!   proxy: blocking idle reads would pin the fixed pool).
+//! * [`HandleTable`] — guest↔host handle translation table for the
+//!   future host-forwarding path (BINDER-3).
 //! * Protocol constants (`BINDER_*`, `BC_*`, `BR_*`, `SVC_MGR_*`) —
 //!   exact matches of the kernel `<uapi/linux/android/binder.h>` and
-//!   AOSP `frameworks/native/libs/binder/IServiceManager.cpp`.
+//!   AOSP-11 `frameworks/native` (IServiceManager / servicemanager).
 
 use libc::c_void;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -104,6 +173,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 // Crate-local logging macros (defined in lib.rs) — no external `log` crate.
 // `error` is not currently used in this skeleton (all error paths use
@@ -204,35 +274,38 @@ pub struct BinderPtrCookie {
 
 /// `struct binder_handle_cookie` — payload of
 /// `BC_REQUEST_DEATH_NOTIFICATION`, `BC_CLEAR_DEATH_NOTIFICATION`.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
+///
+/// The kernel declares it `__attribute__((packed))` — `__u32 handle`
+/// immediately followed by `binder_uintptr_t cookie` with NO padding,
+/// 12 bytes on 64-bit ABIs (which is why those BC_* ioctls carry a size
+/// field of 12, not 16).
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub struct BinderHandleCookie {
     pub handle: u32,
-    pub pad: u32,
     pub cookie: u64,
 }
 
-/// `struct binder_pri_desc` — payload of `BR_ACQUIRE`, `BR_RELEASE`,
-/// `BR_INCREFS`, `BR_DECREFS`.
+/// `struct binder_pri_desc` — payload of `BC_ATTEMPT_ACQUIRE`.
+/// 8 bytes: two 32-bit fields, no padding.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 #[allow(dead_code)]
 pub struct BinderPriDesc {
-    pub priority: u32,
+    pub priority: i32,
     pub desc: u32,
-    pub pad: u32,
 }
 
-/// `struct binder_pri_cookie` — payload of `BR_ATTEMPT_ACQUIRE`,
-/// `BC_ACQUIRE_FAILED`, `BC_INCREFS_FAILED`.
+/// `struct binder_pri_ptr_cookie` — payload of `BR_ATTEMPT_ACQUIRE`.
+/// 24 bytes: `__s32 priority` + natural padding + two pointers.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 #[allow(dead_code)]
-pub struct BinderPriCookie {
-    pub priority: u32,
-    pub desc: u32,
+pub struct BinderPriPtrCookie {
+    pub priority: i32,
     pub pad: u32,
+    pub ptr: u64,
     pub cookie: u64,
 }
 
@@ -279,12 +352,54 @@ pub struct FlatBinderObject {
     pub cookie: u64,
 }
 
+/// `struct binder_transaction_data_sg` — payload of
+/// `BC_TRANSACTION_SG` / `BC_REPLY_SG`: the 64-byte
+/// `binder_transaction_data` + `binder_size_t buffers_size` = 72 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+pub struct BinderTransactionDataSg {
+    pub transaction_data: BinderTransactionData,
+    pub buffers_size: u64,
+}
+
+/// `struct binder_transaction_data_secctx` — payload of
+/// `BR_TRANSACTION_SEC_CTX` (same ioctl nr as `BR_TRANSACTION`; the
+/// 72-byte size field distinguishes them). We never send it — AOSP-11
+/// libbinder accepts the plain form too (`IPCThreadState::waitForResponse`
+/// handles both) — defined for completeness.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+pub struct BinderTransactionDataSecctx {
+    pub transaction_data: BinderTransactionData,
+    pub secctx: u64,
+}
+
+/// `struct binder_node_debug_info` — argument of
+/// `BINDER_GET_NODE_DEBUG_INFO`. 24 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
+pub struct BinderNodeDebugInfo {
+    pub debug_id: u32,
+    pub pad: u32,
+    pub ptr: u64,
+    pub cookie: u64,
+}
+
 // ============================================================================
-// Binder ioctl numbers (drivers/android/binder.h).
+// Binder ioctl numbers (drivers/android/binder.h — `enum` with _IOWR('b', …)).
 //
 // These MUST match the kernel exactly — the guest's libbinder.so uses
 // these literal numbers in `ioctl()` calls, and any translation layer
-// has to recognise them.
+// has to recognise them. Only the TOP-LEVEL ioctls use type 'b'; the
+// BC_* stream commands use type 'c' and the BR_* returns use type 'r'
+// (see below) — that split is the kernel's own, and it is ABI-frozen:
+// verified 2026-08-24 against BOTH /usr/include/linux/android/binder.h
+// (this build host's kernel UAPI) AND bionic's android-11.0.0_r1 mirror
+// of the same header (the one the ROM's userspace was actually built
+// against) — zero differences across all 38 shared definitions.
 // ============================================================================
 
 /// `BINDER_WRITE_READ` — the workhorse ioctl. Sends BC_* commands and
@@ -309,17 +424,30 @@ pub const BINDER_SET_MAX_THREADS: u32 = _IOW(BINDER_IOC_TYPE, 5, 4);
 pub const BINDER_SET_IDLE_PRIORITY: u32 = _IOW(BINDER_IOC_TYPE, 6, 4);
 
 /// `BINDER_SET_CONTEXT_MGR` — become the servicemanager for this binder
-/// context. Only one process per context may set this. The modern kernel
-/// uses `BINDER_SET_CONTEXT_MGR_EXT` (with a flat_binder_object arg);
-/// `BINDER_SET_CONTEXT_MGR` is the legacy form with no arg (`_IO`).
+/// context (kernel: `_IOW('b', 7, __s32)` = 0x40046207 in BOTH the
+/// modern kernel header and bionic-11).
+///
+/// **Wire note (the 6-Z113 pairing):** this constant keeps the LEGACY
+/// `_IO('b', 7)` = 0x6207 spelling because that is what the 6-Z113
+/// loader translates the kernel spelling DOWN to before putting it on
+/// the wire (`BP_IOC_SET_CTX_MGR_WIRE` in twoyi_loader_shlib.c). The
+/// dispatcher accepts BOTH — see [`BINDER_SET_CONTEXT_MGR_KERNEL`] — so
+/// either client spelling works and neither side of the loader/proxy
+/// pair needs a forced change (resolves the 6-Z113 "do not fix one side
+/// alone" warning).
 pub const BINDER_SET_CONTEXT_MGR: u32 = _IO(BINDER_IOC_TYPE, 7);
+
+/// The kernel/bionic spelling of `BINDER_SET_CONTEXT_MGR`
+/// (`_IOW('b', 7, __s32)`). Accepted by [`dispatch_request`] alongside
+/// the legacy wire spelling above.
+pub const BINDER_SET_CONTEXT_MGR_KERNEL: u32 = _IOW(BINDER_IOC_TYPE, 7, 4);
 
 /// `BINDER_THREAD_EXIT` — tell the kernel a binder thread is exiting
 /// (so it can clean up its per-thread state).
 pub const BINDER_THREAD_EXIT: u32 = _IOW(BINDER_IOC_TYPE, 8, 4);
 
 /// `BINDER_VERSION` — query the binder protocol version. Returns a
-/// `__u32` that should match `BINDER_CURRENT_PROTOCOL_VERSION`.
+/// `struct binder_version { __s32 protocol_version; }`.
 pub const BINDER_VERSION: u32 = _IOWR(BINDER_IOC_TYPE, 9, 4);
 
 /// `BINDER_GET_NODE_DEBUG_INFO` — for debuggerd / dumpstate.
@@ -327,7 +455,7 @@ pub const BINDER_VERSION: u32 = _IOWR(BINDER_IOC_TYPE, 9, 4);
 pub const BINDER_GET_NODE_DEBUG_INFO: u32 = _IOWR(
     BINDER_IOC_TYPE,
     11,
-    std::mem::size_of::<FlatBinderObject>() as u32,
+    std::mem::size_of::<BinderNodeDebugInfo>() as u32,
 );
 
 /// `BINDER_SET_CONTEXT_MGR_EXT` — modern form of SET_CONTEXT_MGR, takes
@@ -342,279 +470,386 @@ pub const BINDER_SET_CONTEXT_MGR_EXT: u32 = _IOW(
 
 // ============================================================================
 // BC_* — binder commands (written by userspace into the write_buffer of
-// BINDER_WRITE_READ).
+// BINDER_WRITE_READ). Kernel: `enum binder_driver_command_protocol`.
 //
 // Each BC_* is encoded in the write_buffer as a [u32 cmd][cmd-specific
-// payload] pair. The cmd u32 IS the ioctl number (so the payload size
-// can be extracted from bits 16..29 via [`bc_payload_size`]).
+// payload] pair. The cmd u32 IS an ioctl-style number (so the payload
+// size can be extracted from bits 16..29 via [`bc_payload_size`]).
 //
-// The kernel enum (`enum BinderCommand` in `<uapi/linux/android/binder.h>`)
-// starts at `nr=1` (nr=0 is unused in the BC_* space). We match the
-// kernel exactly so the guest's libbinder.so (which uses these literal
-// numbers) recognises our commands.
+// KERNEL TRUTH (resolved 6-Z114 after two contradictory wrong guesses —
+// 6-Z113 flagged BC_ENTER_LOOPER as `_IO('b',16)`, the 6-Z114 task
+// brief guessed `_IO('b',13)`; BOTH were wrong): the whole BC_* family
+// uses ioctl type char **'c'** (0x63), NOT 'b', and the enum starts at
+// nr=0 with BC_TRANSACTION. Verified against
+// /usr/include/linux/android/binder.h and bionic-11's byte-identical
+// mirror:
+//
+//   BC_TRANSACTION        = _IOW('c',  0, binder_transaction_data)     0x40406300
+//   BC_REPLY              = _IOW('c',  1, binder_transaction_data)     0x40406301
+//   BC_ACQUIRE_RESULT     = _IOW('c',  2, __s32)                      0x40046302
+//   BC_FREE_BUFFER        = _IOW('c',  3, binder_uintptr_t)           0x40086303
+//   BC_INCREFS            = _IOW('c',  4, __u32)                      0x40046304
+//   BC_ACQUIRE            = _IOW('c',  5, __u32)                      0x40046305
+//   BC_RELEASE            = _IOW('c',  6, __u32)                      0x40046306
+//   BC_DECREFS            = _IOW('c',  7, __u32)                      0x40046307
+//   BC_INCREFS_DONE       = _IOW('c',  8, binder_ptr_cookie)          0x40106308
+//   BC_ACQUIRE_DONE       = _IOW('c',  9, binder_ptr_cookie)          0x40106309
+//   BC_ATTEMPT_ACQUIRE    = _IOW('c', 10, binder_pri_desc)            0x4008630a
+//   BC_REGISTER_LOOPER    = _IO ('c', 11)                             0x0000630b
+//   BC_ENTER_LOOPER       = _IO ('c', 12)                             0x0000630c
+//   BC_EXIT_LOOPER        = _IO ('c', 13)                             0x0000630d
+//   BC_REQUEST_DEATH_NOTIFICATION  = _IOW('c', 14, binder_handle_cookie[packed, 12])
+//   BC_CLEAR_DEATH_NOTIFICATION    = _IOW('c', 15, binder_handle_cookie)
+//   BC_DEAD_BINDER_DONE   = _IOW('c', 16, binder_uintptr_t)           0x40086310
+//   BC_TRANSACTION_SG     = _IOW('c', 17, binder_transaction_data_sg) 0x40486311
+//   BC_REPLY_SG           = _IOW('c', 18, binder_transaction_data_sg) 0x40486312
 // ============================================================================
 
+/// Binder command ioctl type char — `'c'` = 0x63 (kernel
+/// `enum binder_driver_command_protocol`).
+pub const BC_IOC_TYPE: u32 = b'c' as u32;
+
 /// `BC_TRANSACTION` — send a synchronous (or one-way, if TF_ONE_WAY)
-/// transaction to a remote binder.
+/// transaction to a remote binder. Kernel nr is **0** (`_IOW('c', 0, …)`).
 pub const BC_TRANSACTION: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    1,
+    BC_IOC_TYPE,
+    0,
     std::mem::size_of::<BinderTransactionData>() as u32,
 );
 
 /// `BC_REPLY` — send the reply to a received `BR_TRANSACTION`.
 pub const BC_REPLY: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    2,
+    BC_IOC_TYPE,
+    1,
     std::mem::size_of::<BinderTransactionData>() as u32,
 );
 
-/// `BC_ACQUIRE` — acquire a strong reference on a remote handle.
-pub const BC_ACQUIRE: u32 = _IOW(BINDER_IOC_TYPE, 3, 4);
+/// `BC_ACQUIRE_RESULT` — legacy, not supported by the kernel.
+#[allow(dead_code)]
+pub const BC_ACQUIRE_RESULT: u32 = _IOW(BC_IOC_TYPE, 2, 4);
 
-/// `BC_RELEASE` — release a strong reference on a remote handle.
-pub const BC_RELEASE: u32 = _IOW(BINDER_IOC_TYPE, 4, 4);
+/// `BC_FREE_BUFFER` — return a transaction-data buffer received via
+/// `BR_TRANSACTION` / `BR_REPLY` to the driver for reuse.
+pub const BC_FREE_BUFFER: u32 = _IOW(BC_IOC_TYPE, 3, 8);
 
 /// `BC_INCREFS` — acquire a weak reference on a remote handle.
-pub const BC_INCREFS: u32 = _IOW(BINDER_IOC_TYPE, 5, 4);
+pub const BC_INCREFS: u32 = _IOW(BC_IOC_TYPE, 4, 4);
 
-/// `BC_ACQUIRE_DONE` — acknowledge completion of a `BR_ACQUIRE`.
-pub const BC_ACQUIRE_DONE: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    6,
-    std::mem::size_of::<BinderPtrCookie>() as u32,
-);
+/// `BC_ACQUIRE` — acquire a strong reference on a remote handle.
+pub const BC_ACQUIRE: u32 = _IOW(BC_IOC_TYPE, 5, 4);
 
-/// `BC_ACQUIRE_FAILED` — failed acknowledgement (removed from modern
-/// kernels but the ioctl number is still reserved).
-#[allow(dead_code)]
-pub const BC_ACQUIRE_FAILED: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    7,
-    std::mem::size_of::<BinderPriCookie>() as u32,
-);
+/// `BC_RELEASE` — release a strong reference on a remote handle.
+pub const BC_RELEASE: u32 = _IOW(BC_IOC_TYPE, 6, 4);
+
+/// `BC_DECREFS` — release a weak reference on a remote handle.
+pub const BC_DECREFS: u32 = _IOW(BC_IOC_TYPE, 7, 4);
 
 /// `BC_INCREFS_DONE` — acknowledge completion of a `BR_INCREFS`.
 pub const BC_INCREFS_DONE: u32 = _IOW(
-    BINDER_IOC_TYPE,
+    BC_IOC_TYPE,
     8,
     std::mem::size_of::<BinderPtrCookie>() as u32,
 );
 
-/// `BC_INCREFS_FAILED` — failed acknowledgement (removed from modern
-/// kernels but the ioctl number is still reserved).
-#[allow(dead_code)]
-pub const BC_INCREFS_FAILED: u32 = _IOW(
-    BINDER_IOC_TYPE,
+/// `BC_ACQUIRE_DONE` — acknowledge completion of a `BR_ACQUIRE`.
+pub const BC_ACQUIRE_DONE: u32 = _IOW(
+    BC_IOC_TYPE,
     9,
-    std::mem::size_of::<BinderPriCookie>() as u32,
+    std::mem::size_of::<BinderPtrCookie>() as u32,
 );
 
-/// `BC_FREE_BUFFER` — return a transaction-data buffer received via
-/// `BR_TRANSACTION` / `BR_REPLY` to the kernel for reuse.
-pub const BC_FREE_BUFFER: u32 = _IOW(BINDER_IOC_TYPE, 10, 8);
-
-/// `BC_TRANSACTION_SG` — scatter-gather variant of `BC_TRANSACTION`.
-/// Payload is `binder_transaction_data_sg` = `binder_transaction_data`
-/// (64 bytes) + `binder_size_t buffers_size` (8 bytes) = 72 bytes total.
-///
-/// The kernel defines this as `_IOW('b', 11, struct binder_transaction_data_sg)`
-/// where `binder_transaction_data_sg` is 72 bytes. Using 64 (just the base
-/// struct) produces the wrong ioctl number and the guest's `libbinder.so`
-/// (which uses the kernel literal) won't match — silently dropping ALL
-/// scatter-gather transactions.
-pub const BC_TRANSACTION_SG: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    11,
-    // 72 = size_of::<BinderTransactionData>() + size_of::<u64>()
-    // (binder_transaction_data + buffers_size)
-    (std::mem::size_of::<BinderTransactionData>() + 8) as u32,
-);
-
-/// `BC_REPLY_SG` — scatter-gather variant of `BC_REPLY`.
-/// Same 72-byte payload as `BC_TRANSACTION_SG`.
-pub const BC_REPLY_SG: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    12,
-    (std::mem::size_of::<BinderTransactionData>() + 8) as u32,
-);
-
-/// `BC_ENTER_LOOPER` — declare this thread a binder looper (it'll call
-/// `BINDER_WRITE_READ` with `read_size > 0` to block waiting for work).
-pub const BC_ENTER_LOOPER: u32 = _IO(BINDER_IOC_TYPE, 13);
+/// `BC_ATTEMPT_ACQUIRE` — try-acquire; rejected by the kernel (-EINVAL).
+#[allow(dead_code)]
+pub const BC_ATTEMPT_ACQUIRE: u32 =
+    _IOW(BC_IOC_TYPE, 10, std::mem::size_of::<BinderPriDesc>() as u32);
 
 /// `BC_REGISTER_LOOPER` — declare this thread was spawned by the
 /// application in response to `BR_SPAWN_LOOPER`.
-pub const BC_REGISTER_LOOPER: u32 = _IO(BINDER_IOC_TYPE, 14);
+pub const BC_REGISTER_LOOPER: u32 = _IO(BC_IOC_TYPE, 11);
+
+/// `BC_ENTER_LOOPER` — declare this thread a binder looper (it'll call
+/// `BINDER_WRITE_READ` with `read_size > 0` to block waiting for work).
+/// Kernel truth: `_IO('c', 12)` = 0x630c (NOT `_IO('b',13)` as the
+/// pre-Z114 table had it, and NOT `_IO('b',16)` as 6-Z113 guessed).
+pub const BC_ENTER_LOOPER: u32 = _IO(BC_IOC_TYPE, 12);
 
 /// `BC_EXIT_LOOPER` — declare this thread is exiting the looper.
-pub const BC_EXIT_LOOPER: u32 = _IO(BINDER_IOC_TYPE, 15);
+/// Kernel truth: `_IO('c', 13)` = 0x630d.
+pub const BC_EXIT_LOOPER: u32 = _IO(BC_IOC_TYPE, 13);
 
-/// `BC_REQUEST_DEATH_NOTIFICATION` — ask the kernel to send
-/// `BR_DEAD_BINDER` when the referenced handle dies.
+/// `BC_REQUEST_DEATH_NOTIFICATION` — ask the driver to send
+/// `BR_DEAD_BINDER` when the referenced handle dies. Payload is the
+/// kernel's PACKED 12-byte `binder_handle_cookie`.
 pub const BC_REQUEST_DEATH_NOTIFICATION: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    16,
+    BC_IOC_TYPE,
+    14,
     std::mem::size_of::<BinderHandleCookie>() as u32,
 );
 
 /// `BC_CLEAR_DEATH_NOTIFICATION` — cancel a previous
 /// `BC_REQUEST_DEATH_NOTIFICATION`.
 pub const BC_CLEAR_DEATH_NOTIFICATION: u32 = _IOW(
-    BINDER_IOC_TYPE,
-    17,
+    BC_IOC_TYPE,
+    15,
     std::mem::size_of::<BinderHandleCookie>() as u32,
 );
 
 /// `BC_DEAD_BINDER_DONE` — acknowledge receipt of a `BR_DEAD_BINDER`.
-pub const BC_DEAD_BINDER_DONE: u32 = _IOW(BINDER_IOC_TYPE, 18, 8);
+pub const BC_DEAD_BINDER_DONE: u32 = _IOW(BC_IOC_TYPE, 16, 8);
+
+/// `BC_TRANSACTION_SG` — scatter-gather variant of `BC_TRANSACTION`.
+/// Payload is `binder_transaction_data_sg` = `binder_transaction_data`
+/// (64 bytes) + `binder_size_t buffers_size` (8 bytes) = 72 bytes total
+/// (`_IOW('c', 17, …)`).
+pub const BC_TRANSACTION_SG: u32 = _IOW(
+    BC_IOC_TYPE,
+    17,
+    (std::mem::size_of::<BinderTransactionData>() + 8) as u32,
+);
+
+/// `BC_REPLY_SG` — scatter-gather variant of `BC_REPLY`.
+/// Same 72-byte payload as `BC_TRANSACTION_SG` (`_IOW('c', 18, …)`).
+pub const BC_REPLY_SG: u32 = _IOW(
+    BC_IOC_TYPE,
+    18,
+    (std::mem::size_of::<BinderTransactionData>() + 8) as u32,
+);
 
 // ============================================================================
-// BR_* — binder returns (written by the kernel into the read_buffer of
-// BINDER_WRITE_READ, and by our proxy into the read_buffer of our wire
-// BINDER_WRITE_READ response).
+// BR_* — binder returns (written by the driver into the read_buffer of
+// BINDER_WRITE_READ, and by our proxy into the read side of our wire
+// BINDER_WRITE_READ response). Kernel: `enum binder_driver_return_protocol`.
 //
-// The kernel enum (`enum BinderReturn`) uses nr=0 for BR_ERROR, nr=1
-// for BR_OK, then nr=2..8 for BR_TRANSACTION..BR_ATTEMPT_ACQUIRE, and
-// nr=12..17 for the rest. We match the kernel exactly.
+// KERNEL TRUTH: the whole BR_* family uses ioctl type char **'r'**
+// (0x72). The pre-Z114 table used 'b' and was wrong in every entry —
+// which meant the ROM's libbinder (matching 'r' constants) hit the
+// `*** BAD COMMAND ***` default arm in `IPCThreadState::executeCommand`
+// for every BR we emitted. Same sources as the BC_* audit above:
+//
+//   BR_ERROR        = _IOR('r', 0, __s32)   0x80047200
+//   BR_OK           = _IO ('r', 1)          0x00007201
+//   BR_TRANSACTION  = _IOR('r', 2, binder_transaction_data)       0x80407202
+//   BR_REPLY        = _IOR('r', 3, binder_transaction_data)       0x80407203
+//   BR_DEAD_REPLY   = _IO ('r', 5)          0x00007205
+//   BR_TRANSACTION_COMPLETE = _IO ('r', 6)  0x00007206
+//   BR_NOOP         = _IO ('r', 12)         0x0000720c
+//   BR_SPAWN_LOOPER = _IO ('r', 13)         0x0000720d
+//   BR_FAILED_REPLY = _IO ('r', 17)         0x00007211
 // ============================================================================
 
-/// `BR_ERROR` — kernel returned an error.
-#[allow(dead_code)]
-pub const BR_ERROR: u32 = _IOR(BINDER_IOC_TYPE, 0, 4);
+/// Binder return ioctl type char — `'r'` = 0x72 (kernel
+/// `enum binder_driver_return_protocol`).
+pub const BR_IOC_TYPE: u32 = b'r' as u32;
 
-/// `BR_OK` — success (kernel often sends this as a heartbeat).
+/// `BR_ERROR` — driver returned an error (payload: i32 error code).
 #[allow(dead_code)]
-pub const BR_OK: u32 = _IO(BINDER_IOC_TYPE, 1);
+pub const BR_ERROR: u32 = _IOR(BR_IOC_TYPE, 0, 4);
+
+/// `BR_OK` — success (driver often sends this as a heartbeat).
+#[allow(dead_code)]
+pub const BR_OK: u32 = _IO(BR_IOC_TYPE, 1);
+
+/// `BR_TRANSACTION_SEC_CTX` — same nr as `BR_TRANSACTION` but carrying
+/// `binder_transaction_data_secctx` (72 bytes). We never send it (kept
+/// for the audit table; AOSP-11 libbinder understands the plain form).
+#[allow(dead_code)]
+pub const BR_TRANSACTION_SEC_CTX: u32 = _IOR(
+    BR_IOC_TYPE,
+    2,
+    std::mem::size_of::<BinderTransactionDataSecctx>() as u32,
+);
 
 /// `BR_TRANSACTION` — incoming transaction from another process.
 pub const BR_TRANSACTION: u32 = _IOR(
-    BINDER_IOC_TYPE,
+    BR_IOC_TYPE,
     2,
     std::mem::size_of::<BinderTransactionData>() as u32,
 );
 
 /// `BR_REPLY` — reply to a previously-sent `BC_TRANSACTION`.
 pub const BR_REPLY: u32 = _IOR(
-    BINDER_IOC_TYPE,
+    BR_IOC_TYPE,
     3,
     std::mem::size_of::<BinderTransactionData>() as u32,
+);
+
+/// `BR_ACQUIRE_RESULT` — legacy, not supported.
+#[allow(dead_code)]
+pub const BR_ACQUIRE_RESULT: u32 = _IOR(BR_IOC_TYPE, 4, 4);
+
+/// `BR_DEAD_REPLY` — the target of the last transaction is dead.
+pub const BR_DEAD_REPLY: u32 = _IO(BR_IOC_TYPE, 5);
+
+/// `BR_TRANSACTION_COMPLETE` — the last BC_TRANSACTION/BC_REPLY was
+/// accepted. `IPCThreadState::waitForResponse` consumes this and keeps
+/// looping for the actual `BR_REPLY` — batching COMPLETE+REPLY in one
+/// response frame is legal (and what we do).
+pub const BR_TRANSACTION_COMPLETE: u32 = _IO(BR_IOC_TYPE, 6);
+
+/// `BR_INCREFS` — acquire a weak reference on a local binder
+/// (payload: `binder_ptr_cookie`).
+#[allow(dead_code)]
+pub const BR_INCREFS: u32 = _IOR(
+    BR_IOC_TYPE,
+    7,
+    std::mem::size_of::<BinderPtrCookie>() as u32,
 );
 
 /// `BR_ACQUIRE` — acquire a strong reference on a local binder.
 #[allow(dead_code)]
 pub const BR_ACQUIRE: u32 = _IOR(
-    BINDER_IOC_TYPE,
-    4,
-    std::mem::size_of::<BinderPriDesc>() as u32,
+    BR_IOC_TYPE,
+    8,
+    std::mem::size_of::<BinderPtrCookie>() as u32,
 );
 
 /// `BR_RELEASE` — release a strong reference on a local binder.
 #[allow(dead_code)]
 pub const BR_RELEASE: u32 = _IOR(
-    BINDER_IOC_TYPE,
-    5,
-    std::mem::size_of::<BinderPriDesc>() as u32,
-);
-
-/// `BR_INCREFS` — acquire a weak reference on a local binder.
-#[allow(dead_code)]
-pub const BR_INCREFS: u32 = _IOR(
-    BINDER_IOC_TYPE,
-    6,
-    std::mem::size_of::<BinderPriDesc>() as u32,
+    BR_IOC_TYPE,
+    9,
+    std::mem::size_of::<BinderPtrCookie>() as u32,
 );
 
 /// `BR_DECREFS` — release a weak reference on a local binder.
 #[allow(dead_code)]
 pub const BR_DECREFS: u32 = _IOR(
-    BINDER_IOC_TYPE,
-    7,
-    std::mem::size_of::<BinderPriDesc>() as u32,
+    BR_IOC_TYPE,
+    10,
+    std::mem::size_of::<BinderPtrCookie>() as u32,
 );
 
-/// `BR_ATTEMPT_ACQUIRE` — try-acquire (rare).
+/// `BR_ATTEMPT_ACQUIRE` — try-acquire (rare; payload
+/// `binder_pri_ptr_cookie`, 24 bytes).
 #[allow(dead_code)]
 pub const BR_ATTEMPT_ACQUIRE: u32 = _IOR(
-    BINDER_IOC_TYPE,
-    8,
-    std::mem::size_of::<BinderPriCookie>() as u32,
+    BR_IOC_TYPE,
+    11,
+    std::mem::size_of::<BinderPriPtrCookie>() as u32,
 );
 
 /// `BR_NOOP` — no-op. The looper consumes this and loops again.
-pub const BR_NOOP: u32 = _IO(BINDER_IOC_TYPE, 12);
+pub const BR_NOOP: u32 = _IO(BR_IOC_TYPE, 12);
 
-/// `BR_SPAWN_LOOPER` — kernel wants the process to spawn another binder
+/// `BR_SPAWN_LOOPER` — driver wants the process to spawn another binder
 /// thread (up to the `BINDER_SET_MAX_THREADS` limit).
-pub const BR_SPAWN_LOOPER: u32 = _IO(BINDER_IOC_TYPE, 13);
+pub const BR_SPAWN_LOOPER: u32 = _IO(BR_IOC_TYPE, 13);
 
-/// `BR_FINISHED` — historical, no longer sent by the kernel.
+/// `BR_FINISHED` — historical, no longer sent by the driver.
 #[allow(dead_code)]
-pub const BR_FINISHED: u32 = _IO(BINDER_IOC_TYPE, 14);
+pub const BR_FINISHED: u32 = _IO(BR_IOC_TYPE, 14);
 
 /// `BR_DEAD_BINDER` — a remote binder we requested death notification
 /// for has died.
 #[allow(dead_code)]
-pub const BR_DEAD_BINDER: u32 = _IOR(BINDER_IOC_TYPE, 15, 8);
+pub const BR_DEAD_BINDER: u32 = _IOR(BR_IOC_TYPE, 15, 8);
 
 /// `BR_CLEAR_DEATH_NOTIFICATION_DONE` — ack of `BC_CLEAR_DEATH_NOTIFICATION`.
 #[allow(dead_code)]
-pub const BR_CLEAR_DEATH_NOTIFICATION_DONE: u32 = _IOR(BINDER_IOC_TYPE, 16, 8);
+pub const BR_CLEAR_DEATH_NOTIFICATION_DONE: u32 = _IOR(BR_IOC_TYPE, 16, 8);
 
 /// `BR_FAILED_REPLY` — the last `BC_TRANSACTION` failed (e.g. the
 /// target handle is invalid, or the target process died).
-pub const BR_FAILED_REPLY: u32 = _IO(BINDER_IOC_TYPE, 17);
+pub const BR_FAILED_REPLY: u32 = _IO(BR_IOC_TYPE, 17);
 
 // ============================================================================
-// Service manager transaction codes
-// (frameworks/native/libs/binder/IServiceManager.cpp).
+// Service manager transaction codes.
 //
-// These are the `code` field of `binder_transaction_data` when the
-// target handle is 0 (the servicemanager's well-known handle).
+// AOSP-11 truth: the ROM's servicemanager implements the AIDL
+// `android.os.IServiceManager` (frameworks/native
+// cmds/servicemanager/ServiceManager.cpp), and libbinder's
+// `defaultServiceManager()` returns a shim over that same AIDL
+// interface (libs/binder/IServiceManager.cpp, ServiceManagerShim). AIDL
+// numbers transactions FIRST_CALL_TRANSACTION (=1) + method index, and
+// the first four methods were ordered to match the legacy hand-written
+// protocol codes exactly:
+//
+//   1 getService          2 checkService
+//   3 addService          4 listServices
+//   5 registerForNotifications   6 unregisterForNotifications
+//   7 isDeclared          8 registerClientCallback
+//   9 tryUnregisterService
 // ============================================================================
 
-/// `SVC_MGR_GET_SERVICE` — look up a service by name, return a strong
-/// binder. Old name; `SVC_MGR_CHECK_SERVICE` is the same code.
+/// `getService` — look up a service by name (legacy GET_SERVICE).
 pub const SVC_MGR_GET_SERVICE: u32 = 1;
 
-/// `SVC_MGR_CHECK_SERVICE` — same as `SVC_MGR_GET_SERVICE` (alias).
+/// `checkService` — non-blocking lookup (same wire shape as GET).
 pub const SVC_MGR_CHECK_SERVICE: u32 = 2;
 
-/// `SVC_MGR_ADD_SERVICE` — register a service by name. The transaction
-/// carries the service name + a strong binder reference.
+/// `addService` — register a service by name. The transaction carries
+/// the service name + a strong binder flat object + allowIsolated +
+/// dumpPriority.
 pub const SVC_MGR_ADD_SERVICE: u32 = 3;
 
-/// `SVC_MGR_LIST_SERVICES` — enumerate registered services by index.
+/// `listServices` — enumerate registered service names.
 pub const SVC_MGR_LIST_SERVICES: u32 = 4;
 
-/// `SVC_MGR_CHECK_SERVICE_IF_EXIST` — existence check (rare).
+/// `registerForNotifications` — request a callback when a service is
+/// registered (accepted + acknowledged; no callback delivery — minimal).
+pub const SVC_MGR_REGISTER_FOR_NOTIFICATIONS: u32 = 5;
+
+/// `unregisterForNotifications`.
 #[allow(dead_code)]
-pub const SVC_MGR_CHECK_SERVICE_IF_EXIST: u32 = 5;
+pub const SVC_MGR_UNREGISTER_FOR_NOTIFICATIONS: u32 = 6;
+
+/// `isDeclared`.
+#[allow(dead_code)]
+pub const SVC_MGR_IS_DECLARED: u32 = 7;
+
+/// `registerClientCallback`.
+#[allow(dead_code)]
+pub const SVC_MGR_REGISTER_CLIENT_CALLBACK: u32 = 8;
+
+/// `tryUnregisterService`.
+#[allow(dead_code)]
+pub const SVC_MGR_TRY_UNREGISTER_SERVICE: u32 = 9;
 
 /// The well-known binder handle of the servicemanager itself.
 pub const SVC_MGR_HANDLE: u32 = 0;
 
 // ============================================================================
-// Flat-binder-object type constants (drivers/android/binder.h).
+// Flat-binder-object type constants (kernel `B_PACK_CHARS(c1,c2,c3,0x85)`).
 // ============================================================================
 
+const fn b_pack_chars(c1: u8, c2: u8, c3: u8) -> u32 {
+    ((c1 as u32) << 24) | ((c2 as u32) << 16) | ((c3 as u32) << 8) | 0x85
+}
+
+/// Strong local binder (ptr + cookie point at the owner's BBinder).
+pub const BINDER_TYPE_BINDER: u32 = b_pack_chars(b's', b'b', b'*'); // 0x73622a85
+/// Weak local binder.
 #[allow(dead_code)]
-pub const BINDER_TYPE_BINDER: u32 = 1; // strong local binder
+pub const BINDER_TYPE_WEAK_BINDER: u32 = b_pack_chars(b'w', b'b', b'*'); // 0x77622a85
+/// Strong remote reference (binder field = the remote handle).
+pub const BINDER_TYPE_HANDLE: u32 = b_pack_chars(b's', b'h', b'*'); // 0x73682a85
+/// Weak remote reference.
 #[allow(dead_code)]
-pub const BINDER_TYPE_WEAK_BINDER: u32 = 2; // weak local binder
+pub const BINDER_TYPE_WEAK_HANDLE: u32 = b_pack_chars(b'w', b'h', b'*'); // 0x77682a85
+/// File descriptor.
 #[allow(dead_code)]
-pub const BINDER_TYPE_HANDLE: u32 = 3; // strong remote ref
+pub const BINDER_TYPE_FD: u32 = b_pack_chars(b'f', b'd', b'*'); // 0x66642a85
+/// File-descriptor array.
 #[allow(dead_code)]
-pub const BINDER_TYPE_WEAK_HANDLE: u32 = 4; // weak remote ref
+pub const BINDER_TYPE_FDA: u32 = b_pack_chars(b'f', b'd', b'a'); // 0x66646185
+/// Scatter-gather pointer.
 #[allow(dead_code)]
-pub const BINDER_TYPE_FD: u32 = 5; // file descriptor
-#[allow(dead_code)]
-pub const BINDER_TYPE_FDA: u32 = 6; // FD array
-#[allow(dead_code)]
-pub const BINDER_TYPE_PTR: u32 = 7; // scatter-gather pointer
+pub const BINDER_TYPE_PTR: u32 = b_pack_chars(b'p', b't', b'*'); // 0x70742a85
+
+/// `FLAT_BINDER_FLAG_ACCEPTS_FDS`.
+pub const FLAT_BINDER_FLAG_ACCEPTS_FDS: u32 = 0x100;
+
+/// The flags value libbinder's `flattenBinder()` stamps on every binder
+/// flat object it writes when background scheduling is enabled (the
+/// normal case): `0x13` (MAX_NICE / priority 19) | ACCEPTS_FDS = `0x113`
+/// (android-11 `Parcel.cpp:200`; the FD-object writer at `Parcel.cpp:1108`
+/// uses `0x7f` instead — not a binder flag). The receiving
+/// `unflattenBinder` ignores `flags`, so the value is cosmetic, but we
+/// reproduce the wire truth for byte-fidelity.
+pub const FLAT_FLAGS_LIBBINDER_DEFAULT: u32 = 0x13 | FLAT_BINDER_FLAG_ACCEPTS_FDS;
 
 // ============================================================================
-// Transaction flags (binder_transaction_data.flags).
+// Transaction flags (kernel `enum transaction_flags`).
 // ============================================================================
 
 /// `TF_ONE_WAY` — the transaction is asynchronous (no reply expected).
@@ -627,6 +862,12 @@ pub const TF_ROOT_OBJECT: u32 = 0x04;
 pub const TF_STATUS_CODE: u32 = 0x08;
 /// `TF_ACCEPT_FDS` — the sender is willing to receive FDs in the reply.
 pub const TF_ACCEPT_FDS: u32 = 0x10;
+/// `TF_CLEAR_BUF` — clear buffer on txn complete.
+#[allow(dead_code)]
+pub const TF_CLEAR_BUF: u32 = 0x20;
+/// `TF_UPDATE_TXN` — update the outdated pending async txn.
+#[allow(dead_code)]
+pub const TF_UPDATE_TXN: u32 = 0x40;
 
 // ============================================================================
 // Misc constants.
@@ -637,11 +878,57 @@ pub const TF_ACCEPT_FDS: u32 = 0x10;
 /// ships protocol version 8.
 pub const BINDER_CURRENT_PROTOCOL_VERSION: u32 = 8;
 
-/// Number of worker threads in the binder proxy's thread pool. Each
-/// worker handles one concurrent guest connection. 4 matches what VM's
-/// `libvm.so` uses (based on the `BINDER_SET_MAX_THREADS` value seen in
-/// the BinderService disassembly — see `VM_JAVA_ANALYSIS.md` §5.2).
+/// Number of worker threads in the binder proxy's thread pool. Kept
+/// for the skeleton-era [`ThreadPool`] (now only exercised by its own
+/// unit test); the S1b proxy spawns one thread PER connection bounded
+/// by [`MAX_PROXY_CONNECTIONS`] instead, because blocking idle reads
+/// would pin every member of a fixed pool.
 pub const BINDER_THREAD_POOL_SIZE: usize = 4;
+
+/// Base of the proxy-allocated fake service handles: `0xF0000000 + n`
+/// with `n >= 1`. Far above any real kernel handle (the kernel
+/// allocates handles densely from 1), so a fake handle can never alias
+/// a host handle on the [`forward_transaction_to_host`] path.
+pub const PROXY_HANDLE_BASE: u32 = 0xF000_0000;
+
+/// Maximum concurrent guest connections (one thread each). The guest's
+/// `libbinder.so` opens one binder fd per process (`ProcessState`),
+/// and a booting GSI has dozens of processes; 64 is comfortably above
+/// that and bounded so a misbehaving guest can't thread-bomb the daemon.
+pub const MAX_PROXY_CONNECTIONS: usize = 64;
+
+/// How long a pure-read `BINDER_WRITE_READ` blocks on its connection
+/// queue before yielding `BR_NOOP` (the S1b blocking-idle analogue of
+/// the kernel's blocking `read_buffer`). 250 ms keeps polling latency
+/// reasonable while not busy-spinning the connection thread.
+pub const IDLE_POLL_TICK: Duration = Duration::from_millis(250);
+
+/// Cap on queued undelivered BR items per connection (defence against a
+/// runaway server that never reads its reply queue).
+pub const MAX_QUEUED_ITEMS: usize = 256;
+
+/// The marker that announces a v2 WRITE_READ payload (the z115 loader
+/// counterpart). A request that ends exactly after its BC_* stream is
+/// v1 (z113) — byte-compatible; a v2 request appends
+/// `[WIRE_V2_MAGIC][u32 blob_count]` followed by `blob_count` parcel
+/// blobs pairing in order with the BC_TRANSACTION/BC_REPLY/`*_SG`
+/// records. Responses echo the trailer only when the request was v2.
+/// Bytes are `'W' 'V' '2' '0'` in native-endian word order.
+pub const WIRE_V2_MAGIC: u32 = u32::from_ne_bytes(*b"WV20");
+
+/// AIDL interface-token header tag for `/dev/binder` clients
+/// (`Parcel::writeInterfaceToken`); `SYST` = `'S' 'Y' 'S' 'T'`.
+pub const AIDL_HEADER_TAG_SYST: u32 = u32::from_ne_bytes(*b"SYST");
+
+/// AIDL interface-token header tag for `/dev/vndbinder` clients
+/// (vendor-context binder). Accepted alongside `SYST` (the proxy does
+/// not yet split contexts).
+pub const AIDL_HEADER_TAG_VNDR: u32 = u32::from_ne_bytes(*b"VNDR");
+
+/// The servicemanager AIDL interface descriptor (the string16 that
+/// follows the 3-i32 header in every `android.os.IServiceManager`
+/// transaction parcel).
+pub const SVC_MGR_IFACE_DESCRIPTOR: &str = "android.os.IServiceManager";
 
 // ============================================================================
 // Wire framing for the Unix-socket proxy protocol.
@@ -706,6 +993,277 @@ struct WireBinderWriteRead {
 struct WireBinderWriteReadResponse {
     /// The BR_* command stream the server wants the guest to consume.
     read_buffer: Vec<u8>,
+}
+
+// ============================================================================
+// Parcel codec — libbinder Parcel byte buffer reader/writer.
+//
+// Matches android-11 `frameworks/native/libs/binder/Parcel.cpp` field for
+// field (verified against the fetched source per 6-Z114 §3.2). The proxy
+// uses these to (a) parse the AIDL interface-token header + per-code args
+// out of each `BC_TRANSACTION`'s parcel data, and (b) synthesise the
+// `binder::Status`-prefixed reply parcels the AIDL stub expects back.
+// ============================================================================
+
+/// Cursor over a libbinder Parcel byte buffer. All multi-byte reads are
+/// native-endian (LE on the supported aarch64/x86_64 targets). All
+/// `read_*` methods return `None` if the cursor runs past the end of the
+/// buffer; callers treat that as a malformed parcel and reply with
+/// `BR_FAILED_REPLY`.
+struct ParcelReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ParcelReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        ParcelReader { buf, pos: 0 }
+    }
+
+    /// Bytes remaining between the cursor and the end of the buffer.
+    #[allow(dead_code)]
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    /// Read a little-endian i32. `None` if past end.
+    fn read_i32(&mut self) -> Option<i32> {
+        self.read_u32().map(|v| v as i32)
+    }
+
+    /// Read a little-endian u32. `None` if past end.
+    fn read_u32(&mut self) -> Option<u32> {
+        if self.pos + 4 > self.buf.len() {
+            return None;
+        }
+        let v = u32::from_ne_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Some(v)
+    }
+
+    /// Read a UTF-16LE string16 (`Parcel::writeString16` android-11):
+    /// `[i32 len_in_char16][len × u16][u16 0 NUL — always written]
+    /// [zero-pad to 4-byte alignment]`. `len = -1` encodes null →
+    /// returns `Some(None)` so callers can distinguish; `None` only on
+    /// truncation. Invalid surrogate pairs are replaced with U+FFFD
+    /// (lossy — matches `String::from_utf16_lossy`).
+    fn read_string16(&mut self) -> Option<Option<String>> {
+        let len = self.read_i32()?;
+        if len < 0 {
+            // Parcel::writeString16(nullptr) writes -1 and nothing else
+            // (no NUL, no pad). Consumer treats as null.
+            return Some(None);
+        }
+        let len = len as usize;
+        let byte_len = len * 2;
+        if self.pos + byte_len + 2 > self.buf.len() {
+            return None;
+        }
+        let mut chars = Vec::with_capacity(len);
+        for i in 0..len {
+            let off = self.pos + i * 2;
+            let u = u16::from_ne_bytes(self.buf[off..off + 2].try_into().unwrap());
+            chars.push(u);
+        }
+        self.pos += byte_len;
+        self.pos += 2; // always-written trailing NUL
+                       // Pad to 4-byte alignment of the data buffer.
+        while self.pos < self.buf.len() && self.pos % 4 != 0 {
+            self.pos += 1;
+        }
+        Some(Some(String::from_utf16_lossy(&chars)))
+    }
+
+    /// Read a `flat_binder_object` (24 bytes). `None` if past end.
+    fn read_flat_binder(&mut self) -> Option<FlatBinderObject> {
+        if self.pos + 24 > self.buf.len() {
+            return None;
+        }
+        let typ = u32::from_ne_bytes(self.buf[self.pos..self.pos + 4].try_into().unwrap());
+        let flags = u32::from_ne_bytes(self.buf[self.pos + 4..self.pos + 8].try_into().unwrap());
+        let binder = u64::from_ne_bytes(self.buf[self.pos + 8..self.pos + 16].try_into().unwrap());
+        let cookie = u64::from_ne_bytes(self.buf[self.pos + 16..self.pos + 24].try_into().unwrap());
+        self.pos += 24;
+        Some(FlatBinderObject {
+            r#type: typ,
+            flags,
+            binder,
+            cookie,
+        })
+    }
+
+    /// Consume the AIDL interface-token header
+    /// (`Parcel::writeInterfaceToken` android-11 — verified per 6-Z114 §3.2):
+    /// `[i32 strict_policy][i32 work_source][i32 header_tag][string16 descriptor]`.
+    /// Returns the parsed `(strict, work, tag, descriptor)` tuple; `None`
+    /// if the buffer was too short. The descriptor is `None` if the
+    /// request parcel encoded it as null.
+    fn read_aidl_header(&mut self) -> Option<(i32, i32, u32, Option<String>)> {
+        let strict = self.read_i32()?;
+        let work = self.read_i32()?;
+        let tag = self.read_u32()?;
+        let iface = self.read_string16()?;
+        Some((strict, work, tag, iface))
+    }
+}
+
+/// Builder for a libbinder Parcel byte buffer + its companion offsets
+/// array. Writes are little-endian. `write_flat_binder` ALSO appends the
+/// offset of the object being written to the offsets array — both the
+/// kernel's translation table and the Parcel object bookkeeping depend
+/// on every flat object being listed in `binder_transaction_data.offsets`
+/// (verified 6-Z114 §3.2 / §3.3).
+struct ParcelWriter {
+    data: Vec<u8>,
+    offsets: Vec<u8>,
+}
+
+impl ParcelWriter {
+    fn new() -> Self {
+        ParcelWriter {
+            data: Vec::new(),
+            offsets: Vec::new(),
+        }
+    }
+
+    fn write_i32(&mut self, v: i32) {
+        self.data.extend_from_slice(&v.to_ne_bytes());
+    }
+
+    #[allow(dead_code)]
+    fn write_u32(&mut self, v: u32) {
+        self.data.extend_from_slice(&v.to_ne_bytes());
+    }
+
+    /// Write a UTF-16LE string16 with the always-written trailing NUL and
+    /// 4-byte pad (`Parcel::writeString16` android-11).
+    fn write_string16(&mut self, s: &str) {
+        let u16s: Vec<u16> = s.encode_utf16().collect();
+        let len = u16s.len() as i32;
+        self.data.extend_from_slice(&len.to_ne_bytes());
+        for u in u16s {
+            self.data.extend_from_slice(&u.to_ne_bytes());
+        }
+        // Always-written NUL terminator
+        self.data.extend_from_slice(&0u16.to_ne_bytes());
+        // Pad to 4-byte alignment of the DATA buffer (Parcel pads to 4).
+        while self.data.len() % 4 != 0 {
+            self.data.push(0);
+        }
+    }
+
+    /// Write a `flat_binder_object` (24 bytes) and append its offset to
+    /// the offsets array. Returns the offset at which the object was
+    /// written.
+    fn write_flat_binder(&mut self, obj: &FlatBinderObject) -> u64 {
+        let off = self.data.len() as u64;
+        self.data.extend_from_slice(&obj.r#type.to_ne_bytes());
+        self.data.extend_from_slice(&obj.flags.to_ne_bytes());
+        self.data.extend_from_slice(&obj.binder.to_ne_bytes());
+        self.data.extend_from_slice(&obj.cookie.to_ne_bytes());
+        self.offsets.extend_from_slice(&off.to_ne_bytes());
+        off
+    }
+
+    /// Write the AIDL success-status prefix (`Parcel::writeNoException`):
+    /// a single i32 0 (EX_NONE). Reply parcels begin with this; the
+    /// 3-word interface-token header is REQUEST-side only.
+    fn write_status_ok(&mut self) {
+        self.write_i32(0);
+    }
+
+    /// The current data buffer length (for offsets bookkeeping / assertions).
+    #[allow(dead_code)]
+    fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Consume the writer, returning `(data, offsets)`.
+    fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
+        (self.data, self.offsets)
+    }
+}
+
+// ============================================================================
+// Proxy-side servicemanager registry + v2 wire blob.
+// ============================================================================
+
+/// One v2 wire blob (parcel data + offsets array) — pairs in stream order
+/// with each `BC_TRANSACTION`/`BC_REPLY`/`*_SG` on the request side and
+/// each `BR_REPLY`/`BR_TRANSACTION` on the response side (6-Z114 §4.4).
+///
+/// `offsets` is informational on the proxy side: the servicemanager
+/// proxy reads the request parcel sequentially (so it doesn't NEED the
+/// offsets array), but a future host-forwarding path (BINDER-3) and a
+/// proper server-routing extension will need it to walk the flat
+/// objects in their kernel-listed order.
+struct RequestBlob {
+    data: Vec<u8>,
+    #[allow(dead_code)]
+    offsets: Vec<u8>,
+}
+
+/// Proxy-side servicemanager registry: service name → fake proxy handle
+/// (allocated from [`PROXY_HANDLE_BASE`] + 1). Per 6-Z114 §3.3 / §3.4 the
+/// proxy stamps the proxy handle into the `BINDER_TYPE_HANDLE` flat
+/// object it returns to the requester; a subsequent `BC_TRANSACTION` to
+/// that handle would be routed back to the owning guest connection (the
+/// route path is a v2+ extension; the registry itself only needs the
+/// lookup + add).
+#[derive(Default)]
+pub struct ServiceRegistry {
+    /// name → fake proxy handle. A `BTreeMap` so `list_services` iterates
+    /// in deterministic (alphabetical) order — matches the array shape
+    /// `listServices` returns and makes unit tests reproducible.
+    by_name: BTreeMap<String, u32>,
+    /// Monotonic counter; starts at `PROXY_HANDLE_BASE + 1` so handle 0
+    /// stays reserved for the servicemanager itself.
+    next_handle: u32,
+}
+
+impl ServiceRegistry {
+    pub fn new() -> Self {
+        ServiceRegistry {
+            by_name: BTreeMap::new(),
+            next_handle: PROXY_HANDLE_BASE + 1,
+        }
+    }
+
+    /// Look up a service by name. Returns the proxy handle on hit.
+    pub fn get(&self, name: &str) -> Option<u32> {
+        self.by_name.get(name).copied()
+    }
+
+    /// Register a service name, allocating a new fake handle if the name
+    /// isn't already registered. Returns the handle to use in the reply.
+    /// Re-registering the same name returns the EXISTING handle (matches
+    /// the native servicemanager's "overwrite" semantics in
+    /// `frameworks/native/cmds/servicemanager/ServiceManager.cpp`).
+    pub fn add(&mut self, name: &str) -> u32 {
+        if let Some(&h) = self.by_name.get(name) {
+            return h;
+        }
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.by_name.insert(name.to_string(), h);
+        h
+    }
+
+    /// Snapshot of all registered service names in alphabetical order
+    /// (BTreeMap iter is sorted — matches `listServices`' array shape).
+    pub fn list(&self) -> Vec<String> {
+        self.by_name.keys().cloned().collect()
+    }
+
+    /// Number of services currently registered.
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    /// `true` iff no services are registered.
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
 }
 
 // ============================================================================
@@ -891,8 +1449,13 @@ pub struct BinderProxy {
     /// non-servicemanager handle. `None` means "not yet opened" (or
     /// "open failed and we're returning errors for all forwards").
     host_binder_fd: Arc<Mutex<Option<RawFd>>>,
-    /// Per-VM handle table (guest handle ↔ host handle ↔ service name).
+    /// Per-VM handle table (guest handle ↔ host handle ↔ service name)
+    /// for the future host-forwarding path (BINDER-3).
     handles: Arc<Mutex<HandleTable>>,
+    /// Proxy-side servicemanager registry — populated by
+    /// `SVC_MGR_ADD_SERVICE` and queried by `SVC_MGR_GET_SERVICE` /
+    /// `SVC_MGR_CHECK_SERVICE` (6-Z114 §3).
+    services: Arc<Mutex<ServiceRegistry>>,
     /// Set to true by [`BinderProxyHandle::shutdown`] / drop to ask the
     /// accept thread to exit.
     shutdown: Arc<AtomicBool>,
@@ -928,6 +1491,7 @@ impl BinderProxy {
             path: socket_path.to_string(),
             host_binder_fd: Arc::new(Mutex::new(None)),
             handles: Arc::new(Mutex::new(HandleTable::new())),
+            services: Arc::new(Mutex::new(ServiceRegistry::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -944,6 +1508,7 @@ impl BinderProxy {
             .expect("BinderProxy::spawn: listener already taken");
         let host_fd = Arc::clone(&self.host_binder_fd);
         let handles = Arc::clone(&self.handles);
+        let services = Arc::clone(&self.services);
         // Clone the shutdown Arc twice: one for the accept thread, one
         // for the returned handle. Both share the same AtomicBool.
         let shutdown_for_thread = Arc::clone(&self.shutdown);
@@ -970,8 +1535,10 @@ impl BinderProxy {
                             info!("[KR64][binder][vm{}] client connected", vm_id);
                             let host_fd = Arc::clone(&host_fd);
                             let handles = Arc::clone(&handles);
+                            let services = Arc::clone(&services);
                             pool.execute(move || {
-                                if let Err(e) = handle_connection(stream, vm_id, &host_fd, &handles)
+                                if let Err(e) =
+                                    handle_connection(stream, vm_id, &host_fd, &handles, &services)
                                 {
                                     warning!(
                                         "[KR64][binder][vm{}] connection handler ended: {}",
@@ -1139,6 +1706,7 @@ fn handle_connection(
     vm_id: u32,
     host_fd: &Arc<Mutex<Option<RawFd>>>,
     handles: &Arc<Mutex<HandleTable>>,
+    services: &Arc<Mutex<ServiceRegistry>>,
 ) -> io::Result<()> {
     info!("[KR64][binder][vm{}] handling new connection", vm_id);
     loop {
@@ -1150,7 +1718,7 @@ fn handle_connection(
             }
             Err(e) => return Err(e),
         };
-        let resp = dispatch_request(&req, vm_id, host_fd, handles);
+        let resp = dispatch_request(&req, vm_id, host_fd, handles, services);
         write_frame(&mut stream, &resp)?;
     }
 }
@@ -1165,6 +1733,7 @@ fn dispatch_request(
     vm_id: u32,
     host_fd: &Arc<Mutex<Option<RawFd>>>,
     handles: &Arc<Mutex<HandleTable>>,
+    services: &Arc<Mutex<ServiceRegistry>>,
 ) -> Resp {
     match req.cmd {
         BINDER_VERSION => handle_version(vm_id),
@@ -1185,14 +1754,17 @@ fn dispatch_request(
             }
         }
 
-        BINDER_SET_CONTEXT_MGR => {
+        BINDER_SET_CONTEXT_MGR | BINDER_SET_CONTEXT_MGR_KERNEL => {
+            // Both spellings accepted: the kernel/bionic header spells it
+            // `_IOW('b',7,__s32)` = 0x40046207 (BINDER_SET_CONTEXT_MGR_KERNEL);
+            // the 6-Z113 loader puts the legacy `_IO('b',7)` = 0x6207 on the
+            // wire (BINDER_SET_CONTEXT_MGR). The proxy is the servicemanager
+            // for this VM, so either way we just ack — there is nothing for
+            // the host's /dev/binder to do here.
             info!(
-                "[KR64][binder][vm{}] SET_CONTEXT_MGR — guest is now the servicemanager",
-                vm_id
+                "[KR64][binder][vm{}] SET_CONTEXT_MGR (0x{:08x}) — proxy is the servicemanager",
+                vm_id, req.cmd
             );
-            // Accept: the guest's servicemanager has registered with us.
-            // We do NOT proxy this to the host — the host already has
-            // its own servicemanager on /dev/binder.
             Resp {
                 ret: 0,
                 payload: Vec::new(),
@@ -1207,7 +1779,7 @@ fn dispatch_request(
             }
         }
 
-        BINDER_WRITE_READ => handle_write_read(&req.payload, vm_id, host_fd, handles),
+        BINDER_WRITE_READ => handle_write_read(&req.payload, vm_id, host_fd, handles, services),
 
         other => {
             warning!(
@@ -1251,8 +1823,9 @@ fn handle_write_read(
     vm_id: u32,
     host_fd: &Arc<Mutex<Option<RawFd>>>,
     handles: &Arc<Mutex<HandleTable>>,
+    services: &Arc<Mutex<ServiceRegistry>>,
 ) -> Resp {
-    // Parse the wire header.
+    // Parse the v1 wire header: [u32 write_size][u32 read_capacity][write_size BC_* bytes].
     if payload.len() < 8 {
         return Resp {
             ret: -(libc::EINVAL),
@@ -1266,7 +1839,7 @@ fn handle_write_read(
             "[KR64][binder][vm{}] BINDER_WRITE_READ: truncated payload (write_size={}, have {})",
             vm_id,
             write_size,
-            payload.len() - 8
+            payload.len().saturating_sub(8)
         );
         return Resp {
             ret: -(libc::EINVAL),
@@ -1275,8 +1848,49 @@ fn handle_write_read(
     }
     let write_buf = &payload[8..8 + write_size];
 
-    // Process each BC_* command in the write buffer.
+    // Parse the optional v2 trailer (6-Z114 §4.4):
+    //   [u32 WIRE_V2_MAGIC][u32 blob_count]
+    //   (blob_count ×) [u32 data_len][u32 offsets_len][data_len bytes][offsets_len bytes]
+    // A request that ends exactly after the BC stream is v1 (z113 client —
+    // byte-compatible, no parcel blobs). A v2 request inlines the parcel
+    // bytes the proxy needs to actually parse BC_TRANSACTION data.
+    let mut off = 8 + write_size;
+    let mut req_blobs: Vec<RequestBlob> = Vec::new();
+    let mut is_v2 = false;
+    if off + 8 <= payload.len() {
+        let magic = u32::from_ne_bytes(payload[off..off + 4].try_into().unwrap());
+        if magic == WIRE_V2_MAGIC {
+            is_v2 = true;
+            off += 4;
+            let count = u32::from_ne_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+            off += 4;
+            for _ in 0..count {
+                if off + 8 > payload.len() {
+                    break;
+                }
+                let data_len =
+                    u32::from_ne_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+                let offsets_len =
+                    u32::from_ne_bytes(payload[off + 4..off + 8].try_into().unwrap()) as usize;
+                off += 8;
+                if off + data_len + offsets_len > payload.len() {
+                    break;
+                }
+                let data = payload[off..off + data_len].to_vec();
+                off += data_len;
+                let offsets = payload[off..off + offsets_len].to_vec();
+                off += offsets_len;
+                req_blobs.push(RequestBlob { data, offsets });
+            }
+        }
+    }
+
+    // Walk the BC_* stream. For each BC_TRANSACTION/BC_TRANSACTION_SG, the
+    // i-th v2 blob (in stream order) carries that transaction's parcel
+    // data + offsets (6-Z114 §4.4 — both sides walk the same stream).
     let mut read_buf: Vec<u8> = Vec::new();
+    let mut reply_blobs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut blob_idx = 0usize;
     let mut consumed = 0usize;
     while consumed + 4 <= write_buf.len() {
         let cmd = u32::from_ne_bytes(write_buf[consumed..consumed + 4].try_into().unwrap());
@@ -1288,7 +1902,7 @@ fn handle_write_read(
                 vm_id,
                 cmd,
                 psize,
-                write_buf.len() - consumed
+                write_buf.len().saturating_sub(consumed)
             );
             break;
         }
@@ -1297,40 +1911,67 @@ fn handle_write_read(
 
         match cmd {
             BC_TRANSACTION | BC_TRANSACTION_SG => {
-                let result = handle_transaction(cmd_payload, vm_id, host_fd, handles);
+                // Pull the next v2 blob as this transaction's parcel.
+                let req_blob = if is_v2 && blob_idx < req_blobs.len() {
+                    let b = &req_blobs[blob_idx];
+                    blob_idx += 1;
+                    Some(b)
+                } else {
+                    None
+                };
+                let result =
+                    handle_transaction(cmd_payload, vm_id, host_fd, handles, services, req_blob);
                 match result {
                     TransactionResult::Failed => {
                         push_br_failed_reply(&mut read_buf);
                     }
-                    TransactionResult::Reply(data) => {
-                        push_br_reply(&mut read_buf, &data);
+                    TransactionResult::Reply { data, offsets } => {
+                        // Kernel-true batch (6-Z114 §4.5): the client's
+                        // `waitForResponse` consumes BR_TRANSACTION_COMPLETE
+                        // then loops to read BR_REPLY.
+                        push_br_transaction_complete(&mut read_buf);
+                        push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
+                        if is_v2 {
+                            // v2: the reply parcel bytes ride in the
+                            // response trailer; tr.data_ptr / tr.offsets_ptr
+                            // stay 0 on the wire (the client patches them
+                            // from the blob index before copying into mIn).
+                            reply_blobs.push((data, offsets));
+                        }
+                        // v1: the reply parcel bytes are not on the wire —
+                        // the z113 client can't dereference tr.data_ptr=0
+                        // anyway, so the legacy synthetic shapes are the
+                        // best we can do (6-Z114 §2.4 / §4.4).
                     }
                 }
             }
             BC_REPLY | BC_REPLY_SG => {
-                // We're the server side, so we shouldn't receive
-                // BC_REPLY from the guest (the guest is the client).
-                // Log and ignore.
-                info!(
-                    "[KR64][binder][vm{}] BC_REPLY from guest — ignored (skeleton)",
-                    vm_id
-                );
+                // The guest is the client of the servicemanager; it does
+                // not produce BC_REPLY. (A future server-routing extension
+                // would consume BC_REPLY here and correlate it back to the
+                // original requester as BR_REPLY — 6-Z114 §4.5 / §5.4.)
+                info!("[KR64][binder][vm{}] BC_REPLY from guest — ignored", vm_id);
             }
-            BC_ACQUIRE | BC_RELEASE | BC_INCREFS => {
-                // Strong/weak refcount changes on remote handles. For
-                // the skeleton we accept and ignore — a real impl would
-                // forward these to the host's /dev/binder so the host's
-                // binder driver can manage refcounts on the host's
-                // servicemanager / ActivityManager etc.
+            BC_ACQUIRE | BC_RELEASE | BC_INCREFS | BC_DECREFS => {
+                // Strong/weak refcount changes on remote handles. The
+                // proxy accepts these silently — a real impl would forward
+                // them to the host's /dev/binder so the host's binder
+                // driver can manage refcounts on the host's servicemanager
+                // / ActivityManager etc. (BINDER-3 TODO).
             }
-            BC_ACQUIRE_DONE | BC_INCREFS_DONE | BC_ACQUIRE_FAILED | BC_INCREFS_FAILED => {
-                // Acknowledgements of refcount operations on local
-                // binders. The skeleton doesn't host any local binders
-                // (no guest-side services), so these are no-ops.
+            BC_ACQUIRE_DONE | BC_INCREFS_DONE => {
+                // Acknowledgements of refcount operations on local binders
+                // (kernel UAPI: BC_ACQUIRE_DONE, BC_INCREFS_DONE only —
+                // there is no BC_ACQUIRE_FAILED / BC_INCREFS_FAILED enum
+                // member in drivers/android/binder.h; the pre-Z114 code
+                // matched on undefined identifiers that rustc then treated
+                // as binding patterns, breaking the build — 6-Z114).
             }
             BC_FREE_BUFFER | BC_DEAD_BINDER_DONE => {
                 // Return a transaction-data buffer to the kernel, or
-                // acknowledge a death notification. Skeleton: no-op.
+                // acknowledge a death notification. With v2 blobs the
+                // client frees its own stash; v1 has no buffers to free.
+                // Either way: no-op.
             }
             BC_ENTER_LOOPER | BC_REGISTER_LOOPER | BC_EXIT_LOOPER => {
                 info!(
@@ -1355,17 +1996,29 @@ fn handle_write_read(
         }
     }
 
-    // If we have read capacity left and produced nothing, push a BR_NOOP
-    // so the guest's looper doesn't busy-spin on empty BINDER_WRITE_READ
-    // returns.
+    // Idle path: a pure-read BINDER_WRITE_READ (no BC_* that produced BR
+    // bytes) gets a BR_NOOP so the guest's `getAndExecuteCommand` loops
+    // instead of busy-spinning (6-Z112 G3; 6-Z114 §5 — the S1b blocking
+    // idle is a v2+ extension, the v1 proxy keeps the BR_NOOP path).
     if read_buf.is_empty() && read_capacity > 0 {
         push_br_noop(&mut read_buf);
     }
 
-    // Build the wire response: [u32 read_size][read_size bytes].
-    let mut resp_payload = Vec::with_capacity(4 + read_buf.len());
+    // Build the wire response: [u32 read_size][read_size BR_* bytes] plus
+    // the optional v2 trailer [u32 WIRE_V2_MAGIC][u32 blob_count][blobs…].
+    let mut resp_payload = Vec::with_capacity(4 + read_buf.len() + 8);
     resp_payload.extend_from_slice(&(read_buf.len() as u32).to_ne_bytes());
     resp_payload.extend_from_slice(&read_buf);
+    if is_v2 {
+        resp_payload.extend_from_slice(&WIRE_V2_MAGIC.to_ne_bytes());
+        resp_payload.extend_from_slice(&(reply_blobs.len() as u32).to_ne_bytes());
+        for (data, offsets) in &reply_blobs {
+            resp_payload.extend_from_slice(&(data.len() as u32).to_ne_bytes());
+            resp_payload.extend_from_slice(&(offsets.len() as u32).to_ne_bytes());
+            resp_payload.extend_from_slice(data);
+            resp_payload.extend_from_slice(offsets);
+        }
+    }
 
     Resp {
         ret: 0,
@@ -1377,18 +2030,26 @@ fn handle_write_read(
 // Transaction dispatch — servicemanager vs forward-to-host.
 // ============================================================================
 
-/// Result of handling a `BC_TRANSACTION`.
-///
-/// Note: a previous `Noop` variant (meaning "no reply pushed") was removed —
-/// returning `Noop` caused the guest to busy-spin on `BR_NOOP` forever
-/// (see the comment on `servicemanager_proxy`'s `SVC_MGR_ADD_SERVICE` arm).
-/// Every handler MUST push either a `BR_REPLY` or `BR_FAILED_REPLY` so the
-/// guest's `BINDER_WRITE_READ` loop terminates.
+/// Result of handling a `BC_TRANSACTION`. Every handler path MUST push
+/// either a `BR_REPLY` (with its reply parcel bytes) or a `BR_FAILED_REPLY`
+/// into the read buffer so the guest's `BINDER_WRITE_READ` loop terminates
+/// (a previous `Noop` variant livelocked the guest on `BR_NOOP` forever —
+/// see 6-Z114 §5.1 / the comment on `servicemanager_proxy`).
 enum TransactionResult {
-    /// Push a `BR_FAILED_REPLY` into the read buffer.
+    /// Push `[BR_FAILED_REPLY]` (no payload). Used when the transaction
+    /// parcel is malformed or the target handle is invalid.
     Failed,
-    /// Push a `BR_REPLY` with the given reply data bytes.
-    Reply(Vec<u8>),
+    /// Push `[BR_TRANSACTION_COMPLETE][BR_REPLY][binder_transaction_data]`
+    /// with `tr.data_size = data.len()` / `tr.offsets_size = offsets.len()`.
+    /// For v2 requests the `data`/`offsets` bytes ride in the response
+    /// trailer; for v1 they are dropped (the z113 client can't dereference
+    /// `tr.data_ptr = 0` anyway).
+    Reply {
+        /// The reply parcel's data buffer.
+        data: Vec<u8>,
+        /// The reply parcel's offsets array (8 bytes per flat object).
+        offsets: Vec<u8>,
+    },
 }
 
 /// Handle a `BC_TRANSACTION` (or `BC_TRANSACTION_SG`) command.
@@ -1401,7 +2062,14 @@ fn handle_transaction(
     cmd_payload: &[u8],
     vm_id: u32,
     host_fd: &Arc<Mutex<Option<RawFd>>>,
-    handles: &Arc<Mutex<HandleTable>>,
+    // `handles` is the per-VM guest↔host handle-translation table reserved
+    // for the future host-forwarding path (BINDER-3 TODO, 6-Z114 §2.6).
+    // The current servicemanager-proxy path doesn't translate handles
+    // (target handle 0 is the servicemanager itself), so the param is
+    // `_`-prefixed; the host-forwarding stub below likewise ignores it.
+    _handles: &Arc<Mutex<HandleTable>>,
+    services: &Arc<Mutex<ServiceRegistry>>,
+    req_blob: Option<&RequestBlob>,
 ) -> TransactionResult {
     if cmd_payload.len() < std::mem::size_of::<BinderTransactionData>() {
         warning!(
@@ -1413,17 +2081,20 @@ fn handle_transaction(
         return TransactionResult::Failed;
     }
 
-    // Parse the fields we care about.
+    // Parse the fields we care about (offsets per BinderTransactionData).
     let target_handle = u32::from_ne_bytes(cmd_payload[0..4].try_into().unwrap());
     let code = u32::from_ne_bytes(cmd_payload[16..20].try_into().unwrap());
     let flags = u32::from_ne_bytes(cmd_payload[20..24].try_into().unwrap());
 
     if target_handle == SVC_MGR_HANDLE {
         info!(
-            "[KR64][binder][vm{}] servicemanager transaction: code={} flags=0x{:02x}",
-            vm_id, code, flags
+            "[KR64][binder][vm{}] servicemanager transaction: code={} flags=0x{:02x} v2={}",
+            vm_id,
+            code,
+            flags,
+            req_blob.is_some()
         );
-        return servicemanager_proxy(cmd_payload, code, handles);
+        return servicemanager_proxy(code, services, req_blob);
     }
 
     info!(
@@ -1439,7 +2110,10 @@ fn handle_transaction(
     // side (the host's /dev/binder doesn't know about our guest
     // handles), but it has the right structure.
     match forward_transaction_to_host(cmd_payload, host_fd) {
-        Ok(reply_bytes) => TransactionResult::Reply(reply_bytes),
+        Ok(reply_bytes) => TransactionResult::Reply {
+            data: reply_bytes,
+            offsets: Vec::new(),
+        },
         Err(e) => {
             warning!(
                 "[KR64][binder][vm{}] forward_transaction_to_host failed: {}",
@@ -1453,70 +2127,209 @@ fn handle_transaction(
 
 /// Intercept servicemanager transactions (target handle 0).
 ///
-/// # Parcel layout (AOSP `frameworks/native/libs/binder/IServiceManager.cpp`)
+/// # Wire shape (6-Z114 §3.2 — verified against android-11
+/// `frameworks/native/libs/binder/Parcel.cpp` + `IServiceManager.cpp`)
 ///
-/// The transaction's data buffer is a parcel:
+/// The transaction's data buffer is an AIDL parcel. Every REQUEST parcel
+/// begins with the libbinder interface-token header
+/// `writeInterfaceToken(descriptor)`:
 ///
 /// ```text
-///   i32  strict_mode_policy
-///   i32  work_source
-///   u16[] interface_descriptor_string  (length-prefixed)
+///   i32  strict_mode_policy   (getStrictModePolicy() | STRICT_MODE_PENALTY_GATHER; usually 0)
+///   i32  work_source_uid      (kUnsetWorkSource = -1 → 0xFFFFFFFF unless propagated)
+///   i32  header_tag           'SYST' = 0x53595354 (or 'VNDR' on /dev/vndbinder)
+///   string16 descriptor       "android.os.IServiceManager"
 ///   …    per-code arguments
 /// ```
 ///
-/// For `SVC_MGR_GET_SERVICE` the per-code argument is a length-prefixed
-/// UTF-16 service name string. For `SVC_MGR_ADD_SERVICE` it's the
-/// service name + a strong binder flat object.
+/// The proxy parses leniently (consumes the 3 i32s + one string16 to
+/// reach the args) but logs mismatches. Per-code arg + reply shapes
+/// live in the match arms below (6-Z114 §3.1 / §3.3).
 ///
-/// # Skeleton behaviour
+/// # v2 vs legacy v1 behaviour
 ///
-/// The skeleton does NOT parse the parcel — it would need to follow the
-/// `binder_transaction_data.data.ptr` pointer into the guest's address
-/// space (which requires either `process_vm_readv` or a shared memory
-/// mapping negotiated via the wire protocol). Instead we log the
-/// request code and return:
-///
-/// * `SVC_MGR_GET_SERVICE` / `SVC_MGR_CHECK_SERVICE` → `Failed` (the
-///   guest will see `BR_FAILED_REPLY` and retry, eventually giving up).
-/// * `SVC_MGR_ADD_SERVICE` → `Reply(0)` (we accept the registration but
-///   don't record anything; in a real impl we'd store the name + handle
-///   in the [`HandleTable`]). Returning `Noop` would livelock the guest.
-/// * `SVC_MGR_LIST_SERVICES` → `Failed` (no services to enumerate).
-/// * anything else → `Failed`.
+/// With a v2 wire blob (`req_blob = Some`) the proxy parses the real
+/// request parcel and synthesises a real reply parcel — both ride the
+/// v2 trailer. With v1 (`req_blob = None`) the 6-Z113 loader cannot
+/// inline parcel bytes, so the proxy answers the *legacy* synthetic
+/// shapes (GET → AIDL null binder, ADD → status 0) — correct enough
+/// to keep the ROM's libbinder loops terminating, registry inert
+/// (6-Z114 §2.4 / §4.4).
 fn servicemanager_proxy(
-    _cmd_payload: &[u8],
     code: u32,
-    _handles: &Arc<Mutex<HandleTable>>,
+    services: &Arc<Mutex<ServiceRegistry>>,
+    req_blob: Option<&RequestBlob>,
 ) -> TransactionResult {
+    // No v2 blob → legacy v1 path.
+    let blob = match req_blob {
+        Some(b) => b,
+        None => return servicemanager_legacy(code),
+    };
+
+    let mut reader = ParcelReader::new(&blob.data);
+    // Consume the AIDL interface-token header.
+    let (_strict, _work, tag, iface) = match reader.read_aidl_header() {
+        Some(v) => v,
+        None => {
+            warning!("[KR64][binder][svc] malformed AIDL header (code={})", code);
+            return TransactionResult::Failed;
+        }
+    };
+    // Lenient hygiene: log mismatches but don't reject — the proxy parses
+    // leniently per 6-Z114 §3.2. The native servicemanager's
+    // `enforceInterface` would reject, but the proxy is permissive.
+    if tag != AIDL_HEADER_TAG_SYST && tag != AIDL_HEADER_TAG_VNDR {
+        warning!(
+            "[KR64][binder][svc] unexpected AIDL header tag 0x{:08x} (expected SYST/VNDR)",
+            tag
+        );
+    }
+    if let Some(ref iface_str) = iface {
+        if iface_str != SVC_MGR_IFACE_DESCRIPTOR {
+            warning!(
+                "[KR64][binder][svc] unexpected AIDL descriptor {:?} (expected {:?})",
+                iface_str,
+                SVC_MGR_IFACE_DESCRIPTOR
+            );
+        }
+    }
+
+    let mut writer = ParcelWriter::new();
+    // Reply prefix: AIDL Status::ok() = EX_NONE (i32 0).
+    writer.write_status_ok();
+
     match code {
         SVC_MGR_GET_SERVICE | SVC_MGR_CHECK_SERVICE => {
-            warning!(
-                "[KR64][binder][svc] SVC_MGR_GET_SERVICE/CHECK_SERVICE: skeleton cannot parse parcel"
-            );
-            TransactionResult::Failed
+            // Arg: string16 name. Reply hit: BINDER_TYPE_HANDLE with proxy
+            // handle in low 32 bits. Reply miss: AIDL null binder =
+            // BINDER_TYPE_BINDER with cookie 0 (the client's
+            // `readStrongBinder` sees that as nullptr — 6-Z114 §3.3).
+            let name = match reader.read_string16() {
+                Some(Some(s)) => s,
+                _ => String::new(),
+            };
+            let reg = services.lock().expect("ServiceRegistry poisoned");
+            match reg.get(&name) {
+                Some(handle) => {
+                    let obj = FlatBinderObject {
+                        r#type: BINDER_TYPE_HANDLE,
+                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                        binder: handle as u64,
+                        cookie: 0,
+                    };
+                    writer.write_flat_binder(&obj);
+                    info!(
+                        "[KR64][binder][svc] getService({}) hit → handle 0x{:08x}",
+                        name, handle
+                    );
+                }
+                None => {
+                    let obj = FlatBinderObject {
+                        r#type: BINDER_TYPE_BINDER,
+                        flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                        binder: 0,
+                        cookie: 0,
+                    };
+                    writer.write_flat_binder(&obj);
+                    info!(
+                        "[KR64][binder][svc] getService({}) miss → null binder",
+                        name
+                    );
+                }
+            }
         }
         SVC_MGR_ADD_SERVICE => {
-            // SVC_MGR_ADD_SERVICE is a synchronous transaction — the guest's
-            // IServiceManager::addService calls waitForResponse, which loops
-            // on BINDER_WRITE_READ until it sees BR_REPLY.
-            //
-            // Returning Noop causes a livelock: the guest receives BR_NOOP
-            // and busy-spins forever. Instead, return a Reply with status 0
-            // (success) so the guest proceeds.
-            info!("[KR64][binder][svc] SVC_MGR_ADD_SERVICE accepted (skeleton: not recorded, returning success)");
-            // The reply parcel for IServiceManager is a single i32 status (0 = OK)
-            let status_reply: [u8; 4] = 0i32.to_ne_bytes();
-            TransactionResult::Reply(status_reply.to_vec())
+            // Arg: string16 name + flat_binder_object (strong) + i32 allowIsolated + i32 dumpPriority.
+            // We register the name → fake handle; the guest's binder ptr/cookie
+            // would need per-connection ownership tracking (a v2+ ext).
+            let name = match reader.read_string16() {
+                Some(Some(s)) => s,
+                _ => String::new(),
+            };
+            let _guest_flat = reader.read_flat_binder(); // consumed, not yet stored
+            let _allow_isolated = reader.read_i32();
+            let _dump_priority = reader.read_i32();
+            let mut reg = services.lock().expect("ServiceRegistry poisoned");
+            let handle = reg.add(&name);
+            info!(
+                "[KR64][binder][svc] addService({}) → fake handle 0x{:08x}",
+                name, handle
+            );
+            // Reply body: void (header only) per 6-Z114 §3.3.
         }
         SVC_MGR_LIST_SERVICES => {
-            info!("[KR64][binder][svc] SVC_MGR_LIST_SERVICES — returning empty (skeleton)");
-            TransactionResult::Failed
+            // Arg: i32 dumpPriority (ignored — we don't filter).
+            let _ = reader.read_i32();
+            let reg = services.lock().expect("ServiceRegistry poisoned");
+            let names = reg.list();
+            // Reply body: [i32 count][count × string16].
+            writer.write_i32(names.len() as i32);
+            for n in &names {
+                writer.write_string16(n);
+            }
+            info!("[KR64][binder][svc] listServices → {} entries", names.len());
+        }
+        SVC_MGR_REGISTER_FOR_NOTIFICATIONS => {
+            // §3.3 minimal: accepted+ack is enough (no callback delivery).
+            // Args: string16 name + flat_binder (callback) — consumed.
+            let _ = reader.read_string16();
+            let _ = reader.read_flat_binder();
+            // Reply body: void.
+        }
+        SVC_MGR_IS_DECLARED => {
+            // Arg: string16 name. Reply body: i32 0|1.
+            let name = match reader.read_string16() {
+                Some(Some(s)) => s,
+                _ => String::new(),
+            };
+            let reg = services.lock().expect("ServiceRegistry poisoned");
+            let declared = reg.get(&name).is_some() as i32;
+            writer.write_i32(declared);
         }
         _ => {
             warning!("[KR64][binder][svc] unhandled servicemanager code {}", code);
-            TransactionResult::Failed
+            return TransactionResult::Failed;
         }
     }
+
+    let (data, offsets) = writer.into_parts();
+    TransactionResult::Reply { data, offsets }
+}
+
+/// Legacy v1 path (no parcel blob): the 6-Z113 loader cannot inline the
+/// guest's parcel bytes, so the proxy answers the *synthetic* shapes per
+/// 6-Z114 §2.4 — GET/CHECK → AIDL null binder (status 0 + flat
+/// `{BINDER_TYPE_BINDER, 0, 0, 0}`), ADD → status 0 (header only). This
+/// keeps the ROM's libbinder loops terminating without a real registry
+/// hit. For v2 requests with a parcel blob, [`servicemanager_proxy`] does
+/// the full parse + reply.
+fn servicemanager_legacy(code: u32) -> TransactionResult {
+    let mut writer = ParcelWriter::new();
+    writer.write_status_ok(); // EX_NONE
+    match code {
+        SVC_MGR_GET_SERVICE | SVC_MGR_CHECK_SERVICE => {
+            // AIDL null binder — the client's readStrongBinder sees
+            // BINDER_TYPE_BINDER with cookie 0 → nullptr (6-Z114 §3.3).
+            writer.write_flat_binder(&FlatBinderObject {
+                r#type: BINDER_TYPE_BINDER,
+                flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+                binder: 0,
+                cookie: 0,
+            });
+        }
+        SVC_MGR_ADD_SERVICE
+        | SVC_MGR_LIST_SERVICES
+        | SVC_MGR_REGISTER_FOR_NOTIFICATIONS
+        | SVC_MGR_IS_DECLARED => {
+            // Header-only "accepted" reply (no payload after exception=0).
+            // For LIST this is the wrong shape (should be [i32 0] for an
+            // empty array) but the v1 client can't dereference the parcel
+            // anyway — keeping the loop terminating is the best we can do.
+        }
+        _ => return TransactionResult::Failed,
+    }
+    let (data, offsets) = writer.into_parts();
+    TransactionResult::Reply { data, offsets }
 }
 
 /// Forward a `BC_TRANSACTION` to the host's `/dev/binder` via a real
@@ -1692,27 +2505,31 @@ fn push_br_failed_reply(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&BR_FAILED_REPLY.to_ne_bytes());
 }
 
-/// Push `[BR_REPLY][binder_transaction_data]` followed by the reply's
-/// data buffer. The `binder_transaction_data` is synthesised with all
-/// fields zeroed except `data_size` / `data_ptr` (which point at the
-/// reply data buffer we're embedding).
-///
-/// NOTE: the guest's libbinder.so expects `data_ptr` to be a pointer
-/// into ITS OWN address space, not ours. The skeleton here just passes
-/// a placeholder pointer — the guest will get garbage if it tries to
-/// dereference it. A real impl would either (a) allocate a buffer in
-/// the guest's address space (via the wire protocol's "shared buffer"
-/// extension) and put the reply data there, or (b) inline the reply
-/// data into the `binder_transaction_data.data.buf[8]` inline array.
-fn push_br_reply(buf: &mut Vec<u8>, reply_data: &[u8]) {
+/// Push `[BR_TRANSACTION_COMPLETE]` (4 bytes, no payload). The client's
+/// `IPCThreadState::waitForResponse` consumes this and keeps looping for
+/// the actual `BR_REPLY` (6-Z114 §4.5 — sync reply may batch
+/// `[BR_TRANSACTION_COMPLETE][BR_REPLY]`).
+fn push_br_transaction_complete(buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&BR_TRANSACTION_COMPLETE.to_ne_bytes());
+}
+
+/// Push `[BR_REPLY][binder_transaction_data]` with `tr.data_size` and
+/// `tr.offsets_size` stamped from the reply parcel; `tr.data_ptr` and
+/// `tr.offsets_ptr` stay 0 on the wire — the v2 client patches them from
+/// the response trailer's blob index before copying the BR bytes into
+/// its mIn (6-Z114 §4.4 / §4.5). The reply parcel bytes themselves ride
+/// the v2 response trailer; they are NOT inlined here (the v1 client
+/// can't dereference `tr.data_ptr = 0` anyway).
+fn push_br_reply(buf: &mut Vec<u8>, data_size: u64, offsets_size: u64) {
     buf.extend_from_slice(&BR_REPLY.to_ne_bytes());
     let tx = BinderTransactionData {
-        data_size: reply_data.len() as u64,
+        data_size,
+        offsets_size,
         ..Default::default()
     };
-    // Serialize the struct as little-endian bytes. Since the struct is
-    // #[repr(C)] and we're on a little-endian platform (aarch64 /
-    // x86_64), `to_ne_bytes` via raw byte copy works.
+    // Serialize the struct as native-endian bytes. The struct is
+    // #[repr(C)] and we're on a little-endian platform (aarch64 / x86_64),
+    // so a raw byte copy IS `to_ne_bytes`.
     let tx_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(
             &tx as *const BinderTransactionData as *const u8,
@@ -1720,7 +2537,6 @@ fn push_br_reply(buf: &mut Vec<u8>, reply_data: &[u8]) {
         )
     };
     buf.extend_from_slice(tx_bytes);
-    buf.extend_from_slice(reply_data);
 }
 
 // ============================================================================
@@ -1731,9 +2547,9 @@ fn push_br_reply(buf: &mut Vec<u8>, reply_data: &[u8]) {
 /// number. The ioctl number encodes the arg size in bits 16..29
 /// (the `size` field of `_IOC(dir, type, nr, size)`).
 ///
-/// For example, `BC_TRANSACTION` = `_IOW('b', 0, sizeof(binder_transaction_data))`
-/// = `(1<<30) | (64<<16) | ('b'<<8) | 0`, so `bc_payload_size(BC_TRANSACTION)`
-/// returns 64.
+/// For example, `BC_TRANSACTION` = `_IOW('c', 0, sizeof(binder_transaction_data))`
+/// = `(1<<30) | (64<<16) | ('c'<<8) | 0` = 0x40406300, so
+/// `bc_payload_size(BC_TRANSACTION)` returns 64.
 fn bc_payload_size(cmd: u32) -> u32 {
     (cmd >> 16) & 0x3fff
 }
@@ -1780,43 +2596,85 @@ mod tests {
 
     #[test]
     fn bc_br_constants_match_kernel_values() {
-        // These are the canonical values from <uapi/linux/android/binder.h>
-        // on aarch64 / x86_64. The kernel enum uses nr=1 for BC_TRANSACTION
-        // (NOT nr=0), and nr=1 for BR_OK (NOT BR_TRANSACTION). We match the
-        // kernel exactly so the guest's libbinder.so (which uses these
-        // literal numbers) recognises our commands.
-        assert_eq!(BC_TRANSACTION, 0x40406201, "BC_TRANSACTION");
-        assert_eq!(BC_REPLY, 0x40406202, "BC_REPLY");
-        assert_eq!(BC_ACQUIRE, 0x40046203, "BC_ACQUIRE");
-        assert_eq!(BC_RELEASE, 0x40046204, "BC_RELEASE");
-        assert_eq!(BC_INCREFS, 0x40046205, "BC_INCREFS");
-        assert_eq!(BC_ACQUIRE_DONE, 0x40106206, "BC_ACQUIRE_DONE");
-        assert_eq!(BC_INCREFS_DONE, 0x40106208, "BC_INCREFS_DONE");
-        assert_eq!(BC_FREE_BUFFER, 0x4008620a, "BC_FREE_BUFFER");
+        // Locked table per 6-Z114 PROTOCOL.md §1.1 — verified against
+        // /usr/include/linux/android/binder.h (this build host) AND
+        // bionic's android-11.0.0_r1 mirror of the same header
+        // (the one the ROM's userspace was actually built against).
+        // The split is the kernel's own and ABI-frozen: top-level ioctls
+        // type 'b' (0x62), BC_* type 'c' (0x63), BR_* type 'r' (0x72).
+        //
+        // BC_* (each is `[u32 cmd][payload]` in the write_buffer):
+        assert_eq!(
+            BC_TRANSACTION, 0x40406300,
+            "BC_TRANSACTION = _IOW('c',0,64)"
+        );
+        assert_eq!(BC_REPLY, 0x40406301, "BC_REPLY = _IOW('c',1,64)");
+        assert_eq!(BC_FREE_BUFFER, 0x40086303, "BC_FREE_BUFFER = _IOW('c',3,8)");
+        assert_eq!(BC_INCREFS, 0x40046304, "BC_INCREFS = _IOW('c',4,4)");
+        assert_eq!(BC_ACQUIRE, 0x40046305, "BC_ACQUIRE = _IOW('c',5,4)");
+        assert_eq!(BC_RELEASE, 0x40046306, "BC_RELEASE = _IOW('c',6,4)");
+        assert_eq!(BC_DECREFS, 0x40046307, "BC_DECREFS = _IOW('c',7,4)");
+        assert_eq!(
+            BC_INCREFS_DONE, 0x40106308,
+            "BC_INCREFS_DONE = _IOW('c',8,16)"
+        );
+        assert_eq!(
+            BC_ACQUIRE_DONE, 0x40106309,
+            "BC_ACQUIRE_DONE = _IOW('c',9,16)"
+        );
+        assert_eq!(
+            BC_REGISTER_LOOPER, 0x0000630B,
+            "BC_REGISTER_LOOPER = _IO('c',11)"
+        );
+        assert_eq!(BC_ENTER_LOOPER, 0x0000630C, "BC_ENTER_LOOPER = _IO('c',12)");
+        assert_eq!(BC_EXIT_LOOPER, 0x0000630D, "BC_EXIT_LOOPER = _IO('c',13)");
+        assert_eq!(
+            BC_REQUEST_DEATH_NOTIFICATION, 0x400C630E,
+            "BC_REQUEST_DEATH_NOTIFICATION = _IOW('c',14,12)"
+        );
+        assert_eq!(
+            BC_CLEAR_DEATH_NOTIFICATION, 0x400C630F,
+            "BC_CLEAR_DEATH_NOTIFICATION = _IOW('c',15,12)"
+        );
+        assert_eq!(
+            BC_DEAD_BINDER_DONE, 0x40086310,
+            "BC_DEAD_BINDER_DONE = _IOW('c',16,8)"
+        );
         // BC_TRANSACTION_SG / BC_REPLY_SG use struct binder_transaction_data_sg
         // (64-byte binder_transaction_data + 8-byte buffers_size = 72 bytes),
         // so the _IOW size field is 0x48, not 0x40. The struct size MUST
         // match the kernel's or the guest's libbinder.so (which uses the
         // kernel literal) silently drops every scatter-gather transaction.
-        assert_eq!(BC_TRANSACTION_SG, 0x4048620b, "BC_TRANSACTION_SG");
-        assert_eq!(BC_REPLY_SG, 0x4048620c, "BC_REPLY_SG");
-        assert_eq!(BC_ENTER_LOOPER, 0x0000620d, "BC_ENTER_LOOPER");
-        assert_eq!(BC_REGISTER_LOOPER, 0x0000620e, "BC_REGISTER_LOOPER");
-        assert_eq!(BC_EXIT_LOOPER, 0x0000620f, "BC_EXIT_LOOPER");
-        assert_eq!(BC_REQUEST_DEATH_NOTIFICATION, 0x40106210);
-        assert_eq!(BC_CLEAR_DEATH_NOTIFICATION, 0x40106211);
-        assert_eq!(BC_DEAD_BINDER_DONE, 0x40086212);
+        assert_eq!(
+            BC_TRANSACTION_SG, 0x40486311,
+            "BC_TRANSACTION_SG = _IOW('c',17,72)"
+        );
+        assert_eq!(BC_REPLY_SG, 0x40486312, "BC_REPLY_SG = _IOW('c',18,72)");
 
-        assert_eq!(BR_ERROR, 0x80046200, "BR_ERROR");
-        assert_eq!(BR_OK, 0x00006201, "BR_OK");
-        assert_eq!(BR_TRANSACTION, 0x80406202, "BR_TRANSACTION");
-        assert_eq!(BR_REPLY, 0x80406203, "BR_REPLY");
-        assert_eq!(BR_NOOP, 0x0000620c, "BR_NOOP");
-        assert_eq!(BR_SPAWN_LOOPER, 0x0000620d, "BR_SPAWN_LOOPER");
-        assert_eq!(BR_FINISHED, 0x0000620e, "BR_FINISHED");
-        assert_eq!(BR_FAILED_REPLY, 0x00006211, "BR_FAILED_REPLY");
-        assert_eq!(BR_DEAD_BINDER, 0x8008620f, "BR_DEAD_BINDER");
-        assert_eq!(BR_CLEAR_DEATH_NOTIFICATION_DONE, 0x80086210);
+        // BR_* (each is `[u32 br][payload]` in the read_buffer):
+        assert_eq!(BR_ERROR, 0x80047200, "BR_ERROR = _IOR('r',0,4)");
+        assert_eq!(BR_OK, 0x00007201, "BR_OK = _IO('r',1)");
+        assert_eq!(
+            BR_TRANSACTION, 0x80407202,
+            "BR_TRANSACTION = _IOR('r',2,64)"
+        );
+        assert_eq!(BR_REPLY, 0x80407203, "BR_REPLY = _IOR('r',3,64)");
+        assert_eq!(BR_DEAD_REPLY, 0x00007205, "BR_DEAD_REPLY = _IO('r',5)");
+        assert_eq!(
+            BR_TRANSACTION_COMPLETE, 0x00007206,
+            "BR_TRANSACTION_COMPLETE = _IO('r',6)"
+        );
+        assert_eq!(BR_NOOP, 0x0000720C, "BR_NOOP = _IO('r',12)");
+        assert_eq!(BR_SPAWN_LOOPER, 0x0000720D, "BR_SPAWN_LOOPER = _IO('r',13)");
+        assert_eq!(
+            BR_DEAD_BINDER, 0x8008720F,
+            "BR_DEAD_BINDER = _IOR('r',15,8)"
+        );
+        assert_eq!(
+            BR_CLEAR_DEATH_NOTIFICATION_DONE, 0x80087210,
+            "BR_CLEAR_DEATH_NOTIFICATION_DONE = _IOR('r',16,8)"
+        );
+        assert_eq!(BR_FAILED_REPLY, 0x00007211, "BR_FAILED_REPLY = _IO('r',17)");
     }
 
     #[test]
@@ -2004,5 +2862,402 @@ mod tests {
         // joins them, so by the time drop returns all 10 jobs have run.
         drop(pool);
         assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    // -------- Parcel codec round-trips (6-Z114 §3.2) -----------------
+
+    /// `Parcel::writeString16` → `readString16` round-trip for ASCII,
+    /// BMP non-ASCII, and empty string. Verifies the length prefix,
+    /// always-written NUL, and 4-byte pad are all consumed symmetrically.
+    #[test]
+    fn parcel_string16_round_trip() {
+        for s in [
+            "",
+            "activity",
+            "android.os.IServiceManager",
+            "café",
+            "日本語",
+        ] {
+            let mut w = ParcelWriter::new();
+            w.write_string16(s);
+            // Reader position after the string must equal writer length
+            // — proves we consumed the NUL + pad the same way.
+            let (data, _) = w.into_parts();
+            let mut r = ParcelReader::new(&data);
+            let out = r
+                .read_string16()
+                .expect("read_string16 returned Some")
+                .expect("string16 was non-null");
+            assert_eq!(out, s, "string16 round-trip mismatch for {:?}", s);
+            assert_eq!(
+                r.remaining(),
+                0,
+                "reader should have consumed the whole buffer for {:?}",
+                s
+            );
+        }
+    }
+
+    /// AIDL interface-token header (`Parcel::writeInterfaceToken`)
+    /// round-trips exactly: strict / work / tag / descriptor all match.
+    #[test]
+    fn parcel_aidl_header_round_trip() {
+        let mut w = ParcelWriter::new();
+        w.write_i32(0); // strict_mode_policy
+        w.write_i32(-1); // work_source_uid (kUnsetWorkSource)
+        w.write_u32(AIDL_HEADER_TAG_SYST);
+        w.write_string16(SVC_MGR_IFACE_DESCRIPTOR);
+        let (data, _) = w.into_parts();
+        let mut r = ParcelReader::new(&data);
+        let (strict, work, tag, iface) = r
+            .read_aidl_header()
+            .expect("read_aidl_header returned Some");
+        assert_eq!(strict, 0, "strict_mode_policy");
+        assert_eq!(work, -1, "work_source_uid");
+        assert_eq!(tag, AIDL_HEADER_TAG_SYST, "header tag");
+        assert_eq!(
+            iface.as_deref(),
+            Some(SVC_MGR_IFACE_DESCRIPTOR),
+            "interface descriptor"
+        );
+        assert_eq!(r.remaining(), 0, "header must consume the whole buffer");
+    }
+
+    /// `write_flat_binder` MUST also append the object's byte offset to
+    /// the offsets array — both the kernel's translation table and the
+    /// Parcel object bookkeeping depend on it (6-Z114 §3.2).
+    #[test]
+    fn parcel_write_flat_binder_appends_offset() {
+        let mut w = ParcelWriter::new();
+        // First write an i32 status (4 bytes) so the flat object lands at
+        // a non-zero offset — proves the offset is data-relative, not 0.
+        w.write_status_ok();
+        let obj = FlatBinderObject {
+            r#type: BINDER_TYPE_HANDLE,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0xF000_0001, // proxy handle, low 32 bits
+            cookie: 0,
+        };
+        let off = w.write_flat_binder(&obj);
+        assert_eq!(off, 4, "flat object must land after the i32 status prefix");
+        let (data, offsets) = w.into_parts();
+        assert_eq!(
+            data.len(),
+            4 + 24,
+            "data = i32 status + 24-byte flat object"
+        );
+        assert_eq!(offsets.len(), 8, "offsets array = one u64 offset");
+        let parsed_off = u64::from_ne_bytes(offsets[..].try_into().unwrap());
+        assert_eq!(
+            parsed_off, 4,
+            "offsets[0] must equal the object's data offset"
+        );
+        // Read it back and verify field-for-field.
+        let mut r = ParcelReader::new(&data);
+        let _status = r.read_i32().expect("status prefix");
+        let back = r.read_flat_binder().expect("flat_binder object");
+        assert_eq!(back.r#type, BINDER_TYPE_HANDLE);
+        assert_eq!(back.flags, FLAT_FLAGS_LIBBINDER_DEFAULT);
+        assert_eq!(back.binder, 0xF000_0001);
+        assert_eq!(back.cookie, 0);
+    }
+
+    // -------- ServiceRegistry (6-Z114 §3.3 / §3.4) ------------------
+
+    #[test]
+    fn service_registry_add_then_get_returns_allocated_handle() {
+        let mut reg = ServiceRegistry::new();
+        let h1 = reg.add("activity");
+        let h2 = reg.add("package");
+        // Handles come from PROXY_HANDLE_BASE + 1, monotonically.
+        assert_eq!(h1, PROXY_HANDLE_BASE + 1);
+        assert_eq!(h2, PROXY_HANDLE_BASE + 2);
+        assert_eq!(reg.get("activity"), Some(h1));
+        assert_eq!(reg.get("package"), Some(h2));
+        assert_eq!(reg.get("nope"), None, "miss must return None");
+        assert_eq!(reg.len(), 2);
+        assert!(!reg.is_empty());
+    }
+
+    // -------- servicemanager proxy end-to-end over the v2 wire -------
+    // (6-Z114 §3 + §4.4 — exercises the full parse → reply → blob trailer
+    // path through BinderProxy)
+
+    /// Helper: build a `binder_transaction_data` payload for a
+    /// BC_TRANSACTION to handle 0 with the given code + flags. The
+    /// data/offsets pointers are 0 (the v2 client patches them from the
+    /// blob index).
+    fn make_bc_transaction_payload(code: u32, flags: u32) -> [u8; 64] {
+        let mut tx = [0u8; 64];
+        // target.handle = 0 (servicemanager)
+        tx[0..4].copy_from_slice(&0u32.to_ne_bytes());
+        // code
+        tx[16..20].copy_from_slice(&code.to_ne_bytes());
+        // flags
+        tx[20..24].copy_from_slice(&flags.to_ne_bytes());
+        // data_size / offsets_size stay 0 on the wire (v2: blob carries bytes)
+        tx
+    }
+
+    /// Helper: build an AIDL request parcel for `android.os.IServiceManager`
+    /// — `[i32 0 strict][i32 -1 work][i32 SYST tag][string16 descriptor]`
+    /// followed by the caller-provided per-code args writer. Each flat
+    /// object's offset in the args writer is shifted by the size of the
+    /// AIDL header so the merged offsets array stays correct relative to
+    /// the merged data buffer.
+    fn make_servicemanager_request_parcel(args: &mut ParcelWriter) -> (Vec<u8>, Vec<u8>) {
+        let mut w = ParcelWriter::new();
+        w.write_i32(0); // strict
+        w.write_i32(-1); // work_source
+        w.write_u32(AIDL_HEADER_TAG_SYST);
+        w.write_string16(SVC_MGR_IFACE_DESCRIPTOR);
+        let args_offset = w.data.len() as u64;
+        // Move args.data and args.offsets out so we can iterate the
+        // offsets without contending with the data borrow.
+        let args_data = std::mem::take(&mut args.data);
+        let args_offsets = std::mem::take(&mut args.offsets);
+        w.data.extend_from_slice(&args_data);
+        // Shift each u64 offset by the AIDL header's byte size so it
+        // points into the merged data buffer at the right place.
+        for chunk in args_offsets.chunks_exact(8) {
+            let off = u64::from_ne_bytes(chunk.try_into().unwrap()) + args_offset;
+            w.offsets.extend_from_slice(&off.to_ne_bytes());
+        }
+        w.into_parts()
+    }
+
+    /// Helper: build a v2 BINDER_WRITE_READ wire payload for one
+    /// BC_TRANSACTION carrying one parcel blob.
+    fn make_v2_write_read_payload(
+        bc_stream: &[u8],
+        blob_data: &[u8],
+        blob_offsets: &[u8],
+        read_capacity: u32,
+    ) -> Vec<u8> {
+        let write_size = bc_stream.len() as u32;
+        let mut p = Vec::new();
+        p.extend_from_slice(&write_size.to_ne_bytes());
+        p.extend_from_slice(&read_capacity.to_ne_bytes());
+        p.extend_from_slice(bc_stream);
+        // v2 trailer
+        p.extend_from_slice(&WIRE_V2_MAGIC.to_ne_bytes());
+        p.extend_from_slice(&1u32.to_ne_bytes()); // one blob
+        p.extend_from_slice(&(blob_data.len() as u32).to_ne_bytes());
+        p.extend_from_slice(&(blob_offsets.len() as u32).to_ne_bytes());
+        p.extend_from_slice(blob_data);
+        p.extend_from_slice(blob_offsets);
+        p
+    }
+
+    /// Helper: frame a payload as `[u32 cmd][u32 arg_len][payload]` and
+    /// send it; read back the framed response `[i32 ret][u32 arg_len][...]`.
+    fn exchange(stream: &mut UnixStream, cmd: u32, payload: &[u8]) -> (i32, Vec<u8>) {
+        let mut req = Vec::with_capacity(8 + payload.len());
+        req.extend_from_slice(&cmd.to_ne_bytes());
+        req.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        req.extend_from_slice(payload);
+        stream.write_all(&req).expect("write request");
+        let mut hdr = [0u8; 8];
+        stream.read_exact(&mut hdr).expect("read response header");
+        let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
+        let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; arg_len];
+        stream
+            .read_exact(&mut payload)
+            .expect("read response payload");
+        (ret, payload)
+    }
+
+    /// ADD_SERVICE then GET_SERVICE over the v2 wire: the GET reply must
+    /// carry a `BINDER_TYPE_HANDLE` flat object whose `binder` field
+    /// equals the proxy-allocated handle, listed in the offsets array.
+    #[test]
+    fn servicemanager_proxy_v2_add_then_get_returns_handle() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // ---- BC_TRANSACTION ADD_SERVICE "my_svc" ----
+        let mut args = ParcelWriter::new();
+        args.write_string16("my_svc");
+        args.write_flat_binder(&FlatBinderObject {
+            r#type: BINDER_TYPE_BINDER,
+            flags: FLAT_FLAGS_LIBBINDER_DEFAULT,
+            binder: 0xdead, // guest weakrefs ptr — not yet tracked
+            cookie: 0xbeef, // guest BBinder ptr — not yet tracked
+        });
+        args.write_i32(0); // allowIsolated
+        args.write_i32(0); // dumpPriority
+        let (req_data, req_off) = make_servicemanager_request_parcel(&mut args);
+
+        // Build the BC_TRANSACTION stream: [u32 cmd][64-byte tr_data].
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_ADD_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &req_data, &req_off, 4096);
+
+        let (ret, resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0, "ADD_SERVICE WRITE_READ should succeed");
+        // Response shape: [u32 read_size][BR_TRANSACTION_COMPLETE][BR_REPLY][64-byte tr]
+        //                  [u32 WIRE_V2_MAGIC][u32 1][u32 data_len][u32 off_len][data][offsets]
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        // 4 bytes BR_TRANSACTION_COMPLETE + 4 bytes BR_REPLY + 64 bytes tr = 72.
+        assert_eq!(
+            read_size,
+            4 + 4 + 64,
+            "ADD reply BR stream = COMPLETE + REPLY + 64-byte tr"
+        );
+        let br_complete = u32::from_ne_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(br_complete, BR_TRANSACTION_COMPLETE);
+        let br_reply = u32::from_ne_bytes(resp[8..12].try_into().unwrap());
+        assert_eq!(br_reply, BR_REPLY);
+        // ADD reply parcel = [i32 0] (status) only — no flat object.
+        // Locate the v2 trailer and verify the blob.
+        let mut off = 4 + read_size;
+        let magic = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap());
+        assert_eq!(magic, WIRE_V2_MAGIC, "response must be v2");
+        off += 4;
+        let blob_count = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap());
+        assert_eq!(blob_count, 1, "ADD response carries one reply blob");
+        off += 4;
+        let data_len = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+        let off_len = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
+        assert_eq!(data_len, 4, "ADD reply = [i32 0] status only");
+        assert_eq!(off_len, 0, "ADD reply has no flat objects");
+        let status = i32::from_ne_bytes(resp[off + 8..off + 12].try_into().unwrap());
+        assert_eq!(status, 0, "ADD reply status = EX_NONE");
+
+        // ---- BC_TRANSACTION GET_SERVICE "my_svc" ----
+        let mut args2 = ParcelWriter::new();
+        args2.write_string16("my_svc");
+        let (req_data2, req_off2) = make_servicemanager_request_parcel(&mut args2);
+        let mut bc2 = Vec::with_capacity(4 + 64);
+        bc2.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc2.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload2 = make_v2_write_read_payload(&bc2, &req_data2, &req_off2, 4096);
+        let (ret2, resp2) = exchange(&mut stream, BINDER_WRITE_READ, &payload2);
+        assert_eq!(ret2, 0, "GET_SERVICE WRITE_READ should succeed");
+        let read_size2 = u32::from_ne_bytes(resp2[0..4].try_into().unwrap()) as usize;
+        assert_eq!(read_size2, 4 + 4 + 64, "GET reply BR stream");
+        let br_complete2 = u32::from_ne_bytes(resp2[4..8].try_into().unwrap());
+        assert_eq!(br_complete2, BR_TRANSACTION_COMPLETE);
+        let br_reply2 = u32::from_ne_bytes(resp2[8..12].try_into().unwrap());
+        assert_eq!(br_reply2, BR_REPLY);
+        // Locate the v2 trailer reply blob.
+        let mut off2 = 4 + read_size2;
+        assert_eq!(
+            u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()),
+            WIRE_V2_MAGIC
+        );
+        off2 += 4;
+        assert_eq!(
+            u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()),
+            1
+        );
+        off2 += 4;
+        let data_len2 = u32::from_ne_bytes(resp2[off2..off2 + 4].try_into().unwrap()) as usize;
+        let off_len2 = u32::from_ne_bytes(resp2[off2 + 4..off2 + 8].try_into().unwrap()) as usize;
+        assert_eq!(
+            data_len2,
+            4 + 24,
+            "GET reply = [i32 0 status] + 24-byte flat"
+        );
+        assert_eq!(off_len2, 8, "GET reply offsets = one u64 offset");
+        let blob2 = &resp2[off2 + 8..off2 + 8 + data_len2];
+        let status2 = i32::from_ne_bytes(blob2[0..4].try_into().unwrap());
+        assert_eq!(status2, 0, "GET reply status = EX_NONE");
+        // Flat-object layout (24 bytes): u32 type, u32 flags, u64 binder, u64 cookie.
+        let flat_type = u32::from_ne_bytes(blob2[4..8].try_into().unwrap());
+        assert_eq!(
+            flat_type, BINDER_TYPE_HANDLE,
+            "GET hit → BINDER_TYPE_HANDLE"
+        );
+        // The proxy handle lives in the `binder` u64 field (low 32 bits on
+        // remote refs — 6-Z114 §3.2).
+        let flat_handle = u64::from_ne_bytes(blob2[12..20].try_into().unwrap()) as u32;
+        assert_eq!(
+            flat_handle,
+            PROXY_HANDLE_BASE + 1,
+            "proxy handle = 0xF0000000 + 1 (first registered service)"
+        );
+        // The reply offsets array must list the flat object's offset (= 4,
+        // after the i32 status prefix).
+        let reply_offsets = &resp2[off2 + 8 + data_len2..off2 + 8 + data_len2 + off_len2];
+        let listed_off = u64::from_ne_bytes(reply_offsets[..].try_into().unwrap());
+        assert_eq!(
+            listed_off, 4,
+            "reply offsets[0] = flat object's data offset"
+        );
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    /// GET_SERVICE for an unregistered name must reply with a `null binder`
+    /// — `BINDER_TYPE_BINDER` with `cookie = 0` (the client's
+    /// `readStrongBinder` decodes that as nullptr — 6-Z114 §3.3).
+    #[test]
+    fn servicemanager_proxy_v2_get_miss_returns_null_binder() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        let mut args = ParcelWriter::new();
+        args.write_string16("does_not_exist");
+        let (req_data, req_off) = make_servicemanager_request_parcel(&mut args);
+        let mut bc = Vec::with_capacity(4 + 64);
+        bc.extend_from_slice(&BC_TRANSACTION.to_ne_bytes());
+        bc.extend_from_slice(&make_bc_transaction_payload(SVC_MGR_GET_SERVICE, 0));
+        let payload = make_v2_write_read_payload(&bc, &req_data, &req_off, 4096);
+        let (ret, resp) = exchange(&mut stream, BINDER_WRITE_READ, &payload);
+        assert_eq!(ret, 0);
+
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_ne_bytes(resp[4..8].try_into().unwrap()),
+            BR_TRANSACTION_COMPLETE
+        );
+        assert_eq!(
+            u32::from_ne_bytes(resp[8..12].try_into().unwrap()),
+            BR_REPLY
+        );
+
+        let mut off = 4 + read_size;
+        assert_eq!(
+            u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()),
+            WIRE_V2_MAGIC
+        );
+        off += 8; // magic(4) + blob_count(4)
+        let data_len = u32::from_ne_bytes(resp[off..off + 4].try_into().unwrap()) as usize;
+        let off_len = u32::from_ne_bytes(resp[off + 4..off + 8].try_into().unwrap()) as usize;
+        assert_eq!(data_len, 4 + 24, "miss reply = [i32 0] + 24-byte null flat");
+        assert_eq!(off_len, 8, "null flat object still listed in offsets");
+        let blob = &resp[off + 8..off + 8 + data_len];
+        let status = i32::from_ne_bytes(blob[0..4].try_into().unwrap());
+        assert_eq!(
+            status, 0,
+            "miss is still a successful transaction (EX_NONE)"
+        );
+        // Flat-object layout (24 bytes): u32 type, u32 flags, u64 binder, u64 cookie.
+        let flat_type = u32::from_ne_bytes(blob[4..8].try_into().unwrap());
+        assert_eq!(
+            flat_type, BINDER_TYPE_BINDER,
+            "miss → AIDL null binder (BINDER_TYPE_BINDER with cookie 0)"
+        );
+        let binder = u64::from_ne_bytes(blob[12..20].try_into().unwrap());
+        let cookie = u64::from_ne_bytes(blob[20..28].try_into().unwrap());
+        assert_eq!(binder, 0, "null binder: binder field = 0");
+        assert_eq!(cookie, 0, "null binder: cookie = 0");
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
     }
 }
