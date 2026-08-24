@@ -2960,6 +2960,49 @@ static int is_proc_sys_virtual_file(const char *path) {
            strcmp(path, "/proc/sys/vm/mmap_rnd_compat_bits") == 0;
 }
 
+// 6-Z123b: post-open diagnostic + write-retry for the proc-sys trio.
+// Run 32752805062: init's SetKptrRestrict ifstream open of the rootfs
+// copy SUCCEEDED (the 6-Z123 translation works) but the ofstream open
+// FAILED with no avc (it reached the rootfs file) — the errno was
+// invisible (the tracer's return-log cap). This helper (a) LOGS every
+// proc-sys open with flags + fd + errno (rate-capped), and (b) on a
+// write-intent failure retries after an explicit ensure-create —
+// mirroring the selinuxfs open() handling. Returns the fd to use.
+static int proc_sys_open_finish(const char *path, const char *translated,
+                                int flags, mode_t mode, int fd) {
+    static int log_count = 0;
+    if (is_proc_sys_virtual_file(path)) {
+        if (log_count < 24) {
+            log_count++;
+            char msg[512];
+            int len = snprintf(msg, sizeof(msg),
+                               "[twoyi_loader] 6-Z123b: open(%s, flags=0x%x) -> fd=%d errno=%d\n",
+                               path, flags, fd, fd < 0 ? errno : 0);
+            syscall(NR_write, 2, msg, len > 0 ? (size_t)len : 0);
+        }
+        if (fd < 0 && (flags & (O_WRONLY | O_RDWR)) && g_rootfs) {
+            // Write-intent open failed — ensure the file exists (the
+            // loader's ensure_proc_sys_files should have made it, but a
+            // first-boot race or a wiped rootfs could leave it missing)
+            // and retry once.
+            int cfd = twoyi_sys_open(translated, O_WRONLY | O_CREAT, 0666);
+            if (cfd >= 0) {
+                syscall(NR_close, cfd);
+                fd = (int)twoyi_sys_open(translated, flags, mode);
+                if (log_count < 24) {
+                    log_count++;
+                    char msg[512];
+                    int len2 = snprintf(msg, sizeof(msg),
+                                        "[twoyi_loader] 6-Z123b: retry open(%s) -> fd=%d errno=%d\n",
+                                        path, fd, fd < 0 ? errno : 0);
+                    syscall(NR_write, 2, msg, len2 > 0 ? (size_t)len2 : 0);
+                }
+            }
+        }
+    }
+    return fd;
+}
+
 // Pre-create {rootfs}/proc/sys/{kernel,vm}/<file> with a valid seed.
 // Idempotent: an existing file (e.g. "4" left by a previous boot
 // cycle's write) is left alone — any in-range value satisfies the
@@ -3201,6 +3244,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
     const char *translated = translate(path);
     int fd = real_openat(dirfd, translated, flags, mode);
+    // 6-Z123b: proc-sys trio diagnostic + write-intent retry.
+    fd = proc_sys_open_finish(path, translated, flags, mode, fd);
     // Binder device open fallback (see binder_open_fallback() docs above).
     if (is_binder_device_path(path)) {
         int saved_errno = fd < 0 ? errno : 0;
@@ -3295,6 +3340,8 @@ int open(const char *path, int flags, ...) {
     if (real_openat) fd = real_openat(AT_FDCWD, translated, flags, mode);
     else fd = syscall(NR_openat, AT_FDCWD, translated, flags, mode);
 #endif
+    // 6-Z123b: proc-sys trio diagnostic + write-intent retry.
+    fd = proc_sys_open_finish(path, translated, flags, mode, fd);
     // Binder device open fallback (see binder_open_fallback() docs above).
     if (is_binder_device_path(path)) {
         int saved_errno = fd < 0 ? errno : 0;
