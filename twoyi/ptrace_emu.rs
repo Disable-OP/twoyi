@@ -234,6 +234,13 @@ struct ChildAbi {
     openat2: i64,
     stat: i64,
     lstat: i64,
+    // 6-Z121: plain fstat — fd-based (arg1=fd, arg2=statbuf), NO path
+    // translation, but the EXIT-side root-ownership virtualization for
+    // the guest's /dev/__properties__/* files needs to match on it
+    // (libpropertyinfoparser's LoadPath() stats property_info and
+    // rejects st_uid != 0 — see the 6-Z121 EXIT arm).
+    //   x86_64: 5, i386: 108, aarch64: 80.
+    fstat: i64,
     newfstatat: i64,
     statx: i64,
     // stat64 / lstat64 / fstat64 — the i386 64-bit-struct variants of
@@ -1055,6 +1062,7 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     openat2: 437,
     stat: 4,
     lstat: 6,
+    fstat: 5,
     newfstatat: 262,
     statx: 332,
     // x86_64 stat/lstat/fstat are already 64-bit (struct stat carries
@@ -1303,6 +1311,7 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     openat2: 437,
     stat: 106,
     lstat: 107,
+    fstat: 108,
     newfstatat: 300,
     statx: 383,
     // Task 6-T: i386 stat64/lstat64/fstat64. Verified directly against
@@ -1660,6 +1669,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     openat2: 437,
     stat: -1,
     lstat: -1,
+    fstat: 80,
     newfstatat: 79,
     statx: 291,
     // asm-generic (aarch64) uses statx + newfstatat exclusively; there
@@ -5862,6 +5872,88 @@ fn is_properties_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("__properties__")
 }
 
+/// 6-Z121: is this HOST path one of the guest's property METADATA files
+/// directly under /dev/__properties__/ (property_info,
+/// properties_serial, properties_ctxtN, …)? Matches BOTH the bare guest
+/// spelling (`/dev/__properties__/property_info`) AND the
+/// translate_path-mangled rootfs form
+/// (`{rootfs}/dev/__properties__/property_info`) by anchoring on the
+/// last `/dev/__properties__/` segment.
+///
+/// Rejects: relative paths, the old single-file `/dev/__properties__`
+/// spelling (final component `__properties__` — that one has NO child
+/// file name), deeper paths (`…/__properties__/sub/file`), and
+/// superstrings (`…/__properties__x`).
+fn is_property_metadata_file(path: &str) -> bool {
+    const SEGMENT: &str = "/dev/__properties__/";
+    if !path.starts_with('/') {
+        return false;
+    }
+    if let Some(idx) = path.find(SEGMENT) {
+        let name = &path[idx + SEGMENT.len()..];
+        return !name.is_empty() && !name.contains('/');
+    }
+    false
+}
+
+/// 6-Z121: the (st_mode, st_uid, st_gid) byte offsets inside the
+/// child's `struct stat` for the plain-fstat syscalls we virtualize.
+/// Dispatched by the syscall NUMBER (the only per-ABI discriminator
+/// available at the call site): x86_64 fstat=5, aarch64 fstat=80.
+/// Anything else (i386 fstat=108 with the old 32-bit layout, or an
+/// unknown nr) returns None → the caller skips virtualization — the
+/// i386 guest is covered by the 6-Z71 stat64 machinery and TWRP's
+/// AOSP 5.1 property system has no property_info trie at all.
+///
+/// Layouts (bionic == kernel uapi for both):
+///   x86_64 (`asm-generic`-style with nlink BEFORE mode):
+///     st_dev@0(8) st_ino@8(8) st_nlink@16(8) st_mode@24(4)
+///     st_uid@28(4) st_gid@32(4) __pad0@36(4) st_rdev@40(8) …
+///   aarch64 (asm-generic):
+///     st_dev@0(8) st_ino@8(8) st_mode@16(4) st_nlink@20(4)
+///     st_uid@24(4) st_gid@28(4) st_rdev@32(8) …
+fn stat_ownership_layout(fstat_nr: i64) -> Option<(usize, usize, usize)> {
+    if fstat_nr == 5 {
+        Some((24, 28, 32)) // x86_64
+    } else if fstat_nr == 80 {
+        Some((16, 24, 28)) // aarch64
+    } else {
+        None
+    }
+}
+
+/// 6-Z121: pure core of the root-ownership virtualization — patch a
+/// `struct stat` byte slice so st_uid=0, st_gid=0 and st_mode carries
+/// no S_IWGRP/S_IWOTH bits. Returns the patched copy, or None when the
+/// slice is too short for the layout (caller leaves the buffer alone —
+/// the kernel's own struct is always better than a half-patch).
+fn virtualize_stat_ownership(
+    bytes: &[u8],
+    mode_off: usize,
+    uid_off: usize,
+    gid_off: usize,
+) -> Option<Vec<u8>> {
+    let need = gid_off.checked_add(4)?;
+    if bytes.len() < need
+        || mode_off.checked_add(4)? > bytes.len()
+        || uid_off.checked_add(4)? > bytes.len()
+    {
+        return None;
+    }
+    let mut out = bytes.to_vec();
+    let mode = u32::from_ne_bytes([
+        out[mode_off],
+        out[mode_off + 1],
+        out[mode_off + 2],
+        out[mode_off + 3],
+    ]);
+    let new_mode = mode & !(libc::S_IWGRP as u32 | libc::S_IWOTH as u32);
+    out[mode_off..mode_off + 4].copy_from_slice(&new_mode.to_ne_bytes());
+    out[uid_off..uid_off + 4].copy_from_slice(&0u32.to_ne_bytes());
+    out[gid_off..gid_off + 4].copy_from_slice(&0u32.to_ne_bytes());
+    Some(out)
+}
+
 /// Task 6-Z73: is this HOST path the TWRP framebuffer file? Matches both
 /// `{rootfs}/dev/graphics/fb0` and `{rootfs}/dev/fb0` (the two paths kr64
 /// pre-creates + the two the fb hook can create).
@@ -7290,6 +7382,12 @@ pub fn run_ptrace_loop(
     // loops fire thousands of legitimate ENOENTs — those must not flood
     // logcat). EMULATED / FAILED lines are NOT counted.
     let mut z71_skip_logs: u32 = 0;
+    // 6-Z121: rate-limit for the fstat root-ownership virtualization
+    // logs (the loader's init fstats the property files in every
+    // exec'd guest process; a reboot-looping init would flood the
+    // log otherwise).
+    let mut z121_log_count: u32 = 0;
+    const Z121_LOG_CAP: u32 = 60;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
     //
@@ -7765,6 +7863,12 @@ pub fn run_ptrace_loop(
     // through a path that has no natural return of its own.
     let mut last_child_exit: Option<i32> = None;
 
+    // 6-Z122: set by the ESRCH branch when the switch target is the
+    // RUNNING ESRCH'd pid itself — the next iteration must SKIP the
+    // PTRACE_SYSCALL resume (it ESRCHs on a non-stopped tracee) and go
+    // straight to the blocking waitpid for that child's next stop.
+    let mut skip_next_resume: bool = false;
+
     loop {
         // ── Deferred ABI reset (after execve EXIT) — PER CHILD ──
         //
@@ -7830,13 +7934,25 @@ pub fn run_ptrace_loop(
         // resuming init instead would leave the recovery service stuck
         // in its SIGSTOP forever, and init would never receive the
         // child-stop event that breaks it out of its own waitpid.
-        let r = unsafe {
-            libc::ptrace(
-                libc::PTRACE_SYSCALL,
-                current_pid,
-                0,
-                resume_signal as libc::c_long,
-            )
+        //
+        // 6-Z122: `skip_next_resume` (set by the ESRCH branch when
+        // current_pid is a RUNNING — not ptrace-stopped — tracee)
+        // skips this resume entirely: PTRACE_SYSCALL on a running
+        // tracee returns ESRCH, and re-issuing it every iteration
+        // livelocks the loop away from the waitpid that would have
+        // received the child's next stop.
+        let r = if skip_next_resume {
+            skip_next_resume = false;
+            0 // pretend success — nothing to resume, straight to waitpid
+        } else {
+            unsafe {
+                libc::ptrace(
+                    libc::PTRACE_SYSCALL,
+                    current_pid,
+                    0,
+                    resume_signal as libc::c_long,
+                )
+            }
         };
         // Reset for the next iteration — only set again if a
         // signal-delivery branch below populates it.
@@ -7998,6 +8114,23 @@ pub fn run_ptrace_loop(
                         }
                     ));
                     current_pid = live_pid;
+                    // 6-Z122 (run 32745030268 livelock): when the switch
+                    // target IS the RUNNING ESRCH'd pid itself, do NOT
+                    // re-resume it — PTRACE_SYSCALL requires a
+                    // ptrace-STOPPED tracee, and `continue`-ing back to
+                    // the top re-issues the same failing call forever
+                    // (the daemonize re-anchor spun 400+ iterations
+                    // between "ESRCH pid 7194 is ALIVE and RUNNING" and
+                    // the child's exit). Set the skip flag instead: the
+                    // next iteration goes straight to the blocking
+                    // waitpid and the child's next stop arrives there.
+                    if live_pid == esrch_pid && matches!(reaped, Reaped::Running) {
+                        skip_next_resume = true;
+                        log(&format!(
+                            "6-Z122: ESRCH'd pid {} is RUNNING (not stopped) — next iteration skips the resume and waits for its next stop (no PTRACE_SYSCALL ping-pong)",
+                            esrch_pid
+                        ));
+                    }
                     continue;
                 }
 
@@ -11677,6 +11810,104 @@ pub fn run_ptrace_loop(
                             }
                         }
                         pending_open_translated_path.remove(&pid);
+                    }
+
+                    // ── 6-Z121: plain-fstat EXIT → root-ownership
+                    // virtualization for the guest's /dev/__properties__/*
+                    // metadata files ──
+                    //
+                    // Run 32745030268 (d3ee664): the Android 11
+                    // second-stage init died at "Failed to load
+                    // serialized property info file" (LOG(FATAL) →
+                    // InitFatalReboot). libpropertyinfoparser's
+                    // PropertyInfoAreaFile::LoadPath(
+                    //     "/dev/__properties__/property_info")
+                    // validates the fstat result BEFORE the mmap:
+                    //   if ((fd_stat.st_uid != 0) || (fd_stat.st_gid != 0)
+                    //       || ((fd_stat.st_mode & (S_IWGRP|S_IWOTH)) != 0)
+                    //       || (fd_stat.st_size < sizeof(PropertyInfoArea)))
+                    //     return false;
+                    // The unrooted app (u0_aNNN) OWNS every file under
+                    // {rootfs}/dev — init's own WriteStringToFile
+                    // fchown(fd, 0, 0) fails with EPERM — so
+                    // st_uid=10xxx makes LoadPath fail UNCONDITIONALLY,
+                    // no matter that the trie content init just wrote
+                    // is valid (the mmap+injection path was already
+                    // fine: the 6-Z2 rewrite detaches it to anonymous
+                    // and the 6-Z62 injector copies the trie bytes).
+                    //
+                    // THE FIX (virtualization, not suppression): after a
+                    // SUCCESSFUL plain fstat (x86_64 nr=5 / aarch64
+                    // nr=80 — the 64-bit ABIs whose struct layouts we
+                    // know; the i386 guest is covered by the 6-Z71
+                    // stat64 machinery and TWRP's AOSP 5.1 property
+                    // system has no property_info trie at all) whose fd
+                    // maps (via open_fd_owner_paths) to a
+                    // /dev/__properties__/ file, rewrite the child's
+                    // struct stat so the guest sees the file as
+                    // root:root with no group/world write — exactly
+                    // what a real device's property files look like.
+                    // Same class of lie as getpid()→1: the guest's
+                    // world-view, not the host's.
+                    if abi.fstat != -1 && syscall_num == abi.fstat {
+                        let fstat_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if fstat_ret >= 0 {
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            if let Some(p) = open_fd_owner_paths.get(&(pid, fd)).cloned() {
+                                if is_property_metadata_file(&p) {
+                                    if let Some((mode_off, uid_off, gid_off)) =
+                                        stat_ownership_layout(abi.fstat)
+                                    {
+                                        let buf = get_syscall_arg(&regs, abi.reg_arg2);
+                                        if buf != 0 {
+                                            if let Some(bytes) =
+                                                read_child_bytes(pid, buf, gid_off + 4)
+                                            {
+                                                if let Some(patched) = virtualize_stat_ownership(
+                                                    &bytes, mode_off, uid_off, gid_off,
+                                                ) {
+                                                    let wrote = write_child_bytes_pokedata(
+                                                        pid,
+                                                        buf + mode_off as u64,
+                                                        &patched[mode_off..gid_off + 4],
+                                                    );
+                                                    if z121_log_count < Z121_LOG_CAP {
+                                                        z121_log_count += 1;
+                                                        log(&format!(
+                                                            "6-Z121: fstat(fd={}) on {} -> virtualized root:root (mode {:#o} -> {:#o}, uid {} -> 0, gid {} -> 0; wrote {} of {} span bytes)",
+                                                            fd,
+                                                            p,
+                                                            u32::from_ne_bytes(
+                                                                bytes[mode_off..mode_off + 4]
+                                                                    .try_into()
+                                                                    .unwrap_or([0u8; 4])
+                                                            ),
+                                                            u32::from_ne_bytes(
+                                                                patched[mode_off..mode_off + 4]
+                                                                    .try_into()
+                                                                    .unwrap_or([0u8; 4])
+                                                            ),
+                                                            u32::from_ne_bytes(
+                                                                bytes[uid_off..uid_off + 4]
+                                                                    .try_into()
+                                                                    .unwrap_or([0u8; 4])
+                                                            ),
+                                                            u32::from_ne_bytes(
+                                                                bytes[gid_off..gid_off + 4]
+                                                                    .try_into()
+                                                                    .unwrap_or([0u8; 4])
+                                                            ),
+                                                            wrote,
+                                                            gid_off + 4 - mode_off
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // ── Task 6-Z62: mmap2 content injection (EXIT side) ──
@@ -20501,6 +20732,92 @@ mod tests {
         // /system/etc/selinux_foo (superstring of "selinux" but NOT
         // a child of the /system/etc/selinux/ dir) is NOT matched.
         assert!(!is_readonly_config_path("/system/etc/selinux_foo/policy"));
+    }
+
+    // ── Task 6-Z121: property-file root-ownership virtualization ───
+    #[test]
+    fn z121_is_property_metadata_file_classifier() {
+        // The canonical guest spellings.
+        assert!(is_property_metadata_file(
+            "/dev/__properties__/property_info"
+        ));
+        assert!(is_property_metadata_file(
+            "/dev/__properties__/properties_serial"
+        ));
+        assert!(is_property_metadata_file(
+            "/dev/__properties__/properties_ctxt0"
+        ));
+        // The translate_path-mangled rootfs forms (what the tracer's
+        // fd→path map actually holds for the AOSP guest).
+        assert!(is_property_metadata_file(
+            "/data/user/0/io.twoyi.debug/rootfs/dev/__properties__/property_info"
+        ));
+        assert!(is_property_metadata_file(
+            "/data/user/0/io.twoyi/rootfs/dev/__properties__/properties_serial"
+        ));
+        // NON-matches: the old single-file spelling (no child name),
+        // deeper paths, superstrings, relative paths, empty.
+        assert!(!is_property_metadata_file("/dev/__properties__"));
+        assert!(!is_property_metadata_file("/dev/__properties__/sub/file"));
+        assert!(!is_property_metadata_file("/dev/__properties__x"));
+        assert!(!is_property_metadata_file("property_info"));
+        assert!(!is_property_metadata_file(""));
+        assert!(!is_property_metadata_file("/dev/null"));
+    }
+
+    #[test]
+    fn z121_stat_ownership_layout_dispatch() {
+        // x86_64 fstat = 5: mode@24, uid@28, gid@32.
+        assert_eq!(stat_ownership_layout(5), Some((24, 28, 32)));
+        // aarch64 fstat = 80: mode@16, uid@24, gid@28.
+        assert_eq!(stat_ownership_layout(80), Some((16, 24, 28)));
+        // i386 fstat = 108 (old 32-bit layout) + unknown nrs → skip.
+        assert_eq!(stat_ownership_layout(108), None);
+        assert_eq!(stat_ownership_layout(-1), None);
+    }
+
+    #[test]
+    fn z121_virtualize_stat_ownership_x86_64_layout() {
+        // Build a 48-byte x86_64-flavoured struct stat slice:
+        // st_mode@24 = 0o100666 (regular file, rw-rw-rw-),
+        // st_uid@28 = 10167, st_gid@32 = 10167.
+        let mut bytes = vec![0u8; 48];
+        bytes[24..28].copy_from_slice(&0o100_666u32.to_ne_bytes());
+        bytes[28..32].copy_from_slice(&10167u32.to_ne_bytes());
+        bytes[32..36].copy_from_slice(&10167u32.to_ne_bytes());
+        bytes[40..48].copy_from_slice(&12345u64.to_ne_bytes()); // st_rdev
+        let patched = virtualize_stat_ownership(&bytes, 24, 28, 32)
+            .expect("48-byte buffer is long enough for x86_64 layout");
+        // st_mode: group/world write bits cleared → 0o100644.
+        assert_eq!(
+            u32::from_ne_bytes(patched[24..28].try_into().unwrap()),
+            0o100_644
+        );
+        // Ownership virtualized to root:root.
+        assert_eq!(u32::from_ne_bytes(patched[28..32].try_into().unwrap()), 0);
+        assert_eq!(u32::from_ne_bytes(patched[32..36].try_into().unwrap()), 0);
+        // Everything outside the patched span is untouched.
+        assert_eq!(&patched[40..48], &12345u64.to_ne_bytes());
+        assert_eq!(&patched[0..24], &bytes[0..24]);
+        // An already-clean root-owned 0444 file stays byte-identical.
+        bytes[24..28].copy_from_slice(&0o100_444u32.to_ne_bytes());
+        bytes[28..36].copy_from_slice(&[0u8; 8]);
+        let clean = virtualize_stat_ownership(&bytes, 24, 28, 32).unwrap();
+        assert_eq!(clean, bytes);
+    }
+
+    #[test]
+    fn z121_virtualize_stat_ownership_short_buffer_is_none() {
+        // A buffer too short for the requested layout → None (caller
+        // leaves the kernel's struct alone rather than half-patch).
+        let bytes = vec![0u8; 16];
+        assert!(virtualize_stat_ownership(&bytes, 24, 28, 32).is_none());
+        // aarch64 layout on a 20-byte buffer: gid_off+4 = 32 > 20 → None.
+        let bytes = vec![1u8; 20];
+        assert!(virtualize_stat_ownership(&bytes, 16, 24, 28).is_none());
+        // Exactly long enough (32 bytes for aarch64) → Some.
+        let bytes = vec![1u8; 32];
+        assert!(virtualize_stat_ownership(&bytes, 16, 24, 28).is_some());
     }
 
     #[test]
