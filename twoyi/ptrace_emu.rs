@@ -7869,6 +7869,20 @@ pub fn run_ptrace_loop(
     // straight to the blocking waitpid for that child's next stop.
     let mut skip_next_resume: bool = false;
 
+    // 6-Z126: consecutive-ESRCH accounting per pid. Run 32773072503:
+    // pid 7039 (ueventd) reached a state where PTRACE_SYSCALL ESRCHs
+    // while /proc says ALIVE — the tracee ESCAPED the tracer (no longer
+    // receives its stops; the exact kernel-side detach cause is opaque,
+    // e.g. an exec-path side effect). The 6-Z89 branch kept switching
+    // back to it forever, burning every other iteration on the failing
+    // resume while the boot ran on around it. After ESCAPE_THRESHOLD
+    // consecutive ESRCH rounds on the SAME pid, DETACH (best-effort) +
+    // drop it from the tracked set: the process keeps running untraced
+    // (it already is), and the supervisor serves the real children.
+    let mut esrch_streak: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    const ESCAPE_THRESHOLD: u32 = 64;
+
     loop {
         // ── Deferred ABI reset (after execve EXIT) — PER CHILD ──
         //
@@ -8041,6 +8055,54 @@ pub fn run_ptrace_loop(
                 //      removes one dead pid from the tracked set, so the
                 //      dead-children case strictly converges.
                 let esrch_pid = current_pid;
+                // ── 6-Z126: escape accounting + detach-after-N ──
+                //
+                // Every ESRCH round on this pid bumps its streak; ANY
+                // successful interaction resets it (see the reset point
+                // after the blocking waitpid dispatch below). At
+                // ESCAPE_THRESHOLD consecutive rounds the pid is an
+                // ESCAPED tracee (PTRACE_SYSCALL can't reach it but
+                // /proc says alive): best-effort PTRACE_DETACH + drop
+                // from the tracked set so the supervisor stops
+                // ping-ponging on it. The process itself keeps running
+                // untraced — it already stopped receiving our stops.
+                {
+                    let streak = esrch_streak.entry(esrch_pid).or_insert(0);
+                    *streak = streak.saturating_add(1);
+                    if *streak >= ESCAPE_THRESHOLD {
+                        log(&format!(
+                            "6-Z126: pid {} ESRCHed {} consecutive times while /proc-alive — ESCAPED tracee; issuing best-effort PTRACE_DETACH and dropping it from the tracked set (it runs untraced; the supervisor serves the remaining children)",
+                            esrch_pid, *streak
+                        ));
+                        unsafe {
+                            libc::ptrace(libc::PTRACE_DETACH, esrch_pid, 0, 0);
+                        }
+                        tracked_pids.retain(|&p| p != esrch_pid);
+                        esrch_streak.remove(&esrch_pid);
+                        // Pick the next live child (or end the loop when
+                        // none remain) — same decision as the ALL-GONE
+                        // tail below, applied immediately.
+                        match any_traced_child_alive(&tracked_pids) {
+                            Some(live_pid) => {
+                                log(&format!(
+                                    "6-Z126: after detaching {}, switching the ptrace loop to live child {}",
+                                    esrch_pid, live_pid
+                                ));
+                                current_pid = live_pid;
+                                skip_next_resume = true;
+                                continue;
+                            }
+                            None => {
+                                log(&format!(
+                                    "6-Z126: after detaching {}, ALL TRACED CHILDREN GONE — ending the ptrace loop (return {})",
+                                    esrch_pid,
+                                    last_child_exit.unwrap_or(-1)
+                                ));
+                                return last_child_exit.unwrap_or(-1);
+                            }
+                        }
+                    }
+                }
                 let reaped = reap_child(esrch_pid);
                 // Only a definitively-DEAD or GONE outcome drops the pid
                 // from the tracked set — AliveStopped/Running mean the
@@ -8169,6 +8231,10 @@ pub fn run_ptrace_loop(
             log(&format!("waitpid failed: {}", e));
             return -1;
         }
+        // 6-Z126: a successfully received stop proves the tracee
+        // relationship is healthy — reset its ESRCH streak (the streak
+        // only survives while PTRACE_SYSCALL keeps failing).
+        esrch_streak.remove(&waited);
         // Update `current_pid` to the child that actually stopped. The
         // shadow `let pid = current_pid` below makes the existing
         // handler code (which uses `pid` for ptrace_getregs /
@@ -12515,10 +12581,24 @@ pub fn run_ptrace_loop(
                                 let buf_addr = get_syscall_arg(&regs, abi.reg_arg2);
                                 let to_read = std::cmp::min(ret as usize, 256);
                                 let captured = read_child_bytes(pid, buf_addr, to_read);
-                                // Look up the path from open fd tracking
-                                let path_info = match open_fd_paths.get(&fd) {
+                                // Look up the path from open fd tracking.
+                                // 6-Z126: per-(pid, fd) lookup FIRST —
+                                // fd tables are per-process, so the
+                                // fd-only map misattributes reads when
+                                // multiple children hold the same fd
+                                // NUMBER for different files (run
+                                // 32773072503: a healthy service's
+                                // read+ppoll event loop was logged as
+                                // 'path=/system/lib/libc++.so' for
+                                // hundreds of iterations because fd=7
+                                // meant libc++.so in ONE child and a
+                                // socket/pipe in ANOTHER).
+                                let path_info = match open_fd_owner_paths.get(&(pid, fd)) {
                                     Some(p) => format!(", path=\"{}\"", p),
-                                    None => String::new(),
+                                    None => match open_fd_paths.get(&fd) {
+                                        Some(p) => format!(", path=\"{}\"", p),
+                                        None => String::new(),
+                                    },
                                 };
                                 match captured {
                                     Some(bytes) => {

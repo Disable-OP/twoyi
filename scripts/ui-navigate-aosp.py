@@ -129,6 +129,36 @@ def capture_logs():
                   errors="replace") as f:
             f.write(rr.stdout or "")
         print(f"    rootfs/{d}: {len(rr.stdout or '')} bytes")
+    # 6-Z126: guest-binary INTEGRITY — md5 + first bytes of the key
+    # runtime binaries/libs on the rootfs vs the emulator's originals.
+    # If the extraction/symlink-rewrite corrupted a library, the guest's
+    # linker/ART parse garbage and scudo aborts (run 32773072503's
+    # zygote-child SIGABRT) — this pins it in one shot.
+    checks = [
+        "system/lib/libc++.so", "system/lib64/libc++.so",
+        "system/lib64/libc.so", "system/lib64/libart.so",
+        "system/lib64/libartbase.so", "system/bin/app_process64",
+        "system/bin/app_process32", "system/bin/linker64",
+        "system/lib/libdl.so", "system/lib64/libdl.so",
+    ]
+    lines = []
+    for rel in checks:
+        guest = adb_shell(
+            f"run-as {PACKAGE} sh -c 'md5sum profiles/default/rootfs/{rel}; "
+            f"od -An -tx1 -N16 profiles/default/rootfs/{rel}' "
+            f"2>&1 | head -3", timeout=30)
+        host = adb_shell(
+            f"sh -c 'md5sum /{rel}; od -An -tx1 -N16 /{rel}' "
+            f"2>&1 | head -3", timeout=30)
+        lines.append(f"== {rel} ==")
+        lines.append("guest(rootfs): " + (guest.stdout or "").strip())
+        lines.append("host(emulator): " + (host.stdout or "").strip())
+        match = (guest.stdout or "").split()[:1] == (host.stdout or "").split()[:1] \
+            and bool((guest.stdout or "").strip())
+        lines.append(f"md5 match: {'YES' if match else 'NO'}")
+    with open(f"{ART}/rootfs-integrity.txt", "w", errors="replace") as f:
+        f.write("\n".join(lines) + "\n")
+    print("    rootfs-integrity.txt written")
     adb("pull", f"/sdcard/Android/data/{PACKAGE}/files/log",
         f"{ART}/app-logs", timeout=60)
     for remote, local in [
@@ -211,6 +241,32 @@ def main():
             print(f"    t={int(time.time() - t0)}s "
                   f"activity={get_current_activity()} shots={shot}")
             dump_ui(f"08_progress_{int(time.time() - t0)}s")
+            # 6-Z126: LIVE kmsg snapshot — the guest init's own messages
+            # are only copied to /sdcard at kr64 TEARDOWN, which never
+            # runs when the guest wedges instead of exiting (run
+            # 32773072503 lost ALL guest init messages that way). Pull
+            # the file directly every 60 s so a wedged boot still tells
+            # us exactly where init stalled / which service is looping.
+            ts = int(time.time() - t0)
+            rr = adb_shell(
+                f"run-as {PACKAGE} cat rootfs/dev/__kmsg__ 2>/dev/null "
+                f"| tail -c 200000", timeout=30)
+            if rr.stdout:
+                with open(f"{ART}/kmsg-live-{ts}s.txt", "w",
+                          errors="replace") as f:
+                    f.write(rr.stdout)
+                # The last 12 lines tell us the current frontier.
+                tail = "\n".join(rr.stdout.rstrip().splitlines()[-12:])
+                print(f"    [kmsg@{ts}s] last lines:\n      "
+                      + "\n      ".join(tail.splitlines()[-6:]))
+            # Guest process census — which guest processes are alive.
+            ps = adb_shell(
+                "ps -A | grep -E 'twoyi|app_process|zygote|ueventd|"
+                "servicemanager|vold|surfaceflinger|init '", timeout=20)
+            if ps.stdout:
+                with open(f"{ART}/guest-ps-{ts}s.txt", "w",
+                          errors="replace") as f:
+                    f.write(ps.stdout)
         time.sleep(SCREENSHOT_EVERY)
 
     dump_ui("09_final")
