@@ -13502,7 +13502,26 @@ pub fn run_ptrace_loop(
                                     && protocol == NETLINK_KOBJECT_UEVENT_Z99
                                     && ret < 0
                                     && ret > -4096
+                                    && !boot_recovery
                                 {
+                                    // TWRP gate (SESSION-RESUME-003-FIX6):
+                                    // skip the fake-fd allocation in
+                                    // TWRP mode (boot_recovery=true). The
+                                    // 6-Z99 fake fd 0x6b00_0000 is far
+                                    // above FD_SETSIZE (1024); TWRP's
+                                    // recovery code does FD_SET on it
+                                    // inside its select() loop, hitting
+                                    // bionic's _FORTIFY_SOURCE check that
+                                    // aborts with "FD_SET: file descriptor
+                                    // >= FD_SETSIZE". The working commit
+                                    // e870e0343f (pre-6-Z99) let the
+                                    // kernel's real -EACCES stand and
+                                    // TWRP handled the failed socket
+                                    // gracefully. AOSP mode keeps the
+                                    // 6-Z99 emulation unchanged (still
+                                    // needed to clear first_stage_init's
+                                    // PLOG(FATAL) "Could not open uevent
+                                    // socket" check).
                                     let base =
                                         netlink_fd_next.entry(pid).or_insert(NETLINK_FAKE_FD_BASE);
                                     let fd = *base;
@@ -14046,8 +14065,27 @@ pub fn run_ptrace_loop(
                             let domain = read_child_u32(pid, sc_args_ptr).map(|v| v as i64);
                             let protocol =
                                 read_child_u32(pid, sc_args_ptr.wrapping_add(8)).map(|v| v as i64);
-                            if domain == Some(16) && protocol == Some(15) && ret < 0 && ret > -4096
+                            if domain == Some(16)
+                                && protocol == Some(15)
+                                && ret < 0
+                                && ret > -4096
+                                && !boot_recovery
                             {
+                                // TWRP gate (SESSION-RESUME-003-FIX6):
+                                // TWRP runs i386 compat in boot_recovery
+                                // mode, so THIS is the arm that fired at
+                                // kr64 log line 5219 in run 32718454683
+                                // and inserted the fake fd 0x6b000000 into
+                                // fake_netlink_fds. With the gate, no fake
+                                // fd is inserted in TWRP mode → all
+                                // subsequent fd-subcall checks
+                                // (`fake_netlink_fds.get(&pid).map_or(false,
+                                // ...)`) return false → the kernel's real
+                                // -EACCES stands → TWRP's recovery code
+                                // sees socket()==-1 and continues without
+                                // a uevent socket (as the working commit
+                                // e870e0343f did). AOSP mode keeps the
+                                // 6-Z99 emulation unchanged.
                                 let base =
                                     netlink_fd_next.entry(pid).or_insert(NETLINK_FAKE_FD_BASE);
                                 let fd = *base;
