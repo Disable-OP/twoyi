@@ -2050,6 +2050,84 @@ int getexeccon(char **context) {
     return -1;
 }
 
+// =========================================================================
+// 6-Z125: getfilecon / lgetfilecon / fgetfilecon (+ _raw variants) —
+// THE missing service-start hook.
+//
+// Run 32770427272 (55c4d2a): after 6-Z124 unlocked SetKptrRestrict and
+// the early-init actions, EVERY service start died at
+//   init: Could not start exec service: Could not get file context
+// (linkerconfig, apexd-bootstrap) -> 'bootstrap-apexd-failed' -> clean
+// shutdown. service.cpp's ComputeContextFromExecutable chain:
+//     getcon()                 -> hooked -> "u:r:init:s0"        OK
+//     getfilecon(path)         -> REAL libselinux -> getxattr(
+//                                 "security.selinux") -> ENODATA
+//                                 (the staged binaries carry no label —
+//                                 the app CANNOT set security.* xattrs,
+//                                 lsetxattr EPERM) -> -1
+//                              -> "Could not get file context" THE WALL
+//     security_compute_create() -> hooked (derives u:r:<domain>:s0) OK
+//
+// The fix: fabricate a per-binary *_exec label from the path's basename
+// (the real device convention: /system/bin/apexd is labeled
+// u:object_r:apexd_exec:s0). The existing security_compute_create hook
+// then derives the matching u:r:<domain>:s0 transition context (which
+// differs from mycon "u:r:init:s0"), so Service::Start proceeds to
+// fork+exec — and the exec itself succeeds via the kernel's
+// execute_no_trans grant for app_data_file (the proven init/secilc
+// path; setexeccon is already a no-op success).
+//
+// Return semantics match libselinux: the LENGTH of the context string
+// (positive) on success, -1 on failure (init checks `== -1`).
+// =========================================================================
+static int twoyi_fake_filecon(const char *path, char **context) {
+    if (!context) return -1;
+    // Derive the type from the basename: "/system/bin/apexd" ->
+    // "u:object_r:apexd_exec:s0". No basename -> generic system_file.
+    const char *base = "system_file";
+    char type[128];
+    if (path && *path) {
+        const char *slash = strrchr(path, '/');
+        const char *b = slash ? slash + 1 : path;
+        if (*b) {
+            snprintf(type, sizeof(type), "%s_exec", b);
+            base = type;
+        }
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf), "u:object_r:%s:s0", base);
+    *context = strdup(buf);
+    return *context ? (int)strlen(*context) : -1;
+}
+
+int getfilecon(const char *path, char **context) {
+    return twoyi_fake_filecon(path, context);
+}
+
+int lgetfilecon(const char *path, char **context) {
+    return twoyi_fake_filecon(path, context);
+}
+
+int fgetfilecon(int fd, char **context) {
+    (void)fd;
+    // fd-based: fabricate a generic label (the compute hook only needs
+    // a non-mycon "object_r:" form to derive the transition context).
+    return twoyi_fake_filecon("/proc/self/fd", context);
+}
+
+int getfilecon_raw(const char *path, char **context) {
+    return twoyi_fake_filecon(path, context);
+}
+
+int lgetfilecon_raw(const char *path, char **context) {
+    return twoyi_fake_filecon(path, context);
+}
+
+int fgetfilecon_raw(int fd, char **context) {
+    (void)fd;
+    return twoyi_fake_filecon("/proc/self/fd", context);
+}
+
 int setexeccon(const char *context) {
     (void)context;
     // Fake success — don't actually set the exec context
