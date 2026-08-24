@@ -3237,6 +3237,41 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
     if path == "/proc/cmdline" {
         return format!("{}/twrp-cmdline", rootfs);
     }
+    // 6-Z99b: /proc/<pid>/maps + /proc/<pid>/status + /proc/<pid>/cmdline
+    // + /proc/<pid>/auxv — redirect to /proc/self/* so init's own
+    // get-pid-then-open /proc/<getpid()>/maps pattern (AOSP 11 init's
+    // `ReadProcessMaps` at system/core/init/util.cpp ~line 318, called
+    // from InstallSignalHandlers / MemoryRecovery) hits the synthetic
+    // generator the VFS registered for /proc/self/* (vfs.rs::new_android).
+    //
+    // Without this redirect, init opens /proc/1/maps (its guest-pid)
+    // against the HOST's /proc — the host's pid 1 is the runner's
+    // systemd/init, which is root-owned; the GitHub runner's unprivileged
+    // user gets ENOENT (hidepid=2 / invisible-on-EACCES semantics) or
+    // EACCES depending on /proc mount options. Init's response to the
+    // open failure is to fall back to a defensive mprotect-loop (545s
+    // run 32693764975 / 32697552367 — pid 7220+7224 did 5120 iterations
+    // of mprotect(nr=10) → exit_group(0) without ever reading its
+    // memory layout; the AOSP boot verdict was a no-op init exit).
+    //
+    // The redirect is generic: any /proc/<digit>/{maps,status,cmdline,
+    // auxv} → /proc/self/{maps,status,cmdline,auxv}. The synthetic
+    // generators produce content that is INIT-acceptable (a hardcoded
+    // maps layout + the tracee's pid in status). For TWRP this branch
+    // is dead code (TWRP's init is AOSP 5.1 and doesn't open
+    // /proc/<pid>/maps); for AOSP it is the difference between
+    // second_stage_init proceeding past its memory-recovery phase vs
+    // spinning on mprotect until exit_group.
+    if path.starts_with("/proc/") {
+        for suffix in &["/maps", "/status", "/cmdline", "/auxv"] {
+            if path.ends_with(suffix) {
+                let middle = &path["/proc/".len()..path.len() - suffix.len()];
+                if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit()) {
+                    return format!("/proc/self{}", suffix);
+                }
+            }
+        }
+    }
     // /proc/, /data/, /apex/ — leave untranslated. The host's /proc
     // is partially readable by untrusted_app (so /proc/self/* works);
     // /data + /apex are either app-private (already accessible) or
@@ -15914,6 +15949,38 @@ mod tests {
             translate_path(rootfs, "/dev/kmsgx"),
             format!("{}/dev/kmsgx", rootfs)
         );
+    }
+
+    #[test]
+    fn translate_path_redirects_proc_pid_maps_to_proc_self() {
+        // 6-Z99b: /proc/<digit>/{maps,status,cmdline,auxv} → /proc/self/*
+        // (the synthetic generator registered in vfs.rs::new_android).
+        // The host's /proc/1/maps is root-owned (the runner's init);
+        // unprivileged_app gets ENOENT (hidepid) or EACCES — init's
+        // response is the mprotect-loop until exit_group (AOSP runs
+        // 32693764975 + 32697552367). The redirect makes init's own
+        // get-pid-then-open pattern hit the synthetic content.
+        let rootfs = "/data/user/0/io.twoyi/rootfs";
+        assert_eq!(translate_path(rootfs, "/proc/1/maps"), "/proc/self/maps");
+        assert_eq!(translate_path(rootfs, "/proc/7220/maps"), "/proc/self/maps");
+        assert_eq!(
+            translate_path(rootfs, "/proc/0/status"),
+            "/proc/self/status"
+        );
+        assert_eq!(
+            translate_path(rootfs, "/proc/12345/cmdline"),
+            "/proc/self/cmdline"
+        );
+        assert_eq!(
+            translate_path(rootfs, "/proc/99999/auxv"),
+            "/proc/self/auxv"
+        );
+        // /proc/self/* stays /proc/self/* (NOT a digit-only middle).
+        assert_eq!(translate_path(rootfs, "/proc/self/maps"), "/proc/self/maps");
+        // /proc/<non-digit>/maps is left to the generic /proc/ passthrough.
+        assert_eq!(translate_path(rootfs, "/proc/abc/maps"), "/proc/abc/maps");
+        assert_eq!(translate_path(rootfs, "/proc/1/mem"), "/proc/1/mem");
+        assert_eq!(translate_path(rootfs, "/proc/1/mapsx"), "/proc/1/mapsx");
     }
 
     // ── SysV shared-memory syscall number tests ─────────────────────
