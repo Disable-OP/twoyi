@@ -36,6 +36,11 @@ static void unsetenv_internal(const char *name);
 // Binder device open fallback (defined later, before __open_2 hook)
 static int is_binder_device_path(const char *path);
 static int binder_open_fallback(const char *path, int real_fd, int saved_errno);
+// qemu_pipe device open fallback (6-Z116; defined later, alongside
+// binder_open_fallback — mirrors the z113 pattern; see the block comment
+// at the definition site for the z115 §3 + §7-Rank-1 rationale).
+static int is_qemu_pipe_device_path(const char *path);
+static int qemu_pipe_open_fallback(const char *path, int real_fd, int saved_errno);
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -321,6 +326,466 @@ static void binder_fd_clear(int fd) {
     pthread_mutex_lock(&g_binder_fd_lock);
     g_binder_fallback_fds[fd >> 3] &= (unsigned char)~(1u << (fd & 7));
     pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
+// ---------------------------------------------------------------------------
+// Binder proxy wire client — 6-Z113 (z112 DESIGN.md, strategy S1a).
+//
+// In non-root mode kr64 materializes {rootfs}/vm0/dev/binder as a
+// Unix-domain SOCKET (plus the {rootfs}/dev/binder symlink). open(2) on a
+// bound socket node returns ENXIO, which used to land in the /dev/null
+// fallback below — a non-pollable fd whose fake ioctls livelocked
+// servicemanager (z112 G3). Instead we CONNECT a Unix stream socket to the
+// kr64 binder proxy and speak its Frame/Resp wire protocol from the ioctl
+// hook (kr64_src/binder.rs read_frame/write_frame):
+//
+//   guest->host frame:  [u32 cmd][u32 arg_len][arg_len bytes payload]
+//   host->guest resp:   [i32 ret ][u32 arg_len][arg_len bytes payload]
+//
+// (native-endian; x86_64 and aarch64 are both little-endian, so a plain
+// memcpy of u32 words is the wire encoding). BINDER_WRITE_READ uses the
+// proxy's custom WireBinderWriteRead layout because the kernel struct's
+// write_buffer/read_buffer are USER POINTERS that only make sense
+// in-process — which is exactly where this hook runs, so we marshal:
+//
+//   request payload:  [u32 write_size][u32 read_capacity][write bytes]
+//   response payload: [u32 read_size ][read bytes]
+//
+// and set bwr->write_consumed = write_size (the proxy always consumes the
+// whole BC_* stream) and bwr->read_consumed = copied bytes. That consumed
+// accounting is the G3 livelock fix: IPCThreadState::waitForResponse spins
+// if write_consumed never advances (mOut never drains) while no BR_* ever
+// arrives. The proxy pushes BR_NOOP when idle with read capacity, and its
+// servicemanager_proxy ADD_SERVICE arm answers BR_REPLY (fake success), so
+// the ROM servicemanager's startup addService("manager") terminates.
+//
+// The connected socket fd is pollable/epoll-able (unlike /dev/null), so
+// servicemanager's Looper::pollAll sleeps instead of hot-spinning.
+//
+// G5 decision (single socket for all three binder contexts): the proxy
+// exposes exactly ONE socket and the wire protocol has no context tag, so
+// /dev/binder, /dev/hwbinder AND /dev/vndbinder all connect to
+// {rootfs}/vm0/dev/binder and share one binder context. Wrong for a real
+// three-context system, but strictly better than /dev/null for the HAL
+// services (no ENOENT livelock class) until S1b adds a context tag.
+//
+// All socket syscalls here are RAW (SYS_socket/SYS_connect/SYS_sendto/
+// SYS_recvfrom) to avoid recursing through our own PLT hooks (the fb-hook
+// input-bridge recipe). connect(2) sockaddr_un paths are NOT translated by
+// the tracer or this loader, so the absolute $TWOYI_ROOTFS-derived path is
+// the host-side truth (TWOYI_ROOTFS is preserved across clearenv() — see
+// the clearenv hook above).
+// ---------------------------------------------------------------------------
+#include <stddef.h>  // offsetof (used for sockaddr_un path length)
+
+// Ioctl numbers: GUEST spellings (kernel uapi / bionic) vs the proxy's
+// dispatch constants (binder.rs). They differ for VERSION's alternate
+// spelling and for SET_CONTEXT_MGR (binder.rs matches the legacy _IO('b',7)
+// form while the kernel/bionic spell it _IOW('b',7,__s32)) — we translate
+// on the wire so the proxy's match arms hit.
+#define BP_IOC_VERSION_GUEST      0xc0046209u  // _IOWR('b', 9, 4) — bionic uapi
+#define BP_IOC_VERSION_ALT        0xc004620du  // alt spelling (see mmap hook)
+#define BP_IOC_SET_MAX_THREADS    0x40046205u  // _IOW('b', 5, 4)  — same both sides
+#define BP_IOC_SET_CTX_MGR_GUEST  0x40046207u  // _IOW('b', 7, 4)  — kernel/bionic
+#define BP_IOC_SET_CTX_MGR_WIRE   0x00006207u  // _IO('b', 7)      — binder.rs arm
+#define BP_IOC_THREAD_EXIT        0x40046208u  // _IOW('b', 8, 4)  — same both sides
+#define BP_IOC_WRITE_READ         0xc0306201u  // _IOWR('b', 1, 48) — same both sides
+#define BP_MAX_FRAME              (1u << 20)   // 1 MiB payload cap (binder.rs read_frame)
+
+// Third fd class: CONNECTED PROXY fds (alongside fallback + real binder).
+static unsigned char g_binder_proxy_fds[(TWOYI_MAX_FD + 7) / 8];
+
+static void binder_fd_mark_proxy(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    g_binder_proxy_fds[fd >> 3] |= (unsigned char)(1u << (fd & 7));
+    pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
+static int binder_fd_is_proxy(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return 0;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    int r = (g_binder_proxy_fds[fd >> 3] >> (fd & 7)) & 1;
+    pthread_mutex_unlock(&g_binder_fd_lock);
+    return r;
+}
+
+static void binder_fd_clear_proxy(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_binder_fd_lock);
+    g_binder_proxy_fds[fd >> 3] &= (unsigned char)~(1u << (fd & 7));
+    pthread_mutex_unlock(&g_binder_fd_lock);
+}
+
+// ---------------------------------------------------------------------------
+// qemu_pipe proxy fd tracking — 6-Z116 (z115 DESIGN.md §3 + §7-Rank-1).
+//
+// When qemu_pipe_open_fallback() CONNECTS a Unix stream socket to the
+// host-app's (or kr64 daemon's) qemu_pipe proxy at {TWOYI_ROOTFS}/dev/
+// qemu_pipe, that fd is recorded here. There is NO ioctl hook for
+// qemu_pipe (the protocol is pure read/write — the goldfish EGL driver
+// writes "pipe:opengles" then GL command packets, reads reply bytes),
+// so this set is for fd-recycling hygiene only: the close() hook clears
+// the bit so a recycled fd number is not mistaken for a connected proxy
+// socket (same reasoning as the binder sets above). /dev/null fallback
+// fds (returned when the proxy is unreachable) are NOT tracked here —
+// the guest's writes to /dev/null are silently discarded and reads
+// return EOF naturally, with no fd-class dispatch needed.
+//
+// O_CLOEXEC on the connected socket (SYS_socket with SOCK_CLOEXEC) means
+// proxy fds do not survive execve, so no stale entries after exec.
+// ---------------------------------------------------------------------------
+static unsigned char g_qemu_pipe_proxy_fds[(TWOYI_MAX_FD + 7) / 8];
+static pthread_mutex_t g_qemu_pipe_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void qemu_pipe_fd_mark_proxy(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_qemu_pipe_fd_lock);
+    g_qemu_pipe_proxy_fds[fd >> 3] |= (unsigned char)(1u << (fd & 7));
+    pthread_mutex_unlock(&g_qemu_pipe_fd_lock);
+}
+
+static void qemu_pipe_fd_clear_proxy(int fd) {
+    if (fd < 0 || fd >= TWOYI_MAX_FD) return;
+    pthread_mutex_lock(&g_qemu_pipe_fd_lock);
+    g_qemu_pipe_proxy_fds[fd >> 3] &= (unsigned char)~(1u << (fd & 7));
+    pthread_mutex_unlock(&g_qemu_pipe_fd_lock);
+}
+
+// One proxy connection is a sequential request/response stream (binder.rs
+// handle_connection reads one frame, dispatches, writes one response), but
+// libbinder shares a single driver fd across its thread pool — concurrent
+// ioctl()s on the same fd would interleave frames and desync the stream.
+// Serializing preserves correctness (a throughput cap, not a deadlock: the
+// proxy always answers exactly one response per request).
+static pthread_mutex_t g_bp_wire_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int bp_send_all(int fd, const void *buf, size_t len) {
+    const unsigned char *p = (const unsigned char *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = (ssize_t)syscall(SYS_sendto, fd, p + off, len - off,
+                                     MSG_NOSIGNAL, NULL, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;  // errno set (EPIPE when the proxy died, etc.)
+        }
+        if (n == 0) return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+static int bp_recv_all(int fd, void *buf, size_t len) {
+    unsigned char *p = (unsigned char *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = (ssize_t)syscall(SYS_recvfrom, fd, p + off, len - off,
+                                     0, NULL, NULL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) { errno = ECONNRESET; return -1; }  // proxy closed
+        off += (size_t)n;
+    }
+    return 0;
+}
+
+// One request->response exchange. Returns a malloc'd payload buffer (caller
+// frees; never NULL when *resp_len is 0 — a 1-byte sentinel is returned) or
+// NULL on transport failure with errno set. *ret_out receives the proxy's
+// i32 ret (0 success, negative errno), *resp_len the payload size.
+static unsigned char *bp_exchange(int fd, uint32_t cmd,
+                                  const void *req_payload, uint32_t req_len,
+                                  int32_t *ret_out, uint32_t *resp_len) {
+    unsigned char hdr[8];
+    memcpy(hdr + 0, &cmd, 4);
+    memcpy(hdr + 4, &req_len, 4);
+    if (bp_send_all(fd, hdr, 8) != 0) return NULL;
+    if (req_len > 0 && bp_send_all(fd, req_payload, req_len) != 0) return NULL;
+
+    if (bp_recv_all(fd, hdr, 8) != 0) return NULL;
+    int32_t ret;
+    uint32_t rlen;
+    memcpy(&ret, hdr + 0, 4);
+    memcpy(&rlen, hdr + 4, 4);
+    if (rlen > BP_MAX_FRAME) { errno = EPROTO; return NULL; }
+
+    unsigned char *p = (unsigned char *)malloc(rlen > 0 ? rlen : 1);
+    if (!p) { errno = ENOMEM; return NULL; }
+    if (rlen > 0 && bp_recv_all(fd, p, rlen) != 0) {
+        free(p);
+        return NULL;
+    }
+    *ret_out = ret;
+    *resp_len = rlen;
+    return p;
+}
+
+// Connect a Unix stream socket to the kr64 binder proxy. Candidates, in
+// order (fb-hook input-bridge recipe — fresh socket per candidate because a
+// failed connect(2) leaves socket state unspecified):
+//   0: {TWOYI_ROOTFS}/vm0/dev/binder   — the canonical proxy socket
+//   1: {TWOYI_ROOTFS}/dev/binder      — the relative symlink to it
+//   2: vm0/dev/binder                 — relative (guest cwd is the rootfs)
+// Returns the connected fd or -1 (caller falls back to /dev/null — no
+// regression when the proxy is absent, e.g. TWRP mode).
+static int binder_proxy_connect(const char *guest_path) {
+    char cands[3][160];
+    int ncands = 0;
+    static int logged_fail = 0;
+
+    if (g_rootfs && g_rootfs[0]) {
+        size_t rl = strlen(g_rootfs);
+        while (rl > 1 && g_rootfs[rl - 1] == '/') rl--;  // strip trailing '/'
+        const char *suffixes[2] = { "/vm0/dev/binder", "/dev/binder" };
+        for (int i = 0; i < 2; i++) {
+            size_t sl = strlen(suffixes[i]);
+            if (rl + sl + 1 > sizeof(cands[0])) continue;  // must fit sun_path
+            if (rl == 1)  // rootfs is "/" — suffix already absolute
+                snprintf(cands[ncands], sizeof(cands[0]), "%s", suffixes[i] + 1);
+            else
+                snprintf(cands[ncands], sizeof(cands[0]), "%.*s%s",
+                         (int)rl, g_rootfs, suffixes[i]);
+            ncands++;
+        }
+    }
+    if (ncands < 3)
+        snprintf(cands[ncands++], sizeof(cands[0]), "vm0/dev/binder");
+
+    for (int i = 0; i < ncands; i++) {
+        int sfd = (int)syscall(SYS_socket, AF_UNIX,
+                               SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (sfd < 0) return -1;
+        struct sockaddr_un sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        size_t pl = strlen(cands[i]);
+        if (pl >= sizeof(sa.sun_path)) {
+            syscall(NR_close, sfd);
+            continue;
+        }
+        memcpy(sa.sun_path, cands[i], pl + 1);
+        socklen_t salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + pl);
+        long rc = syscall(SYS_connect, (long)sfd, &sa, (long)salen);
+        if (rc == 0) {
+            char msg[320];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] binder proxy: %s -> CONNECTED %s (fd=%d)\n",
+                guest_path ? guest_path : "(null)", cands[i], sfd);
+            write_str(2, msg);
+            return sfd;
+        }
+        syscall(NR_close, sfd);
+    }
+    if (!logged_fail) {
+        logged_fail = 1;
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] binder proxy: connect FAILED for %s -> /dev/null "
+            "fallback (proxy absent?)\n", guest_path ? guest_path : "(null)");
+        write_str(2, msg);
+    }
+    return -1;
+}
+
+// Kernel struct binder_write_read for 64-bit binder_size_t (x86_64 +
+// aarch64 guests — the only targets this loader builds for). The ioctl arg
+// is a POINTER to it, and since this hook runs in-process the
+// write_buffer/read_buffer pointers are directly dereferenceable.
+struct bp_binder_write_read {
+    uint64_t write_size;
+    uint64_t write_consumed;
+    uint64_t write_buffer;   // binder_uintptr_t — guest pointer
+    uint64_t read_size;
+    uint64_t read_consumed;
+    uint64_t read_buffer;    // guest pointer
+};
+
+// BINDER_WRITE_READ marshalling (called with g_bp_wire_lock held).
+// Forwards the guest's BC_* write buffer verbatim; copies the proxy's BR_*
+// response bytes into the guest's read buffer; sets BOTH consumed fields
+// (the livelock fix). Returns 0 / -1 with errno like a real ioctl.
+static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
+    static unsigned log_budget = 2;
+
+    // The proxy parses the BC_* stream from offset 0 and never reports
+    // partial consumption, so a nonzero incoming write_consumed (which
+    // libbinder only produces after a SUCCESSFUL ioctl — and we always
+    // report write_consumed == write_size on success) would resend
+    // already-consumed commands. Reject nonsense defensively.
+    if (bwr->write_consumed > bwr->write_size) { errno = EINVAL; return -1; }
+    if (bwr->write_size > 0 && bwr->write_buffer == 0) { errno = EFAULT; return -1; }
+    if (bwr->read_size > 0 && bwr->read_buffer == 0) { errno = EFAULT; return -1; }
+    // 8-byte WireBinderWriteRead header must fit under the proxy's 1 MiB
+    // read_frame cap, else the proxy DROPS THE CONNECTION.
+    if (8 + bwr->write_size > BP_MAX_FRAME) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] binder proxy WRITE_READ: write_size=%llu > cap "
+            "-> EINVAL\n", (unsigned long long)bwr->write_size);
+        write_str(2, msg);
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Single frame: [u32 WRITE_READ][u32 8+ws][u32 ws][u32 read_cap][bytes]
+    uint64_t ws = bwr->write_size - bwr->write_consumed;
+    uint32_t req_len = (uint32_t)(8 + ws);
+    unsigned char *req = (unsigned char *)malloc(req_len);
+    if (!req) { errno = ENOMEM; return -1; }
+    uint32_t ws32 = (uint32_t)ws;
+    uint32_t rc32 = (uint32_t)(bwr->read_size > 0xffffffffull
+                               ? 0xffffffffull : bwr->read_size);
+    memcpy(req + 0, &ws32, 4);
+    memcpy(req + 4, &rc32, 4);
+    if (ws > 0)
+        memcpy(req + 8, (const void *)(uintptr_t)(bwr->write_buffer + bwr->write_consumed), ws);
+
+    int32_t ret = 0;
+    uint32_t rlen = 0;
+    unsigned char *resp = bp_exchange(fd, BP_IOC_WRITE_READ, req, req_len,
+                                      &ret, &rlen);
+    free(req);
+    if (!resp) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] binder proxy WRITE_READ: transport FAILED "
+            "(errno=%d: %s)\n", errno, strerror(errno));
+        write_str(2, msg);
+        return -1;
+    }
+    if (ret != 0) {
+        errno = (ret <= 0 && ret >= -4095) ? -ret : EPROTO;
+        free(resp);
+        return -1;
+    }
+    // Response payload: [u32 read_size][read_size bytes of BR_* stream].
+    if (rlen < 4) { free(resp); errno = EPROTO; return -1; }
+    uint32_t srv_read;
+    memcpy(&srv_read, resp + 0, 4);
+    if (4ull + (uint64_t)srv_read > (uint64_t)rlen) {
+        free(resp);
+        errno = EPROTO;
+        return -1;
+    }
+    uint64_t ncopy = ((uint64_t)srv_read < bwr->read_size)
+                     ? (uint64_t)srv_read : bwr->read_size;
+    if (ncopy > 0) {
+        memcpy((void *)(uintptr_t)bwr->read_buffer, resp + 4, (size_t)ncopy);
+        if (ncopy < (uint64_t)srv_read) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] binder proxy WRITE_READ: BR stream %u bytes "
+                "TRUNCATED to %llu (read_size) — S1b TODO\n",
+                srv_read, (unsigned long long)ncopy);
+            write_str(2, msg);
+        }
+    }
+    bwr->read_consumed = ncopy;
+    bwr->write_consumed = bwr->write_size;  // proxy consumed the whole stream
+
+    if (log_budget > 0) {
+        log_budget--;
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] binder proxy WRITE_READ: ws=%llu rs=%llu -> "
+            "write_consumed=%llu read_consumed=%llu (first BR=0x%08x)\n",
+            (unsigned long long)ws, (unsigned long long)bwr->read_size,
+            (unsigned long long)bwr->write_consumed,
+            (unsigned long long)bwr->read_consumed,
+            ncopy >= 4 ? *(const uint32_t *)(const void *)(resp + 4) : 0u);
+        write_str(2, msg);
+    }
+    free(resp);
+    return 0;
+}
+
+// Binder ioctl dispatch for CONNECTED PROXY fds (called from the ioctl
+// hook). Translate guest ioctl spellings to the proxy's wire constants,
+// exchange the frame, write response bytes back into the guest's arg.
+// Returns 0 / -1 with errno like a real ioctl.
+static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
+    static unsigned log_budget = 4;
+    uint32_t wire = req;
+    uint32_t req_len = 0;
+    const void *req_payload = NULL;
+    uint32_t cookie = 0;
+
+    pthread_mutex_lock(&g_bp_wire_lock);
+
+    if (req == BP_IOC_WRITE_READ) {
+        int rv = -1;
+        if (argp)
+            rv = binder_proxy_write_read(fd, (struct bp_binder_write_read *)argp);
+        else
+            errno = EFAULT;
+        pthread_mutex_unlock(&g_bp_wire_lock);
+        return rv;
+    }
+
+    if (req == BP_IOC_VERSION_GUEST || req == BP_IOC_VERSION_ALT) {
+        // Both guest spellings -> the proxy's BINDER_VERSION arm (nr 9).
+        wire = BP_IOC_VERSION_GUEST;
+    } else if (req == BP_IOC_SET_MAX_THREADS) {
+        if (argp) { cookie = *(const uint32_t *)argp; req_payload = &cookie; req_len = 4; }
+    } else if (req == BP_IOC_SET_CTX_MGR_GUEST || req == BP_IOC_SET_CTX_MGR_WIRE) {
+        // becomeContextManager passes 0/NULL as the arg — never deref.
+        wire = BP_IOC_SET_CTX_MGR_WIRE;
+        if (argp) { cookie = *(const uint32_t *)argp; req_payload = &cookie; req_len = 4; }
+    } else {
+        // Generic forward (BINDER_THREAD_EXIT, SET_CONTEXT_MGR_EXT, node
+        // debug ioctls, ...): the ioctl number's size bits give the arg
+        // size. Unknown-to-the-proxy cmds come back -EINVAL (honest).
+        uint32_t sz = (req >> 16) & 0x3fff;
+        if (!argp) sz = 0;
+        if (sz > 4096) { errno = EINVAL; goto fail; }
+        req_len = sz;
+        req_payload = argp;
+    }
+
+    {
+        int32_t ret = 0;
+        uint32_t rlen = 0;
+        unsigned char *resp = bp_exchange(fd, wire, req_payload, req_len,
+                                          &ret, &rlen);
+        if (!resp) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] binder proxy ioctl 0x%x: transport FAILED "
+                "(errno=%d: %s)\n", req, errno, strerror(errno));
+            write_str(2, msg);
+            goto fail;
+        }
+        if (log_budget > 0) {
+            log_budget--;
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] binder proxy ioctl 0x%x -> wire 0x%x "
+                "ret=%d rlen=%u\n", req, wire, ret, rlen);
+            write_str(2, msg);
+        }
+        if (ret != 0) {
+            errno = (ret <= 0 && ret >= -4095) ? -ret : EPROTO;
+            free(resp);
+            goto fail;
+        }
+        // Write response bytes back (VERSION's protocol_version, _IOWR
+        // node-debug structs). Guarded by the ioctl's own size bits.
+        uint32_t sz = (req >> 16) & 0x3fff;
+        if (argp && rlen > 0 && sz > 0) {
+            uint32_t n = rlen < sz ? rlen : sz;
+            memcpy(argp, resp, n);
+        }
+        free(resp);
+    }
+    pthread_mutex_unlock(&g_bp_wire_lock);
+    return 0;
+
+fail:
+    pthread_mutex_unlock(&g_bp_wire_lock);
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,7 +1471,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 // Hook ioctl — intercept binder ioctls.
 //
-// Two kinds of binder fds reach this hook:
+// Three kinds of binder fds reach this hook:
 //   1. REAL binderfs fds — opened successfully from /dev/binderfs/* (the
 //      container has its own binderfs, mounted by kr64 with chmod 0666).
 //      These support REAL binder IPC within the container's binder domain.
@@ -1017,32 +1482,43 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 //      binder-dependent services would crash or hang.
 //
 //   2. FALLBACK fds — /dev/null fds returned by binder_open_fallback()
-//      when the real open of a binder device failed (e.g., EACCES for a
-//      process that ran before the kr64 chmod took effect, or a SELinux
-//      denial). These CANNOT do real binder IPC — the real ioctl would
-//      return ENOTTY on /dev/null. For these, we keep faking
-//      BINDER_VERSION (-> 8), BINDER_SET_MAX_THREADS,
-//      BINDER_SET_CONTEXT_MGR, BINDER_WRITE_READ so the calling process
-//      (e.g., a HIDL HAL service) sees fd >= 0 and a valid protocol
-//      version, then blocks in its threadpool without crashing.
+//      when the real open of a binder device failed AND the kr64 binder
+//      proxy was unreachable (proxy absent — e.g. TWRP mode). These
+//      CANNOT do real binder IPC — the real ioctl would return ENOTTY on
+//      /dev/null. For these, we keep faking BINDER_VERSION (-> 8),
+//      BINDER_SET_MAX_THREADS, BINDER_SET_CONTEXT_MGR,
+//      BINDER_WRITE_READ so the calling process (e.g., a HIDL HAL
+//      service) sees fd >= 0 and a valid protocol version, then blocks in
+//      its threadpool without crashing.
+//
+//   3. PROXY fds (6-Z113) — CONNECTED Unix sockets to the kr64 binder
+//      proxy, returned by binder_open_fallback() when the real open failed
+//      but {TWOYI_ROOTFS}/vm0/dev/binder accepted a connect(2) (non-root
+//      mode's expected shape: open on the socket node gives ENXIO). For
+//      these, binder_proxy_ioctl() speaks the proxy's Frame/Resp wire
+//      protocol — see the wire client block above the framebuffer
+//      tracking for the full contract.
 //
 // Fd tracking: binder_open_fallback() records each fallback fd in
-// g_binder_fallback_fds (see above). The close() hook clears it. Real
-// binderfs fds are never in the set, so they pass through to the real
-// ioctl. We do NOT suppress real ioctl errors: if real_ioctl returns -1,
+// g_binder_fallback_fds and each proxy fd in g_binder_proxy_fds (see
+// above). The close() hook clears both. Real binderfs fds are in
+// neither set, so they pass through to the real ioctl. We do NOT
+// suppress real ioctl errors: if real_ioctl returns -1,
 // we log the errno and return -1.
 //
 // Binder ioctl numbers (from kernel: include/uapi/linux/android/binder.h):
-// BINDER_VERSION = _IOWR('b', 13, struct binder_version)
+// BINDER_VERSION = _IOWR('b', 9, struct binder_version)
 // BINDER_SET_MAX_THREADS = _IOW('b', 5, __u32)
-// BINDER_SET_CONTEXT_MGR = _IOW('b', 7, __u32)
+// BINDER_SET_CONTEXT_MGR = _IOW('b', 7, __s32)
 // BINDER_WRITE_READ = _IOWR('b', 1, struct binder_write_read)
 //
 // On x86_64: 'b' = 0x62, so:
-// BINDER_VERSION = _IOWR(0x62, 13, struct{__s32}) = 0xc004620d
-//                 (older kernels: _IOWR(0x62, 9, ...) = 0xc0046209)
+// BINDER_VERSION = _IOWR(0x62, 9, struct{__s32}) = 0xc0046209
+//                 (0xc004620d below is NOT a kernel spelling — nr 13 is
+//                  BINDER_SET_CONTEXT_MGR_EXT; we keep accepting it because
+//                  the mmap hook probes it — 6-Z113 verified vs binder.rs)
 // BINDER_SET_MAX_THREADS = _IOW(0x62, 5, __u32) = 0x40046205
-// BINDER_SET_CONTEXT_MGR = _IOW(0x62, 7, __u32) = 0x40046207
+// BINDER_SET_CONTEXT_MGR = _IOW(0x62, 7, __s32) = 0x40046207
 // BINDER_WRITE_READ = _IOWR(0x62, 1, ...) = 0xc0306201
 // Use the correct ioctl signature for the build target:
 // - bionic (Android NDK): int ioctl(int, int, ...)
@@ -1174,6 +1650,21 @@ int ioctl(int fd, unsigned long request, ...) {
         return 0;
     }
 
+    // 3. PROXY fds — 6-Z113: connected Unix sockets to the kr64 binder
+    //    proxy ({rootfs}/vm0/dev/binder, handed out by
+    //    binder_open_fallback when the real open failed but the proxy is
+    //    reachable). Translate the binder ioctl into the proxy's
+    //    Frame/Resp wire protocol (see the wire client block above for the
+    //    full contract: VERSION/SET_MAX_THREADS/SET_CONTEXT_MGR/
+    //    THREAD_EXIT pass-through with ioctl-number translation, and
+    //    WRITE_READ marshalled to WireBinderWriteRead with correct
+    //    write_consumed/read_consumed accounting — the z112 G3 livelock
+    //    fix). Transport failures return -1 with errno (honest ioctl
+    //    semantics; no silent degradation to the fakes above).
+    if (binder_fd_is_proxy(fd)) {
+        return binder_proxy_ioctl(fd, req, argp);
+    }
+
     // REAL binder fd (real binderfs device) — pass through to the real
     // ioctl so real binder IPC happens within the container's binderfs
     // domain. Do NOT fake success: if the real ioctl fails, log the errno
@@ -1232,10 +1723,15 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 // ioctls). Real binderfs fds are never in the set, so clearing is a
 // no-op for them. We clear unconditionally — clearing an unset bit is
 // harmless and avoids a mutex-locked lookup before the mutex-locked clear.
+// 6-Z113: also clears the binder PROXY fd class (same reasoning — a
+// recycled fd number must not be treated as a connected proxy socket).
+// 6-Z116: also clears the qemu_pipe PROXY fd class (same reasoning).
 int close(int fd) {
     static int (*real_close)(int) = NULL;
     if (!real_close) real_close = dlsym(RTLD_NEXT, "close");
     binder_fd_clear(fd);
+    binder_fd_clear_proxy(fd);
+    qemu_pipe_fd_clear_proxy(fd);
     fb_fd_clear(fd);
     if (real_close) return real_close(fd);
     return (int)syscall(NR_close, fd);
@@ -2558,12 +3054,17 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
 
     if (!real_openat) {
-        // real_openat not resolved — use direct syscall, then apply binder
-        // fallback if the path is a binder device.
+        // real_openat not resolved — use direct syscall, then apply binder /
+        // qemu_pipe fallback if the path matches.
         int fd = syscall(NR_openat, dirfd, path, flags, mode);
         if (is_binder_device_path(path)) {
             int saved_errno = fd < 0 ? errno : 0;
             return binder_open_fallback(path, fd, saved_errno);
+        }
+        // qemu_pipe device open fallback (6-Z116; mirrors binder above).
+        if (is_qemu_pipe_device_path(path)) {
+            int saved_errno = fd < 0 ? errno : 0;
+            return qemu_pipe_open_fallback(path, fd, saved_errno);
         }
         return track_fb_fd(path, fd);
     }
@@ -2573,6 +3074,13 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (is_binder_device_path(path)) {
         int saved_errno = fd < 0 ? errno : 0;
         return binder_open_fallback(path, fd, saved_errno);
+    }
+    // qemu_pipe device open fallback (6-Z116; mirrors binder above —
+    // connect to the proxy at {TWOYI_ROOTFS}/dev/qemu_pipe, fall back to
+    // /dev/null on connect failure). See qemu_pipe_open_fallback() docs.
+    if (is_qemu_pipe_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return qemu_pipe_open_fallback(path, fd, saved_errno);
     }
     return track_fb_fd(path, fd);
 }
@@ -2661,6 +3169,13 @@ int open(const char *path, int flags, ...) {
         int saved_errno = fd < 0 ? errno : 0;
         return binder_open_fallback(path, fd, saved_errno);
     }
+    // qemu_pipe device open fallback (6-Z116; mirrors binder above —
+    // connect to the proxy at {TWOYI_ROOTFS}/dev/qemu_pipe, fall back to
+    // /dev/null on connect failure). See qemu_pipe_open_fallback() docs.
+    if (is_qemu_pipe_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return qemu_pipe_open_fallback(path, fd, saved_errno);
+    }
     return track_fb_fd(path, fd);
 }
 
@@ -2744,6 +3259,11 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
 //   crash suppression: the BINDER_VERSION check still runs and our ioctl hook
 //   returns a valid version (8). The HAL service simply cannot perform real
 //   binder IPC — it blocks in its threadpool, which init treats as "running".
+//
+//   6-Z113 (z112 S1a): in NON-ROOT mode the "failed open" is actually the
+//   kr64 binder proxy's Unix socket node (open gives ENXIO), so before the
+//   /dev/null fallback we CONNECT to the proxy — see the wire client block
+//   above the framebuffer tracking. /dev/null remains the last resort.
 static int is_binder_device_path(const char *path) {
     if (!path) return 0;
     return (strcmp(path, "/dev/binder") == 0 ||
@@ -2758,7 +3278,20 @@ static int is_binder_device_path(const char *path) {
 static int binder_open_fallback(const char *path, int real_fd, int saved_errno) {
     if (real_fd >= 0) return real_fd;           // real open succeeded — use it
     if (!is_binder_device_path(path)) return real_fd;  // not a binder device
-    // Real open failed — open /dev/null as a virtual binder fd.
+    // 6-Z113 (z112 S1a): the real open failed — in non-root mode that is the
+    // EXPECTED outcome (open(2) on the proxy's Unix-socket node returns
+    // ENXIO), so BEFORE falling back to /dev/null, try to CONNECT to the
+    // kr64 binder proxy at {TWOYI_ROOTFS}/vm0/dev/binder. A connected
+    // socket fd is pollable and the ioctl hook speaks the Frame/Resp wire
+    // protocol on it (see the wire client block above). If the connect
+    // fails too (proxy absent — e.g. TWRP mode, or kr64 fell back to the
+    // host binder), the /dev/null path below is unchanged: no regression.
+    int pfd = binder_proxy_connect(path);
+    if (pfd >= 0) {
+        binder_fd_mark_proxy(pfd);
+        return pfd;
+    }
+    // Proxy unreachable — open /dev/null as a virtual binder fd.
     // twoyi_sys_open uses a direct syscall (no PLT recursion).
     int fb = twoyi_sys_open("/dev/null", O_RDWR | O_CLOEXEC, 0);
     char msg[320];
@@ -2779,6 +3312,177 @@ static int binder_open_fallback(const char *path, int real_fd, int saved_errno) 
         // survive execve.
         binder_fd_mark_fallback(fb);
     }
+    return fb;
+}
+
+// =========================================================================
+// qemu_pipe device open fallback (6-Z116, z115 DESIGN.md §3 + §7-Rank-1)
+// =========================================================================
+// ROOT CAUSE: in non-root mode the host-app's spawn_qemu_pipe_proxy
+// (core.rs line 913) AND the kr64 daemon's qemu_pipe::spawn_qemu_pipe_proxy
+// (kr64_src/qemu_pipe.rs line 57) both bind a UnixListener socket NODE at
+// {TWOYI_ROOTFS}/dev/qemu_pipe (verified against devices.rs::create_qemu_pipe
+// line 218 + the kr64_src/qemu_pipe.rs test fixtures line 415). The guest's
+// goldfish EGL driver open(2)s /dev/qemu_pipe — but open(2) on a bound
+// Unix-socket NODE returns ENXIO (the bound-socket-node hazard empirically
+// verified for /dev/binder in z112 §3-G1). And even with should_translate
+// returning 0 for /dev/qemu_pipe (the /dev/ catch-all on line ~2890, kept
+// at 0 per z115 §11 Do-NOT-forget), the host kernel has no /dev/qemu_pipe
+// char device on a real Android phone → the untranslated open ENOENTs.
+// Either way the open fails; the qemu_pipe wire never gets established; the
+// goldfish EGL driver falls back to SwiftShader → no GL bytes ever reach
+// the host renderer (z115 §3 blocker; the entire host renderer + proxy
+// pipeline built by 6-Z114 + twoyi_glue.cpp + the AOSP emugl source is
+// unreachable without this fix).
+//
+// FIX (mirrors z113's binder_open_fallback exactly): on open failure of
+// /dev/qemu_pipe, CONNECT a Unix stream socket to {TWOYI_ROOTFS}/dev/qemu_pipe
+// and return the connected fd. The qemu_pipe protocol is pure read/write
+// (NO binder-style ioctls to translate): the goldfish EGL driver's first
+// write is the 13-byte string "pipe:opengles" (the channel-name handshake
+// per kr64_src/qemu_pipe.rs line 28 + core.rs::read_channel_name line 1050),
+// which the proxy reads and uses to connect onward to {rootfs}/opengles
+// (the RenderServer). The next write is a 4-byte clientFlags u32 (per
+// kr64_src/qemu_pipe.rs line 33), then emugl command packets (8-byte header:
+// u32 opcode + u32 packetLen + payload). Reads return the host EGL's reply
+// stream. The connected socket fd is pollable / epoll-able (unlike a
+// /dev/null fallback), so any future SF Looper that adds this fd sleeps
+// instead of hot-spinning.
+//
+// No ioctl hook needed — the qemu_pipe protocol is pure read/write. The
+// close() hook clears the proxy bit (fd-recycling hygiene, same as z113).
+//
+// FALLBACK-on-fallback: if the proxy connect fails too (proxy absent —
+// e.g. TWRP mode where kr64 uses the fb0 path, or the renderer thread
+// didn't start), open /dev/null as a virtual qemu_pipe fd. The guest's
+// writes are silently discarded and reads return EOF, triggering the
+// goldfish EGL fallback to SwiftShader — same EFFECTIVE outcome as today's
+// ENOENT (no regression). This mirrors z113's binder /dev/null last-resort,
+// with the same caveat that /dev/null is slightly worse than -1 because the
+// guest writes-then-reads before noticing (an extra round-trip before the
+// EGL fallback). Acceptable because in production (where the proxy IS up)
+// the connect succeeds and we never reach /dev/null; in TWRP mode the guest
+// isn't trying to render via GL anyway.
+static int is_qemu_pipe_device_path(const char *path) {
+    if (!path) return 0;
+    // The goldfish pipe family. AOSP's goldfish_pipe driver exposes
+    // /dev/qemu_pipe (the canonical path used by BOTH twoyi proxies —
+    // core.rs::spawn_qemu_pipe_proxy line 913 + kr64_src/devices.rs line
+    // 218). No /dev/gpu_pipe or /dev/gld_pipe variants exist in the twoyi
+    // tree (verified by grep), but the matcher accepts /dev/gpu_pipe for
+    // forward-compat with vendor forks that rename the device. /dev/gld_pipe
+    // is NOT matched (looks like a typo; no AOSP reference).
+    return (strcmp(path, "/dev/qemu_pipe") == 0 ||
+            strcmp(path, "/dev/gpu_pipe") == 0);
+}
+
+// Connect a Unix stream socket to the host-app's (or kr64 daemon's)
+// qemu_pipe proxy. Candidates, in order (z113 fb-hook input-bridge recipe
+// — fresh socket per candidate because a failed connect(2) leaves socket
+// state unspecified):
+//   0: {TWOYI_ROOTFS}/dev/qemu_pipe  — the canonical proxy socket
+//   1: dev/qemu_pipe                 — relative (guest cwd is the rootfs)
+// Returns the connected fd or -1 (caller falls back to /dev/null — no
+// regression when the proxy is absent, e.g. TWRP mode).
+static int qemu_pipe_proxy_connect(const char *guest_path) {
+    char cands[2][160];
+    int ncands = 0;
+    static int logged_fail = 0;
+
+    if (g_rootfs && g_rootfs[0]) {
+        size_t rl = strlen(g_rootfs);
+        while (rl > 1 && g_rootfs[rl - 1] == '/') rl--;  // strip trailing '/'
+        const char *suffix = "/dev/qemu_pipe";
+        size_t sl = strlen(suffix);
+        if (rl + sl + 1 <= sizeof(cands[0])) {
+            if (rl == 1)  // rootfs is "/" — suffix already absolute
+                snprintf(cands[ncands], sizeof(cands[0]), "%s", suffix + 1);
+            else
+                snprintf(cands[ncands], sizeof(cands[0]), "%.*s%s",
+                         (int)rl, g_rootfs, suffix);
+            ncands++;
+        }
+    }
+    if (ncands < 2)
+        snprintf(cands[ncands++], sizeof(cands[0]), "dev/qemu_pipe");
+
+    for (int i = 0; i < ncands; i++) {
+        int sfd = (int)syscall(SYS_socket, AF_UNIX,
+                               SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (sfd < 0) return -1;
+        struct sockaddr_un sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sun_family = AF_UNIX;
+        size_t pl = strlen(cands[i]);
+        if (pl >= sizeof(sa.sun_path)) {
+            syscall(NR_close, sfd);
+            continue;
+        }
+        memcpy(sa.sun_path, cands[i], pl + 1);
+        socklen_t salen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + pl);
+        long rc = syscall(SYS_connect, (long)sfd, &sa, (long)salen);
+        if (rc == 0) {
+            char msg[320];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] qemu_pipe proxy: %s -> CONNECTED %s (fd=%d)\n",
+                guest_path ? guest_path : "(null)", cands[i], sfd);
+            write_str(2, msg);
+            return sfd;
+        }
+        syscall(NR_close, sfd);
+    }
+    if (!logged_fail) {
+        logged_fail = 1;
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "[twoyi_loader] qemu_pipe proxy: connect FAILED for %s -> "
+            "/dev/null fallback (proxy absent?)\n",
+            guest_path ? guest_path : "(null)");
+        write_str(2, msg);
+    }
+    return -1;
+}
+
+// Called from __open_2/open/openat after the real open of /dev/qemu_pipe.
+// If the real open failed, CONNECT to the host-app's qemu_pipe proxy at
+// {TWOYI_ROOTFS}/dev/qemu_pipe. If the connect fails too (proxy absent),
+// open /dev/null as a virtual qemu_pipe fd (no regression vs. today's
+// ENOENT — the goldfish EGL driver falls back to SwiftShader either way).
+// `real_fd` is the result of the real open; `saved_errno` is errno right
+// after the failed open (captured by the caller before any other syscall).
+static int qemu_pipe_open_fallback(const char *path, int real_fd, int saved_errno) {
+    if (real_fd >= 0) return real_fd;  // real open succeeded — use it
+    if (!is_qemu_pipe_device_path(path)) return real_fd;  // not a qemu_pipe device
+    // The real open failed (ENOENT on the host's /dev/qemu_pipe, or ENXIO
+    // on the proxy's bound socket node if should_translate were 1 — either
+    // way we land here). Try to CONNECT to the qemu_pipe proxy. A connected
+    // socket fd is pollable and the guest's subsequent write("pipe:opengles")
+    // + read(reply) go through naturally (the proxy decodes the channel name
+    // and forwards to {rootfs}/opengles). No ioctl hook needed — the
+    // qemu_pipe protocol is pure read/write (unlike binder).
+    int pfd = qemu_pipe_proxy_connect(path);
+    if (pfd >= 0) {
+        qemu_pipe_fd_mark_proxy(pfd);
+        return pfd;
+    }
+    // Proxy unreachable — open /dev/null as a virtual qemu_pipe fd.
+    // twoyi_sys_open uses a direct syscall (no PLT recursion).
+    int fb = twoyi_sys_open("/dev/null", O_RDWR | O_CLOEXEC, 0);
+    char msg[320];
+    snprintf(msg, sizeof(msg),
+        "[twoyi_loader] qemu_pipe_open_fallback: %s real open FAILED "
+        "(errno=%d:%s) -> virtual /dev/null fd=%d\n",
+        path, saved_errno, strerror(saved_errno), fb);
+    write_str(2, msg);
+    if (fb < 0) {
+        // /dev/null itself failed (very unlikely) — restore original errno
+        errno = saved_errno;
+    }
+    // Note: /dev/null fds are NOT tracked in g_qemu_pipe_proxy_fds (the
+    // proxy bit is for CONNECTED sockets only). The guest's writes to
+    // /dev/null are silently discarded and reads return EOF — there's no
+    // ioctl hook for qemu_pipe (unlike binder), so no fd-class dispatch is
+    // needed. O_CLOEXEC ensures the fd does not survive execve.
     return fb;
 }
 
@@ -2844,6 +3548,15 @@ int __open_2(const char *path, int flags) {
 #else
     else fd = (int)syscall(NR_openat, AT_FDCWD, path, flags);
 #endif
+    // qemu_pipe device open fallback (6-Z116; mirrors binder_open_fallback).
+    // /dev/qemu_pipe stays on host per should_translate (the /dev/ catch-all
+    // returns 0 — see line ~2890), so the real open above hits the host's
+    // /dev/qemu_pipe → ENOENT (real Android has no such device). The fallback
+    // connects to {TWOYI_ROOTFS}/dev/qemu_pipe (the proxy's bound socket).
+    if (is_qemu_pipe_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return qemu_pipe_open_fallback(path, fd, saved_errno);
+    }
     return track_fb_fd(path, fd);
 }
 
@@ -2908,6 +3621,13 @@ int __open_real(const char *pathname, int flags, ...) {
 #else
     else fd = (int)syscall(NR_openat, AT_FDCWD, pathname, flags, mode);
 #endif
+    // qemu_pipe device open fallback (6-Z116; mirrors binder_open_fallback).
+    // See the __open_2 pass-through branch above for the rationale
+    // (should_translate=0 → host's /dev/qemu_pipe → ENOENT → connect).
+    if (is_qemu_pipe_device_path(pathname)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return qemu_pipe_open_fallback(pathname, fd, saved_errno);
+    }
     return track_fb_fd(pathname, fd);
 }
 
