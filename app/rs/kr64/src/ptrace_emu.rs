@@ -12180,6 +12180,49 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // 6-Z110 TWRP gate fix3 diagnostic: capture writev content
+                    // when boot_recovery=true AND writev return is in a reasonable
+                    // range. This identifies the 89-byte abort message TWRP writes
+                    // to recovery.log right before abort(). The first 128 bytes
+                    // are logged (covers the "E: __fortify_fail: ..." or
+                    // "E: failed to ..." message that triggers the abort).
+                    // boot_recovery=true means TWRP recovery mode, which is
+                    // i386 compat — so the iovec is 8 bytes (4-byte ptr + 4-byte len).
+                    if boot_recovery
+                        && past_first_execve
+                        && abi.writev_nr != -1
+                        && syscall_num == abi.writev_nr
+                    {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret > 0 && ret <= 512 {
+                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                            if iovcnt >= 1 {
+                                // i386 iovec: 4-byte iov_base + 4-byte iov_len = 8 bytes
+                                let iov0_base_addr = read_child_u32(pid, iov_ptr).map(|v| v as u64);
+                                let iov0_len =
+                                    read_child_u32(pid, iov_ptr.wrapping_add(4)).map(|v| v as u64);
+                                if let (Some(base), Some(len)) = (iov0_base_addr, iov0_len) {
+                                    let to_read = std::cmp::min(
+                                        std::cmp::min(len as usize, ret as usize),
+                                        128,
+                                    );
+                                    if to_read > 0 {
+                                        let captured = read_child_bytes(pid, base, to_read);
+                                        if let Some(bytes) = captured {
+                                            let captured_str = String::from_utf8_lossy(&bytes);
+                                            log(&format!(
+                                                "6-Z110-TWRP-GATE-DIAG-WRITEV: writev(fd={}, iovcnt={}, ret={}): {:?}",
+                                                fd, iovcnt, ret, captured_str
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Task 6-Z29: fake setexeccon (write to /proc/self/attr/exec).
                     // init's Service::Start() calls setexeccon(seclabel) which is
                     // implemented as write(fd, context, len) to /proc/self/attr/exec.
