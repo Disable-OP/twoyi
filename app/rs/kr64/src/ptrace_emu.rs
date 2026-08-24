@@ -3734,7 +3734,20 @@ fn stage_guest_executable_capped(
 /// /init*.rc family; (b) the second-stage import dirs'
 /// /system/etc/init/*.rc, /vendor/etc/init/*.rc, /odm/etc/init/*.rc;
 /// (d) a `fstab.`-prefixed basename whose parent dir is `/` or
-/// `/vendor/etc` (the only two dirs that carry fstabs).
+/// `/vendor/etc` (the only two dirs that carry fstabs);
+/// (e) the SELinux policy dirs /system/etc/selinux/*,
+/// /vendor/etc/selinux/*, /system_ext/etc/selinux/* — secilc (the
+/// SELinux policy compiler that second_stage_init execs after the
+/// fstab/SELinux-loadstep) stats + reads plat_sepolicy.cil,
+/// plat_sepolicy_and_mapping.sha256, plat_sepolicy_vers.txt, etc.
+/// from these dirs. Without the redirect, secilc's open of
+/// /system/etc/selinux/plat_sepolicy.cil hits the HOST's /system
+/// (which doesn't have it — the runner is a Linux GitHub Actions
+/// box, not an Android device) → ENOENT → secilc exits 255 → init
+/// logs "Unable to load SELinux policy" → InitFatalReboot → exit.
+/// Verified in AOSP run 32697972116 (head 11bbf71): secilc was
+/// staged + exec'd by z101+z102, ran to the plat_sepolicy.cil stat,
+/// and died with the "Could not stat file" log.
 pub fn is_readonly_config_path(path: &str) -> bool {
     if !path.starts_with('/') {
         return false;
@@ -3758,6 +3771,20 @@ pub fn is_readonly_config_path(path: &str) -> bool {
         let basename = &path[idx + 1..];
         let parent = &path[..idx];
         if basename.starts_with("fstab.") && (parent.is_empty() || parent == "/vendor/etc") {
+            return true;
+        }
+    }
+    // (e) SELinux policy dirs — secilc + init's SELinux loading step
+    // need the CIL/sha256/vers files. All files in these dirs are
+    // read-only ROM content; redirecting them to the rootfs copy is
+    // safe (write-intent opens are filtered by rom_config_override's
+    // caller via open_flags_indicate_write).
+    for prefix in &[
+        "/system/etc/selinux/",
+        "/vendor/etc/selinux/",
+        "/system_ext/etc/selinux/",
+    ] {
+        if path.starts_with(prefix) {
             return true;
         }
     }
@@ -20220,6 +20247,33 @@ mod tests {
         assert!(!is_readonly_config_path("relative.rc"));
         assert!(!is_readonly_config_path(""));
         assert!(!is_readonly_config_path("/system/etc/init/"));
+        // (e) the SELinux policy dirs (6-Z103b extension) — secilc +
+        // init's SELinux loading step stat + read plat_sepolicy.cil,
+        // plat_sepolicy_and_mapping.sha256, plat_sepolicy_vers.txt,
+        // system_ext_sepolicy.cil, etc. from these dirs.
+        assert!(is_readonly_config_path(
+            "/system/etc/selinux/plat_sepolicy.cil"
+        ));
+        assert!(is_readonly_config_path(
+            "/system/etc/selinux/plat_sepolicy_and_mapping.sha256"
+        ));
+        assert!(is_readonly_config_path(
+            "/vendor/etc/selinux/plat_sepolicy_vers.txt"
+        ));
+        assert!(is_readonly_config_path(
+            "/system_ext/etc/selinux/system_ext_sepolicy.cil"
+        ));
+        // The DIR itself (no specific file) — still matches: any
+        // read-only open inside these dirs is a ROM policy file.
+        assert!(is_readonly_config_path("/system/etc/selinux/"));
+        // Other /system/etc/ subdirs are NOT matched (deliberate
+        // narrowing — keeps ld.config.txt + platform.xml + the
+        // non-SELinux configs on the host path).
+        assert!(!is_readonly_config_path("/system/etc/ld.config.txt"));
+        assert!(!is_readonly_config_path("/system/etc/platform.xml"));
+        // /system/etc/selinux_foo (superstring of "selinux" but NOT
+        // a child of the /system/etc/selinux/ dir) is NOT matched.
+        assert!(!is_readonly_config_path("/system/etc/selinux_foo/policy"));
     }
 
     #[test]
