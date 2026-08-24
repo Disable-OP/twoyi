@@ -30,10 +30,31 @@ SCREENSHOT_EVERY = 5
 
 ADB = ["adb", "-s", "emulator-5554"]
 
+# 6-Z127: a CompletedProcess stand-in for timed-out/failed adb calls.
+# Run 32777004259: the guest's ptrace storm starved the emulator so
+# hard that a 15s `screencap` TIMED OUT — and the raised
+# TimeoutExpired killed the WHOLE navigation script at t=71s, losing
+# the remaining 530s of the boot window and all post-run captures.
+# Every adb call below is now failure-tolerant: a timeout logs a note
+# and yields an empty result instead of crashing the run.
+class AdbTimeout:
+    def __init__(self):
+        self.stdout = ""
+        self.stderr = "<adb timeout>"
+        self.returncode = -1
+
 
 def adb(*args, timeout=30):
-    return subprocess.run(ADB + list(args), capture_output=True, text=True,
-                          timeout=timeout)
+    try:
+        return subprocess.run(ADB + list(args), capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"    [adb-timeout] {' '.join(args)[:120]} "
+              f"({timeout}s) — emulator starved; continuing")
+        return AdbTimeout()
+    except OSError as e:
+        print(f"    [adb-error] {e} — continuing")
+        return AdbTimeout()
 
 
 def adb_shell(cmd, timeout=30):

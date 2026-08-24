@@ -1240,6 +1240,61 @@ int setresuid(uid_t ruid, uid_t euid, uid_t suid) { (void)ruid; (void)euid; (voi
 int setresgid(gid_t rgid, gid_t egid, gid_t sgid) { (void)rgid; (void)egid; (void)sgid; return 0; }
 int unshare(int flags) { (void)flags; return 0; }
 
+// =========================================================================
+// 6-Z127: prctl + capset — the capability-service FATAL pair.
+//
+// Run 32777004259 (1ece4d9) LIVE kmsg: the guest boot devolved into a
+// rapid crash loop — EVERY capability-carrying service died at
+//   init: prctl(PR_SET_SECUREBITS) failed for <service>: Operation not
+//   permitted -> LOG(FATAL) -> SIGABRT -> InitFatalReboot (x58 in 71s).
+// service.cpp SetProcessAttributesAndCaps: for services with
+// `capabilities` + non-root uid it does
+//   prctl(PR_GET_SECUREBITS)  — works (returns 0 for the app)
+//   prctl(PR_SET_SECUREBITS, SECBIT_KEEP_CAPS|SECBIT_KEEP_CAPS_LOCKED)
+//                            — needs CAP_SETPCAP -> EPERM -> FATAL  ← HERE
+//   ... then SetCapsForExec() -> capset() — will be the NEXT EPERM.
+// PR_SET_SECUREBITS is 38 / PR_GET_SECUREBITS is 39 (both directions
+// handled: GET must keep succeeding — return 0, the "no securebits"
+// state).
+// Everything else (PR_SET_NAME, PR_SET_PDEATHSIG, PR_SET_DUMPABLE,
+// PR_GET_DUMPABLE, PR_SET_VMA...) PASSES THROUGH to the real prctl.
+// =========================================================================
+int prctl(int option, ...) {
+    if (option == 38 /* PR_SET_SECUREBITS */) {
+        return 0;  // fake success — the sandbox has no CAP_SETPCAP
+    }
+    if (option == 39 /* PR_GET_SECUREBITS */) {
+        return 0;  // no securebits locked
+    }
+    va_list ap;
+    va_start(ap, option);
+    unsigned long arg2 = va_arg(ap, unsigned long);
+    unsigned long arg3 = va_arg(ap, unsigned long);
+    unsigned long arg4 = va_arg(ap, unsigned long);
+    unsigned long arg5 = va_arg(ap, unsigned long);
+    va_end(ap);
+    static int (*real_prctl)(int, ...) = NULL;
+    if (!real_prctl) real_prctl = dlsym(RTLD_NEXT, "prctl");
+    if (real_prctl) return real_prctl(option, arg2, arg3, arg4, arg5);
+    errno = EINVAL;
+    return -1;
+}
+
+// capset — fake success (SetCapsForExec's next EPERM wall; the guest
+// cannot manage capability sets without CAP_SETPCAP).
+int capset(void *hdrp, void *datap) {
+    (void)hdrp; (void)datap;
+    return 0;
+}
+
+// capget — fake success with an all-zero header/data (some callers
+// probe capabilities before setting them; a -1 return is treated as
+// fatal by init's DropInheritableCaps path).
+int capget(void *hdrp, void *datap) {
+    (void)hdrp; (void)datap;
+    return 0;
+}
+
 // Hook setpgid — fake success.
 // ROOT CAUSE: init calls setpgid(0, 0) when forking services (ueventd, etc.).
 // In our container (PID namespace without proper session setup), this fails
