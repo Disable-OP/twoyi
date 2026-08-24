@@ -2960,14 +2960,14 @@ static int is_proc_sys_virtual_file(const char *path) {
            strcmp(path, "/proc/sys/vm/mmap_rnd_compat_bits") == 0;
 }
 
-// 6-Z123b: post-open diagnostic + write-retry for the proc-sys trio.
-// Run 32752805062: init's SetKptrRestrict ifstream open of the rootfs
-// copy SUCCEEDED (the 6-Z123 translation works) but the ofstream open
-// FAILED with no avc (it reached the rootfs file) — the errno was
-// invisible (the tracer's return-log cap). This helper (a) LOGS every
-// proc-sys open with flags + fd + errno (rate-capped), and (b) on a
-// write-intent failure retries after an explicit ensure-create —
-// mirroring the selinuxfs open() handling. Returns the fd to use.
+// 6-Z123b/c: post-open diagnostic + write-retry for the proc-sys trio.
+// Run 32755956760: the ifstream open SUCCEEDED (fd=14, translated to the
+// rootfs copy) but the ofstream open returned EACCES (-13, NO SELinux
+// avc — pure DAC; the write bits were stripped from the file by an as-
+// yet-unidentified writer between boot cycles). This helper (a) LOGS
+// every proc-sys open with flags + fd + errno (rate-capped), and (b) on
+// a write-intent failure heals the mode (chmod 0666), ensure-creates,
+// and retries. Returns the fd to use.
 static int proc_sys_open_finish(const char *path, const char *translated,
                                 int flags, mode_t mode, int fd) {
     static int log_count = 0;
@@ -2981,10 +2981,9 @@ static int proc_sys_open_finish(const char *path, const char *translated,
             syscall(NR_write, 2, msg, len > 0 ? (size_t)len : 0);
         }
         if (fd < 0 && (flags & (O_WRONLY | O_RDWR)) && g_rootfs) {
-            // Write-intent open failed — ensure the file exists (the
-            // loader's ensure_proc_sys_files should have made it, but a
-            // first-boot race or a wiped rootfs could leave it missing)
-            // and retry once.
+            // Write-intent open failed — heal the mode, ensure the file
+            // exists, and retry once.
+            twoyi_sys_chmod(translated, 0666);
             int cfd = twoyi_sys_open(translated, O_WRONLY | O_CREAT, 0666);
             if (cfd >= 0) {
                 syscall(NR_close, cfd);
@@ -3007,6 +3006,13 @@ static int proc_sys_open_finish(const char *path, const char *translated,
 // Idempotent: an existing file (e.g. "4" left by a previous boot
 // cycle's write) is left alone — any in-range value satisfies the
 // read-open, and the write loop overwrites it immediately anyway.
+// 6-Z123c: the file is ALSO chmod'd 0666 on EVERY process start —
+// run 32755956760 proved the ofstream's O_WRONLY|O_CREAT|O_TRUNC open
+// of an existing file returns EACCES (no SELinux avc — pure DAC),
+// i.e. SOMETHING strips the write bits between cycles (candidate:
+// bionic's fortified __open_2 creating with mode 0 after a delete, or
+// an init.rc chmod). Healing the mode here unblocks the write-open
+// regardless of the corrupter.
 static void ensure_proc_sys_files(void) {
     if (!g_rootfs) return;
     static const struct {
@@ -3034,6 +3040,8 @@ static void ensure_proc_sys_files(void) {
             syscall(NR_write, fd, "\n", 1);
             syscall(NR_close, fd);
         }
+        // 6-Z123c: unconditional mode heal — see the comment above.
+        twoyi_sys_chmod(path, 0666);
     }
 }
 
@@ -3750,6 +3758,13 @@ int __open_2(const char *path, int flags) {
 #else
         else fd = syscall(NR_openat, AT_FDCWD, translated, flags);
 #endif
+        // 6-Z123c: the ifstream/ofstream opens of the security-sysctl
+        // trio go through THIS hook (run 32755956760 — the open/openat
+        // hooks' diagnostic never fired but the paths WERE translated).
+        // Route them through the diagnostic + mode-heal + write-retry
+        // helper. __open_2 has no mode parameter — pass 0666 (the retry
+        // ignores the mode for existing files; the heal chmod'd them).
+        fd = proc_sys_open_finish(path, translated, flags, 0666, fd);
         int saved_errno = fd < 0 ? errno : 0;
         // Log binder device open results
         if (path && is_binder_device_path(path)) {
