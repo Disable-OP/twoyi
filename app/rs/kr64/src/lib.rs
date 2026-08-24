@@ -93,12 +93,42 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // test`. A production version would plug into Android's
 // `__android_log_write` / `logd` socket, but for the MVP stderr is
 // sufficient and avoids the `android_logger` / `log` dependencies.
+//
+// 6-Z131: EVERY line emitted through these macros (and the ptrace loop's
+// `log` closure) is capped by `cap_log_line` below. The app-side
+// FileLogger tee re-reads this process's stderr line-by-line; a
+// multi-megabyte diagnostic line (guest children inherit kr64's stderr
+// fd and can write huge blobs without a newline) OOM'd the app in run
+// 32786386000 (145 MB single line -> OutOfMemoryError -> the whole app
+// died mid-boot). Defense in depth: the app now bounds its reads too,
+// but kr64 must never EMIT an unbounded line in the first place.
 // ============================================================================
+
+/// 6-Z131: hard cap (bytes) for a single emitted diagnostic log line.
+pub(crate) const MAX_LOG_LINE: usize = 8192;
+
+/// 6-Z131: cap `s` at `max` bytes, appending "...[log line truncated]"
+/// when it actually truncates. Truncation is clamped to a UTF-8 char
+/// boundary -- slicing a `str` at a non-boundary PANICS, and this runs
+/// on the ptrace loop's hot path where a panic would kill the guest.
+///
+/// Returns a borrowed `Cow` (zero-copy) when the line is already short
+/// enough, which is the overwhelmingly common case.
+pub(crate) fn cap_log_line(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}...[log line truncated]", &s[..end]))
+}
 
 /// Log an info-level message to stderr.
 macro_rules! info {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 INFO] {}", format_args!($($arg)*))
+        eprintln!("[KR64 INFO] {}", $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
     };
 }
 
@@ -109,14 +139,14 @@ macro_rules! info {
 /// makes the bare name `warn` ambiguous in `pub(crate) use` exports.
 macro_rules! warning {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 WARN] {}", format_args!($($arg)*))
+        eprintln!("[KR64 WARN] {}", $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
     };
 }
 
 /// Log an error-level message to stderr.
 macro_rules! error {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 ERROR] {}", format_args!($($arg)*))
+        eprintln!("[KR64 ERROR] {}", $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
     };
 }
 

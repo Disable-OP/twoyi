@@ -7037,7 +7037,15 @@ pub fn run_ptrace_loop(
 ) -> i32 {
     use std::io::Write;
     let log = |msg: &str| {
-        let _ = writeln!(std::io::stderr(), "[KR64][ptrace] {}", msg);
+        // 6-Z131: cap every emitted line at MAX_LOG_LINE bytes — the
+        // app-side FileLogger tee re-reads this process's stderr
+        // line-by-line, and a huge diagnostic line OOM'd the whole app
+        // (run 32786386000: a single 145 MB "line").
+        let _ = writeln!(
+            std::io::stderr(),
+            "[KR64][ptrace] {}",
+            crate::cap_log_line(msg, crate::MAX_LOG_LINE)
+        );
     };
 
     log(&format!(
@@ -9029,10 +9037,12 @@ pub fn run_ptrace_loop(
                                     .spawn(move || {
                                         use std::io::Write;
                                         let tlog = |msg: &str| {
+                                            // 6-Z131: same 8 KB line cap as
+                                            // the main `log` closure above.
                                             let _ = writeln!(
                                                 std::io::stderr(),
                                                 "[KR64][ptrace] {}",
-                                                msg
+                                                crate::cap_log_line(msg, crate::MAX_LOG_LINE)
                                             );
                                         };
                                         tlog(&format!(
@@ -12554,7 +12564,16 @@ pub fn run_ptrace_loop(
                                 let prefix = if is_klog { "DIAG KLOG" } else { "DIAG write" };
                                 match captured {
                                     Some(bytes) => {
+                                        // 6-Z131: cap the LOGGED capture at
+                                        // 2048 chars. The raw capture is
+                                        // already bounded (<= 256 bytes
+                                        // above), but the {:?} escaping
+                                        // below expands control chars ~6x,
+                                        // and the app-side FileLogger tee
+                                        // must never see another huge line
+                                        // (run 32786386000 OOM).
                                         let captured_str = String::from_utf8_lossy(&bytes);
+                                        let captured_str = crate::cap_log_line(&captured_str, 2048);
                                         log(&format!(
                                             "{}(fd={}, ret={}): {:?}",
                                             prefix, fd, ret, captured_str

@@ -17,6 +17,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
@@ -553,27 +554,23 @@ public final class FileLogger {
                 try {
                     StringBuilder sb = new StringBuilder();
                     // Read kr64-app-stderr.log first (primary path).
+                    // 6-Z131: BOUNDED-LINE reads — see appendBoundedLines.
+                    // (The old BufferedReader.readLine() loop tried to
+                    // materialise a whole 145 MB newline-less "line" from
+                    // the guest and OOM'd the app — run 32786386000.)
                     if (src.exists() && src.length() > 0) {
                         sb.append("── kr64-app-stderr.log (")
                           .append(src.length()).append(" bytes) ──\n");
-                        try (BufferedReader br = new BufferedReader(
-                                new InputStreamReader(new FileInputStream(src), StandardCharsets.UTF_8))) {
-                            String line;
-                            while ((line = br.readLine()) != null) {
-                                sb.append(line).append("\n");
-                            }
+                        try (FileInputStream fis = new FileInputStream(src)) {
+                            appendBoundedLines(fis, sb);
                         }
                     }
                     // Then append log.txt (fallback path) if it exists.
                     if (src2.exists() && src2.length() > 0) {
                         sb.append("\n── log.txt (")
                           .append(src2.length()).append(" bytes) ──\n");
-                        try (BufferedReader br = new BufferedReader(
-                                new InputStreamReader(new FileInputStream(src2), StandardCharsets.UTF_8))) {
-                            String line;
-                            while ((line = br.readLine()) != null) {
-                                sb.append(line).append("\n");
-                            }
+                        try (FileInputStream fis = new FileInputStream(src2)) {
+                            appendBoundedLines(fis, sb);
                         }
                     }
                     if (sb.length() > 0) {
@@ -593,9 +590,20 @@ public final class FileLogger {
                             "-- kr64 log truncated (fresh container launch) --");
                     tee2Offset = logcatTeeIncremental(src2, tee2Offset,
                             "-- log.txt truncated (fresh container launch) --");
-                } catch (IOException ignored) {
-                    // Source file may be briefly locked by kr64's write —
-                    // try again next cycle.
+                } catch (OutOfMemoryError | Exception e) {
+                    // 6-Z131: NEVER let the tee kill the app. Run
+                    // 32786386000 died exactly here — the old unbounded
+                    // readLine() loop fed a 145 MB "line" into
+                    // String.getBytes → OutOfMemoryError propagated out
+                    // of this thread → Android's default uncaught-
+                    // exception handler killed the whole app (and the
+                    // guest) mid-boot. Log a short note and keep polling.
+                    try {
+                        Log.w(TAG, "kr64 tee pass failed ("
+                                + e.getClass().getSimpleName() + ") — continuing");
+                    } catch (Throwable ignored) {
+                        // Even the note failed — still keep the pump alive.
+                    }
                 }
                 try {
                     Thread.sleep(2_000L);
@@ -607,6 +615,88 @@ public final class FileLogger {
         }, "FileLogger-Kr64Tee");
         t.setDaemon(true);
         t.start();
+    }
+
+    // -------------------------------------------------------------------------
+    // 6-Z131: bounded-line reads for the kr64 tee (the run-32786386000 OOM)
+    // -------------------------------------------------------------------------
+
+    /**
+     * 6-Z131: hard per-line cap for the kr64 tee reads. Guest children
+     * inherit kr64's stderr fd and can write huge binary blobs with no
+     * newline for megabytes on end — run 32786386000 died when the old
+     * {@code BufferedReader.readLine()} loop tried to materialise a
+     * single 145 MB "line" ({@code String.getBytes} at the old line 580
+     * threw {@link OutOfMemoryError}, which killed the whole app and
+     * the guest mid-boot).
+     */
+    private static final int MAX_LINE_BYTES = 64 * 1024;
+
+    /**
+     * 6-Z131: bytes of an over-long line that are actually KEPT (decoded
+     * lossily) before the {@code ...[truncated N bytes]} marker.
+     */
+    private static final int TRUNCATED_KEEP_BYTES = 8192;
+
+    /**
+     * 6-Z131: append every line of {@code in} to {@code sb}, reading RAW
+     * bytes in fixed 8 KB chunks — never via {@code readLine()}, which
+     * happily builds a 145 MB String for a newline-less blob. A "line"
+     * (run of bytes up to the next '\n') longer than
+     * {@link #MAX_LINE_BYTES} is truncated to its first
+     * {@link #TRUNCATED_KEEP_BYTES} bytes (decoded lossily — malformed
+     * UTF-8 becomes U+FFFD, never throws) plus a
+     * {@code ...[truncated N bytes]} marker, and the remainder of that
+     * line is discarded until the terminating newline. Total allocation
+     * per line stays under ~128 KB no matter what the guest writes.
+     */
+    private static void appendBoundedLines(InputStream in, StringBuilder sb) throws IOException {
+        final byte[] chunk = new byte[8192];
+        // Kept bytes of the current line — never grows past MAX_LINE_BYTES.
+        final byte[] kept = new byte[MAX_LINE_BYTES];
+        int keptLen = 0;
+        // Total bytes of the current line seen so far (kept + discarded).
+        long lineTotal = 0;
+        int n;
+        while ((n = in.read(chunk)) != -1) {
+            for (int i = 0; i < n; i++) {
+                final byte b = chunk[i];
+                if (b == '\n') {
+                    appendOneLine(sb, kept, keptLen, lineTotal);
+                    keptLen = 0;
+                    lineTotal = 0;
+                } else {
+                    lineTotal++;
+                    if (keptLen < MAX_LINE_BYTES) {
+                        kept[keptLen++] = b;
+                    }
+                }
+            }
+        }
+        // Final line without a trailing newline (EOF). lineTotal == 0
+        // means the file ended exactly on a '\n' — append nothing (same
+        // as readLine() returning null there).
+        if (lineTotal > 0) {
+            appendOneLine(sb, kept, keptLen, lineTotal);
+        }
+    }
+
+    /**
+     * 6-Z131: emit one bounded line. Lines up to {@link #MAX_LINE_BYTES}
+     * are appended verbatim; longer lines keep only the first
+     * {@link #TRUNCATED_KEEP_BYTES} bytes plus a marker counting the
+     * bytes that were dropped.
+     */
+    private static void appendOneLine(StringBuilder sb, byte[] kept, int keptLen, long lineTotal) {
+        if (lineTotal <= MAX_LINE_BYTES) {
+            // Bounded line — keep it in full.
+            sb.append(new String(kept, 0, keptLen, StandardCharsets.UTF_8)).append('\n');
+            return;
+        }
+        // Over-long line — keep the head, count the dropped tail.
+        final int keep = Math.min(keptLen, TRUNCATED_KEEP_BYTES);
+        sb.append(new String(kept, 0, keep, StandardCharsets.UTF_8))
+          .append("...[truncated ").append(lineTotal - keep).append(" bytes]\n");
     }
 
     /**
