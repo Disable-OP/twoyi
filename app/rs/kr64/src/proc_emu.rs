@@ -548,7 +548,35 @@ fn write_proc_sys(proc_dir: &str) -> std::io::Result<()> {
     fs::create_dir_all(&kernel_dir)?;
     fs::create_dir_all(&vm_dir)?;
 
-    write_file(&kernel_dir, "kptr_restrict", "1\n")?;
+    // ── 6-Z124: the SECURITY-SYCTL TRIO is WRITABLE (0666) ──────────
+    //
+    // Run 32758528528 (5b089e4) root-caused the SetKptrRestrict FATAL:
+    // the ifstream open of the rootfs copy SUCCEEDED (fd=14) but the
+    // ofstream open (O_WRONLY|O_CREAT|O_TRUNC) returned EACCES — the
+    // trio was mode 0444 (this function's own write_file chmod), and
+    // the GUEST CANNOT chmod it back: the guest's inherited seccomp
+    // filter TRAPS chmod (tracer log: "chmod nr=90 -> 90" — the rax=nr
+    // leak of a seccomp-aborted syscall — followed by the SIGSYS
+    // handler's fake-success WITHOUT an fs op: "chmod/chroot/unshare do
+    // NOT get an fs op (they are pure fake-success)"). The loader's
+    // 6-Z123c heal chmod suffers the same trap (it runs inside the
+    // guest). The kr64 PARENT's set_permissions DOES work (these files
+    // provably end at 0444), so the fix is to create the trio WRITABLE
+    // here, before the guest ever runs.
+    //
+    // security.cpp (android11-release) SetHighestAvailableOptionValue:
+    //   ifstream open (must succeed) → ofstream write candidates
+    //   (O_WRONLY|O_CREAT|O_TRUNC — needs owner-write on the EXISTING
+    //   file) → seekg(0) re-read VERIFY (same file → coherent).
+    //   Both SetKptrRestrictAction and SetMmapRndBitsAction LOG(FATAL)
+    //   when the loop fails. Values: kptr min 2 max 4 (writes "4"),
+    //   mmap_rnd_bits x86_64 min=max 32, mmap_rnd_compat_bits min=max
+    //   16 — the seeds below are all in-range and get overwritten by
+    //   init's own writes anyway.
+    write_file_mode(&kernel_dir, "kptr_restrict", "2\n", 0o666)?;
+    write_file_mode(&vm_dir, "mmap_rnd_bits", "32\n", 0o666)?;
+    write_file_mode(&vm_dir, "mmap_rnd_compat_bits", "16\n", 0o666)?;
+
     write_file(&kernel_dir, "dmesg_restrict", "1\n")?;
     write_file(&kernel_dir, "ngroups_max", "65536\n")?;
     write_file(&kernel_dir, "hostname", "twoyi\n")?;
@@ -560,8 +588,6 @@ fn write_proc_sys(proc_dir: &str) -> std::io::Result<()> {
     )?;
     write_file(&kernel_dir, "ostype", "Linux\n")?;
 
-    write_file(&vm_dir, "mmap_rnd_bits", "16\n")?;
-    write_file(&vm_dir, "mmap_rnd_compat_bits", "16\n")?;
     write_file(&vm_dir, "overcommit_memory", "1\n")?;
     write_file(&vm_dir, "overcommit_ratio", "50\n")?;
     write_file(&vm_dir, "swappiness", "60\n")?;
@@ -908,6 +934,18 @@ pub fn write_vendor_default_prop(
 /// Internal helper: write `content` to `{dir}/{name}` with mode 0444
 /// (read-only — these are kernel-synthesised files).
 fn write_file(dir: &str, name: &str, content: &str) -> std::io::Result<()> {
+    write_file_mode(dir, name, content, 0o444)
+}
+
+/// 6-Z124: write `content` to `{dir}/{name}` with an EXPLICIT final
+/// mode. `write_file` keeps its 0444 default (kernel-synthesised,
+/// read-only); the security-sysctl trio passes 0666 because the
+/// Android 11 guest's SetKptrRestrict/SetMmapRndBits builtins WRITE
+/// these files (ofstream O_WRONLY|O_CREAT|O_TRUNC on the existing
+/// file needs owner-write) and the guest's seccomp filter traps chmod
+/// — it can never heal the mode itself. See write_proc_sys's 6-Z124
+/// block for the full run-32758528528 evidence chain.
+fn write_file_mode(dir: &str, name: &str, content: &str, mode: u32) -> std::io::Result<()> {
     let path = format!("{}/{}", dir, name);
 
     // Idempotency: a previous write_file() leaves the file at mode 0o444
@@ -926,7 +964,7 @@ fn write_file(dir: &str, name: &str, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o444));
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(mode));
     }
     // Sanity: make sure the file exists.
     debug_assert!(
@@ -974,6 +1012,51 @@ mod tests {
         for name in &["sys/kernel/kptr_restrict", "sys/vm/mmap_rnd_bits"] {
             let p = format!("{}/proc/{}", rootfs, name);
             assert!(Path::new(&p).exists(), "missing {}", p);
+        }
+        let _ = std::fs::remove_dir_all(&rootfs);
+    }
+
+    // ── 6-Z124: the security-sysctl trio MUST be owner-writable ─────
+    // (the Android 11 guest's SetKptrRestrict/SetMmapRndBits builtins
+    // ofstream-open them O_WRONLY|O_CREAT|O_TRUNC and the guest cannot
+    // chmod — its seccomp filter traps chmod. Run 32758528528's
+    // "chmod nr=90 -> 90" rax-leak + EACCES ofstream is the evidence.)
+    #[test]
+    fn z124_security_sysctl_trio_is_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let rootfs = tmpdir();
+        populate_proc(&rootfs, 2, 1024).expect("populate_proc");
+        for rel in &[
+            "proc/sys/kernel/kptr_restrict",
+            "proc/sys/vm/mmap_rnd_bits",
+            "proc/sys/vm/mmap_rnd_compat_bits",
+        ] {
+            let p = format!("{}/{}", rootfs, rel);
+            let md = std::fs::metadata(&p).expect(rel);
+            assert!(
+                md.permissions().mode() & 0o200 != 0,
+                "{} must be owner-writable (mode {:#o}) — the guest's \
+                 SetKptrRestrict ofstream needs it and its seccomp-trapped \
+                 chmod cannot heal it",
+                rel,
+                md.permissions().mode() & 0o777
+            );
+        }
+        // The OTHER kernel-synthesised sysctls stay read-only (0444) —
+        // nothing writes them and the read-only semantic is preserved.
+        for rel in &[
+            "proc/sys/kernel/dmesg_restrict",
+            "proc/sys/kernel/hostname",
+            "proc/sys/vm/swappiness",
+        ] {
+            let p = format!("{}/{}", rootfs, rel);
+            let md = std::fs::metadata(&p).expect(rel);
+            assert_eq!(
+                md.permissions().mode() & 0o777,
+                0o444,
+                "{} stays kernel-synthesised read-only",
+                rel
+            );
         }
         let _ = std::fs::remove_dir_all(&rootfs);
     }
