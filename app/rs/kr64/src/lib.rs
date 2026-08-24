@@ -5799,14 +5799,25 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // create a stub file that's never read, and worse, would create the
     // /vendor/etc/ directory in TWRP's ramdisk if it doesn't exist (TWRP
     // puts its vendor files in /sbin/, not /vendor/).
-    if cfg.boot_recovery {
-        info!("[KR64] TWRP boot: skipping /vendor/etc/fstab.ranchu overwrite (TWRP has /etc/recovery.fstab)");
-    } else {
+    // 6-Z99: UNCONDITIONAL /vendor/etc/fstab.ranchu stub. The existing
+    // non-TWRP branch already wrote it, yet E2E 32666825601's init logged
+    // "ReadFstabFromFile(): cannot open file: '/vendor/etc/fstab.ranchu':
+    // No such file or directory" — make the write unconditional so the
+    // file always exists pre-fork (empty would suffice — init's "Failed
+    // to fstab for first stage mount" fell through non-fatally — but the
+    // long-standing minimal stub content is strictly better for vold
+    // later). TWRP ignores /vendor (reads /etc/recovery.fstab); creating
+    // the dir in its ramdisk is harmless.
+    {
         let fstab_path = format!("{}/vendor/etc/fstab.ranchu", rootfs_prefix);
         let fstab_content = "# Minimal fstab for twoyi virtualization\n/dev/null /system ext4 ro wait\n/dev/null /vendor ext4 ro wait\n/dev/null /data ext4 nosuid,nodev wait,check,formattable,latemount,resize\n";
         let _ = std::fs::create_dir_all(format!("{}/vendor/etc", rootfs_prefix));
         let _ = std::fs::write(&fstab_path, fstab_content);
-        info!("[KR64] PARENT: overwrote fstab.ranchu with minimal stub");
+        if cfg.boot_recovery {
+            info!("[KR64] PARENT: wrote /vendor/etc/fstab.ranchu stub (TWRP boot — informational; TWRP reads /etc/recovery.fstab)");
+        } else {
+            info!("[KR64] PARENT: overwrote fstab.ranchu with minimal stub");
+        }
     }
 
     // Pre-create /dev/__properties__/property_info on the HOST and in the
