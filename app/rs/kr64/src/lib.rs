@@ -7694,8 +7694,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // ROM binaries to {data_dir}/cache/twoyi_stage/ and exec them
             // from there (the rootfs is on the noexec app-data partition;
             // the app cache dir is the ONE executable place we own).
-            let exit_code =
-                ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs, &cfg.data_dir, &vfs, recovery_pid);
+            let exit_code = ptrace_emu::run_ptrace_loop(
+                pid,
+                &cfg.rootfs,
+                &cfg.data_dir,
+                &vfs,
+                recovery_pid,
+                cfg.boot_recovery,
+            );
             info!(
                 "[KR64][parent] ptrace emulation loop ended — child exit code: {}",
                 exit_code
