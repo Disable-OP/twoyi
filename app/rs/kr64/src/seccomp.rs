@@ -292,6 +292,52 @@ fn allowed_syscalls() -> HashSet<i32> {
         add_nr!(s, nr);
     }
 
+    // --- signals: the signalfd / pidfd family (Task 6-Z109) ---
+    //
+    // Android 11 init (system/core/init/init.cpp, signal_handler_init):
+    //   sigprocmask(SIG_BLOCK, {SIGCHLD});          // allowed above
+    //   fd = signalfd4(-1, {SIGCHLD}, 8, SFD_NONBLOCK|SFD_CLOEXEC);
+    //   epoll_ctl(epfd, EPOLL_CTL_ADD, fd, {EPOLLIN});
+    // …then the main epoll loop reads child-death signalfd_siginfo records
+    // from that fd. kill(62)/tgkill(234)/tkill(200) are init's service-
+    // restart hammers (already allowed above); pidfd_open(434)/
+    // pidfd_send_signal(424) are the modern equivalents newer init
+    // releases prefer. ALL of these are process-scoped and
+    // permission-checked per-signal — safe for an untrusted app uid:
+    // signalfd4 can only observe the CALLER'S OWN pending signals, and
+    // kill/tgkill/pidfd_send_signal still go through the kernel's
+    // per-process permission checks (same-uid or CAP_KILL).
+    //
+    // Numbers (libc crate, verified against the kernel UAPI tables):
+    //   x86_64:  signalfd=282 signalfd4=289 pidfd_send_signal=424
+    //            pidfd_open=434 kill=62 tkill=200 tgkill=234
+    //   i386:    signalfd=321 signalfd4=327 pidfd_send_signal=424
+    //            pidfd_open=434 kill=37  tkill=238 tgkill=270
+    //   aarch64: signalfd=(dropped — asm-generic kept only signalfd4=74)
+    //            pidfd_send_signal=424 pidfd_open=434 kill=129
+    //            tkill=130 tgkill=131
+    //
+    // NOTE (deployment truth): in the ptrace-emulation mode that actually
+    // boots the guest, this filter is NOT installed (lib.rs skips
+    // seccomp::install for the i386 guest — the wrong-arch arm would
+    // KILL_PROCESS every int $0x80 syscall), so the HOST app-uid filter
+    // is what the guest really hits; host-side blocks are handled by the
+    // tracer's 6-Z109 ENOSYS fallbacks (ptrace_emu.rs — signalfd4 fake-fd
+    // + tracer-forwarded kill). These entries harden the ROOT mode
+    // (filter installed, x86_64 guest) and LOCK the intent against a
+    // future deny-by-default tightening — the same belt-and-suspenders
+    // rationale as the 6-Z108 rt_sigaction entry.
+    add_nr!(s, SYS_signalfd4);
+    add_nr!(s, SYS_pidfd_open);
+    add_nr!(s, SYS_pidfd_send_signal);
+    // SYS_signalfd (the pre-signalfd4 variant) exists only on x86 —
+    // asm-generic dropped it (aarch64 callers use signalfd4 directly).
+    // The libc crate therefore omits the constant for android-aarch64;
+    // gate x86_64-only so the crate compiles everywhere (same pattern
+    // as SYS_newfstatat above).
+    #[cfg(target_arch = "x86_64")]
+    add_nr!(s, SYS_signalfd);
+
     // --- sockets / IPC (present on both) ---
     for &nr in &[
         SYS_socket,
@@ -989,6 +1035,116 @@ mod tests {
         assert!(allowed.contains(&(libc::SYS_close as i32)));
         assert!(allowed.contains(&(libc::SYS_mmap as i32)));
         assert!(allowed.contains(&(libc::SYS_ioctl as i32)));
+    }
+
+    #[test]
+    fn z108_rt_sigaction_allowed_not_trapped_not_killed() {
+        // Task 6-Z108 (SIGCHLD depth): rt_sigaction must EXECUTE with
+        // REAL kernel semantics for the guest — never trapped (SIGSYS
+        // emulation) and never killed. This is load-bearing for
+        // SIGCHLD: a guest that registers SIG_IGN for SIGCHLD relies
+        // on the KERNEL auto-reaping its children (POSIX SIG_IGN
+        // semantics — no zombies, no wait4). If this syscall were
+        // faked instead of executed, the real disposition would never
+        // be set and the children would zombify forever — the aosp16
+        // "livelock Z" shape. The default-ALLOW fallthrough would
+        // cover it too, but the explicit allow-list entry (plus this
+        // lock) documents the intent and guards against a future
+        // deny-by-default tightening. ptrace_emu.rs mirrors this on
+        // its side: nr 13/67/174 are NOT in
+        // compute_exit_return_value (test-locked there), so the only
+        // fake that can ever touch rt_sigaction is the i386
+        // never-executed ENOSYS fallback, which RECORDS the
+        // registration for diagnostics.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            libc::SYS_rt_sigaction,
+            13,
+            "x86_64 rt_sigaction must be nr 13"
+        );
+        let allowed = allowed_syscalls();
+        assert!(
+            allowed.contains(&(libc::SYS_rt_sigaction as i32)),
+            "SYS_rt_sigaction must be in the allow-list (6-Z108: real sigaction semantics, incl. SIGCHLD auto-reap under SIG_IGN)"
+        );
+        let trapped = trapped_syscalls();
+        assert!(!trapped.contains(&(libc::SYS_rt_sigaction as i32)));
+        let killed = killed_syscalls();
+        assert!(!killed.contains(&(libc::SYS_rt_sigaction as i32)));
+    }
+
+    #[test]
+    fn z109_signalfd_pidfd_kill_family_allowed_not_trapped_not_killed() {
+        // Task 6-Z109 (signalfd + rt_sigprocmask depth): the whole
+        // signal-DISPATCH path Android 11 init depends on must EXECUTE
+        // with real kernel semantics — never trapped (SIGSYS emulation)
+        // and never killed:
+        //   - rt_sigprocmask: init blocks SIGCHLD before creating the
+        //     signalfd (signalfd semantics REQUIRE the signal blocked).
+        //     If the mask syscall were faked, the kernel would keep
+        //     DELIVERING SIGCHLD while init waits on a signalfd that
+        //     never becomes readable — events lost both ways.
+        //   - signalfd4: init's signal_handler_init FATALs on a failed
+        //     signalfd ("failed to create signalfd"); allowing it is
+        //     process-scoped + safe (the fd can only observe the
+        //     caller's OWN blocked signals).
+        //   - kill/tgkill/tkill: init's service-restart hammer. The
+        //     brief's item 4: "kill/tgkill FROM the guest to itself
+        //     must execute for real" — the ptrace reaper (6-Z106/108)
+        //     hands statuses back; the guest's kill must reach the
+        //     kernel or service stop/restart loops spin.
+        //   - pidfd_open/pidfd_send_signal: same class (process-scoped,
+        //     per-signal permission-checked); Android 11 init does not
+        //     use them yet, newer releases do — allow-listed for the
+        //     same reason as signalfd4.
+        // The filter's DEFAULT is ALLOW, so these entries are intent
+        // documentation + a guard against a future deny-by-default
+        // tightening — the same belt-and-suspenders lock as 6-Z108's
+        // rt_sigaction entry.
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(libc::SYS_signalfd4, 289, "x86_64 signalfd4 must be nr 289");
+            assert_eq!(libc::SYS_signalfd, 282, "x86_64 signalfd must be nr 282");
+            assert_eq!(libc::SYS_kill, 62, "x86_64 kill must be nr 62");
+            assert_eq!(libc::SYS_tgkill, 234, "x86_64 tgkill must be nr 234");
+            assert_eq!(libc::SYS_pidfd_send_signal, 424);
+            assert_eq!(libc::SYS_pidfd_open, 434);
+            assert_eq!(
+                libc::SYS_rt_sigprocmask,
+                14,
+                "x86_64 rt_sigprocmask must be nr 14"
+            );
+        }
+        let allowed = allowed_syscalls();
+        let trapped = trapped_syscalls();
+        let killed = killed_syscalls();
+        for nr in [
+            libc::SYS_rt_sigprocmask,
+            libc::SYS_rt_sigpending,
+            libc::SYS_rt_sigtimedwait,
+            libc::SYS_kill,
+            libc::SYS_tgkill,
+            libc::SYS_tkill,
+            libc::SYS_signalfd4,
+            libc::SYS_pidfd_open,
+            libc::SYS_pidfd_send_signal,
+        ] {
+            let nr = nr as i32;
+            assert!(
+                allowed.contains(&nr),
+                "SYS nr {} must be in the allow-list (6-Z109: init's signal path executes for real)",
+                nr
+            );
+            assert!(!trapped.contains(&nr), "SYS nr {} must NOT be trapped", nr);
+            assert!(!killed.contains(&nr), "SYS nr {} must NOT be killed", nr);
+        }
+        // The x86-only legacy variant, where the libc crate defines it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(allowed.contains(&(libc::SYS_signalfd as i32)));
+            assert!(!trapped.contains(&(libc::SYS_signalfd as i32)));
+            assert!(!killed.contains(&(libc::SYS_signalfd as i32)));
+        }
     }
 
     #[test]
