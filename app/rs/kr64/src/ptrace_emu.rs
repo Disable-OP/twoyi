@@ -14082,7 +14082,20 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
-                        } else if subcall == 3 {
+                        }
+                        // 6-Z110 fix: the connect (subcall 3) arm must
+                        // fire as a SEPARATE `if` (not `else if`), because
+                        // for the connect subcall the args array IS
+                        // readable (a[0]=fd), so the `else if let Some(fd0)`
+                        // branch succeeds and the connect arm never fires.
+                        // The connect is the FIRST socketcall on this fd
+                        // (the fd is NOT yet tracked — that's the whole
+                        // point of this arm: track it + fake the return
+                        // to 0). The fd-subcall arms above only fire on
+                        // ALREADY-tracked fds (in fake_netlink_fds OR
+                        // fake_propserv_fds), so for a fresh connect they
+                        // do nothing and we fall through to this `if`.
+                        if subcall == 3 {
                             // ── 6-Z110: i386 socketcall subcall-3
                             // (connect) on the EXACT property-service
                             // sockaddr ──
