@@ -970,11 +970,37 @@ def main():
     #   3: tap 160 570    — bottom center (the slider area)
     # The rotation covers every dismissal path; once the gate is gone
     # the gestures are harmless on the TWRP grid / splash / app UI.
+    #
+    # ── 7-Z119: split the rotation at 120 s ──
+    # The last E2E run showed: the gate was dismissed by ~120 s, the
+    # TWRP main menu appeared, but the OLD swipe (gestures[2]:
+    # swipe 60,570 → 280,570) crossed the "OTG" button in the menu
+    # grid. That opened the "No OTG cable found ... Swipe to Enable"
+    # dialog and the run sat stuck on it for ~440 s.
+    # Fix: keep the gate-dismissal rotation for the FIRST 120 s (the
+    # swipe is still required there to clear the gate). AFTER 120 s
+    # switch to a SAFE-ONLY rotation that never crosses a menu button
+    # — center taps + BACK (BACK dismisses any dialog/submenu and
+    # returns to the main menu, so a stray dialog is auto-recovered):
+    #   0: tap 160 320    — center (no menu button hit)
+    #   1: keyevent 4     — BACK (dismisses OTG dialog / any submenu)
+    #   2: tap 160 320    — center
+    #   3: tap 160 320    — center
+    # Also: capture a one-off screenshot 1 s after every gesture so a
+    # short-lived transition (the 5 s cadence can miss a 0.5 s flip
+    # between dialog-dismissed and main-menu-re-rendered) is caught
+    # in the frame sequence as `07_boot_<elapsed>s_postg`.
     gestures = [
         "input tap 160 320",               # 0: center — generic
         "input tap 80 570",                # 1: 'Keep Read Only' button (bottom-left)
         "input swipe 60 570 280 570 400",  # 2: 'Swipe to Allow Modifications' slider (bottom, swipe right)
         "input tap 160 570",               # 3: bottom center — the slider area
+    ]
+    gestures_safe = [
+        "input tap 160 320",               # 0: center (no menu button hit)
+        "input keyevent 4",                # 1: BACK — dismisses any dialog/submenu
+        "input tap 160 320",               # 2: center
+        "input tap 160 320",               # 3: center
     ]
     gesture_index = 0
     for i in range(boot_wait // 5):
@@ -982,9 +1008,20 @@ def main():
         elapsed = (i + 1) * 5
         if elapsed % 30 == 0:
             g = gesture_index % 4
-            adb_shell(gestures[g])
-            print(f"  feeding gesture {g}: {gestures[g]} (at {elapsed}s)")
+            # First 120 s: gate-dismissal rotation (needs the swipe at
+            # index 2). After 120 s: safe-only (center taps + BACK) so
+            # we never accidentally cross a menu button and open a
+            # dead-end dialog like OTG.
+            seq = gestures if elapsed <= 120 else gestures_safe
+            adb_shell(seq[g])
+            mode = "gate" if elapsed <= 120 else "safe"
+            print(f"  feeding gesture {g}: {seq[g]} (at {elapsed}s, {mode})")
             gesture_index += 1
+            # One-off mid-cycle capture 1 s after the gesture so a
+            # transition (dialog → main menu) is caught even if the
+            # 5 s cadence would have missed a 0.5 s frame.
+            wait(1)
+            screenshot(f"07_boot_{elapsed}s_postg")
         screenshot(f"07_boot_{elapsed}s")
         activity = get_current_activity()
         # Don't break on "left Render2Activity" — the TWRP screen might
