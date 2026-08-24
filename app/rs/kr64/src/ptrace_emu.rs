@@ -13681,8 +13681,60 @@ pub fn run_ptrace_loop(
                                 // In AOSP mode (cfg.boot_recovery=false), the connect fake
                                 // is REQUIRED: AOSP init REQUIRES property_set to succeed
                                 // and aborts on failure.
+                                //
+                                // 6-Z110 TWRP gate fix2 (sub-agent SESSION-RESUME-003-FIX3):
+                                // on a real-Android host (the AVD emulator), the HOST's
+                                // own init has ALREADY bound /dev/socket/property_service.
+                                // kr64 has NO private mount namespace (seccomp blocks
+                                // mount()), so TWRP's connect() resolves against the
+                                // HOST's listener and the kernel returns 0 (SUCCESS).
+                                // The previous "leave real return untouched" wasn't
+                                // enough — bionic proceeded past the connect, sent the
+                                // prop_msg, and read back the response. The host's init
+                                // doesn't write to TWRP's mapped /dev/__properties__ →
+                                // read-back fails → bionic's __libc_fatal fires →
+                                // abort() (observed in run 32705804419).
+                                //
+                                // The fix: in TWRP mode, when the kernel returned SUCCESS
+                                // (ret >= 0) AND the sockaddr exactly matches property_service,
+                                // FORCE the return to -ECONNREFUSED. This makes bionic return
+                                // -EIO at the connect step (BEFORE send/read-back) —
+                                // __libc_fatal is NEVER called. TWRP's init then logs
+                                // "Failed to set '...'" via KLOG and continues (the same
+                                // graceful pattern as the working run 32656407287).
                                 if boot_recovery {
-                                    // TWRP mode: leave the real -ECONNREFUSED return
+                                    if ret >= 0 {
+                                        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                        let sockaddr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                        let addrlen = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                        if let Some(kind) = sockaddr_un_is_property_service(
+                                            pid,
+                                            sockaddr_ptr,
+                                            addrlen,
+                                            &abi,
+                                        ) {
+                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                                // -111 = ECONNREFUSED (canonical "no listener"
+                                                // errno for AF_UNIX; matches bionic's
+                                                // __system_property_set error path).
+                                                set_syscall_ret(&mut regs2, &abi, -111);
+                                                if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                                    log(&format!(
+                                                        "6-Z110-TWRP-GATE FAILED: ptrace_setregs for connect(fd={}): {} — child sees {} (success; will proceed to read-back and abort)",
+                                                        fd, e, ret
+                                                    ));
+                                                } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                                    propserv_log_count += 1;
+                                                    log(&format!(
+                                                        "6-Z110-TWRP-GATE: connect(fd={}, {:?}) returned {} (host's property_service listener accepted) — FORCED to -111 (-ECONNREFUSED) so bionic returns -EIO at the connect step (before send/read-back); TWRP init will log 'Failed to set' and continue",
+                                                        fd, kind, ret
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // TWRP mode + ret < 0: leave the real failure
                                     // untouched; TWRP's init handles it gracefully.
                                 } else if ret < 0 && ret > -4096 {
                                     let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
@@ -14159,7 +14211,64 @@ pub fn run_ptrace_loop(
                             // the set succeeded, the read-back fails, TWRP
                             // aborts (observed in run 32701082892). AOSP mode
                             // REQUIRES the fake (init aborts on connect failure).
-                            if !boot_recovery && ret < 0 && ret > -4096 {
+                            //
+                            // 6-Z110 TWRP gate fix2 (sub-agent SESSION-RESUME-003-FIX3):
+                            // on a real-Android host (the AVD emulator), the HOST's
+                            // own init has ALREADY bound /dev/socket/property_service.
+                            // kr64 has NO private mount namespace, so TWRP's i386
+                            // socketcall subcall-3 connect() resolves against the
+                            // HOST's listener and the kernel returns 0 (SUCCESS).
+                            // The previous "leave real return untouched" wasn't
+                            // enough — bionic proceeded past the connect, sent the
+                            // prop_msg, and read back the response. The host's init
+                            // doesn't write to TWRP's mapped /dev/__properties__ →
+                            // read-back fails → bionic's __libc_fatal fires →
+                            // abort() (observed in run 32705804419).
+                            //
+                            // The fix: in TWRP mode, when the kernel returned SUCCESS
+                            // (ret >= 0) AND the sockaddr exactly matches property_service,
+                            // FORCE the return to -ECONNREFUSED. This makes bionic return
+                            // -EIO at the connect step (BEFORE send/read-back) —
+                            // __libc_fatal is NEVER called. TWRP's init then logs
+                            // "Failed to set '...'" via KLOG and continues.
+                            if boot_recovery {
+                                if ret >= 0 {
+                                    let fd_opt = read_child_u32(pid, sc_args_ptr);
+                                    let sockaddr_ptr =
+                                        read_child_u32(pid, sc_args_ptr.wrapping_add(4))
+                                            .map(|v| v as u64);
+                                    let addrlen = read_child_u32(pid, sc_args_ptr.wrapping_add(8))
+                                        .map(|v| v as i64);
+                                    if let (Some(fd), Some(sockaddr_ptr), Some(addrlen)) =
+                                        (fd_opt, sockaddr_ptr, addrlen)
+                                    {
+                                        if let Some(kind) = sockaddr_un_is_property_service(
+                                            pid,
+                                            sockaddr_ptr,
+                                            addrlen,
+                                            &abi,
+                                        ) {
+                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                                set_syscall_ret(&mut regs2, &abi, -111);
+                                                if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                                    log(&format!(
+                                                        "6-Z110-TWRP-GATE FAILED: socketcall(3)=connect ptrace_setregs for fd={}: {} — child sees {} (success; will proceed to read-back and abort)",
+                                                        fd, e, ret
+                                                    ));
+                                                } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                                    propserv_log_count += 1;
+                                                    log(&format!(
+                                                        "6-Z110-TWRP-GATE: socketcall(3)=connect(fd={}, {:?}) returned {} (host's property_service listener accepted) — FORCED to -111 (-ECONNREFUSED) so bionic returns -EIO at the connect step; TWRP init will log 'Failed to set' and continue",
+                                                        fd, kind, ret
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // TWRP mode + ret < 0: leave the real failure untouched.
+                            } else if !boot_recovery && ret < 0 && ret > -4096 {
                                 let fd_opt = read_child_u32(pid, sc_args_ptr);
                                 let sockaddr_ptr = read_child_u32(pid, sc_args_ptr.wrapping_add(4))
                                     .map(|v| v as u64);
