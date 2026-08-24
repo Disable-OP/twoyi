@@ -6941,6 +6941,7 @@ pub fn run_ptrace_loop(
     data_dir: &str,
     vfs: &crate::vfs::Vfs,
     recovery_pid: Option<libc::pid_t>,
+    boot_recovery: bool,
 ) -> i32 {
     use std::io::Write;
     let log = |msg: &str| {
@@ -13670,7 +13671,20 @@ pub fn run_ptrace_loop(
                         match op {
                             PropServOp::Connect => {
                                 // Failure-only + exact-sockaddr match.
-                                if ret < 0 && ret > -4096 {
+                                // 6-Z110 TWRP gate: in TWRP mode (cfg.boot_recovery=true),
+                                // TWRP's init logs "Failed to set 'persist.*'" and continues
+                                // gracefully on a real connect failure. Faking the connect
+                                // to succeed makes bionic's __system_property_set proceed
+                                // to the read-back verification, which fails (z111 refuses
+                                // to write the OLD-format property area), triggering TWRP's
+                                // assertion and abort() — observed in run 32701082892.
+                                // In AOSP mode (cfg.boot_recovery=false), the connect fake
+                                // is REQUIRED: AOSP init REQUIRES property_set to succeed
+                                // and aborts on failure.
+                                if boot_recovery {
+                                    // TWRP mode: leave the real -ECONNREFUSED return
+                                    // untouched; TWRP's init handles it gracefully.
+                                } else if ret < 0 && ret > -4096 {
                                     let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
                                     let sockaddr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                                     let addrlen = get_syscall_arg(&regs, abi.reg_arg3) as i64;
@@ -14137,7 +14151,15 @@ pub fn run_ptrace_loop(
                             // direct-arm's
                             // sockaddr_un_is_property_service matcher +
                             // failure-only gate.
-                            if ret < 0 && ret > -4096 {
+                            //
+                            // 6-Z110 TWRP gate: in TWRP mode (boot_recovery=true),
+                            // leave the real -ECONNREFUSED return untouched —
+                            // TWRP's init logs "Failed to set 'persist.*'" and
+                            // continues; faking the connect makes bionic think
+                            // the set succeeded, the read-back fails, TWRP
+                            // aborts (observed in run 32701082892). AOSP mode
+                            // REQUIRES the fake (init aborts on connect failure).
+                            if !boot_recovery && ret < 0 && ret > -4096 {
                                 let fd_opt = read_child_u32(pid, sc_args_ptr);
                                 let sockaddr_ptr = read_child_u32(pid, sc_args_ptr.wrapping_add(4))
                                     .map(|v| v as u64);
