@@ -12610,7 +12610,15 @@ pub fn run_ptrace_loop(
                     // before exit(1); 150 hid the middle phase where
                     // fork/clone attempts + the exit trigger live).
                     // Task 6-Z26: raised from 200 to 500 (see ENTRY gate above).
-                    if past_first_execve && post_execve_syscall_count <= 500 {
+                    // 6-Z123b: raised 500 -> 3000 to MATCH the ENTRY-side
+                    // cap (6-Z98). Run 32752805062: init's SetKptrRestrict
+                    // opens of /proc/sys/kernel/kptr_restrict fired at
+                    // post-execve #1561/#1563 — the ENTRYs were logged
+                    // (cap 3000) but the RETURNS were dark (cap 500),
+                    // hiding the ofstream-open's errno ("Cannot open for
+                    // writing" was all init told us). ENTRY and RETURN now
+                    // cover the same window.
+                    if past_first_execve && post_execve_syscall_count <= 3000 {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
