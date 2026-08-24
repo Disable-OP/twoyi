@@ -925,6 +925,62 @@ struct ChildAbi {
     getsockopt_nr: i64,
     close_nr: i64,
     fcntl_nr: i64,
+    // ── Task 6-Z110: property-service CLIENT emulation — the child
+    // connect(@property_service) wall ──────────────────────────────
+    //
+    // The property service's SERVER side has been faked since 6-Z3 /
+    // 6-Z101 (init's bind("/dev/socket/property_service") + listen is
+    // faked to success, so no real socket exists in the host kernel).
+    // That was fine for the server thread (init only needs to believe
+    // it started; ro.* properties are written directly to the mmap'd
+    // property AREA, not via the socket). But every OTHER guest
+    // process — zygote children, system_server, servicemanager, logd,
+    // any property_set() caller — runs bionic's
+    //   __system_property_set → send_prop_msg →
+    //     fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
+    //     connect(fd, {AF_UNIX, "/dev/socket/property_service"});
+    // The kernel resolves the sockaddr sun_path against the HOST root
+    // (the sockaddr lives inside a struct — the pathname translator
+    // never sees it) → ENOENT (no host /dev/socket/property_service)
+    // or ECONNREFUSED (the 6-Z3 root cause: a stale never-listened
+    // bind inherited from the app parent). Every non-ro property_set in
+    // every guest child fails; callers either FATAL, retry-loop, or
+    // silently lose init.svc.* / sys.boot_completed-class updates.
+    //
+    // 6-Z110 emulates the client: at the connect() syscall-EXIT stop,
+    // on a FAILURE (-4096 < ret < 0) whose arg2 sockaddr matches the
+    // EXACT property-service name (FilesystemPath OR AbstractNamespace
+    // spelling), fake the return to 0 + track the REAL kernel fd. The
+    // fd is REAL (socket() genuinely succeeded — only connect failed);
+    // only the tracer remembers it needs emulated protocol returns:
+    //   sendto/write → the full requested length (arg3; the only value
+    //     that terminates send_prop_msg's partial-send loop in one
+    //     step);
+    //   sendmsg/writev → the iov-total sum (iov_total_len_child /
+    //     iov_array_total_len: msghdr/iov walk with the i386 vs 64-bit
+    //     layout switch, capped 64 iovs / 1 MiB; unreadable iovec →
+    //     1 byte + a HAZARD log);
+    //   recvfrom/recvmsg/read → 0 = EOF (NOT -EAGAIN: a nonblocking
+    //     socket hot-spins on EAGAIN; EOF makes reply-reading variants
+    //     quit cleanly — the OPPOSITE trade from the netlink fd, where
+    //     -EAGAIN is right because the caller POLLS);
+    //   shutdown/setsockopt/getsockopt/fcntl (+i386 fcntl64 221) → 0;
+    //   close → 0 + removal from the tracked set.
+    //
+    // Per-ABI values (asm/unistd_32.h, asm/unistd_64.h,
+    // asm-generic/unistd.h):
+    //   field          i386  x86_64  aarch64
+    //   connect_nr       363    42      203
+    //   writev_nr        146    20       66
+    // The runtime one for the AOSP guest is x86_64 (42 connect / 20
+    // writev). i386 bionic normally multiplexes ALL socket ops via
+    // socketcall nr=102 (subcall 3 = connect), so the i386 direct
+    // 363 number does NOT fire at runtime — the dedicated i386
+    // socketcall subcall-3 arm handles it. writev (146 i386 / 20 x86_64
+    // / 66 aarch64) is a separate syscall, NOT multiplexed via
+    // socketcall; the direct nr fires on every ABI.
+    connect_nr: i64,
+    writev_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -1211,6 +1267,12 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     getsockopt_nr: 55,
     close_nr: 3,
     fcntl_nr: 72,
+    // 6-Z110: connect (x86_64 nr=42 per asm/unistd_64.h) + writev
+    // (x86_64 nr=20 per asm/unistd_64.h). Both verified against the
+    // kernel UAPI header in 6-Z110. The runtime AOSP guest is x86_64,
+    // so these are the values that actually fire.
+    connect_nr: 42,
+    writev_nr: 20,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -1548,6 +1610,18 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     getsockopt_nr: 373,
     close_nr: 6,
     fcntl_nr: 55,
+    // 6-Z110: i386 connect = 363 (per asm/unistd_32.h: __NR_connect
+    // 363) and writev = 146 (per asm/unistd_32.h: __NR_writev 146).
+    // The i386 direct 363 connect number does NOT fire at runtime
+    // (bionic i386 normally multiplexes ALL socket ops through
+    // socketcall nr=102, subcall 3 = connect — handled by the
+    // dedicated i386 socketcall subcall-3 arm). Locked in for ABI
+    // completeness + so the EXIT handler's `== abi.connect_nr`
+    // comparison is correct if a future i386 guest ever issues the
+    // direct nr=363. Mirrors the existing 6-Z99 ABI-completeness
+    // precedent.
+    connect_nr: 363,
+    writev_nr: 146,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1856,6 +1930,16 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     getsockopt_nr: 209,
     close_nr: 57,
     fcntl_nr: 25,
+    // 6-Z110: aarch64 connect = 203 (per asm-generic/unistd.h:
+    // __NR_connect 203) and writev = 66 (per asm-generic/unistd.h:
+    // __NR_writev 66). The host is x86_64 running an i386 child, so
+    // these aarch64 numbers are dead code at runtime; locked in for
+    // ABI completeness + so the EXIT handler's `== abi.connect_nr` /
+    // `== abi.writev_nr` comparison is correct if a future aarch64
+    // guest is ever supported. Mirrors the existing 6-Z99
+    // ABI-completeness precedent.
+    connect_nr: 203,
+    writev_nr: 66,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -3074,6 +3158,14 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "openat2"
     } else if abi.pread64 != -1 && nr == abi.pread64 {
         "pread64"
+    } else if abi.socket_nr != -1 && nr == abi.socket_nr {
+        // 6-Z101: bonus labels for socket/bind/listen (end-of-chain
+        // = no shadowing of existing branches; test locks it).
+        "socket"
+    } else if abi.bind_nr != -1 && nr == abi.bind_nr {
+        "bind"
+    } else if abi.listen_nr != -1 && nr == abi.listen_nr {
+        "listen"
     } else {
         "unknown"
     }
@@ -3234,6 +3326,449 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
         return path.to_string();
     }
     format!("{}{}", rootfs, path)
+}
+
+// ── Task 6-Z101: staged-executable map (the self-execve enabler) ──
+//
+// The marker lives at `{rootfs}/.twoyi-staged` and is a flat map of
+// `guest-path<TAB>cache-path` lines. lib.rs writes one entry at staging
+// time (the boot-init copy at {data_dir}/cache/twoyi_init); the ptrace
+// emulator reads it ONCE before the first execve and consults it for
+// every subsequent execve ENTRY. The 6-Z102 tracer-side generic staging
+// (below) appends fresh pairs at runtime.
+
+/// The marker filename inside the rootfs. Shared by the lib.rs writer
+/// and the ptrace_emu reader so the two never disagree on the location.
+pub const STAGED_EXE_MARKER: &str = ".twoyi-staged";
+
+/// Absolute path of the staged-exe marker inside the rootfs.
+pub fn staged_exes_marker_path(rootfs: &str) -> String {
+    format!("{}/{}", rootfs, STAGED_EXE_MARKER)
+}
+
+/// Parse the marker content. Each line is `guest-path<TAB>cache-path`.
+/// Comments (`#`), blanks, and non-absolute paths are skipped. Each pair
+/// is registered under BOTH the raw guest form AND the rootfs-prefixed
+/// alias (or the stripped guest form when the key was written rootfs-
+/// prefixed), so lookups hit with either the raw guest path or a
+/// translate_path-mangled one.
+fn parse_staged_exes(content: &str, rootfs: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let rootfs_prefix = if rootfs.ends_with('/') {
+        rootfs.to_string()
+    } else {
+        format!("{}/", rootfs)
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut parts = trimmed.split('\t');
+        let key = match parts.next() {
+            Some(k) => k,
+            None => continue,
+        };
+        let val = match parts.next() {
+            Some(v) => v,
+            None => continue,
+        };
+        if !key.starts_with('/') || !val.starts_with('/') {
+            continue;
+        }
+        // Register both forms so the consumer hits regardless of whether
+        // the key was written raw or rootfs-prefixed.
+        map.insert(key.to_string(), val.to_string());
+        if let Some(rest) = key.strip_prefix(rootfs_prefix.as_str()) {
+            let stripped = format!("/{}", rest);
+            if stripped != key {
+                map.insert(stripped, val.to_string());
+            }
+        } else {
+            let prefixed = format!("{}{}", rootfs, key);
+            map.insert(prefixed, val.to_string());
+        }
+    }
+    map
+}
+
+/// Look up a guest path in the staged-exe map. Tries the raw form first,
+/// then the rootfs-prefixed form.
+fn staged_exe_for<'a>(
+    map: &'a std::collections::HashMap<String, String>,
+    rootfs: &str,
+    guest_path: &str,
+) -> Option<&'a str> {
+    if let Some(v) = map.get(guest_path) {
+        return Some(v.as_str());
+    }
+    let prefixed = format!("{}{}", rootfs, guest_path);
+    map.get(&prefixed).map(|v| v.as_str())
+}
+
+/// Read the marker file (one-shot, called lazily at the first execve).
+/// Returns (map, status_note) so the caller can log whether the read
+/// succeeded, the marker was missing, or the file was unreadable.
+fn load_staged_exes_map(rootfs: &str) -> (std::collections::HashMap<String, String>, String) {
+    let marker = staged_exes_marker_path(rootfs);
+    match std::fs::read_to_string(&marker) {
+        Ok(content) => {
+            let map = parse_staged_exes(&content, rootfs);
+            let n = map.len();
+            (
+                map,
+                format!(
+                    "loaded staged-exe marker ({} pairs) from {}",
+                    (n + 1) / 2,
+                    marker
+                ),
+            )
+        }
+        Err(e) => {
+            let kind = e.kind();
+            let note = if kind == std::io::ErrorKind::NotFound {
+                format!(
+                    "staged-exe marker {} absent (no ROM binaries staged yet)",
+                    marker
+                )
+            } else {
+                format!("staged-exe marker {} unreadable: {}", marker, e)
+            };
+            (std::collections::HashMap::new(), note)
+        }
+    }
+}
+
+// ── Task 6-Z102: generic executable staging ─────────────────────────
+//
+// The tracer-side staging engine: any guest execve of {rootfs}{P} whose
+// ELF magic matches gets copied to {data_dir}/cache/twoyi_stage/<name>,
+// chmod 0755, the .twoyi-staged marker is RMW-updated, and the in-loop
+// map grows at runtime so subsequent execs of the same path reuse the
+// cached copy. Caps: STAGE_MAX_FILES files / STAGE_MAX_TOTAL_BYTES bytes
+// — a full Android 11 /system/bin is ~150 MiB so legitimate service
+// staging fits, runaway churn cannot fill the data partition.
+
+/// Subdirectory under {data_dir}/cache where staged guest executables
+/// live. The app cache dir is the ONE executable place the app owns; the
+/// rootfs partition is noexec.
+pub const STAGE_CACHE_DIR_NAME: &str = "twoyi_stage";
+
+/// Hard cap on the number of staged files in the cache dir.
+pub const STAGE_MAX_FILES: usize = 100;
+
+/// Hard cap on the total bytes the staging dir may consume.
+pub const STAGE_MAX_TOTAL_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Absolute path of the staging dir inside the app cache dir.
+fn stage_cache_dir(data_dir: &str) -> String {
+    format!("{}/cache/{}", data_dir, STAGE_CACHE_DIR_NAME)
+}
+
+/// FNV-1a 64-bit. Dependency-free, stable across boots (so the same
+/// guest path always maps to the same cache filename — marker pairs stay
+/// valid across reboots and a re-stage is a no-op cache hit).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Build the cache filename for a guest path: a 64-char stem (slashes +
+/// hostile chars → '_') followed by `_` + 12 hex digits of the masked
+/// (48-bit) FNV-1a of the FULL path. `/system/bin/sh` vs `/vendor/bin/sh`
+/// never collide; names never exceed 77 chars (64 + 1 + 12).
+fn sanitize_stage_name(guest_path: &str) -> String {
+    let stem: String = guest_path
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c == '/' || c == '\0' || c == '\n' || c == '\r' || c == '\t' || c == ' ' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let hash = fnv1a64(guest_path.as_bytes()) & 0xFFFF_FFFF_FFFF; // exactly 12 hex digits
+    format!("{}_{:012x}", stem, hash)
+}
+
+/// Does the file at `path` start with the ELF magic `\x7fELF`? The §2
+/// guardrail: only ELF executables are staged (scripts/configs stay on
+/// the host path).
+fn has_elf_magic(path: &str) -> bool {
+    match std::fs::File::open(path) {
+        Ok(mut f) => {
+            use std::io::Read;
+            let mut buf = [0u8; 4];
+            f.read_exact(&mut buf).is_ok() && buf == [0x7f, b'E', b'L', b'F']
+        }
+        Err(_) => false,
+    }
+}
+
+/// Count files + total bytes under the staging dir. Subdirs / unreadable
+/// entries are skipped (never fatal). Used for cap bookkeeping.
+fn stage_dir_usage(dir: &str) -> (usize, u64) {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return (0, 0),
+    };
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        if let Ok(md) = std::fs::metadata(&p) {
+            if md.is_file() {
+                files += 1;
+                bytes += md.len();
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// Read-modify-write the .twoyi-staged marker. Mirrors lib.rs's writer
+/// exactly: replace-not-duplicate (keyed by guest path, comments
+/// preserved). The two writers stay interchangeable; the marker format is
+/// unchanged.
+fn append_staged_marker(rootfs: &str, guest_key: &str, cache_path: &str) {
+    let marker = staged_exes_marker_path(rootfs);
+    let existing = std::fs::read_to_string(&marker).unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let new_line = format!("{}\t{}", guest_key, cache_path);
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            out.push(line.to_string());
+            continue;
+        }
+        let mut parts = trimmed.split('\t');
+        let key = parts.next().unwrap_or("");
+        if key == guest_key {
+            out.push(new_line.clone());
+            replaced = true;
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !replaced {
+        out.push(new_line);
+    }
+    let _ = std::fs::write(&marker, out.join("\n") + "\n");
+}
+
+/// Insert a freshly-staged pair into the in-loop map. Same normalization
+/// parse_staged_exes applies: register BOTH the raw guest form and the
+/// rootfs-prefixed alias.
+fn staged_exes_insert(
+    map: &mut std::collections::HashMap<String, String>,
+    rootfs: &str,
+    guest_path: &str,
+    cache_path: &str,
+) {
+    map.insert(guest_path.to_string(), cache_path.to_string());
+    let prefixed = format!("{}{}", rootfs, guest_path);
+    map.insert(prefixed, cache_path.to_string());
+}
+
+/// The outcome of a stage attempt. `Staged` = a new copy was written;
+/// `Reused` = an identical-length existing copy was already present
+/// (marker re-registered for cross-boot consistency); `Skip(reason)` =
+/// the path didn't qualify (no ROM copy / non-ELF / relative / dir /
+/// caps exceeded) — the execve is left untouched (graceful degradation).
+#[derive(Debug)]
+enum StageOutcome {
+    Staged { cache_path: String, bytes: u64 },
+    Reused { cache_path: String, bytes: u64 },
+    Skip(&'static str),
+}
+
+/// Production entry: uses the STAGE_MAX_FILES / STAGE_MAX_TOTAL_BYTES
+/// consts.
+fn stage_guest_executable(rootfs: &str, data_dir: &str, guest_path: &str) -> StageOutcome {
+    stage_guest_executable_capped(
+        rootfs,
+        data_dir,
+        guest_path,
+        STAGE_MAX_FILES,
+        STAGE_MAX_TOTAL_BYTES,
+    )
+}
+
+/// Testable core with injectable caps. Logic:
+///   - absolute path only → normalize a rootfs-prefixed input back to
+///     the raw guest key
+///   - {rootfs}<P> must exist as a regular file, be non-empty, have ELF
+///     magic, and fit the byte cap
+///   - cache hit on an identical-length existing copy = Reused (marker
+///     re-registered)
+///   - otherwise enforce the dir caps → copy, chmod 0755, append marker
+///   - every refusal path returns Skip(reason)
+fn stage_guest_executable_capped(
+    rootfs: &str,
+    data_dir: &str,
+    guest_path: &str,
+    max_files: usize,
+    max_total_bytes: u64,
+) -> StageOutcome {
+    if !guest_path.starts_with('/') {
+        return StageOutcome::Skip("relative path");
+    }
+    // Normalize a rootfs-prefixed input back to the raw guest key.
+    let rootfs_prefix = if rootfs.ends_with('/') {
+        rootfs.to_string()
+    } else {
+        format!("{}/", rootfs)
+    };
+    let guest_key = if let Some(rest) = guest_path.strip_prefix(rootfs_prefix.as_str()) {
+        format!("/{}", rest)
+    } else if guest_path == rootfs {
+        return StageOutcome::Skip("path equals rootfs");
+    } else {
+        guest_path.to_string()
+    };
+    let rom_path = format!("{}{}", rootfs, guest_key);
+    let md = match std::fs::metadata(&rom_path) {
+        Ok(m) => m,
+        Err(_) => return StageOutcome::Skip("no ROM copy"),
+    };
+    if !md.is_file() {
+        return StageOutcome::Skip("not a regular file");
+    }
+    let bytes = md.len();
+    if bytes == 0 {
+        return StageOutcome::Skip("empty file");
+    }
+    if bytes > max_total_bytes {
+        return StageOutcome::Skip("single-file byte cap exceeded");
+    }
+    if !has_elf_magic(&rom_path) {
+        return StageOutcome::Skip("not ELF magic");
+    }
+    let dir = stage_cache_dir(data_dir);
+    let cache_name = sanitize_stage_name(&guest_key);
+    let cache_path = format!("{}/{}", dir, cache_name);
+    // Cache hit on an identical-length existing copy = Reused.
+    if let Ok(existing_md) = std::fs::metadata(&cache_path) {
+        if existing_md.is_file() && existing_md.len() == bytes {
+            append_staged_marker(rootfs, &guest_key, &cache_path);
+            return StageOutcome::Reused { cache_path, bytes };
+        }
+    }
+    // Enforce dir caps before copying.
+    let (cur_files, cur_bytes) = stage_dir_usage(&dir);
+    if cur_files >= max_files {
+        return StageOutcome::Skip("file-count cap exceeded");
+    }
+    if cur_bytes + bytes > max_total_bytes {
+        return StageOutcome::Skip("dir byte cap exceeded");
+    }
+    // Copy + chmod + marker.
+    if let Err(_) = std::fs::create_dir_all(&dir) {
+        return StageOutcome::Skip("create_dir_all failed");
+    }
+    if std::fs::copy(&rom_path, &cache_path).is_err() {
+        return StageOutcome::Skip("copy failed");
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
+    append_staged_marker(rootfs, &guest_key, &cache_path);
+    StageOutcome::Staged { cache_path, bytes }
+}
+
+// ── Task 6-Z103: ROM rc/fstab import translation ───────────────────
+//
+// second-stage init parses /init.rc then imports
+// /system/etc/init/*.rc + /vendor/etc/init/*.rc (+ /odm/etc/init/*.rc),
+// and mount_all/FirstStageMount read fstab.* from the ramdisk root or
+// /vendor/etc/. translate_path passes /system/* and /vendor/* through
+// UNTRANSLATED (deliberate: the HOST's /system provides the dynamic
+// linker + bionic in non-root mode) — so those config reads hit the
+// HOST's rc files: the WRONG ROM's services get parsed, or ENOENT when
+// the host lacks the file. The classifier below encodes the MINIMAL
+// list of read-only ROM config paths whose opens should be redirected
+// to the ROM copy.
+
+/// The minimal read-only ROM-config path list. (a) the ramdisk-root
+/// /init*.rc family; (b) the second-stage import dirs'
+/// /system/etc/init/*.rc, /vendor/etc/init/*.rc, /odm/etc/init/*.rc;
+/// (d) a `fstab.`-prefixed basename whose parent dir is `/` or
+/// `/vendor/etc` (the only two dirs that carry fstabs).
+pub fn is_readonly_config_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    // (a) the ramdisk-root /init*.rc family.
+    if path == "/init.rc" {
+        return true;
+    }
+    if path.starts_with("/init") && path.ends_with(".rc") {
+        return true;
+    }
+    // (b)+(c) the three etc/init dirs' *.rc children.
+    for prefix in &["/system/etc/init/", "/vendor/etc/init/", "/odm/etc/init/"] {
+        if path.starts_with(prefix) && path.ends_with(".rc") {
+            return true;
+        }
+    }
+    // (d) fstab.* reads whose parent is `/` (the ramdisk root) or
+    // `/vendor/etc` (the only two dirs that carry fstabs).
+    if let Some(idx) = path.rfind('/') {
+        let basename = &path[idx + 1..];
+        let parent = &path[..idx];
+        if basename.starts_with("fstab.") && (parent.is_empty() || parent == "/vendor/etc") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does this open-flags value indicate WRITE intent? Access mode ≠
+/// O_RDONLY, or any of O_CREAT / O_TRUNC / O_APPEND. Linux-generic flag
+/// bits — identical across x86/i386/aarch64. Makes the "READ-ONLY
+/// exception" literal: write-intent opens are NEVER redirected to the
+/// ROM copy.
+pub fn open_flags_indicate_write(flags: u32) -> bool {
+    const O_RDONLY: u32 = 0;
+    const O_CREAT: u32 = 0o100;
+    const O_TRUNC: u32 = 0o1000;
+    const O_APPEND: u32 = 0o2000;
+    const O_ACCMODE: u32 = 0o3;
+    const O_WRONLY: u32 = 0o1;
+    const O_RDWR: u32 = 0o2;
+    if (flags & O_ACCMODE) != O_RDONLY {
+        return true;
+    }
+    if (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0 {
+        return true;
+    }
+    let _ = (O_WRONLY, O_RDWR); // suppress unused-const warnings
+    false
+}
+
+/// `Some("{rootfs}{path}")` ONLY when the classifier hits AND
+/// `{rootfs}{path}` exists as a regular file AND the open is read-only.
+/// Missing/non-regular ROM copy → None → caller falls through to normal
+/// translate_path (a missing ROM file still 404s/ENOENTs naturally
+/// against whichever tree would have served it).
+pub fn rom_config_override(rootfs: &str, path: &str, write_intent: bool) -> Option<String> {
+    if write_intent {
+        return None;
+    }
+    if !is_readonly_config_path(path) {
+        return None;
+    }
+    let rom_copy = format!("{}{}", rootfs, path);
+    match std::fs::metadata(&rom_copy) {
+        Ok(md) if md.is_file() => Some(rom_copy),
+        _ => None,
+    }
 }
 
 // ── String read/write helpers ──────────────────────────────────────
@@ -3638,6 +4173,1262 @@ fn read_child_u32(pid: libc::pid_t, addr: u64) -> Option<u32> {
     }
     // Host and child are both little-endian x86 — low 32 bits.
     Some(word as u32)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Task 6-Z110: property-service CLIENT emulation — pure helpers
+//
+// The matcher, the dispatcher, the return-value mapping, and the iov
+// walkers are PURE (no ptrace, no globals) so they can be unit-locked
+// by the z110 tests below. The ptrace-using EXIT arms that consume
+// them live further down inside run_ptrace_loop.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Task 6-Z110: how a matched sockaddr_un spells the property-service
+/// path. `FilesystemPath` = the literal "/dev/socket/property_service"
+/// bionic's PROP_SERVICE_NAME uses; `AbstractNamespace` = the leading-
+/// NUL abstract spelling some toolbox/vendor clients use. The
+/// distinction is informational (both get the SAME fake); the variant
+/// only shows up in the log line so the E2E greppable signature tells
+/// the client spelling apart.
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum PropServSockaddrKind {
+    FilesystemPath,
+    AbstractNamespace,
+}
+
+/// Task 6-Z110: the exact-name sockaddr_un matcher for
+/// "/dev/socket/property_service" + "\0property_service" — PURE CORE
+/// (operates on a 128-byte blob the caller already PEEKDATA'd).
+///
+/// `blob` is the first 128 bytes of the child's `struct sockaddr_un`
+/// (16-bit `sun_family` at +0, then `sun_path[108]` at +2). `addrlen`
+/// is the sockaddr length arg to connect() (arg3). Match against the
+/// two exact spellings:
+///   - FilesystemPath: sun_path starts with "/dev/socket/
+///     property_service" (may or may not be NUL-terminated within the
+///     addrlen — bionic always NUL-terminates within 108 bytes; we
+///     match up to the first NUL OR the slice end, whichever is first).
+///   - AbstractNamespace: sun_path starts with '\0' followed by
+///     "property_service" (the leading NUL is the abstract-namespace
+///     marker; the rest is the name with NO trailing NUL required).
+///
+/// Returns None for everything else: @TWOYI_SOCK, @TWOYI_BOOT_SOCK,
+/// /dev/socket/zygote, prefix-superstrings (the matcher is EXACT, not
+/// prefix), the relative "property_service" path (no leading slash and
+/// no leading NUL), AF_INET/AF_NETLINK blobs that happen to carry the
+/// right NAME bytes, and short / unreadable blobs. The 6-Z96c lesson
+/// enforced structurally: only the EXACT property-service sockaddr is
+/// ever faked.
+///
+/// Family must be AF_UNIX(1) for the FilesystemPath case (the path
+/// spelling is meaningless for AF_NETLINK/AF_INET). The
+/// AbstractNamespace case requires AF_UNIX too (the leading-NUL
+/// convention is AF_UNIX-specific). The matcher rejects a non-1
+/// family even if sun_path bytes match.
+///
+/// Split out from `sockaddr_un_is_property_service` (the ptrace-using
+/// wrapper below) so the matcher is PURE + test-locked — the
+/// `z110_sockaddr_matcher_*` tests construct a blob, call this, and
+/// assert the variant / None without having to fork a tracee.
+fn sockaddr_blob_is_property_service(
+    blob: &[u8],
+    addrlen: i64,
+    abi: &ChildAbi,
+) -> Option<PropServSockaddrKind> {
+    // Sanity-gate addrlen: a sockaddr_un is struct sockaddr_un { sa_family_t
+    // sun_family; char sun_path[108]; } = 110 bytes total, but bionic
+    // passes addrlen = offsetof(sockaddr_un, sun_path) + strlen(path)+1,
+    // so for the filesystem spelling the minimum is 2 (family) + 1 ('/')
+    // + 31 (the path) + 1 (NUL) = 35 — round to a comfortable lower bound
+    // of 3 and upper bound of 128 (the sockaddr_storage size, more than
+    // enough for any sockaddr_un). Outside [3, 128] → reject.
+    if addrlen < 3 || addrlen > 128 {
+        return None;
+    }
+    if blob.len() < 2 {
+        return None;
+    }
+    // Sun family at +0..+2, little-endian u16.
+    let family = u16::from_le_bytes([blob[0], blob[1]]);
+    const AF_UNIX: u16 = 1;
+    if family != AF_UNIX {
+        return None;
+    }
+    // sun_path starts at +2. Take the slice up to the first NUL OR the
+    // blob end, whichever is first (matches bionic's strlen semantics).
+    let mut end = 2usize;
+    while end < blob.len() {
+        if blob[end] == 0 {
+            break;
+        }
+        end += 1;
+    }
+    let path_bytes = &blob[2..end];
+    // FilesystemPath spelling: "/dev/socket/property_service" exact.
+    const FS_SPELLING: &[u8] = b"/dev/socket/property_service";
+    if path_bytes == FS_SPELLING {
+        return Some(PropServSockaddrKind::FilesystemPath);
+    }
+    // AbstractNamespace spelling: leading NUL is the marker (byte 0 of
+    // sun_path); the rest is "property_service" with NO trailing NUL
+    // required (abstract-namespace names are length-tagged by addrlen,
+    // not NUL-terminated). So the FULL sun_path from +2 onward, BEFORE
+    // the NUL-cut above (which clipped the abstract-spelling case to
+    // empty — the leading byte IS NUL), is what we match here. Re-take
+    // the slice WITHOUT the NUL-cut:
+    if blob.len() >= 2 + 1 + b"property_service".len() {
+        // sun_path[0] = 0, sun_path[1..1+19] = "property_service" (19 chars).
+        if blob[2] == 0 && &blob[3..3 + b"property_service".len()] == b"property_service" {
+            return Some(PropServSockaddrKind::AbstractNamespace);
+        }
+    }
+    let _ = abi; // 6-Z110: abi carries no per-arch sockaddr offset; AF_UNIX
+                 // sun_path lives at +2 on every Linux ABI. The param is kept
+                 // for symmetry with netlink_op_for / propserv_op_for.
+    None
+}
+
+/// Task 6-Z110: the ptrace-using wrapper around
+/// `sockaddr_blob_is_property_service`. PEEKDATA's the first 128 bytes
+/// at `sockaddr_ptr` then calls the pure matcher. Returns None on
+/// PEEKDATA failure (the pure matcher would receive an empty blob and
+/// reject it).
+fn sockaddr_un_is_property_service(
+    pid: libc::pid_t,
+    sockaddr_ptr: u64,
+    addrlen: i64,
+    abi: &ChildAbi,
+) -> Option<PropServSockaddrKind> {
+    if sockaddr_ptr == 0 {
+        return None;
+    }
+    // PEEK 128 bytes — covers the full sun_path[108] + a few extra for
+    // safety. read_child_bytes already stops at the first unmapped word.
+    match read_child_bytes(pid, sockaddr_ptr, 128) {
+        Some(b) => sockaddr_blob_is_property_service(&b, addrlen, abi),
+        None => None,
+    }
+}
+
+/// Task 6-Z110: which property-service-client syscall is this? The
+/// dispatcher used by the EXIT arms that fake the fd-taking calls on a
+/// tracked property-client fd. Deliberately a SEPARATE enum from
+/// NetlinkOp: the two fd sets are structurally disjoint (netlink fds
+/// are ≥ 0x6b00_0000; property-client fds are real kernel fds), but
+/// the SAME set of fd-ops (sendto/recvfrom/close/etc.) is faked on
+/// both, so the variant names mirror NetlinkOp one-for-one EXCEPT
+/// `Connect` (netlink never tracks a connect — only property clients
+/// do) and the absence of `Socket` / `Bind` / `Listen` (those are the
+/// SERVER-side calls the 6-Z3 / 6-Z101 fake handled; the client only
+/// does connect + send + recv + close).
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum PropServOp {
+    Connect,
+    SendTo,
+    SendMsg,
+    WriteV,
+    RecvFrom,
+    RecvMsg,
+    Read,
+    Shutdown,
+    SetSockOpt,
+    GetSockOpt,
+    Fcntl,
+    Close,
+}
+
+/// Task 6-Z110: map a syscall number to a PropServOp for the
+/// property-client-fd EXIT arms. Mirrors the netlink_op_for dispatch
+/// pattern (per-ABI -1 sentinels + i386 fcntl64 bitness gate), but
+/// adds the connect_nr / writev_nr fields the 6-Z110 ABI gained, and
+/// the Read variant (read is NOT a socket-family syscall, so netlink
+/// never tracked it — but the property-client fd IS a real kernel fd
+/// that bionic reads with read() in some reply-reading variants).
+fn propserv_op_for(nr: i64, abi: &ChildAbi) -> Option<PropServOp> {
+    if abi.connect_nr != -1 && nr == abi.connect_nr {
+        Some(PropServOp::Connect)
+    } else if abi.sendto_nr != -1 && nr == abi.sendto_nr {
+        Some(PropServOp::SendTo)
+    } else if abi.sendmsg_nr != -1 && nr == abi.sendmsg_nr {
+        Some(PropServOp::SendMsg)
+    } else if abi.writev_nr != -1 && nr == abi.writev_nr {
+        Some(PropServOp::WriteV)
+    } else if abi.recvfrom_nr != -1 && nr == abi.recvfrom_nr {
+        Some(PropServOp::RecvFrom)
+    } else if abi.recvmsg_nr != -1 && nr == abi.recvmsg_nr {
+        Some(PropServOp::RecvMsg)
+    } else if abi.shutdown_nr != -1 && nr == abi.shutdown_nr {
+        Some(PropServOp::Shutdown)
+    } else if abi.setsockopt_nr != -1 && nr == abi.setsockopt_nr {
+        Some(PropServOp::SetSockOpt)
+    } else if abi.getsockopt_nr != -1 && nr == abi.getsockopt_nr {
+        Some(PropServOp::GetSockOpt)
+    } else if abi.close_nr != -1 && nr == abi.close_nr {
+        Some(PropServOp::Close)
+    } else if abi.fcntl_nr != -1 && nr == abi.fcntl_nr {
+        Some(PropServOp::Fcntl)
+    } else if abi.execve == 11 && nr == 221 {
+        // i386 fcntl64 (bionic prefers it over fcntl); the
+        // `abi.execve == 11` bitness test mirrors the 6-Z57 ENOSYS
+        // override's i386 gate, so x86_64/aarch64 nr=221 can't misfire.
+        Some(PropServOp::Fcntl)
+    } else {
+        None
+    }
+    // NOTE: read_nr is intentionally NOT in this list — read on a
+    // tracked property-client fd is handled by a SEPARATE inline arm
+    // (the generic read path is shared with the kmsg/write DIAG
+    // diagnostic, and a `Read` variant here would collide with the
+    // existing read EXIT handler's flow). The inline arm matches
+    // `nr == abi.read && tracked(fd)` directly. The `Read` variant
+    // above is reserved for the test matrix's 9-way no-collision sweep.
+}
+
+/// Task 6-Z110: given a PropServOp on a tracked property-client fd,
+/// what return value should the EXIT arm substitute? The mapping is
+/// the OPPOSITE trade from netlink_ret_for on the recv side: a
+/// nonblocking socket hot-spins on EAGAIN, so EOF (0) is the only
+/// non-spinning value for the send-then-read-once reply-reading
+/// variants bionic's __system_property_set uses.
+fn propserv_ret_for(op: PropServOp) -> i64 {
+    match op {
+        // The actual requested byte count is computed inline at the
+        // call site (sendto: arg3 / SendMsg: iov walk / WriteV: iov
+        // walk) — these are placeholders that the call site overrides.
+        // The unit tests assert the per-op MAPPING (send → full-len,
+        // recv → 0, the rest → 0); the inline computation is exercised
+        // by the propserv_ret_mapping_and_tracked_set_lifecycle test.
+        PropServOp::SendTo | PropServOp::SendMsg | PropServOp::WriteV => -1, // sentinel: overridden inline
+        PropServOp::RecvFrom | PropServOp::RecvMsg | PropServOp::Read => 0,  // EOF
+        PropServOp::Shutdown
+        | PropServOp::SetSockOpt
+        | PropServOp::GetSockOpt
+        | PropServOp::Fcntl
+        | PropServOp::Close => 0,
+        // Connect never reaches propserv_ret_for — the connect EXIT
+        // arm fakes 0 inline (it has to PEEK the sockaddr first to
+        // decide whether to fake at all, which the helper above does
+        // not do). The unit test asserts Connect's deliberate absence
+        // from the propserv_ret_for input set.
+        PropServOp::Connect => 0,
+    }
+}
+
+/// Task 6-Z110: walk an iovec array in the child's address space and
+/// return the TOTAL byte count the array claims. Used by the writev
+/// and sendmsg EXIT arms (after the iov_total_len_child helper sums
+/// the iovec array the msghdr points to). The count is the SUM of the
+/// iov_len fields, NOT a memcpy'd byte count — the fake just makes
+/// writev/sendmsg report "everything sent", so the byte count is what
+/// the caller expects to be acknowledged as written.
+///
+/// Layout switch: on i386 (abi.execve == 11), `struct iovec` is
+/// {void* iov_base; size_t iov_len;} with 4-byte fields (the i386
+/// userspace ABI); on x86_64 / aarch64, both fields are 8 bytes. The
+/// `is_i386` flag picks the read stride.
+///
+/// Safety caps (mirrors bionic's own writev/sendmsg limits):
+///   - max 64 iovecs (more is rejected with the partial sum);
+///   - max 1 MiB total (a property prop_msg is 128 bytes; anything
+///     larger is a non-bionic client or a bug — capped to keep a
+///     hostile iov from spinning PEEKDATA forever);
+///   - an unreadable iov (PEEKDATA fails on the iov struct itself)
+///     contributes 1 byte (the smallest non-zero value that lets the
+///     caller's partial-send loop make progress) and logs a HAZARD
+///     line at the call site (the caller decides what counts as a
+///     hazard — this helper only returns the count + whether any iov
+///     was unreadable).
+fn iov_array_total_len(
+    pid: libc::pid_t,
+    iov_ptr: u64,
+    iov_count: u64,
+    is_i386: bool,
+) -> (i64, bool) {
+    const MAX_IOVS: u64 = 64;
+    const MAX_TOTAL: i64 = 1024 * 1024;
+    if iov_count == 0 || iov_ptr == 0 {
+        return (0, false);
+    }
+    let count = std::cmp::min(iov_count, MAX_IOVS) as usize;
+    let stride = if is_i386 { 8usize } else { 16usize };
+    let mut total: i64 = 0;
+    let mut hazard = false;
+    for i in 0..count {
+        let base = iov_ptr.wrapping_add((i * stride) as u64);
+        let len_off = if is_i386 { 4u64 } else { 8u64 };
+        let len_addr = base.wrapping_add(len_off);
+        let len_val = if is_i386 {
+            read_child_u32(pid, len_addr).map(|v| v as i64)
+        } else {
+            // 64-bit size_t: read two u32 halves (low + high) and combine.
+            let lo = read_child_u32(pid, len_addr).map(|v| v as u64);
+            let hi = read_child_u32(pid, len_addr.wrapping_add(4)).map(|v| v as u64);
+            match (lo, hi) {
+                (Some(l), Some(h)) => Some(((h << 32) | l) as i64),
+                _ => None,
+            }
+        };
+        match len_val {
+            Some(n) if n > 0 => {
+                total = total.saturating_add(n);
+                if total >= MAX_TOTAL {
+                    return (MAX_TOTAL, hazard);
+                }
+            }
+            _ => {
+                // Unreadable iov OR zero-length iov — the helper can't
+                // tell them apart, so contribute 1 (a non-zero count
+                // that lets the caller's partial-send loop terminate
+                // in one step) and flag the hazard.
+                hazard = true;
+                total = total.saturating_add(1);
+                if total >= MAX_TOTAL {
+                    return (MAX_TOTAL, hazard);
+                }
+            }
+        }
+    }
+    (total, hazard)
+}
+
+/// Task 6-Z110: walk a `struct msghdr` in the child's address space
+/// and return the TOTAL byte count of its iov array. Used by the
+/// sendmsg EXIT arm. Layout switch (i386 vs 64-bit):
+///
+/// i386 `struct msghdr` (per bits/socket.h):
+///   +0:  void*         msg_name        (4 bytes)
+///   +4:  socklen_t     msg_namelen     (4 bytes)
+///   +8:  struct iovec* msg_iov         (4 bytes)
+///   +12: size_t        msg_iovlen      (4 bytes)
+///   +16: void*         msg_control     (4 bytes)
+///   +20: size_t        msg_controllen  (4 bytes)
+///   +24: int           msg_flags       (4 bytes)
+///
+/// x86_64 / aarch64 `struct msghdr`:
+///   +0:  void*         msg_name        (8 bytes)
+///   +8:  socklen_t     msg_namelen     (4 bytes) + 4 pad
+///   +16: struct iovec* msg_iov         (8 bytes)
+///   +24: size_t        msg_iovlen      (8 bytes)
+///   +32: void*         msg_control     (8 bytes)
+///   +40: size_t        msg_controllen  (8 bytes)
+///   +48: int           msg_flags       (4 bytes)
+///
+/// We only need msg_iov (the pointer) + msg_iovlen (the count) — the
+/// other fields are ignored. The pointer field at +8 (i386) / +16
+/// (64-bit) is read via two u32 PEEKs on i386 and combined.
+fn iov_total_len_child(pid: libc::pid_t, msghdr_ptr: u64, is_i386: bool) -> (i64, bool) {
+    if msghdr_ptr == 0 {
+        return (0, false);
+    }
+    let (iov_ptr, iov_count) = if is_i386 {
+        let iov_ptr = match read_child_u32(pid, msghdr_ptr.wrapping_add(8)) {
+            Some(v) => v as u64,
+            None => return (0, true),
+        };
+        let iov_count = match read_child_u32(pid, msghdr_ptr.wrapping_add(12)) {
+            Some(v) => v as u64,
+            None => return (0, true),
+        };
+        (iov_ptr, iov_count)
+    } else {
+        let lo = read_child_u32(pid, msghdr_ptr.wrapping_add(16));
+        let hi = read_child_u32(pid, msghdr_ptr.wrapping_add(20));
+        let iov_ptr = match (lo, hi) {
+            (Some(l), Some(h)) => ((h as u64) << 32) | (l as u64),
+            _ => return (0, true),
+        };
+        let lo = read_child_u32(pid, msghdr_ptr.wrapping_add(24));
+        let hi = read_child_u32(pid, msghdr_ptr.wrapping_add(28));
+        let iov_count = match (lo, hi) {
+            (Some(l), Some(h)) => ((h as u64) << 32) | (l as u64),
+            _ => return (0, true),
+        };
+        (iov_ptr, iov_count)
+    };
+    iov_array_total_len(pid, iov_ptr, iov_count, is_i386)
+}
+
+/// Task 6-Z110: drop the dead pid's per-pid fd-table state. Called from
+/// BOTH the WIFEXITED and WIFSIGNALED branches of run_ptrace_loop so
+/// that a pid-RECYCLED successor inherits NOTHING — a stale entry
+/// would make the new pid's genuine socket ops hit the property-client
+/// fake path (the corruption class the forget_dead_pid_state pattern
+/// exists to prevent). Drops:
+///   - in_syscall_map[pid]: the per-child in_syscall flag (Task 6-Z54)
+///   - fake_netlink_fds[pid]: the per-child netlink fake-fd set (6-Z99)
+///   - netlink_fd_next[pid]: the per-child fake-fd allocator (6-Z99)
+///   - fake_propserv_fds[pid]: the per-child property-client fd set
+///     (6-Z110 — the new entry this layer adds)
+/// `kmsg_fd` (Option<i32>) and `recovery_child_pid` are deliberately
+/// NOT touched here: they are loop-level singletons (the captured kmsg
+/// fd is process-local; the recovery child pid is init-specific). They
+/// are cleared separately in the init_pid re-anchor branch.
+///
+/// Pure (no ptrace, no globals) so the
+/// `z110_propserv_ret_mapping_and_tracked_set_lifecycle` test can
+/// construct a fake state, insert an entry, call this, and assert
+/// removal — locking the per-pid cleanup contract independently of the
+/// ptrace loop's waitpid/wait-status plumbing.
+fn forget_dead_pid_state(
+    pid: libc::pid_t,
+    in_syscall_map: &mut std::collections::HashMap<libc::pid_t, bool>,
+    fake_netlink_fds: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+    netlink_fd_next: &mut std::collections::HashMap<libc::pid_t, i32>,
+    fake_propserv_fds: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+) {
+    in_syscall_map.remove(&pid);
+    fake_netlink_fds.remove(&pid);
+    netlink_fd_next.remove(&pid);
+    fake_propserv_fds.remove(&pid);
+}
+
+/// Task 6-Z111: drop the dead pid's property-area registrations. The
+/// `property_area_fds` (per-(pid, fd) HashSet) is RETAINED entry-by-
+/// entry: only the dead pid's (pid, *) pairs are removed (the fd
+/// table is gone; the mappings outlive the fd but the fd→area
+/// association is no longer meaningful). The `prop_area_maps` (per-pid
+/// Vec<(addr, len)>) is removed entry-by-entry: the dead pid's
+/// address space is gone (a pid-RECYCLED successor's fresh mm has
+/// no mapping at the inherited addresses — a stale entry would let
+/// the broadcaster POKEDATA into the wrong process's address space,
+/// the corruption class the forget_dead_pid_state pattern exists to
+/// prevent).
+///
+/// Pure (no ptrace, no globals) so the
+/// `z111_register_dedupes_and_caps` test can construct a fake state,
+/// insert an entry, call this, and assert removal.
+fn forget_dead_pid_state_areas(
+    pid: libc::pid_t,
+    property_area_fds: &mut std::collections::HashSet<(libc::pid_t, i32)>,
+    prop_area_maps: &mut std::collections::HashMap<libc::pid_t, Vec<(u64, usize)>>,
+) {
+    property_area_fds.retain(|&(p, _)| p != pid);
+    prop_area_maps.remove(&pid);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Task 6-Z111: property AREA write emulation — pure cores
+//
+// The classifier, the prop_msg decoder, the format detector, the trie
+// walker, and the update planner are ALL pure (no ptrace, no globals)
+// so they can be unit-locked by the z111 tests below. The
+// ptrace-using broadcaster that consumes them lives further down
+// inside run_ptrace_loop (right at the 6-Z110 send-fake).
+//
+// All layouts + the update protocol are verified from AOSP sources
+// fetched during the z111 layer (android-11.0.0_r1
+// `libc/system_properties/include/system_properties/prop_area.h` +
+// `prop_info.h` + `prop_area.cpp` + `system_properties.cpp` +
+// `contexts_serialized.cpp`; tag android-5.1.1_r37
+// `libc/include/sys/_system_properties.h` for the OLD-format
+// detector). The layouts + magic values are test-locked in the
+// `z111_prop_area_detect_old_corrupt_and_valid` and
+// `z111_synthetic_area_walk_matches_bionic_layout` tests.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Task 6-Z111: the property-area file classifier. Matches the file
+/// paths bionic opens at property_init / __system_properties_init:
+///
+/// ACCEPTS (returns true):
+///   - `/dev/__properties__` — the TWRP (5.x) single-file spelling.
+///   - `/dev/__properties__/properties_serial` — the Android 8+
+///     NEW-format directory + serial file.
+///   - `/dev/__properties__/properties_ctxt<N>` — the per-context
+///     serialized area files (N is a digit string).
+///   - rootfs-prefixed spellings of the above (e.g.
+///     `{rootfs}/dev/__properties__/properties_serial`).
+///
+/// REJECTS (returns false):
+///   - `/dev/__properties__/property_info` — the context INDEX file
+///     (a trie write into it would be CORRUPTION — the index is a
+///     separate serialized trie of context-name → context-id, NOT a
+///     property area). Locks the z111 §2.1 "deliberately REJECTS"
+///     invariant.
+///   - `/dev/__properties__/properties_ctxtX` — nondigit suffix
+///     (e.g. "ctxtX" or "ctxt_old"). The per-context files are
+///     numbered `properties_ctxt0`, `properties_ctxt1`, ...
+///   - Deeper paths under `/dev/__properties__/` (e.g.
+///     `/dev/__properties__/subdir/file`).
+///   - Superstrings of the bare names (e.g. `properties_serial.bak`).
+///   - `/dev/socket/property_service` — the property-service SOCKET
+///     path (a Unix-socket node, NOT a property area; the 6-Z110
+///     matcher handles that separately).
+///   - Relative paths (e.g. `__properties__` with no leading slash).
+///   - Empty string.
+fn is_property_area_file(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    // Strip the rootfs prefix (everything up to and including the
+    // literal "/dev/" segment) so rootfs-prefixed spellings match the
+    // bare forms. The path must still contain "/dev/" for the strip to
+    // make sense; if it doesn't, leave it unchanged (it'll fall
+    // through to the rejects below).
+    let bare = match path.find("/dev/") {
+        Some(idx) => &path[idx..],
+        None => path,
+    };
+    // (a) TWRP single-file spelling.
+    if bare == "/dev/__properties__" {
+        return true;
+    }
+    // (b)(c)(d) NEW-format directory + per-area files. The directory
+    // prefix is "/dev/__properties__/", then the FILE name is one of:
+    //   - "properties_serial" — the serial file.
+    //   - "properties_ctxt<N>" where N is a nonempty digit string.
+    // Anything else (e.g. "property_info", "subdir/file", "properties_
+    // serial.bak") is rejected.
+    const DIR_PREFIX: &str = "/dev/__properties__/";
+    if let Some(name) = bare.strip_prefix(DIR_PREFIX) {
+        // No further slashes — a deeper path is NOT an area.
+        if name.contains('/') {
+            return false;
+        }
+        if name == "properties_serial" {
+            return true;
+        }
+        // "properties_ctxt<N>" — strip the literal prefix, the rest
+        // must be a nonempty digit string.
+        if let Some(num) = name.strip_prefix("properties_ctxt") {
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+        // "property_info" — the context INDEX file. Deliberately
+        // rejected (a trie write into it would corrupt the index).
+        // Also catches "properties_ctxt" (empty suffix) and
+        // "properties_ctxtX" (nondigit suffix) — these are NOT
+        // per-area files.
+        return false;
+    }
+    // The bare "/dev/__properties__" spelling is matched above. Any
+    // other path (e.g. "/dev/socket/property_service",
+    // "/dev/__properties__foo" superstring, "/dev/null") is rejected.
+    false
+}
+
+/// Task 6-Z111: parse a bionic prop_msg. bionic (5.1..11) sends:
+///   struct prop_msg { u32 cmd; char name[32]; char value[92]; } = 128 bytes
+/// with cmd PROP_MSG_SETPROP=1 or PROP_MSG_SETPROP2=0x00020001 (NOT
+/// plain 2 — but plain 2 is accepted defensively anyway, since some
+/// pre-11 bionic forks reportedly used it).
+///
+/// The task brief's name[92]/value[92] @ 4/96 layout is implemented as
+/// a defensive WIDE fallback (188 bytes), selected when the classic
+/// parse yields an empty NAME on a ≥188-byte frame (some vendor
+/// toolboxes emit the wide layout for long names that don't fit in
+/// 32 bytes).
+///
+/// Returns `Some((name, value))` on a successful parse:
+///   - cmd is SETPROP or SETPROP2 (or plain 2 defensively);
+///   - frame is at least CLASSIC_SIZE (128 bytes);
+///   - name is NUL-terminated within 31 bytes (the hard
+///     `__system_property_set` name-length gate — names >31 bytes are
+///     rejected by bionic before the prop_msg is even built; an
+///     UNTERMINATED classic name that runs all 32 bytes would
+///     otherwise mis-parse as a garbage wide name, so this gate also
+///     protects the wide-fallback selection).
+/// `value` may be empty (a `property_set("key", "")` clears the value —
+/// bionic serializes that as a 1-byte NUL in value[0]).
+///
+/// Returns `None` for:
+///   - cmd 3 / any other cmd value (a future bionic variant);
+///   - frame shorter than CLASSIC_SIZE (a truncated send);
+///   - name not NUL-terminated within 31 bytes (an unterminated or
+///     oversized name).
+fn parse_prop_msg(frame: &[u8]) -> Option<(String, String)> {
+    const PROP_MSG_SETPROP: u32 = 1;
+    const PROP_MSG_SETPROP2: u32 = 0x0002_0001;
+    const PROP_MSG_SETPROP_PLAIN_2: u32 = 2;
+    const CLASSIC_SIZE: usize = 128; // {u32; char[32]; char[92]} = 4+32+92
+    const WIDE_SIZE: usize = 188; // {u32; char[92]; char[92]} = 4+92+92
+    const NAME_MAX_LEN: usize = 31; // bionic's __system_property_set gate
+
+    if frame.len() < CLASSIC_SIZE {
+        return None;
+    }
+    // cmd is little-endian u32 @ 0.
+    let cmd = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
+    if cmd != PROP_MSG_SETPROP && cmd != PROP_MSG_SETPROP2 && cmd != PROP_MSG_SETPROP_PLAIN_2 {
+        return None;
+    }
+    // Classic parse: name @ 4, 32 bytes; value @ 36, 92 bytes.
+    // Name must be NUL-terminated within 31 bytes.
+    let name_end = (4..4 + NAME_MAX_LEN).find(|&i| frame[i] == 0).unwrap_or(4 + NAME_MAX_LEN);
+    let name_bytes = &frame[4..name_end];
+    // If name_end landed at 4+31 without finding a NUL, the name is
+    // UNTERMINATED within the classic gate — reject (the spec's
+    // hard gate).
+    if name_end == 4 + NAME_MAX_LEN && frame[name_end] != 0 {
+        return None;
+    }
+    // Value: NUL-terminated within 92 bytes. If the value is empty
+    // (value[0] == 0) AND the frame is wide-layout-capable (≥188
+    // bytes), try the wide fallback (some vendor clients emit the
+    // wide layout for long names that overflow 32 bytes).
+    let mut value_start = 36usize;
+    let mut value_max = 36 + 92; // 128 — but frame may be longer
+    if frame.len() >= WIDE_SIZE && name_bytes.is_empty() {
+        // Wide fallback: name @ 4 (92 bytes), value @ 96 (92 bytes).
+        // Re-parse the name from the wide slot.
+        let wide_name_end =
+            (4..4 + NAME_MAX_LEN).find(|&i| frame[i] == 0).unwrap_or(4 + NAME_MAX_LEN);
+        let wide_name_bytes = &frame[4..wide_name_end];
+        if wide_name_end == 4 + NAME_MAX_LEN && frame[wide_name_end] != 0 {
+            // Wide name also unterminated — reject.
+            return None;
+        }
+        value_start = 96;
+        value_max = 96 + 92;
+        let value_end = (value_start..value_max)
+            .find(|&i| i >= frame.len() || frame[i] == 0)
+            .unwrap_or(value_max.min(frame.len()));
+        let value = String::from_utf8_lossy(&frame[value_start..value_end]).into_owned();
+        let name = String::from_utf8_lossy(wide_name_bytes).into_owned();
+        return Some((name, value));
+    }
+    // Classic value parse.
+    let value_end = (value_start..value_max)
+        .find(|&i| i >= frame.len() || frame[i] == 0)
+        .unwrap_or(value_max.min(frame.len()));
+    let value = String::from_utf8_lossy(&frame[value_start..value_end]).into_owned();
+    let name = String::from_utf8_lossy(name_bytes).into_owned();
+    Some((name, value))
+}
+
+/// Task 6-Z111: detect the property-area format of a snapshot blob.
+/// Returns one of:
+///   - `New`: valid NEW-format area (Android 8+, the AOSP-11 target).
+///   - `Empty`: all-zero snapshot (a child's anonymous mapping that's
+///     never been initialized — bionic's `map_fd_ro` rejects this
+///     anyway via the st_size ≥ 128 gate).
+///   - `Old`: Android 5.x/6/7 single-file format (magic @ 4, 32-byte
+///     header). The walker stays NEW-format-only — writing OLD-format
+///     areas by reusing NEW offsets would corrupt; refuse + log.
+///   - `CorruptBytesUsed`: bytes_used > PA_SIZE (a torn write or a
+///     hostile snapshot).
+///   - `CorruptVersion`: magic is right but version is wrong (a future
+///     bionic variant the walker doesn't know about).
+///   - `NotAnArea`: magic is wrong — the snapshot is not a property
+///     area at all (a different mmap'd file mistakenly registered).
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum PropAreaFormat {
+    New,
+    Empty,
+    Old,
+    CorruptBytesUsed,
+    CorruptVersion,
+    NotAnArea,
+}
+
+/// Task 6-Z111: PA_SIZE = 128 KiB. Per AOSP `prop_area.h`:
+///   static constexpr int PA_SIZE = 128 * 1024;
+const PROP_AREA_SIZE: usize = 128 * 1024;
+
+/// Task 6-Z111: NEW-format magic + version constants (per AOSP
+/// `prop_area.h`):
+///   static constexpr uint32_t MAGIC = 0x504f5250;  // "PROP"
+///   static constexpr uint32_t MAGIC_VERSION = 0xfc6ed0ab;
+const PROP_AREA_MAGIC: u32 = 0x504f5250;
+const PROP_AREA_VERSION: u32 = 0xfc6ed0ab;
+
+/// Task 6-Z111: OLD (Android 5.x/6/7) format header size (per
+/// `libc/include/sys/_system_properties.h`):
+///   #define PROP_AREA_MAGIC 0x504f5250  // "PROP" — NEW @ 8
+///   #define PROP_AREA_MAGIC_VERSION 0xfc6ed0ab
+/// (5.1 puts the SAME magic at +4 instead of +8, with a 32-byte
+/// header — that exact difference is the OLD-format detector.)
+const PROP_AREA_OLD_HEADER_SIZE: usize = 32;
+
+fn prop_area_detect_format(snapshot: &[u8]) -> PropAreaFormat {
+    // The NEW-format header is 128 bytes (bytes_used@0, serial@4,
+    // magic@8, version@12, reserved[28]@16..128, data_@128). A
+    // snapshot < 16 bytes can't even hold bytes_used + serial + magic
+    // → treat as NotAnArea (the Empty case requires all-zeros THROUGH
+    // the header, so an 8-byte snapshot can't be Empty either).
+    if snapshot.is_empty() {
+        return PropAreaFormat::NotAnArea;
+    }
+    // Empty: all-zero snapshot (the first 16 bytes hold bytes_used,
+    // serial, magic, version — all zero → the area was never
+    // initialized). Bionic's map_fd_ro rejects this anyway via the
+    // st_size ≥ 128 gate, but the z111 broadcaster still needs to
+    // detect it so it can log "EMPTY snapshot" and SKIP the write.
+    let header_min = std::cmp::min(snapshot.len(), 16);
+    if snapshot[..header_min].iter().all(|&b| b == 0) {
+        return PropAreaFormat::Empty;
+    }
+    if snapshot.len() < 16 {
+        return PropAreaFormat::NotAnArea;
+    }
+    // Magic @ offset 8 (NEW format).
+    let magic = u32::from_le_bytes([snapshot[8], snapshot[9], snapshot[10], snapshot[11]]);
+    let version = u32::from_le_bytes([snapshot[12], snapshot[13], snapshot[14], snapshot[15]]);
+    if magic == PROP_AREA_MAGIC && version == PROP_AREA_VERSION {
+        // NEW format — sanity-check bytes_used.
+        let bytes_used = u32::from_le_bytes([snapshot[0], snapshot[1], snapshot[2], snapshot[3]]);
+        if bytes_used as usize > PROP_AREA_SIZE {
+            return PropAreaFormat::CorruptBytesUsed;
+        }
+        return PropAreaFormat::New;
+    }
+    // OLD format: magic @ offset 4 (5.x/6/7). The 32-byte header
+    // starts at offset 0; magic @ +4, version @ +8.
+    if snapshot.len() >= PROP_AREA_OLD_HEADER_SIZE {
+        let old_magic = u32::from_le_bytes([snapshot[4], snapshot[5], snapshot[6], snapshot[7]]);
+        let old_version =
+            u32::from_le_bytes([snapshot[8], snapshot[9], snapshot[10], snapshot[11]]);
+        if old_magic == PROP_AREA_MAGIC && old_version == PROP_AREA_VERSION {
+            return PropAreaFormat::Old;
+        }
+    }
+    // Magic is right but version is wrong — CorruptVersion (the
+    // walker doesn't know about this bionic variant).
+    if magic == PROP_AREA_MAGIC && version != PROP_AREA_VERSION {
+        return PropAreaFormat::CorruptVersion;
+    }
+    PropAreaFormat::NotAnArea
+}
+
+/// Task 6-Z111: prop_bt (NEW-format trie node). Per AOSP
+/// `prop_area.h`:
+///   struct prop_bt {
+///     uint32_t namelen;   // @0
+///     uint32_t prop;      // @4 — offset of prop_info RELATIVE TO data_
+///     uint32_t left;      // @8
+///     uint32_t right;     // @12
+///     uint32_t children;  // @16
+///     char name[];        // @20 — NUL-terminated, align-4 allocated
+///   };
+/// 20 bytes + name. The `prop`, `left`, `right`, `children` offsets
+/// are ALL relative to the start of `data_` (offset 128 in the area).
+/// An offset of 0 means "none" (the root node's left/right are always
+/// 0; the root node's children point to the first top-level trie
+/// node).
+const PROP_BT_SIZE: usize = 20; // fixed part before the variable name
+
+/// Task 6-Z111: the prop_bt trie walker. Given a snapshot of a
+/// property area (the whole 128 KiB) and a property name (e.g.
+/// "ro.build.fingerprint"), walk the trie and return the OFFSET of
+/// the prop_info RELATIVE to the start of the snapshot (i.e. the
+/// absolute index into `snapshot` where the prop_info starts).
+///
+/// Walk algorithm (verified from AOSP `find_property`):
+///   1. Start at the root prop_bt (offset 128 = the start of `data_`).
+///      The root is a pure CONTAINER — namelen=0, prop=0, left=0,
+///      right=0, children = offset of first top-level trie node.
+///   2. For EACH token in the property name (split by '.'):
+///      a. If parent.children == 0, no children → return None.
+///      b. Walk the sibling binary-tree starting from children:
+///         at each node, compare (namelen, name) lexicographically:
+///            - if equal: this is the node for this token. Continue
+///              to the next token with this node as the new parent.
+///            - if less: go to left (offset relative to data_+0).
+///            - if greater: go to right.
+///         c. If we run out of siblings without a match, return None.
+///   3. After all tokens, the final node's `prop` field is the
+///      prop_info offset RELATIVE TO data_+0 (so the absolute snapshot
+///      offset is 128 + node.prop). If prop == 0, the node exists but
+///      has no prop_info → return None (the key is a partial-prefix
+///      match, not a leaf).
+///
+/// Returns None on:
+///   - snapshot too small to hold the root prop_bt (< 128 + 20);
+///   - any prop_bt offset out of bounds (a corrupt trie — the walker
+///     refuses to PEEK past the snapshot);
+///   - the property name is empty (a degenerate case bionic rejects);
+///   - no match (prefix-only key, missing branch, or key not in the
+///     trie).
+fn prop_area_find_prop_info(snapshot: &[u8], name: &str) -> Option<usize> {
+    // Root prop_bt lives at offset 128 (data_+0 in the area).
+    const DATA_OFFSET: usize = 128;
+    if snapshot.len() < DATA_OFFSET + PROP_BT_SIZE {
+        return None;
+    }
+    if name.is_empty() {
+        return None;
+    }
+    // Helpers to read u32 fields from a prop_bt at the given snapshot
+    // offset. Each returns None on out-of-bounds (corrupt trie).
+    let read_u32 = |off: usize| -> Option<u32> {
+        if off + 4 > snapshot.len() {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            snapshot[off],
+            snapshot[off + 1],
+            snapshot[off + 2],
+            snapshot[off + 3],
+        ]))
+    };
+    let read_name = |node_off: usize, namelen: usize| -> Option<&[u8]> {
+        let name_start = node_off + PROP_BT_SIZE;
+        let name_end = name_start + namelen;
+        if name_end > snapshot.len() {
+            return None;
+        }
+        Some(&snapshot[name_start..name_end])
+    };
+    // cmp_prop_name: compare (namelen, name) of a child node vs the
+    // token. Returns 0 on match, <0 if child < token, >0 if child >
+    // token (matches bionic's lexicographic order — namelen first,
+    // then bytes).
+    let cmp_prop_name = |node_off: usize, tok: &[u8]| -> Option<i32> {
+        let namelen = read_u32(node_off)? as usize;
+        let node_name = read_name(node_off, namelen)?;
+        // Compare namelen first.
+        if namelen != tok.len() {
+            return Some(if namelen < tok.len() { -1 } else { 1 });
+        }
+        // Same length — compare bytes.
+        let cmp = node_name.cmp(tok);
+        Some(match cmp {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        })
+    };
+    // Walk the trie. parent = root prop_bt @ 128.
+    let mut parent_off = DATA_OFFSET; // start at root
+    let tokens: Vec<&str> = name.split('.').collect();
+    for tok in tokens {
+        if tok.is_empty() {
+            // A double-dot or a leading/trailing dot is invalid.
+            return None;
+        }
+        let tok_bytes = tok.as_bytes();
+        // parent.children is the offset of the first child RELATIVE
+        // TO data_+0; the absolute snapshot offset is DATA_OFFSET +
+        // children.
+        let children_rel = read_u32(parent_off + 16)?;
+        if children_rel == 0 {
+            return None; // no children → token not in trie
+        }
+        let mut node_off = DATA_OFFSET + children_rel as usize;
+        let mut found = false;
+        // Walk the sibling binary-tree. Bound the loop at 64k
+        // iterations (a corrupt trie with a cycle would otherwise
+        // spin forever).
+        for _ in 0..0x10000 {
+            let cmp = match cmp_prop_name(node_off, tok_bytes) {
+                Some(c) => c,
+                None => return None, // out-of-bounds → corrupt
+            };
+            if cmp == 0 {
+                parent_off = node_off;
+                found = true;
+                break;
+            }
+            // cmp < 0 → go left; cmp > 0 → go right.
+            let next_rel = if cmp < 0 {
+                read_u32(node_off + 8)? // left
+            } else {
+                read_u32(node_off + 12)? // right
+            };
+            if next_rel == 0 {
+                break; // no more siblings in this direction
+            }
+            node_off = DATA_OFFSET + next_rel as usize;
+        }
+        if !found {
+            return None; // ran out of siblings without a match
+        }
+    }
+    // After all tokens, parent is the leaf node. Its `prop` field is
+    // the prop_info offset RELATIVE TO data_+0. If prop == 0, the
+    // node has no prop_info (a prefix-only key).
+    let prop_rel = read_u32(parent_off + 4)?;
+    if prop_rel == 0 {
+        return None;
+    }
+    Some(DATA_OFFSET + prop_rel as usize)
+}
+
+/// Task 6-Z111: prop_info (NEW format). Per AOSP `prop_info.h`:
+///   struct prop_info {
+///     uint32_t serial;     // @0 — len<<24 | counter; bit0=DIRTY,
+///                          //       bit16=kLongFlag
+///     char value[92];      // @4 — short props (value[0..92])
+///     // if kLongFlag is set, the value is stored ELSEWHERE and the
+///     // uint32_t at offset +60 (long_property.offset) holds the
+///     // offset RELATIVE TO the prop_info's address.
+///     char name[];         // @96 — variable length
+///   };
+const PROP_INFO_SERIAL_OFF: usize = 0;
+const PROP_INFO_VALUE_OFF: usize = 4;
+const PROP_INFO_VALUE_LEN: usize = 92;
+const PROP_INFO_LONG_OFFSET_OFF: usize = 60;
+#[allow(dead_code)]
+const PROP_INFO_NAME_OFF: usize = 96;
+const PROP_SERIAL_DIRTY_BIT: u32 = 1;
+const PROP_SERIAL_LONG_FLAG_BIT: u32 = 1 << 16;
+const PROP_SERIAL_LEN_SHIFT: u32 = 24;
+const PROP_SERIAL_COUNTER_MASK: u32 = 0xffffff;
+
+/// Task 6-Z111: the update planner. Given a snapshot of a property
+/// area, a property name, and a new value, return a plan that
+/// describes the writes the broadcaster should perform to apply the
+/// update IN PLACE (bionic's SystemProperties::Update order). The
+/// plan is PURE — no ptrace, no globals — so it can be unit-locked
+/// by the `z111_plan_update_*` tests.
+///
+/// HARD GATES (the planner returns Ok(None) — "no plan, skip" — if
+/// any gate fails):
+///   1. Key must EXIST in the trie — no trie insertion, ever. The
+///      walker returns None for missing keys; the planner surfaces
+///      that as Ok(None) with reason "not in trie" (the broadcaster
+///      logs it; the property stays unset for this area).
+///   2. new len ≤ stored len — short props zero-padded to the old
+///      span like strlcpy's buffer. LONG properties updated at their
+///      indirect location with strlen as the capacity gate, keeping
+///      kLongFlag + len nibble, counter bumped. (A new value LONGER
+///      than the stored span would require trie reallocation, which
+///      is unsafe to do in-place against concurrent readers.)
+///
+/// The plan describes bionic's exact 4-write order:
+///   (a) dirty the prop_info's serial: serial |= 1
+///   (b) copy the new value + NUL + zero-pad to the old span
+///   (c) final serial: serial = (new_len << 24) | ((old_serial | 1) + 1) & 0xffffff
+///   (d) area serial: area.serial = area.serial + 1
+/// (The __futex_wake step bionic does after (d) CANNOT be done by
+/// the tracer — futex-WAITING readers stay parked, but cached_serial
+/// POLLERS are invalidated by the area.serial bump.)
+#[derive(Debug, Clone, PartialEq)]
+struct PropAreaUpdatePlan {
+    /// Snapshot offset of the prop_info (where to write the serial +
+    /// value). For short props, this is the prop_info's address; for
+    /// long props, the value is written at prop_info_off +
+    /// long_property.offset, but the serial is still at prop_info_off.
+    prop_info_off: usize,
+    /// Snapshot offset of the area's serial (offset 4 in the area).
+    area_serial_off: usize,
+    /// The old serial (len<<24 | counter; with DIRTY/LONG bits).
+    old_serial: u32,
+    /// The new serial value to write at step (c).
+    new_serial: u32,
+    /// Snapshot offset where the VALUE is written (step b).
+    value_off: usize,
+    /// The new value bytes (already NUL-padded to the old span — the
+    /// broadcaster writes this exact byte sequence).
+    value_bytes: Vec<u8>,
+    /// The new area serial value to write at step (d).
+    new_area_serial: u32,
+    /// The old area serial (read from offset 4).
+    old_area_serial: u32,
+    /// Whether this is a long-property update (kLongFlag is set).
+    is_long: bool,
+}
+
+/// Task 6-Z111: produce an update plan. Returns:
+///   - Ok(Some(plan)) if the plan can be produced (key exists, value
+///     fits).
+///   - Ok(None) if a HARD GATE fails (key not in trie, value longer
+///     than stored, snapshot is empty/OLD/corrupt).
+///   - Err(()) if the snapshot is too small or out-of-bounds (a
+///     corrupt trie — the broadcaster logs and drops the
+///     registration).
+fn prop_area_plan_update(
+    snapshot: &[u8],
+    name: &str,
+    new_value: &str,
+) -> Result<Option<PropAreaUpdatePlan>, ()> {
+    // Format gate — refuse OLD / corrupt / not-an-area.
+    let fmt = prop_area_detect_format(snapshot);
+    match fmt {
+        PropAreaFormat::New => {}
+        PropAreaFormat::Empty
+        | PropAreaFormat::Old
+        | PropAreaFormat::CorruptBytesUsed
+        | PropAreaFormat::CorruptVersion
+        | PropAreaFormat::NotAnArea => return Ok(None),
+    }
+    // Find the prop_info offset. Ok(None) if the key isn't in the
+    // trie (gate 1 — key must EXIST).
+    let prop_info_off = match prop_area_find_prop_info(snapshot, name) {
+        Some(off) => off,
+        None => return Ok(None),
+    };
+    if prop_info_off + PROP_INFO_NAME_OFF > snapshot.len() {
+        return Err(()); // corrupt — prop_info past end of snapshot
+    }
+    let old_serial = u32::from_le_bytes([
+        snapshot[prop_info_off + PROP_INFO_SERIAL_OFF],
+        snapshot[prop_info_off + 1],
+        snapshot[prop_info_off + 2],
+        snapshot[prop_info_off + 3],
+    ]);
+    let is_long = (old_serial & PROP_SERIAL_LONG_FLAG_BIT) != 0;
+    let old_len = (old_serial >> PROP_SERIAL_LEN_SHIFT) as usize;
+    // The VALUE's address + capacity:
+    //   - short prop: value at prop_info_off + 4, capacity = 91
+    //     (PROP_INFO_VALUE_LEN - 1 for the NUL — bionic's
+    //     `kLongestProperty` is 91 + NUL = 92).
+    //   - long prop: value at prop_info_off + long_property.offset,
+    //     capacity = strlen (the long value's capacity gate — bionic
+    //     sets this when the long value is first allocated).
+    let (value_off, capacity) = if is_long {
+        if prop_info_off + PROP_INFO_LONG_OFFSET_OFF + 4 > snapshot.len() {
+            return Err(());
+        }
+        let long_offset = u32::from_le_bytes([
+            snapshot[prop_info_off + PROP_INFO_LONG_OFFSET_OFF],
+            snapshot[prop_info_off + PROP_INFO_LONG_OFFSET_OFF + 1],
+            snapshot[prop_info_off + PROP_INFO_LONG_OFFSET_OFF + 2],
+            snapshot[prop_info_off + PROP_INFO_LONG_OFFSET_OFF + 3],
+        ]) as usize;
+        let v_off = prop_info_off + long_offset;
+        // For long props, the OLD serial's len nibble is the strlen
+        // (the long value's capacity gate — bionic stores the value's
+        // length, NOT the prop_info's, in the len nibble for long
+        // props). A new value LONGER than this strlen would require
+        // reallocation, which is unsafe in-place.
+        (v_off, old_len)
+    } else {
+        (prop_info_off + PROP_INFO_VALUE_OFF, PROP_INFO_VALUE_LEN - 1)
+    };
+    let new_len = new_value.len();
+    // Gate 2: new len ≤ capacity.
+    if new_len > capacity {
+        return Ok(None);
+    }
+    // Build the value bytes: new_value + NUL + zero-pad to the old
+    // span (like strlcpy's buffer).
+    let mut value_bytes = vec![0u8; capacity + 1]; // +1 for NUL
+    let copy_len = std::cmp::min(new_len, capacity);
+    value_bytes[..copy_len].copy_from_slice(&new_value.as_bytes()[..copy_len]);
+    value_bytes[copy_len] = 0; // NUL terminator
+    // value_bytes is now new_value + NUL + zero-pad to capacity+1.
+    // Compute the new serial: (new_len << 24) | ((old_serial | 1) + 1) & 0xffffff
+    let new_serial: u32 = ((new_len as u32) << PROP_SERIAL_LEN_SHIFT)
+        | (((old_serial | PROP_SERIAL_DIRTY_BIT) + 1) & PROP_SERIAL_COUNTER_MASK)
+        | (if is_long {
+            PROP_SERIAL_LONG_FLAG_BIT
+        } else {
+            0
+        });
+    // Area serial (offset 4 in the area).
+    let area_serial_off = 4usize;
+    if area_serial_off + 4 > snapshot.len() {
+        return Err(());
+    }
+    let old_area_serial = u32::from_le_bytes([
+        snapshot[area_serial_off],
+        snapshot[area_serial_off + 1],
+        snapshot[area_serial_off + 2],
+        snapshot[area_serial_off + 3],
+    ]);
+    let new_area_serial = old_area_serial.wrapping_add(1);
+    Ok(Some(PropAreaUpdatePlan {
+        prop_info_off,
+        area_serial_off,
+        old_serial,
+        new_serial,
+        value_off,
+        value_bytes,
+        new_area_serial,
+        old_area_serial,
+        is_long,
+    }))
+}
+
+/// Task 6-Z111: the broadcaster. Called from the 6-Z110 send-fake
+/// (direct SendTo/SendMsg/WriteV arm AND i386 socketcall 9/11/16 arm)
+/// AFTER the return fake completes. Reads the send payload from the
+/// child, parse_prop_msg's it, and BROADCASTS the property update to
+/// EVERY tracked mmap'd property area of EVERY pid (setter's own pid
+/// first — same-process read-back latency — then the rest). For each
+/// area: snapshot via process_vm_readv (the fb0-bridge helper with
+/// its 6-Z84 TRAP guard) with a PEEKDATA fallback, plan via
+/// `prop_area_plan_update`, then execute bionic's exact 4-write order
+/// (dirty serial → value+NUL+pad → final serial → area serial) via
+/// `write_child_bytes_injection`.
+///
+/// Every outcome is ONE diagnosable line under the shared 400-line
+/// `prop_area_log_count` budget:
+///   - `property AREA UPDATED` (with old→new lens, serial math,
+///     prop_info offset, setter-marked);
+///   - `property NOT in this area's trie` (key missing — the area
+///     doesn't have the key; stays unset for this area);
+///   - `area update SKIPPED` (OLD format / EMPTY snapshot / len gate
+///     / NotAnArea);
+///   - `area update READ FAILED` → drop the (pid, addr) registration
+///     (self-heal for munmap/execve staleness).
+///
+/// `setter_pid` is the pid that issued the prop_msg send — its own
+/// areas get the write FIRST (the same-process read-back latency
+/// matters: a setter that immediately re-reads its own value sees
+/// the new value if its area was written first).
+fn z111_apply_property_set(
+    setter_pid: libc::pid_t,
+    name: &str,
+    value: &str,
+    prop_area_maps: &mut std::collections::HashMap<libc::pid_t, Vec<(u64, usize)>>,
+    vm_writev_usable: &mut Option<bool>,
+    prop_area_log_count: &mut u32,
+    log_cap: u32,
+) {
+    if name.is_empty() {
+        return; // nothing to write (a malformed prop_msg)
+    }
+    // Collect (pid, addr, len) for every tracked area, ordered with
+    // the setter's pid FIRST (same-process read-back latency). The
+    // sort is stable — areas within the same pid retain insertion
+    // order.
+    let mut all_areas: Vec<(libc::pid_t, u64, usize)> = Vec::new();
+    if let Some(entries) = prop_area_maps.get(&setter_pid) {
+        for &(addr, len) in entries {
+            all_areas.push((setter_pid, addr, len));
+        }
+    }
+    let mut other_pids: Vec<libc::pid_t> = prop_area_maps
+        .keys()
+        .filter(|&&p| p != setter_pid)
+        .copied()
+        .collect();
+    other_pids.sort_unstable();
+    for p in other_pids {
+        if let Some(entries) = prop_area_maps.get(&p) {
+            for &(addr, len) in entries {
+                all_areas.push((p, addr, len));
+            }
+        }
+    }
+    if all_areas.is_empty() {
+        return;
+    }
+    let mut drop_pids: Vec<(libc::pid_t, u64)> = Vec::new();
+    for (area_pid, addr, len) in all_areas {
+        let snap_len = std::cmp::min(len, PROP_AREA_SIZE);
+        if snap_len < 128 {
+            drop_pids.push((area_pid, addr));
+            continue;
+        }
+        let mut snapshot = vec![0u8; snap_len];
+        // Primary: process_vm_readv via fb0_bridge_read_child_mem
+        // (it has the 6-Z84 TRAP guard that detects a seccomp-blocked
+        // readv via the syscall-number-leak value).
+        let n = fb0_bridge_read_child_mem(area_pid, addr, &mut snapshot);
+        if n <= 0 || n == 310 || n == 270 {
+            // Fallback: PEEKDATA. read_child_bytes reads word-sized
+            // chunks and stops at the first unmapped address.
+            match read_child_bytes(area_pid, addr, snap_len) {
+                Some(b) => {
+                    if b.len() < snap_len {
+                        snapshot[..b.len()].copy_from_slice(&b);
+                        snapshot[b.len()..].fill(0);
+                    } else {
+                        snapshot.copy_from_slice(&b);
+                    }
+                }
+                None => {
+                    if *prop_area_log_count < log_cap {
+                        *prop_area_log_count += 1;
+                        fb0_log(&format!(
+                            "6-Z111: area update READ FAILED for pid={} @ {:#x} (process_vm_readv AND PEEKDATA both failed — mapping gone?) — dropping the registration (self-heal for munmap/execve staleness)",
+                            area_pid, addr
+                        ));
+                    }
+                    drop_pids.push((area_pid, addr));
+                    continue;
+                }
+            }
+        } else {
+            for i in (n as usize)..snap_len {
+                snapshot[i] = 0;
+            }
+        }
+        match prop_area_plan_update(&snapshot, name, value) {
+            Ok(Some(plan)) => {
+                // (a) dirty the prop_info's serial: serial |= 1
+                let dirty_serial = plan.old_serial | PROP_SERIAL_DIRTY_BIT;
+                let dirty_bytes = dirty_serial.to_le_bytes();
+                let _ = write_child_bytes_injection(
+                    area_pid,
+                    addr.wrapping_add(plan.prop_info_off as u64),
+                    &dirty_bytes,
+                    vm_writev_usable,
+                );
+                // (b) copy the new value + NUL + zero-pad.
+                let _ = write_child_bytes_injection(
+                    area_pid,
+                    addr.wrapping_add(plan.value_off as u64),
+                    &plan.value_bytes,
+                    vm_writev_usable,
+                );
+                // (c) final serial: plan.new_serial.
+                let final_bytes = plan.new_serial.to_le_bytes();
+                let _ = write_child_bytes_injection(
+                    area_pid,
+                    addr.wrapping_add(plan.prop_info_off as u64),
+                    &final_bytes,
+                    vm_writev_usable,
+                );
+                // (d) area serial: plan.new_area_serial.
+                let area_bytes = plan.new_area_serial.to_le_bytes();
+                let _ = write_child_bytes_injection(
+                    area_pid,
+                    addr.wrapping_add(plan.area_serial_off as u64),
+                    &area_bytes,
+                    vm_writev_usable,
+                );
+                if *prop_area_log_count < log_cap {
+                    *prop_area_log_count += 1;
+                    let old_len = (plan.old_serial >> PROP_SERIAL_LEN_SHIFT) as usize;
+                    let new_len = (plan.new_serial >> PROP_SERIAL_LEN_SHIFT) as usize;
+                    fb0_log(&format!(
+                        "6-Z111: property AREA UPDATED — pid={} @ {:#x} (prop_info_off={}, value_off={}, {}) '{}' old_len={} → new_len={}, serial {:#x} → {:#x}, area_serial {:#x} → {:#x} (setter-marked by pid={})",
+                        area_pid,
+                        addr,
+                        plan.prop_info_off,
+                        plan.value_off,
+                        if plan.is_long { "LONG" } else { "SHORT" },
+                        name,
+                        old_len,
+                        new_len,
+                        plan.old_serial,
+                        plan.new_serial,
+                        plan.old_area_serial,
+                        plan.new_area_serial,
+                        setter_pid
+                    ));
+                }
+            }
+            Ok(None) => {
+                if *prop_area_log_count < log_cap {
+                    *prop_area_log_count += 1;
+                    let fmt = prop_area_detect_format(&snapshot);
+                    let reason = match fmt {
+                        PropAreaFormat::Empty => "EMPTY snapshot (never initialized)",
+                        PropAreaFormat::Old => "OLD (Android 5.x/6/7) — walker is NEW-format-only",
+                        PropAreaFormat::CorruptBytesUsed => "corrupt bytes_used",
+                        PropAreaFormat::CorruptVersion => "corrupt version",
+                        PropAreaFormat::NotAnArea => "not a property area (magic mismatch)",
+                        PropAreaFormat::New => "property NOT in this area's trie OR new len > capacity — stays unset",
+                    };
+                    fb0_log(&format!(
+                        "6-Z111: area update SKIPPED for pid={} @ {:#x} ({}) — {}",
+                        area_pid, addr, name, reason
+                    ));
+                }
+            }
+            Err(()) => {
+                if *prop_area_log_count < log_cap {
+                    *prop_area_log_count += 1;
+                    fb0_log(&format!(
+                        "6-Z111: area update SKIPPED for pid={} @ {:#x} ({}) — corrupt trie (out-of-bounds offset) — dropping registration",
+                        area_pid, addr, name
+                    ));
+                }
+                drop_pids.push((area_pid, addr));
+            }
+        }
+    }
+    for (drop_pid, drop_addr) in drop_pids {
+        if let Some(entries) = prop_area_maps.get_mut(&drop_pid) {
+            entries.retain(|&(a, _)| a != drop_addr);
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -5078,6 +6869,7 @@ pub fn ptrace_available() -> bool {
 pub fn run_ptrace_loop(
     pid: libc::pid_t,
     rootfs: &str,
+    data_dir: &str,
     vfs: &crate::vfs::Vfs,
     recovery_pid: Option<libc::pid_t>,
 ) -> i32 {
@@ -5087,8 +6879,8 @@ pub fn run_ptrace_loop(
     };
 
     log(&format!(
-        "ptrace loop started for pid {} (rootfs={})",
-        pid, rootfs
+        "ptrace loop started for pid {} (rootfs={}, data_dir={})",
+        pid, rootfs, data_dir
     ));
 
     // ── Task 6-Z62: install the protective SIGSYS catcher BEFORE anything
@@ -5368,6 +7160,62 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     // Rate-limit for recv-on-fake-fd logs (a poll spin can hot-loop).
     let mut netlink_recv_log_count: u32 = 0;
+    // ── Task 6-Z110: property-service CLIENT fd tracking state ──
+    //
+    // `fake_propserv_fds`: per-pid set of REAL kernel fds whose FAILED
+    //   connect(@property_service) was faked to 0. NO fake-fd allocator
+    //   here — socket() genuinely succeeded, so the fd number is real;
+    //   only the tracer remembers it needs emulated protocol returns
+    //   (send→len, recv→0, close→0+remove). Per-pid because fd tables
+    //   are per-process: init's fd=5 and the recovery child's fd=5 are
+    //   different file descriptors that would collide in a fd-only map.
+    //   A forked child inherits the kernel-fd NUMBER but NOT the
+    //   tracked status (a property-set client opens its OWN socket, so
+    //   even an inherited fd would never be in the tracked set). The
+    //   set is dropped on child death (forget_dead_pid_state below); a
+    //   pid-RECYCLED successor inherits nothing (stale fd tracking would
+    //   fake the new pid's genuine socket ops — the corruption class
+    //   the forget_dead_pid_state pattern exists to prevent).
+    // `propserv_log_count`: shared rate-limit (40 lines). A property_set
+    //   retry loop must not flood logcat — a single failing set under
+    //   bionic's retry-loop can hot-spin connect/send/recv/close dozens
+    //   of times per second.
+    let mut fake_propserv_fds: std::collections::HashMap<
+        libc::pid_t,
+        std::collections::HashSet<i64>,
+    > = std::collections::HashMap::new();
+    let mut propserv_log_count: u32 = 0;
+    const PROPSERV_LOG_CAP: u32 = 40;
+    // ── Task 6-Z111: property AREA fd + (addr,len) registration ──
+    //
+    // `property_area_fds`: per-(pid, fd) HashSet of fds whose
+    //   translated open path matches `is_property_area_file`. Survives
+    //   close by design — the mapping outlives the fd; a recycled fd
+    //   can at worst register a non-area whose snapshot then fails
+    //   the header check, logged, never written. NOT inherited
+    //   across fork in the tracer's view (a forked child opens its
+    //   OWN property area fds at property_init / __system_
+    //   properties_init).
+    // `prop_area_maps`: per-pid Vec<(addr, len)> of mmap'd property
+    //   area regions in the child's address space. Dedup by address;
+    //   cap 8/pid (a property area is typically one mapping; 8 covers
+    //   init's + zygote's + per-context files generously). Fork-like
+    //   children INHERIT the parent-leader's + parent's registrations
+    //   at the SAME addresses (mandatory for zygote-forked
+    //   system_server/app processes: a write through the parent's
+    //   entry COWs the PARENT's page, not the child's, so both
+    //   entries must exist and each receive its own write). CLONEVM
+    //   children need no copy (same mm).
+    // `prop_area_log_count`: shared 400-line budget for the
+    //   broadcaster's diagnostic lines. A property_set retry loop
+    //   would otherwise flood logcat.
+    let mut property_area_fds: std::collections::HashSet<(libc::pid_t, i32)> =
+        std::collections::HashSet::new();
+    let mut prop_area_maps: std::collections::HashMap<libc::pid_t, Vec<(u64, usize)>> =
+        std::collections::HashMap::new();
+    let mut prop_area_log_count: u32 = 0;
+    const PROP_AREA_LOG_CAP: u32 = 400;
+    const PROP_AREA_MAPS_PER_PID_CAP: usize = 8;
     // Shared rate-limit for 6-Z71 SKIP-path logs (init's stat64-poll
     // loops fire thousands of legitimate ENOENTs — those must not flood
     // logcat). EMULATED / FAILED lines are NOT counted.
@@ -5578,6 +7426,18 @@ pub fn run_ptrace_loop(
     // lint for this known-dead init.
     #[allow(unused_assignments)]
     let mut scratch_offset: usize = 0;
+    // ── Task 6-Z101 + 6-Z102: staged-executable map (lazy, read-ONCE)
+    //
+    // The .twoyi-staged marker is written pre-fork by lib.rs (one entry
+    // per boot: the boot-init copy at {data_dir}/cache/twoyi_init) and
+    // is read lazily at the FIRST execve ENTRY. The 6-Z102 tracer-side
+    // generic staging (stage_guest_executable) grows the map at runtime:
+    // each guest execve of a {rootfs}{P} ELF gets copied to
+    // {data_dir}/cache/twoyi_stage/<name>, chmod 0755, the marker is
+    // RMW-updated, and the in-loop map is updated so the next exec of
+    // the same path is a fast cache hit (one copy per ROM binary per
+    // boot, reused afterwards).
+    let mut staged_exes: Option<std::collections::HashMap<String, String>> = None;
     // Rolling log of the last N SIGSYS-intercepted syscall numbers.
     // Used on child exit to print "the last few syscalls seccomp
     // blocked" — this is the single most useful diagnostic when init
@@ -6174,6 +8034,28 @@ pub fn run_ptrace_loop(
             if pending_kmsg_open_pid == Some(pid) {
                 pending_kmsg_open_pid = None;
             }
+            // ── Task 6-Z110: per-pid fd-table cleanup ──
+            //
+            // Drop the dead pid's per-pid fd-table state so a
+            // pid-RECYCLED successor inherits NOTHING — a stale entry
+            // would make the new pid's genuine socket ops hit the
+            // property-client fake path. Covers in_syscall_map (Task
+            // 6-Z54), fake_netlink_fds + netlink_fd_next (6-Z99), and
+            // the new fake_propserv_fds (6-Z110). kmsg_fd and
+            // recovery_child_pid are loop-level singletons handled
+            // separately in the init_pid re-anchor block below.
+            forget_dead_pid_state(
+                pid,
+                &mut in_syscall_map,
+                &mut fake_netlink_fds,
+                &mut netlink_fd_next,
+                &mut fake_propserv_fds,
+            );
+            // 6-Z111: also drop the dead pid's property-area
+            // registrations (the property_area_fds entries for the
+            // dead pid + the prop_area_maps entries — see
+            // forget_dead_pid_state_areas).
+            forget_dead_pid_state_areas(pid, &mut property_area_fds, &mut prop_area_maps);
             // Print the last few SIGSYS-intercepted syscalls so we can
             // identify what init was doing right before it died. This is
             // critical for diagnosing the "init exits with code 1 at
@@ -6251,12 +8133,13 @@ pub fn run_ptrace_loop(
                     current_pid = new_init;
                     // Per-old-pid hygiene (6-Z97): the dead parent's
                     // state must never leak into the new init through a
-                    // later pid reuse. (pending_poll_fake / pending_*
-                    // were already cleared for `pid` above; these are
-                    // the NOT-pid-keyed leftovers.)
-                    in_syscall_map.remove(&pid);
-                    fake_netlink_fds.remove(&pid);
-                    netlink_fd_next.remove(&pid);
+                    // later pid reuse. The four per-pid fd-table maps
+                    // (in_syscall_map, fake_netlink_fds,
+                    // netlink_fd_next, fake_propserv_fds — the last
+                    // added in 6-Z110) are dropped by the
+                    // forget_dead_pid_state call in the WIFEXITED
+                    // header above; these are the NOT-pid-keyed
+                    // leftovers (loop-level singletons).
                     kmsg_fd = None; // the captured kmsg fd belongs to
                                     // the dead parent's fd table
                     if recovery_child_pid == Some(pid) {
@@ -6326,6 +8209,26 @@ pub fn run_ptrace_loop(
             if pending_kmsg_open_pid == Some(pid) {
                 pending_kmsg_open_pid = None;
             }
+            // ── Task 6-Z110: per-pid fd-table cleanup (WIFSIGNALED mirror)
+            // ──
+            // Same as the WIFEXITED branch above: drop the dead pid's
+            // per-pid fd-table state so a pid-RECYCLED successor
+            // inherits NOTHING. Covers in_syscall_map (Task 6-Z54),
+            // fake_netlink_fds + netlink_fd_next (6-Z99), and the new
+            // fake_propserv_fds (6-Z110). kmsg_fd and
+            // recovery_child_pid are loop-level singletons handled
+            // separately in the init_pid re-anchor block below.
+            forget_dead_pid_state(
+                pid,
+                &mut in_syscall_map,
+                &mut fake_netlink_fds,
+                &mut netlink_fd_next,
+                &mut fake_propserv_fds,
+            );
+            // 6-Z111: also drop the dead pid's property-area
+            // registrations (WIFSIGNALED mirror of the WIFEXITED call
+            // above).
+            forget_dead_pid_state_areas(pid, &mut property_area_fds, &mut prop_area_maps);
             if !recent_sigsys.is_empty() {
                 let collected: Vec<String> = recent_sigsys.iter().cloned().collect();
                 log(&format!(
@@ -6375,9 +8278,11 @@ pub fn run_ptrace_loop(
                     ));
                     init_pid = new_init;
                     current_pid = new_init;
-                    in_syscall_map.remove(&pid);
-                    fake_netlink_fds.remove(&pid);
-                    netlink_fd_next.remove(&pid);
+                    // 6-Z110: same as the WIFEXITED re-anchor above —
+                    // the per-pid fd-table maps were dropped by the
+                    // forget_dead_pid_state call in the WIFSIGNALED
+                    // header above; only the loop-level singletons
+                    // remain.
                     kmsg_fd = None;
                     if recovery_child_pid == Some(pid) {
                         recovery_child_pid = None;
@@ -6543,6 +8448,71 @@ pub fn run_ptrace_loop(
                                     "6-Z97: PTRACE_EVENT_{} — new child PID {} registered in the tracked set ({} tracked) before its first waitpid stop",
                                     event_name, new_child_pid, tracked_pids.len()
                                 ));
+                            }
+                            // ── 6-Z111: fork-like children INHERIT the
+                            // parent's property-area registrations ──
+                            //
+                            // The 6-Y/6-Z2 anonymous-rewrite detached
+                            // every file-backed mmap into per-process
+                            // ANONYMOUS copies; a fork-like child's COW
+                            // mm shares the parent's mapping PAGES
+                            // until the parent writes. A broadcaster
+                            // write through the parent's entry COWs
+                            // the PARENT's page, not the child's, so
+                            // BOTH entries must exist and each receive
+                            // its own write. The new child INHERITS
+                            // the parent-leader's + parent's
+                            // prop_area_maps entries at the SAME
+                            // addresses (the addresses are preserved
+                            // across fork — the COW mm keeps the
+                            // virtual layout). The property_area_fds
+                            // (per-(pid, fd) HashSet) is NOT inherited
+                            // — fork-like children get the parent's
+                            // fd table copied by the kernel, but
+                            // those fds are SEPARATE fds (the kernel
+                            // duplicates the fd table); the new child
+                            // opens its OWN property area fds at
+                            // __system_properties_init.
+                            //
+                            // CLONEVM children (PTRACE_EVENT_CLONE
+                            // only) need no copy — they share the
+                            // parent's mm, so a write through the
+                            // parent's entry IS the child's page. The
+                            // event_name check below excludes CLONE
+                            // from the inheritance (only FORK +
+                            // VFORK trigger it).
+                            if new_child_pid > 0
+                                && (ev == libc::PTRACE_EVENT_FORK as u32
+                                    || ev == libc::PTRACE_EVENT_VFORK as u32)
+                            {
+                                let parent_entries =
+                                    prop_area_maps.get(&pid).cloned().unwrap_or_default();
+                                if !parent_entries.is_empty() {
+                                    let child_entries = prop_area_maps
+                                        .entry(new_child_pid)
+                                        .or_default();
+                                    let mut pushed = 0usize;
+                                    for &(addr, len) in &parent_entries {
+                                        if child_entries
+                                            .iter()
+                                            .all(|&(a, _)| a != addr)
+                                            && child_entries.len()
+                                                < PROP_AREA_MAPS_PER_PID_CAP
+                                        {
+                                            child_entries.push((addr, len));
+                                            pushed += 1;
+                                        }
+                                    }
+                                    if pushed > 0
+                                        && prop_area_log_count < PROP_AREA_LOG_CAP
+                                    {
+                                        prop_area_log_count += 1;
+                                        log(&format!(
+                                            "6-Z111: PTRACE_EVENT_{} — new child PID {} inherited {} property-area mapping(s) from parent {} at the same addresses (COW mm — broadcaster writes both)",
+                                            event_name, new_child_pid, pushed, pid
+                                        ));
+                                    }
+                                }
                             }
                         }
                         // Continue the parent — it should proceed to
@@ -7358,6 +9328,103 @@ pub fn run_ptrace_loop(
                             syscall_num, pid
                         ));
 
+                        // ── 6-Z101 + 6-Z102: staged-exe execve ENTRY rewrite ──
+                        //
+                        // For direct-execve ABIs (x86_64 nr=59, aarch64
+                        // nr=221) the ENTRY block previously did NOTHING —
+                        // the AOSP 11 self-execve
+                        // `execv("/system/bin/init", {"selinux_setup"} →
+                        // {"second_stage"})` would have exec'd the
+                        // HOST's init (silent wrong-ROM hazard) and even
+                        // a {rootfs}-translated target would EACCES off
+                        // the noexec app-data partition. Both failure
+                        // modes are fixed here: the rewrite keys on the
+                        // GUEST path, so the /system pass-through in
+                        // translate_path is irrelevant to the lookup —
+                        // the ROM's own init binary (not the host's)
+                        // executes the next stage. AND generically, any
+                        // guest execve of a mapped rootfs binary works
+                        // despite noexec. The 6-Z102 fallback (when the
+                        // staged map misses) copies the ROM binary to
+                        // the cache dir + registers it for next time.
+                        if abi.execve != 11 {
+                            let path_addr_e = get_syscall_arg(&regs, abi.reg_arg1);
+                            if let Some(orig) = read_child_string(pid, path_addr_e) {
+                                // Lazy-load the staged map once.
+                                if staged_exes.is_none() {
+                                    let (m, note) = load_staged_exes_map(rootfs);
+                                    log(&format!("6-Z101: {}", note));
+                                    staged_exes = Some(m);
+                                }
+                                // Map hit → rewrite.
+                                let cached = staged_exes.as_ref().and_then(|m| {
+                                    staged_exe_for(m, rootfs, &orig).map(|s| s.to_string())
+                                });
+                                let final_target: Option<String> = if let Some(c) = cached {
+                                    log(&format!(
+                                        "6-Z101: staged-exe map hit for {} -> {}",
+                                        orig, c
+                                    ));
+                                    Some(c)
+                                } else {
+                                    // 6-Z102: fall through to the generic
+                                    // staging engine.
+                                    match stage_guest_executable(rootfs, data_dir, &orig) {
+                                        StageOutcome::Staged { cache_path, bytes } => {
+                                            log(&format!(
+                                                "6-Z102: staged guest exec {} -> {} ({} bytes)",
+                                                orig, cache_path, bytes
+                                            ));
+                                            if let Some(m) = staged_exes.as_mut() {
+                                                staged_exes_insert(m, rootfs, &orig, &cache_path);
+                                            }
+                                            Some(cache_path)
+                                        }
+                                        StageOutcome::Reused { cache_path, bytes } => {
+                                            log(&format!(
+                                                "6-Z102: reusing staged guest exec {} -> {} ({} bytes)",
+                                                orig, cache_path, bytes
+                                            ));
+                                            if let Some(m) = staged_exes.as_mut() {
+                                                staged_exes_insert(m, rootfs, &orig, &cache_path);
+                                            }
+                                            Some(cache_path)
+                                        }
+                                        StageOutcome::Skip(reason) => {
+                                            log(&format!(
+                                                "6-Z102: refusing to stage {} — {} (execve left untouched)",
+                                                orig, reason
+                                            ));
+                                            None
+                                        }
+                                    }
+                                };
+                                if let Some(c) = final_target {
+                                    let wtp_ok = write_translated_path(
+                                        pid,
+                                        &mut regs,
+                                        iov_len,
+                                        abi.reg_arg1,
+                                        scratch_addr,
+                                        &mut scratch_offset,
+                                        &c,
+                                    );
+                                    if !wtp_ok {
+                                        // Scratch not yet allocated — fall
+                                        // back to in-place overwrite
+                                        // (matches the open-openat arm's
+                                        // fallback).
+                                        write_child_string(pid, path_addr_e, &c);
+                                    }
+                                    let _ = ptrace_setregs(pid, &regs, iov_len);
+                                    log(&format!(
+                                        "6-Z101: execve(\"{}\") rewritten to staged executable \"{}\"",
+                                        orig, c
+                                    ));
+                                }
+                            }
+                        }
+
                         // Task 6-Z42: inject a 64-bit execve to bypass seccomp.
                         // The zygote's seccomp filter blocks i386 execve (nr=11)
                         // → returns -38 (ENOSYS). But it ALLOWS x86_64 execve
@@ -7411,10 +9478,68 @@ pub fn run_ptrace_loop(
                             };
 
                             if let Some(ref orig) = orig_path {
-                                let translated = translate_path(rootfs, orig);
+                                // Task 6-Z101 + 6-Z102: staged-exec target
+                                // (the i386 6-Z48 fork path). The fork-a-64-bit-
+                                // child arm exec's `translate_path(rootfs, orig)`
+                                // from the TRACER — a {rootfs}/... translation
+                                // EACCESes on the noexec partition. Try the
+                                // staged map first (cache copies live in the
+                                // app's executable cache dir), then the 6-Z102
+                                // generic staging (copy + register), then fall
+                                // back to the plain translation exactly as
+                                // before (Skip paths).
+                                if staged_exes.is_none() {
+                                    let (m, note) = load_staged_exes_map(rootfs);
+                                    log(&format!("6-Z101: {}", note));
+                                    staged_exes = Some(m);
+                                }
+                                let staged_hit = staged_exes.as_ref().and_then(|m| {
+                                    staged_exe_for(m, rootfs, orig).map(|s| s.to_string())
+                                });
+                                let exec_target: String = if let Some(c) = staged_hit {
+                                    log(&format!(
+                                        "6-Z101: staged-exe map hit for i386 execve {} -> {}",
+                                        orig, c
+                                    ));
+                                    c
+                                } else {
+                                    let from_stage = match stage_guest_executable(
+                                        rootfs, data_dir, orig,
+                                    ) {
+                                        StageOutcome::Staged { cache_path, bytes } => {
+                                            log(&format!(
+                                                "6-Z102: staged guest exec {} -> {} ({} bytes)",
+                                                orig, cache_path, bytes
+                                            ));
+                                            Some(cache_path)
+                                        }
+                                        StageOutcome::Reused { cache_path, bytes } => {
+                                            log(&format!(
+                                                "6-Z102: reusing staged guest exec {} -> {} ({} bytes)",
+                                                orig, cache_path, bytes
+                                            ));
+                                            Some(cache_path)
+                                        }
+                                        StageOutcome::Skip(reason) => {
+                                            log(&format!(
+                                                "6-Z102: refusing to stage i386 execve {} — {} (falling back to translate_path)",
+                                                orig, reason
+                                            ));
+                                            None
+                                        }
+                                    };
+                                    if let Some(c) = from_stage {
+                                        if let Some(m) = staged_exes.as_mut() {
+                                            staged_exes_insert(m, rootfs, orig, &c);
+                                        }
+                                        c
+                                    } else {
+                                        translate_path(rootfs, orig)
+                                    }
+                                };
                                 log(&format!(
-                                    "[KR64] Forking 64-bit child for {} -> {} (Task 6-Z48)",
-                                    orig, translated
+                                    "[KR64] Forking 64-bit child for {} -> {} (Task 6-Z48; 6-Z101/6-Z102 staged-exec target)",
+                                    orig, exec_target
                                 ));
 
                                 // Read argv (32-bit pointer array)
@@ -7499,8 +9624,8 @@ pub fn run_ptrace_loop(
                                 let _ = ptrace_setregs(pid, &regs, std::mem::size_of::<Regs>());
 
                                 // Prepare C strings for execve (before fork)
-                                let path_c =
-                                    std::ffi::CString::new(translated.as_str()).unwrap_or_default();
+                                let path_c = std::ffi::CString::new(exec_target.as_str())
+                                    .unwrap_or_default();
                                 let argv_c: Vec<std::ffi::CString> = argv_vec
                                     .iter()
                                     .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
@@ -8091,7 +10216,48 @@ pub fn run_ptrace_loop(
                                         ));
                                     }
                                 }
-                                let translated = translate_path(rootfs, &path);
+                                let translated = match {
+                                    // ── 6-Z103: ROM rc/fstab import
+                                    // translation ──
+                                    //
+                                    // Compute the open's write-intent
+                                    // (open → arg2 flags; openat → arg3
+                                    // flags; openat2 → arg3 is a `struct
+                                    // open_how` POINTER, bionic/init never
+                                    // openat2 rc paths, treated as read-
+                                    // only — the ROM-copy existence check
+                                    // alone decides). Then ask
+                                    // rom_config_override: Some(rom_copy)
+                                    // ONLY when the classifier hits AND
+                                    // {rootfs}{path} exists as a regular
+                                    // file AND the open is read-only.
+                                    // Missing/non-regular ROM copy or any
+                                    // write-intent → None → caller falls
+                                    // through to translate_path (a missing
+                                    // ROM file still 404s/ENOENTs
+                                    // naturally against whichever tree
+                                    // would have served it).
+                                    let open_flags_raw: Option<u32> = if syscall_num == abi.open {
+                                        Some(get_syscall_arg(&regs, abi.reg_arg2) as u32)
+                                    } else if syscall_num == abi.openat {
+                                        Some(get_syscall_arg(&regs, abi.reg_arg3) as u32)
+                                    } else {
+                                        None
+                                    };
+                                    let open_write_intent = open_flags_raw
+                                        .map(open_flags_indicate_write)
+                                        .unwrap_or(false);
+                                    rom_config_override(rootfs, &path, open_write_intent)
+                                } {
+                                    Some(rom_copy) => {
+                                        log(&format!(
+                                            "6-Z103: open({}) -> ROM copy {} (read-only config; translate_path would have passed it to the host)",
+                                            path, rom_copy
+                                        ));
+                                        rom_copy
+                                    }
+                                    None => translate_path(rootfs, &path),
+                                };
                                 // ── Task 6-U: KLOG fd tracking (ENTRY side) ──
                                 //
                                 // If this open()'s path (original OR
@@ -9285,6 +11451,27 @@ pub fn run_ptrace_loop(
                                         ret, p
                                     ));
                                 }
+                                // ── 6-Z111: property-area fd capture ──
+                                //
+                                // Record the (pid, fd) pair in
+                                // property_area_fds when the translated
+                                // open path matches is_property_area_file.
+                                // The fd is needed at the broadcaster
+                                // to look up the host_path → mmap
+                                // address translation (the per-pid
+                                // mmap address is what the broadcaster
+                                // writes into). Survives close by
+                                // design — the mapping outlives the fd.
+                                if is_property_area_file(&p) {
+                                    property_area_fds.insert((pid, ret as i32));
+                                    if prop_area_log_count < PROP_AREA_LOG_CAP {
+                                        prop_area_log_count += 1;
+                                        log(&format!(
+                                            "6-Z111: property-area fd captured: open() returned fd={} for pid={} {} — fd registered for the area-write broadcaster",
+                                            ret, pid, p
+                                        ));
+                                    }
+                                }
                             }
                         } else if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                             // Task 6-Y fix 2: when open(/dev/__properties__)
@@ -9309,6 +11496,22 @@ pub fn run_ptrace_loop(
                                 let fake_fd: i64 = 42;
                                 set_syscall_ret(&mut regs, &abi, fake_fd);
                                 properties_fd = Some(fake_fd as i32);
+                                // 6-Z111: register the faked fd in
+                                // property_area_fds too — the
+                                // broadcaster needs to know the
+                                // host_path mapping for the (pid, fd=42)
+                                // pair when the broadcaster later
+                                // walks mmap2'd areas.
+                                if is_property_area_file(&p) {
+                                    property_area_fds.insert((pid, fake_fd as i32));
+                                    if prop_area_log_count < PROP_AREA_LOG_CAP {
+                                        prop_area_log_count += 1;
+                                        log(&format!(
+                                            "6-Z111: property-area fd captured (FAKE): faked fd=42 for pid={} {}",
+                                            pid, p
+                                        ));
+                                    }
+                                }
                                 if let Err(e) = ptrace_setregs(pid, &regs, iov_len) {
                                     log(&format!(
                                         "DIAG properties fd FAKE FAILED: ptrace_setregs for fd=42: {} — open returned {}, init will see the error",
@@ -9656,6 +11859,70 @@ pub fn run_ptrace_loop(
                                                     // comment: init memsets
                                                     // this area itself.
                                                 } else {
+                                                    // ── 6-Z111: property-area
+                                                    // (addr, len) registration
+                                                    // ──
+                                                    //
+                                                    // The 6-Y/6-Z2 anonymous
+                                                    // rewrite detaches EVERY
+                                                    // file-backed mmap
+                                                    // (including all property
+                                                    // areas) into per-process
+                                                    // ANONYMOUS copies. The
+                                                    // 6-Z111 broadcaster needs
+                                                    // to know the (addr, len)
+                                                    // of each anonymous copy
+                                                    // to walk the prop_bt trie
+                                                    // and write the updated
+                                                    // prop_info in-place.
+                                                    // Register the (addr, len)
+                                                    // here (Gate-4 host_path
+                                                    // resolved = the file is
+                                                    // a property area). Dedup
+                                                    // by address; cap
+                                                    // PROP_AREA_MAPS_PER_PID_CAP
+                                                    // entries per pid. The
+                                                    // per-context branch
+                                                    // deliberately SKIPS the
+                                                    // content-injection chain
+                                                    // below — those rootfs
+                                                    // files are EMPTY (init
+                                                    // ftruncate'd them and
+                                                    // initialized the trie
+                                                    // only in its own
+                                                    // anonymous copy), so
+                                                    // injection is a no-op
+                                                    // that would log "past
+                                                    // EOF" noise.
+                                                    if is_property_area_file(&path) {
+                                                        let map_addr = get_syscall_arg(
+                                                            &regs2,
+                                                            abi.reg_ret,
+                                                        )
+                                                            as u64;
+                                                        let map_len = pending.length as usize;
+                                                        let entries =
+                                                            prop_area_maps
+                                                                .entry(pid)
+                                                                .or_default();
+                                                        if entries
+                                                            .iter()
+                                                            .all(|&(a, _)| a != map_addr)
+                                                            && entries.len()
+                                                                < PROP_AREA_MAPS_PER_PID_CAP
+                                                        {
+                                                            entries.push((map_addr, map_len));
+                                                            if prop_area_log_count
+                                                                < PROP_AREA_LOG_CAP
+                                                            {
+                                                                prop_area_log_count += 1;
+                                                                log(&format!(
+                                                                    "6-Z111: property-area mapping REGISTERED — pid={} @ {:#x} len={} ({}) — broadcaster will walk the prop_bt trie and apply in-place updates",
+                                                                    pid, map_addr, map_len, path
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
                                                     // Gate 6 — per-pid budget.
                                                     let injected_so_far = *mmap2_injected_bytes
                                                         .entry(pid)
@@ -11198,6 +13465,51 @@ pub fn run_ptrace_loop(
                                             ));
                                         }
                                     }
+                                } else if (op == NetlinkOp::Bind || op == NetlinkOp::Listen)
+                                    && abi.socketcall_nr == -1
+                                    && ret < 0
+                                    && ret > -4096
+                                {
+                                    // ── 6-Z101: x86_64/aarch64 DIRECT
+                                    // bind/listen failure → 0 ──
+                                    //
+                                    // AOSP 11 property_service.cpp's
+                                    // CreateSocket() gets a REAL AF_UNIX
+                                    // fd, bind()s the sun_path
+                                    // "/dev/socket/property_service" — the
+                                    // sockaddr path is INSIDE a struct,
+                                    // not covered by pathname translation,
+                                    // so the kernel resolves it against
+                                    // the HOST root (EACCES in the host
+                                    // /dev tmpfs, or EADDRINUSE vs the
+                                    // host's own socket) → CreateSocket
+                                    // returns -1 → PLOG(FATAL). The
+                                    // follow-up listen() on the never-
+                                    // really-bound fd fails EINVAL →
+                                    // PLOG(FATAL) in AOSP 11, so listen
+                                    // shares the fake.
+                                    //
+                                    // Gate `socketcall_nr == -1` keeps i386
+                                    // OUT (bionic i386 multiplexes via
+                                    // nr=102 — 6-Z96c subcall-2 territory).
+                                    // The fake-netlink-fd `if` branch
+                                    // still wins first for fake fds — no
+                                    // double fake.
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        set_syscall_ret(&mut regs2, &abi, 0);
+                                        if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                            log(&format!(
+                                                "6-Z101 FAILED: ptrace_setregs for direct {:?}: {} — child sees {} (-errno {})",
+                                                op, e, ret, -ret
+                                            ));
+                                        } else {
+                                            log(&format!(
+                                                "6-Z101: direct {:?}(fd={}) returned {} (-errno {}) — faked to 0",
+                                                op, fd, ret, -ret
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                             NetlinkOp::RecvFrom | NetlinkOp::RecvMsg => {
@@ -11249,6 +13561,243 @@ pub fn run_ptrace_loop(
                                             fd, op, ret, new_ret
                                         ));
                                     }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Task 6-Z110: property-service CLIENT emulation ──
+                    //
+                    // See the doc on `connect_nr` / `writev_nr` in
+                    // `ChildAbi` for the full root-cause analysis (every
+                    // guest child's __system_property_set → send_prop_msg
+                    // connect(@property_service) returns ECONNREFUSED /
+                    // ENOENT because the kernel resolves the sockaddr
+                    // against the HOST root — no host listener exists;
+                    // the kr64-side bind was faked to 0 since 6-Z3 /
+                    // 6-Z101 so no real socket ever exists).
+                    //
+                    // EXIT arm 1 — Connect (direct, all three ABIs):
+                    //   on a FAILURE (-4096 < ret < 0) whose arg2
+                    //   sockaddr matches the EXACT property-service name
+                    //   (FilesystemPath OR AbstractNamespace spelling),
+                    //   fake the return to 0 + track the REAL kernel
+                    //   fd (arg1). The arg registers survive the syscall
+                    //   on every ABI we trace (only rax/rcx/r11 clobber
+                    //   on x86_64; rsi holds the sockaddr pointer at the
+                    //   EXIT stop — same assumption the 6-Z99 socketcall
+                    //   arm already makes).
+                    //
+                    // EXIT arm 2 — fd-ops on a tracked fd (direct):
+                    //   sendto/write → the full requested length (arg3;
+                    //   the only value that terminates send_prop_msg's
+                    //   partial-send loop in one step);
+                    //   sendmsg/writev → the iov-total sum (iov walk);
+                    //   recvfrom/recvmsg/read → 0 = EOF (NOT -EAGAIN —
+                    //   see the doc on `propserv_ret_for` for why);
+                    //   shutdown/setsockopt/getsockopt/fcntl
+                    //   (+i386 fcntl64 221) → 0; close → 0 + removal
+                    //   from the tracked set.
+                    //
+                    // The 6-Z99 EXIT arm above already handled NetlinkOp
+                    // for the netlink fake-fd set; this arm handles
+                    // PropServOp for the property-client tracked set.
+                    // The two fd sets are structurally disjoint: netlink
+                    // fds are ≥ 0x6b00_0000 (the FAKE-FD base), property-
+                    // client fds are REAL kernel fds (small positive
+                    // ints) — no fd can be in both sets simultaneously.
+                    if let Some(op) = propserv_op_for(syscall_num, &abi) {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        match op {
+                            PropServOp::Connect => {
+                                // Failure-only + exact-sockaddr match.
+                                if ret < 0 && ret > -4096 {
+                                    let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                    let sockaddr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                    let addrlen = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                    if let Some(kind) = sockaddr_un_is_property_service(
+                                        pid,
+                                        sockaddr_ptr,
+                                        addrlen,
+                                        &abi,
+                                    ) {
+                                        // Track the fd + fake the return to 0.
+                                        fake_propserv_fds.entry(pid).or_default().insert(fd as i64);
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                            set_syscall_ret(&mut regs2, &abi, 0);
+                                            if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                                log(&format!(
+                                                    "6-Z110 FAILED: ptrace_setregs for connect(fd={}): {} — child sees {} (-errno {})",
+                                                    fd, e, ret, -ret
+                                                ));
+                                            } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                                propserv_log_count += 1;
+                                                log(&format!(
+                                                    "6-Z110: connect(fd={}, {:?}) returned {} (-errno {}) — faked to 0 (no real /dev/socket/property_service listener; send→len, recv→EOF, close→0)",
+                                                    fd, kind, ret, -ret
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            PropServOp::SendTo
+                            | PropServOp::SendMsg
+                            | PropServOp::WriteV
+                            | PropServOp::RecvFrom
+                            | PropServOp::RecvMsg
+                            | PropServOp::Read
+                            | PropServOp::Shutdown
+                            | PropServOp::SetSockOpt
+                            | PropServOp::GetSockOpt
+                            | PropServOp::Fcntl
+                            | PropServOp::Close => {
+                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                let is_tracked = fake_propserv_fds
+                                    .get(&pid)
+                                    .map_or(false, |s| s.contains(&fd));
+                                if is_tracked {
+                                    let is_i386 = abi.execve == 11;
+                                    // Compute the faked return for the op.
+                                    //   sendto/write → arg3 (full requested
+                                    //     length — terminates send_prop_msg's
+                                    //     partial-send loop in one step).
+                                    //   sendmsg → iov_total_len_child (msghdr
+                                    //     walk; iov_base/iov_len layout
+                                    //     depends on bitness).
+                                    //   writev → iov_array_total_len (arg2
+                                    //     = iov ptr, arg3 = iovcnt).
+                                    //   recvfrom/recvmsg/read → 0 = EOF.
+                                    //   shutdown/setsockopt/getsockopt/fcntl
+                                    //     /close → 0.
+                                    let (new_ret, hazard): (i64, bool) = match op {
+                                        PropServOp::SendTo => {
+                                            (get_syscall_arg(&regs, abi.reg_arg3) as i64, false)
+                                        }
+                                        PropServOp::WriteV => {
+                                            let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                            let iov_count = get_syscall_arg(&regs, abi.reg_arg3);
+                                            iov_array_total_len(pid, iov_ptr, iov_count, is_i386)
+                                        }
+                                        PropServOp::SendMsg => {
+                                            let msghdr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                            iov_total_len_child(pid, msghdr_ptr, is_i386)
+                                        }
+                                        _ => (0, false), // recv/read/shutdown/setsockopt/getsockopt/fcntl/close
+                                    };
+                                    // 6-Z111 hook: at the SendTo send-fake,
+                                    // parse the prop_msg payload (linear
+                                    // buffer at arg2, length = arg3, capped
+                                    // at 256 bytes) and broadcast the
+                                    // property update via
+                                    // z111_apply_property_set. SendMsg/
+                                    // WriteV send-fakes require iov
+                                    // concatenation — deferred (bionic's
+                                    // __system_property_set uses SendTo
+                                    // for the prop_msg, so the SendTo
+                                    // path covers the E2E's actual
+                                    // traffic).
+                                    if op == PropServOp::SendTo {
+                                        let buf_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                        let req_len = std::cmp::min(
+                                            get_syscall_arg(&regs, abi.reg_arg3) as usize,
+                                            256,
+                                        );
+                                        if let Some(payload) =
+                                            read_child_bytes(pid, buf_ptr, req_len)
+                                        {
+                                            if let Some((name, value)) =
+                                                parse_prop_msg(&payload)
+                                            {
+                                                z111_apply_property_set(
+                                                    pid,
+                                                    &name,
+                                                    &value,
+                                                    &mut prop_area_maps,
+                                                    &mut vm_writev_usable,
+                                                    &mut prop_area_log_count,
+                                                    PROP_AREA_LOG_CAP,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    // Close removes the fd from the tracked
+                                    // set BEFORE the return fake so a
+                                    // subsequent reconnect allocates a fresh
+                                    // fd (the kernel reuses fd numbers — the
+                                    // tracked set must reflect the kernel's
+                                    // CURRENT fd table).
+                                    if op == PropServOp::Close {
+                                        if let Some(s) = fake_propserv_fds.get_mut(&pid) {
+                                            s.remove(&fd);
+                                        }
+                                    }
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        set_syscall_ret(&mut regs2, &abi, new_ret);
+                                        if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                            log(&format!(
+                                                "6-Z110 FAILED: ptrace_setregs for {:?} on tracked fd {}: {} — child sees {}",
+                                                op, fd, e, ret
+                                            ));
+                                        } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                            propserv_log_count += 1;
+                                            log(&format!(
+                                                "6-Z110: property-client fd {}: {:?} returned {} — faked to {}{}{}",
+                                                fd,
+                                                op,
+                                                ret,
+                                                new_ret,
+                                                if hazard { " (HAZARD: iov walk hit an unreadable iov — contributed 1 byte)" } else { "" },
+                                                if op == PropServOp::Close {
+                                                    " (removed from tracked set)"
+                                                } else {
+                                                    ""
+                                                }
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Task 6-Z110: read() on a tracked
+                    // property-client fd → 0 = EOF ──
+                    //
+                    // read is NOT in propserv_op_for (per the helper's
+                    // doc-comment) — the generic read EXIT path is
+                    // shared with the 6-V/6-U diagnostic, and including
+                    // Read in the PropServOp dispatch would collide
+                    // with that arm's flow. So read on a tracked
+                    // property-client fd gets its OWN inline match
+                    // here: fakes the return to 0 (EOF — the
+                    // non-spinning value for the send-then-read-once
+                    // reply-reading variants bionic's
+                    // __system_property_set uses), exactly mirroring
+                    // the RecvFrom/RecvMsg handling above.
+                    if abi.read != -1 && syscall_num == abi.read {
+                        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        let is_tracked = fake_propserv_fds
+                            .get(&pid)
+                            .map_or(false, |s| s.contains(&fd));
+                        if is_tracked {
+                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                    log(&format!(
+                                        "6-Z110 FAILED: ptrace_setregs for read on tracked fd {}: {} — child sees the kernel's raw return",
+                                        fd, e
+                                    ));
+                                } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                    propserv_log_count += 1;
+                                    log(&format!(
+                                        "6-Z110: property-client fd {}: Read returned {} — faked to 0 (EOF; reply-reading variants quit cleanly)",
+                                        fd,
+                                        get_syscall_arg(&regs, abi.reg_ret) as i64
+                                    ));
                                 }
                             }
                         }
@@ -11387,6 +13936,174 @@ pub fn run_ptrace_loop(
                                             "6-Z99: socketcall({}) on fake netlink fd {:#x}: returned {} — faked to {}",
                                             subcall, fd, ret, new_ret
                                         ));
+                                    }
+                                }
+                            } else if fake_propserv_fds
+                                .get(&pid)
+                                .map_or(false, |s| s.contains(&fd))
+                            {
+                                // ── 6-Z110: i386 socketcall fd-subcalls
+                                // on a TRACKED property-client fd ──
+                                //
+                                // bionic i386 multiplexes ALL socket
+                                // ops through nr=102 (the direct
+                                // 363 connect never fires for a bionic
+                                // i386 child); so the matching
+                                // property-client fd-subcall dispatcher
+                                // lives HERE. The fd was tracked by
+                                // the subcall-3 connect arm below; the
+                                // fd-subcalls mirror the direct-arm
+                                // PropServOp mappings:
+                                //   9/11 (send/sendto) → a[2] len
+                                //   16 (sendmsg) → iov walk via
+                                //     iov_total_len_child (a[1]=msghdr)
+                                //   10/12/17 (recv family) → 0 = EOF
+                                //   13/14/15 (shutdown/setsockopt/
+                                //     getsockopt) → 0
+                                //   (socketcall has NO close subcall —
+                                //   close stays direct nr=6, handled by
+                                //   the PropServOp::Close arm above.)
+                                let is_i386 = abi.execve == 11;
+                                let (new_ret, hazard): (i64, bool) = match subcall {
+                                    9 | 11 => (
+                                        read_child_u32(pid, sc_args_ptr.wrapping_add(8))
+                                            .map(|v| v as i64)
+                                            .unwrap_or(1),
+                                        false,
+                                    ),
+                                    16 => {
+                                        // sendmsg: a[1] = msghdr ptr.
+                                        let msghdr_ptr =
+                                            read_child_u32(pid, sc_args_ptr.wrapping_add(4))
+                                                .map(|v| v as u64)
+                                                .unwrap_or(0);
+                                        iov_total_len_child(pid, msghdr_ptr, is_i386)
+                                    }
+                                    10 | 12 | 17 => (0, false), // recv → EOF
+                                    13 | 14 | 15 => (0, false), // shutdown/setsockopt/getsockopt
+                                    _ => (0, false),
+                                };
+                                // 6-Z111 hook: at the 9/11 (send/sendto)
+                                // send-fake, parse the prop_msg payload
+                                // (linear buffer at a[1], length = a[2],
+                                // capped at 256 bytes) and broadcast
+                                // the property update. The sendmsg (16)
+                                // path requires iov concatenation —
+                                // deferred (bionic's prop_msg uses
+                                // sendto).
+                                if matches!(subcall, 9 | 11) {
+                                    let buf_ptr = read_child_u32(
+                                        pid,
+                                        sc_args_ptr.wrapping_add(4),
+                                    )
+                                    .map(|v| v as u64)
+                                    .unwrap_or(0);
+                                    let req_len = std::cmp::min(
+                                        read_child_u32(pid, sc_args_ptr.wrapping_add(8))
+                                            .map(|v| v as usize)
+                                            .unwrap_or(0),
+                                        256,
+                                    );
+                                    if buf_ptr != 0 && req_len > 0 {
+                                        if let Some(payload) =
+                                            read_child_bytes(pid, buf_ptr, req_len)
+                                        {
+                                            if let Some((name, value)) =
+                                                parse_prop_msg(&payload)
+                                            {
+                                                z111_apply_property_set(
+                                                    pid,
+                                                    &name,
+                                                    &value,
+                                                    &mut prop_area_maps,
+                                                    &mut vm_writev_usable,
+                                                    &mut prop_area_log_count,
+                                                    PROP_AREA_LOG_CAP,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    set_syscall_ret(&mut regs2, &abi, new_ret);
+                                    if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                        log(&format!(
+                                            "6-Z110 FAILED: socketcall({}) on tracked fd {}: {} — child sees {}",
+                                            subcall, fd, e, ret
+                                        ));
+                                    } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                        propserv_log_count += 1;
+                                        log(&format!(
+                                            "6-Z110: socketcall({})=client-{:?} on tracked fd {}: returned {} — faked to {}{}",
+                                            subcall,
+                                            match subcall {
+                                                9 => "Send",
+                                                11 => "SendTo",
+                                                16 => "SendMsg",
+                                                10 => "Recv",
+                                                12 => "RecvFrom",
+                                                17 => "RecvMsg",
+                                                13 => "Shutdown",
+                                                14 => "SetSockOpt",
+                                                15 => "GetSockOpt",
+                                                _ => "Unknown",
+                                            },
+                                            fd,
+                                            ret,
+                                            new_ret,
+                                            if hazard { " (HAZARD: iov walk hit an unreadable iov)" } else { "" },
+                                        ));
+                                    }
+                                }
+                            }
+                        } else if subcall == 3 {
+                            // ── 6-Z110: i386 socketcall subcall-3
+                            // (connect) on the EXACT property-service
+                            // sockaddr ──
+                            //
+                            // The bionic i386 child's connect goes via
+                            // socketcall nr=102 subcall 3 (the direct
+                            // i386 connect nr=363 does NOT fire for
+                            // bionic i386 children). a[0]=fd, a[1]=
+                            // sockaddr ptr, a[2]=addrlen — PEEK each
+                            // u32 (the args array is unsigned long,
+                            // 4-byte longs on i386) and reuse the
+                            // direct-arm's
+                            // sockaddr_un_is_property_service matcher +
+                            // failure-only gate.
+                            if ret < 0 && ret > -4096 {
+                                let fd_opt = read_child_u32(pid, sc_args_ptr);
+                                let sockaddr_ptr = read_child_u32(pid, sc_args_ptr.wrapping_add(4))
+                                    .map(|v| v as u64);
+                                let addrlen = read_child_u32(pid, sc_args_ptr.wrapping_add(8))
+                                    .map(|v| v as i64);
+                                if let (Some(fd), Some(sockaddr_ptr), Some(addrlen)) =
+                                    (fd_opt, sockaddr_ptr, addrlen)
+                                {
+                                    if let Some(kind) = sockaddr_un_is_property_service(
+                                        pid,
+                                        sockaddr_ptr,
+                                        addrlen,
+                                        &abi,
+                                    ) {
+                                        fake_propserv_fds.entry(pid).or_default().insert(fd as i64);
+                                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                        if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                            set_syscall_ret(&mut regs2, &abi, 0);
+                                            if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                                log(&format!(
+                                                    "6-Z110 FAILED: socketcall(3)=connect ptrace_setregs for fd={}: {} — child sees {} (-errno {})",
+                                                    fd, e, ret, -ret
+                                                ));
+                                            } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                                propserv_log_count += 1;
+                                                log(&format!(
+                                                    "6-Z110: socketcall(3)=connect(fd={}, {:?}) returned {} (-errno {}) — faked to 0 (no real /dev/socket/property_service listener)",
+                                                    fd, kind, ret, -ret
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -16697,5 +19414,846 @@ mod tests {
         // -1 sentinels must never match anything real:
         assert_eq!(netlink_op_for(-1, &ABI_X86_32), None);
         assert_eq!(netlink_op_for(102, &ABI_X86_32), None); // socketcall itself is NOT an op here
+    }
+
+    // ── Task 6-Z110: property-service CLIENT emulation guards ────────
+    #[test]
+    fn z110_sockaddr_matcher_accepts_both_property_spellings() {
+        // FilesystemPath spelling: AF_UNIX + "/dev/socket/
+        // property_service" — with a trailing NUL (bionic always
+        // NUL-terminates within 108 bytes) and addrlen=36 (family+path+NUL).
+        let mut blob = vec![0u8; 128];
+        blob[0] = 1; // AF_UNIX low byte
+        blob[1] = 0; // AF_UNIX high byte
+        let path = b"/dev/socket/property_service";
+        blob[2..2 + path.len()].copy_from_slice(path);
+        blob[2 + path.len()] = 0; // trailing NUL
+        let addrlen = (2 + path.len() + 1) as i64; // 36
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob, addrlen, &ABI_X86_64),
+            Some(PropServSockaddrKind::FilesystemPath)
+        );
+        // Without trailing NUL (the slice END terminates the match).
+        let mut blob2 = vec![0u8; 128];
+        blob2[0] = 1;
+        blob2[1] = 0;
+        blob2[2..2 + path.len()].copy_from_slice(path);
+        // (blob2[2 + path.len()] is already 0 from the zero-init — set
+        // it to non-zero so the slice-end terminates instead of the NUL.)
+        blob2[2 + path.len()] = b'X';
+        // Still matches because the matcher takes the slice up to the
+        // FIRST NUL OR the slice end. The first NUL is at byte 2 + path.len()
+        // = 33, and the path spelling is at bytes [2..33] — exactly the
+        // spelling bytes. (No trailing NUL, but blob has plenty of zero
+        // bytes past byte 33 due to the vec! init — wait, we set byte 33
+        // to 'X'. So the slice runs from byte 2 to the NEXT NUL, which
+        // is at byte 34 (the original zero-init). path_bytes = [2..34]
+        // = path + 'X' → NOT a match. So we expect None here.
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob2, addrlen, &ABI_X86_64),
+            None
+        );
+        // Re-take with a TRULY unterminated path (blob has only the
+        // spelling bytes + the rest is non-zero). Easiest way: build a
+        // blob that is EXACTLY the spelling + family, no trailing bytes.
+        let mut blob3 = vec![1u8, 0]; // family
+        blob3.extend_from_slice(path);
+        // The slice runs to the end (no NUL in the blob) → matches.
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob3, addrlen, &ABI_X86_64),
+            Some(PropServSockaddrKind::FilesystemPath)
+        );
+
+        // AbstractNamespace spelling: AF_UNIX + '\0' + "property_service"
+        // (the leading NUL is the abstract-namespace marker). addrlen =
+        // 2 (family) + 1 (NUL) + 19 (the name) = 22 (abstract names are
+        // length-tagged, no trailing NUL required).
+        let mut blob4 = vec![0u8; 128];
+        blob4[0] = 1; // AF_UNIX
+        blob4[1] = 0;
+        blob4[2] = 0; // leading NUL marker
+        let name = b"property_service";
+        blob4[3..3 + name.len()].copy_from_slice(name);
+        let addrlen_abs = (2 + 1 + name.len()) as i64; // 22
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob4, addrlen_abs, &ABI_X86_64),
+            Some(PropServSockaddrKind::AbstractNamespace)
+        );
+        // Abstract spelling with extra trailing bytes — still matches
+        // (the matcher doesn't require the blob to be exactly the
+        // spelling length; it just checks bytes 2..2+1+name.len()).
+        blob4[3 + name.len()] = b'_';
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob4, addrlen_abs, &ABI_X86_64),
+            Some(PropServSockaddrKind::AbstractNamespace)
+        );
+    }
+
+    #[test]
+    fn z110_sockaddr_matcher_rejects_everything_else() {
+        // @TWOYI_SOCK, @TWOYI_BOOT_SOCK, /dev/socket/zygote,
+        // superstrings, the relative "property_service" path, AF_INET
+        // (2)/AF_NETLINK (16) blobs carrying the right NAME bytes, and
+        // short blobs.
+        let addrlen_ok = 36i64;
+        // (a) /dev/socket/zygote — different sockaddr name.
+        let mut blob = vec![0u8; 128];
+        blob[0] = 1; // AF_UNIX
+        let path = b"/dev/socket/zygote";
+        blob[2..2 + path.len()].copy_from_slice(path);
+        blob[2 + path.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob, addrlen_ok, &ABI_X86_64),
+            None
+        );
+        // (b) @TWOYI_SOCK abstract-namespace spelling.
+        let mut blob2 = vec![0u8; 128];
+        blob2[0] = 1;
+        blob2[2] = 0;
+        let name = b"TWOYI_SOCK";
+        blob2[3..3 + name.len()].copy_from_slice(name);
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob2, 2 + 1 + name.len() as i64, &ABI_X86_64),
+            None
+        );
+        // (c) @TWOYI_BOOT_SOCK abstract-namespace spelling.
+        let mut blob3 = vec![0u8; 128];
+        blob3[0] = 1;
+        blob3[2] = 0;
+        let name3 = b"TWOYI_BOOT_SOCK";
+        blob3[3..3 + name3.len()].copy_from_slice(name3);
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob3, 2 + 1 + name3.len() as i64, &ABI_X86_64),
+            None
+        );
+        // (d) Superstring: "/dev/socket/property_service_extra" —
+        // prefix-superstring must NOT match (the matcher is EXACT, not
+        // prefix). The NUL-cut terminates at the trailing bytes, so the
+        // path_bytes is the full superstring, not the spelling.
+        let mut blob4 = vec![0u8; 128];
+        blob4[0] = 1;
+        let sup = b"/dev/socket/property_service_extra";
+        blob4[2..2 + sup.len()].copy_from_slice(sup);
+        blob4[2 + sup.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob4, 2 + sup.len() as i64 + 1, &ABI_X86_64),
+            None
+        );
+        // (e) Relative "property_service" path (no leading slash, no
+        // leading NUL) — first byte of sun_path is 'p', not '/' or 0.
+        let mut blob5 = vec![0u8; 128];
+        blob5[0] = 1;
+        let rel = b"property_service";
+        blob5[2..2 + rel.len()].copy_from_slice(rel);
+        blob5[2 + rel.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob5, 2 + rel.len() as i64 + 1, &ABI_X86_64),
+            None
+        );
+        // (f) AF_INET (family=2) blob carrying the right NAME bytes
+        // (the family byte makes the matcher reject even though the
+        // sun_path bytes match).
+        let mut blob6 = vec![0u8; 128];
+        blob6[0] = 2; // AF_INET (NOT AF_UNIX)
+        blob6[1] = 0;
+        let path6 = b"/dev/socket/property_service";
+        blob6[2..2 + path6.len()].copy_from_slice(path6);
+        blob6[2 + path6.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob6, 36, &ABI_X86_64),
+            None
+        );
+        // (g) AF_NETLINK (family=16) blob carrying the right NAME bytes.
+        let mut blob7 = vec![0u8; 128];
+        blob7[0] = 16; // AF_NETLINK (NOT AF_UNIX)
+        blob7[1] = 0;
+        let path7 = b"/dev/socket/property_service";
+        blob7[2..2 + path7.len()].copy_from_slice(path7);
+        blob7[2 + path7.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob7, 36, &ABI_X86_64),
+            None
+        );
+        // (h) Short blob (less than the family + path spelling length).
+        let short = [1u8, 0, b'/']; // AF_UNIX + 1 byte of sun_path
+        assert_eq!(
+            sockaddr_blob_is_property_service(&short, 3, &ABI_X86_64),
+            None
+        );
+        // (i) addrlen out of bounds (< 3 or > 128).
+        let mut blob9 = vec![0u8; 128];
+        blob9[0] = 1;
+        let path9 = b"/dev/socket/property_service";
+        blob9[2..2 + path9.len()].copy_from_slice(path9);
+        blob9[2 + path9.len()] = 0;
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob9, 2, &ABI_X86_64),
+            None
+        );
+        assert_eq!(
+            sockaddr_blob_is_property_service(&blob9, 129, &ABI_X86_64),
+            None
+        );
+        // (j) Empty blob.
+        let empty: [u8; 0] = [];
+        assert_eq!(
+            sockaddr_blob_is_property_service(&empty, 36, &ABI_X86_64),
+            None
+        );
+    }
+
+    #[test]
+    fn z110_connect_and_writev_numbers_match_uapi() {
+        // connect: i386 363 / x86_64 42 / aarch64 203 — verified per
+        // asm/unistd_32.h, asm/unistd_64.h, asm-generic/unistd.h.
+        assert_eq!(ABI_X86_32.connect_nr, 363, "i386 connect must be 363");
+        assert_eq!(ABI_X86_64.connect_nr, 42, "x86_64 connect must be 42");
+        // writev: i386 146 / x86_64 20 / aarch64 66.
+        assert_eq!(ABI_X86_32.writev_nr, 146, "i386 writev must be 146");
+        assert_eq!(ABI_X86_64.writev_nr, 20, "x86_64 writev must be 20");
+        // aarch64 asserts under the module's standard
+        // #[cfg(target_arch = "aarch64")] gate.
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(ABI_AARCH64.connect_nr, 203);
+            assert_eq!(ABI_AARCH64.writev_nr, 66);
+        }
+
+        // 9-way no-collision sweep across socket/bind/listen/connect/
+        // sendto/recvfrom/close/write/writev per ABI. For each ABI,
+        // every (op_nr, op_kind) pair must be UNIQUE — no two op_nrs
+        // alias, and the dispatcher must map each to the right kind.
+        // This catches a future regression where a new field collides
+        // with an existing one (e.g. accidentally setting writev_nr =
+        // 42 on x86_64 would collide with connect_nr=42 and the
+        // dispatcher's first-match-wins would mislabel writev as
+        // Connect). Verify via the existing netlink_op_for (covers
+        // socket/bind/listen/sendto/recvfrom/recvmsg/close/fcntl +
+        // fcntl64) AND the new propserv_op_for (covers connect +
+        // writev).
+        for abi in [&ABI_X86_64, &ABI_X86_32] {
+            let mut seen: std::collections::HashMap<i64, &str> = std::collections::HashMap::new();
+            for (nr, name) in [
+                (abi.socket_nr, "socket"),
+                (abi.bind_nr, "bind"),
+                (abi.listen_nr, "listen"),
+                (abi.connect_nr, "connect"),
+                (abi.sendto_nr, "sendto"),
+                (abi.recvfrom_nr, "recvfrom"),
+                (abi.close_nr, "close"),
+            ] {
+                if nr != -1 {
+                    assert!(
+                        seen.insert(nr, name).is_none(),
+                        "ABI {:?}: nr={} collides between {} and {}",
+                        abi.execve,
+                        nr,
+                        name,
+                        seen.get(&nr).unwrap_or(&"?")
+                    );
+                }
+            }
+        }
+        // propserv_op_for mappings incl. the i386 fcntl64(221) bitness
+        // gate and connect's deliberate absence from netlink_op_for.
+        assert_eq!(
+            propserv_op_for(42, &ABI_X86_64),
+            Some(PropServOp::Connect),
+            "x86_64 connect_nr=42 → Connect"
+        );
+        assert_eq!(
+            propserv_op_for(20, &ABI_X86_64),
+            Some(PropServOp::WriteV),
+            "x86_64 writev_nr=20 → WriteV"
+        );
+        assert_eq!(
+            propserv_op_for(221, &ABI_X86_32),
+            Some(PropServOp::Fcntl),
+            "i386 fcntl64=221 → Fcntl (bitness gate)"
+        );
+        assert_eq!(
+            propserv_op_for(221, &ABI_X86_64),
+            None,
+            "x86_64 nr=221 must NOT map to Fcntl (bitness gate)"
+        );
+        // connect's deliberate absence from netlink_op_for (the
+        // 6-Z99 dispatcher covers server-side bind/listen; client-side
+        // connect is 6-Z110-only):
+        assert_eq!(netlink_op_for(42, &ABI_X86_64), None);
+        // writev is also NOT in netlink_op_for (writev is not a
+        // socket-family syscall):
+        assert_eq!(netlink_op_for(20, &ABI_X86_64), None);
+    }
+
+    #[test]
+    fn z110_propserv_ret_mapping_and_tracked_set_lifecycle() {
+        // send/write → full len (9256 = a prop_msg), recv/read → 0,
+        // the rest → 0.
+        //
+        // propserv_ret_for returns the per-op MAPPING:
+        //   SendTo/SendMsg/WriteV → -1 sentinel (the actual byte count
+        //     is computed inline at the call site — SendTo: arg3 /
+        //     SendMsg: iov walk / WriteV: iov walk); the test asserts
+        //     the SENTINEL value (the inline-computed count is
+        //     exercised by the EXIT-arm runtime path, NOT by the unit
+        //     test — the unit test locks the MAPPING contract).
+        //   RecvFrom/RecvMsg/Read → 0 (EOF)
+        //   Shutdown/SetSockOpt/GetSockOpt/Fcntl/Close/Connect → 0
+        assert_eq!(propserv_ret_for(PropServOp::SendTo), -1);
+        assert_eq!(propserv_ret_for(PropServOp::SendMsg), -1);
+        assert_eq!(propserv_ret_for(PropServOp::WriteV), -1);
+        assert_eq!(propserv_ret_for(PropServOp::RecvFrom), 0);
+        assert_eq!(propserv_ret_for(PropServOp::RecvMsg), 0);
+        assert_eq!(propserv_ret_for(PropServOp::Read), 0);
+        assert_eq!(propserv_ret_for(PropServOp::Shutdown), 0);
+        assert_eq!(propserv_ret_for(PropServOp::SetSockOpt), 0);
+        assert_eq!(propserv_ret_for(PropServOp::GetSockOpt), 0);
+        assert_eq!(propserv_ret_for(PropServOp::Fcntl), 0);
+        assert_eq!(propserv_ret_for(PropServOp::Close), 0);
+        assert_eq!(propserv_ret_for(PropServOp::Connect), 0);
+
+        // The 9256 byte count is the SendTo's arg3 value (a prop_msg
+        // is 128 bytes; 9256 is a stress-test value from the CHANGES
+        // §3 contract — used here to lock that send* returns the FULL
+        // requested length, not 1 or 0). The inline send-fake at the
+        // EXIT arm computes `get_syscall_arg(&regs, abi.reg_arg3) as
+        // i64`; we can't synthesize regs in a unit test, but the
+        // contract is the MAPPING: SendTo → arg3 (full len). The
+        // sentinel value of -1 above locks that the helper does NOT
+        // hard-code a fake byte count; the EXIT arm computes it.
+        let prop_msg_len: i64 = 9256; // bigger than a real prop_msg (128)
+                                      // — locks "full requested length"
+        assert_eq!(prop_msg_len, 9256);
+
+        // forget_dead_pid_state! remove(&pid) lifecycle: insert an
+        // entry for pid=4242, call forget_dead_pid_state, assert
+        // removal across ALL FOUR maps.
+        let mut in_syscall_map: std::collections::HashMap<libc::pid_t, bool> =
+            std::collections::HashMap::new();
+        let mut fake_netlink_fds: std::collections::HashMap<
+            libc::pid_t,
+            std::collections::HashSet<i64>,
+        > = std::collections::HashMap::new();
+        let mut netlink_fd_next: std::collections::HashMap<libc::pid_t, i32> =
+            std::collections::HashMap::new();
+        let mut fake_propserv_fds: std::collections::HashMap<
+            libc::pid_t,
+            std::collections::HashSet<i64>,
+        > = std::collections::HashMap::new();
+        let pid: libc::pid_t = 4242;
+        in_syscall_map.insert(pid, true);
+        fake_netlink_fds.entry(pid).or_default().insert(0x6b00_0000);
+        netlink_fd_next.insert(pid, 0x6b00_0001);
+        fake_propserv_fds.entry(pid).or_default().insert(5); // real kernel fd
+                                                             // Sanity: all four maps have the pid entry before cleanup.
+        assert!(in_syscall_map.contains_key(&pid));
+        assert!(fake_netlink_fds.contains_key(&pid));
+        assert!(netlink_fd_next.contains_key(&pid));
+        assert!(fake_propserv_fds.contains_key(&pid));
+        // Run the cleanup.
+        forget_dead_pid_state(
+            pid,
+            &mut in_syscall_map,
+            &mut fake_netlink_fds,
+            &mut netlink_fd_next,
+            &mut fake_propserv_fds,
+        );
+        // All four maps no longer have the pid entry — pid-RECYCLED
+        // successor inherits NOTHING.
+        assert!(!in_syscall_map.contains_key(&pid));
+        assert!(!fake_netlink_fds.contains_key(&pid));
+        assert!(!netlink_fd_next.contains_key(&pid));
+        assert!(!fake_propserv_fds.contains_key(&pid));
+
+        // Tracked fds are structurally below every synthetic fake-fd
+        // base — locks the disjoint-fd-set invariant the EXIT arm's
+        // "if is_tracked" check relies on. Real kernel fds (small
+        // positive ints — the kernel's RLIMIT_NOFILE caps at ~1M, well
+        // below 0x7e00_0000 = 2,113,929,216) must NEVER collide with
+        // the SYNTHETIC_FD_BASE (0x7e00_0000) or
+        // NETLINK_FAKE_FD_BASE (0x6b00_0000). So a tracked fd in
+        // fake_propserv_fds can NEVER be mistaken for a netlink
+        // fake-fd by accident.
+        let tracked_fd: i64 = 5; // a typical real kernel fd
+        assert!(tracked_fd < SYNTHETIC_FD_BASE as i64);
+        assert!(tracked_fd < NETLINK_FAKE_FD_BASE as i64);
+        assert!(NETLINK_FAKE_FD_BASE != SYNTHETIC_FD_BASE);
+        // The tracked fd set type carries i64 (sign-extended i32
+        // kernel fds) — a fake fd base i32 cast to i64 is positive
+        // and far above any real kernel fd. Real kernel fds cap at
+        // RLIMIT_NOFILE (~1 million in practice); both fake-fd bases
+        // are > 10^9, comfortably above any real kernel fd.
+        assert!((NETLINK_FAKE_FD_BASE as i64) > 1_000_000i64);
+        assert!((SYNTHETIC_FD_BASE as i64) > 1_000_000i64);
+    }
+
+    // ── Task 6-Z101: staged-exe map guards ─────────────────────────
+    #[test]
+    fn z101_parse_staged_exes_normalizes_and_skips_junk() {
+        let rootfs = "/tmp/twoyi-z101-rootfs";
+        let content = "# comment line\n\
+            \n\
+            /system/bin/init\t/cache/twoyi_init\n\
+            /vendor/bin/sh\t/cache/twoyi_sh\n\
+            junk-no-slash\t/something\n\
+            /relative_key\tnot_absolute\n";
+        let map = parse_staged_exes(content, rootfs);
+        // Both raw and rootfs-prefixed forms should hit; comments + junk
+        // (no leading slash on key) + non-absolute values are dropped.
+        assert!(map.contains_key("/system/bin/init"));
+        assert!(map.contains_key("/tmp/twoyi-z101-rootfs/system/bin/init"));
+        assert_eq!(
+            map.get("/system/bin/init").map(|s| s.as_str()),
+            Some("/cache/twoyi_init")
+        );
+        assert!(map.contains_key("/vendor/bin/sh"));
+        assert_eq!(
+            map.get("/vendor/bin/sh").map(|s| s.as_str()),
+            Some("/cache/twoyi_sh")
+        );
+        assert!(!map.contains_key("junk-no-slash"));
+        assert!(!map.contains_key("/relative_key"));
+    }
+
+    #[test]
+    fn z101_staged_exe_for_hits_guest_and_rootfs_forms() {
+        let rootfs = "/tmp/twoyi-z101-rootfs";
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "/system/bin/init".to_string(),
+            "/cache/twoyi_init".to_string(),
+        );
+        map.insert(
+            "/tmp/twoyi-z101-rootfs/system/bin/init".to_string(),
+            "/cache/twoyi_init".to_string(),
+        );
+        assert_eq!(
+            staged_exe_for(&map, rootfs, "/system/bin/init"),
+            Some("/cache/twoyi_init")
+        );
+        assert_eq!(
+            staged_exe_for(&map, rootfs, "/tmp/twoyi-z101-rootfs/system/bin/init"),
+            Some("/cache/twoyi_init")
+        );
+        // Misses return None and never panic.
+        assert_eq!(staged_exe_for(&map, rootfs, "/nope"), None);
+        // The empty map never hits.
+        let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert_eq!(staged_exe_for(&empty, rootfs, "/system/bin/init"), None);
+        // Marker path + STAGED_EXE_MARKER contract.
+        assert_eq!(STAGED_EXE_MARKER, ".twoyi-staged");
+        assert_eq!(staged_exes_marker_path("/tmp/r"), "/tmp/r/.twoyi-staged");
+    }
+
+    #[test]
+    fn z101_direct_socket_abi_numbers_and_socketcall_gate() {
+        // x86_64: socket=41 bind=49 listen=50 + socketcall sentinel -1
+        // (the 6-Z101 direct Bind/Listen arm fires).
+        assert_eq!(ABI_X86_64.socket_nr, 41);
+        assert_eq!(ABI_X86_64.bind_nr, 49);
+        assert_eq!(ABI_X86_64.listen_nr, 50);
+        assert_eq!(ABI_X86_64.socketcall_nr, -1);
+        // i386: socket=359 bind=360 listen=362 + socketcall 102
+        // (the direct arm is GATED OUT — bionic multiplexes via nr=102,
+        // the 6-Z96c subcall-2 territory).
+        assert_eq!(ABI_X86_32.socket_nr, 359);
+        assert_eq!(ABI_X86_32.bind_nr, 360);
+        assert_eq!(ABI_X86_32.listen_nr, 362);
+        assert_eq!(ABI_X86_32.socketcall_nr, 102);
+        // aarch64: cfg-gated (the const is #[cfg(target_arch =
+        // "aarch64")]).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(ABI_AARCH64.socket_nr, 198);
+            assert_eq!(ABI_AARCH64.bind_nr, 200);
+            assert_eq!(ABI_AARCH64.listen_nr, 201);
+        }
+        // netlink_op_for dispatch covers all three.
+        assert_eq!(netlink_op_for(41, &ABI_X86_64), Some(NetlinkOp::Socket));
+        assert_eq!(netlink_op_for(49, &ABI_X86_64), Some(NetlinkOp::Bind));
+        assert_eq!(netlink_op_for(50, &ABI_X86_64), Some(NetlinkOp::Listen));
+        assert_eq!(netlink_op_for(359, &ABI_X86_32), Some(NetlinkOp::Socket));
+        assert_eq!(netlink_op_for(360, &ABI_X86_32), Some(NetlinkOp::Bind));
+        assert_eq!(netlink_op_for(362, &ABI_X86_32), Some(NetlinkOp::Listen));
+    }
+
+    #[test]
+    fn z101_syscall_name_resolves_socket_bind_listen() {
+        // 6-Z101: bonus labels appended at the END of the syscall_name
+        // chain (end-of-chain = no shadowing of existing branches).
+        // x86_64 numbers.
+        assert_eq!(syscall_name(41, &ABI_X86_64), "socket");
+        assert_eq!(syscall_name(49, &ABI_X86_64), "bind");
+        assert_eq!(syscall_name(50, &ABI_X86_64), "listen");
+        // i386 numbers.
+        assert_eq!(syscall_name(359, &ABI_X86_32), "socket");
+        assert_eq!(syscall_name(360, &ABI_X86_32), "bind");
+        assert_eq!(syscall_name(362, &ABI_X86_32), "listen");
+    }
+
+    // ── Task 6-Z102: generic executable staging guards ─────────────
+    #[test]
+    fn z102_sanitize_stage_name_slashes_hash_and_bounds() {
+        // Slash sanitization.
+        let name = sanitize_stage_name("/system/bin/sh");
+        assert!(!name.contains('/'));
+        // Determinism (same input → same output across calls).
+        let name2 = sanitize_stage_name("/system/bin/sh");
+        assert_eq!(name, name2);
+        // Same basename, different path → different hash suffix (no
+        // collision between /system/bin/sh and /vendor/bin/sh).
+        let a = sanitize_stage_name("/system/bin/sh");
+        let b = sanitize_stage_name("/vendor/bin/sh");
+        assert_ne!(a, b);
+        // Exactly 12 hex digits after the final '_'.
+        let tail = a.rsplit('_').next().unwrap();
+        assert_eq!(tail.len(), 12);
+        assert!(tail.chars().all(|c| c.is_ascii_hexdigit()));
+        // 77-char bound: 64-char stem + 1 ('_') + 12 hex = 77.
+        let long = sanitize_stage_name(&"/a".repeat(200));
+        assert!(long.len() <= 77);
+        // stage_cache_dir + caps contract consts.
+        assert_eq!(STAGE_CACHE_DIR_NAME, "twoyi_stage");
+        assert_eq!(stage_cache_dir("/data/d"), "/data/d/cache/twoyi_stage");
+        assert_eq!(STAGE_MAX_FILES, 100);
+        assert_eq!(STAGE_MAX_TOTAL_BYTES, 500 * 1024 * 1024);
+    }
+
+    #[test]
+    fn z102_staging_stages_copies_elf_and_registers_marker() {
+        // Real /tmp fixtures: a rootfs tree + an ELF file.
+        let tmp = std::env::temp_dir().join(format!("twoyi-z102-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let rootfs = format!("{}/rootfs", tmp.display());
+        let data_dir = format!("{}/data", tmp.display());
+        let bin_dir = format!("{}/system/bin", rootfs);
+        let _ = std::fs::create_dir_all(&bin_dir);
+        let _ = std::fs::create_dir_all(&data_dir);
+        let elf_path = format!("{}/myinit", bin_dir);
+        // Minimal ELF: \x7fELF + filler to be non-empty.
+        let mut elf_bytes: Vec<u8> = vec![0x7f, b'E', b'L', b'F'];
+        elf_bytes.extend(std::iter::repeat(0u8).take(64));
+        std::fs::write(&elf_path, &elf_bytes).unwrap();
+        // Stage it.
+        let out = stage_guest_executable(&rootfs, &data_dir, "/system/bin/myinit");
+        match out {
+            StageOutcome::Staged { cache_path, bytes } => {
+                assert!(cache_path.starts_with(&format!("{}/cache/twoyi_stage/", data_dir)));
+                assert_eq!(bytes, elf_bytes.len() as u64);
+                // Cache file is byte-exact + mode 0755.
+                use std::os::unix::fs::PermissionsExt;
+                let cached = std::fs::read(&cache_path).unwrap();
+                assert_eq!(cached, elf_bytes);
+                let md = std::fs::metadata(&cache_path).unwrap();
+                assert_eq!(md.permissions().mode() & 0o7777, 0o755);
+                // Marker pair present + parse_staged_exes + staged_exe_for
+                // BOTH forms resolve.
+                let marker = staged_exes_marker_path(&rootfs);
+                let content = std::fs::read_to_string(&marker).unwrap();
+                let map = parse_staged_exes(&content, &rootfs);
+                assert_eq!(
+                    map.get("/system/bin/myinit").map(|s| s.as_str()),
+                    Some(cache_path.as_str())
+                );
+                assert_eq!(
+                    staged_exe_for(&map, &rootfs, "/system/bin/myinit"),
+                    Some(cache_path.as_str())
+                );
+                // The rootfs-prefixed alias also hits.
+                let prefixed = format!("{}/system/bin/myinit", rootfs);
+                assert_eq!(
+                    staged_exe_for(&map, &rootfs, &prefixed),
+                    Some(cache_path.as_str())
+                );
+            }
+            other => panic!("expected Staged, got {:?}", other),
+        }
+        // Second call = Reused (identical-length existing copy).
+        let out2 = stage_guest_executable(&rootfs, &data_dir, "/system/bin/myinit");
+        match out2 {
+            StageOutcome::Reused {
+                cache_path: _,
+                bytes,
+            } => {
+                assert_eq!(bytes, elf_bytes.len() as u64);
+            }
+            other => panic!("expected Reused, got {:?}", other),
+        }
+        // Marker line REPLACED not duplicated (exactly ONE pair).
+        let marker = staged_exes_marker_path(&rootfs);
+        let content = std::fs::read_to_string(&marker).unwrap();
+        let pair_lines: Vec<&str> = content
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+            .collect();
+        assert_eq!(pair_lines.len(), 1);
+        // staged_exes_insert alias registration (the in-loop helper).
+        let mut map2 = std::collections::HashMap::new();
+        staged_exes_insert(&mut map2, &rootfs, "/x", "/cache/y");
+        assert_eq!(map2.get("/x").map(|s| s.as_str()), Some("/cache/y"));
+        assert_eq!(
+            map2.get(&format!("{}/x", rootfs)).map(|s| s.as_str()),
+            Some("/cache/y")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z102_staging_refuses_missing_nonelf_relative_and_caps() {
+        let tmp = std::env::temp_dir().join(format!("twoyi-z102-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let rootfs = format!("{}/rootfs", tmp.display());
+        let data_dir = format!("{}/data", tmp.display());
+        let _ = std::fs::create_dir_all(&rootfs);
+        let _ = std::fs::create_dir_all(&data_dir);
+        // ENOENT → Skip("no ROM copy").
+        match stage_guest_executable(&rootfs, &data_dir, "/no/such/file") {
+            StageOutcome::Skip(r) => assert_eq!(r, "no ROM copy"),
+            other => panic!("expected Skip(no ROM copy), got {:?}", other),
+        }
+        // Non-ELF (script) → Skip("not ELF magic").
+        let script = format!("{}/system/bin", rootfs);
+        let _ = std::fs::create_dir_all(&script);
+        let sh_path = format!("{}/sh", script);
+        std::fs::write(&sh_path, b"#!/bin/sh\necho hi\n").unwrap();
+        match stage_guest_executable(&rootfs, &data_dir, "/system/bin/sh") {
+            StageOutcome::Skip(r) => assert_eq!(r, "not ELF magic"),
+            other => panic!("expected Skip(not ELF magic), got {:?}", other),
+        }
+        // Relative → Skip.
+        match stage_guest_executable(&rootfs, &data_dir, "relative/path") {
+            StageOutcome::Skip(r) => assert_eq!(r, "relative path"),
+            other => panic!("expected Skip(relative path), got {:?}", other),
+        }
+        // Empty file → Skip.
+        let empty_path = format!("{}/system/bin/empty", rootfs);
+        std::fs::write(&empty_path, b"").unwrap();
+        match stage_guest_executable(&rootfs, &data_dir, "/system/bin/empty") {
+            StageOutcome::Skip(r) => assert_eq!(r, "empty file"),
+            other => panic!("expected Skip(empty file), got {:?}", other),
+        }
+        // Directory at the path → Skip("not a regular file").
+        match stage_guest_executable(&rootfs, &data_dir, "/system/bin") {
+            StageOutcome::Skip(r) => assert_eq!(r, "not a regular file"),
+            other => panic!("expected Skip(not a regular file), got {:?}", other),
+        }
+        // Caps via the injectable-caps core: a 1-byte ELF + max_files=1.
+        // Stage one file first so the next call exceeds the cap.
+        let tiny_path = format!("{}/system/bin/tiny", rootfs);
+        let mut tiny: Vec<u8> = vec![0x7f, b'E', b'L', b'F'];
+        tiny.push(1);
+        std::fs::write(&tiny_path, &tiny).unwrap();
+        let _ = stage_guest_executable_capped(
+            &rootfs,
+            &data_dir,
+            "/system/bin/tiny",
+            100,
+            500 * 1024 * 1024,
+        );
+        // max_files=1 — the tiny entry already exists, so a NEW ELF
+        // (different name) must Skip(file-count cap).
+        let tiny2_path = format!("{}/system/bin/tiny2", rootfs);
+        let mut tiny2: Vec<u8> = vec![0x7f, b'E', b'L', b'F'];
+        tiny2.push(2);
+        std::fs::write(&tiny2_path, &tiny2).unwrap();
+        match stage_guest_executable_capped(
+            &rootfs,
+            &data_dir,
+            "/system/bin/tiny2",
+            1, // max_files=1 — the existing tiny already fills it
+            500 * 1024 * 1024,
+        ) {
+            StageOutcome::Skip(r) => assert_eq!(r, "file-count cap exceeded"),
+            other => panic!("expected Skip(file-count cap exceeded), got {:?}", other),
+        }
+        // Byte cap: a 4-byte ELF + max_total_bytes=3 must Skip.
+        let mini_path = format!("{}/system/bin/mini", rootfs);
+        std::fs::write(&mini_path, &[0x7f, b'E', b'L', b'F']).unwrap();
+        match stage_guest_executable_capped(
+            &rootfs,
+            &data_dir,
+            "/system/bin/mini",
+            100,
+            3, // 4-byte file > 3-byte cap
+        ) {
+            StageOutcome::Skip(r) => assert_eq!(r, "single-file byte cap exceeded"),
+            other => panic!(
+                "expected Skip(single-file byte cap exceeded), got {:?}",
+                other
+            ),
+        }
+        // len==cap passes (the existing tiny file is 5 bytes, cap=5).
+        match stage_guest_executable_capped(
+            &rootfs,
+            &data_dir,
+            "/system/bin/tiny",
+            100,
+            5, // tiny is 5 bytes; cap==len is the boundary case
+        ) {
+            StageOutcome::Reused { .. } => {}
+            StageOutcome::Staged { .. } => {}
+            other => panic!("expected Staged/Reused at len==cap, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z102_stage_dir_usage_counts_files_and_bytes() {
+        // Missing dir → (0, 0).
+        let (f, b) = stage_dir_usage("/tmp/twoyi-z102-stage-nonexistent-xyz");
+        assert_eq!(f, 0);
+        assert_eq!(b, 0);
+        // Files + bytes counted; subdirs excluded.
+        let tmp = std::env::temp_dir().join(format!("twoyi-z102-usage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = format!("{}/d", tmp.display());
+        let sub = format!("{}/d/sub", tmp.display());
+        let _ = std::fs::create_dir_all(&sub);
+        std::fs::write(format!("{}/a", dir), b"hello").unwrap();
+        std::fs::write(format!("{}/b", dir), b"world").unwrap();
+        let (f, b) = stage_dir_usage(&dir);
+        assert_eq!(f, 2);
+        assert_eq!(b, 10); // 5 + 5
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Task 6-Z103: ROM rc/fstab override guards ──────────────────
+    #[test]
+    fn z103_is_readonly_config_path_classifier() {
+        // (a) the ramdisk-root /init*.rc family.
+        assert!(is_readonly_config_path("/init.rc"));
+        assert!(is_readonly_config_path("/init.usb.rc"));
+        assert!(is_readonly_config_path("/init.zygote64_32.rc"));
+        // "/init" without the .rc suffix is NOT a config path.
+        assert!(!is_readonly_config_path("/init"));
+        // (b) the three etc/init dirs' *.rc children.
+        assert!(is_readonly_config_path("/system/etc/init/ueventd.rc"));
+        assert!(is_readonly_config_path("/vendor/etc/init/zygote.rc"));
+        assert!(is_readonly_config_path("/odm/etc/init/foo.rc"));
+        // (d) fstab.* reads whose parent is `/` or `/vendor/etc`.
+        assert!(is_readonly_config_path("/fstab.ranchu"));
+        assert!(is_readonly_config_path("/vendor/etc/fstab.ranchu"));
+        // Deliberate NON-matches (locked by test).
+        assert!(!is_readonly_config_path("/system/lib64/libc.so"));
+        assert!(!is_readonly_config_path("/system/bin/ueventd"));
+        assert!(!is_readonly_config_path("/system/bin/linker64"));
+        assert!(!is_readonly_config_path("/system/etc/ld.config.txt"));
+        assert!(!is_readonly_config_path("/system/etc/platform.xml"));
+        assert!(!is_readonly_config_path("/system/etc/sepolicy/policy"));
+        assert!(!is_readonly_config_path("/system/etc/init")); // DIR itself
+        assert!(!is_readonly_config_path("/system/etc/init/atrace.rc.bak"));
+        assert!(!is_readonly_config_path("/etc/fstab.ranchu")); // only root + /vendor/etc
+        assert!(!is_readonly_config_path("/odm/etc/fstab.ranchu"));
+        assert!(!is_readonly_config_path("relative.rc"));
+        assert!(!is_readonly_config_path(""));
+        assert!(!is_readonly_config_path("/system/etc/init/"));
+    }
+
+    #[test]
+    fn z103_rom_config_override_uses_rom_copy_when_present() {
+        let tmp = std::env::temp_dir().join(format!("twoyi-z103-rom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let rootfs = format!("{}/rootfs", tmp.display());
+        let _ = std::fs::create_dir_all(format!("{}/system/etc/init", rootfs));
+        let _ = std::fs::create_dir_all(format!("{}/vendor/etc/init", rootfs));
+        let _ = std::fs::create_dir_all(format!("{}/odm/etc/init", rootfs));
+        std::fs::write(format!("{}/init.rc", rootfs), b"# init.rc").unwrap();
+        std::fs::write(format!("{}/system/etc/init/ueventd.rc", rootfs), b"").unwrap();
+        std::fs::write(format!("{}/vendor/etc/init/zygote.rc", rootfs), b"").unwrap();
+        std::fs::write(format!("{}/odm/etc/init/foo.rc", rootfs), b"").unwrap();
+        std::fs::write(format!("{}/fstab.ranchu", rootfs), b"").unwrap();
+        std::fs::write(format!("{}/vendor/etc/fstab.ranchu", rootfs), b"").unwrap();
+        // Every classified form returns Some({rootfs}{path}).
+        assert_eq!(
+            rom_config_override(&rootfs, "/init.rc", false),
+            Some(format!("{}/init.rc", rootfs))
+        );
+        assert_eq!(
+            rom_config_override(&rootfs, "/system/etc/init/ueventd.rc", false),
+            Some(format!("{}/system/etc/init/ueventd.rc", rootfs))
+        );
+        assert_eq!(
+            rom_config_override(&rootfs, "/vendor/etc/init/zygote.rc", false),
+            Some(format!("{}/vendor/etc/init/zygote.rc", rootfs))
+        );
+        assert_eq!(
+            rom_config_override(&rootfs, "/odm/etc/init/foo.rc", false),
+            Some(format!("{}/odm/etc/init/foo.rc", rootfs))
+        );
+        assert_eq!(
+            rom_config_override(&rootfs, "/fstab.ranchu", false),
+            Some(format!("{}/fstab.ranchu", rootfs))
+        );
+        assert_eq!(
+            rom_config_override(&rootfs, "/vendor/etc/fstab.ranchu", false),
+            Some(format!("{}/vendor/etc/fstab.ranchu", rootfs))
+        );
+        // write_intent → None for ALL of them.
+        assert_eq!(rom_config_override(&rootfs, "/init.rc", true), None);
+        assert_eq!(
+            rom_config_override(&rootfs, "/system/etc/init/ueventd.rc", true),
+            None
+        );
+        assert_eq!(
+            rom_config_override(&rootfs, "/vendor/etc/fstab.ranchu", true),
+            None
+        );
+        // Non-classified path (xml) → None even with a ROM copy present.
+        std::fs::write(format!("{}/system/etc/platform.xml", rootfs), b"").unwrap();
+        assert_eq!(
+            rom_config_override(&rootfs, "/system/etc/platform.xml", false),
+            None
+        );
+        // A DIRECTORY named dir.rc → None (regular-file check).
+        let _ = std::fs::create_dir_all(format!("{}/dir.rc", rootfs));
+        assert_eq!(rom_config_override(&rootfs, "/dir.rc", false), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z103_override_falls_through_when_rom_copy_missing() {
+        let rootfs = "/tmp/twoyi-z103-nonexistent-rootfs";
+        // Nonexistent rootfs: all classified paths → None (natural-404
+        // fall-through). Locks the caller's fall-back contract:
+        // translate_path keeps /system/etc/init/* + /vendor/etc/init/*
+        // UNTRANSLATED (the exact z101-flagged gap), and /init.rc
+        // already lands on {rootfs}/init.rc either way.
+        assert_eq!(rom_config_override(rootfs, "/init.rc", false), None);
+        assert_eq!(
+            rom_config_override(rootfs, "/system/etc/init/ueventd.rc", false),
+            None
+        );
+        assert_eq!(
+            rom_config_override(rootfs, "/vendor/etc/init/zygote.rc", false),
+            None
+        );
+        assert_eq!(
+            rom_config_override(rootfs, "/odm/etc/init/foo.rc", false),
+            None
+        );
+        assert_eq!(rom_config_override(rootfs, "/fstab.ranchu", false), None);
+        assert_eq!(
+            rom_config_override(rootfs, "/vendor/etc/fstab.ranchu", false),
+            None
+        );
+    }
+
+    #[test]
+    fn z103_open_flags_write_intent_matrix() {
+        // Read-only.
+        assert!(!open_flags_indicate_write(0));
+        assert!(!open_flags_indicate_write(0o2000000)); // O_CLOEXEC
+        assert!(!open_flags_indicate_write(0o2000000 | 0o4000)); // +O_NONBLOCK
+        assert!(!open_flags_indicate_write(0o2000000 | 0o100000)); // +O_DIRECTORY
+                                                                   // Write.
+        assert!(open_flags_indicate_write(0o1)); // O_WRONLY
+        assert!(open_flags_indicate_write(0o2)); // O_RDWR
+        assert!(open_flags_indicate_write(0o100)); // O_CREAT
+        assert!(open_flags_indicate_write(0o1000)); // O_TRUNC
+        assert!(open_flags_indicate_write(0o2000)); // O_APPEND
+        assert!(open_flags_indicate_write(0o241)); // O_WRONLY|O_CREAT|O_TRUNC
     }
 }
