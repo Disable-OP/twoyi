@@ -4323,6 +4323,7 @@ fn sockaddr_un_is_property_service(
 /// SERVER-side calls the 6-Z3 / 6-Z101 fake handled; the client only
 /// does connect + send + recv + close).
 #[derive(PartialEq, Debug, Clone, Copy)]
+#[allow(dead_code)] // Read variant: reserved for the test matrix's 9-way no-collision sweep per the 6-Z110 spec; the inline read arm matches `nr == abi.read && tracked(fd)` directly without going through propserv_op_for, so Read is never returned from the dispatcher at runtime but exists for parity with NetlinkOp and the unit-test sweep.
 enum PropServOp {
     Connect,
     SendTo,
@@ -4391,6 +4392,7 @@ fn propserv_op_for(nr: i64, abi: &ChildAbi) -> Option<PropServOp> {
 /// nonblocking socket hot-spins on EAGAIN, so EOF (0) is the only
 /// non-spinning value for the send-then-read-once reply-reading
 /// variants bionic's __system_property_set uses.
+#[allow(dead_code)] // The dispatcher computes the faked return INLINE at the call site (sendto: arg3 / sendmsg: iov walk / writev: iov walk — overridden at the EXIT arm), so this function is never called at runtime. It exists to lock the per-op MAPPING in unit tests (z110_propserv_ret_mapping_and_tracked_set_lifecycle) — send→full-len, recv→0, the rest→0.
 fn propserv_ret_for(op: PropServOp) -> i64 {
     match op {
         // The actual requested byte count is computed inline at the
@@ -4755,7 +4757,9 @@ fn parse_prop_msg(frame: &[u8]) -> Option<(String, String)> {
     }
     // Classic parse: name @ 4, 32 bytes; value @ 36, 92 bytes.
     // Name must be NUL-terminated within 31 bytes.
-    let name_end = (4..4 + NAME_MAX_LEN).find(|&i| frame[i] == 0).unwrap_or(4 + NAME_MAX_LEN);
+    let name_end = (4..4 + NAME_MAX_LEN)
+        .find(|&i| frame[i] == 0)
+        .unwrap_or(4 + NAME_MAX_LEN);
     let name_bytes = &frame[4..name_end];
     // If name_end landed at 4+31 without finding a NUL, the name is
     // UNTERMINATED within the classic gate — reject (the spec's
@@ -4772,8 +4776,9 @@ fn parse_prop_msg(frame: &[u8]) -> Option<(String, String)> {
     if frame.len() >= WIDE_SIZE && name_bytes.is_empty() {
         // Wide fallback: name @ 4 (92 bytes), value @ 96 (92 bytes).
         // Re-parse the name from the wide slot.
-        let wide_name_end =
-            (4..4 + NAME_MAX_LEN).find(|&i| frame[i] == 0).unwrap_or(4 + NAME_MAX_LEN);
+        let wide_name_end = (4..4 + NAME_MAX_LEN)
+            .find(|&i| frame[i] == 0)
+            .unwrap_or(4 + NAME_MAX_LEN);
         let wide_name_bytes = &frame[4..wide_name_end];
         if wide_name_end == 4 + NAME_MAX_LEN && frame[wide_name_end] != 0 {
             // Wide name also unterminated — reject.
@@ -5198,8 +5203,8 @@ fn prop_area_plan_update(
     let copy_len = std::cmp::min(new_len, capacity);
     value_bytes[..copy_len].copy_from_slice(&new_value.as_bytes()[..copy_len]);
     value_bytes[copy_len] = 0; // NUL terminator
-    // value_bytes is now new_value + NUL + zero-pad to capacity+1.
-    // Compute the new serial: (new_len << 24) | ((old_serial | 1) + 1) & 0xffffff
+                               // value_bytes is now new_value + NUL + zero-pad to capacity+1.
+                               // Compute the new serial: (new_len << 24) | ((old_serial | 1) + 1) & 0xffffff
     let new_serial: u32 = ((new_len as u32) << PROP_SERIAL_LEN_SHIFT)
         | (((old_serial | PROP_SERIAL_DIRTY_BIT) + 1) & PROP_SERIAL_COUNTER_MASK)
         | (if is_long {
@@ -5404,7 +5409,9 @@ fn z111_apply_property_set(
                         PropAreaFormat::CorruptBytesUsed => "corrupt bytes_used",
                         PropAreaFormat::CorruptVersion => "corrupt version",
                         PropAreaFormat::NotAnArea => "not a property area (magic mismatch)",
-                        PropAreaFormat::New => "property NOT in this area's trie OR new len > capacity — stays unset",
+                        PropAreaFormat::New => {
+                            "property NOT in this area's trie OR new len > capacity — stays unset"
+                        }
                     };
                     fb0_log(&format!(
                         "6-Z111: area update SKIPPED for pid={} @ {:#x} ({}) — {}",
@@ -8488,24 +8495,18 @@ pub fn run_ptrace_loop(
                                 let parent_entries =
                                     prop_area_maps.get(&pid).cloned().unwrap_or_default();
                                 if !parent_entries.is_empty() {
-                                    let child_entries = prop_area_maps
-                                        .entry(new_child_pid)
-                                        .or_default();
+                                    let child_entries =
+                                        prop_area_maps.entry(new_child_pid).or_default();
                                     let mut pushed = 0usize;
                                     for &(addr, len) in &parent_entries {
-                                        if child_entries
-                                            .iter()
-                                            .all(|&(a, _)| a != addr)
-                                            && child_entries.len()
-                                                < PROP_AREA_MAPS_PER_PID_CAP
+                                        if child_entries.iter().all(|&(a, _)| a != addr)
+                                            && child_entries.len() < PROP_AREA_MAPS_PER_PID_CAP
                                         {
                                             child_entries.push((addr, len));
                                             pushed += 1;
                                         }
                                     }
-                                    if pushed > 0
-                                        && prop_area_log_count < PROP_AREA_LOG_CAP
-                                    {
+                                    if pushed > 0 && prop_area_log_count < PROP_AREA_LOG_CAP {
                                         prop_area_log_count += 1;
                                         log(&format!(
                                             "6-Z111: PTRACE_EVENT_{} — new child PID {} inherited {} property-area mapping(s) from parent {} at the same addresses (COW mm — broadcaster writes both)",
@@ -11895,16 +11896,12 @@ pub fn run_ptrace_loop(
                                                     // that would log "past
                                                     // EOF" noise.
                                                     if is_property_area_file(&path) {
-                                                        let map_addr = get_syscall_arg(
-                                                            &regs2,
-                                                            abi.reg_ret,
-                                                        )
-                                                            as u64;
+                                                        let map_addr =
+                                                            get_syscall_arg(&regs2, abi.reg_ret)
+                                                                as u64;
                                                         let map_len = pending.length as usize;
                                                         let entries =
-                                                            prop_area_maps
-                                                                .entry(pid)
-                                                                .or_default();
+                                                            prop_area_maps.entry(pid).or_default();
                                                         if entries
                                                             .iter()
                                                             .all(|&(a, _)| a != map_addr)
@@ -13707,9 +13704,7 @@ pub fn run_ptrace_loop(
                                         if let Some(payload) =
                                             read_child_bytes(pid, buf_ptr, req_len)
                                         {
-                                            if let Some((name, value)) =
-                                                parse_prop_msg(&payload)
-                                            {
+                                            if let Some((name, value)) = parse_prop_msg(&payload) {
                                                 z111_apply_property_set(
                                                     pid,
                                                     &name,
@@ -13992,12 +13987,9 @@ pub fn run_ptrace_loop(
                                 // deferred (bionic's prop_msg uses
                                 // sendto).
                                 if matches!(subcall, 9 | 11) {
-                                    let buf_ptr = read_child_u32(
-                                        pid,
-                                        sc_args_ptr.wrapping_add(4),
-                                    )
-                                    .map(|v| v as u64)
-                                    .unwrap_or(0);
+                                    let buf_ptr = read_child_u32(pid, sc_args_ptr.wrapping_add(4))
+                                        .map(|v| v as u64)
+                                        .unwrap_or(0);
                                     let req_len = std::cmp::min(
                                         read_child_u32(pid, sc_args_ptr.wrapping_add(8))
                                             .map(|v| v as usize)
@@ -14008,9 +14000,7 @@ pub fn run_ptrace_loop(
                                         if let Some(payload) =
                                             read_child_bytes(pid, buf_ptr, req_len)
                                         {
-                                            if let Some((name, value)) =
-                                                parse_prop_msg(&payload)
-                                            {
+                                            if let Some((name, value)) = parse_prop_msg(&payload) {
                                                 z111_apply_property_set(
                                                     pid,
                                                     &name,
