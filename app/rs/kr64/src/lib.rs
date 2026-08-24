@@ -5808,15 +5808,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // long-standing minimal stub content is strictly better for vold
     // later). TWRP ignores /vendor (reads /etc/recovery.fstab); creating
     // the dir in its ramdisk is harmless.
+    //
+    // 6-Z101 PART D: the stub content is now COMMENT-ONLY (0 entries).
+    // The previous 3 /dev/null entries were active fstab entries that
+    // Android 11 init parses in BOTH stages; active entries would send
+    // first-stage mount AND second-stage `mount_all` at /dev/null
+    // (ENOTBLK noise, potentially boot-fatal mount_all failures). An
+    // empty (comment-only) fstab parses cleanly (fs_mgr treats comment
+    // lines as no-ops → 0 entries, success) → FirstStageMount finds no
+    // `first_stage_mount`-flagged entries → skips early mounts entirely
+    // (same non-fatal shape as the aosp16-proven ENOENT fallthrough,
+    // minus the error log). No early mounts is the twoyi model: the
+    // ptrace path translation provides /system + /vendor, and the self-
+    // execve now goes through the staged cache copy. vold keeps working
+    // per the ORIGINAL pre-6-Z99 design comment ("ship a truly empty
+    // fstab — vold proceeds with an empty fstab").
     {
         let fstab_path = format!("{}/vendor/etc/fstab.ranchu", rootfs_prefix);
-        let fstab_content = "# Minimal fstab for twoyi virtualization\n/dev/null /system ext4 ro wait\n/dev/null /vendor ext4 ro wait\n/dev/null /data ext4 nosuid,nodev wait,check,formattable,latemount,resize\n";
+        let fstab_content = "# Minimal fstab for twoyi virtualization (comment-only — 0 entries; FirstStageMount skips early mounts, vold proceeds with an empty fstab)\n";
         let _ = std::fs::create_dir_all(format!("{}/vendor/etc", rootfs_prefix));
         let _ = std::fs::write(&fstab_path, fstab_content);
         if cfg.boot_recovery {
             info!("[KR64] PARENT: wrote /vendor/etc/fstab.ranchu stub (TWRP boot — informational; TWRP reads /etc/recovery.fstab)");
         } else {
-            info!("[KR64] PARENT: overwrote fstab.ranchu with minimal stub");
+            info!("[KR64] PARENT: overwrote fstab.ranchu with comment-only stub (0 entries)");
         }
     }
 
@@ -6726,6 +6741,67 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 &cache_init,
                                 std::fs::Permissions::from_mode(0o755),
                             );
+                            // 6-Z101 PART B: read-modify-write the
+                            // .twoyi-staged marker keyed by cfg.init_path
+                            // (re-run replaces its line, preserves future
+                            // entries; currently the one
+                            // `/system/bin/init<TAB>{data_dir}/cache/twoyi_init`
+                            // pair; TWRP boots record `/init`). The ptrace
+                            // emulator reads this marker lazily at the
+                            // first execve and consults it for every
+                            // subsequent execve ENTRY (the staged-exe map
+                            // — see ptrace_emu::load_staged_exes_map +
+                            // staged_exe_for). Mirrors the in-loop writer
+                            // (ptrace_emu::append_staged_marker) exactly so
+                            // the two writers stay interchangeable.
+                            {
+                                let marker_path =
+                                    crate::ptrace_emu::staged_exes_marker_path(&cfg.rootfs);
+                                let guest_key = cfg.init_path.clone();
+                                let cache_path_for_marker = cache_init.clone();
+                                let existing =
+                                    std::fs::read_to_string(&marker_path).unwrap_or_default();
+                                let new_line = format!("{}\t{}", guest_key, cache_path_for_marker);
+                                let mut out: Vec<String> = Vec::new();
+                                let mut replaced = false;
+                                for line in existing.lines() {
+                                    let trimmed = line.trim();
+                                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                                        out.push(line.to_string());
+                                        continue;
+                                    }
+                                    let key = trimmed.split('\t').next().unwrap_or("");
+                                    if key == guest_key {
+                                        out.push(new_line.clone());
+                                        replaced = true;
+                                    } else {
+                                        out.push(line.to_string());
+                                    }
+                                }
+                                if !replaced {
+                                    out.push(new_line);
+                                }
+                                if let Err(e) = std::fs::write(&marker_path, out.join("\n") + "\n")
+                                {
+                                    unsafe {
+                                        safe_write_err(b"[KR64 CHILD] 6-Z101: staged-exe marker write FAILED for ");
+                                        safe_write_err(marker_path.as_bytes());
+                                        safe_write_err(b": ");
+                                        safe_write_err(e.to_string().as_bytes());
+                                        safe_write_err(b"\n");
+                                    }
+                                } else {
+                                    unsafe {
+                                        safe_write_err(b"[KR64 CHILD] 6-Z101: staged-exe marker ");
+                                        safe_write_err(marker_path.as_bytes());
+                                        safe_write_err(b" <- ");
+                                        safe_write_err(guest_key.as_bytes());
+                                        safe_write_err(b" -> ");
+                                        safe_write_err(cache_path_for_marker.as_bytes());
+                                        safe_write_err(b"\n");
+                                    }
+                                }
+                            }
                             unsafe {
                                 safe_write_err(b"[KR64 CHILD] copied init to ");
                                 safe_write_err(cache_init.as_bytes());
@@ -7613,7 +7689,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 None
             };
 
-            let exit_code = ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs, &vfs, recovery_pid);
+            // 6-Z102 PART D: pass `&cfg.data_dir` so the ptrace loop's
+            // generic-staging engine (stage_guest_executable) can copy guest
+            // ROM binaries to {data_dir}/cache/twoyi_stage/ and exec them
+            // from there (the rootfs is on the noexec app-data partition;
+            // the app cache dir is the ONE executable place we own).
+            let exit_code =
+                ptrace_emu::run_ptrace_loop(pid, &cfg.rootfs, &cfg.data_dir, &vfs, recovery_pid);
             info!(
                 "[KR64][parent] ptrace emulation loop ended — child exit code: {}",
                 exit_code
