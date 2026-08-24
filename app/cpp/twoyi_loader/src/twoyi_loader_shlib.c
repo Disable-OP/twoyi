@@ -2918,6 +2918,82 @@ static int mkdir_p(const char *path, mode_t mode) {
     return mkdir(tmp, mode);
 }
 
+// 6-Z123: the security-sysctl trio the Android 11 init FATALs on.
+//
+// Run 32749762701 (584a79f): after 6-Z121 unlocked PropertyInit, the
+// guest advanced through the FULL init.rc parse (all 60+ .rc files)
+// and died at the SetKptrRestrict builtin:
+//   init: Cannot open for reading: /proc/sys/kernel/kptr_restrict
+//   init: Unable to set adequate kptr_restrict value!
+//   init: InitFatalReboot: signal 6
+// security.cpp's SetHighestAvailableOptionValue() opens the sysctl
+// with std::ifstream (must SUCCEED), writes each candidate value with
+// std::ofstream (O_WRONLY|O_CREAT|O_TRUNC), then seeks the ifstream
+// back and VERIFIES the read matches the write. The host emulator's
+// real /proc/sys/kernel/kptr_restrict is SELinux-denied for
+// untrusted_app (the ifstream open fails), and init's
+// SetKptrRestrictAction/SetMmapRndBitsAction both LOG(FATAL) when the
+// set-verify loop fails.
+//
+// THE FIX: virtualize the three files into the rootfs — pre-created
+// with a valid seed (so the ifstream open succeeds), translated by
+// should_translate (so ofstream writes + the seekg(0) re-read hit the
+// SAME rootfs file — write/read-back coherence is automatic), and
+// app-owned (so the write succeeds). init sees a perfectly normal
+// writable sysctl.
+//
+// The trio (values from security.cpp android11-release):
+//   /proc/sys/kernel/kptr_restrict        — SetKptrRestrictAction:
+//       min 2, max 4 (writes "4" first, accepts it)
+//   /proc/sys/vm/mmap_rnd_bits            — SetMmapRndBitsAction
+//       (x86_64): min 32, max 32 (writes "32")
+//   /proc/sys/vm/mmap_rnd_compat_bits     — the compat sibling:
+//       min 16, max 16 (writes "16")
+// TestPerfEventSelinuxAction (perf_event_open test) is fully
+// non-fatal; MixHwrngIntoLinuxRng reads /dev/hw_random (already
+// virtualized); wait_for_coldboot_done is pre-set by the property
+// pre-seeds.
+static int is_proc_sys_virtual_file(const char *path) {
+    if (!path) return 0;
+    return strcmp(path, "/proc/sys/kernel/kptr_restrict") == 0 ||
+           strcmp(path, "/proc/sys/vm/mmap_rnd_bits") == 0 ||
+           strcmp(path, "/proc/sys/vm/mmap_rnd_compat_bits") == 0;
+}
+
+// Pre-create {rootfs}/proc/sys/{kernel,vm}/<file> with a valid seed.
+// Idempotent: an existing file (e.g. "4" left by a previous boot
+// cycle's write) is left alone — any in-range value satisfies the
+// read-open, and the write loop overwrites it immediately anyway.
+static void ensure_proc_sys_files(void) {
+    if (!g_rootfs) return;
+    static const struct {
+        const char *rel;   // path under /proc/sys/
+        const char *seed;  // a valid in-range value
+    } files[] = {
+        {"kernel/kptr_restrict", "2"},
+        {"vm/mmap_rnd_bits", "32"},
+        {"vm/mmap_rnd_compat_bits", "16"},
+    };
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/proc/sys", g_rootfs);
+    mkdir_p(dir, 0755);
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        char sub[512];
+        snprintf(sub, sizeof(sub), "%s/proc/sys/%s", g_rootfs,
+                 strncmp(files[i].rel, "kernel/", 7) == 0 ? "kernel" : "vm");
+        mkdir_p(sub, 0755);
+        char path[600];
+        snprintf(path, sizeof(path), "%s/proc/sys/%s", g_rootfs, files[i].rel);
+        // O_EXCL: only the creator writes the seed.
+        int fd = twoyi_sys_open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+        if (fd >= 0) {
+            syscall(NR_write, fd, files[i].seed, strlen(files[i].seed));
+            syscall(NR_write, fd, "\n", 1);
+            syscall(NR_close, fd);
+        }
+    }
+}
+
 static void ensure_selinuxfs_files(void) {
     if (!g_rootfs) return;
     char dir[512];
@@ -2959,6 +3035,10 @@ static int should_translate(const char *path) {
     // IMPORTANT: Use boundary checks (path[N] == 0 || path[N] == '/') to avoid
     // matching paths that just start with the same prefix.
     // e.g., /sys must NOT match /system (which starts with /sys)
+    // 6-Z123: the three security sysctls init FATALs on — virtualize to
+    // rootfs (see ensure_proc_sys_files for the full rationale). Checked
+    // BEFORE the blanket /proc rejection below.
+    if (is_proc_sys_virtual_file(path)) return 1;
     if (strncmp(path, "/proc", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
     if (strncmp(path, "/sys", 4) == 0 && (path[4] == 0 || path[4] == '/')) return 0;
     if (strncmp(path, "/data", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
@@ -4073,6 +4153,10 @@ static void twoyi_init(void) {
 
     // Create SELinuxFS virtual files (init needs /sys/fs/selinux/checkreqprot etc.)
     ensure_selinuxfs_files();
+    // 6-Z123: the security-sysctl trio (kptr_restrict + mmap_rnd_bits +
+    // mmap_rnd_compat_bits) — see ensure_proc_sys_files() for the
+    // SetKptrRestrict/SetMmapRndBits FATAL rationale.
+    ensure_proc_sys_files();
     write_str(2, "[twoyi_loader] selinuxfs virtual files created\n");
 
     // Pre-create directories that init's mkdir commands create.
