@@ -14264,6 +14264,21 @@ pub fn run_ptrace_loop(
                                                     ));
                                                 }
                                             }
+                                        } else if propserv_log_count < PROPSERV_LOG_CAP {
+                                            // DIAGNOSTIC: log the sockaddr blob so we can see
+                                            // what TWRP is connecting to when it's NOT the
+                                            // property_service path. This identifies the
+                                            // remaining SIGABRT trigger (sub-agent SESSION-
+                                            // RESUME-003-FIX3 follow-up).
+                                            propserv_log_count += 1;
+                                            let blob = read_child_bytes(pid, sockaddr_ptr, 128)
+                                                .unwrap_or_default();
+                                            let preview: Vec<u8> =
+                                                blob.iter().take(48).cloned().collect();
+                                            log(&format!(
+                                                "6-Z110-TWRP-GATE-DIAG: socketcall(3)=connect(fd={}, addrlen={}) returned {} (success) but sockaddr did NOT match property_service — blob[0..48]={:?} (hex); NOT forcing failure (let connect succeed and observe what TWRP does next)",
+                                                fd, addrlen, ret, preview
+                                            ));
                                         }
                                     }
                                 }
