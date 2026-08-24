@@ -343,6 +343,25 @@ jobs:
               echo "  (no linker64 — checking x86 linker)"
           echo "  ✓ AOSP x86_64 rootfs preloaded from the AVD system image"
 
+          # ── 6-Z120 diagnostics: SELinux-compile input ground truth ───
+          # The guest's Android 11 init compiles its SELinux policy with
+          # secilc at boot (the emulator tree has no matching precompiled
+          # policy for our rootfs). These listings land in the workflow
+          # log so every run proves which CIL/fstab inputs exist in the
+          # rootfs vs. on the emulator, and how much disk is left.
+          echo "── rootfs SELinux inputs ──"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/etc/selinux/ 2>&1 | head -25"
+          echo "── rootfs SELinux mapping dir ──"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/etc/selinux/mapping/ 2>&1 | head -12"
+          echo "── rootfs vendor selinux (CIL + vers + fstab) ──"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/vendor/etc/selinux/ 2>&1 | head -15"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/vendor/etc/fstab.ranchu 2>&1"
+          echo "── emulator-side source files (shell-user view) ──"
+          $ADB shell "ls -la /system/etc/selinux/plat_sepolicy.cil /vendor/etc/selinux/plat_sepolicy_vers.txt 2>&1"
+          echo "── rootfs size + disk space ──"
+          $ADB shell "run-as io.twoyi.debug du -sh profiles/default/rootfs 2>&1"
+          $ADB shell "df -h /data 2>&1 | tail -2"
+
       - name: UI navigation — boot AOSP container
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk

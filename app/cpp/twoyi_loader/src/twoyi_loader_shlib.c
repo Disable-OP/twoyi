@@ -1909,6 +1909,56 @@ int lstat(const char *path, struct stat *buf) {
     return syscall(SYS_newfstatat, AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
 }
 
+// Hook stat — translate paths to rootfs (6-Z120: the secilc wall).
+//
+// secilc.c stats EVERY CIL input file right after a SUCCESSFUL fopen():
+//     file = fopen(argv[i], "r");      // hooked -> rootfs copy -> OK
+//     rc = stat(argv[i], &filedata);   // NOT hooked -> EMULATOR's copy
+// On the emulator /system/etc/selinux/plat_sepolicy.cil carries the
+// sepolicy_file label and untrusted_app's { getattr } is DENIED
+// (run 32724319465 avc line 173, permissive=0):
+//   avc: denied { getattr } for path="/system/etc/selinux/plat_sepolicy.cil"
+//   scontext=u:r:untrusted_app_27 tcontext=u:object_r:sepolicy_file:s0
+// -> "Could not stat file" -> secilc exit 255 -> init InitFatalReboot.
+// Translating stat() to the rootfs copy (whose readability the hooked
+// fopen already proved) unlocks the whole SELinux-compile bootstep of
+// the Android 11 guest. init's own stat() callers get the same benefit.
+int stat(const char *path, struct stat *buf) {
+    if (path && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_stat)(const char *, struct stat *) = NULL;
+        if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat");
+        if (real_stat) return real_stat(translated, buf);
+        return syscall(SYS_newfstatat, AT_FDCWD, translated, buf, 0);
+    }
+    static int (*real_stat)(const char *, struct stat *) = NULL;
+    if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat");
+    if (real_stat) return real_stat(path, buf);
+    return syscall(SYS_newfstatat, AT_FDCWD, path, buf, 0);
+}
+
+// Hook fstatat — translate ABSOLUTE guest paths to rootfs (6-Z120).
+// Absolute paths ignore dirfd per openat(2) semantics, so translating
+// them is safe regardless of which dirfd the caller passes. RELATIVE
+// paths (guest-internal dirfd lookups, e.g. openat(dirfd,"event0"))
+// pass through untouched — the guest's own fds point into the rootfs
+// already.
+int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
+    if (path && path[0] == '/' && should_translate(path)) {
+        char translated[512];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        static int (*real_fstatat)(int, const char *, struct stat *, int) = NULL;
+        if (!real_fstatat) real_fstatat = dlsym(RTLD_NEXT, "fstatat");
+        if (real_fstatat) return real_fstatat(dirfd, translated, buf, flags);
+        return syscall(SYS_newfstatat, dirfd, translated, buf, flags);
+    }
+    static int (*real_fstatat)(int, const char *, struct stat *, int) = NULL;
+    if (!real_fstatat) real_fstatat = dlsym(RTLD_NEXT, "fstatat");
+    if (real_fstatat) return real_fstatat(dirfd, path, buf, flags);
+    return syscall(SYS_newfstatat, dirfd, path, buf, flags);
+}
+
 // Hook lchown — translate paths to rootfs
 int lchown(const char *path, uid_t owner, gid_t group) {
     if (path && should_translate(path)) {
@@ -2881,6 +2931,7 @@ static void ensure_selinuxfs_files(void) {
         "enforce",       // init writes "0" or "1" here
         "load",          // init writes policy here
         "policyvers",    // init reads policy version
+        "null",          // secilc's -f file_contexts sink (writes discarded)
         NULL
     };
     for (int i = 0; files[i]; i++) {
@@ -3179,11 +3230,42 @@ int open(const char *path, int flags, ...) {
     return track_fb_fd(path, fd);
 }
 
+// selinuxfs fopen helper (6-Z120b): /sys/fs/selinux/* must resolve to the
+// rootfs's virtual selinuxfs files for fopen() callers too. secilc's
+// file_contexts output (-f /sys/fs/selinux/null, mode "w+") fopen's this
+// path AFTER a successful compile; the open()/openat() hooks already
+// special-case selinuxfs, but fopen did NOT — it resolved against the
+// HOST's REAL selinuxfs where untrusted_app writes are denied (EACCES)
+// and secilc died with "Failed to open file_contexts file" (exit 255)
+// even though the compiled policy write had succeeded. Mirrors the
+// open() hook: write-intent modes create the virtual file first.
+static FILE *fopen_selinuxfs_translated(const char *path, const char *mode,
+                                        FILE *(*real_fn)(const char *, const char *)) {
+    char translated[600];
+    snprintf(translated, sizeof(translated), "%s%s",
+             g_rootfs ? g_rootfs : "", path);
+    // write-intent fopen modes: w / a / + (any of them needs the file to
+    // exist for O_TRUNC/O_APPEND semantics — create-if-missing like open())
+    int write_intent =
+        (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')));
+    if (write_intent && g_rootfs) {
+        int cfd = twoyi_sys_open(translated, O_WRONLY | O_CREAT, 0666);
+        if (cfd >= 0) syscall(NR_close, cfd);
+    }
+    return real_fn ? real_fn(translated, mode) : NULL;
+}
+
 // Hook fopen — translate paths to rootfs.
 // fopen() internally calls openat() within libc, bypassing our PLT hooks.
 // This means vold's fs_mgr_read_fstab() (which uses fopen) can't find
 // /vendor/etc/fstab.ranchu in the rootfs. We must hook fopen directly.
 FILE *fopen(const char *path, const char *mode) {
+    // selinuxfs special case FIRST (should_translate excludes /sys)
+    if (path && strncmp(path, "/sys/fs/selinux", 15) == 0 && g_rootfs) {
+        static FILE *(*real_fopen_s)(const char *, const char *) = NULL;
+        if (!real_fopen_s) real_fopen_s = dlsym(RTLD_NEXT, "fopen");
+        return fopen_selinuxfs_translated(path, mode, real_fopen_s);
+    }
     if (path && should_translate(path)) {
         char translated[512];
         snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
@@ -3200,6 +3282,12 @@ FILE *fopen(const char *path, const char *mode) {
 
 // Hook fopen64 — same as fopen but for large file support
 FILE *fopen64(const char *path, const char *mode) {
+    // selinuxfs special case FIRST (should_translate excludes /sys)
+    if (path && strncmp(path, "/sys/fs/selinux", 15) == 0 && g_rootfs) {
+        static FILE *(*real_fopen64_s)(const char *, const char *) = NULL;
+        if (!real_fopen64_s) real_fopen64_s = dlsym(RTLD_NEXT, "fopen64");
+        return fopen_selinuxfs_translated(path, mode, real_fopen64_s);
+    }
     if (path && should_translate(path)) {
         char translated[512];
         snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
@@ -3216,6 +3304,23 @@ FILE *fopen64(const char *path, const char *mode) {
 
 // Hook freopen — translate paths to rootfs
 FILE *freopen(const char *path, const char *mode, FILE *stream) {
+    // selinuxfs special case FIRST (should_translate excludes /sys)
+    if (path && strncmp(path, "/sys/fs/selinux", 15) == 0 && g_rootfs) {
+        static FILE *(*real_freopen_s)(const char *, const char *, FILE *) = NULL;
+        if (!real_freopen_s) real_freopen_s = dlsym(RTLD_NEXT, "freopen");
+        // freopen replaces an existing stream; route through the translated
+        // path with the same create-if-missing write handling.
+        char translated[600];
+        snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
+        int write_intent =
+            (mode && (strchr(mode, 'w') || strchr(mode, 'a') || strchr(mode, '+')));
+        if (write_intent) {
+            int cfd = twoyi_sys_open(translated, O_WRONLY | O_CREAT, 0666);
+            if (cfd >= 0) syscall(NR_close, cfd);
+        }
+        if (real_freopen_s) return real_freopen_s(translated, mode, stream);
+        return NULL;
+    }
     if (path && should_translate(path)) {
         char translated[512];
         snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
