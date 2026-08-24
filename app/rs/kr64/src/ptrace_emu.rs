@@ -878,6 +878,53 @@ struct ChildAbi {
     // hide the install. See the Task 6-Z69 block near the ENTRY match
     // for the full design.
     set_thread_area_nr: i64,
+    // ── Task 6-Z99: uevent netlink socket emulation — socket-family
+    // syscall numbers ───────────────────────────────────────────────
+    //
+    // Android 11 first_stage_init calls socket(AF_NETLINK, SOCK_RAW|
+    // SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT) and
+    // PLOG(FATAL)s "Could not open uevent socket" when refused (E2E
+    // 32666825601 /dev/__kmsg__: InitFatalReboot signal 6 at syscall
+    // #2145). The zygote seccomp filter denies it with ERRNO (not TRAP)
+    // — a SIGSYS would have been rewritten to getpid+0 and init would
+    // have seen fd 0 "success" — so the denial appears as a negative
+    // rax at the syscall-EXIT stop, where the 6-Z99 block substitutes a
+    // synthetic fake fd (NETLINK_FAKE_FD_BASE) and fakes the fd-taking
+    // follow-ups (bind/listen/setsockopt → 0, recv* → -EAGAIN,
+    // send* → byte count, close → 0, poll never-readable via 6-Z5/6-Z17).
+    //
+    // Per-ABI values (asm/unistd_32.h, asm/unistd_64.h,
+    // asm-generic/unistd.h):
+    //   field           i386  x86_64  aarch64
+    //   socket_nr        359     41      198
+    //   bind_nr          360     49      200
+    //   listen_nr        362     50      201
+    //   sendto_nr        369     44      206
+    //   sendmsg_nr        -1     46      211   (i386: socketcall subcall 16 only)
+    //   recvfrom_nr      370     45      207
+    //   recvmsg_nr        -1     47      212   (i386: socketcall subcall 17 only)
+    //   shutdown_nr      371     48      210
+    //   setsockopt_nr    372     54      208
+    //   getsockopt_nr    373     55      209
+    //   close_nr           6      3       57
+    //   fcntl_nr          55     72       25   (i386 ALSO fcntl64=221, matched
+    //                                          via the abi.execve==11 gate)
+    // x86_64 fires at runtime (AOSP guest is 64-bit); i386 direct numbers
+    // are locked in for completeness (bionic i386 normally multiplexes via
+    // socketcall nr=102 — handled by the dedicated subcall arm). -1
+    // sentinels mirror the socketcall_nr / poll_nr precedent.
+    socket_nr: i64,
+    bind_nr: i64,
+    listen_nr: i64,
+    sendto_nr: i64,
+    sendmsg_nr: i64,
+    recvfrom_nr: i64,
+    recvmsg_nr: i64,
+    shutdown_nr: i64,
+    setsockopt_nr: i64,
+    getsockopt_nr: i64,
+    close_nr: i64,
+    fcntl_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -1152,6 +1199,18 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // processes install TLS via arch_prctl ARCH_SET_GS) → sentinel -1,
     // mirroring the ABI_AARCH64.open precedent.
     set_thread_area_nr: -1,
+    socket_nr: 41,
+    bind_nr: 49,
+    listen_nr: 50,
+    sendto_nr: 44,
+    sendmsg_nr: 46,
+    recvfrom_nr: 45,
+    recvmsg_nr: 47,
+    shutdown_nr: 48,
+    setsockopt_nr: 54,
+    getsockopt_nr: 55,
+    close_nr: 3,
+    fcntl_nr: 72,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -1477,6 +1536,18 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // (static bionic) and the recovery child's dynamic linker call it
     // to install the %gs-based TLS thread pointer (Task 6-Z69).
     set_thread_area_nr: 243,
+    socket_nr: 359,
+    bind_nr: 360,
+    listen_nr: 362,
+    sendto_nr: 369,
+    sendmsg_nr: -1,
+    recvfrom_nr: 370,
+    recvmsg_nr: -1,
+    shutdown_nr: 371,
+    setsockopt_nr: 372,
+    getsockopt_nr: 373,
+    close_nr: 6,
+    fcntl_nr: 55,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1773,6 +1844,18 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // Task 6-Z69: aarch64 has no set_thread_area syscall (TLS is set
     // via tpidr_el0, configured by clone()) → sentinel -1.
     set_thread_area_nr: -1,
+    socket_nr: 198,
+    bind_nr: 200,
+    listen_nr: 201,
+    sendto_nr: 206,
+    sendmsg_nr: 211,
+    recvfrom_nr: 207,
+    recvmsg_nr: 212,
+    shutdown_nr: 210,
+    setsockopt_nr: 208,
+    getsockopt_nr: 209,
+    close_nr: 57,
+    fcntl_nr: 25,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -3472,6 +3555,90 @@ const PREAD64_EMU_MAX_BYTES: u64 = 64 * 1024;
 /// fd can ever collide with. Only the tracer's own
 /// open_fd_owner_paths map ever resolves it.
 const SYNTHETIC_FD_BASE: i32 = 0x7e00_0000;
+
+/// Task 6-Z99: base for FAKE netlink-uevent fds. Deliberately distinct
+/// from SYNTHETIC_FD_BASE (0x7e00_0000) so the openat fake-fd space and
+/// the netlink fake-fd space can never alias. Same properties: a
+/// positive i32 far above anything RLIMIT_NOFILE can hand out; only the
+/// tracer's fake_netlink_fds set ever resolves it.
+const NETLINK_FAKE_FD_BASE: i32 = 0x6b00_0000;
+
+/// Task 6-Z99: which socket-family syscall is this? Used by the EXIT
+/// arms that fake the fd-taking calls on a fake netlink uevent fd.
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum NetlinkOp {
+    Socket,
+    Bind,
+    Listen,
+    SendTo,
+    SendMsg,
+    RecvFrom,
+    RecvMsg,
+    Shutdown,
+    SetSockOpt,
+    GetSockOpt,
+    Close,
+    Fcntl,
+}
+
+fn netlink_op_for(nr: i64, abi: &ChildAbi) -> Option<NetlinkOp> {
+    if abi.socket_nr != -1 && nr == abi.socket_nr {
+        Some(NetlinkOp::Socket)
+    } else if abi.bind_nr != -1 && nr == abi.bind_nr {
+        Some(NetlinkOp::Bind)
+    } else if abi.listen_nr != -1 && nr == abi.listen_nr {
+        Some(NetlinkOp::Listen)
+    } else if abi.sendto_nr != -1 && nr == abi.sendto_nr {
+        Some(NetlinkOp::SendTo)
+    } else if abi.sendmsg_nr != -1 && nr == abi.sendmsg_nr {
+        Some(NetlinkOp::SendMsg)
+    } else if abi.recvfrom_nr != -1 && nr == abi.recvfrom_nr {
+        Some(NetlinkOp::RecvFrom)
+    } else if abi.recvmsg_nr != -1 && nr == abi.recvmsg_nr {
+        Some(NetlinkOp::RecvMsg)
+    } else if abi.shutdown_nr != -1 && nr == abi.shutdown_nr {
+        Some(NetlinkOp::Shutdown)
+    } else if abi.setsockopt_nr != -1 && nr == abi.setsockopt_nr {
+        Some(NetlinkOp::SetSockOpt)
+    } else if abi.getsockopt_nr != -1 && nr == abi.getsockopt_nr {
+        Some(NetlinkOp::GetSockOpt)
+    } else if abi.close_nr != -1 && nr == abi.close_nr {
+        Some(NetlinkOp::Close)
+    } else if abi.fcntl_nr != -1 && nr == abi.fcntl_nr {
+        Some(NetlinkOp::Fcntl)
+    } else if abi.execve == 11 && nr == 221 {
+        // i386 fcntl64 (bionic prefers it over fcntl); the
+        // `abi.execve == 11` bitness test mirrors the 6-Z57 ENOSYS
+        // override's i386 gate, so x86_64/aarch64 nr=221 can't misfire.
+        Some(NetlinkOp::Fcntl)
+    } else {
+        None
+    }
+}
+
+/// Task 6-Z99: read one u32 of the child's memory (the i386 socketcall
+/// args array elements: unsigned long a[n] with 4-byte longs on i386).
+/// Follows the same PTRACE_PEEKDATA dance read_child_string uses; if
+/// the file already has a peek-word helper near read_child_string,
+/// reuse it here instead and delete this.
+fn read_child_u32(pid: libc::pid_t, addr: u64) -> Option<u32> {
+    if addr == 0 {
+        return None;
+    }
+    // errno dance per ptrace(2): PEEKDATA returns -1 on error, but -1 is
+    // also a valid word value — clear errno first, then check after. On
+    // Android __errno_location is not exposed by the libc crate; the
+    // file's established portable pattern (see the 6-Z69 prctl write
+    // helper) is std::io::Error::last_os_error().
+    let _ = std::io::Error::last_os_error(); // clear errno
+    let word = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64, 0) };
+    let peek_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if word == -1 && peek_errno != 0 {
+        return None; // genuine peek failure (EIO / unmapped)
+    }
+    // Host and child are both little-endian x86 — low 32 bits.
+    Some(word as u32)
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Task 6-Z69: set_thread_area (i386 nr=243) — REAL TLS/GDT emulation
@@ -5187,6 +5354,20 @@ pub fn run_ptrace_loop(
     let mut pending_pread64: Option<PendingPread64> = None;
     let mut synthetic_fd_next: std::collections::HashMap<libc::pid_t, i32> =
         std::collections::HashMap::new();
+    // 6-Z99: per-pid set of FAKE netlink-uevent fds + per-pid allocator.
+    // Mirrors the synthetic_fd_next pattern above; separate base so the
+    // openat fake-fd space and this one can never alias. Fake fds are NOT
+    // inherited across fork in the tracer's view (a forked child touching
+    // an inherited fake fd sees the kernel's EBADF — acceptable; every
+    // Android consumer of the uevent socket opens its OWN).
+    let mut fake_netlink_fds: std::collections::HashMap<
+        libc::pid_t,
+        std::collections::HashSet<i64>,
+    > = std::collections::HashMap::new();
+    let mut netlink_fd_next: std::collections::HashMap<libc::pid_t, i32> =
+        std::collections::HashMap::new();
+    // Rate-limit for recv-on-fake-fd logs (a poll spin can hot-loop).
+    let mut netlink_recv_log_count: u32 = 0;
     // Shared rate-limit for 6-Z71 SKIP-path logs (init's stat64-poll
     // loops fire thousands of legitimate ENOENTs — those must not flood
     // logcat). EMULATED / FAILED lines are NOT counted.
@@ -6074,6 +6255,8 @@ pub fn run_ptrace_loop(
                     // were already cleared for `pid` above; these are
                     // the NOT-pid-keyed leftovers.)
                     in_syscall_map.remove(&pid);
+                    fake_netlink_fds.remove(&pid);
+                    netlink_fd_next.remove(&pid);
                     kmsg_fd = None; // the captured kmsg fd belongs to
                                     // the dead parent's fd table
                     if recovery_child_pid == Some(pid) {
@@ -6193,6 +6376,8 @@ pub fn run_ptrace_loop(
                     init_pid = new_init;
                     current_pid = new_init;
                     in_syscall_map.remove(&pid);
+                    fake_netlink_fds.remove(&pid);
+                    netlink_fd_next.remove(&pid);
                     kmsg_fd = None;
                     if recovery_child_pid == Some(pid) {
                         recovery_child_pid = None;
@@ -10907,6 +11092,168 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── Task 6-Z99: uevent netlink socket emulation ──
+                    //
+                    // Android 11 first_stage_init:
+                    //   fd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK,
+                    //               NETLINK_KOBJECT_UEVENT);
+                    //   if (fd == -1) PLOG(FATAL) << "Could not open uevent socket";
+                    //   … bind(fd, {nl_family=AF_NETLINK, nl_pid=getpid(),
+                    //               nl_groups=0xffffffff}) …
+                    // The untrusted-app seccomp filter refuses the socket with
+                    // ERRNO (NOT SIGSYS-TRAP — empirically init SAW the -1: the
+                    // 32666825601 kmsg has the FATAL line), so the denial lands
+                    // here at the EXIT stop as a negative rax. We replace it
+                    // with a synthetic fake fd (0x6b00_0000 + per-pid counter,
+                    // far above RLIMIT_NOFILE — the 6-Z71 SYNTHETIC_FD_BASE
+                    // pattern) recorded in fake_netlink_fds, and fake every
+                    // fd-taking follow-up: bind/listen/setsockopt/getsockopt/
+                    // shutdown/fcntl → 0 (init only needs open+bind to clear
+                    // FirstStageMain's PLOG(FATAL) checks), recvmsg/recvfrom →
+                    // -EAGAIN (never an in-kernel eternal block; callers
+                    // re-poll and poll is never-readable via the 6-Z5
+                    // fake-positive→0 + 6-Z17 revents-zeroing arms), sendto →
+                    // byte count, close → 0 + set removal. A REAL success
+                    // (kernel actually granted the netlink socket) is left
+                    // untouched — only failures are replaced.
+                    if let Some(op) = netlink_op_for(syscall_num, &abi) {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        match op {
+                            NetlinkOp::Socket => {
+                                // Arg registers survive the syscall on both
+                                // ABIs (rdi/rsi/rdx; ebx/ecx/edx) — same
+                                // assumption the 6-Z96c subcall read makes.
+                                let domain = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                let sock_type = get_syscall_arg(&regs, abi.reg_arg2) as i64;
+                                let protocol = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                const AF_NETLINK_Z99: i64 = 16;
+                                const NETLINK_KOBJECT_UEVENT_Z99: i64 = 15;
+                                if domain == AF_NETLINK_Z99
+                                    && protocol == NETLINK_KOBJECT_UEVENT_Z99
+                                    && ret < 0
+                                    && ret > -4096
+                                {
+                                    let base =
+                                        netlink_fd_next.entry(pid).or_insert(NETLINK_FAKE_FD_BASE);
+                                    let fd = *base;
+                                    // Stay inside positive i32 (mirrors the
+                                    // 6-Z71 rollover guard).
+                                    if *base < 0x6bff_fff0 {
+                                        *base += 1;
+                                    }
+                                    fake_netlink_fds.entry(pid).or_default().insert(fd as i64);
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        set_syscall_ret(&mut regs2, &abi, fd as i64);
+                                        if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                            log(&format!(
+                                                "6-Z99 FAILED: ptrace_setregs for fake uevent fd ({}): {} — child sees {} (-errno {})",
+                                                syscall_num, e, ret, -ret
+                                            ));
+                                        } else {
+                                            log(&format!(
+                                                "6-Z99: socket(AF_NETLINK, {:#x}, NETLINK_KOBJECT_UEVENT) returned {} (-errno {}) — REPLACED with fake fd {:#x} (bind/listen→0, recv*→-EAGAIN, send*→len, poll never-readable)",
+                                                sock_type, ret, -ret, fd
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            NetlinkOp::Bind
+                            | NetlinkOp::Listen
+                            | NetlinkOp::Shutdown
+                            | NetlinkOp::SetSockOpt
+                            | NetlinkOp::GetSockOpt
+                            | NetlinkOp::Fcntl
+                            | NetlinkOp::Close => {
+                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                if fake_netlink_fds
+                                    .get(&pid)
+                                    .map_or(false, |s| s.contains(&fd))
+                                {
+                                    if op == NetlinkOp::Close {
+                                        if let Some(s) = fake_netlink_fds.get_mut(&pid) {
+                                            s.remove(&fd);
+                                        }
+                                    }
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        set_syscall_ret(&mut regs2, &abi, 0);
+                                        if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                            log(&format!(
+                                                "6-Z99 FAILED: ptrace_setregs for {:?} on fake netlink fd {:#x}: {}",
+                                                op, fd, e
+                                            ));
+                                        } else {
+                                            log(&format!(
+                                                "6-Z99: fake netlink fd {:#x}: {:?} returned {} — faked to 0{}",
+                                                fd,
+                                                op,
+                                                ret,
+                                                if op == NetlinkOp::Close {
+                                                    " (removed from fake set)"
+                                                } else {
+                                                    ""
+                                                }
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            NetlinkOp::RecvFrom | NetlinkOp::RecvMsg => {
+                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                if fake_netlink_fds
+                                    .get(&pid)
+                                    .map_or(false, |s| s.contains(&fd))
+                                {
+                                    // -EAGAIN = "nothing yet": consistent with
+                                    // the SOCK_NONBLOCK the socket was created
+                                    // with, never an eternal in-kernel block,
+                                    // and NOT 0 (0 = orderly-shutdown would
+                                    // look like a valid empty uevent).
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        set_syscall_ret(&mut regs2, &abi, -11);
+                                        let _ = ptrace_setregs(pid, &regs2, len);
+                                        if netlink_recv_log_count < 20 {
+                                            netlink_recv_log_count += 1;
+                                            log(&format!(
+                                                "6-Z99: fake netlink fd {:#x}: {:?} returned {} — faked to -EAGAIN (no uevents will ever arrive; poll stays not-readable via 6-Z5/6-Z17)",
+                                                fd, op, ret
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            NetlinkOp::SendTo | NetlinkOp::SendMsg => {
+                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                if fake_netlink_fds
+                                    .get(&pid)
+                                    .map_or(false, |s| s.contains(&fd))
+                                {
+                                    // sendto(fd, buf, LEN, …): len = arg2 →
+                                    // report "all bytes sent". sendmsg's arg2
+                                    // is an msghdr* — not worth an iov sum for
+                                    // a socket nothing legitimately sends on.
+                                    let new_ret: i64 = if op == NetlinkOp::SendTo {
+                                        get_syscall_arg(&regs, abi.reg_arg2) as i64
+                                    } else {
+                                        1
+                                    };
+                                    let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        set_syscall_ret(&mut regs2, &abi, new_ret);
+                                        let _ = ptrace_setregs(pid, &regs2, len);
+                                        log(&format!(
+                                            "6-Z99: fake netlink fd {:#x}: {:?} returned {} — faked to {} (success)",
+                                            fd, op, ret, new_ret
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // ── Task 6-Z3: socketcall error-return fake-success ─────
                     //
                     // i386 socketcall (nr=102) is a multiplexed socket
@@ -10973,6 +11320,77 @@ pub fn run_ptrace_loop(
                         // read-verify caught the fake, but a REAL failure
                         // would have been silently hidden too).
                         let subcall = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        // ── 6-Z99: uevent netlink emulation via i386
+                        // socketcall subcalls (arg1=subcall, arg2=pointer to
+                        // unsigned-long args array; bionic i386 multiplexes
+                        // ALL socket ops through nr=102) ──
+                        //   subcall 1 (socket): a[0]=domain a[1]=type a[2]=protocol
+                        //   fd subcalls: a[0]=fd; send/sendto: a[2]=len
+                        let sc_args_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                        if subcall == 1 {
+                            let domain = read_child_u32(pid, sc_args_ptr).map(|v| v as i64);
+                            let protocol =
+                                read_child_u32(pid, sc_args_ptr.wrapping_add(8)).map(|v| v as i64);
+                            if domain == Some(16) && protocol == Some(15) && ret < 0 && ret > -4096
+                            {
+                                let base =
+                                    netlink_fd_next.entry(pid).or_insert(NETLINK_FAKE_FD_BASE);
+                                let fd = *base;
+                                if *base < 0x6bff_fff0 {
+                                    *base += 1;
+                                }
+                                fake_netlink_fds.entry(pid).or_default().insert(fd as i64);
+                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    set_syscall_ret(&mut regs2, &abi, fd as i64);
+                                    if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                        log(&format!(
+                                            "6-Z99 FAILED: socketcall socket fake fd: {}",
+                                            e
+                                        ));
+                                    } else {
+                                        log(&format!(
+                                            "6-Z99: socketcall(socket) AF_NETLINK/NETLINK_KOBJECT_UEVENT returned {} (-errno {}) — REPLACED with fake fd {:#x}",
+                                            ret, -ret, fd
+                                        ));
+                                    }
+                                }
+                            }
+                        } else if let Some(fd0) = read_child_u32(pid, sc_args_ptr) {
+                            let fd = fd0 as i64;
+                            if fake_netlink_fds
+                                .get(&pid)
+                                .map_or(false, |s| s.contains(&fd))
+                            {
+                                // 2=bind 4=listen 13=shutdown 14=setsockopt
+                                // 15=getsockopt → 0; 10=recv 12=recvfrom
+                                // 17=recvmsg → -EAGAIN; 9=send 11=sendto →
+                                // len (a[2]); 16=sendmsg → 1.
+                                let new_ret: i64 = match subcall {
+                                    2 | 4 | 13 | 14 | 15 => 0,
+                                    10 | 12 | 17 => -11,
+                                    9 | 11 => read_child_u32(pid, sc_args_ptr.wrapping_add(8))
+                                        .map(|v| v as i64)
+                                        .unwrap_or(1),
+                                    _ => 1,
+                                };
+                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    set_syscall_ret(&mut regs2, &abi, new_ret);
+                                    if let Err(e) = ptrace_setregs(pid, &regs2, len) {
+                                        log(&format!(
+                                            "6-Z99 FAILED: socketcall({}) on fake fd {:#x}: {}",
+                                            subcall, fd, e
+                                        ));
+                                    } else {
+                                        log(&format!(
+                                            "6-Z99: socketcall({}) on fake netlink fd {:#x}: returned {} — faked to {}",
+                                            subcall, fd, ret, new_ret
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         if subcall != 2 {
                             // Non-bind socketcall: leave the real return.
                         } else if ret < 0 && ret > -4096 {
@@ -16236,5 +16654,48 @@ mod tests {
         assert_eq!(syscall_name(180, &ABI_X86_32), "pread64");
         // x86_64 numbers resolve too (pre-execve kr64-side diagnostics).
         assert_eq!(syscall_name(ABI_X86_64.pread64, &ABI_X86_64), "pread64");
+    }
+
+    // ── Task 6-Z99: uevent netlink emulation guards ─────────────────
+    #[test]
+    fn z99_netlink_fake_fd_base_is_positive_and_disjoint() {
+        assert!(NETLINK_FAKE_FD_BASE > 0);
+        assert!(NETLINK_FAKE_FD_BASE != SYNTHETIC_FD_BASE);
+    }
+    #[test]
+    fn z99_socket_family_numbers_match_uapi() {
+        assert_eq!(ABI_X86_64.socket_nr, 41);
+        assert_eq!(ABI_X86_64.bind_nr, 49);
+        assert_eq!(ABI_X86_64.recvmsg_nr, 47);
+        assert_eq!(ABI_X86_64.sendto_nr, 44);
+        assert_eq!(ABI_X86_64.close_nr, 3);
+        assert_eq!(ABI_X86_64.fcntl_nr, 72);
+        assert_eq!(ABI_X86_32.socket_nr, 359);
+        assert_eq!(ABI_X86_32.bind_nr, 360);
+        assert_eq!(ABI_X86_32.recvfrom_nr, 370);
+        assert_eq!(ABI_X86_32.sendmsg_nr, -1); // socketcall 16 only
+        assert_eq!(ABI_X86_32.recvmsg_nr, -1); // socketcall 17 only
+        assert_eq!(ABI_X86_32.close_nr, 6);
+        // ABI_AARCH64 only exists on aarch64 hosts (the const is
+        // `#[cfg(target_arch = "aarch64")]` — same treatment as every
+        // existing aarch64 abi assert in this module).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(ABI_AARCH64.socket_nr, 198);
+            assert_eq!(ABI_AARCH64.close_nr, 57);
+        }
+    }
+    #[test]
+    fn z99_netlink_op_for_maps_and_sentinels() {
+        assert_eq!(netlink_op_for(41, &ABI_X86_64), Some(NetlinkOp::Socket));
+        assert_eq!(netlink_op_for(49, &ABI_X86_64), Some(NetlinkOp::Bind));
+        assert_eq!(netlink_op_for(3, &ABI_X86_64), Some(NetlinkOp::Close));
+        assert_eq!(netlink_op_for(46, &ABI_X86_64), Some(NetlinkOp::SendMsg));
+        // i386 fcntl64=221 must map ONLY on i386 (execve==11 gate):
+        assert_eq!(netlink_op_for(221, &ABI_X86_32), Some(NetlinkOp::Fcntl));
+        assert_eq!(netlink_op_for(221, &ABI_X86_64), None);
+        // -1 sentinels must never match anything real:
+        assert_eq!(netlink_op_for(-1, &ABI_X86_32), None);
+        assert_eq!(netlink_op_for(102, &ABI_X86_32), None); // socketcall itself is NOT an op here
     }
 }
