@@ -9663,6 +9663,48 @@ pub fn run_ptrace_loop(
                                     }
                                 };
                                 if let Some(c) = final_target {
+                                    // ── 6-Z128: verified rewrite with a
+                                    // {rootfs} fallback ──
+                                    //
+                                    // Run 32778339668 (bd5a78e): the
+                                    // staged rewrite SILENTLY failed to
+                                    // stick for zygote's
+                                    // execve("/dev/twoyi-bin/app_process64")
+                                    // — the arm fired at a stop whose
+                                    // scratch area was stale (the
+                                    // POKEDATA/POKEDATA-string write or
+                                    // the setregs no-opped), NO
+                                    // translation ran, and the kernel
+                                    // executed the RAW guest path
+                                    // against the host root → ENOENT →
+                                    // init: 'cannot execv(...app_process64)'
+                                    // → crash loop. The previous run's
+                                    // identical exec SUCCEEDED — a
+                                    // state-dependent race the old
+                                    // `let _ =` ignored.
+                                    //
+                                    // Fix: after setregs, VERIFY by
+                                    // reading arg1 back from the child.
+                                    // On mismatch, retry with the
+                                    // {rootfs}-translated original path
+                                    // (translate_path already rewrites
+                                    // /dev/* → {rootfs}/dev/*, and the
+                                    // rootfs copy is exec-granted — the
+                                    // cache staging itself proves
+                                    // app-data exec works). On still-
+                                    // mismatch, log LOUDLY so the class
+                                    // is instantly diagnosable.
+                                    let verify_arg1 = |p: &str| -> bool {
+                                        let mut vr: Regs = unsafe { std::mem::zeroed() };
+                                        if ptrace_getregs(pid, &mut vr).is_err() {
+                                            return false;
+                                        }
+                                        let a = get_syscall_arg(&vr, abi.reg_arg1);
+                                        a != 0
+                                            && read_child_string(pid, a)
+                                                .map(|s| s == p)
+                                                .unwrap_or(false)
+                                    };
                                     let wtp_ok = write_translated_path(
                                         pid,
                                         &mut regs,
@@ -9679,11 +9721,63 @@ pub fn run_ptrace_loop(
                                         // fallback).
                                         write_child_string(pid, path_addr_e, &c);
                                     }
-                                    let _ = ptrace_setregs(pid, &regs, iov_len);
-                                    log(&format!(
-                                        "6-Z101: execve(\"{}\") rewritten to staged executable \"{}\"",
-                                        orig, c
-                                    ));
+                                    match ptrace_setregs(pid, &regs, iov_len) {
+                                        Ok(()) => {}
+                                        Err(e) => log(&format!(
+                                            "6-Z128: execve rewrite setregs FAILED for \"{}\": {} — trying the rootfs fallback",
+                                            orig, e
+                                        )),
+                                    }
+                                    if verify_arg1(&c) {
+                                        log(&format!(
+                                            "6-Z101: execve(\"{}\") rewritten to staged executable \"{}\" (VERIFIED)",
+                                            orig, c
+                                        ));
+                                    } else {
+                                        // The staged rewrite did not stick
+                                        // (stale scratch / silent write
+                                        // failure). Rewrite to the
+                                        // {rootfs}-translated ORIGINAL
+                                        // path — for /dev/twoyi-bin/*
+                                        // that is the rootfs's own
+                                        // exec-granted copy.
+                                        let rf = translate_path(rootfs, &orig);
+                                        if rf != orig {
+                                            let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                            if ptrace_getregs(pid, &mut regs2).is_ok() {
+                                                let wtp2 = write_translated_path(
+                                                    pid,
+                                                    &mut regs2,
+                                                    iov_len,
+                                                    abi.reg_arg1,
+                                                    scratch_addr,
+                                                    &mut scratch_offset,
+                                                    &rf,
+                                                );
+                                                if !wtp2 {
+                                                    write_child_string(pid, path_addr_e, &rf);
+                                                }
+                                                if let Err(e) = ptrace_setregs(pid, &regs2, iov_len)
+                                                {
+                                                    log(&format!(
+                                                        "6-Z128: rootfs-fallback setregs FAILED for \"{}\": {}",
+                                                        rf, e
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        if verify_arg1(&rf) {
+                                            log(&format!(
+                                                "6-Z128: execve(\"{}\") staged rewrite did NOT stick — rewrote to ROOTFS copy \"{}\" (VERIFIED)",
+                                                orig, rf
+                                            ));
+                                        } else {
+                                            log(&format!(
+                                                "6-Z128: execve(\"{}\") rewrite FAILED BOTH staged (\"{}\") and rootfs (\"{}\") — the kernel will see the ORIGINAL path (execve will likely ENOENT)",
+                                                orig, c, rf
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         }
