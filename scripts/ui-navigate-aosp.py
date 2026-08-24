@@ -161,6 +161,9 @@ def capture_logs():
         "system/lib64/libartbase.so", "system/bin/app_process64",
         "system/bin/app_process32", "system/bin/linker64",
         "system/lib/libdl.so", "system/lib64/libdl.so",
+        "system/lib64/libbase.so", "system/lib64/libm.so",
+        "system/lib64/libunwindstack.so",
+        "apex/com.android.art/lib64/libnativeloader.so",
     ]
     lines = []
     for rel in checks:

@@ -2194,6 +2194,18 @@ int setexeccon_raw(const char *context) {
     return 0;
 }
 
+// 6-Z130: setsockcreatecon — fake success (the guest cannot set socket
+// creation contexts; init's zygote-socket creation dies on EACCES).
+int setsockcreatecon(const char *context) {
+    (void)context;
+    return 0;
+}
+
+int setsockcreatecon_raw(const char *context) {
+    (void)context;
+    return 0;
+}
+
 int security_compute_create(const char *scon, const char *tcon,
                             security_class_t tclass, char **newcon) {
     (void)scon; (void)tclass;
@@ -2771,10 +2783,14 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
     // Set LD_LIBRARY_PATH to include rootfs library directories
     // This is needed because binaries in /dev/twoyi-bin/ need libraries
     // from {rootfs}/system/lib64/ and {rootfs}/apex/com.android.runtime/lib64/
+    // 6-Z130: + /apex/com.android.art/lib64 (libnativeloader.so — app_process64
+    // link wall) and /apex/com.android.i18n/lib64 (libandroidicu.so — mediaserver).
+    // /apex/* passes through UNTRANSLATED to the HOST emulator's mounted APEXes
+    // (same mechanism as the working com.android.runtime entries).
     char ld_library_path[2048];
     snprintf(ld_library_path, sizeof(ld_library_path),
-        "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/vendor/lib64:%s/apex/com.android.os.statsd/lib64:%s/system_ext/lib64:%s/product/lib64",
-        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
+        "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/apex/com.android.art/lib64:%s/apex/com.android.i18n/lib64:%s/vendor/lib64:%s/apex/com.android.os.statsd/lib64:%s/system_ext/lib64:%s/product/lib64",
+        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
 
     char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3));
     if (!new_envp) {
@@ -4464,6 +4480,8 @@ static void twoyi_init(void) {
     prop_set("ro.bootfrog", "0");
     prop_set("ro.persistent_properties.ready", "true");
     prop_set("ro.actionable_compatible_property.enabled", "true");
+    // 6-Z130: unblock updatable services (netd etc.) — init's AreRuntimeApexesReady gate
+    prop_set("apexd.status", "activated");
     // ro.zygote is needed for init to parse init.zygote64_32.rc
     prop_set("ro.zygote", "zygote64_32");
     // sys.boot_completed is the final goal — but don't set it yet
