@@ -164,6 +164,10 @@ def capture_logs():
         "system/lib64/libbase.so", "system/lib64/libm.so",
         "system/lib64/libunwindstack.so",
         "apex/com.android.art/lib64/libnativeloader.so",
+        # 6-Z137: the quota-truncation victims + their kin.
+        "system/lib64/libutils.so", "system/lib64/libnblog.so",
+        "system/lib64/libaudioclient.so", "system/lib64/libbinder.so",
+        "system/lib64/liblog.so", "system/lib64/libz.so",
     ]
     lines = []
     for rel in checks:
