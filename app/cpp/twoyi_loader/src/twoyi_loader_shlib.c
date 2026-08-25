@@ -46,6 +46,7 @@ static int qemu_pipe_open_fallback(const char *path, int real_fd, int saved_errn
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mount.h>
+#include <sys/statfs.h>  // 6-Z143: struct statfs (the selinuxfs magic hook)
 #include <sys/socket.h>
 #include <sys/un.h>
 // Android system property constants (from sys/system_properties.h)
@@ -2530,6 +2531,62 @@ int security_getenforce(void) {
 int security_setenforce(int value) {
     (void)value;
     return 0;
+}
+
+// 6-Z143: selinux_status_open — fake success. libselinux's implementation
+// needs to find the selinuxfs mount point (reads /proc/filesystems or
+// /proc/mounts — EACCES for the app on the HOST) and then open+mmap
+// /sys/fs/selinux/status. Even with the status page created + the open
+// hooks fixed, the MOUNT-POINT DISCOVERY fails first (run 32828992586:
+// the aborting processes never even open the status file — the failure
+// is in the discovery step). Fake 0 (success): init only checks >= 0
+// and the status data (enforcing=0, policyload=1) matches what our
+// virtual selinuxfs reports anyway.
+int selinux_status_open(int fallback) {
+    (void)fallback;
+    return 0;
+}
+
+void selinux_status_close(void) {
+    // no-op — nothing was actually opened
+}
+
+// 6-Z143: statfs — the selinuxfs mount-point discovery. libselinux's
+// init_selinuxmnt() does statfs("/sys/fs/selinux") and checks
+// f_type == SELINUX_MAGIC (0xf97cff8c). Our virtual selinuxfs directory
+// lives on the app's ext4 — wrong magic — so the check falls through to
+// /proc/filesystems (EACCES for the app), selinux_mnt stays NULL, and
+// selinux_status_open returns ENOENT BEFORE ever opening the status
+// file (the run 32828992586 abort signature). Report SELINUX_MAGIC for
+// the virtual selinuxfs path; pass everything else through.
+int statfs(const char *path, struct statfs *buf) {
+    static int (*real_statfs)(const char *, struct statfs *) = NULL;
+    if (!real_statfs) real_statfs = dlsym(RTLD_NEXT, "statfs");
+    if (real_statfs) {
+        int r = real_statfs(path, buf);
+        if (r == 0 && path && buf &&
+            strncmp(path, "/sys/fs/selinux", 15) == 0) {
+            // SELINUX_MAGIC from <linux/magic.h> — the value
+            // init_selinuxmnt() compares f_type against.
+            buf->f_type = 0xf97cff8cUL;
+        }
+        return r;
+    }
+    return syscall(SYS_statfs, path, buf);
+}
+
+int statfs64(const char *path, struct statfs64 *buf) {
+    static int (*real_statfs64)(const char *, struct statfs64 *) = NULL;
+    if (!real_statfs64) real_statfs64 = dlsym(RTLD_NEXT, "statfs64");
+    if (real_statfs64) {
+        int r = real_statfs64(path, buf);
+        if (r == 0 && path && buf &&
+            strncmp(path, "/sys/fs/selinux", 15) == 0) {
+            buf->f_type = 0xf97cff8cUL;
+        }
+        return r;
+    }
+    return syscall(SYS_statfs, path, buf);
 }
 
 // Hook keyctl — init calls keyctl_get_keyring_ID(KEY_SPEC_SESSION_KEYRING, 1)
