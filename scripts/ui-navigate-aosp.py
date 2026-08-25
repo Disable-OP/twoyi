@@ -358,6 +358,30 @@ def main():
     print("=" * 60)
     print(f"  screenshot md5 distribution: {md5s}")
 
+    # ── ARM64-A1: final launcher-state assertion ──
+    # The post-Launch-Container check at step 2 catches the IMMEDIATE
+    # crash, but a slower failure (app starts ptrace, runs for 30-200s,
+    # then crashes mid-way) would slip past step 2 and produce a
+    # false-green workflow. Re-check the final activity here: if we're
+    # back on the system launcher at the end of the boot wait, the
+    # container never finished booting — FAIL the workflow.
+    final_activity = get_current_activity() or ""
+    print(f"  Final activity: {final_activity}")
+    final_activity_lc = final_activity.lower()
+    is_launcher = (
+        "launcher" in final_activity_lc
+        or "nexuslauncher" in final_activity_lc
+        or final_activity_lc.strip() == ""
+    )
+    if is_launcher:
+        print()
+        print("  ✗✗✗ FINAL STATE IS LAUNCHER — AOSP CONTAINER NEVER BOOTED")
+        print(f"  The twoyi app is no longer the resumed activity after")
+        print(f"  {BOOT_WAIT}s of boot wait. This is the false-green")
+        print("  pattern — failing the workflow now.")
+        sys.exit(1)
+    print(f"  ✓ Final activity is non-launcher ({final_activity}) — container booted.")
+
     kr64_count = 0
     try:
         with open(f"{ART}/logcat-full.txt", errors="replace") as f:

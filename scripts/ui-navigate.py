@@ -946,7 +946,59 @@ def main():
 
     xml = dump_ui("06_after_launch")
     root = parse_ui(xml)
-    print(f"  Current activity: {get_current_activity()}")
+    activity_after_launch = get_current_activity()
+    print(f"  Current activity: {activity_after_launch}")
+
+    # ── ARM64-T1: catch the silent "app crashed back to launcher" case ──
+    # Run 32886902337 (arm64 via native bridge) produced a false-green
+    # workflow because the script took screenshots for 180s after the
+    # Launch Container tap and exited 0 — but the app had actually
+    # CRASHED back to the launcher within 5s of the tap (the arm64
+    # ptrace path couldn't decode x86_64 register layout returned by
+    # the host kernel). The 180s of "launcher" screenshots were then
+    # misread as "TWRP booted".
+    #
+    # Hard-abort here if the resumed activity is the system launcher —
+    # the twoyi app process is gone, and no amount of waiting will
+    # bring TWRP up. The error includes the diagnostic captures
+    # (logcat, app-logs, run-as cat of FileLogger) so the next
+    # debugging session has the crash trace.
+    if activity_after_launch and "launcher" in activity_after_launch.lower():
+        print()
+        print("=" * 60)
+        print("  ✗✗✗ ABORTING: twoyi app crashed back to launcher after Launch Container tap")
+        print("=" * 60)
+        print(f"  Current activity: {activity_after_launch}")
+        print("  The app process died immediately after the ptrace launch.")
+        print("  This is the run-32886902337 failure pattern (arm64 native bridge")
+        print("  couldn't decode x86_64 register layout from host kernel).")
+        print()
+        print("  Capturing diagnostic artifacts before exiting...")
+        screenshot("08_abort_launcher_crash")
+        logcat = adb("logcat", "-d", timeout=15)
+        with open(os.path.join(ART, "logcat.txt"), "w") as f:
+            f.write(logcat)
+        try:
+            os.makedirs(os.path.join(ART, "app-logs"), exist_ok=True)
+            subprocess.run(ADB + ["pull", f"/sdcard/Android/data/{PACKAGE}/files/log/",
+                                 os.path.join(ART, "app-logs/")],
+                          capture_output=True, timeout=30)
+        except Exception:
+            pass
+        # Try run-as cat of the FileLogger crash log too.
+        for remote, local in [
+            ("cache/log/app.log", "app.log"),
+            ("cache/log/boot.log", "boot.log"),
+            ("cache/log/crash.log", "crash.log"),
+            ("kr64-app-stderr.log", "kr64-app-stderr.log"),
+        ]:
+            out = adb_shell(f"run-as {PACKAGE} cat {remote}", timeout=60)
+            if out:
+                with open(os.path.join(ART, local), "w", errors="replace") as f:
+                    f.write(out)
+                print(f"  pulled via run-as: {remote} -> {local}")
+        print("  Diagnostic artifacts captured. Exiting with code 1.")
+        sys.exit(1)
 
     # ─────────────────────────────────────────────
     # Step 7: Wait for boot — screenshots every 5s
@@ -1133,6 +1185,41 @@ def main():
             for sub in sorted(os.listdir(path)):
                 subpath = os.path.join(path, sub)
                 print(f"    {sub} ({os.path.getsize(subpath)} bytes)")
+
+    # ── ARM64-T2: final launcher-state assertion ──
+    # The post-Launch-Container check at step 6 catches the IMMEDIATE
+    # crash, but a slower failure (app boots ptrace, runs for 30-200s,
+    # then crashes mid-way) would slip past step 6 and produce the
+    # same false-green workflow that 32886902337 did.
+    #
+    # Re-check the final activity here: if we're back on the system
+    # launcher at the end of the boot wait, TWRP never came up —
+    # FAIL the workflow with exit 1 so the false-green pattern stops.
+    final_activity = get_current_activity() or ""
+    print()
+    print("=" * 60)
+    print("  Final launcher-state check")
+    print("=" * 60)
+    print(f"  Final activity: {final_activity}")
+    final_activity_lc = final_activity.lower()
+    is_launcher = (
+        "launcher" in final_activity_lc
+        or "nexuslauncher" in final_activity_lc
+        or final_activity_lc.strip() == ""
+    )
+    # Render2Activity is twoyi's render surface — being on it OR on any
+    # non-launcher activity means the app is still alive (boot succeeded
+    # OR is still in progress). Only the launcher means a crash.
+    if is_launcher:
+        print()
+        print("  ✗✗✗ FINAL STATE IS LAUNCHER — TWRP NEVER BOOTED")
+        print("  The twoyi app is no longer the resumed activity after")
+        print(f"  {boot_wait}s of boot wait. This is the false-green")
+        print("  pattern from run 32886902337 — failing the workflow now.")
+        print()
+        print("  Diagnostic artifacts captured above. Exiting with code 1.")
+        sys.exit(1)
+    print(f"  ✓ Final activity is non-launcher ({final_activity}) — TWRP boot succeeded.")
 
 if __name__ == "__main__":
     main()
