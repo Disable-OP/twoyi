@@ -3559,7 +3559,13 @@ int openat(int dirfd, const char *path, int flags, ...) {
     // Init opens /sys/fs/selinux/checkreqprot, /sys/fs/selinux/enforce, etc.
     // These need to exist as writable files.
     if (path && strncmp(path, "/sys/fs/selinux/", 16) == 0) {
-        const char *translated = translate(path);
+        // 6-Z142: explicit rootfs prefix (translate() passes /sys through
+        // to the HOST's real selinuxfs — EACCES for the app; the virtual
+        // files live at {rootfs}/sys/fs/selinux/).
+        char selinux_translated[600];
+        snprintf(selinux_translated, sizeof(selinux_translated), "%s%s",
+                 g_rootfs ? g_rootfs : "", path);
+        const char *translated = selinux_translated;
         int fd = real_openat ? real_openat(dirfd, translated, flags, mode)
                               : syscall(NR_openat, dirfd, translated, flags, mode);
         if (fd < 0 && (flags & O_WRONLY || flags & O_RDWR)) {
@@ -3638,7 +3644,16 @@ int open(const char *path, int flags, ...) {
 
     // Special handling for selinuxfs paths — same as openat()
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
-        const char *translated = translate(path);
+        // 6-Z142: use the EXPLICIT rootfs-prefixed path, NOT translate()
+        // — should_translate() returns 0 for /sys (host kernel paths),
+        // so translate() passed /sys/fs/selinux/* through to the HOST's
+        // REAL selinuxfs where every open EACCESes for the app. The
+        // virtual files live at {rootfs}/sys/fs/selinux/ (created by
+        // ensure_selinuxfs_files); open THOSE.
+        char selinux_translated[600];
+        snprintf(selinux_translated, sizeof(selinux_translated), "%s%s",
+                 g_rootfs ? g_rootfs : "", path);
+        const char *translated = selinux_translated;
         // Ensure the file exists — create it if missing
         char real_path[600];
         snprintf(real_path, sizeof(real_path), "%s/sys/fs/selinux", g_rootfs ? g_rootfs : "");
