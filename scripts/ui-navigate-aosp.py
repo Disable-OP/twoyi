@@ -183,6 +183,39 @@ def capture_logs():
     with open(f"{ART}/rootfs-integrity.txt", "w", errors="replace") as f:
         f.write("\n".join(lines) + "\n")
     print("    rootfs-integrity.txt written")
+    # 6-Z134: READ-PROBE the exact files the guest linker failed on —
+    # how many bytes can the APP UID actually read, and what's on disk?
+    # (The "only found 1 bytes"/"file size 0" link failures: this pins
+    # whether the FILE is broken or the READ path is.)
+    probes = [
+        # (label, shell command — runs via adb shell, app uid via run-as)
+        ("guest /dev staged libs",
+         f"run-as {PACKAGE} sh -c 'ls -la rootfs/dev/*.so 2>&1; "
+         f"wc -c rootfs/dev/libgetpid_hook.so rootfs/dev/libtwoyi_loader_shlib.so "
+         f"rootfs/dev/libdl.so 2>&1'"),
+        ("guest /dev libgetpid_hook 64-byte read",
+         f"run-as {PACKAGE} sh -c 'dd if=rootfs/dev/libgetpid_hook.so bs=64 count=1 "
+         f"2>/dev/null | od -An -tx1 | head -1'"),
+        ("host /apex runtime bionic (app view)",
+         "ls -la /apex/com.android.runtime/lib64/bionic/libdl.so "
+         "/apex/com.android.runtime/lib64/bionic/libc.so 2>&1"),
+        ("host /apex libdl 64-byte read (shell uid)",
+         "dd if=/apex/com.android.runtime/lib64/bionic/libdl.so bs=64 count=1 "
+         "2>/dev/null | od -An -tx1 | head -1"),
+        ("host /apex art+i18n dirs",
+         "ls /apex/com.android.art/lib64/libnativeloader.so "
+         "/apex/com.android.i18n/lib64/libandroidicu.so 2>&1"),
+        ("rootfs apex stub tree",
+         f"run-as {PACKAGE} sh -c 'ls -la rootfs/apex/com.android.runtime/lib64/bionic/ "
+         "2>&1 | head -12'"),
+    ]
+    probed = []
+    for label, cmd in probes:
+        rr = adb_shell(cmd, timeout=30)
+        probed.append(f"== {label} ==\n{rr.stdout or rr.stderr or ''}")
+    with open(f"{ART}/file-read-probes.txt", "w", errors="replace") as f:
+        f.write("\n".join(probed) + "\n")
+    print("    file-read-probes.txt written")
     adb("pull", f"/sdcard/Android/data/{PACKAGE}/files/log",
         f"{ART}/app-logs", timeout=60)
     for remote, local in [
@@ -212,6 +245,11 @@ def main():
     print("=" * 60)
 
     print("\n  Step 1: Launch app via launcher")
+    # 6-Z134: enable the bionic linker's own debug log for the guest
+    # (LD_DEBUG=2 "libs") via the marker file kr64 checks — the linker's
+    # account of every library search/open/read is the ground truth for
+    # the "only found 1 bytes" / "file size 0 >= 0" link-failure class.
+    adb_shell(f"run-as {PACKAGE} sh -c 'echo 2 > .ld_debug' 2>/dev/null", timeout=15)
     adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
     time.sleep(6)
     activity = get_current_activity()
