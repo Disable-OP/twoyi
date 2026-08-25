@@ -10278,7 +10278,7 @@ pub fn run_ptrace_loop(
                         // whole exec'd lifetime (~4839 iterations ≈ 2400 syscall
                         // pairs) so the next run captures the child's path
                         // verbatim (including every mprotect ENTRY).
-                        if post_execve_syscall_count <= 3000 {
+                        if post_execve_syscall_count <= 20000 {
                             log(&format!(
                                 "post-execve syscall #{}: nr={} [{}]",
                                 post_execve_syscall_count,
@@ -10410,7 +10410,7 @@ pub fn run_ptrace_loop(
                     // lines identified the re-anchored child's /proc/self/comm
                     // + fstab probes in run 32663728329, and the #500 cutoff
                     // landed mid-linker-storm.
-                    if past_first_execve && post_execve_syscall_count <= 3000 {
+                    if past_first_execve && post_execve_syscall_count <= 20000 {
                         let path_idx = match syscall_num {
                             n if n == abi.open => Some(abi.reg_arg1),
                             n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
@@ -12929,7 +12929,7 @@ pub fn run_ptrace_loop(
                     // hiding the ofstream-open's errno ("Cannot open for
                     // writing" was all init told us). ENTRY and RETURN now
                     // cover the same window.
-                    if past_first_execve && post_execve_syscall_count <= 3000 {
+                    if past_first_execve && post_execve_syscall_count <= 20000 {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
