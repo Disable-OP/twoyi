@@ -7223,6 +7223,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 /apex/com.android.runtime/lib64/bionic:\
                 /apex/com.android.runtime/lib64:\
                 /apex/com.android.runtime/lib64/bootstrap:\
+                /apex/com.android.art/lib64:\
+                /apex/com.android.i18n/lib64:\
                 /system/lib64:\
                 /system/lib64/bootstrap:\
                 /vendor/lib64:\
@@ -7242,20 +7244,45 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Usage: set TWOYI_LD_DEBUG=2 in the CI env to enable "libs" level
         // debug (library load/unload). Set TWOYI_LD_DEBUG=4 for "files"
         // level (file opens). Set TWOYI_LD_DEBUG=6 for both.
-        if let Ok(ld_debug_val) = std::env::var("TWOYI_LD_DEBUG") {
-            if !ld_debug_val.is_empty() {
-                let ld_debug_env = format!("LD_DEBUG={}", ld_debug_val);
-                match CString::new(ld_debug_env) {
-                    Ok(c) => {
-                        env_vars.push(c);
-                        unsafe {
-                            safe_write_err(b"[KR64 CHILD] TWOYI_LD_DEBUG set -- enabling LD_DEBUG for guest init\n");
-                        }
+        //
+        // 6-Z134: FILE-BASED TRIGGER — the app's env cannot be set from CI
+        // (the app launches kr64 via ProcessBuilder with its own env), so
+        // also check the marker file {data_dir}/.ld_debug whose CONTENT is
+        // the LD_DEBUG value (e.g. "2"). The nav script creates it via
+        // run-as before launching the container — the run's artifact then
+        // carries the linker's own account of every library search/open/
+        // read (the ground truth for the "only found 1 bytes" /
+        // "file size 0 >= 0" link-failure class).
+        let ld_debug_from_file: Option<String> = {
+            let marker = format!("{}/.ld_debug", cfg.data_dir);
+            std::fs::read_to_string(&marker)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        if ld_debug_from_file.is_some() {
+            unsafe {
+                safe_write_err(
+                    b"[KR64 CHILD] .ld_debug marker present -- enabling LD_DEBUG for guest init (file trigger)\n",
+                );
+            }
+        }
+        let ld_debug_val = std::env::var("TWOYI_LD_DEBUG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or(ld_debug_from_file);
+        if let Some(ld_debug_val) = ld_debug_val {
+            let ld_debug_env = format!("LD_DEBUG={}", ld_debug_val);
+            match CString::new(ld_debug_env) {
+                Ok(c) => {
+                    env_vars.push(c);
+                    unsafe {
+                        safe_write_err(b"[KR64 CHILD] LD_DEBUG enabled for guest init\n");
                     }
-                    Err(_) => unsafe {
-                        safe_write_err(b"[KR64 CHILD] WARN: TWOYI_LD_DEBUG contains NUL byte -- skipping LD_DEBUG\n");
-                    },
                 }
+                Err(_) => unsafe {
+                    safe_write_err(b"[KR64 CHILD] WARN: LD_DEBUG value contains NUL byte -- skipping LD_DEBUG\n");
+                },
             }
         }
         if skip_preload {
