@@ -2038,9 +2038,26 @@ fn handle_write_read(
 
     // Idle path: a pure-read BINDER_WRITE_READ (no BC_* that produced BR
     // bytes) gets a BR_NOOP so the guest's `getAndExecuteCommand` loops
-    // instead of busy-spinning (6-Z112 G3; 6-Z114 §5 — the S1b blocking
-    // idle is a v2+ extension, the v1 proxy keeps the BR_NOOP path).
+    // (6-Z112 G3; 6-Z114 §5).
+    //
+    // 6-Z152: BLOCKING idle — sleep IDLE_POLL_TICK (250ms) BEFORE pushing
+    // BR_NOOP, emulating the kernel's blocking `read_buffer`. Without this,
+    // surfaceflinger (which polls binder for vsync/rendering events with a
+    // pure-read BINDER_WRITE_READ) busy-loops at ~100Hz: each call returns
+    // immediately with BR_NOOP, the guest's `ioctl` returns, the guest
+    // immediately re-issues the same ioctl. The tracer (one ptrace thread
+    // handling ALL pids via waitpid(-1)) gets 100% pinned on surfaceflinger
+    // poll-stop / poll-resume cycles, starving init/zygote/ueventd/
+    // servicemanager (which sit in 't' state, never resuming). The knock-on
+    // effect: zygote never gets CPU to fork system_server → no
+    // boot_completed. The 250ms sleep throttles surfaceflinger's poll rate
+    // to ~4Hz, freeing the tracer to drain the other stopped children. This
+    // runs in the per-connection thread (one per guest binder fd, bounded
+    // by MAX_PROXY_CONNECTIONS), so blocking here doesn't stall other
+    // connections. The S1b proxy was DESIGNED for this (see the comment on
+    // BINDER_THREAD_POOL_SIZE at line 886 + IDLE_POLL_TICK at line 904).
     if read_buf.is_empty() && read_capacity > 0 {
+        std::thread::sleep(IDLE_POLL_TICK);
         push_br_noop(&mut read_buf);
     }
 
@@ -2885,17 +2902,37 @@ mod tests {
         req.extend_from_slice(&BINDER_WRITE_READ.to_ne_bytes());
         req.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
         req.extend_from_slice(&payload);
+
+        // 6-Z152: time the request — the proxy must block for at least
+        // IDLE_POLL_TICK (250ms) before returning BR_NOOP, emulating the
+        // kernel's blocking read. Without this, surfaceflinger busy-loops
+        // at ~100Hz and pins the ptrace tracer.
+        let send_start = std::time::Instant::now();
         stream.write_all(&req).expect("write request");
 
         // Read response: [i32 ret][u32 arg_len][u32 read_size][read_size bytes].
         let mut hdr = [0u8; 8];
         stream.read_exact(&mut hdr).expect("read response header");
+        let elapsed = send_start.elapsed();
         let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
         let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
         assert_eq!(ret, 0);
         assert!(
             arg_len >= 4,
             "BINDER_WRITE_READ response should have a read_size header"
+        );
+
+        // 6-Z152: the response must take AT LEAST IDLE_POLL_TICK to arrive
+        // (allow 30ms slack for CI scheduling jitter). This is the ground
+        // truth that the blocking-idle behaviour is engaged.
+        let min_expected = IDLE_POLL_TICK
+            .checked_sub(Duration::from_millis(30))
+            .unwrap();
+        assert!(
+            elapsed >= min_expected,
+            "idle BINDER_WRITE_READ must block for >= {:?} (got {:?}) — the 6-Z152 blocking-idle fix is missing",
+            min_expected,
+            elapsed
         );
 
         let mut resp = vec![0u8; arg_len];
