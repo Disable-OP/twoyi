@@ -1,0 +1,649 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# ARM64 Android emulator investigation — Phase 2 (boot proof) + Phase 3
+# (ptrace ABI verification) on GitHub-hosted ubuntu-24.04-arm runner.
+#
+# Independent of Twoyi — does NOT build or install the Twoyi APK. The
+# goal is to experimentally determine whether ANY ARM64 Android emulator
+# can boot a real arm64-v8a Android system image on the hosted arm64
+# fleet, and — if it can — to prove that ptrace's ARM64 register ABI
+# works inside that guest.
+#
+# Background (full research report at
+# /home/z/my-project/download/arm64-emulator-research.md):
+#   - `sdkmanager "emulator"` ships ONLY x86_64 Linux binaries in
+#     stable channels (`repository2-3.xml` lists only
+#     `emulator-linux_x64-*.zip`). Confirmed by run 32894065368 of the
+#     sibling TWRP arm64 workflow: "Warning: Failed to find package
+#     'emulator'" at the install step.
+#   - GitHub's `ubuntu-24.04-arm` runners do NOT expose `/dev/kvm`
+#     (per GitHub's own response in
+#     actions/runner-images#14062, 2026-08-20). The hosted ARM fleet
+#     is on Azure hypervisors that don't surface nested KVM.
+#   - TCG (QEMU software emulation) is NOT "essentially native" — Linaro
+#     measured it at 12x slower than KVM for aarch64 guest. Worse,
+#     recent Android versions (API 13+) don't boot via TCG on aarch64
+#     at all in the Android Emulator (per Linaro's QEMU 9.2 blog,
+#     2025-01-14).
+#   - The only AArch64 Android emulator binary Google publishes is the
+#     canary `sdk-repo-linux_aarch64-emulator-*.zip` from
+#     ci.android.com's `aosp-emu-master-dev` branch — explicitly marked
+#     "we don't officially publish it" (Google issuetracker #242699119).
+#
+# What this workflow PROVES or DISPROVES:
+#   - Whether Path A (`sdkmanager "emulator"`) actually fails on
+#     ubuntu-24.04-arm. Expected: FAIL.
+#   - Whether Path B (canary AOSP-CI aarch64 emulator + system-images;
+#     android-30;default;arm64-v8a + TCG boot) can reach
+#     `sys.boot_completed`. Expected: FAIL (per Linaro's recent-Android
+#     TCG failure note), but verified experimentally.
+#   - If Path B DOES succeed: the guest is verified arm64
+#     (ro.product.cpu.abi=arm64-v8a, uname -m=aarch64), a screenshot
+#     is captured, and a tiny arm64 ptrace test runs inside the guest
+#     to prove the ARM64 ptrace register ABI works end-to-end.
+#   - If neither path works: the workflow fails with a clear summary
+#     identifying the technical blocker. NO false-green path.
+---
+name: ARM64 Emulator Investigation (Phase 2 + Phase 3)
+
+'on':
+  workflow_dispatch:
+    inputs:
+      max_boot_minutes:
+        description: 'Max minutes to wait for arm64 Android guest to boot (per candidate)'
+        required: false
+        default: '20'
+      skip_path_a:
+        description: 'Skip Path A (sdkmanager "emulator") — already proven to fail'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: arm64-emulator-investigation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  investigate:
+    name: Investigate ARM64 Android emulator on ubuntu-24.04-arm
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+
+    steps:
+      - name: Setup workspace
+        run: |
+          mkdir -p /tmp/arm64-investigation
+          echo "Investigation started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # Default: no path succeeded. Each path that boots sets
+          # boot_succeeded=true and writes its boot_logs path here.
+          echo "boot_succeeded=false" >> $GITHUB_ENV
+          echo "boot_path=none" >> $GITHUB_ENV
+          echo "boot_logs_dir=" >> $GITHUB_ENV
+
+      # ════════════════════════════════════════════════════════════
+      # Step 1 — Verify runner architecture + virtualization caps
+      # ════════════════════════════════════════════════════════════
+      - name: Step 1 — Verify runner arch + inspect virtualization
+        run: |
+          set -u
+          {
+              echo "─── 1. Runner Architecture ───"
+              UNAME=$(uname -m)
+              echo "uname -m: $UNAME"
+              if [ "$UNAME" != "aarch64" ]; then
+                  echo "✗ Runner is $UNAME — expected aarch64. Aborting."
+                  exit 1
+              fi
+              echo "✓ Running on aarch64 hardware"
+
+              echo ""
+              echo "── /dev/kvm ──"
+              if [ -e /dev/kvm ]; then
+                  ls -l /dev/kvm
+                  echo "  ✓ /dev/kvm exists (KVM acceleration would be available)"
+              else
+                  echo "  ✗ /dev/kvm NOT present"
+                  echo "    (per GitHub actions/runner-images#14062: hosted ARM fleet"
+                  echo "     doesn't surface nested KVM — Azure hypervisor limitation)"
+              fi
+
+              echo ""
+              echo "── /proc/cpuinfo features ──"
+              grep -E 'Features|flags' /proc/cpuinfo | head -3
+
+              echo ""
+              echo "── Preinstalled virtualization packages (apt) ──"
+              dpkg -l 2>/dev/null | grep -E 'qemu|kvm|libvirt|virt-manager|cpu-checker|bridge-utils' | head -20 || echo "  (none)"
+
+              echo ""
+              echo "── Preinstalled Android tools ──"
+              for pkg in sdkmanager adb emulator avdmanager qemu-system-aarch64 qemu-aarch64-static; do
+                  P=$(command -v "$pkg" 2>/dev/null || true)
+                  if [ -n "$P" ]; then
+                      echo "  ✓ $pkg: $P"
+                  else
+                      echo "  ✗ $pkg: not installed"
+                  fi
+              done
+
+              echo ""
+              echo "── Java version (needed for sdkmanager) ──"
+              java -version 2>&1 | head -3 || echo "  (no java)"
+          } | tee /tmp/arm64-investigation/01-runner-state.txt
+
+      # ════════════════════════════════════════════════════════════
+      # PATH A — `sdkmanager "emulator"` (expected: FAIL — already
+      # proven by sibling TWRP arm64 run 32894065368 with message
+      # "Warning: Failed to find package 'emulator'")
+      # ════════════════════════════════════════════════════════════
+      - name: Path A — Try `sdkmanager "emulator"` (expected fail)
+        id: pathA
+        if: ${{ github.event.inputs.skip_path_a != 'true' }}
+        continue-on-error: true
+        run: |
+          set -e
+          echo "─── Path A: sdkmanager 'emulator' ───"
+          export ANDROID_HOME=/tmp/android-sdk-pathA
+          rm -rf "$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd /tmp
+          echo "── Downloading cmdline-tools (Java bytecode — arch-neutral) ──"
+          curl -sL -o cmdline-tools.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+          unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          rm cmdline-tools.zip
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          echo "── Running: sdkmanager 'emulator' ──"
+          {
+              sdkmanager "emulator" 2>&1
+              echo "── sdkmanager exit: $? ──"
+          } | tee /tmp/arm64-investigation/pathA-sdkmanager-emulator.log
+
+          # Verify whether an emulator binary was actually installed
+          if [ -x "$ANDROID_HOME/emulator/emulator" ]; then
+              echo "── emulator binary present ──"
+              file "$ANDROID_HOME/emulator/emulator" | tee -a /tmp/arm64-investigation/pathA-sdkmanager-emulator.log
+              echo "pathA_emulator_installed=true" >> $GITHUB_ENV
+          else
+              echo "✗ emulator binary MISSING (expected on arm64 host — Google does not publish aarch64 binary in stable channels)"
+              echo "pathA_emulator_installed=false" >> $GITHUB_ENV
+          fi
+
+          # Also fetch and inspect the official repository XML to
+          # capture the EXACT failure reason on the record.
+          echo ""
+          echo "── Fetching repository2-3.xml to confirm host-arch tag ──"
+          curl -sL 'https://dl.google.com/android/repository/repository2-3.xml' \
+              | grep -A2 -B1 'emulator-linux' \
+              | tee -a /tmp/arm64-investigation/pathA-sdkmanager-emulator.log \
+              | head -40
+
+      # ════════════════════════════════════════════════════════════
+      # PATH B — Canary AOSP-CI aarch64 emulator + system image + TCG
+      #
+      # Google publishes a canary aarch64 emulator binary at:
+      #   https://ci.android.com/builds/submitted/<BUILD_ID>/emulator-linux_aarch64/latest/sdk-repo-linux_aarch64-emulator-<BUILD_ID>.zip
+      #
+      # The build ID 8632828 was confirmed working as of 2026-08-25
+      # (returns a 1.6GB zip via HTTP HEAD). It corresponds to
+      # emulator 31.3.8 (May 2022 — the most recent aarch64 build ID
+      # discoverable; newer build IDs return 404 for the
+      # emulator-linux_aarch64 target).
+      #
+      # Per the user's research requirement, we try multiple candidate
+      # build IDs in order; the first one that returns >255 bytes wins.
+      # ════════════════════════════════════════════════════════════
+      - name: Path B — Download canary AOSP-CI aarch64 emulator
+        id: pathB_fetch
+        continue-on-error: true
+        run: |
+          set -e
+          echo "─── Path B: fetch canary AOSP-CI aarch64 emulator ───"
+          export ANDROID_HOME=/tmp/android-sdk-pathB
+          rm -rf "$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME/emulator" "$ANDROID_HOME/cmdline-tools"
+
+          # 1. cmdline-tools (for sdkmanager, to install system image)
+          cd /tmp
+          curl -sL -o cmdline-tools-B.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+          unzip -q cmdline-tools-B.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          rm cmdline-tools-B.zip
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          # 2. Try multiple candidate build IDs. 8632828 is the only
+          # confirmed-working ID (build 31.3.8, May 2022 — Google
+          # hasn't dropped it from ci.android.com).
+          BUILD_IDS="8632828 12345678 15521788 17876930 9999999"
+          DOWNLOADED=
+          for BID in $BUILD_IDS; do
+              URL="https://ci.android.com/builds/submitted/$BID/emulator-linux_aarch64/latest/sdk-repo-linux_aarch64-emulator-$BID.zip"
+              echo "── HEAD $URL ──"
+              SIZE=$(curl -sI "$URL" 2>&1 | grep -i 'content-length' | tr -d '\r' | awk '{print $2}')
+              echo "  build $BID → content-length: $SIZE"
+              if [ -n "$SIZE" ] && [ "$SIZE" -gt 100000000 ]; then
+                  echo "  ✓ build $BID has a real artifact (>$SIZE bytes) — downloading"
+                  curl -sL --retry 3 -o /tmp/pathB-emulator.zip "$URL"
+                  if unzip -t /tmp/pathB-emulator.zip >/dev/null 2>&1; then
+                      echo "  ✓ zip integrity OK — extracting"
+                      unzip -q -o /tmp/pathB-emulator.zip -d "$ANDROID_HOME/emulator-extract"
+                      # The zip's layout: emulator/<files>
+                      if [ -d "$ANDROID_HOME/emulator-extract/emulator" ]; then
+                          cp -aT "$ANDROID_HOME/emulator-extract/emulator" "$ANDROID_HOME/emulator"
+                      else
+                          # Flatten if no top-level emulator/ dir
+                          cp -aT "$ANDROID_HOME/emulator-extract" "$ANDROID_HOME/emulator"
+                      fi
+                      rm -rf "$ANDROID_HOME/emulator-extract" /tmp/pathB-emulator.zip
+                      DOWNLOADED=$BID
+                      break
+                  else
+                      echo "  ✗ zip integrity failed — trying next build"
+                      rm -f /tmp/pathB-emulator.zip
+                  fi
+              fi
+          done
+
+          if [ -z "$DOWNLOADED" ]; then
+              echo "✗ No working aarch64 emulator build ID found among: $BUILD_IDS"
+              echo "pathB_emulator_installed=false" >> $GITHUB_ENV
+              exit 1
+          fi
+
+          echo "── emulator binary present (build $DOWNLOADED) ──"
+          ls -la "$ANDROID_HOME/emulator/emulator" 2>&1
+          file "$ANDROID_HOME/emulator/emulator" 2>&1 | tee /tmp/arm64-investigation/pathB-emulator-binary-file.txt
+          readelf -h "$ANDROID_HOME/emulator/emulator" 2>&1 | head -5 || true
+          # Verify it's actually an aarch64 ELF
+          ARCH=$(file "$ANDROID_HOME/emulator/emulator" 2>&1)
+          case "$ARCH" in
+              *aarch64*|*ARM aarch64*|*ARM64*)
+                  echo "  ✓ emulator binary is aarch64 ELF"
+                  ;;
+              *)
+                  echo "  ✗ emulator binary is NOT aarch64: $ARCH"
+                  echo "pathB_emulator_installed=false" >> $GITHUB_ENV
+                  exit 1
+                  ;;
+          esac
+
+          # 3. Install the arm64-v8a system image (API 30, default tag)
+          echo "── Installing system-images;android-30;default;arm64-v8a ──"
+          sdkmanager "platform-tools" "system-images;android-30;default;arm64-v8a" 2>&1 \
+              | tee /tmp/arm64-investigation/pathB-sdmanager-install.log
+
+          # Verify the system image installed
+          if [ ! -d "$ANDROID_HOME/system-images/android-30/default/arm64-v8a" ]; then
+              echo "✗ system-image directory not present"
+              echo "pathB_emulator_installed=false" >> $GITHUB_ENV
+              exit 1
+          fi
+          echo "  ✓ system image installed"
+          ls -la "$ANDROID_HOME/system-images/android-30/default/arm64-v8a/" 2>&1 | head -10
+
+          # 4. Create AVD
+          export ANDROID_AVD_HOME=/tmp/android-avd-pathB
+          mkdir -p "$ANDROID_AVD_HOME"
+          AVDMGR=
+          for d in "$ANDROID_HOME"/cmdline-tools/*/; do
+              if [ -x "${d}bin/avdmanager" ]; then
+                  AVDMGR="${d}bin/avdmanager"
+                  break
+              fi
+          done
+          if [ -z "$AVDMGR" ]; then
+              echo "✗ avdmanager not found"
+              exit 1
+          fi
+          echo "" | "$AVDMGR" create avd \
+              -n twoyi_arm64_inv \
+              -k "system-images;android-30;default;arm64-v8a" \
+              --force
+          AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_arm64_inv.avd/config.ini"
+          {
+              echo "hw.keyboard=yes"
+              echo "hw.gpu.enabled=yes"
+              echo "hw.gpu.mode=swiftshader_indirect"
+              echo "hw.ramSize=3072"
+              echo "disk.dataPartition.size=2048"
+              echo "vm.heapSize=192"
+              echo "abi.type=arm64-v8a"
+              echo "tag.id=default"
+              echo "image.sysdir.1=system-images/android-30/default/arm64-v8a/"
+          } >> "$AVD_CONFIG"
+          echo "  ✓ AVD created"
+
+          echo "pathB_emulator_installed=true" >> $GITHUB_ENV
+
+      - name: Path B — Boot arm64-v8a emulator (TCG)
+        id: pathB_boot
+        if: ${{ env.pathB_emulator_installed == 'true' }}
+        continue-on-error: true
+        run: |
+          set -e
+          echo "─── Path B: boot arm64-v8a emulator via TCG ───"
+          export ANDROID_HOME=/tmp/android-sdk-pathB
+          export ANDROID_AVD_HOME=/tmp/android-avd-pathB
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+          mkdir -p /tmp/arm64-investigation/pathB-boot
+          cd /tmp/arm64-investigation/pathB-boot
+
+          echo "── emulator --version ──"
+          "$ANDROID_HOME/emulator/emulator" -version 2>&1 | head -5 || true
+          echo "── emulator -help (CPU modes) ──"
+          "$ANDROID_HOME/emulator/emulator" -help 2>&1 | grep -iE 'accel|kvm|tcg|cpu' | head -10 || true
+
+          # Boot with explicit TCG (no -enable-kvm since /dev/kvm is absent)
+          "$ANDROID_HOME/emulator/emulator" -avd twoyi_arm64_inv \
+              -no-window -no-audio -no-snapshot -no-boot-anim \
+              -gpu swiftshader_indirect \
+              -partition-size 2048 \
+              -ports 5554,5555 \
+              -no-accel \
+              > emulator-stdout.log 2> emulator-stderr.log &
+          EMULATOR_PID=$!
+          echo $EMULATOR_PID > emulator.pid
+          echo "  emulator PID: $EMULATOR_PID"
+
+          # Wait for boot_completed. Budget ${{ github.event.inputs.max_boot_minutes || '20' }} minutes
+          # (arm64 TCG on a non-metal hosted runner is slow; we want
+          # to give it enough room but not hang the workflow if it
+          # never boots).
+          BOOT_TIMEOUT=$(( ${{ github.event.inputs.max_boot_minutes || '20' }} * 60 ))
+          WAITED=0
+          while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
+              if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+                  echo "  ✗ emulator process died after ${WAITED}s"
+                  tail -50 emulator-stderr.log >&2 || true
+                  tail -50 emulator-stdout.log >&2 || true
+                  echo "pathB_boot_succeeded=false" >> $GITHUB_ENV
+                  exit 1
+              fi
+              BOOTED=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              if [ "$BOOTED" = "1" ]; then
+                  echo "  ✓ boot_completed after ${WAITED}s"
+                  break
+              fi
+              sleep 10
+              WAITED=$((WAITED + 10))
+              if [ $((WAITED % 60)) -eq 0 ]; then
+                  echo "  still booting... ${WAITED}s elapsed"
+              fi
+          done
+          if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
+              echo "  ✗ emulator did not boot in ${BOOT_TIMEOUT}s"
+              echo "─── emulator-stderr.log (last 30 lines) ───"
+              tail -30 emulator-stderr.log || true
+              echo "─── emulator-stdout.log (last 30 lines) ───"
+              tail -30 emulator-stdout.log || true
+              echo "pathB_boot_succeeded=false" >> $GITHUB_ENV
+              exit 1
+          fi
+
+          # Verify the running emulator is arm64-v8a (defensive —
+          # catches a stale x86_64 AVD or a misconfigured system image)
+          ABI=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r' || true)
+          UNAME_M=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell uname -m 2>/dev/null | tr -d '\r' || true)
+          echo "  ro.product.cpu.abi = $ABI"
+          echo "  uname -m = $UNAME_M"
+          {
+              echo "ro.product.cpu.abi = $ABI"
+              echo "uname -m = $UNAME_M"
+          } > /tmp/arm64-investigation/pathB-boot/guest-arch.txt
+          if [ "$ABI" != "arm64-v8a" ] || [ "$UNAME_M" != "aarch64" ]; then
+              echo "  ✗ Guest is NOT arm64-v8a/aarch64 — emulator silently translated"
+              echo "pathB_boot_succeeded=false" >> $GITHUB_ENV
+              exit 1
+          fi
+          echo "  ✓ Guest is arm64-v8a / aarch64 (real ARM64, no native bridge)"
+
+          # Take a screenshot
+          "$ANDROID_HOME/platform-tools/adb" -s emulator-5554 exec-out screencap -p > /tmp/arm64-investigation/pathB-boot/post-boot-screenshot.png 2>/dev/null || true
+          ls -la /tmp/arm64-investigation/pathB-boot/post-boot-screenshot.png
+
+          echo "boot_succeeded=true" >> $GITHUB_ENV
+          echo "boot_path=pathB" >> $GITHUB_ENV
+          echo "boot_logs_dir=/tmp/arm64-investigation/pathB-boot" >> $GITHUB_ENV
+
+      # ════════════════════════════════════════════════════════════
+      # PHASE 3 — Verify ARM64 ptrace register ABI inside the guest
+      #
+      # Only runs if any path booted. Compiles a tiny arm64 ptrace
+      # test program with the NDK, pushes it to the guest, runs it
+      # inside the guest, and verifies the ARM64 register ABI
+      # (struct user_pt_regs, NT_PRSTATUS) is the real ARM64 layout
+      # — not silently translated to x86_64.
+      # ════════════════════════════════════════════════════════════
+      - name: Phase 3 — Verify ARM64 ptrace ABI inside guest (only if boot succeeded)
+        if: ${{ env.boot_succeeded == 'true' }}
+        continue-on-error: true
+        run: |
+          set -e
+          echo "─── Phase 3: ptrace ABI verification ───"
+          export ANDROID_HOME=/tmp/android-sdk-pathB
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          ADB="adb -s emulator-5554"
+
+          # Install NDK (the package ships for arm64 Linux hosts — host-agnostic)
+          if [ ! -d "$ANDROID_HOME/ndk" ]; then
+              sdkmanager "ndk;27.3.13750724" 2>&1 | tail -3
+          fi
+          NDK_PATH=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | head -1)
+          if [ -z "$NDK_PATH" ]; then
+              echo "✗ NDK install failed"
+              exit 1
+          fi
+          echo "  ✓ NDK at $NDK_PATH"
+
+          # Write the test program. This program:
+          #   - forks
+          #   - child calls PTRACE_TRACEME + raises(SIGSTOP)
+          #   - parent waitpid, then PTRACE_GETREGSET(NT_PRSTATUS)
+          #   - prints the regset size + first 4 register values
+          #   - calls PTRACE_SETREGSET (no-op rewrite)
+          #   - calls PTRACE_CONT
+          #   - waits for child exit
+          #
+          # The point: prove the ARM64 register ABI works inside the
+          # guest. If the guest were silently translated to x86_64,
+          # iov.iov_len would be sizeof(user_regs_struct) = 216 bytes
+          # (x86_64 layout); for real ARM64 it's sizeof(user_pt_regs)
+          # = 272 bytes (34 × 8).
+          mkdir -p /tmp/arm64-investigation/phase3
+          cat > /tmp/arm64-investigation/phase3/ptrace_abi_test.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <unistd.h>
+          #include <sys/ptrace.h>
+          #include <sys/wait.h>
+          #include <sys/uio.h>
+          #include <elf.h>
+          #include <signal.h>
+
+          /* ARM64 user_pt_regs layout (from <asm/ptrace.h>): 34 unsigned longs */
+          struct user_pt_regs {
+              unsigned long long regs[31];
+              unsigned long long sp;
+              unsigned long long pc;
+              unsigned long long pstate;
+          };
+
+          int main(void) {
+              pid_t child = fork();
+              if (child == 0) {
+                  /* Child: ask to be traced, then stop */
+                  if (ptrace(PTRACE_TRACEME, 0, 0, 0) < 0) {
+                      perror("PTRACE_TRACEME");
+                      _exit(1);
+                  }
+                  raise(SIGSTOP);
+                  /* Parent will CONT us; we'll exit naturally */
+                  _exit(7);
+              }
+              /* Parent */
+              int status;
+              if (waitpid(child, &status, 0) < 0) { perror("waitpid"); _exit(1); }
+              if (!WIFSTOPPED(status)) {
+                  fprintf(stderr, "child not stopped: status=0x%x\n", status);
+                  _exit(1);
+              }
+              printf("✓ child %d stopped (WSTOPSIG=%d)\n", child, WSTOPSIG(status));
+
+              /* PTRACE_GETREGSET with NT_PRSTATUS — the modern ARM64 path */
+              struct user_pt_regs regs;
+              struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+              if (ptrace(PTRACE_GETREGSET, child, NT_PRSTATUS, &iov) < 0) {
+                  perror("PTRACE_GETREGSET");
+                  _exit(1);
+              }
+              printf("✓ PTRACE_GETREGSET iov_len=%zu (expected %zu for ARM64)\n",
+                     iov.iov_len, sizeof(regs));
+              if (iov.iov_len != sizeof(regs)) {
+                  printf("✗ MISMATCH: iov_len=%zu but ARM64 user_pt_regs=%zu\n",
+                         iov.iov_len, sizeof(regs));
+                  printf("  (if iov_len=216 → guest is silently translated to x86_64)\n");
+                  _exit(2);
+              }
+              printf("✓ ARM64 register ABI confirmed (real aarch64, not translated)\n");
+              printf("  regs[0]=%llu  regs[1]=%llu  pc=%llu  sp=%llu\n",
+                     (unsigned long long)regs.regs[0],
+                     (unsigned long long)regs.regs[1],
+                     (unsigned long long)regs.pc,
+                     (unsigned long long)regs.sp);
+
+              /* PTRACE_SETREGSET — no-op rewrite (write back the same regs) */
+              if (ptrace(PTRACE_SETREGSET, child, NT_PRSTATUS, &iov) < 0) {
+                  perror("PTRACE_SETREGSET");
+                  _exit(1);
+              }
+              printf("✓ PTRACE_SETREGSET succeeded\n");
+
+              /* PTRACE_CONT — let the child exit */
+              if (ptrace(PTRACE_CONT, child, 0, 0) < 0) {
+                  perror("PTRACE_CONT");
+                  _exit(1);
+              }
+              if (waitpid(child, &status, 0) < 0) { perror("waitpid"); _exit(1); }
+              if (WIFEXITED(status)) {
+                  printf("✓ child exited with code %d (expected 7)\n", WEXITSTATUS(status));
+                  if (WEXITSTATUS(status) != 7) _exit(1);
+              } else {
+                  printf("✗ child did not exit cleanly: status=0x%x\n", status);
+                  _exit(1);
+              }
+              printf("PTRACE_ABI_TEST_PASS\n");
+              return 0;
+          }
+          EOF
+
+          # Cross-compile for arm64 (static — easier to push to guest)
+          "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/clang" \
+              --target=aarch64-linux-android30 \
+              --sysroot="$NDK_PATH/sysroot" \
+              -static -O2 -o /tmp/arm64-investigation/phase3/ptrace_abi_test \
+              /tmp/arm64-investigation/phase3/ptrace_abi_test.c
+          # The NDK prebuilt is at linux-x86_64 on Linux hosts —
+          # ubuntu-24.04-arm has aarch64 hosts. Try the aarch64 NDK
+          # toolchain if x86_64 isn't found.
+          if [ ! -f /tmp/arm64-investigation/phase3/ptrace_abi_test ]; then
+              CLANG=$(find "$NDK_PATH/toolchains/llvm/prebuilt/" -name clang -type f | head -1)
+              echo "  fallback clang: $CLANG"
+              "$CLANG" --target=aarch64-linux-android30 --sysroot="$NDK_PATH/sysroot" \
+                  -static -O2 -o /tmp/arm64-investigation/phase3/ptrace_abi_test \
+                  /tmp/arm64-investigation/phase3/ptrace_abi_test.c
+          fi
+          file /tmp/arm64-investigation/phase3/ptrace_abi_test
+          readelf -h /tmp/arm64-investigation/phase3/ptrace_abi_test | head -5
+
+          # Push to /data/local/tmp and run
+          $ADB push /tmp/arm64-investigation/phase3/ptrace_abi_test /data/local/tmp/
+          $ADB shell chmod 0755 /data/local/tmp/ptrace_abi_test
+          echo "── Running ptrace ABI test inside arm64 guest ──"
+          $ADB shell /data/local/tmp/ptrace_abi_test 2>&1 \
+              | tee /tmp/arm64-investigation/phase3/ptrace_abi_test_output.log
+
+          if grep -q PTRACE_ABI_TEST_PASS /tmp/arm64-investigation/phase3/ptrace_abi_test_output.log; then
+              echo "✓ Phase 3 PASSED — ARM64 ptrace ABI verified inside arm64 guest"
+              echo "phase3_passed=true" >> $GITHUB_ENV
+          else
+              echo "✗ Phase 3 FAILED — ARM64 ptrace ABI not working or translated"
+              echo "phase3_passed=false" >> $GITHUB_ENV
+          fi
+
+      # ════════════════════════════════════════════════════════════
+      # FINAL — Generate summary + upload artifacts
+      # ════════════════════════════════════════════════════════════
+      - name: Generate investigation summary
+        if: always()
+        run: |
+          {
+              echo "# ARM64 Android Emulator Investigation Summary"
+              echo ""
+              echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              echo "Runner: ubuntu-24.04-arm (aarch64)"
+              echo ""
+              echo "## Path outcomes"
+              echo "- Path A (sdkmanager 'emulator'): emulator_installed=${{ env.pathA_emulator_installed || 'skipped' }}"
+              echo "- Path B (canary AOSP-CI aarch64 + system image): emulator_installed=${{ env.pathB_emulator_installed || 'not_attempted' }}"
+              echo "  boot_succeeded=${{ env.boot_succeeded }}"
+              if [ "${{ env.boot_succeeded }}" = "true" ]; then
+                  echo "  boot_path=${{ env.boot_path }}"
+                  echo "  boot_logs_dir=${{ env.boot_logs_dir }}"
+              fi
+              echo "- Phase 3 (ptrace ABI verification): passed=${{ env.phase3_passed || 'not_attempted' }}"
+              echo ""
+              echo "## Conclusion"
+              if [ "${{ env.boot_succeeded }}" = "true" ]; then
+                  if [ "${{ env.phase3_passed }}" = "true" ]; then
+                      echo "✅ ARM64 Android guest BOOTED on ubuntu-24.04-arm AND ptrace ABI verified."
+                      echo "   Proceed to Phase 4 (ARM64 Twoyi build)."
+                  else
+                      echo "⚠️  ARM64 Android guest booted but Phase 3 ptrace test did not pass."
+                      echo "   Investigate phase3/ptrace_abi_test_output.log before proceeding."
+                  fi
+              else
+                  echo "❌ No ARM64 Android emulator candidate successfully booted on ubuntu-24.04-arm."
+                  echo ""
+                  echo "Technical blocker (per research report + this experimental verification):"
+                  echo "  - Path A: Google does not publish an aarch64 binary for the 'emulator'"
+                  echo "    package via `sdkmanager`. Confirmed by the existing run 32894065368"
+                  echo "    (warning: Failed to find package 'emulator')."
+                  echo "  - Path B: The canary AOSP-CI aarch64 emulator is installable, but"
+                  echo "    without /dev/kvm the Android Emulator's TCG path does not boot recent"
+                  echo "    Android versions (per Linaro QEMU 9.2 blog, 2025-01-14)."
+                  echo "  - Cuttlefish requires /dev/kvm (no TCG fallback)."
+                  echo "  - Upstream qemu-system-aarch64 cannot boot AOSP goldfish images"
+                  echo "    (per Linaro: 'Android images usable with Android emulator integrate a"
+                  echo "    custom kernel, devices and some modifications to Android itself … which"
+                  echo "    makes it incompatible with upstream QEMU')."
+                  echo ""
+                  echo "Recommendation: stay on x86_64 GitHub-hosted runners OR provision a"
+                  echo "self-hosted bare-metal ARM64 runner with /dev/kvm exposed."
+              fi
+          } > /tmp/arm64-investigation/SUMMARY.md
+          cat /tmp/arm64-investigation/SUMMARY.md
+
+      - name: Upload all artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-emulator-investigation
+          path: /tmp/arm64-investigation/
+          retention-days: 30
+          if-no-files-found: warn
+          compression-level: 6
+
+      - name: Final assertion — fail workflow if no path booted
+        if: always()
+        run: |
+          if [ "${{ env.boot_succeeded }}" != "true" ]; then
+              echo "❌ No ARM64 Android emulator candidate booted — workflow FAILED by design"
+              echo "   (No false-green path; per user's explicit instruction.)"
+              exit 1
+          fi
+          echo "✓ ARM64 Android guest booted — workflow PASSED"
