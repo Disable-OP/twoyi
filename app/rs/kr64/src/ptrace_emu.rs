@@ -10317,6 +10317,36 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         }
+                        // 6-Z146: prctl ENTRY-SKIP — break the SIGSYS
+                        // re-entry loop. Run 32840391026: the guest's
+                        // init wedged in 37,111 consecutive
+                        // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)
+                        // calls (the linker's/scudo's VMA naming). The
+                        // kernel returns -22 (EINVAL — the app lacks the
+                        // permission), the seccomp filter TRAPS the
+                        // syscall, and the SIGSYS handler fires AFTER
+                        // the EXIT stop ("DESYNC") — the resume re-enters
+                        // the same syscall instruction forever. Skipping at
+                        // ENTRY (orig_rax = -1) makes the kernel treat it
+                        // as a skipped syscall: seccomp sees nr=-1 (no
+                        // rule matches, no SIGSYS), the EXIT fake (6-Z143
+                        // table -> Some(0)) writes rax=0, and rip advances
+                        // past the instruction. Only SETTER-class prctls
+                        // are skipped — the GETTERS (PR_GET_*) must return
+                        // their real values... but the kernel returns
+                        // EINVAL/EPERM for most of those too, and the
+                        // existing fake table already forces 0 — so skip
+                        // ALL prctls for the guest uniformly (the fake
+                        // table governs the result).
+                        if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                            set_syscall_num(&mut regs, &abi, -1);
+                            if ptrace_setregs(pid, &regs, iov_len).is_err() {
+                                log(&format!(
+                                    "6-Z146: prctl ENTRY-SKIP setregs FAILED for pid={} — the syscall will execute",
+                                    pid
+                                ));
+                            }
+                        }
                     }
 
                     // Task 6-S: always log fork/clone/vfork/wait4/exit_group
