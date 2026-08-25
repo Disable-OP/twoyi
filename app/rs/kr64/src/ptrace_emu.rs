@@ -11035,7 +11035,27 @@ pub fn run_ptrace_loop(
                             // linked, the only file-backed mmap is
                             // /dev/__properties__ — safe to rewrite all
                             // file-backed to anonymous.
-                            if (flags & libc::MAP_ANONYMOUS) == 0 {
+                            // 6-Z133: the rewrite+injection is
+                            // I386-ONLY. The zygote seccomp filter
+                            // blocks file-backed mmap2 for I386
+                            // compat — that is what the 6-Z2
+                            // rewrite was built for. x86_64 children
+                            // CAN do real file-backed mmaps (the app
+                            // loads its own libraries that way), and
+                            // the anonymous rewrite + 6-Z62 content
+                            // injection actively CORRUPTED the
+                            // 64-bit guest's libraries (run
+                            // 32794434177: 'missing PT_DYNAMIC in
+                            // libbinder.so', 'file offset >= file
+                            // size: 0 >= 0', 'only found 1 bytes' —
+                            // deterministic link failures). Real
+                            // file-backed mmaps give the guest
+                            // linker the real bytes; MAP_SHARED
+                            // property-area mmaps become real shared
+                            // file mappings (app-owned files —
+                            // allowed, and cross-process property
+                            // sharing actually works).
+                            if (flags & libc::MAP_ANONYMOUS) == 0 && abi.mmap2 != -1 {
                                 // ── Task 6-Z62: snapshot the ORIGINAL mmap
                                 // args for the EXIT-side content injection.
                                 //
