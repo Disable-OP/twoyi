@@ -1364,7 +1364,42 @@ pub fn create_binder_device(rootfs: &str, vm_id: u32) -> std::io::Result<String>
     let vm_dir = format!("{}/vm{}", rootfs, vm_id);
     let vm_dev = format!("{}/dev", vm_dir);
     let sock_path = format!("{}/dev/binder", vm_dir);
-    let link_path = format!("{}/dev/binder", rootfs);
+
+    // 6-Z151: ALL THREE binder contexts (/dev/binder, /dev/hwbinder,
+    // /dev/vndbinder) must be exposed as symlinks to the single proxy
+    // socket at {rootfs}/vm{id}/dev/binder. The single-socket design
+    // (G5: see the loader's binder_open_fallback block comment in
+    // twoyi_loader_shlib.c) routes all three contexts to the same
+    // kr64 binder proxy — but until 6-Z151 only /dev/binder was
+    // symlinked; /dev/hwbinder and /dev/vndbinder were MISSING from
+    // the rootfs.
+    //
+    // ROOT CAUSE (run 32863013472, head e7a16e0 = 6-Z150): once Z150
+    // cured the ComputeLastValidCap prctl spin, init finally reached
+    // service-start. Its FIRST early service — wait_for_keymaster —
+    // calls libhidlbase's defaultServiceManager(), which does
+    // `access("/dev/hwbinder", F_OK)` BEFORE open(). The loader's
+    // access() PLT hook (twoyi_loader_shlib.c line ~2178) calls
+    // should_translate(), which logs "should_translate: /dev/hwbinder
+    // -> YES (binder)" and returns 1, then translate() prepends the
+    // rootfs, then real_access() issues faccessat on
+    // {rootfs}/dev/hwbinder → ENOENT (the path didn't exist — no
+    // symlink, no file). The guest's libhidlbase treats this as
+    // "device absent" → defaultServiceManager() returns null →
+    // `CHECK(serviceManager != nullptr) << "Could not retrieve
+    // ServiceManager"` (Keymaster.cpp:125) → abort() → init's
+    // InitFatalReboot handler (signal 6) → reboot loop ~every 90s.
+    // BOOT_COMPLETED = 0.
+    //
+    // The fix mirrors what /dev/binder already does: create /dev/hwbinder
+    // and /dev/vndbinder as relative symlinks to ../vm{id}/dev/binder.
+    // access() now resolves the symlink target (the bound socket node
+    // EXISTS) → returns 0 → libhidlbase proceeds to open() → the
+    // openat PLT hook's real_openat on the symlink target returns ENXIO
+    // (can't open() a bound Unix socket) → is_binder_device_path →
+    // binder_open_fallback → binder_proxy_connect → CONNECTED to the
+    // kr64 proxy. Both access() and open() are satisfied.
+    let link_paths: [&str; 3] = ["/dev/binder", "/dev/hwbinder", "/dev/vndbinder"];
 
     // Make sure /vm{id}/dev and /dev exist.
     fs::create_dir_all(&vm_dev)?;
@@ -1376,16 +1411,19 @@ pub fn create_binder_device(rootfs: &str, vm_id: u32) -> std::io::Result<String>
         let _ = fs::set_permissions(format!("{}/dev", rootfs), fs::Permissions::from_mode(0o755));
     }
 
-    // Remove stale socket / symlink from a previous run.
+    // Remove stale socket / symlinks from a previous run.
     match fs::remove_file(&sock_path) {
         Ok(()) => info!("[KR64][binder] removed stale socket: {}", sock_path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warning!("[KR64][binder] could not remove {}: {}", sock_path, e),
     }
-    match fs::remove_file(&link_path) {
-        Ok(()) => info!("[KR64][binder] removed stale symlink: {}", link_path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warning!("[KR64][binder] could not remove {}: {}", link_path, e),
+    for link in link_paths {
+        let link_path = format!("{}{}", rootfs, link);
+        match fs::remove_file(&link_path) {
+            Ok(()) => info!("[KR64][binder] removed stale symlink: {}", link_path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warning!("[KR64][binder] could not remove {}: {}", link_path, e),
+        }
     }
 
     // Bind the Unix listener. This creates the socket file as a side
@@ -1400,21 +1438,23 @@ pub fn create_binder_device(rootfs: &str, vm_id: u32) -> std::io::Result<String>
         let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o666));
     }
 
-    // Create the symlink. Target is RELATIVE (`../vm{id}/dev/binder`)
+    // Create the symlinks. Target is RELATIVE (`../vm{id}/dev/binder`)
     // so the kernel resolves it relative to the symlink's own location
     // — i.e. `{rootfs}/dev/` — which yields `{rootfs}/vm{id}/dev/binder`.
     // This works inside the chroot too (no leading `/`).
     #[cfg(unix)]
     {
         let target = format!("../vm{}/dev/binder", vm_id);
-        std::os::unix::fs::symlink(&target, &link_path)?;
+        for link in link_paths {
+            let link_path = format!("{}{}", rootfs, link);
+            std::os::unix::fs::symlink(&target, &link_path)?;
+        }
     }
 
     info!(
-        "[KR64][binder] created socket {} (fd={}) and symlink {} → ../vm{}/dev/binder",
+        "[KR64][binder] created socket {} (fd={}) and 3 symlinks {{/dev/binder, /dev/hwbinder, /dev/vndbinder}} -> ../vm{}/dev/binder",
         sock_path,
         listener.as_raw_fd(),
-        link_path,
         vm_id
     );
 
@@ -2749,6 +2789,34 @@ mod tests {
         // And it should point to ../vm7/dev/binder.
         let target = fs::read_link(&link).expect("read_link");
         assert_eq!(target.to_string_lossy(), "../vm7/dev/binder");
+
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    // 6-Z151: ALL THREE binder contexts must be exposed as symlinks, or
+    // libhidlbase's `access("/dev/hwbinder", F_OK)` pre-check ENOENTs
+    // → defaultServiceManager() returns null → wait_for_keymaster abort
+    // → init InitFatalReboot loop (run 32863013472, head e7a16e0).
+    #[test]
+    fn create_binder_device_creates_hwbinder_and_vndbinder_symlinks() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 3).expect("create_binder_device");
+        assert!(path.ends_with("vm3/dev/binder"));
+
+        for name in &["binder", "hwbinder", "vndbinder"] {
+            let link = format!("{}/dev/{}", rootfs, name);
+            let meta = fs::symlink_metadata(&link).unwrap_or_else(|_| panic!("{} metadata", link));
+            assert!(
+                meta.file_type().is_symlink(),
+                "{rootfs}/dev/{name} should be a symlink (got {meta:?})",
+            );
+            let target = fs::read_link(&link).unwrap_or_else(|_| panic!("read_link {link}"));
+            assert_eq!(
+                target.to_string_lossy(),
+                "../vm3/dev/binder",
+                "{link} should target ../vm3/dev/binder",
+            );
+        }
 
         let _ = fs::remove_dir_all(&rootfs);
     }
