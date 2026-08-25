@@ -155,12 +155,38 @@ jobs:
         if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
         run: cargo install cargo-xdk
 
-      - name: Setup Android NDK
+      - name: Setup Android NDK (direct sdkmanager — works on arm64 hosts)
+        # The nttld/setup-ndk@v1 action hardcodes its supported-host list
+        # to linux (x86_64)/darwin/win32 and rejects linux-arm64 with
+        # "Error: Unsupported host 'linux-arm64'" (run 32892478844 / 32892481714).
+        # Direct sdkmanager install works because the NDK package itself
+        # is host-agnostic (ships binaries for x86_64 + arm64 Linux, plus
+        # darwin/win). The ubuntu-24.04-arm runner image pre-installs
+        # Android SDK + cmdline-tools at /usr/local/lib/android/sdk.
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27c
-          add-to-path: false
+        run: |
+          set -e
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          # Ensure cmdline-tools exists (pre-installed on runner image,
+          # but be defensive in case of cache misses).
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+              mkdir -p "$ANDROID_HOME/cmdline-tools"
+              cd /tmp
+              curl -sL -o cmdline-tools.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+              rm cmdline-tools.zip
+          fi
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          # NDK r27c (LTS, late 2024). Package version is the numeric ID
+          # 27.3.13750724; the install path is
+          # $ANDROID_HOME/ndk/27.3.13750724.
+          sdkmanager "ndk;27.3.13750724"
+          NDK_PATH="$ANDROID_HOME/ndk/27.3.13750724"
+          test -d "$NDK_PATH" || { echo "✗ NDK r27c install failed"; exit 1; }
+          echo "ndk-path=$NDK_PATH" >> "$GITHUB_OUTPUT"
+          echo "  ✓ NDK r27c installed at $NDK_PATH"
 
       - name: Cache Android SDK (arm64-v8a default system image)
         id: cache-sdk
