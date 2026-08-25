@@ -2782,15 +2782,18 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 
     // Set LD_LIBRARY_PATH to include rootfs library directories
     // This is needed because binaries in /dev/twoyi-bin/ need libraries
-    // from {rootfs}/system/lib64/ and {rootfs}/apex/com.android.runtime/lib64/
+    // from {rootfs}/system/lib64/ — plus the APEX lib dirs.
     // 6-Z130: + /apex/com.android.art/lib64 (libnativeloader.so — app_process64
     // link wall) and /apex/com.android.i18n/lib64 (libandroidicu.so — mediaserver).
-    // /apex/* passes through UNTRANSLATED to the HOST emulator's mounted APEXes
-    // (same mechanism as the working com.android.runtime entries).
+    // 6-Z132: the /apex/* entries are PLAIN (no {rootfs} prefix) — they pass
+    // through UNTRANSLATED to the HOST emulator's fully-mounted APEXes
+    // (same arch; should_translate returns 0 for /apex). Prefixing them with
+    // {rootfs} pointed the linker at the rootfs's INCOMPLETE apex tree and
+    // made libnativeloader.so / libandroidicu.so ENOENT (run 32790504763).
     char ld_library_path[2048];
     snprintf(ld_library_path, sizeof(ld_library_path),
-        "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib64/bootstrap:%s/apex/com.android.runtime/lib64:%s/apex/com.android.runtime/lib64/bionic:%s/apex/com.android.runtime/lib64/bootstrap:%s/apex/com.android.art/lib64:%s/apex/com.android.i18n/lib64:%s/vendor/lib64:%s/apex/com.android.os.statsd/lib64:%s/system_ext/lib64:%s/product/lib64",
-        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
+        "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib64/bootstrap:/apex/com.android.runtime/lib64:/apex/com.android.runtime/lib64/bionic:/apex/com.android.runtime/lib64/bootstrap:/apex/com.android.art/lib64:/apex/com.android.i18n/lib64:%s/vendor/lib64:/apex/com.android.os.statsd/lib64:%s/system_ext/lib64:%s/product/lib64",
+        g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
 
     char **new_envp = (char **)malloc(sizeof(char *) * (env_count + 3));
     if (!new_envp) {
@@ -3265,7 +3268,15 @@ static int should_translate(const char *path) {
     // Guest rootfs paths — translate
     if (strncmp(path, "/system", 7) == 0 && (path[7] == 0 || path[7] == '/')) return 1;
     if (strncmp(path, "/vendor", 7) == 0 && (path[7] == 0 || path[7] == '/')) return 1;
-    if (strncmp(path, "/apex", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 1;
+    // 6-Z132: /apex/* PASSES THROUGH to the host's mounted APEXes. The
+    // rootfs's apex tree is incomplete (kr64's apex_extract loopback
+    // mount fails with /dev/loop-control EPERM in the sandbox), while
+    // the emulator's own /apex/com.android.{runtime,art,i18n} are fully
+    // mounted with correct-arch libs — and the guest is the SAME ARCH.
+    // Translating /apex to the rootfs made libnativeloader.so /
+    // libandroidicu.so (and 115/128 runtime APEX libs) ENOENT.
+    // The tracer's translate_path already passes /apex through too.
+    if (strncmp(path, "/apex", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 0;
     if (strncmp(path, "/init", 5) == 0 && (path[5] == 0 || path[5] == '/')) return 1;
     if (strncmp(path, "/default.prop", 13) == 0) return 1;
     // Init creates these directories during boot — translate to rootfs
@@ -3895,7 +3906,8 @@ int __open_2(const char *path, int flags) {
     if (path && strncmp(path, "/sys/fs/selinux", 15) == 0) {
         return open(path, flags);  // our hook (translate + create)
     }
-    // Translate only rootfs paths (system, vendor, apex, data, init)
+    // Translate only rootfs paths (system, vendor, data, init — 6-Z132:
+    // /apex now passes through to the HOST's mounted APEXes)
     if (should_translate(path)) {
         const char *translated = translate(path);
         static int (*real_open2)(const char *, int) = NULL;
