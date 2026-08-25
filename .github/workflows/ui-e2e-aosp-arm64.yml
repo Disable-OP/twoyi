@@ -317,32 +317,85 @@ jobs:
           $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
           echo "  ✓ APK installed"
 
+          # ════════════════════════════════════════════════════════════
+          # EXTRACT /system/bin/init DIRECTLY FROM THE SDK system.img
+          # (offline, on the host — bypasses the Play Store adb-root
+          # restriction that blocks the live-emulator tar approach)
+          # ════════════════════════════════════════════════════════════
+          # On the google_apis_playstore API-30 x86_64 image BOTH:
+          #   /init              (root-only 0750)
+          #   /system/bin/init   (root-only 0750)
+          # are root-only. The Play Store image rejects `adb root` ("adbd
+          # cannot run as root in production builds"), so a shell-user
+          # `tar cf - /init /system/bin/init` SILENTLY SKIPS both (tar's
+          # 2>/dev/null swallows the permission-denied errors). The
+          # resulting rootfs has NO init binary at all → run 32886904666
+          # step #17 failure ("guest init (real file) not found/empty
+          # after replacement"). The first fix (ee9a9e0) tried to copy
+          # from system/bin/init inside the rootfs — but system/bin/init
+          # was ALSO missing from the rootfs for the same reason (run
+          # 32887874450 step #17 failure: "cp: bad 'system/bin/init':
+          # No such file or directory").
+          #
+          # The DEFINITIVE fix: extract /system/bin/init DIRECTLY from
+          # the SDK's system.img file on the HOST. The system.img is
+          # an ext4 filesystem image shipped with the system image
+          # package; we can read its contents offline (no adb, no
+          # emulator permissions in the loop). The image is in sparse
+          # ext4 format (Android's simg2img format) so we convert it
+          # to raw ext4 with simg2img, then use debugfs to dump
+          # /bin/init (which is /system/bin/init in the live fs view).
+          SYSIMG_DIR="$ANDROID_HOME/system-images/android-30/google_apis_playstore/x86_64"
+          SYSIMG="$SYSIMG_DIR/system.img"
+          echo "── Extracting /system/bin/init directly from system.img (offline) ──"
+          echo "  system.img: $SYSIMG"
+          ls -lh "$SYSIMG" || { echo "✗ system.img not found at $SYSIMG"; exit 1; }
+          file "$SYSIMG"
+          # Convert sparse ext4 → raw ext4. simg2img is shipped with
+          # platform-tools. If simg2img fails (image already raw), fall
+          # back to a plain cp.
+          RAW_SYSIMG=/tmp/system.raw.img
+          if ! "$ANDROID_HOME/platform-tools/simg2img" "$SYSIMG" "$RAW_SYSIMG" 2>/tmp/simg.err; then
+              echo "  simg2img failed (image may already be raw ext4): $(cat /tmp/simg.err)"
+              cp "$SYSIMG" "$RAW_SYSIMG"
+          fi
+          file "$RAW_SYSIMG"
+          ls -lh "$RAW_SYSIMG"
+          # Extract /bin/init from the raw ext4 image using debugfs.
+          # debugfs is part of e2fsprogs (pre-installed on Ubuntu).
+          # The "dump" subcommand writes the file's bytes to a host path.
+          # Inside system.img, paths are relative to the system mount
+          # point: /system/bin/init in the live fs == /bin/init in img.
+          mkdir -p /tmp/sysimg-extract
+          debugfs -R "dump bin/init /tmp/sysimg-extract/init" "$RAW_SYSIMG" 2>&1 | tail -5 || true
+          if [ ! -s /tmp/sysimg-extract/init ]; then
+              echo "✗ debugfs dump of bin/init failed (file empty / not found in image)"
+              echo "  Listing /bin/ in the system image to diagnose:"
+              debugfs -R "ls bin" "$RAW_SYSIMG" 2>&1 | head -20
+              exit 1
+          fi
+          ls -lh /tmp/sysimg-extract/init
+          file /tmp/sysimg-extract/init
+          chmod 0755 /tmp/sysimg-extract/init
+          # Push the real init binary to /sdcard/Download/init so the
+          # app-uid run-as can pick it up (the app uid can read
+          # /sdcard/Download via shell user piping).
+          $ADB push /tmp/sysimg-extract/init /sdcard/Download/init 2>&1 | tail -1
+          $ADB shell ls -la /sdcard/Download/init
+
           # ── Extract the x86_64 rootfs FROM THE RUNNING EMULATOR ───
-          # Same flow as ui-e2e-aosp.yml, with one critical Play Store
-          # image adjustment: the google_apis_playstore image does NOT
-          # support `adb root` (Play Store images ship with userdebug
-          # disabled for security). That means shell-user `tar cf -
-          # /init` will FAIL because /init is root-only 0750 on this
-          # image, and tar's `2>/dev/null` will silently skip it.
-          #
-          # So we DROP /init from the tar list (shell user can't read
-          # it on the Play Store image anyway) and instead create the
-          # init file unconditionally from system/bin/init (which IS
-          # world-readable — the same init binary the bootimg symlinks
-          # /init → /system/bin/init at).
-          #
-          # The guest's init/zygote/system_server binaries are x86_64
-          # NATIVE (the emulator is x86_64 with KVM), so they run with
-          # no translation. The twoyi tracer (arm64-v8a via native
-          # bridge) ptraces them — exposing arm64-specific bugs in
-          # twoyi's Rust code where it makes aarch64-layout assumptions
-          # when running under libndk_translation.
+          # Same flow as ui-e2e-aosp.yml, but the tarball omits /init
+          # (root-only 0750 on Play Store image; we just pushed the
+          # extracted init to /sdcard/Download/init, see above).
+          # shell-user tar CAN read system/, vendor/, default.prop
+          # (they're world-readable 0755 dirs + 0644 files — the only
+          # root-only files in /system are /system/bin/init and a
+          # handful of others, but those are exceptions; the bulk of
+          # the system/ tree is shell-readable).
           adb -s emulator-5554 wait-for-device
           # NOTE: `adb root` deliberately skipped — Play Store image
           # rejects it ("adbd cannot run as root in production builds").
-          # shell-user tar can still read system/, vendor/, default.prop
-          # because they're world-readable on AOSP images.
-          echo "── Tarring the rootfs out of the booted emulator (system+vendor+default.prop — /init dropped, Play Store image rejects adb root) ──"
+          echo "── Tarring the rootfs out of the booted emulator (system+vendor+default.prop — /init comes from system.img, not the tarball) ──"
           adb -s emulator-5554 exec-out \
               "cd / && tar cf - system/ vendor/ default.prop 2>/dev/null" \
               | gzip -1 > /tmp/profile_rootfs.tar.gz
@@ -370,34 +423,29 @@ jobs:
           # trying to set the mode of the symlink TARGET (on a read-only
           # mount) which is a no-op for the rootfs we extracted. The real
           # extracted files DO get their modes normalized by this command.
-          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && chmod -R u+rwX,go+rX,go-w . 2>/dev/null; chmod 0755 system/bin/init 2>/dev/null; chmod -R u+x system/bin 2>/dev/null; true'"
+          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && chmod -R u+rwX,go+rX,go-w . 2>/dev/null; chmod -R u+x system/bin 2>/dev/null; true'"
           echo "  ✓ normalized rootfs ownership/modes"
 
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/ | head -20"
 
-          # ── ALWAYS copy system/bin/init → init (unconditional) ────
-          # The Play Store image rejects `adb root`, so /init (root-only
-          # 0750 on this image) was NOT in the tarball. The x86_64 AOSP
-          # workflow gated this on `test -L init` — but with no init
-          # in the tarball, that test is false and the copy was skipped,
-          # leaving no init at all (run 32886904666 step #17 failure).
-          # Here we ALWAYS create init from system/bin/init (which IS
-          # world-readable and was extracted by the tarball). If a
-          # future system image somehow includes /init as a symlink,
-          # the `rm -f init` step replaces it cleanly; if it's a real
-          # file already, same thing. The end state is always:
-          #   profiles/default/rootfs/init = real binary, 0755, app-owned.
-          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && rm -f init && cp system/bin/init init && chmod 0755 init'"
-          echo "  ✓ created init from system/bin/init (0755, app-owned)"
+          # ── Create init from /sdcard/Download/init (the debugfs-extracted copy) ──
+          # The Play Store image rejects `adb root`, so neither /init
+          # nor /system/bin/init were in the shell-user tarball. We
+          # instead pushed the real init binary (extracted directly
+          # from the SDK's system.img via debugfs) to /sdcard/Download/init
+          # above. Here we cat that into the rootfs's init slot.
+          # /sdcard/Download is owned by the shell uid — `cat` runs as
+          # shell (allowed), and `run-as io.twoyi.debug sh -c '> init'`
+          # writes the bytes into the app's private dir.
+          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && rm -f init && cat /sdcard/Download/init > init && chmod 0755 init'"
+          # Clean up the staging init from /sdcard
+          $ADB shell "rm /sdcard/Download/init" || true
+          echo "  ✓ created init from system.img-extracted init (0755, app-owned)"
 
           # Verify the init file exists and is non-empty
           if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/init" || \
              ! $ADB shell "run-as io.twoyi.debug sh -c 'test -s profiles/default/rootfs/init'"; then
               echo "✗ guest init (real file) not found/empty after replacement"; exit 1
-          fi
-          # Sanity: confirm system/bin/init was actually extracted (it's the source)
-          if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/system/bin/init"; then
-              echo "✗ system/bin/init missing from rootfs (tarball extraction failed?)"; exit 1
           fi
           echo "  ✓ init file verified"
           # Rewrite absolute /system|/apex|/vendor symlinks to relative
