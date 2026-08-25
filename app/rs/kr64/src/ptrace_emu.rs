@@ -7868,6 +7868,14 @@ pub fn run_ptrace_loop(
     // x86_64 execve nr=59 but blocks i386 execve nr=11).
     let mut pending_64bit_execve: bool = false;
     let mut post_execve_syscall_count: u64 = 0;
+    // 6-Z145 (Task 2): gate counter for the post-execve prctl-arg ENTRY
+    // log below — identifies WHICH prctl option a spinning guest is
+    // issuing (run 32835164907's ~15,700-call prctl spin was invisible:
+    // the post-execve log prints only the nr). Capped at 40 lines for
+    // the whole tracer lifetime so a 15,700-call spin cannot flood
+    // logcat (40 lines covers the loader/init/scudo early prctls AND
+    // the transition into the spin; the spin's option is stable).
+    let mut post_execve_prctl_log_count: u64 = 0;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -10285,6 +10293,29 @@ pub fn run_ptrace_loop(
                                 syscall_num,
                                 syscall_name(syscall_num, &abi)
                             ));
+                        }
+                        // 6-Z145 (Task 2): prctl-arg ENTRY logging — see the
+                        // counter's declaration for the full rationale. The
+                        // args are read from the ENTRY-side `regs` snapshot
+                        // (arg registers are live at the syscall-ENTRY stop;
+                        // same read the 6-S fork-family log below makes).
+                        // prctl numbers: x86_64=157, i386=172, aarch64=167
+                        // (mirrors the 6-Z143 table in
+                        // compute_exit_return_value). option=arg1 (e.g.
+                        // PR_SET_VMA=0x53564d41, PR_SET_NAME=15, PR_SET_VMA
+                        // sub-option arrives in arg2), arg2=arg2 (the
+                        // PR_SET_VMA sub-option / first payload word).
+                        if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                            post_execve_prctl_log_count =
+                                post_execve_prctl_log_count.saturating_add(1);
+                            if post_execve_prctl_log_count <= 40 {
+                                log(&format!(
+                                    "post-execve prctl ENTRY: pid={} option={} arg2={:#x}",
+                                    pid,
+                                    get_syscall_arg(&regs, abi.reg_arg1),
+                                    get_syscall_arg(&regs, abi.reg_arg2)
+                                ));
+                            }
                         }
                     }
 
@@ -13841,10 +13872,37 @@ pub fn run_ptrace_loop(
                                 //      0xEE981000 → init wrote the property
                                 //      header to address 0 → SIGSEGV.
                                 let fresh_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
-                                let forced_value: Option<i64> = if abi.execve == 11 {
-                                    if _forced_ret_opt.is_some() {
-                                        _forced_ret_opt
-                                    } else if syscall_num == 1 || syscall_num == 252 {
+                                // 6-Z145: the compute-table match is checked
+                                // FIRST and UNCONDITIONALLY. If
+                                // _forced_ret_opt.is_some() — the table
+                                // matched THIS syscall (chmod/chown/mount/
+                                // mknod/xattr/prctl/setrlimit… from
+                                // compute_exit_return_value) — the fake MUST
+                                // apply regardless of fresh_ret: it is the
+                                // single authoritative rax write, and no
+                                // fresh_ret gate may sit between the table
+                                // match and the write. Run 32835164907
+                                // (ba62d65): the second-stage init wedged in
+                                // a ~15,700-call prctl(nr=157) spin (kernel
+                                // -22 EINVAL every call, ZERO interleaved
+                                // syscalls — scudo's tagged-allocator init);
+                                // the 6-Z143 table entry matched nr=157 but
+                                // the two-shaped gate below (i386 arm's
+                                // inner table check + the x86_64 else-arm)
+                                // left the -22/-9/-38 conditions as the only
+                                // fresh_ret-dependent fake paths, so a
+                                // kernel errno could leak as the final rax
+                                // the guest consumed and retried on.
+                                // Hoisting the table check makes the fake
+                                // fire for EVERY matched syscall on EVERY
+                                // ABI, one write, no competing preserve
+                                // path. (The fresh_ret-gated -38/-9 arms
+                                // below still cover the NOT-matched i386
+                                // syscalls exactly as before.)
+                                let forced_value: Option<i64> = if _forced_ret_opt.is_some() {
+                                    _forced_ret_opt
+                                } else if abi.execve == 11 {
+                                    if syscall_num == 1 || syscall_num == 252 {
                                         None // exit / exit_group — never fake
                                     } else if fresh_ret == -38 {
                                         Some(i386_enosys_fake_value(syscall_num))
@@ -13858,7 +13916,7 @@ pub fn run_ptrace_loop(
                                         None
                                     }
                                 } else {
-                                    _forced_ret_opt
+                                    None
                                 };
                                 if forced_value.is_none() {
                                     // Task 6-Z60: real success or legitimate
