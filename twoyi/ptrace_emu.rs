@@ -7885,6 +7885,27 @@ pub fn run_ptrace_loop(
     // logcat (40 lines covers the loader/init/scudo early prctls AND
     // the transition into the spin; the spin's option is stable).
     let mut post_execve_prctl_log_count: u64 = 0;
+    // 6-Z148: RIP-sampling diagnostic state for the post-execve prctl
+    // spin (run 32843174575: 16,326 consecutive prctls, ZERO other
+    // syscalls — a pure userspace allocation loop; the rip + the scudo
+    // region args identify the caller, which the nr/args logs cannot).
+    //   `prctl_rip_samples`: per-pid count of prctl ENTRIES already
+    //   sampled — the FIRST 12 prctls per pid get a rip+args log line
+    //   (12 covers the loader/init/scudo early prctls AND the
+    //   transition into the spin; the spin's call site is stable).
+    //   `prctl_spin_consecutive`: per-pid count of CONSECUTIVE prctl
+    //   ENTRIES (reset by any other syscall ENTRY) — the SPIN DETECTOR.
+    //   Every 500th consecutive prctl logs one SPIN-DETECTED line with
+    //   the last rip, confirming the spin on the next run (16,326
+    //   prctls → ~33 lines, bounded).
+    //   `connect_path_log_count`: global cap (30 lines) for the
+    //   connect-path diagnostic — the 4,783-connect ENOENT burst that
+    //   precedes the spin; names WHICH socket path init hammers.
+    let mut prctl_rip_samples: std::collections::HashMap<libc::pid_t, u32> =
+        std::collections::HashMap::new();
+    let mut prctl_spin_consecutive: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
+    let mut connect_path_log_count: u64 = 0;
 
     // Task 6-Z48: PID of the NEW 64-bit child that kr64 forks to execve
     // /sbin/recovery. The 64-bit syscall injection (6-Z45 fix2) doesn't work
@@ -10324,6 +10345,105 @@ pub fn run_ptrace_loop(
                                     get_syscall_arg(&regs, abi.reg_arg1),
                                     get_syscall_arg(&regs, abi.reg_arg2)
                                 ));
+                            }
+                        }
+                        // 6-Z148: RIP sampling — name the exact guest loop
+                        // site. The spin is a pure userspace allocation
+                        // loop (16,326 consecutive prctls, zero other
+                        // syscalls); the rip + the scudo region args
+                        // identify the caller. Runs BEFORE the 6-Z147
+                        // rewrite below so rip reflects the prctl CALL
+                        // SITE (after the rewrite the nr changes but rip
+                        // is identical — placement here keeps the
+                        // diagnostic self-contained).
+                        // Task 3 rides along: the consecutive-prctl SPIN
+                        // DETECTOR — any non-prctl syscall ENTRY resets
+                        // the per-pid run; every 500th consecutive prctl
+                        // logs ONE SPIN-DETECTED line with the last rip.
+                        if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                            {
+                                let n = prctl_rip_samples.entry(pid).or_insert(0);
+                                if *n < 12 {
+                                    *n += 1;
+                                    // x86_64 user_regs_struct: rip is u64 index 16
+                                    // (same raw-index read the 6-Z98 exit_group DIAG
+                                    // below uses; i386/aarch64 layouts differ but the
+                                    // runtime AOSP guest is x86_64).
+                                    let regs_ptr = &regs as *const Regs as *const u64;
+                                    let rip = unsafe { *regs_ptr.add(16) };
+                                    log(&format!(
+                                        "6-Z148 prctl-sample pid={} rip={:#x} option={:#x} addr={:#x} len={:#x}",
+                                        pid, rip,
+                                        get_syscall_arg(&regs, abi.reg_arg1),
+                                        get_syscall_arg(&regs, abi.reg_arg3),
+                                        get_syscall_arg(&regs, abi.reg_arg4)
+                                    ));
+                                }
+                            }
+                            let run = prctl_spin_consecutive.entry(pid).or_insert(0);
+                            *run += 1;
+                            if *run % 500 == 0 {
+                                let regs_ptr = &regs as *const Regs as *const u64;
+                                let rip = unsafe { *regs_ptr.add(16) };
+                                log(&format!(
+                                    "6-Z148 SPIN-DETECTED pid={} after {} consecutive prctls (last rip={:#x})",
+                                    pid, *run, rip
+                                ));
+                            }
+                        } else {
+                            // A non-prctl syscall ENTRY breaks the
+                            // consecutive-prctl run — reset the spin counter.
+                            prctl_spin_consecutive.insert(pid, 0);
+                        }
+                        // 6-Z148 (Task 2): connect-path logging — the
+                        // 4,783-connect ENOENT burst that precedes the prctl
+                        // spin. At ENTRY the return value is not yet visible,
+                        // so the first 30 connect ENTRIES are logged with
+                        // their sockaddr_un sun_path (arg2 → struct
+                        // sockaddr_un: u16 sun_family at +0, char
+                        // sun_path[108] at +2 — the same layout the 6-Z110
+                        // matcher reads; reuses read_child_bytes). ENOENT is
+                        // the filesystem-spelling failure (no host socket
+                        // node), so naming the path names the service init
+                        // is hammering. Non-AF_UNIX families are logged as
+                        // <family=N> (their bytes are not a path).
+                        if syscall_num == abi.connect_nr {
+                            connect_path_log_count = connect_path_log_count.saturating_add(1);
+                            if connect_path_log_count <= 30 {
+                                let sockaddr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                                if let Some(blob) = read_child_bytes(pid, sockaddr_ptr, 110) {
+                                    const AF_UNIX: u16 = 1;
+                                    let family = if blob.len() >= 2 {
+                                        u16::from_le_bytes([blob[0], blob[1]])
+                                    } else {
+                                        0
+                                    };
+                                    let path = if family != AF_UNIX {
+                                        format!("<family={}>", family)
+                                    } else if blob.len() > 2 {
+                                        // sun_path at +2, max 108 bytes.
+                                        // Filesystem spelling: NUL-terminated.
+                                        // Abstract spelling: sun_path[0] == 0,
+                                        // name runs to the next NUL / 108 cap.
+                                        let sp = &blob[2..];
+                                        let end = if sp.first() == Some(&0) {
+                                            sp[1..]
+                                                .iter()
+                                                .position(|&b| b == 0)
+                                                .map(|p| p + 1)
+                                                .unwrap_or(sp.len())
+                                        } else {
+                                            sp.iter().position(|&b| b == 0).unwrap_or(sp.len())
+                                        };
+                                        String::from_utf8_lossy(&sp[..end]).into_owned()
+                                    } else {
+                                        String::new()
+                                    };
+                                    log(&format!(
+                                        "6-Z148 connect-path pid={} path={:?}",
+                                        pid, path
+                                    ));
+                                }
                             }
                         }
                         // 6-Z147: prctl ENTRY rewrite to getpid — the
