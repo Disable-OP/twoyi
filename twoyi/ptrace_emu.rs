@@ -2231,6 +2231,47 @@ fn ptrace_getregs_legacy(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<u
 fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Result<()> {
     use ptrace_regset::{NT_PRSTATUS, PTRACE_SETREGSET};
 
+    // 6-Z135: RAX AUDIT — the register-corruption hunt. Run 32803104772
+    // proved the guest linker saw pread64→1 / fstatfs→ENOENT while the
+    // tracer's EXIT logs showed the correct kernel returns: something
+    // between the syscall and the child's userspace read overwrote rax.
+    // This audit logs EVERY setregs that CHANGES rax (old→new, with the
+    // child's CURRENT syscall number for context), rate-capped, so the
+    // next run names the exact corrupting call site. Thread-local to
+    // avoid touching the 100+ call sites; cheap (one compare per call).
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::cell::Cell;
+        thread_local! {
+            static RAX_AUDIT_COUNT: Cell<u32> = const { Cell::new(0) };
+        }
+        // rax is u64 index 10 in the x86_64 user_regs_struct view.
+        let regs_ptr = regs as *const Regs as *const u64;
+        let new_rax = unsafe { *regs_ptr.add(10) };
+        let mut old: Regs = unsafe { std::mem::zeroed() };
+        if ptrace_getregs(pid, &mut old).is_ok() {
+            let old_ptr = &old as *const Regs as *const u64;
+            let old_rax = unsafe { *old_ptr.add(10) };
+            if old_rax != new_rax {
+                let orig_rax = unsafe { *old_ptr.add(15) }; // orig_rax idx 15
+                RAX_AUDIT_COUNT.with(|c| {
+                    let n = c.get();
+                    if n < 4000 {
+                        c.set(n + 1);
+                        crate::info!(
+                            "6-Z135 RAX-AUDIT: pid={} setregs rax {:#x} -> {:#x} (orig_rax={} [{}])",
+                            pid,
+                            old_rax,
+                            new_rax,
+                            orig_rax as i64,
+                            syscall_name(orig_rax as i64, &ABI_X86_64)
+                        );
+                    }
+                });
+            }
+        }
+    }
+
     // libc::iovec has `iov_base: *mut c_void`; for SETREGSET we only
     // need `*const c_void` (the kernel reads from us), but the struct
     // layout is identical and the cast is safe — the kernel does not
@@ -6890,11 +6931,33 @@ fn write_translated_path(
     if !write_child_string_unchecked(pid, new_addr, translated) {
         return false;
     }
-    // Update the path-argument register to point at the scratch copy.
-    set_syscall_arg(regs, path_arg_index, new_addr);
-    if ptrace_setregs(pid, regs, iov_len).is_err() {
-        return false;
+    // 6-Z135: FRESH-REGS DISCIPLINE — take a FRESH getregs snapshot and
+    // modify ONLY the path-argument register in it. The old path wrote
+    // the CALLER's `regs` snapshot back (set_syscall_arg(regs, ...) +
+    // setregs(regs)) — when that snapshot was taken at a different stop
+    // (the ENTRY/EXIT DESYNC class, or a signal-delivery stop between
+    // the snapshot and this call), the setregs OVERWROTE THE CHILD'S
+    // LIVE REGISTERS — including rax — with STALE values. Run 32803104772:
+    // the guest linker saw pread64 return 1 (a stale faked-getpid rax=1)
+    // and fstatfs return ENOENT (a stale open-ENOENT rax=-2) while the
+    // tracer's own EXIT logs showed the CORRECT kernel returns (all
+    // pread64→64, all fstatfs→0) — the corruption happened between the
+    // syscall and the child's userspace read, by a stale-register
+    // setregs. Writing only the intended arg on a fresh snapshot kills
+    // the whole class.
+    {
+        let mut fresh: Regs = unsafe { std::mem::zeroed() };
+        if ptrace_getregs(pid, &mut fresh).is_err() {
+            return false;
+        }
+        set_syscall_arg(&mut fresh, path_arg_index, new_addr);
+        if ptrace_setregs(pid, &fresh, iov_len).is_err() {
+            return false;
+        }
     }
+    // Keep the caller's snapshot consistent too (for any later reads of
+    // the arg in the same arm) — but the SETREGS above no longer uses it.
+    set_syscall_arg(regs, path_arg_index, new_addr);
     // Advance the rotating cursor: round up the path length (including
     // the NUL terminator) to 8-byte alignment so the next path starts
     // on a clean word boundary. Wrap to 0 when fewer than 256 bytes
