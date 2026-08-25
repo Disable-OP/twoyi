@@ -11757,6 +11757,21 @@ pub fn run_ptrace_loop(
                         }
                         pending_kmsg_open_pid = None;
                     }
+                    // 6-Z132: close() EXIT — invalidate the fd→path maps.
+                    // fd numbers are recycled: a stale entry makes the
+                    // 6-Z62 mmap content-injector inject the WRONG
+                    // FILE's bytes into the next mapping that reuses
+                    // the fd number (run 32790504763's deterministic
+                    // mid-link SIGSEGV storm: rip inside linker64 text
+                    // right after opening the next .so).
+                    if syscall_num == abi.close_nr {
+                        let closed_fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                        let ret_c = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret_c == 0 && closed_fd >= 0 {
+                            open_fd_paths.remove(&closed_fd);
+                            open_fd_owner_paths.remove(&(pid, closed_fd));
+                        }
+                    }
                     // Task 6-V Part A2 — open()/openat()/openat2() EXIT:
                     // record the returned fd → translated-path mapping into
                     // `open_fd_paths` (used by the read() diagnostic below
