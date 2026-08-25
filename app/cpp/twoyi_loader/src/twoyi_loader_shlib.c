@@ -1233,11 +1233,39 @@ int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
     return 0;
 }
 
-int setuid(uid_t uid) { (void)uid; return 0; }
-int setgid(gid_t gid) { (void)gid; return 0; }
+// =========================================================================
+// 6-Z138: UID/GID VIRTUALIZATION — services must see their DECLARED ids.
+//
+// Run 32809458174 (2515435): servicemanager exit_group(127) right after
+// getuid() returned 10167 — the APP's uid. System services CHECK their
+// identity (servicemanager and friends require AID_ROOT/system; media
+// requires AID_MEDIA...) and bail when the uid is wrong. init's
+// SetProcessAttributes calls setresuid(uid,uid,uid) — our fake succeeds
+// but the REAL uid stays the app's. Record the REQUESTED id at each
+// setuid-family call and report it from the getuid-family hooks
+// (default 0 = root before any setuid, matching a real boot's init).
+// =========================================================================
+static __thread uid_t g_virtual_uid = 0;
+static __thread gid_t g_virtual_gid = 0;
+
+uid_t getuid(void) { return g_virtual_uid; }
+uid_t geteuid(void) { return g_virtual_uid; }
+gid_t getgid(void) { return g_virtual_gid; }
+gid_t getegid(void) { return g_virtual_gid; }
+
+int setuid(uid_t uid) { g_virtual_uid = uid; return 0; }
+int setgid(gid_t gid) { g_virtual_gid = gid; return 0; }
 int setgroups(size_t size, const gid_t *list) { (void)size; (void)list; return 0; }
-int setresuid(uid_t ruid, uid_t euid, uid_t suid) { (void)ruid; (void)euid; (void)suid; return 0; }
-int setresgid(gid_t rgid, gid_t egid, gid_t sgid) { (void)rgid; (void)egid; (void)sgid; return 0; }
+int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
+    (void)ruid; (void)suid;
+    g_virtual_uid = euid;
+    return 0;
+}
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
+    (void)rgid; (void)sgid;
+    g_virtual_gid = egid;
+    return 0;
+}
 int unshare(int flags) { (void)flags; return 0; }
 
 // =========================================================================
