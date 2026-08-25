@@ -253,7 +253,22 @@ def main():
     # (LD_DEBUG=2 "libs") via the marker file kr64 checks — the linker's
     # account of every library search/open/read is the ground truth for
     # the "only found 1 bytes" / "file size 0 >= 0" link-failure class.
-    adb_shell(f"run-as {PACKAGE} sh -c 'echo 2 > .ld_debug' 2>/dev/null", timeout=15)
+    #
+    # 6-Z154: DISABLED by default — the LD_DEBUG output generates a write
+    # syscall PER symbol lookup, and the tracer intercepts + logs each
+    # one. With 2-3M syscalls per service boot, this overloaded the
+    # tracer (kr64 log = 81 MB / 1.14M lines in Z153 run) and froze the
+    # emulator at 65s (21 adb-timeouts, REGRESSION vs Z152 which ran
+    # 481s). Set ENABLE_LD_DEBUG=1 in the CI env to re-enable for
+    # specific link-failure debugging — the diagnostic value is preserved
+    # for when it's needed again.
+    if os.environ.get("ENABLE_LD_DEBUG", "0") == "1":
+        adb_shell(f"run-as {PACKAGE} sh -c 'echo 2 > .ld_debug' 2>/dev/null", timeout=15)
+        print("  [ENABLE_LD_DEBUG=1] LD_DEBUG marker written")
+    else:
+        # Remove any stale marker from previous runs
+        adb_shell(f"run-as {PACKAGE} sh -c 'rm -f .ld_debug' 2>/dev/null", timeout=15)
+        print("  [ENABLE_LD_DEBUG=0] LD_DEBUG disabled (6-Z154 default)")
     adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
     time.sleep(6)
     activity = get_current_activity()
