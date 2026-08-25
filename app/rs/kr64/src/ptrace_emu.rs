@@ -2364,6 +2364,44 @@ fn set_syscall_ret(regs: &mut Regs, abi: &ChildAbi, val: i64) {
     }
 }
 
+/// 6-Z150: the option-aware emulated prctl return value.
+///
+/// The 6-Z147 rewrite executes getpid in place of every prctl and then
+/// forces the return value at EXIT. The uniform `0` proved WRONG for
+/// `PR_CAPBSET_READ`: init's `ComputeLastValidCap` (AOSP
+/// system/core/init/capabilities.cpp — our staged copy) terminates its
+/// probe loop ONLY on the kernel's `-EINVAL` once `cap > CAP_LAST_CAP`;
+/// fake success wedged the whole boot in an ~8M-prctl loop (run
+/// 32859526781). This table restores real-kernel semantics for the
+/// options the guest actually exercises:
+///
+/// - `PR_CAPBSET_READ` (23): `1` while in the virtual bounding set,
+///   `-EINVAL` (`-22`) once `cap > 38` (`CAP_AUDIT_READ` — the staged
+///   init's `static_assert(CAP_LAST_CAP == CAP_AUDIT_READ)` and the
+///   5.4-class goldfish kernels). The bionic wrapper converts the
+///   `-22` to `errno = EINVAL`, `-1` — the loop's exit condition.
+/// - `PR_CAP_AMBIENT` (47): `0` — `IS_SET` reads "not set" (still
+///   `>= 0`, so `CapAmbientSupported()` stays true, matching a real
+///   kernel) and the mutating sub-options report success.
+/// - everything else (`PR_SET_VMA` naming, `PR_SET_NAME`,
+///   `PR_SET_DUMPABLE`, the loader's `PR_SET_NO_NEW_PRIVS` /
+///   `PR_SET_SECCOMP`, `PR_SET_SECUREBITS`...): `0` — the fake-success
+///   that cured the abort storms.
+fn emulated_prctl_ret(option: u64, arg2: u64) -> i64 {
+    const PR_CAPBSET_READ: u64 = 23;
+    const CAP_LAST_CAP_EMULATED: u64 = 38;
+    if option == PR_CAPBSET_READ {
+        if arg2 > CAP_LAST_CAP_EMULATED {
+            -22 // -EINVAL
+        } else {
+            1 // in the bounding set
+        }
+    } else {
+        // PR_CAP_AMBIENT and all setters: success
+        0
+    }
+}
+
 /// Set the syscall number in registers.
 ///
 /// On x86_64 this writes `orig_rax` (the kernel's "what syscall was
@@ -7510,15 +7548,21 @@ pub fn run_ptrace_loop(
     let mut kmsg_fd: Option<i32> = None;
     let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
     let mut post_execve_write_count: u64 = 0;
-    // 6-Z147: per-pid set of children whose prctl ENTRY was rewritten to
+    // 6-Z147: per-pid record of children whose prctl ENTRY was rewritten to
     // getpid (the seccomp-safe skip — see the 6-Z147 ENTRY block for the
-    // full rationale). A HashSet (not the Option<pid> of the other
+    // full rationale). Keyed by pid (not the Option<pid> of the other
     // pending_* flags) because ANY traced child may have a rewritten
-    // prctl in flight: the flag is consumed at THAT child's next EXIT
-    // stop to force rax=0 (prctl success semantics) — a mid-flight
-    // rewrite in child A must not be consumed by child B's EXIT.
-    let mut prctl_rewritten_pids: std::collections::HashSet<libc::pid_t> =
-        std::collections::HashSet::new();
+    // prctl in flight; the record is consumed at THAT child's next EXIT
+    // stop. 6-Z150: the value became (option, arg2) captured at ENTRY —
+    // the EXIT-side fake must be OPTION-AWARE. The uniform rax=0 of
+    // a2979ad broke init's ComputeLastValidCap: its probe loop
+    // `for (; prctl(PR_CAPBSET_READ, cap) >= 0; ++cap)` relies on the
+    // kernel's -EINVAL once cap > CAP_LAST_CAP; faked success turned it
+    // into an ~8-million-prctl wedge (run 32859526781 — the whole boot
+    // frozen inside the FIRST SetCapsForExec call, before any service
+    // could start).
+    let mut prctl_rewritten_args: std::collections::HashMap<libc::pid_t, (u64, u64)> =
+        std::collections::HashMap::new();
 
     // ── Task 6-V diagnostic state ────────────────────────────────────
     //
@@ -10555,15 +10599,30 @@ pub fn run_ptrace_loop(
                         // getpid (39 on x86_64) — allowed by the app's
                         // filter (no SIGSYS), the kernel executes it,
                         // rip advances normally — and force rax=0 at
-                        // EXIT via prctl_rewritten_pids. Only SETTER-class
+                        // EXIT via the 6-Z150 option-aware table. Only SETTER-class
                         // semantics are faked uniformly — the GETTERS
                         // (PR_GET_*) would want real values, but the
                         // kernel returns EINVAL/EPERM for those too and
                         // the 6-Z143 fake table already forces 0, so the
                         // rewrite governs ALL prctls uniformly.
+                        //
+                        // 6-Z150: the uniform rax=0 EXIT fake proved
+                        // WRONG for PR_CAPBSET_READ — init's
+                        // ComputeLastValidCap probe loop (AOSP
+                        // capabilities.cpp, our staged copy at
+                        // app/cpp/init/capabilities.cpp:86) terminates
+                        // ONLY on the kernel's -EINVAL for cap >
+                        // CAP_LAST_CAP; fake success made it spin ~8M
+                        // times (run 32859526781). The EXIT side now
+                        // applies real-kernel semantics per option,
+                        // using (option, arg2) captured here BEFORE
+                        // the nr rewrite (arg registers are live at
+                        // the ENTRY stop).
                         if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                            let prctl_option = get_syscall_arg(&regs, abi.reg_arg1);
+                            let prctl_arg2 = get_syscall_arg(&regs, abi.reg_arg2);
                             set_syscall_num(&mut regs, &abi, abi.getpid);
-                            prctl_rewritten_pids.insert(pid);
+                            prctl_rewritten_args.insert(pid, (prctl_option, prctl_arg2));
                             if ptrace_setregs(pid, &regs, iov_len).is_err() {
                                 log(&format!(
                                     "6-Z147: prctl->getpid rewrite FAILED for pid={} — the syscall will execute",
@@ -13216,14 +13275,41 @@ pub fn run_ptrace_loop(
                     // cover the same window.
                     if past_first_execve && post_execve_syscall_count <= 20000 {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        // 6-Z147: force rax=0 for ENTRY-rewritten prctls (the
-                        // kernel executed getpid; the guest must see prctl's
-                        // success semantics).
-                        if prctl_rewritten_pids.remove(&pid) && ret >= 0 {
-                            let mut regs_pr: Regs = unsafe { std::mem::zeroed() };
-                            if ptrace_getregs(pid, &mut regs_pr).is_ok() {
-                                set_syscall_ret(&mut regs_pr, &abi, 0);
-                                let _ = ptrace_setregs(pid, &regs_pr, iov_len);
+                        // 6-Z147/6-Z150: force the emulated prctl return for
+                        // ENTRY-rewritten prctls (the kernel executed
+                        // getpid; the guest must see prctl's semantics).
+                        // 6-Z150: the fake is OPTION-AWARE — the uniform
+                        // rax=0 wedged init in ComputeLastValidCap's
+                        // probe loop (prctl(PR_CAPBSET_READ, cap) >= 0
+                        // never failed). Real-kernel semantics for the
+                        // options the guest actually uses:
+                        //   PR_CAPBSET_READ (23): 1 while cap is in the
+                        //     virtual bounding set, -EINVAL once cap >
+                        //     CAP_LAST_CAP — CAP_LAST_CAP is 38
+                        //     (CAP_AUDIT_READ) per the staged init's
+                        //     static_assert and the 5.4-class goldfish
+                        //     kernels the emulator ships; the libc
+                        //     wrapper converts the -22 to errno=EINVAL,
+                        //     return -1, and the loop exits exactly as
+                        //     on a real device (last_valid_cap = 38).
+                        //   PR_CAP_AMBIENT (47): 0 — IS_SET reads as
+                        //     "not set" (>= 0, so CapAmbientSupported()
+                        //     stays true like a real 5.4 kernel) and
+                        //     RAISE/LOWER/CLEAR_ALL report success.
+                        //   everything else (PR_SET_VMA naming,
+                        //     PR_SET_NAME, PR_SET_DUMPABLE, the loader's
+                        //     PR_SET_NO_NEW_PRIVS/PR_SET_SECCOMP,
+                        //     PR_SET_SECUREBITS...): 0 — the 6-Z147
+                        //     fake-success that cured the abort storms.
+                        if let Some((prctl_option, prctl_arg2)) = prctl_rewritten_args.remove(&pid)
+                        {
+                            if ret >= 0 {
+                                let emulated = emulated_prctl_ret(prctl_option, prctl_arg2);
+                                let mut regs_pr: Regs = unsafe { std::mem::zeroed() };
+                                if ptrace_getregs(pid, &mut regs_pr).is_ok() {
+                                    set_syscall_ret(&mut regs_pr, &abi, emulated);
+                                    let _ = ptrace_setregs(pid, &regs_pr, iov_len);
+                                }
                             }
                         }
                         let ret_desc: String = if ret < 0 && ret > -4096 {
@@ -17983,6 +18069,63 @@ mod tests {
             orig_rax, 0,
             "set_syscall_ret must NOT touch the syscall-number slot (orig_rax, index 15)"
         );
+    }
+
+    #[test]
+    fn emulated_prctl_ret_terminates_compute_last_valid_cap() {
+        // 6-Z150 regression guard: init's ComputeLastValidCap probe loop
+        // `for (; prctl(PR_CAPBSET_READ, cap) >= 0; ++cap)` must see a
+        // FAILURE once cap > CAP_LAST_CAP — the a2979ad uniform rax=0
+        // fake wedged the boot in an ~8M-prctl loop (run 32859526781).
+        // Probe the exact cap range the loop walks (it starts at
+        // CAP_WAKE_ALARM=35 and runs past 38 until failure).
+        for cap in [0u64, 1, 35, 37, 38] {
+            assert_eq!(
+                emulated_prctl_ret(23, cap),
+                1,
+                "PR_CAPBSET_READ({cap}) must report 'in bounding set' (>= 0)"
+            );
+        }
+        for cap in [39u64, 40, 41, 64, u32::MAX as u64, u64::MAX] {
+            assert_eq!(
+                emulated_prctl_ret(23, cap),
+                -22,
+                "PR_CAPBSET_READ({cap}) must fail with -EINVAL (the loop's exit condition)"
+            );
+        }
+        // The loop as the guest runs it: start at CAP_WAKE_ALARM, stop at
+        // the first negative return — must terminate with last_valid_cap
+        // landing on 38 exactly like a real 5.4-class kernel.
+        let mut cap = 35u64;
+        while emulated_prctl_ret(23, cap) >= 0 {
+            cap += 1;
+        }
+        assert_eq!(cap, 39, "the probe loop must stop at the FIRST invalid cap");
+        assert_eq!(cap - 1, 38, "last_valid_cap must be CAP_AUDIT_READ (38)");
+    }
+
+    #[test]
+    fn emulated_prctl_ret_keeps_setter_fake_success() {
+        // 6-Z150: the abort-curing fake-success for every other option
+        // must be preserved — the loader's PR_SET_NO_NEW_PRIVS /
+        // PR_SET_SECCOMP bootstrap, scudo's PR_SET_VMA region naming,
+        // thread PR_SET_NAME, the 6-Z127 PR_SET_SECUREBITS (38) and the
+        // 6-Z143 table all depend on rax=0.
+        for option in [
+            0x53564d41u64, // PR_SET_VMA
+            15,            // PR_SET_NAME
+            3,             // PR_SET_DUMPABLE
+            38,            // PR_SET_SECUREBITS (the 6-Z127 pair)
+            39,            // PR_GET_SECUREBITS
+            47,            // PR_CAP_AMBIENT (IS_SET -> 0, still >= 0)
+            22,            // PR_GET_SECCOMP
+        ] {
+            assert_eq!(
+                emulated_prctl_ret(option, 0),
+                0,
+                "option {option:#x} must keep the 6-Z147 fake-success (0)"
+            );
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
