@@ -172,6 +172,24 @@ typedef struct prop_info prop_info;
     #define SYS_chown 92
   #endif
 #endif
+// 6-Z139: tgkill (x86_64: 234) / rt_tgsigqueueinfo (x86_64: 297) — used
+// by the abort-unmasking hooks' syscall() fallback. Old NDK headers may
+// lack the SYS_* spellings; __NR_* is checked first, then the verified
+// x86_64 numbers (aarch64: tgkill=131, rt_tgsigqueueinfo=240).
+#ifndef SYS_tgkill
+  #ifdef __NR_tgkill
+    #define SYS_tgkill __NR_tgkill
+  #elif defined(__x86_64__)
+    #define SYS_tgkill 234
+  #endif
+#endif
+#ifndef SYS_rt_tgsigqueueinfo
+  #ifdef __NR_rt_tgsigqueueinfo
+    #define SYS_rt_tgsigqueueinfo __NR_rt_tgsigqueueinfo
+  #elif defined(__x86_64__)
+    #define SYS_rt_tgsigqueueinfo 297
+  #endif
+#endif
 
 // =========================================================================
 // Architecture-independent syscall wrappers
@@ -267,6 +285,17 @@ static void write_str(int fd, const char *s) {
 volatile int g_runtime_ready = 0;
 volatile int g_sigsys_count = 0;
 static const char *g_rootfs = NULL;
+
+// 6-Z139: the REAL pid of this process (captured at loader init via a
+// raw syscall BEFORE any hooks install). bionic's abort() does
+// tgkill(getpid(), gettid(), SIGABRT) — with the getpid hook returning
+// 1 (the fake init pid), tgkill(1, real_tid) returns ESRCH and abort()
+// falls back to _exit(127), masking EVERY guest FATAL as a silent 127
+// exit (run 32811363109: servicemanager/wait_for_keymaster/zygote all
+// died this way with no crash message). tgkill/rt_tgsigqueueinfo hooks
+// rewrite tgid==1 (or == the fake getpid) to this REAL pid so the
+// signal actually delivers and the crash message prints.
+static int g_real_pid = -1;
 
 // Mount table
 #define MAX_MOUNTS 32
@@ -712,6 +741,16 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
     uint32_t req_len = 0;
     const void *req_payload = NULL;
     uint32_t cookie = 0;
+
+    // BINDER_SET_CONTEXT_MGR_EXT = 0x4018620d (Android 11's
+    // servicemanager calls it with a flat_binder_object context
+    // after the plain SET_CONTEXT_MGR; the kr64 vm0 proxy bridge
+    // rejects it as "unknown ioctl" — satisfy it locally as success,
+    // never forward it down the wire).
+    if (req == 0x4018620du) {
+        write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR_EXT) -> success\n");
+        return 0;
+    }
 
     pthread_mutex_lock(&g_bp_wire_lock);
 
@@ -1347,6 +1386,35 @@ int setns(int fd, int nstype) {
     return 0;
 }
 
+// =========================================================================
+// 6-Z139: abort unmasking — tgkill/rt_tgsigqueueinfo real-pid rewrite.
+//
+// bionic's abort() does tgkill(getpid(), gettid(), SIGABRT). The getpid
+// hook (getpid_hook.so, also in LD_PRELOAD) returns 1 — the fake init
+// pid — so tgkill(1, real_tid) hits ESRCH (no such tgid) and abort()
+// falls back to _exit(127), masking EVERY guest FATAL as a silent 127
+// exit with no crash message (run 32811363109: servicemanager,
+// wait_for_keymaster and zygote all died this way). Rewrite tgid==1
+// (the fake getpid value) to g_real_pid — captured at loader init via a
+// raw syscall before any hook installs — so the signal actually
+// delivers, the SIGABRT handler runs and the crash message prints.
+// =========================================================================
+int tgkill(int tgid, int tid, int sig) {
+    if (tgid == 1 && g_real_pid > 0) tgid = g_real_pid;
+    static int (*real_tgkill)(int, int, int) = NULL;
+    if (!real_tgkill) real_tgkill = dlsym(RTLD_NEXT, "tgkill");
+    if (real_tgkill) return real_tgkill(tgid, tid, sig);
+    return syscall(SYS_tgkill, tgid, tid, sig);
+}
+
+int rt_tgsigqueueinfo(int tgid, int tid, int sig, void *uinfo) {
+    if (tgid == 1 && g_real_pid > 0) tgid = g_real_pid;
+    static int (*real_rt_tgsigqueueinfo)(int, int, int, void *) = NULL;
+    if (!real_rt_tgsigqueueinfo) real_rt_tgsigqueueinfo = dlsym(RTLD_NEXT, "rt_tgsigqueueinfo");
+    if (real_rt_tgsigqueueinfo) return real_rt_tgsigqueueinfo(tgid, tid, sig, uinfo);
+    return syscall(SYS_rt_tgsigqueueinfo, tgid, tid, sig, uinfo);
+}
+
 // Hook android_get_control_socket — return a fake fd.
 // lmkd and other services call this to get the socket fd that init
 // created for them via "socket" in the .rc file. The fd is normally
@@ -1722,6 +1790,13 @@ int ioctl(int fd, unsigned long request, ...) {
         // BINDER_SET_CONTEXT_MGR = 0x40046207
         if (req == 0x40046207u) {
             write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR) -> success\n");
+            return 0;
+        }
+        // BINDER_SET_CONTEXT_MGR_EXT = 0x4018620d (Android 11's
+        // servicemanager calls it with a flat_binder_object context
+        // after the plain SET_CONTEXT_MGR; reject it as a FATAL).
+        if (req == 0x4018620du) {
+            write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR_EXT) -> success\n");
             return 0;
         }
         // BINDER_WRITE_READ = 0xc0306201 — return success with no data
@@ -4273,6 +4348,15 @@ static int install_sigsys(void) {
 // =========================================================================
 __attribute__((constructor(101)))
 static void twoyi_init(void) {
+    // 6-Z139: capture the REAL pid FIRST, before any hook could
+    // recurse (getpid is interposed to return 1 — the fake init pid —
+    // by getpid_hook.so, so only a raw syscall sees the truth here).
+    // The tgkill/rt_tgsigqueueinfo hooks rewrite tgid==1 to this so
+    // bionic's abort() actually delivers SIGABRT (see g_real_pid).
+    if (g_real_pid < 0) {
+        g_real_pid = (int)syscall(SYS_getpid);
+    }
+
     // Get rootfs path from env
     g_rootfs = getenv("TWOYI_ROOTFS");
     if (!g_rootfs) g_rootfs = "/data/data/io.twoyi/rootfs";
