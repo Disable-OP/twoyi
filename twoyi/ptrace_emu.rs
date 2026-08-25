@@ -2589,6 +2589,21 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.setxattr
         || syscall_nr == abi.lsetxattr
         || syscall_nr == abi.fsetxattr
+        // 6-Z143: prctl(SET_SECUREBITS) + setrlimit — the capability/
+        // rlimit attribute fakes. Run 32828992586's [glog] mirror:
+        // 'prctl(PR_SET_SECUREBITS) failed for logd/lmkd/system_suspend'
+        // and 'setrlimit(14, ...) failed: Operation not permitted' each
+        // LOG(FATAL)'d services to death. The loader's PLT hooks cover
+        // libc-call sites, but the seccomp-trapped raw syscalls (and
+        // direct-syscall callers) need the tracer-side fake. prctl
+        // numbers: x86_64=157, i386=172, aarch64=167. setrlimit:
+        // x86_64=160, i386=75, aarch64=164. ugetrlimit (i386 191)
+        // reads — fake 0 too (unlimited).
+        || syscall_nr == 157  // prctl (x86_64)
+        || syscall_nr == 160  // setrlimit (x86_64)
+        || (abi.execve == 11 && (syscall_nr == 172 || syscall_nr == 75 || syscall_nr == 191)) // i386: prctl/setrlimit/ugetrlimit
+        || (abi.execve == 221 && (syscall_nr == 167 || syscall_nr == 164))
+    // aarch64: prctl/setrlimit
     {
         Some(0)
     } else {
