@@ -72,7 +72,8 @@ To test the build locally before committing:
 - The workflow uses NDK r27c (r22b has compatibility issues with modern Rust)
 - Build artifacts are logs-only (`.tar.xz`), 7-day retention — see the
   Features section above for the storage-budget rationale. The same
-  policy applies to kvm-e2e-test, arm64-seccomp-test, and kr64-tests.
+  policy applies to the UI E2E workflows (ui-e2e-test, ui-e2e-aosp,
+  ui-e2e-test-arm64, ui-e2e-aosp-arm64) and kr64-tests.
 - Rust targets aarch64-linux-android and x86_64-linux-android are installed
   automatically
 - Placeholder assets are not bundled — CI builds produce a "shell" APK that

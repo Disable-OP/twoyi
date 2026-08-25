@@ -1,0 +1,380 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# ARM64 UI-only end-to-end test for twoyi (TWRP boot).
+#
+# Goal: reach parity with ui-e2e-test.yml, but exercising the arm64-v8a
+# build of twoyi's native libraries (libtwoyi.so, libOpenglRender.so,
+# libloader.so, kr64) so that arm64-specific code paths in the Rust
+# tracer and C++ loader get CI coverage.
+#
+# Architecture choice (per user request):
+#   - GitHub's free ubuntu-24.04-arm runners have NO nested virtualization
+#     (no /dev/kvm), so an arm64-v8a Android system image would run in
+#     TCG mode — too slow for an E2E test that needs to boot in CI time.
+#   - We instead use an ubuntu-latest (x86_64) runner WITH KVM, and boot
+#     an x86_64 Android emulator that has the Google Play Store system
+#     image. That image ships libndk_translation.so (Houdini's successor)
+#     which transparently translates arm64 binaries to x86_64 at runtime.
+#   - twoyi's APK is built for arm64-v8a ONLY — when installed on the
+#     x86_64 emulator, the native bridge picks up the arm64 .so files
+#     and translates their instructions to x86_64. The Java/Dex layer
+#     is arch-independent, so only the .so side exercises arm64 code.
+#   - The TWRP recovery image is the arm64 `angler` (Nexus 6P) image
+#     downloaded fresh each run from dl.twrp.me — its ramdisk's init
+#     binary is a real aarch64 ELF, also run via the native bridge.
+#
+# What this tests that ui-e2e-test.yml does NOT:
+#   - The arm64-v8a build of twoyi's Rust + C++ code actually links and
+#     loads under a real Android runtime.
+#   - The ptrace tracer's struct layouts, syscall numbers, and register
+#     handling for aarch64 are exercised (the guest is arm64 → translated
+#     → arm64 syscalls hit the tracer's aarch64 paths).
+#   - Native bridge (libndk_translation / Houdini) compatibility with
+#     twoyi's PLT hooks and LD_PRELOAD of libtwoyi_loader_shlib.so.
+#
+# Differences from ui-e2e-test.yml:
+#   - System image: google_apis_playstore;x86_64 (NOT google_apis;x86_64)
+#     → includes libndk_translation.so for arm64-to-x86_64 binary translation.
+#   - ABI: -Pabis=arm64-v8a (NOT x86_64).
+#   - TWRP image: arm64 `angler` image downloaded at runtime (NOT the
+#     committed x86 byt_t_crv2 image in assets/twrp/).
+#   - Added a "Verify native bridge" step that fails the build early if
+#     libndk_translation.so is missing from the booted emulator (means
+#     the wrong system image was installed).
+#   - Boot timeout increased to 360s (Play Store image boots slower).
+---
+name: UI E2E Test (ARM64 via native bridge)
+
+'on':
+  workflow_dispatch:
+    inputs:
+      boot_wait_seconds:
+        description: 'How long to wait for the container to boot before capturing the final screenshot (seconds)'
+        required: false
+        default: '120'
+
+concurrency:
+  group: ui-e2e-test-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-e2e-test-arm64:
+    name: UI-only ARM64 (TWRP) E2E on x86_64 emulator + native bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Enable KVM access
+        run: |
+          set -u
+          echo "── KVM availability ──"
+          if [ -e /dev/kvm ]; then
+              echo "  /dev/kvm exists"
+          else
+              echo "  /dev/kvm does NOT exist — trying modprobe + mknod"
+              sudo modprobe kvm 2>/dev/null || true
+              sudo modprobe kvm_intel 2>/dev/null || true
+              sudo modprobe kvm_amd 2>/dev/null || true
+              sudo mknod /dev/kvm c 10 232 2>/dev/null || true
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-linux-android
+          cache: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rs/target
+            app/rs/loader/target
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache cargo-xdk
+        id: cache-cargo-xdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-xdk
+          key: ${{ runner.os }}-cargo-xdk-2.12.6
+
+      - name: Install cargo-xdk
+        if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
+        run: cargo install cargo-xdk
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Cache Android SDK (Play Store x86_64 image with native bridge)
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk
+          key: ${{ runner.os }}-sdk-android30-google_apis_playstore-x86_64-v1
+
+      - name: Install Android SDK + emulator + Play Store x86_64 system image
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
+              cd /tmp
+              CMDLINE_TOOLS_URL='https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+              curl -sL -o cmdline-tools.zip "$CMDLINE_TOOLS_URL"
+              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+              rm cmdline-tools.zip
+          fi
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          # Accept ALL licenses including android-sdk-playstore-license
+          # (needed for the google_apis_playstore system image which is
+          # the only x86_64 image with libndk_translation.so / Houdini).
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --update
+          sdkmanager \
+              "platform-tools" \
+              "platforms;android-30" \
+              "build-tools;30.0.3" \
+              "emulator" \
+              "system-images;android-30;google_apis_playstore;x86_64"
+          echo "✓ SDK + emulator + Play Store x86_64 system image installed"
+
+      - name: Create x86_64 AVD (Play Store image, native bridge target)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROID_AVD_HOME: /home/runner/.android/avd
+        run: |
+          set -ex
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_AVD_HOME=/home/runner/.android/avd
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p "$ANDROID_AVD_HOME"
+          AVDMGR="$(command -v avdmanager 2>/dev/null || true)"
+          if [ -z "$AVDMGR" ] || [ ! -x "$AVDMGR" ]; then
+            for d in "$ANDROID_HOME"/cmdline-tools/*/; do
+              if [ -x "${d}bin/avdmanager" ]; then
+                AVDMGR="${d}bin/avdmanager"
+                break
+              fi
+            done
+          fi
+          echo "" | "$AVDMGR" create avd \
+              -n twoyi_test_arm64 \
+              -k "system-images;android-30;google_apis_playstore;x86_64" \
+              --force
+          AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_test_arm64.avd/config.ini"
+          {
+              echo "hw.keyboard=yes"
+              echo "hw.gpu.enabled=yes"
+              echo "hw.gpu.mode=swiftshader_indirect"
+              echo "hw.ramSize=4096"
+              echo "disk.dataPartition.size=6144"
+              echo "vm.heapSize=256"
+          } >> "$AVD_CONFIG"
+          echo "✓ AVD created"
+
+      - name: Grant execute permission for gradlew and build scripts
+        run: |
+          chmod +x gradlew
+          chmod +x app/rs/build_rs.sh
+          chmod +x app/rs/loader/build.sh || true
+
+      - name: Build APK (arm64-v8a only)
+        # CRITICAL: this is the entire point of this workflow. The twoyi
+        # native libs (libtwoyi.so, libOpenglRender.so, libloader.so,
+        # kr64) will be built for aarch64-linux-android ONLY — not x86_64.
+        # The native bridge on the x86_64 Play Store emulator image will
+        # translate them at runtime when the system tries to load them.
+        # If the build fails here, it means the arm64 Rust/C++ code has a
+        # compile-time issue — fix that before proceeding.
+        run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Boot emulator (headless, KVM)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p /tmp/ui-e2e-artifacts
+          "$ANDROID_HOME/emulator/emulator" -avd twoyi_test_arm64 \
+              -no-window -no-audio -no-snapshot -no-boot-anim \
+              -gpu swiftshader_indirect \
+              -partition-size 4096 -read-only \
+              -ports 5554,5555 \
+              -qemu -enable-kvm \
+              > /tmp/ui-e2e-artifacts/emulator-stdout.log \
+              2> /tmp/ui-e2e-artifacts/emulator-stderr.log &
+          EMULATOR_PID=$!
+          echo $EMULATOR_PID > /tmp/emulator.pid
+          echo "  emulator PID: $EMULATOR_PID"
+
+          # Play Store image boots slower than google_apis (more services).
+          BOOT_TIMEOUT=360
+          WAITED=0
+          while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
+              if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+                  echo "  ✗ emulator died"
+                  tail -30 /tmp/ui-e2e-artifacts/emulator-stderr.log >&2 || true
+                  exit 1
+              fi
+              BOOTED=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              if [ "$BOOTED" = "1" ]; then
+                  echo "  ✓ boot_completed after ${WAITED}s"
+                  break
+              fi
+              sleep 2
+              WAITED=$((WAITED + 2))
+              printf '.'
+          done
+          if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
+              echo "  ✗ emulator did not boot in ${BOOT_TIMEOUT}s"
+              exit 1
+          fi
+
+      - name: Verify native bridge (libndk_translation / Houdini)
+        # The whole workflow hinges on this — if the booted emulator has
+        # no native bridge, the arm64-v8a twoyi APK will fail to install
+        # with INSTALL_FAILED_NO_MATCHING_ABIS and the rest is wasted.
+        # Fail the workflow EARLY with a clear message if it's missing.
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          ADB="adb -s emulator-5554"
+          echo "── Native bridge verification ──"
+          # libndk_translation.so (Android 11+) and libhoudini.so (older)
+          # are the two known native bridge implementations.
+          NDK_TRANSLATION_64=$($ADB shell ls /system/lib64/libndk_translation.so 2>/dev/null | tr -d '\r' || true)
+          HOUDINI_64=$($ADB shell ls /system/lib64/libhoudini.so 2>/dev/null | tr -d '\r' || true)
+          HOUDINI_32=$($ADB shell ls /system/lib/libhoudini.so 2>/dev/null | tr -d '\r' || true)
+          ARM64_NATIVE_DIR=$($ADB shell ls /system/lib64/arm64/ 2>/dev/null | head -3 | tr -d '\r' || true)
+          echo "  libndk_translation.so (64-bit): $NDK_TRANSLATION_64"
+          echo "  libhoudini.so (64-bit): $HOUDINI_64"
+          echo "  libhoudini.so (32-bit): $HOUDINI_32"
+          echo "  /system/lib64/arm64/ contents: $ARM64_NATIVE_DIR"
+          if [ -n "$NDK_TRANSLATION_64" ] || [ -n "$HOUDINI_64" ] || [ -n "$HOUDINI_32" ]; then
+              echo "  ✓ Native bridge detected — arm64-v8a APK will install"
+          else
+              echo "  ✗ Native bridge NOT detected"
+              echo "    Installed system image: $("$ADB" shell getprop ro.build.description | tr -d '\r')"
+              echo "    Boot a google_apis_playstore image instead — google_apis has no native bridge."
+              exit 1
+          fi
+
+      - name: Download arm64 TWRP image (Nexus 6P angler)
+        # dl.twrp.me serves the .img with a referer-based anti-leech
+        # check; without `-e` (Referer) the response is the HTML landing
+        # page (~6.8KB) instead of the ~17MB binary image.
+        # The angler image is the smallest verified-arm64 bootable TWRP
+        # in TWRP 3.7.0_9-0 (same version as the existing x86 byt_t_crv2).
+        # sha256: 21e41c0607b150f8dc5e5a4b0975a64d1eb62c4aff34920231d027e0793e8028
+        # md5:    cf9a9067d18f64ed6992514826e1f9df
+        run: |
+          set -e
+          mkdir -p /tmp/twrp-arm64
+          cd /tmp/twrp-arm64
+          # 3 retries; the dl.twrp.me CDN occasionally 503s under load.
+          curl -fL --retry 3 -A "Mozilla/5.0" \
+              -e "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img.html" \
+              -o twrp-3.7.0_9-0-angler.img \
+              "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img"
+          echo "cf9a9067d18f64ed6992514826e1f9df  twrp-3.7.0_9-0-angler.img" | md5sum -c -
+          ls -lh twrp-3.7.0_9-0-angler.img
+          file twrp-3.7.0_9-0-angler.img || true
+
+      - name: Install APK + push arm64 TWRP recovery.img
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          ADB="adb -s emulator-5554"
+
+          # Install the arm64-v8a-only twoyi APK on the x86_64 emulator.
+          # The native bridge picks up the arm64-v8a .so files; if it's
+          # missing, install fails with INSTALL_FAILED_NO_MATCHING_ABIS.
+          APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
+          echo "── Installing APK: $APK ──"
+          $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
+          echo "  ✓ APK installed"
+
+          # Push the arm64 TWRP image to /sdcard/Download/recovery.img.
+          # The user said: "I already used an weird x86 TWRP image from
+          # an x86_64 device, and TWRP still fully work" — TWRP's
+          # recovery init is robust to arch mismatches, but for the
+          # arm64 path test we use a real arm64 image (angler).
+          echo "── Pushing arm64 TWRP image to /sdcard/Download/recovery.img ──"
+          $ADB push /tmp/twrp-arm64/twrp-3.7.0_9-0-angler.img /sdcard/Download/recovery.img
+          echo "  ✓ recovery.img pushed ($(stat -c%s /tmp/twrp-arm64/twrp-3.7.0_9-0-angler.img) bytes)"
+          $ADB shell ls -la /sdcard/Download/recovery.img
+
+      - name: UI navigation — import ROM + boot container
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '120' }}
+          TWOYI_PACKAGE: io.twoyi.debug
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          mkdir -p /tmp/ui-e2e-artifacts
+          python3 scripts/ui-navigate.py
+
+      - name: Pack artifacts
+        if: always()
+        run: |
+          ./scripts/pack-logs.sh /tmp/ui-e2e-logs.tar.xz \
+            /tmp/ui-e2e-artifacts/ \
+            || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-e2e-arm64-logs
+          path: /tmp/ui-e2e-logs.tar.xz
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Kill emulator
+        if: always()
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          adb -s emulator-5554 emu kill 2>/dev/null || true
+          kill $(cat /tmp/emulator.pid 2>/dev/null) 2>/dev/null || true
