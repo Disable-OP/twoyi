@@ -199,6 +199,7 @@ jobs:
       - name: Path B — Download canary AOSP-CI aarch64 emulator
         id: pathB_fetch
         continue-on-error: true
+        timeout-minutes: 15
         run: |
           set -e
           echo "─── Path B: fetch canary AOSP-CI aarch64 emulator ───"
@@ -218,6 +219,18 @@ jobs:
           # 2. Try multiple candidate build IDs. 8632828 is the only
           # confirmed-working ID (build 31.3.8, May 2022 — Google
           # hasn't dropped it from ci.android.com).
+          #
+          # FIX for v2: the previous run (32901106471) downloaded the
+          # 1.6GB zip in 490ms — impossible; curl silently failed
+          # (probably -s swallowed a network error, or the response
+          # was a redirect to an HTML error page). New approach:
+          #   - Use -f (fail on 4xx/5xx), -S (show errors), -L (follow redirects)
+          #   - Use --retry 5 --retry-delay 5 --retry-all-errors
+          #   - Use --max-time 600 (10-min hard cap)
+          #   - Use -C - (resume on partial download)
+          #   - Stat the downloaded file and compare to HEAD content-length
+          #     BEFORE attempting unzip -t
+          #   - If file size is wrong, retry up to 3 times
           BUILD_IDS="8632828 12345678 15521788 17876930 9999999"
           DOWNLOADED=
           for BID in $BUILD_IDS; do
@@ -226,8 +239,39 @@ jobs:
               SIZE=$(curl -sI "$URL" 2>&1 | grep -i 'content-length' | tr -d '\r' | awk '{print $2}')
               echo "  build $BID → content-length: $SIZE"
               if [ -n "$SIZE" ] && [ "$SIZE" -gt 100000000 ]; then
-                  echo "  ✓ build $BID has a real artifact (>$SIZE bytes) — downloading"
-                  curl -sL --retry 3 -o /tmp/pathB-emulator.zip "$URL"
+                  echo "  ✓ build $BID has a real artifact ($SIZE bytes) — downloading (max 10 min)"
+                  rm -f /tmp/pathB-emulator.zip
+                  # Try up to 3 times — resume on partial.
+                  TRIES=0
+                  while [ $TRIES -lt 3 ]; do
+                      TRIES=$((TRIES+1))
+                      echo "  download attempt $TRIES/3..."
+                      # Note: -C - tells curl to resume from where it left off.
+                      # If the file is empty, this is equivalent to a fresh start.
+                      curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
+                          --max-time 600 \
+                          -C - \
+                          -o /tmp/pathB-emulator.zip \
+                          "$URL" 2>&1 | tail -3 || true
+                      ACTUAL_SIZE=$(stat -c%s /tmp/pathB-emulator.zip 2>/dev/null || echo 0)
+                      echo "  downloaded $ACTUAL_SIZE bytes (expected $SIZE)"
+                      if [ "$ACTUAL_SIZE" = "$SIZE" ]; then
+                          echo "  ✓ size match"
+                          break
+                      elif [ "$ACTUAL_SIZE" -gt 100000000 ]; then
+                          echo "  partial download ($ACTUAL_SIZE / $SIZE) — resuming"
+                      else
+                          echo "  ✗ download too small — likely a network error; retrying"
+                          rm -f /tmp/pathB-emulator.zip
+                          sleep 3
+                      fi
+                  done
+                  ACTUAL_SIZE=$(stat -c%s /tmp/pathB-emulator.zip 2>/dev/null || echo 0)
+                  if [ "$ACTUAL_SIZE" != "$SIZE" ]; then
+                      echo "  ✗ final size mismatch: $ACTUAL_SIZE != $SIZE — trying next build ID"
+                      rm -f /tmp/pathB-emulator.zip
+                      continue
+                  fi
                   if unzip -t /tmp/pathB-emulator.zip >/dev/null 2>&1; then
                       echo "  ✓ zip integrity OK — extracting"
                       unzip -q -o /tmp/pathB-emulator.zip -d "$ANDROID_HOME/emulator-extract"
