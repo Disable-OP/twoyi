@@ -13273,34 +13273,56 @@ pub fn run_ptrace_loop(
                     // hiding the ofstream-open's errno ("Cannot open for
                     // writing" was all init told us). ENTRY and RETURN now
                     // cover the same window.
-                    if past_first_execve && post_execve_syscall_count <= 20000 {
-                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
-                        // 6-Z147/6-Z150: force the emulated prctl return for
-                        // ENTRY-rewritten prctls (the kernel executed
-                        // getpid; the guest must see prctl's semantics).
-                        // 6-Z150: the fake is OPTION-AWARE — the uniform
-                        // rax=0 wedged init in ComputeLastValidCap's
-                        // probe loop (prctl(PR_CAPBSET_READ, cap) >= 0
-                        // never failed). Real-kernel semantics for the
-                        // options the guest actually uses:
-                        //   PR_CAPBSET_READ (23): 1 while cap is in the
-                        //     virtual bounding set, -EINVAL once cap >
-                        //     CAP_LAST_CAP — CAP_LAST_CAP is 38
-                        //     (CAP_AUDIT_READ) per the staged init's
-                        //     static_assert and the 5.4-class goldfish
-                        //     kernels the emulator ships; the libc
-                        //     wrapper converts the -22 to errno=EINVAL,
-                        //     return -1, and the loop exits exactly as
-                        //     on a real device (last_valid_cap = 38).
-                        //   PR_CAP_AMBIENT (47): 0 — IS_SET reads as
-                        //     "not set" (>= 0, so CapAmbientSupported()
-                        //     stays true like a real 5.4 kernel) and
-                        //     RAISE/LOWER/CLEAR_ALL report success.
-                        //   everything else (PR_SET_VMA naming,
-                        //     PR_SET_NAME, PR_SET_DUMPABLE, the loader's
-                        //     PR_SET_NO_NEW_PRIVS/PR_SET_SECCOMP,
-                        //     PR_SET_SECUREBITS...): 0 — the 6-Z147
-                        //     fake-success that cured the abort storms.
+                    // 6-Z153: split the prctl emulation OUT of the
+                    // post_execve_syscall_count <= 20000 gate. The counter
+                    // is SHARED across all traced pids (set to 0 on each
+                    // execve + incremented per post-execve syscall); when
+                    // init's first-stage spun in mprotect+process_vm_writev
+                    // for 2.5M iterations, the counter exceeded 20000 and
+                    // the prctl emulation was SKIPPED for ALL subsequent
+                    // pids — including lmkd's pre-execve PR_SET_SECUREBITS
+                    // call. lmkd's rewritten prctl returned the kernel's
+                    // getpid value (the actual pid, positive), which AOSP
+                    // init's check (prctl(...) != 0) treated as failure —
+                    // combined with stale errno=ENOENT from a previous
+                    // failed writepid (/dev/cpuset/system-background/tasks
+                    // missing) → "prctl(PR_SET_SECUREBITS) failed for lmkd:
+                    // No such file or directory" → InitFatalReboot reboot
+                    // loop. The cap on LOGGING stays (avoids log spam),
+                    // but the EMULATION must run unconditionally.
+                    let ret = if past_first_execve {
+                        get_syscall_arg(&regs, abi.reg_ret) as i64
+                    } else {
+                        0
+                    };
+                    // 6-Z147/6-Z150: force the emulated prctl return for
+                    // ENTRY-rewritten prctls (the kernel executed
+                    // getpid; the guest must see prctl's semantics).
+                    // 6-Z150: the fake is OPTION-AWARE — the uniform
+                    // rax=0 wedged init in ComputeLastValidCap's
+                    // probe loop (prctl(PR_CAPBSET_READ, cap) >= 0
+                    // never failed). Real-kernel semantics for the
+                    // options the guest actually uses:
+                    //   PR_CAPBSET_READ (23): 1 while cap is in the
+                    //     virtual bounding set, -EINVAL once cap >
+                    //     CAP_LAST_CAP — CAP_LAST_CAP is 38
+                    //     (CAP_AUDIT_READ) per the staged init's
+                    //     static_assert and the 5.4-class goldfish
+                    //     kernels the emulator ships; the libc
+                    //     wrapper converts the -22 to errno=EINVAL,
+                    //     return -1, and the loop exits exactly as
+                    //     on a real device (last_valid_cap = 38).
+                    //   PR_CAP_AMBIENT (47): 0 — IS_SET reads as
+                    //     "not set" (>= 0, so CapAmbientSupported()
+                    //     stays true like a real 5.4 kernel) and
+                    //     RAISE/LOWER/CLEAR_ALL report success.
+                    //   everything else (PR_SET_VMA naming,
+                    //     PR_SET_NAME, PR_SET_DUMPABLE, the loader's
+                    //     PR_SET_NO_NEW_PRIVS/PR_SET_SECCOMP,
+                    //     PR_SET_SECUREBITS...): 0 — the 6-Z147
+                    //     fake-success that cured the abort storms.
+                    // 6-Z153: NO counter gate — see the comment above.
+                    if past_first_execve {
                         if let Some((prctl_option, prctl_arg2)) = prctl_rewritten_args.remove(&pid)
                         {
                             if ret >= 0 {
@@ -13312,6 +13334,8 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                    }
+                    if past_first_execve && post_execve_syscall_count <= 20000 {
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
                         } else {
