@@ -7510,6 +7510,15 @@ pub fn run_ptrace_loop(
     let mut kmsg_fd: Option<i32> = None;
     let mut pending_kmsg_open_pid: Option<libc::pid_t> = None; // 6-Z83: per-pid
     let mut post_execve_write_count: u64 = 0;
+    // 6-Z147: per-pid set of children whose prctl ENTRY was rewritten to
+    // getpid (the seccomp-safe skip — see the 6-Z147 ENTRY block for the
+    // full rationale). A HashSet (not the Option<pid> of the other
+    // pending_* flags) because ANY traced child may have a rewritten
+    // prctl in flight: the flag is consumed at THAT child's next EXIT
+    // stop to force rax=0 (prctl success semantics) — a mid-flight
+    // rewrite in child A must not be consumed by child B's EXIT.
+    let mut prctl_rewritten_pids: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
 
     // ── Task 6-V diagnostic state ────────────────────────────────────
     //
@@ -10317,32 +10326,36 @@ pub fn run_ptrace_loop(
                                 ));
                             }
                         }
-                        // 6-Z146: prctl ENTRY-SKIP — break the SIGSYS
-                        // re-entry loop. Run 32840391026: the guest's
-                        // init wedged in 37,111 consecutive
-                        // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...)
-                        // calls (the linker's/scudo's VMA naming). The
-                        // kernel returns -22 (EINVAL — the app lacks the
-                        // permission), the seccomp filter TRAPS the
-                        // syscall, and the SIGSYS handler fires AFTER
-                        // the EXIT stop ("DESYNC") — the resume re-enters
-                        // the same syscall instruction forever. Skipping at
-                        // ENTRY (orig_rax = -1) makes the kernel treat it
-                        // as a skipped syscall: seccomp sees nr=-1 (no
-                        // rule matches, no SIGSYS), the EXIT fake (6-Z143
-                        // table -> Some(0)) writes rax=0, and rip advances
-                        // past the instruction. Only SETTER-class prctls
-                        // are skipped — the GETTERS (PR_GET_*) must return
-                        // their real values... but the kernel returns
-                        // EINVAL/EPERM for most of those too, and the
-                        // existing fake table already forces 0 — so skip
-                        // ALL prctls for the guest uniformly (the fake
-                        // table governs the result).
+                        // 6-Z147: prctl ENTRY rewrite to getpid — the
+                        // seccomp-safe skip (REPLACES 6-Z146, whose
+                        // orig_rax=-1 ENTRY-SKIP is UNSAFE on x86_64: the
+                        // app's seccomp filter still EVALUATES the
+                        // skipped syscall — seccomp runs BEFORE the
+                        // kernel's orig_ax=-1 check — so nr=-1 matches
+                        // no allow rule → TRAP → SIGSYS). Run
+                        // 32843174575: 6-Z146 halved the prctl spin
+                        // (37,111 → 18,604) but triggered a WORSE storm
+                        // — 5,141,701 suppressed SIGSYS for nr=-1 and a
+                        // stat64-class retry storm (the handler's EPERM
+                        // fake makes the guest's init retry). The
+                        // orig_rax=-1 skip is only safe for i386 children
+                        // (no compat seccomp trap). The 6-Z9 xattr
+                        // pattern instead: rewrite the syscall NUMBER to
+                        // getpid (39 on x86_64) — allowed by the app's
+                        // filter (no SIGSYS), the kernel executes it,
+                        // rip advances normally — and force rax=0 at
+                        // EXIT via prctl_rewritten_pids. Only SETTER-class
+                        // semantics are faked uniformly — the GETTERS
+                        // (PR_GET_*) would want real values, but the
+                        // kernel returns EINVAL/EPERM for those too and
+                        // the 6-Z143 fake table already forces 0, so the
+                        // rewrite governs ALL prctls uniformly.
                         if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
-                            set_syscall_num(&mut regs, &abi, -1);
+                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                            prctl_rewritten_pids.insert(pid);
                             if ptrace_setregs(pid, &regs, iov_len).is_err() {
                                 log(&format!(
-                                    "6-Z146: prctl ENTRY-SKIP setregs FAILED for pid={} — the syscall will execute",
+                                    "6-Z147: prctl->getpid rewrite FAILED for pid={} — the syscall will execute",
                                     pid
                                 ));
                             }
@@ -12992,6 +13005,16 @@ pub fn run_ptrace_loop(
                     // cover the same window.
                     if past_first_execve && post_execve_syscall_count <= 20000 {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        // 6-Z147: force rax=0 for ENTRY-rewritten prctls (the
+                        // kernel executed getpid; the guest must see prctl's
+                        // success semantics).
+                        if prctl_rewritten_pids.remove(&pid) && ret >= 0 {
+                            let mut regs_pr: Regs = unsafe { std::mem::zeroed() };
+                            if ptrace_getregs(pid, &mut regs_pr).is_ok() {
+                                set_syscall_ret(&mut regs_pr, &abi, 0);
+                                let _ = ptrace_setregs(pid, &regs_pr, iov_len);
+                            }
+                        }
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
                         } else {
