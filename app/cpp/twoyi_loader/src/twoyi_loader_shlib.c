@@ -3267,6 +3267,17 @@ static int should_translate(const char *path) {
     if (strncmp(path, "/dev", 4) == 0 && (path[4] == 0)) return 0;  // /dev exactly
     // Guest rootfs paths — translate
     if (strncmp(path, "/system", 7) == 0 && (path[7] == 0 || path[7] == '/')) return 1;
+    // 6-Z136: vendor LIBRARY dirs pass through to the HOST (same arch,
+    // complete tree — the rootfs's vendor/lib64 is INCOMPLETE: run
+    // 32805483993 showed {rootfs}/vendor/lib64/android.hardware.*.so
+    // ENOENT for 78 clean link failures while the emulator's own
+    // /vendor/lib64 has them all). Binaries/configs under the rest of
+    // /vendor still translate (exec staging + ROM configs); only the
+    // LIB search paths pass through, mirroring the /apex passthrough.
+    if (strncmp(path, "/vendor/lib64", 13) == 0 &&
+        (path[13] == 0 || path[13] == '/')) return 0;
+    if (strncmp(path, "/vendor/lib", 11) == 0 &&
+        (path[11] == 0 || path[11] == '/')) return 0;
     if (strncmp(path, "/vendor", 7) == 0 && (path[7] == 0 || path[7] == '/')) return 1;
     // 6-Z132: /apex/* PASSES THROUGH to the host's mounted APEXes. The
     // rootfs's apex tree is incomplete (kr64's apex_extract loopback
