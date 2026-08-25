@@ -272,9 +272,18 @@ jobs:
           adb -s emulator-5554 root
           sleep 3
           adb -s emulator-5554 wait-for-device
-          echo "── Tarring the rootfs out of the booted emulator (system+vendor+init+apex) ──"
+          # 6-Z137: apex/ EXCLUDED from the tar. (a) /apex passes through
+          # to the HOST's mounted APEXes at every layer (loader
+          # should_translate + tracer translate_path — the 6-Z132 fix),
+          # so the rootfs apex tree is dead weight; (b) the rootfs was
+          # hitting a STORAGE QUOTA mid-extraction (2.1GB extracted; run
+          # 32807372406: libnblog.so = 1 byte, libutils.so = 0 bytes,
+          # libaudioclient.so ENOENT — classic truncation-at-quota), and
+          # dropping the ~500MB apex tree frees the quota for the system
+          # tree to extract COMPLETELY.
+          echo "── Tarring the rootfs out of the booted emulator (system+vendor+init) ──"
           adb -s emulator-5554 exec-out \
-              "cd / && tar cf - system/ vendor/ init default.prop apex/ 2>/dev/null" \
+              "cd / && tar cf - system/ vendor/ init default.prop 2>/dev/null" \
               | gzip -1 > /tmp/profile_rootfs.tar.gz
           adb -s emulator-5554 unroot || true
           sleep 2
@@ -339,6 +348,13 @@ jobs:
           # into /system or /apex into RELATIVE links rooted at the rootfs.
           $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && find . -type l | while read l; do t=\$(readlink "\$l"); case "\$t" in /system/*|/apex/*|/vendor/*) d=\$(dirname "\$l"); r=\$(realpath --relative-to="\$d" ".\$t" 2>/dev/null); [ -n "\$r" ] && ln -sfn "\$r" "\$l" 2>/dev/null;; esac; done; true'"
           echo "  ✓ rewrote absolute /system|/apex|/vendor symlinks to relative"
+          # 6-Z137: free the quota — drop the (now-unused) rootfs apex
+          # tree left by older extractions and report the storage state.
+          # /apex passes through to the HOST at every layer; this tree is
+          # dead weight that pushed the extraction past the app quota
+          # (truncated system libs — the libnblog/libutils corruption).
+          $ADB shell "run-as io.twoyi.debug sh -c 'rm -rf profiles/default/rootfs/apex; du -sh profiles/default/rootfs; df -h /data | tail -1'"
+          echo "  ✓ freed the stale rootfs/apex tree (host-APEX passthrough makes it dead weight)"
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/bin/linker64" || \
               echo "  (no linker64 — checking x86 linker)"
           echo "  ✓ AOSP x86_64 rootfs preloaded from the AVD system image"
