@@ -1,0 +1,428 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# ARM64 UI-only end-to-end test for twoyi (AOSP boot).
+#
+# Sibling of ui-e2e-test-arm64.yml (TWRP). Boots a full Android AOSP
+# container via twoyi, exercising the arm64-v8a build of twoyi's native
+# libraries (libtwoyi.so, libOpenglRender.so, libloader.so, kr64).
+#
+# Architecture choice (per user request — same as TWRP variant):
+#   - ubuntu-latest (x86_64) runner WITH KVM
+#   - x86_64 Android emulator using the Google Play Store system image
+#     (google_apis_playstore) which ships libndk_translation.so — the
+#     native bridge that translates arm64 binaries to x86_64 at runtime
+#   - twoyi APK built for arm64-v8a ONLY — installed on the x86_64
+#     emulator, run via the native bridge
+#   - AOSP rootfs extracted from the running x86_64 emulator (the same
+#     flow as ui-e2e-aosp.yml). The guest binaries (init, zygote,
+#     system_server, etc.) are x86_64 native — they run with no
+#     translation. The twoyi arm64 tracer (translated by the native
+#     bridge) ptraces them; the syscalls it sees are x86_64 syscall
+#     numbers. This exposes arm64-specific bugs in the tracer where it
+#     makes arm64-layout assumptions (struct layouts, syscall numbers,
+#     register set names) when running under Houdini/ndk_translation.
+#
+# What this tests that ui-e2e-aosp.yml does NOT:
+#   - The arm64-v8a build of twoyi's Rust + C++ code actually links and
+#     loads on a real Android runtime (with native bridge).
+#   - twoyi's PLT hooks / LD_PRELOAD libtwoyi_loader_shlib.so still work
+#     when the loader itself is arm64 and the guest binaries are x86_64
+#     (the loader's PLT hooks attach to the host's libc.so path which
+#     is x86_64 — verifying the loader handles the cross-arch case).
+#   - The ptrace tracer's aarch64 register-access paths (PTRACE_PEEKUSER
+#     offsets, struct user_regs_struct layouts) get exercised.
+#
+# Differences from ui-e2e-aosp.yml:
+#   - System image: google_apis_playstore;x86_64 (NOT google_apis;x86_64)
+#     → includes libndk_translation.so for arm64-to-x86_64 translation.
+#   - ABI: -Pabis=arm64-v8a (NOT x86_64).
+#   - Added a "Verify native bridge" step that fails the build early if
+#     libndk_translation.so / libhoudini.so is missing from the booted
+#     emulator (means the wrong system image was installed).
+#   - Boot timeout for the emulator increased to 360s (Play Store image
+#     boots slower than google_apis due to more services).
+#   - AVD name: twoyi_test_arm64 (avoids colliding with the cached
+#     twoyi_test AVD used by the x86_64 workflows).
+#   - The rootfs preload still uses the x86_64 system tree from the
+#     running emulator. The guest runs natively (x86_64), the twoyi
+#     tracer runs via native bridge (arm64-v8a → x86_64 translation).
+#     This is the path that exposes arm64-specific bugs in twoyi's
+#     Rust code without requiring a separate arm64 rootfs build.
+---
+name: UI E2E Test (ARM64 AOSP via native bridge)
+
+'on':
+  workflow_dispatch:
+    inputs:
+      boot_wait_seconds:
+        description: 'How long to wait for the guest Android to boot (seconds)'
+        required: false
+        default: '600'
+
+concurrency:
+  group: ui-e2e-aosp-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui-e2e-aosp-arm64:
+    name: UI-only ARM64 AOSP E2E on x86_64 emulator + native bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Enable KVM access
+        run: |
+          set -u
+          echo "── KVM availability ──"
+          if [ -e /dev/kvm ]; then
+              echo "  /dev/kvm exists"
+          else
+              echo "  /dev/kvm does NOT exist — trying modprobe + mknod"
+              sudo modprobe kvm 2>/dev/null || true
+              sudo modprobe kvm_intel 2>/dev/null || true
+              sudo modprobe kvm_amd 2>/dev/null || true
+              sudo mknod /dev/kvm c 10 232 2>/dev/null || true
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          ls -l /dev/kvm || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-linux-android
+          cache: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rs/target
+            app/rs/loader/target
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache cargo-xdk
+        id: cache-cargo-xdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-xdk
+          key: ${{ runner.os }}-cargo-xdk-2.12.6
+
+      - name: Install cargo-xdk
+        if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
+        run: cargo install cargo-xdk
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Cache Android SDK (Play Store x86_64 image with native bridge)
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/android/sdk
+          key: ${{ runner.os }}-sdk-android30-google_apis_playstore-x86_64-v1
+
+      - name: Install Android SDK + emulator + Play Store x86_64 system image
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
+              cd /tmp
+              CMDLINE_TOOLS_URL='https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+              curl -sL -o cmdline-tools.zip "$CMDLINE_TOOLS_URL"
+              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+              rm cmdline-tools.zip
+          fi
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          # Accept ALL licenses including android-sdk-playstore-license
+          # (needed for the google_apis_playstore system image which is
+          # the only x86_64 image with libndk_translation.so / Houdini).
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --update
+          sdkmanager \
+              "platform-tools" \
+              "platforms;android-30" \
+              "build-tools;30.0.3" \
+              "emulator" \
+              "system-images;android-30;google_apis_playstore;x86_64"
+          echo "✓ SDK + emulator + Play Store x86_64 system image installed"
+
+      - name: Create x86_64 AVD (Play Store image, native bridge target)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROID_AVD_HOME: /home/runner/.android/avd
+        run: |
+          set -ex
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_AVD_HOME=/home/runner/.android/avd
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p "$ANDROID_AVD_HOME"
+          AVDMGR="$(command -v avdmanager 2>/dev/null || true)"
+          if [ -z "$AVDMGR" ] || [ ! -x "$AVDMGR" ]; then
+            for d in "$ANDROID_HOME"/cmdline-tools/*/; do
+              if [ -x "${d}bin/avdmanager" ]; then
+                AVDMGR="${d}bin/avdmanager"
+                break
+              fi
+            done
+          fi
+          echo "" | "$AVDMGR" create avd \
+              -n twoyi_test_arm64 \
+              -k "system-images;android-30;google_apis_playstore;x86_64" \
+              --force
+          AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_test_arm64.avd/config.ini"
+          {
+              echo "hw.keyboard=yes"
+              echo "hw.gpu.enabled=yes"
+              echo "hw.gpu.mode=swiftshader_indirect"
+              echo "hw.ramSize=3072"
+              echo "disk.dataPartition.size=8192"
+              echo "vm.heapSize=256"
+          } >> "$AVD_CONFIG"
+          echo "✓ AVD created"
+
+      - name: Grant execute permission for gradlew and build scripts
+        run: |
+          chmod +x gradlew
+          chmod +x app/rs/build_rs.sh
+          chmod +x app/rs/loader/build.sh || true
+
+      - name: Build APK (debuggable variant, arm64-v8a only)
+        # CRITICAL: this is the entire point of this workflow. The twoyi
+        # native libs (libtwoyi.so, libOpenglRender.so, libloader.so,
+        # kr64) will be built for aarch64-linux-android ONLY — not x86_64.
+        # The native bridge on the x86_64 Play Store emulator image will
+        # translate them at runtime when the system tries to load them.
+        # If the build fails here, it means the arm64 Rust/C++ code has a
+        # compile-time issue — fix that before proceeding.
+        run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Boot emulator (headless, KVM)
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          mkdir -p /tmp/ui-e2e-artifacts
+          "$ANDROID_HOME/emulator/emulator" -avd twoyi_test_arm64 \
+              -no-window -no-audio -no-snapshot -no-boot-anim \
+              -gpu swiftshader_indirect \
+              -partition-size 4096 \
+              -ports 5554,5555 \
+              -qemu -enable-kvm \
+              > /tmp/ui-e2e-artifacts/emulator-stdout.log \
+              2> /tmp/ui-e2e-artifacts/emulator-stderr.log &
+          EMULATOR_PID=$!
+          echo $EMULATOR_PID > /tmp/emulator.pid
+          echo "  emulator PID: $EMULATOR_PID"
+
+          BOOT_TIMEOUT=360
+          WAITED=0
+          while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
+              if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
+                  echo "  ✗ emulator died"
+                  tail -30 /tmp/ui-e2e-artifacts/emulator-stderr.log >&2 || true
+                  exit 1
+              fi
+              BOOTED=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              if [ "$BOOTED" = "1" ]; then
+                  echo "  ✓ boot_completed after ${WAITED}s"
+                  break
+              fi
+              sleep 2
+              WAITED=$((WAITED + 2))
+              printf '.'
+          done
+          if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
+              echo "  ✗ emulator did not boot in ${BOOT_TIMEOUT}s"
+              exit 1
+          fi
+
+      - name: Verify native bridge (libndk_translation / Houdini)
+        # The whole workflow hinges on this — if the booted emulator has
+        # no native bridge, the arm64-v8a twoyi APK will fail to install
+        # with INSTALL_FAILED_NO_MATCHING_ABIS and the rest is wasted.
+        # Fail the workflow EARLY with a clear message if it's missing.
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          ADB="adb -s emulator-5554"
+          echo "── Native bridge verification ──"
+          NDK_TRANSLATION_64=$($ADB shell ls /system/lib64/libndk_translation.so 2>/dev/null | tr -d '\r' || true)
+          HOUDINI_64=$($ADB shell ls /system/lib64/libhoudini.so 2>/dev/null | tr -d '\r' || true)
+          HOUDINI_32=$($ADB shell ls /system/lib/libhoudini.so 2>/dev/null | tr -d '\r' || true)
+          ARM64_NATIVE_DIR=$($ADB shell ls /system/lib64/arm64/ 2>/dev/null | head -3 | tr -d '\r' || true)
+          echo "  libndk_translation.so (64-bit): $NDK_TRANSLATION_64"
+          echo "  libhoudini.so (64-bit): $HOUDINI_64"
+          echo "  libhoudini.so (32-bit): $HOUDINI_32"
+          echo "  /system/lib64/arm64/ contents: $ARM64_NATIVE_DIR"
+          if [ -n "$NDK_TRANSLATION_64" ] || [ -n "$HOUDINI_64" ] || [ -n "$HOUDINI_32" ]; then
+              echo "  ✓ Native bridge detected — arm64-v8a APK will install"
+          else
+              echo "  ✗ Native bridge NOT detected"
+              echo "    Installed system image: $("$ADB" shell getprop ro.build.description | tr -d '\r')"
+              echo "    Boot a google_apis_playstore image instead — google_apis has no native bridge."
+              exit 1
+          fi
+
+      - name: Install APK + preload AOSP rootfs from the AVD system image
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          set -x
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          ADB="adb -s emulator-5554"
+
+          # Install the arm64-v8a DEBUGGABLE variant (io.twoyi.debug).
+          # The native bridge on the Play Store image picks up the
+          # arm64-v8a .so files. If the install fails with
+          # INSTALL_FAILED_NO_MATCHING_ABIS, the native bridge step
+          # above should have caught it — but if it slipped through,
+          # exit here so the failure is obvious.
+          APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
+          echo "── Installing APK: $APK ──"
+          $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
+          echo "  ✓ APK installed"
+
+          # ── Extract the x86_64 rootfs FROM THE RUNNING EMULATOR ───
+          # Same flow as ui-e2e-aosp.yml: the guest's init/zygote/
+          # system_server binaries are x86_64 NATIVE (the emulator is
+          # x86_64 with KVM), so they run with no translation. The
+          # twoyi tracer (arm64-v8a via native bridge) ptraces them —
+          # exposing arm64-specific bugs in twoyi's Rust code where
+          # it makes aarch64-layout assumptions when running under
+          # libndk_translation.
+          adb -s emulator-5554 wait-for-device
+          adb -s emulator-5554 root
+          sleep 3
+          adb -s emulator-5554 wait-for-device
+          echo "── Tarring the rootfs out of the booted emulator (system+vendor+init) ──"
+          adb -s emulator-5554 exec-out \
+              "cd / && tar cf - system/ vendor/ init default.prop 2>/dev/null" \
+              | gzip -1 > /tmp/profile_rootfs.tar.gz
+          adb -s emulator-5554 unroot || true
+          sleep 2
+          adb -s emulator-5554 wait-for-device
+          ls -la /tmp/profile_rootfs.tar.gz
+          [ -s /tmp/profile_rootfs.tar.gz ] || { echo "✗ rootfs tar is empty"; exit 1; }
+          gzip -t /tmp/profile_rootfs.tar.gz || { echo "✗ corrupt gzip"; exit 1; }
+          $ADB push /tmp/profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
+
+          # ── Preload into the app's private profile dir via run-as ────
+          $ADB shell monkey -p io.twoyi.debug -c android.intent.category.LAUNCHER 1
+          sleep 8
+          $ADB shell am force-stop io.twoyi.debug
+          sleep 2
+
+          $ADB shell "run-as io.twoyi.debug mkdir -p profiles/default/rootfs"
+          $ADB shell "cat /sdcard/Download/profile_rootfs.tar.gz | run-as io.twoyi.debug tar -xz -C profiles/default/rootfs"
+          $ADB shell "rm /sdcard/Download/profile_rootfs.tar.gz"
+
+          # Normalize ownership + modes (root-owned 0700/0750 → app-owned 0755/0644)
+          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && chmod -R u+rwX,go+rX,go-w . && chmod 0755 init system/bin/init 2>/dev/null; chmod -R u+x system/bin 2>/dev/null; true'"
+          echo "  ✓ normalized rootfs ownership/modes"
+
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/ | head -20"
+
+          # Replace the absolute /system/bin/init symlink with a real copy
+          if $ADB shell "run-as io.twoyi.debug test -L profiles/default/rootfs/init"; then
+              $ADB shell "run-as io.twoyi.debug sh -c 'cp profiles/default/rootfs/system/bin/init profiles/default/rootfs/init.real && rm profiles/default/rootfs/init && mv profiles/default/rootfs/init.real profiles/default/rootfs/init && chmod 0755 profiles/default/rootfs/init'"
+              echo "  ✓ replaced the absolute init symlink with a real copy (0755)"
+          fi
+          if ! $ADB shell "run-as io.twoyi.debug test -f profiles/default/rootfs/init" || \
+             ! $ADB shell "run-as io.twoyi.debug sh -c 'test -s profiles/default/rootfs/init'"; then
+              echo "✗ guest init (real file) not found/empty after replacement"; exit 1
+          fi
+          # Rewrite absolute /system|/apex|/vendor symlinks to relative
+          $ADB shell "run-as io.twoyi.debug sh -c 'cd profiles/default/rootfs && find . -type l | while read l; do t=\$(readlink "\$l"); case "\$t" in /system/*|/apex/*|/vendor/*) d=\$(dirname "\$l"); r=\$(realpath --relative-to="\$d" ".\$t" 2>/dev/null); [ -n "\$r" ] && ln -sfn "\$r" "\$l" 2>/dev/null;; esac; done; true'"
+          echo "  ✓ rewrote absolute /system|/apex|/vendor symlinks to relative"
+          # Free the stale rootfs/apex tree (host-APEX passthrough makes it dead weight)
+          $ADB shell "run-as io.twoyi.debug sh -c 'rm -rf profiles/default/rootfs/apex; du -sh profiles/default/rootfs; df -h /data | tail -1'"
+          echo "  ✓ freed the stale rootfs/apex tree"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/bin/linker64" || \
+              echo "  (no linker64 — checking x86 linker)"
+          echo "  ✓ AOSP x86_64 rootfs preloaded from the AVD system image"
+
+          # SELinux compile input ground truth (same diagnostic block as x86_64 AOSP E2E)
+          echo "── rootfs SELinux inputs ──"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/etc/selinux/ 2>&1 | head -25"
+          echo "── rootfs SELinux mapping dir ──"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/etc/selinux/mapping/ 2>&1 | head -12"
+          echo "── rootfs vendor selinux (CIL + vers + fstab) ──"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/vendor/etc/selinux/ 2>&1 | head -15"
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/vendor/etc/fstab.ranchu 2>&1"
+          echo "── emulator-side source files (shell-user view) ──"
+          $ADB shell "ls -la /system/etc/selinux/plat_sepolicy.cil /vendor/etc/selinux/plat_sepolicy_vers.txt 2>&1"
+          echo "── rootfs size + disk space ──"
+          $ADB shell "run-as io.twoyi.debug du -sh profiles/default/rootfs 2>&1"
+          $ADB shell "df -h /data 2>&1 | tail -2"
+
+      - name: UI navigation — boot AOSP container
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
+          AOSP_PACKAGE: io.twoyi.debug
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          python3 scripts/ui-navigate-aosp.py
+
+      - name: Pack artifacts
+        if: always()
+        run: |
+          ./scripts/pack-logs.sh /tmp/ui-e2e-logs.tar.xz \
+            /tmp/ui-e2e-artifacts/ \
+            || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-e2e-aosp-arm64-logs
+          path: /tmp/ui-e2e-logs.tar.xz
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Kill emulator
+        if: always()
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          adb -s emulator-5554 emu kill 2>/dev/null || true
+          kill $(cat /tmp/emulator.pid 2>/dev/null) 2>/dev/null || true
