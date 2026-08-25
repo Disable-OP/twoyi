@@ -161,15 +161,15 @@ jobs:
         # "Error: Unsupported host 'linux-arm64'" (run 32892478844 / 32892481714).
         # Direct sdkmanager install works because the NDK package itself
         # is host-agnostic (ships binaries for x86_64 + arm64 Linux, plus
-        # darwin/win). The ubuntu-24.04-arm runner image pre-installs
-        # Android SDK + cmdline-tools at /usr/local/lib/android/sdk.
+        # darwin/win). The ubuntu-24.04-arm runner image does NOT
+        # Android SDK at /home/runner/android-sdk (user-writable; not pre-installed).
         id: setup-ndk
         run: |
           set -e
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          # Ensure cmdline-tools exists (pre-installed on runner image,
-          # but be defensive in case of cache misses).
+          # Ensure cmdline-tools exists (NOT pre-installed on arm64 runner;
+          # always download fresh on first run; cached on subsequent runs).
           if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
               mkdir -p "$ANDROID_HOME/cmdline-tools"
               cd /tmp
@@ -192,14 +192,14 @@ jobs:
         id: cache-sdk
         uses: actions/cache@v4
         with:
-          path: /usr/local/lib/android/sdk
+          path: /home/runner/android-sdk
           key: ${{ runner.os }}-{{ runner.arch }}-sdk-android30-default-arm64-v8a-v1
 
       - name: Install Android SDK + emulator + arm64-v8a system image
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           set -e
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=/home/runner/android-sdk
           mkdir -p "$ANDROID_HOME/cmdline-tools"
           if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
               cd /tmp
@@ -225,12 +225,12 @@ jobs:
 
       - name: Create arm64-v8a AVD
         env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
-          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          ANDROID_HOME: /home/runner/android-sdk
+          ANDROID_SDK_ROOT: /home/runner/android-sdk
           ANDROID_AVD_HOME: /home/runner/.android/avd
         run: |
           set -ex
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=/home/runner/android-sdk
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
           export ANDROID_AVD_HOME=/home/runner/.android/avd
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
@@ -283,7 +283,7 @@ jobs:
         run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_HOME: /home/runner/android-sdk
 
       - name: Boot arm64-v8a emulator (headless, TCG)
         # On arm64 hardware (ubuntu-24.04-arm runner), the Android
@@ -295,9 +295,9 @@ jobs:
         # in the loop below; job timeout-minutes is 90 to give the
         # entire workflow plenty of room.
         env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_HOME: /home/runner/android-sdk
         run: |
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           mkdir -p /tmp/ui-e2e-artifacts
           "$ANDROID_HOME/emulator/emulator" -avd twoyi_test_arm64 \
@@ -377,9 +377,9 @@ jobs:
 
       - name: Install APK + push arm64 TWRP recovery.img
         env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_HOME: /home/runner/android-sdk
         run: |
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
           ADB="adb -s emulator-5554"
 
@@ -404,11 +404,11 @@ jobs:
 
       - name: UI navigation — import ROM + boot container
         env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_HOME: /home/runner/android-sdk
           BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
           TWOYI_PACKAGE: io.twoyi.debug
         run: |
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
           mkdir -p /tmp/ui-e2e-artifacts
           python3 scripts/ui-navigate.py
@@ -433,8 +433,8 @@ jobs:
       - name: Kill emulator
         if: always()
         env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_HOME: /home/runner/android-sdk
         run: |
-          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
           adb -s emulator-5554 emu kill 2>/dev/null || true
