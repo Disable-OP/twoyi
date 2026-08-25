@@ -9,21 +9,33 @@
 # libloader.so, kr64) so that arm64-specific code paths in the Rust
 # tracer and C++ loader get CI coverage.
 #
-# Architecture (v2 — switched from native bridge to real arm64 QEMU TCG):
-#   - GitHub's free ubuntu-24.04-arm runners have NO nested virtualization
-#     (no /dev/kvm), so an arm64-v8a Android system image would run in
-#     TCG mode — too slow on a real arm64 host.
-#   - ubuntu-latest (x86_64) runner WITH KVM for the host, but the Android
-#     emulator itself runs an arm64-v8a system image (system-images;
-#     android-30;default;arm64-v8a) under QEMU TCG software emulation
-#     (NO hardware KVM accel — KVM can't virtualize arm64 on x86_64 HW).
+# Architecture (v3 — switched to a real arm64 runner; v2's x86_64 runner
+#             couldn't boot arm64 system images):
+#   - GitHub's ubuntu-24.04-arm runners are arm64 Ampere hardware (free
+#     public preview since Jan 2025). They have NO nested KVM (no
+#     /dev/kvm), but the arm64 Android emulator binary boots arm64-v8a
+#     system images via QEMU TCG — arm64-to-arm64 TCG is essentially
+#     native execution with a JIT, so boot is ~5-10 min (not 30 min).
 #   - twoyi's APK is built for arm64-v8a ONLY — it runs NATIVELY on the
 #     arm64 emulator (no translation layer, no native bridge).
 #   - The TWRP recovery image is the arm64 `angler` (Nexus 6P) image
 #     downloaded fresh each run from dl.twrp.me — its ramdisk's init
 #     binary is a real aarch64 ELF, runs natively on the arm64 emulator.
 #
-# Why this replaced the native bridge approach (v1):
+# Why v3 replaced v2 (x86_64 runner + arm64-v8a system image):
+#   The Android emulator binary shipped with the Linux x86_64 Android
+#     SDK does NOT include an arm64 TCG backend. v2's run 32891452405
+#     failed in 10s with `FATAL: Avd's CPU Architecture 'arm64' is not
+#     supported by the QEMU2 emulator on x86_64 host. System image
+#     must match the host architecture.` The -no-accel flag only
+#     disables hardware acceleration; it does NOT enable cross-arch
+#     TCG system-image emulation. The x86_64 emulator binary is
+#     hard-coded to x86/x86_64 guests only.
+#
+# Why v2 replaced v1 (native bridge on x86_64 Play Store image):
+#   See below — the ptrace arch-mismatch crash.
+#
+# Why v1 (native bridge on x86_64 Play Store image) was abandoned:
 #   The native bridge (libndk_translation.so on google_apis_playstore
 #   x86_64 image) translates the twoyi app's arm64 .so to x86_64 at
 #   runtime. When twoyi's arm64 Rust kernel calls ptrace() on a forked
@@ -49,18 +61,20 @@
 #   - ABI: -Pabis=arm64-v8a (NOT x86_64).
 #   - TWRP image: arm64 `angler` image downloaded at runtime (NOT the
 #     committed x86 byt_t_crv2 image in assets/twrp/).
-#   - Emulator flags: NO `-qemu -enable-kvm` (KVM can't do arm64 on
-#     x86_64 HW); `-no-accel` forces QEMU TCG software emulation.
-#   - Boot timeout: 1500s (25 min) — arm64 TCG boot is 10-20× slower
-#     than x86_64 KVM.
-#   - Job timeout: 90 min (vs 30 min) for slow arm64 boot + 10-min
-#     TWRP container boot wait.
-#   - default boot_wait_seconds: 600s (vs 60s) — arm64 TCG boots slow.
-#   - ui-navigate.py's new post-Launch-Container + final assertions
-#     abort the script (exit 1) if the app crashed back to launcher
-#     (the bug that produced the false "TWRP works!" run 32886902337).
+#   - Runner: ubuntu-24.04-arm (arm64 Ampere hardware, no nested KVM
+#     but arm64-to-arm64 TCG works at near-native speed).
+#   - Emulator flags: NO `-qemu -enable-kvm` (no /dev/kvm on the
+#     arm64 runner); NO `-no-accel` either — let the Android emulator
+#     auto-detect TCG mode for arm64-v8a system image on arm64 host.
+#   - Boot timeout: 1200s (20 min) — arm64 TCG boot on arm64 HW is
+#     ~5-10 min, allow extra slack.
+#   - Job timeout: 90 min for slow boot + 10-min TWRP container wait.
+#   - default boot_wait_seconds: 600s (vs 60s) — guest TWRP boots slow.
+#   - ui-navigate.py's post-Launch-Container + final assertions abort
+#     the script (exit 1) if the app crashed back to launcher (the
+#     bug that produced the false "TWRP works!" run 32886902337).
 ---
-name: UI E2E Test (ARM64 via QEMU TCG)
+name: UI E2E Test (ARM64 via real arm64 runner)
 
 'on':
   workflow_dispatch:
@@ -76,27 +90,33 @@ concurrency:
 
 jobs:
   ui-e2e-test-arm64:
-    name: UI-only ARM64 (TWRP) E2E on arm64-v8a emulator (QEMU TCG)
-    runs-on: ubuntu-latest
+    name: UI-only ARM64 (TWRP) E2E on arm64-v8a emulator (arm64 runner)
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # NOTE: KVM is irrelevant for arm64-v8a system images — KVM can only
-      # accelerate x86_64-on-x86_64, not arm64-on-x86_64. We keep this
-      # step for symmetry with the x86_64 workflow (it's a no-op here
-      # and takes <2s); the emulator below uses `-no-accel` to force
-      # QEMU TCG software emulation.
-      - name: Enable KVM access
+      # NOTE: ubuntu-24.04-arm runners do NOT have nested KVM (no
+      # /dev/kvm). The arm64 Android emulator boots arm64-v8a system
+      # images via QEMU TCG (arm64-to-arm64 JIT — near-native speed,
+      # NOT cross-architecture translation).
+      - name: Check runner architecture (arm64 expected)
         run: |
           set -u
-          echo "── KVM availability (informational only — arm64 TCG does NOT use KVM) ──"
+          echo "── Runner architecture ──"
+          uname -m
+          if [ "$(uname -m)" != "aarch64" ]; then
+              echo "  ✗ Runner is $(uname -m), expected aarch64. ubuntu-24.04-arm required."
+              exit 1
+          fi
+          echo "  ✓ Running on aarch64 hardware — arm64 Android emulator will work"
+          echo "── /dev/kvm (informational — expected missing on hosted arm64 runners) ──"
           if [ -e /dev/kvm ]; then
-              echo "  /dev/kvm exists (would be used by x86_64 system images; ignored for arm64)"
+              echo "  /dev/kvm exists (KVM would speed up the boot, but TCG is fine)"
           else
-              echo "  /dev/kvm not present (expected on this runner; arm64 TCG does not need it)"
+              echo "  /dev/kvm not present — Android emulator will use QEMU TCG software emulation (arm64-on-arm64, ~5-10 min boot)"
           fi
 
       - name: Set up JDK 17
@@ -121,15 +141,15 @@ jobs:
             ~/.cargo/git
             app/rs/target
             app/rs/loader/target
-          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-{{ runner.arch }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-{{ runner.arch }}-cargo-
 
       - name: Cache cargo-xdk
         id: cache-cargo-xdk
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-xdk
-          key: ${{ runner.os }}-cargo-xdk-2.12.6
+          key: ${{ runner.os }}-{{ runner.arch }}-cargo-xdk-2.12.6
 
       - name: Install cargo-xdk
         if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
@@ -147,7 +167,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /usr/local/lib/android/sdk
-          key: ${{ runner.os }}-sdk-android30-default-arm64-v8a-v1
+          key: ${{ runner.os }}-{{ runner.arch }}-sdk-android30-default-arm64-v8a-v1
 
       - name: Install Android SDK + emulator + arm64-v8a system image
         if: steps.cache-sdk.outputs.cache-hit != 'true'
@@ -239,17 +259,15 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_HOME: /usr/local/lib/android/sdk
 
-      - name: Boot arm64-v8a emulator (headless, QEMU TCG)
-        # CRITICAL difference from x86_64 workflow: NO -qemu -enable-kvm.
-        # KVM on x86_64 hardware CANNOT emulate arm64 — it can only
-        # virtualize x86_64 guests. The Android emulator auto-detects
-        # that the AVD's system image is arm64-v8a and launches
-        # qemu-system-aarch64 under the hood with TCG (software
-        # translation). `-no-accel` makes this explicit and fails fast
-        # if the host mistakenly thinks it can use KVM.
-        # Boot time is 10-20 min (vs ~30s for x86_64 KVM) — budget
-        # 1500s in the loop below; job timeout-minutes is 90 to give
-        # the entire workflow plenty of room.
+      - name: Boot arm64-v8a emulator (headless, TCG)
+        # On arm64 hardware (ubuntu-24.04-arm runner), the Android
+        # emulator binary boots arm64-v8a system images via QEMU TCG
+        # (arm64-to-arm64 JIT — near-native speed, no cross-arch
+        # translation). No `-qemu -enable-kvm` (no /dev/kvm); no
+        # `-no-accel` either — let the emulator auto-pick TCG.
+        # Boot time: ~5-10 min on hosted arm64 runners; budget 1200s
+        # in the loop below; job timeout-minutes is 90 to give the
+        # entire workflow plenty of room.
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
         run: |
@@ -258,7 +276,6 @@ jobs:
           mkdir -p /tmp/ui-e2e-artifacts
           "$ANDROID_HOME/emulator/emulator" -avd twoyi_test_arm64 \
               -no-window -no-audio -no-snapshot -no-boot-anim \
-              -no-accel \
               -gpu swiftshader_indirect \
               -partition-size 4096 -read-only \
               -ports 5554,5555 \
@@ -268,10 +285,11 @@ jobs:
           echo $EMULATOR_PID > /tmp/emulator.pid
           echo "  emulator PID: $EMULATOR_PID"
 
-          # arm64 TCG boot is slow (10-20 min). Poll sys.boot_completed
-          # every 10s for up to 1500s (25 min). Die early if the emulator
-          # process exits (qemu crash, bad system image, etc.).
-          BOOT_TIMEOUT=1500
+          # arm64 TCG boot on hosted arm64 runner: ~5-10 min. Poll
+          # sys.boot_completed every 10s for up to 1200s (20 min).
+          # Die early if the emulator process exits (qemu crash, bad
+          # system image, etc.).
+          BOOT_TIMEOUT=1200
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
               if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
