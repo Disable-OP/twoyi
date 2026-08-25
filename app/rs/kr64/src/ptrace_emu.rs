@@ -7889,18 +7889,27 @@ pub fn run_ptrace_loop(
     // spin (run 32843174575: 16,326 consecutive prctls, ZERO other
     // syscalls — a pure userspace allocation loop; the rip + the scudo
     // region args identify the caller, which the nr/args logs cannot).
+    // 6-Z149 UPGRADE (run 32854785554: the wedge is ~8M prctls and the
+    // rip is libc's shared prctl syscall instruction — 0x...adfa in
+    // every pid — so rip alone cannot name the loop):
     //   `prctl_rip_samples`: per-pid count of prctl ENTRIES already
-    //   sampled — the FIRST 12 prctls per pid get a rip+args log line
-    //   (12 covers the loader/init/scudo early prctls AND the
-    //   transition into the spin; the spin's call site is stable).
+    //   DEEP-sampled — the FIRST 12 prctls per pid PLUS every 5000th
+    //   consecutive prctl (spin-time) get (a) the legacy rip+args line
+    //   and (b) a 6-Z149 prctl-deep line: the PR_SET_VMA name string
+    //   at arg5 ("scudo:..." vs "<lib>.so:.bss" names the allocator
+    //   path), the [rsp] return address (bionic's prctl wrapper pushes
+    //   nothing — [rsp] IS the caller's call site), and a 32-slot
+    //   stack scan of code-range values (the caller chain).
     //   `prctl_spin_consecutive`: per-pid count of CONSECUTIVE prctl
     //   ENTRIES (reset by any other syscall ENTRY) — the SPIN DETECTOR.
-    //   Every 500th consecutive prctl logs one SPIN-DETECTED line with
-    //   the last rip, confirming the spin on the next run (16,326
-    //   prctls → ~33 lines, bounded).
+    //   MILESTONE crossings only (500, 1000, 5000, 50k, 500k, 5M, 50M)
+    //   log a SPIN-DETECTED line with the last rip — the a2979ad
+    //   every-500th version flooded the artifact (15,871 lines /
+    //   ~1.4MB for the ~8M-prctl wedge).
     //   `connect_path_log_count`: global cap (30 lines) for the
     //   connect-path diagnostic — the 4,783-connect ENOENT burst that
-    //   precedes the spin; names WHICH socket path init hammers.
+    //   precedes the spin; names WHICH socket path init hammers
+    //   (answer: /dev/socket/logdw — init's liblog writer).
     let mut prctl_rip_samples: std::collections::HashMap<libc::pid_t, u32> =
         std::collections::HashMap::new();
     let mut prctl_spin_consecutive: std::collections::HashMap<libc::pid_t, u64> =
@@ -10361,9 +10370,34 @@ pub fn run_ptrace_loop(
                         // the per-pid run; every 500th consecutive prctl
                         // logs ONE SPIN-DETECTED line with the last rip.
                         if syscall_num == 157 || syscall_num == 172 || syscall_num == 167 {
+                            // 6-Z149: deep prctl sampling. The Z148 run
+                            // proved the spin's rip is libc's prctl
+                            // syscall INSTRUCTION (every caller shares
+                            // it — 0x...adfa across 4 pids), so rip
+                            // alone cannot name the loop. What can:
+                            // (a) the PR_SET_VMA name string at arg5 —
+                            // "scudo:primary"/"scudo:secondary"/"<lib>:
+                            // .bss" pinpoints the allocator path;
+                            // (b) the return address at [rsp] — bionic's
+                            // prctl wrapper pushes nothing, so [rsp] is
+                            // the caller's call site;
+                            // (c) a 32-slot stack scan for code-range
+                            // addresses — the caller chain (init's own
+                            // PIE text vs libc-internal scudo are
+                            // distinguishable by range; the linker's
+                            // libc.so mmap is already in the log for
+                            // base correlation). Sampled for the first
+                            // 12 prctls per pid (baseline) PLUS every
+                            // 5000th consecutive prctl (the spin
+                            // itself — the Z148 wedge ran ~8M prctls,
+                            // so spin-time samples are the ones that
+                            // matter).
+                            let spin_before =
+                                prctl_spin_consecutive.get(&pid).copied().unwrap_or(0);
                             {
                                 let n = prctl_rip_samples.entry(pid).or_insert(0);
-                                if *n < 12 {
+                                let deep = *n < 12 || (spin_before > 0 && spin_before % 5000 == 0);
+                                if deep {
                                     *n += 1;
                                     // x86_64 user_regs_struct: rip is u64 index 16
                                     // (same raw-index read the 6-Z98 exit_group DIAG
@@ -10371,18 +10405,75 @@ pub fn run_ptrace_loop(
                                     // runtime AOSP guest is x86_64).
                                     let regs_ptr = &regs as *const Regs as *const u64;
                                     let rip = unsafe { *regs_ptr.add(16) };
+                                    let rsp = unsafe { *regs_ptr.add(19) };
+                                    let option = get_syscall_arg(&regs, abi.reg_arg1);
+                                    let addr = get_syscall_arg(&regs, abi.reg_arg3);
+                                    let len = get_syscall_arg(&regs, abi.reg_arg4);
                                     log(&format!(
                                         "6-Z148 prctl-sample pid={} rip={:#x} option={:#x} addr={:#x} len={:#x}",
-                                        pid, rip,
-                                        get_syscall_arg(&regs, abi.reg_arg1),
-                                        get_syscall_arg(&regs, abi.reg_arg3),
-                                        get_syscall_arg(&regs, abi.reg_arg4)
+                                        pid, rip, option, addr, len
+                                    ));
+                                    // 6-Z149 deep fields. The name string
+                                    // is only meaningful for PR_SET_VMA
+                                    // (0x53564d41); other options leave
+                                    // arg5 as garbage/0. read_child_bytes
+                                    // is the same PTRACE_PEEKDATA helper
+                                    // the connect-path diagnostic uses.
+                                    let arg5 = get_syscall_arg(&regs, abi.reg_arg5);
+                                    let name = if option == 0x53564d41 && arg5 > 0x1000 {
+                                        match read_child_bytes(pid, arg5, 32) {
+                                            Some(bytes) => {
+                                                let end = bytes
+                                                    .iter()
+                                                    .position(|b| *b == 0)
+                                                    .unwrap_or(32);
+                                                String::from_utf8_lossy(&bytes[..end]).to_string()
+                                            }
+                                            None => "<unreadable>".to_string(),
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    // Stack scan: 32 u64 slots from rsp.
+                                    // Slot 0 is the caller's return
+                                    // address; deeper slots carry saved
+                                    // registers and the caller chain.
+                                    // Only plausible code pointers
+                                    // (>0x10000) are logged to keep the
+                                    // line bounded; the [i] indexes name
+                                    // the slot for post-hoc frame
+                                    // reconstruction.
+                                    let mut stack_dump = String::new();
+                                    if let Some(bytes) = read_child_bytes(pid, rsp, 32 * 8) {
+                                        for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+                                            let v = u64::from_le_bytes(chunk.try_into().unwrap());
+                                            if v > 0x10000 {
+                                                stack_dump.push_str(&format!(" [{}]={:#x}", i, v));
+                                            }
+                                        }
+                                    }
+                                    log(&format!(
+                                        "6-Z149 prctl-deep pid={} rip={:#x} option={:#x} addr={:#x} len={:#x} name='{}' rsp={:#x} stack:{}",
+                                        pid, rip, option, addr, len, name, rsp,
+                                        if stack_dump.is_empty() {
+                                            "<unreadable>"
+                                        } else {
+                                            &stack_dump
+                                        }
                                     ));
                                 }
                             }
                             let run = prctl_spin_consecutive.entry(pid).or_insert(0);
                             *run += 1;
-                            if *run % 500 == 0 {
+                            // 6-Z149: milestone-only spin reporting. The
+                            // a2979ad `% 500` version flooded the log
+                            // (15,871 lines for the ~8M-prctl wedge —
+                            // ~1.4MB of the 8.2MB artifact). Milestones
+                            // keep the same information at 7 lines.
+                            if matches!(
+                                *run,
+                                500 | 1000 | 5000 | 50_000 | 500_000 | 5_000_000 | 50_000_000
+                            ) {
                                 let regs_ptr = &regs as *const Regs as *const u64;
                                 let rip = unsafe { *regs_ptr.add(16) };
                                 log(&format!(
