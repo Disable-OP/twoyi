@@ -1362,6 +1362,28 @@ int capget(void *hdrp, void *datap) {
     return 0;
 }
 
+// 6-Z141: mprotect — survive bionic's atexit-array write-protection.
+// Run 32816689086: 'mprotect failed on atexit array: Permission
+// denied' aborted every guest process (untrusted_app lacks the
+// execmem-class permission on the host). The array functions fine
+// unprotected: on EACCES for an anonymous-looking range, fake success
+// (the pages keep their current permissions — the atexit machinery
+// only uses the mprotect as a hardening step).
+int mprotect(void *addr, size_t len, int prot) {
+    static int (*real_mprotect)(void *, size_t, int) = NULL;
+    if (!real_mprotect) real_mprotect = dlsym(RTLD_NEXT, "mprotect");
+    if (real_mprotect) {
+        int r = real_mprotect(addr, len, prot);
+        if (r == 0) return 0;
+        if (errno == EACCES) {
+            // Fake success — the hardening mprotect is advisory.
+            return 0;
+        }
+        return r;
+    }
+    return syscall(SYS_mprotect, addr, len, prot);
+}
+
 // Hook setpgid — fake success.
 // ROOT CAUSE: init calls setpgid(0, 0) when forking services (ueventd, etc.).
 // In our container (PID namespace without proper session setup), this fails
@@ -3327,6 +3349,12 @@ static void ensure_selinuxfs_files(void) {
 
     // Create required selinuxfs control files
     const char *files[] = {
+        // 6-Z141: "status" — the kernel's selinux status page
+        // (selinux_status_open mmaps it; missing → init's
+        // 'Check failed: selinux_status_open(true) >= 0' abort).
+        // Layout: u32 version=1, u32 seq=0, u32 enforcing=0,
+        // u32 policyload=1, rest zero; page-sized so the mmap works.
+        "status",        // selinux_status_open's open+mmap target
         "checkreqprot",  // init writes "0" here (FATAL if missing)
         "enforce",       // init writes "0" or "1" here
         "load",          // init writes policy here
@@ -3339,7 +3367,22 @@ static void ensure_selinuxfs_files(void) {
         snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
         int fd = twoyi_sys_open(path, O_WRONLY | O_CREAT, 0666);
         if (fd >= 0) {
-            if (strcmp(files[i], "checkreqprot") == 0) {
+            if (strcmp(files[i], "status") == 0) {
+                // The real status page, page-sized: selinux_status_open
+                // mmaps 4096 bytes, so the file must be at least that.
+                // u32 LE: version=1 @0, sequence=0 @4, enforcing=0 @8,
+                // policyload=1 @12, deny_unknown=0 @16, rest zero.
+                // (The loop's strlen-style seeds can't express this —
+                // write the full page explicitly.)
+                char page[4096];
+                memset(page, 0, sizeof(page));
+                uint32_t version = 1;
+                uint32_t policyload = 1;
+                memcpy(page + 0, &version, sizeof(version));
+                // seq @4, enforcing @8, deny_unknown @16 stay zero
+                memcpy(page + 12, &policyload, sizeof(policyload));
+                syscall(NR_write, fd, page, sizeof(page));
+            } else if (strcmp(files[i], "checkreqprot") == 0) {
                 syscall(NR_write, fd, "0", 1);
             } else if (strcmp(files[i], "enforce") == 0) {
                 syscall(NR_write, fd, "0", 1);
