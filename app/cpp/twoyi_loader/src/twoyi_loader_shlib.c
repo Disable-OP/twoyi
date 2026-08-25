@@ -1446,77 +1446,95 @@ int android_get_control_socket(const char *name) {
 }
 
 // =========================================================================
-// Hook __android_log_buf_write / __android_log_write — write to stderr as fallback
+// 6-Z140: android_log family → stderr mirror. The guest's logd is dead
+// (its sockets are unreachable), so every ART/system log line —
+// including ABORT MESSAGES, the crash-storm forensics we need most —
+// is silently lost. Mirror each call to stderr (2, unbuffered write)
+// BEFORE the real function runs, so the E2E artifact always carries
+// the guest's own words.
 //
-// vold's LogdLogger sends LOG(ERROR) to logd, but logd may be unavailable in
-// the guest process. Error messages before exit(1) are silently dropped.
-//
-// Fix: hook these functions to write the message to stderr (which we redirect
-// to a file for vold) so we can see the actual error message. We still call
-// the real function (it may fail silently if logd is unavailable).
-//
-// CRITICAL: write_str() internally calls __android_log_write via
-// dlsym(RTLD_DEFAULT, ...), which resolves to OUR hook (since this library is
-// LD_PRELOAD'd and first in the symbol search order). Without the re-entrancy
-// guard, we'd have: __android_log_write -> write_str -> __android_log_write
-// -> write_str -> ... -> stack overflow.
-//
-// The thread-local `in_log_hook` flag breaks this cycle: when our hook is
-// re-entered via write_str, we skip the write_str call and only forward to
-// the real liblog function (found via RTLD_NEXT).
+// NOTE (6-Z140): this REPLACES the older __android_log_write /
+// __android_log_buf_write fallback hooks (and their `in_log_hook`
+// re-entrancy guard). The old hooks mirrored via write_str(), whose
+// dlsym(RTLD_DEFAULT, "__android_log_write") resolves back to OUR
+// hook — hence the guard. log_mirror_line() uses only snprintf + a
+// raw NR_write syscall, so it can never re-enter the hook chain and
+// the guard is obsolete. write_str()'s own dlsym call now lands here:
+// each loader message also mirrors one "[glog I/twoyi_loader]" line
+// (a single extra copy — no cycle).
 // =========================================================================
-static __thread int in_log_hook = 0;
-
-int __android_log_buf_write(int bufID, int prio, const char *tag, const char *text) {
-    if (!in_log_hook) {
-        in_log_hook = 1;
-        if (text) {
-            char msg[1024];
-            const char *prio_str = "U";
-            switch (prio) {
-                case 0: prio_str = "V"; break;
-                case 1: prio_str = "D"; break;
-                case 2: prio_str = "I"; break;
-                case 3: prio_str = "W"; break;
-                case 4: prio_str = "E"; break;
-                case 5: prio_str = "F"; break;
-            }
-            snprintf(msg, sizeof(msg), "[%s/%s] %s\n", prio_str, tag ? tag : "?", text);
-            write_str(2, msg);
-        }
-        in_log_hook = 0;
+static void log_mirror_line(int prio, const char *tag, const char *text) {
+    if (!text) return;
+    char c;
+    switch (prio) {
+        case 0: c = 'U'; break; case 1: c = 'F'; break; case 2: c = 'E'; break;
+        case 3: c = 'W'; break; case 4: c = 'I'; break; case 5: c = 'D'; break;
+        case 6: c = 'V'; break; default: c = '?'; break;
     }
-    // Call the real function (may fail silently if logd is unavailable)
-    static int (*real_log_buf_write)(int, int, const char *, const char *) = NULL;
-    if (!real_log_buf_write) real_log_buf_write = dlsym(RTLD_NEXT, "__android_log_buf_write");
-    if (real_log_buf_write) return real_log_buf_write(bufID, prio, tag, text);
-    return 0;
+    char line[2048];
+    int n = snprintf(line, sizeof(line), "[glog %c/%s] %s\n", c, tag ? tag : "?", text);
+    if (n > 0) syscall(NR_write, 2, line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
 }
 
 int __android_log_write(int prio, const char *tag, const char *text) {
-    if (!in_log_hook) {
-        in_log_hook = 1;
-        if (text) {
-            char msg[1024];
-            const char *prio_str = "U";
-            switch (prio) {
-                case 0: prio_str = "V"; break;
-                case 1: prio_str = "D"; break;
-                case 2: prio_str = "I"; break;
-                case 3: prio_str = "W"; break;
-                case 4: prio_str = "E"; break;
-                case 5: prio_str = "F"; break;
-            }
-            snprintf(msg, sizeof(msg), "[%s/%s] %s\n", prio_str, tag ? tag : "?", text);
-            write_str(2, msg);
-        }
-        in_log_hook = 0;
-    }
-    // Call real function (outside the guard to avoid recursion)
-    static int (*real_log_write)(int, const char *, const char *) = NULL;
-    if (!real_log_write) real_log_write = dlsym(RTLD_NEXT, "__android_log_write");
-    if (real_log_write) return real_log_write(prio, tag, text);
+    log_mirror_line(prio, tag, text);
+    static int (*real_fn)(int, const char *, const char *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "__android_log_write");
+    if (real_fn) return real_fn(prio, tag, text);
     return 0;
+}
+
+int __android_log_buf_write(int bufID, int prio, const char *tag, const char *text) {
+    log_mirror_line(prio, tag, text);
+    static int (*real_fn)(int, int, const char *, const char *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "__android_log_buf_write");
+    if (real_fn) return real_fn(bufID, prio, tag, text);
+    return 0;
+}
+
+int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    log_mirror_line(prio, tag, buf);
+    return __android_log_write(prio, tag, buf);
+}
+
+int __android_log_vprint(int prio, const char *tag, const char *fmt, va_list ap) {
+    char buf[1024];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    log_mirror_line(prio, tag, buf);
+    return __android_log_write(prio, tag, buf);
+}
+
+int __android_log_buf_print(int bufID, int prio, const char *tag, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    log_mirror_line(prio, tag, buf);
+    static int (*real_fn)(int, int, const char *, const char *, ...) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "__android_log_buf_print");
+    if (real_fn) {
+        va_list ap2;
+        va_start(ap2, fmt);
+        int r = real_fn(bufID, prio, tag, "%s", buf);
+        va_end(ap2);
+        return r;
+    }
+    return 0;
+}
+
+// android_set_abort_message — THE abort-reason carrier (bionic stores
+// it for crash_dump; with tombstoned unreachable it is otherwise lost).
+void android_set_abort_message(const char *message) {
+    log_mirror_line(1 /*FATAL*/, "abort", message ? message : "(null)");
+    static void (*real_fn)(const char *) = NULL;
+    if (!real_fn) real_fn = dlsym(RTLD_NEXT, "android_set_abort_message");
+    if (real_fn) real_fn(message);
 }
 
 // =========================================================================
