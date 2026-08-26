@@ -4427,6 +4427,22 @@ fn read_child_u32(pid: libc::pid_t, addr: u64) -> Option<u32> {
     Some(word as u32)
 }
 
+/// 6-Z160: read a full 64-bit word from the traced child (aarch64 +
+/// x86_64 iovec fields, pointers). Same errno-dance contract as
+/// `read_child_u32`.
+fn read_child_u64(pid: libc::pid_t, addr: u64) -> Option<u64> {
+    if addr == 0 {
+        return None;
+    }
+    let _ = std::io::Error::last_os_error(); // clear errno
+    let word = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64, 0) };
+    let peek_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    if word == -1 && peek_errno != 0 {
+        return None; // genuine peek failure (EIO / unmapped)
+    }
+    Some(word as u64)
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Task 6-Z110: property-service CLIENT emulation — pure helpers
 //
@@ -13162,10 +13178,28 @@ pub fn run_ptrace_loop(
                             let iov_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                             let iovcnt = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                             if iovcnt >= 1 {
-                                // i386 iovec: 4-byte iov_base + 4-byte iov_len = 8 bytes
-                                let iov0_base_addr = read_child_u32(pid, iov_ptr).map(|v| v as u64);
-                                let iov0_len =
-                                    read_child_u32(pid, iov_ptr.wrapping_add(4)).map(|v| v as u64);
+                                // 6-Z160: iovec layout by ABI. i386: 4-byte
+                                // iov_base + 4-byte iov_len (8 bytes total).
+                                // aarch64/x86_64: 8-byte iov_base + 8-byte
+                                // iov_len (16 bytes total). The old i386-only
+                                // decode read the HIGH half of the 64-bit
+                                // iov_base as iov_len (usually 0) → every
+                                // arm64 writev capture silently vanished —
+                                // including recovery's fatal log lines right
+                                // before its exit(1) (run 32981635332:
+                                // socket→fcntl→connect→writev→close→exit).
+                                let iov0_base_addr: Option<u64>;
+                                let iov0_len: Option<u64>;
+                                if abi.execve == 221 || abi.execve == 59 {
+                                    // 64-bit ABIs (aarch64 / x86_64)
+                                    iov0_base_addr = read_child_u64(pid, iov_ptr);
+                                    iov0_len = read_child_u64(pid, iov_ptr.wrapping_add(8));
+                                } else {
+                                    // i386
+                                    iov0_base_addr = read_child_u32(pid, iov_ptr).map(|v| v as u64);
+                                    iov0_len = read_child_u32(pid, iov_ptr.wrapping_add(4))
+                                        .map(|v| v as u64);
+                                }
                                 if let (Some(base), Some(len)) = (iov0_base_addr, iov0_len) {
                                     let to_read = std::cmp::min(
                                         std::cmp::min(len as usize, ret as usize),
