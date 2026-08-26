@@ -411,8 +411,25 @@ jobs:
           $ADB push /tmp/profile_rootfs.tar.gz /sdcard/Download/ 2>&1 | tail -1
 
           # ── Preload into the app's private profile dir via run-as ────
-          $ADB shell monkey -p io.twoyi.debug -c android.intent.category.LAUNCHER 1
-          sleep 8
+          # The app only needs to have RUN ONCE for its data dir to exist.
+          # monkey is flaky on redroid (run 32951496349: cold-launch exited
+          # 251 and killed this step under set -e; the TWRP sibling saw
+          # monkey fail to foreground the app entirely). Tolerate monkey
+          # failing: retry via explicit am start, then VERIFY the data dir
+          # exists via run-as — only that matters for the preload below.
+          $ADB shell monkey -p io.twoyi.debug -c android.intent.category.LAUNCHER 1 || \
+              echo "  (monkey exited nonzero — tolerated; retrying via am start)"
+          sleep 4
+          if ! $ADB shell "run-as io.twoyi.debug ls files >/dev/null 2>&1"; then
+              echo "  data dir not created yet — am start fallback"
+              $ADB shell am start -n io.twoyi.debug/io.twoyi.ui.SettingsActivity || true
+              sleep 8
+          fi
+          if ! $ADB shell "run-as io.twoyi.debug ls files >/dev/null 2>&1"; then
+              echo "  ✗ app data dir still missing after monkey + am start"
+              exit 1
+          fi
+          echo "  ✓ app data dir exists (run-as works)"
           $ADB shell am force-stop io.twoyi.debug
           sleep 2
 

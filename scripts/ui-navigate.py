@@ -598,7 +598,10 @@ def verify_rom_imported(root):
     fallback is removed. Now:
       - If the current foreground activity is NOT io.twoyi, return False
         immediately (we are not even looking at the Settings screen).
-      - If we can't find the 'Select ROM' preference, return False.
+      - If we can't find the 'Select ROM' preference, SCROLL DOWN through
+        the preference list (up to 6 swipes — on high-res screens like
+        redroid's 720x1280, 'Select ROM' sits several viewport-heights
+        down inside the Advanced category) before returning False.
     """
     # GUARD: must be on io.twoyi to trust any UI signal. If we're on
     # Google Photos (or anything else), we are NOT on the Settings
@@ -611,43 +614,65 @@ def verify_rom_imported(root):
     if root is None:
         print("  ✗ ROM import verification failed: no UI hierarchy available")
         return False
-    # Check for explicit "No ROM" markers
-    for node in root.iter("node"):
-        txt = (node.get("text", "") or "").lower()
-        desc = (node.get("content-desc", "") or "").lower()
-        for marker in ["no rom installed", "no rom", "no roms"]:
-            if marker in txt or marker in desc:
-                print(f"  ✗ ROM import verification failed: found '{marker}' (text={txt!r}, desc={desc!r})")
-                return False
-    # Check the 'Select ROM' preference summary — if it still says
-    # 'Import rootfs ...', no ROM was imported.
-    parent_map = {c: p for p in root.iter() for c in p}
-    for node in root.iter("node"):
-        if node.get("resource-id", "") != "android:id/title":
+
+    def check_dump(r):
+        """Return (found, imported) for a dumped hierarchy.
+        found=False  -> 'Select ROM' not in this viewport.
+        found=True   -> title found; imported reflects the summary check."""
+        for node in r.iter("node"):
+            txt = (node.get("text", "") or "").lower()
+            desc = (node.get("content-desc", "") or "").lower()
+            for marker in ["no rom installed", "no rom", "no roms"]:
+                if marker in txt or marker in desc:
+                    print(f"  ✗ ROM import verification failed: found '{marker}' (text={txt!r}, desc={desc!r})")
+                    return (True, False)
+        parent_map = {c: p for p in r.iter() for c in p}
+        for node in r.iter("node"):
+            if node.get("resource-id", "") != "android:id/title":
+                continue
+            txt = (node.get("text", "") or "").lower()
+            if "select rom" not in txt:
+                continue
+            # Found the 'Select ROM' title node — look at sibling summary
+            parent = parent_map.get(node)
+            if parent is None:
+                continue
+            for sib in parent:
+                if sib.get("resource-id", "") == "android:id/summary":
+                    summary = (sib.get("text", "") or "").lower()
+                    print(f"  'Select ROM' summary: {summary!r}")
+                    # If the summary still mentions importing rootfs, no ROM is imported
+                    if "import rootfs" in summary or "import a " in summary or "import a." in summary:
+                        print("  ✗ Select ROM summary still shows import prompt — NO ROM imported")
+                        return (True, False)
+                    print("  ✓ Select ROM summary changed from default import prompt — ROM appears imported")
+                    return (True, True)
+        return (False, None)
+
+    # Pass 1: check the caller-provided dump (current viewport).
+    found, imported = check_dump(root)
+    if found:
+        return imported
+
+    # Pass 2: scroll down through the preference list, re-dumping each
+    # viewport, until 'Select ROM' is visible or we run out of list.
+    for i in range(6):
+        print(f"  'Select ROM' not in viewport — scrolling down to find it (attempt {i+1}/6)")
+        swipe_up()
+        wait(1)
+        xml = dump_ui(f"05_verify_scroll_{i}")
+        r = parse_ui(xml)
+        if r is None:
             continue
-        txt = (node.get("text", "") or "").lower()
-        if "select rom" not in txt:
-            continue
-        # Found the 'Select ROM' title node — look at sibling summary
-        parent = parent_map.get(node)
-        if parent is None:
-            continue
-        for sib in parent:
-            if sib.get("resource-id", "") == "android:id/summary":
-                summary = (sib.get("text", "") or "").lower()
-                print(f"  'Select ROM' summary: {summary!r}")
-                # If the summary still mentions importing rootfs, no ROM is imported
-                if "import rootfs" in summary or "import a " in summary or "import a." in summary:
-                    print("  ✗ Select ROM summary still shows import prompt — NO ROM imported")
-                    return False
-                print("  ✓ Select ROM summary changed from default import prompt — ROM appears imported")
-                return True
-    # Could not find the Select ROM preference at all. Previously this
-    # returned True ("assume imported") which masked real failures where
-    # the picker closed without a real selection and we ended up on an
-    # unrelated screen. Return False so the test aborts early instead of
+        found, imported = check_dump(r)
+        if found:
+            return imported
+
+    # Could not find the Select ROM preference even after scrolling.
+    # Previously this returned True ("assume imported") which masked
+    # real failures. Return False so the test aborts early instead of
     # producing misleading "No ROM Installed" screenshots later.
-    print("  ✗ Could not find 'Select ROM' preference in UI — returning False (was 'assume imported')")
+    print("  ✗ Could not find 'Select ROM' preference in UI after scrolling — returning False (was 'assume imported')")
     return False
 
 
@@ -690,6 +715,32 @@ def main():
     print("=" * 60)
     adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
     wait(5)
+    # Launch robustness (redroid arm64): on fast cold starts the activity
+    # may not have resumed yet when we check — and on some launches monkey
+    # silently fails to foreground the app (v5 run 32951494158: step 2
+    # scrolled the LAUNCHER for 8 attempts because the app never came up).
+    # Retry monkey once, then fall back to an explicit component start
+    # (SettingsActivity IS the launcher activity — singleTask, so this is
+    # exactly the same activity a launcher tap would bring up).
+    activity = get_current_activity() or ""
+    if PACKAGE not in activity.lower():
+        print(f"  App not foregrounded after monkey (activity={activity!r}) — retrying monkey")
+        adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
+        wait(4)
+        activity = get_current_activity() or ""
+        if PACKAGE not in activity.lower():
+            print(f"  Still not foregrounded (activity={activity!r}) — am start fallback")
+            adb_shell(f"am start -n {PACKAGE}/io.twoyi.ui.SettingsActivity")
+            wait(4)
+            activity = get_current_activity() or ""
+            if PACKAGE not in activity.lower():
+                print(f"  ⚠ App STILL not foregrounded (activity={activity!r}) — continuing; Step 3 am start will retry")
+            else:
+                print(f"  ✓ App foregrounded via am start fallback (activity={activity!r})")
+        else:
+            print(f"  ✓ App foregrounded on monkey retry (activity={activity!r})")
+    else:
+        print(f"  ✓ App foregrounded (activity={activity!r})")
     xml = dump_ui("01_app_launched")
     root = parse_ui(xml)
     detect_screen_size(root)
