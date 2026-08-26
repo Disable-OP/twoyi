@@ -200,7 +200,20 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         mLoadingLayout.setVisibility(View.VISIBLE);
         mLoadingView.startAnimation();
 
-        UITips.checkForAndroid12(this, this::bootSystem);
+        // The upstream Android-12 guide gate is REMOVED (v5.3).
+        // UITips.checkForAndroid12(this, this::bootSystem) used to block
+        // bootSystem() behind TWO chained modal dialogs ("Attention — You
+        // are running on Android 12..." → "Don't show again" → "Make sure
+        // you've followed the tutorial..." → "I confirm it"). That gate is
+        // a warning for END USERS on real Android 12+ devices (phantom
+        // process killing / ptrace restrictions require manual setup). In
+        // THIS fork the container runs under our own kr64 ptrace emulator
+        // on controlled hosts (CI emulator / redroid with adb root), where
+        // the warning is meaningless — and in CI it froze the whole E2E
+        // for the full boot wait: run 32952695067 sat with BOTH dialogs on
+        // screen for 600s, bootSystem() never ran, and the workflow still
+        // passed green. Boot unconditionally.
+        bootSystem();
 
         mSurfaceView.setOnTouchListener(this);
 

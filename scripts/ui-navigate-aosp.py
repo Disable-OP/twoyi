@@ -25,7 +25,27 @@ import xml.etree.ElementTree as ET
 
 PACKAGE = os.environ.get("AOSP_PACKAGE", "io.twoyi.debug")
 ART = "/tmp/ui-e2e-artifacts"
-BOOT_WAIT = int(os.environ.get("BOOT_WAIT_SECONDS", "600"))
+BOOT_WAIT = int(os.environ.get("BOOT_WAIT_SECONDS", "30"))
+
+# Screen size for gesture scaling — detected once via `wm size` (the
+# redroid arm64 display is 720x1280; the x86_64 AVD is 320x640 or 768x
+# 1280 depending on image). v5.3: hardcoded 320x640 gestures landed in
+# empty space on 720x1280 (run 32952695067 — both blocking popups sat
+# undismissed for the whole wait), so all synthetic gestures now scale.
+SCREEN_W, SCREEN_H = 320, 640
+
+
+def detect_screen_size():
+    global SCREEN_W, SCREEN_H
+    out = adb_shell("wm size", timeout=10)
+    if hasattr(out, "stdout"):
+        out = out.stdout
+    m = re.search(r"(\d+)x(\d+)", out or "")
+    if m:
+        SCREEN_W, SCREEN_H = int(m.group(1)), int(m.group(2))
+    print(f"  [screen] {SCREEN_W}x{SCREEN_H}")
+
+
 SCREENSHOT_EVERY = 5
 
 # ADB serial is configurable via env var so the same script works for:
@@ -112,7 +132,10 @@ def find_by_text(root, text, exact=False):
 
 
 def scroll_down():
-    adb_shell("input swipe 160 500 160 150 300", timeout=15)
+    # Screen-relative vertical swipe (center column).
+    adb_shell(
+        f"input swipe {SCREEN_W // 2} {int(SCREEN_H * 0.7)} "
+        f"{SCREEN_W // 2} {int(SCREEN_H * 0.3)} 300", timeout=15)
 
 
 def scroll_to_find(text, max_scrolls=6, exact=False):
@@ -129,6 +152,54 @@ def scroll_to_find(text, max_scrolls=6, exact=False):
 
 def tap(x, y):
     adb_shell(f"input tap {x} {y}", timeout=15)
+
+
+def dismiss_blocking_popups(tag="popup", rounds=8):
+    """Dismiss the popups that block Render2Activity.bootSystem() (v5.3).
+
+    Same ground truth as ui-navigate.py step 6b (run 32952695067, VLM +
+    XML analysis): SystemUI ImmersiveModeConfirmation ("GOT IT",
+    android:id/ok) on top, the legacy Android-12 "Attention" dialog
+    chain beneath (removed at the source in v5.3 — this is the safety
+    net). All taps parsed from uiautomator bounds, never guessed.
+    """
+    adb_shell("settings put global immersive_mode_confirmations confirmed")
+    taps_done = 0
+    for r in range(rounds):
+        xml = dump_ui(f"{tag}_round{r}")
+        root = parse_ui(xml)
+        if root is None:
+            time.sleep(1)
+            continue
+
+        def _find_any(candidates):
+            for node in root.iter("node"):
+                txt = (node.get("text", "") or "").strip().lower()
+                rid = node.get("resource-id", "") or ""
+                for c in candidates:
+                    if c in txt or (c == "got it" and rid == "android:id/ok"
+                                    and txt):
+                        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                                     node.get("bounds", ""))
+                        if m:
+                            x1, y1, x2, y2 = map(int, m.groups())
+                            return ((x1 + x2) // 2, (y1 + y2) // 2, txt)
+            return None
+
+        hit = (_find_any(["got it"])
+               or _find_any(["don't show again", "dont show again",
+                             "don’t show again", "不再提示"])
+               or _find_any(["i confirm", "我已确认"]))
+        if hit:
+            cx, cy, label = hit
+            print(f"  popup-dismiss[{r}]: tapping {label!r} at ({cx},{cy})")
+            tap(cx, cy)
+            taps_done += 1
+            time.sleep(2)
+            continue
+        print(f"  popup-dismiss[{r}]: no blocking popup visible — clear")
+        break
+    return taps_done
 
 
 def get_current_activity():
@@ -247,6 +318,7 @@ def capture_logs():
 
 
 def main():
+    detect_screen_size()
     os.makedirs(ART, exist_ok=True)
     print("=" * 60)
     print(f"  AOSP E2E navigation v2 (package {PACKAGE})")
@@ -327,6 +399,18 @@ def main():
     dump_ui("02_after_launch_tap")
     print("  ✓ Render2Activity is foreground — the container is booting")
 
+    # ── v5.3 Step 2b: dismiss the popups that block bootSystem() ──
+    # Same story as ui-navigate.py step 6b (run 32952695067: SystemUI
+    # "GOT IT" fullscreen confirmation + legacy Android-12 "Attention"
+    # dialog froze the launch for the entire wait). The app-side dialog
+    # is removed at the source; this kills the SystemUI confirmation and
+    # taps any residual popup by PARSED uiautomator bounds.
+    print("\n  Step 2b: Dismiss blocking popups (GOT IT / Android-12 gate)")
+    screenshot("02b_popups_before")
+    n_popups = dismiss_blocking_popups(tag="02b_popup")
+    screenshot("02b_popups_after")
+    print(f"  Step 2b done: {n_popups} popup button(s) tapped")
+
     print(f"\n  Step 3: Waiting {BOOT_WAIT}s for guest boot "
           f"(screenshots every {SCREENSHOT_EVERY}s)")
     t0 = time.time()
@@ -337,7 +421,7 @@ def main():
         p = screenshot(f"07_boot_{shot * SCREENSHOT_EVERY}s")
         h = md5(p)
         md5s[h] = md5s.get(h, 0) + 1
-        if shot % (60 // SCREENSHOT_EVERY) == 0:
+        if shot % (15 // SCREENSHOT_EVERY) == 0:
             print(f"    t={int(time.time() - t0)}s "
                   f"activity={get_current_activity()} shots={shot}")
             dump_ui(f"08_progress_{int(time.time() - t0)}s")
