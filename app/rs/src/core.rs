@@ -1181,6 +1181,7 @@ fn twrp_fb_render_loop(
     let mut fb_buf = vec![0u8; fb_size];
     let mut last_blit: Vec<u8> = Vec::with_capacity(fb_size);
     let mut idle_ticks: u32 = 0;
+    let mut short_read_logged: u32 = 0;
 
     // Render loop: read fb0 → (dirty-check) → blit to SurfaceView.
     loop {
@@ -1194,9 +1195,34 @@ fn twrp_fb_render_loop(
             }
         };
         let mut reader = std::io::BufReader::new(file);
-        if let Err(e) = reader.read_exact(&mut fb_buf) {
-            if !e.to_string().contains("UnexpectedEof") {
-                log::warn!("[CORE][TWRP-FB] read failed: {}", e);
+        // Tolerant read (6-Z172): a short fb0 file must not wedge the loop
+        // in a warn-storm — read whatever is there, zero-fill the rest so
+        // the dirty check sees a coherent frame, and log the shortfall
+        // (with the actual file size) only for the first few occurrences.
+        {
+            let mut total = 0usize;
+            while total < fb_size {
+                use std::io::Read as _;
+                match reader.read(&mut fb_buf[total..]) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(_) => break,
+                }
+            }
+            if total < fb_size {
+                fb_buf[total..].fill(0);
+                if short_read_logged < 5 {
+                    short_read_logged += 1;
+                    let fsize = std::fs::metadata(&fb_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    log::warn!(
+                        "[CORE][TWRP-FB] short read: got {}/{} bytes (fb0 file len={}) — rendering partial frame",
+                        total,
+                        fb_size,
+                        fsize
+                    );
+                }
             }
         }
 

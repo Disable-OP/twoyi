@@ -598,6 +598,14 @@ jobs:
                   echo "-- key processes:"
                   sudo docker exec redroid sh -c \
                     "ps -A -o PID,NAME 2>/dev/null | grep -E 'recovery|twoyi|surfaceflinger|system_server|adbd'" 2>&1 | head -20
+                  # 6-Z173: rootfs ground truth (docker exec runs as ROOT
+                  # inside the container — app-private dirs readable).
+                  # The fb0 size must equal W*H*4 (native-res chain) and
+                  # /dev/socket must still contain adbd (the 6-Z173 unlink
+                  # fix protects it). One listing per snapshot is cheap.
+                  echo "-- rootfs/dev listing (fb0 size + socket survival):"
+                  sudo docker exec redroid sh -c \
+                    "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/graphics/ /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>&1 | head -40" 2>&1
                 else
                   echo "-- container: NOT RUNNING (died?) — inspect:"
                   sudo docker inspect redroid --format \

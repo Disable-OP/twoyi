@@ -115,16 +115,48 @@ def pull_with_fallback(external_path, internal_path, local_path, timeout=10):
             pass
     return pull_via_run_as(internal_path, local_path, timeout=timeout)
 
-def screenshot(name):
-    path = os.path.join(ART, f"screenshot-{name}.png")
+def _screencap_adb():
+    """screencap via adb; returns raw PNG bytes or b''."""
     try:
         r = subprocess.run(ADB + ["exec-out", "screencap", "-p"],
-                          capture_output=True, timeout=15)
-        with open(path, "wb") as f:
-            f.write(r.stdout)
-        print(f"  [screenshot] {name} ({len(r.stdout)} bytes)")
-    except Exception as e:
-        print(f"  [screenshot] FAILED: {e}")
+                           capture_output=True, timeout=20)
+        return r.stdout or b""
+    except Exception:
+        return b""
+
+def _screencap_docker():
+    """screencap via docker exec + docker cp — works when adb is DEAD but
+    the container + SurfaceFlinger live (run 33015609499: the guest jail
+    unlinked the container's real /dev/socket/adbd; every adb channel died
+    while the framework kept running). Returns raw PNG bytes or b''."""
+    try:
+        subprocess.run(["sudo", "docker", "exec", "redroid",
+                        "screencap", "-p", "/sdcard/_e2e_cap.png"],
+                       capture_output=True, timeout=25)
+        subprocess.run(["sudo", "docker", "cp",
+                        "redroid:/sdcard/_e2e_cap.png", "/tmp/_e2e_cap.png"],
+                       capture_output=True, timeout=15)
+        with open("/tmp/_e2e_cap.png", "rb") as f:
+            data = f.read()
+        os.remove("/tmp/_e2e_cap.png")
+        return data if data[:8] == b"\x89PNG\r\n\x1a\n" else b""
+    except Exception:
+        return b""
+
+def screenshot(name):
+    path = os.path.join(ART, f"screenshot-{name}.png")
+    data = _screencap_adb()
+    if not data:
+        # One adb reconnect attempt, then the docker fallback.
+        subprocess.run(["adb", "connect", ADB[-1]], capture_output=True, timeout=10)
+        data = _screencap_adb()
+    if not data:
+        data = _screencap_docker()
+        if data:
+            print("  [screenshot] via docker fallback (adb dead?)")
+    with open(path, "wb") as f:
+        f.write(data)
+    print(f"  [screenshot] {name} ({len(data)} bytes)")
     return path
 
 def dump_ui(name):

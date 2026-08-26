@@ -11075,3 +11075,42 @@ Stage Summary:
 - If the wedge was the abort loop or render saturation, next run reaches
   the honest verdict point with full evidence. If the container still
   dies, docker-exec-watch names it (OOM/exit code/kernel).
+
+---
+Task ID: 6-Z173
+Agent: main
+Task: adb-death root cause + unlink isolation + evidence hardening
+
+Evidence (run 33015609499 on 1d79d62, docker-exec watcher worked):
+- CONTAINER + FRAMEWORK SURVIVED (system_server ep_poll, surfaceflinger,
+  hwcomposer VSYNC at 21:35:00, app alive) AND **pid 2559 recovery ALIVE,
+  sleeping in hrtimer_nanosleep** — TWRP survived past the gr_init abort!
+- ADB DIED at 21:33:45.892: AdbDebuggingManager "Connection refused" then
+  ENOENT forever; container's adbd absent from final ps. Exactly when the
+  guest jail went active (KR64 spin child 2583: epoll_pwait/accept4/write,
+  399k iterations, exit 0).
+- ROOT CAUSE: guest init starting its OWN adbd service unlinks the stale
+  socket path first — unlinkat("/dev/socket/adbd") with a PEEK-blind heap
+  path (the 6-Z170 class) had NO +1 fallback for the unlink family → the
+  unlink executed UNTRANSLATED → DELETED the container's REAL
+  /dev/socket/adbd → container adbd died → all screenshots/evidence dark.
+- Also visible: [CORE][TWRP-FB] "read failed: failed to fill whole
+  buffer" repeating — the fb0 file is SHORTER than 720x1600x4 at read
+  time (cause unknown; rootfs listings land next run).
+
+Fixes:
+- ptrace_emu.rs 6-Z173: unlink/unlinkat ENTRY read-FAIL branch now applies
+  the 6-Z170 +1-pointer cwd-relative rewrite (unlinkat dirfd := AT_FDCWD,
+  path := addr+1 → resolves inside {rootfs}) — the guest can never unlink
+  real container socket paths again.
+- core.rs: tolerant fb0 read (short reads zero-fill + first-5-occurrence
+  log with actual file size instead of a warn storm).
+- E2E watcher: rootfs/dev listings (fb0 size + /dev/socket survival) each
+  snapshot (docker exec = root inside the container).
+- ui-navigate.py: screencap fallback chain adb → adb-reconnect → docker
+  exec + docker cp (works with adb dead, framework alive).
+
+Stage Summary:
+- Chain status: init ✓ props ✓ logger ✓ fstab ✓ partitions ✓ theme ✓
+  gr_init SURVIVED (recovery alive) → [adb evidence channel now protected]
+  → fb0 content size mystery → render → gate-dismissal touch → main menu.
