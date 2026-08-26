@@ -11036,3 +11036,42 @@ Stage Summary:
   main menu. Next-run verdicts: (1) "abort() INTERCEPTED caller_pc=0x..."
   line + offline symbolization, (2) ashmem SET_SIZE lines + no fd=-1,
   (3) "geometry from env: WxH" == wm size, (4) screenshot md5 CHANGES.
+
+---
+Task ID: 6-Z172
+Agent: main
+Task: Post-run 33014296538 verdict + meltdown fixes
+
+Evidence (run 33014296538 on d65aa21, 720x1600@320):
+- NATIVE-RESOLUTION CHAIN CONFIRMED WORKING: wm size "Physical size:
+  720x1600", ui-navigate cross-check passed (wm vs uiautomator mismatch
+  detected and resolved to 720x1600), navigation taps all scaled correctly.
+- WITHIN ~5s OF "Launch Container": EVERY adb channel died — screencap 0
+  bytes, dumpsys "(unknown)", final logcat 0 bytes. Zero kr64/app evidence
+  pulled. Previous run (33010273952 @320x640) kept adb alive the whole 30s.
+- Prime suspects (no evidence channel survived to distinguish): (a) the
+  6-Z171 abort interpose RE-ENTERING at full speed (TWRP crash handler
+  re-aborts -> 32KB maps dump + marker lines per entry -> stderr/CPU
+  meltdown), (b) the unthrottled fb0 render loop at 720x1600 (4.6MiB read
+  + blit + SurfaceFlinger software composite at 30fps = ~276MiB/s) CPU
+  saturating all runner cores, (c) container/kernel death.
+
+Fixes:
+- hook: ONE-SHOT fatal guard (g_fatal_entered) — first abort/assert/pure-
+  virtual prints marker + maps ONCE, every re-entry goes straight to raw
+  tgkill. fatal_reraise marked noreturn (warning-free NDK builds both
+  arches, verified locally with real clang r27c).
+- core.rs twrp_fb_render_loop: dirty-check throttle — keep last-blitted
+  copy, blit ONLY on real content change (u64-chunk compare), adaptive
+  backoff 33ms -> 66ms -> 250ms while static. TWRP menus are static; idle
+  cost drops to one fb read per tick.
+- E2E workflow: adb-independent evidence watcher — while ui-navigate.py
+  runs, docker exec snapshots (logcat -d -t 400 + key ps lines + container
+  running/OOM/exit state) every 15s into docker-exec-watch.log; final
+  logcat-dockerexec.txt + ps-dockerexec.txt + container-state.txt dumps
+  even when adb is dead. Evidence survives ANY framework wedge now.
+
+Stage Summary:
+- If the wedge was the abort loop or render saturation, next run reaches
+  the honest verdict point with full evidence. If the container still
+  dies, docker-exec-watch names it (OOM/exit code/kernel).

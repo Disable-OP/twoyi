@@ -575,7 +575,55 @@ jobs:
           ADB_SERIAL: localhost:5555
         run: |
           mkdir -p /tmp/ui-e2e-artifacts
+
+          # ── 6-Z172: adb-independent evidence watcher ─────────────────
+          # Run 33014296538: within ~5s of Launch Container EVERY adb
+          # channel died (screencap/dumpsys/logcat all empty) and the run
+          # produced ZERO evidence of what happened. docker exec talks to
+          # the container directly — it works as long as the container
+          # LIVES, even when the Android framework inside is wedged. The
+          # watcher snapshots logcat + key processes every 15s while the
+          # navigation script runs, and names the container state
+          # (running / died / OOM-killed) when it stops matching.
+          rm -f /tmp/ui-e2e-artifacts/nav-done
+          (
+            I=0
+            while [ ! -f /tmp/ui-e2e-artifacts/nav-done ]; do
+              sleep 15; I=$((I+15))
+              {
+                echo "===== docker-exec snapshot @${I}s $(date -u +%H:%M:%S) ====="
+                if sudo docker ps --filter name=redroid --filter status=running -q | grep -q .; then
+                  echo "-- container: RUNNING"
+                  sudo docker exec redroid logcat -d -t 400 2>&1 | tail -n 400
+                  echo "-- key processes:"
+                  sudo docker exec redroid sh -c \
+                    "ps -A -o PID,NAME 2>/dev/null | grep -E 'recovery|twoyi|surfaceflinger|system_server|adbd'" 2>&1 | head -20
+                else
+                  echo "-- container: NOT RUNNING (died?) — inspect:"
+                  sudo docker inspect redroid --format \
+                    'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} err={{.State.Error}}' 2>&1
+                  echo "-- last docker logs:"
+                  sudo docker logs redroid 2>&1 | tail -n 50
+                fi
+              } >> /tmp/ui-e2e-artifacts/docker-exec-watch.log 2>&1
+            done
+          ) &
+          WATCHER=$!
+
           python3 scripts/ui-navigate.py
+          RC=$?
+          touch /tmp/ui-e2e-artifacts/nav-done
+          kill $WATCHER 2>/dev/null || true
+
+          # Final adb-independent dump (works even when adb is dead).
+          sudo docker exec redroid logcat -d \
+            > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
+          sudo docker exec redroid sh -c "ps -A" \
+            > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
+          sudo docker inspect redroid --format \
+            'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' \
+            > /tmp/ui-e2e-artifacts/container-state.txt 2>&1 || true
+          exit $RC
 
       - name: Pack artifacts
         if: always()

@@ -1167,10 +1167,22 @@ fn twrp_fb_render_loop(
         waited / 2
     );
 
-    // Allocate the framebuffer read buffer.
+    // Allocate the framebuffer read buffer + a "last blitted" copy for the
+    // 6-Z172 dirty-check throttle. Without it the loop reads fb_size bytes
+    // AND pushes a full ANativeWindow frame at ~30fps even when TWRP shows
+    // a static menu — at native resolutions (e.g. 720x1600 = 4.6 MiB/frame)
+    // that is ~276 MiB/s of memory traffic plus a SurfaceFlinger composite
+    // per frame in redroid's SOFTWARE guest GPU mode, which saturated all
+    // runner cores and wedged the whole framework (run 33014296538: every
+    // adb channel — screencap/dumpsys/logcat — dead within 5 s of launch).
+    // TWRP screens are mostly STATIC (menus): compare-then-blit makes the
+    // idle cost ~one fb read per tick and a blit ONLY on real changes, with
+    // an adaptive backoff (33 ms → 250 ms) while nothing changes.
     let mut fb_buf = vec![0u8; fb_size];
+    let mut last_blit: Vec<u8> = Vec::with_capacity(fb_size);
+    let mut idle_ticks: u32 = 0;
 
-    // Render loop: read fb0 → blit to SurfaceView, ~30fps.
+    // Render loop: read fb0 → (dirty-check) → blit to SurfaceView.
     loop {
         // Read the framebuffer file.
         let file = match std::fs::File::open(&fb_path) {
@@ -1188,21 +1200,51 @@ fn twrp_fb_render_loop(
             }
         }
 
-        // Blit the framebuffer to the ANativeWindow.
-        unsafe {
-            twrp_blit_to_surface(
-                window,
-                &fb_buf,
-                surface_width,
-                surface_height,
-                fb_w,
-                fb_h,
-                fb_bpp,
-            );
+        // Dirty check (u64 chunks; both buffers are fb_size long). Skip the
+        // blit entirely when the framebuffer content did not change.
+        let changed = {
+            let prev: &[u8] = &last_blit;
+            prev.len() != fb_buf.len()
+                || prev
+                    .chunks_exact(8)
+                    .zip(fb_buf.chunks_exact(8))
+                    .any(|(a, b)| a != b)
+                || prev[prev.len() & !7..] != fb_buf[fb_buf.len() & !7..]
+        };
+        if changed {
+            // Blit the framebuffer to the ANativeWindow.
+            unsafe {
+                twrp_blit_to_surface(
+                    window,
+                    &fb_buf,
+                    surface_width,
+                    surface_height,
+                    fb_w,
+                    fb_h,
+                    fb_bpp,
+                );
+            }
+            if last_blit.is_empty() {
+                log::info!(
+                    "[CORE][TWRP-FB] first non-blank frame blitted ({}x{})",
+                    fb_w,
+                    fb_h
+                );
+            }
+            last_blit.clear();
+            last_blit.extend_from_slice(&fb_buf);
+            idle_ticks = 0;
+            std::thread::sleep(Duration::from_millis(33));
+        } else {
+            idle_ticks = idle_ticks.saturating_add(1);
+            // 33ms while fresh, backing off to 250ms when static.
+            let delay_ms = match idle_ticks {
+                0..=3 => 33,
+                4..=10 => 66,
+                _ => 250,
+            };
+            std::thread::sleep(Duration::from_millis(delay_ms));
         }
-
-        // ~30fps
-        std::thread::sleep(Duration::from_millis(33));
     }
 }
 

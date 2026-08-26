@@ -2093,6 +2093,15 @@ int ioctl(int fd, int request, ...) {
 // preserves it for level-0 return addresses.
 // ---------------------------------------------------------------------------
 
+// ONE-SHOT guard: TWRP's crash handler catches SIGABRT and may re-abort
+// (or init restarts recovery into another abort). Without the guard the
+// maps dump + marker lines re-enter at full speed — run 33014296538: the
+// whole framework wedged seconds after launch with every adb channel
+// dead (the abort spam loop is a prime suspect for the CPU meltdown).
+// First entry prints evidence ONCE; every later entry goes straight to
+// the raw tgkill.
+static volatile int g_fatal_entered = 0;
+
 // Dump up to ~32 KiB of /proc/self/maps to stderr — gives the exact load
 // bases needed to symbolize the printed caller PCs (the binaries are
 // stripped; module+offset + disasm context identifies the call site).
@@ -2120,13 +2129,25 @@ static void fatal_dump_maps(void) {
     write_str(2, "[twrp_fb_hook] --- end maps ---\n");
 }
 
+// Print the fatal evidence exactly once (see g_fatal_entered).
+static void fatal_evidence_once(const char *kind, void *pc) {
+    if (g_fatal_entered) return;
+    g_fatal_entered = 1;
+    write_str(2, "[twrp_fb_hook] *** ");
+    write_str(2, kind);
+    write_str(2, " INTERCEPTED *** caller_pc=0x");
+    write_hex64(2, (unsigned long long)(unsigned long)pc);
+    write_str(2, "\n");
+    fatal_dump_maps();
+}
+
 // Re-raise SIGABRT with default semantics, without touching errno/TLS:
 // rt_sigaction would need a kernel sigaction struct (restorer fields) —
 // instead we tgkill directly. If the process installed a SIGABRT handler
 // (TWRP's crash handler does), it fires — same as bionic's first
 // raise(). If it returns, pause forever (abort must not return).
+static void fatal_reraise(void) __attribute__((noreturn));
 static void fatal_reraise(void) {
-    fatal_dump_maps();
     long pid = raw_syscall1(SYS_getpid, 0);
     long tid = raw_syscall1(SYS_gettid, 0);
     for (;;) {
@@ -2139,9 +2160,7 @@ void abort(void) __attribute__((noreturn));
 void abort(void) {
     void *pc = NULL;
     pc = __builtin_return_address(0);
-    write_str(2, "[twrp_fb_hook] *** abort() INTERCEPTED *** caller_pc=0x");
-    write_hex64(2, (unsigned long long)(unsigned long)pc);
-    write_str(2, "\n");
+    fatal_evidence_once("abort()", pc);
     fatal_reraise();
 }
 
@@ -2150,15 +2169,19 @@ void __assert2(const char *file, int line, const char *expr) __attribute__((nore
 void __assert2(const char *file, int line, const char *expr) {
     void *pc = NULL;
     pc = __builtin_return_address(0);
-    write_str(2, "[twrp_fb_hook] *** __assert2 INTERCEPTED *** ");
-    write_str(2, file ? file : "(null)");
-    write_str(2, ":");
-    write_num(2, line);
-    write_str(2, ": ");
-    write_str(2, expr ? expr : "(null)");
-    write_str(2, " caller_pc=0x");
-    write_hex64(2, (unsigned long long)(unsigned long)pc);
-    write_str(2, "\n");
+    if (!g_fatal_entered) {
+        g_fatal_entered = 1;
+        write_str(2, "[twrp_fb_hook] *** __assert2 INTERCEPTED *** ");
+        write_str(2, file ? file : "(null)");
+        write_str(2, ":");
+        write_num(2, line);
+        write_str(2, ": ");
+        write_str(2, expr ? expr : "(null)");
+        write_str(2, " caller_pc=0x");
+        write_hex64(2, (unsigned long long)(unsigned long)pc);
+        write_str(2, "\n");
+        fatal_dump_maps();
+    }
     fatal_reraise();
 }
 
@@ -2168,8 +2191,6 @@ void __cxa_pure_virtual(void) __attribute__((noreturn));
 void __cxa_pure_virtual(void) {
     void *pc = NULL;
     pc = __builtin_return_address(0);
-    write_str(2, "[twrp_fb_hook] *** __cxa_pure_virtual INTERCEPTED *** caller_pc=0x");
-    write_hex64(2, (unsigned long long)(unsigned long)pc);
-    write_str(2, "\n");
+    fatal_evidence_once("__cxa_pure_virtual", pc);
     fatal_reraise();
 }
