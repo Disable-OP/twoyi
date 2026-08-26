@@ -625,6 +625,17 @@ jobs:
                   echo "-- TWRP child env (TWOYI_FB_*):"
                   sudo docker exec redroid sh -c \
                     'for p in $(ps -A -o PID,NAME 2>/dev/null | grep -E "recovery|sbin" | awk "{print \$1}"); do echo "== pid $p"; tr "\0" "\n" < /proc/$p/environ 2>/dev/null | grep -E "TWOYI_FB|LD_PRELOAD|TWOYI_ROOTFS"; done' 2>&1
+                  # 6-Z178: MODULE BASES for crash-rip symbolization. The
+                  # child cannot read /proc/self/maps through the jail
+                  # (PEEK-blind +1 rewrite sends it rootfs-relative) and
+                  # the tracer's app-domain view of /proc/<pid>/maps is
+                  # denied — but container-ROOT docker exec reads it
+                  # fine. Bases are static per process, so ANY snapshot
+                  # symbolizes ANY later crash rip (e.g. 33018901591's
+                  # post-scanline SIGSEGV rip=0xffffedbc8470).
+                  echo "-- recovery/init module bases (maps head):"
+                  sudo docker exec redroid sh -c \
+                    'for p in $(ps -A -o PID,NAME 2>/dev/null | grep -E "recovery| sbin/|sbin_" | awk "{print \$1}"); do echo "== pid $p maps:"; head -n 40 /proc/$p/maps 2>/dev/null; done' 2>&1
                 else
                   echo "-- container: NOT RUNNING (died?) — inspect:"
                   sudo docker inspect redroid --format \
