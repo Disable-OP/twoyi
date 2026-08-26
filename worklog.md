@@ -10601,3 +10601,9 @@ Changes (6-Z162, E2E):
 Stage Summary:
 - Commit ready: 6-Z161 (DIAG + urandom fix + env lib64) + 6-Z162 (evidence). Next run decides: (a) which fd spins (accept4 readback names it), (b) WHY init's service forks exit 1 (linker verdict from the probes), (c) whether urandom ELOOP is gone.
 - Remaining hypothesis queue: property-service real-bind (sockaddr rewrite to {rootfs}/dev/socket/property_service) once the spinning fd is confirmed to be the property socket; adbd env/preload differential; fb0 render pipeline after recovery survives its event loop.
+
+FIXUP (6-Z161): compile fix — the spin_diag_readlink_fd helper was module-level
+but called the loop-local `log` closure (E0425, run 32988374421 build job
+98239830879). The helper now RETURNS Option<String>; both call sites do
+`if let Some(msg) = ... { log(&msg); }` (if-let, not .map, to stay
+clippy -D warnings clean).

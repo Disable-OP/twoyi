@@ -4100,35 +4100,35 @@ fn read_child_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> 
 }
 
 /// 6-Z161: parent-side fd-identity probe — readlink(/proc/<pid>/fd/<fd>)
-/// and log the backing object ONCE per (pid, fd) pair. The tracer runs
-/// as the child's parent (same uid), so /proc/<pid>/fd/<fd> symlinks are
-/// readable. `seen` dedupes so a 60k-iteration spin logs each identity
-/// at most once. Pure diagnostics — no behaviour change.
+/// and return a log line for the backing object, ONCE per (pid, fd)
+/// pair. The tracer runs as the child's parent (same uid), so
+/// /proc/<pid>/fd/<fd> symlinks are readable. `seen` dedupes so a
+/// 60k-iteration spin logs each identity at most once. Returns `None`
+/// when the pair was already reported (or fd < 0). Pure diagnostics —
+/// no behaviour change. NOTE: returns the MESSAGE instead of logging
+/// directly because the module-level logger here is the `info!` macro
+/// while the hot loop uses its own `log` closure — the caller decides.
 fn spin_diag_readlink_fd(
     pid: libc::pid_t,
     fd: i64,
     seen: &mut std::collections::HashSet<(libc::pid_t, i64)>,
-) {
+) -> Option<String> {
     if fd < 0 {
-        return;
+        return None;
     }
     if !seen.insert((pid, fd)) {
-        return; // already logged this (pid, fd) pair
+        return None; // already reported this (pid, fd) pair
     }
     let link = format!("/proc/{}/fd/{}", pid, fd);
     match std::fs::read_link(&link) {
-        Ok(target) => {
-            log(&format!(
-                "6-Z161 fd identity: /proc/{}/fd/{} -> {:?}",
-                pid, fd, target
-            ));
-        }
-        Err(e) => {
-            log(&format!(
-                "6-Z161 fd identity: readlink /proc/{}/fd/{} failed: {}",
-                pid, fd, e
-            ));
-        }
+        Ok(target) => Some(format!(
+            "6-Z161 fd identity: /proc/{}/fd/{} -> {:?}",
+            pid, fd, target
+        )),
+        Err(e) => Some(format!(
+            "6-Z161 fd identity: readlink /proc/{}/fd/{} failed: {}",
+            pid, fd, e
+        )),
     }
 }
 
@@ -10561,7 +10561,11 @@ pub fn run_ptrace_loop(
                                     get_syscall_arg(&regs, abi.reg_arg4),
                                     spin_diag_accept4_count
                                 ));
-                                spin_diag_readlink_fd(pid, acc_fd, &mut spin_diag_seen_fds);
+                                if let Some(msg) =
+                                    spin_diag_readlink_fd(pid, acc_fd, &mut spin_diag_seen_fds)
+                                {
+                                    log(&msg);
+                                }
                             }
                         } else if syscall_num == 22 || syscall_num == 281 || syscall_num == 319 {
                             pending_epoll_readback.insert(
@@ -13674,11 +13678,13 @@ pub fn run_ptrace_loop(
                                                     " data={:#x} (fd hint {})",
                                                     data, data as i64
                                                 ));
-                                                spin_diag_readlink_fd(
+                                                if let Some(msg) = spin_diag_readlink_fd(
                                                     pid,
                                                     data as i64,
                                                     &mut spin_diag_seen_fds,
-                                                );
+                                                ) {
+                                                    log(&msg);
+                                                }
                                             }
                                         }
                                     } else {
