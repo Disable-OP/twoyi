@@ -96,3 +96,4 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
+scripts/__pycache__/

@@ -6328,46 +6328,64 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
-        // ── 6-Z159: adaptive /dev/urandom + /dev/random ──────────────
+        // ── 6-Z161: /dev/urandom + /dev/random — REGULAR FILES with real
+        // entropy, ALWAYS ─────────────────────────────────────────────
         //
-        // On the arm64 redroid runner the plain symlink
-        // {rootfs}/dev/urandom -> /dev/urandom hit ELOOP when the guest
-        // opened the translated path (run 32976478078 kmsg stub:
-        // 'Failed to open /dev/urandom: Too many symbolic links
-        // encountered' — twice; init's RNG seeding then silently
-        // degraded). On the x86 emulator host the same symlink works,
-        // so: create the symlink, TEST-OPEN it in THIS context, and
-        // fall back to a regular empty file when traversal fails (the
-        // proven /dev/hw_random precedent — reads return EOF, callers
-        // treat it as 'no entropy source' and continue).
-        for (rel, target) in [
-            ("dev/urandom", "/dev/urandom"),
-            ("dev/random", "/dev/random"),
-        ] {
-            let link_path = format!("{}/{}", rootfs_prefix, rel);
-            let _ = std::fs::remove_file(&link_path);
-            let mut usable = false;
-            if symlink(target, &link_path).is_ok() {
-                usable = std::fs::File::open(&link_path).is_ok();
-            }
-            if !usable {
-                let _ = std::fs::remove_file(&link_path);
-                let replaced = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .mode(0o666)
-                    .open(&link_path);
-                match replaced {
-                    Ok(_) => warning!(
-                        "[KR64] PARENT: 6-Z159: {} -> {} symlink failed test-open (ELOOP/EACCES in this context) — replaced with a regular empty file (hw_random precedent)",
-                        link_path, target
-                    ),
-                    Err(e) => warning!(
-                        "[KR64] PARENT: 6-Z159: could not create {} at all: {}",
-                        link_path, e
-                    ),
+        // 6-Z159's "adaptive symlink" approach FAILED on the arm64
+        // redroid runner (run 32983937665, SHA 3481022 — which INCLUDES
+        // the 6-Z159 fix): init still logged 'Failed to open
+        // /dev/urandom: Too many symbolic links encountered' TWICE.
+        // The parent's post-symlink test-open ran in the PARENT's
+        // context (no chroot/mount-ns) and succeeded, so the symlink
+        // was kept — but the CHILD resolves the absolute symlink target
+        // in a DIFFERENT context (the guest's jailed root), where
+        // /dev/urandom points back into {rootfs}/dev/urandom → ELOOP.
+        // A parent-side test-open can never prove what the CHILD will
+        // see; stop trying. Regular files are context-proof: no
+        // symlink traversal at all.
+        //
+        // Entropy: the parent reads 4096 bytes from the HOST's real
+        // /dev/urandom (world-readable — works in both the KVM root
+        // context and the redroid untrusted_app context) and writes
+        // them into the file. TWRP init reads /dev/urandom ONCE to
+        // seed its RAND (the kmsg shows it opens + reads + continues
+        // after the current failure); 4 KiB of genuine entropy is
+        // more than enough for that. If the parent's own urandom read
+        // fails (paranoia), fall back to an empty file — EOF, the
+        // proven hw_random precedent (init logs + continues).
+        for rel in ["dev/urandom", "dev/random"] {
+            let file_path = format!("{}/{}", rootfs_prefix, rel);
+            let _ = std::fs::remove_file(&file_path);
+            let entropy: Vec<u8> = std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| {
+                    use std::io::Read;
+                    let mut buf = vec![0u8; 4096];
+                    f.read_exact(&mut buf).map(|_| buf)
+                })
+                .unwrap_or_default();
+            let wrote = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o666)
+                .open(&file_path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, &entropy));
+            match wrote {
+                Ok(_) => {
+                    let _ = std::fs::set_permissions(
+                        &file_path,
+                        std::fs::Permissions::from_mode(0o666),
+                    );
+                    info!(
+                        "[KR64] PARENT: 6-Z161: {} pre-created as a REGULAR FILE with {} bytes of real host entropy (no symlink — ELOOP-proof in every child context)",
+                        file_path,
+                        entropy.len()
+                    );
                 }
+                Err(e) => warning!(
+                    "[KR64] PARENT: 6-Z161: could not create {} : {}",
+                    file_path, e
+                ),
             }
         }
 
@@ -7291,7 +7309,16 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 // it so any pre-init.rc code that needs /sbin libs can
                 // find them (e.g. /sbin/linker for dynamically-linked
                 // /sbin/recovery which has interpreter /sbin/linker).
-                CString::new("LD_LIBRARY_PATH=/sbin:/system/lib").unwrap(),
+                // 6-Z161: append :/system/lib64 — the angler recovery is
+                // arm64 (PT_INTERP /sbin/linker64, ELF64) and its libs
+                // resolve from /sbin first, but adbd + any other dynamic
+                // service that inherits THIS env needs the 64-bit dir in
+                // the search path as the fallback (run 32983937665:
+                // "Service 'adbd' (pid 2620) exited with status 1" —
+                // every instant exit-1 is a linker failure family
+                // symptom; the x86-era "/sbin:/system/lib" value left
+                // the arm64 service with NO 64-bit fallback dir).
+                CString::new("LD_LIBRARY_PATH=/sbin:/system/lib:/system/lib64").unwrap(),
                 twoyi_rootfs_env,
             ]
         } else {

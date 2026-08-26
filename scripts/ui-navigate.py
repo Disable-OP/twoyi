@@ -1339,13 +1339,96 @@ def main():
         ("rootfs/dev/__kmsg__", "kmsg-stub.txt"),
         ("rootfs/sys/fs/selinux/null", "selinux-null-stub.txt"),
         ("rootfs/sys/fs/selinux/enforce", "selinux-enforce-stub.txt"),
-        (".twoyi-staged", "staged-exes.txt"),
+        # 6-Z162 FIX: the staged-exe marker lives INSIDE the rootfs
+        # (rootfs/.twoyi-staged — see ptrace_emu::staged_exes_marker_path).
+        # The pre-6-Z162 path (.twoyi-staged, relative to the data dir)
+        # NEVER existed, which is why staged-exes.txt was silently
+        # missing from every artifact since 6-Z158.
+        ("rootfs/.twoyi-staged", "staged-exes.txt"),
+        # 6-Z162: the app-side tee of the tracer log + the ramdisk's own
+        # init-diag file (62 bytes on run 32983937665, never pulled).
+        ("rootfs/twrp-init.log", "twrp-init-rootfs.txt"),
+        ("rootfs/twrp-cmdline", "twrp-cmdline.txt"),
     ]:
         out = adb_shell(f"run-as {PACKAGE} cat {remote}", timeout=60)
         if out:
             with open(os.path.join(ART, local), "w", errors="replace") as f:
                 f.write(out)
             print(f"  pulled rootfs evidence: {remote} -> {local} ({len(out)} bytes)")
+
+    # ── 6-Z162: directory listings that settle linker questions ──────
+    # Run 32983937665: "Service 'recovery' (pid 2619/2641) exited with
+    # status 1" + "Service 'adbd' ... exited with status 1" — the instant
+    # exit-1 family is a dynamic-linker failure symptom, but we could
+    # never SEE /sbin's contents (does linker64 exist? libc.so? which
+    # libs did the angler ramdisk ship?). These listings answer that in
+    # one run. All failure-tolerant: a missing dir just yields an error
+    # string in the file (still evidence).
+    for remote, local in [
+        ("ls -la rootfs/sbin/", "sbin-contents.txt"),
+        ("ls -la rootfs/tmp/ rootfs/lib64/ rootfs/system/lib/ 2>&1", "tmp-lib-dirs.txt"),
+        ("ls -la rootfs/system/lib64/ 2>&1 | head -60", "system-lib64.txt"),
+        ("ls -la rootfs/etc/ 2>&1 | head -40", "etc-contents.txt"),
+    ]:
+        out = adb_shell(f"run-as {PACKAGE} sh -c '{remote}'", timeout=60)
+        if out:
+            with open(os.path.join(ART, local), "w", errors="replace") as f:
+                f.write(out)
+            print(f"  pulled listing: {remote} -> {local} ({len(out)} bytes)")
+
+    # ── 6-Z162: manual service-exec probes — the definitive ──────────
+    # exit-1 diagnosis. The guest's services die inside the jail where
+    # their stderr is invisible — but the tracer's STAGED copies in
+    # cache/twoyi_stage/ are exec-allowed AND their PT_INTERP is already
+    # rewritten to the HOST-absolute rootfs linker64 (Task 6-Z50/6-Z157),
+    # so run-as can exec them DIRECTLY. The bionic linker then prints
+    # "CANNOT LINK"/"library 'X' not found"/"cannot locate symbol"
+    # straight to OUR captured stderr — the exact lines the jail swallows.
+    # NOTE: a fresh `cp` of rootfs/sbin/<bin> would NOT work — its
+    # PT_INTERP is still the GUEST-absolute /sbin/linker64, which does
+    # not exist outside the jail (execve → ENOENT). Only the marker's
+    # staged entries are patched.
+    # toybox `timeout` bounds each probe so a probe that actually RUNS
+    # (recovery may sit in its event loop for its whole lifetime) cannot
+    # hang the step.
+    staged_marker = adb_shell(f"run-as {PACKAGE} cat rootfs/.twoyi-staged", timeout=30) or ""
+    staged_pairs = []  # [(guest_path, cache_path)]
+    for line in staged_marker.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) == 2 and parts[0].startswith("/") and parts[1].startswith("/"):
+            staged_pairs.append((parts[0], parts[1]))
+    with open(os.path.join(ART, "service-exec-probe-MARKER.txt"), "w", errors="replace") as f:
+        f.write(staged_marker or "(marker missing/empty)\n")
+
+    base_env = (
+        "LD_LIBRARY_PATH=/data/user/0/{pkg}/rootfs/sbin:"
+        "/data/user/0/{pkg}/rootfs/system/lib:"
+        "/data/user/0/{pkg}/rootfs/system/lib64; "
+        "PATH=/data/user/0/{pkg}/rootfs/sbin:/data/user/0/{pkg}/rootfs/system/bin; "
+        "TWOYI_ROOTFS=/data/user/0/{pkg}/rootfs"
+    ).format(pkg=PACKAGE)
+    preload_env = (
+        "LD_PRELOAD=/data/user/0/" + PACKAGE + "/rootfs/sbin/libtwrp_fb_hook.so; " + base_env
+    )
+    # Probe targets: every staged exe whose guest path matches the dying
+    # services (recovery, adbd, ueventd...). The nopreload differential
+    # variant rules the fb-hook in/out as the loader failure source.
+    wanted = [p for p in staged_pairs if p[0].endswith(
+        ("/sbin/recovery", "/sbin/adbd", "/sbin/ueventd", "/sbin/linker64"))]
+    for guest_path, cache_path in wanted:
+        base = guest_path.rsplit("/", 1)[-1]
+        for variant, env_str in [("", preload_env), ("-nopreload", base_env)]:
+            label = f"{base}{variant}"
+            cmd = (
+                f"run-as {PACKAGE} sh -c 'ls -la {cache_path}; "
+                f"{env_str} timeout 8 {cache_path} 2>&1; "
+                f"echo PROBE_EXIT_CODE:$?'"
+            )
+            out = adb_shell(cmd, timeout=30)
+            with open(os.path.join(ART, f"service-exec-probe-{label}.txt"), "w",
+                      errors="replace") as f:
+                f.write(f"$ {cmd}\n{out or '(no output)'}\n")
+            print(f"  probe {label}: captured ({len(out or '')} bytes)")
 
     # Pull the TWRP diagnostic logs.
     #

@@ -10575,3 +10575,29 @@ Stage Summary:
     3. **Build a separate x86_64 twoyi binary as well + run the existing x86_64 ui-e2e-test.yml / ui-e2e-aosp.yml workflows as the ARM64 "build-it-and-verify-the-build-succeeds" gate** (drop the "run it on an arm64 emulator" goal — the existing x86_64 E2E workflows already prove the arm64-v8a APK is functionally correct because the rust + cpp + java sources are arch-agnostic). This is the most honest path: arm64-v8a APK packaging parity (✓ build succeeds), but no arm64-v8a runtime parity (because there is no way to run it on GitHub-hosted x86_64 runners without a real arm64 host).
   - **FALSE-GREEN CHECK**: This P-4 poller verified the actual failure (status=completed, conclusion=failure, step 15 exit code 1, FATAL emulator message present, NO `Final activity: NexusLauncherActivity` line ever reached, NO `ABORTING` assertion triggered). This is NOT a repeat of the 32886902337 false-green — both runs are honestly marked failure and the root cause is the emulator-arch mismatch, not a script-bug cover-up.
 
+
+---
+Task ID: 6-Z161 + 6-Z162
+Agent: main (continuation session)
+Task: Continue the TWRP-on-arm64-redroid boot loop — analyze run 32983937665 (SHA 3481022, latest), fix what the evidence proves, upgrade the evidence pipeline.
+
+Work Log:
+- Read the full evidence from run 32983937665 artifacts (kmsg-stub, kr64.log 126k lines, rootfs listing):
+  - The 6-Z160a writev capture WORKS — init's full boot story is now visible (rc parsing, property loading, service starts).
+  - HARD BLOCKER: `Service 'recovery' (pid 2619/2641) exited with status 1` + `Service 'adbd' (pid 2620) exited with status 1` — init's OWN service forks die instantly (exit-1 family = dynamic-linker failure symptoms), init restart-loops them forever.
+  - BUT the PROACTIVE 6-Z49 recovery child (pid 2606) exec'd successfully (linker ran, found /system/bin/linker64 + /system/lib64/libc.so) and stayed ALIVE 159,823 traced syscalls, then exit_group(0xffffffff)=255 at teardown. THE SCREEN STAYED BLACK the whole window.
+  - THE SPIN: 60,117× epoll_pwait(nr=22)→1 ready + 60,117× accept4(nr=242)→-EINVAL, starting at recovery post-execve syscall #1317 — BEFORE recovery ever opened /dev/graphics/fb0. Hypothesis: a real unix socket that was never LISTENed (6-Z3/6-Z101 fake-success bind/listen for property_service) reports EPOLLHUP every epoll_pwait while accept4 returns EINVAL. The spinning fd's IDENTITY was never observed — 6-Z161 DIAG pins it.
+  - /dev/urandom ELOOP PERSISTS despite 6-Z159: the parent-side symlink test-open succeeds in the PARENT context but the CHILD resolves the absolute symlink in the jailed root → ELOOP. A parent-side test can never prove child-side resolution.
+  - staged-exes.txt was silently missing since 6-Z158: the pull used `.twoyi-staged` but the marker lives at `rootfs/.twoyi-staged`.
+
+Changes (6-Z161, kr64):
+- ptrace_emu.rs (+ mirror twoyi/ptrace_emu.rs): spin-fd DIAG — accept4 family ENTRY logs fd+flags+readlink(/proc/pid/fd/N) identity (first 24, deduped); epoll_pwait family ENTRY records (nr, events buf, maxevents), EXIT decodes the first ready epoll_event's events mask + data word (class-aware 12/16-byte layout) + fd identity. ZERO behaviour change.
+- lib.rs: /dev/urandom + /dev/random are now ALWAYS regular files pre-filled with 4096 bytes of real host entropy (no symlink, ELOOP-proof in every child context; parent reads host /dev/urandom pre-fork).
+- lib.rs: TWRP guest env LD_LIBRARY_PATH now /sbin:/system/lib:/system/lib64 (arm64 services had NO 64-bit fallback dir).
+
+Changes (6-Z162, E2E):
+- ui-navigate.py: fixed the staged-exes marker path; added pulls for rootfs/twrp-init.log + twrp-cmdline; added sbin/tmp/lib64/system-lib64/etc listings; added MANUAL SERVICE-EXEC PROBES — exec the tracer's PT_INTERP-patched staged copies (recovery/adbd/ueventd/linker64 from the marker) via run-as with the service env (±LD_PRELOAD differential, toybox timeout 8) so the bionic linker prints CANNOT-LINK errors straight into the artifacts — the definitive exit-1 diagnosis.
+
+Stage Summary:
+- Commit ready: 6-Z161 (DIAG + urandom fix + env lib64) + 6-Z162 (evidence). Next run decides: (a) which fd spins (accept4 readback names it), (b) WHY init's service forks exit 1 (linker verdict from the probes), (c) whether urandom ELOOP is gone.
+- Remaining hypothesis queue: property-service real-bind (sockaddr rewrite to {rootfs}/dev/socket/property_service) once the spinning fd is confirmed to be the property socket; adbd env/preload differential; fb0 render pipeline after recovery survives its event loop.
