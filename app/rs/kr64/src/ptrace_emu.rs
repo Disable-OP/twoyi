@@ -8351,6 +8351,8 @@ pub fn run_ptrace_loop(
     // diverge from what the jailed child actually saw).
     let mut twres_diag_count: u64 = 0;
     let mut twres_dir_dumped: bool = false;
+    // 6-Z170: stat-family +1-rewrite counter (first 20 logged).
+    let mut stat_read_fail_rw_count: u64 = 0;
     // 6-Z164: FAILED-/tmp-open DIAG counter. The 6-Z163f arm above only
     // fires on ret >= 0 — run 32996812991 logged ZERO 6-Z163f lines while
     // the fb_hook printed fd=-1 for the jailed /tmp/recovery.log opens:
@@ -11922,23 +11924,51 @@ pub fn run_ptrace_loop(
                                 // read_child_string FAILED on the path
                                 // register (PTRACE_PEEKDATA EIO — the same
                                 // failure the DIAG write buffer readbacks
-                                // showed in run 32996812991). The open will
-                                // now run UNTRANSLATED against the host
-                                // (redroid /tmp is not app-writable →
-                                // fd=-1, exactly what the fb_hook printed
-                                // for /tmp/recovery.log). Log it so the
-                                // next run can correlate these with the
-                                // hook's fd=-1 lines.
+                                // showed in run 32996812991). Historically
+                                // the open then ran UNTRANSLATED against
+                                // the host (redroid /twres, /etc/* → ENOENT
+                                // — exactly the run-33008669118 /twres
+                                // mystery: files present, loads failing,
+                                // PageManager reads via bionic-INTERNAL
+                                // openat so not even the fb_hook's PLT
+                                // wrapper sees them).
+                                //
+                                // ── 6-Z170: THE +1-POINTER cwd-relative
+                                // REWRITE ── THE wholesale fix for the
+                                // PEEK-blind open class — needs ZERO
+                                // memory reads: rewrite dirfd := AT_FDCWD
+                                // and path := path_addr + 1 (the kernel
+                                // reads the SAME string one byte deeper,
+                                // skipping the leading '/'), so an
+                                // absolute "/twres/splash.xml" resolves as
+                                // the cwd-relative "twres/splash.xml"
+                                // against the child's cwd — WHICH IS THE
+                                // ROOTFS. Never worse than the status quo:
+                                // a non-absolute path or a chdir'd child
+                                // just fails the way it already did.
+                                let rewrite_ok = {
+                                    let path_arg = if syscall_num == abi.open {
+                                        abi.reg_arg1
+                                    } else {
+                                        abi.reg_arg2
+                                    };
+                                    if syscall_num == abi.openat || syscall_num == abi.openat2 {
+                                        set_syscall_arg(&mut regs, abi.reg_arg1, (-100i64) as u64);
+                                    }
+                                    set_syscall_arg(&mut regs, path_arg, path_addr + 1);
+                                    ptrace_setregs(pid, &regs, iov_len).is_ok()
+                                };
                                 open_read_fail_diag_count =
                                     open_read_fail_diag_count.saturating_add(1);
-                                if open_read_fail_diag_count <= 12 {
+                                if open_read_fail_diag_count <= 60 {
                                     let peek_err = peek_word_errno(pid, path_addr);
                                     log(&format!(
-                                        "6-Z164: open ENTRY path-read FAILED pid={} nr={} path_addr={:#x} peek_errno={} — open runs UNTRANSLATED against the host (occurrence {})",
+                                        "6-Z170: open ENTRY path-read FAILED pid={} nr={} path_addr={:#x} peek_errno={} — rewrote to cwd-relative +1 ({}), kernel resolves against the rootfs cwd (occurrence {})",
                                         pid,
                                         syscall_num,
                                         path_addr,
                                         peek_err,
+                                        if rewrite_ok { "OK" } else { "SETREGS FAILED" },
                                         open_read_fail_diag_count
                                     ));
                                     // 6-Z167: name the mapping class for the
@@ -12052,6 +12082,40 @@ pub fn run_ptrace_loop(
                                 {
                                     write_child_string(pid, path_addr, &translated);
                                 }
+                            } else if past_first_execve && path_addr != 0 {
+                                // ── 6-Z170: stat-family +1-pointer rewrite ──
+                                // Same PEEK-blind class as the open arm
+                                // (run 33008669118: PageManager's theme
+                                // loads never even REACHED an open — the
+                                // preceding stat/access failed untranslated
+                                // against the host). Rewrite the path
+                                // pointer +1 (skip the leading '/') and the
+                                // dirfd := AT_FDCWD for the *at variants —
+                                // the kernel then stats the cwd-relative
+                                // path against the child's cwd (the
+                                // rootfs) without the tracer ever reading
+                                // the string.
+                                let has_dirfd = syscall_num == abi.newfstatat
+                                    || syscall_num == abi.statx
+                                    || (abi.fstatat64_nr != -1
+                                        && syscall_num == abi.fstatat64_nr);
+                                if has_dirfd {
+                                    set_syscall_arg(&mut regs, abi.reg_arg1, (-100i64) as u64);
+                                }
+                                set_syscall_arg(&mut regs, path_arg_index, path_addr + 1);
+                                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                    stat_read_fail_rw_count =
+                                        stat_read_fail_rw_count.saturating_add(1);
+                                    if stat_read_fail_rw_count <= 20 {
+                                        log(&format!(
+                                            "6-Z170: stat-family ENTRY path-read FAILED pid={} nr={} path_addr={:#x} — rewrote to cwd-relative +1 (occurrence {})",
+                                            pid,
+                                            syscall_num,
+                                            path_addr,
+                                            stat_read_fail_rw_count
+                                        ));
+                                    }
+                                }
                             }
                         }
                         // ── Task 6-Z71: fstat64 (i386 nr=197) ENTRY →
@@ -12131,6 +12195,15 @@ pub fn run_ptrace_loop(
                                 {
                                     write_child_string(pid, path_addr, &translated);
                                 }
+                            } else if past_first_execve && path_addr != 0 {
+                                // 6-Z170: +1-pointer cwd-relative rewrite —
+                                // see the open arm (TWFunc::Path_Exists gates
+                                // theme loads via access()).
+                                if syscall_num == abi.faccessat {
+                                    set_syscall_arg(&mut regs, abi.reg_arg1, (-100i64) as u64);
+                                }
+                                set_syscall_arg(&mut regs, path_arg_index, path_addr + 1);
+                                let _ = ptrace_setregs(pid, &regs, iov_len);
                             }
                         }
                         n if n == abi.readlink || n == abi.readlinkat => {

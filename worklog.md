@@ -10888,3 +10888,37 @@ Stage Summary:
 - Next-run verdicts: (1) "6-Z169: RUNTIME .../twres listing" contents, (2) 6-Z169 open lines
   (translated path + errno), (3) twres-contents.txt artifact, (4) if files exist + opens
   translated-fine: instrument stat/access next.
+
+---
+Task ID: 6-Z170
+Agent: main
+Task: The +1-pointer cwd-relative rewrite — wholesale fix for the PEEK-blind open/stat class
+
+Evidence (run 33008669118 on 14f245a):
+- twres-keyfiles.txt: ALL FOUR theme files exist at pull time with EXACT pristine sizes
+  (splash 1341, ui 27480, portrait 186887, en.xml 50513) + full twres tree intact.
+- ZERO 6-Z169 lines + ZERO twres traces in the tracer log: the /twres opens NEVER produced a
+  pending translated path. The 12-cap on the 6-Z164 read-fail DIAG was consumed by EARLY
+  init-phase opens (pid 2595, one address class 0xffffd4aa9280) — the recovery-phase read
+  failures were INVISIBLE (cap blindness, third time a cap hid the story).
+- Mechanism (settled): PageManager loads via bionic-INTERNAL openat (fopen -> internal call,
+  never crosses the PLT — the fb_hook cannot see it). The openat's path register points into
+  the PEEK-blind class (heap/std::string buffers): PEEK EIO + PVM also fails → translation
+  skipped → the open runs UNTRANSLATED against the host → /twres/* ENOENT. The preceding
+  access()/stat() probes fail the same way (which is why splash.xml never even reached an open).
+
+Fix (6-Z170, ptrace_emu.rs) — THE +1-POINTER cwd-relative REWRITE (needs ZERO memory reads):
+- open/openat/openat2 ENTRY, path-read FAILED → rewrite dirfd := AT_FDCWD and path pointer :=
+  path_addr + 1. The kernel reads the SAME string one byte deeper (skipping the leading '/')
+  and resolves it RELATIVE to the child's cwd — WHICH IS THE ROOTFS. "/twres/splash.xml"
+  becomes "twres/splash.xml" → {rootfs}/twres/splash.xml. Never worse than status quo: a
+  relative path or a chdir'd child merely fails as it already did.
+- Same rewrite for the stat family (stat/lstat/stat64/lstat64/newfstatat/fstatat64/statx) and
+  access/faccessat (TWFunc::Path_Exists gates theme loads).
+- Read-fail DIAG cap raised 12 → 60 (so later phases stay visible); the 6-Z164 line renamed
+  6-Z170 and reports the rewrite verdict.
+
+Stage Summary:
+- Every jail-visible blocker is now either fixed honestly (mounts -ENODEV) or bypassed without
+  reading child memory (+1 rewrite + hook prefix retry). Expected next run: theme loads
+  succeed → PageManager ui.xml → minui render on the pre-created fb0 → FIRST PIXELS.
