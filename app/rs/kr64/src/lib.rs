@@ -4821,6 +4821,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 e
             );
         }
+        // 6-Z171c: /dev/ashmem + /dev/pmsg0 stand-ins (regular files) so
+        // minui's opens succeed; the hook fakes the ASHMEM_* ioctls.
+        if let Err(e) = devices::create_twrp_misc_devs(&rootfs_prefix) {
+            warning!(
+                "[KR64] PARENT: failed to create TWRP misc devs (/dev/ashmem,/dev/pmsg0): {}",
+                e
+            );
+        }
     }
 
     // TWRP BOOT: pre-create {rootfs}/dev/input/event0 + event1 as EMPTY
@@ -7320,6 +7328,25 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 // symptom; the x86-era "/sbin:/system/lib" value left
                 // the arm64 service with NO 64-bit fallback dir).
                 CString::new("LD_LIBRARY_PATH=/sbin:/system/lib:/system/lib64").unwrap(),
+                // 6-Z171b: native-resolution passthrough. The TWRP child's
+                // libtwrp_fb_hook.so reads TWOYI_FB_WIDTH/TWOYI_FB_HEIGHT at
+                // first use and synthesizes FBIOGET_VSCREENINFO /
+                // FBIOGET_FSCREENINFO geometry to MATCH — no compile-time
+                // hardcode anywhere in the chain (Java auto-detect ->
+                // renderer_init -> core.rs --width/--height -> kr64 cfg ->
+                // here + create_twrp_framebuffer's file size). Values <= 0
+                // (unset) pass redroid's own default panel (320x640) so the
+                // hook's fallback and the fb0 file size always agree.
+                CString::new(format!(
+                    "TWOYI_FB_WIDTH={}",
+                    if cfg.width > 0 { cfg.width } else { 320 }
+                ))
+                .unwrap(),
+                CString::new(format!(
+                    "TWOYI_FB_HEIGHT={}",
+                    if cfg.height > 0 { cfg.height } else { 640 }
+                ))
+                .unwrap(),
                 twoyi_rootfs_env,
             ]
         } else {

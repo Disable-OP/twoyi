@@ -220,6 +220,19 @@ static long raw_syscall1(long num, long a) {
     return x0;
 }
 
+static long raw_syscall2(long num, long a, long b) {
+    register long x8 __asm__("x8") = num;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1)
+        : "memory"
+    );
+    return x0;
+}
+
 static long raw_syscall3(long num, long a, long b, long c) {
     register long x8 __asm__("x8") = num;
     register long x0 __asm__("x0") = a;
@@ -290,6 +303,23 @@ static void write_hex(int fd, unsigned int val) {
     write_str(fd, &buf[i]);
 }
 
+// 64-bit hex formatter — aarch64 code addresses exceed 32 bits, so the
+// abort()/__assert2 interposition (6-Z171) needs this to print caller PCs.
+static void write_hex64(int fd, unsigned long long val) {
+    char buf[19];
+    int i = (int)sizeof(buf);
+    buf[--i] = '\0';
+    if (val == 0) {
+        buf[--i] = '0';
+    } else {
+        const char *hexd = "0123456789abcdef";
+        while (val) { buf[--i] = hexd[val & 0xf]; val >>= 4; }
+    }
+    buf[--i] = 'x';
+    buf[--i] = '0';
+    write_str(fd, &buf[i]);
+}
+
 static void write_num(int fd, int v) {
     char buf[16];
     int i = (int)sizeof(buf);
@@ -304,6 +334,68 @@ static void write_num(int fd, int v) {
     }
     (void)raw_syscall3(SYS_write, fd, (long)&buf[i], (long)(sizeof(buf) - (size_t)i));
 }
+
+// ---------------------------------------------------------------------------
+// 6-Z171b: RUNTIME screen geometry (native-resolution support).
+//
+// The compile-time 320x640 hardcode forced the TWRP container to a fixed
+// size no matter what screen the host Android actually has. The resolution
+// chain is now:
+//
+//   Java ProfileSettings (auto-detect via DisplayMetrics, or the user's
+//   per-profile override) → renderer_init(width,height) → core.rs
+//   --width/--height → kr64 cfg → {rootfs}/dev/graphics/fb0 file size AND
+//   the TWOYI_FB_WIDTH/TWOYI_FB_HEIGHT env vars on the TWRP child → THIS
+//   hook reads them at first use and reports matching FBIOGET_VSCREENINFO /
+//   FBIOGET_FSCREENINFO geometry.
+//
+// Fallback (env missing, e.g. very old kr64): 320x640 — redroid's own
+// default panel, so the old behavior is preserved exactly.
+// ---------------------------------------------------------------------------
+#define TWRP_FB_WIDTH          320   /* fallback only — see fb_geometry_init */
+#define TWRP_FB_HEIGHT         640   /* fallback only — see fb_geometry_init */
+#define TWRP_FB_BPP            32
+#define TWRP_FB_BYTES_PER_PIX  4
+static int g_fb_rt_w = 0;
+static int g_fb_rt_h = 0;
+
+static int my_atoi_pos(const char *s) {
+    if (!s) return 0;
+    int v = 0;
+    int seen = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (v < 100000) v = v * 10 + (*s - '0');
+        s++;
+        seen = 1;
+    }
+    return seen ? v : 0;
+}
+
+static void fb_geometry_init(void) {
+    if (g_fb_rt_w > 0) return; /* already initialized */
+    g_fb_rt_w = TWRP_FB_WIDTH;
+    g_fb_rt_h = TWRP_FB_HEIGHT;
+    if (getenv) {
+        int w = my_atoi_pos(getenv("TWOYI_FB_WIDTH"));
+        int h = my_atoi_pos(getenv("TWOYI_FB_HEIGHT"));
+        if (w > 0 && h > 0) {
+            g_fb_rt_w = w;
+            g_fb_rt_h = h;
+            write_str(2, "[twrp_fb_hook] geometry from env: ");
+            write_num(2, w); write_str(2, "x"); write_num(2, h);
+            write_str(2, "\n");
+            return;
+        }
+    }
+    write_str(2, "[twrp_fb_hook] geometry: env missing -> fallback ");
+    write_num(2, g_fb_rt_w); write_str(2, "x"); write_num(2, g_fb_rt_h);
+    write_str(2, "\n");
+}
+
+static int fb_w(void)  { fb_geometry_init(); return g_fb_rt_w; }
+static int fb_h(void)  { fb_geometry_init(); return g_fb_rt_h; }
+static long fb_line_length(void) { return (long)fb_w() * TWRP_FB_BYTES_PER_PIX; }
+static long fb_smem_len(void)    { return (long)fb_w() * (long)fb_h() * TWRP_FB_BYTES_PER_PIX; }
 
 // ---------------------------------------------------------------------------
 // Framebuffer fd tracking.
@@ -341,6 +433,95 @@ static int is_fb_path(const char *path) {
     if (my_strcmp(path, "/dev/graphics/fb0") == 0) return 1;
     if (my_strcmp(path, "/dev/fb0") == 0) return 1;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 6-Z171c: /dev/ashmem support (regular file + faked ioctls).
+//
+// Run 33010273952 (arm64): right after the splash asset loads, recovery
+// opened "/dev/ashmem" -> fd=-1 and "/dev/pmsg0" -> fd=-1, then the child
+// SELF-ABORTED (tgkill SIGABRT) inside minui gr_init. Many TWRP builds'
+// graphics backends allocate the backbuffer via ashmem; the ENOENT on
+// /dev/ashmem is a prime abort suspect. kr64 now pre-creates BOTH files
+// as app-owned regular files; we mark successful ashmem opens and fake
+// the ASHMEM_* ioctl protocol on them:
+//   - ASHMEM_SET_SIZE  -> ftruncate the backing file to the size (so the
+//     caller's later mmap(len, MAP_SHARED, fd) has a big-enough file) + 0
+//   - ASHMEM_GET_SIZE  -> the last SET_SIZE value
+//   - SET_NAME / SET_PROT_MASK / PIN / UNPIN -> 0
+// The mmap itself is NOT touched: on aarch64 the tracer does not rewrite
+// file-backed MAP_SHARED (that rewrite is i386-only), so the mapping is
+// a real file-backed one and shared-memory semantics "just work" for a
+// single-process user (minui).
+//
+// ioctl numbers: bionic's ashmem.h builds them with _IOW(0x77, nr, T),
+// so the size field differs between 32-bit (i386: 0x400877xx) and 64-bit
+// (aarch64: 0x401077xx for pointer/long-sized args). We accept BOTH.
+// ---------------------------------------------------------------------------
+#define ASHMEM_NAME        0x7701
+#define ASHMEM_SET_NAME    0x7702
+#define ASHMEM_SET_SIZE    0x7703
+#define ASHMEM_GET_SIZE    0x7704
+#define ASHMEM_SET_PROT_MASK 0x7705
+static unsigned char g_ash_fds[(TWRP_FB_MAX_FD + 7) / 8];
+static long g_ash_size[TWRP_FB_MAX_FD]; /* last SET_SIZE per fd (page-rounded file len) */
+
+static void ash_fd_mark(int fd) {
+    if (fd < 0 || fd >= TWRP_FB_MAX_FD) return;
+    g_ash_fds[fd >> 3] |= (unsigned char)(1u << (fd & 7));
+    g_ash_size[fd] = 0;
+}
+static int ash_fd_is_tracked(int fd) {
+    if (fd < 0 || fd >= TWRP_FB_MAX_FD) return 0;
+    return (g_ash_fds[fd >> 3] >> (fd & 7)) & 1;
+}
+static void ash_fd_clear(int fd) {
+    if (fd < 0 || fd >= TWRP_FB_MAX_FD) return;
+    g_ash_fds[fd >> 3] &= (unsigned char)~(1u << (fd & 7));
+}
+
+static int is_ashmem_path(const char *path) {
+    if (!path) return 0;
+    if (my_strcmp(path, "/dev/ashmem") == 0) return 1;
+    return 0;
+}
+
+// Strip the _IOC size/dir bits: keep type (0x77) + nr. Returns 0 if the
+// request is not an ashmem-family ioctl at all.
+static unsigned ash_req_nr(unsigned req) {
+    if (((req >> 8) & 0xff) != 0x77) return 0;
+    return req & 0xff;
+}
+
+// Handle one ioctl on a tracked ashmem fd. Returns the ioctl return value,
+// or -2 when the request is not ashmem-family (caller passes through).
+static int ashmem_ioctl(int fd, unsigned req, unsigned long arg) {
+    unsigned nr = ash_req_nr(req);
+    if (!nr) return -2;
+    switch (nr) {
+        case 0x03: { /* ASHMEM_SET_SIZE: arg IS the size (by value) */
+            long size = (long)arg;
+            if (size < 0) size = 0;
+            long fl = (long)raw_syscall3(SYS_fcntl, fd, 4 /*F_SETFL*/, 0);
+            (void)fl;
+            long r = raw_syscall3(SYS_ftruncate, fd, size, 0);
+            g_ash_size[fd >= 0 && fd < TWRP_FB_MAX_FD ? fd : 0] = size;
+            write_str(2, "[twrp_fb_hook] ashmem SET_SIZE(");
+            write_num(2, (int)size);
+            write_str(2, ") ftruncate -> ");
+            write_num(2, (int)r);
+            write_str(2, "\n");
+            return 0;
+        }
+        case 0x04: /* ASHMEM_GET_SIZE */
+            return (fd >= 0 && fd < TWRP_FB_MAX_FD) ? (int)g_ash_size[fd] : 0;
+        case 0x01: case 0x02: case 0x05: /* NAME / SET_NAME / SET_PROT_MASK */
+        case 0x06: case 0x07: case 0x08: case 0x09: case 0x0a: case 0x0b:
+        case 0x0c: case 0x0d: /* PIN / UNPIN / GET_PIN / PURGE / ... */
+            return 0;
+        default:
+            return 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -482,21 +663,34 @@ static int rootfs_retry_open(const char *path, int abs_fd, int flags, int mode) 
 #define INBR_BTN_TOOL_FINGER     0x145  /* 325 */
 #define INBR_BTN_TOUCH           0x14a  /* 330 */
 
-// Virtual touch panel extents — MUST MATCH TWRP_FB_WIDTH/HEIGHT (320x640;
-// the host SurfaceView feeds the same coordinate space, so we only CLAMP).
-#define INBR_MAX_X               319
-#define INBR_MAX_Y               639
+// Virtual touch panel extents — RUNTIME (6-Z171b): must match the fb
+// geometry (fb_w()-1 / fb_h()-1) so minui's EVIOCGABS abs_max and the
+// incoming host coordinates live in the SAME native-resolution space as
+// the rendered framebuffer. (Was a hardcoded 319/639.)
+#define INBR_MAX_X               (fb_w() - 1)
+#define INBR_MAX_Y               (fb_h() - 1)
+
+// struct input_event layout is ARCH-DEPENDENT (6-Z171c fix):
+//   i386:    timeval = 2×u32 (8B) + type u16 + code u16 + value s32 = 16B
+//   aarch64: timeval = 2×s64 (16B) + type u16 + code u16 + value s32 = 24B
+// minui read()s sizeof(struct input_event) per event — feeding an arm64
+// child 16-byte i386 frames misaligns EVERY type/code/value (garbage
+// events, no touches recognized). The header (timeval) is always zeroed
+// by us, so the only layout difference that matters is the TOTAL size
+// and the offset of type/code/value (always at INBR_EV_SIZE-8/-6/-4).
+#if defined(__aarch64__)
+  #define INBR_EV_SIZE           24
+#elif defined(__i386__)
+  #define INBR_EV_SIZE           16
+#else
+  #error "twrp_fb_hook.c: no struct input_event layout for this arch"
+#endif
+#define INBR_MSG_SIZE            20
 
 // Kernel errno values (arch-independent) — we build with -nostdlib and
 // must not depend on the host errno.h having been included consistently.
 #define INBR_EAGAIN              11
 #define INBR_EINTR                4
-
-// i386 struct input_event = 16 bytes:
-//   struct timeval time (u32 tv_sec + u32 tv_usec on 32-bit);
-//   u16 type; u16 code; s32 value;
-#define INBR_EV_SIZE             16
-#define INBR_MSG_SIZE            20
 #define INBR_RING_EVENTS         64     /* 64 * 16 = 1 KiB pending buffer */
 #define INBR_MAX_SLOTS           4
 #define INBR_DRAIN_BUF           1024
@@ -577,16 +771,23 @@ static void inbr_emit(struct inbr_slot *s, unsigned short type,
         }
     }
     p = s->ring + s->ring_len;
-    p[0] = 0; p[1] = 0; p[2] = 0; p[3] = 0;             /* tv_sec  = 0   */
-    p[4] = 0; p[5] = 0; p[6] = 0; p[7] = 0;             /* tv_usec = 0   */
-    p[8]  = (unsigned char)(type & 0xff);
-    p[9]  = (unsigned char)((type >> 8) & 0xff);
-    p[10] = (unsigned char)(code & 0xff);
-    p[11] = (unsigned char)((code >> 8) & 0xff);
-    p[12] = (unsigned char)((unsigned)value & 0xff);
-    p[13] = (unsigned char)(((unsigned)value >> 8) & 0xff);
-    p[14] = (unsigned char)(((unsigned)value >> 16) & 0xff);
-    p[15] = (unsigned char)(((unsigned)value >> 24) & 0xff);
+    /* timeval header: zeroed (minui ignores timestamps) — INBR_EV_SIZE-8
+     * bytes: 8 on i386 (2×u32), 16 on aarch64 (2×s64). */
+    {
+        unsigned ti;
+        for (ti = 0; ti < (unsigned)(INBR_EV_SIZE - 8); ti++) p[ti] = 0;
+    }
+    {
+        unsigned char *q = s->ring + s->ring_len + (INBR_EV_SIZE - 8);
+        q[0] = (unsigned char)(type & 0xff);
+        q[1] = (unsigned char)((type >> 8) & 0xff);
+        q[2] = (unsigned char)(code & 0xff);
+        q[3] = (unsigned char)((code >> 8) & 0xff);
+        q[4] = (unsigned char)((unsigned)value & 0xff);
+        q[5] = (unsigned char)(((unsigned)value >> 8) & 0xff);
+        q[6] = (unsigned char)(((unsigned)value >> 16) & 0xff);
+        q[7] = (unsigned char)(((unsigned)value >> 24) & 0xff);
+    }
     s->ring_len += INBR_EV_SIZE;
 }
 
@@ -1217,14 +1418,6 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
 // Trail device reports and what this TWRP image was built for; the app
 // side swaps R/B when blitting (core.rs, Task 6-Z64).
 // ---------------------------------------------------------------------------
-#define TWRP_FB_WIDTH          320
-#define TWRP_FB_HEIGHT         640
-#define TWRP_FB_BPP            32
-#define TWRP_FB_BYTES_PER_PIX  4
-#define TWRP_FB_LINE_LENGTH    (TWRP_FB_WIDTH * TWRP_FB_BYTES_PER_PIX)  /* 1280 */
-#define TWRP_FB_SMEM_LEN       (TWRP_FB_WIDTH * TWRP_FB_HEIGHT * TWRP_FB_BYTES_PER_PIX)  /* 819200 */
-
-// FB_ACTIVATE_NOW = 0 (see linux/fb.h)
 #define TWRP_FB_ACTIVATE_NOW   0
 // FB_TYPE_PACKED_PIXELS = 0
 #define TWRP_FB_TYPE_PACKED    0
@@ -1233,10 +1426,11 @@ static int input_ioctl(int fd, unsigned req, void *argp) {
 
 static void fill_vscreeninfo(struct fb_var_screeninfo *v) {
     my_memset(v, 0, sizeof(*v));
-    v->xres = TWRP_FB_WIDTH;
-    v->yres = TWRP_FB_HEIGHT;
-    v->xres_virtual = TWRP_FB_WIDTH;
-    v->yres_virtual = TWRP_FB_HEIGHT;
+    fb_geometry_init();
+    v->xres = (__u32)g_fb_rt_w;
+    v->yres = (__u32)g_fb_rt_h;
+    v->xres_virtual = (__u32)g_fb_rt_w;
+    v->yres_virtual = (__u32)g_fb_rt_h;
     v->xoffset = 0;
     v->yoffset = 0;
     v->bits_per_pixel = TWRP_FB_BPP;
@@ -1289,14 +1483,14 @@ static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
     // to a non-zero placeholder (libminuitwrp doesn't dereference it;
     // it only uses smem_len for the mmap size).
     f->smem_start = 0;
-    f->smem_len = TWRP_FB_SMEM_LEN;
+    f->smem_len = (__u32)fb_smem_len();
     f->type = TWRP_FB_TYPE_PACKED;
     f->type_aux = 0;
     f->visual = TWRP_FB_VISUAL_TRUECOLOR;
     f->xpanstep = 0;
     f->ypanstep = 0;
     f->ywrapstep = 0;
-    f->line_length = TWRP_FB_LINE_LENGTH;
+    f->line_length = (__u32)fb_line_length();
     f->mmio_start = 0;
     f->mmio_len = 0;
     f->accel = 0;
@@ -1416,8 +1610,8 @@ int open(const char *path, int flags, ...) {
                                 O_CREAT | O_RDWR, 0644)
             : -1;
         if (create_fd >= 0) {
-            // Truncate to framebuffer size
-            raw_syscall3(SYS_ftruncate, create_fd, TWRP_FB_SMEM_LEN, 0);
+            // Truncate to framebuffer size (runtime native geometry)
+            raw_syscall3(SYS_ftruncate, create_fd, fb_smem_len(), 0);
             raw_syscall1(SYS_close, create_fd);
             // Re-open with the original flags
             fd = real_open ? real_open(path, flags, mode)
@@ -1456,9 +1650,9 @@ int open(const char *path, int flags, ...) {
         int trunc_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
             (long)path, O_RDWR, 0);
         if (trunc_fd >= 0) {
-            raw_syscall3(SYS_ftruncate, trunc_fd, TWRP_FB_SMEM_LEN, 0);
+            raw_syscall3(SYS_ftruncate, trunc_fd, fb_smem_len(), 0);
             raw_syscall1(SYS_close, trunc_fd);
-            write_str(2, "[twrp_fb_hook] ftruncated existing fb0 to TWRP_FB_SMEM_LEN\n");
+            write_str(2, "[twrp_fb_hook] ftruncated existing fb0 to runtime smem_len\n");
         }
     }
     write_str(2, "[twrp_fb_hook] open(\"");
@@ -1468,6 +1662,10 @@ int open(const char *path, int flags, ...) {
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
         write_str(2, " [FB0 TRACKED]");
+    }
+    if (fd >= 0 && is_ashmem_path(path)) {
+        ash_fd_mark(fd);
+        write_str(2, " [ASHMEM TRACKED]");
     }
     write_str(2, "\n");
     return fd;
@@ -1498,7 +1696,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
                                 O_CREAT | O_RDWR, 0644)
             : -1;
         if (create_fd >= 0) {
-            raw_syscall3(SYS_ftruncate, create_fd, TWRP_FB_SMEM_LEN, 0);
+            raw_syscall3(SYS_ftruncate, create_fd, fb_smem_len(), 0);
             raw_syscall1(SYS_close, create_fd);
             fd = real_openat ? real_openat(dirfd, path, flags, mode)
                              : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
@@ -1539,9 +1737,9 @@ int openat(int dirfd, const char *path, int flags, ...) {
         int trunc_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
             (long)path, O_RDWR, 0);
         if (trunc_fd >= 0) {
-            raw_syscall3(SYS_ftruncate, trunc_fd, TWRP_FB_SMEM_LEN, 0);
+            raw_syscall3(SYS_ftruncate, trunc_fd, fb_smem_len(), 0);
             raw_syscall1(SYS_close, trunc_fd);
-            write_str(2, "[twrp_fb_hook] ftruncated existing fb0 to TWRP_FB_SMEM_LEN\n");
+            write_str(2, "[twrp_fb_hook] ftruncated existing fb0 to runtime smem_len\n");
         }
     }
     write_str(2, "[twrp_fb_hook] openat(df="); write_num(2, dirfd);
@@ -1552,6 +1750,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (fd >= 0 && is_fb_path(path)) {
         fb_fd_mark(fd);
         write_str(2, " [FB0 TRACKED]");
+    }
+    if (fd >= 0 && is_ashmem_path(path)) {
+        ash_fd_mark(fd);
+        write_str(2, " [ASHMEM TRACKED]");
     }
     write_str(2, "\n");
     return fd;
@@ -1584,6 +1786,10 @@ int __open_2(const char *path, int flags) {
         fb_fd_mark(fd);
         write_str(2, " [FB0 TRACKED]");
     }
+    if (fd >= 0 && is_ashmem_path(path)) {
+        ash_fd_mark(fd);
+        write_str(2, " [ASHMEM TRACKED]");
+    }
     write_str(2, "\n");
     return fd;
 }
@@ -1612,6 +1818,10 @@ int __openat_2(int dirfd, const char *path, int flags) {
         fb_fd_mark(fd);
         write_str(2, " [FB0 TRACKED]");
     }
+    if (fd >= 0 && is_ashmem_path(path)) {
+        ash_fd_mark(fd);
+        write_str(2, " [ASHMEM TRACKED]");
+    }
     write_str(2, "\n");
     return fd;
 }
@@ -1638,6 +1848,12 @@ int close(int fd) {
         write_str(2, "[twrp_fb_hook] close(fd=");
         write_num(2, fd);
         write_str(2, ") (was tracked fb0 fd)\n");
+    }
+    if (ash_fd_is_tracked(fd)) {
+        ash_fd_clear(fd);
+        write_str(2, "[twrp_fb_hook] close(fd=");
+        write_num(2, fd);
+        write_str(2, ") (was tracked ashmem fd)\n");
     }
     static int (*real_close)(int) = NULL;
     if (!real_close && dlsym) real_close = (int (*)(int))dlsym(RTLD_NEXT, "close");
@@ -1725,6 +1941,13 @@ int ioctl(int fd, int request, ...) {
         return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
     }
 
+    // 6-Z171c: ashmem-fd ioctls — fake the ASHMEM_* protocol on the
+    // pre-created regular-file /dev/ashmem (see the ashmem block above).
+    if (ash_fd_is_tracked(fd)) {
+        int r = ashmem_ioctl(fd, req, (unsigned long)argp);
+        if (r != -2) return r;
+    }
+
     // DIAGNOSTIC (Task 31): log EVERY ioctl() call to verify our hook is
     // being invoked. Key ioctl numbers to watch for:
     //   FBIOGET_VSCREENINFO = 0x4600  (libminuitwrp reads screen size)
@@ -1766,7 +1989,7 @@ int ioctl(int fd, int request, ...) {
             // misdirected run analysis for hours — TWRP's own prints had
             // the truth: 320 x 640).
             write_str(2, "[twrp_fb_hook] ioctl(FBIOGET_VSCREENINFO) -> ");
-            write_num(2, TWRP_FB_WIDTH); write_str(2, "x"); write_num(2, TWRP_FB_HEIGHT);
+            write_num(2, fb_w()); write_str(2, "x"); write_num(2, fb_h());
             write_str(2, "@"); write_num(2, TWRP_FB_BPP); write_str(2, "bpp\n");
             return 0;
         }
@@ -1777,9 +2000,9 @@ int ioctl(int fd, int request, ...) {
         case 0x4602u: {  // FBIOGET_FSCREENINFO
             if (argp) fill_fscreeninfo((struct fb_fix_screeninfo *)argp);
             write_str(2, "[twrp_fb_hook] ioctl(FBIOGET_FSCREENINFO) -> smem_len=");
-            write_num(2, TWRP_FB_SMEM_LEN);
+            write_num(2, (int)fb_smem_len());
             write_str(2, " line_length=");
-            write_num(2, TWRP_FB_LINE_LENGTH);
+            write_num(2, (int)fb_line_length());
             write_str(2, "\n");
             return 0;
         }
@@ -1834,3 +2057,80 @@ int ioctl(int fd, int request, ...) {
 // raw_syscall6 with explicit ebp save/restore — see the i386 syscall
 // convention comment above raw_syscall1.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 6-Z171a: abort()/__assert2()/__cxa_pure_virtual() interposition — NAME
+// the fatal site before dying.
+//
+// Run 33010273952 (arm64): the recovery child SELF-ABORTS via
+// tgkill(self, SIGABRT) inside minui gr_init right after the splash asset
+// loads, with NO abort message in any channel (not in the shared stderr,
+// not in logcat; debuggerd does not attach to traced children). We
+// intercept the PLT-visible fatal entries, print the caller PC (plus
+// file:line:expr for bionic asserts), and then re-raise SIGABRT to the
+// kernel so the observable behavior (signal death) is IDENTICAL — the
+// only delta is one stderr line of evidence.
+//
+// Coverage note: calls to abort() from WITHIN bionic's libc.so (internal
+// aliases) do not cross the PLT and are not interposed; but TWRP's own
+// code (recovery binary, libminuitwrp, libc++ std::terminate → abort)
+// DOES cross the PLT and will be caught.
+//
+// PC capture: __builtin_return_address(0) is read at function entry
+// (before any of our calls can clobber the link register). On aarch64
+// this is x30; on i386 the return address slot at [esp]. With -O2 clang
+// preserves it for level-0 return addresses.
+// ---------------------------------------------------------------------------
+
+// Re-raise SIGABRT with default semantics, without touching errno/TLS:
+// rt_sigaction would need a kernel sigaction struct (restorer fields) —
+// instead we tgkill directly. If the process installed a SIGABRT handler
+// (TWRP's crash handler does), it fires — same as bionic's first
+// raise(). If it returns, pause forever (abort must not return).
+static void fatal_reraise(void) {
+    long pid = raw_syscall1(SYS_getpid, 0);
+    long tid = raw_syscall1(SYS_gettid, 0);
+    for (;;) {
+        raw_syscall4(SYS_tgkill, pid, tid, 6 /*SIGABRT*/, 0);
+        raw_syscall2(SYS_ppoll, 0, 0); /* park if a handler returns */
+    }
+}
+
+void abort(void) __attribute__((noreturn));
+void abort(void) {
+    void *pc = NULL;
+    pc = __builtin_return_address(0);
+    write_str(2, "[twrp_fb_hook] *** abort() INTERCEPTED *** caller_pc=0x");
+    write_hex64(2, (unsigned long long)(unsigned long)pc);
+    write_str(2, "\n");
+    fatal_reraise();
+}
+
+// bionic assert(3): void __assert2(const char *file, int line, const char *expr)
+void __assert2(const char *file, int line, const char *expr) __attribute__((noreturn));
+void __assert2(const char *file, int line, const char *expr) {
+    void *pc = NULL;
+    pc = __builtin_return_address(0);
+    write_str(2, "[twrp_fb_hook] *** __assert2 INTERCEPTED *** ");
+    write_str(2, file ? file : "(null)");
+    write_str(2, ":");
+    write_num(2, line);
+    write_str(2, ": ");
+    write_str(2, expr ? expr : "(null)");
+    write_str(2, " caller_pc=0x");
+    write_hex64(2, (unsigned long long)(unsigned long)pc);
+    write_str(2, "\n");
+    fatal_reraise();
+}
+
+// C++ pure-virtual call → std::terminate → abort. Interposed directly so
+// we see it even if terminate is inlined in the caller's binary.
+void __cxa_pure_virtual(void) __attribute__((noreturn));
+void __cxa_pure_virtual(void) {
+    void *pc = NULL;
+    pc = __builtin_return_address(0);
+    write_str(2, "[twrp_fb_hook] *** __cxa_pure_virtual INTERCEPTED *** caller_pc=0x");
+    write_hex64(2, (unsigned long long)(unsigned long)pc);
+    write_str(2, "\n");
+    fatal_reraise();
+}

@@ -142,15 +142,33 @@ def parse_ui(xml_path):
         return None
 
 def detect_screen_size(root):
-    """Detect screen size from the root hierarchy node bounds."""
+    """Detect screen size from the root hierarchy node bounds.
+
+    Cross-checked against `wm size` (the SAME source of truth the app's
+    DisplayMetrics auto-detect uses — 6-Z171b native-resolution chain).
+    Any mismatch between the two is loud evidence, not a silent default.
+    """
     global SCREEN_W, SCREEN_H
+    wm = adb_shell("wm size")
+    m = re.search(r"(\d+)x(\d+)", wm or "")
+    if m:
+        wm_w, wm_h = int(m.group(1)), int(m.group(2))
+        print(f"  [screen] wm size: {wm_w}x{wm_h}")
+    else:
+        wm_w = wm_h = 0
     if root is not None:
         bounds = root.get("bounds", "")
         m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
         if m:
             SCREEN_W = int(m.group(3))
             SCREEN_H = int(m.group(4))
-            print(f"  [screen] {SCREEN_W}x{SCREEN_H}")
+            print(f"  [screen] uiautomator bounds: {SCREEN_W}x{SCREEN_H}")
+    if wm_w and wm_h and (wm_w != SCREEN_W or wm_h != SCREEN_H):
+        print(f"  [screen] NOTE: wm size ({wm_w}x{wm_h}) != uiautomator bounds "
+              f"({SCREEN_W}x{SCREEN_H}) — using wm size (app-side truth)")
+        SCREEN_W, SCREEN_H = wm_w, wm_h
+    with open(os.path.join(ART, "screen-size.txt"), "w") as f:
+        f.write(f"wm: {wm}\nuiautomator: {SCREEN_W}x{SCREEN_H}\nfinal: {SCREEN_W}x{SCREEN_H}\n")
 
 def find_by_text(root, text, exact=False):
     """Find a UI node by text or content-desc. Returns (cx, cy, node) or None."""
