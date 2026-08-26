@@ -1319,6 +1319,27 @@ def main():
                 f.write(out)
             print(f"  pulled via run-as: {remote} -> {local}")
 
+    # ── 6-Z158: pull the GUEST rootfs internals via run-as ──
+    # After the boot wait the staged rootfs holds the guest's own
+    # runtime evidence: TWRP recovery's own log (/tmp/recovery.log —
+    # written as soon as recovery main() runs), the __kmsg__ stub (all
+    # guest kernel-log writes incl. init/recovery fatals that never
+    # reach logcat), and the selinux stubs the init dance wrote. These
+    # pin down post-restorecon blockers (recovery exit 127 family)
+    # without another dispatch cycle.
+    for remote, local in [
+        ("rootfs/tmp/recovery.log", "twrp-recovery.log"),
+        ("rootfs/dev/__kmsg__", "kmsg-stub.txt"),
+        ("rootfs/sys/fs/selinux/null", "selinux-null-stub.txt"),
+        ("rootfs/sys/fs/selinux/enforce", "selinux-enforce-stub.txt"),
+        (".twoyi-staged", "staged-exes.txt"),
+    ]:
+        out = adb_shell(f"run-as {PACKAGE} cat {remote}", timeout=60)
+        if out:
+            with open(os.path.join(ART, local), "w", errors="replace") as f:
+                f.write(out)
+            print(f"  pulled rootfs evidence: {remote} -> {local} ({len(out)} bytes)")
+
     # Pull the TWRP diagnostic logs.
     #
     # kr64 mirrors these three files to /sdcard/Android/data/io.twoyi/
