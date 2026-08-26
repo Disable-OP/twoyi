@@ -1467,6 +1467,38 @@ def main():
             f.write(ld_debug_out)
         print(f"  pulled recovery LD_DEBUG output ({len(ld_debug_out)} bytes)")
 
+    # ── 6-Z163c: ldd-mode trace — LD_TRACE_LOADED_OBJECTS=1 makes even the
+    # OLD bionic linker print the full DT_NEEDED walk (every lib + the
+    # path it resolved to, or the not-found line) WITHOUT executing main.
+    # This settles WHERE the old linker searches when it claims
+    # libaosprecovery.so "not found" despite the file existing in the
+    # very first LD_LIBRARY_PATH dir. Plus: run the linker64 DIRECTLY
+    # with the staged binary as its argv (old linkers support this) —
+    # a second, independent view of the same walk.
+    staged_recovery = adb_shell(
+        f"run-as {PACKAGE} sh -c 'ls /data/user/0/{PACKAGE}/cache/twoyi_stage/_sbin_recovery_*'",
+        timeout=30) or ""
+    staged_recovery = staged_recovery.splitlines()[0].strip() if staged_recovery.strip() else ""
+    if staged_recovery:
+        ldd_out = adb_shell(
+            f"run-as {PACKAGE} sh -c '{base_env} LD_TRACE_LOADED_OBJECTS=1 "
+            f"{staged_recovery} 2>&1; echo LDD_EXIT:$?'",
+            timeout=30)
+        if ldd_out:
+            with open(os.path.join(ART, "recovery-ldd.txt"), "w", errors="replace") as f:
+                f.write(ldd_out)
+            print(f"  pulled recovery ldd trace ({len(ldd_out)} bytes)")
+        direct_out = adb_shell(
+            f"run-as {PACKAGE} sh -c '{base_env} {TIMEOUT} 8 "
+            f"/data/user/0/{PACKAGE}/rootfs/sbin/linker64 {staged_recovery} 2>&1 | head -40; "
+            f"echo DIRECT_LINKER_EXIT:$?'",
+            timeout=30)
+        if direct_out:
+            with open(os.path.join(ART, "recovery-direct-linker.txt"), "w",
+                      errors="replace") as f:
+                f.write(direct_out)
+            print(f"  pulled direct linker64 trace ({len(direct_out)} bytes)")
+
     # Pull the TWRP diagnostic logs.
     #
     # kr64 mirrors these three files to /sdcard/Android/data/io.twoyi/
