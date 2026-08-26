@@ -1028,6 +1028,19 @@ struct ChildAbi {
     setresuid_nr: i64,
     setresgid_nr: i64,
     setgroups_nr: i64,
+    // 6-Z156: getxattr-family numbers — lgetxattr("security.selinux")
+    // returning -ENODATA is FATAL for the old omni libselinux baked into
+    // static arm64 TWRP ramdisk inits (restorecon_sb does selabel_lookup
+    // FIRST, then lgetfilecon, and treats ANY lgetfilecon error —
+    // including ENODATA — as restorecon failure → init's
+    // security_failure() → reboot → rt_sigsuspend park). The EXIT-side
+    // 6-Z156 handler fakes the sandbox label into the child's buffer.
+    //   getxattr:  i386=229, x86_64=191, aarch64(asm-generic)=8
+    //   lgetxattr: i386=230, x86_64=192, aarch64=9
+    //   fgetxattr: i386=231, x86_64=193, aarch64=10
+    getxattr_nr: i64,
+    lgetxattr_nr: i64,
+    fgetxattr_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -1332,6 +1345,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     setresuid_nr: 117,
     setresgid_nr: 119,
     setgroups_nr: 116,
+    getxattr_nr: 191,
+    lgetxattr_nr: 192,
+    fgetxattr_nr: 193,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -1692,6 +1708,9 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     setresuid_nr: 208,
     setresgid_nr: 210,
     setgroups_nr: 81,
+    getxattr_nr: 229,
+    lgetxattr_nr: 230,
+    fgetxattr_nr: 231,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1868,19 +1887,20 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // run 32961216041 traced it as "nr=33 -> -13 (-errno 13)" right
     // before init's exit_group(1).
     mknodat: 33,
-    // aarch64 setxattr / lsetxattr / fsetxattr. Real Android aarch64
-    // bionic uses the upstream Linux asm-generic numbers: setxattr=188,
-    // lsetxattr=189, fsetxattr=190 (matching x86_64). This sandbox's
-    // /usr/include/asm-generic/unistd.h NON-STANDARDLY lists these as
-    // 5/6/7, but those numbers are io_setup / io_destroy /
-    // io_getevents in upstream Linux — the sandbox header is wrong
-    // (verified directly in Task 6-R; see the doc on these fields in
-    // `ChildAbi` for the full discrepancy analysis). We use 188/189/190
-    // so that a real aarch64 TWRP recovery calling lsetxattr() will be
-    // correctly fake-succeeded.
-    setxattr: 188,
-    lsetxattr: 189,
-    fsetxattr: 190,
+    // aarch64 setxattr / lsetxattr / fsetxattr — CORRECTED in 6-Z156.
+    // aarch64 uses the asm-generic table where the xattr family lives at
+    // 5..16: setxattr=5, lsetxattr=6, fsetxattr=7, getxattr=8,
+    // lgetxattr=9, fgetxattr=10. The PREVIOUS values (188/189/190) were
+    // the X86_64 numbers copy-pasted into the aarch64 table by Task 6-R
+    // — they were never exercised (the arm64 guest never reached a
+    // setxattr before 6-Z155/6-Z156) and are provably wrong: the actual
+    // arm64 TWRP guest's lgetxattr fired as nr=9 (runs 32966475822 /
+    // 32968075629 post-execve syscall #109 → -ENODATA), and 188-190 on
+    // asm-generic are the mq_* message-queue syscalls, not xattrs.
+    // Verified against include/uapi/asm-generic/unistd.h.
+    setxattr: 5,
+    lsetxattr: 6,
+    fsetxattr: 7,
     // SysV shared-memory syscalls — see the comment on these fields
     // in `ChildAbi`. aarch64 uses asm-generic/unistd.h, where
     // shmget=194, shmctl=195, shmat=196.
@@ -2024,6 +2044,9 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     setresuid_nr: 147,
     setresgid_nr: 148,
     setgroups_nr: 159,
+    getxattr_nr: 8,
+    lgetxattr_nr: 9,
+    fgetxattr_nr: 10,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -3160,6 +3183,14 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "setuid"
     } else if abi.setgid_nr != -1 && nr == abi.setgid_nr {
         "setgid"
+    } else if abi.getxattr_nr != -1 && nr == abi.getxattr_nr {
+        // 6-Z156: label the get-xattr family (the read side whose ENODATA
+        // fake unblocks the arm64 TWRP init restorecon fatal).
+        "getxattr"
+    } else if abi.lgetxattr_nr != -1 && nr == abi.lgetxattr_nr {
+        "lgetxattr"
+    } else if abi.fgetxattr_nr != -1 && nr == abi.fgetxattr_nr {
+        "fgetxattr"
     } else if abi.mkdir != -1 && nr == abi.mkdir {
         "mkdir"
     } else if abi.mkdirat != -1 && nr == abi.mkdirat {
@@ -14238,6 +14269,115 @@ pub fn run_ptrace_loop(
                     // xattr number); when the rewrite succeeds,
                     // syscall_num at EXIT is `getpid` and this block
                     // is a no-op (compute_exit_return_value(getpid)=None).
+                    // ── 6-Z156: getxattr-family ENODATA/EPERM → fake the
+                    // sandbox SELinux label into the child's buffer ──
+                    //
+                    // ROOT CAUSE of the arm64 TWRP frozen boot (runs
+                    // 32966475822, 32968075629, 32971573879 — identical
+                    // 77x-line traces ending at rt_sigsuspend): the static
+                    // omni-built init in the TWRP angler ramdisk calls
+                    // restorecon("/init") right after selinux_initialize;
+                    // its (old) libselinux restorecon_sb does
+                    // selabel_lookup FIRST (succeeds — the minimal
+                    // file_contexts has /init) and THEN lgetfilecon, and
+                    // treats ANY lgetfilecon error — including -ENODATA —
+                    // as fatal: "init: restorecon failed: No data
+                    // available" (writev #2 = exactly 46 bytes with the
+                    // kmsg <3> prefix) → security_failure() → reboot
+                    // (-EPERM) → for(;;) rt_sigsuspend park. On real
+                    // devices ramfs files ALWAYS carry security.selinux
+                    // xattrs (kernel SELinux labels them), so the ENODATA
+                    // path never fires there; in the twoyi sandbox the
+                    // rootfs lives on app-data storage where security.*
+                    // xattrs cannot exist OR be set (EPERM for
+                    // untrusted_app) — the read side must be virtualised
+                    // exactly like the write side already is
+                    // (setxattr-family fake-success since 6-R).
+                    //
+                    // Handler: on the syscall-EXIT stop of
+                    // getxattr/lgetxattr/fgetxattr whose fresh return is
+                    // -ENODATA (-61) or -EPERM (-1) AND whose name
+                    // argument is exactly "security.selinux", write
+                    // b"u:object_r:rootfs:s0\0" into the child's value
+                    // buffer (arg3) and set the return to 20 (the label
+                    // length, no NUL — xattr semantics). size==0 is the
+                    // size-probe form: return 20 without writing. The
+                    // label matches the minimal file_contexts entries
+                    // (Task 6-Z7), so restorecon's subsequent
+                    // context-comparison sees them EQUAL and skips the
+                    // setfilecon entirely — restorecon returns 0 and init
+                    // proceeds to fork+exec /sbin/recovery.
+                    //
+                    // Arg registers are preserved across the syscall at
+                    // the EXIT stop (the same property the 6-Z154 mknod
+                    // stub block relies on). This block does its own
+                    // getregs+setregs; the generic fake path below will
+                    // then see the fresh ret=20, match no table entry and
+                    // preserve it (6-Z60 "PRESERVING real return").
+                    // (fd/name/value/size arg order is identical for the
+                    // three variants: path|fd is arg1, name arg2, value
+                    // arg3, size arg4.)
+                    if syscall_num == abi.getxattr_nr
+                        || syscall_num == abi.lgetxattr_nr
+                        || syscall_num == abi.fgetxattr_nr
+                    {
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        if let Ok(len2) = ptrace_getregs(pid, &mut regs2) {
+                            let fresh_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                            if fresh_ret == -61 || fresh_ret == -1 {
+                                let name_addr = get_syscall_arg(&regs2, abi.reg_arg2);
+                                if let Some(xname) = read_child_string(pid, name_addr) {
+                                    if xname == "security.selinux" {
+                                        const LABEL: &[u8] = b"u:object_r:rootfs:s0";
+                                        let value_addr = get_syscall_arg(&regs2, abi.reg_arg3);
+                                        let size = get_syscall_arg(&regs2, abi.reg_arg4);
+                                        if size == 0 {
+                                            // size probe → required length
+                                            set_syscall_ret(&mut regs2, &abi, LABEL.len() as i64);
+                                            let _ = ptrace_setregs(pid, &regs2, len2);
+                                            log(&format!(
+                                                "6-Z156: {}(\"security.selinux\") size probe returned {} — faked {} (sandbox label length; file has no real xattr)",
+                                                syscall_name(syscall_num, &abi),
+                                                fresh_ret,
+                                                LABEL.len()
+                                            ));
+                                        } else if value_addr != 0 {
+                                            let mut buf = LABEL.to_vec();
+                                            buf.push(0);
+                                            let (written, how) = write_child_bytes_injection(
+                                                pid,
+                                                value_addr,
+                                                &buf,
+                                                &mut vm_writev_usable,
+                                            );
+                                            if written == buf.len() {
+                                                set_syscall_ret(
+                                                    &mut regs2,
+                                                    &abi,
+                                                    LABEL.len() as i64,
+                                                );
+                                                let _ = ptrace_setregs(pid, &regs2, len2);
+                                                log(&format!(
+                                                    "6-Z156: {}(\"security.selinux\") returned {} — faked label \"{}\" ({} bytes via {}) + ret {} (real kernel: no xattr on app-data rootfs — ENODATA is fatal for the old omni libselinux restorecon)",
+                                                    syscall_name(syscall_num, &abi),
+                                                    fresh_ret,
+                                                    String::from_utf8_lossy(LABEL),
+                                                    written,
+                                                    how,
+                                                    LABEL.len()
+                                                ));
+                                            } else {
+                                                log(&format!(
+                                                    "6-Z156: FAILED to inject label buffer ({} of {} bytes via {}) — leaving kernel return {}",
+                                                    written, buf.len(), how, fresh_ret
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _forced_ret_opt = compute_exit_return_value(syscall_num, &abi);
                     // Task 6-Z53/6-Z60: ENOSYS fallback. The DESYNC issue
                     // means the EXIT handler sometimes sees the wrong syscall
@@ -18806,6 +18946,47 @@ mod tests {
         // exist as setuid/setgid in the aarch64 table.
         assert_eq!(compute_exit_return_value(147, &ABI_X86_32), None);
         assert_eq!(compute_exit_return_value(159, &ABI_X86_32), None);
+    }
+
+    #[test]
+    fn aarch64_xattr_numbers_corrected_6z156() {
+        // 6-Z156: the aarch64 setxattr family was mis-numbered as the
+        // X86_64 values (188/189/190 = mq_* on asm-generic). The real
+        // asm-generic numbers are set=5/6/7 and get=8/9/10 — proven by
+        // the actual arm64 TWRP guest firing lgetxattr as nr=9 (runs
+        // 32966475822 / 32968075629, post-execve syscall #109 → -ENODATA).
+        // The set family must still fake-success (compute table), and
+        // the get family must resolve its labels.
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(compute_exit_return_value(5, &ABI_AARCH64), Some(0));
+            assert_eq!(compute_exit_return_value(6, &ABI_AARCH64), Some(0));
+            assert_eq!(compute_exit_return_value(7, &ABI_AARCH64), Some(0));
+            assert_eq!(syscall_name(5, &ABI_AARCH64), "setxattr");
+            assert_eq!(syscall_name(6, &ABI_AARCH64), "lsetxattr");
+            assert_eq!(syscall_name(9, &ABI_AARCH64), "lgetxattr");
+            assert_eq!(syscall_name(8, &ABI_AARCH64), "getxattr");
+            assert_eq!(syscall_name(10, &ABI_AARCH64), "fgetxattr");
+            // The old WRONG numbers must NOT match anything on aarch64.
+            assert_eq!(compute_exit_return_value(188, &ABI_AARCH64), None);
+            assert_eq!(compute_exit_return_value(189, &ABI_AARCH64), None);
+            assert_eq!(compute_exit_return_value(190, &ABI_AARCH64), None);
+        }
+        // x86_64 keeps its real 188/189/190 set family (these WERE
+        // correct there) and gains the 191/192/193 get labels.
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(compute_exit_return_value(188, &ABI_X86_64), Some(0));
+            assert_eq!(syscall_name(192, &ABI_X86_64), "lgetxattr");
+        }
+        // i386 get family labels (229/230/231).
+        assert_eq!(syscall_name(230, &ABI_X86_32), "lgetxattr");
+        // getxattr family is NOT in the fake-success table — the 6-Z156
+        // EXIT handler owns the get side (it must inject a real string).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(compute_exit_return_value(9, &ABI_AARCH64), None);
+        }
     }
 
     #[test]
