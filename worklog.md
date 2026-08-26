@@ -10647,3 +10647,21 @@ Changes (6-Z163b):
 - bind hook: ABSTRACT property-service spelling (matcher reuse: sockaddr_blob_is_property_service) ALSO rewrites to the translated FS path {rootfs}/dev/socket/property_service (escaping redroid's shared abstract namespace entirely).
 - bind hook: skip-reason DIAG (first 12): family / abstract-non-property / non-absolute / peek-short + blob[0..16] hexdump — settles the skip question definitively next run.
 - probes: sbin-lib-magic.txt (dd|od hexdump of the first 32 bytes of libaosprecovery.so/libc.so/libcrecovery.so/liblog.so/libminuitwrp.so/linker64/recovery/adbd — a valid arm64 .so starts 7f 45 4c 46 02 01 01 00) + recovery-ld-debug.txt (LD_DEBUG=1 — the old bionic linker prints its search decisions).
+
+---
+Task ID: 6-Z163d
+Agent: main
+Task: Fix the lying probe — POSIX sh does not export bare assignments
+
+Evidence (runs 32990637557 + 32992050112 + 32992892431 on 6-Z163/6-Z163b/6-Z163c):
+- THE SPIN IS DEAD: run 32992892431 has ZERO accept4 spins (was 119,100) and the property socket bound FOR REAL:
+  "6-Z163: bind(fd=8, /dev/socket/property_service) sockaddr REWRITTEN to {rootfs}/dev/socket/property_service" — epoll_pwait now healthy (241 total vs 119k).
+- adbd binds rewritten 9x (adbd restarts, still exit 1 silently — it links fine: it's ET_EXEC static).
+- PROBE BUG (my own): POSIX sh does NOT export bare "VAR=x;" assignments — LD_PRELOAD/LD_LIBRARY_PATH NEVER reached the staged binary. The "CANNOT LINK libaosprecovery.so not found" was the NO-ENV fallback (/system/lib64 has no TWRP libs). Verified locally: sh -c 'A=1; env' | grep A prints NOTHING.
+- Pristine-image comparison: downloaded twrp-3.7.0_9-0-angler.img, extracted ramdisk, parsed cpio — ALL sbin sizes match the rootfs EXACTLY (libaosprecovery.so 34544 == 34544, byte-perfect ELF: ET_DYN AARCH64, 8 phdrs, sections end exactly at EOF). Extraction is perfect; corruption theory dead.
+- So the in-jail "Service 'recovery' exited with status 1" root cause is STILL UNKNOWN — the probe lied about it until now.
+
+Fix (6-Z163d): probe env strings are now PREFIX ASSIGNMENTS on the actual command (VAR=x VAR2=y timeout 8 BIN) — guaranteed to reach the binary through timeout's environ. Same for LD_DEBUG / ldd-mode / direct-linker64 probes.
+
+Stage Summary:
+- Property service: REAL (bound at translated path). Spin: DEAD. Remaining blocker: in-jail recovery exit 1 — the fixed probe will finally tell the truth next run.
