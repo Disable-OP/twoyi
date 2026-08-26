@@ -10720,17 +10720,14 @@ pub fn run_ptrace_loop(
                                             // Scratch write (rotating cursor,
                                             // overflow-checked) + fresh-regs
                                             // arg2/arg3 update.
-                                            let aligned =
-                                                (new_sa.len() + 7) & !7;
+                                            let aligned = (new_sa.len() + 7) & !7;
                                             if scratch_offset + aligned > 4096 {
                                                 scratch_offset = 0;
                                             }
-                                            let sa_scratch =
-                                                scratch_addr + scratch_offset as u64;
+                                            let sa_scratch = scratch_addr + scratch_offset as u64;
                                             if write_child_blob(pid, sa_scratch, &new_sa) {
                                                 let new_len = new_sa.len() as i64;
-                                                let mut fresh: Regs =
-                                                    unsafe { std::mem::zeroed() };
+                                                let mut fresh: Regs = unsafe { std::mem::zeroed() };
                                                 if ptrace_getregs(pid, &mut fresh).is_ok() {
                                                     set_syscall_arg(
                                                         &mut fresh,
@@ -10742,8 +10739,7 @@ pub fn run_ptrace_loop(
                                                         abi.reg_arg3,
                                                         new_len as u64,
                                                     );
-                                                    if ptrace_setregs(pid, &fresh, iov_len)
-                                                        .is_ok()
+                                                    if ptrace_setregs(pid, &fresh, iov_len).is_ok()
                                                     {
                                                         set_syscall_arg(
                                                             &mut regs,
@@ -22560,7 +22556,10 @@ mod tests {
         let path = b"/dev/socket/property_service";
         blob[2..2 + path.len()].copy_from_slice(path);
         blob[2 + path.len()] = 0;
-        assert_eq!(unix_fs_sun_path(&blob), Some("/dev/socket/property_service"));
+        assert_eq!(
+            unix_fs_sun_path(&blob),
+            Some("/dev/socket/property_service")
+        );
     }
 
     #[test]
@@ -22614,5 +22613,4 @@ mod tests {
         assert_eq!(overflows.len(), 108);
         assert!(build_translated_unix_sockaddr(&overflows).is_none());
     }
-
 }

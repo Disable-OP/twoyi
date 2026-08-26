@@ -10625,3 +10625,5 @@ Fix (6-Z163):
 - The 6-Z110 connect gate/client-emulation auto-disengages for rewritten binds (its exact-path matcher won't match the prefixed translated path).
 - New pure helpers unix_fs_sun_path + build_translated_unix_sockaddr + write_child_blob; 3 unit tests (families/abstract/relative rejection, layout, 108-byte sun_path cap).
 - ui-navigate.py: probe `timeout` now invoked by host-absolute /system/bin/timeout (run 32988644183 had every probe 127 on "timeout: not found" — the rootfs PATH shadowed redroid's toybox).
+
+FIXUP (6-Z163): rustfmt line-joining diffs from run 32989901122's fmt gate (5 spots: aligned/sa_scratch/fresh one-liners, setregs one-liner, test assert wrap, trailing blank line).
