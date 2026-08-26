@@ -13215,6 +13215,46 @@ pub fn run_ptrace_loop(
                                             ));
                                         }
                                     }
+                                    // 6-Z160a: ALSO capture iov[1] — kmsg-style
+                                    // writes are 2-iov (prefix "<N>tag: " in
+                                    // iov0, the message text in iov1). Without
+                                    // this the arm64 captures only ever showed
+                                    // the prefix (run 32983006496: every line
+                                    // read "<5>init: " with the payload lost).
+                                    if iovcnt >= 2 {
+                                        let (b1, l1): (Option<u64>, Option<u64>) =
+                                            if abi.execve == 221 || abi.execve == 59 {
+                                                (
+                                                    read_child_u64(pid, iov_ptr.wrapping_add(16)),
+                                                    read_child_u64(pid, iov_ptr.wrapping_add(24)),
+                                                )
+                                            } else {
+                                                (
+                                                    read_child_u32(pid, iov_ptr.wrapping_add(8))
+                                                        .map(|v| v as u64),
+                                                    read_child_u32(pid, iov_ptr.wrapping_add(12))
+                                                        .map(|v| v as u64),
+                                                )
+                                            };
+                                        if let (Some(base1), Some(len1)) = (b1, l1) {
+                                            let to_read1 = std::cmp::min(
+                                                std::cmp::min(len1 as usize, ret as usize),
+                                                256,
+                                            );
+                                            if to_read1 > 0 {
+                                                if let Some(bytes1) =
+                                                    read_child_bytes(pid, base1, to_read1)
+                                                {
+                                                    let s1 = String::from_utf8_lossy(&bytes1);
+                                                    let s1 = crate::cap_log_line(&s1, 2048);
+                                                    log(&format!(
+                                                        "6-Z160-WRITEV-IOV1: writev(fd={}, ret={}): {:?}",
+                                                        fd, ret, s1
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
