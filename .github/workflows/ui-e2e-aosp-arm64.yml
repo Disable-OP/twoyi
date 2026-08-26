@@ -28,7 +28,7 @@
 #   - twoyi APK built for arm64-v8a ONLY — runs NATIVELY on redroid
 #     (no translation layer, no native bridge).
 #   - AOSP rootfs extracted from the running redroid container via
-#     `adb root` (redroid 11.0.0-latest accepts it) + `tar cf -
+#     `adb root` (redroid 16.0.0-latest accepts it) + `tar cf -
 #     system/ vendor/ init default.prop`. The guest binaries (init,
 #     zygote, system_server, etc.) are arm64-native — they run with
 #     no translation. The twoyi arm64 tracer ptraces them; the syscalls
@@ -75,7 +75,7 @@
 #     The x86_64 sibling is a single job because it can build + test
 #     natively on the same runner.
 #   - Android runtime: redroid Docker container (NOT the sdk emulator).
-#     Image: redroid/redroid:11.0.0-latest (Android 11 = API 30, the
+#     Image: redroid/redroid:16.0.0-latest (Android 16 = API 36, the
 #     same version as the x86_64 sibling for apples-to-apples parity).
 #   - Runner: ubuntu-24.04-arm (arm64 Ampere hardware, NO /dev/kvm
 #     but redroid doesn't need it — Android runs as host processes).
@@ -94,7 +94,7 @@
 #   - default boot_wait_seconds: 600s (vs 600s — matches x86_64).
 #   - Step 17 (preload rootfs): RESTORED the original x86_64 flow
 #     (`adb root` → `tar cf - system/ vendor/ init default.prop` →
-#     `adb unroot`). redroid 11.0.0-latest accepts `adb root` — no
+#     `adb unroot`). redroid 16.0.0-latest accepts `adb root` — no
 #     more debugfs / simg2img / system.img extraction hacks.
 #   - ui-navigate-aosp.py's post-Launch-Container + final assertions
 #     abort the script (exit 1) if the app crashed back to launcher
@@ -278,19 +278,19 @@ jobs:
           echo "  ✓ platform-tools installed"
 
       # ───────────────────────────────────────────────────────────────
-      # Step: Pull + launch redroid (arm64-v8a Android 11)
+      # Step: Pull + launch redroid (arm64-v8a Android 16)
       # ───────────────────────────────────────────────────────────────
-      - name: Pull + launch redroid (arm64-v8a Android 11)
+      - name: Pull + launch redroid (arm64-v8a Android 16)
         run: |
           set -e
           mkdir -p /tmp/ui-e2e-artifacts
-          sudo docker pull redroid/redroid:11.0.0-latest
+          sudo docker pull redroid/redroid:16.0.0-latest
           sudo docker run -itd --rm --privileged \
               --name redroid \
               -v /dev/binderfs:/dev/binderfs:rw \
               -v $HOME/redroid-data:/data \
               -p 5555:5555 \
-              redroid/redroid:11.0.0-latest \
+              redroid/redroid:16.0.0-latest \
               androidboot.use_memfd=1 \
               androidboot.redroid_gpu_mode=guest
           REDROID_PID=$(sudo docker inspect -f '{{.State.Pid}}' redroid)
@@ -333,11 +333,11 @@ jobs:
               exit 1
           fi
           SDK=$(adb -s localhost:5555 shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
-          echo "  ro.build.version.sdk = $SDK (expect 30 for Android 11)"
-          echo "  ✓ redroid is arm64-v8a Android 11 (no native bridge, no translation)"
+          echo "  ro.build.version.sdk = $SDK (expect 36 for Android 16)"
+          echo "  ✓ redroid is arm64-v8a Android 16 (no native bridge, no translation)"
 
       - name: Install APK + preload AOSP rootfs from redroid
-        # With redroid 11.0.0-latest we use the ORIGINAL x86_64 flow —
+        # With redroid 16.0.0-latest we use the ORIGINAL x86_64 flow —
         # `adb root` works on redroid (it's a developer image), so we
         # can `tar cf - system/ vendor/ init default.prop` directly.
         env:
@@ -358,7 +358,7 @@ jobs:
           # EXTRACT AOSP ROOTFS FROM THE RUNNING redroid CONTAINER
           # (same flow as ui-e2e-aosp.yml x86_64 — restored v2)
           # ════════════════════════════════════════════════════════════
-          # redroid 11.0.0-latest accepts `adb root` (it's a pure AOSP
+          # redroid 16.0.0-latest accepts `adb root` (it's a pure AOSP
           # developer image, not a production build). /init is
           # root-owned 0750 — shell-user tar skips it. `adb root`
           # lets tar see it. apex/ is EXCLUDED (host-APEX passthrough
@@ -371,7 +371,7 @@ jobs:
           ADB_UID=$(adb -s localhost:5555 shell id -u 2>/dev/null | tr -d '\r' || true)
           echo "  adbd uid after adb root: $ADB_UID"
           if [ "$ADB_UID" != "0" ]; then
-              echo "  ✗ adb root failed — redroid 11.0.0-latest rejected it"
+              echo "  ✗ adb root failed — redroid 16.0.0-latest rejected it"
               exit 1
           fi
 
