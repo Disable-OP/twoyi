@@ -6471,6 +6471,27 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "quiet",
             "verifier",
         ];
+        // 6-Z159b: pinned by the 6-Z159a listing (run 32980068049): the
+        // angler rootfs contains BOTH init.recovery.angler.rc AND
+        // init.partlink.rc — the plain `init.<hw>.rc` pattern made
+        // partlink a second candidate → len != 1 → None. But init.rc
+        // PROVES the split: it literally imports the generic rc files
+        // (logd/ldconfig/mksh/nano/usb/service/vold_decrypt) and imports
+        // the hardware one via `import /init.recovery.${ro.hardware}.rc`,
+        // while init.partlink.rc is not imported by init.rc AT ALL (a
+        // module rc pulled in by other rc files). So: candidate patterns
+        // are ONLY fstab.<hw> / ueventd.<hw>.rc / init.recovery.<hw>.rc
+        // (the ${ro.hardware} convention — plain init.<x>.rc DROPPED),
+        // any candidate whose file init.rc imports LITERALLY is excluded,
+        // and exactly one remaining candidate wins (else ranchu fallback,
+        // x86 emulator rootfs unchanged).
+        let init_rc_imports: Vec<String> =
+            std::fs::read_to_string(format!("{}/init.rc", rootfs_prefix))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("import "))
+                .map(|s| s.trim().rsplit('/').next().unwrap_or("").to_string())
+                .collect();
         let detected_hw: Option<String> = std::fs::read_dir(&rootfs_prefix).ok().and_then(|rd| {
             let mut cands: Vec<String> = Vec::new();
             for ent in rd.flatten() {
@@ -6482,8 +6503,6 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                         Some(mid)
                     } else if let Some(mid) = rest.strip_prefix("init.recovery.") {
                         Some(mid)
-                    } else if let Some(mid) = rest.strip_prefix("init.") {
-                        Some(mid)
                     } else {
                         None
                     }
@@ -6491,7 +6510,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     None
                 };
                 if let Some(hw) = hw {
-                    if !hw.is_empty() && !hw.contains('.') && !generic_rc_names.contains(&hw) {
+                    let generic = hw.is_empty()
+                        || hw.contains('.')
+                        || generic_rc_names.contains(&hw)
+                        || init_rc_imports.iter().any(|imp| imp == &name);
+                    if !generic {
                         cands.push(hw.to_string());
                     }
                 }
