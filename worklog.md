@@ -11213,3 +11213,52 @@ Stage Summary:
   the maps dump working, any further SIGSEGV (like 33018901591's
   post-scanline crash) becomes symbolizable. Both blockers of the last
   two runs are now defused.
+
+---
+Task ID: 6-Z179 RESULTS + HANDOFF
+Agent: main
+Task: Session wrap — deterministic post-input-setup SIGSEGV named as next blocker
+
+Evidence (runs 33021261552 + 33021972679 with the 2s maps trap):
+- THE PIXEL BLOCKER IS NOW DETERMINISTIC AND NARROW: every recovery
+  restart crashes with SIGSEGV si_addr=0xffff00000013 (identical across
+  ALL restarts AND runs; rip/rsp vary per exec = ASLR). The crash
+  sequence in the tracer log is ALWAYS:
+      openat -> fd6 (an input/event node) → read → close
+      socket(nr=198) -> fd6 → fcntl(nr=25)=2 → fcntl=0
+      [SIGSEGV: rip/rsp BOTH in the 0xffff... garbage region]
+  i.e. the crash lands EXACTLY at the end of minui ev_init / the input
+  bridge connect + fcntl tail — a TWRP thread running on a garbage stack
+  (rip and rsp 208 bytes apart in an unmapped 0xffff... region).
+- The 0xffff... region is NOT mapped in these children (real maps show
+  userspace at 0xfd21....) — so the 6-Z170-era "PEEK-blind" addresses
+  were largely INVALID POINTERS from the same corruption family, and
+  PEEK EIO on them was correct behavior.
+- The 2s maps trap works (3 snapshots captured) but the crashing pids'
+  short lifetimes still dodge it; captured pids' maps show the layout.
+- 6-Z177 throttle + 6-Z173 adbd protection + native-res fb0 (4608000B)
+  + geometry file all held; screenshots are real 720x1600 PNGs; VLM
+  verdict on every run so far: solid black (no rendered UI yet).
+
+Next-session attack plan (ranked):
+1. The crash is at the INPUT-BRIDGE tail. Candidates: (a) a bug in the
+   hook's arm64 inbr_connect (verify the AF_UNIX sockaddr layout + the
+   fd it hands back), (b) minui's ev_add/epoll on our socket fd,
+   (c) a pthread whose stack mmap got faked. Cheap probe: E2E with the
+   input bridge DISABLED (env TWOYI_NO_INPUT=1 gate in try_open_input_
+   bridge -> return -2 always) — if TWRP then renders pixels, the bridge
+   is the killer; if it still crashes, it is minui-internal.
+2. Symbolize using the maps trap: make the trap ALSO capture the
+   crashing pid (parse the tracer's "child NNNN killed by signal 11"
+   from logcat stream and snapshot THAT pid immediately at next tick).
+3. The render loop + dirty-check + VLM verdict pipeline is READY — the
+   moment pixels land, screenshots + VLM close the loop.
+
+Stage Summary:
+- Session arc (commits d540901..3dfd448, 13 pushes, all gates green):
+  abort/one-shot fatal guard → native-resolution chain end-to-end (wm
+  size → Java → kr64 → fb0 4608000B) → adbd isolation (6-Z173) →
+  evidence pipeline (docker-exec watcher + taps + maps trap + direct
+  kr64-app-stderr artifact) → render-loop dirty-check → accept4 spin
+  throttle → geometry file. TWRP reaches PixelFlinger JIT (scanlines!)
+  then dies at the deterministic input-tail crash.
