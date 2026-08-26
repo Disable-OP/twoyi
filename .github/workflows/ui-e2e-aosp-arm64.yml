@@ -251,11 +251,11 @@ jobs:
           sudo mkdir -p /dev/binderfs
           sudo mount -t binder binder /dev/binderfs
           ls -la /dev/binderfs/
-          sudo ln -sf /dev/binderfs/binder     /dev/binder
-          sudo ln -sf /dev/binderfs/hwbinder   /dev/hwbinder
-          sudo ln -sf /dev/binderfs/vndbinder  /dev/vndbinder
-          ls -la /dev/binder /dev/hwbinder /dev/vndbinder
-          echo "  ✓ binderfs mounted + /dev/binder symlinks created"
+          # NOTE: redroid 16.0.0-latest auto-detects binderfs at /dev/binderfs
+          # (issue redroid-doc #859). The /dev/binder char-device symlinks
+          # we used in v4.0-v4.2 were a workaround for older tags (10-15)
+          # that hard-coded /dev/binder; they're not needed for 16.0.0-latest.
+          echo "  ✓ binderfs mounted"
 
           command -v docker >/dev/null || sudo apt-get install -y docker.io
           docker --version
@@ -299,7 +299,7 @@ jobs:
 
           export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
-          BOOT_TIMEOUT=300
+          BOOT_TIMEOUT=600
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
               adb connect localhost:5555 >/dev/null 2>&1 || true
@@ -310,18 +310,28 @@ jobs:
               fi
               if ! sudo docker ps --filter name=redroid --filter status=running | grep -q redroid; then
                   echo "  ✗ redroid container died after ${WAITED}s"
-                  sudo docker logs redroid 2>&1 | tail -50
+                  sudo docker logs redroid 2>&1 | tail -200
                   exit 1
               fi
               sleep 5
               WAITED=$((WAITED + 5))
-              if [ $((WAITED % 30)) -eq 0 ]; then
+              if [ $((WAITED % 60)) -eq 0 ]; then
                   echo "  still booting... ${WAITED}s elapsed"
+                  PROP=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+                  INIT_SVC=$(adb -s localhost:5555 shell getprop init.svc.bootanim 2>/dev/null | tr -d '\r' || true)
+                  echo "    boot_completed=$PROP  bootanim=$INIT_SVC"
               fi
           done
           if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
               echo "  ✗ redroid did not boot in ${BOOT_TIMEOUT}s"
-              sudo docker logs redroid 2>&1 | tail -100
+              echo "── full docker logs (last 300 lines) ──"
+              sudo docker logs redroid 2>&1 | tail -300
+              echo "── adb diagnostics (if reachable) ──"
+              adb -s localhost:5555 shell getprop 2>&1 | head -50 || true
+              echo "── redroid processes (docker exec ps) ──"
+              sudo docker exec redroid sh -c "ps -A 2>/dev/null | head -30" 2>&1 || true
+              echo "── redroid logcat (last 100 lines, if logcat exists) ──"
+              sudo docker exec redroid sh -c "logcat -d -t 100 2>/dev/null" 2>&1 || true
               exit 1
           fi
 
