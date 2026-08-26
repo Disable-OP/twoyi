@@ -10711,9 +10711,7 @@ pub fn run_ptrace_loop(
                             // first-word PEEK failure. Every one of them
                             // now logs (first 12), so the next run names
                             // the exact reason.
-                            let blob: Option<Vec<u8>> = if sa_ptr == 0
-                                || sa_len < 3
-                                || sa_len > 128
+                            let blob: Option<Vec<u8>> = if sa_ptr == 0 || sa_len < 3 || sa_len > 128
                             {
                                 None
                             } else {
