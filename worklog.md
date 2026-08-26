@@ -10709,3 +10709,63 @@ Task: /tmp DIAG did not fire — the recovery logger opens bypass pending_open_t
   3. TWRP recovery LINKS + BOOTS through DataManager/LANG in BOTH contexts (jail + probe). Death point: right after the /tmp/recovery.log logger re-open + one property set + signal setup — exit(1) in jail / exit(255) in probe. No LOGERR captured yet.
   4. The honest probe suite (timeout 8 env ...) + ldd-mode + direct-linker + lib-magic dumps + sbin/tmp/etc listings + staged-marker pull are all in place and verified.
   5. Suspect list for the exit(1), ranked: (a) TWRP logger fatal on /tmp/recovery.log open result (settle with the ENTRY-pair DIAG above); (b) fstab/PartitionManager init after LANG (watch for "I:Reading /etc/recovery.fstab" absence); (c) crypto/keymaster (TW_INCLUDE_CRYPTO := true). The next evidence: full-stdout tail is ALREADY captured (kr64-app-stderr.log has the I: lines via inherited stdio) — grep it for post-LANG lines each run.
+
+---
+Task ID: 6-Z164 + 6-Z165
+Agent: main
+Task: The arm64 black-screen verdict — honest run-32996812991 analysis + the /tmp kill-chain fix
+
+Evidence (run 32996812991, SHA 3ba05b3 — VLM screenshot analysis + full kr64/logcat/kmsg read):
+- THE VERDICT IS BLACK SCREEN, NOT BOOT: every screenshot after 06b_popups_before shares ONE md5
+  (f3936d2b...) — a solid black frame; VLM confirms "completely black". kmsg: recovery exited
+  status 1 TEN times (pids 2621..2850), adbd same. Nothing ever reached graphics — no fb0 open
+  anywhere in the trace.
+- Kill chain (rebuilt from the raw ptrace trace, NOT the previous session's "boots" claim):
+  TWRP reaches post-LANG, its logger open("/tmp/recovery.log", O_CREAT|O_WRONLY|O_APPEND=0x441)
+  prints fd=-1 INSIDE the jail (fb_hook fragments interleaved in kr64-app-stderr.log), then
+  socket+connect(property)+writev+close+sigaction → exit_group(1). Same death point as
+  6-Z163e/f: THE LOGGER OPEN IS THE PRIME SUSPECT again.
+- WHY THE 6-Z163f DIAG WAS BLIND: it only logs when ret >= 0. Failed opens fell into the ret<0
+  else-arm which has NO /tmp logging → zero lines ≠ no opens. (Also: the else-arm's property
+  fake-fd path was the only consumer.) Fixed in 6-Z164.
+- EVIDENCE-PIPELINE CORRUPTION discovered (why this run was so hard to read):
+  1. The child's stderr (fd 2, fb_hook messages) and the ptrace log share ONE open file
+     description → byte-level interleaving garbles both ("nr=40 [ount]" etc). Absence of a log
+     line proves nothing.
+  2. The DIAG write "fd=" field reads x0 at syscall EXIT — on arm64 x0 holds the RETURN value by
+     then, so "fd=21, ret=21" really means fd==bytecount coincidence; the real fd was 2.
+  3. read_child_string/read_child_bytes EIO failures ("<buffer read failed: EIO>") on the
+     arm64 child's message buffers — possibly the same failure that makes the hook's open path
+     reads flaky (hypothesis: untranslated → host /tmp → fd=-1).
+- Facts pinned despite the corruption: {rootfs}/tmp EXISTS (drwx------ u0_a87, from extraction
+  17:59, EMPTY at pull); translate_path default-branch maps /tmp/* → {rootfs}/tmp/*; the probe
+  (outside jail) gets EACCES on /tmp/recovery.log → redroid HAS a /tmp the app can't write; the
+  jail's fb_hook fd=-1 is therefore EITHER untranslated-host-EACCES OR a translated-open that
+  still failed (mechanism unresolved — 6-Z164 DIAGs will name it next run); mount("tmpfs","/tmp")
+  hit the REAL kernel untranslated (-ENOENT, "no SIGSYS interceptions recorded" — the 6-Z91 SIGSYS
+  pseudo-mount arm never fires on this arm64 flow) though the compute-table fake then shows the
+  CHILD a 0; mkdirat translation + fscreate/"/tmp" DIR opens work in the same child (fd 9 real).
+
+Fix (6-Z164, kr64 ptrace_emu.rs):
+- /tmp open-FAILURE DIAG: the ret<0 else-arm now logs original+translated path+errno (first 12).
+- openat ENTRY path-read DIAG: read_child_string failure logs (pid, nr, path_addr) — exposes the
+  PEEK-EIO/no-translation hypothesis directly.
+- pending_open_original_path per-pid stash (ENTRY) consumed at EXIT alongside the translated one.
+- Pseudo-mount materialization: at mount ENTRY (post-execve, UNGATED like 6-Z153), pseudo fs +
+  absolute target → parent create_dir_all({rootfs}{target}) (new pure helper pseudo_mount_target
+  + 2 unit tests; mirrors the SIGSYS arm's side effect for the no-SIGSYS arm64 flow).
+
+Fix (6-Z165, twrp_fb_hook.c):
+- tmp_retry_open(): when an ABSOLUTE "/tmp..." open fails, (a) probe the same path without
+  O_CREAT (raw -errno → the evidence the corrupted log couldn't show), (b) retry with path+1
+  RELATIVE — the guest cwd IS the rootfs, so "tmp/..." resolves to {rootfs}/tmp/... with NO
+  translation needed. Wired into open/openat/__open_2/__openat_2. Robust to EVERY hypothesis:
+  untranslated-host-EACCES → retry succeeds; translated-but-broken → retry bypasses translation.
+  TWRP's logger then writes {rootfs}/tmp/recovery.log → the E2E pull (twrp-recovery.log artifact,
+  already wired) captures TWRP's OWN account of the NEXT failure (fstab? crypto? graphics?).
+
+Stage Summary:
+- Do NOT claim boot until a screenshot md5 CHANGES post-launch. Next run's verdicts:
+  (1) hook "/tmp abs open fd=... probe_raw=... rel retry -> fd=..." lines, (2) 6-Z164 open
+  FAILED/ENTRY path-read lines naming the translation mechanism, (3) twrp-recovery.log existing
+  for the first time, (4) pseudo-mount materialized lines.
