@@ -1019,6 +1019,15 @@ struct ChildAbi {
     // socketcall; the direct nr fires on every ABI.
     connect_nr: i64,
     writev_nr: i64,
+    // 6-Z155: identity-syscall fake-success fields. See the long doc on
+    // these in `ChildAbi` — plain `setuid`/`setgid` (x86_64 only),
+    // `setresuid`/`setresgid` (all three ABIs), and `setgroups` (all
+    // three ABIs). init must never see EPERM from these.
+    setuid_nr: i64,
+    setgid_nr: i64,
+    setresuid_nr: i64,
+    setresgid_nr: i64,
+    setgroups_nr: i64,
     // Register indices into the `Regs` buffer reinterpreted as a u64
     // array. On x86_64 these index into user_regs_struct; on aarch64
     // into user_pt_regs. On x86_64 running a 32-bit child, PTRACE_GETREGS
@@ -1316,6 +1325,13 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // so these are the values that actually fire.
     connect_nr: 42,
     writev_nr: 20,
+    // 6-Z155 identity-syscall fakes (x86_64: setuid=105, setgid=106,
+    // setresuid=117, setresgid=119, setgroups=116).
+    setuid_nr: 105,
+    setgid_nr: 106,
+    setresuid_nr: 117,
+    setresgid_nr: 119,
+    setgroups_nr: 116,
     reg_syscall: 15, // orig_rax
     reg_ret: 10,     // rax
     reg_arg1: 14,    // rdi
@@ -1669,6 +1685,13 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // precedent.
     connect_nr: 363,
     writev_nr: 146,
+    // 6-Z155 identity-syscall fakes (i386: no plain setuid/setgid —
+    // kernel-internal only; setresuid=208, setresgid=210, setgroups=81).
+    setuid_nr: -1,
+    setgid_nr: -1,
+    setresuid_nr: 208,
+    setresgid_nr: 210,
+    setgroups_nr: 81,
     // i386 syscall args are passed in ebx/ecx/edx/esi (not rdi/rsi/
     // rdx/r10). When reading these from a 32-bit child via the 64-bit
     // user_regs_struct view (PTRACE_GETREGS zero-extends), the values
@@ -1994,6 +2017,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // ABI-completeness precedent.
     connect_nr: 203,
     writev_nr: 66,
+    // 6-Z155 identity-syscall fakes (aarch64 asm-generic: setuid=146,
+    // setgid=144, setresuid=147, setresgid=148, setgroups=159).
+    setuid_nr: 146,
+    setgid_nr: 144,
+    setresuid_nr: 147,
+    setresgid_nr: 148,
+    setgroups_nr: 159,
     reg_syscall: 8, // x8 (syscall number)
     reg_ret: 0,     // x0 (return value)
     reg_arg1: 0,    // x0
@@ -2619,6 +2649,36 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || (abi.execve == 11 && (syscall_nr == 172 || syscall_nr == 75 || syscall_nr == 191)) // i386: prctl/setrlimit/ugetrlimit
         || (abi.execve == 221 && (syscall_nr == 167 || syscall_nr == 164))
     // aarch64: prctl/setrlimit
+        //
+        // Task 6-Z155: identity-syscall fakes — setuid/setgid (plain
+        // forms exist only on x86_64/aarch64) + setresuid/setresgid +
+        // setgroups on all three ABIs. ROOT CAUSE (run 32966475822 +
+        // 32968075629, redroid 14 arm64): the arm64 TWRP ramdisk init
+        // runs /sbin/recovery DIRECTLY (single fork + execve, no service
+        // manager). Before execve it drops to uid 0 via
+        // setresgid/setgroups/setresuid — as the untrusted_app-domain
+        // twoyi process the real kernel returns -EPERM, bionic's
+        // setresuid wrapper inlines that as -1 with errno EPERM, init
+        // logs the 3 fatal writevs (~70/46/59 bytes) at post-execve
+        // syscalls #110-#112, syncs, opens /proc/sysrq-trigger (-EACCES),
+        // calls reboot() (-EPERM), then parks in rt_sigsuspend forever
+        // — exactly init's security_failure(): `for (;;) pause();`
+        // after android_reboot fails. On x86_64 the SAME point is
+        // reached INSIDE service_start() → the EPERM only kills the
+        // 'recovery' service child (kr64 relaunches it), init itself
+        // survives — which is why x86_64 TWRP boots. Faking these
+        // identity syscalls to 0 makes init believe it IS root, exactly
+        // like the existing chmod/mount/mknod fake-success family (the
+        // kr64 sandbox already virtualises ownership: rootfs files are
+        // app-owned and st_uid=0 is faked for the property files). No
+        // new privileges are involved — the traced child keeps its real
+        // app uid; only the RETURN VALUE the child reads is rewritten,
+        // the same mechanism as every other fake in this list.
+        || syscall_nr == abi.setresuid_nr
+        || syscall_nr == abi.setresgid_nr
+        || syscall_nr == abi.setgroups_nr
+        || syscall_nr == abi.setuid_nr
+        || syscall_nr == abi.setgid_nr
     {
         Some(0)
     } else {
@@ -3087,6 +3147,19 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "mknodat"
     } else if nr == abi.chroot {
         "chroot"
+    } else if abi.setresuid_nr != -1 && nr == abi.setresuid_nr {
+        // 6-Z155: label the identity fakes so the E2E trace shows what
+        // init actually called before its execve (setresgid comes first,
+        // then setgroups, then setresuid).
+        "setresuid"
+    } else if abi.setresgid_nr != -1 && nr == abi.setresgid_nr {
+        "setresgid"
+    } else if abi.setgroups_nr != -1 && nr == abi.setgroups_nr {
+        "setgroups"
+    } else if abi.setuid_nr != -1 && nr == abi.setuid_nr {
+        "setuid"
+    } else if abi.setgid_nr != -1 && nr == abi.setgid_nr {
+        "setgid"
     } else if abi.mkdir != -1 && nr == abi.mkdir {
         "mkdir"
     } else if abi.mkdirat != -1 && nr == abi.mkdirat {
@@ -14309,6 +14382,21 @@ pub fn run_ptrace_loop(
                                     ));
                                 }
                                 if let Some(fake_val) = _forced_ret {
+                                    // 6-Z155: identity-syscall fakes are the
+                                    // arm64-TWRP boot unblocker — always log
+                                    // them (they fire at most a handful of
+                                    // times per guest boot, never in loops).
+                                    let identity_fake = syscall_num == abi.setresuid_nr
+                                        || syscall_num == abi.setresgid_nr
+                                        || syscall_num == abi.setgroups_nr
+                                        || syscall_num == abi.setuid_nr
+                                        || syscall_num == abi.setgid_nr;
+                                    if identity_fake {
+                                        log(&format!(
+                                            "6-Z155: {}() nr={} returned {} (-errno {}) — faked to 0 (untrusted_app cannot change ids; init must believe it is root so the direct /sbin/recovery execve proceeds instead of security_failure() → reboot → rt_sigsuspend park)",
+                                            name, syscall_num, fresh_ret, -fresh_ret
+                                        ));
+                                    }
                                     if loop_count <= 200 {
                                         log(&format!(
                                             "intercepted {}() nr={} at EXIT → faking return {} (6-Z60: syscall failed — fresh_ret={})",
@@ -14383,7 +14471,7 @@ pub fn run_ptrace_loop(
                                     let path_addr = get_syscall_arg(&regs2, path_idx);
                                     if path_addr != 0 {
                                         if let Some(path) = read_child_string(pid, path_addr) {
-                                            let real_path = translate_path(&rootfs, &path);
+                                            let real_path = translate_path(rootfs, &path);
                                             if let Some(parent) =
                                                 std::path::Path::new(&real_path).parent()
                                             {
@@ -18667,6 +18755,57 @@ mod tests {
         // The aarch64 mknod SENTINEL (-1) must still match nothing
         // real — and mknodat must NOT collide with i386 mkdirat (296).
         assert_eq!(compute_exit_return_value(296, &ABI_X86_32), None);
+    }
+
+    #[test]
+    fn compute_exit_return_value_identity_fakes_6z155() {
+        // 6-Z155: setresuid/setresgid/setgroups (+ plain setuid/setgid
+        // where the ABI has them) join the fake-success set. Root cause:
+        // arm64 TWRP ramdisk init drops ids via setresgid/setgroups/
+        // setresuid before its DIRECT /sbin/recovery execve — the real
+        // kernel returns -EPERM under untrusted_app and init takes its
+        // security_failure() path (reboot → rt_sigsuspend park), traced
+        // on runs 32966475822 + 32968075629 as post-execve writevs
+        // #110-#112 → sync → sysrq open (-EACCES) → reboot (-EPERM) →
+        // rt_sigsuspend with no return. Numbers verified against the
+        // kernel UAPI headers (asm-generic, unistd_32.h, unistd_64.h):
+        //   setresuid: i386=208, x86_64=117, aarch64=147
+        //   setresgid: i386=210, x86_64=119, aarch64=148
+        //   setgroups: i386=81,  x86_64=116, aarch64=159
+        //   setuid:    (no i386 user syscall), x86_64=105, aarch64=146
+        //   setgid:    (no i386 user syscall), x86_64=106, aarch64=144
+        // i386 (208/210/81; plain setuid/setgid are -1 sentinels):
+        assert_eq!(compute_exit_return_value(208, &ABI_X86_32), Some(0));
+        assert_eq!(compute_exit_return_value(210, &ABI_X86_32), Some(0));
+        assert_eq!(compute_exit_return_value(81, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(208, &ABI_X86_32), "setresuid");
+        assert_eq!(syscall_name(210, &ABI_X86_32), "setresgid");
+        assert_eq!(syscall_name(81, &ABI_X86_32), "setgroups");
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(compute_exit_return_value(117, &ABI_X86_64), Some(0));
+            assert_eq!(compute_exit_return_value(119, &ABI_X86_64), Some(0));
+            assert_eq!(compute_exit_return_value(116, &ABI_X86_64), Some(0));
+            assert_eq!(compute_exit_return_value(105, &ABI_X86_64), Some(0));
+            assert_eq!(compute_exit_return_value(106, &ABI_X86_64), Some(0));
+            assert_eq!(syscall_name(117, &ABI_X86_64), "setresuid");
+            assert_eq!(syscall_name(105, &ABI_X86_64), "setuid");
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(compute_exit_return_value(147, &ABI_AARCH64), Some(0));
+            assert_eq!(compute_exit_return_value(148, &ABI_AARCH64), Some(0));
+            assert_eq!(compute_exit_return_value(159, &ABI_AARCH64), Some(0));
+            assert_eq!(compute_exit_return_value(146, &ABI_AARCH64), Some(0));
+            assert_eq!(compute_exit_return_value(144, &ABI_AARCH64), Some(0));
+            assert_eq!(syscall_name(147, &ABI_AARCH64), "setresuid");
+            assert_eq!(syscall_name(146, &ABI_AARCH64), "setuid");
+        }
+        // No collision with neighbouring numbers: 147 on i386
+        // (getgid32-era region) must stay unfaked; aarch64 146/144 only
+        // exist as setuid/setgid in the aarch64 table.
+        assert_eq!(compute_exit_return_value(147, &ABI_X86_32), None);
+        assert_eq!(compute_exit_return_value(159, &ABI_X86_32), None);
     }
 
     #[test]
