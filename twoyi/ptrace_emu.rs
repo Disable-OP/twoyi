@@ -6623,6 +6623,107 @@ fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
     true
 }
 
+/// 6-Z163: write an ARBITRARY byte blob (no NUL appending — the caller
+/// controls the exact bytes) into the child's memory at `addr`, in
+/// POKEDATA word chunks. Same contract as `write_child_string_unchecked`
+/// but for binary structs (translated sockaddr blobs).
+fn write_child_blob(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> bool {
+    if addr == 0 || bytes.is_empty() {
+        return false;
+    }
+    let word_size = std::mem::size_of::<libc::c_long>();
+    let mut offset = 0i64;
+    while offset < bytes.len() as i64 {
+        let mut word_bytes = [0u8; 8];
+        let chunk_len = std::cmp::min(word_size, bytes.len() - offset as usize);
+        word_bytes[..chunk_len]
+            .copy_from_slice(&bytes[offset as usize..offset as usize + chunk_len]);
+        let word = libc::c_long::from_ne_bytes(word_bytes);
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKEDATA,
+                pid,
+                addr as i64 + offset,
+                word as libc::c_long,
+            )
+        };
+        if r == -1 {
+            return false;
+        }
+        offset += word_size as i64;
+    }
+    true
+}
+
+// ── Task 6-Z163: AF_UNIX bind() sun_path rewrite — pure helpers ──────
+//
+// Run 32988644183 (SHA dc3962a, 6-Z161 DIAG) pinned the arm64 TWRP init
+// busy-spin: init's StartPropertyService did
+//   socket(AF_UNIX) -> fd 8
+//   unlinkat("/dev/socket/property_service") -> -2   (translated, OK)
+//   bind(fd, {AF_UNIX, "/dev/socket/property_service"}, 110) -> EACCES
+//     (sockaddr paths live INSIDE a struct — pathname translation never
+//      sees them; the kernel resolves against the HOST's /dev/socket,
+//      which untrusted_app cannot write)
+//   → the 6-Z101 EXIT fake flipped that failure to 0 — init believed the
+//     bind, but fd 8 was NEVER bound and NEVER in LISTEN state.
+//   → epoll_pwait on an unconnected AF_UNIX socket reports EPOLLHUP
+//     (events=0x10 — observed, occurrence 1..13) on EVERY call → init's
+//     event loop wakes instantly, every time → accept4(fd 8) -> -EINVAL
+//     (kernel: not a listening socket) → 60k+ spin, 100% CPU, and the
+//     property service is dead (every guest __system_property_set no-ops).
+//
+// FIX (this task): at the bind() ENTRY stop, REWRITE the child's
+// sockaddr_un so the kernel binds the TRANSLATED path
+// {rootfs}/dev/socket/property_service — a real, app-writable location.
+// The real bind then SUCCEEDS, listen() really listens, epoll_pwait
+// really blocks, accept4 really waits for connections. No EXIT-side
+// fake is needed: the 6-Z101 fake only fires on ret < 0, and a
+// successful real bind returns 0. If the real bind STILL fails (dir
+// missing, stale socket), the existing 6-Z101 fake remains as the
+// fallback — the old spin behavior, no worse than before.
+//
+// GATED to TWRP mode: the AOSP E2E is green with the current fake; its
+// init (Android 11) handles the EPOLLHUP loop differently. Opting the
+// AOSP path in is a separate, evidence-driven change.
+
+/// Pure classifier: given the first bytes of a sockaddr blob, return the
+/// filesystem sun_path when it is an AF_UNIX sockaddr whose sun_path is
+/// an absolute NUL-terminated path. Rejects everything else (AF_INET/
+/// AF_NETLINK families, abstract-namespace names, relative paths, missing
+/// NUL). `sun_path` starts at offset 2 (sizeof(sa_family_t)).
+fn unix_fs_sun_path(blob: &[u8]) -> Option<&str> {
+    if blob.len() < 3 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([blob[0], blob[1]]);
+    if family != 1 {
+        return None; // AF_UNIX only (1 on every ABI we trace)
+    }
+    if blob[2] != b'/' {
+        return None; // abstract ('\0'-prefixed) or relative — leave alone
+    }
+    let end = blob[2..].iter().position(|&b| b == 0)? + 2;
+    std::str::from_utf8(&blob[2..end]).ok()
+}
+
+/// Pure builder: the rewritten sockaddr blob for a translated bind.
+/// Layout: [family u16 LE][host_path bytes][NUL]. The kernel bounds
+/// sun_path by addrlen, so the caller must also pass the new addrlen
+/// (2 + host_path.len() + 1). Returns None when the translated path
+/// cannot fit sun_path[108] (with NUL) — the caller then leaves the
+/// original sockaddr untouched (falls back to the 6-Z101 fake).
+fn build_translated_unix_sockaddr(host_path: &str) -> Option<Vec<u8>> {
+    if host_path.len() + 1 > 108 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(2 + host_path.len() + 1);
+    out.extend_from_slice(&1u16.to_ne_bytes()); // AF_UNIX
+    out.extend_from_slice(host_path.as_bytes());
+    out.push(0); // NUL
+    Some(out)
+}
+
 // ============================================================================
 // Task 6-Z62: mmap2 CONTENT INJECTION — module-level helpers
 // ============================================================================
@@ -10576,6 +10677,100 @@ pub fn run_ptrace_loop(
                                     get_syscall_arg(&regs, abi.reg_arg3) as usize,
                                 ),
                             );
+                        }
+                        // ── 6-Z163: AF_UNIX bind() sun_path rewrite (TWRP
+                        // mode, direct-bind ABIs only) — see the helpers'
+                        // doc block for the full evidence chain. At the
+                        // bind ENTRY stop, rewrite the child's sockaddr to
+                        // the TRANSLATED path so the kernel performs a REAL
+                        // bind at {rootfs}/dev/socket/... — killing the
+                        // EPOLLHUP storm + accept4 -EINVAL spin at its
+                        // root (the never-really-bound property socket).
+                        // Parent-side prep: mkdir -p the target's parent
+                        // dir + unlink any stale socket file (a leftover
+                        // from a previous run would EADDRINUSE the real
+                        // bind; init's own unlinkat was TRANSLATED and
+                        // already removed the guest-path copy, but a
+                        // crash between runs can leave stragglers).
+                        if boot_recovery
+                            && abi.bind_nr != -1
+                            && syscall_num == abi.bind_nr
+                            && abi.socketcall_nr == -1
+                            && scratch_addr != 0
+                        {
+                            let sa_ptr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let sa_len = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                            if sa_ptr != 0 && sa_len >= 3 && sa_len <= 128 {
+                                if let Some(blob) = read_child_bytes(pid, sa_ptr, 128) {
+                                    if let Some(guest_path) = unix_fs_sun_path(&blob) {
+                                        let host_path = translate_path(rootfs, guest_path);
+                                        if let Some(new_sa) =
+                                            build_translated_unix_sockaddr(&host_path)
+                                        {
+                                            // Parent-side prep (tracer runs
+                                            // while the child is STOPPED —
+                                            // synchronous filesystem prep is
+                                            // safe here).
+                                            if let Some(dir) =
+                                                std::path::Path::new(&host_path).parent()
+                                            {
+                                                let _ = std::fs::create_dir_all(dir);
+                                            }
+                                            let _ = std::fs::remove_file(&host_path);
+                                            // Scratch write (rotating cursor,
+                                            // overflow-checked) + fresh-regs
+                                            // arg2/arg3 update.
+                                            let aligned =
+                                                (new_sa.len() + 7) & !7;
+                                            if scratch_offset + aligned > 4096 {
+                                                scratch_offset = 0;
+                                            }
+                                            let sa_scratch =
+                                                scratch_addr + scratch_offset as u64;
+                                            if write_child_blob(pid, sa_scratch, &new_sa) {
+                                                let new_len = new_sa.len() as i64;
+                                                let mut fresh: Regs =
+                                                    unsafe { std::mem::zeroed() };
+                                                if ptrace_getregs(pid, &mut fresh).is_ok() {
+                                                    set_syscall_arg(
+                                                        &mut fresh,
+                                                        abi.reg_arg2,
+                                                        sa_scratch,
+                                                    );
+                                                    set_syscall_arg(
+                                                        &mut fresh,
+                                                        abi.reg_arg3,
+                                                        new_len as u64,
+                                                    );
+                                                    if ptrace_setregs(pid, &fresh, iov_len)
+                                                        .is_ok()
+                                                    {
+                                                        set_syscall_arg(
+                                                            &mut regs,
+                                                            abi.reg_arg2,
+                                                            sa_scratch,
+                                                        );
+                                                        set_syscall_arg(
+                                                            &mut regs,
+                                                            abi.reg_arg3,
+                                                            new_len as u64,
+                                                        );
+                                                        scratch_offset += aligned;
+                                                        log(&format!(
+                                                            "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
+                                                            get_syscall_arg(&regs, abi.reg_arg1),
+                                                            guest_path,
+                                                            host_path,
+                                                            sa_len,
+                                                            new_len
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         // 6-Z145 (Task 2): prctl-arg ENTRY logging — see the
                         // counter's declaration for the full rationale. The
@@ -22356,4 +22551,68 @@ mod tests {
         assert!(open_flags_indicate_write(0o2000)); // O_APPEND
         assert!(open_flags_indicate_write(0o241)); // O_WRONLY|O_CREAT|O_TRUNC
     }
+    // ── Task 6-Z163: AF_UNIX bind() sun_path rewrite — pure helpers ────
+    #[test]
+    fn z163_unix_fs_sun_path_accepts_absolute_unix_path() {
+        let mut blob = vec![0u8; 128];
+        blob[0] = 1; // AF_UNIX
+        blob[1] = 0;
+        let path = b"/dev/socket/property_service";
+        blob[2..2 + path.len()].copy_from_slice(path);
+        blob[2 + path.len()] = 0;
+        assert_eq!(unix_fs_sun_path(&blob), Some("/dev/socket/property_service"));
+    }
+
+    #[test]
+    fn z163_unix_fs_sun_path_rejects_other_families_and_forms() {
+        // AF_INET (2) — not AF_UNIX
+        let mut inet = vec![0u8; 128];
+        inet[0] = 2;
+        assert_eq!(unix_fs_sun_path(&inet), None);
+        // AF_NETLINK (16)
+        let mut nl = vec![0u8; 128];
+        nl[0] = 16;
+        assert_eq!(unix_fs_sun_path(&nl), None);
+        // Abstract namespace ('\0'-prefixed sun_path)
+        let mut abs = vec![0u8; 128];
+        abs[0] = 1;
+        abs[2] = 0; // leading NUL = abstract
+        assert_eq!(unix_fs_sun_path(&abs), None);
+        // Relative path
+        let mut rel = vec![0u8; 128];
+        rel[0] = 1;
+        rel[2] = b'p';
+        rel[3] = b'r';
+        rel[4] = b'o';
+        rel[5] = b'p';
+        rel[6] = 0;
+        assert_eq!(unix_fs_sun_path(&rel), None);
+        // No NUL terminator within the blob AND slice end unterminated
+        let mut unterminated = vec![b'A'; 128];
+        unterminated[0] = 1;
+        unterminated[1] = b'A' - b'A'; // 0
+        unterminated[2] = b'/';
+        assert_eq!(unix_fs_sun_path(&unterminated), None);
+        // Too short
+        assert_eq!(unix_fs_sun_path(&[1, 0]), None);
+    }
+
+    #[test]
+    fn z163_build_translated_unix_sockaddr_layout_and_cap() {
+        let host = "/data/user/0/io.twoyi.debug/rootfs/dev/socket/property_service";
+        let sa = build_translated_unix_sockaddr(host).expect("63-char path fits");
+        assert_eq!(sa.len(), 2 + host.len() + 1);
+        assert_eq!(&sa[0..2], &1u16.to_ne_bytes());
+        assert_eq!(&sa[2..2 + host.len()], host.as_bytes());
+        assert_eq!(*sa.last().unwrap(), 0);
+        // 107-char path + NUL = 108 — exactly fits
+        let fits = "/".to_string() + &"a".repeat(106);
+        assert_eq!(fits.len(), 107);
+        assert!(build_translated_unix_sockaddr(&fits).is_some());
+        // 108-char path + NUL = 109 — over the sun_path[108] cap
+        let overflows = "/".to_string() + &"a".repeat(107);
+        assert_eq!(overflows.len(), 108);
+        assert!(build_translated_unix_sockaddr(&overflows).is_none());
+    }
+
 }
