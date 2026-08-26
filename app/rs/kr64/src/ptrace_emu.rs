@@ -11406,7 +11406,9 @@ pub fn run_ptrace_loop(
                         } else {
                             None
                         };
-                        if let Some(real_tgt) = pseudo_mount_target(rootfs, tgt.as_deref(), fs.as_deref()) {
+                        if let Some(real_tgt) =
+                            pseudo_mount_target(rootfs, tgt.as_deref(), fs.as_deref())
+                        {
                             match std::fs::create_dir_all(&real_tgt) {
                                 Ok(()) => log(&format!(
                                     "6-Z164: pseudo-mount materialized {} (fstype={}) at mount ENTRY",
