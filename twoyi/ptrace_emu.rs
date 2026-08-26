@@ -10704,8 +10704,43 @@ pub fn run_ptrace_loop(
                         {
                             let sa_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                             let sa_len = get_syscall_arg(&regs, abi.reg_arg3) as i64;
-                            if sa_ptr != 0 && sa_len >= 3 && sa_len <= 128 {
-                                if let Some(blob) = read_child_bytes(pid, sa_ptr, 128) {
+                            // 6-Z163c: NO silent branches. Run 32992050112
+                            // had init's bind skip WITHOUT the 6-Z163b
+                            // skip-DIAG firing — the only silent paths left
+                            // were sa_ptr==0 / sa_len out of range / a
+                            // first-word PEEK failure. Every one of them
+                            // now logs (first 12), so the next run names
+                            // the exact reason.
+                            let blob: Option<Vec<u8>> = if sa_ptr == 0
+                                || sa_len < 3
+                                || sa_len > 128
+                            {
+                                None
+                            } else {
+                                read_child_bytes(pid, sa_ptr, 128)
+                            };
+                            if blob.is_none() {
+                                spin_diag_bind_skip_count =
+                                    spin_diag_bind_skip_count.saturating_add(1);
+                                if spin_diag_bind_skip_count <= 12 {
+                                    log(&format!(
+                                        "6-Z163c: bind(fd={}) NOT rewritten — OUTER gate: sa_ptr={:#x} sa_len={} ({}) (occurrence {})",
+                                        get_syscall_arg(&regs, abi.reg_arg1),
+                                        sa_ptr,
+                                        sa_len,
+                                        if sa_ptr == 0 {
+                                            "null sockaddr"
+                                        } else if sa_len < 3 || sa_len > 128 {
+                                            "addrlen out of [3,128]"
+                                        } else {
+                                            "PEEK failed (first word unreadable)"
+                                        },
+                                        spin_diag_bind_skip_count
+                                    ));
+                                }
+                            }
+                            if let Some(blob) = blob {
+                                {
                                     // 6-Z163b: determine the rewrite target.
                                     // FS spelling ("/dev/socket/...") → the
                                     // general translated-path rewrite.
