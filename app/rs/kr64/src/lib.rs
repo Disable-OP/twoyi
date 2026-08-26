@@ -6292,8 +6292,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let symlinks: &[(&str, &str)] = &[
             ("dev/null", "/dev/null"),
             ("dev/zero", "/dev/zero"),
-            ("dev/urandom", "/dev/urandom"),
-            ("dev/random", "/dev/random"),
+            // 6-Z159: urandom/random moved OUT of this table — see the
+            // adaptive block below (symlink ELOOP on the arm64 redroid
+            // runner, run 32976478078 kmsg: 'Failed to open /dev/urandom:
+            // Too many symbolic links encountered').
             ("dev/console", "/dev/console"),
             ("dev/ptmx", "/dev/ptmx"),
             ("dev/tty", "/dev/tty"),
@@ -6322,6 +6324,49 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                         target,
                         e
                     );
+                }
+            }
+        }
+
+        // ── 6-Z159: adaptive /dev/urandom + /dev/random ──────────────
+        //
+        // On the arm64 redroid runner the plain symlink
+        // {rootfs}/dev/urandom -> /dev/urandom hit ELOOP when the guest
+        // opened the translated path (run 32976478078 kmsg stub:
+        // 'Failed to open /dev/urandom: Too many symbolic links
+        // encountered' — twice; init's RNG seeding then silently
+        // degraded). On the x86 emulator host the same symlink works,
+        // so: create the symlink, TEST-OPEN it in THIS context, and
+        // fall back to a regular empty file when traversal fails (the
+        // proven /dev/hw_random precedent — reads return EOF, callers
+        // treat it as 'no entropy source' and continue).
+        for (rel, target) in [
+            ("dev/urandom", "/dev/urandom"),
+            ("dev/random", "/dev/random"),
+        ] {
+            let link_path = format!("{}/{}", rootfs_prefix, rel);
+            let _ = std::fs::remove_file(&link_path);
+            let mut usable = false;
+            if symlink(target, &link_path).is_ok() {
+                usable = std::fs::File::open(&link_path).is_ok();
+            }
+            if !usable {
+                let _ = std::fs::remove_file(&link_path);
+                let replaced = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o666)
+                    .open(&link_path);
+                match replaced {
+                    Ok(_) => warning!(
+                        "[KR64] PARENT: 6-Z159: {} -> {} symlink failed test-open (ELOOP/EACCES in this context) — replaced with a regular empty file (hw_random precedent)",
+                        link_path, target
+                    ),
+                    Err(e) => warning!(
+                        "[KR64] PARENT: 6-Z159: could not create {} at all: {}",
+                        link_path, e
+                    ),
                 }
             }
         }
@@ -6395,8 +6440,94 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // file and splits on \0. With spaces, the entire file is one
         // big string with no NUL → no key=value pairs found →
         // ro.hardware='' (empty) → boot sequence failure (Task 6-Y).
-        let cmdline_content = "androidboot.hardware=ranchu\0androidboot.hardware.gralloc=ranchu\0androidboot.hardware.vulkan=ranchu\0androidboot.serialno=twoyi\0androidboot.boot_devices=pci0000:00/0000:00:03.0\0androidboot.verifiedbootstate=orange\0androidboot.flash.locked=0\0androidboot.slot_suffix=\0androidboot.vbmeta.size=0\0qemu=1\0qemu.avd_name=twoyi_test\0";
-        match std::fs::write(&cmdline_path, cmdline_content) {
+        // 6-Z159: derive androidboot.hardware from the ACTUAL recovery
+        // image instead of hardcoding ranchu. The ranchu value matched
+        // the x86 emulator rootfs but broke every real-device image:
+        // TWRP angler (hardware=angler) looked for /fstab.ranchu +
+        // /init.recovery.ranchu.rc (both absent — the ramdisk ships
+        // init.recovery.angler.rc) and recovery exited 1 (run
+        // 32976478078 kmsg stub: 'fs_mgr: Cannot open file
+        // /fstab.ranchu' + "could not import file
+        // '/init.recovery.ranchu.rc' from '/init.rc'").
+        //
+        // Detection: scan the rootfs top level for a
+        // hardware-suffixed file whose suffix is NOT one of TWRP's
+        // generic per-mode rc names (service/usb/nano/hlthchrg/logd/
+        // ldconfig/mksh/vold_decrypt). fstab.<hw> / ueventd.<hw>.rc /
+        // init.<hw>.rc / init.recovery.<hw>.rc all vote; a single
+        // distinct candidate wins. No candidate (e.g. the x86
+        // emulator rootfs, whose fstab.ranchu lives under /vendor/etc)
+        // falls back to ranchu — preserving x86 behaviour exactly.
+        let generic_rc_names: &[&str] = &[
+            "service",
+            "usb",
+            "nano",
+            "hlthchrg",
+            "logd",
+            "ldconfig",
+            "mksh",
+            "vold_decrypt",
+            "crypto",
+            "quiet",
+            "verifier",
+        ];
+        let detected_hw: Option<String> = std::fs::read_dir(&rootfs_prefix).ok().and_then(|rd| {
+            let mut cands: Vec<String> = Vec::new();
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().to_string();
+                let hw: Option<&str> = if let Some(rest) = name.strip_prefix("fstab.") {
+                    Some(rest)
+                } else if let Some(rest) = name.strip_suffix(".rc") {
+                    if let Some(mid) = rest.strip_prefix("ueventd.") {
+                        Some(mid)
+                    } else if let Some(mid) = rest.strip_prefix("init.recovery.") {
+                        Some(mid)
+                    } else if let Some(mid) = rest.strip_prefix("init.") {
+                        Some(mid)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(hw) = hw {
+                    if !hw.is_empty() && !hw.contains('.') && !generic_rc_names.contains(&hw) {
+                        cands.push(hw.to_string());
+                    }
+                }
+            }
+            cands.sort();
+            cands.dedup();
+            if cands.len() == 1 {
+                Some(cands.remove(0))
+            } else {
+                None
+            }
+        });
+        let hw = detected_hw.clone().unwrap_or_else(|| "ranchu".to_string());
+        if detected_hw.is_some() {
+            info!(
+                "[KR64] PARENT: 6-Z159: androidboot.hardware detected from recovery image = {:?} (was hardcoded ranchu)",
+                hw
+            );
+        } else {
+            info!(
+                "[KR64] PARENT: 6-Z159: no unique hardware suffix found in rootfs — keeping androidboot.hardware=ranchu (x86 emulator rootfs behaviour)"
+            );
+        }
+        let cmdline_content = format!(
+            "androidboot.hardware={}\0{}androidboot.serialno=twoyi\0androidboot.boot_devices=pci0000:00/0000:00:03.0\0androidboot.verifiedbootstate=orange\0androidboot.flash.locked=0\0androidboot.slot_suffix=\0androidboot.vbmeta.size=0\0{}",
+            hw,
+            // ranchu-only extras (emulator gralloc/vulkan) preserved for
+            // the x86 rootfs; meaningless for real-device images
+            if hw == "ranchu" {
+                "androidboot.hardware.gralloc=ranchu\0androidboot.hardware.vulkan=ranchu\0"
+            } else {
+                ""
+            },
+            if hw == "ranchu" { "qemu=1\0qemu.avd_name=twoyi_test\0" } else { "" }
+        );
+        match std::fs::write(&cmdline_path, &cmdline_content) {
             Ok(_) => {
                 let _ =
                     std::fs::set_permissions(&cmdline_path, std::fs::Permissions::from_mode(0o444));
