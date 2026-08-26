@@ -18312,10 +18312,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // 6-Z168: the jail's /data must be the ROOTFS copy — run
         // 33004885224 caught TWRP walking the HOST's real /data/system
         // and /data/media through the old passthrough.
-        assert_eq!(
-            translate_path(rootfs, "/data"),
-            format!("{}/data", rootfs)
-        );
+        assert_eq!(translate_path(rootfs, "/data"), format!("{}/data", rootfs));
         assert_eq!(
             translate_path(rootfs, "/data/media/TWRP"),
             format!("{}/data/media/TWRP", rootfs)
