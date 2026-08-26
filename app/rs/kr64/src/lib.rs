@@ -1225,7 +1225,33 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
 /// Returns the patched content, or `None` if the `service recovery` line
 /// was not found. The patch is IDEMPOTENT: if the setenv line is already
 /// present, the caller should skip the write (checked before calling).
+/// Extra `setenv` lines the recovery service needs (6-Z175).
+///
+/// TWRP's init does NOT pass its own environ to forked services — the
+/// service env is built from the init.rc `setenv` options (plus a few
+/// globals). Run 33017901360's /proc evidence proved it: recovery's env
+/// had LD_PRELOAD (an init.rc setenv line we patch in) but NOT
+/// TWOYI_FB_WIDTH/TWOYI_FB_HEIGHT/TWOYI_ROOTFS (kr64's execve environ for
+/// init). The twrp_fb_hook therefore fell back to 320x640 geometry and
+/// ftruncate'd fb0 to 819200 regardless of the native resolution.
+fn twrp_recovery_setenv_lines(fb_width: i32, fb_height: i32, rootfs: &str) -> String {
+    let w = if fb_width > 0 { fb_width } else { 320 };
+    let h = if fb_height > 0 { fb_height } else { 640 };
+    format!(
+        "\n    setenv TWOYI_FB_WIDTH {}\n    setenv TWOYI_FB_HEIGHT {}\n    setenv TWOYI_ROOTFS {}",
+        w, h, rootfs
+    )
+}
+
+#[cfg(test)]
 fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
+    patch_twrp_init_rc_recovery_service_with_env(content, "")
+}
+
+fn patch_twrp_init_rc_recovery_service_with_env(
+    content: &str,
+    extra_setenv: &str,
+) -> Option<String> {
     // Find the "service recovery" line. It may be "service recovery /sbin/recovery"
     // or "service recovery /sbin/recovery\r" (CRLF). We match the prefix
     // "service recovery " at the start of a line.
@@ -1266,6 +1292,10 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
                 .any(|l| l.trim_start().starts_with("seclabel"));
             result.push('\n');
             result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
+            // 6-Z175: the native-resolution + rootfs env lines (see
+            // twrp_recovery_setenv_lines — TWRP init does not inherit
+            // kr64's environ into services).
+            result.push_str(extra_setenv);
             // Task 6-Z36: add LD_LIBRARY_PATH=/sbin so the 32-bit TWRP linker
             // searches /sbin/ for the recovery binary's 23 NEEDED libraries
             // (libaosprecovery.so, libblkid.so, libminuitwrp.so, etc.). Without
@@ -1363,7 +1393,12 @@ const TWRP_LD_PRELOAD_PATCH_MARKER: &str = "    setenv LD_PRELOAD /sbin/libtwrp_
 ///   `format!("{}/...", rootfs_prefix)` which gives `/...` when the
 ///   prefix is empty (root mode, chroot-relative) or `{host_path}/...`
 ///   when non-empty (non-root mode, host paths).
-fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
+fn patch_twrp_init_rc_recovery_service_in_rootfs(
+    rootfs_prefix: &str,
+    fb_width: i32,
+    fb_height: i32,
+) {
+    let extra_setenv = twrp_recovery_setenv_lines(fb_width, fb_height, rootfs_prefix);
     // -----------------------------------------------------------------
     // Step 1: build the candidate .rc file list (ordered, deduplicated).
     // -----------------------------------------------------------------
@@ -1468,11 +1503,14 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
             Ok(c) => c,
             Err(_) => continue, // missing/unreadable — skip silently
         };
-        if let Some(patched) = patch_twrp_init_rc_recovery_service(&content) {
+        if let Some(patched) = patch_twrp_init_rc_recovery_service_with_env(&content, &extra_setenv)
+        {
             match std::fs::write(path, &patched) {
                 Ok(()) => info!(
-                    "[KR64] PARENT: patched {} — added 'setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so' to recovery service",
-                    path
+                    "[KR64] PARENT: patched {} — added 'setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so' + TWOYI_FB_WIDTH/HEIGHT/ROOTFS env (native res {}x{}) to recovery service",
+                    path,
+                    if fb_width > 0 { fb_width } else { 320 },
+                    if fb_height > 0 { fb_height } else { 640 }
                 ),
                 Err(e) => warning!(
                     "[KR64] PARENT: failed to write patched {}: {} (recovery will crash in libminuitwrp.so)",
@@ -1509,10 +1547,13 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(rootfs_prefix: &str) {
     // is preserved literally (a backslash-newline continuation in a
     // normal string literal would STRIP the leading whitespace, which
     // would break init.rc's service-option indentation requirement).
-    let twoyi_rc_content = concat!(
-        "service recovery /sbin/recovery\n",
-        "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so\n",
-        "    seclabel u:r:recovery:s0\n",
+    let twoyi_rc_content = format!(
+        concat!(
+            "service recovery /sbin/recovery\n",
+            "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so{}\n",
+            "    seclabel u:r:recovery:s0\n",
+        ),
+        extra_setenv
     );
     if let Err(e) = std::fs::write(&twoyi_rc_path, twoyi_rc_content) {
         warning!(
@@ -5150,7 +5191,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // The patch is IDEMPOTENT: if the setenv line is already present
     // (e.g., from a previous boot), we skip the write.
     if cfg.boot_recovery {
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs_prefix);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs_prefix, cfg.width, cfg.height);
 
         // TWRP BOOT: DELETE /property_contexts ENTIRELY.
         // The TWRP ramdisk's /property_contexts file has `#line 1 "..."`
@@ -9871,7 +9912,7 @@ mod tests {
     fn rootfs_patcher_patches_init_rc_when_service_recovery_is_in_init_rc() {
         let dir = make_test_rootfs("service recovery /sbin/recovery\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert!(
             init_rc.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
@@ -9900,7 +9941,7 @@ mod tests {
         )
         .unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         // init.rc should be UNTOUCHED (no service recovery line, no patch).
         let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert!(
@@ -9937,7 +9978,7 @@ mod tests {
         )
         .unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         // init.rc should be UNTOUCHED.
         let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert!(
@@ -9977,7 +10018,7 @@ mod tests {
         )
         .unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         let imported = std::fs::read_to_string(dir.join("init.recovery.qcom.rc")).unwrap();
         assert!(
             imported.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
@@ -9996,7 +10037,7 @@ mod tests {
     fn rootfs_patcher_falls_back_to_init_twoyi_rc_when_no_service_found() {
         let dir = make_test_rootfs("service ueventd /sbin/ueventd\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
 
         // init.twoyi.rc should be created with the expected content.
         let twoyi_rc_path = dir.join("init.twoyi.rc");
@@ -10038,9 +10079,9 @@ mod tests {
     fn rootfs_patcher_is_idempotent_when_service_in_init_rc() {
         let dir = make_test_rootfs("service recovery /sbin/recovery\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         let init_rc_after_first = std::fs::read_to_string(dir.join("init.rc")).unwrap();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         let init_rc_after_second = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert_eq!(
             init_rc_after_first, init_rc_after_second,
@@ -10063,9 +10104,9 @@ mod tests {
     fn rootfs_patcher_fallback_is_idempotent_for_import_line() {
         let dir = make_test_rootfs("service ueventd /sbin/ueventd\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         let init_rc_after_first = std::fs::read_to_string(dir.join("init.rc")).unwrap();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         let init_rc_after_second = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert_eq!(
             init_rc_after_first, init_rc_after_second,
@@ -10091,7 +10132,7 @@ mod tests {
         let dir = make_test_rootfs("import extra.rc\nservice ueventd /sbin/ueventd\n");
         std::fs::write(dir.join("extra.rc"), "service recovery /sbin/recovery\n").unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
         let extra = std::fs::read_to_string(dir.join("extra.rc")).unwrap();
         assert!(
             extra.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
