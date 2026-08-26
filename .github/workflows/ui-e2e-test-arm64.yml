@@ -618,7 +618,7 @@ jobs:
                   #     actually reached the TWRP child
                   echo "-- kr64-app-stderr tail:"
                   sudo docker exec redroid sh -c \
-                    "tail -n 120 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 120 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || echo '(kr64-app-stderr.log not found)'" 2>&1
+                    "grep -hE 'twrp_fb_hook|geometry|FB0|TRACKED|INTERCEPTED|ABORT|ASHMEM|VSCREENINFO|fscreeninfo|TWRP framebuffer|misc dev|KR64.*PARENT|TWRP-FB|created virtual|ftruncate' /data/user/0/io.twoyi.debug/kr64-app-stderr.log /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null | tail -n 100 || tail -n 40 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 40 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || echo '(kr64-app-stderr.log not found)'" 2>&1
                   echo "-- FileLogger boot tail:"
                   sudo docker exec redroid sh -c \
                     "ls -t /storage/emulated/0/Android/data/io.twoyi.debug/files/log/*.log 2>/dev/null | head -1 | xargs -r tail -n 60" 2>&1

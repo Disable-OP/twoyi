@@ -11114,3 +11114,37 @@ Stage Summary:
 - Chain status: init ✓ props ✓ logger ✓ fstab ✓ partitions ✓ theme ✓
   gr_init SURVIVED (recovery alive) → [adb evidence channel now protected]
   → fb0 content size mystery → render → gate-dismissal touch → main menu.
+
+---
+Task ID: 6-Z175
+Agent: main
+Task: The init.rc env injection — TWOYI_FB_* must ride the setenv patch
+
+Evidence (run 33017901360 on 17436c0):
+- THE DECISIVE /proc TAP: recovery's environ has LD_PRELOAD=... but NO
+  TWOYI_FB_WIDTH/TWOYI_FB_HEIGHT/TWOYI_ROOTFS. TWRP's init does NOT pass
+  its own (kr64-provided) environ to forked services — the service env is
+  built from init.rc `setenv` options. LD_PRELOAD only reaches recovery
+  because kr64 PATCHES it into init.rc. kr64's execve-env vars (6-Z171b)
+  never reach the recovery process -> the hook always fell back to
+  320x640 -> fb0 ftruncated to 819200 regardless of native res.
+- Java side fixed the same run: getMaximumWindowMetrics (API 30+) now
+  reports the REAL 720x1600 display (getRealMetrics reported the legacy
+  targetSdk-28 compat window: uiautomator bounds 320x640).
+- kr64-app-stderr tap works (file found post-spawn); dominated by the
+  capped per-syscall spam — the tap now greps for hook/KR64-PARENT lines.
+
+Fix (kr64 lib.rs):
+- twrp_recovery_setenv_lines(w, h, rootfs) + the init.rc recovery-service
+  patch now injects setenv TWOYI_FB_WIDTH/TWOYI_FB_HEIGHT/TWOYI_ROOTFS
+  right after the LD_PRELOAD line (same mechanism, same idempotence), for
+  BOTH the in-place patch and the fallback init.twoyi.rc authoring path.
+- Orchestrator + caller pass cfg.width/cfg.height; tests updated (720x1600
+  fixtures); wrapper kept test-only to satisfy clippy.
+
+Stage Summary:
+- Native-res chain now COMPLETE end-to-end: wm size 720x1600 -> Java
+  getMaximumWindowMetrics -> renderer_init -> kr64 --width/--height ->
+  fb0 file 4608000B + init.rc setenv TWOYI_FB_* -> hook geometry -> VSCREENINFO.
+  Next verdict: "geometry from env: 720x1600" in kr64-app-stderr + fb0
+  = 4608000 in the listing + (stretch) first pixels in screenshots.
