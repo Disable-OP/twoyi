@@ -2222,11 +2222,7 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Res
 /// `regs`; for a 32-bit compat child it truncates each 64-bit slot to
 /// its low 32 bits when populating the child's `user_regs_struct32`.
 #[cfg(target_arch = "x86_64")]
-fn ptrace_setregs(
-    pid: libc::pid_t,
-    regs: &Regs,
-    _iov_len: usize,
-) -> std::io::Result<()> {
+fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, _iov_len: usize) -> std::io::Result<()> {
     // 6-Z135: RAX AUDIT — the register-corruption hunt. Run 32803104772
     // proved the guest linker saw pread64→1 / fstatfs→ENOENT while the
     // tracer's EXIT logs showed the correct kernel returns: something
