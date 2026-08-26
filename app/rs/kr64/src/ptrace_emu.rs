@@ -490,6 +490,26 @@ struct ChildAbi {
     // unistd_32.h (__NR_mknod 14), unistd_64.h (__NR_mknod 133), and
     // /usr/include/asm-generic/unistd.h (no __NR_mknod — only
     // __NR_mknodat 33) in Task 5-X.
+    // mknodat(dirfd, pathname, mode, dev) — the *at sibling of mknod
+    // (6-Z154). On ABIs that dropped plain mknod (aarch64/asm-generic:
+    // mknod=-1 sentinel), bionic's mknod() wrapper issues mknodat(
+    // AT_FDCWD, ...) — so on aarch64 the syscall that actually reaches
+    // the kernel is mknodat (33). Run 32961216041 (arm64 TWRP on
+    // redroid): the guest init's open("/sys/fs/selinux/null") → ENOENT
+    // was followed by mknodat(nr=33) → -EACCES (real kernel; the
+    // zygote's Android-14 seccomp policy returns ERRNO instead of
+    // TRAP, so the SIGSYS path — with its stub-creation fs op — never
+    // fires on that runtime) → init exit(1) at post-execve syscall #59.
+    // Adding this field routes mknodat through the same EXIT-handler
+    // fake-success + rootfs stub-creation as the SIGSYS mknod branch.
+    //
+    // Verified directly against the kernel's UAPI headers on this box:
+    //   i386:   mknodat = 297  (/usr/include/x86_64-linux-gnu/asm/
+    //            unistd_32.h — NOTE: 296 is mkdirat, NOT mknodat; do
+    //            not "fix" this to 296)
+    //   x86_64: mknodat = 259  (unistd_64.h)
+    //   aarch64: mknodat = 33  (asm-generic/unistd.h)
+    mknodat: i64,
     mount: i64,
     chroot: i64,
     mkdir: i64,
@@ -1170,6 +1190,10 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // but the EXIT handler's if-chain is ABI-aware so we lock the
     // x86_64 number in too (cheap insurance).
     mknod: 133,
+    // x86_64 mknodat = 259 (per /usr/include/x86_64-linux-gnu/asm/
+    // unistd_64.h, verified directly in 6-Z154). Pairs with mknod: 133
+    // above for the EXIT handler's fake-success + stub-creation.
+    mknodat: 259,
     // x86_64 setxattr / lsetxattr / fsetxattr (per /usr/include/x86_64-
     // linux-gnu/asm/unistd_64.h: __NR_setxattr 188, __NR_lsetxattr 189,
     // __NR_fsetxattr 190, verified directly against the kernel's UAPI
@@ -1459,6 +1483,9 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // diagnostic label correctly says "[unknown]" for syscall 14
     // — and post-5-X it correctly says "mknod" (this addition).
     mknod: 14,
+    // i386 mknodat = 297 (per /usr/include/x86_64-linux-gnu/asm/
+    // unistd_32.h, verified directly in 6-Z154 — 296 is mkdirat).
+    mknodat: 297,
     // i386 setxattr / lsetxattr / fsetxattr (per /usr/include/x86_64-
     // linux-gnu/asm/unistd_32.h: __NR_setxattr 226, __NR_lsetxattr 227,
     // __NR_fsetxattr 228, verified directly against the kernel's UAPI
@@ -1812,6 +1839,12 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // is currently dead code at runtime — the sentinel keeps the
     // compile happy and documents the aarch64 behaviour.
     mknod: -1,
+    // aarch64 mknodat = 33 (asm-generic/unistd.h, verified directly in
+    // 6-Z154). THIS is the value that fires on the arm64 runners: the
+    // guest's bionic mknod() wrapper issues mknodat(AT_FDCWD, ...) —
+    // run 32961216041 traced it as "nr=33 -> -13 (-errno 13)" right
+    // before init's exit_group(1).
+    mknodat: 33,
     // aarch64 setxattr / lsetxattr / fsetxattr. Real Android aarch64
     // bionic uses the upstream Linux asm-generic numbers: setxattr=188,
     // lsetxattr=189, fsetxattr=190 (matching x86_64). This sandbox's
@@ -2567,6 +2600,7 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         || syscall_nr == abi.mount
         || syscall_nr == abi.rt_sigprocmask
         || syscall_nr == abi.mknod
+        || syscall_nr == abi.mknodat
         || syscall_nr == abi.setxattr
         || syscall_nr == abi.lsetxattr
         || syscall_nr == abi.fsetxattr
@@ -3046,6 +3080,11 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         // With this entry, syscall 14 on i386 is correctly labelled
         // "mknod" in the SIGSYS diagnostic log.
         "mknod"
+    } else if abi.mknodat != -1 && nr == abi.mknodat {
+        // 6-Z154: label the *at variant (mirrors the mkdirat FIX A label
+        // arm). The `!= -1` guard keeps nr=-1 SIGSYS-desync stops labelled
+        // "[unknown]" (mirrors the mknod/mkdirat guards).
+        "mknodat"
     } else if nr == abi.chroot {
         "chroot"
     } else if abi.mkdir != -1 && nr == abi.mkdir {
@@ -10726,6 +10765,11 @@ pub fn run_ptrace_loop(
                             // a nr=-1 SIGSYS-desync stop from matching
                             // the sentinel on ABIs that dropped mkdirat.
                             n if abi.mkdirat != -1 && n == abi.mkdirat => Some(abi.reg_arg2),
+                            // 6-Z154: mknodat(dirfd, path, mode, dev) —
+                            // dirfd in arg1, path in arg2 (like
+                            // openat/mkdirat/unlinkat). Plain mknod keeps
+                            // its arg1 slot below.
+                            n if abi.mknodat != -1 && n == abi.mknodat => Some(abi.reg_arg2),
                             n if n == abi.chdir => Some(abi.reg_arg1),
                             n if n == abi.readlink => Some(abi.reg_arg1),
                             n if n == abi.readlinkat => Some(abi.reg_arg2),
@@ -14301,6 +14345,63 @@ pub fn run_ptrace_loop(
                                 // iteration 203). When _forced_ret is None we
                                 // skip the write entirely and PRESERVE the
                                 // kernel's real return value.
+                                //
+                                // ── 6-Z154: mknod / mknodat rootfs stub ──
+                                //
+                                // The SIGSYS-side mknod branch (which creates
+                                // the empty-file stub so the guest's NEXT
+                                // open() succeeds) only runs when the
+                                // zygote's seccomp policy TRAPs the syscall.
+                                // On runtimes whose policy returns ERRNO
+                                // instead (redroid Android 14, arm64 — run
+                                // 32961216041), the REAL kernel executes the
+                                // mknodat and returns -EACCES (no CAP_MKNOD),
+                                // and only this EXIT-side fake runs — so the
+                                // stub must be created HERE too. Idempotent:
+                                // on runtimes where SIGSYS already created
+                                // the stub (x86 emulator API 30), or where
+                                // the real mknod SUCCEEDED (rooted hosts,
+                                // fresh_ret >= 0), we skip — the fs state is
+                                // already correct.
+                                //
+                                // Path arg: mknod → arg1, mknodat → arg2
+                                // (dirfd first, like openat/mkdirat). Arg
+                                // registers are preserved across the syscall
+                                // at the EXIT stop on x86-64 (rdi/rsi/rdx)
+                                // and aarch64 (x0..x5) — the same property
+                                // the "post-execve path" ENTRY log relies
+                                // on for its fresh regs2 re-reads.
+                                if (syscall_num == abi.mknod
+                                    || (abi.mknodat != -1 && syscall_num == abi.mknodat))
+                                    && fresh_ret < 0
+                                {
+                                    let path_idx = if syscall_num == abi.mknod {
+                                        abi.reg_arg1
+                                    } else {
+                                        abi.reg_arg2
+                                    };
+                                    let path_addr = get_syscall_arg(&regs2, path_idx);
+                                    if path_addr != 0 {
+                                        if let Some(path) = read_child_string(pid, path_addr) {
+                                            let real_path = translate_path(&rootfs, &path);
+                                            if let Some(parent) =
+                                                std::path::Path::new(&real_path).parent()
+                                            {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            match std::fs::File::create(&real_path) {
+                                                Ok(_) => log(&format!(
+                                                    "6-Z154: mknod-family stub created {} (real syscall returned {} — fake 0 + stub so the guest's next open() succeeds)",
+                                                    real_path, fresh_ret
+                                                )),
+                                                Err(e) => log(&format!(
+                                                    "6-Z154: FAILED to create mknod-family stub {}: {}",
+                                                    real_path, e
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(fake_val) = _forced_ret {
                                     set_syscall_ret(&mut regs2, &abi, fake_val);
                                 }
@@ -18542,6 +18643,30 @@ mod tests {
         // aarch64 fchownat = 54.
         assert_eq!(compute_exit_return_value(54, &ABI_AARCH64), Some(0));
         assert_eq!(syscall_name(54, &ABI_AARCH64), "fchownat");
+    }
+
+    #[test]
+    fn compute_exit_return_value_mknodat_returns_zero_6z154() {
+        // 6-Z154: mknodat joins the fake-success set on every ABI that
+        // has it (i386=297, x86_64=259, aarch64=33 — verified against
+        // the kernel UAPI headers; note i386 296 is mkdirat, NOT
+        // mknodat). Run 32961216041 (arm64 redroid) traced nr=33 →
+        // -EACCES right before init's exit_group(1).
+        assert_eq!(compute_exit_return_value(297, &ABI_X86_32), Some(0));
+        assert_eq!(syscall_name(297, &ABI_X86_32), "mknodat");
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(compute_exit_return_value(259, &ABI_X86_64), Some(0));
+            assert_eq!(syscall_name(259, &ABI_X86_64), "mknodat");
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(compute_exit_return_value(33, &ABI_AARCH64), Some(0));
+            assert_eq!(syscall_name(33, &ABI_AARCH64), "mknodat");
+        }
+        // The aarch64 mknod SENTINEL (-1) must still match nothing
+        // real — and mknodat must NOT collide with i386 mkdirat (296).
+        assert_eq!(compute_exit_return_value(296, &ABI_X86_32), None);
     }
 
     #[test]
