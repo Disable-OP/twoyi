@@ -10631,3 +10631,19 @@ FIXUP (6-Z163): rustfmt line-joining diffs from run 32989901122's fmt gate (5 sp
 FIXUP (6-Z163 #2): clippy -D unused_assignments — scratch_offset += aligned was dead on
 execve-reset paths (run 32989897968 build). Added the write_translated_path-style
 wrap guard (scratch_offset + 256 > 4096 -> 0) which also reads the increment.
+
+---
+Task ID: 6-Z163b
+Agent: main
+Task: Diagnose the two survivors — the unrewritten property bind + the libaosprecovery.so "not found"
+
+Evidence (run 32990637557, SHA aa84bf0 — first 6-Z163 build):
+- adbd's binds got REWRITTEN for real (5x: /dev/socket/adbd -> {rootfs}/dev/socket/adbd, stale-socket unlink handled). adbd now runs far enough to bind its control socket (still exits/restarts after).
+- init's property bind did NOT get rewritten: nr=200 ENTRY passed but no 6-Z163 line; kernel returned -98 EADDRINUSE (redroid's OWN socket at the untranslated path) -> 6-Z101 faked it -> the SAME EPOLLHUP spin (fd 8, events=0x10, 119k iterations).
+- Hypothesis: init binds the ABSTRACT spelling "\0property_service" (blob[2]==0 -> my FS-only classifier skipped it); abstract names live in redroid's SHARED abstract namespace where redroid's init already holds the name -> EADDRINUSE fits perfectly.
+- PROBE VERDICT (the decisive one): staged recovery exec'd by run-as prints "CANNOT LINK EXECUTABLE: library \"libaosprecovery.so\" not found" — yet /sbin/libaosprecovery.so EXISTS (34544 bytes, 0755) and LD_LIBRARY_PATH pointed at /sbin. Either the file is corrupt (extraction garbage -> linker's magic check fails -> "not found") or a subtler resolver issue. adbd probe: silent exit 1.
+
+Changes (6-Z163b):
+- bind hook: ABSTRACT property-service spelling (matcher reuse: sockaddr_blob_is_property_service) ALSO rewrites to the translated FS path {rootfs}/dev/socket/property_service (escaping redroid's shared abstract namespace entirely).
+- bind hook: skip-reason DIAG (first 12): family / abstract-non-property / non-absolute / peek-short + blob[0..16] hexdump — settles the skip question definitively next run.
+- probes: sbin-lib-magic.txt (dd|od hexdump of the first 32 bytes of libaosprecovery.so/libc.so/libcrecovery.so/liblog.so/libminuitwrp.so/linker64/recovery/adbd — a valid arm64 .so starts 7f 45 4c 46 02 01 01 00) + recovery-ld-debug.txt (LD_DEBUG=1 — the old bionic linker prints its search decisions).
