@@ -540,6 +540,14 @@ jobs:
           # qemu 2.12 ranchu uses MMIO virtio transports — virtio
           # devices are auto-plugged into the transports the board
           # creates (create_virtio_devices in ranchu.c).
+          #
+          # v6 fix: ranchu's UART is a PL011 (hw/arm/ranchu.c line 546:
+          # create_serial_device(..., "pl011", ...); base 0x9000000 per
+          # memmap). The Linux console device for PL011 is ttyAMA0 —
+          # NOT ttyS0. v5 (run 32948954044) ran qemu for the full
+          # 20-minute window with a 0-byte serial.log because
+          # console=ttyS0 matched nothing. Also add earlycon so we see
+          # output from the earliest boot stage possible.
           # API-30 image partition set: system + vendor + userdata +
           # encryptionkey (metadata). The Android emulator attaches all
           # of them as virtio-blk devices in this order; the ramdisk's
@@ -567,7 +575,7 @@ jobs:
             $ENC_ARGS \
             -drive "file=$LOG_DIR/userdata.img,if=none,id=userdata,format=raw" \
             -device "virtio-blk-device,drive=userdata" \
-            -append "qemu=1 no_timer_check androidboot.hardware=ranchu androidboot.console=ttyS0 androidboot.selinux=permissive console=ttyS0 printk.synchronous=1" \
+            -append "qemu=1 no_timer_check androidboot.hardware=ranchu androidboot.console=ttyAMA0 androidboot.selinux=permissive console=ttyAMA0 earlycon=pl011,mmio32,0x9000000 printk.synchronous=1" \
             -netdev user,id=net0 \
             -device "virtio-net-device,netdev=net0" \
             -nographic \
