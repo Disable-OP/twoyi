@@ -128,13 +128,17 @@ def _screencap_docker():
     """screencap via docker exec + docker cp — works when adb is DEAD but
     the container + SurfaceFlinger live (run 33015609499: the guest jail
     unlinked the container's real /dev/socket/adbd; every adb channel died
-    while the framework kept running). Returns raw PNG bytes or b''."""
+    while the framework kept running). Returns raw PNG bytes or b''.
+
+    Uses /data/local/tmp (real filesystem) — the earlier /sdcard variant
+    silently failed: /sdcard is the emulated FUSE view and docker cp from
+    it can return nothing."""
     try:
         subprocess.run(["sudo", "docker", "exec", "redroid",
-                        "screencap", "-p", "/sdcard/_e2e_cap.png"],
+                        "screencap", "-p", "/data/local/tmp/_e2e_cap.png"],
                        capture_output=True, timeout=25)
         subprocess.run(["sudo", "docker", "cp",
-                        "redroid:/sdcard/_e2e_cap.png", "/tmp/_e2e_cap.png"],
+                        "redroid:/data/local/tmp/_e2e_cap.png", "/tmp/_e2e_cap.png"],
                        capture_output=True, timeout=15)
         with open("/tmp/_e2e_cap.png", "rb") as f:
             data = f.read()

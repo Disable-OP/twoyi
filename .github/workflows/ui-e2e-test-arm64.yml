@@ -606,6 +606,25 @@ jobs:
                   echo "-- rootfs/dev listing (fb0 size + socket survival):"
                   sudo docker exec redroid sh -c \
                     "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/graphics/ /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>&1 | head -40" 2>&1
+                  # 6-Z174: THE DECISIVE EVIDENCE TAPS — the app-private
+                  # files adb can no longer reach (dead-adbd runs) are all
+                  # readable as root via docker exec:
+                  #   - kr64-app-stderr.log: the tracer + twrp_fb_hook
+                  #     stderr ("geometry from env", FB0 TRACKED, abort
+                  #     markers, VSCREENINFO synthesis)
+                  #   - FileLogger logs: Java-side boot story
+                  #     ("renderer_init virt=WxH")
+                  #   - /proc/<recovery-pid>/environ: whether TWOYI_FB_*
+                  #     actually reached the TWRP child
+                  echo "-- kr64-app-stderr tail:"
+                  sudo docker exec redroid sh -c \
+                    "tail -n 120 /data/user/0/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || tail -n 120 /data/data/io.twoyi.debug/kr64-app-stderr.log 2>/dev/null || echo '(kr64-app-stderr.log not found)'" 2>&1
+                  echo "-- FileLogger boot tail:"
+                  sudo docker exec redroid sh -c \
+                    "ls -t /storage/emulated/0/Android/data/io.twoyi.debug/files/log/*.log 2>/dev/null | head -1 | xargs -r tail -n 60" 2>&1
+                  echo "-- TWRP child env (TWOYI_FB_*):"
+                  sudo docker exec redroid sh -c \
+                    'for p in $(ps -A -o PID,NAME 2>/dev/null | grep -E "recovery|sbin" | awk "{print \$1}"); do echo "== pid $p"; tr "\0" "\n" < /proc/$p/environ 2>/dev/null | grep -E "TWOYI_FB|LD_PRELOAD|TWOYI_ROOTFS"; done' 2>&1
                 else
                   echo "-- container: NOT RUNNING (died?) — inspect:"
                   sudo docker inspect redroid --format \

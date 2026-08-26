@@ -138,9 +138,21 @@ public class ProfileSettings {
      * Get the physical screen width in pixels. Uses DisplayMetrics.
      */
     private static int getScreenWidth(Context context) {
+        // 6-Z174: on API 30+ use getMaximumWindowMetrics — getRealMetrics
+        // reports the app's COMPAT-SCALED window for legacy targetSdk (28)
+        // apps, which on the arm64 redroid E2E gave 320x640 while the
+        // real panel was 720x1600 (run 33016909850: uiautomator bounds
+        // 320x640 vs wm size 720x1600; fb0 created at 819200 instead of
+        // 4608000). The TWRP container must run at the REAL native
+        // resolution — MaximumWindowMetrics reports it regardless of the
+        // app's compat window.
         try {
             WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
             if (wm != null) {
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    android.graphics.Rect b = wm.getMaximumWindowMetrics().getBounds();
+                    if (b.width() > 0) return b.width();
+                }
                 DisplayMetrics dm = new DisplayMetrics();
                 wm.getDefaultDisplay().getRealMetrics(dm);
                 if (dm.widthPixels > 0) return dm.widthPixels;
@@ -153,9 +165,14 @@ public class ProfileSettings {
      * Get the physical screen height in pixels. Uses DisplayMetrics.
      */
     private static int getScreenHeight(Context context) {
+        // 6-Z174: same real-display source as getScreenWidth above.
         try {
             WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
             if (wm != null) {
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    android.graphics.Rect b = wm.getMaximumWindowMetrics().getBounds();
+                    if (b.height() > 0) return b.height();
+                }
                 DisplayMetrics dm = new DisplayMetrics();
                 wm.getDefaultDisplay().getRealMetrics(dm);
                 if (dm.heightPixels > 0) return dm.heightPixels;
