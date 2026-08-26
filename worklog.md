@@ -10922,3 +10922,49 @@ Stage Summary:
 - Every jail-visible blocker is now either fixed honestly (mounts -ENODEV) or bypassed without
   reading child memory (+1 rewrite + hook prefix retry). Expected next run: theme loads
   succeed → PageManager ui.xml → minui render on the pre-created fb0 → FIRST PIXELS.
+
+---
+Task ID: 6-Z170 RESULTS + 6-Z171 HANDOFF (for the next session)
+Agent: main
+Task: Theme loads WORKING — next blocker: the minui-gr_init SIGABRT + the fb0 mmap display path
+
+Evidence (run 33010273952 on 69b12df):
+- 6-Z170 WORKED: 80 +1-rewrites fired. THE THEME LOADS NOW: "/twres/splash.xml" -> fd=3,
+  "/twres/images/splashlogo.png" -> fd=4, "/twres/fonts/RobotoCondensed-Regular.ttf" -> fd=3 —
+  every prior theme-load blocker is dead. recovery.log ~520 lines/cycle, clean TWRP-owned story.
+- NEW BLOCKER: after splash load, "/dev/ashmem" fd=-1 + "/dev/pmsg0" fd=-1, then the child
+  SELF-ABORTS: "Service 'recovery' killed by signal 6" x3-4 (pids 2612/2634/2692/2718/2727),
+  each ~1.1M tracer iterations. Final syscalls: property socket+connect(SUCCESS)+writev(76B)+
+  close → rt_sigaction → tgkill(self, SIGABRT). No abort message in ANY channel (not in the
+  shared stderr, not in logcat — redroid's own bluetooth SIGABRTs there are unrelated noise;
+  debuggerd does not attach to traced children).
+- Death point in TWRP code: minui gr_init after "setting DRM_FORMAT_RGBX8888 and
+  GGL_PIXEL_FORMAT_RGBX_8888" — DRM scan fails (no cards, expected) → fbdev path: fb0 fd=0
+  [FB0 TRACKED], VSCREENINFO via the hook's ioctl synthesis ✓, splash assets load ✓, then
+  abort. Prime suspects: (a) the fbdev gr_init's mmap(fi.smem_len, MAP_SHARED, fb0_fd) — the
+  tracer REWRITES file-backed MAP_SHARED to anonymous (the 6-Y properties workaround) —
+  minui may detect/hate that, or the abort is a heap/pthread fatal; (b) /dev/ashmem missing
+  (some minui builds allocate the backbuffer there).
+- ⚠️ DISPLAY-PATH INSIGHT (independent of the abort): even when TWRP survives to render, the
+  anonymous-mmap rewrite means TWRP draws into memory NOBODY DISPLAYS — the fb0 FILE (what
+  the app shows) stays zero = permanent black screen. The fb0 fd's mmap MUST hit the file
+  (real MAP_SHARED on the app-owned regular file) or be bridged (content injector) for PIXELS.
+
+Next steps (6-Z171 design, ranked):
+1. fb_hook: PLT-hook abort() (and __cxa_pure_virtual / std::terminate if cheap) to print the
+   caller PC + a marker line to stderr BEFORE aborting — names the fatal reason next run.
+2. Tracer: exempt the fb0 fd (fd recorded by the hook via a shared marker file or simply
+   {rootfs}/dev/graphics/fb0 opens tracked in open_fd_owner_paths) from the mmap2 MAP_SHARED →
+   MAP_ANONYMOUS rewrite so minui's framebuffer mapping is the REAL file — both a likely
+   abort-fix and REQUIRED for pixels. If seccomp -ENOSYSs the real file-backed mmap (why the
+   6-Y rewrite exists), bridge instead: on mmap EXIT of the fb0 fd, note the address; sync
+   anonymous→file on msync/close/exit or let the app read the mapping via process_vm_readv.
+3. Consider pre-creating {rootfs}/dev/ashmem as a regular file (mode 0666) — the hook's retry
+   already redirects there; ashmem ioctls would ENOTTY but some callers just need a mem fd.
+4. Keep the honest-verdict protocol: no boot claim until a post-launch screenshot md5 CHANGES.
+
+Stage Summary:
+- Session arc (commits 828630f..69b12df, 11 pushes, all gates green at tip): /tmp logger fix →
+  fstab+fb0 unblocked (hook rootfs-prefix retry) → honest mount -ENODEV (10,478x spin dead) →
+  /data into the rootfs → +1-pointer cwd-relative rewrite (PEEK-blind class fixed) → THEME
+  LOADS. Remaining to pixels: the gr_init abort + the fb0 mmap display path.
