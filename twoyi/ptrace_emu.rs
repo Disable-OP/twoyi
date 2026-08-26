@@ -10717,14 +10717,20 @@ pub fn run_ptrace_loop(
                                                 let _ = std::fs::create_dir_all(dir);
                                             }
                                             let _ = std::fs::remove_file(&host_path);
-                                            // Scratch write (rotating cursor,
-                                            // overflow-checked) + fresh-regs
-                                            // arg2/arg3 update.
+                                            // Scratch write (the area was
+                                            // re-reserved at THIS ENTRY stop
+                                            // — see the reservation block —
+                                            // so a LOCAL cursor is enough;
+                                            // mutating scratch_offset here
+                                            // would be dead: the next ENTRY
+                                            // resets it).
                                             let aligned = (new_sa.len() + 7) & !7;
-                                            if scratch_offset + aligned > 4096 {
-                                                scratch_offset = 0;
-                                            }
-                                            let sa_scratch = scratch_addr + scratch_offset as u64;
+                                            let cursor = if scratch_offset + aligned > 4096 {
+                                                0
+                                            } else {
+                                                scratch_offset
+                                            };
+                                            let sa_scratch = scratch_addr + cursor as u64;
                                             if write_child_blob(pid, sa_scratch, &new_sa) {
                                                 let new_len = new_sa.len() as i64;
                                                 let mut fresh: Regs = unsafe { std::mem::zeroed() };
@@ -10751,20 +10757,6 @@ pub fn run_ptrace_loop(
                                                             abi.reg_arg3,
                                                             new_len as u64,
                                                         );
-                                                        scratch_offset += aligned;
-                                                        // Mirror
-                                                        // write_translated_path's
-                                                        // cursor wrap: when
-                                                        // fewer than 256
-                                                        // bytes remain,
-                                                        // wrap to 0 (also
-                                                        // READS the
-                                                        // increment above,
-                                                        // satisfying
-                                                        // unused_assignments).
-                                                        if scratch_offset + 256 > 4096 {
-                                                            scratch_offset = 0;
-                                                        }
                                                         log(&format!(
                                                             "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
                                                             get_syscall_arg(&regs, abi.reg_arg1),
