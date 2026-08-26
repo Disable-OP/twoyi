@@ -472,9 +472,13 @@ jobs:
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/system/etc/selinux/mapping/ 2>&1 | head -12"
           echo "── rootfs vendor selinux (CIL + vers + fstab) ──"
           $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/vendor/etc/selinux/ 2>&1 | head -15"
-          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/vendor/etc/fstab.ranchu 2>&1"
+          # DIAGNOSTIC ONLY — never fatal: fstab.ranchu is an EMULATOR
+          # name; a redroid-sourced rootfs has its own fstab name, so
+          # the ls legitimately reports "No such file" (run 32952698969
+          # died here under set -e after a fully successful preload).
+          $ADB shell "run-as io.twoyi.debug ls -la profiles/default/rootfs/vendor/etc/fstab.* 2>&1" || true
           echo "── redroid-side source files (shell-user view) ──"
-          $ADB shell "ls -la /system/etc/selinux/plat_sepolicy.cil /vendor/etc/selinux/plat_sepolicy_vers.txt 2>&1"
+          $ADB shell "ls -la /system/etc/selinux/plat_sepolicy.cil /vendor/etc/selinux/plat_sepolicy_vers.txt 2>&1" || true
           echo "── rootfs size + disk space ──"
           $ADB shell "run-as io.twoyi.debug du -sh profiles/default/rootfs 2>&1"
           $ADB shell "df -h /data 2>&1 | tail -2"
