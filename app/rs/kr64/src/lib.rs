@@ -1958,12 +1958,18 @@ fn precreate_sysfs_stubs(rootfs_prefix: &str) {
     // so init's read() interprets SELinux as off — safe default for TWRP in
     // the sandbox. `load` is empty (init writes its policy blob to it; the
     // write succeeds silently against the regular file — no kernel policy
-    // is actually loaded).
+    // is actually loaded). `null` (6-Z154) is the write-sink old TWRP
+    // init's logging redirect opens FIRST — run 32961216041 (arm64 redroid)
+    // traced open("/sys/fs/selinux/null") → ENOENT → fallback mknodat →
+    // -EACCES → init exit(1) at post-execve syscall #59. Pre-creating the
+    // stub makes the FIRST open succeed, so the mknod fallback (and its
+    // EXIT-side 6-Z154 stub) never even fires on this path.
     touch("sys/fs/selinux/enforce", 0o666, "0");
     touch("sys/fs/selinux/load", 0o666, "");
+    touch("sys/fs/selinux/null", 0o666, "");
 
     info!(
-        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion)",
+        "[KR64] PARENT: pre-created fake sysfs in {}/sys (class/ + fs/selinux/{{enforce,load,null}}) — guest init's open('/sys/class') + open('/sys/fs/selinux/*') will succeed instead of -EACCES (Task 6-P; was the iter-3059 exit(1) blocker after 6-O's property_contexts deletion; 6-Z154 added selinux/null — was the arm64 redroid init exit(1))",
         rootfs_prefix
     );
 }
@@ -11727,8 +11733,13 @@ mod tests {
                 p.display()
             );
         }
-        // Empty files init opens (SELinux sysfs).
-        for rel in &["sys/fs/selinux/enforce", "sys/fs/selinux/load"] {
+        // Empty files init opens (SELinux sysfs). 6-Z154: `null` joins the
+        // set — arm64 TWRP init's logging sink (see precreate_sysfs_stubs).
+        for rel in &[
+            "sys/fs/selinux/enforce",
+            "sys/fs/selinux/load",
+            "sys/fs/selinux/null",
+        ] {
             let p = dir.join(rel);
             assert!(
                 p.is_file(),
