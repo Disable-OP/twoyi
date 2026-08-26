@@ -1202,6 +1202,23 @@ pub fn create_twrp_framebuffer(rootfs: &str, width: u32, height: u32) -> std::io
     // smem_len, and the TWRP child env always agree (6-Z171b).
     let fb_width = if width == 0 { 320 } else { width };
     let fb_height = if height == 0 { 640 } else { height };
+
+    // 6-Z176: the geometry FILE — the env-plumbing-independent truth for
+    // twrp_fb_hook's runtime geometry. TWRP's old init constructs the
+    // recovery service env from init.rc setenv options and STILL did not
+    // deliver TWOYI_FB_* (run 33018901591: the hook fell back to 320x640
+    // and ftruncated this 4,608,000-byte file down to 819,200). The hook
+    // reads {rootfs}/.twoyi-fb-geometry ("WxH\n") — env first, then this
+    // file, then the 320x640 fallback.
+    if let Err(e) = std::fs::write(
+        format!("{}/.twoyi-fb-geometry", rootfs),
+        format!("{}x{}\n", fb_width, fb_height),
+    ) {
+        warning!(
+            "[KR64][devices] failed to write {}/.twoyi-fb-geometry: {} (hook will rely on env/fallback geometry)",
+            rootfs, e
+        );
+    }
     const FB_BYTES_PER_PIXEL: u32 = 4;
     let smem_len: u64 = u64::from(fb_width) * u64::from(fb_height) * u64::from(FB_BYTES_PER_PIXEL);
 

@@ -398,7 +398,60 @@ static void fb_geometry_init(void) {
             return;
         }
     }
-    write_str(2, "[twrp_fb_hook] geometry: env missing -> fallback ");
+    /* 6-Z176: geometry FILE fallback — {rootfs}/.twoyi-fb-geometry,
+     * written by kr64's parent at fb0-creation time ("WxH\n"). This
+     * removes ALL env-plumbing dependencies (TWRP's old init builds the
+     * service env from init.rc setenv options only — run 33018901591
+     * proved TWOYI_FB_* still did not reach the hook even after the
+     * 6-Z175 init.rc patch, so the hook kept shrinking fb0 to the
+     * 320x640 fallback). The file is opened via the same
+     * jail-resolvable forms the hook already uses (rootfs-prefixed,
+     * cwd-relative fallback — the guest cwd IS the rootfs). */
+    {
+        static const char *rel = ".twoyi-fb-geometry";
+        char pathbuf[560];
+        const char *gp = NULL;
+        if (getenv) {
+            const char *root = getenv("TWOYI_ROOTFS");
+            if (root && root[0] == '/') {
+                int i = 0;
+                while (root[i] && i < 500) { pathbuf[i] = root[i]; i++; }
+                pathbuf[i++] = '/';
+                int j = 0;
+                while (rel[j] && i < 558) { pathbuf[i] = rel[j]; i++; j++; }
+                pathbuf[i] = '\0';
+                gp = pathbuf;
+            }
+        }
+        int gfd = -1;
+        if (gp) gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)gp, 0 /*O_RDONLY*/, 0);
+        if (gfd < 0)
+            gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)rel, 0, 0);
+        if (gfd >= 0) {
+            char gbuf[32];
+            long n = raw_syscall3(SYS_read, gfd, (long)gbuf, (long)(sizeof(gbuf) - 1));
+            raw_syscall1(SYS_close, gfd);
+            if (n > 0) {
+                gbuf[n] = '\0';
+                int w = 0, h = 0;
+                const char *p = gbuf;
+                while (*p >= '0' && *p <= '9') { w = w * 10 + (*p - '0'); p++; }
+                if (*p == 'x' || *p == 'X') {
+                    p++;
+                    while (*p >= '0' && *p <= '9') { h = h * 10 + (*p - '0'); p++; }
+                }
+                if (w > 0 && h > 0) {
+                    g_fb_rt_w = w;
+                    g_fb_rt_h = h;
+                    write_str(2, "[twrp_fb_hook] geometry from file: ");
+                    write_num(2, w); write_str(2, "x"); write_num(2, h);
+                    write_str(2, "\n");
+                    return;
+                }
+            }
+        }
+    }
+    write_str(2, "[twrp_fb_hook] geometry: env+file missing -> fallback ");
     write_num(2, g_fb_rt_w); write_str(2, "x"); write_num(2, g_fb_rt_h);
     write_str(2, "\n");
 }
@@ -1534,6 +1587,11 @@ static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
 int __open_2(const char *path, int flags);
 int __openat_2(int dirfd, const char *path, int flags);
 
+// 6-Z176: defined near the bottom (with the other fatal machinery);
+// forward-declared so the constructor can snapshot /proc/self/maps at
+// load time (see the comment block in the constructor).
+static void fatal_dump_maps(void);
+
 __attribute__((constructor))
 static void twrp_fb_hook_init(void) {
     int i;
@@ -1566,6 +1624,21 @@ static void twrp_fb_hook_init(void) {
     write_str(2, " close@"); write_hex(2, (unsigned int)(uintptr_t)&close);
     write_str(2, " ioctl@"); write_hex(2, (unsigned int)(uintptr_t)(int(*)(int,int,...))&ioctl);
     write_str(2, "\n");
+
+    // 6-Z176: dump /proc/self/maps ONCE AT LOAD. Run 33018901591: the
+    // recovery child SIGSEGV'd (si_addr 0xffff00000013, rip
+    // 0xffffedbc8470) right after libpixelflinger generated its first
+    // scanlines — but the rip could NOT be symbolized because module
+    // bases are unknown at crash time (tracer-side /proc/<pid>/maps is
+    // ENOENT — the 6-Z167 pid-namespace finding; bionic's debuggerd
+    // client also failed: "Unable to open connection to debuggerd").
+    // At CONSTRUCTOR time ALL DT_NEEDED libraries (libminuitwrp,
+    // libpixelflinger, ...) are already mapped and their bases never
+    // move — this snapshot makes ANY later crash rip symbolizable
+    // offline. Runs BEFORE the tracer's per-syscall spam, so the dump
+    // lands clean (no byte interleaving). One dump per process load
+    // (~8KB × the crash-restart cycle count — cheap evidence).
+    fatal_dump_maps();
 }
 
 // ---------------------------------------------------------------------------
