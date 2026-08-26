@@ -4094,7 +4094,7 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
 extern "C" {
     fn process_vm_readv(
         pid: libc::pid_t,
-        local_iov: *mut libc::iovec,
+        local_iov: *const libc::iovec,
         liovcnt: libc::c_ulong,
         remote_iov: *const libc::iovec,
         riovcnt: libc::c_ulong,
@@ -4161,7 +4161,7 @@ fn maps_bracket_in(content: &str, addr: u64) -> String {
     for line in content.lines() {
         if let Some((range, _rest)) = line.split_once(' ') {
             if let Some((s, e)) = range.split_once('-') {
-                if let (Ok(s), Ok(e)) = (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)) {
+                if let (Ok(_s), Ok(e)) = (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)) {
                     if addr < e {
                         return match prev {
                             Some(p) => format!("{}\n{}", p, line),
