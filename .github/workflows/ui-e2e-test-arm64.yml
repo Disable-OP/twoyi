@@ -124,9 +124,29 @@ name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
         description: 'redroid Docker image tag (arm64): 14.0.0-latest, 16.0.0-latest, 13.0.0-latest, 11.0.0-latest ...'
         required: false
         default: '14.0.0-latest'
+      recovery_name:
+        description: 'Label for the recovery image under test (used in logs). Default: TWRP 3.7.0_9-0 angler'
+        required: false
+        default: 'twrp-3.7.0_9-0-angler'
+      recovery_url:
+        description: 'Direct URL of an arm64 recovery .img (Android boot image). Empty = built-in TWRP angler download. Works for OrangeFox / PitchBlack / SHRP / other TWRP builds'
+        required: false
+        default: ''
+      recovery_referer:
+        description: 'Optional Referer header for the download (dl.twrp.me anti-leech needs it; SourceForge/GitHub do not)'
+        required: false
+        default: ''
+      recovery_md5:
+        description: 'Optional md5 to verify the downloaded image. Empty = skip verification'
+        required: false
+        default: ''
 
 concurrency:
-  group: ui-e2e-test-arm64-${{ github.ref }}
+  # Per-recovery group: different recovery images (recovery_name input)
+  # run IN PARALLEL — dispatching the OrangeFox matrix run must NOT
+  # cancel an in-progress TWRP-angler run. Re-dispatching the SAME
+  # recovery still cancels its previous run (same as before).
+  group: ui-e2e-test-arm64-${{ github.ref }}-${{ github.event.inputs.recovery_name || 'twrp-3.7.0_9-0-angler' }}
   cancel-in-progress: true
 
 jobs:
@@ -291,25 +311,74 @@ jobs:
           command -v docker >/dev/null || sudo apt-get install -y docker.io
           docker --version
 
-      - name: Download arm64 TWRP image (Nexus 6P angler)
-        # dl.twrp.me serves the .img with a referer-based anti-leech
-        # check; without `-e` (Referer) the response is the HTML landing
-        # page (~6.8KB) instead of the ~17MB binary image.
+      - name: "Download arm64 recovery image (default: TWRP 3.7.0_9-0 angler)"
+        # Default path: dl.twrp.me serves the .img with a referer-based
+        # anti-leech check; without `-e` (Referer) the response is the
+        # HTML landing page (~6.8KB) instead of the ~17MB binary image.
         # The angler image is the smallest verified-arm64 bootable TWRP
         # in TWRP 3.7.0_9-0 (same version as the existing x86 byt_t_crv2).
         # sha256: 21e41c0607b150f8dc5e5a4b0975a64d1eb62c4aff34920231d027e0793e8028
         # md5:    cf9a9067d18f64ed6992514826e1f9df
+        # Multi-recovery matrix: recovery_url/recovery_referer/recovery_md5
+        # inputs override the default — any arm64 Android-boot-image
+        # recovery (other TWRP devices, OrangeFox, PitchBlack, SHRP ...)
+        # can be A/B-tested without commits. Everything is normalised to
+        # /tmp/twrp-arm64/recovery.img for the later steps.
+        env:
+          RECOVERY_NAME: ${{ github.event.inputs.recovery_name || 'twrp-3.7.0_9-0-angler' }}
+          RECOVERY_URL: ${{ github.event.inputs.recovery_url }}
+          RECOVERY_REFERER: ${{ github.event.inputs.recovery_referer }}
+          RECOVERY_MD5: ${{ github.event.inputs.recovery_md5 }}
         run: |
           set -e
           mkdir -p /tmp/twrp-arm64
           cd /tmp/twrp-arm64
-          curl -fL --retry 3 -A "Mozilla/5.0" \
-              -e "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img.html" \
-              -o twrp-3.7.0_9-0-angler.img \
-              "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img"
-          echo "cf9a9067d18f64ed6992514826e1f9df  twrp-3.7.0_9-0-angler.img" | md5sum -c -
-          ls -lh twrp-3.7.0_9-0-angler.img
-          file twrp-3.7.0_9-0-angler.img || true
+          if [ -n "$RECOVERY_URL" ]; then
+            echo "── Downloading recovery image: $RECOVERY_NAME from $RECOVERY_URL ──"
+            REFERER_ARGS=""
+            if [ -n "$RECOVERY_REFERER" ]; then
+              REFERER_ARGS="-e $RECOVERY_REFERER"
+            fi
+            # -L follows mirrors (SourceForge redirects); --retry for CDN flakes.
+            curl -fL --retry 3 -A "Mozilla/5.0" $REFERER_ARGS \
+                -o download.img \
+                "$RECOVERY_URL"
+          else
+            echo "── Downloading default recovery image: TWRP 3.7.0_9-0 angler ──"
+            curl -fL --retry 3 -A "Mozilla/5.0" \
+                -e "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img.html" \
+                -o download.img \
+                "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img"
+          fi
+          if [ -n "$RECOVERY_MD5" ]; then
+            echo "$RECOVERY_MD5  download.img" | md5sum -c -
+          else
+            echo "  (md5 verification skipped — no recovery_md5 input)"
+          fi
+          # Sanity: must be an Android boot image (magic "ANDROID!"), a
+          # sparse/ext4 image, or a zip containing one. Fail fast here —
+          # NOT 10 minutes later inside the guest.
+          MAGIC=$(head -c 8 download.img)
+          if [ "$MAGIC" = "ANDROID!" ]; then
+            echo "  ✓ Android boot image magic (ANDROID!)"
+          elif head -c 4 download.img | grep -q "PK"; then
+            echo "  ⚠ zip file — extracting recovery.img if present"
+            # PBRP zips nest it at TWRP/recovery.img; OrangeFox/SHRP
+            # installer zips keep it at the top level or in a subdir.
+            # -j flattens; try top-level first, then any subdir.
+            unzip -o -j download.img 'recovery.img' -d . \
+              || unzip -o -j download.img '*/recovery.img' -d . \
+              || { echo "✗ zip contains no recovery.img"; exit 1; }
+            MAGIC2=$(head -c 8 recovery.img)
+            [ "$MAGIC2" = "ANDROID!" ] || { echo "✗ extracted file is not an Android boot image"; exit 1; }
+            mv recovery.img download.img
+            echo "  ✓ extracted Android boot image from zip"
+          else
+            echo "✗ not an Android boot image and not a zip (magic: $MAGIC)"; exit 1
+          fi
+          mv download.img recovery.img
+          ls -lh recovery.img
+          file recovery.img || true
 
       # ───────────────────────────────────────────────────────────────
       # Step: Pull + launch redroid (arm64-v8a, tag from input)
@@ -414,10 +483,10 @@ jobs:
           $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
           echo "  ✓ APK installed"
 
-          # Push the arm64 TWRP image to /sdcard/Download/recovery.img.
-          echo "── Pushing arm64 TWRP image to /sdcard/Download/recovery.img ──"
-          $ADB push /tmp/twrp-arm64/twrp-3.7.0_9-0-angler.img /sdcard/Download/recovery.img
-          echo "  ✓ recovery.img pushed ($(stat -c%s /tmp/twrp-arm64/twrp-3.7.0_9-0-angler.img) bytes)"
+          # Push the recovery image to /sdcard/Download/recovery.img.
+          echo "── Pushing arm64 recovery image to /sdcard/Download/recovery.img ──"
+          $ADB push /tmp/twrp-arm64/recovery.img /sdcard/Download/recovery.img
+          echo "  ✓ recovery.img pushed ($(stat -c%s /tmp/twrp-arm64/recovery.img) bytes)"
           $ADB shell ls -la /sdcard/Download/recovery.img
 
       - name: UI navigation — import ROM + boot container
