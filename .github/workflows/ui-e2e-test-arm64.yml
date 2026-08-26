@@ -4,38 +4,52 @@
 #
 # ARM64 UI-only end-to-end test for twoyi (TWRP boot).
 #
-# Goal: reach parity with ui-e2e-test.yml, but exercising the arm64-v8a
-# build of twoyi's native libraries (libtwoyi.so, libOpenglRender.so,
-# libloader.so, kr64) so that arm64-specific code paths in the Rust
-# tracer and C++ loader get CI coverage.
+# Goal: reach parity with ui-e2e-test.yml (x86_64), but exercising the
+# arm64-v8a build of twoyi's native libraries (libtwoyi.so,
+# libOpenglRender.so, libloader.so, kr64) so that arm64-specific code
+# paths in the Rust tracer and C++ loader get CI coverage.
 #
-# Architecture (v3 — switched to a real arm64 runner; v2's x86_64 runner
-#             couldn't boot arm64 system images):
-#   - GitHub's ubuntu-24.04-arm runners are arm64 Ampere hardware (free
-#     public preview since Jan 2025). They have NO nested KVM (no
-#     /dev/kvm), but the arm64 Android emulator binary boots arm64-v8a
-#     system images via QEMU TCG — arm64-to-arm64 TCG is essentially
-#     native execution with a JIT, so boot is ~5-10 min (not 30 min).
-#   - twoyi's APK is built for arm64-v8a ONLY — it runs NATIVELY on the
-#     arm64 emulator (no translation layer, no native bridge).
+# Architecture (v4 — switched to redroid after v1/v2/v3 all failed):
+#   - redroid is a containerised REAL Android user space. It runs
+#     Android as native arm64 Linux processes on the host kernel — NO
+#     QEMU, NO KVM, NO TCG translation, NO native bridge. The Android
+#     processes (init, zygote, system_server, surfaceflinger, app
+#     processes) are regular Linux tasks visible to the host kernel.
+#     This means:
+#       * Real ARM64 ptrace ABI (struct user_pt_regs, iov_len == 272)
+#         — the WHOLE POINT of this workflow.
+#       * Near-native speed (no JIT translation overhead).
+#       * ADB over TCP port 5555.
+#       * Standard Android screencap (no custom framebuffer plumbing).
+#   - The runner is GitHub's `ubuntu-24.04-arm` (aarch64 Ampere
+#     hardware, Ubuntu 24.04 LTS). Its kernel (linux-azure 6.17) ships
+#     `binder_linux.ko` as a loadable module in the
+#     `linux-modules-extra-$(uname -r)` apt package — NOT preinstalled
+#     but installable in ~5 seconds. Modern redroid uses `memfd`
+#     instead of the removed `ashmem` Linux 5.18+ module.
+#   - The twoyi APK is built for arm64-v8a ONLY and runs NATIVELY on
+#     redroid (no translation layer, no native bridge).
 #   - The TWRP recovery image is the arm64 `angler` (Nexus 6P) image
 #     downloaded fresh each run from dl.twrp.me — its ramdisk's init
-#     binary is a real aarch64 ELF, runs natively on the arm64 emulator.
+#     binary is a real aarch64 ELF, ptrace'd natively by twoyi's
+#     arm64-v8a tracer.
+#
+# Why v4 (redroid) replaced v3 (x86_64 runner + arm64-v8a system image):
+#   v3 tried `sdkmanager "emulator"` on ubuntu-24.04-arm to install an
+#   arm64 Android emulator binary. This permanently fails because Google
+#   does NOT publish an aarch64 Linux binary for the `emulator` package
+#   via sdkmanager — only `emulator-linux_x64-*.zip` exists in the
+#   repository2-3.xml. See runs 32901106471 (v1) + 32901574547 (v2) +
+#   the blocker report at download/arm64-emulator-blocker-report.md.
 #
 # Why v3 replaced v2 (x86_64 runner + arm64-v8a system image):
 #   The Android emulator binary shipped with the Linux x86_64 Android
-#     SDK does NOT include an arm64 TCG backend. v2's run 32891452405
-#     failed in 10s with `FATAL: Avd's CPU Architecture 'arm64' is not
-#     supported by the QEMU2 emulator on x86_64 host. System image
-#     must match the host architecture.` The -no-accel flag only
-#     disables hardware acceleration; it does NOT enable cross-arch
-#     TCG system-image emulation. The x86_64 emulator binary is
-#     hard-coded to x86/x86_64 guests only.
+#   SDK does NOT include an arm64 TCG backend. v2's run 32891455624
+#   failed in 10s with `FATAL: Avd's CPU Architecture 'arm64' is not
+#   supported by the QEMU2 emulator on x86_64 host. System image
+#   must match the host architecture.`
 #
 # Why v2 replaced v1 (native bridge on x86_64 Play Store image):
-#   See below — the ptrace arch-mismatch crash.
-#
-# Why v1 (native bridge on x86_64 Play Store image) was abandoned:
 #   The native bridge (libndk_translation.so on google_apis_playstore
 #   x86_64 image) translates the twoyi app's arm64 .so to x86_64 at
 #   runtime. When twoyi's arm64 Rust kernel calls ptrace() on a forked
@@ -45,8 +59,9 @@
 #   register count). This mismatch corrupts the register state and
 #   the twoyi app crashes immediately on "Launch Container" tap →
 #   run 32886902337: every screenshot from 5s..180s showed the launcher.
+#   This was the "false-green TWRP" run that prompted this v4 rewrite.
 #
-# What this tests that ui-e2e-test.yml does NOT:
+# What this tests that ui-e2e-test.yml (x86_64) does NOT:
 #   - The arm64-v8a build of twoyi's Rust + C++ code actually links and
 #     loads under a real arm64 Android runtime.
 #   - The ptrace tracer's aarch64 struct layouts, syscall numbers, and
@@ -55,26 +70,29 @@
 #     guest ELF is a real arm64 binary (not native-bridge-translated).
 #
 # Differences from ui-e2e-test.yml (x86_64):
-#   - System image: default;arm64-v8a (NOT google_apis;x86_64).
-#     Pure AOSP, no Google services, smaller + faster than google_apis
-#     arm64-v8a; supports `adb root` (used by sibling AOSP workflow).
-#   - ABI: -Pabis=arm64-v8a (NOT x86_64).
+#   - Android runtime: redroid Docker container (NOT the sdk emulator).
+#     Image: redroid/redroid:11.0.0-latest (Android 11 = API 30, the
+#     same version as the x86_64 sibling for apples-to-apples parity).
+#   - Runner: ubuntu-24.04-arm (arm64 Ampere hardware, NO /dev/kvm
+#     but redroid doesn't need it — Android runs as host processes).
+#   - Boot accelerator: NONE needed — redroid boots in ~30-60s as
+#     native processes on the host CPU.
+#   - ADB serial: `localhost:5555` (TCP) instead of `emulator-5554`
+#     (qemud). ui-navigate.py picks this up from the ADB_SERIAL env
+#     var; the x86_64 default `emulator-5554` is preserved.
+#   - Setup: install `linux-modules-extra-$(uname -r)` apt package
+#     (provides binder_linux.ko) + modprobe + mount binderfs + start
+#     the redroid container with `docker run`.
+#   - Cleanup: `docker stop redroid` (instead of `adb emu kill`).
+#   - Job timeout: 60 min (vs 30 min — extra slack for first-run
+#     docker pull of the ~800MB redroid image).
 #   - TWRP image: arm64 `angler` image downloaded at runtime (NOT the
 #     committed x86 byt_t_crv2 image in assets/twrp/).
-#   - Runner: ubuntu-24.04-arm (arm64 Ampere hardware, no nested KVM
-#     but arm64-to-arm64 TCG works at near-native speed).
-#   - Emulator flags: NO `-qemu -enable-kvm` (no /dev/kvm on the
-#     arm64 runner); NO `-no-accel` either — let the Android emulator
-#     auto-detect TCG mode for arm64-v8a system image on arm64 host.
-#   - Boot timeout: 1200s (20 min) — arm64 TCG boot on arm64 HW is
-#     ~5-10 min, allow extra slack.
-#   - Job timeout: 90 min for slow boot + 10-min TWRP container wait.
-#   - default boot_wait_seconds: 600s (vs 60s) — guest TWRP boots slow.
 #   - ui-navigate.py's post-Launch-Container + final assertions abort
 #     the script (exit 1) if the app crashed back to launcher (the
-#     bug that produced the false "TWRP works!" run 32886902337).
+#     bug that produced the false-green v1 run 32886902337).
 ---
-name: UI E2E Test (ARM64 via real arm64 runner)
+name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
 
 'on':
   workflow_dispatch:
@@ -90,34 +108,63 @@ concurrency:
 
 jobs:
   ui-e2e-test-arm64:
-    name: UI-only ARM64 (TWRP) E2E on arm64-v8a emulator (arm64 runner)
+    name: UI-only ARM64 (TWRP) E2E on redroid (arm64 runner)
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # NOTE: ubuntu-24.04-arm runners do NOT have nested KVM (no
-      # /dev/kvm). The arm64 Android emulator boots arm64-v8a system
-      # images via QEMU TCG (arm64-to-arm64 JIT — near-native speed,
-      # NOT cross-architecture translation).
-      - name: Check runner architecture (arm64 expected)
+      # ───────────────────────────────────────────────────────────────
+      # Step: Provision redroid prerequisites
+      #
+      # ubuntu-24.04-arm runner image does NOT preinstall:
+      #   - linux-modules-extra-$(uname -r) — needed for binder_linux.ko
+      #   - android-tools-adb                — needed for ADB client
+      #   - docker.io                        — Docker is preinstalled but
+      #                                       apt-install is a no-op if so
+      #
+      # Kernel config (verified from linux-buildinfo-6.17.0-1022-azure
+      # deb): CONFIG_ANDROID_BINDER_IPC=m, CONFIG_ANDROID_BINDERFS=m,
+      # CONFIG_ANDROID_BINDER_DEVICES="" (binderfs-only mode — must
+      # mount -t binder to materialise /dev/binderfs/{binder,hwbinder,vndbinder}).
+      # ───────────────────────────────────────────────────────────────
+      - name: Provision redroid prerequisites (binderfs + adb)
         run: |
-          set -u
+          set -e
           echo "── Runner architecture ──"
           uname -m
           if [ "$(uname -m)" != "aarch64" ]; then
               echo "  ✗ Runner is $(uname -m), expected aarch64. ubuntu-24.04-arm required."
               exit 1
           fi
-          echo "  ✓ Running on aarch64 hardware — arm64 Android emulator will work"
-          echo "── /dev/kvm (informational — expected missing on hosted arm64 runners) ──"
-          if [ -e /dev/kvm ]; then
-              echo "  /dev/kvm exists (KVM would speed up the boot, but TCG is fine)"
-          else
-              echo "  /dev/kvm not present — Android emulator will use QEMU TCG software emulation (arm64-on-arm64, ~5-10 min boot)"
-          fi
+          echo "  ✓ Running on aarch64 hardware"
+
+          echo "── Install kernel modules + adb ──"
+          # linux-modules-extra ships binder_linux.ko (verified).
+          # android-tools-adb provides the `adb` CLI.
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              linux-modules-extra-$(uname -r) \
+              android-tools-adb
+
+          echo "── Load binderfs + mount at /dev/binderfs ──"
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          sudo mkdir -p /dev/binderfs
+          sudo mount -t binder binder /dev/binderfs
+          ls -la /dev/binderfs/
+          # redroid 11.0.0-latest still hard-codes /dev/binder (not
+          # binderfs). Symlinks let the old tag work.
+          sudo ln -sf /dev/binderfs/binder     /dev/binder
+          sudo ln -sf /dev/binderfs/hwbinder   /dev/hwbinder
+          sudo ln -sf /dev/binderfs/vndbinder  /dev/vndbinder
+          ls -la /dev/binder /dev/hwbinder /dev/vndbinder
+          echo "  ✓ binderfs mounted + /dev/binder symlinks created"
+
+          # Docker is preinstalled on ubuntu-24.04-arm but double-check.
+          command -v docker >/dev/null || sudo apt-get install -y docker.io
+          docker --version
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -156,20 +203,15 @@ jobs:
         run: cargo install cargo-xdk
 
       - name: Setup Android NDK (direct sdkmanager — works on arm64 hosts)
-        # The nttld/setup-ndk@v1 action hardcodes its supported-host list
-        # to linux (x86_64)/darwin/win32 and rejects linux-arm64 with
-        # "Error: Unsupported host 'linux-arm64'" (run 32892478844 / 32892481714).
-        # Direct sdkmanager install works because the NDK package itself
-        # is host-agnostic (ships binaries for x86_64 + arm64 Linux, plus
-        # darwin/win). The ubuntu-24.04-arm runner image does NOT
-        # Android SDK at /home/runner/android-sdk (user-writable; not pre-installed).
+        # The nttld/setup-ndk@v1 action rejects linux-arm64 with
+        # "Error: Unsupported host 'linux-arm64'" (run 32892478844).
+        # Direct sdkmanager install works because the NDK package is
+        # host-agnostic (ships binaries for x86_64 + arm64 Linux).
         id: setup-ndk
         run: |
           set -e
           export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          # Ensure cmdline-tools exists (NOT pre-installed on arm64 runner;
-          # always download fresh on first run; cached on subsequent runs).
           if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
               mkdir -p "$ANDROID_HOME/cmdline-tools"
               cd /tmp
@@ -179,93 +221,12 @@ jobs:
               rm cmdline-tools.zip
           fi
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          # NDK r27c (LTS, late 2024). Package version is the numeric ID
-          # 27.3.13750724; the install path is
-          # $ANDROID_HOME/ndk/27.3.13750724.
+          # NDK r27c (LTS, late 2024). Numeric ID 27.3.13750724.
           sdkmanager "ndk;27.3.13750724"
           NDK_PATH="$ANDROID_HOME/ndk/27.3.13750724"
           test -d "$NDK_PATH" || { echo "✗ NDK r27c install failed"; exit 1; }
           echo "ndk-path=$NDK_PATH" >> "$GITHUB_OUTPUT"
           echo "  ✓ NDK r27c installed at $NDK_PATH"
-
-      - name: Cache Android SDK (arm64-v8a default system image)
-        id: cache-sdk
-        uses: actions/cache@v4
-        with:
-          path: /home/runner/android-sdk
-          key: ${{ runner.os }}-{{ runner.arch }}-sdk-android30-default-arm64-v8a-v1
-
-      - name: Install Android SDK + emulator + arm64-v8a system image
-        if: steps.cache-sdk.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          export ANDROID_HOME=/home/runner/android-sdk
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
-              cd /tmp
-              CMDLINE_TOOLS_URL='https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
-              curl -sL -o cmdline-tools.zip "$CMDLINE_TOOLS_URL"
-              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
-              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-              rm cmdline-tools.zip
-          fi
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --update
-          # default;arm64-v8a is pure AOSP, no Google services — smaller and
-          # faster to boot than google_apis;arm64-v8a. The Android emulator
-          # runs it via QEMU TCG (qemu-system-aarch64) on x86_64 host HW.
-          sdkmanager \
-              "platform-tools" \
-              "platforms;android-30" \
-              "build-tools;30.0.3" \
-              "emulator" \
-              "system-images;android-30;default;arm64-v8a"
-          echo "✓ SDK + emulator + arm64-v8a (default) system image installed"
-
-      - name: Create arm64-v8a AVD
-        env:
-          ANDROID_HOME: /home/runner/android-sdk
-          ANDROID_SDK_ROOT: /home/runner/android-sdk
-          ANDROID_AVD_HOME: /home/runner/.android/avd
-        run: |
-          set -ex
-          export ANDROID_HOME=/home/runner/android-sdk
-          export ANDROID_SDK_ROOT="$ANDROID_HOME"
-          export ANDROID_AVD_HOME=/home/runner/.android/avd
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          mkdir -p "$ANDROID_AVD_HOME"
-          AVDMGR="$(command -v avdmanager 2>/dev/null || true)"
-          if [ -z "$AVDMGR" ] || [ ! -x "$AVDMGR" ]; then
-            for d in "$ANDROID_HOME"/cmdline-tools/*/; do
-              if [ -x "${d}bin/avdmanager" ]; then
-                AVDMGR="${d}bin/avdmanager"
-                break
-              fi
-            done
-          fi
-          echo "" | "$AVDMGR" create avd \
-              -n twoyi_test_arm64 \
-              -k "system-images;android-30;default;arm64-v8a" \
-              --force
-          AVD_CONFIG="$ANDROID_AVD_HOME/twoyi_test_arm64.avd/config.ini"
-          {
-              echo "hw.keyboard=yes"
-              echo "hw.gpu.enabled=yes"
-              echo "hw.gpu.mode=swiftshader_indirect"
-              echo "hw.ramSize=4096"
-              echo "disk.dataPartition.size=6144"
-              echo "vm.heapSize=256"
-              # Explicit ABI + tag (avdmanager usually sets these auto-
-              # matically from the -k argument, but pinning them in the
-              # config.ini protects against an upstream avdmanager
-              # regression that picks the wrong ABI on a host that has
-              # BOTH x86_64 and arm64-v8a system images installed).
-              echo "abi.type=arm64-v8a"
-              echo "tag.id=default"
-              echo "image.sysdir.1=system-images/android-30/default/arm64-v8a/"
-          } >> "$AVD_CONFIG"
-          echo "✓ AVD created (arm64-v8a, default tag)"
 
       - name: Grant execute permission for gradlew and build scripts
         run: |
@@ -276,83 +237,87 @@ jobs:
       - name: Build APK (arm64-v8a only)
         # CRITICAL: this is the entire point of this workflow. The twoyi
         # native libs (libtwoyi.so, libOpenglRender.so, libloader.so,
-        # kr64) are built for aarch64-linux-android ONLY — not x86_64.
-        # They run NATIVELY on the arm64-v8a emulator (no native bridge).
-        # If the build fails here, it means the arm64 Rust/C++ code has
-        # a compile-time issue — fix that before proceeding.
+        # kr64) are built for aarch64-linux-android ONLY.
+        # On redroid they run NATIVELY (no native bridge, no
+        # translation). If the build fails here, it means the arm64
+        # Rust/C++ code has a compile-time issue — fix that first.
         run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_HOME: /home/runner/android-sdk
 
-      - name: Boot arm64-v8a emulator (headless, TCG)
-        # On arm64 hardware (ubuntu-24.04-arm runner), the Android
-        # emulator binary boots arm64-v8a system images via QEMU TCG
-        # (arm64-to-arm64 JIT — near-native speed, no cross-arch
-        # translation). No `-qemu -enable-kvm` (no /dev/kvm); no
-        # `-no-accel` either — let the emulator auto-pick TCG.
-        # Boot time: ~5-10 min on hosted arm64 runners; budget 1200s
-        # in the loop below; job timeout-minutes is 90 to give the
-        # entire workflow plenty of room.
-        env:
-          ANDROID_HOME: /home/runner/android-sdk
+      # ───────────────────────────────────────────────────────────────
+      # Step: Pull + launch redroid (arm64-v8a Android 11)
+      #
+      # Image: redroid/redroid:11.0.0-latest (Android 11 = API 30, the
+      # same version as the x86_64 sibling for apples-to-apples parity).
+      # 800MB arm64 layer on Docker Hub; first-run pull takes ~30s on
+      # GitHub's network. Subsequent runs hit Docker layer cache.
+      #
+      # Redroid boots in ~30-60s on the arm64 Ampere CPU — Android is
+      # running as native processes, not as a VM. Poll sys.boot_completed
+      # every 5s; die early if `docker logs` shows a binder/ashmem error.
+      # ───────────────────────────────────────────────────────────────
+      - name: Pull + launch redroid (arm64-v8a Android 11)
         run: |
-          export ANDROID_HOME=/home/runner/android-sdk
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          set -e
           mkdir -p /tmp/ui-e2e-artifacts
-          "$ANDROID_HOME/emulator/emulator" -avd twoyi_test_arm64 \
-              -no-window -no-audio -no-snapshot -no-boot-anim \
-              -gpu swiftshader_indirect \
-              -partition-size 4096 -read-only \
-              -ports 5554,5555 \
-              > /tmp/ui-e2e-artifacts/emulator-stdout.log \
-              2> /tmp/ui-e2e-artifacts/emulator-stderr.log &
-          EMULATOR_PID=$!
-          echo $EMULATOR_PID > /tmp/emulator.pid
-          echo "  emulator PID: $EMULATOR_PID"
+          # Pull first (separate from `run` so failure is visible)
+          sudo docker pull redroid/redroid:11.0.0-latest
+          # Launch — bind-mount binderfs, use memfd (no ashmem on 6.17),
+          # software GPU (no /dev/dri on hosted arm runners).
+          sudo docker run -itd --rm --privileged \
+              --name redroid \
+              -v /dev/binderfs:/dev/binderfs:rw \
+              -v $HOME/redroid-data:/data \
+              -p 5555:5555 \
+              redroid/redroid:11.0.0-latest \
+              androidboot.use_memfd=1 \
+              androidboot.redroid_gpu_mode=guest
+          REDROID_PID=$(sudo docker inspect -f '{{.State.Pid}}' redroid)
+          echo "  redroid container PID: $REDROID_PID"
+          echo $REDROID_PID > /tmp/redroid.pid
 
-          # arm64 TCG boot on hosted arm64 runner: ~5-10 min. Poll
-          # sys.boot_completed every 10s for up to 1200s (20 min).
-          # Die early if the emulator process exits (qemu crash, bad
-          # system image, etc.).
-          BOOT_TIMEOUT=1200
+          # Wait for boot_completed (up to 300s — usually 30-60s)
+          BOOT_TIMEOUT=300
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
-              if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-                  echo "  ✗ emulator died after ${WAITED}s"
-                  tail -50 /tmp/ui-e2e-artifacts/emulator-stderr.log >&2 || true
-                  tail -50 /tmp/ui-e2e-artifacts/emulator-stdout.log >&2 || true
-                  exit 1
-              fi
-              BOOTED=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+              # `adb connect localhost:5555` may fail for the first ~10s
+              # while redroid's adbd is starting; retry every loop iter.
+              adb connect localhost:5555 >/dev/null 2>&1 || true
+              BOOTED=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
               if [ "$BOOTED" = "1" ]; then
                   echo "  ✓ boot_completed after ${WAITED}s"
                   break
               fi
-              sleep 10
-              WAITED=$((WAITED + 10))
-              if [ $((WAITED % 60)) -eq 0 ]; then
+              # Die early if redroid crashed
+              if ! sudo docker ps --filter name=redroid --filter status=running | grep -q redroid; then
+                  echo "  ✗ redroid container died after ${WAITED}s"
+                  sudo docker logs redroid 2>&1 | tail -50
+                  exit 1
+              fi
+              sleep 5
+              WAITED=$((WAITED + 5))
+              if [ $((WAITED % 30)) -eq 0 ]; then
                   echo "  still booting... ${WAITED}s elapsed"
               fi
           done
           if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
-              echo "  ✗ emulator did not boot in ${BOOT_TIMEOUT}s"
-              echo "  emulator-stderr.log (last 30 lines):"
-              tail -30 /tmp/ui-e2e-artifacts/emulator-stderr.log || true
-              echo "  emulator-stdout.log (last 30 lines):"
-              tail -30 /tmp/ui-e2e-artifacts/emulator-stdout.log || true
+              echo "  ✗ redroid did not boot in ${BOOT_TIMEOUT}s"
+              sudo docker logs redroid 2>&1 | tail -100
               exit 1
           fi
 
-          # Verify the running emulator is arm64-v8a (defensive —
-          # catches a stale x86_64 AVD or a misconfigured system image).
-          ABI=$("$ANDROID_HOME/platform-tools/adb" -s emulator-5554 shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r' || true)
+          # Defensive: verify the running redroid is actually arm64-v8a.
+          ABI=$(adb -s localhost:5555 shell getprop ro.product.cpu.abi 2>/dev/null | tr -d '\r' || true)
           echo "  ro.product.cpu.abi = $ABI"
           if [ "$ABI" != "arm64-v8a" ]; then
-              echo "  ✗ Emulator ABI is '$ABI' — expected arm64-v8a. Aborting."
+              echo "  ✗ redroid ABI is '$ABI' — expected arm64-v8a. Aborting."
               exit 1
           fi
-          echo "  ✓ Emulator is arm64-v8a (no native bridge, no translation)"
+          SDK=$(adb -s localhost:5555 shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
+          echo "  ro.build.version.sdk = $SDK (expect 30 for Android 11)"
+          echo "  ✓ redroid is arm64-v8a Android 11 (no native bridge, no translation)"
 
       - name: Download arm64 TWRP image (Nexus 6P angler)
         # dl.twrp.me serves the .img with a referer-based anti-leech
@@ -376,37 +341,35 @@ jobs:
           file twrp-3.7.0_9-0-angler.img || true
 
       - name: Install APK + push arm64 TWRP recovery.img
-        env:
-          ANDROID_HOME: /home/runner/android-sdk
         run: |
+          set -e
           export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
-          ADB="adb -s emulator-5554"
+          ADB="adb -s localhost:5555"
 
-          # arm64-v8a APK on arm64-v8a emulator → ABI matches natively.
-          # If this fails with INSTALL_FAILED_NO_MATCHING_ABIS, the
-          # emulator isn't actually arm64-v8a (check the verify step
-          # above) or the APK was built for the wrong ABI.
+          # arm64-v8a APK on arm64-v8a redroid → ABI matches natively.
+          # If this fails with INSTALL_FAILED_NO_MATCHING_ABIS, redroid
+          # isn't actually arm64-v8a (check the verify step above) or
+          # the APK was built for the wrong ABI.
           APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
           echo "── Installing APK: $APK ──"
           $ADB install -t -g "$APK" || { echo "✗ install failed"; exit 1; }
           echo "  ✓ APK installed"
 
           # Push the arm64 TWRP image to /sdcard/Download/recovery.img.
-          # The user said: "I already used an weird x86 TWRP image from
-          # an x86_64 device, and TWRP still fully work" — TWRP's
-          # recovery init is robust to arch mismatches, but for the
-          # arm64 path test we use a real arm64 image (angler).
           echo "── Pushing arm64 TWRP image to /sdcard/Download/recovery.img ──"
           $ADB push /tmp/twrp-arm64/twrp-3.7.0_9-0-angler.img /sdcard/Download/recovery.img
           echo "  ✓ recovery.img pushed ($(stat -c%s /tmp/twrp-arm64/twrp-3.7.0_9-0-angler.img) bytes)"
           $ADB shell ls -la /sdcard/Download/recovery.img
 
       - name: UI navigation — import ROM + boot container
+        # ADB_SERIAL=localhost:5555 overrides the default emulator-5554
+        # so ui-navigate.py talks to redroid instead of the AVD.
         env:
           ANDROID_HOME: /home/runner/android-sdk
           BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
           TWOYI_PACKAGE: io.twoyi.debug
+          ADB_SERIAL: localhost:5555
         run: |
           export ANDROID_HOME=/home/runner/android-sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
@@ -430,11 +393,8 @@ jobs:
           if-no-files-found: warn
           compression-level: 0
 
-      - name: Kill emulator
+      - name: Stop redroid
         if: always()
-        env:
-          ANDROID_HOME: /home/runner/android-sdk
         run: |
-          export ANDROID_HOME=/home/runner/android-sdk
-          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          adb -s emulator-5554 emu kill 2>/dev/null || true
+          sudo docker stop redroid 2>/dev/null || true
+          sudo docker rm   redroid 2>/dev/null || true

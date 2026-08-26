@@ -28,7 +28,11 @@ ART = "/tmp/ui-e2e-artifacts"
 BOOT_WAIT = int(os.environ.get("BOOT_WAIT_SECONDS", "600"))
 SCREENSHOT_EVERY = 5
 
-ADB = ["adb", "-s", "emulator-5554"]
+# ADB serial is configurable via env var so the same script works for:
+#   - x86_64 Android emulator (serial "emulator-5554")
+#   - redroid Docker container on arm64 runner (serial "localhost:5555")
+# Default keeps the x86_64 path working without any env changes.
+ADB = ["adb", "-s", os.environ.get("ADB_SERIAL", "emulator-5554")]
 
 # 6-Z127: a CompletedProcess stand-in for timed-out/failed adb calls.
 # Run 32777004259: the guest's ptrace storm starved the emulator so
