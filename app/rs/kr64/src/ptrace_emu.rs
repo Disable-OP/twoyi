@@ -2908,6 +2908,24 @@ fn is_pseudo_fs_type(fstype: &str) -> bool {
     )
 }
 
+/// 6-Z164: rootfs target dir for a guest pseudo-fs mount (tmpfs/devpts/
+/// proc/sysfs/…), if any. `None` when the fstype is block-storage or the
+/// target is not absolute. Mirrors the SIGSYS mount arm's create_dir_all
+/// side effect for the post-execve path, where run 32996812991 showed
+/// TWRP's mount("tmpfs", "/tmp") reaching the REAL kernel untranslated
+/// (-ENOENT, host has no /tmp) with the compute-table fake then showing
+/// the CHILD a 0 — so nothing ever materialised the mount-point dir and
+/// every later translated create under /tmp failed with ENOENT.
+fn pseudo_mount_target(rootfs: &str, tgt: Option<&str>, fstype: Option<&str>) -> Option<String> {
+    let fstype = fstype?;
+    let tgt = tgt?;
+    if is_pseudo_fs_type(fstype) && tgt.starts_with('/') {
+        Some(format!("{}{}", rootfs, tgt))
+    } else {
+        None
+    }
+}
+
 /// Task 6-Z60: is this i386 syscall number one whose FIRST argument is a
 /// file descriptor? Used to detect fcntl64/ftruncate/dup2/close calls that
 /// target the FAKE properties fd (42) — the synthetic fd the properties
@@ -8198,6 +8216,26 @@ pub fn run_ptrace_loop(
     // log their translated path + return value — settles whether TWRP's
     // /tmp/recovery.log logger open succeeds inside the jail).
     let mut tmp_diag_count: u64 = 0;
+    // 6-Z164: FAILED-/tmp-open DIAG counter. The 6-Z163f arm above only
+    // fires on ret >= 0 — run 32996812991 logged ZERO 6-Z163f lines while
+    // the fb_hook printed fd=-1 for the jailed /tmp/recovery.log opens:
+    // open FAILURES were invisible to the DIAG. This counter covers the
+    // ret < 0 branch so the next run shows the failing /tmp opens WITH
+    // their original + translated paths and errno.
+    let mut tmp_diag_fail_count: u64 = 0;
+    // 6-Z164: openat ENTRY path-read failure DIAG (first 12). If
+    // read_child_string fails on the path register the open runs
+    // UNTRANSLATED against the host — the leading hypothesis for the
+    // jailed /tmp/recovery.log fd=-1 (redroid /tmp exists but is not
+    // app-writable → EACCES → fd=-1).
+    let mut open_read_fail_diag_count: u64 = 0;
+    // 6-Z164: ORIGINAL (pre-translation) open path per pid, set at the
+    // open ENTRY arm, consumed at the matching EXIT alongside the
+    // translated path so the /tmp DIAGs can distinguish "open was never
+    // translated" (no ENTRY record at all) from "translated but still
+    // failed" (record present, translated != original).
+    let mut pending_open_original_path: std::collections::HashMap<libc::pid_t, String> =
+        std::collections::HashMap::new();
     // pending epoll_pwait EXIT readbacks: pid -> (syscall nr, events buf
     // addr, maxevents). The nr is re-checked at the EXIT stop so a
     // signal-interrupted/restarted sequence never decodes a stale
@@ -11344,6 +11382,47 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z164: pseudo-mount target materialization ────
+                    // UNGATED (runs even past the 20000-call logging cap,
+                    // mirroring the 6-Z153 lesson: emulation must not ride
+                    // on a log-volume gate). At mount ENTRY, when the
+                    // fstype is pseudo and the target is absolute, create
+                    // {rootfs}{target} in the parent. The kernel's own
+                    // mount() will still fail (untranslated target →
+                    // ENOENT/EPERM) and the compute-table fake then shows
+                    // the child a 0 — but the mount-point DIR now really
+                    // exists in the rootfs, so every later translated
+                    // open(O_CREAT)/mkdir under it succeeds.
+                    if past_first_execve && syscall_num == abi.mount {
+                        let tgt_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                        let fs_addr = get_syscall_arg(&regs, abi.reg_arg3);
+                        let tgt = if tgt_addr != 0 {
+                            read_child_string(pid, tgt_addr)
+                        } else {
+                            None
+                        };
+                        let fs = if fs_addr != 0 {
+                            read_child_string(pid, fs_addr)
+                        } else {
+                            None
+                        };
+                        if let Some(real_tgt) = pseudo_mount_target(rootfs, tgt.as_deref(), fs.as_deref()) {
+                            match std::fs::create_dir_all(&real_tgt) {
+                                Ok(()) => log(&format!(
+                                    "6-Z164: pseudo-mount materialized {} (fstype={}) at mount ENTRY",
+                                    real_tgt,
+                                    fs.as_deref().unwrap_or("?")
+                                )),
+                                Err(e) => log(&format!(
+                                    "6-Z164: pseudo-mount materialize FAILED for {} (fstype={}): {}",
+                                    real_tgt,
+                                    fs.as_deref().unwrap_or("?"),
+                                    e
+                                )),
+                            }
+                        }
+                    }
+
                     // ── Lazy scratch-area reservation ──────────────────
                     //
                     // Translated paths are always longer than the originals
@@ -11441,6 +11520,11 @@ pub fn run_ptrace_loop(
                             };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
+                                // 6-Z164: stash the ORIGINAL path for the
+                                // EXIT-side /tmp failure DIAG (the translated
+                                // path alone cannot prove whether translation
+                                // actually engaged for THIS open).
+                                pending_open_original_path.insert(pid, path.clone());
                                 // ── VFS materialization ─────────────────
                                 //
                                 // BEFORE calling translate_path, ask the VFS
@@ -11663,6 +11747,29 @@ pub fn run_ptrace_loop(
                                         // well-defined.
                                         write_child_string(pid, path_addr, &translated);
                                     }
+                                }
+                            } else if past_first_execve {
+                                // ── 6-Z164: open ENTRY path-read DIAG ──
+                                // read_child_string FAILED on the path
+                                // register (PTRACE_PEEKDATA EIO — the same
+                                // failure the DIAG write buffer readbacks
+                                // showed in run 32996812991). The open will
+                                // now run UNTRANSLATED against the host
+                                // (redroid /tmp is not app-writable →
+                                // fd=-1, exactly what the fb_hook printed
+                                // for /tmp/recovery.log). Log it so the
+                                // next run can correlate these with the
+                                // hook's fd=-1 lines.
+                                open_read_fail_diag_count =
+                                    open_read_fail_diag_count.saturating_add(1);
+                                if open_read_fail_diag_count <= 12 {
+                                    log(&format!(
+                                        "6-Z164: open ENTRY path-read FAILED pid={} nr={} path_addr={:#x} — open runs UNTRANSLATED against the host (occurrence {})",
+                                        pid,
+                                        syscall_num,
+                                        path_addr,
+                                        open_read_fail_diag_count
+                                    ));
                                 }
                             }
                         }
@@ -12835,6 +12942,31 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         } else if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
+                            // ── 6-Z164: /tmp open-FAILURE DIAG ──
+                            // The 6-Z163f arm above only covers ret >= 0;
+                            // run 32996812991's jailed /tmp/recovery.log
+                            // opens failed (fb_hook printed fd=-1) with
+                            // ZERO 6-Z163f lines — failures were dark.
+                            // Log them WITH the original path (from the
+                            // 6-Z164 ENTRY stash) so "never translated"
+                            // vs "translated but failed" is decidable.
+                            if p.contains("/tmp/") && past_first_execve {
+                                tmp_diag_fail_count = tmp_diag_fail_count.saturating_add(1);
+                                if tmp_diag_fail_count <= 12 {
+                                    let orig = pending_open_original_path
+                                        .get(&pid)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    log(&format!(
+                                        "6-Z164: open FAILED original={:?} translated={:?} ret={} (-errno {}) (occurrence {})",
+                                        orig,
+                                        p,
+                                        ret,
+                                        -ret,
+                                        tmp_diag_fail_count
+                                    ));
+                                }
+                            }
                             // Task 6-Y fix 2: when open(/dev/__properties__)
                             // fails (ret < 0 — 6-Z84: fd 0 is now correctly
                             // treated as success above), fake a successful
@@ -12974,6 +13106,7 @@ pub fn run_ptrace_loop(
                             }
                         }
                         pending_open_translated_path.remove(&pid);
+                        pending_open_original_path.remove(&pid);
                     }
 
                     // ── 6-Z121: plain-fstat EXIT → root-ownership
@@ -17925,6 +18058,34 @@ mod tests {
     // mechanism exists to support — making sure a translated path is
     // indeed longer than the original (which is the whole reason we
     // need the scratch area in the first place).
+
+    #[test]
+    fn pseudo_mount_target_tmpfs_tmp_maps_to_rootfs_tmp() {
+        // Run 32996812991's exact case: TWRP's mount("tmpfs", "/tmp").
+        assert_eq!(
+            pseudo_mount_target(
+                "/data/user/0/io.twoyi.debug/rootfs",
+                Some("/tmp"),
+                Some("tmpfs")
+            ),
+            Some("/data/user/0/io.twoyi.debug/rootfs/tmp".to_string())
+        );
+    }
+
+    #[test]
+    fn pseudo_mount_target_rejects_block_storage_and_relative() {
+        // Block-storage fstypes (vfat/ext4) must NOT be materialised —
+        // 6-Z91 denies those with -ENODEV and creating dirs would lie.
+        assert_eq!(
+            pseudo_mount_target("/r", Some("/sdcard"), Some("vfat")),
+            None
+        );
+        // Relative targets can't be rootfs-prefixed (no anchor).
+        assert_eq!(pseudo_mount_target("/r", Some("tmp"), Some("tmpfs")), None);
+        // Missing args → None (bind mounts with NULL fstype).
+        assert_eq!(pseudo_mount_target("/r", Some("/mnt"), None), None);
+        assert_eq!(pseudo_mount_target("/r", None, Some("tmpfs")), None);
+    }
 
     #[test]
     fn translate_path_prepends_rootfs_for_init_rc() {

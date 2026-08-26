@@ -344,6 +344,55 @@ static int is_fb_path(const char *path) {
 }
 
 // ---------------------------------------------------------------------------
+// 6-Z165: /tmp absolute-open failure → cwd-relative retry.
+//
+// Run 32996812991 (arm64 jail): TWRP's logger open("/tmp/recovery.log",
+// O_CREAT|O_WRONLY|O_APPEND) printed fd=-1 INSIDE the jail although
+// {rootfs}/tmp exists and is app-owned — the ABSOLUTE /tmp path never
+// resolved into the rootfs (mechanism under investigation; the 6-Z164
+// tracer DIAGs will name it next run). The guest's cwd IS the rootfs, so
+// a RELATIVE "tmp/..." open resolves to {rootfs}/tmp/... through the
+// kernel WITHOUT needing any absolute-path translation. Retrying once
+// with path+1 hands TWRP a working fd so its logger (and every later
+// /tmp file) materialises inside the rootfs where the E2E evidence pull
+// finds it — and recovery.log then carries TWRP's own account of
+// whatever kills it next.
+// ---------------------------------------------------------------------------
+static int is_tmp_path(const char *path) {
+    if (!path) return 0;
+    if (path[0] != '/' || path[1] != 't' || path[2] != 'm' || path[3] != 'p') return 0;
+    return path[4] == '\0' || path[4] == '/';
+}
+
+// Shared retry: absolute "/tmp..." open FAILED → (a) probe the same
+// absolute path once WITHOUT O_CREAT (no side effects) so the log shows
+// the raw -errno the corrupted interleaved tracer log could not, then
+// (b) retry via raw syscall with path+1 (relative, cwd=rootfs).
+// Returns the working fd, or the original abs_fd when the retry also
+// fails. Only the raw returns are logged — no libc errno dependency
+// (-nostdlib: the hook must not read/write the TLS errno slot).
+static int tmp_retry_open(const char *path, int abs_fd, int flags, int mode) {
+    if (abs_fd >= 0 || !is_tmp_path(path)) return abs_fd;
+    long probe = raw_syscall4(SYS_openat, AT_FDCWD, (long)path,
+                              flags & ~O_CREAT, 0);
+    if (probe >= 0) {
+        // Probe leaked an fd (the absolute path IS openable read-only —
+        // e.g. an existing file after the create failed on flags).
+        raw_syscall1(SYS_close, (int)probe);
+    }
+    int rfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)(path + 1),
+                                flags, mode);
+    write_str(2, "[twrp_fb_hook] /tmp abs open fd=");
+    write_num(2, abs_fd);
+    write_str(2, " probe_raw=");
+    write_num(2, (int)probe);
+    write_str(2, " rel retry -> fd=");
+    write_num(2, rfd);
+    write_str(2, "\n");
+    return rfd >= 0 ? rfd : abs_fd;
+}
+
+// ---------------------------------------------------------------------------
 // INPUT BRIDGE (6-Z93) — host touch events -> guest evdev input_event.
 //
 // WHY: TWRP's minui is a plain evdev reader. It scans /dev/input for
@@ -1338,6 +1387,9 @@ int open(const char *path, int flags, ...) {
             write_str(2, "\n");
         }
     }
+    // 6-Z165: /tmp absolute-open failure → cwd-relative retry (see the
+    // tmp_retry_open comment block above for the full rationale).
+    fd = tmp_retry_open(path, fd, flags, mode);
     // ALWAYS ftruncate the existing fb0 file to TWRP_FB_SMEM_LEN — even
     // when open() SUCCEEDED. Root cause (6-Q's definitive diff of KVM
     // strace vs UI E2E logcat):
@@ -1410,6 +1462,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
             write_str(2, "\n");
         }
     }
+    // 6-Z165: /tmp absolute-open failure → cwd-relative retry. is_tmp_path
+    // only matches ABSOLUTE paths, so the AT_FDCWD retry inside is valid
+    // regardless of the caller's dirfd.
+    fd = tmp_retry_open(path, fd, flags, mode);
     // ALWAYS ftruncate the existing fb0 file to TWRP_FB_SMEM_LEN — even
     // when openat() SUCCEEDED. Root cause (6-Q's definitive diff of KVM
     // strace vs UI E2E logcat):
@@ -1469,6 +1525,8 @@ int __open_2(const char *path, int flags) {
     int fd;
     if (real_open2) fd = real_open2(path, flags);
     else            fd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, 0);
+    // 6-Z165: /tmp absolute-open failure → cwd-relative retry.
+    fd = tmp_retry_open(path, fd, flags, 0);
     // DIAGNOSTIC (Task 31): log EVERY __open_2() call (bionic's fortified
     // open variant — selected by -D_FORTIFY_SOURCE). If libminuitwrp was
     // built with _FORTIFY_SOURCE, this is the variant that gets called
@@ -1496,6 +1554,9 @@ int __openat_2(int dirfd, const char *path, int flags) {
     int fd;
     if (real_openat2) fd = real_openat2(dirfd, path, flags);
     else              fd = (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, 0);
+    // 6-Z165: /tmp absolute-open failure → cwd-relative retry (absolute
+    // "/tmp" paths ignore dirfd, AT_FDCWD retry is always valid).
+    fd = tmp_retry_open(path, fd, flags, 0);
     // DIAGNOSTIC (Task 31): log EVERY __openat_2() call.
     write_str(2, "[twrp_fb_hook] __openat_2(df="); write_num(2, dirfd);
     write_str(2, ", \"");
