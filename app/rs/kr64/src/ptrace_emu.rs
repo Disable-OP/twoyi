@@ -18344,14 +18344,13 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // correct for a ptraced unprivileged child that can't mount a
         // fresh proc). /proc/cmdline is handled by the special-case above
         // (translates to {rootfs}/twrp-cmdline).
-        for p in &["/proc/self/status"] {
-            assert_eq!(
-                translate_path(rootfs, p),
-                *p,
-                "path {} should not be translated",
-                p
-            );
-        }
+        let p = "/proc/self/status";
+        assert_eq!(
+            translate_path(rootfs, p),
+            p,
+            "path {} should not be translated",
+            p
+        );
         // /dev/* IS now translated to rootfs/dev/* (the host /dev is
         // read-only for untrusted_app, so we redirect to the writable
         // rootfs copy where we pre-create device stubs and symlinks).
