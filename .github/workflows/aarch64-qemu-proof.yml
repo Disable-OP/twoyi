@@ -64,9 +64,9 @@ name: aarch64-qemu build-and-boot proof (v4)
   workflow_dispatch:
     inputs:
       api_level:
-        description: 'Android API level (28 = Pie, contemporary with the 2019 fork)'
+        description: 'Android API level (30 = Android 11 — the only arm64-v8a image still downloadable)'
         required: false
-        default: '28'
+        default: '30'
       build_minutes:
         description: 'Hard cap on QEMU build minutes'
         required: false
@@ -437,10 +437,52 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" > /dev/null
 
           API_LEVEL=${{ inputs.api_level }}
-          PKG="system-images;android-${API_LEVEL};default;arm64-v8a"
-          echo "── Installing: $PKG ──"
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "$PKG" 2>&1 | tail -8
           IMG_DIR="$ANDROID_HOME/system-images/android-${API_LEVEL}/default/arm64-v8a"
+          mkdir -p "$IMG_DIR"
+          # v4.3 fix: sdkmanager CANNOT install arm64-v8a system images on
+          # a linux-aarch64 host — the package declares a dependency on the
+          # 'emulator' package, which Google does not publish for aarch64:
+          #   "Warning: Dependant package with key emulator not found!"
+          #   "Warning: Unable to compute a complete list of dependencies."
+          # (run 32948317207). ALSO: Google removed ALL arm system images
+          # from the live repository2-3.xml / sys-img XMLs entirely.
+          # BUT the zip artifacts are still served directly. Verified by
+          # HTTP probe: sys-img/android/arm64-v8a-30_r02.zip → 200 OK,
+          # 548,363,615 bytes. Central-directory listing (range request):
+          #   kernel-ranchu (13.5MB), ramdisk.img (1.7MB),
+          #   system.img (3.2GB), userdata.img (1MB), vendor.img (51MB).
+          # Only API 30 (Android 11) r01/r02 exist; API 28/29 are 404.
+          SYSIMG_ZIP="sys-img/android/arm64-v8a-${API_LEVEL}_r02.zip"
+          SYSIMG_URL="https://dl.google.com/android/repository/$SYSIMG_ZIP"
+          echo "── Direct download: $SYSIMG_URL ──"
+          if ! curl -fsSL --retry 3 --retry-delay 5 --max-time 900 \
+               "$SYSIMG_URL" -o /tmp/sysimg.zip; then
+            # try r01 as fallback
+            SYSIMG_ZIP="sys-img/android/arm64-v8a-${API_LEVEL}_r01.zip"
+            SYSIMG_URL="https://dl.google.com/android/repository/$SYSIMG_ZIP"
+            echo "  r02 failed — trying $SYSIMG_URL"
+            curl -fsSL --retry 3 --retry-delay 5 --max-time 900 \
+              "$SYSIMG_URL" -o /tmp/sysimg.zip || {
+                echo "✗ direct system-image download failed"
+                exit 1
+              }
+          fi
+          ZIP_SIZE=$(stat -c%s /tmp/sysimg.zip)
+          echo "  downloaded $ZIP_SIZE bytes"
+          # Verify it's a real zip (not a 4KB 404 page)
+          if [ "$ZIP_SIZE" -lt 500000000 ]; then
+            echo "✗ zip too small ($ZIP_SIZE < 500MB) — likely an error page"
+            file /tmp/sysimg.zip
+            exit 1
+          fi
+          unzip -q -o /tmp/sysimg.zip -d "$IMG_DIR"
+          # The zip extracts under an arm64-v8a/ prefix → matches the SDK
+          # layout $IMG_DIR/arm64-v8a/<files>. Normalize: move files up.
+          if [ -d "$IMG_DIR/arm64-v8a" ]; then
+            mv "$IMG_DIR/arm64-v8a"/* "$IMG_DIR/"
+            rmdir "$IMG_DIR/arm64-v8a"
+          fi
+          rm -f /tmp/sysimg.zip
           if [ ! -d "$IMG_DIR" ]; then
             echo "✗ arm64-v8a system image NOT installed for API ${API_LEVEL}"
             exit 1
@@ -477,11 +519,12 @@ jobs:
           LOG_DIR="$PROOF_DIR/boot_logs"
           mkdir -p "$LOG_DIR"
 
-          # Make writable copies of the images (qemu opens them
-          # read-write by default; the SDK dir images are fine to
-          # copy to keep the originals pristine).
-          cp "$IMG_DIR/system.img" "$LOG_DIR/system.img" 2>/dev/null || \
-            cp "$IMG_DIR/system.img" "$LOG_DIR/system.img"
+          # Symlink the images into the boot dir (read-only ones via
+          # symlink; writable ones as copies). qemu opens -drive files
+          # read-write by default; add readonly=on for system/vendor.
+          ln -sf "$IMG_DIR/system.img" "$LOG_DIR/system.img"
+          ln -sf "$IMG_DIR/vendor.img" "$LOG_DIR/vendor.img" 2>/dev/null || true
+          ln -sf "$IMG_DIR/encryptionkey.img" "$LOG_DIR/encryptionkey.img" 2>/dev/null || true
           cp "$IMG_DIR/userdata.img" "$LOG_DIR/userdata.img" 2>/dev/null || \
             cp "$IMG_DIR/userdata.img" "$LOG_DIR/userdata.img"
 
@@ -497,6 +540,20 @@ jobs:
           # qemu 2.12 ranchu uses MMIO virtio transports — virtio
           # devices are auto-plugged into the transports the board
           # creates (create_virtio_devices in ranchu.c).
+          # API-30 image partition set: system + vendor + userdata +
+          # encryptionkey (metadata). The Android emulator attaches all
+          # of them as virtio-blk devices in this order; the ramdisk's
+          # fstab.ranchu references /dev/block/vd* paths by kernel
+          # cmdline slot suffix, so device ORDER matters (system=a,
+          # vendor=b, userdata=c per AVDInfo partition layout).
+          VENDOR_ARGS=""
+          if [ -f "$LOG_DIR/vendor.img" ]; then
+            VENDOR_ARGS='-drive file='$LOG_DIR'/vendor.img,if=none,id=vendor,format=raw,readonly=on -device virtio-blk-device,drive=vendor'
+          fi
+          ENC_ARGS=""
+          if [ -f "$LOG_DIR/encryptionkey.img" ]; then
+            ENC_ARGS='-drive file='$LOG_DIR'/encryptionkey.img,if=none,id=enckey,format=raw,readonly=on -device virtio-blk-device,drive=enckey'
+          fi
           $QEMU_BIN \
             -M ranchu \
             -cpu cortex-a57 \
@@ -506,9 +563,11 @@ jobs:
             -initrd "$IMG_DIR/ramdisk.img" \
             -drive "file=$LOG_DIR/system.img,if=none,id=system,format=raw" \
             -device "virtio-blk-device,drive=system" \
+            $VENDOR_ARGS \
+            $ENC_ARGS \
             -drive "file=$LOG_DIR/userdata.img,if=none,id=userdata,format=raw" \
             -device "virtio-blk-device,drive=userdata" \
-            -append "qemu=1 no_timer_check androidboot.hardware=ranchu androidboot.console=ttyS0 androidboot.selinux=permissive console=ttyS0 printk=1" \
+            -append "qemu=1 no_timer_check androidboot.hardware=ranchu androidboot.console=ttyS0 androidboot.selinux=permissive console=ttyS0 printk.synchronous=1" \
             -netdev user,id=net0 \
             -device "virtio-net-device,netdev=net0" \
             -nographic \
