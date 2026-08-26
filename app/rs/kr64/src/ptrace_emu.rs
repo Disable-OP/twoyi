@@ -4099,6 +4099,39 @@ fn read_child_bytes(pid: libc::pid_t, addr: u64, len: usize) -> Option<Vec<u8>> 
     Some(result)
 }
 
+/// 6-Z161: parent-side fd-identity probe — readlink(/proc/<pid>/fd/<fd>)
+/// and log the backing object ONCE per (pid, fd) pair. The tracer runs
+/// as the child's parent (same uid), so /proc/<pid>/fd/<fd> symlinks are
+/// readable. `seen` dedupes so a 60k-iteration spin logs each identity
+/// at most once. Pure diagnostics — no behaviour change.
+fn spin_diag_readlink_fd(
+    pid: libc::pid_t,
+    fd: i64,
+    seen: &mut std::collections::HashSet<(libc::pid_t, i64)>,
+) {
+    if fd < 0 {
+        return;
+    }
+    if !seen.insert((pid, fd)) {
+        return; // already logged this (pid, fd) pair
+    }
+    let link = format!("/proc/{}/fd/{}", pid, fd);
+    match std::fs::read_link(&link) {
+        Ok(target) => {
+            log(&format!(
+                "6-Z161 fd identity: /proc/{}/fd/{} -> {:?}",
+                pid, fd, target
+            ));
+        }
+        Err(e) => {
+            log(&format!(
+                "6-Z161 fd identity: readlink /proc/{}/fd/{} failed: {}",
+                pid, fd, e
+            ));
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Task 6-Z71: stat64/lstat64/fstat64 (i386 nr=195/196/197) + pread64
 // (i386 nr=180) — REAL emulation via ptrace.
@@ -8031,6 +8064,37 @@ pub fn run_ptrace_loop(
     // logcat (40 lines covers the loader/init/scudo early prctls AND
     // the transition into the spin; the spin's option is stable).
     let mut post_execve_prctl_log_count: u64 = 0;
+    // ── 6-Z161: spin-fd DIAG state — identify the accept4/epoll_pwait
+    // hot loop that consumed the proactive recovery's entire lifetime
+    // (run 32983937665, SHA 3481022): pid 2606 spent 159,823 traced
+    // syscalls in a tight  epoll_pwait(nr=22) -> 1  →  accept4(nr=242)
+    // -> -EINVAL  cycle (60k+ each on arm64), starting at post-execve
+    // syscall #1317 — BEFORE it ever opened /dev/graphics/fb0, so the
+    // screen stayed black the whole 90s window. Working hypothesis: a
+    // REAL unix socket that was never put in LISTEN state (the
+    // 6-Z3/6-Z101 fake-success bind/listen path) reports EPOLLHUP on
+    // every epoll_pwait (permanently "ready") while accept4 on a
+    // non-listening socket returns -EINVAL. But the spinning fd's
+    // IDENTITY has never been observed — these DIAGs (ZERO behaviour
+    // change) pin it:
+    //   accept4 family ENTRY: fd (arg1) + flags (arg4), first 24 only
+    //   epoll_pwait family:   arg2 (events buffer) + arg3 (maxevents)
+    //     recorded at ENTRY, decoded at EXIT when ret > 0 (first ready
+    //     epoll_event's events mask + data word)
+    //   per-(pid,fd) parent-side readlink(/proc/<pid>/fd/<fd>) — logs
+    //     the backing object ONCE per pair
+    // accept4:    aarch64=242, x86_64=288, i386=364
+    // epoll_pwait: aarch64=22,  x86_64=281, i386=319
+    let mut spin_diag_accept4_count: u64 = 0;
+    let mut spin_diag_epoll_count: u64 = 0;
+    let mut spin_diag_seen_fds: std::collections::HashSet<(libc::pid_t, i64)> =
+        std::collections::HashSet::new();
+    // pending epoll_pwait EXIT readbacks: pid -> (syscall nr, events buf
+    // addr, maxevents). The nr is re-checked at the EXIT stop so a
+    // signal-interrupted/restarted sequence never decodes a stale
+    // buffer under a different syscall's return value.
+    let mut pending_epoll_readback: std::collections::HashMap<libc::pid_t, (i64, u64, usize)> =
+        std::collections::HashMap::new();
     // 6-Z148: RIP-sampling diagnostic state for the post-execve prctl
     // spin (run 32843174575: 16,326 consecutive prctls, ZERO other
     // syscalls — a pure userspace allocation loop; the rip + the scudo
@@ -10478,6 +10542,36 @@ pub fn run_ptrace_loop(
                                 syscall_num,
                                 syscall_name(syscall_num, &abi)
                             ));
+                        }
+                        // ── 6-Z161: spin-fd DIAG (ENTRY side) — zero
+                        // behaviour change. accept4 family: log fd+flags
+                        // + fd identity (first 24). epoll_pwait family:
+                        // record (events buf, maxevents) for the EXIT-side
+                        // readback. See the state declaration for the full
+                        // rationale (run 32983937665's 60k-iteration
+                        // epoll_pwait→accept4(-EINVAL) spin, fd unknown).
+                        if syscall_num == 242 || syscall_num == 288 || syscall_num == 364 {
+                            spin_diag_accept4_count = spin_diag_accept4_count.saturating_add(1);
+                            if spin_diag_accept4_count <= 24 {
+                                let acc_fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                log(&format!(
+                                    "6-Z161 accept4 ENTRY: pid={} fd={} flags={:#x} (occurrence {})",
+                                    pid,
+                                    acc_fd,
+                                    get_syscall_arg(&regs, abi.reg_arg4),
+                                    spin_diag_accept4_count
+                                ));
+                                spin_diag_readlink_fd(pid, acc_fd, &mut spin_diag_seen_fds);
+                            }
+                        } else if syscall_num == 22 || syscall_num == 281 || syscall_num == 319 {
+                            pending_epoll_readback.insert(
+                                pid,
+                                (
+                                    syscall_num,
+                                    get_syscall_arg(&regs, abi.reg_arg2),
+                                    get_syscall_arg(&regs, abi.reg_arg3) as usize,
+                                ),
+                            );
                         }
                         // 6-Z145 (Task 2): prctl-arg ENTRY logging — see the
                         // counter's declaration for the full rationale. The
@@ -13537,6 +13631,66 @@ pub fn run_ptrace_loop(
                             ret_desc,
                             orig_rax_note
                         ));
+                    }
+
+                    // ── 6-Z161: spin-fd DIAG (EXIT side) — decode the
+                    // first ready epoll_event after an epoll_pwait that
+                    // returned > 0. The events buffer lives in the
+                    // child's WRITABLE memory (the kernel just wrote the
+                    // ready set into it), so PTRACE_PEEKDATA succeeds.
+                    // Layout: i386 = packed 12 bytes (u32 events + u64
+                    // data); x86_64/aarch64 = 16 bytes (u32 events + 4
+                    // pad + u64 data). The data word is whatever the
+                    // registrant passed to epoll_ctl — init/TWRP usually
+                    // store the fd (or a pointer); either way it names
+                    // the spinning fd. Capped at 24 decodes.
+                    if past_first_execve {
+                        if let Some((epoll_nr, ev_addr, maxevents)) =
+                            pending_epoll_readback.remove(&pid)
+                        {
+                            if syscall_num == epoll_nr && ret > 0 && maxevents > 0 && maxevents <= 1024 {
+                                spin_diag_epoll_count = spin_diag_epoll_count.saturating_add(1);
+                                if spin_diag_epoll_count <= 24 {
+                                    // i386 (execve=11) uses the packed
+                                    // 12-byte layout; the 64-bit ABIs use 16.
+                                    let evsz =
+                                        if abi.execve == 11 { 12usize } else { 16usize };
+                                    let mut decoded = String::new();
+                                    if let Some(bytes) = read_child_bytes(pid, ev_addr, evsz) {
+                                        if bytes.len() >= 8 {
+                                            let events = u32::from_ne_bytes([
+                                                bytes[0], bytes[1], bytes[2], bytes[3],
+                                            ]);
+                                            decoded =
+                                                format!("events={:#x}", events);
+                                            if bytes.len() >= evsz {
+                                                let data_off = evsz - 8;
+                                                let mut data_arr = [0u8; 8];
+                                                data_arr.copy_from_slice(
+                                                    &bytes[data_off..data_off + 8],
+                                                );
+                                                let data = u64::from_ne_bytes(data_arr);
+                                                decoded.push_str(&format!(
+                                                    " data={:#x} (fd hint {})",
+                                                    data, data as i64
+                                                ));
+                                                spin_diag_readlink_fd(
+                                                    pid,
+                                                    data as i64,
+                                                    &mut spin_diag_seen_fds,
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        decoded = "events buffer UNREADABLE".to_string();
+                                    }
+                                    log(&format!(
+                                        "6-Z161 epoll_pwait EXIT: pid={} ret={} maxevents={} first-event {} (occurrence {})",
+                                        pid, ret, maxevents, decoded, spin_diag_epoll_count
+                                    ));
+                                }
+                            }
+                        }
                     }
 
                     // Task 6-S: log the return value for
