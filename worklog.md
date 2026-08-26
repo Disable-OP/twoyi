@@ -10695,3 +10695,17 @@ Change (6-Z163f): every /tmp/* open's translated path + return value logged (fir
 Stage Summary:
 - Session trajectory: urandom ELOOP fixed → LD_LIBRARY_PATH arm64 → spin root-caused via 6-Z161 fd-identity DIAG → REAL property socket (6-Z163 bind rewrite, sockaddr blob into scratch) → probe honesty (POSIX sh export gotcha + timeout env poisoning) → recovery now LINKS + BOOTS through DataManager to post-LANG in BOTH contexts with a REAL property set on the way.
 - Next: the /tmp DIAG settles the logger-open question; then fstab/graphics init is the final stretch to pixels.
+
+---
+Task ID: 6-Z163f OBSERVATION (for the next session)
+Agent: main
+Task: /tmp DIAG did not fire — the recovery logger opens bypass pending_open_translated_path
+
+- Run 32996812991: zero 6-Z163f lines, yet the hook's stderr fragments ("open(\"/tmp/recovery.log\"...") prove the opens HAPPENED through traced syscalls. The hook calls real_open() (dlsym→libc open→openat) — those ARE openat syscalls; either the ENTRY path-read for THAT pid didn't populate pending_open_translated_path (check the openat ENTRY arm's gating — e.g. it may skip when the fd will be staged/mapped), or the opens use openat with a dirfd the handler doesn't decode. NEXT STEP: add the same result-DIAG inside the openat ENTRY arm itself is wrong (result only exists at EXIT) — instead log (pid, path) at ENTRY when path contains "/tmp/" and match it at the openat EXIT unconditionally.
+- The probe-side /tmp/recovery.log open fails with a REAL EACCES outside the jail (redroid /tmp not app-writable) — expected; pre-creating it is impossible. IN THE JAIL it should succeed via translation; the empty-looking {rootfs}/tmp is consistent with a successful child-ns tmpfs mount.
+- STATE OF PLAY at session end (tip 8c722d7, all CI green):
+  1. Property socket REAL (bound at {rootfs}/dev/socket/property_service; recovery CONNECTED + set a property through it). The 119k epoll/accept4 spin is DEAD.
+  2. /dev/urandom ELOOP fixed (entropy regular files).
+  3. TWRP recovery LINKS + BOOTS through DataManager/LANG in BOTH contexts (jail + probe). Death point: right after the /tmp/recovery.log logger re-open + one property set + signal setup — exit(1) in jail / exit(255) in probe. No LOGERR captured yet.
+  4. The honest probe suite (timeout 8 env ...) + ldd-mode + direct-linker + lib-magic dumps + sbin/tmp/etc listings + staged-marker pull are all in place and verified.
+  5. Suspect list for the exit(1), ranked: (a) TWRP logger fatal on /tmp/recovery.log open result (settle with the ENTRY-pair DIAG above); (b) fstab/PartitionManager init after LANG (watch for "I:Reading /etc/recovery.fstab" absence); (c) crypto/keymaster (TW_INCLUDE_CRYPTO := true). The next evidence: full-stdout tail is ALREADY captured (kr64-app-stderr.log has the I: lines via inherited stdio) — grep it for post-LANG lines each run.
