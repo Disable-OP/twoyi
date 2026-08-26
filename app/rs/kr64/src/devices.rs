@@ -1195,9 +1195,13 @@ pub fn create_graphics_device_stubs(rootfs: &str) -> std::io::Result<()> {
 /// fall back to HWComposer/qemu_pipe when fb0 returns ENOTTY).
 pub fn create_twrp_framebuffer(rootfs: &str, width: u32, height: u32) -> std::io::Result<()> {
     // Use the profile's virtual display dimensions (passed from core.rs
-    // via kr64's --width/--height args). Default to 720x1280 if 0.
-    let fb_width = if width == 0 { 720 } else { width };
-    let fb_height = if height == 0 { 1280 } else { height };
+    // via kr64's --width/--height args). Default to redroid's own default
+    // panel (320x640) when 0 — MUST match the hook's TWOYI_FB_WIDTH/
+    // TWOYI_FB_HEIGHT fallback (lib.rs) and twrp_fb_hook.c's compile-time
+    // fallback so the file size, the synthesized FBIOGET_FSCREENINFO
+    // smem_len, and the TWRP child env always agree (6-Z171b).
+    let fb_width = if width == 0 { 320 } else { width };
+    let fb_height = if height == 0 { 640 } else { height };
     const FB_BYTES_PER_PIXEL: u32 = 4;
     let smem_len: u64 = u64::from(fb_width) * u64::from(fb_height) * u64::from(FB_BYTES_PER_PIXEL);
 
@@ -1237,6 +1241,49 @@ pub fn create_twrp_framebuffer(rootfs: &str, width: u32, height: u32) -> std::io
     Ok(())
 }
 
+/// TWRP boot: pre-create the misc character-device files minui probes.
+///
+/// Run 33010273952 (arm64): right after the splash asset load, recovery
+/// opened `/dev/ashmem` → fd=-1 and `/dev/pmsg0` → fd=-1, then
+/// SELF-ABORTED (tgkill SIGABRT) inside minui gr_init. On a real device
+/// both are ashmem/pmsg char devices; inside the jail we create plain
+/// app-owned regular files (mode 0666, 1 byte so they are non-empty):
+///
+/// - `/dev/ashmem`: callers open it, then drive the ASHMEM_* ioctl
+///   protocol — which `libtwrp_fb_hook.so` (6-Z171c) fakes on the fd,
+///   ftruncate-ing the backing file to the requested size so the caller's
+///   later `mmap(len, MAP_SHARED, fd)` has a big-enough file. On aarch64
+///   the tracer does NOT rewrite file-backed MAP_SHARED (i386-only), so
+///   the mapping is real and single-process ashmem semantics hold.
+/// - `/dev/pmsg0`: `__android_log_pmsg_write` just needs a writable sink;
+///   a regular file swallows the logs harmlessly.
+///
+/// Must be called in TWRP boot mode only (same gate as
+/// [`create_twrp_framebuffer`]).
+pub fn create_twrp_misc_devs(rootfs: &str) -> std::io::Result<()> {
+    for rel in ["dev/ashmem", "dev/pmsg0"] {
+        let path = format!("{}/{}", rootfs, rel);
+        // Re-create fresh each boot (stale SET_SIZE truncations from a
+        // previous run are reset).
+        let _ = fs::remove_file(&path);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?;
+            f.set_len(1)?;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o666));
+        }
+        info!(
+            "[KR64][devices] TWRP misc dev: {} (regular file, ashmem/pmsg0 stand-in)",
+            path
+        );
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Tests — pure-Rust, no Android deps, so they run on the host too.
 // (cargo test --lib)
@@ -1257,6 +1304,37 @@ mod tests {
         p.push(format!("kr64-test-{}-{}", std::process::id(), n));
         fs::create_dir_all(&p).unwrap();
         p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn create_twrp_misc_devs_creates_ashmem_and_pmsg0() {
+        let rootfs = tmpdir();
+        fs::create_dir_all(format!("{}/dev", rootfs)).unwrap();
+        create_twrp_misc_devs(&rootfs).expect("misc devs");
+        for rel in ["dev/ashmem", "dev/pmsg0"] {
+            let p = format!("{}/{}", rootfs, rel);
+            let meta = fs::metadata(&p).expect("file exists");
+            assert!(meta.is_file(), "{} should be a regular file", rel);
+            assert_eq!(meta.len(), 1, "{} should be 1 byte", rel);
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o666,
+                "{} should be 0666",
+                rel
+            );
+        }
+        // Re-creating (second boot) resets stale sizes instead of failing.
+        fs::write(format!("{}/dev/ashmem", rootfs), vec![0u8; 12345]).unwrap();
+        create_twrp_misc_devs(&rootfs).expect("recreate");
+        assert_eq!(
+            fs::metadata(format!("{}/dev/ashmem", rootfs))
+                .unwrap()
+                .len(),
+            1,
+            "recreate must truncate stale content"
+        );
+        let _ = fs::remove_dir_all(&rootfs);
     }
 
     #[test]

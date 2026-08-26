@@ -140,6 +140,14 @@ name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
         description: 'Optional md5 to verify the downloaded image. Empty = skip verification'
         required: false
         default: ''
+      redroid_resolution:
+        description: 'Native resolution for the redroid Android display as WxH (e.g. 720x1600). auto = redroid default. The TWRP container auto-matches this via the app detection + TWOYI_FB_* env — no hardcoded dims'
+        required: false
+        default: '720x1600'
+      redroid_dpi:
+        description: 'Native density for the redroid Android display (dpi). Only used when redroid_resolution is set'
+        required: false
+        default: '320'
 
 concurrency:
   # Per-recovery group: different recovery images (recovery_name input)
@@ -386,9 +394,33 @@ jobs:
       - name: Pull + launch redroid
         env:
           REDROID_TAG: ${{ github.event.inputs.redroid_tag || '14.0.0-latest' }}
+          REDROID_RESOLUTION: ${{ github.event.inputs.redroid_resolution || '720x1600' }}
+          REDROID_DPI: ${{ github.event.inputs.redroid_dpi || '320' }}
         run: |
           set -e
           mkdir -p /tmp/ui-e2e-artifacts
+
+          # ── Native resolution (6-Z171b) ──────────────────────────────
+          # The user-facing goal: BOTH the Android (redroid) display and
+          # the TWRP container run at ONE resolution — the native one —
+          # instead of independent hardcodes. Here we CONFIGURE the
+          # Android side (androidboot.redroid_width/height/dpi). The TWRP
+          # side needs no configuration at all: the app auto-detects the
+          # display via DisplayMetrics, passes it through renderer_init ->
+          # core.rs --width/--height -> kr64, which sizes the fb0 file AND
+          # exports TWOYI_FB_WIDTH/TWOYI_FB_HEIGHT to the TWRP child, whose
+          # hook synthesizes matching FBIOGET_VSCREENINFO/FSCREENINFO.
+          RES_ARGS=""
+          if [ "$REDROID_RESOLUTION" != "auto" ] && echo "$REDROID_RESOLUTION" | grep -qE '^[0-9]+x[0-9]+$'; then
+              W=$(echo "$REDROID_RESOLUTION" | cut -dx -f1)
+              H=$(echo "$REDROID_RESOLUTION" | cut -dx -f2)
+              RES_ARGS="androidboot.redroid_width=$W androidboot.redroid_height=$H androidboot.redroid_dpi=$REDROID_DPI"
+              echo "  native resolution requested: ${W}x${H}@${REDROID_DPI}dpi"
+          else
+              echo "  native resolution: auto (redroid default 320x640)"
+          fi
+          echo "$REDROID_RESOLUTION" > /tmp/ui-e2e-artifacts/requested-resolution.txt
+
           echo "── Pulling redroid/redroid:$REDROID_TAG (arm64) ──"
           sudo docker pull "redroid/redroid:$REDROID_TAG"
           sudo docker run -itd --rm --privileged \
@@ -398,7 +430,8 @@ jobs:
               -p 5555:5555 \
               "redroid/redroid:$REDROID_TAG" \
               androidboot.use_memfd=1 \
-              androidboot.redroid_gpu_mode=guest
+              androidboot.redroid_gpu_mode=guest \
+              $RES_ARGS
           REDROID_PID=$(sudo docker inspect -f '{{.State.Pid}}' redroid)
           echo "  redroid container PID: $REDROID_PID"
           echo $REDROID_PID > /tmp/redroid.pid
@@ -459,6 +492,30 @@ jobs:
           SDK=$(adb -s localhost:5555 shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
           echo "  ro.build.version.sdk = $SDK"
           echo "  ✓ redroid is arm64-v8a Android (no native bridge, no translation)"
+
+          # ── Ground truth: the ACTUAL native display resolution ──────
+          # This is the single source of truth the whole chain must match:
+          # app auto-detect (DisplayMetrics) == wm size; TWRP container
+          # (fb0 size + TWOYI_FB_* env) follows the app. Recorded to the
+          # artifacts so every run's analysis starts from measured truth.
+          WM_SIZE=$(adb -s localhost:5555 shell wm size 2>/dev/null | tr -d '\r' || true)
+          WM_DENSITY=$(adb -s localhost:5555 shell wm density 2>/dev/null | tr -d '\r' || true)
+          echo "── Native display ground truth ──"
+          echo "$WM_SIZE"; echo "$WM_DENSITY"
+          {
+              echo "$WM_SIZE"
+              echo "$WM_DENSITY"
+              adb -s localhost:5555 shell dumpsys window displays 2>/dev/null | grep -E "init|cur|app" | head -6 || true
+          } > /tmp/ui-e2e-artifacts/native-display.txt
+          if [ "$REDROID_RESOLUTION" != "auto" ]; then
+              W=$(echo "$REDROID_RESOLUTION" | cut -dx -f1)
+              H=$(echo "$REDROID_RESOLUTION" | cut -dx -f2)
+              if ! echo "$WM_SIZE" | grep -q "${W}x${H}"; then
+                  echo "  ⚠ wm size does not contain the requested ${W}x${H} — continuing, but the TWRP container will follow whatever Android reports"
+              else
+                  echo "  ✓ native resolution confirmed: ${W}x${H}"
+              fi
+          fi
 
       - name: Install APK + push arm64 TWRP recovery.img
         run: |

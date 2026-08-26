@@ -10968,3 +10968,71 @@ Stage Summary:
   fstab+fb0 unblocked (hook rootfs-prefix retry) → honest mount -ENODEV (10,478x spin dead) →
   /data into the rootfs → +1-pointer cwd-relative rewrite (PEEK-blind class fixed) → THEME
   LOADS. Remaining to pixels: the gr_init abort + the fb0 mmap display path.
+
+---
+Task ID: 6-Z171
+Agent: main
+Task: gr_init abort naming + native-resolution chain + arm64 touch layout fix
+
+Design (from the 6-Z170 RESULTS handoff + this session's code audit):
+- AUDIT FINDING (changes the plan): the 6-Y MAP_SHARED→MAP_ANONYMOUS mmap
+  rewrite is I386-ONLY (ptrace_emu.rs gates on abi.mmap2 != -1; aarch64 has
+  no mmap2). On arm64 minui's fb0 mmap is a REAL file-backed MAP_SHARED —
+  TWRP pixels would write STRAIGHT into the fb0 file the app polls. No
+  bridge needed on arm64; the display-path worry from the handoff does not
+  apply. The ONLY blocker is the gr_init SIGABRT.
+
+Changes (twrp_fb_hook.c):
+- 6-Z171a: PLT-interpose abort() / __assert2 / __cxa_pure_virtual — print
+  the caller PC (write_hex64 — aarch64 addresses exceed 32 bits; plus
+  file:line:expr for bionic asserts) then re-raise SIGABRT via raw
+  tgkill(self) so observable behavior is IDENTICAL. Internal-to-libc abort
+  callers are NOT covered (documented) — TWRP's own code + libc++ terminate
+  ARE. This names the fatal site next run.
+- 6-Z171b: RUNTIME fb geometry — TWRP_FB_WIDTH/HEIGHT (320x640) demoted to
+  fallback-only; fb_geometry_init() lazily reads TWOYI_FB_WIDTH/
+  TWOYI_FB_HEIGHT from the child env (kr64 sets them from --width/--height
+  which trace back to Java DisplayMetrics auto-detect). fill_vscreeninfo/
+  fill_fscreeninfo/ftruncate sites/all log lines use the runtime values.
+  NATIVE-RESOLUTION CHAIN: Java auto-detect → renderer_init → core.rs
+  --width/--height → kr64 cfg → fb0 file size + TWOYI_FB_* env → hook
+  geometry. No compile-time hardcode anywhere in the chain.
+- 6-Z171c: /dev/ashmem support — mark ashmem opens in all 4 open wrappers,
+  fake the ASHMEM_* ioctl protocol (SET_SIZE arg is BY VALUE; ftruncate the
+  backing regular file to it so the caller's MAP_SHARED mmap is big enough;
+  GET_SIZE returns the remembered size; NAME/PROT_MASK/PIN → 0). Both
+  32-bit (0x400877xx) and 64-bit (0x401077xx) _IOW encodings accepted
+  (nr-only match on type 0x77).
+- TOUCH FIX (found by audit, would have broken arm64 input completely):
+  struct input_event is 24B on aarch64 (16B timeval) vs 16B on i386 —
+  INBR_EV_SIZE is now arch-conditional and inbr_emit writes type/code/
+  value at INBR_EV_SIZE-8 (the old code emitted i386 frames to the arm64
+  child = every field misaligned). INBR_MAX_X/Y now runtime fb_w()-1/
+  fb_h()-1 (was hardcoded 319/639) so EVIOCGABS abs_max matches the native
+  resolution space.
+
+Changes (kr64):
+- lib.rs: TWRP child env gains TWOYI_FB_WIDTH/TWOYI_FB_HEIGHT (cfg
+  fallback 320/640).
+- devices.rs: create_twrp_misc_devs() pre-creates {rootfs}/dev/ashmem +
+  {rootfs}/dev/pmsg0 as 1-byte 0666 regular files (fresh each boot);
+  called beside create_twrp_framebuffer in TWRP mode. fb0-size fallback
+  aligned 720x1280 → 320x640 (matches hook + env fallbacks). +1 unit test.
+
+Changes (E2E):
+- ui-e2e-test-arm64.yml: redroid_resolution (default 720x1600) +
+  redroid_dpi (default 320) inputs → androidboot.redroid_width/height/dpi
+  docker args; 'auto' = redroid default. Post-boot ground-truth step:
+  wm size + wm density + dumpsys into native-display.txt artifact.
+- ui-navigate.py: detect_screen_size cross-checks uiautomator bounds
+  against `wm size` (prefers wm — the same truth the app auto-detects),
+  writes screen-size.txt artifact.
+
+Gates: kr64 cargo fmt/test/clippy green locally (560 tests).
+
+Stage Summary:
+- Boot chain: ... theme load ✓ → gr_init abort (named next run by 6-Z171a)
+  → real fb0 mmap (no rewrite on arm64) → pixels → gate-dismissal touch →
+  main menu. Next-run verdicts: (1) "abort() INTERCEPTED caller_pc=0x..."
+  line + offline symbolization, (2) ashmem SET_SIZE lines + no fd=-1,
+  (3) "geometry from env: WxH" == wm size, (4) screenshot md5 CHANGES.
