@@ -1435,6 +1435,38 @@ def main():
                 f.write(f"$ {cmd}\n{out or '(no output)'}\n")
             print(f"  probe {label}: captured ({len(out or '')} bytes)")
 
+    # ── 6-Z163b: WHY did the linker say "libaosprecovery.so not found"
+    # when /sbin/libaosprecovery.so EXISTS (34544 bytes, mode 0755)?
+    # Either the file is corrupt (bad ELF magic — the ramdisk extraction
+    # may have produced garbage) or the old linker's search failed for a
+    # subtler reason. Hexdump the first 32 bytes of every DT_NEEDED
+    # candidate the probe env points at: a VALID arm64 shared lib starts
+    # 7f 45 4c 46 02 01 01 00 (ELF magic, ELFCLASS64, LSByte, current).
+    magic_out = adb_shell(
+        f"run-as {PACKAGE} sh -c 'for f in libaosprecovery.so libc.so "
+        f"libcrecovery.so liblog.so libminuitwrp.so linker64 recovery adbd; do "
+        f"echo \"== $f ==\"; ls -la rootfs/sbin/$f 2>&1; "
+        f"dd if=rootfs/sbin/$f bs=1 count=32 2>/dev/null | od -An -tx1; done'",
+        timeout=60)
+    if magic_out:
+        with open(os.path.join(ART, "sbin-lib-magic.txt"), "w", errors="replace") as f:
+            f.write(magic_out)
+        print(f"  pulled sbin lib magic dump ({len(magic_out)} bytes)")
+
+    # LD_DEBUG=1 variant for recovery — the OLD bionic linker prints its
+    # library search decisions (which dirs it tried, what failed) when
+    # LD_DEBUG is set. Harmless if unsupported (env is just ignored).
+    ld_debug_out = adb_shell(
+        f"run-as {PACKAGE} sh -c '{preload_env} LD_DEBUG=1 "
+        f"{TIMEOUT} 8 "
+        f"/data/user/0/{PACKAGE}/cache/twoyi_stage/_sbin_recovery_* 2>&1 | head -60; "
+        f"echo LDDEBUG_EXIT:$?'",
+        timeout=30)
+    if ld_debug_out:
+        with open(os.path.join(ART, "recovery-ld-debug.txt"), "w", errors="replace") as f:
+            f.write(ld_debug_out)
+        print(f"  pulled recovery LD_DEBUG output ({len(ld_debug_out)} bytes)")
+
     # Pull the TWRP diagnostic logs.
     #
     # kr64 mirrors these three files to /sdcard/Android/data/io.twoyi/

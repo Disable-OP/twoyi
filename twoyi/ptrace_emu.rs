@@ -8190,6 +8190,10 @@ pub fn run_ptrace_loop(
     let mut spin_diag_epoll_count: u64 = 0;
     let mut spin_diag_seen_fds: std::collections::HashSet<(libc::pid_t, i64)> =
         std::collections::HashSet::new();
+    // 6-Z163b: counter for the bind-rewrite skip DIAG (first 12 skips log
+    // the reason + the first 16 blob bytes — run 32990637557's silent
+    // skip of init's property bind made the miss invisible).
+    let mut spin_diag_bind_skip_count: u64 = 0;
     // pending epoll_pwait EXIT readbacks: pid -> (syscall nr, events buf
     // addr, maxevents). The nr is re-checked at the EXIT stop so a
     // signal-interrupted/restarted sequence never decodes a stale
@@ -10702,8 +10706,72 @@ pub fn run_ptrace_loop(
                             let sa_len = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                             if sa_ptr != 0 && sa_len >= 3 && sa_len <= 128 {
                                 if let Some(blob) = read_child_bytes(pid, sa_ptr, 128) {
-                                    if let Some(guest_path) = unix_fs_sun_path(&blob) {
-                                        let host_path = translate_path(rootfs, guest_path);
+                                    // 6-Z163b: determine the rewrite target.
+                                    // FS spelling ("/dev/socket/...") → the
+                                    // general translated-path rewrite.
+                                    // ABSTRACT spelling ("\0property_service")
+                                    // → ALSO rewrite to the translated FS
+                                    // path: abstract names live in the host's
+                                    // (redroid's) SHARED abstract namespace,
+                                    // where redroid's own init already holds
+                                    // "\0property_service" → EADDRINUSE —
+                                    // exactly run 32990637557's unrewritten
+                                    // bind(fd) → -98 (the FS-spelling rewrite
+                                    // alone skipped it, so the 6-Z101 fake
+                                    // masked the failure and the EPOLLHUP
+                                    // spin lived on).
+                                    let fs_target = unix_fs_sun_path(&blob).map(|gp| gp.to_string());
+                                    let abstract_is_propserv = fs_target.is_none()
+                                        && blob.len() > 2
+                                        && blob[2] == 0
+                                        && sockaddr_blob_is_property_service(
+                                            &blob,
+                                            sa_len,
+                                            &abi,
+                                        )
+                                        .is_some();
+                                    let rewrite_guest_path = fs_target.or_else(|| {
+                                        if abstract_is_propserv {
+                                            Some("/dev/socket/property_service".to_string())
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    // 6-Z163b DIAG: when NO rewrite happens,
+                                    // say WHY (first 12) — run 32990637557 had
+                                    // init's bind skipped silently (only adbd's
+                                    // binds logged REWRITTEN), and the reason
+                                    // was invisible.
+                                    if rewrite_guest_path.is_none() {
+                                        spin_diag_bind_skip_count =
+                                            spin_diag_bind_skip_count.saturating_add(1);
+                                        if spin_diag_bind_skip_count <= 12 {
+                                            let hexhead: String = blob
+                                                .iter()
+                                                .take(16)
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect::<Vec<_>>()
+                                                .join(" ");
+                                            log(&format!(
+                                                "6-Z163b: bind(fd={}) NOT rewritten (reason: {}) sa_len={} blob[0..16]={} (occurrence {})",
+                                                get_syscall_arg(&regs, abi.reg_arg1),
+                                                if blob.len() < 3 {
+                                                    "peek too short".to_string()
+                                                } else if u16::from_ne_bytes([blob[0], blob[1]]) != 1 {
+                                                    format!("family={}", u16::from_ne_bytes([blob[0], blob[1]]))
+                                                } else if blob[2] == 0 {
+                                                    "abstract non-property name".to_string()
+                                                } else {
+                                                    "non-absolute or non-UTF8 sun_path".to_string()
+                                                },
+                                                sa_len,
+                                                hexhead,
+                                                spin_diag_bind_skip_count
+                                            ));
+                                        }
+                                    }
+                                    if let Some(guest_path) = rewrite_guest_path {
+                                        let host_path = translate_path(rootfs, &guest_path);
                                         if let Some(new_sa) =
                                             build_translated_unix_sockaddr(&host_path)
                                         {
