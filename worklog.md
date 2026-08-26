@@ -11148,3 +11148,36 @@ Stage Summary:
   fb0 file 4608000B + init.rc setenv TWOYI_FB_* -> hook geometry -> VSCREENINFO.
   Next verdict: "geometry from env: 720x1600" in kr64-app-stderr + fb0
   = 4608000 in the listing + (stretch) first pixels in screenshots.
+
+---
+Task ID: 6-Z176
+Agent: main
+Task: Geometry file fallback + load-time maps snapshot (SIGSEGV symbolization)
+
+Evidence (run 33018901591 on e11bb64 — biggest progress run yet):
+- NATIVE-RES + FULL PIPELINE STABLE: kr64 parent created fb0 at 4,608,000B
+  (720x1600) ✓; adb SURVIVED the whole run (6-Z173 held) ✓; screenshots are
+  real 720x1600 PNGs ✓ (VLM verdict: solid black — no rendered UI yet).
+- TWRP REACHED RENDERING: libpixelflinger generated scanlines (ArmToArm64
+ Assembler "generated scanline__..." lines = PixelFlinger JIT at work!)
+  then **SIGSEGV si_addr=0xffff00000013 rip=0xffffedbc8470 in
+  _sbin_recovery_** right after (debuggerd refused; tracer can't read
+  maps) — the pixel blocker is now a crash AFTER gr_init.
+- fb0 MYSTERY SOLVED-ish: the hook SHRANK the 4.6MB fb0 to 819,200 — its
+  geometry STILL fell back to 320x640: even with the 6-Z175 init.rc setenv
+  patch, TWOYI_FB_* did not reach recovery (old TWRP init env construction).
+  Render loop short-read confirms (819200/4608000).
+- Hook stderr lines confirmed present but BYTE-INTERLEAVED with tracer
+  DIAG lines (shared fd 2) — greps must tolerate mid-line cuts.
+
+Fixes:
+- hook fb_geometry_init: env -> {rootfs}/.twoyi-fb-geometry FILE (raw open,
+  rootfs-prefixed + cwd-relative forms) -> 320x640 fallback. The file is
+  written by kr64 create_twrp_framebuffer (same dims as the fb0 file size).
+- hook constructor: /proc/self/maps dump AT LOAD (all DT_NEEDED libs
+  mapped, bases never move, lands before tracer spam) — the SIGSEGV rip
+  becomes symbolizable offline next run.
+
+Stage Summary:
+- Chain: ... theme ✓ gr_init ✓ pixelflinger RENDERING STARTED ✓ -> SIGSEGV
+  after first scanlines (next blocker, now symbolizable) -> pixels -> menu.
