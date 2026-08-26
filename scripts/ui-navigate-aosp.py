@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 
 PACKAGE = os.environ.get("AOSP_PACKAGE", "io.twoyi.debug")
 ART = "/tmp/ui-e2e-artifacts"
-BOOT_WAIT = int(os.environ.get("BOOT_WAIT_SECONDS", "30"))
+BOOT_WAIT = int(os.environ.get("BOOT_WAIT_SECONDS", "60"))
 
 # Screen size for gesture scaling — detected once via `wm size` (the
 # redroid arm64 display is 720x1280; the x86_64 AVD is 320x640 or 768x
