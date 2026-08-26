@@ -3480,9 +3480,27 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
             }
         }
     }
-    // /proc/, /data/, /apex/ — leave untranslated. The host's /proc
+    // 6-Z168: {rootfs}-prefixed paths stay untouched (the fb_hook's
+    // rootfs_retry_open forms land here — double-prefixing would break
+    // them), and /data/* now TRANSLATES into the rootfs: run 33004885224
+    // showed TWRP walking the HOST's real /data/system and /data/media
+    // through the old "/data/ passthrough" (reading redroid's actual
+    // system data + failing EACCES). The jail's /data must be the rootfs
+    // copy, which the app owns and TWRP can populate (/data/media).
+    let rootfs_prefix = if rootfs.ends_with('/') {
+        rootfs.to_string()
+    } else {
+        format!("{}/", rootfs)
+    };
+    if path == rootfs || path.starts_with(&rootfs_prefix) {
+        return path.to_string();
+    }
+    if path.starts_with("/data/") || path == "/data" {
+        return format!("{}{}", rootfs, path);
+    }
+    // /proc/, /apex/ — leave untranslated. The host's /proc
     // is partially readable by untrusted_app (so /proc/self/* works);
-    // /data + /apex are either app-private (already accessible) or
+    // /apex is either app-private (already accessible) or
     // not needed by TWRP init.
     //
     // NOTE (Task 6-P): /sys/ used to be in this list (left untranslated
@@ -3494,7 +3512,7 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
     // materialises {rootfs}/sys/class/ + {rootfs}/sys/fs/selinux/{
     // enforce,load} so the translated opens succeed against an empty
     // fake sysfs instead of the host's real one.
-    for prefix in &["/proc/", "/data/", "/apex/"] {
+    for prefix in &["/proc/", "/apex/"] {
         if path.starts_with(prefix) {
             return path.to_string();
         }
@@ -8321,6 +8339,11 @@ pub fn run_ptrace_loop(
     // log their translated path + return value — settles whether TWRP's
     // /tmp/recovery.log logger open succeeds inside the jail).
     let mut tmp_diag_count: u64 = 0;
+    let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    // 6-Z168: log cap for the block-storage mount -ENODEV overrides (the
+    // fstype classification is logged at ENTRY; this caps the EXIT lines).
+    let mut mount_enodev_logged: u64 = 0;
     // 6-Z164: FAILED-/tmp-open DIAG counter. The 6-Z163f arm above only
     // fires on ret >= 0 — run 32996812991 logged ZERO 6-Z163f lines while
     // the fb_hook printed fd=-1 for the jailed /tmp/recovery.log opens:
@@ -11530,6 +11553,34 @@ pub fn run_ptrace_loop(
                                     fs.as_deref().unwrap_or("?"),
                                     e
                                 )),
+                            }
+                        }
+                        // ── 6-Z168: block-storage mount classification ──
+                        // Run 33004885224: the compute table fakes EVERY
+                        // mount to 0 on the ptrace path (the 6-Z91 fstype-
+                        // aware -ENODEV lives only in the SIGSYS arm, which
+                        // never fires on the arm64 flow). TWRP's Mount()
+                        // saw fake success while Is_Mounted()'s st_dev
+                        // comparison saw no real mount → Check_FS_Type/
+                        // Mount retried /dev/block/sda1 10,478 times and
+                        // the GUI never started. Honest -ENODEV for block
+                        // fstypes makes TWRP mark the partition unmountable
+                        // and MOVE ON (the documented 6-Z91 behavior).
+                        let block_storage_mount = match fs.as_deref() {
+                            Some(f) => !f.is_empty() && !is_pseudo_fs_type(f),
+                            None => true, // NULL/empty fstype: bind/remount — deny (6-Z91 semantics)
+                        };
+                        if block_storage_mount {
+                            pending_mount_enodev.insert(pid);
+                            mount_enodev_logged = mount_enodev_logged.saturating_add(1);
+                            if mount_enodev_logged <= 30 {
+                                log(&format!(
+                                    "6-Z168: block-storage mount {}->{} fstype={} classified at ENTRY — EXIT will return -ENODEV (honest: no real block devices; the fake 0 caused TWRP's 10,478x Mount/Is_Mounted loop in run 33004885224) [{} /30]",
+                                    "<src>",
+                                    tgt.as_deref().unwrap_or("?"),
+                                    fs.as_deref().unwrap_or("(null)"),
+                                    mount_enodev_logged
+                                ));
                             }
                         }
                     }
@@ -15301,7 +15352,15 @@ pub fn run_ptrace_loop(
                                 // path. (The fresh_ret-gated -38/-9 arms
                                 // below still cover the NOT-matched i386
                                 // syscalls exactly as before.)
-                                let forced_value: Option<i64> = if _forced_ret_opt.is_some() {
+                                let forced_value: Option<i64> = if syscall_num == abi.mount
+                                    && pending_mount_enodev.remove(&pid)
+                                {
+                                    // ── 6-Z168: honest -ENODEV for block-storage mounts ──
+                                    // Overrides the compute table's fake 0 (see the ENTRY-side
+                                    // classification comment). TWRP handles -ENODEV gracefully:
+                                    // the partition is marked unmountable and boot proceeds.
+                                    Some(-(libc::ENODEV as i64))
+                                } else if _forced_ret_opt.is_some() {
                                     _forced_ret_opt
                                 } else if abi.execve == 11 {
                                     if syscall_num == 1 || syscall_num == 252 {
@@ -18248,6 +18307,30 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
     }
 
     #[test]
+    fn translate_path_data_translates_into_rootfs_but_rootfs_prefix_is_sacred() {
+        let rootfs = "/data/user/0/io.twoyi/rootfs";
+        // 6-Z168: the jail's /data must be the ROOTFS copy — run
+        // 33004885224 caught TWRP walking the HOST's real /data/system
+        // and /data/media through the old passthrough.
+        assert_eq!(
+            translate_path(rootfs, "/data"),
+            format!("{}/data", rootfs)
+        );
+        assert_eq!(
+            translate_path(rootfs, "/data/media/TWRP"),
+            format!("{}/data/media/TWRP", rootfs)
+        );
+        // The fb_hook's rootfs-prefixed retry forms must pass through
+        // UNTOUCHED (double-prefixing would break every retry).
+        let hooked = format!("{}/dev/graphics/fb0", rootfs);
+        assert_eq!(translate_path(rootfs, &hooked), hooked);
+        let hooked2 = format!("{}/tmp/recovery.log", rootfs);
+        assert_eq!(translate_path(rootfs, &hooked2), hooked2);
+        // The rootfs dir itself is untouched too.
+        assert_eq!(translate_path(rootfs, rootfs), rootfs);
+    }
+
+    #[test]
     fn translate_path_prepends_rootfs_for_init_rc() {
         let t = translate_path("/data/user/0/io.twoyi/rootfs", "/init.rc");
         assert_eq!(t, "/data/user/0/io.twoyi/rootfs/init.rc");
@@ -18258,13 +18341,13 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
     }
 
     #[test]
-    fn translate_path_leaves_proc_data_untouched_but_translates_sys() {
+    fn translate_path_leaves_proc_untouched_but_translates_sys() {
         let rootfs = "/data/user/0/io.twoyi/rootfs";
-        // /proc + /data are still left untranslated (they hit the host's
-        // real proc/data, which is correct for a ptraced unprivileged
-        // child that can't mount a fresh proc). /proc/cmdline is handled
-        // by the special-case above (translates to {rootfs}/twrp-cmdline).
-        for p in &["/proc/self/status", "/data/data"] {
+        // /proc stays untranslated (it hits the host's real proc, which is
+        // correct for a ptraced unprivileged child that can't mount a
+        // fresh proc). /proc/cmdline is handled by the special-case above
+        // (translates to {rootfs}/twrp-cmdline).
+        for p in &["/proc/self/status"] {
             assert_eq!(
                 translate_path(rootfs, p),
                 *p,

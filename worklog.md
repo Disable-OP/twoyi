@@ -10812,3 +10812,44 @@ Stage Summary:
   fallback making the 6-Z164 failures DISAPPEAR, (3) fstab parsed → PartitionManager mounts
   → minui graphics on the pre-created fb0 → PIXELS?, (4) if still black but alive: next
   blocker will be visible in recovery.log (it now survives every run).
+
+---
+Task ID: 6-Z168
+Agent: main
+Task: The 10,478x Mount/Is_Mounted spin — honest -ENODEV for block-storage mounts + /data into the rootfs
+
+Evidence (run 33004885224 on 407c000):
+- MAJOR PROGRESS: fb0 OPENED (fd=0 [FB0 TRACKED] — "fb0 reports (possibly inaccurate)"), fstab READ
+  (fd=3, "I:Reading /etc/recovery.fstab", all 11 fstab entries processed). The 6-Z166 retry worked:
+  "/etc/recovery.fstab abs open fd=-1 ... rootfs retry via=1 -> fd=3".
+- twrp-recovery.log: 90 → 31,642 lines. ONE TWRP boot cycle (not 10x appends — the log rotated).
+- NEW BLOCKER (the wedge): after "Updating partition details...", TWRP spun 10,478x on
+  open("/dev/block/sda1") + "Can't probe device" — the GUI/theme stage NEVER started (no ui.xml
+  load anywhere). TWRP source (Partition.cpp): the ONLY Check_FS_Type caller is Mount(); the spin
+  driver: compute_exit_return_value FAKES EVERY mount() to 0 on the ptrace path (the 6-Z91
+  fstype-aware -ENODEV lives ONLY in the SIGSYS arm, which never fires on arm64 — "no SIGSYS
+  interceptions recorded"). Mount() saw fake success, Is_Mounted()'s st_dev comparison saw NO real
+  mount → TWRP retried forever. probe_raw=-13 confirmed: sda1 exists on the HOST (EACCES) so
+  Is_Present stayed true.
+- SAFETY BUG: /data/* was in the passthrough list — TWRP walked redroid's REAL /data/system
+  ("Error opening '/data/system/integrity_staging' (Permission denied)") and set its backup
+  folder inside the HOST /data/media. The jail's /data must be {rootfs}/data.
+
+Fix (6-Z168, ptrace_emu.rs):
+- mount ENTRY classification (in the 6-Z164 block): fstype non-empty AND not pseudo → stash pid in
+  pending_mount_enodev (+capped log); NULL/empty fstype (bind/remount) → also denied (6-Z91
+  semantics). mount EXIT: forced_value override to -ENODEV (after the compute table's fake-0
+  decision point). TWRP marks partitions unmountable and MOVES ON (documented 6-Z91 behavior on
+  x86: "Unable to mount + proceed").
+- translate_path: /data/* → {rootfs}/data/*, EXCEPT paths already under {rootfs} (the hook's
+  prefixed retry forms are sacred — double-prefix would break them). "/data/" removed from the
+  passthrough list. Tests updated + new
+  translate_path_data_translates_into_rootfs_but_rootfs_prefix_is_sacred.
+
+Stage Summary:
+- Boot chain so far: init ✓ → property service ✓ → recovery links ✓ → logger ✓ → DataManager/LANG ✓
+  → fb0 fd ✓ → fstab read+processed ✓ → WEDGED in Update_Size/Mount spin (this fix) → next:
+  theme/ui.xml load → PageManager → RENDER.
+- Next-run checklist: (1) "6-Z168: block-storage mount ... -ENODEV" lines + NO 10k probe spin,
+  (2) "Loading package: twrp / ui.xml" in recovery.log, (3) /data/media created under
+  {rootfs}/data (NOT host /data), (4) PIXELS — screenshot md5 changes.
