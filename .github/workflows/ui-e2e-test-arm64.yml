@@ -73,7 +73,7 @@
 #     The x86_64 sibling is a single job because it can build + test
 #     natively on the same runner.
 #   - Android runtime: redroid Docker container (NOT the sdk emulator).
-#     Image: redroid/redroid:11.0.0-latest (Android 11 = API 30, the
+#     Image: redroid/redroid:16.0.0-latest (Android 16 = API 36, the
 #     same version as the x86_64 sibling for apples-to-apples parity).
 #   - Runner: ubuntu-24.04-arm (arm64 Ampere hardware, NO /dev/kvm
 #     but redroid doesn't need it — Android runs as host processes).
@@ -250,7 +250,7 @@ jobs:
           sudo mkdir -p /dev/binderfs
           sudo mount -t binder binder /dev/binderfs
           ls -la /dev/binderfs/
-          # redroid 11.0.0-latest hard-codes /dev/binder (not binderfs).
+          # redroid 16.0.0-latest hard-codes /dev/binder (not binderfs).
           sudo ln -sf /dev/binderfs/binder     /dev/binder
           sudo ln -sf /dev/binderfs/hwbinder   /dev/hwbinder
           sudo ln -sf /dev/binderfs/vndbinder  /dev/vndbinder
@@ -306,19 +306,19 @@ jobs:
           file twrp-3.7.0_9-0-angler.img || true
 
       # ───────────────────────────────────────────────────────────────
-      # Step: Pull + launch redroid (arm64-v8a Android 11)
+      # Step: Pull + launch redroid (arm64-v8a Android 16)
       # ───────────────────────────────────────────────────────────────
-      - name: Pull + launch redroid (arm64-v8a Android 11)
+      - name: Pull + launch redroid (arm64-v8a Android 16)
         run: |
           set -e
           mkdir -p /tmp/ui-e2e-artifacts
-          sudo docker pull redroid/redroid:11.0.0-latest
+          sudo docker pull redroid/redroid:16.0.0-latest
           sudo docker run -itd --rm --privileged \
               --name redroid \
               -v /dev/binderfs:/dev/binderfs:rw \
               -v $HOME/redroid-data:/data \
               -p 5555:5555 \
-              redroid/redroid:11.0.0-latest \
+              redroid/redroid:16.0.0-latest \
               androidboot.use_memfd=1 \
               androidboot.redroid_gpu_mode=guest
           REDROID_PID=$(sudo docker inspect -f '{{.State.Pid}}' redroid)
@@ -362,8 +362,8 @@ jobs:
               exit 1
           fi
           SDK=$(adb -s localhost:5555 shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
-          echo "  ro.build.version.sdk = $SDK (expect 30 for Android 11)"
-          echo "  ✓ redroid is arm64-v8a Android 11 (no native bridge, no translation)"
+          echo "  ro.build.version.sdk = $SDK (expect 36 for Android 16)"
+          echo "  ✓ redroid is arm64-v8a Android 16 (no native bridge, no translation)"
 
       - name: Install APK + push arm64 TWRP recovery.img
         env:
