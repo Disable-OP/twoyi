@@ -4087,21 +4087,13 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     }
 }
 
-// process_vm_readv(2) — declared locally so the build does not depend on
-// the libc crate exposing it for every target triple (present on
-// linux/android for all arches we ship; ENOSYS at runtime degrades to the
-// old PEEK-only behaviour).
-extern "C" {
-    fn process_vm_readv(
-        pid: libc::pid_t,
-        local_iov: *const libc::iovec,
-        liovcnt: libc::c_ulong,
-        remote_iov: *const libc::iovec,
-        riovcnt: libc::c_ulong,
-        flags: libc::c_ulong,
-    ) -> libc::ssize_t;
-}
-
+// process_vm_readv(2) — invoked via the RAW syscall(2) number
+// (libc::SYS_process_vm_readv — per-arch: 270 on aarch64, 310 on x86_64,
+// 347 on i386), NOT the libc wrapper: bionic does not export the named
+// symbol at the linked API level (run 33004281476: "ld.lld: error:
+// undefined symbol: process_vm_readv"), while the raw syscall works on
+// every kernel we target. An ENOSYS at runtime degrades to the old
+// PEEK-only behaviour.
 /// 6-Z167: read a NUL-terminated C string from the child via
 /// process_vm_readv (256-byte chunks, 4096 cap). Returns None when the
 /// very first chunk fails — callers fall back to the legacy PEEK result.
@@ -4118,7 +4110,17 @@ fn read_child_string_pvm(pid: libc::pid_t, addr: u64) -> Option<String> {
             iov_base: (addr as usize + off) as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        let n = unsafe { process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_process_vm_readv,
+                pid,
+                &local as *const libc::iovec,
+                1 as libc::c_ulong,
+                &remote as *const libc::iovec,
+                1 as libc::c_ulong,
+                0 as libc::c_ulong,
+            )
+        };
         if n <= 0 {
             break;
         }
