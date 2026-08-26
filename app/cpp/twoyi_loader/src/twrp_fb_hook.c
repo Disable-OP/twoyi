@@ -184,6 +184,17 @@ static long raw_syscall1(long num, long a) {
     return ret;
 }
 
+static long raw_syscall2(long num, long a, long b) {
+    long ret;
+    __asm__ volatile (
+        "int $0x80"
+        : "=a"(ret)
+        : "a"(num), "b"(a), "c"(b)
+        : "memory"
+    );
+    return ret;
+}
+
 static long raw_syscall3(long num, long a, long b, long c) {
     long ret;
     __asm__ volatile (
