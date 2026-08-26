@@ -275,7 +275,22 @@ def main():
         print("  [ENABLE_LD_DEBUG=0] LD_DEBUG disabled (6-Z154 default)")
     adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
     time.sleep(6)
-    activity = get_current_activity()
+    # Launch robustness (redroid arm64): monkey is flaky there (TWRP v5
+    # run 32951494158: monkey never foregrounded the app; AOSP v5 run
+    # 32951496349: monkey cold-launch exited 251). Retry monkey once,
+    # then fall back to an explicit component start — SettingsActivity IS
+    # the launcher activity (singleTask), so this equals a launcher tap.
+    activity = get_current_activity() or ""
+    if PACKAGE not in activity.lower():
+        print(f"  App not foregrounded after monkey (activity={activity!r}) — retrying")
+        adb_shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1")
+        time.sleep(4)
+        activity = get_current_activity() or ""
+        if PACKAGE not in activity.lower():
+            print(f"  Still not foregrounded (activity={activity!r}) — am start fallback")
+            adb_shell(f"am start -n {PACKAGE}/io.twoyi.ui.SettingsActivity")
+            time.sleep(4)
+            activity = get_current_activity() or ""
     print(f"  Current activity: {activity}")
     dump_ui("01_app_launched")
 
