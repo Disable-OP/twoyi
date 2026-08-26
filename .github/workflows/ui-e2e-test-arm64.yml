@@ -586,6 +586,28 @@ jobs:
           # navigation script runs, and names the container state
           # (running / died / OOM-killed) when it stops matching.
           rm -f /tmp/ui-e2e-artifacts/nav-done
+          # 6-Z179: fast maps trap — recovery crash-restarts live only
+          # seconds; the 15s watcher keeps missing them. This tight loop
+          # (2s) captures /proc/<pid>/maps the FIRST time it sees each
+          # new recovery/init pid. Module bases are static per process,
+          # so one snapshot symbolizes that restart's crash rip.
+          rm -f /tmp/ui-e2e-artifacts/twrp-maps-trap.log /tmp/.twrp_maps_seen
+          (
+            for I in $(seq 1 120); do
+              [ -f /tmp/ui-e2e-artifacts/nav-done ] && break
+              for P in $(sudo docker exec redroid sh -c "ps -A -o PID,NAME 2>/dev/null" 2>/dev/null | grep -E "recovery|sbin|kr64" | awk '{print $1}'); do
+                if ! grep -qx "$P" /tmp/.twrp_maps_seen 2>/dev/null; then
+                  echo "$P" >> /tmp/.twrp_maps_seen
+                  {
+                    echo "===== maps of pid $P @ $(date -u +%H:%M:%S) ====="
+                    sudo docker exec redroid sh -c "cat /proc/$P/maps 2>&1" 2>&1 | head -n 60
+                  } >> /tmp/ui-e2e-artifacts/twrp-maps-trap.log 2>&1
+                fi
+              done
+              sleep 2
+            done
+          ) &
+          TRAP=$!
           (
             I=0
             while [ ! -f /tmp/ui-e2e-artifacts/nav-done ]; do
@@ -651,7 +673,7 @@ jobs:
           python3 scripts/ui-navigate.py
           RC=$?
           touch /tmp/ui-e2e-artifacts/nav-done
-          kill $WATCHER 2>/dev/null || true
+          kill $WATCHER $TRAP 2>/dev/null || true
 
           # Final adb-independent dump (works even when adb is dead).
           sudo docker exec redroid logcat -d \
