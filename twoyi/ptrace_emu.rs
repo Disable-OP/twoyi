@@ -10720,16 +10720,13 @@ pub fn run_ptrace_loop(
                                     // alone skipped it, so the 6-Z101 fake
                                     // masked the failure and the EPOLLHUP
                                     // spin lived on).
-                                    let fs_target = unix_fs_sun_path(&blob).map(|gp| gp.to_string());
+                                    let fs_target =
+                                        unix_fs_sun_path(&blob).map(|gp| gp.to_string());
                                     let abstract_is_propserv = fs_target.is_none()
                                         && blob.len() > 2
                                         && blob[2] == 0
-                                        && sockaddr_blob_is_property_service(
-                                            &blob,
-                                            sa_len,
-                                            &abi,
-                                        )
-                                        .is_some();
+                                        && sockaddr_blob_is_property_service(&blob, sa_len, &abi)
+                                            .is_some();
                                     let rewrite_guest_path = fs_target.or_else(|| {
                                         if abstract_is_propserv {
                                             Some("/dev/socket/property_service".to_string())
