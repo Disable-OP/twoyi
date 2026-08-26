@@ -10853,3 +10853,38 @@ Stage Summary:
 - Next-run checklist: (1) "6-Z168: block-storage mount ... -ENODEV" lines + NO 10k probe spin,
   (2) "Loading package: twrp / ui.xml" in recovery.log, (3) /data/media created under
   {rootfs}/data (NOT host /data), (4) PIXELS — screenshot md5 changes.
+
+---
+Task ID: 6-Z169
+Agent: main
+Task: GUI stage reached — the /twres mystery (evidence iteration)
+
+Evidence (run 33007215600 on 029c828):
+- 6-Z168 WORKED: the 10,478x sda1 probe spin is DEAD (recovery.log 31,642 -> 617 lines). Mounts now
+  fail HONESTLY and TWRP moves on: "I:Unable to mount '/s'|'/cache'|'/usb-otg'" once each, 30x
+  "6-Z168: block-storage mount ... -ENODEV" in the tracer log. fb0 fd=0 [FB0 TRACKED].
+- TWRP reached the GUI STAGE for the first time: splash -> fstab -> partitions -> languages:
+  "PageManager::LoadFileToBuffer '/twres/languages/en.xml'" -> "E:Unable to load" + last line
+  "I:Translating partition display names". Screens still black (nothing rendered).
+- THE /twres MYSTERY: app log says "Extracted 3217 entries from cpio (sawTrailer=true)" (ALL
+  theme files included — verified against the pristine image: splash.xml 1341B, en.xml 50513B,
+  ui.xml 27480B, portrait.xml 186887B all present in the cpio) — yet PageManager's loads ENOENT
+  with NO trace in the tracer log (no path-read failures for those opens, no hook lines —
+  PageManager reads via libc++-internal openat paths).
+- 6-Z167 findings: PEEK failures are errno=EIO on ONE address class (0xfffff36b24e0, 12x, all
+  EARLY init-phase pid 2608 opens that SUCCEED anyway fd=3) and /proc/2608/maps is ENOENT FROM
+  THE TRACER (pid-namespace/visibility oddity in redroid). PVM did NOT rescue those reads (the
+  DIAG fires only when read_child_string returns None AFTER the PVM fallback).
+
+Change (6-Z169): pure-evidence iteration, zero behavior change.
+- E2E: ls -laR rootfs/twres/ + wc -c of splash/ui/portrait/en.xml pulls.
+- Tracer: /twres open-result DIAG (first 20, success+failure) + ONE-SHOT RUNTIME dir dump of
+  {rootfs}/twres + twres/languages at the first /twres open FAILURE — the runtime existence
+  proof (pull-time listings can diverge from what the child saw).
+
+Stage Summary:
+- Boot chain: init ✓ props ✓ logger ✓ LANG ✓ fb0 fd ✓ fstab ✓ partitions ✓ (no spin) → WEDGED
+  at theme/language load (this iteration decides: files-missing-at-runtime vs open-mechanism).
+- Next-run verdicts: (1) "6-Z169: RUNTIME .../twres listing" contents, (2) 6-Z169 open lines
+  (translated path + errno), (3) twres-contents.txt artifact, (4) if files exist + opens
+  translated-fine: instrument stat/access next.

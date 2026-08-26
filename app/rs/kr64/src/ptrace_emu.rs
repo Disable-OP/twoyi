@@ -8344,6 +8344,13 @@ pub fn run_ptrace_loop(
     // 6-Z168: log cap for the block-storage mount -ENODEV overrides (the
     // fstype classification is logged at ENTRY; this caps the EXIT lines).
     let mut mount_enodev_logged: u64 = 0;
+    // 6-Z169: /twres open-result DIAG (first 20) + one-shot runtime dir
+    // dump. Run 33007215600: the importer extracted all 3217 cpio entries
+    // (sawTrailer=true, app log) yet PageManager's /twres loads ENOENT'd.
+    // The dump is the RUNTIME existence proof (pull-time listings can
+    // diverge from what the jailed child actually saw).
+    let mut twres_diag_count: u64 = 0;
+    let mut twres_dir_dumped: bool = false;
     // 6-Z164: FAILED-/tmp-open DIAG counter. The 6-Z163f arm above only
     // fires on ret >= 0 — run 32996812991 logged ZERO 6-Z163f lines while
     // the fb_hook printed fd=-1 for the jailed /tmp/recovery.log opens:
@@ -13073,6 +13080,16 @@ pub fn run_ptrace_loop(
                                         ));
                                     }
                                 }
+                                // ── 6-Z169: /twres open-result DIAG (success side) ──
+                                if p.contains("/twres") && past_first_execve {
+                                    twres_diag_count = twres_diag_count.saturating_add(1);
+                                    if twres_diag_count <= 20 {
+                                        log(&format!(
+                                            "6-Z169: open twres {:?} -> fd {} (occurrence {})",
+                                            p, ret, twres_diag_count
+                                        ));
+                                    }
+                                }
                                 // Task 6-Z62: per-(pid, fd) copy of the same
                                 // mapping. fd tables are PER-PROCESS, so the
                                 // fd-only map above collides between init
@@ -13148,6 +13165,69 @@ pub fn run_ptrace_loop(
                                         -ret,
                                         tmp_diag_fail_count
                                     ));
+                                }
+                            }
+                            // ── 6-Z169: /twres open-FAILURE DIAG + one-shot
+                            // runtime dir dump (the importer claims all 3217
+                            // entries extracted — prove what the filesystem
+                            // holds AT THE MOMENT the jailed child looks). ──
+                            if p.contains("/twres") && past_first_execve {
+                                twres_diag_count = twres_diag_count.saturating_add(1);
+                                if twres_diag_count <= 20 {
+                                    log(&format!(
+                                        "6-Z169: open twres FAILED {:?} -> {} (-errno {}) (occurrence {})",
+                                        p,
+                                        ret,
+                                        -ret,
+                                        twres_diag_count
+                                    ));
+                                }
+                                if !twres_dir_dumped {
+                                    twres_dir_dumped = true;
+                                    let dir = format!("{}/twres", rootfs);
+                                    match std::fs::read_dir(&dir) {
+                                        Ok(entries) => {
+                                            let names: Vec<String> = entries
+                                                .filter_map(|e| {
+                                                    e.ok().map(|e| {
+                                                        e.file_name().to_string_lossy().into_owned()
+                                                    })
+                                                })
+                                                .collect();
+                                            log(&format!(
+                                                "6-Z169: RUNTIME {}/twres listing ({} entries): {:?}",
+                                                rootfs,
+                                                names.len(),
+                                                names
+                                            ));
+                                            let lang = format!("{}/twres/languages", rootfs);
+                                            match std::fs::read_dir(&lang) {
+                                                Ok(es) => {
+                                                    let ns: Vec<String> = es
+                                                        .filter_map(|e| {
+                                                            e.ok().map(|e| {
+                                                                e.file_name().to_string_lossy()
+                                                                    .into_owned()
+                                                            })
+                                                        })
+                                                        .collect();
+                                                    log(&format!(
+                                                        "6-Z169: RUNTIME twres/languages listing ({} entries): {:?}",
+                                                        ns.len(),
+                                                        ns
+                                                    ));
+                                                }
+                                                Err(e) => log(&format!(
+                                                    "6-Z169: RUNTIME read_dir twres/languages FAILED: {}",
+                                                    e
+                                                )),
+                                            }
+                                        }
+                                        Err(e) => log(&format!(
+                                            "6-Z169: RUNTIME read_dir {}/twres FAILED: {}",
+                                            rootfs, e
+                                        )),
+                                    }
                                 }
                             }
                             // Task 6-Y fix 2: when open(/dev/__properties__)
