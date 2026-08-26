@@ -1327,6 +1327,13 @@ def main():
     # reach logcat), and the selinux stubs the init dance wrote. These
     # pin down post-restorecon blockers (recovery exit 127 family)
     # without another dispatch cycle.
+    # Rootfs top-level listing — settles hardware-detection questions
+    # (6-Z159a) in one run: exactly what the kr64 parent saw.
+    listing = adb_shell(f"run-as {PACKAGE} ls -la rootfs/", timeout=30)
+    if listing:
+        with open(os.path.join(ART, "rootfs-listing.txt"), "w", errors="replace") as f:
+            f.write(listing)
+        print(f"  pulled rootfs listing ({len(listing)} bytes)")
     for remote, local in [
         ("rootfs/tmp/recovery.log", "twrp-recovery.log"),
         ("rootfs/dev/__kmsg__", "kmsg-stub.txt"),

@@ -6511,8 +6511,21 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 hw
             );
         } else {
+            // 6-Z159a: the standalone logic provably finds 'angler' on the
+            // extracted angler ramdisk, yet run 32978121405 logged the None
+            // branch — dump the directory the detector actually saw + every
+            // candidate it considered so ONE run pins the divergence.
+            let listing: Vec<String> = std::fs::read_dir(&rootfs_prefix)
+                .map(|rd| {
+                    rd.flatten()
+                        .take(60)
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
             info!(
-                "[KR64] PARENT: 6-Z159: no unique hardware suffix found in rootfs — keeping androidboot.hardware=ranchu (x86 emulator rootfs behaviour)"
+                "[KR64] PARENT: 6-Z159: no unique hardware suffix found in rootfs {:?} — keeping androidboot.hardware=ranchu. Dir listing (first 60): {:?}",
+                rootfs_prefix, listing
             );
         }
         let cmdline_content = format!(
