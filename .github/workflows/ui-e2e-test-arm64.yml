@@ -93,6 +93,23 @@
 #   - ui-navigate.py's post-Launch-Container + final assertions abort
 #     the script (exit 1) if the app crashed back to launcher (the
 #     bug that produced the false-green v1 run 32886902337).
+#
+# v5 (native-adb fix): v4.x installed the SDK platform-tools via
+# sdkmanager — but that adb is an x86_64 ELF. Every later step exported
+# PATH="$ANDROID_HOME/platform-tools:$PATH", shadowing the NATIVE
+# arm64 adb from android-tools-adb. Result (run 32942686027): ALL adb
+# calls died with "cannot execute binary file: Exec format error" —
+# the 600s boot wait polled a dead adb while Android inside redroid
+# was actually booting (all HAL services up, zygote preloading).
+# v5 DELETES the sdkmanager platform-tools step entirely: the ONLY adb
+# on PATH is Ubuntu's native arm64 android-tools-adb, enforced by an
+# adb-version sanity gate before the container starts.
+# v5 also parameterizes the redroid tag (input redroid_tag, default
+# 14.0.0-latest — the research-verified actively-pulled arm64 image;
+# 16.0.0-latest showed a zygote restart loop and can be A/B-tested via
+# the input without a commit), streams `docker logs -f` into the
+# artifacts from container start, and adds adb-independent container
+# diagnostics (docker exec getprop/ps/logcat) on every progress tick.
 ---
 name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
 
@@ -103,6 +120,10 @@ name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
         description: 'How long to wait for the TWRP container to boot before capturing the final screenshot (seconds)'
         required: false
         default: '600'
+      redroid_tag:
+        description: 'redroid Docker image tag (arm64): 14.0.0-latest, 16.0.0-latest, 13.0.0-latest, 11.0.0-latest ...'
+        required: false
+        default: '14.0.0-latest'
 
 concurrency:
   group: ui-e2e-test-arm64-${{ github.ref }}
@@ -239,11 +260,20 @@ jobs:
           fi
           echo "  ✓ Running on aarch64 hardware"
 
-          echo "── Install kernel modules + adb ──"
+          echo "── Install kernel modules + native arm64 adb ──"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
               linux-modules-extra-$(uname -r) \
               android-tools-adb
+
+          echo "── adb sanity gate (v5) ──"
+          # The ONLY adb on PATH must be Ubuntu's NATIVE arm64 build.
+          # The v4.x failure mode (sdkmanager's x86_64 adb shadowing it)
+          # surfaces here as 'Exec format error' — fail fast, not 600s later.
+          command -v adb || { echo "✗ adb not found on PATH"; exit 1; }
+          adb version || { echo "✗ adb is not executable on aarch64 (Exec format error?)"; exit 1; }
+          adb version | head -2
+          echo "  ✓ native adb executes on $(uname -m)"
 
           echo "── Load binderfs + mount at /dev/binderfs ──"
           # modprobe binderfs (provides binderfs + the binder,hwbinder,vndbinder
@@ -260,31 +290,6 @@ jobs:
 
           command -v docker >/dev/null || sudo apt-get install -y docker.io
           docker --version
-
-      - name: Setup Android SDK platform-tools (for adb on the arm64 host)
-        # The arm64 runner doesn't preinstall the Android SDK. We need
-        # platform-tools (for adb). The full SDK + emulator + system
-        # image is NOT needed (redroid provides the Android runtime).
-        run: |
-          set -e
-          export ANDROID_HOME=/home/runner/android-sdk
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
-              cd /tmp
-              curl -sL -o cmdline-tools.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
-              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
-              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-              rm cmdline-tools.zip
-          fi
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          # Only platform-tools needed; no emulator, no system image,
-          # no NDK (we don't build here — the build-apk job does that).
-          sdkmanager "platform-tools"
-          echo "  ✓ platform-tools installed"
-          # `adb` is also available via android-tools-adb apt package; the
-          # sdkmanager-installed one is more recent and matches what the
-          # x86_64 sibling uses.
 
       - name: Download arm64 TWRP image (Nexus 6P angler)
         # dl.twrp.me serves the .img with a referer-based anti-leech
@@ -307,29 +312,34 @@ jobs:
           file twrp-3.7.0_9-0-angler.img || true
 
       # ───────────────────────────────────────────────────────────────
-      # Step: Pull + launch redroid (arm64-v8a Android 16)
+      # Step: Pull + launch redroid (arm64-v8a, tag from input)
       # ───────────────────────────────────────────────────────────────
-      - name: Pull + launch redroid (arm64-v8a Android 16)
+      - name: Pull + launch redroid
+        env:
+          REDROID_TAG: ${{ github.event.inputs.redroid_tag || '14.0.0-latest' }}
         run: |
           set -e
           mkdir -p /tmp/ui-e2e-artifacts
-          sudo docker pull redroid/redroid:16.0.0-latest
+          echo "── Pulling redroid/redroid:$REDROID_TAG (arm64) ──"
+          sudo docker pull "redroid/redroid:$REDROID_TAG"
           sudo docker run -itd --rm --privileged \
               --name redroid \
               -v /dev/binderfs:/dev/binderfs:rw \
               -v $HOME/redroid-data:/data \
               -p 5555:5555 \
-              redroid/redroid:16.0.0-latest \
+              "redroid/redroid:$REDROID_TAG" \
               androidboot.use_memfd=1 \
               androidboot.redroid_gpu_mode=guest
           REDROID_PID=$(sudo docker inspect -f '{{.State.Pid}}' redroid)
           echo "  redroid container PID: $REDROID_PID"
           echo $REDROID_PID > /tmp/redroid.pid
 
-          # Wait for boot_completed (up to 600s — Android 16 is heavier
-          # than 11, first boot on github-hosted arm runner is slow).
-          export ANDROID_HOME=/home/runner/android-sdk
-          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          # Stream the container's full log from birth into the artifacts
+          # (evidence for EVERY failure — v4.x only dumped logs on timeout).
+          sudo docker logs -f redroid > /tmp/ui-e2e-artifacts/redroid.log 2>&1 &
+          echo $! > /tmp/redroid-log.pid
+
+          # Wait for boot_completed (up to 600s). adb = NATIVE arm64 build.
           BOOT_TIMEOUT=600
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
@@ -348,23 +358,23 @@ jobs:
               WAITED=$((WAITED + 5))
               if [ $((WAITED % 60)) -eq 0 ]; then
                   echo "  still booting... ${WAITED}s elapsed"
-                  # Progress hint: dump redroid's getprop (if adb is up)
-                  # every 60s so we can see how far Android has gotten.
+                  # adb-independent progress (docker exec): framework state
+                  SVC=$(sudo docker exec redroid getprop init.svc.zygote 2>/dev/null | tr -d '\r' || true)
+                  PROC=$(sudo docker exec redroid sh -c "ps -A 2>/dev/null | grep -cE 'zygote|system_server|surfaceflinger'" 2>/dev/null || true)
                   PROP=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
-                  INIT_SVC=$(adb -s localhost:5555 shell getprop init.svc.bootanim 2>/dev/null | tr -d '\r' || true)
-                  echo "    boot_completed=$PROP  bootanim=$INIT_SVC"
+                  echo "    boot_completed=$PROP  init.svc.zygote=$SVC  framework_procs=$PROC"
               fi
           done
           if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
               echo "  ✗ redroid did not boot in ${BOOT_TIMEOUT}s"
-              echo "── full docker logs (last 300 lines) ──"
-              sudo docker logs redroid 2>&1 | tail -300
-              echo "── adb diagnostics (if reachable) ──"
-              adb -s localhost:5555 shell getprop 2>&1 | head -50 || true
+              echo "── redroid getprop (docker exec — adb-independent) ──"
+              sudo docker exec redroid getprop 2>&1 | grep -E "boot_completed|init.svc|build.version|cpu.abi" | head -30 || true
               echo "── redroid processes (docker exec ps) ──"
-              sudo docker exec redroid sh -c "ps -A 2>/dev/null | head -30" 2>&1 || true
-              echo "── redroid logcat (last 100 lines, if logcat exists) ──"
-              sudo docker exec redroid sh -c "logcat -d -t 100 2>/dev/null" 2>&1 || true
+              sudo docker exec redroid sh -c "ps -A 2>/dev/null" 2>&1 | head -40 || true
+              echo "── redroid logcat tail (docker exec) ──"
+              sudo docker exec redroid sh -c "logcat -d 2>/dev/null" 2>&1 | tail -300 || true
+              echo "── docker logs tail ──"
+              sudo docker logs redroid 2>&1 | tail -300
               exit 1
           fi
 
@@ -376,16 +386,12 @@ jobs:
               exit 1
           fi
           SDK=$(adb -s localhost:5555 shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r' || true)
-          echo "  ro.build.version.sdk = $SDK (expect 36 for Android 16)"
-          echo "  ✓ redroid is arm64-v8a Android 16 (no native bridge, no translation)"
+          echo "  ro.build.version.sdk = $SDK"
+          echo "  ✓ redroid is arm64-v8a Android (no native bridge, no translation)"
 
       - name: Install APK + push arm64 TWRP recovery.img
-        env:
-          ANDROID_HOME: /home/runner/android-sdk
         run: |
           set -e
-          export ANDROID_HOME=/home/runner/android-sdk
-          export PATH="$ANDROID_HOME/platform-tools:$PATH"
           ADB="adb -s localhost:5555"
 
           # arm64-v8a APK on arm64-v8a redroid → ABI matches natively.
@@ -407,13 +413,10 @@ jobs:
         # ADB_SERIAL=localhost:5555 overrides the default emulator-5554
         # so ui-navigate.py talks to redroid instead of the AVD.
         env:
-          ANDROID_HOME: /home/runner/android-sdk
           BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
           TWOYI_PACKAGE: io.twoyi.debug
           ADB_SERIAL: localhost:5555
         run: |
-          export ANDROID_HOME=/home/runner/android-sdk
-          export PATH="$ANDROID_HOME/platform-tools:$PATH"
           mkdir -p /tmp/ui-e2e-artifacts
           python3 scripts/ui-navigate.py
 
