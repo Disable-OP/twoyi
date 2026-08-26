@@ -8353,6 +8353,15 @@ pub fn run_ptrace_loop(
     let mut twres_dir_dumped: bool = false;
     // 6-Z170: stat-family +1-rewrite counter (first 20 logged).
     let mut stat_read_fail_rw_count: u64 = 0;
+    // 6-Z173: unlink/unlinkat +1-rewrite counter (first 20 logged). Run
+    // 33015609499: guest init starting its adbd service ran
+    // unlinkat("/dev/socket/adbd") with a PEEK-blind heap path — no +1
+    // fallback existed for the unlink family — the unlink executed
+    // UNTRANSLATED against the CONTAINER'S REAL /dev/socket/adbd and the
+    // container's adbd died (AdbDebuggingManager ENOENT forever, every
+    // adb channel dead for the rest of the run). This counter sizes the
+    // evidence trail for the same class.
+    let mut unlink_read_fail_rw_count: u64 = 0;
     // 6-Z164: FAILED-/tmp-open DIAG counter. The 6-Z163f arm above only
     // fires on ret >= 0 — run 32996812991 logged ZERO 6-Z163f lines while
     // the fb_hook printed fd=-1 for the jailed /tmp/recovery.log opens:
@@ -12459,6 +12468,54 @@ pub fn run_ptrace_loop(
                                     )
                                 {
                                     write_child_string(pid, path_addr, &translated);
+                                }
+                            } else {
+                                // ── 6-Z173: PEEK-blind unlink class — the
+                                // +1-pointer cwd-relative rewrite (the
+                                // 6-Z170 pattern, extended to unlink/
+                                // unlinkat) ──
+                                //
+                                // Run 33015609499: the guest init's own
+                                // adbd service startup unlinks its stale
+                                // socket path before bind. The path lives
+                                // in a heap std::string (the PEEK-EIO
+                                // class), read_child_string fails, the
+                                // unlink runs UNTRANSLATED — and deleted
+                                // the CONTAINER'S REAL
+                                // /dev/socket/adbd. The container's adbd
+                                // died, every adb channel (screencap/
+                                // dumpsys/logcat) went dark, and the run
+                                // lost all screenshots + evidence while
+                                // TWRP itself stayed ALIVE.
+                                //
+                                // Fix: same never-worse-than-status-quo
+                                // rewrite as 6-Z170 — dirfd := AT_FDCWD,
+                                // path := path_addr + 1. The kernel reads
+                                // the same string one byte deeper (no
+                                // leading '/') and resolves it RELATIVE to
+                                // the child's cwd — WHICH IS THE ROOTFS —
+                                // so the unlink lands on
+                                // {rootfs}/dev/socket/adbd (the jail's
+                                // copy, where the 6-Z163 bind already
+                                // put the guest's socket).
+                                let rewrite_ok = {
+                                    if syscall_num == abi.unlinkat {
+                                        set_syscall_arg(&mut regs, abi.reg_arg1, (-100i64) as u64);
+                                    }
+                                    set_syscall_arg(&mut regs, path_arg_index, path_addr + 1);
+                                    ptrace_setregs(pid, &regs, iov_len).is_ok()
+                                };
+                                unlink_read_fail_rw_count =
+                                    unlink_read_fail_rw_count.saturating_add(1);
+                                if unlink_read_fail_rw_count <= 20 {
+                                    log(&format!(
+                                        "6-Z173: unlink ENTRY path-read FAILED pid={} nr={} path_addr={:#x} — rewrote to cwd-relative +1 ({}), unlink resolves inside the rootfs (occurrence {})",
+                                        pid,
+                                        syscall_num,
+                                        path_addr,
+                                        if rewrite_ok { "OK" } else { "SETREGS FAILED" },
+                                        unlink_read_fail_rw_count
+                                    ));
                                 }
                             }
                         }
