@@ -7472,13 +7472,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             let recovery_pid = if cfg.boot_recovery {
                 let recovery_path = format!("{}/sbin/recovery", cfg.rootfs);
 
-                // Task 6-Z50: Read the recovery binary's PT_INTERP and patch it
-                // to use the HOST's linker. The recovery binary is dynamically
-                // linked with PT_INTERP = /sbin/linker (rootfs-relative). The
-                // kernel can't find /sbin/linker on the HOST. The HOST has
-                // /system/bin/linker (the emulator's 32-bit bionic linker).
-                // We patch the binary's PT_INTERP to the full rootfs path
-                // ({rootfs}/sbin/linker) so the kernel finds the TWRP linker.
+                // Task 6-Z50 (+ 6-Z157 ELF64 fix): read the recovery
+                // binary's PT_INTERP and patch it to the GUEST rootfs's
+                // own bionic linker. The recovery binary is dynamically
+                // linked with PT_INTERP = /sbin/linker (32-bit builds)
+                // or /sbin/linker64 (64-bit builds) — rootfs-relative
+                // paths the HOST kernel cannot resolve at execve time.
+                // We patch PT_INTERP to the absolute host path
+                // {rootfs}/sbin/linker{,64} so the kernel finds the
+                // linker SHIPPED IN THE SAME RAMDISK (matching API level
+                // — using the host's own /system/bin/linker64 instead
+                // would run e.g. an Android-14 linker against an
+                // Android-6-era recovery: "CANNOT LINK" → exit 127,
+                // observed on arm64 run 32973154137).
+                //
+                // 6-Z157: the parser previously used ELF32 header
+                // offsets unconditionally (e_phoff from byte 28,
+                // e_phentsize 42, e_phnum 44). On the aarch64 (ELF64)
+                // TWRP recovery that read garbage → "no PT_INTERP
+                // found" → the binary was left UNPATCHED → staged
+                // execve failed with ENOENT/127. Now: EI_CLASS decides
+                // the layout AND the linker variant:
+                //   ELF32 (EI_CLASS=1): e_phoff@28(u32) e_phentsize@42
+                //     e_phnum@44; phdr p_offset@+4(u32) p_filesz@+16(u32)
+                //   ELF64 (EI_CLASS=2): e_phoff@32(u64) e_phentsize@54
+                //     e_phnum@56; phdr p_offset@+8(u64) p_filesz@+32(u64)
                 let patched_path = {
                     // Open the recovery binary for read+write to patch PT_INTERP
                     match std::fs::OpenOptions::new()
@@ -7490,11 +7508,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             use std::io::{Read, Seek, Write};
                             let mut ehdr = [0u8; 64];
                             if file.read_exact(&mut ehdr).is_ok() && &ehdr[0..4] == b"\x7fELF" {
-                                let e_phoff =
-                                    u32::from_le_bytes([ehdr[28], ehdr[29], ehdr[30], ehdr[31]])
-                                        as u64;
-                                let e_phentsize = u16::from_le_bytes([ehdr[42], ehdr[43]]) as usize;
-                                let e_phnum = u16::from_le_bytes([ehdr[44], ehdr[45]]) as usize;
+                                // 6-Z157: class-aware ELF header parse.
+                                let is_elf64 = ehdr[4] == 2;
+                                let (e_phoff, e_phentsize, e_phnum): (u64, usize, usize) =
+                                    if is_elf64 {
+                                        (
+                                            u64::from_le_bytes([
+                                                ehdr[32], ehdr[33], ehdr[34], ehdr[35], ehdr[36],
+                                                ehdr[37], ehdr[38], ehdr[39],
+                                            ]),
+                                            u16::from_le_bytes([ehdr[54], ehdr[55]]) as usize,
+                                            u16::from_le_bytes([ehdr[56], ehdr[57]]) as usize,
+                                        )
+                                    } else {
+                                        (
+                                            u32::from_le_bytes([
+                                                ehdr[28], ehdr[29], ehdr[30], ehdr[31],
+                                            ]) as u64,
+                                            u16::from_le_bytes([ehdr[42], ehdr[43]]) as usize,
+                                            u16::from_le_bytes([ehdr[44], ehdr[45]]) as usize,
+                                        )
+                                    };
+                                // 6-Z157: phdr field offsets by class.
+                                let (p_off_field, p_sz_field, sz_bytes): (u64, u64, usize) =
+                                    if is_elf64 { (8, 32, 8) } else { (4, 16, 4) };
                                 let mut phdrs = vec![0u8; e_phentsize * e_phnum];
                                 let _ = file.seek(std::io::SeekFrom::Start(e_phoff));
                                 let _ = file.read_exact(&mut phdrs);
@@ -7509,20 +7546,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                         phdrs[off + 3],
                                     ]);
                                     if p_type == 3 {
-                                        interp_offset = Some(u32::from_le_bytes([
-                                            phdrs[off + 4],
-                                            phdrs[off + 5],
-                                            phdrs[off + 6],
-                                            phdrs[off + 7],
-                                        ])
-                                            as u64);
-                                        interp_filesz = Some(u32::from_le_bytes([
-                                            phdrs[off + 16],
-                                            phdrs[off + 17],
-                                            phdrs[off + 18],
-                                            phdrs[off + 19],
-                                        ])
-                                            as usize);
+                                        let read_u =
+                                            |base: usize, field: u64, width: usize| -> u64 {
+                                                let s = base + field as usize;
+                                                let mut v = 0u64;
+                                                for b in (0..width).rev() {
+                                                    v = (v << 8) | phdrs[s + b] as u64;
+                                                }
+                                                v
+                                            };
+                                        interp_offset = Some(read_u(off, p_off_field, sz_bytes));
+                                        interp_filesz =
+                                            Some(read_u(off, p_sz_field, sz_bytes) as usize);
                                         break;
                                     }
                                 }
@@ -7533,9 +7568,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     let mut interp_buf = vec![0u8; p_filesz];
                                     let _ = file.read_exact(&mut interp_buf);
                                     let interp_str = String::from_utf8_lossy(&interp_buf);
-                                    info!("[KR64] Task 6-Z50: PT_INTERP offset={}, filesz={}, path={:?}",
-                                        p_offset, p_filesz, interp_str.trim_end_matches('\0'));
-                                    let new_interp = format!("{}/sbin/linker\0", cfg.rootfs);
+                                    info!("[KR64] Task 6-Z50: PT_INTERP offset={}, filesz={}, path={:?} (ELF{})",
+                                        p_offset, p_filesz, interp_str.trim_end_matches('\0'),
+                                        if is_elf64 { 64 } else { 32 });
+                                    // 6-Z157: linker variant by ELF class —
+                                    // 32-bit binaries use /sbin/linker,
+                                    // 64-bit use /sbin/linker64. Both live
+                                    // in the TWRP ramdisk (same cpio as the
+                                    // recovery binary itself).
+                                    let linker_name = if is_elf64 { "linker64" } else { "linker" };
+                                    let guest_linker =
+                                        format!("{}/sbin/{}", cfg.rootfs, linker_name);
+                                    if !std::path::Path::new(&guest_linker).exists() {
+                                        error!("[KR64] Task 6-Z157: guest linker {} NOT found in rootfs — PT_INTERP left unpatched (execve of the staged binary will ENOENT)",
+                                            guest_linker);
+                                    }
+                                    let new_interp = format!("{}\0", guest_linker);
                                     let new_interp_path =
                                         new_interp.trim_end_matches('\0').to_string();
                                     if new_interp.len() <= p_filesz {
@@ -7552,114 +7600,113 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                         // Doesn't fit — APPEND the new interp at the end of the file
                                         // and update the PT_INTERP program header to point to it.
                                         //
-                                        // Task 6-Z65 (Agent G flag): the patch runs on EVERY kr64
-                                        // relaunch (~2s apart). Previously it blindly re-appended
-                                        // 41 bytes each cycle — growing the file every time AND
-                                        // silently swallowing write errors (`let _ =`). Two fixes:
-                                        //   1. IDEMPOTENCY: if the interp ALREADY points at the
-                                        //      full rootfs path, skip the append entirely.
-                                        //   2. READ-BACK VERIFICATION: after writing, re-read the
-                                        //      phdr + interp and log what's ACTUALLY on disk —
-                                        //      a swallowed write failure is now visible.
-                                        let already_patched =
-                                            interp_str.trim_end_matches('\0') == new_interp_path;
-                                        if already_patched {
-                                            info!("[KR64] Task 6-Z65: PT_INTERP already patched to the rootfs path — skipping re-append (idempotent)");
-                                        } else {
-                                            let file_size =
-                                                file.metadata().map(|m| m.len()).unwrap_or(0);
-                                            let new_offset = file_size;
-                                            let new_filesz = new_interp.len();
-                                            // Append the new interp string
-                                            let append_res = {
-                                                let _ = file.seek(std::io::SeekFrom::End(0));
-                                                file.write_all(new_interp.as_bytes())
-                                            };
-                                            if let Err(e) = append_res {
-                                                error!("[KR64] Task 6-Z65: PT_INTERP append WRITE FAILED: {} — execve will likely fail with ENOENT", e);
-                                            } else {
-                                                info!("[KR64] Task 6-Z50: appended new PT_INTERP at offset {} ({} bytes)",
-                                            new_offset, new_filesz);
-                                                // Update the PT_INTERP program header's p_offset and p_filesz
-                                                // 32-bit ELF: p_offset at phdr+4 (4 bytes), p_filesz at phdr+16 (4 bytes)
-                                                let mut pt_interp_phdr_off = None;
-                                                for i in 0..e_phnum {
-                                                    let off = i * e_phentsize;
-                                                    let p_type = u32::from_le_bytes([
-                                                        phdrs[off],
-                                                        phdrs[off + 1],
-                                                        phdrs[off + 2],
-                                                        phdrs[off + 3],
-                                                    ]);
-                                                    if p_type == 3 {
-                                                        pt_interp_phdr_off =
-                                                            Some(e_phoff as u64 + off as u64);
-                                                        break;
-                                                    }
-                                                }
-                                                if let Some(phdr_off) = pt_interp_phdr_off {
-                                                    // Write new p_offset (at phdr_off + 4)
-                                                    let w1 = {
-                                                        let _ = file.seek(
-                                                            std::io::SeekFrom::Start(phdr_off + 4),
-                                                        );
-                                                        file.write_all(
-                                                            &(new_offset as u32).to_le_bytes(),
-                                                        )
-                                                    };
-                                                    // Write new p_filesz (at phdr_off + 16)
-                                                    let w2 = {
-                                                        let _ = file.seek(
-                                                            std::io::SeekFrom::Start(phdr_off + 16),
-                                                        );
-                                                        file.write_all(
-                                                            &(new_filesz as u32).to_le_bytes(),
-                                                        )
-                                                    };
-                                                    if w1.is_err() || w2.is_err() {
-                                                        error!("[KR64] Task 6-Z65: PT_INTERP phdr update FAILED (w1={:?}, w2={:?}) — kernel will use the OLD interpreter path", w1.err(), w2.err());
-                                                    } else {
-                                                        info!("[KR64] Task 6-Z50: updated PT_INTERP phdr: p_offset={}, p_filesz={}",
-                                                new_offset, new_filesz);
-                                                        // Task 6-Z65: READ-BACK verification — re-read the
-                                                        // phdr + interp from disk (bypassing the File's buffer
-                                                        // via a fresh open) and log exactly what a subsequent
-                                                        // execve would see.
-                                                        let verify = std::fs::read(&recovery_path).ok().and_then(|bytes| {
-                                                let v_e_phoff = u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]) as u64;
-                                                let v_e_phentsize = u16::from_le_bytes([bytes[42], bytes[43]]) as usize;
-                                                let v_e_phnum = u16::from_le_bytes([bytes[44], bytes[45]]) as usize;
-                                                for i in 0..v_e_phnum {
-                                                    let off = i * v_e_phentsize;
-                                                    let p_type = u32::from_le_bytes([bytes[v_e_phoff as usize + off], bytes[v_e_phoff as usize + off + 1], bytes[v_e_phoff as usize + off + 2], bytes[v_e_phoff as usize + off + 3]]);
-                                                    if p_type == 3 {
-                                                        let v_off = u32::from_le_bytes([bytes[v_e_phoff as usize + off + 4], bytes[v_e_phoff as usize + off + 5], bytes[v_e_phoff as usize + off + 6], bytes[v_e_phoff as usize + off + 7]]) as usize;
-                                                        let v_sz = u32::from_le_bytes([bytes[v_e_phoff as usize + off + 16], bytes[v_e_phoff as usize + off + 17], bytes[v_e_phoff as usize + off + 18], bytes[v_e_phoff as usize + off + 19]]) as usize;
-                                                        let end = (v_off + v_sz).min(bytes.len());
-                                                        return Some((v_off, v_sz, String::from_utf8_lossy(&bytes[v_off..end]).trim_end_matches('\0').to_string(), bytes.len()));
-                                                    }
-                                                }
-                                                None
-                                            });
-                                                        match verify {
-                                                Some((v_off, v_sz, v_str, v_len)) => {
-                                                    if v_str == new_interp_path {
-                                                        info!("[KR64] Task 6-Z65: READ-BACK VERIFIED — PT_INTERP @{} ({} bytes) = {:?} (file size {}) — execve will find the rootfs linker",
-                                                            v_off, v_sz, v_str, v_len);
-                                                    } else {
-                                                        error!("[KR64] Task 6-Z65: READ-BACK MISMATCH — PT_INTERP @{} ({} bytes) = {:?} (expected {:?}, file size {}) — the patch did NOT persist!",
-                                                            v_off, v_sz, v_str, new_interp_path, v_len);
-                                                    }
-                                                }
-                                                None => error!("[KR64] Task 6-Z65: read-back verification FAILED — could not re-parse the patched ELF"),
+                                        let file_len = {
+                                            let mut end = 0u64;
+                                            let _ = file.seek(std::io::SeekFrom::End(0));
+                                            if let Ok(pos) = file.stream_position() {
+                                                end = pos;
                                             }
+                                            end
+                                        };
+                                        let new_offset = file_len;
+                                        // pad to 8-byte alignment for safety
+                                        let new_offset = (new_offset + 7) & !7u64;
+                                        let new_filesz = new_interp.len();
+                                        let _ = file.seek(std::io::SeekFrom::Start(new_offset));
+                                        let w0 = file.write_all(new_interp.as_bytes());
+                                        if w0.is_err() {
+                                            error!("[KR64] Task 6-Z50: append write FAILED");
+                                        } else {
+                                            info!("[KR64] Task 6-Z50: appended new PT_INTERP at offset {} ({} bytes)",
+                                        new_offset, new_filesz);
+                                            // Update the PT_INTERP program header's p_offset and
+                                            // p_filesz (6-Z157: class-aware field offsets + widths)
+                                            let mut pt_interp_phdr_off = None;
+                                            for i in 0..e_phnum {
+                                                let off = i * e_phentsize;
+                                                let p_type = u32::from_le_bytes([
+                                                    phdrs[off],
+                                                    phdrs[off + 1],
+                                                    phdrs[off + 2],
+                                                    phdrs[off + 3],
+                                                ]);
+                                                if p_type == 3 {
+                                                    pt_interp_phdr_off = Some(e_phoff + off as u64);
+                                                    break;
+                                                }
+                                            }
+                                            if let Some(phdr_off) = pt_interp_phdr_off {
+                                                let mut wr = |field_off: u64, width: usize, val: u64| -> std::io::Result<()> {
+                                                    let _ = file.seek(std::io::SeekFrom::Start(phdr_off + field_off));
+                                                    let bytes = val.to_le_bytes();
+                                                    file.write_all(&bytes[..width])
+                                                };
+                                                // Write new p_offset + p_filesz
+                                                let w1 = wr(p_off_field, sz_bytes, new_offset);
+                                                let w2 =
+                                                    wr(p_sz_field, sz_bytes, new_filesz as u64);
+                                                if w1.is_err() || w2.is_err() {
+                                                    error!("[KR64] Task 6-Z65: PT_INTERP phdr update FAILED (w1={:?}, w2={:?}) — kernel will use the OLD interpreter path", w1.err(), w2.err());
+                                                } else {
+                                                    info!("[KR64] Task 6-Z50: updated PT_INTERP phdr: p_offset={}, p_filesz={}",
+                                                        new_offset, new_filesz);
+                                                    // Task 6-Z65: READ-BACK verification — re-read the
+                                                    // phdr + interp from disk (bypassing the File's buffer
+                                                    // via a fresh open) and log exactly what a subsequent
+                                                    // execve would see. (6-Z157: class-aware parse.)
+                                                    let verify = std::fs::read(&recovery_path).ok().and_then(|bytes| {
+                                                        let ve64 = bytes.get(4) == Some(&2);
+                                                        let v_e_phoff: u64 = if ve64 {
+                                                            let mut a = [0u8; 8]; a.copy_from_slice(&bytes[32..40]); u64::from_le_bytes(a)
+                                                        } else {
+                                                            let mut a = [0u8; 4]; a.copy_from_slice(&bytes[28..32]); u32::from_le_bytes(a) as u64
+                                                        };
+                                                        let v_e_phentsize = if ve64 {
+                                                            u16::from_le_bytes([bytes[54], bytes[55]]) as usize
+                                                        } else {
+                                                            u16::from_le_bytes([bytes[42], bytes[43]]) as usize
+                                                        };
+                                                        let v_e_phnum = if ve64 {
+                                                            u16::from_le_bytes([bytes[56], bytes[57]]) as usize
+                                                        } else {
+                                                            u16::from_le_bytes([bytes[44], bytes[45]]) as usize
+                                                        };
+                                                        let (v_off_f, v_sz_f, v_w): (u64, u64, usize) = if ve64 { (8, 32, 8) } else { (4, 16, 4) };
+                                                        for i in 0..v_e_phnum {
+                                                            let off = i * v_e_phentsize;
+                                                            let p_type = u32::from_le_bytes([bytes[v_e_phoff as usize + off], bytes[v_e_phoff as usize + off + 1], bytes[v_e_phoff as usize + off + 2], bytes[v_e_phoff as usize + off + 3]]);
+                                                            if p_type == 3 {
+                                                                let base = v_e_phoff as usize + off;
+                                                                let rd = |field: u64, width: usize| -> usize {
+                                                                    let s = base + field as usize;
+                                                                    let mut v = 0usize;
+                                                                    for b in (0..width).rev() { v = (v << 8) | (bytes[s + b] as usize); }
+                                                                    v
+                                                                };
+                                                                let v_off = rd(v_off_f, v_w);
+                                                                let v_sz = rd(v_sz_f, v_w);
+                                                                let end = (v_off + v_sz).min(bytes.len());
+                                                                return Some((v_off, v_sz, String::from_utf8_lossy(&bytes[v_off..end]).trim_end_matches('\0').to_string(), bytes.len()));
+                                                            }
+                                                        }
+                                                        None
+                                                    });
+                                                    match verify {
+                                                        Some((v_off, v_sz, v_str, v_len)) => {
+                                                            if v_str == new_interp_path {
+                                                                info!("[KR64] Task 6-Z65: READ-BACK VERIFIED — PT_INTERP @{} ({} bytes) = {:?} (file size {}) — execve will find the rootfs linker",
+                                                                    v_off, v_sz, v_str, v_len);
+                                                            } else {
+                                                                error!("[KR64] Task 6-Z65: READ-BACK MISMATCH — PT_INTERP @{} ({} bytes) = {:?} (expected {:?}, file size {}) — the patch did NOT persist!",
+                                                                    v_off, v_sz, v_str, new_interp_path, v_len);
+                                                            }
+                                                        }
+                                                        None => error!("[KR64] Task 6-Z65: read-back verification FAILED — could not re-parse the patched ELF"),
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                } else {
-                                    error!("[KR64] Task 6-Z50: no PT_INTERP found");
                                 }
                             }
                         }
