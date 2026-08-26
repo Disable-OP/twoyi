@@ -119,7 +119,7 @@ name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
       boot_wait_seconds:
         description: 'How long to wait for the TWRP container to boot before capturing the final screenshot (seconds)'
         required: false
-        default: '600'
+        default: '30'
       redroid_tag:
         description: 'redroid Docker image tag (arm64): 14.0.0-latest, 16.0.0-latest, 13.0.0-latest, 11.0.0-latest ...'
         required: false
@@ -339,8 +339,10 @@ jobs:
           sudo docker logs -f redroid > /tmp/ui-e2e-artifacts/redroid.log 2>&1 &
           echo $! > /tmp/redroid-log.pid
 
-          # Wait for boot_completed (up to 600s). adb = NATIVE arm64 build.
-          BOOT_TIMEOUT=600
+          # Wait for boot_completed (up to 120s — redroid 14 boots in
+          # ~5s on arm64; 120 is a generous cap, loop exits early).
+          # adb = NATIVE arm64 build.
+          BOOT_TIMEOUT=120
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
               adb connect localhost:5555 >/dev/null 2>&1 || true
@@ -394,6 +396,15 @@ jobs:
           set -e
           ADB="adb -s localhost:5555"
 
+          # v5.3: kill the SystemUI immersive-mode confirmation popup
+          # ("Viewing full screen / To exit, swipe down from the top /
+          # GOT IT"). Run 32952695067: this popup + the app's Android-12
+          # dialog blocked bootSystem() for the ENTIRE 600s wait. The
+          # app-side dialog is removed at the source; this settings put
+          # prevents SystemUI from ever showing the confirmation.
+          $ADB shell settings put global immersive_mode_confirmations confirmed
+          echo "  ✓ immersive_mode_confirmations=confirmed"
+
           # arm64-v8a APK on arm64-v8a redroid → ABI matches natively.
           # If this fails with INSTALL_FAILED_NO_MATCHING_ABIS, redroid
           # isn't actually arm64-v8a (check the verify step above) or
@@ -413,7 +424,7 @@ jobs:
         # ADB_SERIAL=localhost:5555 overrides the default emulator-5554
         # so ui-navigate.py talks to redroid instead of the AVD.
         env:
-          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '30' }}
           TWOYI_PACKAGE: io.twoyi.debug
           ADB_SERIAL: localhost:5555
         run: |

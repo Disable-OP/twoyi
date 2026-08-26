@@ -427,6 +427,126 @@ def swipe_up():
     y2 = int(SCREEN_H * 0.3)
     adb_shell(f"input swipe {cx} {y1} {cx} {y2} 300")
 
+def dismiss_blocking_popups(tag="popup", rounds=8):
+    """Dismiss the popups that block Render2Activity from ever booting.
+
+    FORENSIC GROUND TRUTH (run 32952695067 artifacts — uiautomator XML
+    dumps + VLM analysis of the screenshots, NOT coordinate guesses):
+
+      Popup 1 — SystemUI ImmersiveModeConfirmation, package="android":
+        text "Viewing full screen" / "To exit, swipe down from the top."
+        button node: text="GOT IT", resource-id="android:id/ok",
+        class="android.widget.Button", bounds=[464,353][640,449] on the
+        720x1280 redroid display (i.e. NOT at any fixed coordinate — we
+        parse the bounds from the live XML dump and tap its center).
+        Triggered because Render2Activity sets IMMERSIVE_STICKY fullscreen
+        flags; it covers the whole screen and hides the app dialog from
+        uiautomator's top-window dump (the app dialog is still visible in
+        the composite screenshot, poking out beneath it).
+
+      Popup 2 — the app's own Android-12 AlertDialog chain (legacy APKs
+        only; REMOVED at the source in v5.3 — Render2Activity now calls
+        bootSystem() directly):
+        "Attention — You are running on Android 12, please follow the
+        guide to use twoyi." with buttons "Read it" / "Don't show again",
+        then a second dialog "I confirm it". We tap "Don't show again"
+        (NEVER "Read it" — that opens a browser and finishes the
+        activity), then "I confirm it". Button labels may render ALL-CAPS
+        in the dump, so matching is case-insensitive substring.
+
+    Strategy per round (up to `rounds`, ~2s apart):
+      0. One-time belt: `settings put global immersive_mode_confirmations
+         confirmed` — kills popup 1 system-wide for every future launch.
+      1. Dump UI → if a "GOT IT"-style confirm button exists → tap its
+         parsed center. Repeat (SystemUI can re-show it once).
+      2. Else if "don't show again" exists → tap it, then on the next
+         round tap "confirm".
+      3. Stop when a round finds neither (screen is clear → bootSystem
+         is free to run).
+
+    Returns the number of taps performed. Every round's XML dump and a
+    before/after screenshot land in the artifacts for evidence.
+    """
+    # Belt: make sure SystemUI never shows the immersive confirmation
+    # again on this device (idempotent, harmless on emulators that ship
+    # with it pre-confirmed).
+    adb_shell("settings put global immersive_mode_confirmations confirmed")
+
+    taps_done = 0
+    for r in range(rounds):
+        xml = dump_ui(f"{tag}_round{r}")
+        root = parse_ui(xml)
+        if root is None:
+            wait(1)
+            continue
+
+        # 1) SystemUI fullscreen confirmation (any casing of "got it").
+        got_it = None
+        for node in root.iter("node"):
+            txt = (node.get("text", "") or "").strip().lower()
+            rid = node.get("resource-id", "") or ""
+            if txt in ("got it", "ok", "okay") or (
+                    rid == "android:id/ok" and txt):
+                got_it = node
+                break
+        if got_it is not None:
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                         got_it.get("bounds", ""))
+            if m:
+                cx = (int(m.group(1)) + int(m.group(3))) // 2
+                cy = (int(m.group(2)) + int(m.group(4))) // 2
+                print(f"  popup-dismiss[{r}]: tapping 'GOT IT' at "
+                      f"({cx},{cy}) from XML bounds {got_it.get('bounds')}")
+                tap(cx, cy)
+                taps_done += 1
+                wait(2)
+                continue
+
+        # 2) Legacy app Android-12 dialog chain (case-insensitive).
+        dont_show = None
+        for node in root.iter("node"):
+            txt = (node.get("text", "") or "").strip().lower()
+            if "don't show again" in txt or "dont show again" in txt \
+                    or "don’t show again" in txt or "不再提示" in txt:
+                dont_show = node
+                break
+        if dont_show is not None:
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                         dont_show.get("bounds", ""))
+            if m:
+                cx = (int(m.group(1)) + int(m.group(3))) // 2
+                cy = (int(m.group(2)) + int(m.group(4))) // 2
+                print(f"  popup-dismiss[{r}]: tapping 'Don't show again' at "
+                      f"({cx},{cy}) from XML bounds")
+                tap(cx, cy)
+                taps_done += 1
+                wait(2)
+                continue
+
+        confirm = None
+        for node in root.iter("node"):
+            txt = (node.get("text", "") or "").strip().lower()
+            if "i confirm" in txt or "我已确认" in txt:
+                confirm = node
+                break
+        if confirm is not None:
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]",
+                         confirm.get("bounds", ""))
+            if m:
+                cx = (int(m.group(1)) + int(m.group(3))) // 2
+                cy = (int(m.group(2)) + int(m.group(4))) // 2
+                print(f"  popup-dismiss[{r}]: tapping 'I confirm it' at "
+                      f"({cx},{cy}) from XML bounds")
+                tap(cx, cy)
+                taps_done += 1
+                wait(2)
+                continue
+
+        # Nothing blockable found — screen is clear.
+        print(f"  popup-dismiss[{r}]: no blocking popup visible — clear")
+        break
+    return taps_done
+
 def swipe_down():
     """Swipe down to scroll up the list. Uses screen-relative coordinates."""
     cx = SCREEN_W // 2
@@ -705,7 +825,12 @@ def escape_google_photos():
     return True
 
 def main():
-    boot_wait = int(os.environ.get("BOOT_WAIT_SECONDS", "60"))
+    # v5.3: 30s default (was 600s). The old 600s wait burned 10 minutes
+    # staring at two undismissed popups (run 32952695067) — the popups are
+    # now removed at the source AND actively dismissed (step 6b), so the
+    # wait is just for the TWRP render itself. 30s is generous: redroid
+    # arm64 is native and TWRP is a ramdisk-only guest.
+    boot_wait = int(os.environ.get("BOOT_WAIT_SECONDS", "30"))
 
     # ─────────────────────────────────────────────
     # Step 1: Launch app
@@ -1004,6 +1129,26 @@ def main():
     activity_after_launch = get_current_activity()
     print(f"  Current activity: {activity_after_launch}")
 
+    # ─────────────────────────────────────────────
+    # Step 6b: Dismiss the popups that block bootSystem()
+    # ─────────────────────────────────────────────
+    # Run 32952695067: BOTH the SystemUI "Viewing full screen / GOT IT"
+    # confirmation AND the app's Android-12 "Attention" dialog sat on
+    # screen for the ENTIRE 600s wait — bootSystem() never ran, TWRP never
+    # rendered, and the workflow still passed (false green). The app-side
+    # dialog is removed in v5.3 (Render2Activity boots unconditionally);
+    # this step kills the SystemUI confirmation via settings and taps any
+    # residual popup button by its PARSED uiautomator bounds — never a
+    # guessed coordinate. Screenshot evidence before/after.
+    print()
+    print("=" * 60)
+    print("  Step 6b: Dismiss blocking popups (GOT IT / Android-12 gate)")
+    print("=" * 60)
+    screenshot("06b_popups_before")
+    n_popups = dismiss_blocking_popups(tag="06b_popup")
+    screenshot("06b_popups_after")
+    print(f"  Step 6b done: {n_popups} popup button(s) tapped")
+
     # ── ARM64-T1: catch the silent "app crashed back to launcher" case ──
     # Run 32886902337 (arm64 via native bridge) produced a false-green
     # workflow because the script took screenshots for 180s after the
@@ -1062,63 +1207,54 @@ def main():
     print("=" * 60)
     print(f"  Step 7: Wait for boot ({boot_wait}s) — screenshots every 5s")
     print("=" * 60)
-    # ── 6-Z88: dismiss the TWRP welcome gate during the wait ──
-    # Run 32640227105 proved TWRP renders the welcome gate LIVE:
+    # ── History: TWRP renders its welcome gate LIVE (run 32640227105):
     # "Unmounted System Partition — Keep Read Only?" with buttons
     # Keep Read Only / Select Language / Swipe to Allow Modifications.
     # A plain center tap does NOT dismiss this gate — it needs a BUTTON
-    # TAP or a SLIDER SWIPE. So every 30 s (every 6th iteration of this
-    # 5 s loop) fire the next gesture from a rotating sequence
-    # (gesture_index % 4):
-    #   0: tap 160 320    — center (generic input, harmless everywhere)
-    #   1: tap 80 570     — the 'Keep Read Only' button (bottom-left)
-    #   2: swipe 60→280 @ y=570 — the 'Swipe to Allow Modifications'
-    #                              slider (bottom, swipe right)
-    #   3: tap 160 570    — bottom center (the slider area)
-    # The rotation covers every dismissal path; once the gate is gone
-    # the gestures are harmless on the TWRP grid / splash / app UI.
+    # TAP or a SLIDER SWIPE, hence the rotation below.
     #
-    # ── 7-Z119: split the rotation at 120 s ──
-    # The last E2E run showed: the gate was dismissed by ~120 s, the
-    # TWRP main menu appeared, but the OLD swipe (gestures[2]:
-    # swipe 60,570 → 280,570) crossed the "OTG" button in the menu
-    # grid. That opened the "No OTG cable found ... Swipe to Enable"
-    # dialog and the run sat stuck on it for ~440 s.
-    # Fix: keep the gate-dismissal rotation for the FIRST 120 s (the
-    # swipe is still required there to clear the gate). AFTER 120 s
-    # switch to a SAFE-ONLY rotation that never crosses a menu button
-    # — center taps + BACK (BACK dismisses any dialog/submenu and
-    # returns to the main menu, so a stray dialog is auto-recovered):
-    #   0: tap 160 320    — center (no menu button hit)
-    #   1: keyevent 4     — BACK (dismisses OTG dialog / any submenu)
-    #   2: tap 160 320    — center
-    #   3: tap 160 320    — center
-    # Also: capture a one-off screenshot 1 s after every gesture so a
-    # short-lived transition (the 5 s cadence can miss a 0.5 s flip
-    # between dialog-dismissed and main-menu-re-rendered) is caught
-    # in the frame sequence as `07_boot_<elapsed>s_postg`.
+    # ── v5.3: gate dismissal, screen-relative, 10s cadence ──
+    # The TWRP welcome gate ("Unmounted System Partition — Keep Read Only?"
+    # with Keep Read Only / Select Language / Swipe to Allow Modifications)
+    # still needs a BUTTON TAP or SLIDER SWIPE. The OLD rotation used
+    # hardcoded 320x640 coordinates ("input tap 160 320" etc.) — on the
+    # 720x1280 redroid display those landed in empty space, which is why
+    # run 32952695067 sat frozen: neither popup nor gate was ever touched.
+    # All gestures are now computed from SCREEN_W/SCREEN_H (detected in
+    # step 1 from the hierarchy root bounds):
+    #   0: center tap — generic, harmless everywhere
+    #   1: bottom-left button — 'Keep Read Only' (0.25W, 0.89H)
+    #   2: bottom slider swipe — 'Swipe to Allow Modifications'
+    #      (0.19W → 0.88W at 0.89H)
+    #   3: bottom-center tap — the slider area
+    # A gesture fires every 10s (so a 30s wait = up to 3 gestures, enough
+    # for the gate + one retry). BACK is deliberately NOT in the first
+    # rotation: on the gate it does nothing; it stays available via the
+    # safe rotation below.
+    #
+    # After 120s (long waits re-enabled via BOOT_WAIT_SECONDS for local
+    # debugging) the rotation switches to SAFE-ONLY (center taps + BACK)
+    # so a stray gesture can never cross a TWRP menu button (the old
+    # hardcoded swipe crossed "OTG" and dead-ended the run for ~440s).
     gestures = [
-        "input tap 160 320",               # 0: center — generic
-        "input tap 80 570",                # 1: 'Keep Read Only' button (bottom-left)
-        "input swipe 60 570 280 570 400",  # 2: 'Swipe to Allow Modifications' slider (bottom, swipe right)
-        "input tap 160 570",               # 3: bottom center — the slider area
+        f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 0: center
+        f"input tap {int(SCREEN_W * 0.25)} {int(SCREEN_H * 0.89)}",  # 1: Keep Read Only
+        f"input swipe {int(SCREEN_W * 0.19)} {int(SCREEN_H * 0.89)} "
+        f"{int(SCREEN_W * 0.88)} {int(SCREEN_H * 0.89)} 400",        # 2: slider
+        f"input tap {SCREEN_W // 2} {int(SCREEN_H * 0.89)}",         # 3: slider area
     ]
     gestures_safe = [
-        "input tap 160 320",               # 0: center (no menu button hit)
-        "input keyevent 4",                # 1: BACK — dismisses any dialog/submenu
-        "input tap 160 320",               # 2: center
-        "input tap 160 320",               # 3: center
+        f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 0: center
+        "input keyevent 4",                                         # 1: BACK
+        f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 2: center
+        f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 3: center
     ]
     gesture_index = 0
-    for i in range(boot_wait // 5):
+    for i in range(max(1, boot_wait // 5)):
         wait(5)
         elapsed = (i + 1) * 5
-        if elapsed % 30 == 0:
+        if elapsed % 10 == 0:
             g = gesture_index % 4
-            # First 120 s: gate-dismissal rotation (needs the swipe at
-            # index 2). After 120 s: safe-only (center taps + BACK) so
-            # we never accidentally cross a menu button and open a
-            # dead-end dialog like OTG.
             seq = gestures if elapsed <= 120 else gestures_safe
             adb_shell(seq[g])
             mode = "gate" if elapsed <= 120 else "safe"
@@ -1274,7 +1410,9 @@ def main():
         print()
         print("  Diagnostic artifacts captured above. Exiting with code 1.")
         sys.exit(1)
-    print(f"  ✓ Final activity is non-launcher ({final_activity}) — TWRP boot succeeded.")
+    print(f"  ✓ Final activity is non-launcher ({final_activity}) — app still "
+          "alive; inspect 07_boot/08_final screenshots for the TWRP frame "
+          "(the frame sequence is the render evidence).")
 
 if __name__ == "__main__":
     main()

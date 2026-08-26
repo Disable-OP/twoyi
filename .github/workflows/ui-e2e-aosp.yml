@@ -36,7 +36,7 @@ name: UI E2E Test (AOSP)
       boot_wait_seconds:
         description: 'How long to wait for the guest Android to boot (seconds)'
         required: false
-        default: '600'
+        default: '30'
 
 concurrency:
   group: ui-e2e-aosp-${{ github.ref }}
@@ -244,6 +244,12 @@ jobs:
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
           ADB="adb -s emulator-5554"
 
+          # v5.3 parity with arm64: kill the SystemUI immersive-mode
+          # confirmation popup ("Viewing full screen / GOT IT") so it can
+          # never block bootSystem() (see run 32952695067 on arm64).
+          $ADB shell settings put global immersive_mode_confirmations confirmed
+          echo "  ✓ immersive_mode_confirmations=confirmed"
+
           # Install the DEBUGGABLE variant (package io.twoyi.debug) —
           # run-as works, enabling rootfs preload + log pulling.
           APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
@@ -381,7 +387,7 @@ jobs:
       - name: UI navigation — boot AOSP container
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
-          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '600' }}
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '30' }}
           AOSP_PACKAGE: io.twoyi.debug
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk
