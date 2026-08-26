@@ -402,7 +402,14 @@ jobs:
           ./aarch64-softmmu/qemu-system-aarch64 --version
           echo ""
           echo "── Available machine types (ranchu must be listed) ──"
-          ./aarch64-softmmu/qemu-system-aarch64 -M help 2>&1 | tee machine_types.log
+          # v4.2 fix: qemu -M help prints the list but the Android-glue
+          # atexit path makes the process exit non-zero (~5s later) —
+          # run 32947432638: list printed completely (ranchu listed as
+          # DEFAULT machine!) yet exit code 1 + pipefail killed the step
+          # before the grep could run. Redirect to file and tolerate the
+          # exit code; verify ranchu from the FILE content.
+          ./aarch64-softmmu/qemu-system-aarch64 -M help > machine_types.log 2>&1 || true
+          cat machine_types.log
           grep -q ranchu machine_types.log || {
             echo "✗ ranchu machine type missing from the built binary"
             exit 1
