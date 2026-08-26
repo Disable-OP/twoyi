@@ -8194,6 +8194,10 @@ pub fn run_ptrace_loop(
     // the reason + the first 16 blob bytes — run 32990637557's silent
     // skip of init's property bind made the miss invisible).
     let mut spin_diag_bind_skip_count: u64 = 0;
+    // 6-Z163f: counter for the /tmp open-result DIAG (first 12 /tmp opens
+    // log their translated path + return value — settles whether TWRP's
+    // /tmp/recovery.log logger open succeeds inside the jail).
+    let mut tmp_diag_count: u64 = 0;
     // pending epoll_pwait EXIT readbacks: pid -> (syscall nr, events buf
     // addr, maxevents). The nr is re-checked at the EXIT stop so a
     // signal-interrupted/restarted sequence never decodes a stale
@@ -12750,6 +12754,35 @@ pub fn run_ptrace_loop(
                             // returns are errors.
                             if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
                                 open_fd_paths.insert(ret as i32, p.clone());
+                                // ── 6-Z163f: /tmp open-result DIAG ──
+                                // Run 32995619653: the jailed recovery
+                                // died (exit 1) right after TWO
+                                // O_CREAT|O_APPEND opens of
+                                // /tmp/recovery.log + one property-set —
+                                // but the opens' RESULTS were never
+                                // observable ({rootfs}/tmp looked empty
+                                // to the evidence pull, which is ALSO
+                                // consistent with a child-mount-ns tmpfs
+                                // the pull can't see). Log every /tmp/*
+                                // open result (first 12) so the next run
+                                // settles whether TWRP's logger open
+                                // succeeded inside the jail.
+                                if p.contains("/tmp/") && past_first_execve {
+                                    tmp_diag_count = tmp_diag_count.saturating_add(1);
+                                    if tmp_diag_count <= 12 {
+                                        log(&format!(
+                                            "6-Z163f: open(\"{}\") -> {} ({}) (occurrence {})",
+                                            p,
+                                            ret,
+                                            if ret < 0 {
+                                                format!("-errno {}", -ret)
+                                            } else {
+                                                "fd".to_string()
+                                            },
+                                            tmp_diag_count
+                                        ));
+                                    }
+                                }
                                 // Task 6-Z62: per-(pid, fd) copy of the same
                                 // mapping. fd tables are PER-PROCESS, so the
                                 // fd-only map above collides between init

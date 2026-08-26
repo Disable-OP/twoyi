@@ -10679,3 +10679,19 @@ Evidence (run 32994748383, SHA 664923b — honest-env probes):
 Fix (6-Z163e):
 - All probes: `timeout 8 env VAR=... BIN` — timeout keeps a CLEAN env, env(1) applies the guest env to the target only.
 - Added /tmp/recovery.log capture after the "ldd" run (TWRP mirrors its full log there; redroid /tmp is probe-writable; pulled + cleaned).
+
+---
+Task ID: 6-Z163f
+Agent: main
+Task: The recovery exit(1) micro-mystery — /tmp open-result DIAG
+
+Evidence (run 32995619653, honest probes):
+- JAIL: recovery reaches post-LANG (its I: lines are in the stderr capture via inherited stdio), then socket+connect(SUCCESS → the REAL property socket we bound in 6-Z163!)+writev(78B prop msg)+close+sigprocmask+sigaction → exit_group(1). No LOGERR anywhere.
+- PROBE: same post-LANG point, two /tmp/recovery.log O_CREAT opens fail (fd=-1, real EACCES outside jail), exit 255.
+- {rootfs}/tmp appears EMPTY to the run-as pull — but that is ALSO consistent with a successful child-namespace tmpfs mount (the pull runs in a different mount ns). The opens' results were never observable.
+
+Change (6-Z163f): every /tmp/* open's translated path + return value logged (first 12) — the open EXIT consumption site already had the ENTRY-flag/EXIT-consume plumbing.
+
+Stage Summary:
+- Session trajectory: urandom ELOOP fixed → LD_LIBRARY_PATH arm64 → spin root-caused via 6-Z161 fd-identity DIAG → REAL property socket (6-Z163 bind rewrite, sockaddr blob into scratch) → probe honesty (POSIX sh export gotcha + timeout env poisoning) → recovery now LINKS + BOOTS through DataManager to post-LANG in BOTH contexts with a REAL property set on the way.
+- Next: the /tmp DIAG settles the logger-open question; then fstab/graphics init is the final stretch to pixels.
