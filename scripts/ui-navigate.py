@@ -1403,12 +1403,20 @@ def main():
     base_env = (
         "LD_LIBRARY_PATH=/data/user/0/{pkg}/rootfs/sbin:"
         "/data/user/0/{pkg}/rootfs/system/lib:"
-        "/data/user/0/{pkg}/rootfs/system/lib64; "
-        "TWOYI_ROOTFS=/data/user/0/{pkg}/rootfs"
+        "/data/user/0/{pkg}/rootfs/system/lib64"
     ).format(pkg=PACKAGE)
     preload_env = (
-        "LD_PRELOAD=/data/user/0/" + PACKAGE + "/rootfs/sbin/libtwrp_fb_hook.so; " + base_env
+        "LD_PRELOAD=/data/user/0/" + PACKAGE + "/rootfs/sbin/libtwrp_fb_hook.so " + base_env
     )
+    # 6-Z163d FIX (the big one): POSIX sh does NOT export bare `VAR=x;`
+    # assignments to child processes (verified: `sh -c 'A=1; env' | grep A`
+    # prints NOTHING on dash/mksh/toybox). The pre-6-Z163d probes joined
+    # the env with `;` — LD_PRELOAD/LD_LIBRARY_PATH never reached the
+    # staged binary, and the linker's "libaosprecovery.so not found" was
+    # just the NO-ENV fallback (/system/lib64 has no TWRP libs). The env
+    # strings above are now PREFIX ASSIGNMENTS on the actual command
+    # (space-separated, no semicolons) so they are guaranteed to reach
+    # the exec'd binary through timeout's environ.
     # 6-Z163 fixup: `timeout` must be invoked by its HOST-absolute path —
     # the probe env deliberately points PATH at the ROOTFS dirs (so the
     # probe resolves tools the way the jailed service would), which hid
@@ -1426,7 +1434,7 @@ def main():
             label = f"{base}{variant}"
             cmd = (
                 f"run-as {PACKAGE} sh -c 'ls -la {cache_path}; "
-                f"{env_str} {TIMEOUT} 8 {cache_path} 2>&1; "
+                f"TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {env_str} {TIMEOUT} 8 {cache_path} 2>&1; "
                 f"echo PROBE_EXIT_CODE:$?'"
             )
             out = adb_shell(cmd, timeout=30)
@@ -1457,7 +1465,7 @@ def main():
     # library search decisions (which dirs it tried, what failed) when
     # LD_DEBUG is set. Harmless if unsupported (env is just ignored).
     ld_debug_out = adb_shell(
-        f"run-as {PACKAGE} sh -c '{preload_env} LD_DEBUG=1 "
+        f"run-as {PACKAGE} sh -c 'LD_DEBUG=1 TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {preload_env} "
         f"{TIMEOUT} 8 "
         f"/data/user/0/{PACKAGE}/cache/twoyi_stage/_sbin_recovery_* 2>&1 | head -60; "
         f"echo LDDEBUG_EXIT:$?'",
@@ -1481,7 +1489,7 @@ def main():
     staged_recovery = staged_recovery.splitlines()[0].strip() if staged_recovery.strip() else ""
     if staged_recovery:
         ldd_out = adb_shell(
-            f"run-as {PACKAGE} sh -c '{base_env} LD_TRACE_LOADED_OBJECTS=1 "
+            f"run-as {PACKAGE} sh -c 'LD_TRACE_LOADED_OBJECTS=1 TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {base_env} "
             f"{staged_recovery} 2>&1; echo LDD_EXIT:$?'",
             timeout=30)
         if ldd_out:
@@ -1489,7 +1497,7 @@ def main():
                 f.write(ldd_out)
             print(f"  pulled recovery ldd trace ({len(ldd_out)} bytes)")
         direct_out = adb_shell(
-            f"run-as {PACKAGE} sh -c '{base_env} {TIMEOUT} 8 "
+            f"run-as {PACKAGE} sh -c 'TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {base_env} {TIMEOUT} 8 "
             f"/data/user/0/{PACKAGE}/rootfs/sbin/linker64 {staged_recovery} 2>&1 | head -40; "
             f"echo DIRECT_LINKER_EXIT:$?'",
             timeout=30)
