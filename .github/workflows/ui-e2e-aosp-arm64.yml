@@ -43,21 +43,23 @@
 #   repository2-3.xml. See runs 32901106471 (v1) + 32901574547 (v2) +
 #   the blocker report at download/arm64-emulator-blocker-report.md.
 #
-# Why v3 replaced v2 (x86_64 runner + arm64-v8a system image):
-#   The Android emulator binary shipped with the Linux x86_64 Android
-#   SDK does NOT include an arm64 TCG backend. v2's run 32891455624
-#   failed in 10s with `FATAL: Avd's CPU Architecture 'arm64' is not
-#   supported by the QEMU2 emulator on x86_64 host.`
-#
-# Why v2 replaced v1 (native bridge on x86_64 Play Store image):
-#   The native bridge (libndk_translation.so on google_apis_playstore
-#   x86_64 image) translates the twoyi app's arm64 .so to x86_64 at
-#   runtime. When twoyi's arm64 Rust kernel calls ptrace() on a forked
-#   child, the kernel returns x86_64 register layout (struct
-#   user_regs_struct), but the arm64-translated code expects arm64
-#   layout (struct user_pt_regs — different field offsets, different
-#   register count). This mismatch corrupts the register state and
-#   the twoyi app crashes immediately on "Launch Container" tap.
+# Why v4 splits the workflow into TWO JOBS (build on x86_64, test on arm64):
+#   The Android NDK r27c ships ONLY x86_64 Linux host binaries — there
+#   is NO aarch64 Linux NDK host variant. On the arm64 runner, clang
+#   /clang++/ld.lld/llvm-ar from the NDK are x86_64 ELF binaries that
+#   the kernel cannot execute (no binfmt_misc registered for x86_64
+#   on ubuntu-24.04-arm). The first run (32939635687) failed with:
+#     /home/runner/android-sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin/clang: 1: Syntax error: "(" unexpected
+#   Workarounds considered:
+#     (a) `apt install qemu-user-static binfmt-support` + register the
+#         x86_64 ELF binfmt_misc handler — would work but with a 5-10x
+#         slowdown on every clang invocation; the Rust+C++ Twoyi build
+#         takes ~10 min on native x86_64 → ~50-100 min via qemu, blowing
+#         past the 90-min job timeout.
+#     (b) Build the APK on an x86_64 runner (where the NDK is native)
+#         and download it on the arm64 runner. This is the chosen
+#         approach — it's also how Google's own android emulator images
+#         are built for CI (cross-compile on x86_64, deploy on arm64).
 #
 # What this tests that ui-e2e-aosp.yml (x86_64) does NOT:
 #   - The arm64-v8a build of twoyi's Rust + C++ code actually links and
@@ -69,6 +71,9 @@
 #     get exercised end-to-end.
 #
 # Differences from ui-e2e-aosp.yml (x86_64):
+#   - TWO JOBS: build-apk (ubuntu-latest/x86_64) → e2e (ubuntu-24.04-arm).
+#     The x86_64 sibling is a single job because it can build + test
+#     natively on the same runner.
 #   - Android runtime: redroid Docker container (NOT the sdk emulator).
 #     Image: redroid/redroid:11.0.0-latest (Android 11 = API 30, the
 #     same version as the x86_64 sibling for apples-to-apples parity).
@@ -83,17 +88,17 @@
 #     (provides binder_linux.ko) + modprobe + mount binderfs + start
 #     the redroid container with `docker run`.
 #   - Cleanup: `docker stop redroid` (instead of `adb emu kill`).
-#   - Job timeout: 90 min (vs 50 min — extra slack for first-run
-#     docker pull + AOSP rootfs extraction + slow arm64 AOSP boot).
+#   - Job timeout: 90 min for the e2e job (vs 50 min — extra slack
+#     for first-run docker pull + AOSP rootfs extraction + slow arm64
+#     AOSP boot via redroid).
 #   - default boot_wait_seconds: 600s (vs 600s — matches x86_64).
-#   - AVD name: not used (no AVD with redroid; it's a Docker image).
 #   - Step 17 (preload rootfs): RESTORED the original x86_64 flow
 #     (`adb root` → `tar cf - system/ vendor/ init default.prop` →
 #     `adb unroot`). redroid 11.0.0-latest accepts `adb root` — no
 #     more debugfs / simg2img / system.img extraction hacks.
-#   - ui-navigate-aosp.py's new post-Launch-Container + final
-#     assertions abort the script (exit 1) if the app crashed back
-#     to launcher (the bug that produced false-green runs).
+#   - ui-navigate-aosp.py's post-Launch-Container + final assertions
+#     abort the script (exit 1) if the app crashed back to launcher
+#     (the bug that produced false-green runs).
 ---
 name: UI E2E Test (ARM64 AOSP via redroid on ubuntu-24.04-arm)
 
@@ -110,14 +115,119 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ui-e2e-aosp-arm64:
-    name: UI-only ARM64 AOSP E2E on redroid (arm64 runner)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
-
+  # ════════════════════════════════════════════════════════════════
+  # JOB 1: Build the arm64-v8a APK on an x86_64 runner
+  # (NDK r27c only ships x86_64 Linux binaries; running clang on
+  # arm64 host without binfmt_misc fails with "Syntax error: (")
+  # ════════════════════════════════════════════════════════════════
+  build-apk:
+    name: Build arm64-v8a APK (x86_64 runner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: aarch64-linux-android
+          cache: false
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            app/rs/target
+            app/rs/loader/target
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-arm64-
+
+      - name: Cache cargo-xdk
+        id: cache-cargo-xdk
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-xdk
+          key: ${{ runner.os }}-cargo-xdk-2.12.6
+
+      - name: Install cargo-xdk
+        if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
+        run: cargo install cargo-xdk
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Grant execute permission for gradlew and build scripts
+        run: |
+          chmod +x gradlew
+          chmod +x app/rs/build_rs.sh
+          chmod +x app/rs/loader/build.sh || true
+
+      - name: Build APK (debuggable variant, arm64-v8a only)
+        run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-v8a-apk-aosp
+          path: app/build/outputs/apk/debuggable/*.apk
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  # ════════════════════════════════════════════════════════════════
+  # JOB 2: Run the redroid-based E2E on the arm64 runner
+  # ════════════════════════════════════════════════════════════════
+  ui-e2e-aosp-arm64:
+    name: UI-only ARM64 AOSP E2E on redroid (arm64 runner)
+    needs: build-apk
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download pre-built arm64-v8a APK
+        uses: actions/download-artifact@v4
+        with:
+          name: arm64-v8a-apk-aosp
+          path: app/build/outputs/apk/debuggable/
+
+      - name: Verify APK architecture (arm64-v8a only)
+        run: |
+          set -e
+          APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
+          echo "APK: $APK"
+          unzip -l "$APK" | grep -E "lib/.*\.so" || { echo "✗ no native libs in APK"; exit 1; }
+          ABI_COUNT=$(unzip -l "$APK" | grep -cE "lib/arm64-v8a/")
+          if [ "$ABI_COUNT" -eq 0 ]; then
+              echo "✗ APK has no arm64-v8a libs — build step is broken"
+              unzip -l "$APK" | grep -E "lib/" | head -5
+              exit 1
+          fi
+          X86_COUNT=$(unzip -l "$APK" | grep -cE "lib/x86_64/" || true)
+          if [ "$X86_COUNT" -gt 0 ]; then
+              echo "✗ APK has x86_64 libs — -Pabis=arm64-v8a was ignored"
+              exit 1
+          fi
+          echo "  ✓ APK contains arm64-v8a libs only ($ABI_COUNT files)"
 
       # ───────────────────────────────────────────────────────────────
       # Step: Provision redroid prerequisites
@@ -144,7 +254,6 @@ jobs:
           sudo mkdir -p /dev/binderfs
           sudo mount -t binder binder /dev/binderfs
           ls -la /dev/binderfs/
-          # redroid 11.0.0-latest hard-codes /dev/binder (not binderfs).
           sudo ln -sf /dev/binderfs/binder     /dev/binder
           sudo ln -sf /dev/binderfs/hwbinder   /dev/hwbinder
           sudo ln -sf /dev/binderfs/vndbinder  /dev/vndbinder
@@ -154,78 +263,22 @@ jobs:
           command -v docker >/dev/null || sudo apt-get install -y docker.io
           docker --version
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '17'
-          cache: 'gradle'
-
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          target: aarch64-linux-android
-          cache: false
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            app/rs/target
-            app/rs/loader/target
-          key: ${{ runner.os }}-{{ runner.arch }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-{{ runner.arch }}-cargo-
-
-      - name: Cache cargo-xdk
-        id: cache-cargo-xdk
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-xdk
-          key: ${{ runner.os }}-{{ runner.arch }}-cargo-xdk-2.12.6
-
-      - name: Install cargo-xdk
-        if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
-        run: cargo install cargo-xdk
-
-      - name: Setup Android NDK (direct sdkmanager — works on arm64 hosts)
-        id: setup-ndk
+      - name: Setup Android SDK platform-tools (for adb on the arm64 host)
         run: |
           set -e
           export ANDROID_HOME=/home/runner/android-sdk
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-              mkdir -p "$ANDROID_HOME/cmdline-tools"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
               cd /tmp
               curl -sL -o cmdline-tools.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
               unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
               mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
               rm cmdline-tools.zip
           fi
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "ndk;27.3.13750724"
-          NDK_PATH="$ANDROID_HOME/ndk/27.3.13750724"
-          test -d "$NDK_PATH" || { echo "✗ NDK r27c install failed"; exit 1; }
-          echo "ndk-path=$NDK_PATH" >> "$GITHUB_OUTPUT"
-          echo "  ✓ NDK r27c installed at $NDK_PATH"
-
-      - name: Grant execute permission for gradlew and build scripts
-        run: |
-          chmod +x gradlew
-          chmod +x app/rs/build_rs.sh
-          chmod +x app/rs/loader/build.sh || true
-
-      - name: Build APK (debuggable variant, arm64-v8a only)
-        # CRITICAL: this is the entire point of this workflow. The twoyi
-        # native libs (libtwoyi.so, libOpenglRender.so, libloader.so,
-        # kr64) are built for aarch64-linux-android ONLY — not x86_64.
-        # They run NATIVELY on redroid (no native bridge).
-        run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_HOME: /home/runner/android-sdk
+          sdkmanager "platform-tools"
+          echo "  ✓ platform-tools installed"
 
       # ───────────────────────────────────────────────────────────────
       # Step: Pull + launch redroid (arm64-v8a Android 11)
@@ -247,6 +300,8 @@ jobs:
           echo "  redroid container PID: $REDROID_PID"
           echo $REDROID_PID > /tmp/redroid.pid
 
+          export ANDROID_HOME=/home/runner/android-sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
           BOOT_TIMEOUT=300
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do

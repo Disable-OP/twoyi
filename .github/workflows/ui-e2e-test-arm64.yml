@@ -42,24 +42,23 @@
 #   repository2-3.xml. See runs 32901106471 (v1) + 32901574547 (v2) +
 #   the blocker report at download/arm64-emulator-blocker-report.md.
 #
-# Why v3 replaced v2 (x86_64 runner + arm64-v8a system image):
-#   The Android emulator binary shipped with the Linux x86_64 Android
-#   SDK does NOT include an arm64 TCG backend. v2's run 32891455624
-#   failed in 10s with `FATAL: Avd's CPU Architecture 'arm64' is not
-#   supported by the QEMU2 emulator on x86_64 host. System image
-#   must match the host architecture.`
-#
-# Why v2 replaced v1 (native bridge on x86_64 Play Store image):
-#   The native bridge (libndk_translation.so on google_apis_playstore
-#   x86_64 image) translates the twoyi app's arm64 .so to x86_64 at
-#   runtime. When twoyi's arm64 Rust kernel calls ptrace() on a forked
-#   child, the kernel returns x86_64 register layout (struct
-#   user_regs_struct), but the arm64-translated code expects arm64
-#   layout (struct user_pt_regs — different field offsets, different
-#   register count). This mismatch corrupts the register state and
-#   the twoyi app crashes immediately on "Launch Container" tap →
-#   run 32886902337: every screenshot from 5s..180s showed the launcher.
-#   This was the "false-green TWRP" run that prompted this v4 rewrite.
+# Why v4 splits the workflow into TWO JOBS (build on x86_64, test on arm64):
+#   The Android NDK r27c ships ONLY x86_64 Linux host binaries — there
+#   is NO aarch64 Linux NDK host variant. On the arm64 runner, clang
+#   /clang++/ld.lld/llvm-ar from the NDK are x86_64 ELF binaries that
+#   the kernel cannot execute (no binfmt_misc registered for x86_64
+#   on ubuntu-24.04-arm). The first run (32939627038) failed with:
+#     /home/runner/android-sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bin/clang: 1: Syntax error: "(" unexpected
+#   Workarounds considered:
+#     (a) `apt install qemu-user-static binfmt-support` + register the
+#         x86_64 ELF binfmt_misc handler — would work but with a 5-10x
+#         slowdown on every clang invocation; the Rust+C++ Twoyi build
+#         takes ~10 min on native x86_64 → ~50-100 min via qemu, blowing
+#         past the 60-min job timeout.
+#     (b) Build the APK on an x86_64 runner (where the NDK is native)
+#         and download it on the arm64 runner. This is the chosen
+#         approach — it's also how Google's own android emulator images
+#         are built for CI (cross-compile on x86_64, deploy on arm64).
 #
 # What this tests that ui-e2e-test.yml (x86_64) does NOT:
 #   - The arm64-v8a build of twoyi's Rust + C++ code actually links and
@@ -70,6 +69,9 @@
 #     guest ELF is a real arm64 binary (not native-bridge-translated).
 #
 # Differences from ui-e2e-test.yml (x86_64):
+#   - TWO JOBS: build-apk (ubuntu-latest/x86_64) → e2e (ubuntu-24.04-arm).
+#     The x86_64 sibling is a single job because it can build + test
+#     natively on the same runner.
 #   - Android runtime: redroid Docker container (NOT the sdk emulator).
 #     Image: redroid/redroid:11.0.0-latest (Android 11 = API 30, the
 #     same version as the x86_64 sibling for apples-to-apples parity).
@@ -84,8 +86,8 @@
 #     (provides binder_linux.ko) + modprobe + mount binderfs + start
 #     the redroid container with `docker run`.
 #   - Cleanup: `docker stop redroid` (instead of `adb emu kill`).
-#   - Job timeout: 60 min (vs 30 min — extra slack for first-run
-#     docker pull of the ~800MB redroid image).
+#   - Job timeout: 60 min for the e2e job (vs 30 min — extra slack
+#     for first-run docker pull of the ~800MB redroid image).
 #   - TWRP image: arm64 `angler` image downloaded at runtime (NOT the
 #     committed x86 byt_t_crv2 image in assets/twrp/).
 #   - ui-navigate.py's post-Launch-Container + final assertions abort
@@ -107,64 +109,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ui-e2e-test-arm64:
-    name: UI-only ARM64 (TWRP) E2E on redroid (arm64 runner)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
-
+  # ════════════════════════════════════════════════════════════════
+  # JOB 1: Build the arm64-v8a APK on an x86_64 runner
+  # (NDK r27c only ships x86_64 Linux binaries; running clang on
+  # arm64 host without binfmt_misc fails with "Syntax error: (")
+  # ════════════════════════════════════════════════════════════════
+  build-apk:
+    name: Build arm64-v8a APK (x86_64 runner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      # ───────────────────────────────────────────────────────────────
-      # Step: Provision redroid prerequisites
-      #
-      # ubuntu-24.04-arm runner image does NOT preinstall:
-      #   - linux-modules-extra-$(uname -r) — needed for binder_linux.ko
-      #   - android-tools-adb                — needed for ADB client
-      #   - docker.io                        — Docker is preinstalled but
-      #                                       apt-install is a no-op if so
-      #
-      # Kernel config (verified from linux-buildinfo-6.17.0-1022-azure
-      # deb): CONFIG_ANDROID_BINDER_IPC=m, CONFIG_ANDROID_BINDERFS=m,
-      # CONFIG_ANDROID_BINDER_DEVICES="" (binderfs-only mode — must
-      # mount -t binder to materialise /dev/binderfs/{binder,hwbinder,vndbinder}).
-      # ───────────────────────────────────────────────────────────────
-      - name: Provision redroid prerequisites (binderfs + adb)
-        run: |
-          set -e
-          echo "── Runner architecture ──"
-          uname -m
-          if [ "$(uname -m)" != "aarch64" ]; then
-              echo "  ✗ Runner is $(uname -m), expected aarch64. ubuntu-24.04-arm required."
-              exit 1
-          fi
-          echo "  ✓ Running on aarch64 hardware"
-
-          echo "── Install kernel modules + adb ──"
-          # linux-modules-extra ships binder_linux.ko (verified).
-          # android-tools-adb provides the `adb` CLI.
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              linux-modules-extra-$(uname -r) \
-              android-tools-adb
-
-          echo "── Load binderfs + mount at /dev/binderfs ──"
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
-          sudo mkdir -p /dev/binderfs
-          sudo mount -t binder binder /dev/binderfs
-          ls -la /dev/binderfs/
-          # redroid 11.0.0-latest still hard-codes /dev/binder (not
-          # binderfs). Symlinks let the old tag work.
-          sudo ln -sf /dev/binderfs/binder     /dev/binder
-          sudo ln -sf /dev/binderfs/hwbinder   /dev/hwbinder
-          sudo ln -sf /dev/binderfs/vndbinder  /dev/vndbinder
-          ls -la /dev/binder /dev/hwbinder /dev/vndbinder
-          echo "  ✓ binderfs mounted + /dev/binder symlinks created"
-
-          # Docker is preinstalled on ubuntu-24.04-arm but double-check.
-          command -v docker >/dev/null || sudo apt-get install -y docker.io
-          docker --version
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -188,45 +144,26 @@ jobs:
             ~/.cargo/git
             app/rs/target
             app/rs/loader/target
-          key: ${{ runner.os }}-{{ runner.arch }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-{{ runner.arch }}-cargo-
+          key: ${{ runner.os }}-cargo-arm64-${{ hashFiles('app/rs/Cargo.lock', 'app/rs/Cargo.toml', 'app/rs/loader/Cargo.lock', 'app/rs/loader/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-arm64-
 
       - name: Cache cargo-xdk
         id: cache-cargo-xdk
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/cargo-xdk
-          key: ${{ runner.os }}-{{ runner.arch }}-cargo-xdk-2.12.6
+          key: ${{ runner.os }}-cargo-xdk-2.12.6
 
       - name: Install cargo-xdk
         if: steps.cache-cargo-xdk.outputs.cache-hit != 'true'
         run: cargo install cargo-xdk
 
-      - name: Setup Android NDK (direct sdkmanager — works on arm64 hosts)
-        # The nttld/setup-ndk@v1 action rejects linux-arm64 with
-        # "Error: Unsupported host 'linux-arm64'" (run 32892478844).
-        # Direct sdkmanager install works because the NDK package is
-        # host-agnostic (ships binaries for x86_64 + arm64 Linux).
+      - name: Setup Android NDK
         id: setup-ndk
-        run: |
-          set -e
-          export ANDROID_HOME=/home/runner/android-sdk
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
-              mkdir -p "$ANDROID_HOME/cmdline-tools"
-              cd /tmp
-              curl -sL -o cmdline-tools.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
-              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
-              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-              rm cmdline-tools.zip
-          fi
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          # NDK r27c (LTS, late 2024). Numeric ID 27.3.13750724.
-          sdkmanager "ndk;27.3.13750724"
-          NDK_PATH="$ANDROID_HOME/ndk/27.3.13750724"
-          test -d "$NDK_PATH" || { echo "✗ NDK r27c install failed"; exit 1; }
-          echo "ndk-path=$NDK_PATH" >> "$GITHUB_OUTPUT"
-          echo "  ✓ NDK r27c installed at $NDK_PATH"
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
 
       - name: Grant execute permission for gradlew and build scripts
         run: |
@@ -234,38 +171,151 @@ jobs:
           chmod +x app/rs/build_rs.sh
           chmod +x app/rs/loader/build.sh || true
 
-      - name: Build APK (arm64-v8a only)
-        # CRITICAL: this is the entire point of this workflow. The twoyi
-        # native libs (libtwoyi.so, libOpenglRender.so, libloader.so,
-        # kr64) are built for aarch64-linux-android ONLY.
-        # On redroid they run NATIVELY (no native bridge, no
-        # translation). If the build fails here, it means the arm64
-        # Rust/C++ code has a compile-time issue — fix that first.
+      - name: Build APK (debuggable variant, arm64-v8a only)
         run: ./gradlew assembleDebuggable -Pabis=arm64-v8a
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_HOME: /home/runner/android-sdk
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-v8a-apk
+          path: app/build/outputs/apk/debuggable/*.apk
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
+
+  # ════════════════════════════════════════════════════════════════
+  # JOB 2: Run the redroid-based E2E on the arm64 runner
+  # ════════════════════════════════════════════════════════════════
+  ui-e2e-test-arm64:
+    name: UI-only ARM64 (TWRP) E2E on redroid (arm64 runner)
+    needs: build-apk
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download pre-built arm64-v8a APK
+        uses: actions/download-artifact@v4
+        with:
+          name: arm64-v8a-apk
+          path: app/build/outputs/apk/debuggable/
+
+      - name: Verify APK architecture (arm64-v8a only)
+        # Defensive: confirm the APK actually contains arm64-v8a libs.
+        # If the build step silently produced an x86_64-only APK (e.g.,
+        # the -Pabis flag was ignored), redroid would fail to install
+        # with INSTALL_FAILED_NO_MATCHING_ABIS.
+        run: |
+          set -e
+          APK=$(ls app/build/outputs/apk/debuggable/*.apk | head -1)
+          echo "APK: $APK"
+          unzip -l "$APK" | grep -E "lib/.*\.so" || { echo "✗ no native libs in APK"; exit 1; }
+          ABI_COUNT=$(unzip -l "$APK" | grep -cE "lib/arm64-v8a/")
+          if [ "$ABI_COUNT" -eq 0 ]; then
+              echo "✗ APK has no arm64-v8a libs — build step is broken"
+              unzip -l "$APK" | grep -E "lib/" | head -5
+              exit 1
+          fi
+          # Also confirm no x86_64 sneaked in (would suggest -Pabis was ignored)
+          X86_COUNT=$(unzip -l "$APK" | grep -cE "lib/x86_64/" || true)
+          if [ "$X86_COUNT" -gt 0 ]; then
+              echo "✗ APK has x86_64 libs — -Pabis=arm64-v8a was ignored"
+              exit 1
+          fi
+          echo "  ✓ APK contains arm64-v8a libs only ($ABI_COUNT files)"
+
+      # ───────────────────────────────────────────────────────────────
+      # Step: Provision redroid prerequisites
+      # ───────────────────────────────────────────────────────────────
+      - name: Provision redroid prerequisites (binderfs + adb)
+        run: |
+          set -e
+          echo "── Runner architecture ──"
+          uname -m
+          if [ "$(uname -m)" != "aarch64" ]; then
+              echo "  ✗ Runner is $(uname -m), expected aarch64. ubuntu-24.04-arm required."
+              exit 1
+          fi
+          echo "  ✓ Running on aarch64 hardware"
+
+          echo "── Install kernel modules + adb ──"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              linux-modules-extra-$(uname -r) \
+              android-tools-adb
+
+          echo "── Load binderfs + mount at /dev/binderfs ──"
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          sudo mkdir -p /dev/binderfs
+          sudo mount -t binder binder /dev/binderfs
+          ls -la /dev/binderfs/
+          # redroid 11.0.0-latest hard-codes /dev/binder (not binderfs).
+          sudo ln -sf /dev/binderfs/binder     /dev/binder
+          sudo ln -sf /dev/binderfs/hwbinder   /dev/hwbinder
+          sudo ln -sf /dev/binderfs/vndbinder  /dev/vndbinder
+          ls -la /dev/binder /dev/hwbinder /dev/vndbinder
+          echo "  ✓ binderfs mounted + /dev/binder symlinks created"
+
+          command -v docker >/dev/null || sudo apt-get install -y docker.io
+          docker --version
+
+      - name: Setup Android SDK platform-tools (for adb on the arm64 host)
+        # The arm64 runner doesn't preinstall the Android SDK. We need
+        # platform-tools (for adb). The full SDK + emulator + system
+        # image is NOT needed (redroid provides the Android runtime).
+        run: |
+          set -e
+          export ANDROID_HOME=/home/runner/android-sdk
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          if [ ! -d "$ANDROID_HOME/cmdline-tools/latest" ]; then
+              cd /tmp
+              curl -sL -o cmdline-tools.zip 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip'
+              unzip -q cmdline-tools.zip -d "$ANDROID_HOME/cmdline-tools"
+              mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+              rm cmdline-tools.zip
+          fi
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          # Only platform-tools needed; no emulator, no system image,
+          # no NDK (we don't build here — the build-apk job does that).
+          sdkmanager "platform-tools"
+          echo "  ✓ platform-tools installed"
+          # `adb` is also available via android-tools-adb apt package; the
+          # sdkmanager-installed one is more recent and matches what the
+          # x86_64 sibling uses.
+
+      - name: Download arm64 TWRP image (Nexus 6P angler)
+        # dl.twrp.me serves the .img with a referer-based anti-leech
+        # check; without `-e` (Referer) the response is the HTML landing
+        # page (~6.8KB) instead of the ~17MB binary image.
+        # The angler image is the smallest verified-arm64 bootable TWRP
+        # in TWRP 3.7.0_9-0 (same version as the existing x86 byt_t_crv2).
+        # sha256: 21e41c0607b150f8dc5e5a4b0975a64d1eb62c4aff34920231d027e0793e8028
+        # md5:    cf9a9067d18f64ed6992514826e1f9df
+        run: |
+          set -e
+          mkdir -p /tmp/twrp-arm64
+          cd /tmp/twrp-arm64
+          curl -fL --retry 3 -A "Mozilla/5.0" \
+              -e "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img.html" \
+              -o twrp-3.7.0_9-0-angler.img \
+              "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img"
+          echo "cf9a9067d18f64ed6992514826e1f9df  twrp-3.7.0_9-0-angler.img" | md5sum -c -
+          ls -lh twrp-3.7.0_9-0-angler.img
+          file twrp-3.7.0_9-0-angler.img || true
 
       # ───────────────────────────────────────────────────────────────
       # Step: Pull + launch redroid (arm64-v8a Android 11)
-      #
-      # Image: redroid/redroid:11.0.0-latest (Android 11 = API 30, the
-      # same version as the x86_64 sibling for apples-to-apples parity).
-      # 800MB arm64 layer on Docker Hub; first-run pull takes ~30s on
-      # GitHub's network. Subsequent runs hit Docker layer cache.
-      #
-      # Redroid boots in ~30-60s on the arm64 Ampere CPU — Android is
-      # running as native processes, not as a VM. Poll sys.boot_completed
-      # every 5s; die early if `docker logs` shows a binder/ashmem error.
       # ───────────────────────────────────────────────────────────────
       - name: Pull + launch redroid (arm64-v8a Android 11)
         run: |
           set -e
           mkdir -p /tmp/ui-e2e-artifacts
-          # Pull first (separate from `run` so failure is visible)
           sudo docker pull redroid/redroid:11.0.0-latest
-          # Launch — bind-mount binderfs, use memfd (no ashmem on 6.17),
-          # software GPU (no /dev/dri on hosted arm runners).
           sudo docker run -itd --rm --privileged \
               --name redroid \
               -v /dev/binderfs:/dev/binderfs:rw \
@@ -279,18 +329,17 @@ jobs:
           echo $REDROID_PID > /tmp/redroid.pid
 
           # Wait for boot_completed (up to 300s — usually 30-60s)
+          export ANDROID_HOME=/home/runner/android-sdk
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
           BOOT_TIMEOUT=300
           WAITED=0
           while [ "$WAITED" -lt "$BOOT_TIMEOUT" ]; do
-              # `adb connect localhost:5555` may fail for the first ~10s
-              # while redroid's adbd is starting; retry every loop iter.
               adb connect localhost:5555 >/dev/null 2>&1 || true
               BOOTED=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
               if [ "$BOOTED" = "1" ]; then
                   echo "  ✓ boot_completed after ${WAITED}s"
                   break
               fi
-              # Die early if redroid crashed
               if ! sudo docker ps --filter name=redroid --filter status=running | grep -q redroid; then
                   echo "  ✗ redroid container died after ${WAITED}s"
                   sudo docker logs redroid 2>&1 | tail -50
@@ -319,28 +368,9 @@ jobs:
           echo "  ro.build.version.sdk = $SDK (expect 30 for Android 11)"
           echo "  ✓ redroid is arm64-v8a Android 11 (no native bridge, no translation)"
 
-      - name: Download arm64 TWRP image (Nexus 6P angler)
-        # dl.twrp.me serves the .img with a referer-based anti-leech
-        # check; without `-e` (Referer) the response is the HTML landing
-        # page (~6.8KB) instead of the ~17MB binary image.
-        # The angler image is the smallest verified-arm64 bootable TWRP
-        # in TWRP 3.7.0_9-0 (same version as the existing x86 byt_t_crv2).
-        # sha256: 21e41c0607b150f8dc5e5a4b0975a64d1eb62c4aff34920231d027e0793e8028
-        # md5:    cf9a9067d18f64ed6992514826e1f9df
-        run: |
-          set -e
-          mkdir -p /tmp/twrp-arm64
-          cd /tmp/twrp-arm64
-          # 3 retries; the dl.twrp.me CDN occasionally 503s under load.
-          curl -fL --retry 3 -A "Mozilla/5.0" \
-              -e "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img.html" \
-              -o twrp-3.7.0_9-0-angler.img \
-              "https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img"
-          echo "cf9a9067d18f64ed6992514826e1f9df  twrp-3.7.0_9-0-angler.img" | md5sum -c -
-          ls -lh twrp-3.7.0_9-0-angler.img
-          file twrp-3.7.0_9-0-angler.img || true
-
       - name: Install APK + push arm64 TWRP recovery.img
+        env:
+          ANDROID_HOME: /home/runner/android-sdk
         run: |
           set -e
           export ANDROID_HOME=/home/runner/android-sdk
