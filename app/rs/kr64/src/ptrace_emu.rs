@@ -8392,6 +8392,10 @@ pub fn run_ptrace_loop(
     // buffer under a different syscall's return value.
     let mut pending_epoll_readback: std::collections::HashMap<libc::pid_t, (i64, u64, usize)> =
         std::collections::HashMap::new();
+    // 6-Z177: consecutive accept4(-EINVAL) count per pid — the spin
+    // throttle state (see the accept4 EXIT handler for the full story).
+    let mut accept4_einval_streak: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
     // 6-Z148: RIP-sampling diagnostic state for the post-execve prctl
     // spin (run 32843174575: 16,326 consecutive prctls, ZERO other
     // syscalls — a pure userspace allocation loop; the rip + the scudo
@@ -14551,6 +14555,56 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         }
+                    }
+
+                    // ── 6-Z177: accept4(-EINVAL) SPIN THROTTLE ──────────
+                    //
+                    // Run 33019847021: the guest init's property socket
+                    // ended up bound-but-never-listening (bind hit
+                    // EADDRINUSE — a duplicate-init/stale-socket race —
+                    // and 6-Z101 faked it to 0; listen then EINVAL'd and
+                    // was faked to 0 too). init's epoll sees EPOLLHUP,
+                    // wakes, accept4 → EINVAL, loops — TWO syscalls per
+                    // iteration THROUGH THE TRACER at ~20 kHz, burning a
+                    // full core and starving the rest of the guest (this
+                    // same spin family decided run 33015609499's meltdown
+                    // and blocked 33019847021 before the GUI stage).
+                    //
+                    // We do NOT try to fix init's socket state — we make
+                    // the spin HARMLESS: after 100 consecutive
+                    // accept4-EINVALs from the same pid, the tracer parks
+                    // 20 ms before resuming the child. The loop drops to
+                    // ~50 wakeups/s (0.1% of a core); init's other
+                    // threads (and the whole guest) get the core back.
+                    // Non-spinning accept4 users are untouched (the
+                    // counter resets on any non-EINVAL accept4 return).
+                    if past_first_execve
+                        && (syscall_num == 242 || syscall_num == 288 || syscall_num == 364)
+                        && ret == -22
+                    {
+                        let n = accept4_einval_streak
+                            .entry(pid)
+                            .and_modify(|c| *c = c.saturating_add(1))
+                            .or_insert(1);
+                        if *n == 100 {
+                            log(&format!(
+                                "6-Z177: accept4(-EINVAL) spin detected pid={} (100 consecutive) — engaging 20ms tracer-side park per iteration (spin is now harmless; likely a bound-but-never-listened property/socket fd from the EADDRINUSE-fake family)",
+                                pid
+                            ));
+                        }
+                        if *n >= 100 {
+                            // Throttle: 20ms park; heartbeat every 1000.
+                            if *n % 1000 == 0 {
+                                log(&format!(
+                                    "6-Z177: accept4 spin still running pid={} ({} consecutive EINVALs)",
+                                    pid, n
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    } else if syscall_num == 242 || syscall_num == 288 || syscall_num == 364 {
+                        // A non-EINVAL accept4 return resets the streak.
+                        accept4_einval_streak.remove(&pid);
                     }
 
                     // Task 6-S: log the return value for
