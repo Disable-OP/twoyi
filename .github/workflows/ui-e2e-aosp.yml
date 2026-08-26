@@ -36,7 +36,7 @@ name: UI E2E Test (AOSP)
       boot_wait_seconds:
         description: 'How long to wait for the guest Android to boot (seconds)'
         required: false
-        default: '30'
+        default: '60'
 
 concurrency:
   group: ui-e2e-aosp-${{ github.ref }}
@@ -387,7 +387,7 @@ jobs:
       - name: UI navigation — boot AOSP container
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
-          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '30' }}
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '60' }}
           AOSP_PACKAGE: io.twoyi.debug
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk

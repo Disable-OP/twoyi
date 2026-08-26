@@ -91,7 +91,7 @@
 #   - Job timeout: 90 min for the e2e job (vs 50 min — extra slack
 #     for first-run docker pull + AOSP rootfs extraction + slow arm64
 #     AOSP boot via redroid).
-#   - default boot_wait_seconds: 30s (v5.3 — matches x86_64; was 600s).
+#   - default boot_wait_seconds: 60s (v5.4 — TWRP keeps 30s, AOSP gets 60s; was 600s, then 30s in v5.3).
 #   - Step 17 (preload rootfs): RESTORED the original x86_64 flow
 #     (`adb root` → `tar cf - system/ vendor/ init default.prop` →
 #     `adb unroot`). redroid 16.0.0-latest accepts `adb root` — no
@@ -121,7 +121,7 @@ name: UI E2E Test (ARM64 AOSP via redroid on ubuntu-24.04-arm)
       boot_wait_seconds:
         description: 'How long to wait for the guest Android to boot (seconds)'
         required: false
-        default: '30'
+        default: '60'
       redroid_tag:
         description: 'redroid Docker image tag (arm64): 14.0.0-latest, 16.0.0-latest, 13.0.0-latest, 11.0.0-latest ...'
         required: false
@@ -494,7 +494,7 @@ jobs:
 
       - name: UI navigation — boot AOSP container
         env:
-          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '30' }}
+          BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '60' }}
           AOSP_PACKAGE: io.twoyi.debug
           ADB_SERIAL: localhost:5555
         run: |
