@@ -484,8 +484,28 @@ jobs:
           echo "  ✓ APK installed"
 
           # Push the recovery image to /sdcard/Download/recovery.img.
+          # 6-Z163d: retry loop — run 32994082069 hit "remote couldn't
+          # create file: Operation not permitted" on the FIRST push
+          # (redroid's sdcard/fuse daemon races the boot; the push step
+          # runs seconds after sys.boot_completed). 5 attempts with a
+          # 10s gap — every earlier run succeeded on attempt 1, so this
+          # only catches the rare slow-fuse case.
           echo "── Pushing arm64 recovery image to /sdcard/Download/recovery.img ──"
-          $ADB push /tmp/twrp-arm64/recovery.img /sdcard/Download/recovery.img
+          PUSH_OK=0
+          for ATTEMPT in 1 2 3 4 5; do
+            if $ADB push /tmp/twrp-arm64/recovery.img /sdcard/Download/recovery.img; then
+              PUSH_OK=1
+              echo "  ✓ push succeeded on attempt $ATTEMPT"
+              break
+            fi
+            echo "  ⚠ push attempt $ATTEMPT failed (sdcard daemon racing?) — retrying in 10s"
+            sleep 10
+          done
+          if [ "$PUSH_OK" != "1" ]; then
+            echo "✗ recovery.img push failed after 5 attempts"
+            $ADB shell ls -la /sdcard/ /sdcard/Download/ || true
+            exit 1
+          fi
           echo "  ✓ recovery.img pushed ($(stat -c%s /tmp/twrp-arm64/recovery.img) bytes)"
           $ADB shell ls -la /sdcard/Download/recovery.img
 
