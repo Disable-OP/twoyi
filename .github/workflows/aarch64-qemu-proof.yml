@@ -355,6 +355,22 @@ jobs:
           PATCH
           echo "✓ extern-C/osdep patch applied"
 
+          # v4 fix #2: the fork's OWN inconsistency — its cpu.h defines
+          # struct CPUWatchpoint with member 'vaddress', but the Android
+          # patch in target/arm/kvm64.c initializes it with '.vaddr':
+          #   kvm64.c:196: error: 'CPUWatchpoint' has no member named
+          #   'vaddr'; did you mean 'vaddress'?
+          # (The 2019 'Patches for aarch64' were never compile-tested
+          # against this tree on Linux — we're the first.)
+          if grep -q '\.vaddr = addr' target/arm/kvm64.c 2>/dev/null; then
+            sed -i 's/\.vaddr = addr/.vaddress = addr/' target/arm/kvm64.c
+            echo "✓ patched kvm64.c .vaddr → .vaddress"
+            grep -n 'vaddress = addr' target/arm/kvm64.c || true
+          else
+            echo "  (kvm64.c .vaddr pattern not found — checking alternatives)"
+            grep -n 'vaddr' target/arm/kvm64.c | head -5 || true
+          fi
+
           # v2 fix #2: DELETE the Android build system's GNUmakefile
           # so plain `make` uses QEMU's own Makefile.
           echo ""
