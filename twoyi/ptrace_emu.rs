@@ -10752,6 +10752,19 @@ pub fn run_ptrace_loop(
                                                             new_len as u64,
                                                         );
                                                         scratch_offset += aligned;
+                                                        // Mirror
+                                                        // write_translated_path's
+                                                        // cursor wrap: when
+                                                        // fewer than 256
+                                                        // bytes remain,
+                                                        // wrap to 0 (also
+                                                        // READS the
+                                                        // increment above,
+                                                        // satisfying
+                                                        // unused_assignments).
+                                                        if scratch_offset + 256 > 4096 {
+                                                            scratch_offset = 0;
+                                                        }
                                                         log(&format!(
                                                             "6-Z163: bind(fd={}, {}) sockaddr REWRITTEN to {} (len {} -> {}) — kernel will bind FOR REAL",
                                                             get_syscall_arg(&regs, abi.reg_arg1),

@@ -10627,3 +10627,7 @@ Fix (6-Z163):
 - ui-navigate.py: probe `timeout` now invoked by host-absolute /system/bin/timeout (run 32988644183 had every probe 127 on "timeout: not found" — the rootfs PATH shadowed redroid's toybox).
 
 FIXUP (6-Z163): rustfmt line-joining diffs from run 32989901122's fmt gate (5 spots: aligned/sa_scratch/fresh one-liners, setregs one-liner, test assert wrap, trailing blank line).
+
+FIXUP (6-Z163 #2): clippy -D unused_assignments — scratch_offset += aligned was dead on
+execve-reset paths (run 32989897968 build). Added the write_translated_path-style
+wrap guard (scratch_offset + 256 > 4096 -> 0) which also reads the increment.
