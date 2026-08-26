@@ -74,9 +74,11 @@
 //     syscall-number comparisons and register-index lookups go
 //     through that ABI so the same loop body handles both cases.
 //     We previously detected bitness by inspecting the `iov_len`
-//     returned by PTRACE_GETREGSET, but on the x86_64 Android
-//     emulator PTRACE_GETREGSET returns EIO (forcing us onto the
-//     PTRACE_GETREGS fallback, which has no iov_len) so we now use
+//     returned by PTRACE_GETREGSET, but on x86_64 ptrace_getregs uses
+//     the legacy PTRACE_GETREGS (the layout-correct request for BOTH
+//     child bitnesses — see the "WHY TWO REQUEST PATHS" note below),
+//     which exposes no iov_len at all, so we now use the ELF header
+//     as the single source of truth for bitness.
 //     the ELF header as the single source of truth for bitness.
 //   - On aarch64 there is no 32-bit userspace, so we always use
 //     ABI_AARCH64.
@@ -89,47 +91,64 @@
 //     - Exception: /init.rc, /init.*.rc, /sbin/*, /etc/* → translate
 //       to rootfs (these are TWRP-specific files).
 
-// Architecture-specific register access.
+// Architecture-specific register access — how `ptrace_getregs` /
+// `ptrace_setregs` talk to the kernel.
 //
-// CRITICAL: On aarch64, PTRACE_GETREGS (12) does NOT exist — it returns
-// EIO. We must use PTRACE_GETREGSET (33) with NT_PRSTATUS (1) and an
-// iovec. PTRACE_GETREGSET works reliably on real aarch64 hardware.
+// ALL ptrace request numbers used here come from the `libc` crate
+// (libc::PTRACE_GETREGSET, libc::PTRACE_SETREGSET, libc::PTRACE_GETREGS,
+// libc::PTRACE_SETREGS) — never from hand-written literals — and
+// `uapi_guard.c` at the crate root cross-checks those values against the
+// target's own C headers (<sys/ptrace.h>, <elf.h>) for every target
+// triple this crate is compiled for (host gnu x86_64,
+// aarch64-linux-android, x86_64-linux-android). NT_PRSTATUS has no libc
+// binding for these targets; it is defined once below as an ELF-spec
+// constant and is likewise verified by uapi_guard.c.
 //
-// CRITICAL (x86_64, emulator fix): PTRACE_GETREGSET returns EIO on the
-// x86_64 Android emulator. On x86_64 we therefore TRY PTRACE_GETREGSET
-// first (so the aarch64 and x86_64 paths share the same primary code)
-// and FALL BACK to the legacy PTRACE_GETREGS (request 12) on EIO.
-// PTRACE_GETREGS works on x86_64 for both 64-bit children and 32-bit
-// (i386 compat) children — the kernel zero-extends each 32-bit register
-// value into the corresponding 64-bit slot of user_regs_struct, so the
-// ABI_X86_32 register indices (5=rbx, 11=rcx, 12=rdx, 13=rsi) work
-// correctly against that 64-bit view.
+// WHY TWO REQUEST PATHS (a genuine Linux UAPI difference, not a
+// per-arch workaround):
 //
-// Because the GETREGS fallback path has no iov_len, child-bitness
-// detection is now done independently by reading /proc/<pid>/exe and
-// inspecting the ELF header — see `detect_child_is_64bit`.
+//   * On aarch64 the kernel implements ONLY the generic regset ptrace
+//     interface: arch/arm64 has no PTRACE_GETREGS/SETREGS at all (the
+//     request is rejected with EIO even though bionic's sys/ptrace.h
+//     still defines the macros). The one true path is
+//     PTRACE_GETREGSET/SETREGSET with NT_PRSTATUS, which always yields
+//     the 272-byte `struct user_pt_regs` — there is no 32-bit userspace
+//     on this target, so there is exactly one register layout.
 //
-// CRITICAL (aarch64, real-device fix): The libc crate declares `ptrace`
-// as a variadic C function (`extern "C" { fn ptrace(c_uint, ...) -> c_long; }`).
-// On aarch64, Rust's C-variadic ABI hands the callee a `__va_list` that the
-// callee walks via `va_arg`. bionic's ptrace() wrapper then forwards the
-// unpacked arguments to the kernel via `syscall(__NR_ptrace, req, pid, addr, data)`.
-// On real arm64 Android devices this has been observed to consistently
-// return EIO for PTRACE_GETREGSET (with NT_PRSTATUS), producing the
-// "ptrace_getregs failed: I/O error (os error 5)" log spam.
+//   * On x86_64 the legacy PTRACE_GETREGS/SETREGS is the layout-correct
+//     choice for this codebase: `Regs` IS `user_regs_struct` (216 bytes)
+//     and the ABI_X86_32 register-index scheme (5=rbx, 11=rcx, 12=rdx,
+//     13=rsi) is defined against the 64-bit view that GETREGS provides
+//     for BOTH 64-bit and 32-bit (i386 compat) children — the kernel
+//     zero-extends each 32-bit register into the corresponding 64-bit
+//     slot. PTRACE_GETREGSET on an i386 child instead returns the
+//     68-byte `user_regs_struct32`, a DIFFERENT field layout that our
+//     index scheme does not describe; using it would corrupt compat
+//     children. (For a 64-bit child both requests return the same
+//     216-byte layout.)
 //
-// The kernel's own ptrace syscall works correctly when invoked directly via
-// `libc::syscall(SYS_ptrace, ...)` — there is no regset lookup problem
-// (NT_PRSTATUS is always present on aarch64), no permission issue, and
-// no size mismatch. The failure is purely an artifact of going through
-// bionic's variadic `ptrace()` wrapper.
+// Historical note: this file previously hand-defined
+// "PTRACE_GETREGSET = 33 / PTRACE_SETREGSET = 34" — INVALID request
+// numbers (the UAPI values are 0x4204/0x4205), which EVERY kernel
+// rejected with EIO. On x86_64 an EIO fallback to PTRACE_GETREGS hid
+// the bug (and it was misdiagnosed as an "emulator quirk" and later as
+// a "bionic variadic ptrace" problem); on aarch64 there was no
+// fallback, so the tracer could never read a single register and the
+// guest never booted — on physical non-rooted devices exactly as much
+// as in rooted CI containers.
 //
-// Fix: bypass `libc::ptrace()` and call the kernel via the raw syscall
-// interface for the GETREGSET/SETREGSET requests on aarch64. We do the
-// same on x86_64 (the raw-syscall path costs nothing there and keeps
-// the GET/SET code paths identical across architectures). We keep
-// `libc::ptrace()` for the non-REGSET requests (PTRACE_SETOPTIONS,
-// PTRACE_SYSCALL, PTRACE_PEEKDATA, ...) because those have been observed
+// We still invoke the kernel via libc::syscall(SYS_ptrace, ...) rather
+// than libc::ptrace(): the raw path is uniformly correct on every
+// architecture and costs nothing. The non-REGSET requests
+// (PTRACE_SETOPTIONS, PTRACE_PEEKDATA, ...) continue to go through
+// libc::ptrace(), which has always worked.
+//
+// Non-root note: every request issued here targets a process this app
+// forked itself (the kr64 child called PTRACE_TRACEME before exec, and
+// fork/clone events auto-attach descendants). Tracing your own
+// descendants requires no CAP_SYS_PTRACE, no permissive kernel and no
+// SELinux relaxation — the same model the original twoyi used on
+// stock, non-rooted, enforcing Android devices.
 // to work fine through bionic and the workaround adds nothing there.
 
 // ── Register types ─────────────────────────────────────────────────
@@ -171,30 +190,20 @@ type Regs = Aarch64Regs;
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(std::mem::size_of::<Aarch64Regs>() == 272);
 
-// Named constants for the generic PTRACE_*REGSET interface, used as
-// the PRIMARY register-fetch path on BOTH x86_64 and aarch64. On
-// x86_64 we fall back to the legacy PTRACE_GETREGS/SETREGS (numbers
-// 12/13) when GETREGSET returns EIO — see `ptrace_getregs_legacy`
-// and `ptrace_setregs_legacy`. The constants below cover only the
-// REGSET requests because the legacy request numbers are small
-// integers that read more clearly as `12`/`13` at the fallback call
-// sites (with a comment pointing at <linux/ptrace.h>). Using names
-// instead of bare `33`/`34`/`1` makes the intent obvious and stops
-// future readers from wondering whether they are syscall numbers,
-// NT_* types, or something else entirely.
-mod ptrace_regset {
-    /// `PTRACE_GETREGSET` — Linux generic ptrace request number, see
-    /// <linux/ptrace.h>. Reads a regset by NT_* type into a user `iovec`.
-    pub const PTRACE_GETREGSET: libc::c_long = 33;
-    /// `PTRACE_SETREGSET` — Linux generic ptrace request number, see
-    /// <linux/ptrace.h>. Writes a regset by NT_* type from a user `iovec`.
-    pub const PTRACE_SETREGSET: libc::c_long = 34;
-    /// `NT_PRSTATUS` — general-purpose registers regset, see
-    /// <linux/elf.h>. This is the regset that maps to `user_pt_regs`
-    /// on aarch64, to `user_regs_struct` on x86_64, and to
-    /// `user_regs_struct32` on i386 compat-mode children.
-    pub const NT_PRSTATUS: libc::c_long = 1;
-}
+/// `NT_PRSTATUS` — the ELF note type identifying the general-purpose
+/// register regset; passed as the `addr` argument of
+/// `PTRACE_GETREGSET`/`PTRACE_SETREGSET`.
+///
+/// The `libc` crate does not export `NT_PRSTATUS` for the android/gnu
+/// targets this crate is built for, so it is defined here — but it is
+/// not an invented value: NT_* note types are part of the
+/// architecture-independent ELF ABI (`include/uapi/linux/elf.h`,
+/// mirrored by glibc's and bionic's `<elf.h>`) and `NT_PRSTATUS == 1`
+/// on every Linux port. `uapi_guard.c` at the crate root
+/// `_Static_assert`s this value against the target toolchain's real
+/// `<elf.h>` on every build, so a divergent toolchain would fail the
+/// build instead of silently corrupting register access.
+const NT_PRSTATUS: libc::c_long = 1;
 
 // ── Child ABI: runtime syscall numbers + register layout ───────────
 //
@@ -212,8 +221,9 @@ mod ptrace_regset {
 // `detect_child_is_64bit`): EI_CLASS=1 → 32-bit i386 child,
 // EI_CLASS=2 → 64-bit x86_64 child. We then select ABI_X86_32 or
 // ABI_X86_64 accordingly. (We used to inspect the `iov_len` returned
-// by PTRACE_GETREGSET, but on the x86_64 Android emulator
-// PTRACE_GETREGSET returns EIO and the GETREGS fallback has no
+// by PTRACE_GETREGSET, but on x86_64 ptrace_getregs uses the legacy
+// PTRACE_GETREGS, which exposes no iov_len — so the ELF header is now
+// the single source of truth.)
 // iov_len — so the ELF header is now the single source of truth.)
 //
 // On aarch64 there is no 32-bit userspace, so we always use ABI_AARCH64.
@@ -1976,12 +1986,13 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
 /// ELF header.
 ///
 /// We do NOT rely on the `iov_len` returned by PTRACE_GETREGSET for
-/// bitness detection anymore. On the x86_64 Android emulator (and
-/// possibly other bionic/kernel combinations) PTRACE_GETREGSET returns
-/// EIO, which forces `ptrace_getregs` to fall back to PTRACE_GETREGS —
-/// and PTRACE_GETREGS does not expose `iov_len` at all. Reading the
-/// child's own ELF header is also a more reliable bitness signal than
-/// the regset size the kernel happened to report: it tells us the
+/// bitness detection anymore. On x86_64 `ptrace_getregs` uses the
+/// legacy PTRACE_GETREGS (the layout-correct request for both child
+/// bitnesses — see the architecture note at the top of this file),
+/// which does not expose `iov_len` at all. Reading the child's own
+/// ELF header is also a more reliable bitness signal than the regset
+/// size the kernel happened to report: it tells us the executable's
+/// actual architecture.
 /// executable's actual architecture.
 ///
 /// # What we read
@@ -2076,36 +2087,23 @@ fn classify_elf_bitness(hdr: &[u8; 20]) -> Option<bool> {
 
 // ── Architecture-specific get/set registers ────────────────────────
 
-/// Get the child's registers.
+/// Get the child's registers into the TRACER-SIDE 64-bit register view
+/// (`Regs`), returning the byte length of that view (272 on aarch64,
+/// 216 on x86_64). The length is only used as the `iov_len` argument
+/// of the matching [`ptrace_setregs`] call — child bitness is detected
+/// separately by [`detect_child_is_64bit`].
 ///
-/// On **aarch64** we always use `PTRACE_GETREGSET` with `NT_PRSTATUS`
-/// (the only regset-fetching ptrace request the aarch64 kernel
-/// supports — `PTRACE_GETREGS` returns `EIO` there).
-///
-/// On **x86_64** we try `PTRACE_GETREGSET` first (because it exposes
-/// `iov_len`, which historically we used for child-bitness detection),
-/// but on the x86_64 Android emulator `PTRACE_GETREGSET` returns
-/// `EIO`. In that case we fall back to the legacy `PTRACE_GETREGS`
-/// request (number 12), which works on x86_64 — both for 64-bit
-/// children and for 32-bit (i386 compat) children, where the kernel
-/// zero-extends each 32-bit register value into the corresponding
-/// 64-bit slot of `user_regs_struct`.
-///
-/// Because the fallback path has no `iov_len`, child bitness is now
-/// detected separately by [`detect_child_is_64bit`] (which reads the
-/// child's ELF header via `/proc/<pid>/exe`). The `usize` we return
-/// is therefore only used as the `iov_len` argument to the matching
-/// [`ptrace_setregs`] call — on the GETREGS fallback path it is just
-/// `sizeof(Regs)` (216 on x86_64), which the SETREGS fallback path
-/// ignores.
-///
-/// The function name `ptrace_getregs` is historical — on x86_64 it
-/// may now actually use `PTRACE_GETREGS` (the legacy request), and on
-/// aarch64 it always uses `PTRACE_GETREGSET`. Kept the name for parity
-/// with the call sites in `run_ptrace_loop`.
+/// Request selection is driven by the register LAYOUT each kernel
+/// interface returns — see the "WHY TWO REQUEST PATHS" note at the top
+/// of this file. The name `ptrace_getregs` is historical; kept for
+/// parity with the call sites in `run_ptrace_loop`.
+#[cfg(target_arch = "aarch64")]
 fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
-    use ptrace_regset::{NT_PRSTATUS, PTRACE_GETREGSET};
-
+    // PTRACE_GETREGSET is the only register-fetching interface the
+    // arm64 kernel implements (arch/arm64 has no PTRACE_GETREGS). It
+    // always yields the 272-byte `struct user_pt_regs` — there is no
+    // 32-bit userspace on this target, so exactly one layout.
+    //
     // Use libc::iovec (matching the kernel's `struct iovec`). The
     // kernel reads `iov_base`/`iov_len` from this struct, copies
     // `iov_len` bytes of register state INTO `iov_base`, and updates
@@ -2115,87 +2113,59 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
         iov_len: std::mem::size_of::<Regs>(),
     };
 
-    // IMPORTANT: bypass libc::ptrace() (bionic's variadic wrapper) and
-    // invoke the kernel ptrace syscall directly via libc::syscall().
-    // See the long comment at the top of this file for the rationale.
+    // Invoke the kernel's ptrace syscall directly via libc::syscall()
+    // rather than libc::ptrace()'s C-variadic wrapper — uniformly
+    // correct on every architecture, and it costs nothing (see the
+    // top-of-file note).
     //
-    // libc::syscall is itself variadic but it is a thin Rust shim that
-    // only forwards the raw syscall arguments to `syscall(2)`; bionic
-    // does no `va_arg` unpacking here because libc::syscall is a
-    // direct syscall stub, not a variadic-C wrapper like ptrace().
-    //
-    // The kernel's SYSCALL_DEFINE4(ptrace, long, request, long, pid,
-    // unsigned long, addr, unsigned long, data) takes addr as an
-    // integer (here NT_PRSTATUS=1), NOT a pointer — that's fine, the
-    // kernel just reads it as `unsigned long` and dispatches on it.
-    //
-    // We use the raw-syscall path on BOTH architectures: the
-    // historical bionic variadic-ptrace EIO problem was observed on
-    // aarch64, but going through libc::syscall uniformly costs nothing
-    // on x86_64 and means we don't need a cfg-split here.
+    // SYSCALL_DEFINE4(ptrace, long request, long pid, unsigned long
+    // addr, unsigned long data): the NT_* note type is passed as an
+    // INTEGER in `addr` and the iovec pointer in `data`, per
+    // <linux/ptrace.h>:
+    //   ret = ptrace(PTRACE_GETREGSET/PTRACE_SETREGSET, pid,
+    //                NT_XXX_TYPE, &iov);
     let r = unsafe {
         libc::syscall(
             libc::SYS_ptrace,
-            PTRACE_GETREGSET,
+            libc::PTRACE_GETREGSET as libc::c_long,
             pid as libc::c_long,
             NT_PRSTATUS,
             &mut iov as *mut libc::iovec,
         )
     };
     if r == -1 {
-        let e = std::io::Error::last_os_error();
-        // On x86_64, PTRACE_GETREGSET returns EIO on the Android
-        // emulator (the kernel exposes PTRACE_GETREGSET only for
-        // ptrace requests that the kernel actually implements for the
-        // traced task's architecture; the emulator's bionic/kernel
-        // combination evidently does not). Fall back to the legacy
-        // PTRACE_GETREGS, which works on x86_64 for both 64-bit and
-        // 32-bit (compat) children. On aarch64 PTRACE_GETREGS does
-        // not exist at all, so we DON'T fall back there — the
-        // aarch64 path MUST go through PTRACE_GETREGSET (which works
-        // on real aarch64 hardware).
-        #[cfg(target_arch = "x86_64")]
-        if e.raw_os_error() == Some(libc::EIO) {
-            return ptrace_getregs_legacy(pid, regs);
-        }
-        return Err(e);
+        return Err(std::io::Error::last_os_error());
     }
     Ok(iov.iov_len)
 }
 
-/// x86_64-only fallback for [`ptrace_getregs`]: read registers via the
-/// legacy `PTRACE_GETREGS` request (number 12).
+/// x86_64 implementation of [`ptrace_getregs`] — see that function's
+/// documentation for the layout contract.
 ///
-/// `PTRACE_GETREGS` is the historical x86_64 register-fetch request.
-/// It does NOT expose `iov_len` — the kernel always writes
-/// `sizeof(user_regs_struct)` (= 216) bytes into the data pointer —
-/// so we return `sizeof(Regs)` as the "iov_len" and rely on
-/// [`detect_child_is_64bit`] for bitness detection.
+/// `PTRACE_GETREGS` (request number from the `libc` crate — 12) always
+/// fills the full 216-byte `user_regs_struct`, for 64-bit AND 32-bit
+/// (i386 compat) children alike: for a compat child the kernel
+/// zero-extends each 32-bit register value into the corresponding
+/// 64-bit slot, which is exactly the unified view the `ABI_X86_64` /
+/// `ABI_X86_32` register-index schemes describe. (`PTRACE_GETREGSET`
+/// on an i386 child would instead return the 68-byte
+/// `user_regs_struct32` — a different field layout this codebase does
+/// not operate on.)
 ///
-/// For a 32-bit (i386 compat) child the kernel zero-extends each
-/// 32-bit register value into the corresponding 64-bit slot of
-/// `user_regs_struct` (rbx ← ebx, rcx ← ecx, …), so the indices in
-/// [`ABI_X86_32`] work correctly against this 64-bit view.
-///
-/// We invoke the kernel via `libc::syscall(SYS_ptrace, …)` for the
-/// same reason [`ptrace_getregs`] does — to bypass bionic's variadic
-/// `ptrace()` wrapper.
+/// This request exposes no `iov_len`; we return `sizeof(Regs)` so the
+/// matching `ptrace_setregs` has a sane length to forward (the x86_64
+/// SETREGS path ignores it — the kernel always transfers exactly
+/// `sizeof(user_regs_struct)` bytes).
 #[cfg(target_arch = "x86_64")]
-fn ptrace_getregs_legacy(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
-    // PTRACE_GETREGS = 12 (see <linux/ptrace.h>). Not exposed by the
-    // `libc` crate on every target, so use the literal value with a
-    // named binding for clarity.
-    const PTRACE_GETREGS: libc::c_long = 12;
-
-    // PTRACE_GETREGS signature:
-    //   ptrace(PTRACE_GETREGS, pid, /*addr*/ 0, /*data*/ void *)
-    // The kernel writes sizeof(user_regs_struct) bytes into `data`.
-    // We pass `regs` directly — `Regs` IS `user_regs_struct` on
-    // x86_64 (see the type alias near the top of this file).
+fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
+    // ptrace(PTRACE_GETREGS, pid, /*addr*/ 0, /*data*/ void *): the
+    // kernel writes sizeof(user_regs_struct) bytes into `data`. `Regs`
+    // IS `user_regs_struct` on x86_64 (see the type alias near the top
+    // of this file).
     let r = unsafe {
         libc::syscall(
             libc::SYS_ptrace,
-            PTRACE_GETREGS,
+            libc::PTRACE_GETREGS as libc::c_long,
             pid as libc::c_long,
             0,
             regs as *mut Regs as *mut libc::c_void,
@@ -2204,33 +2174,59 @@ fn ptrace_getregs_legacy(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<u
     if r == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    // No iov_len on this path — return sizeof(Regs) (= 216 on x86_64)
-    // so the matching `ptrace_setregs` call has a sane value to
-    // forward. The SETREGS fallback path ignores this argument
-    // anyway.
     Ok(std::mem::size_of::<Regs>())
 }
 
-/// Set the child's registers.
+/// Set the child's registers from the TRACER-SIDE 64-bit view (`Regs`).
 ///
-/// Mirrors [`ptrace_getregs`]:
-///   - On **aarch64** we always use `PTRACE_SETREGSET` with `NT_PRSTATUS`.
-///   - On **x86_64** we try `PTRACE_SETREGSET` first, and on `EIO` (the
-///     same failure that triggers the GETREGS fallback in `ptrace_getregs`)
-///     we fall back to the legacy `PTRACE_SETREGS` request.
+/// Mirrors [`ptrace_getregs`] request-for-request (GETREGSET ↔ SETREGSET
+/// on aarch64, GETREGS ↔ SETREGS on x86_64) — symmetry is mandatory:
+/// the layout we read is the layout we must write, otherwise the kernel
+/// would reject the write and we would silently drop register updates
+/// (like a syscall return-value rewrite).
 ///
 /// `iov_len` is the value returned by the matching `ptrace_getregs`
-/// call. On the SETREGS fallback path it is ignored (the kernel always
-/// reads exactly `sizeof(user_regs_struct)` bytes from the data
-/// pointer); on the SETREGSET path it is forwarded to the kernel as
-/// the iovec length.
-///
-/// The GET and SET paths are intentionally symmetric: if GETREGSET
-/// returned EIO for this child then SETREGSET almost certainly will
-/// too, so we fall back to SETREGS in lockstep.
+/// call. On the aarch64 SETREGSET path it is forwarded to the kernel
+/// as the iovec length (272 = `sizeof(user_pt_regs)`); on the x86_64
+/// SETREGS path the kernel always transfers exactly
+/// `sizeof(user_regs_struct)` bytes and the value is ignored.
+#[cfg(target_arch = "aarch64")]
 fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Result<()> {
-    use ptrace_regset::{NT_PRSTATUS, PTRACE_SETREGSET};
+    // libc::iovec has `iov_base: *mut c_void`; for SETREGSET we only
+    // need `*const c_void` (the kernel reads from us), but the struct
+    // layout is identical and the cast is safe — the kernel does not
+    // mutate the regset source buffer for SETREGSET.
+    let iov = libc::iovec {
+        iov_base: regs as *const _ as *mut libc::c_void,
+        iov_len,
+    };
 
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            libc::PTRACE_SETREGSET as libc::c_long,
+            pid as libc::c_long,
+            NT_PRSTATUS,
+            &iov as *const libc::iovec,
+        )
+    };
+    if r == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// x86_64 implementation of [`ptrace_setregs`] — the legacy
+/// `PTRACE_SETREGS` (request number from the `libc` crate — 13).
+/// The kernel reads `sizeof(user_regs_struct)` (= 216) bytes from
+/// `regs`; for a 32-bit compat child it truncates each 64-bit slot to
+/// its low 32 bits when populating the child's `user_regs_struct32`.
+#[cfg(target_arch = "x86_64")]
+fn ptrace_setregs(
+    pid: libc::pid_t,
+    regs: &Regs,
+    _iov_len: usize,
+) -> std::io::Result<()> {
     // 6-Z135: RAX AUDIT — the register-corruption hunt. Run 32803104772
     // proved the guest linker saw pread64→1 / fstatfs→ENOENT while the
     // tracer's EXIT logs showed the correct kernel returns: something
@@ -2239,7 +2235,6 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Res
     // child's CURRENT syscall number for context), rate-capped, so the
     // next run names the exact corrupting call site. Thread-local to
     // avoid touching the 100+ call sites; cheap (one compare per call).
-    #[cfg(target_arch = "x86_64")]
     {
         use std::cell::Cell;
         thread_local! {
@@ -2272,61 +2267,12 @@ fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Res
         }
     }
 
-    // libc::iovec has `iov_base: *mut c_void`; for SETREGSET we only
-    // need `*const c_void` (the kernel reads from us), but the struct
-    // layout is identical and the cast is safe — the kernel does not
-    // mutate the regset source buffer for SETREGSET.
-    let iov = libc::iovec {
-        iov_base: regs as *const _ as *mut libc::c_void,
-        iov_len,
-    };
-
+    // ptrace(PTRACE_SETREGS, pid, /*addr*/ 0, /*data*/ void *): the
+    // kernel reads sizeof(user_regs_struct) bytes from `data`.
     let r = unsafe {
         libc::syscall(
             libc::SYS_ptrace,
-            PTRACE_SETREGSET,
-            pid as libc::c_long,
-            NT_PRSTATUS,
-            &iov as *const libc::iovec,
-        )
-    };
-    if r == -1 {
-        let e = std::io::Error::last_os_error();
-        // Same fallback as in `ptrace_getregs`: on x86_64 the
-        // PTRACE_*REGSET requests return EIO on the Android emulator,
-        // so use the legacy PTRACE_SETREGS (request 13) which writes
-        // sizeof(user_regs_struct) bytes from the data pointer. We
-        // MUST stay symmetric with `ptrace_getregs` — if we read via
-        // GETREGS we must write via SETREGS, otherwise the kernel
-        // would reject the write (and we'd silently drop register
-        // updates like the SIGSYS "rewrite to getpid" return value).
-        #[cfg(target_arch = "x86_64")]
-        if e.raw_os_error() == Some(libc::EIO) {
-            return ptrace_setregs_legacy(pid, regs);
-        }
-        return Err(e);
-    }
-    Ok(())
-}
-
-/// x86_64-only fallback for [`ptrace_setregs`]: write registers via
-/// the legacy `PTRACE_SETREGS` request (number 13).
-///
-/// Symmetric with [`ptrace_getregs_legacy`] — see the comment on that
-/// function for why we go through `libc::syscall` directly. The kernel
-/// reads `sizeof(user_regs_struct)` (= 216) bytes from `regs` and
-/// writes them to the child; for a 32-bit compat child the kernel
-/// truncates each 64-bit slot to its low 32 bits when populating the
-/// child's `user_regs_struct32`.
-#[cfg(target_arch = "x86_64")]
-fn ptrace_setregs_legacy(pid: libc::pid_t, regs: &Regs) -> std::io::Result<()> {
-    // PTRACE_SETREGS = 13 (see <linux/ptrace.h>).
-    const PTRACE_SETREGS: libc::c_long = 13;
-
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_ptrace,
-            PTRACE_SETREGS,
+            libc::PTRACE_SETREGS as libc::c_long,
             pid as libc::c_long,
             0,
             regs as *const Regs as *mut libc::c_void,

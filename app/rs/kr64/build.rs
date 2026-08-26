@@ -26,6 +26,16 @@ fn main() {
     // Re-run if interp.c changes.
     println!("cargo:rerun-if-changed=interp.c");
 
+    // Compile uapi_guard.c FIRST — it _Static_asserts, at build time
+    // and for every target triple, that the ptrace/ELF constants used
+    // by src/ptrace_emu.rs (sourced from the `libc` crate, plus the
+    // single documented NT_PRSTATUS constant) match the target
+    // toolchain's own <sys/ptrace.h> / <elf.h>. A disagreement fails
+    // the build instead of corrupting guest register access at
+    // runtime.
+    println!("cargo:rerun-if-changed=uapi_guard.c");
+    cc::Build::new().file("uapi_guard.c").compile("uapi_guard");
+
     // Compile interp.c — produces a static archive `libinterp.a` which
     // the linker will pull the `.interp` section out of. The
     // `--undefined=interp` link flag below forces the section to be
