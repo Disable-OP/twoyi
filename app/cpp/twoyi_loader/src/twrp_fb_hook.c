@@ -2082,12 +2082,40 @@ int ioctl(int fd, int request, ...) {
 // preserves it for level-0 return addresses.
 // ---------------------------------------------------------------------------
 
+// Dump up to ~32 KiB of /proc/self/maps to stderr — gives the exact load
+// bases needed to symbolize the printed caller PCs (the binaries are
+// stripped; module+offset + disasm context identifies the call site).
+// Uses only raw syscalls; runs INSIDE the child, where /proc/self/maps is
+// always readable (the tracer's /proc/<pid>/maps view was ENOENT — the
+// 6-Z167 finding — but the child's own /proc/self never is).
+static void fatal_dump_maps(void) {
+    write_str(2, "[twrp_fb_hook] --- /proc/self/maps at fatal ---\n");
+    int mfd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
+                                (long)"/proc/self/maps", 0 /*O_RDONLY*/, 0);
+    if (mfd < 0) {
+        write_str(2, "(open /proc/self/maps failed)\n");
+        return;
+    }
+    static char buf[2048];
+    long total = 0;
+    for (;;) {
+        long n = raw_syscall3(SYS_read, mfd, (long)buf, (long)sizeof(buf));
+        if (n <= 0) break;
+        raw_syscall3(SYS_write, 2, (long)buf, n);
+        total += n;
+        if (total > 32768) break;
+    }
+    raw_syscall1(SYS_close, mfd);
+    write_str(2, "[twrp_fb_hook] --- end maps ---\n");
+}
+
 // Re-raise SIGABRT with default semantics, without touching errno/TLS:
 // rt_sigaction would need a kernel sigaction struct (restorer fields) —
 // instead we tgkill directly. If the process installed a SIGABRT handler
 // (TWRP's crash handler does), it fires — same as bionic's first
 // raise(). If it returns, pause forever (abort must not return).
 static void fatal_reraise(void) {
+    fatal_dump_maps();
     long pid = raw_syscall1(SYS_getpid, 0);
     long tid = raw_syscall1(SYS_gettid, 0);
     for (;;) {
