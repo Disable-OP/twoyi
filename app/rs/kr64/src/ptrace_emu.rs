@@ -13652,21 +13652,23 @@ pub fn run_ptrace_loop(
                         if let Some((epoll_nr, ev_addr, maxevents)) =
                             pending_epoll_readback.remove(&pid)
                         {
-                            if syscall_num == epoll_nr && ret > 0 && maxevents > 0 && maxevents <= 1024 {
+                            if syscall_num == epoll_nr
+                                && ret > 0
+                                && maxevents > 0
+                                && maxevents <= 1024
+                            {
                                 spin_diag_epoll_count = spin_diag_epoll_count.saturating_add(1);
                                 if spin_diag_epoll_count <= 24 {
                                     // i386 (execve=11) uses the packed
                                     // 12-byte layout; the 64-bit ABIs use 16.
-                                    let evsz =
-                                        if abi.execve == 11 { 12usize } else { 16usize };
+                                    let evsz = if abi.execve == 11 { 12usize } else { 16usize };
                                     let mut decoded = String::new();
                                     if let Some(bytes) = read_child_bytes(pid, ev_addr, evsz) {
                                         if bytes.len() >= 8 {
                                             let events = u32::from_ne_bytes([
                                                 bytes[0], bytes[1], bytes[2], bytes[3],
                                             ]);
-                                            decoded =
-                                                format!("events={:#x}", events);
+                                            decoded = format!("events={:#x}", events);
                                             if bytes.len() >= evsz {
                                                 let data_off = evsz - 8;
                                                 let mut data_arr = [0u8; 8];
