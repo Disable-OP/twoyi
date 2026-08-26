@@ -12097,8 +12097,7 @@ pub fn run_ptrace_loop(
                                 // the string.
                                 let has_dirfd = syscall_num == abi.newfstatat
                                     || syscall_num == abi.statx
-                                    || (abi.fstatat64_nr != -1
-                                        && syscall_num == abi.fstatat64_nr);
+                                    || (abi.fstatat64_nr != -1 && syscall_num == abi.fstatat64_nr);
                                 if has_dirfd {
                                     set_syscall_arg(&mut regs, abi.reg_arg1, (-100i64) as u64);
                                 }
