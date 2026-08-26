@@ -203,6 +203,7 @@ const _: () = assert!(std::mem::size_of::<Aarch64Regs>() == 272);
 /// `_Static_assert`s this value against the target toolchain's real
 /// `<elf.h>` on every build, so a divergent toolchain would fail the
 /// build instead of silently corrupting register access.
+#[cfg(target_arch = "aarch64")]
 const NT_PRSTATUS: libc::c_long = 1;
 
 // ── Child ABI: runtime syscall numbers + register layout ───────────
