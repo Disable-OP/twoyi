@@ -10665,3 +10665,17 @@ Fix (6-Z163d): probe env strings are now PREFIX ASSIGNMENTS on the actual comman
 
 Stage Summary:
 - Property service: REAL (bound at translated path). Spin: DEAD. Remaining blocker: in-jail recovery exit 1 — the fixed probe will finally tell the truth next run.
+
+---
+Task ID: 6-Z163e
+Agent: main
+Task: Honest probes round 2 — timeout env poisoning + the /tmp/recovery.log capture
+
+Evidence (run 32994748383, SHA 664923b — honest-env probes):
+- THE LDD PROBE IS THE JACKPOT: the old linker ignores LD_TRACE_LOADED_OBJECTS and EXECUTES recovery — TWRP recovery LINKED AND BOOTED outside the jail: full DataManager diagnostics (device id, SDCARD flags, CPU temp, brightness, LANG) then exit 255 right after "I:LANG: en" (resource/graphics stage next). RECOVERY IS A WORKING BINARY in a proper env.
+- The env-prefix probes all failed for a NEW reason: the prefix env applied to /system/bin/timeout FIRST — toybox resolved against the 2016 ramdisk libc and died on the missing `getentropy` symbol ("CANNOT LINK /system/bin/timeout"). The guest env must apply ONLY to the target binary.
+- Jail status this run: spin=0, property socket bound FOR REAL (6-Z163), adbd 9x rebinds.
+
+Fix (6-Z163e):
+- All probes: `timeout 8 env VAR=... BIN` — timeout keeps a CLEAN env, env(1) applies the guest env to the target only.
+- Added /tmp/recovery.log capture after the "ldd" run (TWRP mirrors its full log there; redroid /tmp is probe-writable; pulled + cleaned).

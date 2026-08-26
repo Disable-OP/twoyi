@@ -1434,7 +1434,7 @@ def main():
             label = f"{base}{variant}"
             cmd = (
                 f"run-as {PACKAGE} sh -c 'ls -la {cache_path}; "
-                f"TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {env_str} {TIMEOUT} 8 {cache_path} 2>&1; "
+                f"{TIMEOUT} 8 env TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {env_str} {cache_path} 2>&1; "
                 f"echo PROBE_EXIT_CODE:$?'"
             )
             out = adb_shell(cmd, timeout=30)
@@ -1465,8 +1465,7 @@ def main():
     # library search decisions (which dirs it tried, what failed) when
     # LD_DEBUG is set. Harmless if unsupported (env is just ignored).
     ld_debug_out = adb_shell(
-        f"run-as {PACKAGE} sh -c 'LD_DEBUG=1 TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {preload_env} "
-        f"{TIMEOUT} 8 "
+        f"run-as {PACKAGE} sh -c '{TIMEOUT} 8 env LD_DEBUG=1 TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {preload_env} "
         f"/data/user/0/{PACKAGE}/cache/twoyi_stage/_sbin_recovery_* 2>&1 | head -60; "
         f"echo LDDEBUG_EXIT:$?'",
         timeout=30)
@@ -1489,15 +1488,26 @@ def main():
     staged_recovery = staged_recovery.splitlines()[0].strip() if staged_recovery.strip() else ""
     if staged_recovery:
         ldd_out = adb_shell(
-            f"run-as {PACKAGE} sh -c 'LD_TRACE_LOADED_OBJECTS=1 TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {base_env} "
+            f"run-as {PACKAGE} sh -c 'env LD_TRACE_LOADED_OBJECTS=1 TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {base_env} "
             f"{staged_recovery} 2>&1; echo LDD_EXIT:$?'",
             timeout=30)
         if ldd_out:
             with open(os.path.join(ART, "recovery-ldd.txt"), "w", errors="replace") as f:
                 f.write(ldd_out)
             print(f"  pulled recovery ldd trace ({len(ldd_out)} bytes)")
+        # The old linker ignores LD_TRACE_LOADED_OBJECTS and EXECUTES the
+        # binary — so the "ldd" trace above is actually TWRP recovery's
+        # own boot log, and TWRP also mirrors it to /tmp/recovery.log
+        # (redroid's /tmp is writable from the probe context). Pull that
+        # too — it is LONGER than stdout (LOGE-only lines go there).
+        reclog = adb_shell(f"run-as {PACKAGE} sh -c 'cat /tmp/recovery.log 2>&1; rm -f /tmp/recovery.log'", timeout=30)
+        if reclog:
+            with open(os.path.join(ART, "recovery-probe-tmp-log.txt"), "w",
+                      errors="replace") as f:
+                f.write(reclog)
+            print(f"  pulled /tmp/recovery.log from probe run ({len(reclog)} bytes)")
         direct_out = adb_shell(
-            f"run-as {PACKAGE} sh -c 'TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {base_env} {TIMEOUT} 8 "
+            f"run-as {PACKAGE} sh -c '{TIMEOUT} 8 env TWOYI_ROOTFS=/data/user/0/{PACKAGE}/rootfs {base_env} "
             f"/data/user/0/{PACKAGE}/rootfs/sbin/linker64 {staged_recovery} 2>&1 | head -40; "
             f"echo DIRECT_LINKER_EXIT:$?'",
             timeout=30)
