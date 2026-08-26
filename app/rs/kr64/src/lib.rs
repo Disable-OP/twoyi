@@ -6384,7 +6384,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 }
                 Err(e) => warning!(
                     "[KR64] PARENT: 6-Z161: could not create {} : {}",
-                    file_path, e
+                    file_path,
+                    e
                 ),
             }
         }
