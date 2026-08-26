@@ -10607,3 +10607,21 @@ but called the loop-local `log` closure (E0425, run 32988374421 build job
 98239830879). The helper now RETURNS Option<String>; both call sites do
 `if let Some(msg) = ... { log(&msg); }` (if-let, not .map, to stay
 clippy -D warnings clean).
+
+---
+Task ID: 6-Z163
+Agent: main
+Task: Kill the epoll_pwait/accept4 spin at its root — REAL bind for AF_UNIX sockets via sockaddr rewrite
+
+Evidence (run 32988644183, SHA dc3962a — 6-Z161 DIAG + 6-Z162 probes):
+- The spinner is INIT (pid 2599), fd 8 = socket:[46808], epoll events=0x10 (EPOLLHUP), accept4(fd 8) → -EINVAL. Syscall #328-330: socket()→8, unlinkat(/dev/socket/property_service), bind → EACCES against the HOST /dev/socket (sockaddr paths are NEVER translated — they live inside structs) → 6-Z101 faked the failure to 0 → fd 8 never bound/listened → EPOLLHUP on every epoll_pwait forever + accept4 EINVAL. Property service dead. CONFIRMED the 6-Z161 hypothesis exactly.
+- /dev/urandom ELOOP: GONE (the 6-Z161 entropy-file fix worked — zero urandom errors in the new kmsg).
+- init's OWN recovery service (pid from StartPropertyService run): "Starting service 'recovery'..." with NO exit line — the 6-Z161 LD_LIBRARY_PATH+=/system/lib64 fix appears to have kept it ALIVE (previous runs: instant exit 1 + restart loop). adbd still exits 1 (probe next run will say why — the PATH bug hid `timeout`, now /system/bin/timeout absolute).
+- Screen still black — render pipeline (fb0 + fb-hook bridge) is the next frontier AFTER the property socket works.
+
+Fix (6-Z163):
+- At bind() ENTRY (TWRP mode, direct-bind ABIs — aarch64/x86_64, socketcall_nr==-1): if the sockaddr is AF_UNIX with an absolute filesystem sun_path, rewrite it in the child's scratch area to translate_path(rootfs, path), mkdir -p the parent, unlink stale socket file, set arg2/arg3 (fresh-regs discipline), and let the kernel bind FOR REAL. Real bind → real listen → epoll blocks → accept4 waits → spin GONE + property service ALIVE.
+- No EXIT-side change needed: the 6-Z101 fake only fires on ret < 0 (a successful real bind returns 0). If the real bind still fails, the fake remains as fallback = old behavior, no worse.
+- The 6-Z110 connect gate/client-emulation auto-disengages for rewritten binds (its exact-path matcher won't match the prefixed translated path).
+- New pure helpers unix_fs_sun_path + build_translated_unix_sockaddr + write_child_blob; 3 unit tests (families/abstract/relative rejection, layout, 108-byte sun_path cap).
+- ui-navigate.py: probe `timeout` now invoked by host-absolute /system/bin/timeout (run 32988644183 had every probe 127 on "timeout: not found" — the rootfs PATH shadowed redroid's toybox).

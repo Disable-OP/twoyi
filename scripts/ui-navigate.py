@@ -1404,12 +1404,17 @@ def main():
         "LD_LIBRARY_PATH=/data/user/0/{pkg}/rootfs/sbin:"
         "/data/user/0/{pkg}/rootfs/system/lib:"
         "/data/user/0/{pkg}/rootfs/system/lib64; "
-        "PATH=/data/user/0/{pkg}/rootfs/sbin:/data/user/0/{pkg}/rootfs/system/bin; "
         "TWOYI_ROOTFS=/data/user/0/{pkg}/rootfs"
     ).format(pkg=PACKAGE)
     preload_env = (
         "LD_PRELOAD=/data/user/0/" + PACKAGE + "/rootfs/sbin/libtwrp_fb_hook.so; " + base_env
     )
+    # 6-Z163 fixup: `timeout` must be invoked by its HOST-absolute path —
+    # the probe env deliberately points PATH at the ROOTFS dirs (so the
+    # probe resolves tools the way the jailed service would), which hid
+    # redroid's own /system/bin/timeout on run 32988644183 ("sh: timeout:
+    # inaccessible or not found" → PROBE_EXIT_CODE:127 on every probe).
+    TIMEOUT = "/system/bin/timeout"
     # Probe targets: every staged exe whose guest path matches the dying
     # services (recovery, adbd, ueventd...). The nopreload differential
     # variant rules the fb-hook in/out as the loader failure source.
@@ -1421,7 +1426,7 @@ def main():
             label = f"{base}{variant}"
             cmd = (
                 f"run-as {PACKAGE} sh -c 'ls -la {cache_path}; "
-                f"{env_str} timeout 8 {cache_path} 2>&1; "
+                f"{env_str} {TIMEOUT} 8 {cache_path} 2>&1; "
                 f"echo PROBE_EXIT_CODE:$?'"
             )
             out = adb_shell(cmd, timeout=30)
