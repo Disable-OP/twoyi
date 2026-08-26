@@ -27,7 +27,11 @@ import os
 
 PACKAGE = os.environ.get("TWOYI_PACKAGE", "io.twoyi")
 
-ADB = ["adb", "-s", "emulator-5554"]
+# ADB serial is configurable via env var so the same script works for:
+#   - x86_64 Android emulator (serial "emulator-5554")
+#   - redroid Docker container on arm64 runner (serial "localhost:5555")
+# Default keeps the x86_64 path working without any env changes.
+ADB = ["adb", "-s", os.environ.get("ADB_SERIAL", "emulator-5554")]
 ART = "/tmp/ui-e2e-artifacts"
 os.makedirs(ART, exist_ok=True)
 
