@@ -4052,6 +4052,20 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     loop {
         let word = unsafe { libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64 + offset, 0) };
         if word == -1 {
+            // ── 6-Z167: process_vm_readv fallback ──
+            // Run 33002423676: PEEK returned -1 on MAPPED, kernel-readable
+            // child addresses (the dri/fb0 loop buffer 0xffffc35f6810 — the
+            // kernel itself opened those paths fine), leaving openat ENTRYs
+            // UNTRANSLATED → host /dev/graphics/fb0 + /etc/recovery.fstab
+            // ENOENT → TWRP failed out on fstab. process_vm_readv is a
+            // different kernel path (access_process_vm with iovecs) and may
+            // succeed where PEEK fails. Only engaged on the FIRST word so
+            // mid-string page faults keep their existing break semantics.
+            if offset == 0 && result.is_empty() {
+                if let Some(s) = read_child_string_pvm(pid, addr) {
+                    return Some(s);
+                }
+            }
             break;
         }
         let bytes = word.to_ne_bytes();
@@ -4071,6 +4085,95 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     } else {
         Some(String::from_utf8_lossy(&result).into_owned())
     }
+}
+
+// process_vm_readv(2) — declared locally so the build does not depend on
+// the libc crate exposing it for every target triple (present on
+// linux/android for all arches we ship; ENOSYS at runtime degrades to the
+// old PEEK-only behaviour).
+extern "C" {
+    fn process_vm_readv(
+        pid: libc::pid_t,
+        local_iov: *mut libc::iovec,
+        liovcnt: libc::c_ulong,
+        remote_iov: *const libc::iovec,
+        riovcnt: libc::c_ulong,
+        flags: libc::c_ulong,
+    ) -> libc::ssize_t;
+}
+
+/// 6-Z167: read a NUL-terminated C string from the child via
+/// process_vm_readv (256-byte chunks, 4096 cap). Returns None when the
+/// very first chunk fails — callers fall back to the legacy PEEK result.
+fn read_child_string_pvm(pid: libc::pid_t, addr: u64) -> Option<String> {
+    let mut result = Vec::new();
+    let mut off = 0usize;
+    while result.len() <= 4096 {
+        let mut buf = [0u8; 256];
+        let local = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let remote = libc::iovec {
+            iov_base: (addr as usize + off) as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let n = unsafe { process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        if n <= 0 {
+            break;
+        }
+        let n = n as usize;
+        for &b in &buf[..n] {
+            if b == 0 {
+                return Some(String::from_utf8_lossy(&result).into_owned());
+            }
+            result.push(b);
+        }
+        off += n;
+        // Short read = end of the mapping (no more readable bytes).
+        if n < buf.len() {
+            break;
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&result).into_owned())
+    }
+}
+
+/// 6-Z167: errno of a single PEEK attempt (only meaningful when the PEEK
+/// returned -1). Named helper so the 6-Z164 open ENTRY path-read-failure
+/// DIAG can name WHY the read failed (EIO vs ESRCH vs EINVAL…).
+fn peek_word_errno(pid: libc::pid_t, addr: u64) -> i32 {
+    unsafe {
+        libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64, 0);
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+    }
+}
+
+/// 6-Z167: given the child's /proc/<pid>/maps content, return the mapping
+/// line containing `addr` (plus the preceding mapping for context) or the
+/// two neighbours when `addr` falls in a gap. Pure helper (content in) so
+/// the mapping-bracket logic is unit-testable.
+fn maps_bracket_in(content: &str, addr: u64) -> String {
+    let mut prev: Option<&str> = None;
+    for line in content.lines() {
+        if let Some((range, _rest)) = line.split_once(' ') {
+            if let Some((s, e)) = range.split_once('-') {
+                if let (Ok(s), Ok(e)) = (u64::from_str_radix(s, 16), u64::from_str_radix(e, 16)) {
+                    if addr < e {
+                        return match prev {
+                            Some(p) => format!("{}\n{}", p, line),
+                            None => line.to_string(),
+                        };
+                    }
+                    prev = Some(line);
+                }
+            }
+        }
+    }
+    "(address beyond the last mapping)".to_string()
 }
 
 /// Read exactly `len` bytes from the traced child's memory starting at
@@ -8229,6 +8332,10 @@ pub fn run_ptrace_loop(
     // jailed /tmp/recovery.log fd=-1 (redroid /tmp exists but is not
     // app-writable → EACCES → fd=-1).
     let mut open_read_fail_diag_count: u64 = 0;
+    // 6-Z167: how many /proc/<pid>/maps brackets we already dumped for the
+    // 6-Z164 path-read-failure DIAG (first 3 — enough to name the region
+    // class without flooding the log across TWRP's 10 service restarts).
+    let mut peek_maps_dumped: u64 = 0;
     // 6-Z164: ORIGINAL (pre-translation) open path per pid, set at the
     // open ENTRY arm, consumed at the matching EXIT alongside the
     // translated path so the /tmp DIAGs can distinguish "open was never
@@ -11765,13 +11872,34 @@ pub fn run_ptrace_loop(
                                 open_read_fail_diag_count =
                                     open_read_fail_diag_count.saturating_add(1);
                                 if open_read_fail_diag_count <= 12 {
+                                    let peek_err = peek_word_errno(pid, path_addr);
                                     log(&format!(
-                                        "6-Z164: open ENTRY path-read FAILED pid={} nr={} path_addr={:#x} — open runs UNTRANSLATED against the host (occurrence {})",
+                                        "6-Z164: open ENTRY path-read FAILED pid={} nr={} path_addr={:#x} peek_errno={} — open runs UNTRANSLATED against the host (occurrence {})",
                                         pid,
                                         syscall_num,
                                         path_addr,
+                                        peek_err,
                                         open_read_fail_diag_count
                                     ));
+                                    // 6-Z167: name the mapping class for the
+                                    // first 3 failing addresses (stack?
+                                    // hook .rodata? heap?) — settles WHY PEEK
+                                    // EIOs on kernel-readable pages.
+                                    if peek_maps_dumped < 3 {
+                                        peek_maps_dumped = peek_maps_dumped.saturating_add(1);
+                                        match std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                        {
+                                            Ok(content) => log(&format!(
+                                                "6-Z167: maps bracket for {:#x}:\n{}",
+                                                path_addr,
+                                                maps_bracket_in(&content, path_addr)
+                                            )),
+                                            Err(e) => log(&format!(
+                                                "6-Z167: maps read FAILED for pid={}: {}",
+                                                pid, e
+                                            )),
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -18087,6 +18215,34 @@ mod tests {
         // Missing args → None (bind mounts with NULL fstype).
         assert_eq!(pseudo_mount_target("/r", Some("/mnt"), None), None);
         assert_eq!(pseudo_mount_target("/r", None, Some("tmpfs")), None);
+    }
+
+    #[test]
+    fn maps_bracket_in_returns_containing_and_previous_mapping() {
+        let content = "aaaa0000-aaaa1000 r--p 00000000 00:01 1  /first.so\n\
+bbbb0000-bbbb1000 r--p 00000000 00:01 2  /second.so\n\
+cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
+        // Inside the second mapping → bracket = first + second.
+        let out = maps_bracket_in(content, 0xbbbb0500);
+        assert!(out.contains("/first.so"));
+        assert!(out.contains("/second.so"));
+        assert!(!out.contains("/third.so"));
+        // In the GAP between second and third → both neighbours.
+        let gap = maps_bracket_in(content, 0xbbbb8000);
+        assert!(gap.contains("/second.so"));
+        assert!(gap.contains("/third.so"));
+    }
+
+    #[test]
+    fn maps_bracket_in_beyond_last_mapping_returns_sentinel() {
+        let content = "aaaa0000-aaaa1000 r--p 00000000 00:01 1  /only.so\n";
+        assert_eq!(
+            maps_bracket_in(content, 0xffffffffffff),
+            "(address beyond the last mapping)"
+        );
+        // First mapping hit → no previous neighbour, just the line.
+        let out = maps_bracket_in(content, 0xaaaa0008);
+        assert!(out.contains("/only.so"));
     }
 
     #[test]

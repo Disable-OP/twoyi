@@ -344,49 +344,81 @@ static int is_fb_path(const char *path) {
 }
 
 // ---------------------------------------------------------------------------
-// 6-Z165: /tmp absolute-open failure → cwd-relative retry.
+// 6-Z165/6-Z166: absolute-open failure → rootfs-resolvable retry.
 //
-// Run 32996812991 (arm64 jail): TWRP's logger open("/tmp/recovery.log",
-// O_CREAT|O_WRONLY|O_APPEND) printed fd=-1 INSIDE the jail although
-// {rootfs}/tmp exists and is app-owned — the ABSOLUTE /tmp path never
-// resolved into the rootfs (mechanism under investigation; the 6-Z164
-// tracer DIAGs will name it next run). The guest's cwd IS the rootfs, so
-// a RELATIVE "tmp/..." open resolves to {rootfs}/tmp/... through the
-// kernel WITHOUT needing any absolute-path translation. Retrying once
-// with path+1 hands TWRP a working fd so its logger (and every later
-// /tmp file) materialises inside the rootfs where the E2E evidence pull
-// finds it — and recovery.log then carries TWRP's own account of
-// whatever kills it next.
+// Run 33002423676 (arm64 jail): the 6-Z164 tracer DIAG named the mechanism
+// — read_child_string PEEK-fails on SOME child addresses (the dri/fb0 loop
+// buffer 0xffffc35f6810, 11+ occurrences), so those openat ENTRYs ran
+// UNTRANSLATED against the host: /dev/graphics/fb0 and /etc/recovery.fstab
+// → host ENOENT → TWRP "Failing out of recovery due to problem with fstab".
+// Meanwhile {rootfs}/dev/graphics/fb0 IS pre-created (3686400 bytes) and
+// {rootfs}/etc/recovery.fstab exists — the files were always THERE.
+//
+// The retry uses TWO path forms that need NO tracer translation:
+//   1. "{TWOYI_ROOTFS}{path}" — {rootfs} lives under /data/…, which the
+//      tracer's translate_path PASSES THROUGH untranslated, so the
+//      prefixed path is correct for the kernel in EVERY case.
+//   2. path+1 (relative) — the guest's cwd IS the rootfs (fallback when
+//      the TWOYI_ROOTFS env is unavailable to the weak getenv).
 // ---------------------------------------------------------------------------
-static int is_tmp_path(const char *path) {
-    if (!path) return 0;
-    if (path[0] != '/' || path[1] != 't' || path[2] != 'm' || path[3] != 'p') return 0;
-    return path[4] == '\0' || path[4] == '/';
+
+// Best jail-resolvable form for an absolute guest path: the
+// {TWOYI_ROOTFS}-prefixed absolute path when the env is readable,
+// otherwise path+1 (relative; cwd == rootfs). Returns NULL when the path
+// is not absolute. The result may point at a STATIC BUFFER (overwritten
+// per call) — callers must consume it before the next call.
+static char *rootfs_path_form(const char *path) {
+    static char buf[512];
+    if (!path || path[0] != '/') return NULL;
+    if (getenv) {
+        const char *root = getenv("TWOYI_ROOTFS");
+        if (root && root[0] == '/') {
+            int i = 0;
+            while (root[i] && i < 400) { buf[i] = root[i]; i++; }
+            int j = 0;
+            while (path[j] && i < 510) { buf[i] = (char)path[j]; i++; j++; }
+            buf[i] = '\0';
+            return buf;
+        }
+    }
+    return (char *)(path + 1);
 }
 
-// Shared retry: absolute "/tmp..." open FAILED → (a) probe the same
-// absolute path once WITHOUT O_CREAT (no side effects) so the log shows
-// the raw -errno the corrupted interleaved tracer log could not, then
-// (b) retry via raw syscall with path+1 (relative, cwd=rootfs).
-// Returns the working fd, or the original abs_fd when the retry also
-// fails. Only the raw returns are logged — no libc errno dependency
-// (-nostdlib: the hook must not read/write the TLS errno slot).
-static int tmp_retry_open(const char *path, int abs_fd, int flags, int mode) {
-    if (abs_fd >= 0 || !is_tmp_path(path)) return abs_fd;
+// Shared retry: ABSOLUTE open FAILED → (a) probe the same path once WITHOUT
+// O_CREAT (no side effects) so the log shows the raw -errno, then (b) retry
+// with the rootfs-resolvable form (prefix first, relative as fallback).
+// Returns the working fd, or the original abs_fd when every attempt fails.
+// Only raw returns are logged — no libc errno dependency (-nostdlib: the
+// hook must not read/write the TLS errno slot).
+static int rootfs_retry_open(const char *path, int abs_fd, int flags, int mode) {
+    if (abs_fd >= 0 || !path || path[0] != '/') return abs_fd;
     long probe = raw_syscall4(SYS_openat, AT_FDCWD, (long)path,
                               flags & ~O_CREAT, 0);
     if (probe >= 0) {
-        // Probe leaked an fd (the absolute path IS openable read-only —
-        // e.g. an existing file after the create failed on flags).
+        // Probe leaked an fd (the absolute path IS openable without
+        // O_CREAT — e.g. an existing file after the create failed).
         raw_syscall1(SYS_close, (int)probe);
     }
-    int rfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)(path + 1),
+    int rfd = -1;
+    int via = 0;
+    char *alt = rootfs_path_form(path);
+    if (alt) {
+        rfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)alt, flags, mode);
+        via = 1;
+    }
+    if (rfd < 0 && alt && alt != path + 1) {
+        // Prefix form failed (or env missing) — last resort: relative.
+        rfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)(path + 1),
                                 flags, mode);
-    write_str(2, "[twrp_fb_hook] /tmp abs open fd=");
+        via = 2;
+    }
+    write_str(2, "[twrp_fb_hook] abs open fd=");
     write_num(2, abs_fd);
     write_str(2, " probe_raw=");
     write_num(2, (int)probe);
-    write_str(2, " rel retry -> fd=");
+    write_str(2, " rootfs retry via=");
+    write_num(2, via);
+    write_str(2, " -> fd=");
     write_num(2, rfd);
     write_str(2, "\n");
     return rfd >= 0 ? rfd : abs_fd;
@@ -1368,13 +1400,21 @@ int open(const char *path, int flags, ...) {
     // If opening /dev/graphics/fb0 or /dev/fb0 fails with ENOENT, create
     // the virtual framebuffer file and re-open it. TWRP init may re-mount
     // /dev tmpfs, wiping kr64's pre-created fb0 file.
+    // 6-Z166: the create-side mkdir/open ALSO use the rootfs-resolvable
+    // form — the hook's .rodata string literals hit the same tracer
+    // PEEK failure as the loop buffers, and the prefixed form resolves
+    // into the rootfs regardless of tracer translation.
     if (fd < 0 && is_fb_path(path)) {
         // Create /dev/graphics/ directory if needed
-        mkdir_raw("/dev/graphics", 0755);
+        char *gdir = rootfs_path_form("/dev/graphics");
+        if (gdir) mkdir_raw(gdir, 0755);
         // Create the fb0 file with the right size (320*640*4 = 819200)
-        int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
-            (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
-            O_CREAT | O_RDWR, 0644);
+        char *fbp = rootfs_path_form(
+            my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0");
+        int create_fd = fbp
+            ? (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)fbp,
+                                O_CREAT | O_RDWR, 0644)
+            : -1;
         if (create_fd >= 0) {
             // Truncate to framebuffer size
             raw_syscall3(SYS_ftruncate, create_fd, TWRP_FB_SMEM_LEN, 0);
@@ -1387,9 +1427,9 @@ int open(const char *path, int flags, ...) {
             write_str(2, "\n");
         }
     }
-    // 6-Z165: /tmp absolute-open failure → cwd-relative retry (see the
-    // tmp_retry_open comment block above for the full rationale).
-    fd = tmp_retry_open(path, fd, flags, mode);
+    // 6-Z166: absolute-open failure → rootfs-resolvable retry (see the
+    // rootfs_retry_open comment block above for the full rationale).
+    fd = rootfs_retry_open(path, fd, flags, mode);
     // ALWAYS ftruncate the existing fb0 file to TWRP_FB_SMEM_LEN — even
     // when open() SUCCEEDED. Root cause (6-Q's definitive diff of KVM
     // strace vs UI E2E logcat):
@@ -1447,11 +1487,16 @@ int openat(int dirfd, const char *path, int flags, ...) {
                          : (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, mode);
     // If opening /dev/graphics/fb0 or /dev/fb0 fails with ENOENT, create
     // the virtual framebuffer file and re-open it.
+    // 6-Z166: rootfs-resolvable forms for the create side (see open()).
     if (fd < 0 && is_fb_path(path)) {
-        mkdir_raw("/dev/graphics", 0755);
-        int create_fd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
-            (long)(my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0"),
-            O_CREAT | O_RDWR, 0644);
+        char *gdir = rootfs_path_form("/dev/graphics");
+        if (gdir) mkdir_raw(gdir, 0755);
+        char *fbp = rootfs_path_form(
+            my_strcmp(path, "/dev/fb0") == 0 ? "/dev/fb0" : "/dev/graphics/fb0");
+        int create_fd = fbp
+            ? (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)fbp,
+                                O_CREAT | O_RDWR, 0644)
+            : -1;
         if (create_fd >= 0) {
             raw_syscall3(SYS_ftruncate, create_fd, TWRP_FB_SMEM_LEN, 0);
             raw_syscall1(SYS_close, create_fd);
@@ -1462,10 +1507,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
             write_str(2, "\n");
         }
     }
-    // 6-Z165: /tmp absolute-open failure → cwd-relative retry. is_tmp_path
-    // only matches ABSOLUTE paths, so the AT_FDCWD retry inside is valid
+    // 6-Z166: absolute-open failure → rootfs-resolvable retry. Only
+    // absolute paths engage, so the AT_FDCWD retry inside is valid
     // regardless of the caller's dirfd.
-    fd = tmp_retry_open(path, fd, flags, mode);
+    fd = rootfs_retry_open(path, fd, flags, mode);
     // ALWAYS ftruncate the existing fb0 file to TWRP_FB_SMEM_LEN — even
     // when openat() SUCCEEDED. Root cause (6-Q's definitive diff of KVM
     // strace vs UI E2E logcat):
@@ -1525,8 +1570,8 @@ int __open_2(const char *path, int flags) {
     int fd;
     if (real_open2) fd = real_open2(path, flags);
     else            fd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, 0);
-    // 6-Z165: /tmp absolute-open failure → cwd-relative retry.
-    fd = tmp_retry_open(path, fd, flags, 0);
+    // 6-Z166: absolute-open failure → rootfs-resolvable retry.
+    fd = rootfs_retry_open(path, fd, flags, 0);
     // DIAGNOSTIC (Task 31): log EVERY __open_2() call (bionic's fortified
     // open variant — selected by -D_FORTIFY_SOURCE). If libminuitwrp was
     // built with _FORTIFY_SOURCE, this is the variant that gets called
@@ -1554,9 +1599,9 @@ int __openat_2(int dirfd, const char *path, int flags) {
     int fd;
     if (real_openat2) fd = real_openat2(dirfd, path, flags);
     else              fd = (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, 0);
-    // 6-Z165: /tmp absolute-open failure → cwd-relative retry (absolute
-    // "/tmp" paths ignore dirfd, AT_FDCWD retry is always valid).
-    fd = tmp_retry_open(path, fd, flags, 0);
+    // 6-Z166: absolute-open failure → rootfs-resolvable retry (absolute
+    // paths ignore dirfd, AT_FDCWD retry is always valid).
+    fd = rootfs_retry_open(path, fd, flags, 0);
     // DIAGNOSTIC (Task 31): log EVERY __openat_2() call.
     write_str(2, "[twrp_fb_hook] __openat_2(df="); write_num(2, dirfd);
     write_str(2, ", \"");

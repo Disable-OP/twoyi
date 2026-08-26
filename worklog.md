@@ -10769,3 +10769,46 @@ Stage Summary:
   (1) hook "/tmp abs open fd=... probe_raw=... rel retry -> fd=..." lines, (2) 6-Z164 open
   FAILED/ENTRY path-read lines naming the translation mechanism, (3) twrp-recovery.log existing
   for the first time, (4) pseudo-mount materialized lines.
+
+---
+Task ID: 6-Z166 + 6-Z167
+Agent: main
+Task: recovery.log's first capture — the fstab/fb0 kill chain + the translation-bypass root cause fix
+
+Evidence (run 33002423676 on 828630f):
+- STILL BLACK SCREEN (all post-launch screenshots share the old md5) — but twrp-recovery.log
+  EXISTS FOR THE FIRST TIME (the 6-Z165 /tmp retry unblocked TWRP's logger).
+- TWRP's own account (90 lines): LANG → "Starting the UI..." → DRM scan card0-15 ENOENT (fine)
+  → open("/dev/graphics/fb0") fd=-1 x17 → giving up → splash.xml fails → mtab → fstab:
+  open("/etc/twrp.flags") fd=-1, open("/etc/recovery.fstab") fd=-1 → "E:Critical Error: Unable
+  to open fstab" → "E:Failing out of recovery due to problem with fstab." ← THE FATAL EXIT.
+  The old post-LANG exit(1) is DEAD; death moved to fstab.
+- {rootfs}/etc/recovery.fstab EXISTS (1321 bytes) and {rootfs}/dev/graphics/fb0 IS pre-created
+  (3686400 bytes) — the files were always there; the OPENS bypassed translation.
+- 6-Z164 DIAG NAMED THE MECHANISM: "open ENTRY path-read FAILED pid=2591 nr=56
+  path_addr=0xffffc35f6810" x11 (capped) — read_child_string PEEK-fails on SPECIFIC child
+  addresses (the dri/fb0 loop buffer), so those openats ran UNTRANSLATED against the host
+  (host /dev/graphics/fb0 + /etc/recovery.fstab → ENOENT). Other addresses (TWRP .rodata
+  literals like /tmp/recovery.log) read fine → translated → worked. No chdir. TWOYI_ROOTFS
+  env present in the child.
+- 6-Z164 pseudo-mount materialization worked (rootfs/{dev,dev/pts,proc,sys,sys/fs/selinux,
+  acct,tmp,sys/fs/pstore,dev/usb-ffs/adb} created at mount ENTRY).
+
+Fix (6-Z166, twrp_fb_hook.c): rootfs_retry_open — when ANY absolute open fails, retry with
+  "{TWOYI_ROOTFS}{path}" (immune to the translation bug BY CONSTRUCTION: {rootfs} lives under
+  /data/…, which translate_path passes through) with a path+1 cwd-relative fallback (cwd IS
+  the rootfs). Replaces the /tmp-only retry in open/openat/__open_2/__openat_2; the fb0
+  create-branch mkdir/create also use the rootfs-prefixed form. Expect next run: fb0 opens
+  SUCCEED (pre-created file) + fstab READS (1321-byte file) → TWRP proceeds to graphics.
+
+Fix (6-Z167, ptrace_emu.rs): process_vm_readv fallback in read_child_string when the first
+  PEEK word returns -1 (a DIFFERENT kernel read path — may fix translation wholesale for the
+  PEEK-failing address class) + peek_word_errno + maps-bracket dump (first 3) in the 6-Z164
+  failure DIAG — names the region class (stack/hook-rodata/heap) and the errno behind the EIO.
+
+Stage Summary:
+- Verdict protocol stays: NO boot claim until a post-launch screenshot md5 CHANGES.
+- Next-run checklist: (1) "rootfs retry via=1 -> fd=" hook lines for fb0/fstab, (2) PVM
+  fallback making the 6-Z164 failures DISAPPEAR, (3) fstab parsed → PartitionManager mounts
+  → minui graphics on the pre-created fb0 → PIXELS?, (4) if still black but alive: next
+  blocker will be visible in recovery.log (it now survives every run).
