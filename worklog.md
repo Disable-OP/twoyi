@@ -11181,3 +11181,35 @@ Fixes:
 Stage Summary:
 - Chain: ... theme ✓ gr_init ✓ pixelflinger RENDERING STARTED ✓ -> SIGSEGV
   after first scanlines (next blocker, now symbolizable) -> pixels -> menu.
+
+---
+Task ID: 6-Z177
+Agent: main
+Task: accept4-EINVAL spin throttle + stack-buffer maps path
+
+Evidence (run 33019847021 on 5ce2d40):
+- kr64-app-stderr.log NOW ARRIVES AS A DIRECT ARTIFACT (run-as pull
+  worked) — 87,828 lines of full story.
+- THE SPIN: guest init pid 2650 fd 8 socket:[46813] — bind hit
+  EADDRINUSE (duplicate-init/stale socket race) → 6-Z101 faked 0;
+  listen EINVAL → faked 0 → socket bound-but-never-listening → epoll
+  EPOLLHUP + accept4 EINVAL loop at ~20kHz THROUGH the tracer = full-core
+  starvation (blocked this run before the GUI stage; same family as the
+  33015609499 meltdown).
+- Maps dump failed: "/proc/self/maps" lives in hook .rodata (PEEK-blind)
+  → the 6-Z170 +1 rewrite resolved it rootfs-relative → ENOENT.
+- fb0 created 4,608,000 native ✓; misc devs ✓; init.rc patched with env ✓.
+
+Fixes:
+- ptrace_emu 6-Z177: accept4(-EINVAL) STREAK THROTTLE — after 100
+  consecutive EINVAL accept4s per pid, the tracer parks 20ms per
+  iteration (~50 wakeups/s, 0.1% core). The spin becomes harmless;
+  non-spinning users reset the streak on any other accept4 return.
+- hook 6-Z176b: maps path built in a VOLATILE STACK buffer (stack
+  addresses PEEK fine → translation passthrough → real /proc/self/maps).
+
+Stage Summary:
+- With the spin throttled, the GUI/render path gets the core back; with
+  the maps dump working, any further SIGSEGV (like 33018901591's
+  post-scanline crash) becomes symbolizable. Both blockers of the last
+  two runs are now defused.

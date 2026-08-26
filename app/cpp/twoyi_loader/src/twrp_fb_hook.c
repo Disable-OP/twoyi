@@ -2183,8 +2183,21 @@ static volatile int g_fatal_entered = 0;
 // 6-Z167 finding — but the child's own /proc/self never is).
 static void fatal_dump_maps(void) {
     write_str(2, "[twrp_fb_hook] --- /proc/self/maps at fatal ---\n");
+    /* 6-Z176b: build the path in a VOLATILE STACK buffer. A .rodata
+     * string literal is in the tracer's PEEK-blind class (EIO) — the
+     * 6-Z170 +1 rewrite then resolves "proc/self/maps" RELATIVE to the
+     * rootfs cwd → ENOENT (run 33019847021: "(open /proc/self/maps
+     * failed)"). A volatile buffer physically lives on the stack: the
+     * tracer reads stack addresses fine, translate_path passes /proc paths
+     * through untranslated, and the kernel opens the REAL maps file. */
+    volatile char mpath[17]; /* "/proc/self/maps" + NUL */
+    {
+        static const char src[] = "/proc/self/maps";
+        unsigned k;
+        for (k = 0; k < sizeof(src); k++) mpath[k] = src[k];
+    }
     int mfd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
-                                (long)"/proc/self/maps", 0 /*O_RDONLY*/, 0);
+                                (long)(const char *)mpath, 0 /*O_RDONLY*/, 0);
     if (mfd < 0) {
         write_str(2, "(open /proc/self/maps failed)\n");
         return;
