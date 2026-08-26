@@ -1369,6 +1369,15 @@ def main():
         ("ls -la rootfs/tmp/ rootfs/lib64/ rootfs/system/lib/ 2>&1", "tmp-lib-dirs.txt"),
         ("ls -la rootfs/system/lib64/ 2>&1 | head -60", "system-lib64.txt"),
         ("ls -la rootfs/etc/ 2>&1 | head -40", "etc-contents.txt"),
+        # 6-Z169: run 33007215600 — the importer extracted ALL 3217 cpio
+        # entries (app log: sawTrailer=true) yet PageManager's loads of
+        # /twres/splash.xml + /twres/languages/en.xml ENOENT'd (TWRP:
+        # "E:Package splash failed to load" / "E:Unable to load
+        # '/twres/languages/en.xml'"). Recursive listing + the four key
+        # theme files' sizes settle whether the files exist at PULL time
+        # (vs. runtime — the tracer-side 6-Z169 dir dump covers runtime).
+        ("ls -laR rootfs/twres/ 2>&1 | head -120", "twres-contents.txt"),
+        ("wc -c rootfs/twres/splash.xml rootfs/twres/ui.xml rootfs/twres/portrait.xml rootfs/twres/languages/en.xml 2>&1", "twres-keyfiles.txt"),
     ]:
         out = adb_shell(f"run-as {PACKAGE} sh -c '{remote}'", timeout=60)
         if out:
