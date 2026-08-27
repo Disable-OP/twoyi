@@ -1160,6 +1160,35 @@ def main():
     print("=" * 60)
     print('  Step 6: Tap "Launch Container"')
     print("=" * 60)
+
+    # 6-Z180: optional no-input A/B probe. When TWOYI_NO_INPUT=1 is set
+    # (workflow input twrp_no_input), touch the hook's gate files INSIDE
+    # the container rootfs BEFORE the container boots — the fb hook then
+    # disables its input bridge for this run (real-open fallback), which
+    # isolates whether the deterministic input-tail SIGSEGV lives in the
+    # bridge. Default: NOT set — touch stays enabled (the production
+    # path must boot WITH touch).
+    if os.environ.get("TWOYI_NO_INPUT", "0") == "1":
+        print("  6-Z180: TWOYI_NO_INPUT=1 — touching gate files in rootfs")
+        for rootfs in (
+            "/data/user/0/io.twoyi.debug/rootfs",
+            "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+        ):
+            # adb shell 'touch' (run-as not needed for /data/user/0 app
+            # dirs owned by the app); fall back silently if absent.
+            subprocess.run(
+                ADB + ["shell", f"touch {rootfs}/dev/.twoyi-no-input {rootfs}/.twoyi-no-input 2>/dev/null; true"],
+                capture_output=True,
+            )
+        subprocess.run(
+            ["sudo", "docker", "exec", "redroid",
+             "sh", "-c",
+             "for d in /data/user/0/io.twoyi.debug/rootfs /data/user/0/io.twoyi.debug/profiles/default/rootfs; do"
+             " [ -d \"$d\" ] && touch \"$d/dev/.twoyi-no-input\" \"$d/.twoyi-no-input\" 2>/dev/null; done; true"],
+            capture_output=True,
+        )
+        print("  6-Z180: gate files touched (input bridge will be OFF this run)")
+
     # Scroll back to top — swipe down multiple times
     for _ in range(8):
         swipe_down()
