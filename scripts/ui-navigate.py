@@ -1407,12 +1407,52 @@ def main():
         print("=" * 60)
         print("  Step 8b: sandbox probe — File Manager -> /system")
         print("=" * 60)
+
+        # The probe must run from the TWRP MAIN MENU. Both prior runs
+        # caught TWRP still on the first-run gate (the gate dismissal
+        # happens late). Wait for the main-menu marker in recovery.log
+        # (polling BOTH rootfs locations — the active profile's rootfs
+        # and the legacy rootfs dir), feeding gate gestures while we
+        # wait, and only then start the File Manager taps.
+        def _read_recovery_log():
+            for p in (
+                f"profiles/default/rootfs/tmp/recovery.log",
+                "rootfs/tmp/recovery.log",
+                "/tmp/recovery.log",
+            ):
+                out = adb_shell(f"run-as {PACKAGE} cat {p}", timeout=10)
+                if out:
+                    return out
+            return ""
+
+        def wait_for_main_menu(timeout_s=150):
+            deadline = time.time() + timeout_s
+            gate_idx = 0
+            gates = [
+                f"input swipe {int(SCREEN_W * 0.19)} {int(SCREEN_H * 0.89)} "
+                f"{int(SCREEN_W * 0.88)} {int(SCREEN_H * 0.89)} 400",
+                f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",
+            ]
+            while time.time() < deadline:
+                txt = _read_recovery_log()
+                if "Set page: 'main2'" in txt or "Set page: 'main1'" in txt:
+                    print("  main menu detected in recovery.log")
+                    return True
+                g = gates[gate_idx % len(gates)]
+                adb_shell(g)
+                gate_idx += 1
+                wait(6)
+            print("  WARNING: main menu not detected — probing anyway")
+            return False
+
+        wait_for_main_menu()
+        wait(2)
         screenshot("fm-00-baseline")
-        wait(1)
         # Main menu grid candidates for "Advanced" (2-col x 4-row and
-        # 3-col layouts both put it on the LAST ROW, LEFT/CENTER side).
+        # 3-col layouts both put it on the LAST ROW, LEFT/CENTER side;
+        # higher rows first — the bottom edge may be navbar).
         for i, (fx, fy) in enumerate([
-            (0.25, 0.84), (0.17, 0.82), (0.33, 0.85), (0.25, 0.90),
+            (0.25, 0.74), (0.28, 0.78), (0.25, 0.84), (0.17, 0.82),
         ]):
             x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
             print(f"  tap Advanced candidate {i}: ({x},{y})")
