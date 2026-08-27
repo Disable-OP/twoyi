@@ -1207,43 +1207,11 @@ static int is_input_path(const char *path) {
     return 0;
 }
 
-// 6-Z180: the no-input gate. The deterministic input-tail SIGSEGV (runs
-// 33021261552/33021972679) lands in the ev_init/input-bridge window; the
-// A/B probe is to run the SAME build with the bridge DISABLED and see
-// whether pixels reach fb0 (TWRP renders its menu without touch input —
-// plenty of devices boot recovery with no evdev nodes at all). Env vars
-// do NOT reliably reach the recovery process (6-Z175 — TWRP's init
-// rebuilds the service env from init.rc setenv), so the gate is FILE
-// based, mirroring .twoyi-fb-geometry (6-Z176):
-//   {rootfs}/dev/.twoyi-no-input   (opened via /dev/... -> rootfs/dev
-//                                   translation by the tracer)
-//   {rootfs}/.twoyi-no-input       (cwd-relative — guest cwd IS the
-//                                   rootfs)
-// Either file's EXISTENCE (any content, even empty) disables the bridge:
-// try_open_input_bridge() returns -2 (real open of the pre-created
-// probe file), minui sees a dumb device that reports no events, and the
-// render path runs untouched. The E2E workflow touches these files via
-// docker exec between the ROM import and the Launch Container tap.
-static int g_no_input_gate = -1;   /* -1 = not checked, 0 = on, 1 = off */
-
-static int no_input_gate(void) {
-    if (g_no_input_gate >= 0) return g_no_input_gate;
-    g_no_input_gate = 0;
-    {
-        int gfd = (int)raw_syscall4(SYS_openat, -100 /*AT_FDCWD*/,
-                                    (long)"/dev/.twoyi-no-input", 0, 0);
-        if (gfd < 0)
-            gfd = (int)raw_syscall4(SYS_openat, -100,
-                                    (long)".twoyi-no-input", 0, 0);
-        if (gfd >= 0) {
-            raw_syscall1(SYS_close, gfd);
-            g_no_input_gate = 1;
-            write_str(2, "[twrp_fb_hook] 6-Z180: no-input gate file present"
-                         " — INPUT bridge DISABLED (real open fallback)\n");
-        }
-    }
-    return g_no_input_gate;
-}
+// 6-Z185: the 6-Z180 no-input gate was REMOVED. It was an A/B
+// diagnostic probe (disable the input bridge when a marker file
+// exists) for the input-tail SIGSEGV; the user vetoed input gating
+// ("fix the actual problem") and the real fix shipped separately
+// (the 6-Z183 window-tracking + RGBA path). Touch stays ALWAYS ON.
 
 // Attempt the input bridge for this open(). Returns the fd to hand to the
 // caller, or -2 to fall through to a real open().
@@ -1255,7 +1223,6 @@ static int try_open_input_bridge(const char *path) {
     int i;
 
     if (!is_input_path(path)) return -2;
-    if (no_input_gate()) return -2;
 
     fd = inbr_connect(&slot, init_bytes, &init_len);
     if (fd < 0) {

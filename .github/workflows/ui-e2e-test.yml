@@ -306,6 +306,9 @@ jobs:
           ANDROID_HOME: /usr/local/lib/android/sdk
           BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '30' }}
           TWOYI_PACKAGE: io.twoyi.debug
+          # 6-Z185: drive the File Manager -> /system sandbox probe after
+          # the boot wait (screenshots + rootfs/system listing evidence).
+          TWOYI_PROBE_SYSTEM_APP: '1'
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"

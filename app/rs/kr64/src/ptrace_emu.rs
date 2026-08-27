@@ -254,6 +254,21 @@ struct ChildAbi {
     fstat: i64,
     newfstatat: i64,
     statx: i64,
+    // getdents64 — fd-based directory enumeration (security fix
+    // 6-Z185). It takes NO path argument (arg1 = fd), so it needs no
+    // translation — but it was previously COMPLETELY unhandled, which
+    // meant the kernel happily enumerated WHATEVER the fd pointed at.
+    // Combined with the old untranslated /system passthrough this is
+    // exactly how TWRP's File Manager listed the physical device's
+    // real Magic UI /system/app. The sandbox backstop now checks the
+    // fd's ORIGIN (via /proc/<tid>/fd/<n>) at getdents64 ENTRY and
+    // denies fds that resolve outside the rootfs sandbox.
+    //
+    // Verified against the kernel UAPI headers:
+    //   i386:   __NR_getdents64 220
+    //   x86_64: __NR_getdents64 217
+    //   aarch64 (asm-generic): __NR_getdents64 61
+    getdents64: i64,
     // stat64 / lstat64 / fstat64 — the i386 64-bit-struct variants of
     // stat/lstat/fstat. Modern i386 bionic (including TWRP's recovery)
     // uses stat64 (nr=195) + lstat64 (nr=196) INSTEAD of the old stat
@@ -1145,6 +1160,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // 64-bit ABI never grew a separate fstatat64; aliases
     // ABI_X86_64.newfstatat.
     fstatat64_nr: 262,
+    // x86_64 __NR_getdents64 = 217 (asm/unistd_64.h) — see the
+    // `getdents64` field doc on ChildAbi (security fix 6-Z185).
+    getdents64: 217,
     // x86_64 pread64 = 17 (asm/unistd_64.h). The dedicated 6-Z71 arms
     // only ever FAKE a read when the fresh return is -38 (seccomp
     // filter block) — x86_64 pread64 executes normally under the
@@ -1449,6 +1467,9 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // IS correctly rt_sigprocmask on x86_64; this correction is i386-
     // only because the i386 and x86_64 syscall tables diverge here.
     rt_sigprocmask: 175,
+    // i386 __NR_getdents64 = 220 (asm/unistd_32.h) — see the
+    // `getdents64` field doc on ChildAbi (security fix 6-Z185).
+    getdents64: 220,
     readlink: 85,
     readlinkat: 303,
     chdir: 12,
@@ -1779,6 +1800,9 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // asm-generic) — aarch64 never grew a separate fstatat64; aliases
     // ABI_AARCH64.newfstatat.
     fstatat64_nr: 79,
+    // aarch64 (asm-generic) __NR_getdents64 = 61 — see the
+    // `getdents64` field doc on ChildAbi (security fix 6-Z185).
+    getdents64: 61,
     // aarch64 (asm-generic) pread64 = 67. The dedicated 6-Z71 arms only
     // ever FAKE a read when the fresh return is -38 (seccomp filter
     // block) — aarch64 pread64 executes normally under the filter's
@@ -3214,7 +3238,11 @@ fn set_syscall_arg(regs: &mut Regs, arg: usize, val: u64) {
 /// x86_64 but 21 on i386, so a single static table would be
 /// ambiguous).
 fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
-    if nr == abi.access {
+    if abi.getdents64 != -1 && nr == abi.getdents64 {
+        // 6-Z185: label the directory-enumeration syscall (its fd-origin
+        // check is the backstop's fd-side guard).
+        "getdents64"
+    } else if nr == abi.access {
         "access"
     } else if nr == abi.rt_sigprocmask {
         "rt_sigprocmask"
@@ -3601,163 +3629,617 @@ fn format_syscall_buffer(list: &std::collections::VecDeque<i64>, abi: Option<Chi
 
 // ── Path translation ───────────────────────────────────────────────
 
-/// Translate a guest path to a host path by prepending the rootfs.
+/// Translate a guest path to a host path for the non-root ptrace
+/// sandbox.
+///
+/// SECURITY FIX 6-Z185: this function is now a THIN DELEGATE to
+/// `vfs::SandboxPolicy::translate_guest` — the single, centralized
+/// path-resolution authority (see the `SandboxPolicy` module doc in
+/// vfs.rs for the full policy). All ~17 call sites in this file
+/// therefore route through one implementation.
+///
+/// The previous inline implementation had a deliberate passthrough for
+/// guest `/system/*` and `/vendor/*` ("the HOST's /system provides the
+/// dynamic linker + bionic in non-root mode"). In non-root ptrace mode
+/// — the ONLY mode this function is used in (root/chroot mode never
+/// runs the ptrace loop) — there is no chroot, so that passthrough let
+/// the guest read the REAL HOST filesystem. Combined with getdents64
+/// being entirely unhandled, TWRP's File Manager listed the physical
+/// device's actual /system/app (real Honor/Magic UI packages observed
+/// live). The policy now maps every ROM tree into the rootfs, keeping
+/// only the kernel-PT_INTERP-parity linker/lib runtime fallback on the
+/// host (see `vfs::SandboxPolicy::is_runtime_host_fallback`).
 pub fn translate_path(rootfs: &str, path: &str) -> String {
-    if !path.starts_with('/') {
-        return path.to_string();
+    crate::vfs::SandboxPolicy::new(rootfs).translate_guest(path)
+}
+
+// ── Security fix 6-Z185: sandbox enforcement backstop ───────────────
+//
+// The LAST line of defense against guest filesystem escapes. Runs at
+// the very END of every syscall-ENTRY stop — AFTER all per-syscall
+// handlers have staged their path rewrites — on a FRESH register
+// snapshot, i.e. on exactly the arguments the kernel is about to act
+// on when the loop-top PTRACE_SYSCALL resumes the child.
+//
+// It does NOT trust that any individual handler translated correctly:
+//   * a handler that's missing entirely (renameat was untranslated for
+//     years, getdents64 for the whole project's life),
+//   * a handler bug that forgot to rewrite,
+//   * a symlink inside the rootfs pointing outside,
+//   * a relative-path resolution against an escaped cwd,
+//   * a future regression not yet discovered —
+// all land HERE, where the final real path (symlinks followed) must
+// prove it is inside the rootfs sandbox (or one of the explicitly
+// allowlisted host surfaces: /proc, the mirrored /dev char nodes, the
+// linker/lib runtime fallback, the exec staging dir). Otherwise the
+// syscall is neutered (rewritten to getpid, which always succeeds
+// harmlessly) and the matching EXIT stop fakes -EACCES — or 0 for the
+// fake-success family (chmod/mknod/...) whose existing boot-critical
+// semantics must not change.
+//
+// Every DENY is logged ("SANDBOX BACKSTOP: DENIED …") — a triggered
+// block is itself a bug signal that some upstream translation path is
+// wrong, and it stays valuable long after this fix ships.
+//
+// fd-based coverage: getdents64 (the syscall that enumerated the host
+// /system/app in the original incident) gets an fd-ORIGIN check via
+// /proc/<tid>/fd/<n>; read/write/etc. need no such check because file
+// fds can only originate from open/openat (checked above) — the kernel
+// creates no file fds out of thin air.
+
+/// One path-argument slot of a syscall: which register holds the path
+/// pointer, and (for the *at family) which register holds the dirfd
+/// the path resolves against when relative.
+#[derive(Clone, Copy)]
+struct PathArgSlot {
+    path_reg: usize,
+    /// `Some(dirfd_reg)` for *at syscalls (relative path resolves
+    /// against /proc/<tid>/fd/<dirfd>, NOT the cwd); `None` for plain
+    /// path syscalls (relative resolves against the cwd).
+    dirfd_reg: Option<usize>,
+}
+
+const AT_FDCWD: i64 = -100;
+
+/// The path-taking syscalls that actually EXECUTE against the kernel
+/// (mount/chroot/etc. are seccomp-trapped + EXIT-faked, and rewriting
+/// them here would break those fakes — they are intentionally absent).
+///
+/// The `fake_success` flag marks the family whose returns are already
+/// forced to 0 at EXIT for boot-critical reasons (the EPERM
+/// workaround set — see `compute_exit_return_value`); a DENY there
+/// must fake 0 as well or the guest's boot regresses.
+fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> Vec<(PathArgSlot, bool)> {
+    let a1 = abi.reg_arg1;
+    let a2 = abi.reg_arg2;
+    let a4 = abi.reg_arg4;
+    let mut v: Vec<(PathArgSlot, bool)> = Vec::new();
+    let mut push = |slot: PathArgSlot, fake: bool| v.push((slot, fake));
+    // open / openat / openat2
+    if nr == abi.open {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
     }
-    // /proc/cmdline — translate to rootfs/twrp-cmdline so init can read
-    // the (fake) kernel command line. The host's /proc/cmdline is not
-    // readable by untrusted_app (EACCES from SELinux proc_cmdline label).
-    // We pre-create {rootfs}/twrp-cmdline with appropriate content.
-    // NOTE: we use {rootfs}/twrp-cmdline (NOT {rootfs}/proc/cmdline)
-    // because the /proc directory in rootfs may not be writable (it's
-    // created by the TWRP ramdisk extraction with restrictive perms).
-    if path == "/proc/cmdline" {
-        return format!("{}/twrp-cmdline", rootfs);
+    if nr == abi.openat || nr == abi.openat2 {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
     }
-    // 6-Z99b: /proc/<pid>/maps + /proc/<pid>/status + /proc/<pid>/cmdline
-    // + /proc/<pid>/auxv — redirect to /proc/self/* so init's own
-    // get-pid-then-open /proc/<getpid()>/maps pattern (AOSP 11 init's
-    // `ReadProcessMaps` at system/core/init/util.cpp ~line 318, called
-    // from InstallSignalHandlers / MemoryRecovery) hits the synthetic
-    // generator the VFS registered for /proc/self/* (vfs.rs::new_android).
-    //
-    // Without this redirect, init opens /proc/1/maps (its guest-pid)
-    // against the HOST's /proc — the host's pid 1 is the runner's
-    // systemd/init, which is root-owned; the GitHub runner's unprivileged
-    // user gets ENOENT (hidepid=2 / invisible-on-EACCES semantics) or
-    // EACCES depending on /proc mount options. Init's response to the
-    // open failure is to fall back to a defensive mprotect-loop (545s
-    // run 32693764975 / 32697552367 — pid 7220+7224 did 5120 iterations
-    // of mprotect(nr=10) → exit_group(0) without ever reading its
-    // memory layout; the AOSP boot verdict was a no-op init exit).
-    //
-    // The redirect is generic: any /proc/<digit>/{maps,status,cmdline,
-    // auxv} → /proc/self/{maps,status,cmdline,auxv}. The synthetic
-    // generators produce content that is INIT-acceptable (a hardcoded
-    // maps layout + the tracee's pid in status). For TWRP this branch
-    // is dead code (TWRP's init is AOSP 5.1 and doesn't open
-    // /proc/<pid>/maps); for AOSP it is the difference between
-    // second_stage_init proceeding past its memory-recovery phase vs
-    // spinning on mprotect until exit_group.
-    if path.starts_with("/proc/") {
-        for suffix in &["/maps", "/status", "/cmdline", "/auxv"] {
-            if path.ends_with(suffix) {
-                let middle = &path["/proc/".len()..path.len() - suffix.len()];
-                if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit()) {
-                    return format!("/proc/self{}", suffix);
+    // stat family (plain + *at + 64-bit variants + statx)
+    if nr == abi.stat || nr == abi.lstat || nr == abi.stat64 || nr == abi.lstat64 {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == abi.newfstatat || nr == abi.statx || (abi.fstatat64_nr != -1 && nr == abi.fstatat64_nr)
+    {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+    }
+    // statfs family
+    if nr == abi.statfs_nr || nr == abi.statfs64_nr {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    // access / faccessat
+    if nr == abi.access {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == abi.faccessat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+    }
+    // chdir / readlink(at)
+    if nr == abi.chdir {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == abi.readlink {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == abi.readlinkat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+    }
+    // unlink(at) / mkdir(at) / mknod(at) — mkdirat/mknodat carry the
+    // boot-critical fake-success semantics of their plain forms.
+    if nr == abi.unlink {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == abi.unlinkat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+    }
+    if nr == abi.mkdir {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            true,
+        );
+    }
+    if abi.mkdirat != -1 && nr == abi.mkdirat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            true,
+        );
+    }
+    if nr == abi.mknod {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            true,
+        );
+    }
+    if abi.mknodat != -1 && nr == abi.mknodat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            true,
+        );
+    }
+    // chmod family (fake-success — see compute_exit_return_value)
+    if nr == abi.chmod || nr == abi.lchown || nr == abi.chown {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            true,
+        );
+    }
+    if nr == abi.fchmodat || nr == abi.fchownat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            true,
+        );
+    }
+    // execve (staged → {data_dir}/cache/twoyi_stage, translated →
+    // {rootfs}/...; both are allowlisted) / execveat
+    if nr == abi.execve {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    // rename / renameat / renameat2, link(at), symlink(at), truncate,
+    // utimensat, faccessat2 — NOT translated by any handler today;
+    // the backstop is their only guard (verified: rg shows no arms).
+    //   plain:      rename(arg1,arg2) link(arg1,arg2) symlink(arg1,arg2)
+    //               truncate(arg1) utimensat(arg1 path is arg4!
+    //               — utimensat(dirfd, path, times, flags))
+    //   *at:        renameat(arg2 oldpath, arg4 newpath) linkat(arg2,arg4)
+    //               symlinkat(arg2), faccessat2(arg2)
+    // Numbers per kernel UAPI (i386/x86_64/aarch64):
+    //   rename:     38 / 82 / -1
+    //   renameat:  264 / 292 / 38
+    //   renameat2: 353 / 316 / 276
+    //   link:       9 / 86 / -1
+    //   linkat:    303 / 265 / 37
+    //   symlink:   83 / 88 / -1
+    //   symlinkat: 304 / 266 / 36
+    //   truncate:  92 / 76 / -1
+    //   utimensat: 320 / 280 / 88
+    //   faccessat2: 439 / 439 / 439
+    // (Derived from the ABI's execve number, which is unique per ABI:
+    // 11=i386, 59=x86_64, 221=aarch64.)
+    let (
+        rename,
+        renameat,
+        renameat2,
+        link,
+        linkat,
+        symlink,
+        symlinkat,
+        truncate,
+        utimensat,
+        faccessat2,
+    ) = if abi.execve == 11 {
+        (38i64, 264, 353, 9, 303, 83, 304, 92, 320, 439)
+    } else if abi.execve == 59 {
+        (82, 292, 316, 86, 265, 88, 266, 76, 280, 439)
+    } else {
+        (-1, 38, 276, -1, 37, -1, 36, -1, 88, 439)
+    };
+    if rename != -1 && nr == rename {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == renameat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+        push(
+            PathArgSlot {
+                path_reg: a4,
+                dirfd_reg: Some(abi.reg_arg3),
+            },
+            false,
+        );
+    }
+    if nr == renameat2 {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+        push(
+            PathArgSlot {
+                path_reg: a4,
+                dirfd_reg: Some(abi.reg_arg3),
+            },
+            false,
+        );
+    }
+    if link != -1 && nr == link {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == linkat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+        push(
+            PathArgSlot {
+                path_reg: a4,
+                dirfd_reg: Some(abi.reg_arg3),
+            },
+            false,
+        );
+    }
+    if symlink != -1 && nr == symlink {
+        // arg1 is the link TARGET (pure data stored in the new symlink —
+        // creating it accesses nothing); only the new link path (arg2)
+        // is verified.
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == symlinkat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+    }
+    if truncate != -1 && nr == truncate {
+        push(
+            PathArgSlot {
+                path_reg: a1,
+                dirfd_reg: None,
+            },
+            false,
+        );
+    }
+    if nr == utimensat {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+    }
+    if nr == faccessat2 {
+        push(
+            PathArgSlot {
+                path_reg: a2,
+                dirfd_reg: Some(a1),
+            },
+            false,
+        );
+    }
+    v
+}
+
+/// Does this syscall number need the backstop at all? (Cheap pre-filter
+/// on the stop's OWN register snapshot — zero cost for the ~90% of
+/// syscalls that take no path.)
+fn sandbox_backstop_may_apply(nr: i64, abi: &ChildAbi) -> bool {
+    nr == abi.getdents64 || !sandbox_path_arg_slots(nr, abi).is_empty()
+}
+
+/// The backstop itself. See the module-style comment above. Returns
+/// and logs only; the pending map drives the EXIT-side fake return.
+fn sandbox_backstop_at_entry(
+    pid: libc::pid_t,
+    sandbox: &crate::vfs::SandboxPolicy,
+    abi: &ChildAbi,
+    pending_deny: &mut std::collections::HashMap<libc::pid_t, i64>,
+    log: &dyn Fn(&str),
+) {
+    // Fresh register snapshot: handlers have already flushed their
+    // rewrites via ptrace_setregs; this reads the FINAL staged state.
+    let mut regs: Regs = unsafe { std::mem::zeroed() };
+    let iov_len = match ptrace_getregs(pid, &mut regs) {
+        Ok(len) => len,
+        Err(_) => return, // child gone — nothing to protect
+    };
+    let nr = get_syscall_num(&regs, abi);
+    if nr == abi.getpid || nr == -1 || nr <= 0 {
+        // Rewritten-inert (xattr/TLS/set_thread_area fakes replaced the
+        // number with getpid) or a desync/unknown stop — nothing to do.
+        return;
+    }
+
+    // (a) getdents64 — fd-origin check (the original incident's
+    //     enumeration syscall; it takes NO path, so the open-time
+    //     checks are its only path-side guard — this verifies them).
+    if abi.getdents64 != -1 && nr == abi.getdents64 {
+        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+        match sandbox.verify_fd_origin(pid, fd) {
+            crate::vfs::SandboxVerdict::Allow => {}
+            crate::vfs::SandboxVerdict::Deny(errno, why) => {
+                log(&format!(
+                    "SANDBOX BACKSTOP: DENIED getdents64(fd={}) on pid {} — fd origin {} — faking -{} (6-Z185)",
+                    fd, pid, why, errno
+                ));
+                set_syscall_num(&mut regs, abi, abi.getpid);
+                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                    pending_deny.insert(pid, -(errno as i64));
                 }
             }
         }
+        return;
     }
-    // 6-Z168: {rootfs}-prefixed paths stay untouched (the fb_hook's
-    // rootfs_retry_open forms land here — double-prefixing would break
-    // them), and /data/* now TRANSLATES into the rootfs: run 33004885224
-    // showed TWRP walking the HOST's real /data/system and /data/media
-    // through the old "/data/ passthrough" (reading redroid's actual
-    // system data + failing EACCES). The jail's /data must be the rootfs
-    // copy, which the app owns and TWRP can populate (/data/media).
-    let rootfs_prefix = if rootfs.ends_with('/') {
-        rootfs.to_string()
-    } else {
-        format!("{}/", rootfs)
-    };
-    if path == rootfs || path.starts_with(&rootfs_prefix) {
-        return path.to_string();
+
+    // (b) path-taking syscalls — verify every path argument's final
+    //     resolution. Relative paths resolve against the *at dirfd
+    //     (/proc/<pid>/fd/<dirfd>) or the cwd (/proc/<pid>/cwd).
+    let slots = sandbox_path_arg_slots(nr, abi);
+    if slots.is_empty() {
+        return;
     }
-    if path.starts_with("/data/") || path == "/data" {
-        return format!("{}{}", rootfs, path);
-    }
-    // /proc/, /apex/ — leave untranslated. The host's /proc
-    // is partially readable by untrusted_app (so /proc/self/* works);
-    // /apex is either app-private (already accessible) or
-    // not needed by TWRP init.
-    //
-    // NOTE (Task 6-P): /sys/ used to be in this list (left untranslated
-    // → guest's open("/sys/...") hit the host's REAL kernel sysfs →
-    // EACCES for untrusted_app → init exit(1) at ptrace iteration
-    // ~3059). /sys/ was REMOVED from the untranslated list + moved to
-    // a dedicated translated branch below (mirror of /dev/* handling).
-    // The companion pre-creation in lib.rs::precreate_sysfs_stubs
-    // materialises {rootfs}/sys/class/ + {rootfs}/sys/fs/selinux/{
-    // enforce,load} so the translated opens succeed against an empty
-    // fake sysfs instead of the host's real one.
-    for prefix in &["/proc/", "/apex/"] {
-        if path.starts_with(prefix) {
-            return path.to_string();
+    let cwd = std::fs::read_link(format!("/proc/{}/cwd", pid)).ok();
+    for (slot, fake_success) in slots {
+        let addr = get_syscall_arg(&regs, slot.path_reg);
+        if addr == 0 {
+            continue;
+        }
+        let Some(path) = read_child_string(pid, addr) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue; // AT_EMPTY_PATH — pure fd operation
+        }
+        if !path.starts_with('/') {
+            // Relative: resolve against dirfd when present, else cwd.
+            let base: Option<std::path::PathBuf> = match slot.dirfd_reg {
+                Some(dirfd_reg) => {
+                    let dirfd = get_syscall_arg(&regs, dirfd_reg) as i64;
+                    if dirfd == AT_FDCWD {
+                        cwd.clone()
+                    } else {
+                        std::fs::read_link(format!("/proc/{}/fd/{}", pid, dirfd)).ok()
+                    }
+                }
+                None => cwd.clone(),
+            };
+            let Some(base) = base else {
+                log(&format!(
+                    "SANDBOX BACKSTOP: DENIED {}(\u{2026}relative {:?}) on pid {} — no resolvable base directory — faking -13 (6-Z185)",
+                    syscall_name(nr, abi), path, pid
+                ));
+                set_syscall_num(&mut regs, abi, abi.getpid);
+                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                    let fake = if fake_success {
+                        0
+                    } else {
+                        -(libc::EACCES as i64)
+                    };
+                    pending_deny.insert(pid, fake);
+                }
+                return;
+            };
+            match sandbox.resolve_as_kernel(&path, Some(&base)) {
+                Some(real) => {
+                    if let crate::vfs::SandboxVerdict::Deny(errno, why) =
+                        sandbox.verify_real_path(&real)
+                    {
+                        log(&format!(
+                            "SANDBOX BACKSTOP: DENIED {}({:?} relative to {}) on pid {} — real {} — {} — faking {} (6-Z185)",
+                            syscall_name(nr, abi), path, base.display(), pid, real.display(), why,
+                            if fake_success { 0 } else { -(errno as i64) }
+                        ));
+                        set_syscall_num(&mut regs, abi, abi.getpid);
+                        if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                            let fake = if fake_success { 0 } else { -(errno as i64) };
+                            pending_deny.insert(pid, fake);
+                        }
+                        return;
+                    }
+                }
+                None => {
+                    log(&format!(
+                        "SANDBOX BACKSTOP: DENIED {}({:?} relative to {}) on pid {} — unresolvable (lexical escape / vanished rootfs) — faking -13 (6-Z185)",
+                        syscall_name(nr, abi), path, base.display(), pid
+                    ));
+                    set_syscall_num(&mut regs, abi, abi.getpid);
+                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                        let fake = if fake_success {
+                            0
+                        } else {
+                            -(libc::EACCES as i64)
+                        };
+                        pending_deny.insert(pid, fake);
+                    }
+                    return;
+                }
+            }
+            continue;
+        }
+        // Absolute: resolve + verify.
+        match sandbox.resolve_as_kernel(&path, None) {
+            Some(real) => {
+                if let crate::vfs::SandboxVerdict::Deny(errno, why) =
+                    sandbox.verify_real_path(&real)
+                {
+                    log(&format!(
+                        "SANDBOX BACKSTOP: DENIED {}({:?}) on pid {} — real {} — {} — faking {} (6-Z185)",
+                        syscall_name(nr, abi), path, pid, real.display(), why,
+                        if fake_success { 0 } else { -(errno as i64) }
+                    ));
+                    set_syscall_num(&mut regs, abi, abi.getpid);
+                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                        let fake = if fake_success { 0 } else { -(errno as i64) };
+                        pending_deny.insert(pid, fake);
+                    }
+                    return;
+                }
+            }
+            None => {
+                log(&format!(
+                    "SANDBOX BACKSTOP: DENIED {}({:?}) on pid {} — unresolvable (lexical escape above /) — faking -13 (6-Z185)",
+                    syscall_name(nr, abi), path, pid
+                ));
+                set_syscall_num(&mut regs, abi, abi.getpid);
+                if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                    let fake = if fake_success {
+                        0
+                    } else {
+                        -(libc::EACCES as i64)
+                    };
+                    pending_deny.insert(pid, fake);
+                }
+                return;
+            }
         }
     }
-    // /dev/kmsg — EXACT map to {rootfs}/dev/__kmsg__ (Task 6-Z97). The
-    // guest init's InitKernelLogging() opens "/dev/kmsg" (AOSP) and the
-    // host's /dev/kmsg is root-only (open → EACCES for untrusted_app —
-    // run 32661231764's "DIAG KLOG fd capture: open() returned -13"),
-    // while the generic /dev/* branch below would map it to
-    // {rootfs}/dev/kmsg, a file nothing ever creates (ENOENT). kr64's
-    // parent setup pre-creates {rootfs}/dev/__kmsg__ (regular file in
-    // non-root mode, symlink → /twrp-kmsg.log in root mode — lib.rs),
-    // and is_kmsg_path() already recognises both the raw and the
-    // translated form, so the open succeeds and the guest's kernel
-    // logging (plus every DIAG KLOG tag) works.
-    if path == "/dev/kmsg" {
-        return format!("{}/dev/__kmsg__", rootfs);
-    }
-    // /dev/* — translate to rootfs/dev/* so init finds the pre-created
-    // device stubs and files (e.g., /dev/.booting, /dev/__null__).
-    // The host's /dev is read-only for untrusted_app, so opens of
-    // /dev/* on the host fail with EACCES. By translating to rootfs/dev/,
-    // init operates on the writable rootfs copy.
-    //
-    // Essential device files (null, urandom, zero, etc.) are pre-created
-    // as symlinks to the host's /dev/* by the parent setup, so opens of
-    // these still reach the real kernel devices.
-    //
-    // /dev/__properties__/* is now ALSO translated to rootfs (and
-    // materialised there by the VFS layer — see vfs.rs::Vfs::materialize).
-    // Previously this path was left untranslated so init's open() hit
-    // the host's /dev/__properties__ (mode 0711, owned by root →
-    // EACCES for untrusted_app), which caused a SIGSEGV in find_property
-    // from an uninitialized property-area pointer. The SIGSEGV was being
-    // suppressed by the find_property binary patch (lib.rs:3404-3485,
-    // commits 9154e59+0a4be80+5d561cf) — that patch is removed in step 3
-    // of the VFS rollout. With a valid property area materialised at
-    // {rootfs}/dev/__properties__/properties_serial, find_property()
-    // iterates over 0 properties and returns NULL naturally — no binary
-    // mutation needed.
-    if path.starts_with("/dev/") || path == "/dev" {
-        return format!("{}{}", rootfs, path);
-    }
-    // /sys/* — translate to rootfs/sys/* so init's sysfs enumeration +
-    // SELinux sysfs reads hit the pre-created FAKE sysfs (empty dirs +
-    // empty /sys/fs/selinux/{enforce,load} files materialised by
-    // lib.rs::precreate_sysfs_stubs). Without this translation, init's
-    // open("/sys/class") + open("/sys/fs/selinux/{enforce,load}") hit
-    // the host's REAL kernel sysfs, which untrusted_app can't read →
-    // -EACCES → init exit(1) at ptrace iteration ~3059 (the NEW
-    // post-56a5bd3 UI E2E blocker — Task 6-P).
-    //
-    // The fake sysfs is intentionally SPARSE — we only pre-create the
-    // paths init is known to open (/sys/class, /sys/fs/selinux/*).
-    // Opens of OTHER /sys/* paths will translate to {rootfs}/sys/* +
-    // return -ENOENT (acceptable — init treats unknown sysfs entries
-    // as "no such device" + proceeds, much better than -EACCES).
-    //
-    // SELinux note: this gives init a writable /sys/fs/selinux/load it
-    // can write its policy blob to (the write succeeds silently against
-    // a regular empty file — no kernel policy is actually loaded).
-    // /sys/fs/selinux/enforce is pre-seeded with "0" (permissive) by
-    // lib.rs::precreate_sysfs_stubs. Together these make SELinux appear
-    // permissive to init — non-fatal for TWRP boot in the sandbox.
-    if path.starts_with("/sys/") || path == "/sys" {
-        return format!("{}{}", rootfs, path);
-    }
-    if path.starts_with("/system/") || path == "/system" {
-        return path.to_string();
-    }
-    if path.starts_with("/vendor/") || path == "/vendor" {
-        return path.to_string();
-    }
-    format!("{}{}", rootfs, path)
 }
 
 // ── Task 6-Z101: staged-executable map (the self-execve enabler) ──
@@ -4119,13 +4601,15 @@ fn stage_guest_executable_capped(
 // second-stage init parses /init.rc then imports
 // /system/etc/init/*.rc + /vendor/etc/init/*.rc (+ /odm/etc/init/*.rc),
 // and mount_all/FirstStageMount read fstab.* from the ramdisk root or
-// /vendor/etc/. translate_path passes /system/* and /vendor/* through
-// UNTRANSLATED (deliberate: the HOST's /system provides the dynamic
-// linker + bionic in non-root mode) — so those config reads hit the
-// HOST's rc files: the WRONG ROM's services get parsed, or ENOENT when
-// the host lacks the file. The classifier below encodes the MINIMAL
-// list of read-only ROM config paths whose opens should be redirected
-// to the ROM copy.
+// /vendor/etc/. HISTORICALLY translate_path passed /system/* and
+// /vendor/* through UNTRANSLATED, so those config reads hit the HOST's
+// rc files: the WRONG ROM's services got parsed, or ENOENT when the
+// host lacked the file — this classifier was the band-aid. Since the
+// 6-Z185 sandbox fix, vfs::SandboxPolicy maps ALL of /system +
+// /vendor (+ /apex) into the rootfs, so the generic translation
+// already lands these reads on the ROM copy; the classifier is kept
+// for explicitness + the ROM-copy existence check (it short-circuits
+// before translate_path and logs the redirect).
 
 /// The minimal read-only ROM-config path list. (a) the ramdisk-root
 /// /init*.rc family; (b) the second-stage import dirs'
@@ -7913,6 +8397,18 @@ pub fn run_ptrace_loop(
     log("PTRACE_O_TRACESYSGOOD | TRACEFORK | TRACECLONE | TRACEVFORK | TRACEVFORKDONE | TRACEEXEC | EXITKILL set");
 
     let mut in_syscall = false;
+    // ── Security fix 6-Z185: the sandbox policy + pending-deny map ──
+    //
+    // `sandbox` is the centralized path-resolution + enforcement
+    // authority (vfs.rs::SandboxPolicy). Every translated path and the
+    // entry-side backstop below route through it. `pending_deny` holds
+    // the fake return value for a syscall the backstop neutered
+    // (rewrote to getpid) at its ENTRY stop — the matching EXIT stop
+    // consumes it. Per-pid, mirroring the other pending_* maps.
+    let sandbox = crate::vfs::SandboxPolicy::with_staging(rootfs, data_dir);
+    let mut pending_sandbox_deny: std::collections::HashMap<libc::pid_t, i64> =
+        std::collections::HashMap::new();
+    let mut sandbox_deny_count: u64 = 0;
     // Task 6-Z54: per-child in_syscall tracking. The global `in_syscall` flag
     // causes DESYNC when switching between init and the recovery child. This
     // map saves/restores `in_syscall` per child PID on each waitpid switch.
@@ -13417,9 +13913,70 @@ pub fn run_ptrace_loop(
                             ));
                         }
                     }
+
+                    // ── Security fix 6-Z185: sandbox enforcement backstop ──
+                    //
+                    // The LAST line of defense, running at the very END
+                    // of the ENTRY stop — AFTER every per-syscall handler
+                    // has staged its rewrites, on a FRESH register
+                    // snapshot (exactly what the kernel will act on when
+                    // the loop-top PTRACE_SYSCALL resumes the child). A
+                    // cheap pre-filter on the stop's own nr keeps this
+                    // free for the ~90% of syscalls that take no path.
+                    // See sandbox_backstop_at_entry for the full policy.
+                    if sandbox_backstop_may_apply(syscall_num, &abi) {
+                        let deny_before = pending_sandbox_deny.len();
+                        sandbox_backstop_at_entry(
+                            pid,
+                            &sandbox,
+                            &abi,
+                            &mut pending_sandbox_deny,
+                            &log,
+                        );
+                        if pending_sandbox_deny.len() > deny_before {
+                            sandbox_deny_count += 1;
+                            // A triggered block is itself a bug signal —
+                            // surface the running total every 50 blocks
+                            // so a translation regression can't hide in
+                            // log volume.
+                            if sandbox_deny_count % 50 == 1 {
+                                log(&format!(
+                                    "SANDBOX BACKSTOP: {} blocks so far this boot (6-Z185)",
+                                    sandbox_deny_count
+                                ));
+                            }
+                        }
+                    }
                 } else {
                     // ── Syscall EXIT ──
                     in_syscall = false;
+
+                    // ── Security fix 6-Z185: consume a pending sandbox DENY ──
+                    //
+                    // The ENTRY-side backstop rewrote this child's syscall
+                    // number to getpid (which the kernel then executed
+                    // harmlessly). Fake the return value the guest sees:
+                    // -errno for real denies, or 0 for the fake-success
+                    // family (chmod/mknod/... — see sandbox_path_arg_slots)
+                    // so the existing boot-critical semantics survive.
+                    if let Some(fake_ret) = pending_sandbox_deny.remove(&pid) {
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        match ptrace_getregs(pid, &mut regs2) {
+                            Ok(len2) => {
+                                set_syscall_ret(&mut regs2, &abi, fake_ret);
+                                if let Err(e) = ptrace_setregs(pid, &regs2, len2) {
+                                    log(&format!(
+                                        "SANDBOX BACKSTOP: EXIT fake {} FAILED for pid {}: {} — child sees getpid's return (6-Z185)",
+                                        fake_ret, pid, e
+                                    ));
+                                }
+                            }
+                            Err(e) => log(&format!(
+                                "SANDBOX BACKSTOP: EXIT getregs FAILED for pid {}: {} (6-Z185)",
+                                pid, e
+                            )),
+                        }
+                    }
 
                     // Task 6-Z45: after the i386 execve is skipped
                     // (orig_rax=-1 at ENTRY), the kernel sets rax=0

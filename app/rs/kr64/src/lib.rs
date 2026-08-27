@@ -4156,13 +4156,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //   /system/lib64/libharfbuzz_ng.so
     //
     // The ROM HAS libandroidicu.so at {rootfs}/system/lib64/ — but the
-    // linker's search resolves /system/** against the HOST
-    // (ptrace_emu::translate_path only maps /dev, /sys, /system_ext,
-    // /product and /odm onto the rootfs; /system and /vendor are
-    // deliberately passed through). /system CANNOT be intercepted for
-    // the child: ndk_translation's runner needs its HOST API-30 arm64
-    // libs from the host's /system + /apex trees (that is precisely how
-    // it got 55 libraries deep).
+    // linker's search PREVIOUSLY resolved /system/** against the HOST
+    // (translate_path passed /system through). Since the 6-Z185 sandbox
+    // fix, /system/lib{,64}/** translate into the rootfs when the ROM
+    // ships them (the ROM-copy branch) and only fall back to the host
+    // for lib subtrees the ROM lacks — ndk_translation's runner keeps
+    // finding its HOST API-30 arm64 libs through that fallback.
     //
     // THE FIX: LD_LIBRARY_PATH's FIRST entry is /dev (see the child env
     // build in Step 8), and the interceptor maps the guest's /dev/*

@@ -40,7 +40,7 @@
 //! real `/proc/self/*` for the actual init process in non-root mode.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// How a guest path is resolved by the VFS.
 pub enum VfsNode {
@@ -802,6 +802,738 @@ fn make_proc_meminfo() -> Vec<u8> {
         cached_kb,    // VmallocUsed
     );
     s.into_bytes()
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SandboxPolicy — the single, centralized path-resolution + enforcement
+// authority for the non-root ptrace sandbox (security fix 6-Z185).
+//
+// WHY THIS EXISTS. In non-root ptrace mode kr64 cannot chroot/pivot_root,
+// so the guest's filesystem sandbox exists ONLY because the tracer
+// rewrites every path-taking syscall's path argument from a guest path
+// ("/system/app") into the private rootfs
+// ("/data/user/0/io.twoyi/rootfs/system/app"). That rewriting used to
+// live in ptrace_emu::translate_path with ONE deliberate hole: guest
+// "/system/*" and "/vendor/*" were passed through UNTRANSLATED, hitting
+// the real host filesystem. On a physical device that meant TWRP's File
+// Manager listed the HOST phone's real /system/app (observed live on a
+// Honor Magic UI device: AudioAccessoryManager, BluetoothMidiService,
+// CaptivePortalLoginGoogle, com.google.mainline.adservices — none of
+// which exist in any imported ROM). Combined with getdents64 having no
+// interception at all, the guest could enumerate (and open) real host
+// files. This module closes that class of bug in two layers:
+//
+//   1. TRANSLATION (guest path → host path): every guest path now maps
+//      into the rootfs, with a NARROW, EXPLICIT, read-only host fallback
+//      only for the dynamic-linker runtime pieces the kernel itself can
+//      still reach (PT_INTERP opens "/system/bin/linker{,64}" directly
+//      inside execve, outside tracer reach — parity is kept for
+//      {/system,/apex} lib directories so mixed-ABI guests keep
+//      booting). The file-manager-visible surfaces — /system/app,
+//      /system/priv-app, /system/etc, /vendor/**, ... — resolve into
+//      the rootfs and ENOENT naturally when the ROM does not ship them.
+//
+//   2. ENFORCEMENT BACKSTOP (independent of layer 1): ptrace_emu calls
+//      `verify_*` on EVERY path-taking syscall (and getdents64 fd
+//      origins) at the last stop before the kernel executes the
+//      syscall. Anything resolving (symlinks followed!) outside the
+//      allowlisted roots is DENIED with -EACCES and logged — a triggered
+//      block is itself a bug signal, because it means some translation
+//      path upstream is wrong.
+//
+// ptrace_emu::translate_path() is now a thin DELEGATE to
+// SandboxPolicy::translate_guest(), so all existing call sites route
+// through this module without per-site edits. (This completes the
+// migration vfs.rs's original header announced as a follow-up; the
+// getdents64 side is enforced through verify_fd_origin rather than by
+// emulating the dirent marshalling, which keeps directory reads at
+// native speed — the fd itself is guaranteed sandboxed at open time.)
+//
+// Note on "1-A F.1": that worklog section (the find_property crash)
+// produced the property-area Dynamic nodes kept above; the path
+// authority migration announced in this file's header is what THIS
+// section implements.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Verdict of an enforcement check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxVerdict {
+    /// Inside the intended sandbox (or an explicitly-allowed host path).
+    Allow,
+    /// Outside the sandbox. Carry the errno to fake and a reason for
+    /// the (always-emitted) block log.
+    Deny(i32, &'static str),
+}
+
+/// The centralized sandbox policy.
+///
+/// One instance is constructed per boot by `run_ptrace_loop` (rootfs +
+/// data-dir staging path); `translate_guest` is also reachable through
+/// the stateless `ptrace_emu::translate_path` wrapper (rootfs-only).
+pub struct SandboxPolicy {
+    /// The guest's root filesystem (an absolute host path under the
+    /// app's private data dir). Everything under it is in-sandbox.
+    rootfs: PathBuf,
+    /// Same as `rootfs` but guaranteed to end in '/' — used for
+    /// cheap prefix checks against String paths.
+    rootfs_slash: String,
+    /// CANONICAL rootfs (symlinks resolved). On a real device
+    /// /data/user/0/<pkg> is a symlink to /data/data/<pkg>, and
+    /// verify_real_path compares CANONICALIZED probe paths against
+    /// this prefix — comparing against the non-canonical form would
+    /// false-DENY every single access.
+    rootfs_canon_slash: String,
+    /// The executable-staging dir ({data_dir}/cache/twoyi_stage) used
+    /// by the 6-Z101/6-Z102 execve staging (the rootfs lives on a
+    /// noexec partition; staged guest binaries MUST be exec'able).
+    staging_dir: Option<PathBuf>,
+}
+
+impl SandboxPolicy {
+    pub fn new(rootfs: &str) -> Self {
+        let rootfs_slash = if rootfs.ends_with('/') {
+            rootfs.to_string()
+        } else {
+            format!("{}/", rootfs)
+        };
+        // Canonicalize the rootfs itself so enforcement compares
+        // canonical-to-canonical (see field doc). If canonicalization
+        // fails (rootfs not yet created), fall back to the string form —
+        // verification of a nonexistent sandbox fails closed anyway.
+        let rootfs_canon_slash = std::fs::canonicalize(&rootfs)
+            .map(|c| {
+                let mut s = c.to_string_lossy().into_owned();
+                if !s.ends_with('/') {
+                    s.push('/');
+                }
+                s
+            })
+            .unwrap_or_else(|_| rootfs_slash.clone());
+        SandboxPolicy {
+            rootfs: PathBuf::from(rootfs),
+            rootfs_slash,
+            rootfs_canon_slash,
+            staging_dir: None,
+        }
+    }
+
+    /// Full policy: rootfs + the exec staging area.
+    ///
+    /// The staging area is the app-private `{data_dir}/cache/`
+    /// directory: the rootfs lives on a noexec partition, so guest
+    /// binaries are staged there before execve ({data_dir}/cache/
+    /// twoyi_init, twoyi_sh, and the twoyi_stage/ tree — see the
+    /// .twoyi-staged map in ptrace_emu). Allowing the whole cache dir
+    /// is deliberate: it contains only twoyi's own staged artifacts,
+    /// and enumerating individual staged names here would silently
+    /// break the boot whenever a new staged name appears.
+    pub fn with_staging(rootfs: &str, data_dir: &str) -> Self {
+        let mut p = SandboxPolicy::new(rootfs);
+        p.staging_dir = Some(PathBuf::from(data_dir).join("cache"));
+        p
+    }
+
+    /// True when `host_path` (already a host-side path) is inside the
+    /// rootfs sandbox.
+    fn under_rootfs(&self, host_path: &str) -> bool {
+        let lit = self.rootfs.to_string_lossy();
+        host_path == self.rootfs_slash.trim_end_matches('/')
+            || host_path.starts_with(&self.rootfs_slash)
+            || host_path.starts_with(lit.as_ref())
+    }
+
+    /// True for the narrow set of host device nodes that the sandbox
+    /// intentionally mirrors via absolute symlinks under {rootfs}/dev
+    /// (lib.rs `symlinks` table: null, zero, console, ptmx, tty, kmsg).
+    /// realpath() of an open through those mirrors resolves HERE.
+    fn is_mirrored_host_device(&self, real: &Path) -> bool {
+        let s = real.to_string_lossy();
+        matches!(
+            s.as_ref(),
+            "/dev/null" | "/dev/zero" | "/dev/console" | "/dev/ptmx" | "/dev/tty" | "/dev/kmsg"
+        )
+    }
+
+    /// True for the kernel-PT_INTERP-parity host paths (see module doc):
+    /// the dynamic linkers themselves plus the bionic/APEX *library*
+    /// subtrees. These are code, not user data — the observed leak
+    /// (/system/app listing real device packages) is NOT reachable
+    /// through any of them, and mixed-ABI guests cannot boot without
+    /// them until every guest ROM ships a complete /system tree.
+    fn is_runtime_host_fallback(&self, real: &Path) -> bool {
+        let s = real.to_string_lossy();
+        let s = s.as_ref();
+        if s == "/system/bin/linker" || s == "/system/bin/linker64" {
+            return true;
+        }
+        // /system/lib/** and /system/lib64/**
+        if s.starts_with("/system/lib/") || s.starts_with("/system/lib64/") {
+            return true;
+        }
+        // APEX library trees: /apex/<module>/lib{,64}/**
+        if let Some(rest) = s.strip_prefix("/apex/") {
+            if let Some(slash) = rest.find('/') {
+                let tail = &rest[slash + 1..];
+                if tail.starts_with("lib/") || tail.starts_with("lib64/") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // ── Layer 1: translation ────────────────────────────────────────
+
+    /// Guest path → the host path the kernel should act on.
+    ///
+    /// Mirrors the historical `translate_path` rules (rootfs prefix for
+    /// /data, /dev (incl. the kmsg map), /sys; /proc passthrough with
+    /// the pid→self redirect; {rootfs}-prefixed paths are sacred;
+    /// relative paths untouched — the caller resolves them) and REPLACES
+    /// the vulnerable /system + /vendor passthroughs: every ROM tree now
+    /// maps into the rootfs, except the runtime fallback of
+    /// [`Self::is_runtime_host_fallback`] (linkers + lib subtrees when
+    /// the rootfs copy is absent).
+    pub fn translate_guest(&self, path: &str) -> String {
+        if !path.starts_with('/') {
+            return path.to_string();
+        }
+        // {rootfs}-prefixed paths stay untouched (the fb_hook's
+        // rootfs_retry_open forms land here — double-prefixing would
+        // break them).
+        if self.under_rootfs(path) {
+            return path.to_string();
+        }
+        // /proc/cmdline — synthetic cmdline (host's is EACCES/real).
+        if path == "/proc/cmdline" {
+            return format!("{}/twrp-cmdline", self.rootfs.to_string_lossy());
+        }
+        // /proc/<pid>/{maps,status,cmdline,auxv} → /proc/self/… (the
+        // synthetic generators the VFS registered).
+        if path.starts_with("/proc/") {
+            for suffix in &["/maps", "/status", "/cmdline", "/auxv"] {
+                if path.ends_with(suffix) {
+                    let middle = &path["/proc/".len()..path.len() - suffix.len()];
+                    if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit()) {
+                        return format!("/proc/self{}", suffix);
+                    }
+                }
+            }
+            // All other /proc/** passes through to the host by design
+            // (/proc/self/* works as untrusted_app; the guest's own
+            // process info only).
+            return path.to_string();
+        }
+        // /data/* → the rootfs copy (the jail's /data is the rootfs's).
+        if path.starts_with("/data/") || path == "/data" {
+            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+        }
+        // /dev/kmsg → the __kmsg__ mirror file.
+        if path == "/dev/kmsg" {
+            return format!("{}/dev/__kmsg__", self.rootfs.to_string_lossy());
+        }
+        // /dev/** → rootfs/dev/** (device stubs + intentional host
+        // mirrors as absolute symlinks — see is_mirrored_host_device).
+        if path.starts_with("/dev/") || path == "/dev" {
+            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+        }
+        // /sys/** → the pre-created fake sysfs inside the rootfs.
+        if path.starts_with("/sys/") || path == "/sys" {
+            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+        }
+        // /apex/** — previously passed through (same leak class as
+        // /system; TWRP never reads it, the AOSP/ndk_translation
+        // experiment only needs its LIB trees, which
+        // is_runtime_host_fallback keeps available).
+        if path.starts_with("/apex/") || path == "/apex" {
+            if self.is_runtime_host_fallback(Path::new(path)) {
+                // The guest ROM does not ship an APEX of its own — keep
+                // the kernel-PT_INTERP-parity lib path on the host.
+                return path.to_string();
+            }
+            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+        }
+        // /system/** + /vendor/** (+ /odm, /system_ext, /product via the
+        // default arm below) — THE FIX. These used to pass through to
+        // the real host filesystem, which is how TWRP's File Manager
+        // listed the physical device's real Magic UI /system/app.
+        // Now they resolve inside the rootfs (ENOENT when the ROM does
+        // not ship them — the honest sandbox answer), with the sole
+        // exception of the linker + lib-subtree runtime fallback.
+        if path.starts_with("/system/") || path == "/system" {
+            if self.is_runtime_host_fallback(Path::new(path)) {
+                // The kernel opens PT_INTERP="/system/bin/linker{,64}"
+                // itself during execve — outside tracer reach. Keep
+                // those two exact files (and the lib subtrees a mixed
+                // runtime still needs) reachable; EVERYTHING else under
+                // /system (app, priv-app, etc, ...) is rootfs-only.
+                return path.to_string();
+            }
+            let rootfs_copy = format!("{}{}", self.rootfs.to_string_lossy(), path);
+            if self.is_lib_dir(path) && !Path::new(&rootfs_copy).exists() {
+                // Lib subtrees with no rootfs copy (a TWRP ramdisk keeps
+                // its runtime in /sbin): fall back to the host's lib
+                // tree so the bionic linker still satisfies DT_NEEDED.
+                // Read-only code paths only — is_runtime_host_fallback
+                // allowlists exactly this on the enforcement side too.
+                return path.to_string();
+            }
+            return rootfs_copy;
+        }
+        if path.starts_with("/vendor/") || path == "/vendor" {
+            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+        }
+        // Everything else (/, /init.rc, /sbin/**, /odm, /system_ext,
+        // /product, ...) → the rootfs.
+        format!("{}{}", self.rootfs.to_string_lossy(), path)
+    }
+
+    /// Is `path` one of the runtime library subtrees?
+    fn is_lib_dir(&self, path: &str) -> bool {
+        path.starts_with("/system/lib/") || path.starts_with("/system/lib64/")
+    }
+
+    // ── Layer 2: enforcement backstop ───────────────────────────────
+
+    /// Verdict for a FINAL host path (post-translation — exactly what
+    /// the kernel is about to act on), with symlinks resolved.
+    pub fn verify_real_path(&self, real: &Path) -> SandboxVerdict {
+        let s = real.to_string_lossy();
+        // 1. Inside the rootfs sandbox. BOTH the literal rootfs prefix
+        //    (how translated paths are staged) and the CANONICAL form
+        //    (how this path was resolved — /data/user/0/<pkg> is a
+        //    symlink to /data/data/<pkg> on real devices) are accepted.
+        if s.starts_with(&self.rootfs_slash)
+            || s.starts_with(&self.rootfs_canon_slash)
+            || Path::new(s.as_ref()) == self.rootfs
+        {
+            return SandboxVerdict::Allow;
+        }
+        // 2. Host /proc — long-standing deliberate passthrough (the
+        //    guest's own /proc/self/*; pid-redirected above).
+        if s.starts_with("/proc/") || s == "/proc" {
+            return SandboxVerdict::Allow;
+        }
+        // 3. The intentional absolute device mirrors created under
+        //    {rootfs}/dev (realpath lands on the host node).
+        if self.is_mirrored_host_device(real) {
+            return SandboxVerdict::Allow;
+        }
+        // 4. The narrow linker/lib runtime fallback (module doc).
+        if self.is_runtime_host_fallback(real) {
+            return SandboxVerdict::Allow;
+        }
+        // 5. The exec staging dir (rootfs partition is noexec). Both
+        //    the literal and the canonical form are accepted (the
+        //    staging dir may not exist yet at policy-construction
+        //    time, and /data/user/0 vs /data/data aliasing applies).
+        if let Some(staging) = &self.staging_dir {
+            let st = staging.to_string_lossy().into_owned();
+            let st_slash = if st.ends_with('/') {
+                st.clone()
+            } else {
+                format!("{}/", st)
+            };
+            if s.starts_with(&st_slash) || *real == *staging {
+                return SandboxVerdict::Allow;
+            }
+            if let Ok(c) = std::fs::canonicalize(&staging) {
+                let c_slash = {
+                    let mut x = c.to_string_lossy().into_owned();
+                    if !x.ends_with('/') {
+                        x.push('/');
+                    }
+                    x
+                };
+                if s.starts_with(&c_slash) || *real == c {
+                    return SandboxVerdict::Allow;
+                }
+            }
+        }
+        SandboxVerdict::Deny(
+            libc::EACCES,
+            "resolved outside the rootfs sandbox and no host allowlist matches",
+        )
+    }
+
+    /// Resolve a path AS THE KERNEL WOULD see it, following symlinks,
+    /// and return the canonical result for the verdict.
+    ///
+    /// * `path` — the final (post-translation) path string from the
+    ///   syscall argument.
+    /// * `cwd` — the tracee's current working directory (from
+    ///   /proc/<tid>/cwd) for relative paths.
+    ///
+    /// Lexical `..`/`.` components are normalized BEFORE canonicalizing
+    /// so a path like {rootfs}/x/../../etc/secret cannot slip past the
+    /// prefix check while its prefix exists. For not-yet-existing
+    /// targets (O_CREAT) the deepest EXISTING ancestor is canonicalized
+    /// (symlinks followed) — the new entry would be created under
+    /// wherever that ancestor really lives.
+    pub fn resolve_as_kernel(&self, path: &str, cwd: Option<&Path>) -> Option<PathBuf> {
+        let joined: PathBuf = if path.starts_with('/') {
+            PathBuf::from(path)
+        } else {
+            match cwd {
+                Some(c) => c.join(path),
+                None => return None, // relative path, no cwd → cannot verify
+            }
+        };
+        let normalized = lexical_normalize(&joined)?;
+        deepest_existing_canonical(&normalized)
+    }
+
+    /// Backstop for fd-based directory enumeration (getdents64).
+    ///
+    /// The fd itself was produced by an open/openat that already went
+    /// through translation + `verify_real_path`; this catches any fd
+    /// whose origin STILL resolves outside the sandbox (a future
+    /// translation hole, an fd that leaked in from an unhooked path).
+    /// Non-path fd targets (sockets, pipes, anon inodes) read back as
+    /// "socket:[…]" / "pipe:[…]" / "anon_inode:…" and are allowed —
+    /// getdents64 on them fails with ENOTDIR in the kernel anyway.
+    pub fn verify_fd_origin(&self, tid: libc::pid_t, fd: i64) -> SandboxVerdict {
+        let link = format!("/proc/{}/fd/{}", tid, fd);
+        let target = match std::fs::read_link(&link) {
+            Ok(t) => t,
+            Err(_) => return SandboxVerdict::Allow, // EBADF etc. — kernel reports it
+        };
+        let t = target.to_string_lossy();
+        if t.starts_with("socket:[")
+            || t.starts_with("pipe:[")
+            || t.starts_with("anon_inode:")
+            || t.starts_with("/dev/")
+        {
+            // /dev/* fd targets (e.g. the mirrored char devices, or an
+            // inotify/timer fd presented under /dev) are not guest-file
+            // directories.
+            return SandboxVerdict::Allow;
+        }
+        match self.verify_real_path(&target) {
+            SandboxVerdict::Allow => SandboxVerdict::Allow,
+            SandboxVerdict::Deny(_, why) => SandboxVerdict::Deny(libc::EACCES, why),
+        }
+    }
+}
+
+/// Purely-lexical normalization of `.` and `..` components (no symlink
+/// resolution, no filesystem access). Returns None for a path that
+/// lexically climbs above `/`.
+fn lexical_normalize(p: &Path) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    let mut out: Vec<&OsStr> = Vec::new();
+    for comp in p.components() {
+        use std::path::Component::*;
+        match comp {
+            Prefix(_) | RootDir => {}
+            CurDir => {}
+            ParentDir => {
+                if out.pop().is_none() {
+                    // Climbing above the root — path escapes lexically.
+                    return None;
+                }
+            }
+            Normal(c) => out.push(c),
+        }
+    }
+    let mut buf = PathBuf::from("/");
+    for c in out {
+        buf.push(c);
+    }
+    Some(buf)
+}
+
+/// Canonicalize the deepest EXISTING ancestor of `p` (following
+/// symlinks). `/a/b/c` with b/c missing but /a existing canonicalizes
+/// /a — the verdict then covers where the missing tail would be
+/// created. Returns None when nothing along the chain exists (e.g. the
+/// rootfs itself is gone — deny by failure upstream).
+fn deepest_existing_canonical(p: &Path) -> Option<PathBuf> {
+    let mut cur = p.to_path_buf();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&cur) {
+            return Some(c);
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
+#[cfg(test)]
+mod sandbox_policy_tests {
+    use super::*;
+
+    fn policy() -> SandboxPolicy {
+        SandboxPolicy::new("/data/user/0/io.twoyi/rootfs")
+    }
+
+    #[test]
+    fn translate_maps_rom_trees_into_rootfs() {
+        let p = policy();
+        // The observed leak paths now land inside the sandbox:
+        assert_eq!(
+            p.translate_guest("/system/app"),
+            "/data/user/0/io.twoyi/rootfs/system/app"
+        );
+        assert_eq!(
+            p.translate_guest("/system/app/AudioAccessoryManager/AudioAccessoryManager.apk"),
+            "/data/user/0/io.twoyi/rootfs/system/app/AudioAccessoryManager/AudioAccessoryManager.apk"
+        );
+        assert_eq!(
+            p.translate_guest("/system/etc/hosts"),
+            "/data/user/0/io.twoyi/rootfs/system/etc/hosts"
+        );
+        assert_eq!(
+            p.translate_guest("/vendor/app"),
+            "/data/user/0/io.twoyi/rootfs/vendor/app"
+        );
+        assert_eq!(
+            p.translate_guest("/apex/com.android.art/bin/dex2oat64"),
+            "/data/user/0/io.twoyi/rootfs/apex/com.android.art/bin/dex2oat64"
+        );
+        // Non-rom trees keep their historical mapping:
+        assert_eq!(
+            p.translate_guest("/sbin/recovery"),
+            "/data/user/0/io.twoyi/rootfs/sbin/recovery"
+        );
+        assert_eq!(
+            p.translate_guest("/init.rc"),
+            "/data/user/0/io.twoyi/rootfs/init.rc"
+        );
+        assert_eq!(
+            p.translate_guest("/data/media/TWRP"),
+            "/data/user/0/io.twoyi/rootfs/data/media/TWRP"
+        );
+        assert_eq!(
+            p.translate_guest("/dev/__properties__"),
+            "/data/user/0/io.twoyi/rootfs/dev/__properties__"
+        );
+        assert_eq!(
+            p.translate_guest("/sys/fs/selinux/enforce"),
+            "/data/user/0/io.twoyi/rootfs/sys/fs/selinux/enforce"
+        );
+        assert_eq!(
+            p.translate_guest("/dev/kmsg"),
+            "/data/user/0/io.twoyi/rootfs/dev/__kmsg__"
+        );
+        assert_eq!(
+            p.translate_guest("/proc/cmdline"),
+            "/data/user/0/io.twoyi/rootfs/twrp-cmdline"
+        );
+    }
+
+    #[test]
+    fn translate_runtime_fallback_is_narrow() {
+        let p = policy();
+        // PT_INTERP parity — the two exact linker paths stay on host:
+        assert_eq!(
+            p.translate_guest("/system/bin/linker"),
+            "/system/bin/linker"
+        );
+        assert_eq!(
+            p.translate_guest("/system/bin/linker64"),
+            "/system/bin/linker64"
+        );
+        // Lib subtrees fall back to host ONLY when the rootfs has no
+        // copy. This test env has no /data/... rootfs, so fallback fires:
+        assert_eq!(
+            p.translate_guest("/system/lib64/libc.so"),
+            "/system/lib64/libc.so"
+        );
+        assert_eq!(
+            p.translate_guest("/apex/com.android.runtime/lib64/bionic/libdl.so"),
+            "/apex/com.android.runtime/lib64/bionic/libdl.so"
+        );
+        // ...but NOT for data-bearing subtrees:
+        assert_ne!(
+            p.translate_guest("/system/etc/init/hwservicemanager.rc"),
+            "/system/etc/init/hwservicemanager.rc"
+        );
+        assert_ne!(p.translate_guest("/system/app"), "/system/app");
+    }
+
+    #[test]
+    fn translate_rootfs_prefixed_and_relative_untouched() {
+        let p = policy();
+        assert_eq!(
+            p.translate_guest("/data/user/0/io.twoyi/rootfs/system/bin/x"),
+            "/data/user/0/io.twoyi/rootfs/system/bin/x"
+        );
+        assert_eq!(p.translate_guest("relative/path"), "relative/path");
+        assert_eq!(p.translate_guest("./x"), "./x");
+    }
+
+    #[test]
+    fn verify_allows_rootfs_proc_mirrors_and_fallback() {
+        let p =
+            SandboxPolicy::with_staging("/data/user/0/io.twoyi/rootfs", "/data/user/0/io.twoyi");
+        assert_eq!(
+            p.verify_real_path(Path::new("/data/user/0/io.twoyi/rootfs/system/app")),
+            SandboxVerdict::Allow
+        );
+        assert_eq!(
+            p.verify_real_path(Path::new("/proc/self/maps")),
+            SandboxVerdict::Allow
+        );
+        assert_eq!(
+            p.verify_real_path(Path::new("/dev/null")),
+            SandboxVerdict::Allow
+        );
+        assert_eq!(
+            p.verify_real_path(Path::new("/system/bin/linker64")),
+            SandboxVerdict::Allow
+        );
+        assert_eq!(
+            p.verify_real_path(Path::new("/system/lib64/libc.so")),
+            SandboxVerdict::Allow
+        );
+        assert_eq!(
+            p.verify_real_path(Path::new("/apex/com.android.art/lib64/libart.so")),
+            SandboxVerdict::Allow
+        );
+        assert_eq!(
+            p.verify_real_path(Path::new("/data/user/0/io.twoyi/cache/twoyi_stage/init")),
+            SandboxVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn verify_denies_host_escape_paths() {
+        let p =
+            SandboxPolicy::with_staging("/data/user/0/io.twoyi/rootfs", "/data/user/0/io.twoyi");
+        // The exact observed leak:
+        assert!(matches!(
+            p.verify_real_path(Path::new("/system/app")),
+            SandboxVerdict::Deny(_, _)
+        ));
+        assert!(matches!(
+            p.verify_real_path(Path::new("/system/priv-app")),
+            SandboxVerdict::Deny(_, _)
+        ));
+        assert!(matches!(
+            p.verify_real_path(Path::new(
+                "/system/etc/security/current/mac_permissions.xml"
+            )),
+            SandboxVerdict::Deny(_, _)
+        ));
+        assert!(matches!(
+            p.verify_real_path(Path::new("/vendor/app")),
+            SandboxVerdict::Deny(_, _)
+        ));
+        assert!(matches!(
+            p.verify_real_path(Path::new("/apex/com.android.art/bin/dex2oat64")),
+            SandboxVerdict::Deny(_, _)
+        ));
+        assert!(matches!(
+            p.verify_real_path(Path::new("/sdcard/DCIM")),
+            SandboxVerdict::Deny(_, _)
+        ));
+        assert!(matches!(
+            p.verify_real_path(Path::new("/data/misc/keystore")),
+            SandboxVerdict::Deny(_, _)
+        ));
+        assert!(matches!(
+            p.verify_real_path(Path::new("/etc/passwd")),
+            SandboxVerdict::Deny(_, _)
+        ));
+        // Binaries other than the two linkers are NOT allowed on host:
+        assert!(matches!(
+            p.verify_real_path(Path::new("/system/bin/sh")),
+            SandboxVerdict::Deny(_, _)
+        ));
+    }
+
+    #[test]
+    fn resolve_follows_symlink_escape_and_lexical_dotdot() {
+        // Build a sandbox with a symlink that points OUTSIDE.
+        let base = std::env::temp_dir().join(format!("kr64_sbx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let rootfs = base.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("system/app")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), rootfs.join("escape")).unwrap();
+        let p = SandboxPolicy::new(rootfs.to_str().unwrap());
+
+        // Plain rootfs path → allow.
+        let real = p
+            .resolve_as_kernel(&format!("{}/system/app", rootfs.to_str().unwrap()), None)
+            .unwrap();
+        assert_eq!(p.verify_real_path(&real), SandboxVerdict::Allow);
+
+        // Symlink escape: {rootfs}/escape → …/outside (outside sandbox).
+        let real = p
+            .resolve_as_kernel(&format!("{}/escape", rootfs.to_str().unwrap()), None)
+            .unwrap();
+        assert!(matches!(
+            p.verify_real_path(&real),
+            SandboxVerdict::Deny(_, _)
+        ));
+
+        // Lexical .. climb: {rootfs}/x/../../outside must NOT resolve to
+        // a location that passes the rootfs prefix check.
+        let real = p
+            .resolve_as_kernel(
+                &format!("{}/x/../../outside", rootfs.to_str().unwrap()),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            p.verify_real_path(&real),
+            SandboxVerdict::Deny(_, _)
+        ));
+
+        // O_CREAT form: a missing file under an EXISTING sandbox dir is
+        // allowed (deepest-existing-ancestor logic).
+        let real = p
+            .resolve_as_kernel(
+                &format!("{}/system/app/NewPkg/base.apk", rootfs.to_str().unwrap()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(p.verify_real_path(&real), SandboxVerdict::Allow);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_relative_against_cwd() {
+        let base = std::env::temp_dir().join(format!("kr64_sbxcwd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let rootfs = base.join("rootfs");
+        std::fs::create_dir_all(rootfs.join("sbin")).unwrap();
+        let p = SandboxPolicy::new(rootfs.to_str().unwrap());
+        let cwd = std::fs::canonicalize(rootfs.join("sbin")).unwrap();
+        let real = p
+            .resolve_as_kernel("libtwrp_fb_hook.so", Some(&cwd))
+            .unwrap();
+        assert_eq!(p.verify_real_path(&real), SandboxVerdict::Allow);
+        // No cwd for a relative path → unverifiable → caller denies.
+        assert!(p.resolve_as_kernel("some/rel", None).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fd_origin_check_classifies_targets() {
+        let p = policy();
+        // The tracer's own std fd targets are not guest directories.
+        assert_eq!(
+            p.verify_fd_origin(std::process::id() as libc::pid_t, 0),
+            SandboxVerdict::Allow
+        );
+        // A directory fd on a HOST path (this test binary's cwd) is a
+        // directory → getdents64 would leak it → must DENY.
+        let real_cwd = std::fs::canonicalize(".").unwrap();
+        if real_cwd.starts_with("/home")
+            || real_cwd.starts_with("/tmp")
+            || real_cwd.starts_with("/root")
+        {
+            let f = std::fs::File::open(&real_cwd).unwrap();
+            use std::os::unix::io::AsRawFd;
+            assert!(matches!(
+                p.verify_fd_origin(std::process::id() as libc::pid_t, f.as_raw_fd() as i64),
+                SandboxVerdict::Deny(_, _)
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

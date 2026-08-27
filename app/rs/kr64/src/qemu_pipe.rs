@@ -282,6 +282,15 @@ const KNOWN_CHANNELS: [&str; 3] = ["opengles", "opengles2", "opengles3"];
 /// the start of `buf` through the END of the name (not the terminator).
 /// Returns `None` if the buffer doesn't start with `"pipe:"`, the name
 /// is empty, or no terminator has arrived yet (keep reading).
+///
+/// No-terminator case (the guest sent the name alone and the connection
+/// stays open for the payload): the buffered bytes are accepted as the
+/// complete name UNLESS they are still a proper PREFIX of a known
+/// channel — "pipe:open" must keep waiting because "opengles" may still
+/// arrive (split-delivery regression lock), while "pipe:unknown_channel"
+/// cannot grow into anything known and is returned so the caller can
+/// reject the unknown channel and close the connection (otherwise the
+/// proxy would block on read forever — the hang this rule prevents).
 fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
     if !buf.starts_with(PIPE_PREFIX.as_bytes()) {
         return None;
@@ -304,7 +313,19 @@ fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
             if KNOWN_CHANNELS.contains(&candidate) {
                 return Some((candidate, buf.len()));
             }
-            return None;
+            // Split-delivery patience: a PROPER PREFIX of a known
+            // channel ("open" of "opengles") must keep reading — the
+            // rest of the name may still arrive. Anything else cannot
+            // become a known channel, so treat it as a complete
+            // (unknown) name; the caller logs + closes instead of
+            // blocking forever on the next read.
+            if KNOWN_CHANNELS
+                .iter()
+                .any(|known| known.len() > candidate.len() && known.starts_with(candidate))
+            {
+                return None;
+            }
+            return Some((candidate, buf.len()));
         }
     };
     if end == 0 {
@@ -416,9 +437,10 @@ mod tests {
         assert_eq!(parse_channel_name(b"pipe:open"), None);
         // ...and a full unknown name that IS terminated parses (the
         // caller's known-channel check rejects it afterwards).
+        // ("unknown_channel" is 15 chars: 5 prefix + 15 consumed.)
         assert_eq!(
             parse_channel_name(b"pipe:unknown_channel"),
-            Some(("unknown_channel", 5 + 16))
+            Some(("unknown_channel", 5 + 15))
         );
     }
 
@@ -558,6 +580,12 @@ mod tests {
         .unwrap();
 
         let mut guest = UnixStream::connect(&pipe_path).unwrap();
+        // Anti-hang guard (6-Z185): if the proxy ever regresses to
+        // blocking-on-read for an unterminated unknown channel again,
+        // this test must FAIL fast, not hang the whole suite.
+        guest
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
         guest.write_all(b"pipe:unknown_channel").unwrap();
 
         // The proxy should close the connection gracefully (no renderer
