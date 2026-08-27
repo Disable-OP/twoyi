@@ -1575,7 +1575,8 @@ impl BinderProxy {
                             if active.load(Ordering::Acquire) >= MAX_PROXY_CONNECTIONS {
                                 warning!(
                                     "[KR64][binder][vm{}] connection over cap ({}) dropped",
-                                    vm_id, MAX_PROXY_CONNECTIONS
+                                    vm_id,
+                                    MAX_PROXY_CONNECTIONS
                                 );
                                 drop(stream);
                                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -1596,7 +1597,8 @@ impl BinderProxy {
                                     if let Err(e) = result {
                                         warning!(
                                             "[KR64][binder][vm{}] connection handler ended: {}",
-                                            vm_id, e
+                                            vm_id,
+                                            e
                                         );
                                     }
                                     active_conn.fetch_sub(1, Ordering::AcqRel);
@@ -1605,10 +1607,7 @@ impl BinderProxy {
                                 // Spawn failed: undo the counter bump so the
                                 // slot stays available to later connects.
                                 active.fetch_sub(1, Ordering::AcqRel);
-                                warning!(
-                                    "[KR64][binder][vm{}] conn-thread spawn failed",
-                                    vm_id
-                                );
+                                warning!("[KR64][binder][vm{}] conn-thread spawn failed", vm_id);
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
                         }

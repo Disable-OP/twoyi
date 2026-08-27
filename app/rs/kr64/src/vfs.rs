@@ -358,15 +358,15 @@ fn is_dev_properties_path(guest_path: &str) -> bool {
 /// NULL for every lookup, which is what TWRP init tolerates (it checks for
 /// NULL and falls back). Same behavior as the old binary patch, no mutation.
 fn make_minimal_property_area() -> Vec<u8> {
-    const PROP_AREA_MAGIC: u32 = 0x504f5250; // "PROP" little-endian
-    // Both the pre-8 and the 8+ bionic use the SAME version constant
-    // (0xfc6ed0ab): prop_area::is_valid() checks
-    // `magic == PROP_AREA_MAGIC && version == PROP_AREA_VERSION`, and
-    // there is no version `1` anywhere in bionic. (An earlier revision
-    // wrote 1 here, which made the area INVALID — every mmap rejected,
-    // every lookup NULL. The observable behavior of an empty area is
-    // the same, but a valid header keeps bionic from logging errors
-    // and lets future property-serving actually work.)
+    const PROP_AREA_MAGIC: u32 = 0x504f5250;
+    /// Both the pre-8 and the 8+ bionic use the SAME version constant
+    /// (0xfc6ed0ab): prop_area::is_valid() checks
+    /// `magic == PROP_AREA_MAGIC && version == PROP_AREA_VERSION`, and
+    /// there is no version `1` anywhere in bionic. (An earlier revision
+    /// wrote 1 here, which made the area INVALID — every mmap rejected,
+    /// every lookup NULL. The observable behavior of an empty area is
+    /// the same, but a valid header keeps bionic from logging errors
+    /// and lets future property-serving actually work.)
     const PROP_AREA_VERSION: u32 = 0xfc6ed0ab;
     let mut buf = Vec::with_capacity(128);
     // bytes_used: 0 (no properties)

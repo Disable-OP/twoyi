@@ -55,11 +55,11 @@ pub fn spawn_qemu_pipe_proxy(
     // Non-blocking so the accept loop can poll the shutdown flag.
     let fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
     // Read-modify-write: OR O_NONBLOCK into the existing flags instead
-        // of clobbering them (F_SETFL replaces the whole status word).
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags >= 0 {
-            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        }
+    // of clobbering them (F_SETFL replaces the whole status word).
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -372,17 +372,26 @@ mod tests {
 
     #[test]
     fn parse_opengles() {
-        assert_eq!(parse_channel_name(b"pipe:opengles").map(|(n, _)| n), Some("opengles"));
+        assert_eq!(
+            parse_channel_name(b"pipe:opengles").map(|(n, _)| n),
+            Some("opengles")
+        );
     }
 
     #[test]
     fn parse_opengles2() {
-        assert_eq!(parse_channel_name(b"pipe:opengles2").map(|(n, _)| n), Some("opengles2"));
+        assert_eq!(
+            parse_channel_name(b"pipe:opengles2").map(|(n, _)| n),
+            Some("opengles2")
+        );
     }
 
     #[test]
     fn parse_opengles3() {
-        assert_eq!(parse_channel_name(b"pipe:opengles3").map(|(n, _)| n), Some("opengles3"));
+        assert_eq!(
+            parse_channel_name(b"pipe:opengles3").map(|(n, _)| n),
+            Some("opengles3")
+        );
     }
 
     #[test]

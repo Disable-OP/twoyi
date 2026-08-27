@@ -872,15 +872,15 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, ctx: *mut c_void
     // crate's signal-safe write helpers instead (write(2) only).
     let mut nbuf = [0u8; 12];
     match action {
-        Action::Kill => {
-            unsafe {
-                crate::safe_write_err(b"[KR64][seccomp] BLOCKED.SYSCALL.FAILED: killed guest for syscall ");
-                let n = crate::format_decimal(&mut nbuf, syscall_nr);
-                crate::safe_write_err(&nbuf[..n]);
-                crate::safe_write_err(b"\n");
-                libc::_exit(1);
-            }
-        }
+        Action::Kill => unsafe {
+            crate::safe_write_err(
+                b"[KR64][seccomp] BLOCKED.SYSCALL.FAILED: killed guest for syscall ",
+            );
+            let n = crate::format_decimal(&mut nbuf, syscall_nr);
+            crate::safe_write_err(&nbuf[..n]);
+            crate::safe_write_err(b"\n");
+            libc::_exit(1);
+        },
         Action::Emulate { retval } => {
             // Emulate: set return value, advance PC past syscall instr.
             unsafe {
