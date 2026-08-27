@@ -719,38 +719,63 @@ static int pty_open_master(int flags) {
         if (g_pty_master_fd[i] < 0) { slot = i; break; }
     }
     if (slot < 0) return -1;
-    long sv[2] = { -1, -1 };
-    /* 6-Z188c: MARKED — the tracer must leave this socketpair COMPLETELY
-     * alone (run 33125938988: the unmarked call came back with sv[]
-     * garbage — "slave fd=-45511424" — a rewritten/skipped socketpair;
-     * every dup of the garbage fd then EBADF'd and the shell inherited
-     * the recovery's fds as stdio, reading binary mojibake). */
-    long r = raw_syscall4_marked(199 /* SYS_socketpair aarch64 */,
-                                 1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0,
-                                 (long)sv);
-    if (r != 0 || sv[0] < 0 || sv[0] >= 1024 || sv[1] < 0 || sv[1] >= 1024) {
-        write_str(2, "[twrp_fb_hook] pty socketpair BAD ret=");
-        write_num(2, (int)r);
-        write_str(2, " sv0=");
-        write_num(2, (int)sv[0]);
-        write_str(2, " sv1=");
-        write_num(2, (int)sv[1]);
-        write_str(2, "\n");
-        /* Close whatever half-open fds the kernel may have made. */
+    /* 6-Z188d: run 33126808683 saw ret=0 with sv[0]=15, sv[1]=MY INIT
+     * VALUE — the kernel's pair landed at sv[-1],sv[0] (an off-by-8 on
+     * the out-pointer somewhere in the ptrace path). Defense: a 4-slot
+     * buffer with the OUT-POINTER at index 1, then accept whichever
+     * ADJACENT PAIR is two sane fds. Retries + raw dumps make the next
+     * failure self-describing. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        long sv[4] = { -1, -1, -1, -1 };
+        long r = raw_syscall4_marked(199 /* SYS_socketpair aarch64 */,
+                                     1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0,
+                                     (long)&sv[1]);
+        if (r != 0) {
+            write_str(2, "[twrp_fb_hook] pty socketpair ret=");
+            write_num(2, (int)r);
+            write_str(2, " (attempt ");
+            write_num(2, attempt);
+            write_str(2, ")\n");
+            continue;
+        }
+        int m = -1, s = -1;
+        if (sv[1] >= 0 && sv[1] < 1024 && sv[2] >= 0 && sv[2] < 1024) {
+            m = (int)sv[1]; s = (int)sv[2];
+        } else if (sv[0] >= 0 && sv[0] < 1024 && sv[1] >= 0 && sv[1] < 1024) {
+            /* Off-by-8 write: the pair landed one slot LOW. */
+            m = (int)sv[0]; s = (int)sv[1];
+            write_str(2, "[twrp_fb_hook] pty socketpair OFF-BY-8 recovered\n");
+        } else if (sv[2] >= 0 && sv[2] < 1024 && sv[3] >= 0 && sv[3] < 1024) {
+            /* Off-by-8 HIGH: the pair landed one slot above. */
+            m = (int)sv[2]; s = (int)sv[3];
+            write_str(2, "[twrp_fb_hook] pty socketpair OFF-BY-8+ recovered\n");
+        }
+        if (m >= 0 && s >= 0 && m != s) {
+            g_pty_master_fd[slot] = m;
+            g_pty_slave_fd[slot]  = s;
+            write_str(2, "[twrp_fb_hook] pty master fd=");
+            write_num(2, m);
+            write_str(2, " (slot ");
+            write_num(2, slot);
+            write_str(2, ", slave fd=");
+            write_num(2, s);
+            write_str(2, ")\n");
+            return m;
+        }
+        /* Failure — dump everything for the next iteration. */
+        write_str(2, "[twrp_fb_hook] pty socketpair BAD ret=0 sv=[");
+        for (int k = 0; k < 4; k++) {
+            write_num(2, (int)sv[k]);
+            if (k < 3) write_str(2, " ");
+        }
+        write_str(2, "] (attempt ");
+        write_num(2, attempt);
+        write_str(2, ")\n");
         if (sv[0] >= 0 && sv[0] < 1024) raw_syscall1(SYS_close, sv[0]);
         if (sv[1] >= 0 && sv[1] < 1024) raw_syscall1(SYS_close, sv[1]);
-        return -1;
+        if (sv[2] >= 0 && sv[2] < 1024) raw_syscall1(SYS_close, sv[2]);
     }
-    g_pty_master_fd[slot] = (int)sv[0];
-    g_pty_slave_fd[slot]  = (int)sv[1];
-    write_str(2, "[twrp_fb_hook] pty master fd=");
-    write_num(2, (int)sv[0]);
-    write_str(2, " (slot ");
-    write_num(2, slot);
-    write_str(2, ", slave fd=");
-    write_num(2, (int)sv[1]);
-    write_str(2, ")\n");
-    return (int)sv[0];
+    return -1;
 }
 
 /* 6-Z188c: shared dispatch for ALL FOUR open wrappers (open/openat/
@@ -764,6 +789,13 @@ static int pty_open_dispatch(const char *path, int flags) {
     if (is_ptmx_path(path)) {
         int pfd = pty_open_master(flags);
         if (pfd >= 0) return pfd;
+        /* 6-Z188d: a /dev/ptmx STUB FILE may exist in the rootfs — never
+         * fall through to it (run 33126808683: the stub open SUCCEEDED,
+         * fd=18, and unlockpt/TIOCGPTN then ENOTTY'd downstream). A
+         * failed pty allocation must look like "no ptmx device": ENOENT.
+         */
+        write_str(2, "[twrp_fb_hook] ptmx allocation failed -> ENOENT (not falling through to any stub file)\n");
+        return -1;
     }
     int sfd = pty_open_slave(path);
     if (sfd != -2) return sfd;

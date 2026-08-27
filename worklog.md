@@ -12219,3 +12219,33 @@ Stage Summary:
 - Every layer of the terminal chain is now in place and individually
   verified except the last two (real socketpair values + slave open via
   the fortified variants). Next run should render the ash prompt.
+
+---
+Task ID: 6-Z188d
+Agent: main
+Task: Run 33126808683: socketpair came back ret=0 sv0=15 sv1=-1 (the
+kernel's fd pair landed one slot LOW — an off-by-8 on the out-pointer
+somewhere in the ptrace path); the dispatch then fell through to a
+/dev/ptmx STUB FILE (fd=18, regular file) and unlockpt/TIOCGPTN
+ENOTTY'd downstream; TWRP built a bogus /dev/pts/20 slave path.
+
+Work Log:
+- Evidence: "pty socketpair BAD ret=0 sv0=15 sv1=-1" — sv1 == MY INIT
+  VALUE means the kernel wrote [sv-1],[sv0]; plus
+  'open("/dev/ptmx", fl=0x102) -> fd=18' (the stub-file fallthrough)
+  and "pty slave open /dev/pts/20 ... MISS".
+- 6-Z188d FIXES (self-healing, diagnostic-rich):
+  * 4-slot sv buffer with the out-pointer at &sv[1]; accept whichever
+    ADJACENT pair are two sane distinct fds (normal / one-low / one-
+    high) — recovers from any +-8 pointer drift without caring which
+    ptrace path causes it.
+  * 3 retry attempts; full sv[] dump on each failure.
+  * ptmx dispatch failure now returns ENOENT semantics — never falls
+    through to the /dev/ptmx stub file (getpt fails cleanly instead of
+    handing TWRP a regular-file fd that ENOTTYs later).
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- The pty chain is now robust to the observed corruption class and
+  fails closed when it cannot provide a real channel. Next run either
+  shows the ash prompt or an sv[] dump that names the drift exactly.
