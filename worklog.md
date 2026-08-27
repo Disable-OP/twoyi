@@ -11888,3 +11888,85 @@ Stage Summary:
 - Fixes riding along: ROM re-import atomic swap (staging rename
   failure + gutted-rootfs "No ROM Installed" limbo), TIOCGWINSZ
   terminal answers + rate-limited ioctl spam.
+
+---
+Task ID: 6-Z187
+Agent: main
+Task: User rejection of the iter-12 Stage-A verdict: the FM root listing
+shows system/vendor/cache "folders that should not exist" mixed with
+guest files ("MAKE IT ONLY SHOW GUESTS ONLY AND NOTHING ELSE"), the FM
+must "ALWAYS SHOW GUEST'S ROOTFS" (not only after the Open Terminal
+Here button), and the terminal must stop printing "Child processes
+exited."
+
+Work Log:
+- Ground truth via VLM on run 33114902086 screenshots: the FM root
+  listing = ramdisk files + kr64-pre-created ANDROID-guest compat dirs
+  (data_mirror, linkerconfig, metadata, mnt/*, acct/uid_*) + twoyi
+  markers (.twoyi-staged, .twoyi-fb-geometry) + charger.symlink sidecar
+  noise. On redroid it is NOT host content, but it is NOT a clean guest
+  tree either — the user is right.
+- TERMINAL ROOT CAUSE (three stacked defects):
+  (a) RamdiskImporter stores cpio symlinks as `<name>.symlink` TEXT
+      sidecars, so {rootfs}/sbin/sh does NOT exist (target
+      /sbin/busybox).
+  (b) TWRP terminal.cpp runSlave: execl("/sbin/sh","sh",NULL) then
+      _exit(127). The tracer's execve arm read the path with
+      read_child_string — which FAILS (PEEK EIO + pvm fail + /proc/<pid>
+      ENOENT) for the recovery processes AND every process they fork
+      (2629/2636/2670/2671/3643: 80 path-read failures, all silent for
+      execve). Untranslated raw execve -> kernel -> ENOENT on redroid,
+      BUT ON A MAGISK DEVICE /sbin/sh EXISTS -> HOST SHELL. The backstop
+      also skipped these (unreadable path == skip).
+  (c) Boot shebang services /sbin/permissive.sh + pulldecryptfiles.sh:
+      "not ELF magic" -> left raw -> backstop denied -EACCES -> exit
+      127 noise.
+- 6-Z187 FIXES (all host-side boot provisioning + tracer hardening):
+  1. NEW app/rs/kr64/src/symlinks.rs: patch busybox PT_INTERP in-place
+     to {rootfs}/sbin/linker64 (class-aware ELF32/64, in-place + append
+     phdr-update paths), pre-stage busybox into {data_dir}/cache/
+     twoyi_stage under BOTH "/sbin/busybox" and "/sbin/sh" keys, then
+     MATERIALIZE every .symlink sidecar as a REAL symlink (absolute
+     guest targets -> {rootfs}-prefixed host targets; links resolving
+     to /sbin/busybox -> the STAGED copy so raw kernel execs succeed
+     despite noexec; sidecar removed). Bounded walk (200k entries,
+     depth 16, skips proc/sys/dev).
+  2. read_child_string: THIRD fallback via /proc/<pid>/mem pread
+     (FOLL_FORCE path) when PEEK + process_vm_readv both fail.
+  3. execve arm: (i) when the path read fails -> the +1 cwd-relative
+     rewrite (the execve twin of 6-Z170; kernel resolves sans-leading-
+     '/' against the cwd == rootfs, where /sbin/sh is now a REAL
+     symlink to the staged busybox) + a per-stop "claim" so the backstop
+     knows the tracer redirected it; (ii) when staging Skips with "not
+     ELF magic" but the rootfs file exists -> SHEBANG rewrite: stage the
+     interpreter, rewrite arg1 to it + build argv ["sh", guest script
+     path, argv[1..]] in scratch (kernel script semantics; argv[0] must
+     be "sh" — busybox dispatches on argv[0]).
+  4. BACKSTOP FAIL-CLOSED: execve with an UNREADABLE path that the
+     tracer did NOT redirect is now DENIED -EACCES (was: silently
+     allowed to run raw against the host — the Magisk-/sbin/sh hole).
+  5. FM "guest only" cleanup: TWRP mode no longer pre-creates the
+     Android-guest compat dirs (only cache + dev/block* remain);
+     .twoyi-staged marker relocated to {data_dir}/cache/twoyi-staged
+     (out of the rootfs; lib.rs writer + load/append + tests moved);
+     .twoyi-fb-geometry relocated to {rootfs}/dev/ (devices.rs writer +
+     fb_hook.c reader candidates updated, legacy root path kept as last
+     resort); legacy in-rootfs artifacts removed at boot.
+  6. Probe (ui-navigate.py): FM first-entry EARLY + SETTLED + SCROLLED
+     captures (prove ALWAYS-SHOW), system-folder taps BEFORE and AFTER
+     the terminal (unscrolled + scrolled positions), terminal settle
+     extended to 8s+4s with a dedicated prompt screenshot.
+- Gates: cargo check OK; cargo check --target aarch64-linux-android OK;
+  cargo fmt applied; clippy --all-targets -D warnings OK; 574/574 tests
+  pass (5 new symlink/prestage tests); py_compile OK.
+
+Stage Summary:
+- The FM now shows the REAL guest tree (ramdisk + TWRP's own runtime
+  dirs) — no compat dirs, no markers, no sidecar noise; symlink entries
+  are REAL links like on a real TWRP.
+- The terminal has a working shell path (staged busybox ash via real
+  /sbin/sh symlink, three independent execve routes), and the shebang
+  services should run instead of exit-127-ing.
+- The unreadable-execve host-escape class is closed fail-closed.
+- Next: dispatch arm64 ui-e2e, VLM-verify FM guest-only + terminal
+  prompt + system-folder listings; then Stage B on the physical device.

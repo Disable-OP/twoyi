@@ -4081,6 +4081,7 @@ fn sandbox_backstop_at_entry(
     sandbox: &crate::vfs::SandboxPolicy,
     abi: &ChildAbi,
     pending_deny: &mut std::collections::HashMap<libc::pid_t, i64>,
+    execve_claim: Option<&(libc::pid_t, String)>,
     log: &dyn Fn(&str),
 ) {
     // Fresh register snapshot: handlers have already flushed their
@@ -4132,6 +4133,30 @@ fn sandbox_backstop_at_entry(
             continue;
         }
         let Some(path) = read_child_string(pid, addr) else {
+            // ── 6-Z187: execve with an UNREADABLE path FAILS CLOSED ──
+            // Historically this `continue` meant an execve whose path the
+            // tracer cannot read (the PEEK/pvm/proc-mem-blind recovery-fork
+            // class) ran RAW against the host — benign on redroid (ENOENT)
+            // but a HOST SHELL on any device whose /sbin/sh exists
+            // (Magisk). If the 6-Z187 execve arm already redirected this
+            // stop (claim), the target was chosen BY the tracer; otherwise
+            // a lost syscall beats a host exec.
+            if nr == abi.execve && slot.path_reg == abi.reg_arg1 {
+                let claimed = execve_claim
+                    .map(|(cpid, _how)| *cpid == pid)
+                    .unwrap_or(false);
+                if !claimed {
+                    log(&format!(
+                        "SANDBOX BACKSTOP: DENIED execve on pid {} — path UNREADABLE (PEEK+pvm+proc-mem blind) and not tracer-redirected — failing closed -13 (6-Z187)",
+                        pid
+                    ));
+                    set_syscall_num(&mut regs, abi, abi.getpid);
+                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                        pending_deny.insert(pid, -(libc::EACCES as i64));
+                    }
+                    return;
+                }
+            }
             continue;
         };
         if path.is_empty() {
@@ -4255,9 +4280,15 @@ fn sandbox_backstop_at_entry(
 /// and the ptrace_emu reader so the two never disagree on the location.
 pub const STAGED_EXE_MARKER: &str = ".twoyi-staged";
 
-/// Absolute path of the staged-exe marker inside the rootfs.
-pub fn staged_exes_marker_path(rootfs: &str) -> String {
-    format!("{}/{}", rootfs, STAGED_EXE_MARKER)
+/// Absolute path of the staged-exe marker.
+///
+/// 6-Z187 ("MAKE IT ONLY SHOW GUESTS ONLY AND NOTHING ELSE"): the marker
+/// moved OUT of the guest rootfs ({rootfs}/.twoyi-staged — it showed up in
+/// TWRP's File Manager) into the app-private exec-staging area at
+/// {data_dir}/cache/twoyi-staged. Only the tracer and the pre-exec boot
+/// child read/write it; the guest never needs it.
+pub fn staged_exes_marker_path(data_dir: &str) -> String {
+    format!("{}/cache/twoyi-staged", data_dir)
 }
 
 /// Parse the marker content. Each line is `guest-path<TAB>cache-path`.
@@ -4323,8 +4354,11 @@ fn staged_exe_for<'a>(
 /// Read the marker file (one-shot, called lazily at the first execve).
 /// Returns (map, status_note) so the caller can log whether the read
 /// succeeded, the marker was missing, or the file was unreadable.
-fn load_staged_exes_map(rootfs: &str) -> (std::collections::HashMap<String, String>, String) {
-    let marker = staged_exes_marker_path(rootfs);
+fn load_staged_exes_map(
+    rootfs: &str,
+    data_dir: &str,
+) -> (std::collections::HashMap<String, String>, String) {
+    let marker = staged_exes_marker_path(data_dir);
     match std::fs::read_to_string(&marker) {
         Ok(content) => {
             let map = parse_staged_exes(&content, rootfs);
@@ -4450,8 +4484,8 @@ fn stage_dir_usage(dir: &str) -> (usize, u64) {
 /// exactly: replace-not-duplicate (keyed by guest path, comments
 /// preserved). The two writers stay interchangeable; the marker format is
 /// unchanged.
-fn append_staged_marker(rootfs: &str, guest_key: &str, cache_path: &str) {
-    let marker = staged_exes_marker_path(rootfs);
+fn append_staged_marker(data_dir: &str, guest_key: &str, cache_path: &str) {
+    let marker = staged_exes_marker_path(data_dir);
     let existing = std::fs::read_to_string(&marker).unwrap_or_default();
     let mut out: Vec<String> = Vec::new();
     let mut replaced = false;
@@ -4571,7 +4605,7 @@ fn stage_guest_executable_capped(
     // Cache hit on an identical-length existing copy = Reused.
     if let Ok(existing_md) = std::fs::metadata(&cache_path) {
         if existing_md.is_file() && existing_md.len() == bytes {
-            append_staged_marker(rootfs, &guest_key, &cache_path);
+            append_staged_marker(data_dir, &guest_key, &cache_path);
             return StageOutcome::Reused { cache_path, bytes };
         }
     }
@@ -4592,7 +4626,7 @@ fn stage_guest_executable_capped(
     }
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
-    append_staged_marker(rootfs, &guest_key, &cache_path);
+    append_staged_marker(data_dir, &guest_key, &cache_path);
     StageOutcome::Staged { cache_path, bytes }
 }
 
@@ -4738,6 +4772,20 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
                 if let Some(s) = read_child_string_pvm(pid, addr) {
                     return Some(s);
                 }
+                // ── 6-Z187: /proc/<pid>/mem third fallback ──
+                // Run 33114902086: the TWRP recovery processes and every
+                // process they fork (the TERMINAL children!) are PEEK- AND
+                // pvm-BLIND on their path buffers (peek_errno=EIO while the
+                // KERNEL reads the same pages fine) — that blindness left
+                // TWRP's terminal execl("/sbin/sh") UNTRANSLATED → ENOENT →
+                // "Child processes exited." — and, on devices where the
+                // HOST has /sbin/sh (Magisk!), would have exec'd a HOST
+                // shell. /proc/<pid>/mem is yet another kernel read path
+                // (FOLL_FORCE) and recovers the string in exactly the
+                // cases where PEEK/pvm give up.
+                if let Some(s) = read_child_string_proc_mem(pid, addr) {
+                    return Some(s);
+                }
             }
             break;
         }
@@ -4758,6 +4806,91 @@ fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     } else {
         Some(String::from_utf8_lossy(&result).into_owned())
     }
+}
+
+/// 6-Z187: read a NUL-terminated C string from the child via
+/// /proc/<pid>/mem (pread, 256-byte chunks, 4096 cap). Requires only
+/// PTRACE_MODE_ATTACH read rights — which the tracer, as the child's
+/// ptracer, already holds — and uses a different kernel access path than
+/// both PTRACE_PEEKDATA and process_vm_readv. Returns None when the very
+/// first chunk fails (unreadable/unmapped/proc entry absent).
+fn read_child_string_proc_mem(pid: libc::pid_t, addr: u64) -> Option<String> {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    let mut f = std::fs::File::open(format!("/proc/{}/mem", pid)).ok()?;
+    f.seek(SeekFrom::Start(addr)).ok()?;
+    let mut result: Vec<u8> = Vec::new();
+    while result.len() <= 4096 {
+        let mut buf = [0u8; 256];
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if b == 0 {
+                return Some(String::from_utf8_lossy(&result).into_owned());
+            }
+            result.push(b);
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&result).into_owned())
+    }
+}
+
+/// 6-Z187: write a NUL-terminated array of u64 words (an argv/envp
+/// pointer array) to the child's memory at `addr` via POKEDATA.
+/// Mirrors write_child_string_unchecked's write semantics; the final
+/// partial word is zero-padded. Returns the byte length written.
+fn write_child_u64s_unchecked(pid: libc::pid_t, addr: u64, words: &[u64]) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    for (i, &w) in words.iter().enumerate() {
+        let word = w as libc::c_long;
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKEDATA,
+                pid,
+                (addr as i64) + (i as i64) * (std::mem::size_of::<u64>() as i64),
+                word,
+            )
+        };
+        if r == -1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// 6-Z187: parse a shebang ("#!/sbin/sh", "#!/system/bin/sh -e") from
+/// the first line of the file at `path`. Returns
+/// (interpreter_path, optional_argument). None when the file is not a
+/// script (no leading "#!" or unreadable).
+fn script_shebang_interpreter(path: &str) -> Option<(String, Option<String>)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 256];
+    let n = f.read(&mut head).ok()?;
+    let head = &head[..n];
+    if n < 3 || head[0] != b'#' || head[1] != b'!' {
+        return None;
+    }
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    let line = String::from_utf8_lossy(&head[2..line_end]);
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let interp = parts.next()?.to_string();
+    // A leading "-" argument (e.g. "-e") is the interpreter flag;
+    // anything else (the script name) is impossible in a shebang.
+    let arg = parts.next().map(|s| s.to_string());
+    Some((interp, arg))
 }
 
 // process_vm_readv(2) — invoked via the RAW syscall(2) number
@@ -9179,6 +9312,12 @@ pub fn run_ptrace_loop(
     // jailed /tmp/recovery.log fd=-1 (redroid /tmp exists but is not
     // app-writable → EACCES → fd=-1).
     let mut open_read_fail_diag_count: u64 = 0;
+    // 6-Z187: per-stop claim that THIS pid's execve was already rewritten
+    // by the 6-Z187 arm (staged target written by the tracer itself, or the
+    // +1 cwd-relative fallback whose path the backstop cannot read). The
+    // backstop consumes it to avoid re-verifying (or fail-closing) a
+    // redirect the tracer performed; it is refreshed at every execve ENTRY.
+    let mut execve_rewrite_claim: Option<(libc::pid_t, String)> = None;
     // 6-Z167: how many /proc/<pid>/maps brackets we already dumped for the
     // 6-Z164 path-read-failure DIAG (first 3 — enough to name the region
     // class without flooding the log across TWRP's 10 service restarts).
@@ -11198,11 +11337,14 @@ pub fn run_ptrace_loop(
                         // staged map misses) copies the ROM binary to
                         // the cache dir + registers it for next time.
                         if abi.execve != 11 {
+                            // 6-Z187: refresh the backstop claim at every
+                            // execve ENTRY (never carry a stale one).
+                            execve_rewrite_claim = None;
                             let path_addr_e = get_syscall_arg(&regs, abi.reg_arg1);
                             if let Some(orig) = read_child_string(pid, path_addr_e) {
                                 // Lazy-load the staged map once.
                                 if staged_exes.is_none() {
-                                    let (m, note) = load_staged_exes_map(rootfs);
+                                    let (m, note) = load_staged_exes_map(rootfs, data_dir);
                                     log(&format!("6-Z101: {}", note));
                                     staged_exes = Some(m);
                                 }
@@ -11245,6 +11387,233 @@ pub fn run_ptrace_loop(
                                                 "6-Z102: refusing to stage {} — {} (execve left untouched)",
                                                 orig, reason
                                             ));
+                                            // ── 6-Z187: SHEBANG SCRIPT execve ──
+                                            //
+                                            // init's TWRP services exec
+                                            // /sbin/permissive.sh +
+                                            // /sbin/pulldecryptfiles.sh
+                                            // (both "#!/sbin/sh" scripts). The
+                                            // staging engine refuses them
+                                            // (not ELF) and the kernel
+                                            // cannot script-exec a raw
+                                            // guest path (its shebang
+                                            // interpreter would resolve
+                                            // on the HOST). Rewrite the
+                                            // execve into: interpreter +
+                                            // ["sh", <guest script path>,
+                                            // argv[1..]] — kernel script
+                                            // semantics — with the
+                                            // interpreter STAGED so it
+                                            // executes despite noexec.
+                                            let rom = format!(
+                                                "{}{}",
+                                                if rootfs.ends_with('/') {
+                                                    rootfs.to_string()
+                                                } else {
+                                                    format!("{}/", rootfs)
+                                                },
+                                                orig.trim_start_matches('/')
+                                            );
+                                            let shebang = if reason == "not ELF magic" {
+                                                script_shebang_interpreter(&rom)
+                                            } else {
+                                                None
+                                            };
+                                            if let Some((interp, interp_arg)) = shebang {
+                                                let interp_cached = staged_exes.as_ref().and_then(|m| {
+                                                    staged_exe_for(m, rootfs, &interp)
+                                                        .map(|s| s.to_string())
+                                                }).or_else(|| {
+                                                    match stage_guest_executable(
+                                                        rootfs,
+                                                        data_dir,
+                                                        &interp,
+                                                    ) {
+                                                        StageOutcome::Staged { cache_path, bytes } => {
+                                                            log(&format!(
+                                                                "6-Z187: staged script interpreter {} -> {} ({} bytes)",
+                                                                interp, cache_path, bytes
+                                                            ));
+                                                            if let Some(m) = staged_exes.as_mut() {
+                                                                staged_exes_insert(
+                                                                    m, rootfs, &interp, &cache_path,
+                                                                );
+                                                            }
+                                                            Some(cache_path)
+                                                        }
+                                                        StageOutcome::Reused { cache_path, bytes } => {
+                                                            log(&format!(
+                                                                "6-Z187: reusing staged script interpreter {} -> {} ({} bytes)",
+                                                                interp, cache_path, bytes
+                                                            ));
+                                                            if let Some(m) = staged_exes.as_mut() {
+                                                                staged_exes_insert(
+                                                                    m, rootfs, &interp, &cache_path,
+                                                                );
+                                                            }
+                                                            Some(cache_path)
+                                                        }
+                                                        StageOutcome::Skip(r2) => {
+                                                            log(&format!(
+                                                                "6-Z187: script exec of {} skipped — interpreter {} not stageable: {}",
+                                                                orig, interp, r2
+                                                            ));
+                                                            None
+                                                        }
+                                                    }
+                                                });
+                                                if let Some(staged_interp) = interp_cached {
+                                                    // Verified-rewrite arg1 to the staged
+                                                    // interpreter (same fresh-scratch scheme
+                                                    // as 6-Z129 below).
+                                                    let verify_arg1 = |p: &str| -> bool {
+                                                        let mut vr: Regs =
+                                                            unsafe { std::mem::zeroed() };
+                                                        if ptrace_getregs(pid, &mut vr).is_err() {
+                                                            return false;
+                                                        }
+                                                        let a = get_syscall_arg(&vr, abi.reg_arg1);
+                                                        a != 0
+                                                            && read_child_string(pid, a)
+                                                                .map(|s| s == p)
+                                                                .unwrap_or(false)
+                                                    };
+                                                    let sp_scr = get_syscall_arg(&regs, abi.reg_sp);
+                                                    let mut path_ok = false;
+                                                    for slot in 1..=4usize {
+                                                        let scratch_local = sp_scr
+                                                            .wrapping_sub(4096u64 * slot as u64)
+                                                            & !7u64;
+                                                        if !write_child_string_unchecked(
+                                                            pid,
+                                                            scratch_local,
+                                                            &staged_interp,
+                                                        ) {
+                                                            continue;
+                                                        }
+                                                        set_syscall_arg(
+                                                            &mut regs,
+                                                            abi.reg_arg1,
+                                                            scratch_local,
+                                                        );
+                                                        if ptrace_setregs(pid, &regs, iov_len)
+                                                            .is_err()
+                                                        {
+                                                            continue;
+                                                        }
+                                                        if verify_arg1(&staged_interp) {
+                                                            path_ok = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    if path_ok {
+                                                        // Best-effort argv rewrite: [ "sh",
+                                                        // <guest script path>, argv[1..] ].
+                                                        // argv[0] MUST be a shell name —
+                                                        // busybox dispatches on argv[0]
+                                                        // ("permissive.sh" would hit
+                                                        // "applet not found"). Failure here
+                                                        // only degrades to today's behavior.
+                                                        let argv0 = interp
+                                                            .rsplit('/')
+                                                            .next()
+                                                            .unwrap_or("sh")
+                                                            .to_string();
+                                                        let script_arg = orig.clone();
+                                                        let argv_base = sp_scr
+                                                            .wrapping_sub(24 * 1024u64)
+                                                            & !7u64;
+                                                        let p_argv0 = argv_base;
+                                                        let p_script = argv_base + 256;
+                                                        let p_optarg = argv_base + 1024;
+                                                        let p_array = argv_base + 2048;
+                                                        let mut ok = write_child_string_unchecked(
+                                                            pid, p_argv0, &argv0,
+                                                        );
+                                                        ok &= write_child_string_unchecked(
+                                                            pid,
+                                                            p_script,
+                                                            &script_arg,
+                                                        );
+                                                        if let Some(a) = &interp_arg {
+                                                            ok &= write_child_string_unchecked(
+                                                                pid, p_optarg, a,
+                                                            );
+                                                        }
+                                                        // Original argv[1..] pointers (best
+                                                        // effort — the array read may be
+                                                        // PEEK-blind too).
+                                                        let mut tail: Vec<u64> = Vec::new();
+                                                        let argv_addr =
+                                                            get_syscall_arg(&regs, abi.reg_arg2);
+                                                        if argv_addr != 0 {
+                                                            for i in 0..16i64 {
+                                                                let word = unsafe {
+                                                                    libc::ptrace(
+                                                                        libc::PTRACE_PEEKDATA,
+                                                                        pid,
+                                                                        (argv_addr as i64)
+                                                                            + i * std::mem::size_of::<
+                                                                                u64,
+                                                                            >(
+                                                                            )
+                                                                                as i64,
+                                                                        0,
+                                                                    )
+                                                                };
+                                                                if word == -1 {
+                                                                    break;
+                                                                }
+                                                                if word == 0 {
+                                                                    break;
+                                                                }
+                                                                if i >= 1 {
+                                                                    tail.push(word as u64);
+                                                                }
+                                                            }
+                                                        }
+                                                        let mut words: Vec<u64> =
+                                                            vec![p_argv0, p_script];
+                                                        if interp_arg.is_some() {
+                                                            words.push(p_optarg);
+                                                        }
+                                                        words.extend(tail);
+                                                        words.push(0);
+                                                        ok &= write_child_u64s_unchecked(
+                                                            pid, p_array, &words,
+                                                        );
+                                                        if ok {
+                                                            set_syscall_arg(
+                                                                &mut regs,
+                                                                abi.reg_arg2,
+                                                                p_array,
+                                                            );
+                                                            let _ =
+                                                                ptrace_setregs(pid, &regs, iov_len);
+                                                        }
+                                                        log(&format!(
+                                                            "6-Z187: script execve(\"{}\") rewritten to staged interpreter \"{}\" argv=[{:?}, {:?}{}]{}",
+                                                            orig,
+                                                            staged_interp,
+                                                            argv0,
+                                                            script_arg,
+                                                            interp_arg
+                                                                .as_ref()
+                                                                .map(|a| format!(", {:?}", a))
+                                                                .unwrap_or_default(),
+                                                            if ok { " (+argv)" } else { " (argv rewrite failed — script may not run)" }
+                                                        ));
+                                                        // The staged interpreter path is a
+                                                        // string WE wrote — the backstop can
+                                                        // read + verify it itself.
+                                                    } else {
+                                                        log(&format!(
+                                                            "6-Z187: script execve(\"{}\") rewrite FAILED (scratch unwritable) — left untouched",
+                                                            orig
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                             None
                                         }
                                     }
@@ -11371,6 +11740,48 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                            } else {
+                                // ── 6-Z187: execve path-read FAILED ──
+                                // (PEEK + pvm + /proc/mem all blind on this
+                                // child — the recovery-fork class from run
+                                // 33114902086: TWRP's terminal child
+                                // execl("/sbin/sh") went UNTRANSLATED → the
+                                // kernel exec'd the RAW path on the host →
+                                // ENOENT on redroid, but a HOST SHELL on any
+                                // device whose /sbin/sh exists (Magisk!).
+                                //
+                                // THE +1 cwd-relative fallback (the execve
+                                // twin of the 6-Z170 open fix): rewrite
+                                // arg1 := path_addr + 1. The kernel then
+                                // resolves the same string one byte deeper
+                                // — sans its leading '/' — against the
+                                // child's cwd, WHICH IS THE ROOTFS. With
+                                // the 6-Z187 boot provisioning, {rootfs}/
+                                // sbin/sh is a REAL symlink to the STAGED
+                                // busybox (on the exec-able cache
+                                // partition), so this raw resolution both
+                                // SUCCEEDS and stays inside the sandbox.
+                                // argv/envp are untouched (execl-style
+                                // argv[0]="sh" keeps busybox's ash mode).
+                                if past_first_execve && path_addr_e != 0 {
+                                    set_syscall_arg(&mut regs, abi.reg_arg1, path_addr_e + 1);
+                                    if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                        execve_rewrite_claim =
+                                            Some((pid, "cwd-relative+1".to_string()));
+                                        log(&format!(
+                                            "6-Z187: execve ENTRY path-read FAILED pid={} path_addr={:#x} peek_errno={} — rewrote to cwd-relative +1 (kernel resolves against the rootfs cwd; {}/sbin/* are staged symlinks)",
+                                            pid,
+                                            path_addr_e,
+                                            peek_word_errno(pid, path_addr_e),
+                                            rootfs
+                                        ));
+                                    } else {
+                                        log(&format!(
+                                            "6-Z187: execve ENTRY path-read FAILED pid={} — +1 rewrite SETREGS failed (backstop will fail closed)",
+                                            pid
+                                        ));
+                                    }
+                                }
                             }
                         }
 
@@ -11438,7 +11849,7 @@ pub fn run_ptrace_loop(
                                 // back to the plain translation exactly as
                                 // before (Skip paths).
                                 if staged_exes.is_none() {
-                                    let (m, note) = load_staged_exes_map(rootfs);
+                                    let (m, note) = load_staged_exes_map(rootfs, data_dir);
                                     log(&format!("6-Z101: {}", note));
                                     staged_exes = Some(m);
                                 }
@@ -14082,6 +14493,7 @@ pub fn run_ptrace_loop(
                             &sandbox,
                             &abi,
                             &mut pending_sandbox_deny,
+                            execve_rewrite_claim.as_ref(),
                             &log,
                         );
                         if pending_sandbox_deny.len() > deny_before {
@@ -24083,9 +24495,14 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         // The empty map never hits.
         let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         assert_eq!(staged_exe_for(&empty, rootfs, "/system/bin/init"), None);
-        // Marker path + STAGED_EXE_MARKER contract.
+        // Marker path contract (6-Z187: relocated out of the guest rootfs
+        // into the app-private cache dir so TWRP's File Manager never shows
+        // it — "guest only, nothing else").
         assert_eq!(STAGED_EXE_MARKER, ".twoyi-staged");
-        assert_eq!(staged_exes_marker_path("/tmp/r"), "/tmp/r/.twoyi-staged");
+        assert_eq!(
+            staged_exes_marker_path("/data/u/0/pkg"),
+            "/data/u/0/pkg/cache/twoyi-staged"
+        );
     }
 
     #[test]
@@ -24191,7 +24608,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
                 assert_eq!(md.permissions().mode() & 0o7777, 0o755);
                 // Marker pair present + parse_staged_exes + staged_exe_for
                 // BOTH forms resolve.
-                let marker = staged_exes_marker_path(&rootfs);
+                let marker = staged_exes_marker_path(&data_dir);
                 let content = std::fs::read_to_string(&marker).unwrap();
                 let map = parse_staged_exes(&content, &rootfs);
                 assert_eq!(
@@ -24223,7 +24640,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             other => panic!("expected Reused, got {:?}", other),
         }
         // Marker line REPLACED not duplicated (exactly ONE pair).
-        let marker = staged_exes_marker_path(&rootfs);
+        let marker = staged_exes_marker_path(&data_dir);
         let content = std::fs::read_to_string(&marker).unwrap();
         let pair_lines: Vec<&str> = content
             .lines()
