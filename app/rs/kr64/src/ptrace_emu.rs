@@ -23233,8 +23233,40 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             libc::pid_t,
             std::collections::HashSet<i64>,
         > = std::collections::HashMap::new();
+        let mut prctl_rewritten_args: std::collections::HashMap<
+            libc::pid_t,
+            (u64, u64),
+        > = std::collections::HashMap::new();
+        let mut pending_epoll_readback: std::collections::HashMap<
+            libc::pid_t,
+            (i64, u64, usize),
+        > = std::collections::HashMap::new();
+        let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
+            std::collections::HashSet::new();
+        let mut pending_open_translated_path: std::collections::HashMap<
+            libc::pid_t,
+            String,
+        > = std::collections::HashMap::new();
+        let mut open_fd_owner_paths: std::collections::HashMap<
+            (libc::pid_t, i32),
+            String,
+        > = std::collections::HashMap::new();
+        let mut accept4_einval_streak: std::collections::HashMap<libc::pid_t, u64> =
+            std::collections::HashMap::new();
+        let mut esrch_streak: std::collections::HashMap<libc::pid_t, u32> =
+            std::collections::HashMap::new();
+        let mut pending_getpid: std::collections::HashSet<libc::pid_t> =
+            std::collections::HashSet::new();
         let pid: libc::pid_t = 4242;
         in_syscall_map.insert(pid, true);
+        prctl_rewritten_args.insert(pid, (0x1000, 0x2000));
+        pending_epoll_readback.insert(pid, (0, 0, 0));
+        pending_mount_enodev.insert(pid);
+        pending_open_translated_path.insert(pid, String::from("/tmp/x"));
+        open_fd_owner_paths.insert((pid, 7), String::from("/system/lib64/libc.so"));
+        accept4_einval_streak.insert(pid, 3);
+        esrch_streak.insert(pid, 2);
+        pending_getpid.insert(pid);
         fake_netlink_fds.entry(pid).or_default().insert(0x6b00_0000);
         netlink_fd_next.insert(pid, 0x6b00_0001);
         // Sanity: all four maps have the pid entry before cleanup
@@ -23266,6 +23298,15 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!fake_netlink_fds.contains_key(&pid));
         assert!(!netlink_fd_next.contains_key(&pid));
         assert!(!fake_propserv_fds.contains_key(&pid));
+        // 6-Z184: the extended hygiene covers the newer per-pid maps too.
+        assert!(!prctl_rewritten_args.contains_key(&pid));
+        assert!(!pending_epoll_readback.contains_key(&pid));
+        assert!(!pending_mount_enodev.contains(&pid));
+        assert!(!pending_open_translated_path.contains_key(&pid));
+        assert!(!open_fd_owner_paths.contains_key(&(pid, 7)));
+        assert!(!accept4_einval_streak.contains_key(&pid));
+        assert!(!esrch_streak.contains_key(&pid));
+        assert!(!pending_getpid.contains(&pid));
 
         // Tracked fds are structurally below every synthetic fake-fd
         // base — locks the disjoint-fd-set invariant the EXIT arm's
