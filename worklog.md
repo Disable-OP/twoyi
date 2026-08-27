@@ -11368,3 +11368,65 @@ Stage Summary:
   accept4-EINVAL wedge), abstract-namespace touch bridge (chroot-proof
   connect), chroot-absolute geometry file, adbd-proof evidence pulls.
   TWRP menu + touch: WORKING on arm64 redroid.
+
+---
+Task ID: 6-Z183
+Agent: main
+Task: User report triage — "fix the 0 bytes screenshots (must not slow
+the device), display to the ANDROID APP not into a fb0.raw file, verify
+x86 TWRP + touch on both arches (VLM), the repo is VERY CLUTTERED, the
+colors seem off".
+
+Diagnosis (from run 33062718661 artifacts + code):
+- 0-BYTE SCREENSHOTS: all 21 navigation PNGs were empty. adbd dies with
+  the TWRP container (known), and the docker fallback ran
+  `docker exec redroid screencap ...` — docker exec resolves binaries
+  through the image config PATH, which lacks /system/bin on redroid →
+  "executable file not found" → b'' every time. The workflow's own
+  `sh -c "screencap ..."` variant worked, proving the PATH theory.
+- SLOWNESS: (1) the tracer logged the first 20,000 post-execve syscalls
+  (ENTRY + RETURN + every path arg) — 40k+ stderr lines per traced
+  binary, each mirrored to logcat by the app's FileLogger tee → logd
+  saturation + ring-buffer rotation (TWOYI_DIAG app logs unrecoverable)
+  + whole cores stolen from ptrace emulation; (2) each screenshot burned
+  up to ~90 s in a timeout ladder (2× adb exec-out 20 s + adb connect
+  10 s + docker exec 25 s + docker cp 15 s); (3) the 15 s watcher ran
+  six heavy dumps per tick + a 2 s maps trap.
+- COLORS OFF: twrp_blit_to_surface requested pixel format 5 believing it
+  was WINDOW_FORMAT_RGBA_8888 — but 5 = HAL_PIXEL_FORMAT_BGRA_8888
+  (WINDOW_FORMAT_RGBA_8888 is 1). The RGBA-packed bytes composited with
+  R/B swapped → TWRP's blue theme rendered orange on the app display.
+  fb0.raw decoded both ways proves the file itself is [B,G,R,A]
+  (BGRA-decode gives the true TWRP blue (0,144,202)).
+- BLACK APP SURFACE: the framework screencap showed the immersive-mode
+  tutorial + a black void where the app should be — the render loop
+  captured the ANativeWindow ONCE at spawn; any surface recreation
+  (immersive transitions/resume) left it locking a DEAD window. The
+  6-Z182 "framework shows TWRP" evidence was actually this overlay.
+- CLUTTER: 44 root session docs, download/ (52 docs + stale artifacts),
+  kr64-analysis/ (26 MB), research/, tool-results/ (16 MB), vm-*-src/
+  decompiles, tracked .local/ binaries, a binutils .deb, 2 dead research
+  workflows, 16 one-off scripts, stale screenshots.
+
+Fixes (commit c8fb488):
+- core.rs: TWRP_WINDOW AtomicUsize — reset_window/remove_window swap the
+  live window (acquire/release balanced); the loop re-reads it every
+  tick, force-re-blits on change, idles 200 ms when detached, retries
+  failed blits, queries the window's own size, requests format 1
+  (RGBA_8888) and honours a gralloc-forced BGRA with verbatim fb0
+  copying; first-blit/failure state goes to logcat tag TWOYI_DIAG.
+- ptrace_emu.rs: the three 20k-capped per-syscall log sites are gated
+  behind TWOYI_TRACE_SYSCALLS (default OFF; one boot line reports mode).
+- ui-navigate.py: _screencap_docker = one `sh -c /system/bin/screencap
+  -p file && cat file` exec, PNG-magic validated, no docker cp; adb-dead
+  short-circuit after 3 empty attempts; adb timeout 8 s.
+- ui-e2e-test-arm64.yml: watcher slimmed to a 30 s liveness probe; maps
+  trap removed; final evidence = two app-display framework screencaps 5
+  s apart (fb0.raw pull + md5 deleted — the app display IS the proof).
+- Declutter executed (672 deletions, 17 renames): docs consolidated in
+  docs/reference/, CONTRIBUTING.md rewritten, workflow matrix documented.
+
+Stage Summary:
+- Build APK + kr64 gates running on the push; arm64 + x86 E2E dispatched
+  next; VLM verification of app-display screenshots (menu visible, BLUE
+  theme correct, touch evidence) is the exit criterion, then README.
