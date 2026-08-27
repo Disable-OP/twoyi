@@ -11643,3 +11643,46 @@ Stage Summary:
   next; Stage B (physical Honor device, fresh APK + user screenshot)
   REQUIRED before this is called fixed. Step 5 (100-agent fleet)
   remains BLOCKED behind Stage B per the user's ordering.
+
+---
+Task ID: 6-Z185 STAGE-A-ITER-1
+Agent: main
+Task: Verify the 6-Z185 fix on the arm64 E2E (run 33095660927, non-root
+ptrace mode) and iterate on what the backstop surfaced.
+
+Work Log:
+- kr64 lint+test (push gate): SUCCESS (fmt, clippy -D warnings, 569
+  tests).
+- ARM64 E2E run 33095660927: SUCCESS — TWRP boots with the security
+  fix in non-root ptrace mode; the sandbox probe + evidence pulls ran
+  (fm-*.png series captured; listings initially empty — pulled from
+  rootfs/ while the boot used profiles/default/rootfs; script fixed to
+  probe both).
+- The backstop fired 26 times — ALL non-fatal, boot still green, and
+  each block was a REAL upstream signal (this is the defense working):
+  1. openat("{rootfs}/.twoyi-staged" + file_contexts*/property_contexts)
+     resolved to the canonical rootfs ITSELF (missing tail → deepest-
+     existing-ancestor == rootfs, no trailing slash) — MY containment
+     check missed the exact-equality-vs-canonical-rootfs case because
+     cfg.rootfs is a symlink (rootfs -> profiles/default/rootfs).
+     FIXED: SandboxPolicy now stores rootfs_canon (PathBuf) and
+     verify_real_path accepts == rootfs_canon exactly.
+  2. faccessat("/system/bin/linker64") → symlink to
+     /apex/com.android.runtime/bin/linker64 (Android 10+ runtime APEX)
+     — not in the fallback. FIXED: is_runtime_host_fallback now also
+     allows the two exact runtime-APEX linker paths.
+  3. chmod/fchownat("/dev/socket/property_service") passed through
+     UNTRANSLATED by their arms (pre-existing hole — exactly the class
+     the backstop exists for). The backstop faked return 0, identical
+     to the historical EXIT-side fake → zero behavior change, boot
+     unaffected. (Arm-level translation left as follow-up polish.)
+- build.yml release step: `gh release create --clobber` doesn't exist
+  (only `upload --clobber`) → view-then-upload path for re-dispatch;
+  re-dispatched (run pending).
+
+Stage Summary:
+- Stage A iteration 1 PASS on arm64 (boot + probe machinery + backstop
+  active). Two real verifier bugs fixed (canonical-rootfs equality,
+  APEX runtime linker). Awaiting the x86 run + the re-run with the
+  verifier fixes to confirm 0 unexpected blocks, then VLM verdict on
+  the fm-*.png /system listing before Stage B.

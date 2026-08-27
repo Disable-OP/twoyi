@@ -1497,17 +1497,22 @@ def main():
     # Manager probe screenshots are compared against THIS listing — if
     # the FM shows entries that are not here, the guest is seeing the
     # HOST's /system (escape). For the TWRP ramdisk this listing is
-    # expected to be just usr/ (+ tzdata under it).
-    for remote, local in [
-        ("rootfs/system", "rootfs-system-listing.txt"),
-        ("rootfs/system/app", "rootfs-system-app-listing.txt"),
-        ("rootfs/vendor", "rootfs-vendor-listing.txt"),
-    ]:
-        out = adb_shell(f"run-as {PACKAGE} ls -la {remote}", timeout=30)
-        if out is not None:
-            with open(os.path.join(ART, local), "w", errors="replace") as f:
-                f.write(out)
-            print(f"  pulled sandbox evidence: {remote} ({len(out)} bytes)")
+    # expected to be just usr/ (+ tzdata under it). The app's rootfs
+    # dir may BE a symlink to the active profile's rootfs — probe both
+    # locations so the evidence is never empty by accident.
+    seen = set()
+    for base in ("rootfs", "profiles/default/rootfs"):
+        for leaf in ("system", "system/app", "vendor"):
+            remote = f"{base}/{leaf}"
+            if remote in seen:
+                continue
+            seen.add(remote)
+            out = adb_shell(f"run-as {PACKAGE} ls -la {remote}", timeout=30)
+            if out:
+                local = "rootfs-" + leaf.replace("/", "-") + "-listing.txt"
+                with open(os.path.join(ART, local), "w", errors="replace") as f:
+                    f.write(f"# {remote}\n{out}\n")
+                print(f"  pulled sandbox evidence: {remote} ({len(out)} bytes)")
     for remote, local in [
         ("rootfs/tmp/recovery.log", "twrp-recovery.log"),
         ("rootfs/dev/__kmsg__", "kmsg-stub.txt"),
