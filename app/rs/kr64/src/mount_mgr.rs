@@ -213,7 +213,8 @@ fn remount_tree_read_only(root: &str) {
             if let Err(e) = mount("", root, "", MS_REMOUNT | MS_RDONLY | MS_BIND, None) {
                 warning!(
                     "[KR64][mount_mgr] fallback RO remount of {} failed: {}",
-                    root, e
+                    root,
+                    e
                 );
             }
             return;
