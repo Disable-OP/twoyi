@@ -883,6 +883,11 @@ pub struct SandboxPolicy {
     /// this prefix — comparing against the non-canonical form would
     /// false-DENY every single access.
     rootfs_canon_slash: String,
+    /// The canonical rootfs as a Path — the "probe resolved to the
+    /// rootfs itself" case (a missing tail climbed all the way up:
+    /// open of {rootfs}/.missing-file canonicalizes to exactly the
+    /// rootfs dir, with NO trailing slash) must still be ALLOWED.
+    rootfs_canon: PathBuf,
     /// The executable-staging dir ({data_dir}/cache/twoyi_stage) used
     /// by the 6-Z101/6-Z102 execve staging (the rootfs lives on a
     /// noexec partition; staged guest binaries MUST be exec'able).
@@ -900,7 +905,9 @@ impl SandboxPolicy {
         // canonical-to-canonical (see field doc). If canonicalization
         // fails (rootfs not yet created), fall back to the string form —
         // verification of a nonexistent sandbox fails closed anyway.
-        let rootfs_canon_slash = std::fs::canonicalize(&rootfs)
+        let rootfs_canon = std::fs::canonicalize(&rootfs).ok();
+        let rootfs_canon_slash = rootfs_canon
+            .as_ref()
             .map(|c| {
                 let mut s = c.to_string_lossy().into_owned();
                 if !s.ends_with('/') {
@@ -908,11 +915,12 @@ impl SandboxPolicy {
                 }
                 s
             })
-            .unwrap_or_else(|_| rootfs_slash.clone());
+            .unwrap_or_else(|| rootfs_slash.clone());
         SandboxPolicy {
             rootfs: PathBuf::from(rootfs),
             rootfs_slash,
             rootfs_canon_slash,
+            rootfs_canon: rootfs_canon.unwrap_or_else(|| PathBuf::from(rootfs)),
             staging_dir: None,
         }
     }
@@ -964,6 +972,14 @@ impl SandboxPolicy {
         let s = real.to_string_lossy();
         let s = s.as_ref();
         if s == "/system/bin/linker" || s == "/system/bin/linker64" {
+            return true;
+        }
+        // The runtime APEX's linkers: on Android 10+ /system/bin/linker64
+        // is a symlink to /apex/com.android.runtime/bin/linker64 —
+        // same PT_INTERP-parity class as the /system paths.
+        if s == "/apex/com.android.runtime/bin/linker"
+            || s == "/apex/com.android.runtime/bin/linker64"
+        {
             return true;
         }
         // /system/lib/** and /system/lib64/**
@@ -1102,10 +1118,15 @@ impl SandboxPolicy {
         // 1. Inside the rootfs sandbox. BOTH the literal rootfs prefix
         //    (how translated paths are staged) and the CANONICAL form
         //    (how this path was resolved — /data/user/0/<pkg> is a
-        //    symlink to /data/data/<pkg> on real devices) are accepted.
+        //    symlink to /data/data/<pkg> on real devices, and the app's
+        //    rootfs dir is itself often a symlink to the active
+        //    profile's rootfs) are accepted, plus the exact-equality
+        //    case (probe resolved to the rootfs itself — deepest-
+        //    existing-ancestor of a missing tail).
         if s.starts_with(&self.rootfs_slash)
             || s.starts_with(&self.rootfs_canon_slash)
             || Path::new(s.as_ref()) == self.rootfs
+            || Path::new(s.as_ref()) == self.rootfs_canon
         {
             return SandboxVerdict::Allow;
         }
