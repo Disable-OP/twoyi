@@ -11686,3 +11686,40 @@ Stage Summary:
   APEX runtime linker). Awaiting the x86 run + the re-run with the
   verifier fixes to confirm 0 unexpected blocks, then VLM verdict on
   the fm-*.png /system listing before Stage B.
+
+---
+Task ID: 6-Z185 STAGE-A-ITER-2
+Agent: main
+Task: Analyze the iter-1 runs + fix the probe timing.
+
+Work Log:
+- ARM64 E2E run 33096860977 (iter-1 code): SUCCESS.
+  * Backstop blocks: 26 -> 0 (the canonical-rootfs exact-equality fix
+    eliminated the whole fstatat64/{rootfs}/X/../. family; the
+    /dev/socket chmod family did not fire this boot).
+  * VLM: final app display = TWRP UI rendered, blue/cyan theme
+    correct — no display regression from the security fix.
+- X86 E2E run 33095665677 (pre-iter-1): SUCCESS; 87 blocks analyzed:
+  44 = the canonical-equality bug (fixed), rest = untranslated
+  fchmodat/fchownat arms on /cache/recovery + /dev/socket paths where
+  fake-0 preserved the historical behavior exactly; ZERO actual
+  host-escape attempts; ZERO reads of host /system anywhere.
+- Deterministic guest /system evidence (x86): rootfs/system contains
+  the RAMDISK's own tree (bin, build.prop, etc, lib64, usr) — NOT the
+  emulator host's /system. system/app does not exist (empty listing) —
+  exactly the post-fix expectation.
+- Probe timing bug: both arches' fm-* captures caught the FIRST-RUN
+  GATE (probe ran at boot_wait end; gate dismissal lands later).
+  FIXED in ui-navigate.py: wait_for_main_menu() polls recovery.log
+  (both rootfs locations) for "Set page: 'main2'", feeding gate
+  gestures while waiting (up to 150 s), before the FM taps; Advanced
+  tap candidates re-ordered (higher rows first).
+- Release v0-security-fix created with the APK (gh release path now
+  works; re-dispatch after final code state to refresh the asset).
+
+Stage Summary:
+- Both arches boot green with the sandbox fix; backstop at 0 blocks on
+  arm64 iter-1; guest /system = ramdisk tree, host /system unreachable
+  via any intercepted syscall. One more arm64 run needed for the
+  post-main-menu FM screenshots (probe fix), then VLM verdict closes
+  Stage A.
