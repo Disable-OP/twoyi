@@ -11788,3 +11788,47 @@ Stage Summary:
 - ROM re-import and terminal ioctl spam fixed alongside; Stage B (user's
   physical device, fresh APK from the release this push produces) still
   required to close the security item.
+
+---
+Task ID: 6-Z186 ITER-3/4
+Agent: main
+Task: Get the exact-chain probe actually working on arm64 redroid
+(iters 3-4; the chain itself is the user's physical-device repro).
+
+Work Log:
+- Iter-3 (run 33102864178 analysis + dispatch): VLM on the gate frame
+  pinned the blockers — the SystemUI ImmersiveModeConfirmation
+  ("Viewing full screen", GOT IT at ~(0.77, 0.25) = fixed ~(552,400)
+  px on both 720x1280/720x1600) sits OVER the TWRP gate eating every
+  tap; uiautomator dump fails while TWRP renders (never idle); run-as
+  is DEAD on arm64 redroid (silent empty output — the whole probe was
+  blind; x86 worked because run-as chdirs into the app data dir).
+  Fixes: _read_recovery_log docker-exec fallback (the workflow's own
+  proven channel), blind GOT IT candidates (top quarter, harmless when
+  absent), VLM slider geometry (y=0.88, x 0.10..0.90).
+- Iter-3 result (run 33104264666): docker log fallback WORKED ("gate
+  page 'system_readonly' is UP"), blind taps fired — but "adb declared
+  DEAD" struck at 18:42 BEFORE the probe: redroid's adbd died mid-run,
+  so every input tap/swipe went nowhere (screenshots survived via the
+  docker ladder; input had no fallback). Gate markers prove TWRP never
+  left system_readonly.
+- Iter-4: input_cmd() central adb->docker-exec routing with per-call
+  get-state liveness probing (tap/swipe_up/keyevents/probe gestures all
+  rewired); dump_ui docker fallback (XML via stdout); boot gesture
+  rotation reordered GOT IT-first (overlay must die before gate
+  gestures can land); dispatched with boot_wait=60 (run 33105112068).
+- Evidence so far from iter-1 tracer log (33102864178): 28 ESRCH events
+  during plain boot, ALL absorbed by the 6-Z89 handler, ZERO
+  6-Z126/6-Z186 threshold hits — the escape classifier is armed but
+  needs the terminal's fork/exit storm (or never fires, which would
+  point the physical-device escape at the same misclassification path
+  pre-fix). Backstop blocks = the known untranslated fchownat/chmod
+  family (fake-0 parity), zero host-path reads.
+
+Stage Summary:
+- Probe infrastructure hardened against all three CI failure modes
+  (dead run-as, never-idle uiautomator, dead adbd). Awaiting iter-4
+  artifacts: main2-after-gate is the first checkpoint; terminal markers
+  in recovery.log + 6-Z186 classifier lines in the tracer log are the
+  verdict. Fresh Stage-B APK already published
+  (twoyi-build-ad3fe3e-20260827.apk, contains the fail-closed fix).
