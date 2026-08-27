@@ -11265,7 +11265,33 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                     if let Some(guest_path) = rewrite_guest_path {
-                                        let host_path = translate_path(rootfs, &guest_path);
+                                        // 6-Z181: PER-PID translated bind path.
+                                        // Run 33059349047 named the accept4-
+                                        // EINVAL wedge's root cause directly:
+                                        //   [tid 2916] bind -> 0     (won the path)
+                                        //   [tid 2903] bind -> -98   (EADDRINUSE —
+                                        //              the SAME translated file)
+                                        //   [tid 2903] listen -> -22 (EINVAL — not
+                                        //              bound) -> 2k+ accept4 spin.
+                                        // TWO traced processes (TWRP's init AND
+                                        // its recovery both host a property
+                                        // service) bind the same guest name;
+                                        // after the 6-Z163 rewrite both target
+                                        // ONE host file, and unix bind(2)
+                                        // EADDRINUSEs against a live socket.
+                                        // Suffix the host path with the
+                                        // binder's pid: every binder gets its
+                                        // OWN socket file, bind + listen +
+                                        // epoll + accept4 all become REAL.
+                                        // Guest CLIENTS are unaffected —
+                                        // 6-Z110 intercepts their connect()
+                                        // and fakes the whole protocol (they
+                                        // never touch the real path).
+                                        let host_path = format!(
+                                            "{}.{}",
+                                            translate_path(rootfs, &guest_path),
+                                            pid
+                                        );
                                         if let Some(new_sa) =
                                             build_translated_unix_sockaddr(&host_path)
                                         {
