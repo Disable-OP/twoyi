@@ -119,48 +119,83 @@ def _screencap_adb():
     """screencap via adb; returns raw PNG bytes or b''."""
     try:
         r = subprocess.run(ADB + ["exec-out", "screencap", "-p"],
-                           capture_output=True, timeout=20)
-        return r.stdout or b""
-    except Exception:
-        return b""
-
-def _screencap_docker():
-    """screencap via docker exec + docker cp — works when adb is DEAD but
-    the container + SurfaceFlinger live (run 33015609499: the guest jail
-    unlinked the container's real /dev/socket/adbd; every adb channel died
-    while the framework kept running). Returns raw PNG bytes or b''.
-
-    Uses /data/local/tmp (real filesystem) — the earlier /sdcard variant
-    silently failed: /sdcard is the emulated FUSE view and docker cp from
-    it can return nothing."""
-    try:
-        subprocess.run(["sudo", "docker", "exec", "redroid",
-                        "screencap", "-p", "/data/local/tmp/_e2e_cap.png"],
-                       capture_output=True, timeout=25)
-        subprocess.run(["sudo", "docker", "cp",
-                        "redroid:/data/local/tmp/_e2e_cap.png", "/tmp/_e2e_cap.png"],
-                       capture_output=True, timeout=15)
-        with open("/tmp/_e2e_cap.png", "rb") as f:
-            data = f.read()
-        os.remove("/tmp/_e2e_cap.png")
+                           capture_output=True, timeout=8)
+        data = r.stdout or b""
         return data if data[:8] == b"\x89PNG\r\n\x1a\n" else b""
     except Exception:
         return b""
 
+def _screencap_docker():
+    """screencap via a single `docker exec` — works when adb is DEAD but
+    the container + SurfaceFlinger live (run 33015609499: the guest jail
+    unlinked the container's real /dev/socket/adbd; every adb channel died
+    while the framework kept running). Returns raw PNG bytes or b''.
+
+    6-Z183 FIX (the 0-byte screenshots): this used to `docker exec
+    redroid screencap ...` with the BINARY name directly. docker exec
+    resolves the binary through the image config's PATH — which does NOT
+    include /system/bin on redroid — so every call died with "executable
+    file not found" and ALL 21 navigation screenshots came out 0 bytes
+    (run 33062718661), while the workflow's own `sh -c "screencap ..."`
+    variant worked. The fix mirrors that proven form: run the ABSOLUTE
+    path under sh -c and stream the PNG back on stdout (no docker cp,
+    no second exec round-trip, PNG-magic validated)."""
+    try:
+        r = subprocess.run(
+            ["sudo", "docker", "exec", "redroid", "sh", "-c",
+             "/system/bin/screencap -p /data/local/tmp/_e2e_cap.png "
+             "&& cat /data/local/tmp/_e2e_cap.png"],
+            capture_output=True, timeout=20)
+        data = r.stdout or b""
+        # Locate the PNG signature in case the shell prefixes any noise.
+        idx = data.find(b"\x89PNG\r\n\x1a\n")
+        if idx < 0:
+            return b""
+        return data[idx:]
+    except Exception:
+        return b""
+
+# 6-Z183: adbd inside redroid dies when the TWRP container starts (known
+# open issue). Every screenshot then burned up to ~90 s in a timeout
+# ladder: 2x adb exec-out (20 s each) + adb connect (10 s) + docker exec
+# (25 s) + docker cp (15 s) — the 12 screenshots of the 60 s boot window
+# stretched the run by many minutes and stole CPU from the ptrace
+# emulation. After ADB_DEAD_THRESHOLD consecutive empty adb attempts the
+# adb path is skipped entirely (one final reconnect, then docker-only).
+_ADB_DEAD = False
+_ADB_EMPTY_STREAK = 0
+_ADB_DEAD_THRESHOLD = 3
+
 def screenshot(name):
+    global _ADB_DEAD, _ADB_EMPTY_STREAK
     path = os.path.join(ART, f"screenshot-{name}.png")
-    data = _screencap_adb()
-    if not data:
-        # One adb reconnect attempt, then the docker fallback.
-        subprocess.run(["adb", "connect", ADB[-1]], capture_output=True, timeout=10)
+    data = b""
+    source = "none"
+    if not _ADB_DEAD:
         data = _screencap_adb()
+        if data:
+            source = "adb"
+        else:
+            _ADB_EMPTY_STREAK += 1
+            if _ADB_EMPTY_STREAK >= _ADB_DEAD_THRESHOLD:
+                # One last reconnect attempt, then declare adb dead for the
+                # rest of the run (it does not come back once the TWRP
+                # container starts — verified across 33014296538…33062718661).
+                subprocess.run(["adb", "connect", ADB[-1]], capture_output=True, timeout=10)
+                data = _screencap_adb()
+                if data:
+                    source = "adb"
+                    _ADB_EMPTY_STREAK = 0
+                else:
+                    _ADB_DEAD = True
+                    print("  [screenshot] adb declared DEAD — docker-only from here")
     if not data:
         data = _screencap_docker()
         if data:
-            print("  [screenshot] via docker fallback (adb dead?)")
+            source = "docker"
     with open(path, "wb") as f:
         f.write(data)
-    print(f"  [screenshot] {name} ({len(data)} bytes)")
+    print(f"  [screenshot] {name} ({len(data)} bytes, {source})")
     return path
 
 def dump_ui(name):

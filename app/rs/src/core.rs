@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 
@@ -182,6 +182,47 @@ fn mark_renderer_initialized_for_this_process() {
 /// list of what changes in TWRP mode.
 static BOOT_RECOVERY: AtomicBool = AtomicBool::new(false);
 
+/// Current ANativeWindow* target for the TWRP framebuffer blit loop.
+///
+/// 6-Z183 FIX (black app surface): the render loop used to capture the
+/// window pointer ONCE at spawn and blit to it forever. Android can
+/// recreate the SurfaceView's buffer queue at any time (immersive-mode
+/// transitions, window insets animations, activity resume) — after that
+/// the OLD ANativeWindow is dead, every ANativeWindow_lock fails
+/// silently, and the app shows a BLACK void while the container keeps
+/// rendering (run 33062718661: framework screencap = system overlay +
+/// black, while fb0 held a perfect TWRP menu). The loop now re-reads
+/// this atomic every tick; `reset_window`/`remove_window` swap it with
+/// proper acquire/release bookkeeping, so the blit always targets the
+/// LIVE surface and a recreation just forces one re-blit.
+static TWRP_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" {
+    fn ANativeWindow_acquire(window: *mut c_void);
+    fn ANativeWindow_release(window: *mut c_void);
+    fn ANativeWindow_getWidth(window: *mut c_void) -> i32;
+    fn ANativeWindow_getHeight(window: *mut c_void) -> i32;
+}
+
+/// Publish `window` as the TWRP blit target. Acquires a reference on
+/// the new window and releases the replaced one, so ownership stays
+/// balanced no matter how many times the surface is recreated.
+/// `window` may be null to just detach (e.g. surface destroyed).
+pub fn twrp_set_window(window: *mut c_void) {
+    let new = window as usize;
+    let old = TWRP_WINDOW.swap(new, Ordering::SeqCst);
+    if new != 0 {
+        unsafe { ANativeWindow_acquire(window) };
+    }
+    if old != 0 {
+        unsafe { ANativeWindow_release(old as *mut c_void) };
+    }
+    alog(&format!(
+        "twrp_set_window: {:p} (was {:p})",
+        window, old as *mut c_void
+    ));
+}
+
 /// Set the Boot Recovery (TWRP) flag. Called from JNI
 /// (`set_boot_recovery` in lib.rs) before `init_renderer`.
 pub fn set_boot_recovery(enabled: bool) {
@@ -305,15 +346,18 @@ fn renderer_thread_main(
 
     if is_boot_recovery_enabled() {
         info!("[CORE] TWRP boot: starting framebuffer reader thread (fb0 → SurfaceView)");
+        alog("renderer_thread_main: TWRP mode — fb0 reader thread starting");
         let rootfs = get_rootfs_dir();
         let fb_path = format!("{}/dev/graphics/fb0", rootfs);
-        let sw = surface_width;
-        let sh = surface_height;
         let vw = virtual_width;
         let vh = virtual_height;
-        let inner_wrap = SendPtr(window);
+        // 6-Z183: publish the window through TWRP_WINDOW (the loop re-reads
+        // it every tick — see the static's doc). lib.rs acquired this
+        // pointer's reference for us; twrp_set_window takes over that
+        // ownership (it will release it when replaced/cleared).
+        twrp_set_window(window);
         std::thread::spawn(move || {
-            twrp_fb_render_loop_wrapper(inner_wrap, fb_path, sw, sh, vw, vh);
+            twrp_fb_render_loop(fb_path, vw, vh);
         });
     } else {
         info!("[CORE] Starting AOSP libOpenglRender.so");
@@ -859,6 +903,14 @@ pub fn reset_window(
     fb_width: i32,
     fb_height: i32,
 ) {
+    // 6-Z183: in TWRP mode the emugl subwindow is not running — the fb0
+    // blit loop owns the display path. Route the (possibly RECREATED)
+    // surface to it so blits always target the live window; the loop
+    // sees the swap and force-re-blits the current frame.
+    if is_boot_recovery_enabled() {
+        twrp_set_window(window);
+        return;
+    }
     unsafe {
         renderer_bindings::resetSubWindow(
             window, left, top, width, height, fb_width, fb_height, 1.0, 0.0,
@@ -868,6 +920,13 @@ pub fn reset_window(
 
 /// Remove a window.
 pub fn remove_window(window: *mut c_void) {
+    // 6-Z183: TWRP mode — detaching the blit target pauses rendering
+    // (the loop idles at 200 ms ticks with zero fb reads until a fresh
+    // surfaceCreated/reset_window publishes a new window).
+    if is_boot_recovery_enabled() {
+        twrp_set_window(std::ptr::null_mut());
+        return;
+    }
     unsafe {
         renderer_bindings::removeSubWindow(window);
     }
@@ -1087,42 +1146,15 @@ const DEFAULT_FB_BPP: usize = 4; // RGBA8888 = 32 bits = 4 bytes
 /// Render loop for TWRP boot mode.
 ///
 /// Reads {rootfs}/dev/graphics/fb0 periodically and blits the pixels
-/// to the ANativeWindow (SurfaceView). This makes the TWRP UI visible
-/// in the Java app without requiring OpenGL ES.
+/// to the LIVE ANativeWindow (SurfaceView — re-read from TWRP_WINDOW
+/// every tick, 6-Z183). This makes the TWRP UI visible in the Java app
+/// without requiring OpenGL ES.
 ///
-/// `window` is a raw ANativeWindow* pointer (wrapped in SendPtr for
-/// thread safety).
 /// `fb_path` is the host path to the fb0 file (e.g.
 /// "/data/user/0/io.twoyi/rootfs/dev/graphics/fb0").
-/// `surface_width`/`surface_height` are the physical SurfaceView dimensions.
 /// `virtual_width`/`virtual_height` are the TWRP display dimensions (from
 /// the profile settings — NOT hardcoded).
-fn twrp_fb_render_loop_wrapper(
-    window: SendPtr,
-    fb_path: String,
-    surface_width: i32,
-    surface_height: i32,
-    virtual_width: i32,
-    virtual_height: i32,
-) {
-    twrp_fb_render_loop(
-        window.0,
-        fb_path,
-        surface_width,
-        surface_height,
-        virtual_width,
-        virtual_height,
-    );
-}
-
-fn twrp_fb_render_loop(
-    window: *mut c_void,
-    fb_path: String,
-    surface_width: i32,
-    surface_height: i32,
-    virtual_width: i32,
-    virtual_height: i32,
-) {
+fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32) {
     use std::io::Read;
     use std::time::Duration;
 
@@ -1135,9 +1167,20 @@ fn twrp_fb_render_loop(
     let fb_size = fb_w * fb_h * fb_bpp;
 
     info!(
-        "[CORE][TWRP-FB] render loop started: fb_path={} surface={}x{} virtual={}x{} fb_size={}",
-        fb_path, surface_width, surface_height, virtual_width, virtual_height, fb_size
+        "[CORE][TWRP-FB] render loop started: fb_path={} virtual={}x{} fb_size={}",
+        fb_path, virtual_width, virtual_height, fb_size
     );
+    alog(&format!(
+        "TWRP-FB render loop started: fb={} virtual={}x{}",
+        fb_path, virtual_width, virtual_height
+    ));
+
+    // 6-Z183: the window is re-read every tick from TWRP_WINDOW; when it
+    // changes (surface recreated) force one unconditional re-blit so the
+    // fresh blank surface gets pixels immediately.
+    let mut last_window: usize = 0;
+    let mut blit_fail_logged_for: usize = 0;
+    let mut first_blit_logged = false;
 
     // Wait for the fb0 file to exist (kr64 creates it before forking init).
     let mut waited = 0u32;
@@ -1173,8 +1216,16 @@ fn twrp_fb_render_loop(
     let mut idle_ticks: u32 = 0;
     let mut short_read_logged: u32 = 0;
 
-    // Render loop: read fb0 → (dirty-check) → blit to SurfaceView.
+    // Render loop: read fb0 → (dirty-check) → blit to the LIVE window.
     loop {
+        // 6-Z183: no live surface (app backgrounded / surface destroyed)?
+        // Idle cheaply — no fb reads, no blits, no spin.
+        let window = TWRP_WINDOW.load(Ordering::SeqCst) as *mut c_void;
+        if window.is_null() {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+
         // Read the framebuffer file.
         let file = match std::fs::File::open(&fb_path) {
             Ok(f) => f,
@@ -1216,7 +1267,8 @@ fn twrp_fb_render_loop(
 
         // Dirty check (u64 chunks; both buffers are fb_size long). Skip the
         // blit entirely when the framebuffer content did not change.
-        let changed = {
+        let window_changed = last_window != window as usize;
+        let changed = window_changed || {
             let prev: &[u8] = &last_blit;
             prev.len() != fb_buf.len()
                 || prev
@@ -1227,16 +1279,26 @@ fn twrp_fb_render_loop(
         };
         if changed {
             // Blit the framebuffer to the ANativeWindow.
-            unsafe {
-                twrp_blit_to_surface(
-                    window,
-                    &fb_buf,
-                    surface_width,
-                    surface_height,
-                    fb_w,
-                    fb_h,
-                    fb_bpp,
-                );
+            let ok = unsafe { twrp_blit_to_surface(window, &fb_buf, fb_w, fb_h, fb_bpp) };
+            if !ok {
+                // Rate-limit: log a lock/geometry failure ONCE per window
+                // instance (a dead surface would otherwise spam every tick).
+                // last_window is NOT advanced on failure — a failed blit
+                // (busy SurfaceFlinger, mid-recreation window) retries next
+                // tick instead of freezing the display until fb0 changes.
+                if blit_fail_logged_for != window as usize {
+                    blit_fail_logged_for = window as usize;
+                    alog_error("TWRP-FB blit FAILED (setBuffersGeometry/lock) — surface shows stale pixels");
+                }
+            } else {
+                last_window = window as usize;
+                if !first_blit_logged {
+                    first_blit_logged = true;
+                    alog(&format!(
+                        "TWRP-FB first frame blitted to surface ({}, {}x{})",
+                        fb_path, fb_w, fb_h
+                    ));
+                }
             }
             if last_blit.is_empty() {
                 log::info!(
@@ -1265,26 +1327,37 @@ fn twrp_fb_render_loop(
 /// Blit the TWRP framebuffer to the ANativeWindow.
 ///
 /// Uses ANativeWindow_lock/unlockAndPost to write pixels directly to the
-/// SurfaceView's buffer. The SurfaceView's buffer format is set to
-/// WINDOW_FORMAT_RGBA_8888 (5).
+/// SurfaceView's buffer. The surface buffer format is requested as
+/// WINDOW_FORMAT_RGBA_8888 (**1**).
 ///
-/// We scale the source framebuffer to fit the surface dimensions using
-/// nearest-neighbor sampling.
+/// 6-Z183 COLOR FIX: this used to request format **5**, which the comment
+/// claimed was WINDOW_FORMAT_RGBA_8888 — but 5 is HAL_PIXEL_FORMAT_BGRA_8888
+/// (WINDOW_FORMAT_RGBA_8888 is 1; the WINDOW_FORMAT_* enum aliases the
+/// HAL_PIXEL_FORMAT_* values). The blit below packs pixels in RGBA byte
+/// order, so a BGRA buffer composited them with R and B swapped — TWRP's
+/// blue theme (#0090CA) rendered ORANGE on the app display (the "colors
+/// seem off" report). Requesting format 1 makes the RGBA packing correct.
+/// On grallocs that don't honor the request the returned buffer.format is
+/// honoured below (BGRA → pack BGR order) so the colors stay right either
+/// way.
+///
+/// We scale the source framebuffer to the window's current dimensions
+/// using nearest-neighbor sampling.
+///
+/// Returns true when a frame was actually posted.
 ///
 /// Parameters:
-/// - `fb`: raw framebuffer bytes (RGBA8888)
-/// - `surface_width`/`surface_height`: physical SurfaceView dimensions
+/// - `fb`: raw framebuffer bytes (BGRA byte order in memory, i.e.
+///   [B,G,R,A] per pixel — see the hook's FBIOGET_VSCREENINFO)
 /// - `fb_w`/`fb_h`: source framebuffer dimensions (from profile settings)
-/// - `fb_bpp`: bytes per pixel (4 for RGBA8888)
+/// - `fb_bpp`: bytes per pixel (4)
 unsafe fn twrp_blit_to_surface(
     window: *mut c_void,
     fb: &[u8],
-    surface_width: i32,
-    surface_height: i32,
     fb_w: usize,
     fb_h: usize,
     fb_bpp: usize,
-) {
+) -> bool {
     // ANativeWindow functions from libandroid.so (linked via ndk).
     extern "C" {
         fn ANativeWindow_lock(
@@ -1312,7 +1385,16 @@ unsafe fn twrp_blit_to_surface(
         reserved: [u32; 6],
     }
 
-    const WINDOW_FORMAT_RGBA_8888: i32 = 5;
+    const WINDOW_FORMAT_RGBA_8888: i32 = 1;
+    const HAL_PIXEL_FORMAT_BGRA_8888: i32 = 5;
+
+    // Query the window's own size (6-Z183): a recreated/resized surface
+    // is handled without trusting the size captured at loop spawn.
+    let surface_width = ANativeWindow_getWidth(window);
+    let surface_height = ANativeWindow_getHeight(window);
+    if surface_width <= 0 || surface_height <= 0 {
+        return false;
+    }
 
     // Set the buffer geometry to match the surface dimensions + RGBA8888.
     let r = ANativeWindow_setBuffersGeometry(
@@ -1322,15 +1404,20 @@ unsafe fn twrp_blit_to_surface(
         WINDOW_FORMAT_RGBA_8888,
     );
     if r != 0 {
-        return;
+        return false;
     }
 
     // Lock the window buffer for writing.
     let mut buffer: ANativeWindow_Buffer = std::mem::zeroed();
     let r = ANativeWindow_lock(window, &mut buffer, std::ptr::null_mut());
     if r != 0 {
-        return;
+        return false;
     }
+
+    // Some gralloc implementations keep their preferred format instead of
+    // the requested one — honour whatever they actually gave us so the
+    // channel packing is always right (6-Z183 color fix, belt + braces).
+    let buffer_is_bgra = buffer.format == HAL_PIXEL_FORMAT_BGRA_8888;
 
     // Blit with nearest-neighbor scaling.
     let src_w = fb_w as i32;
@@ -1342,7 +1429,7 @@ unsafe fn twrp_blit_to_surface(
     let bits = buffer.bits;
     if bits.is_null() {
         let _ = ANativeWindow_unlockAndPost(window);
-        return;
+        return false;
     }
 
     for dy in 0..dst_h {
@@ -1359,20 +1446,27 @@ unsafe fn twrp_blit_to_surface(
             // [B,G,R,A]: the hook's FBIOGET_VSCREENINFO declares
             // red.offset=16 / green.offset=8 / blue.offset=0 (exactly
             // what the real byt_t_crv2 Bay Trail panel reports and what
-            // this TWRP image renders for). Android's
-            // WINDOW_FORMAT_RGBA_8888 buffer wants in-memory [R,G,B,A],
-            // so swap R and B here (Task 6-Z64 — otherwise the orange
-            // TWRP logo would render blue).
+            // this TWRP image renders for).
+            //
+            // 6-Z183: the destination packing follows the buffer's ACTUAL
+            // format — RGBA_8888 wants in-memory [R,G,B,A], BGRA_8888
+            // wants [B,G,R,A] (which is exactly fb0's own byte order, so
+            // a BGRA buffer takes a verbatim copy).
             let src_idx = (sy * fb_w + sx) * fb_bpp;
             if src_idx + 3 >= fb.len() {
                 continue;
             }
-            let b = fb[src_idx] as u32;
-            let g = fb[src_idx + 1] as u32;
-            let r = fb[src_idx + 2] as u32;
+            let fb_b = fb[src_idx] as u32;
+            let fb_g = fb[src_idx + 1] as u32;
+            let fb_r = fb[src_idx + 2] as u32;
             let a = fb[src_idx + 3] as u32;
-            // Pack as 0xAABBGGRR (little-endian RGBA_8888)
-            let pixel = (a << 24) | (b << 16) | (g << 8) | r;
+            let pixel = if buffer_is_bgra {
+                // little-endian BGRA_8888: bytes [B,G,R,A]
+                (a << 24) | (fb_r << 16) | (fb_g << 8) | fb_b
+            } else {
+                // little-endian RGBA_8888: bytes [R,G,B,A]
+                (a << 24) | (fb_b << 16) | (fb_g << 8) | fb_r
+            };
 
             let dst_idx = (dy as usize * dst_stride as usize) + dx as usize;
             *bits.add(dst_idx) = pixel;
@@ -1381,4 +1475,5 @@ unsafe fn twrp_blit_to_surface(
 
     // Unlock and post the buffer to the display.
     let _ = ANativeWindow_unlockAndPost(window);
+    true
 }
