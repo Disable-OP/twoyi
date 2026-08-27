@@ -11321,3 +11321,50 @@ Stage Summary:
 - Next: 6-Z181 E2E pair running (touch-on + no-input). If the
   touch-on run still crashes, the SIGSEGV comm/regs/sigframe + POKE
   timeline will name the bridge's exact faulting instruction.
+
+---
+Task ID: 6-Z182 RESULTS — TWRP BOOTS INTO ITS MENU ON ARM64 REDROID, WITH TOUCH
+Agent: main
+Task: Abstract-namespace touch bridge + geometry absolute path — the menu run
+
+EVIDENCE (run 33062718661, touch-on, 6-Z182 build, default inputs):
+- ZERO SIGSEGV, ZERO recovery restarts for the whole run.
+- [twrp_fb_hook] geometry from file: 720x1600 (the chroot-absolute
+  /.twoyi-fb-geometry candidate — native resolution chain COMPLETE).
+- [twrp_fb_hook] INPUT bridge: open("event1") -> touch-events socket
+  fd=7 — THE ABSTRACT \0io.twoyi.touch SOCKET CONNECTED from inside
+  the jail (netns is shared; abstract names ignore the chroot).
+- I:Switching packages (splash) -> I:Set page: 'clear_vars' ->
+  I:Set page: 'main2' — the E2E's gate-dismissal gestures traveled
+  redroid input -> app onTouch -> INPUT_SENDER -> abstract socket ->
+  hook bridge -> evdev -> TWRP: THE GATE WAS DISMISSED AND TWRP
+  NAVIGATED TO ITS MAIN MENU. TOUCH WORKS END TO END.
+- fb0.raw = 4,608,000 B (720x1600x4), 100% non-black sampled pixels;
+  decoded top colors: (26,26,26) TWRP dark bg 69%, (0,144,202) TWRP
+  blue 10%, (0,117,164) blue gradient, (238,238,238) white UI text —
+  the classic TWRP 3.x menu palette, rendered by PixelFlinger.
+- Framework screencap (docker exec, adbd had died) shows the app's own
+  surface displaying TWRP content (blue theme + white text).
+- Screenshots + decoded fb0 proof saved to the repo screenshots/ dir
+  and the run artifacts.
+
+The full boot chain now works on arm64 redroid: app launch -> ROM
+import -> Boot to Recovery -> Launch Container -> kr64 jail -> TWRP
+init -> theme -> gr_init -> PixelFlinger render at NATIVE 720x1600 ->
+fb0 -> app blit -> screen; input: screen gestures -> app -> abstract
+socket -> evdev bridge -> TWRP page navigation.
+
+Remaining known gaps (non-blocking):
+- adbd inside the container dies when the TWRP container starts
+  (docker-exec evidence channel covers everything; adb-side pulls
+  still race it). Root cause still open — likely the guest's own
+  adbd restart loop interacting with the container's adbd.
+- The x86_64 TWRP path (ui-e2e-test.yml) re-verified next.
+
+Stage Summary:
+- Session arc 6-Z180 -> 6-Z182: cand_lens stack-overflow fix, arch-
+  correct crash forensics (rip was x16 all along; 0xffff... is the
+  NORMAL arm64 stack region), per-pid bind paths (EADDRINUSE ->
+  accept4-EINVAL wedge), abstract-namespace touch bridge (chroot-proof
+  connect), chroot-absolute geometry file, adbd-proof evidence pulls.
+  TWRP menu + touch: WORKING on arm64 redroid.
