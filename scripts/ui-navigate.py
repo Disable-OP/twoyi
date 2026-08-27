@@ -237,27 +237,51 @@ def screenshot(name):
     return path
 
 def dump_ui(name):
-    # 6-Z186 iter-4: adb first; docker-exec fallback with the XML on
-    # stdout when redroid's adbd has died mid-run (uiautomator dump
-    # writes to /sdcard/ui-dump.xml in the container either way — cat
-    # it back through the same channel). No sudo-docker on the x86
-    # emulator: the except path keeps the old adb-only behavior.
+    """6-Z186 iter-5: adb FIRST (the proven channel for the early
+    phases), docker-exec ONLY when adb is dead. Iter-4's docker-first
+    ordering froze every dump to the first frame: a failed docker
+    `uiautomator dump` left the previous /sdcard/ui-dump.xml in place
+    and the `cat` served the STALE file — all 24 XMLs in run 33105112068
+    were byte-identical while the real screen scrolled on. Now the
+    remote file is DELETED before each dump attempt so a failure yields
+    EMPTY (parse_ui -> None, callers fall back cleanly) instead of a
+    frozen viewport."""
     xml_path = os.path.join(ART, f"uiautomator-{name}.xml")
+    if os.path.exists(xml_path):
+        os.remove(xml_path)  # never serve a previous same-named dump
+    # adb branch (alive): rm old file -> dump -> pull.
+    global _ADB_DEAD
+    alive = False
+    if not _ADB_DEAD:
+        try:
+            st = subprocess.run(ADB + ["get-state"], capture_output=True,
+                                text=True, timeout=5)
+            alive = "device" in (st.stdout + st.stderr)
+        except Exception:
+            alive = False
+    if alive:
+        adb_shell("rm -f /sdcard/ui-dump.xml; uiautomator dump /sdcard/ui-dump.xml",
+                  timeout=45)
+        subprocess.run(ADB + ["pull", "/sdcard/ui-dump.xml", xml_path],
+                       capture_output=True, timeout=10)
+        if os.path.exists(xml_path) and os.path.getsize(xml_path) > 100:
+            return xml_path
+        # dump failed (stale deleted + nothing new) — fall through to
+        # the docker attempt below, which likewise cannot serve stale.
     try:
         r = subprocess.run(
             ["sudo", "docker", "exec", "redroid", "sh", "-c",
+             "rm -f /sdcard/ui-dump.xml; "
              "uiautomator dump /sdcard/ui-dump.xml >/dev/null 2>&1; "
              "cat /sdcard/ui-dump.xml 2>/dev/null"],
             capture_output=True, timeout=45)
         if r.stdout and b"<hierarchy" in r.stdout:
             with open(xml_path, "wb") as f:
                 f.write(r.stdout)
-            return xml_path
+        elif os.path.exists(xml_path):
+            os.remove(xml_path)  # never leave a stale local copy
     except Exception:
         pass
-    adb_shell("uiautomator dump /sdcard/ui-dump.xml")
-    subprocess.run(ADB + ["pull", "/sdcard/ui-dump.xml", xml_path],
-                  capture_output=True, timeout=10)
     return xml_path
 
 def parse_ui(xml_path):
