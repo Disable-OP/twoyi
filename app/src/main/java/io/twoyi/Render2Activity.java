@@ -38,7 +38,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.twoyi.utils.FileLogger;
 import io.twoyi.utils.LogEvents;
@@ -82,7 +81,6 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
      */
     private final android.graphics.Matrix mTouchMatrix = new android.graphics.Matrix();
 
-    private final AtomicBoolean mIsExtracting = new AtomicBoolean(false);
 
     private final SurfaceHolder.Callback mSurfaceCallback = new SurfaceHolder.Callback() {
         @Override
@@ -362,27 +360,6 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         showBootingProcedure();
     }
 
-    private void showTipsForFirstBoot() {
-        mLoadingText.setText(R.string.extracting_tips);
-        mRootView.postDelayed(() -> {
-            if (mIsExtracting.get()) {
-                mLoadingText.setText(R.string.first_boot_tips);
-            }
-        }, 5000);
-
-        mRootView.postDelayed(() -> {
-            if (mIsExtracting.get()) {
-                mLoadingText.setText(R.string.first_boot_tips2);
-            }
-        }, 10 * 1000);
-
-        mRootView.postDelayed(() -> {
-            if (mIsExtracting.get()) {
-                mLoadingText.setText(R.string.first_boot_tips3);
-            }
-        }, 15 * 1000);
-    }
-
     private void showBootingProcedure() {
         FileLogger.boot("show_booting_procedure", "waiting for BOOT_COMPLETED (60s timeout)");
         // mLoadingText.setText(R.string.booting_tips);
@@ -390,70 +367,68 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         mBootLogView.setVisibility(View.VISIBLE);
         new Thread(() -> {
 
-            if (true) {
-                boolean success = false;
-                try {
-                    // Task 6-Z62: kr64's synthesized BOOT_COMPLETED fires when
-                    // the recovery child's execve completes — observed at
-                    // T+118 s after Activity start in the b889666 E2E
-                    // (Render2Activity 21:30:32 → kr64 daemon 21:32:30), i.e.
-                    // AFTER the old single 60 s waitBoot deadline. A
-                    // CyclicBarrier await that times out BREAKS the barrier,
-                    // so a late markCompleted() could never wake the UI.
-                    // Poll in 5 s slices instead: waitBoot() now re-arms the
-                    // latch after each timed-out slice (BootCompletionServer,
-                    // Task 6-Z62), and the isCompleted() fallback catches the
-                    // broken-barrier race (BOOT_COMPLETED arrived while we
-                    // were between slices). Total window 300 s to match the
-                    // E2E boot_wait.
-                    long bootDeadlineMs = SystemClock.elapsedRealtime() + 300_000L;
-                    while (!success && SystemClock.elapsedRealtime() < bootDeadlineMs) {
-                        success = BootCompletionServer.getInstance().waitBoot(5, TimeUnit.SECONDS);
-                        if (!success && BootCompletionServer.getInstance().isCompleted()) {
-                            // BOOT_COMPLETED arrived during a broken-barrier
-                            // window — boot DID complete; treat as success.
-                            success = true;
-                        }
+            boolean success = false;
+            try {
+                // Task 6-Z62: kr64's synthesized BOOT_COMPLETED fires when
+                // the recovery child's execve completes — observed at
+                // T+118 s after Activity start in the b889666 E2E
+                // (Render2Activity 21:30:32 → kr64 daemon 21:32:30), i.e.
+                // AFTER the old single 60 s waitBoot deadline. A
+                // CyclicBarrier await that times out BREAKS the barrier,
+                // so a late markCompleted() could never wake the UI.
+                // Poll in 5 s slices instead: waitBoot() now re-arms the
+                // latch after each timed-out slice (BootCompletionServer,
+                // Task 6-Z62), and the isCompleted() fallback catches the
+                // broken-barrier race (BOOT_COMPLETED arrived while we
+                // were between slices). Total window 300 s to match the
+                // E2E boot_wait.
+                long bootDeadlineMs = SystemClock.elapsedRealtime() + 300_000L;
+                while (!success && SystemClock.elapsedRealtime() < bootDeadlineMs) {
+                    success = BootCompletionServer.getInstance().waitBoot(5, TimeUnit.SECONDS);
+                    if (!success && BootCompletionServer.getInstance().isCompleted()) {
+                        // BOOT_COMPLETED arrived during a broken-barrier
+                        // window — boot DID complete; treat as success.
+                        success = true;
                     }
-                } catch (Throwable ignored) {
-                    // BootCompletionServer.waitBoot() catches InterruptedException /
-                    // BrokenBarrierException internally and returns false, so this
-                    // catch is a defensive guard against any other unexpected
-                    // Throwable (e.g. IllegalMonitorStateException from a future
-                    // refactor). Swallowing these silently made the boot-failure
-                    // path fire with no diagnostic in logcat — track the exception
-                    // so crash reporters and developers have a clue when
-                    // `success == false` leads to trackBootFailure().
-                    Log.e(TAG, "waitBoot threw — treating as boot failure", ignored);
-                    FileLogger.e(TAG, "waitBoot threw — treating as boot failure", ignored);
                 }
+            } catch (Throwable ignored) {
+                // BootCompletionServer.waitBoot() catches InterruptedException /
+                // BrokenBarrierException internally and returns false, so this
+                // catch is a defensive guard against any other unexpected
+                // Throwable (e.g. IllegalMonitorStateException from a future
+                // refactor). Swallowing these silently made the boot-failure
+                // path fire with no diagnostic in logcat — track the exception
+                // so crash reporters and developers have a clue when
+                // `success == false` leads to trackBootFailure().
+                Log.e(TAG, "waitBoot threw — treating as boot failure", ignored);
+                FileLogger.e(TAG, "waitBoot threw — treating as boot failure", ignored);
+            }
 
-                FileLogger.boot("wait_boot_result", "success=" + success);
-                if (!success) {
-                    FileLogger.boot("boot_failed", "trackBootFailure — NOT calling System.exit (Task 6-Z21: the 2-sec relaunch cycle was caused by System.exit(0) here → Android restarts the process → new kr64 → recovery never reaches framebuffer render. Now we keep the process alive so the existing kr64 can continue running.)");
-                    LogEvents.trackBootFailure(getApplicationContext());
+            FileLogger.boot("wait_boot_result", "success=" + success);
+            if (!success) {
+                FileLogger.boot("boot_failed", "trackBootFailure — NOT calling System.exit (Task 6-Z21: the 2-sec relaunch cycle was caused by System.exit(0) here → Android restarts the process → new kr64 → recovery never reaches framebuffer render. Now we keep the process alive so the existing kr64 can continue running.)");
+                LogEvents.trackBootFailure(getApplicationContext());
 
-                    runOnUiThread(() -> Toast.makeText(getApplicationContext(), R.string.boot_failed, Toast.LENGTH_SHORT).show());
+                runOnUiThread(() -> Toast.makeText(getApplicationContext(), R.string.boot_failed, Toast.LENGTH_SHORT).show());
 
-                    // Task 6-Z21: do NOT call System.exit(0). The recovery
-                    // (kr64 ptrace emulation) is slow — the 60s waitBoot
-                    // timeout fires before BOOT_COMPLETED, triggering this
-                    // boot-failure path. Previously System.exit(0) killed
-                    // the whole process → Android restarted it → a NEW
-                    // kr64 was spawned → the recovery restarted from
-                    // scratch every ~2 sec, never reaching the framebuffer
-                    // render. Now we just log the failure + keep the
-                    // process (and the existing kr64) alive. The recovery
-                    // can continue running past the 60s timeout + may
-                    // eventually reach the framebuffer render.
-                    // (Removed: SystemClock.sleep(3000) + finish() + System.exit(0).)
-                    return;
-                }
+                // Task 6-Z21: do NOT call System.exit(0). The recovery
+                // (kr64 ptrace emulation) is slow — the 60s waitBoot
+                // timeout fires before BOOT_COMPLETED, triggering this
+                // boot-failure path. Previously System.exit(0) killed
+                // the whole process → Android restarted it → a NEW
+                // kr64 was spawned → the recovery restarted from
+                // scratch every ~2 sec, never reaching the framebuffer
+                // render. Now we just log the failure + keep the
+                // process (and the existing kr64) alive. The recovery
+                // can continue running past the 60s timeout + may
+                // eventually reach the framebuffer render.
+                // (Removed: SystemClock.sleep(3000) + finish() + System.exit(0).)
+                return;
             }
 
             runOnUiThread(() -> {
-                mLoadingView.stopAnimation();
-                mLoadingLayout.setVisibility(View.GONE);
+            mLoadingView.stopAnimation();
+            mLoadingLayout.setVisibility(View.GONE);
             });
         }, "waiting-boot").start();
     }
@@ -489,9 +464,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         Log.d(TAG, "onKeyDown: " + keyCode);
-        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            // TODO: 2021/10/26 Add Volume control
-        }
+        // Volume-key passthrough: the guest owns volume handling.
         return super.onKeyDown(keyCode, event);
     }
 
@@ -545,61 +518,84 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             String activeProfile = ProfileManager.getActiveProfile(this);
             File profileRootfsDir = ProfileManager.getProfileRootfsDir(this, activeProfile);
 
-            // Clear existing rootfs
-            if (profileRootfsDir.exists()) {
-                io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
+            // 6-Z184 NON-DESTRUCTIVE IMPORT: extract into a STAGING sibling
+            // first; only after a successful extraction do we swap it into
+            // place. The previous flow deleted the working rootfs BEFORE
+            // extracting — a failed copy, revoked Uri grant, corrupt tar or
+            // timeout left the app with NO ROM at all ("No ROM Installed",
+            // unrecoverable without a re-import).
+            File stagingDir = new File(profileRootfsDir.getParentFile(),
+                    profileRootfsDir.getName() + ".importing");
+            if (stagingDir.exists()) {
+                io.twoyi.utils.IOUtils.deleteDirectory(stagingDir);
             }
-            profileRootfsDir.mkdirs();
+            stagingDir.mkdirs();
 
             File tempFile = new File(getCacheDir(), "rootfs_import.tar");
-
-            ContentResolver contentResolver = getContentResolver();
-            try (InputStream inputStream = contentResolver.openInputStream(uri);
-                 OutputStream os = new FileOutputStream(tempFile)) {
-                // Fixed: openInputStream can return null if the provider
-                // revokes the grant between picker return and our read.
-                if (inputStream == null) {
-                    throw new IOException("ContentResolver returned null stream for " + uri);
+            try {
+                ContentResolver contentResolver = getContentResolver();
+                try (InputStream inputStream = contentResolver.openInputStream(uri);
+                     OutputStream os = new FileOutputStream(tempFile)) {
+                    // Fixed: openInputStream can return null if the provider
+                    // revokes the grant between picker return and our read.
+                    if (inputStream == null) {
+                        throw new IOException("ContentResolver returned null stream for " + uri);
+                    }
+                    byte[] buffer = new byte[8192];
+                    int count;
+                    while ((count = inputStream.read(buffer)) > 0) {
+                        os.write(buffer, 0, count);
+                    }
                 }
-                byte[] buffer = new byte[8192];
-                int count;
-                while ((count = inputStream.read(buffer)) > 0) {
-                    os.write(buffer, 0, count);
+
+                String tempFilePath = tempFile.getAbsolutePath();
+                String stagingPath = stagingDir.getAbsolutePath();
+
+                if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
+                    stagingPath.contains(";") || stagingPath.contains("&")) {
+                    throw new SecurityException("Invalid path detected");
+                }
+
+                // Extract tar to the STAGING directory
+                ProcessBuilder pb = new ProcessBuilder(
+                    "tar", "-xf", tempFilePath,
+                    "-C", stagingPath
+                );
+                Process process = pb.start();
+                // Fixed: waitFor() without a timeout can hang forever on a
+                // corrupt archive. Cap at 120 s; 500 MB rootfs tar extracts in
+                // ~30 s on most devices.
+                int exitCode;
+                if (!process.waitFor(120, TimeUnit.SECONDS)) {
+                    process.destroyForcibly();
+                    throw new IOException("tar extraction timed out after 120 s");
+                } else {
+                    exitCode = process.exitValue();
+                }
+
+                if (exitCode == 0) {
+                    // Swap: remove the old rootfs and move staging into place
+                    // (rename within the same parent directory = same
+                    // filesystem = atomic).
+                    if (profileRootfsDir.exists()) {
+                        io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
+                    }
+                    if (!stagingDir.renameTo(profileRootfsDir)) {
+                        throw new IOException("staging rename failed: "
+                                + stagingPath + " -> " + profileRootfsDir.getAbsolutePath());
+                    }
+                    RomManager.initRootfs(this);
+                    return true;
+                }
+                return false;
+            } finally {
+                // Whatever happened, drop the staged tar and any leftover
+                // staging dir (on success it was renamed away; this is a no-op).
+                tempFile.delete();
+                if (stagingDir.exists()) {
+                    io.twoyi.utils.IOUtils.deleteDirectory(stagingDir);
                 }
             }
-
-            String tempFilePath = tempFile.getAbsolutePath();
-            String rootfsPath = profileRootfsDir.getAbsolutePath();
-
-            if (tempFilePath.contains(";") || tempFilePath.contains("&") ||
-                rootfsPath.contains(";") || rootfsPath.contains("&")) {
-                throw new SecurityException("Invalid path detected");
-            }
-
-            // Extract tar to rootfs directory
-            ProcessBuilder pb = new ProcessBuilder(
-                "tar", "-xf", tempFilePath,
-                "-C", rootfsPath
-            );
-            Process process = pb.start();
-            // Fixed: waitFor() without a timeout can hang forever on a
-            // corrupt archive. Cap at 120 s; 500 MB rootfs tar extracts in
-            // ~30 s on most devices.
-            int exitCode;
-            if (!process.waitFor(120, TimeUnit.SECONDS)) {
-                process.destroyForcibly();
-                throw new IOException("tar extraction timed out after 120 s");
-            } else {
-                exitCode = process.exitValue();
-            }
-
-            tempFile.delete();
-
-            if (exitCode == 0) {
-                RomManager.initRootfs(this);
-            }
-
-            return exitCode == 0;
         }).done(result -> {
             UIHelper.dismiss(dialog);
             if (result) {

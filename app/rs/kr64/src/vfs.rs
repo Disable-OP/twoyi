@@ -348,7 +348,7 @@ fn is_dev_properties_path(guest_path: &str) -> bool {
 ///     unsigned bytes_used;       // 4 — payload bytes used
 ///     unsigned volatile serial;  // 4 — increment on write (0 = stable)
 ///     unsigned magic;            // 4 = 0x504f5250 ("PROP")
-///     unsigned version;          // 4 = PROP_AREA_VERSION (1)
+///     unsigned version;          // 4 = PROP_AREA_VERSION (0xfc6ed0ab)
 ///     unsigned reserved[28];    // 112
 ///     char data[];               // payload: prop_info structs (empty here)
 ///   };
@@ -359,7 +359,15 @@ fn is_dev_properties_path(guest_path: &str) -> bool {
 /// NULL and falls back). Same behavior as the old binary patch, no mutation.
 fn make_minimal_property_area() -> Vec<u8> {
     const PROP_AREA_MAGIC: u32 = 0x504f5250; // "PROP" little-endian
-    const PROP_AREA_VERSION: u32 = 1;
+    // Both the pre-8 and the 8+ bionic use the SAME version constant
+    // (0xfc6ed0ab): prop_area::is_valid() checks
+    // `magic == PROP_AREA_MAGIC && version == PROP_AREA_VERSION`, and
+    // there is no version `1` anywhere in bionic. (An earlier revision
+    // wrote 1 here, which made the area INVALID — every mmap rejected,
+    // every lookup NULL. The observable behavior of an empty area is
+    // the same, but a valid header keeps bionic from logging errors
+    // and lets future property-serving actually work.)
+    const PROP_AREA_VERSION: u32 = 0xfc6ed0ab;
     let mut buf = Vec::with_capacity(128);
     // bytes_used: 0 (no properties)
     buf.extend_from_slice(&0u32.to_le_bytes());
@@ -392,8 +400,10 @@ pub const PROP_AREA_SIZE: usize = 0x20000;
 /// disassembly at worklog 5-Z Step 3 — the version is the constant stored
 /// at offset 12 of the prop_area header). Stock AOSP 5.1 source defines
 /// this as `PROP_AREA_VERSION` in `bionic/libc/include/sys/_system_properties.h`.
-/// NOTE: this is NOT 1 (the NEW Android 8+ format version that
-/// `make_minimal_property_area()` uses for `/dev/__properties__/properties_serial`).
+/// NOTE: bionic uses this SAME constant for the Android 8+ format too
+/// (the pre-8 and 8+ formats differ in `prop_info`/context layout, not
+/// in the area header) — `make_minimal_property_area()` uses it for
+/// `/dev/__properties__/properties_serial` as well.
 pub const PROP_AREA_VERSION_OLD: u32 = 0xfc6ed0ab;
 
 /// Build a valid OLD-format AOSP `__system_property_area__` for TWRP's
@@ -418,9 +428,10 @@ pub const PROP_AREA_VERSION_OLD: u32 = 0xfc6ed0ab;
 /// ```
 /// Total header = 128 bytes. Standard area file size = 0x20000 (128 KB).
 ///
-/// The OLD-format version is `0xfc6ed0ab` (NOT `1` like the NEW format
-/// used by `make_minimal_property_area()` for the Android 8+ path). The
-/// magic is the same `0x504f5250` ("PROP") in both formats.
+/// The version is `0xfc6ed0ab` for BOTH the OLD and the NEW format
+/// (`make_minimal_property_area()` uses the same constant for the
+/// Android 8+ path). The magic is the same `0x504f5250` ("PROP") in
+/// both formats.
 ///
 /// The 128 KB file size matches what `__system_property_area_init` calls
 /// `ftruncate(fd, 0x20000)` + `mmap(NULL, 0x20000, ...)` against. With a
@@ -807,8 +818,8 @@ mod tests {
         assert_eq!(&buf[4..8], &0u32.to_le_bytes());
         // magic = "PROP"
         assert_eq!(&buf[8..12], &0x504f5250u32.to_le_bytes());
-        // version = 1
-        assert_eq!(&buf[12..16], &1u32.to_le_bytes());
+        // version = 0xfc6ed0ab (same constant in old AND new bionic)
+        assert_eq!(&buf[12..16], &0xfc6ed0abu32.to_le_bytes());
     }
 
     #[test]

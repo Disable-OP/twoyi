@@ -1,10 +1,3 @@
-# Copyright Disclaimer: AI-Generated Content
-# This file was created by GitHub Copilot, an AI coding assistant.
-# AI-generated content is not subject to copyright protection and is provided
-# without any warranty, express or implied, including warranties of merchantability,
-# fitness for a particular purpose, or non-infringement.
-# Use at your own risk.
-
 # Open-Source Dynamic Library Loader
 
 This directory contains the source code for an open-source dynamic library loader (`libloader.so` / `loader64`), which is a complete replacement for the proprietary legacy loader.

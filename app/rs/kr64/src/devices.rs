@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -744,9 +737,10 @@ pub fn encode_touch_release(time: libc::timeval, slot: i32) -> Vec<u8> {
 /// `{rootfs}/dev/`, because the host Java process is the one that
 /// accepts connections on it — the host can't see inside the chrooted
 /// rootfs. The guest's `init.rc` is patched to `connect()` to a path
-/// that resolves to `{data_dir}/dev/event` from the host's perspective
-/// (typically via a bind mount of `{data_dir}/dev/event` into the
-/// rootfs at `/dev/event_host`).
+/// that resolves to `{data_dir}/rootfs/dev/event` from the host's
+/// perspective (the socket is created under rootfs/dev/ — NOT
+/// data_dir/dev/ — because data_dir/dev/ may still be owned by root
+/// from a previous adb-root extraction; see the inline comment).
 ///
 /// This mirrors VM's `VMEventManager.java` which runs a
 /// `LocalServerSocket("<vmDataDir>/dev/event")` in the host process.

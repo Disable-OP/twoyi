@@ -467,8 +467,8 @@ jobs:
               if [ $((WAITED % 60)) -eq 0 ]; then
                   echo "  still booting... ${WAITED}s elapsed"
                   # adb-independent progress (docker exec): framework state
-                  SVC=$(sudo docker exec redroid getprop init.svc.zygote 2>/dev/null | tr -d '\r' || true)
-                  PROC=$(sudo docker exec redroid sh -c "ps -A 2>/dev/null | grep -cE 'zygote|system_server|surfaceflinger'" 2>/dev/null || true)
+                  SVC=$(sudo docker exec redroid /system/bin/getprop init.svc.zygote 2>/dev/null | tr -d '\r' || true)
+                  PROC=$(sudo docker exec redroid /system/bin/sh -c "ps -A 2>/dev/null | grep -cE 'zygote|system_server|surfaceflinger'" 2>/dev/null || true)
                   PROP=$(adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
                   echo "    boot_completed=$PROP  init.svc.zygote=$SVC  framework_procs=$PROC"
               fi
@@ -476,11 +476,11 @@ jobs:
           if [ "$WAITED" -ge "$BOOT_TIMEOUT" ]; then
               echo "  ✗ redroid did not boot in ${BOOT_TIMEOUT}s"
               echo "── redroid getprop (docker exec — adb-independent) ──"
-              sudo docker exec redroid getprop 2>&1 | grep -E "boot_completed|init.svc|build.version|cpu.abi" | head -30 || true
+              sudo docker exec redroid /system/bin/getprop 2>&1 | grep -E "boot_completed|init.svc|build.version|cpu.abi" | head -30 || true
               echo "── redroid processes (docker exec ps) ──"
-              sudo docker exec redroid sh -c "ps -A 2>/dev/null" 2>&1 | head -40 || true
+              sudo docker exec redroid /system/bin/sh -c "ps -A 2>/dev/null" 2>&1 | head -40 || true
               echo "── redroid logcat tail (docker exec) ──"
-              sudo docker exec redroid sh -c "logcat -d 2>/dev/null" 2>&1 | tail -300 || true
+              sudo docker exec redroid /system/bin/sh -c "/system/bin/logcat -d 2>/dev/null" 2>&1 | tail -300 || true
               echo "── docker logs tail ──"
               sudo docker logs redroid 2>&1 | tail -300
               exit 1
@@ -614,15 +614,22 @@ jobs:
           ) &
           WATCHER=$!
 
-          python3 scripts/ui-navigate.py
-          RC=$?
+          # 6-Z184: `python3 ...` directly would, under GHA's default
+          # `bash -e`, kill the step on ui-navigate's exit 1 — BEFORE any
+          # of the failure-evidence dumps below could run (exactly when
+          # they're needed). Capture the RC; exit it at the end.
+          RC=0
+          python3 scripts/ui-navigate.py || RC=$?
           touch /tmp/ui-e2e-artifacts/nav-done
           kill $WATCHER 2>/dev/null || true
 
           # Final adb-independent dump (works even when adb is dead).
-          sudo docker exec redroid logcat -d \
+          # 6-Z184: absolute /system/bin paths — docker exec resolves
+          # binaries through the image config PATH, which lacks /system/bin
+          # on redroid (same class as the 0-byte screenshot bug).
+          sudo docker exec redroid /system/bin/logcat -d \
             > /tmp/ui-e2e-artifacts/logcat-dockerexec.txt 2>&1 || true
-          sudo docker exec redroid sh -c "ps -A" \
+          sudo docker exec redroid /system/bin/sh -c "ps -A" \
             > /tmp/ui-e2e-artifacts/ps-dockerexec.txt 2>&1 || true
           # 6-Z181: FULL evidence via docker exec — run 33059345471 lost
           # the whole kr64-app-stderr.log (the new SIGSEGV/SIGFRAME/POKE
@@ -657,12 +664,12 @@ jobs:
           # ABSOLUTE /system/bin path is required: docker exec's default
           # PATH does not include /system/bin (the 0-byte screenshots
           # lesson from ui-navigate.py).
-          sudo docker exec redroid sh -c \
-            "screencap -p /data/local/tmp/final-1.png 2>/dev/null && cat /data/local/tmp/final-1.png" \
+          sudo docker exec redroid /system/bin/sh -c \
+            "/system/bin/screencap -p /data/local/tmp/final-1.png 2>/dev/null && cat /data/local/tmp/final-1.png" \
             > /tmp/ui-e2e-artifacts/screencap-dockerexec.png 2>&1 || true
           sleep 5
-          sudo docker exec redroid sh -c \
-            "screencap -p /data/local/tmp/final-2.png 2>/dev/null && cat /data/local/tmp/final-2.png" \
+          sudo docker exec redroid /system/bin/sh -c \
+            "/system/bin/screencap -p /data/local/tmp/final-2.png 2>/dev/null && cat /data/local/tmp/final-2.png" \
             > /tmp/ui-e2e-artifacts/screencap-dockerexec-5s-later.png 2>&1 || true
           sudo docker inspect redroid --format \
             'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' \

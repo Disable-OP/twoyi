@@ -310,7 +310,11 @@ jobs:
           export ANDROID_HOME=/usr/local/lib/android/sdk
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
           mkdir -p /tmp/ui-e2e-artifacts
-          python3 scripts/ui-navigate.py
+          # 6-Z184: capture the RC so the touch-proof pull below runs even
+          # when navigation aborts (bash -e would have skipped it — the
+          # proof artifact only existed on successful runs).
+          RC=0
+          python3 scripts/ui-navigate.py || RC=$?
 
           # 6-Z183: TWRP's own recovery.log via `run-as` (debug app — no
           # adb root needed, keeping the "unrooted user device" premise).
@@ -324,6 +328,7 @@ jobs:
           echo "── recovery.log pages ──"
           grep -a "Set page\|Switching packages" \
             /tmp/ui-e2e-artifacts/twrp-recovery.log | tail -12 || true
+          exit $RC
 
       - name: Pack artifacts
         if: always()

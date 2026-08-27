@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -878,22 +871,22 @@ impl SensorConnState {
     /// lazy approach gives the same observable behaviour with one fewer
     /// JNI call per sensor that the guest never actually queries.)
     fn check_support(&self, idx: usize) -> bool {
-        let mut s = self.state.lock().unwrap();
         // Fast path: the cache already holds an answer for this idx.
-        // We must NOT call the JNI up-call while holding the mutex if
-        // we can avoid it — in the real impl the up-call may block on
-        // `SensorManager.getDefaultSensor()` (a few ms). The skeleton
-        // stub returns instantly so this is a non-issue today, but the
-        // pattern below (check cache, then call JNI only on a miss,
-        // then store *both* outcomes) is the one the real impl will
-        // want once the JVM up-call is wired in.
-        if let Some(cached) = s.supported[idx] {
+        // We must NOT call the JNI up-call while holding the mutex —
+        // in the real impl the up-call may block on
+        // `SensorManager.getDefaultSensor()` (a few ms), which would
+        // serialize every CHECK_SUPPORT/ENABLE/SET_DELAY behind it.
+        // (The skeleton stub returns instantly, but keep the pattern
+        // correct for the real impl.) Benign race: two first-callers
+        // may both run the JNI probe; it is idempotent and both store
+        // the same value.
+        if let Some(cached) = self.state.lock().unwrap().supported[idx] {
             return cached;
         }
         let supported = jni_check_sensor_support(std::ptr::null_mut(), idx as u32);
         // Cache BOTH true and false — see the field doc for why
         // caching only `true` (the original behaviour) was a bug.
-        s.supported[idx] = Some(supported);
+        self.state.lock().unwrap().supported[idx] = Some(supported);
         supported
     }
 
@@ -1046,7 +1039,12 @@ impl SensorDevice {
         // can poll the shutdown flag between accept attempts (mirrors
         // audio.rs / binder.rs).
         let fd = listener.as_raw_fd();
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+        // Read-modify-write: OR O_NONBLOCK into the existing flags instead
+        // of clobbering them (F_SETFL replaces the whole status word).
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
 
         let shutdown_for_thread = Arc::clone(&self.shutdown);
         let shutdown_for_handle = Arc::clone(&self.shutdown);

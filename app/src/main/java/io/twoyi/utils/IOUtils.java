@@ -188,10 +188,18 @@ public class IOUtils {
         // descriptors. Must use try-with-resources to close them, otherwise
         // FDs leak and can exhaust the per-process FD limit.
         try (java.util.stream.Stream<Path> walk = Files.walk(directory.toPath())) {
+            // 6-Z184: track per-file failures — the old version returned
+            // true whenever the WALK succeeded, so profile deletion /
+            // factory-reset reported success with files left behind
+            // (ghost profiles).
+            java.util.List<File> failures = new java.util.ArrayList<>();
             walk.sorted(Comparator.reverseOrder())
                     .map(Path::toFile)
-                    .forEach(File::delete);
-            return true;
+                    .forEach(f -> { if (!f.delete() && f.exists()) failures.add(f); });
+            if (!failures.isEmpty()) {
+                return false;
+            }
+            return !directory.exists();
         } catch (IOException e) {
             return false;
         }

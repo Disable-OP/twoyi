@@ -4,12 +4,19 @@
 
 //! Core orchestration for the twoyi native renderer.
 //!
-//! After the 100% open-source migration (task AOSP-VENDOR-1) there is
-//! exactly one renderer backend: the AOSP emugl `libOpenglRender.so`
-//! built from source under `app/cpp/emugl`. The legacy closed-source
-//! blobs (`libOpenglRender.so`, `libloader.so`, `libadb.so`) and the
-//! have all been removed — every native library shipped in the APK is
-//! now built from open source code.
+//! There are two render paths:
+//! * TWRP/recovery mode — this module's fb0 reader thread blits the
+//!   guest framebuffer straight to the SurfaceView (no GL involved).
+//! * Android mode — the AOSP emugl `libOpenglRender.so` built from
+//!   source under `app/cpp/emugl` renders the guest's GLES stream.
+//!
+//! After the 100% open-source migration (task AOSP-VENDOR-1) every
+//! native library shipped in the APK is built from source in this
+//! repo: libtwoyi.so (app/rs), libloader.so (app/rs/loader),
+//! libkr64.so + kr64 (app/rs/kr64), libOpenglRender.so (app/cpp/emugl),
+//! libtwoyi_loader_shlib.so + libtwrp_fb_hook.so + libgetpid_hook.so
+//! (app/cpp/twoyi_loader, app/cpp/getpid_hook). libadb.so is still the
+//! prebuilt ADB binary (upstream code, built by scripts/build_libtwoyi.sh).
 
 use log::info;
 use std::ffi::c_void;
@@ -146,28 +153,52 @@ fn renderer_lock_path() -> String {
 ///
 /// This is the bulletproof guard that survives libtwoyi.so reload (which
 /// resets the `RENDERER_STARTED` Rust static but NOT a file on disk).
+///
+/// 6-Z184: the lock stores "<pid> <starttime>" — /proc/<pid>/stat field
+/// 22, the process's clock ticks at exec. Comparing BOTH kills the PID-
+/// reuse false positive: if the OS recycles the exact PID of a dead
+/// previous instance, the new process has a different starttime, the
+/// guard correctly treats the lock as stale, and kr64 spawns normally
+/// (previously the session showed a permanent black screen).
 fn renderer_init_done_for_this_process() -> bool {
     let lock = renderer_lock_path();
     let my_pid = unsafe { libc::getpid() };
     if let Ok(content) = std::fs::read_to_string(&lock) {
-        if let Ok(lock_pid) = content.trim().parse::<i32>() {
-            if lock_pid == my_pid {
+        let mut parts = content.trim().split_whitespace();
+        let lock_pid = parts.next().and_then(|p| p.parse::<i32>().ok());
+        let lock_start = parts.next().and_then(|s| s.parse::<u64>().ok());
+        if let Some(lock_pid) = lock_pid {
+            if lock_pid == my_pid && lock_start == process_start_time(my_pid) {
                 return true; // same process already initialized
             }
-            // Different PID — the process that wrote the lock is dead.
-            // Remove the stale lock so this process can initialize.
+            // Different PID (or recycled PID with a new start time) —
+            // the process that wrote the lock is dead. Remove the stale
+            // lock so this process can initialize.
             let _ = std::fs::remove_file(&lock);
         }
     }
     false
 }
 
-/// Mark the renderer as initialized for THIS process (write the PID to
-/// the lock file). Called once, right after the kr64 child is spawned.
+/// Read field 22 (starttime) of /proc/<pid>/stat — the process's
+/// start time in clock ticks since boot. Two processes with the same
+/// PID but different start times are different processes.
+fn process_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Field 2 (comm) can contain spaces inside parens — everything after
+    // the LAST ')' is fields 3..; starttime is field 22, i.e. index 19.
+    let tail = stat.rsplit(')').next()?;
+    tail.split_whitespace().nth(19).and_then(|s| s.parse().ok())
+}
+
+/// Mark the renderer as initialized for THIS process (write the PID and
+/// start time to the lock file). Called once, right after the kr64 child
+/// is spawned.
 fn mark_renderer_initialized_for_this_process() {
     let lock = renderer_lock_path();
     let my_pid = unsafe { libc::getpid() };
-    let _ = std::fs::write(&lock, my_pid.to_string());
+    let start = process_start_time(my_pid).unwrap_or(0);
+    let _ = std::fs::write(&lock, format!("{} {}", my_pid, start));
 }
 
 /// When true, the next container launch passes `--boot-recovery` to
@@ -352,9 +383,11 @@ fn renderer_thread_main(
         let vw = virtual_width;
         let vh = virtual_height;
         // 6-Z183: publish the window through TWRP_WINDOW (the loop re-reads
-        // it every tick — see the static's doc). lib.rs acquired this
-        // pointer's reference for us; twrp_set_window takes over that
-        // ownership (it will release it when replaced/cleared).
+        // it every tick — see the static's doc). twrp_set_window acquires
+        // its OWN reference and releases the previous one, so ownership
+        // is fully managed there (the fromSurface reference is dropped
+        // when the NativeWindow wrapper in lib.rs goes out of scope —
+        // Java's Surface keeps the window alive until surfaceDestroyed).
         twrp_set_window(window);
         std::thread::spawn(move || {
             twrp_fb_render_loop(fb_path, vw, vh);
@@ -419,19 +452,27 @@ pub fn init_renderer(
         alog("init_renderer: file-guard HOLDS for this PID — refreshing window only, NO kr64 spawn (Task 6-Z24)");
         // The first kr64 child is still running (it's blocked in the
         // ptrace loop). Just update the window so the surface is fresh.
-        unsafe {
-            renderer_bindings::setNativeWindow(window);
-            renderer_bindings::resetSubWindow(
-                window,
-                0,
-                0,
-                surface_width,
-                surface_height,
-                virtual_width,
-                virtual_height,
-                1.0,
-                0.0,
-            );
+        // 6-Z184: in TWRP mode the emugl renderer was never started —
+        // resetSubWindow would poke uninitialized emugl state and the
+        // blit loop would keep the STALE window. Route to the TWRP
+        // window swap instead (mirrors reset_window below).
+        if is_boot_recovery_enabled() {
+            twrp_set_window(window);
+        } else {
+            unsafe {
+                renderer_bindings::setNativeWindow(window);
+                renderer_bindings::resetSubWindow(
+                    window,
+                    0,
+                    0,
+                    surface_width,
+                    surface_height,
+                    virtual_width,
+                    virtual_height,
+                    1.0,
+                    0.0,
+                );
+            }
         }
         return;
     }
@@ -451,20 +492,25 @@ pub fn init_renderer(
     {
         eprintln!("[CORE] Renderer already started — updating window only (no kr64 re-spawn)");
         info!("[CORE] Renderer already started, updating window");
-        // Renderer already started, just update window
-        unsafe {
-            renderer_bindings::setNativeWindow(window);
-            renderer_bindings::resetSubWindow(
-                window,
-                0,
-                0,
-                surface_width,
-                surface_height,
-                virtual_width,
-                virtual_height,
-                1.0,
-                0.0,
-            );
+        // Renderer already started, just update window (TWRP-mode branch
+        // mirrors the file-guard path above).
+        if is_boot_recovery_enabled() {
+            twrp_set_window(window);
+        } else {
+            unsafe {
+                renderer_bindings::setNativeWindow(window);
+                renderer_bindings::resetSubWindow(
+                    window,
+                    0,
+                    0,
+                    surface_width,
+                    surface_height,
+                    virtual_width,
+                    virtual_height,
+                    1.0,
+                    0.0,
+                );
+            }
         }
     } else {
         info!("[CORE] First time initialization");
@@ -494,13 +540,26 @@ pub fn init_renderer(
         // getenv("TWOYI_ROOTFS") in the same process (not the child).
         let working_dir_for_env = get_rootfs_dir();
         unsafe {
-            let c_rootfs = std::ffi::CString::new(working_dir_for_env.as_str())
-                .expect("rootfs path has NUL byte");
-            libc::setenv(
-                b"TWOYI_ROOTFS\0".as_ptr() as *const libc::c_char,
-                c_rootfs.as_ptr(),
-                1,
-            );
+            // A Java-supplied data dir could theoretically contain a NUL
+            // byte; CString::new would fail and .expect() would unwind
+            // across the JNI boundary. Sanitize instead: strip NULs (the
+            // env var is best-effort for the renderer's socket path).
+            let sanitized: String = working_dir_for_env
+                .chars()
+                .filter(|c| *c != '\0')
+                .collect();
+            match std::ffi::CString::new(sanitized.as_str()) {
+                Ok(c_rootfs) => {
+                    libc::setenv(
+                        b"TWOYI_ROOTFS\0".as_ptr() as *const libc::c_char,
+                        c_rootfs.as_ptr(),
+                        1,
+                    );
+                }
+                Err(e) => {
+                    log::error!("[CORE] TWOYI_ROOTFS path not representable as C string: {:?}", e);
+                }
+            }
         }
         info!(
             "[CORE] Set TWOYI_ROOTFS={} in process env for renderer",
@@ -668,21 +727,12 @@ pub fn init_renderer(
             root = working_dir
         );
 
-        // Create log file without panicking across JNI boundary
-        let outputs = match File::create(&log_path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("[CORE] Failed to create log file {}: {}", log_path, e);
-                return;
-            }
-        };
-        let errors = match outputs.try_clone() {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("[CORE] Failed to clone log file handle: {}", e);
-                return;
-            }
-        };
+        // NOTE: the guest-init log file (log.txt) is created ONLY on the
+        // fallback branch below (the only branch that pipes into it).
+        // Creating it unconditionally used to TRUNCATE the previous
+        // boot's guest-init log on every init_renderer call — including
+        // TWRP/kr64 boots, which never write to it at all (they use
+        // kr64-app-stderr.log).
 
         let mut cmd;
         if Path::new(&kr64_path).exists() {
@@ -754,7 +804,8 @@ pub fn init_renderer(
             cmd.arg(&init_path);
         }
 
-        // These env calls are no-ops when using `su -c` (the env is set
+        // These env calls only affect the spawned child (kr64 or the
+        // fallback linker+init); the current process env is untouched.
         // Set LD_LIBRARY_PATH. For the kr64 path, we already set it to
         // the HOST system lib64 (kr64 needs host libs, not rootfs libs).
         // For the fallback path, use the rootfs lib64 paths so init
@@ -795,9 +846,21 @@ pub fn init_renderer(
             let kr64_log = format!("{}/kr64-app-stderr.log", get_data_dir());
             match File::create(&kr64_log) {
                 Ok(f) => {
-                    let f2 = f.try_clone().unwrap_or_else(|_| f.try_clone().unwrap());
-                    cmd.stdout(Stdio::from(f));
-                    cmd.stderr(Stdio::from(f2));
+                    // Clone for stderr without a panic path: if try_clone
+                    // fails (fd exhaustion), fall back to inheriting for
+                    // stderr rather than unwinding across the JNI boundary
+                    // (this function is called from Java).
+                    match f.try_clone() {
+                        Ok(f2) => {
+                            cmd.stdout(Stdio::from(f));
+                            cmd.stderr(Stdio::from(f2));
+                        }
+                        Err(e) => {
+                            log::error!("[CORE] could not clone kr64 log fd: {}", e);
+                            cmd.stdout(Stdio::from(f));
+                            cmd.stderr(Stdio::inherit());
+                        }
+                    }
                     info!("[CORE] kr64 stderr → {}", kr64_log);
                 }
                 Err(e) => {
@@ -807,8 +870,31 @@ pub fn init_renderer(
                 }
             }
         } else {
-            cmd.stdout(Stdio::from(outputs));
-            cmd.stderr(Stdio::from(errors));
+            // Fallback branch — create (truncate) the guest-init log here
+            // and now only here, right before it is used.
+            let piped = match File::create(&log_path) {
+                Ok(f) => match f.try_clone() {
+                    Ok(e) => Some((f, e)),
+                    Err(err) => {
+                        log::error!("[CORE] Failed to clone log file handle: {}", err);
+                        None
+                    }
+                },
+                Err(e) => {
+                    log::error!("[CORE] Failed to create log file {}: {}", log_path, e);
+                    None
+                }
+            };
+            match piped {
+                Some((o, e)) => {
+                    cmd.stdout(Stdio::from(o));
+                    cmd.stderr(Stdio::from(e));
+                }
+                None => {
+                    cmd.stdout(Stdio::inherit());
+                    cmd.stderr(Stdio::inherit());
+                }
+            }
         }
 
         // Task 6-Z13: Kill any existing kr64 process before spawning a new one.
@@ -982,8 +1068,9 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
                 session_id += 1;
                 info!("[CORE] qemu_pipe: guest connected (session={})", sid);
 
-                // Read the "pipe:<channel>" handshake
-                let channel = match read_channel_name(&mut guest) {
+                // Read the "pipe:<channel>" handshake (plus any early
+                // payload bytes that arrived with it).
+                let (channel, leftover) = match read_channel_name(&mut guest) {
                     Ok(c) => c,
                     Err(e) => {
                         log::warn!("[CORE] qemu_pipe: session {} handshake failed: {}", sid, e);
@@ -992,7 +1079,7 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
                 };
                 info!("[CORE] qemu_pipe: session {} channel = {}", sid, channel);
 
-                if channel != "opengles" && channel != "opengles2" && channel != "opengles3" {
+                if !KNOWN_PIPE_CHANNELS.contains(&channel.as_str()) {
                     log::warn!(
                         "[CORE] qemu_pipe: session {} unknown channel '{}'",
                         sid,
@@ -1003,7 +1090,7 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
 
                 // Connect to the renderer
                 let renderer_path = format!("{}/{}", rootfs, channel);
-                let renderer = match UnixStream::connect(&renderer_path) {
+                let mut renderer = match UnixStream::connect(&renderer_path) {
                     Ok(r) => r,
                     Err(e) => {
                         log::error!(
@@ -1019,6 +1106,21 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
                     "[CORE] qemu_pipe: session {} connected to {}",
                     sid, renderer_path
                 );
+
+                // Forward handshake-tail bytes (previously DROPPED —
+                // desyncing the emugl wire protocol when the guest
+                // coalesced the channel name with the first payload).
+                if !leftover.is_empty() {
+                    use std::io::Write;
+                    log::info!(
+                        "[CORE] qemu_pipe: session {} forwarding {} handshake-tail bytes",
+                        sid,
+                        leftover.len()
+                    );
+                    if renderer.write_all(&leftover).is_err() {
+                        continue;
+                    }
+                }
 
                 // Spawn two pump threads
                 let mut guest_w = match guest.try_clone() {
@@ -1095,8 +1197,16 @@ fn spawn_qemu_pipe_proxy(rootfs: &str) {
     }
 }
 
-/// Read the "pipe:<channel>" handshake from the guest.
-fn read_channel_name(stream: &mut std::os::unix::net::UnixStream) -> std::io::Result<String> {
+/// Read the "pipe:<channel>" handshake from the guest. Returns
+/// `(name, leftover)` — leftover holds any bytes that arrived in the
+/// same packet after the channel name (e.g. the first clientFlags
+/// word) and must be forwarded to the renderer by the caller.
+/// Only a TERMINATED name (non-printable byte, or exactly a known
+/// channel) is accepted — end-of-buffer alone must NOT terminate, or
+/// the split delivery "pipe:open"+"gles" would parse as "open".
+fn read_channel_name(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> std::io::Result<(String, Vec<u8>)> {
     use std::io::Read;
     let mut buf = [0u8; 256];
     let mut total = 0;
@@ -1109,8 +1219,8 @@ fn read_channel_name(stream: &mut std::os::unix::net::UnixStream) -> std::io::Re
             ));
         }
         total += n;
-        if let Some(name) = parse_channel_name(&buf[..total]) {
-            return Ok(name.to_string());
+        if let Some((name, consumed)) = parse_channel_name(&buf[..total]) {
+            return Ok((name.to_string(), buf[consumed..total].to_vec()));
         }
     }
     Err(std::io::Error::new(
@@ -1119,21 +1229,39 @@ fn read_channel_name(stream: &mut std::os::unix::net::UnixStream) -> std::io::Re
     ))
 }
 
+/// Channel names the qemu_pipe dispatcher accepts.
+const KNOWN_PIPE_CHANNELS: [&str; 3] = ["opengles", "opengles2", "opengles3"];
+
 /// Parse the "pipe:<channel>" handshake — stops at NUL or non-printable.
-fn parse_channel_name(buf: &[u8]) -> Option<&str> {
+/// Returns `(name, consumed)` where consumed spans buf[..] through the
+/// END of the name; leftover bytes after that belong to the payload.
+fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
+    const PREFIX: usize = 5; // "pipe:".len()
     let prefix = b"pipe:";
     if !buf.starts_with(prefix) {
         return None;
     }
-    let name_bytes = &buf[prefix.len()..];
+    let name_bytes = &buf[PREFIX..];
     let end = name_bytes
         .iter()
-        .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b))
-        .unwrap_or(name_bytes.len());
+        .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b));
+    let end = match end {
+        Some(i) => i,
+        // No terminator: only accept an exact known channel (AOSP
+        // writes exactly "pipe:opengles" and keeps the stream open).
+        None => {
+            let candidate = std::str::from_utf8(name_bytes).ok()?;
+            if KNOWN_PIPE_CHANNELS.contains(&candidate) {
+                return Some((candidate, buf.len()));
+            }
+            return None;
+        }
+    };
     if end == 0 {
         return None;
     }
-    std::str::from_utf8(&name_bytes[..end]).ok()
+    let name = std::str::from_utf8(&name_bytes[..end]).ok()?;
+    Some((name, PREFIX + end))
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,7 +1269,9 @@ fn parse_channel_name(buf: &[u8]) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 /// Default color depth (bits per pixel) for the TWRP framebuffer.
-const DEFAULT_FB_BPP: usize = 4; // RGBA8888 = 32 bits = 4 bytes
+/// NOTE: fb0's byte order is BGRA (see twrp_blit_to_surface); the value
+/// 4 here is BYTES per pixel (32bpp), not a format claim.
+const DEFAULT_FB_BPP: usize = 4;
 
 /// Render loop for TWRP boot mode.
 ///
@@ -1280,17 +1410,7 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
         if changed {
             // Blit the framebuffer to the ANativeWindow.
             let ok = unsafe { twrp_blit_to_surface(window, &fb_buf, fb_w, fb_h, fb_bpp) };
-            if !ok {
-                // Rate-limit: log a lock/geometry failure ONCE per window
-                // instance (a dead surface would otherwise spam every tick).
-                // last_window is NOT advanced on failure — a failed blit
-                // (busy SurfaceFlinger, mid-recreation window) retries next
-                // tick instead of freezing the display until fb0 changes.
-                if blit_fail_logged_for != window as usize {
-                    blit_fail_logged_for = window as usize;
-                    alog_error("TWRP-FB blit FAILED (setBuffersGeometry/lock) — surface shows stale pixels");
-                }
-            } else {
+            if ok {
                 last_window = window as usize;
                 if !first_blit_logged {
                     first_blit_logged = true;
@@ -1299,17 +1419,32 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
                         fb_path, fb_w, fb_h
                     ));
                 }
+                // Update the dirty-check baseline ONLY on success: on
+                // failure the next tick must still see the frame as
+                // "changed" so the blit is genuinely retried (a single
+                // transient ANativeWindow_lock failure — busy
+                // SurfaceFlinger, mid-recreation window — used to freeze
+                // the display on stale pixels until fb0 content changed).
+                if last_blit.is_empty() {
+                    log::info!(
+                        "[CORE][TWRP-FB] first non-blank frame blitted ({}x{})",
+                        fb_w,
+                        fb_h
+                    );
+                }
+                last_blit.clear();
+                last_blit.extend_from_slice(&fb_buf);
+                idle_ticks = 0;
+            } else {
+                // Rate-limit: log a lock/geometry failure ONCE per window
+                // instance (a dead surface would otherwise spam every tick).
+                // last_window is NOT advanced on failure — the blit
+                // retries next tick via the still-stale baseline above.
+                if blit_fail_logged_for != window as usize {
+                    blit_fail_logged_for = window as usize;
+                    alog_error("TWRP-FB blit FAILED (setBuffersGeometry/lock) — surface shows stale pixels");
+                }
             }
-            if last_blit.is_empty() {
-                log::info!(
-                    "[CORE][TWRP-FB] first non-blank frame blitted ({}x{})",
-                    fb_w,
-                    fb_h
-                );
-            }
-            last_blit.clear();
-            last_blit.extend_from_slice(&fb_buf);
-            idle_ticks = 0;
             std::thread::sleep(Duration::from_millis(33));
         } else {
             idle_ticks = idle_ticks.saturating_add(1);

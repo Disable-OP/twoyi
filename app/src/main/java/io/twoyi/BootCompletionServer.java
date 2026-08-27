@@ -243,6 +243,13 @@ public class BootCompletionServer {
                         Log.i(TAG, "BOOT_COMPLETED received on " + SOCK_NAME);
                         FileLogger.boot("boot_completed_received", "sock=" + SOCK_NAME);
                         markCompleted();
+                        // 6-Z184: a client that sends BOOT_COMPLETED and then
+                        // stays connected blocked this worker in read()
+                        // FOREVER — four such clients starved the fixed
+                        // 4-thread pool (and the legacy-socket path). The
+                        // contract is one notification per connection; break
+                        // and let the finally-close clean up.
+                        break;
                     }
                 }
             } catch (IOException ignored) {

@@ -73,7 +73,10 @@ tar -cJf "$OUT" \
     --owner=0 --group=0 --numeric-owner \
     "${EXPANDED[@]}" 2>&1 || {
     echo "✗ tar failed" >&2
-    exit 0  # don't fail the build over a packing error
+    rm -f "$OUT"
+    exit 2  # 6-Z184: a partial/corrupt tarball must not be uploaded as a
+            # normal artifact (workflows guard uploads with || true, so
+            # this only stops the "success" echo below from lying)
 }
 
 SIZE=$(stat -c %s "$OUT" 2>/dev/null || stat -f %z "$OUT" 2>/dev/null || echo 0)

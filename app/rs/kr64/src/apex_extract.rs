@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of merchantability,
-// fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -49,7 +42,7 @@
 //!    syscall with fstype `ext4`). This leverages the kernel's well-tested
 //!    ext4 driver — we don't have to implement an ext4 reader.
 //! 5. **Read `lib64/bionic/libdl.so`** from the mount.
-//! 6. **Cleanup**: `umount2(MNT_DETACH)` + `LOOP_CLR_FD` + delete temp file.
+//! 6. **Cleanup**: `umount(2)` + `LOOP_CLR_FD` + delete temp file.
 //!
 //! # Failure modes
 //!
@@ -436,7 +429,7 @@ pub fn extract_apex_payload_img(apex_path: &str) -> Result<Vec<u8>, String> {
 /// The mount is created in the current mount namespace (no `unshare` —
 /// the caller is expected to have arranged a private namespace if
 /// needed). The mount is automatically cleaned up on function exit
-/// (`umount2(MNT_DETACH)` + `LOOP_CLR_FD` + `remove_dir`).
+/// (`umount(2)` + `LOOP_CLR_FD` + `remove_dir`).
 ///
 /// Returns the file bytes on success, or an error string on failure.
 pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec<u8>, String> {
@@ -663,8 +656,9 @@ pub fn loopback_mount_and_read(ext4_path: &str, file_inside: &str) -> Result<Vec
         )
     });
 
-    // Cleanup: umount the mount (MNT_DETACH so it doesn't block if some
-    // file is still open — none should be, but defensive). Use
+    // Cleanup: umount the mount (plain umount(2): if some file were
+    // still open it would fail EBUSY — none should be, and a failed
+    // cleanup is non-fatal below). Use
     // `tgt_c.as_ptr()` (null-terminated) rather than `mount_dir.as_ptr()`
     // (NOT null-terminated — String's internal buffer doesn't include
     // a NUL byte, so the umount syscall would walk past the buffer).

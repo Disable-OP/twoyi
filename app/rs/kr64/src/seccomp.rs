@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -562,24 +555,31 @@ fn killed_syscalls() -> HashSet<i32> {
 /// The program structure is:
 /// ```text
 ///   1. ld arch                         // load audit arch
-///   2. jeq EXPECTED_ARCH, jt=0, jf=N   // if wrong arch, jump to kill
-///   3. ld nr                           // load syscall number
-///   4. for each allowed syscall:
+///   2. jeq EXPECTED_ARCH, jt=1, jf=0   // right arch: skip the next insn;
+///                                      // wrong arch: fall into the kill
+///   3. ret KILL_PROCESS                // wrong arch dies IMMEDIATELY
+///   4. ld nr                           // load syscall number
+///   5. for each allowed syscall:
 ///        jeq nr, jt=0, jf=1            // if match: fall to ret ALLOW
 ///        ret ALLOW                      // else: skip to next jeq
-///   5. for each trapped syscall:
+///   6. for each trapped syscall:
 ///        jeq nr, jt=0, jf=1
 ///        ret TRAP
-///   6. for each killed syscall:
+///   7. for each killed syscall:
 ///        jeq nr, jt=0, jf=1
 ///        ret KILL_PROCESS
-///   7. ret ALLOW                       // default: allow
-///   8. ret KILL_PROCESS                 // for wrong-arch
+///   8. ret ALLOW                       // default: allow
 /// ```
 ///
-/// The `jt=0, jf=1` pattern keeps jumps short (1 instruction) so we
-/// never overflow the 8-bit jt/jf range, regardless of how many
-/// syscalls are in each set.
+/// EVERY jump in this program is 0 or 1 instructions long, so the
+/// 8-bit jt/jf fields can never overflow, regardless of how many
+/// syscalls are in each set. (An earlier layout kept the wrong-arch
+/// KILL at the very end and patched the arch jeq's jf to jump the
+/// whole program — an offset of ~260-337 instructions for the real
+/// sets, which silently truncated to 8 bits and landed the wrong-arch
+/// path in the middle of the allow chain. Killing inline — the
+/// pattern the kernel's own selftests use — makes that whole class of
+/// bug unrepresentable.)
 pub fn build_filter() -> Vec<SockFilter> {
     let allowed = allowed_syscalls();
     let trapped = trapped_syscalls();
@@ -589,15 +589,17 @@ pub fn build_filter() -> Vec<SockFilter> {
 
     // (1) Load arch.
     prog.push(bpf_ld_abs(OFF_ARCH));
-    // (2) If arch != EXPECTED, jump to the trailing KILL.
-    //     We patch the jf offset after we know the program length.
-    let arch_jeq_idx = prog.len();
-    prog.push(bpf_jeq(AUDIT_ARCH_EXPECTED, 0, 0)); // patched below
+    // (2-3) Arch gate: if the arch does not match, fall through into
+    //     an IMMEDIATE KILL_PROCESS. The jump distances here are 1
+    //     and 0 — always representable in the 8-bit jt/jf fields, no
+    //     matter how long the rest of the program is.
+    prog.push(bpf_jeq(AUDIT_ARCH_EXPECTED, 1, 0)); // match: skip kill
+    prog.push(bpf_ret(SECCOMP_RET_KILL_PROCESS)); // wrong arch: die
 
-    // (3) Load syscall number.
+    // (4) Load syscall number.
     prog.push(bpf_ld_abs(OFF_NR));
 
-    // (4) Allowed syscalls: jeq + ret ALLOW.
+    // (5) Allowed syscalls: jeq + ret ALLOW.
     let mut sorted_allowed: Vec<i32> = allowed
         .iter()
         .copied()
@@ -610,7 +612,7 @@ pub fn build_filter() -> Vec<SockFilter> {
         prog.push(bpf_ret(SECCOMP_RET_ALLOW));
     }
 
-    // (5) Trapped syscalls: jeq + ret TRAP.
+    // (6) Trapped syscalls: jeq + ret TRAP.
     let mut sorted_trapped: Vec<i32> = trapped
         .iter()
         .copied()
@@ -623,7 +625,7 @@ pub fn build_filter() -> Vec<SockFilter> {
         prog.push(bpf_ret(SECCOMP_RET_TRAP));
     }
 
-    // (6) Killed syscalls: jeq + ret KILL.
+    // (7) Killed syscalls: jeq + ret KILL.
     let mut sorted_killed: Vec<i32> = killed.iter().copied().collect();
     sorted_killed.sort_unstable();
     sorted_killed.dedup();
@@ -632,16 +634,19 @@ pub fn build_filter() -> Vec<SockFilter> {
         prog.push(bpf_ret(SECCOMP_RET_KILL_PROCESS));
     }
 
-    // (7) Default: allow.
+    // (8) Default: allow.
     prog.push(bpf_ret(SECCOMP_RET_ALLOW));
 
-    // (8) Kill target (for wrong-arch). Patch the arch jeq's jf to
-    //     jump here. The jf offset is relative to the *next*
-    //     instruction, so it's `kill_idx - arch_jeq_idx - 1`.
-    let kill_idx = prog.len();
-    prog.push(bpf_ret(SECCOMP_RET_KILL_PROCESS));
-    let jf_offset = (kill_idx - arch_jeq_idx - 1) as u8;
-    prog[arch_jeq_idx].jf = jf_offset;
+    // Every jt/jf emitted above is <= 1; assert that invariant so a
+    // future edit cannot reintroduce a long (u8-truncating) jump.
+    for (i, insn) in prog.iter().enumerate() {
+        debug_assert!(
+            insn.jt <= 1 && insn.jf <= 1,
+            "insn {i} has a long jump (jt={}, jf={}) — BPF jt/jf are 8-bit",
+            insn.jt,
+            insn.jf
+        );
+    }
 
     info!(
         "[KR64][seccomp] BPF filter built: {} instructions",
@@ -765,7 +770,9 @@ fn install_sigsys_handler() -> std::io::Result<()> {
     // SA_SIGINFO — pass siginfo + ucontext to the handler.
     // SA_NODEFER  — don't block SIGSYS while in the handler (so a
     //               recursive trap in the handler is visible).
-    // SA_RESTART  — restart interrupted syscalls.
+    // SA_RESTART is deliberately NOT set: interrupted syscalls must
+    // surface EINTR to the guest, not be transparently restarted —
+    // the SIGSYS handler performs its own PC/return-value fixup.
     sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
     // Don't block any other signals during the handler.
     unsafe { libc::sigemptyset(&mut sa.sa_mask as *mut sigset_t) };
@@ -1020,10 +1027,23 @@ mod tests {
         // First instruction must be the arch load.
         assert_eq!(prog[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(prog[0].k, OFF_ARCH);
-        // Last instruction must be a KILL (the wrong-arch fallthrough).
+        // The arch gate must kill INLINE (insn 2 = jeq with jt=1,
+        // insn 3 = KILL_PROCESS) — never a long patched jump, which
+        // would truncate into the 8-bit jf field and let a wrong-arch
+        // syscall land inside the allow chain (regression lock).
+        assert_eq!(prog[1].code, BPF_JMP | BPF_JEQ | BPF_K);
+        assert_eq!(prog[1].jt, 1);
+        assert_eq!(prog[1].jf, 0);
+        assert_eq!(prog[2].code, BPF_RET | BPF_K);
+        assert_eq!(prog[2].k, SECCOMP_RET_KILL_PROCESS);
+        // Last instruction is the default: ALLOW.
         let last = *prog.last().unwrap();
         assert_eq!(last.code, BPF_RET | BPF_K);
-        assert_eq!(last.k, SECCOMP_RET_KILL_PROCESS);
+        assert_eq!(last.k, SECCOMP_RET_ALLOW);
+        // No jump anywhere in the program may exceed 1 instruction.
+        for insn in &prog {
+            assert!(insn.jt <= 1 && insn.jf <= 1, "long jump: {insn:?}");
+        }
     }
 
     #[test]

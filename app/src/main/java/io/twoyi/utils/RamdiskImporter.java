@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of merchantability,
-// fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 /*
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -52,26 +45,75 @@ import org.apache.commons.compress.compressors.xz.XZCompressorInputStream;
 public class RamdiskImporter {
     private static final String TAG = "RamdiskImporter";
 
+    /**
+     * Resolve an archive entry name against the extraction root, rejecting
+     * path-traversal attacks (Zip-Slip / Tar-Slip).
+     *
+     * A malicious .tar/.cpio/.zip (imported via the file picker or
+     * ACTION_VIEW) can carry entries like "../../files/bin/su" that would
+     * otherwise write OUTSIDE targetDir — into app-writable storage,
+     * including the container rootfs binaries that later get executed.
+     * Every extraction site must route through this helper.
+     *
+     * @return the resolved File, guaranteed (canonical-path) to be inside
+     *         {@code targetDir}; or {@code null} if the entry tries to
+     *         escape (caller skips + logs).
+     */
+    private static File safeTargetFile(File targetDir, String entryName) {
+        if (entryName == null) return null;
+        // Reject obviously-absolute names early ("/sbin/x" → strip-lead or skip).
+        String name = entryName.startsWith("/") ? entryName.substring(1) : entryName;
+        if (name.isEmpty()) return targetDir;
+        File root;
+        File dest;
+        try {
+            root = targetDir.getCanonicalFile();
+            dest = new File(root, name).getCanonicalFile();
+        } catch (IOException e) {
+            Log.w(TAG, "rejecting entry with unresolvable path: " + entryName);
+            return null;
+        }
+        if (!dest.getPath().startsWith(root.getPath() + File.separator)
+                && !dest.equals(root)) {
+            Log.w(TAG, "rejecting path-traversal entry: '" + entryName + "' resolves to "
+                    + dest.getPath() + " (outside " + root.getPath() + ")");
+            return null;
+        }
+        return dest;
+    }
+
     public static boolean importRamdisk(Context context, Uri uri, File targetDir) throws IOException {
         File tempFile = new File(context.getCacheDir(), "ramdisk_import");
-        try (InputStream is = context.getContentResolver().openInputStream(uri);
-             OutputStream os = new FileOutputStream(tempFile)) {
-            if (is == null) throw new IOException("Cannot open: " + uri);
-            byte[] buffer = new byte[8192];
-            int count;
-            while ((count = is.read(buffer)) > 0) {
-                os.write(buffer, 0, count);
+        boolean result;
+        try {
+            try (InputStream is = context.getContentResolver().openInputStream(uri);
+                 OutputStream os = new FileOutputStream(tempFile)) {
+                if (is == null) throw new IOException("Cannot open: " + uri);
+                byte[] buffer = new byte[8192];
+                int count;
+                while ((count = is.read(buffer)) > 0) {
+                    os.write(buffer, 0, count);
+                }
             }
+
+            Log.i(TAG, "Import file size: " + tempFile.length() + " bytes");
+            FileLogger.i(TAG, "Import file size: " + tempFile.length() + " bytes");
+
+            String format = detectFormat(tempFile);
+            Log.i(TAG, "Detected format: " + format);
+            FileLogger.i(TAG, "Detected format: " + format);
+            FileLogger.boot("ramdisk_import_format_detected", "format=" + format + " size=" + tempFile.length());
+            result = importDetected(tempFile, targetDir, format);
+        } finally {
+            // Delete the staged copy on EVERY exit path — an exception in
+            // detectFormat()/import*() used to leave the full-size temp
+            // copy (100 MB+) rotting in cacheDir.
+            tempFile.delete();
         }
+        return result;
+    }
 
-        Log.i(TAG, "Import file size: " + tempFile.length() + " bytes");
-        FileLogger.i(TAG, "Import file size: " + tempFile.length() + " bytes");
-
-        String format = detectFormat(tempFile);
-        Log.i(TAG, "Detected format: " + format);
-        FileLogger.i(TAG, "Detected format: " + format);
-        FileLogger.boot("ramdisk_import_format_detected", "format=" + format + " size=" + tempFile.length());
-
+    private static boolean importDetected(File tempFile, File targetDir, String format) throws IOException {
         boolean result;
         switch (format) {
             case "android_bootimg":
@@ -115,7 +157,6 @@ public class RamdiskImporter {
                 break;
         }
 
-        tempFile.delete();
         FileLogger.boot("ramdisk_import_complete", "result=" + result);
         return result;
     }
@@ -466,11 +507,15 @@ public class RamdiskImporter {
             org.apache.commons.compress.archivers.tar.TarArchiveEntry entry;
             int count = 0;
             while ((entry = tais.getNextTarEntry()) != null) {
+                File dest = safeTargetFile(targetDir, entry.getName());
+                if (dest == null) {
+                    continue; // path-traversal entry — skipped
+                }
                 if (entry.isDirectory()) {
-                    new File(targetDir, entry.getName()).mkdirs();
+                    dest.mkdirs();
                     count++;
                 } else {
-                    File f = new File(targetDir, entry.getName());
+                    File f = dest;
                     f.getParentFile().mkdirs();
                     try (FileOutputStream fos = new FileOutputStream(f)) {
                         byte[] buf = new byte[8192];
@@ -578,11 +623,50 @@ public class RamdiskImporter {
 
                 if (modeType == 0x4000) {
                     // Directory
-                    new File(targetDir, name).mkdirs();
+                    File dirDest = safeTargetFile(targetDir, name);
+                    if (dirDest == null) {
+                        // Path traversal — skip the entry AND its data so the
+                        // stream stays in sync.
+                        long rem = filesize;
+                        while (rem > 0) {
+                            long skipped = fis.skip(rem);
+                            if (skipped <= 0) {
+                                byte[] skip = new byte[(int) Math.min(65536, rem)];
+                                int n = fis.read(skip);
+                                if (n < 0) break;
+                                rem -= n;
+                                pos += n;
+                            } else {
+                                rem -= skipped;
+                                pos += skipped;
+                            }
+                        }
+                        continue;
+                    }
+                    dirDest.mkdirs();
                     fileCount++;
                 } else if (modeType == 0x8000) {
                     // Regular file
-                    File file = new File(targetDir, name);
+                    File file = safeTargetFile(targetDir, name);
+                    if (file == null) {
+                        // Path traversal — skip the entry's DATA bytes too so
+                        // the cpio stream stays in sync.
+                        long rem2 = filesize;
+                        while (rem2 > 0) {
+                            long skipped = fis.skip(rem2);
+                            if (skipped <= 0) {
+                                byte[] skip = new byte[(int) Math.min(65536, rem2)];
+                                int n = fis.read(skip);
+                                if (n < 0) break;
+                                rem2 -= n;
+                                pos += n;
+                            } else {
+                                rem2 -= skipped;
+                                pos += skipped;
+                            }
+                        }
+                        continue;
+                    }
                     file.getParentFile().mkdirs();
 
                     // Task 6-Z82: cpio newc hardlink handling. Hardlinked
@@ -697,7 +781,11 @@ public class RamdiskImporter {
                     byte[] target = new byte[(int) filesize];
                     readFully(fis, target);
                     pos += filesize;
-                    File linkFile = new File(targetDir, name + ".symlink");
+                    File linkBase = safeTargetFile(targetDir, name);
+                    if (linkBase == null) {
+                        continue; // path-traversal entry — data already consumed
+                    }
+                    File linkFile = new File(linkBase.getPath() + ".symlink");
                     linkFile.getParentFile().mkdirs();
                     try (FileOutputStream fos = new FileOutputStream(linkFile)) {
                         fos.write(target);

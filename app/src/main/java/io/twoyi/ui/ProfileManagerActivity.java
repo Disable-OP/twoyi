@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of merchantability,
-// fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 /*
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -550,9 +543,20 @@ public class ProfileManagerActivity extends AppCompatActivity {
                 Toast.makeText(this, R.string.profile_import_failed, Toast.LENGTH_SHORT).show();
             }
         }).fail(result -> runOnUiThread(() -> {
-            Toast.makeText(this, getString(R.string.profile_import_failed, result.getMessage()), Toast.LENGTH_SHORT).show();
+            // 6-Z184: profile_import_failed is a format string
+            // ("Failed to import profile: %1$s") — calling getString(id)
+            // with no args showed a literal "%1$s" to the user.
+            Toast.makeText(this,
+                    getString(R.string.profile_import_failed, String.valueOf(result.getMessage())),
+                    Toast.LENGTH_SHORT).show();
             dialog.dismiss();
         }));
+    }
+
+    /** Minimal XML-attribute escaping for preference keys. */
+    private static String escapeXmlAttr(String s) {
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace("\"", "&quot;");
     }
 
     /**
@@ -566,16 +570,22 @@ public class ProfileManagerActivity extends AppCompatActivity {
         for (String key : prefs.getAll().keySet()) {
             Object value = prefs.getAll().get(key);
             if (value instanceof Boolean) {
-                xml.append("  <boolean name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+                xml.append("  <boolean name=\"").append(escapeXmlAttr(key)).append("\" value=\"").append(value).append("\" />\n");
             } else if (value instanceof String) {
-                String escapedValue = ((String) value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
-                xml.append("  <string name=\"").append(key).append("\">").append(escapedValue).append("</string>\n");
+                // 6-Z184: also escape newlines — the import parses
+                // line-by-line, so a raw \n inside the value split the
+                // entry across lines and the preference was silently lost.
+                String escapedValue = ((String) value)
+                        .replace("&", "&amp;").replace("<", "&lt;")
+                        .replace(">", "&gt;").replace("\"", "&quot;")
+                        .replace("\n", "&#10;").replace("\r", "&#13;");
+                xml.append("  <string name=\"").append(escapeXmlAttr(key)).append("\">").append(escapedValue).append("</string>\n");
             } else if (value instanceof Integer) {
-                xml.append("  <int name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+                xml.append("  <int name=\"").append(escapeXmlAttr(key)).append("\" value=\"").append(value).append("\" />\n");
             } else if (value instanceof Long) {
-                xml.append("  <long name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+                xml.append("  <long name=\"").append(escapeXmlAttr(key)).append("\" value=\"").append(value).append("\" />\n");
             } else if (value instanceof Float) {
-                xml.append("  <float name=\"").append(key).append("\" value=\"").append(value).append("\" />\n");
+                xml.append("  <float name=\"").append(escapeXmlAttr(key)).append("\" value=\"").append(value).append("\" />\n");
             }
         }
         
@@ -613,7 +623,8 @@ public class ProfileManagerActivity extends AppCompatActivity {
                     String value = extractTagContent(line);
                     if (name != null && value != null) {
                         // Unescape XML entities (order matters: do &amp; last to avoid re-escaping)
-                        value = value.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&");
+                        value = value.replace("&#10;", "\n").replace("&#13;", "\r")
+                                .replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&");
                         editor.putString(name, value);
                     }
                 } else if (line.startsWith("<int")) {
