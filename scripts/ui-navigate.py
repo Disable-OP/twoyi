@@ -1860,7 +1860,13 @@ def main():
         # AND two screenshots 3 s apart are identical AND differ from
         # the gate frame — the menu is then rendered and stable.
         DANGER_PAGES = ("wipe", "formatdata", "install", "restore",
-                        "restoreconfirm", "reboot")
+                        "restoreconfirm", "reboot",
+                        # 6-Z188: the FM Confirm-Action page (move/copy
+                        # sliders) — reached accidentally when a file is
+                        # selected (run 33123690562: the probe's entry taps
+                        # selected service_contexts, then every File-button
+                        # tap landed here and the terminal chain died).
+                        "filemanagerconfirm")
 
         def _shot_bytes(name):
             p = screenshot(name)
@@ -2032,6 +2038,29 @@ def main():
             screenshot(f"term-04e-system-BEFORE-{i}")
             input_cmd("input keyevent 4")
             wait(1.0)
+        # 6-Z188: return to a CLEAN FM list (nothing selected) before the
+        # terminal episode. A selected file redirects the File-button flow
+        # to the Confirm-Action page instead of the folder-action popup —
+        # run 33123690562's exact failure. BACK out (selection popup /
+        # subfolder / confirm page all clear on BACK) until the frame
+        # matches the settled 04c listing again, or 3 tries.
+        clean_ref = _shot_bytes("term-04e-clean-ref")
+        base = None
+        ref_path = os.path.join(ART, "screenshot-term-04c-fm-root-BEFORE-settled.png")
+        if os.path.exists(ref_path):
+            with open(ref_path, "rb") as f:
+                base = f.read()
+        for bi in range(3):
+            if _back_off_danger(fm_pos):
+                continue
+            if base is not None and clean_ref == base:
+                print(f"  [clean-fm] listing matches settled baseline (try {bi})")
+                break
+            guest_back()
+            wait(1.5)
+            clean_ref = _shot_bytes(f"term-04e-clean-back-{bi}")
+        else:
+            print("  [clean-fm] could not confirm baseline — proceeding (danger watchdog armed)")
 
         # ── 5) THE TERMINAL EPISODE (the escape trigger) ──
         # User's exact chain: FM bottom-right File button -> "Choose
