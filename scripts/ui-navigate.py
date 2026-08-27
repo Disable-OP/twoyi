@@ -49,6 +49,38 @@ def adb(*args, timeout=30):
 def adb_shell(cmd, timeout=30):
     return adb("shell", cmd, timeout=timeout)
 
+def input_cmd(cmd):
+    """6-Z186 iter-4: run an `input ...` shell command on the device.
+
+    PRIMARY: adb. FALLBACK: `sudo docker exec redroid sh -c '<cmd>'`
+    when adb is dead — redroid's adbd dies MID-RUN with no pattern
+    (run 33104264666: "adb declared DEAD" before the boot phase even
+    finished; every later input tap/swipe/keyevent went nowhere while
+    docker exec kept working, so the whole probe chain ran blind).
+    Liveness is probed with `adb get-state` (fast, no side effects) so
+    a dead adb is detected even if the screenshot ladder hasn't tripped
+    _ADB_DEAD yet. On the x86 emulator (no docker) the adb branch is
+    the only one that can succeed — identical to the old behavior.
+    Returns combined output (for error-signal checks in callers)."""
+    global _ADB_DEAD
+    if not _ADB_DEAD:
+        try:
+            st = subprocess.run(ADB + ["get-state"], capture_output=True,
+                                text=True, timeout=5)
+            alive = "device" in (st.stdout + st.stderr)
+        except Exception:
+            alive = False
+        if alive:
+            return adb_shell(cmd, timeout=20) or ""
+        _ADB_DEAD = True
+        print("  [input] adb dead (get-state) — routing input via docker exec")
+    try:
+        r = subprocess.run(["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
+                           capture_output=True, text=True, timeout=20)
+        return (r.stdout or "") + (r.stderr or "")
+    except Exception:
+        return ""
+
 def pull_via_run_as(remote_path, local_path, timeout=10):
     """Read a file from the app's private data dir via `adb shell run-as`.
 
@@ -205,8 +237,25 @@ def screenshot(name):
     return path
 
 def dump_ui(name):
-    adb_shell("uiautomator dump /sdcard/ui-dump.xml")
+    # 6-Z186 iter-4: adb first; docker-exec fallback with the XML on
+    # stdout when redroid's adbd has died mid-run (uiautomator dump
+    # writes to /sdcard/ui-dump.xml in the container either way — cat
+    # it back through the same channel). No sudo-docker on the x86
+    # emulator: the except path keeps the old adb-only behavior.
     xml_path = os.path.join(ART, f"uiautomator-{name}.xml")
+    try:
+        r = subprocess.run(
+            ["sudo", "docker", "exec", "redroid", "sh", "-c",
+             "uiautomator dump /sdcard/ui-dump.xml >/dev/null 2>&1; "
+             "cat /sdcard/ui-dump.xml 2>/dev/null"],
+            capture_output=True, timeout=45)
+        if r.stdout and b"<hierarchy" in r.stdout:
+            with open(xml_path, "wb") as f:
+                f.write(r.stdout)
+            return xml_path
+    except Exception:
+        pass
+    adb_shell("uiautomator dump /sdcard/ui-dump.xml")
     subprocess.run(ADB + ["pull", "/sdcard/ui-dump.xml", xml_path],
                   capture_output=True, timeout=10)
     return xml_path
@@ -358,12 +407,13 @@ def tap(x, y):
     For file-picker-row taps that need to try MULTIPLE methods in
     sequence (with picker-closed checks between each), use
     `tap_picker_row_with_fallbacks()` instead."""
-    r = subprocess.run(ADB + ["shell", f"input swipe {x} {y} {x} {y} 100"],
-                       capture_output=True, text=True, timeout=30)
-    combined = (r.stdout + r.stderr).lower()
+    # 6-Z186 iter-4: routed through input_cmd (adb -> docker-exec
+    # fallback with liveness probing) so the tap survives redroid's
+    # mid-run adbd deaths.
+    combined = input_cmd(f"input swipe {x} {y} {x} {y} 100").lower()
     if any(s in combined for s in ("usage", "unknown", "error", "not found", "invalid")):
         # input swipe not recognized — fall back to input tap
-        adb_shell(f"input tap {x} {y}")
+        input_cmd(f"input tap {x} {y}")
 
 def touchscreen_tap(x, y):
     """Tap at coordinates using 'input touchscreen tap' — a real touchscreen
@@ -520,7 +570,7 @@ def swipe_up():
     cx = SCREEN_W // 2
     y1 = int(SCREEN_H * 0.7)
     y2 = int(SCREEN_H * 0.3)
-    adb_shell(f"input swipe {cx} {y1} {cx} {y2} 300")
+    input_cmd(f"input swipe {cx} {y1} {cx} {y2} 300")
 
 def dismiss_blocking_popups(tag="popup", rounds=8):
     """Dismiss the popups that block Render2Activity from ever booting.
@@ -1337,12 +1387,21 @@ def main():
     # debugging) the rotation switches to SAFE-ONLY (center taps + BACK)
     # so a stray gesture can never cross a TWRP menu button (the old
     # hardcoded swipe crossed "OTG" and dead-ended the run for ~440s).
+    # 6-Z186 iter-4: the ImmersiveModeConfirmation ("Viewing full
+    # screen" / GOT IT, android:id/ok) MUST be dismissed before any
+    # TWRP gate gesture can land — it intercepts every touch. VLM on
+    # run 33102864178's frame + the run-32952695067 XML forensics both
+    # pin the button at ~(552,400) FIXED PIXELS (anchored near the top
+    # on both 720x1280 and 720x1600 displays). Rotation: GOT IT first,
+    # then gate slider, then Keep Read Only. All through input_cmd
+    # (docker-exec fallback) so a mid-run adbd death can't starve the
+    # guest of input (run 33104264666 lost every gesture that way).
     gestures = [
-        f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 0: center
-        f"input tap {int(SCREEN_W * 0.25)} {int(SCREEN_H * 0.89)}",  # 1: Keep Read Only
+        f"input tap {int(SCREEN_W * 0.77)} {int(SCREEN_H * 0.25)}",   # 0: GOT IT
+        f"input tap {int(SCREEN_W * 0.72)} {int(SCREEN_H * 0.22)}",   # 1: GOT IT variant
         f"input swipe {int(SCREEN_W * 0.19)} {int(SCREEN_H * 0.89)} "
-        f"{int(SCREEN_W * 0.88)} {int(SCREEN_H * 0.89)} 400",        # 2: slider
-        f"input tap {SCREEN_W // 2} {int(SCREEN_H * 0.89)}",         # 3: slider area
+        f"{int(SCREEN_W * 0.88)} {int(SCREEN_H * 0.89)} 400",         # 2: gate slider
+        f"input tap {int(SCREEN_W * 0.25)} {int(SCREEN_H * 0.89)}",   # 3: Keep Read Only
     ]
     gestures_safe = [
         f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",               # 0: center
@@ -1357,7 +1416,7 @@ def main():
         if elapsed % 10 == 0:
             g = gesture_index % 4
             seq = gestures if elapsed <= 120 else gestures_safe
-            adb_shell(seq[g])
+            input_cmd(seq[g])
             mode = "gate" if elapsed <= 120 else "safe"
             print(f"  feeding gesture {g}: {seq[g]} (at {elapsed}s, {mode})")
             gesture_index += 1
@@ -1540,7 +1599,7 @@ def main():
         # horizontal span x 0.06..0.94.
         for i in range(3):
             y = int(SCREEN_H * 0.88)
-            adb_shell(f"input swipe {int(SCREEN_W * 0.10)} {y} "
+            input_cmd(f"input swipe {int(SCREEN_W * 0.10)} {y} "
                       f"{int(SCREEN_W * 0.90)} {y} 350")
             wait(2.5)
             dismiss_fullscreen_overlay("post-swipe")
@@ -1626,7 +1685,7 @@ def main():
         screenshot("term-07-terminal-settled")
 
         # ── 6) BACK (bottom nav bar) -> returns to the Advanced page ──
-        adb_shell("input keyevent 4")
+        input_cmd("input keyevent 4")
         wait(2.0)
         screenshot("term-08-after-back")
 
@@ -1655,7 +1714,7 @@ def main():
 
         # Back out of whatever page we ended on.
         for _ in range(6):
-            adb_shell("input keyevent 4")
+            input_cmd("input keyevent 4")
             wait(0.5)
         screenshot("term-13-after-back-all")
 
