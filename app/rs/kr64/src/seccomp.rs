@@ -52,7 +52,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 // Crate-local logging macros (defined in lib.rs) — no external `log` crate.
-use crate::{error, info, warning};
+use crate::{error, info};
 
 // ============================================================================
 // BPF / seccomp constants (not all exposed by the `libc` crate on every

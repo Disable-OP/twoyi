@@ -7818,10 +7818,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 // file_len via metadata (the later file_len
                                 // binding below is scoped to the interp
                                 // rewrite and not visible here).
-                                let file_len_hdr = file
-                                    .metadata()
-                                    .map(|m| m.len())
-                                    .unwrap_or(u64::MAX);
+                                let file_len_hdr =
+                                    file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
                                 let table_ok = e_phnum > 0
                                     && e_phnum <= 65535
                                     && e_phentsize >= min_phentsize
@@ -7942,12 +7940,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                             let phdrs = &phdrs_all;
                                             for i in 0..e_phnum {
                                                 let off = i * e_phentsize;
-                                                let Some(p_type) = phdrs
-                                                    .get(off..off + 4)
-                                                    .map(|b| {
-                                                        u32::from_le_bytes([
-                                                            b[0], b[1], b[2], b[3],
-                                                        ])
+                                                let Some(p_type) =
+                                                    phdrs.get(off..off + 4).map(|b| {
+                                                        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
                                                     })
                                                 else {
                                                     break;
