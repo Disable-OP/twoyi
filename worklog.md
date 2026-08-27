@@ -11262,3 +11262,62 @@ Stage Summary:
   kr64-app-stderr artifact) → render-loop dirty-check → accept4 spin
   throttle → geometry file. TWRP reaches PixelFlinger JIT (scanlines!)
   then dies at the deterministic input-tail crash.
+
+---
+Task ID: 6-Z180 + 6-Z181
+Agent: main
+Task: Fix the actual arm64 TWRP crash (user: touch must work) + per-pid bind fix
+
+6-Z180 (commit 41b5728) — the hook bug + the forensic bug:
+- HOOK BUG FIXED: inbr_connect() staged up to THREE socket-path
+  candidates into cand_lens[2] — the unconditional relative-candidate
+  insert at ncands==2 wrote 4 bytes past the array onto the stack,
+  inside the exact window every deterministic crash died in.
+  cand_lens is now [3] + bounds-guarded inserts.
+- FORENSIC BUG FIXED: the SIGSEGV logger read 'rip' via x86_64 flat
+  index 16 = x16 (IP0 scratch) on aarch64 — every logged
+  "rip = rsp + 0xD0" was a LOCAL VARIABLE ADDRESS; three sessions
+  chased a phantom call target. pc now read per-arch (index 32).
+- 0xffff.... ADDRESSES DECODED: the guest's arm64 stack region IS
+  0xffff....-prefixed (kernel 48-bit VA top-down mmap). The "garbage
+  region" theory is dead; sp=0xfffff2234d10 was a REAL stack pointer.
+- New evidence machinery (all in the shipped build): full x0-x30/pc/sp
+  dump at SIGSEGV + crashing THREAD comm + thread list + gap-marked
+  stack window; rt_sigreturn sigframe dump (pc/sp/pstate the kernel is
+  about to restore, + full 576B frame); SETREGS-SMOKE detector (any
+  setregs that CHANGES pc/sp logs red-handed); POKE audit (every
+  tracer write into child memory); [tid N] tags on all post-execve
+  syscall lines; arm64 syscall-name fallback (fcntl/read/write/
+  writev/connect/rt_sigaction/rt_sigreturn/... no more [unknown]);
+  poll ENTRY -1-sentinel gate; hook banner prints true arch + full
+  64-bit addrs; file-based no-input gate (A/B probe, default OFF).
+
+6-Z180 RESULTS (runs 33059345471 touch-on / 33059349047 no-input):
+- A/B VERDICT: bridge ON = crash-loop (restart ~4.5s, 11 cycles);
+  bridge OFF = recovery ALIVE the whole run, ZERO SIGSEGV. The input
+  bridge is CONFIRMED the crash trigger. cand_lens alone: necessary,
+  not sufficient.
+- POKE audit: the 6-Z163 bind rewrite pokes a 53-byte sockaddr at the
+  guest's stack scratch every restart — visible, timestamped with
+  'forwarding signal 17' (SIGCHLD) 1ms later.
+- no-input run: screenshots still static — recovery wedged in the
+  accept4(-EINVAL) property-socket spin (2000+ consecutive), tids
+  interleaved (epoll spin + lseek file reads).
+
+6-Z181 (commit 2fd... pushed) — the spin's root cause + fix:
+- NAMED: [tid 2916] bind->0 won the ONE translated socket path, then
+  [tid 2903] bind->-98 EADDRINUSE -> listen -EINVAL -> accept4 spin.
+  TWO traced processes host property services; 6-Z163 sent both to
+  the same host file.
+- FIX: per-pid translated bind path ({rootfs}/dev/socket/<name>.<pid>)
+  — every binder gets a real listening socket; guest clients are
+  unaffected (6-Z110 fakes their connects).
+- WORKFLOW: final dump now pulls FULL kr64-app-stderr.log (60k lines),
+  kr64.log, TWRP /tmp/recovery.log and the socket-dir listing via
+  docker exec — evidence survives any adbd death (33059345471 lost
+  everything when adb died at Launch Container).
+
+Stage Summary:
+- Next: 6-Z181 E2E pair running (touch-on + no-input). If the
+  touch-on run still crashes, the SIGSEGV comm/regs/sigframe + POKE
+  timeline will name the bridge's exact faulting instruction.

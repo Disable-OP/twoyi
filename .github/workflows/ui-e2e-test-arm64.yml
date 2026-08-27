@@ -707,6 +707,18 @@ jobs:
           sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>/dev/null" \
             > /tmp/ui-e2e-artifacts/rootfs-socket-dir.txt 2>&1 || true
+          # 6-Z182: THE PIXEL TRUTH — pull fb0 RAW (4.6MB) + md5 + a
+          # brightness histogram + framework screencap PNG. Even with
+          # adbd dead these prove/disprove rendered pixels directly.
+          sudo docker exec redroid sh -c \
+            "cat /data/user/0/io.twoyi.debug/rootfs/dev/graphics/fb0 2>/dev/null" \
+            > /tmp/ui-e2e-artifacts/fb0.raw 2>&1 || true
+          sudo docker exec redroid sh -c \
+            "md5sum /data/user/0/io.twoyi.debug/rootfs/dev/graphics/fb0 /data/user/0/io.twoyi.debug/rootfs/dev/fb0 2>/dev/null" \
+            > /tmp/ui-e2e-artifacts/fb0-md5.txt 2>&1 || true
+          sudo docker exec redroid sh -c \
+            "screencap -p /data/local/tmp/final.png 2>/dev/null && cat /data/local/tmp/final.png" \
+            > /tmp/ui-e2e-artifacts/screencap-dockerexec.png 2>&1 || true
           sudo docker inspect redroid --format \
             'status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' \
             > /tmp/ui-e2e-artifacts/container-state.txt 2>&1 || true

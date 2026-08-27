@@ -427,6 +427,17 @@ static void fb_geometry_init(void) {
         if (gp) gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)gp, 0 /*O_RDONLY*/, 0);
         if (gfd < 0)
             gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)rel, 0, 0);
+        /* 6-Z182: the CHROOT-ABSOLUTE candidate "/.twoyi-fb-geometry".
+         * Run 33061152563: TWOYI_ROOTFS env reached the hook but its
+         * value is a HOST path that does not exist INSIDE the jail
+         * (openat translated it to {rootfs}<host-path> -> ENOENT), and
+         * the cwd-relative open also missed (recovery's cwd is not the
+         * rootfs root). The ABSOLUTE "/.twoyi-fb-geometry" is mapped by
+         * the tracer to {rootfs}/.twoyi-fb-geometry — exactly where
+         * kr64's create_twrp_framebuffer wrote it — and is correct in
+         * every jail mode (chroot, pivot_root, no-namespace). */
+        if (gfd < 0)
+            gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)"/.twoyi-fb-geometry", 0, 0);
         if (gfd >= 0) {
             char gbuf[32];
             long n = raw_syscall3(SYS_read, gfd, (long)gbuf, (long)(sizeof(gbuf) - 1));
@@ -1005,24 +1016,42 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
     struct inbr_sockaddr_un addr;
     char rootbuf[128];
     char relbuf[24];
-    char *cands[3];
-    /* 6-Z180 FIX: cand_lens was [2] while THREE candidates can be staged
-     * (/dev/.touch-sock + $TWOYI_ROOTFS + relative). With all three
-     * present, `cand_lens[ncands]` at ncands==2 wrote 4 bytes PAST the
-     * array onto this function's stack — a deterministic stack
-     * corruption inside the exact window every arm64 crash run died in
-     * (runs 33021261552/33021972679: socket -> fcntl -> fcntl -> SIGSEGV
-     * with a garbage sp). The array now holds all three lengths and
-     * every insert is bounds-guarded. */
-    unsigned cand_lens[3];
+    char absbuf[24];
+    char *cands[4];
+    /* 6-Z180 FIX: cand_lens was [2] while multiple candidates can be
+     * staged (abstract + /dev/.touch-sock + $TWOYI_ROOTFS + relative).
+     * With all present, `cand_lens[ncands]` wrote PAST the array onto
+     * this function's stack — a deterministic stack corruption inside
+     * the exact window every arm64 crash run died in (runs
+     * 33021261552/33021972679: socket -> fcntl -> fcntl -> SIGSEGV with
+     * a garbage sp). The arrays now hold all four candidates and every
+     * insert is bounds-guarded. */
+    unsigned cand_lens[4];
+    /* 6-Z182: abstract-name lengths — cand_lens[i]==0 marks candidate i
+     * as ABSTRACT (name bytes in cands[i], length here). */
+    unsigned cand_name_lens[4];
     int ncands = 0;
     long fd, i;
 
     (void)my_memset(cand_lens, 0, sizeof(cand_lens));
+    (void)my_memset(cand_name_lens, 0, sizeof(cand_name_lens));
     (void)my_memset(cands, 0, sizeof(cands));
 
     *init_len = 0;
     *out_slot = 0;
+
+    /* 6-Z182 candidate 0 (ABSTRACT, tried FIRST): \0io.twoyi.touch —
+     * the chroot-proof listener the app binds (input.rs
+     * touch_server_abstract). Abstract names bypass the filesystem
+     * entirely, so the jail's root cannot hide it. */
+    {
+        static const char abs_name[] = "io.twoyi.touch";
+        unsigned n = (unsigned)(sizeof(abs_name) - 1); /* 14, no NUL */
+        unsigned j;
+        my_memset(absbuf, 0, sizeof(absbuf));
+        for (j = 0; j < n && j < sizeof(absbuf) - 1; j++) absbuf[j] = abs_name[j];
+        cands[ncands] = absbuf; cand_lens[ncands] = 0; cand_name_lens[ncands] = n; ncands++;
+    }
 
     /* 6-Z96b candidate 0: /dev/.touch-sock — a file kr64 writes with the
      * ABSOLUTE host path of the touch socket. Reading it via openat is
@@ -1046,7 +1075,7 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
                 }
                 for (k = 0; pbuf[k]; k++) rootbuf[k] = pbuf[k];
                 rootbuf[k] = 0;
-                if (k > 0 && rootbuf[0] == '/' && ncands < 3) {
+                if (k > 0 && rootbuf[0] == '/' && ncands < 4) {
                     cands[ncands] = rootbuf; cand_lens[ncands] = (unsigned)k; ncands++;
                 }
             }
@@ -1057,7 +1086,7 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
         const char *root = getenv("TWOYI_ROOTFS");
         if (root && root[0] && my_strcmp(root, "/") != 0) {
             unsigned n = inbr_build_path(rootbuf, sizeof(rootbuf), root);
-            if (n > 0 && ncands < 3) { cands[ncands] = rootbuf; cand_lens[ncands] = n; ncands++; }
+            if (n > 0 && ncands < 4) { cands[ncands] = rootbuf; cand_lens[ncands] = n; ncands++; }
         }
     }
     /* candidate 1: relative ../dev/touch-events (guest cwd == rootfs) */
@@ -1067,7 +1096,7 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
         unsigned j;
         my_memset(relbuf, 0, sizeof(relbuf));
         for (j = 0; j < n; j++) relbuf[j] = rel[j];
-        if (ncands < 3) { cands[ncands] = relbuf; cand_lens[ncands] = n; ncands++; }
+        if (ncands < 4) { cands[ncands] = relbuf; cand_lens[ncands] = n; ncands++; }
     }
     if (ncands == 0) return -1; /* unreachable (relative insert is
                                  * unconditional) — kept for clarity */
@@ -1089,11 +1118,28 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
         addr.sun_family = 1 /*AF_UNIX*/;
         {
             unsigned j;
-            for (j = 0; j < cand_lens[i] && j < 107; j++) {
-                addr.sun_path[j] = cands[i][j];
+            if (cand_lens[i] == 0) {
+                /* 6-Z182: ABSTRACT candidate (cand_lens == 0 marks it).
+                 * sun_path[0] stays NUL (abstract marker); the name bytes
+                 * were pre-staged into cands[i]. Abstract AF_UNIX names
+                 * resolve in the NETWORK namespace — immune to the jail's
+                 * chroot/pivot_root (run 33061152563: every filesystem
+                 * candidate ENOENT'd INSIDE the jail because the absolute
+                 * host path does not exist under the rootfs). The app's
+                 * touch_server_abstract() binds \0io.twoyi.touch and
+                 * feeds the same 20-byte TouchMessage stream. */
+                addr.sun_path[0] = '\0';
+                for (j = 0; j < cand_name_lens[i] && j < 105; j++) {
+                    addr.sun_path[1 + j] = cands[i][j];
+                }
+                (void)inbr_unix_connect((int)fd, &addr, 2 + 1 + cand_name_lens[i]);
+            } else {
+                for (j = 0; j < cand_lens[i] && j < 107; j++) {
+                    addr.sun_path[j] = cands[i][j];
+                }
+                (void)inbr_unix_connect((int)fd, &addr, 2 + cand_lens[i]);
             }
         }
-        (void)inbr_unix_connect((int)fd, &addr, 2 + cand_lens[i]);
         /* 6-Z3: a REAL connect failure was faked to 0 by the tracer —
          * verify with plain read(2) (never faked):
          *   >0        connected, initial data pending (stage it)
