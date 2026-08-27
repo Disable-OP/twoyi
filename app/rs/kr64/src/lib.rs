@@ -7853,16 +7853,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                                     }
                                                     v
                                                 };
-                                        interp_offset = Some(read_u(off, p_off_field, sz_bytes));
-                                        interp_filesz =
-                                            Some(read_u(off, p_sz_field, sz_bytes) as usize);
-                                        break;
+                                            interp_offset =
+                                                Some(read_u(off, p_off_field, sz_bytes));
+                                            interp_filesz =
+                                                Some(read_u(off, p_sz_field, sz_bytes) as usize);
+                                            break;
+                                        }
                                     }
-                                }
-                                match (interp_offset, interp_filesz) {
-                                    (Some(o), Some(s)) => Some((o, s)),
-                                    _ => None,
-                                }
+                                    match (interp_offset, interp_filesz) {
+                                        (Some(o), Some(s)) => Some((o, s)),
+                                        _ => None,
+                                    }
                                 };
                                 if let Some((p_offset, p_filesz)) = interp {
                                     let _ = file.seek(std::io::SeekFrom::Start(p_offset));
