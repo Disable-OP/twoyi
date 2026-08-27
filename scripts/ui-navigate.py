@@ -1897,36 +1897,35 @@ def main():
         pages = _pages()
         adv_pos = max([pos for pos, _ in pages], default=0)
 
-        # ── 4) File Manager row on the Advanced list ──
-        # Full-width rows; the analyzer puts row content in the
-        # y 320..640 band. SAFETY: never tap below y = 0.80*H on an
-        # unknown page — the y≈1228 band on Wipe/Install pages is the
-        # button/slider row ("Swipe to Factory Reset" lives there; a
-        # TAP cannot arm a slider, but we simply never go there).
-        # iter-7: danger-watchdog guards every tap; stop at the first
-        # non-danger page change (the FM page may log 'filemanager').
+        # ── 4) File Manager — DETERMINISTIC (iter-9): the Advanced page
+        # is ALSO a 4-button grid (analyzer + VLM on run 33109264796's
+        # term-02-advanced-1 frame): row1 y=414 = Copy Log | ADB
+        # Sideload, row2 y=708 = Terminal | File Manager. Columns
+        # x=192/528. FM = (528,708); Terminal = (192,708) is the
+        # iter-9 FALLBACK entry for the terminal episode.
         fm_open = False
-        for i, (x, y) in enumerate([
-            (360, 414), (360, 530), (360, 320), (360, 640),
-        ]):
+        adv_frame = _shot_bytes("term-02-advanced-frame")
+        for i, (x, y) in enumerate([(528, 708), (528, 708), (360, 708)]):
             if _back_off_danger(adv_pos):
                 continue
             print(f"  tap File Manager candidate {i}: ({x},{y})")
             dismiss_fullscreen_overlay("fm")
             tap(x, y)
             wait(2.0)
-            screenshot(f"term-03-fm-{i}")
+            cur = _shot_bytes(f"term-03-fm-{i}")
             if _back_off_danger(adv_pos):
                 continue
             tail = [p for p_pos, p in _pages() if p_pos > adv_pos]
             if any(p in ("filemanager", "filemanagerlist", "filelist")
-                   or "file" in p.lower() for p in tail):
-                print(f"  file-manager-ish page marker seen: {tail[-4:]}")
+                   for p in tail):
+                print(f"  file-manager page marker seen: {tail[-4:]}")
                 fm_open = True
                 break
-            if tail and all(p in ("advanced", "clear_vars", "main", "main2")
-                            for p in tail[-2:]):
-                continue  # no visible change yet — try next row candidate
+            if cur != adv_frame and cur:
+                print("  frame CHANGED after the FM tap (no marker — the FM "
+                      "page does not log a Set page) — treating as FM open")
+                fm_open = True
+                break
         pages = _pages()
         fm_pos = max([pos for pos, _ in pages], default=0)
         wait(1.0)
@@ -1936,25 +1935,29 @@ def main():
         screenshot("term-04-fm-root-BEFORE-terminal")
 
         # ── 5) THE TERMINAL EPISODE (the escape trigger) ──
-        # Bottom-right File button (analyzer: FM bottom button row at
-        # y≈1228, right column x≈528-672), then "Open Terminal" in the
-        # centered Choose Action popup. Both are guest-rendered
-        # (uiautomator-invisible); recovery.log + tracer log are the
-        # runtime evidence, screenshots the visual record.
-        # iter-7: guarded — only when the FM page actually opened, and
-        # every tap is followed by the danger watchdog.
+        # User's exact chain: FM bottom-right File button -> "Choose
+        # Action in current folder" -> Open Terminal. The FM bottom
+        # button row sits in the y≈1176..1300 band (analyzer on other
+        # pages' bottom bars).
+        # FALLBACK (iter-9): the Advanced page has a direct Terminal
+        # button at (192,708) — same terminal page, same fork/exit
+        # storm. Danger watchdog guards every tap.
+        terminal_open = False
         if fm_open:
+            fm_frame = _shot_bytes("term-04b-fm-frame")
             for i, (bx, by) in enumerate([
                 (620, 1228), (528, 1228), (672, 1176), (560, 1300),
             ]):
                 print(f"  tap bottom-right File button candidate {i}: ({bx},{by})")
                 tap(bx, by)
                 wait(1.5)
-                screenshot(f"term-05-filebtn-{i}")
+                cur = _shot_bytes(f"term-05-filebtn-{i}")
                 if _back_off_danger(fm_pos):
                     continue
-                # Menu rows in the centered popup, y 500..900 band.
-                for ty in (640, 520, 760):
+                if not cur or cur == fm_frame:
+                    continue  # no popup appeared — next candidate
+                # A popup appeared (frame changed) — tap its rows.
+                for ty in (640, 520, 760, 880):
                     print(f"    tap Open Terminal row candidate: (360,{ty})")
                     tap(360, ty)
                     wait(3.0)
@@ -1963,17 +1966,35 @@ def main():
                         break
                     new = [p for pos, p in _pages() if pos > fm_pos]
                     if any("terminal" in p.lower() for p in new):
-                        print("    terminal page marker seen — stopping")
+                        print("    terminal page marker seen")
+                        terminal_open = True
                         break
-                pages = _pages()
-                new = [p for pos, p in pages if pos > fm_pos]
-                print(f"    pages since FM open: {new[-6:]}")
-                if any("terminal" in p.lower() for p in new):
-                    print("    TERMINAL OPENED — chain complete")
+                if terminal_open:
                     break
+                # popup row missed — dismiss popup, next File candidate
+                input_cmd("input keyevent 4")
+                wait(1.0)
         else:
-            print("  [chain] FM page never confirmed — SKIPPING the "
-                  "terminal episode (safety; would tap blind)")
+            print("  [chain] FM page never confirmed — will use the "
+                  "Advanced-page Terminal fallback")
+        if not terminal_open:
+            # FALLBACK: Advanced -> Terminal button (192,708).
+            print("  [terminal fallback] BACK to Advanced, then Terminal "
+                  "button (192,708)")
+            input_cmd("input keyevent 4")
+            wait(1.5)
+            input_cmd("input keyevent 4")
+            wait(1.5)
+            tail = [p for p_pos, p in _pages() if p_pos > fm_pos]
+            if "advanced" in tail or not fm_open:
+                tap(192, 708)
+                wait(3.0)
+                screenshot("term-06f-terminal-fallback")
+                new = [p for p_pos, p in _pages() if p_pos > fm_pos]
+                print(f"  [terminal fallback] pages after tap: {new[-5:]}")
+                if any("terminal" in p.lower() for p in new):
+                    terminal_open = True
+                    print("  TERMINAL OPENED via fallback — chain complete")
 
         # Let the terminal children fork + die (Child processes exited x2)
         wait(5.0)
@@ -1990,13 +2011,15 @@ def main():
         # term-04-fm-root-BEFORE-terminal: identical view + this step is
         # the ONLY difference.
         if fm_open:
-            for (x, y) in [(360, 414), (360, 530), (360, 320)]:
+            # BACK from the terminal returns to the FM (or Advanced);
+            # navigate to the FM again via its Advanced-page button.
+            for (x, y) in [(528, 708), (528, 708)]:
                 print(f"  tap File Manager reopen candidate: ({x},{y})")
                 tap(x, y)
                 wait(2.5)
                 if _back_off_danger(adv_pos):
                     continue
-                break  # first candidate (same row that worked in step 4)
+                break
             screenshot("term-09-fm-AFTER-terminal")
             for i in range(3):
                 swipe_up()
