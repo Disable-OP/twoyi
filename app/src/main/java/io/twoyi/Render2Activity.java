@@ -8,8 +8,11 @@ package io.twoyi;
 
 import android.app.Activity;
 import android.app.ProgressDialog;
+import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.SystemClock;
@@ -72,6 +75,84 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private int mSurfaceHeight;
     private int mSurfaceOffsetX;
     private int mSurfaceOffsetY;
+
+    /**
+     * 6-Z186: debug touch-injection receiver — the CI-probe's
+     * InputManager-independent input channel.
+     *
+     * redroid's `input tap/swipe` (adb AND docker exec) silently
+     * no-ops for entire runs (~50% flaky, runs 33108190303 /
+     * 33110255428 / 33111145397 — rc=0, no error, zero effect), and
+     * the headless container has NO evdev nodes for sendevent. This
+     * receiver feeds the EXACT production touch path
+     * (onTouch -> mTouchMatrix -> Renderer.handleTouch -> touch-events
+     * socket -> twrp_fb_hook -> guest evdev) straight from an
+     * `am broadcast` — ActivityManager, a different binder service,
+     * which keeps working when InputManager injection is dead.
+     *
+     * Extras: --ei x/y (host screen px; x2/y2 for swipes),
+     *         --es action (tap|swipe). Coordinates are translated
+     *         surface-relative via mSurfaceOffsetX/Y first, exactly
+     *         like a real touch on the SurfaceView would arrive.
+     */
+    private BroadcastReceiver mDebugTouchReceiver;
+
+    private void sendDebugTouch(int action, float sx, float sy) {
+        if (mSurfaceWidth <= 0 || mSurfaceHeight <= 0) {
+            return;
+        }
+        long now = SystemClock.uptimeMillis();
+        MotionEvent ev = MotionEvent.obtain(now, now, action, sx, sy,
+                1f, 1f, 0, 1f, 1f, 0, 0);
+        MotionEvent transformed = MotionEvent.obtain(ev);
+        transformed.transform(mTouchMatrix);
+        Renderer.handleTouch(transformed);
+        transformed.recycle();
+        ev.recycle();
+    }
+
+    private void registerDebugTouchReceiver() {
+        mDebugTouchReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                int px = intent.getIntExtra("x", -1);
+                int py = intent.getIntExtra("y", -1);
+                if (px < 0 || py < 0) {
+                    return;
+                }
+                String act = intent.getStringExtra("action");
+                float sx = px - mSurfaceOffsetX;
+                float sy = py - mSurfaceOffsetY;
+                if ("swipe".equals(act)) {
+                    int x2 = intent.getIntExtra("x2", px);
+                    int y2 = intent.getIntExtra("y2", py);
+                    float ex = x2 - mSurfaceOffsetX;
+                    float ey = y2 - mSurfaceOffsetY;
+                    int steps = Math.max(2, intent.getIntExtra("steps", 8));
+                    sendDebugTouch(MotionEvent.ACTION_DOWN, sx, sy);
+                    for (int i = 1; i <= steps; i++) {
+                        float t = (float) i / steps;
+                        sendDebugTouch(MotionEvent.ACTION_MOVE,
+                                sx + (ex - sx) * t, sy + (ey - sy) * t);
+                        SystemClock.sleep(40);
+                    }
+                    sendDebugTouch(MotionEvent.ACTION_UP, ex, ey);
+                } else {
+                    sendDebugTouch(MotionEvent.ACTION_DOWN, sx, sy);
+                    SystemClock.sleep(60);
+                    sendDebugTouch(MotionEvent.ACTION_UP, sx, sy);
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter("io.twoyi.debug.TOUCH");
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(mDebugTouchReceiver, filter,
+                    Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(mDebugTouchReceiver, filter);
+        }
+        Log.i(TAG, "debug touch receiver registered (io.twoyi.debug.TOUCH)");
+    }
 
     /**
      * Cached Matrix that maps SurfaceView-local touch coordinates to virtual
@@ -189,6 +270,10 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         // Size and center the SurfaceView based on virtual display dimensions
         setupSurfaceViewLayout();
+        // 6-Z186: CI-probe input channel (see mDebugTouchReceiver docs).
+        // Registered AFTER setupSurfaceViewLayout so the offsets/matrix
+        // are already populated when a broadcast arrives.
+        registerDebugTouchReceiver();
 
         mLoadingLayout = findViewById(R.id.loadingLayout);
         mLoadingView = findViewById(R.id.loading);
@@ -223,6 +308,15 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         // from firing on a destroyed Activity with a stale Surface pointer.
         if (mSurfaceView != null && mSurfaceCallback != null) {
             mSurfaceView.getHolder().removeCallback(mSurfaceCallback);
+        }
+        // 6-Z186: drop the debug touch receiver with the activity.
+        if (mDebugTouchReceiver != null) {
+            try {
+                unregisterReceiver(mDebugTouchReceiver);
+            } catch (IllegalArgumentException ignored) {
+                // not registered — nothing to do
+            }
+            mDebugTouchReceiver = null;
         }
         super.onDestroy();
     }
