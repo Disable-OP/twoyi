@@ -9228,20 +9228,20 @@ pub fn run_ptrace_loop(
             // recovery_child_pid are loop-level singletons handled
             // separately in the init_pid re-anchor block below.
             forget_dead_pid_state(
-                pid,
-                &mut in_syscall_map,
-                &mut fake_netlink_fds,
-                &mut netlink_fd_next,
-                &mut fake_propserv_fds,
-                &mut prctl_rewritten_args,
-                &mut pending_epoll_readback,
-                &mut pending_mount_enodev,
-                &mut pending_open_translated_path,
-                &mut open_fd_owner_paths,
-                &mut accept4_einval_streak,
-                &mut esrch_streak,
-                &mut pending_getpid,
-            );
+            pid,
+            &mut in_syscall_map,
+            &mut fake_netlink_fds,
+            &mut netlink_fd_next,
+            &mut fake_propserv_fds,
+            &mut prctl_rewritten_args,
+            &mut pending_epoll_readback,
+            &mut pending_mount_enodev,
+            &mut pending_open_translated_path,
+            &mut open_fd_owner_paths,
+            &mut accept4_einval_streak,
+            &mut esrch_streak,
+            &mut pending_getpid,
+        );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
             // dead pid + the prop_area_maps entries — see
@@ -23238,7 +23238,7 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         fake_netlink_fds.entry(pid).or_default().insert(0x6b00_0000);
         netlink_fd_next.insert(pid, 0x6b00_0001);
         fake_propserv_fds.entry(pid).or_default().insert(5); // real kernel fd
-                                                             // Sanity: all four maps have the pid entry before cleanup.
+        // Sanity: all four maps have the pid entry before cleanup.
         assert!(in_syscall_map.contains_key(&pid));
         assert!(fake_netlink_fds.contains_key(&pid));
         assert!(netlink_fd_next.contains_key(&pid));

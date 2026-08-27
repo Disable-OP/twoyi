@@ -7815,18 +7815,28 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 // traced child via PTRACE_O_EXITKILL. Validate
                                 // the program-header table before allocating.
                                 let min_phentsize: usize = if is_elf64 { 56 } else { 32 };
+                                // file_len via metadata (the later file_len
+                                // binding below is scoped to the interp
+                                // rewrite and not visible here).
+                                let file_len_hdr = file
+                                    .metadata()
+                                    .map(|m| m.len())
+                                    .unwrap_or(u64::MAX);
                                 let table_ok = e_phnum > 0
                                     && e_phnum <= 65535
                                     && e_phentsize >= min_phentsize
                                     && e_phentsize <= 4096
                                     && e_phoff
                                         .checked_add((e_phentsize * e_phnum) as u64)
-                                        .map_or(true, |end| end > file_len)
+                                        .map_or(true, |end| end > file_len_hdr)
                                         == false;
                                 let interp: Option<(u64, usize)> = if !table_ok {
                                     warning!(
                                         "[KR64] PT_INTERP scan: implausible phdr table (phoff={}, phentsize={}, phnum={}, file_len={}) — skipping patch for this binary",
-                                        e_phoff, e_phentsize, e_phnum, file_len
+                                        e_phoff,
+                                        e_phentsize,
+                                        e_phnum,
+                                        file_len_hdr
                                     );
                                     None
                                 } else {
