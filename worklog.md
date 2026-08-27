@@ -12069,3 +12069,56 @@ Stage Summary:
   class works for all processes, and the terminal execs the staged
   busybox through the marked prefix form.
 - Awaiting run 4 verification.
+
+---
+Task ID: 6-Z188
+Agent: main
+Task: Terminal shell exits immediately after successful exec (run
+33122549751 verification) — plus master-prompt reorientation to a
+recovery-agnostic runtime.
+
+Work Log:
+- Run 33122549751 (6-Z187c) VERIFIED by monitor sub-agent:
+  * FM first-open POPULATED (acct cache data dev etc external_sd license
+    oem proc res sbin sdcard...) — the empty-before-terminal bug is DEAD.
+  * FM listing guest-only CLEAN (no data_mirror/linkerconfig/metadata/
+    .twoyi-* markers).
+  * "Unable to open '/'" count = 0 (was 3+); via=1 prefix-retry
+    successes 13 (was 4); exit-127 children 0 (was 12).
+  * blind execve on pid 2606 (cwd-relative+1) kernel ret=0 SUCCESS
+    cwd=.../profiles/default/rootfs — /sbin/sh EXECUTED.
+  * BUT the shell exit_group(1)'d instantly and the terminal never
+    rendered a prompt.
+- ROOT CAUSE (from terminal.cpp + hook source): there is no real
+  /dev/ptmx or /dev/pts/N in the sandbox. The pty child's
+  open(ptsname(fdMaster)) = open("/dev/pts/N") ENOENT'd -> fdSlave=-1
+  -> dup2(-1,0/1/2) failed -> ash ran with dead stdio -> exit(1).
+  BONUS BUG found while fixing: the 6-Z186 WINSZ handler answered
+  0x540E — which is the x86 TIOCGWINSZ but the aarch64 TIOCSCTTY!
+  ash's real WINSZ (0x5413 asm-generic) went unanswered on arm64.
+- 6-Z188 FIX (hook-side, recovery-agnostic — works for ANY recovery
+  using the standard getpt/unlockpt/ptsname pty API):
+  * socketpair-backed PTY: open("/dev/ptmx") -> socketpair(AF_UNIX),
+    master end returned, slave end stashed per slot (4 slots).
+  * ioctl on master fd: TIOCSPTLCK=0, TIOCGPTN=slot,
+    TIOCGPTLCK=0, TIOCSCTTY=0, TIOCGWINSZ=24x80.
+  * ptsname/ptsname_r/grantpt interposed -> "/dev/pts/<slot>".
+  * open("/dev/pts/<n>") -> dup(stashed slave) — the child inherited
+    the socket end at fork, so stdio <-> GUI master is a live
+    bidirectional socket pair (what a pty IS for terminal emulators).
+  * WINSZ handler now arch-correct (0x5413 on aarch64, 0x540E/0x5413
+    on x86) + TIOCSCTTY(0x540E asm-generic) answered 0 on any fd.
+  * Foreign paths never shadowed (prefix mismatch -> -2 passthrough).
+- Gates: gcc -fsyntax-only clean (pty code); no Rust changes.
+- MASTER-PROMPT STATE: core fixes 1-3 of the 4 root-cause items are
+  now landed and verified (VFS isolation, FM always-guest-root,
+  terminal exec). Item 4 (TWRP 2.8 angler splash hang) is next; the
+  universal-corpus CI (§23/§31) follows after core semantics hold.
+
+Stage Summary:
+- The full terminal chain is now: getpt -> socketpair master,
+  unlockpt -> 0, fork, open("/dev/pts/0") -> slave socket,
+  dup2 0/1/2, setsid, TIOCSCTTY -> 0, execl("/sbin/sh") -> staged
+  busybox ash (6-Z187), WINSZ 80x24 (arch-correct) — every stage
+  virtualized generically.
+- Awaiting run 5 (pty verification) via monitor sub-agent.
