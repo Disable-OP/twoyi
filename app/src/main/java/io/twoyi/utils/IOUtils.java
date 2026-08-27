@@ -110,6 +110,14 @@ public class IOUtils {
                 }
                 transferred += n;
             }
+            // 6-Z184 AUDIT FIX (agent 80): a short transferTo loop (n<=0
+            // break) used to return "success" with a TRUNCATED target —
+            // profile copies then booted from half-written files. Fail
+            // loudly instead.
+            if (transferred < size) {
+                throw new IOException("copyFile: short copy " + transferred + "/" + size
+                        + " bytes: " + source + " -> " + target);
+            }
         } finally {
             closeSilently(inputStream);
             closeSilently(outputStream);

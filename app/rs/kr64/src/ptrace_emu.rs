@@ -5381,7 +5381,8 @@ fn parse_prop_msg(frame: &[u8]) -> Option<(String, String)> {
     const PROP_MSG_SETPROP_PLAIN_2: u32 = 2;
     const CLASSIC_SIZE: usize = 128; // {u32; char[32]; char[92]} = 4+32+92
     const WIDE_SIZE: usize = 188; // {u32; char[92]; char[92]} = 4+92+92
-    const NAME_MAX_LEN: usize = 31; // bionic's __system_property_set gate
+    const NAME_MAX_LEN: usize = 31; // bionic's classic __system_property_set gate
+    const WIDE_NAME_MAX_LEN: usize = 92;
 
     if frame.len() < CLASSIC_SIZE {
         return None;
@@ -5391,50 +5392,38 @@ fn parse_prop_msg(frame: &[u8]) -> Option<(String, String)> {
     if cmd != PROP_MSG_SETPROP && cmd != PROP_MSG_SETPROP2 && cmd != PROP_MSG_SETPROP_PLAIN_2 {
         return None;
     }
-    // Classic parse: name @ 4, 32 bytes; value @ 36, 92 bytes.
-    // Name must be NUL-terminated within 31 bytes.
-    let name_end = (4..4 + NAME_MAX_LEN)
-        .find(|&i| frame[i] == 0)
-        .unwrap_or(4 + NAME_MAX_LEN);
-    let name_bytes = &frame[4..name_end];
-    // If name_end landed at 4+31 without finding a NUL, the name is
-    // UNTERMINATED within the classic gate — reject (the spec's
-    // hard gate).
-    if name_end == 4 + NAME_MAX_LEN && frame[name_end] != 0 {
+    // 6-Z184 AUDIT FIX (agents 10+13): the layout is selected by FRAME
+    // SIZE, not by "classic name empty". The old fallback re-scanned the
+    // same 31-byte window (could never see a wide name) and only fired
+    // for empty classic names — a ≥188-byte frame with a non-empty name
+    // was misparsed with the value read from classic offset 36 (name
+    // garbage), broadcasting the WRONG (name,value) into every guest
+    // property area.
+    //   classic (<188 B): name @ 4 (31 B gate), value @ 36 (92 B)
+    //   wide     (≥188 B): name @ 4 (92 B gate), value @ 96 (92 B)
+    let is_wide = frame.len() >= WIDE_SIZE;
+    let name_gate = if is_wide { WIDE_NAME_MAX_LEN } else { NAME_MAX_LEN };
+    let name_end = (4..4 + name_gate)
+        .find(|&i| i >= frame.len() || frame[i] == 0)
+        .unwrap_or(4 + name_gate);
+    let name_bytes = &frame[4..name_end.min(frame.len())];
+    if name_end == 4 + name_gate
+        && frame.get(name_end).map_or(true, |&b| b != 0)
+        && frame.len() > name_end
+    {
+        // Name unterminated within its layout's gate — reject.
         return None;
     }
-    // Value: NUL-terminated within 92 bytes. If the value is empty
-    // (value[0] == 0) AND the frame is wide-layout-capable (≥188
-    // bytes), try the wide fallback (some vendor clients emit the
-    // wide layout for long names that overflow 32 bytes).
-    let mut value_start = 36usize;
-    let mut value_max = 36 + 92; // 128 — but frame may be longer
-    if frame.len() >= WIDE_SIZE && name_bytes.is_empty() {
-        // Wide fallback: name @ 4 (92 bytes), value @ 96 (92 bytes).
-        // Re-parse the name from the wide slot.
-        let wide_name_end = (4..4 + NAME_MAX_LEN)
-            .find(|&i| frame[i] == 0)
-            .unwrap_or(4 + NAME_MAX_LEN);
-        let wide_name_bytes = &frame[4..wide_name_end];
-        if wide_name_end == 4 + NAME_MAX_LEN && frame[wide_name_end] != 0 {
-            // Wide name also unterminated — reject.
-            return None;
-        }
-        value_start = 96;
-        value_max = 96 + 92;
-        let value_end = (value_start..value_max)
-            .find(|&i| i >= frame.len() || frame[i] == 0)
-            .unwrap_or(value_max.min(frame.len()));
-        let value = String::from_utf8_lossy(&frame[value_start..value_end]).into_owned();
-        let name = String::from_utf8_lossy(wide_name_bytes).into_owned();
-        return Some((name, value));
-    }
-    // Classic value parse.
+    let value_start = if is_wide { 96 } else { 36 };
+    let value_max = value_start + 92;
     let value_end = (value_start..value_max)
         .find(|&i| i >= frame.len() || frame[i] == 0)
         .unwrap_or(value_max.min(frame.len()));
     let value = String::from_utf8_lossy(&frame[value_start..value_end]).into_owned();
     let name = String::from_utf8_lossy(name_bytes).into_owned();
+    if name.is_empty() {
+        return None;
+    }
     Some((name, value))
 }
 

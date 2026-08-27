@@ -353,7 +353,9 @@ public final class RomManager {
         // daemons on every boot (each EPERM'd today, but would be lethal
         // under an elevated shell). Filter to OUR OWN uid only.
         Shell shell = ShellUtil.newSh();
-        shell.newJob().add("ps -ef | awk -v u=$(id -u) '{if($1==u && $3==1) print $2}'"
+        // 6-Z184 audit follow-up: ps -ef's $1 is the user NAME (u0_aNN),
+        // not the numeric uid — match id -un. Keep the PPID==1 filter.
+        shell.newJob().add("ps -ef | awk -v u=$(id -un) '{if($1==u && $3==1) print $2}'"
                 + " | xargs -r kill -9").exec();
     }
 
