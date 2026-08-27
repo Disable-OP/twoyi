@@ -67,6 +67,12 @@ def input_cmd(cmd):
     else falls back to `input`)."""
     global _ADB_DEAD, _TOUCH_EVDEV, _TOUCH_RANGE, _KEY_EVDEV, _FORCE_SENDEVENT
     if _FORCE_SENDEVENT:
+        # Escalated mode (effect-based: an input round showed zero
+        # effect). docker `input` is presumed dead-silent — go straight
+        # to the app-level broadcast channel, then sendevent.
+        r = _broadcast_cmd(cmd)
+        if r is not None:
+            return r
         return _sendevent_cmd(cmd)
     if not _ADB_DEAD:
         try:
@@ -108,8 +114,45 @@ def input_cmd(cmd):
               f"out={out.strip()[:120]!r}) — trying sendevent")
     except Exception as e:
         print(f"  [input] docker exec threw {e!r} — trying sendevent")
+    # Channel 2b: app-level broadcast (see _broadcast_cmd).
+    r = _broadcast_cmd(cmd)
+    if r is not None:
+        return r
     # Channel 3: sendevent.
     return _sendevent_cmd(cmd)
+
+
+def _broadcast_cmd(cmd):
+    """Channel 2b: `am broadcast` -> Render2Activity's 6-Z186 debug
+    touch receiver -> the production onTouch path. InputManager-
+    independent (ActivityManager service); the only channel that works
+    when docker `input` silently no-ops AND no evdev nodes exist for
+    sendevent (the exact 33110255428 situation). Returns the shell
+    output when the command shape was handled, None otherwise."""
+    m = re.match(r"input (?:tap|swipe) (\d+) (\d+)(?: (\d+) (\d+))?(?: \d+)?", cmd)
+    if not m:
+        return None
+    try:
+        x1, y1 = m.group(1), m.group(2)
+        is_swipe = m.group(3) is not None
+        if is_swipe and (int(x1) != int(m.group(3)) or int(y1) != int(m.group(4))):
+            amcmd = (f"am broadcast -a io.twoyi.debug.TOUCH "
+                     f"--es action swipe --ei x {x1} --ei y {y1} "
+                     f"--ei x2 {m.group(3)} --ei y2 {m.group(4)} "
+                     f"--ei steps 8")
+        else:
+            amcmd = (f"am broadcast -a io.twoyi.debug.TOUCH "
+                     f"--es action tap --ei x {x1} --ei y {y1}")
+        r = subprocess.run(
+            ["sudo", "docker", "exec", "redroid", "sh", "-c", amcmd],
+            capture_output=True, text=True, timeout=20)
+        # Delivery is fire-and-forget; the probe verifies the effect
+        # via its marker/frame checks after each gesture.
+        return (r.stdout or "") + (r.stderr or "")
+    except Exception:
+        # Broadcast channel unavailable — empty string still means
+        # "shape handled, nothing to report"; sendevent follows.
+        return ""
 
 
 def _sendevent_discover():
