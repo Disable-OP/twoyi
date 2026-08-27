@@ -11486,3 +11486,49 @@ Task: README + evidence refresh, final commits
 - x86 workflow: added the `adb exec-out run-as io.twoyi.debug cat
   rootfs/tmp/recovery.log` evidence pull (no adb root — keeps the
   unrooted-device premise).
+
+---
+Task ID: 6-Z184
+Agent: main
+Task: User directive — full-repo bug sweep ("read every line, fix every bug"),
+strip all Copilot/fork debris, explain+organize the vendored AOSP init,
+then spawn a 100-agent read-only Opus audit fleet, read their reports,
+and fix everything real. Keep /home/z/my-project/download/ empty.
+
+Work Log (wave 1 — own fixes before spawning, per user's ordering):
+- 4 parallel Explore sweeps (kr64 Rust / app.rs Rust / Java / CI+scripts)
+  produced ~90 findings; every one verified against source before fixing.
+- Fixed in kr64: seccomp BPF arch-jump u8 truncation (security guard was
+  silently broken — inline KILL restructure), binder 4-thread pool
+  starvation (bounded per-connection threads), vfs property-area version
+  (0xfc6ed0ab both formats), qemu_pipe split-delivery handshake + dropped
+  tail bytes, mount_mgr recursive RO enforcement, F_SETFL clobbers (6),
+  sensors JNI-under-mutex, proc_emu mounts symlink truncation, doc/code
+  mismatches (devices, compat_paths, apex_extract, binder docs).
+- Fixed in app/rs: ANativeWindow ref leak in renderer_init, TWRP-mode
+  branch on both window-refresh paths, blit-failure retry (baseline only
+  advances on success), log.txt truncate-on-kr64-boot, PID-reuse guard
+  (stat starttime), JNI panic paths, handshake+tail (mirror of kr64 fix),
+  input EINTR/accept-error hardening across touch/key/abstract servers.
+- Fixed in Java: RamdiskImporter Zip-Slip/Tar-Slip (canonical containment
+  + stream-sync skip), non-destructive ROM import (staging+atomic swap,
+  both activities), FileLogger thread-safety + streamed 8 MiB-capped kr64
+  tee, Installer adb-shell leak + bg-thread Toast crash, killOrphan uid
+  filter, deleteDirectory truthfulness, BootLogTexture generation counter
+  + '*:I' filter, BootCompletionServer worker pinning, mailto intent
+  actually started, profile XML escaping, ACache hardening, dead code.
+- Fixed CI/scripts: arm64 evidence-on-fail (RC capture), /system/bin
+  absolute paths in docker execs, x86 recovery.log pull on abort,
+  consecutive adb DEAD threshold, PACKAGE env respected, twoyi-logs
+  mirror paths, portable REPO_ROOT, FUNDING single platform, pack-logs
+  exit code, dead pulls/imports removed.
+- Debris: 32 Copilot headers stripped, copilot-instructions.md deleted,
+  dup keystore + committed ELF + unbuildable wrapper removed, AOSP init
+  relocated to docs/reference/aosp-init with WHY_THIS_IS_HERE.md.
+- Commit: 6d0ad9b.
+
+Stage Summary:
+- Wave 1 complete; repo compiles-safe changes only (no behavior change to
+  the proven TWRP boot path except hardened edge cases).
+- Next: spawn 100 read-only OPUS sub-agents in ONE shot, one report file
+  each under /home/z/my-project/bugreports/, then triage + fix + gates.
