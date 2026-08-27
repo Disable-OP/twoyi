@@ -864,32 +864,47 @@ extern "C" fn sigsys_handler(_sig: c_int, info: *mut siginfo_t, ctx: *mut c_void
     // Decide what to do.
     let action = classify(syscall_nr);
 
+    // 6-Z184 AUDIT FIX (agent 62): this handler runs in SIGNAL context —
+    // error!/warning! expand to format! (malloc) + eprintln! (stdio lock),
+    // which are NOT async-signal-safe: with TSYNC every guest thread
+    // carries the filter, and a SIGSYS landing while another thread holds
+    // the allocator/stdio lock deadlocks or corrupts the heap. Use the
+    // crate's signal-safe write helpers instead (write(2) only).
+    let mut nbuf = [0u8; 12];
     match action {
         Action::Kill => {
-            error!(
-                "[KR64][seccomp] BLOCKED.SYSCALL.FAILED: killed guest for syscall {}",
-                syscall_nr
-            );
-            unsafe { libc::_exit(1) };
+            unsafe {
+                crate::safe_write_err(b"[KR64][seccomp] BLOCKED.SYSCALL.FAILED: killed guest for syscall ");
+                let n = crate::format_decimal(&mut nbuf, syscall_nr);
+                crate::safe_write_err(&nbuf[..n]);
+                crate::safe_write_err(b"\n");
+                libc::_exit(1);
+            }
         }
         Action::Emulate { retval } => {
             // Emulate: set return value, advance PC past syscall instr.
-            warning!(
-                "[KR64][seccomp] BLOCKED.SYSCALL.FAILED: trapped syscall {} → emulated (retval={})",
-                syscall_nr,
-                retval
-            );
+            unsafe {
+                crate::safe_write_err(b"[KR64][seccomp] trapped syscall ");
+                let n = crate::format_decimal(&mut nbuf, syscall_nr);
+                crate::safe_write_err(&nbuf[..n]);
+                crate::safe_write_err(b" -> emulated (retval=");
+                let r = crate::format_decimal(&mut nbuf, retval as i32);
+                crate::safe_write_err(&nbuf[..r]);
+                crate::safe_write_err(b")\n");
+            }
             set_return_value(uc, retval);
             advance_pc(uc);
         }
         Action::Passthrough => {
             // This shouldn't happen — only trapped syscalls reach the
-            // handler. But if it does, log and let the kernel retry
-            // (don't advance PC) so the syscall actually executes.
-            warning!(
-                "[KR64][seccomp] SIGSYS for non-trapped syscall {} — passthrough",
-                syscall_nr
-            );
+            // handler. But if it does, note it signal-safely and let the
+            // kernel retry (don't advance PC) so the syscall executes.
+            unsafe {
+                crate::safe_write_err(b"[KR64][seccomp] SIGSYS for non-trapped syscall ");
+                let n = crate::format_decimal(&mut nbuf, syscall_nr);
+                crate::safe_write_err(&nbuf[..n]);
+                crate::safe_write_err(b" - passthrough\n");
+            }
         }
     }
 }

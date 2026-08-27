@@ -1066,6 +1066,11 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
             char pbuf[136];
             long pr = raw_syscall3(SYS_read, tf, (long)pbuf, (long)(sizeof(pbuf) - 1));
             (void)raw_syscall1(SYS_close, tf);
+            /* 6-Z184 AUDIT FIX (agent 2): k must fit sun_path[108]
+             * INCLUDING the NUL (<=107), else the later copy truncates
+             * silently and inbr_unix_connect is handed an addrlen past
+             * the 110-byte sockaddr_un (kernel OOB read). Mirror
+             * inbr_build_path's conservative cap. */
             if (pr > 0 && pr < 128) {
                 long k;
                 pbuf[pr] = 0;
@@ -1075,7 +1080,7 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
                 }
                 for (k = 0; pbuf[k]; k++) rootbuf[k] = pbuf[k];
                 rootbuf[k] = 0;
-                if (k > 0 && rootbuf[0] == '/' && ncands < 4) {
+                if (k > 0 && k <= 105 && rootbuf[0] == '/' && ncands < 4) {
                     cands[ncands] = rootbuf; cand_lens[ncands] = (unsigned)k; ncands++;
                 }
             }

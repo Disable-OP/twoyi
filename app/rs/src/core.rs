@@ -1350,17 +1350,28 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
     loop {
         // 6-Z183: no live surface (app backgrounded / surface destroyed)?
         // Idle cheaply — no fb reads, no blits, no spin.
+        // 6-Z184 AUDIT FIX (agent 71): the loop previously blitted the
+        // raw pointer with NO reference of its own — a concurrent
+        // twrp_set_window(null) (surfaceDestroyed) could release the LAST
+        // reference mid-tick while this thread was between the load and
+        // ANativeWindow_lock → use-after-free. Acquire our OWN reference
+        // for the duration of the tick and release it at the end; the
+        // refcount can then never hit 0 while we hold it.
         let window = TWRP_WINDOW.load(Ordering::SeqCst) as *mut c_void;
         if window.is_null() {
             std::thread::sleep(Duration::from_millis(200));
             continue;
         }
+        unsafe { ANativeWindow_acquire(window) };
+        // Every `continue` below MUST release this reference — the tick
+        // guard below (defer-style) is explicit at each site.
 
         // Read the framebuffer file.
         let file = match std::fs::File::open(&fb_path) {
             Ok(f) => f,
             Err(e) => {
                 log::warn!("[CORE][TWRP-FB] open({}) failed: {} — retrying", fb_path, e);
+                unsafe { ANativeWindow_release(window) };
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
@@ -1445,8 +1456,10 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
                     alog_error("TWRP-FB blit FAILED (setBuffersGeometry/lock) — surface shows stale pixels");
                 }
             }
+            unsafe { ANativeWindow_release(window) };
             std::thread::sleep(Duration::from_millis(33));
         } else {
+            unsafe { ANativeWindow_release(window) };
             idle_ticks = idle_ticks.saturating_add(1);
             // 33ms while fresh, backing off to 250ms when static.
             let delay_ms = match idle_ticks {

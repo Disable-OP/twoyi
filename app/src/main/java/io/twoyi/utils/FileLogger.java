@@ -648,8 +648,7 @@ public final class FileLogger {
                     skipped += s;
                 }
                 fos.write(("...[skipped " + skipped + " of " + len
-                        + " bytes \u2014 tail follows...]
-")
+                        + " bytes \u2014 tail follows...]\n")
                         .getBytes(StandardCharsets.UTF_8));
             }
             byte[] buf = new byte[64 * 1024];

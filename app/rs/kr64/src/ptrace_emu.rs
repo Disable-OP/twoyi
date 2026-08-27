@@ -1689,17 +1689,17 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     getsockopt_nr: 373,
     close_nr: 6,
     fcntl_nr: 55,
-    // 6-Z110: i386 connect = 363 (per asm/unistd_32.h: __NR_connect
-    // 363) and writev = 146 (per asm/unistd_32.h: __NR_writev 146).
-    // The i386 direct 363 connect number does NOT fire at runtime
-    // (bionic i386 normally multiplexes ALL socket ops through
-    // socketcall nr=102, subcall 3 = connect — handled by the
-    // dedicated i386 socketcall subcall-3 arm). Locked in for ABI
-    // completeness + so the EXIT handler's `== abi.connect_nr`
-    // comparison is correct if a future i386 guest ever issues the
-    // direct nr=363. Mirrors the existing 6-Z99 ABI-completeness
-    // precedent.
-    connect_nr: 363,
+    // 6-Z110 + 6-Z184 fix (agent 14): i386 connect = 361 per the
+    // upstream i386 unistd table (socket 359 / bind 360 / connect 361 /
+    // listen 362 / accept 363). The previous value 363 was actually
+    // ACCEPT, inconsistent with our own listen_nr=362. writev = 146.
+    // The direct i386 connect number does NOT fire at runtime (bionic
+    // i386 normally multiplexes ALL socket ops through socketcall
+    // nr=102, subcall 3 = connect — handled by the dedicated i386
+    // socketcall subcall-3 arm). Locked in for ABI completeness + so
+    // the EXIT handler's `== abi.connect_nr` comparison is correct if a
+    // future i386 guest ever issues the direct nr=361.
+    connect_nr: 361,
     writev_nr: 146,
     // 6-Z155 identity-syscall fakes (i386: no plain setuid/setgid —
     // kernel-internal only; setresuid=208, setresgid=210, setgroups=81).
@@ -2714,8 +2714,12 @@ fn compute_exit_return_value(syscall_nr: i64, abi: &ChildAbi) -> Option<i64> {
         // numbers: x86_64=157, i386=172, aarch64=167. setrlimit:
         // x86_64=160, i386=75, aarch64=164. ugetrlimit (i386 191)
         // reads — fake 0 too (unlimited).
-        || syscall_nr == 157  // prctl (x86_64)
-        || syscall_nr == 160  // setrlimit (x86_64)
+        // 6-Z184 AUDIT FIX (agent 9): 157/160 are prctl/setrlimit ONLY
+        // on x86_64 — ungated they also faked i386 157/160
+        // (sched_getscheduler / sched_get_priority_min) and wrong
+        // aarch64 numbers to 0. Gate on the x86_64 ABI like the
+        // sibling arms.
+        || (abi.execve == 59 && (syscall_nr == 157 || syscall_nr == 160)) // x86_64: prctl/setrlimit
         || (abi.execve == 11 && (syscall_nr == 172 || syscall_nr == 75 || syscall_nr == 191)) // i386: prctl/setrlimit/ugetrlimit
         || (abi.execve == 221 && (syscall_nr == 167 || syscall_nr == 164))
     // aarch64: prctl/setrlimit
@@ -5181,17 +5185,40 @@ fn iov_total_len_child(pid: libc::pid_t, msghdr_ptr: u64, is_i386: bool) -> (i64
 /// construct a fake state, insert an entry, call this, and assert
 /// removal — locking the per-pid cleanup contract independently of the
 /// ptrace loop's waitpid/wait-status plumbing.
+#[allow(clippy::too_many_arguments)]
 fn forget_dead_pid_state(
     pid: libc::pid_t,
     in_syscall_map: &mut std::collections::HashMap<libc::pid_t, bool>,
     fake_netlink_fds: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
     netlink_fd_next: &mut std::collections::HashMap<libc::pid_t, i32>,
     fake_propserv_fds: &mut std::collections::HashMap<libc::pid_t, std::collections::HashSet<i64>>,
+    prctl_rewritten_args: &mut std::collections::HashMap<libc::pid_t, (u64, u64)>,
+    pending_epoll_readback: &mut std::collections::HashMap<libc::pid_t, (i64, u64, usize)>,
+    pending_mount_enodev: &mut std::collections::HashSet<libc::pid_t>,
+    pending_open_translated_path: &mut std::collections::HashMap<libc::pid_t, String>,
+    open_fd_owner_paths: &mut std::collections::HashMap<(libc::pid_t, i32), String>,
+    accept4_einval_streak: &mut std::collections::HashMap<libc::pid_t, u64>,
+    esrch_streak: &mut std::collections::HashMap<libc::pid_t, u32>,
+    pending_getpid: &mut std::collections::HashSet<libc::pid_t>,
 ) {
+    // 6-Z184 AUDIT FIX (agent 11): the death hygiene missed ~10 per-pid
+    // maps — a pid-RECYCLED successor inherited stale state (e.g. a
+    // stale prctl_rewritten_args forced its first EXIT ret>=0 rewrite,
+    // a stale pending_mount_enodev forced -ENODEV on its first mount)
+    // and the maps grew unboundedly across a long boot. Everything
+    // keyed by pid is dropped here now.
     in_syscall_map.remove(&pid);
     fake_netlink_fds.remove(&pid);
     netlink_fd_next.remove(&pid);
     fake_propserv_fds.remove(&pid);
+    prctl_rewritten_args.remove(&pid);
+    pending_epoll_readback.remove(&pid);
+    pending_mount_enodev.remove(&pid);
+    pending_open_translated_path.remove(&pid);
+    open_fd_owner_paths.retain(|(p, _), _| *p != pid);
+    accept4_einval_streak.remove(&pid);
+    esrch_streak.remove(&pid);
+    pending_getpid.remove(&pid);
 }
 
 /// Task 6-Z111: drop the dead pid's property-area registrations. The
@@ -5792,6 +5819,16 @@ fn prop_area_plan_update(
             snapshot[prop_info_off + PROP_INFO_LONG_OFFSET_OFF + 3],
         ]) as usize;
         let v_off = prop_info_off + long_offset;
+        // 6-Z184 AUDIT FIX (agent 10): long_offset is guest-controlled —
+        // without a bounds check the broadcaster below writes capacity+1
+        // bytes at an arbitrary offset OUTSIDE the 128 KiB area (the
+        // short-prop path is checked; this path was not). Reject when
+        // the value window leaves the snapshot (or overflows).
+        let v_end = v_off.checked_add(old_len).and_then(|e| e.checked_add(1));
+        match v_end {
+            Some(end) if end <= snapshot.len() => {}
+            _ => return Err(()),
+        }
         // For long props, the OLD serial's len nibble is the strlen
         // (the long value's capacity gate — bionic stores the value's
         // length, NOT the prop_info's, in the len nibble for long
@@ -7248,9 +7285,12 @@ fn mmap2_read_file_slice(
         return Some(Vec::new());
     }
     // Fast path: whole file already cached.
+    // 6-Z184 AUDIT FIX (agent 10): checked slicing — a file that grew
+    // between the cache insert and this mmap2 would panic the tracer
+    // (which kills every traced child via PTRACE_O_EXITKILL).
     if let Some(data) = cache.get(path) {
         let start = offset_bytes as usize;
-        return Some(data[start..start + len].to_vec());
+        return data.get(start..start + len).map(|s| s.to_vec());
     }
     let mut file = std::fs::File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();
@@ -7270,7 +7310,7 @@ fn mmap2_read_file_slice(
         *cache_bytes += file_len;
         cache.insert(path.to_string(), rc.clone());
         let start = offset_bytes as usize;
-        return Some(rc[start..start + len].to_vec());
+        return rc.get(start..start + len).map(|s| s.to_vec());
     }
     // Big file: positioned read of just the slice (no caching).
     use std::os::unix::fs::FileExt;
@@ -7885,7 +7925,13 @@ pub fn run_ptrace_loop(
     // map saves/restores `in_syscall` per child PID on each waitpid switch.
     let mut in_syscall_map: std::collections::HashMap<libc::pid_t, bool> =
         std::collections::HashMap::new();
-    let mut pending_getpid = false;
+    // 6-Z184 AUDIT FIX (agent 12): this used to be a single global bool —
+    // armed by child A's getpid ENTRY, then consumed by the NEXT EXIT stop
+    // of ANY child (no pid check), so an interleaved child B got its real
+    // syscall return overwritten with 1 (e.g. mmap returning 1 -> linker
+    // uses address 0x1 -> SIGSEGV). Per-pid set, mirroring pending_poll_fake.
+    let mut pending_getpid: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
     let mut loop_count: u64 = 0;
     // ── Task 6-Z83: rolling last-16-stops ring (stop forensics) ──
     // Every waitpid stop (syscall entry/exit, ptrace event, SIGSYS,
@@ -9194,6 +9240,14 @@ pub fn run_ptrace_loop(
                 &mut fake_netlink_fds,
                 &mut netlink_fd_next,
                 &mut fake_propserv_fds,
+    &mut prctl_rewritten_args,
+                &mut pending_epoll_readback,
+                &mut pending_mount_enodev,
+                &mut pending_open_translated_path,
+                &mut open_fd_owner_paths,
+                &mut accept4_einval_streak,
+                &mut esrch_streak,
+                &mut pending_getpid,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (the property_area_fds entries for the
@@ -9368,6 +9422,14 @@ pub fn run_ptrace_loop(
                 &mut fake_netlink_fds,
                 &mut netlink_fd_next,
                 &mut fake_propserv_fds,
+    &mut prctl_rewritten_args,
+                &mut pending_epoll_readback,
+                &mut pending_mount_enodev,
+                &mut pending_open_translated_path,
+                &mut open_fd_owner_paths,
+                &mut accept4_einval_streak,
+                &mut esrch_streak,
+                &mut pending_getpid,
             );
             // 6-Z111: also drop the dead pid's property-area
             // registrations (WIFSIGNALED mirror of the WIFEXITED call
@@ -10350,17 +10412,25 @@ pub fn run_ptrace_loop(
                             -38 // exit/exit_group → don't fake
                         } else if syscall_num == 45 {
                             0x80000000 // brk → non-zero (current break)
-                        } else if syscall_num == 186
-                            || syscall_num == 20
-                            || syscall_num == 102
-                            || syscall_num == 104
-                            || syscall_num == 105
-                            || syscall_num == 106
-                            || syscall_num == 107
-                            || syscall_num == 108
+                        } else if syscall_num == 20
+                            || syscall_num == 24
+                            || syscall_num == 47
+                            || syscall_num == 49
+                            || syscall_num == 50
+                            || syscall_num == 201
+                            || syscall_num == 202
+                            || syscall_num == 224
                         {
-                            // gettid(186), getpid(20), getuid(102), getgid(104),
-                            // geteuid(105), getegid(106), getuid32, getgid32 → return 1 (a valid positive ID)
+                            // 6-Z184 AUDIT FIX (agent 11): the old list
+                            // (102/104/105/106/107/108) were x86_64-style
+                            // guesses — on i386 those are
+                            // socketcall/setitimer/getitimer/stat/lstat/
+                            // fstat; faking them to 1 handed the guest a
+                            // phantom fd / fake-stat SUCCESS. Correct i386
+                            // identity getters: getpid 20, getuid 24,
+                            // getgid 47, geteuid 49, getegid 50, gettid 224,
+                            // getuid32 201, getgid32 202, msgget 186 —
+                            // return 1 (a valid positive ID).
                             1
                         } else {
                             -1 // generic error (-EPERM) — caller handles via error path
@@ -12000,13 +12070,13 @@ pub fn run_ptrace_loop(
 
                     match syscall_num {
                         n if n == abi.getpid => {
-                            pending_getpid = true;
+                            pending_getpid.insert(pid);
                             if loop_count <= 20 {
                                 log("intercepted getpid() -> will return 1");
                             }
                         }
                         n if n == abi.getppid => {
-                            pending_getpid = true;
+                            pending_getpid.insert(pid);
                             if loop_count <= 20 {
                                 log("intercepted getppid() -> will return 1");
                             }
@@ -12187,12 +12257,24 @@ pub fn run_ptrace_loop(
                                 // Linux. open(): flags = arg2. openat():
                                 // flags = arg3.
                                 if is_properties_path(&path) || is_properties_path(&translated) {
+                                    // 6-Z184 AUDIT FIX (agent 12): openat2's
+                                    // arg3 is a `struct open_how *` POINTER,
+                                    // not integer flags — stripping bit 0x80
+                                    // from it corrupts the pointer (EFAULT).
+                                    // Restrict the strip to open/openat;
+                                    // openat2 opens fall through to the
+                                    // fd=42 fake as before.
+                                    let is_open_family = syscall_num == abi.open || syscall_num == abi.openat;
                                     let flags_reg = if syscall_num == abi.open {
                                         abi.reg_arg2
                                     } else {
                                         abi.reg_arg3
                                     };
-                                    let flags = get_syscall_arg(&regs, flags_reg) as i32;
+                                    let flags = if is_open_family {
+                                        get_syscall_arg(&regs, flags_reg) as i32
+                                    } else {
+                                        0 // openat2: value ignored (0x80 clear → no strip)
+                                    };
                                     if flags & 0x80 != 0 {
                                         let new_flags = flags & !0x80;
                                         set_syscall_arg(
@@ -14898,8 +14980,12 @@ pub fn run_ptrace_loop(
                     // threads (and the whole guest) get the core back.
                     // Non-spinning accept4 users are untouched (the
                     // counter resets on any non-EINVAL accept4 return).
+                    // 6-Z184 AUDIT FIX (agent 12): accept4 is 288
+                    // (x86_64/aarch64) / 364 (i386). The previous literal
+                    // 242 matched sched_getaffinity/mq_timedsend — an
+                    // unrelated EINVAL loop was mislabeled + parked.
                     if past_first_execve
-                        && (syscall_num == 242 || syscall_num == 288 || syscall_num == 364)
+                        && (syscall_num == 288 || syscall_num == 364)
                         && ret == -22
                     {
                         let n = accept4_einval_streak
@@ -15056,7 +15142,11 @@ pub fn run_ptrace_loop(
                         ));
                     }
 
-                    if pending_getpid {
+                    if pending_getpid.contains(&pid) {
+                        // Only consume for THIS pid, and only if the EXIT
+                        // stop is still a syscall EXIT (the syscall_nr
+                        // rewind already happened above; a signal-delivery
+                        // stop in between would have kept nr intact).
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
                             // `abi` was unwrapped above (it is the
@@ -15071,7 +15161,7 @@ pub fn run_ptrace_loop(
                             set_syscall_ret(&mut regs2, &abi, 1);
                             let _ = ptrace_setregs(pid, &regs2, len);
                         }
-                        pending_getpid = false;
+                        pending_getpid.remove(&pid);
                     }
 
                     // ── Task 6-Z9: xattr-SET EXIT → fake return 0 ──────
@@ -16389,12 +16479,15 @@ pub fn run_ptrace_loop(
                                     .get(&pid)
                                     .map_or(false, |s| s.contains(&fd))
                                 {
-                                    // sendto(fd, buf, LEN, …): len = arg2 →
-                                    // report "all bytes sent". sendmsg's arg2
-                                    // is an msghdr* — not worth an iov sum for
-                                    // a socket nothing legitimately sends on.
+                                    // sendto(fd, buf, LEN, flags, …): LEN
+                                    // is arg3 (arg2 is the buf POINTER —
+                                    // returning it as a byte count handed
+                                    // the guest an absurd "bytes sent").
+                                    // sendmsg's arg2 is an msghdr* — not
+                                    // worth an iov sum for a socket nothing
+                                    // legitimately sends on.
                                     let new_ret: i64 = if op == NetlinkOp::SendTo {
-                                        get_syscall_arg(&regs, abi.reg_arg2) as i64
+                                        get_syscall_arg(&regs, abi.reg_arg3) as i64
                                     } else {
                                         1
                                     };
@@ -23010,9 +23103,11 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
 
     #[test]
     fn z110_connect_and_writev_numbers_match_uapi() {
-        // connect: i386 363 / x86_64 42 / aarch64 203 — verified per
-        // asm/unistd_32.h, asm/unistd_64.h, asm-generic/unistd.h.
-        assert_eq!(ABI_X86_32.connect_nr, 363, "i386 connect must be 363");
+        // connect: i386 361 / x86_64 42 / aarch64 203 — verified per
+        // the upstream i386 unistd table (socket 359, bind 360,
+        // connect 361, listen 362, accept 363), asm/unistd_64.h,
+        // asm-generic/unistd.h.
+        assert_eq!(ABI_X86_32.connect_nr, 361, "i386 connect must be 361");
         assert_eq!(ABI_X86_64.connect_nr, 42, "x86_64 connect must be 42");
         // writev: i386 146 / x86_64 20 / aarch64 66.
         assert_eq!(ABI_X86_32.writev_nr, 146, "i386 writev must be 146");
@@ -23158,12 +23253,20 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(fake_propserv_fds.contains_key(&pid));
         // Run the cleanup.
         forget_dead_pid_state(
-            pid,
-            &mut in_syscall_map,
-            &mut fake_netlink_fds,
-            &mut netlink_fd_next,
-            &mut fake_propserv_fds,
-        );
+                pid,
+                &mut in_syscall_map,
+                &mut fake_netlink_fds,
+                &mut netlink_fd_next,
+                &mut fake_propserv_fds,
+    &mut prctl_rewritten_args,
+                &mut pending_epoll_readback,
+                &mut pending_mount_enodev,
+                &mut pending_open_translated_path,
+                &mut open_fd_owner_paths,
+                &mut accept4_einval_streak,
+                &mut esrch_streak,
+                &mut pending_getpid,
+            );
         // All four maps no longer have the pid entry — pid-RECYCLED
         // successor inherits NOTHING.
         assert!(!in_syscall_map.contains_key(&pid));
