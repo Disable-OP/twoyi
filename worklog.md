@@ -12181,3 +12181,41 @@ Stage Summary:
 - Navigation is now fully marker-driven end to end. Next run should
   finally reach the terminal page and exercise the 6-Z188 socketpair
   pty + the staged busybox ash prompt.
+
+---
+Task ID: 6-Z188c
+Agent: main
+Task: Run 33125938988 (marker-nav probe): terminal page REACHED, pty
+master created, ptsname interposed, /sbin/sh exec'd — but the socketpair
+came back garbage (slave fd=-45511424) and the slave open bypassed the
+pty checks.
+
+Work Log:
+- WINS: terminalcommand marker x1 (navigation fixed); "pty master fd=15
+  (slot 0...)" + "ptsname(fd=15) -> /dev/pts/0" (Z188 engaged);
+  "exec path=/sbin/sh" through the hook exec interposition; FM clean
+  + same guest root before/after; exit-127 count 0.
+- FAILURE ANALYSIS:
+  (a) sv[] garbage: the socketpair syscall went through UNMARKED — the
+      tracer rewrote/skipped it, so the fd array never got kernel-
+      written values; every dup of the garbage slave EBADF'd and sh
+      inherited the recovery's fds as stdio (binary mojibake commands,
+      "File name too long", "syntax error").
+  (b) slave-open count 0: bionic's FORTIFIED open variants (__open_2/
+      __openat_2) have their own wrapper bodies in the hook — my pty
+      checks were only in open()/openat(), so the slave open bypassed
+      them entirely.
+- 6-Z188c FIXES:
+  * socketpair is now raw_syscall4_marked (tracer leaves it completely
+    untouched) + sv[] sanity validation (both fds in [0,1024); on
+    failure: log + close half-open fds + fail the ptmx open cleanly).
+  * pty_open_dispatch() shared by ALL FOUR open wrappers (open/openat/
+    __open_2/__openat_2).
+  * slave-open MISS logging (path matches /dev/pts/N but the slot is
+    dead in this process) for diagnosability.
+- Gates: gcc -fsyntax-only clean (pty code).
+
+Stage Summary:
+- Every layer of the terminal chain is now in place and individually
+  verified except the last two (real socketpair values + slave open via
+  the fortified variants). Next run should render the ash prompt.
