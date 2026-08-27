@@ -208,14 +208,17 @@ jobs:
           ls -lh /tmp/release/
           PRERELEASE_FLAG=""
           if [ "$PRERELEASE" = "true" ]; then PRERELEASE_FLAG="--prerelease"; fi
-          # --clobber re-uses an existing release with the same tag
-          # (re-dispatching the same tag replaces the APK).
-          gh release create "$TAG" "/tmp/release/${APK_NAME}" \
-            --title "Twoyi ${TAG}" \
-            --target "$SHA" \
-            --generate-notes \
-            --clobber \
-            $PRERELEASE_FLAG
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # Re-dispatch of the same tag: replace the APK on the
+            # existing release (upload --clobber IS supported).
+            gh release upload "$TAG" "/tmp/release/${APK_NAME}" --clobber
+          else
+            gh release create "$TAG" "/tmp/release/${APK_NAME}" \
+              --title "Twoyi ${TAG}" \
+              --target "$SHA" \
+              --generate-notes \
+              $PRERELEASE_FLAG
+          fi
           echo "Release created:"
           gh release view "$TAG" --json url -q .url || true
 
