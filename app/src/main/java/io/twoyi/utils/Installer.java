@@ -62,7 +62,14 @@ public class Installer {
         String envCmd = String.format("export TMPDIR=%s;export HOME=%s;", envPath, envPath);
 
         String adbServerCommand = String.format(Locale.US, "%s -P %d nodaemon server", adbPath, ADB_PORT);
-        ShellUtil.newSh().newJob().add(envCmd).add(adbServerCommand).submit();
+        // 6-Z184: the server shell runs `nodaemon server`, which NEVER
+        // completes — so it cannot be waitAndClose()d here (that would
+        // deadlock), and the adb server it hosts must stay alive for the
+        // connect + install jobs below anyway. Keep the reference and
+        // close it (non-blocking) once the install finishes — previously
+        // this shell (and the adb daemon it hosts) leaked on every call.
+        final Shell serverShell = ShellUtil.newSh();
+        serverShell.newJob().add(envCmd).add(adbServerCommand).submit();
 
         Shell shell = ShellUtil.newSh();
 
@@ -170,6 +177,14 @@ public class Installer {
                     installShell.waitAndClose(1, TimeUnit.SECONDS);
                 } catch (Throwable ignored) {
                 }
+                // Also release the adb-server shell (6-Z184): its nodaemon
+                // job never finishes on its own, so a plain close() is the
+                // only way — killing the adb server is intended here, the
+                // install is done.
+                try {
+                    serverShell.close();
+                } catch (Throwable ignored) {
+                }
             }
         });
     }
@@ -198,15 +213,22 @@ public class Installer {
 
         PackageInfo packageInfo = pm.getPackageArchiveInfo(path, 0);
 
+        // 6-Z184: checkFile() runs on a jdeferred background executor;
+        // Toast.show() off the main looper throws RuntimeException, which
+        // jdeferred turns into a reject — the message was never shown and
+        // the failure surfaced as a generic install error instead.
+        final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
         if (packageInfo == null) {
-            Toast.makeText(context.getApplicationContext(), R.string.check_file_invlid_apk, Toast.LENGTH_SHORT).show();
+            main.post(() -> Toast.makeText(context.getApplicationContext(),
+                    R.string.check_file_invlid_apk, Toast.LENGTH_SHORT).show());
             return false;
         }
 
         String packageName = packageInfo.packageName;
 
         if (TextUtils.equals(packageName, context.getPackageName())) {
-            Toast.makeText(context.getApplicationContext(), R.string.check_file_create_self_tip, Toast.LENGTH_SHORT).show();
+            main.post(() -> Toast.makeText(context.getApplicationContext(),
+                    R.string.check_file_create_self_tip, Toast.LENGTH_SHORT).show());
             return false;
         }
 

@@ -562,9 +562,12 @@ fn touch_server() {
                     // new worker can take its turn on the next `accept()`.
                 });
             }
-            Err(_) => {
-                info!("[INPUT] touch-events server accept error!");
-                break;
+            Err(e) => {
+                // A transient accept error (EMFILE, ENOMEM, EINTR…) must
+                // not kill the touch server for the rest of the session —
+                // back off briefly and keep serving.
+                info!("[INPUT] touch-events server accept error: {} — continuing", e);
+                thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }
@@ -638,7 +641,19 @@ fn touch_server_abstract() {
                 if e.raw_os_error() == Some(EINTR) {
                     continue;
                 }
+                // Transient resource errors: keep the listener alive
+                // (previously ANY error returned, permanently disabling
+                // the jailed touch bridge until app restart).
+                if matches!(
+                    e.raw_os_error(),
+                    Some(EMFILE) | Some(ENOMEM) | Some(ENFILE) | Some(ECONNABORTED)
+                ) {
+                    log::warn!("[INPUT] abstract touch accept() transient: {} — retrying", e);
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
                 log::error!("[INPUT] abstract touch accept(): {}", e);
+                close(fd);
                 return;
             }
             info!(
@@ -661,7 +676,20 @@ fn touch_server_abstract() {
                                 bytes[off..].as_ptr() as *const c_void,
                                 bytes.len() - off,
                             );
-                            if n <= 0 {
+                            if n < 0 {
+                                // EINTR before any byte was written: retry,
+                                // don't kill a healthy connection over a
+                                // spurious signal.
+                                if std::io::Error::last_os_error().raw_os_error()
+                                    == Some(EINTR)
+                                    && off == 0
+                                {
+                                    continue;
+                                }
+                                dead = true;
+                                break;
+                            }
+                            if n == 0 {
                                 dead = true;
                                 break;
                             }
@@ -832,9 +860,12 @@ fn key_server() {
                     // Channel disconnected — new client took over
                 });
             }
-            Err(_) => {
-                info!("key server error happened!");
-                break;
+            Err(e) => {
+                // Transient accept errors must not permanently kill the
+                // key server (a dead key server disables guest hardware
+                // keys until app restart).
+                info!("key server accept error: {} — continuing", e);
+                thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }

@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
@@ -61,7 +54,12 @@ pub fn spawn_qemu_pipe_proxy(
 ) -> std::io::Result<QemuPipeProxyHandle> {
     // Non-blocking so the accept loop can poll the shutdown flag.
     let fd = std::os::unix::io::AsRawFd::as_raw_fd(&listener);
-    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    // Read-modify-write: OR O_NONBLOCK into the existing flags instead
+        // of clobbering them (F_SETFL replaces the whole status word).
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
@@ -150,11 +148,13 @@ impl Drop for QemuPipeProxyHandle {
 /// matching renderer socket, and pumps bytes both directions until
 /// either side closes.
 fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Result<()> {
-    // Step 1: read the "pipe:<channel>" handshake.
-    let channel = read_channel_name(&mut guest)?;
+    // Step 1: read the "pipe:<channel>" handshake (plus any payload
+    // bytes that arrived in the same packet — forwarded to the
+    // renderer below so the stream stays in sync).
+    let (channel, leftover) = read_channel_name(&mut guest)?;
     info!("[KR64][qemu_pipe] session {} channel = {}", sid, channel);
 
-    if channel != "opengles" && channel != "opengles2" && channel != "opengles3" {
+    if !KNOWN_CHANNELS.contains(&channel.as_str()) {
         // Unknown channel — close. (Future: route "audio", "camera", etc.)
         warning!(
             "[KR64][qemu_pipe] session {} unknown channel '{}', closing",
@@ -178,6 +178,20 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
         "[KR64][qemu_pipe] session {} connected to renderer at {}",
         sid, renderer_path
     );
+
+    // If the guest coalesced the handshake with early payload bytes
+    // (e.g. the first clientFlags word), push them into the renderer
+    // NOW — the pump below only moves bytes that arrive later, so any
+    // bytes we swallowed here would be silently dropped and the wire
+    // protocol would desync.
+    if !leftover.is_empty() {
+        info!(
+            "[KR64][qemu_pipe] session {} forwarding {} handshake-tail bytes",
+            sid,
+            leftover.len()
+        );
+        renderer.write_all(&leftover)?;
+    }
 
     // Step 3: spawn two pump threads for bidirectional forwarding.
     let g2r_done = Arc::new(AtomicBool::new(false));
@@ -222,10 +236,18 @@ fn handle_session(mut guest: UnixStream, rootfs: &str, sid: u64) -> std::io::Res
 ///
 /// The guest writes the channel name (e.g. `"pipe:opengles"`) in a
 /// single `write()` call. We read up to 256 bytes and parse the
-/// channel name from the buffer. If the first read doesn't contain
-/// a complete channel name, we keep reading until we get one or hit
-/// the buffer limit.
-fn read_channel_name(stream: &mut UnixStream) -> std::io::Result<String> {
+/// channel name from the buffer. Returns `(name, leftover)` where
+/// `leftover` holds any bytes that arrived in the same packet(s)
+/// AFTER the channel name (e.g. the first clientFlags word) — the
+/// caller must forward them or the stream desyncs.
+///
+/// A parse is only accepted when the name is genuinely TERMINATED:
+/// either a non-printable byte follows it in the buffer, or the
+/// accumulated bytes exactly equal `"pipe:" + a known channel name`.
+/// (Accepting end-of-buffer as a terminator would parse the split
+/// delivery `"pipe:open" + "gles"` as channel `"open"` and kill the
+/// session.)
+fn read_channel_name(stream: &mut UnixStream) -> std::io::Result<(String, Vec<u8>)> {
     let mut buf = [0u8; 256];
     let mut total = 0;
     while total < buf.len() {
@@ -241,8 +263,9 @@ fn read_channel_name(stream: &mut UnixStream) -> std::io::Result<String> {
         // first recv typically has all of it. But the guest MAY also
         // include the first 4 bytes of clientFlags in the same packet,
         // so we stop at the first non-printable byte.
-        if let Some(name) = parse_channel_name(&buf[..total]) {
-            return Ok(name.to_string());
+        if let Some((name, consumed)) = parse_channel_name(&buf[..total]) {
+            let leftover = buf[consumed..total].to_vec();
+            return Ok((name.to_string(), leftover));
         }
     }
     Err(std::io::Error::new(
@@ -251,10 +274,15 @@ fn read_channel_name(stream: &mut UnixStream) -> std::io::Result<String> {
     ))
 }
 
-/// If `buf` starts with `"pipe:"` and contains a printable name,
-/// return the name as a `&str`. Returns `None` if the buffer doesn't
-/// start with `"pipe:"` or the name is empty.
-fn parse_channel_name(buf: &[u8]) -> Option<&str> {
+/// Channel names [`handle_session`](fn.handle_session.html) accepts.
+const KNOWN_CHANNELS: [&str; 3] = ["opengles", "opengles2", "opengles3"];
+
+/// If `buf` starts with `"pipe:"` and contains a TERMINATED printable
+/// name, return `(name, total_bytes_consumed)` — consumed counts from
+/// the start of `buf` through the END of the name (not the terminator).
+/// Returns `None` if the buffer doesn't start with `"pipe:"`, the name
+/// is empty, or no terminator has arrived yet (keep reading).
+fn parse_channel_name(buf: &[u8]) -> Option<(&str, usize)> {
     if !buf.starts_with(PIPE_PREFIX.as_bytes()) {
         return None;
     }
@@ -264,12 +292,26 @@ fn parse_channel_name(buf: &[u8]) -> Option<&str> {
     // the channel name in the same write).
     let end = name_bytes
         .iter()
-        .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b))
-        .unwrap_or(name_bytes.len());
+        .position(|&b| b == 0 || !(0x20..=0x7e).contains(&b));
+    let end = match end {
+        Some(i) => i,
+        // No terminator in the buffer: only accept if the bytes so far
+        // spell a complete known channel (AOSP sends exactly
+        // "pipe:opengles" with nothing after it, and the connection
+        // stays open for the payload).
+        None => {
+            let candidate = std::str::from_utf8(name_bytes).ok()?;
+            if KNOWN_CHANNELS.contains(&candidate) {
+                return Some((candidate, buf.len()));
+            }
+            return None;
+        }
+    };
     if end == 0 {
         return None;
     }
-    std::str::from_utf8(&name_bytes[..end]).ok()
+    let name = std::str::from_utf8(&name_bytes[..end]).ok()?;
+    Some((name, PIPE_PREFIX.len() + end))
 }
 
 /// Bidirectional byte pump. Reads from `from`, writes to `to`.
@@ -330,27 +372,44 @@ mod tests {
 
     #[test]
     fn parse_opengles() {
-        assert_eq!(parse_channel_name(b"pipe:opengles"), Some("opengles"));
+        assert_eq!(parse_channel_name(b"pipe:opengles").map(|(n, _)| n), Some("opengles"));
     }
 
     #[test]
     fn parse_opengles2() {
-        assert_eq!(parse_channel_name(b"pipe:opengles2"), Some("opengles2"));
+        assert_eq!(parse_channel_name(b"pipe:opengles2").map(|(n, _)| n), Some("opengles2"));
     }
 
     #[test]
     fn parse_opengles3() {
-        assert_eq!(parse_channel_name(b"pipe:opengles3"), Some("opengles3"));
+        assert_eq!(parse_channel_name(b"pipe:opengles3").map(|(n, _)| n), Some("opengles3"));
     }
 
     #[test]
     fn parse_with_trailing_garbage() {
         // The guest may write a single packet that includes both the
         // channel name and the first 4 bytes of clientFlags. The
-        // parser must stop at the first non-printable byte.
+        // parser must stop at the first non-printable byte — and the
+        // consumed offset must stop at the END of the name so the
+        // caller can forward the tail.
         assert_eq!(
             parse_channel_name(b"pipe:opengles\x00\x00\x00\x00"),
-            Some("opengles")
+            Some(("opengles", 5 + 8))
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unterminated_unknown_name() {
+        // Split delivery "pipe:open" + later "gles": the first chunk
+        // is NOT a known channel and has no terminator — must keep
+        // reading, not parse as channel "open" (regression lock for
+        // the end-of-buffer-as-terminator bug).
+        assert_eq!(parse_channel_name(b"pipe:open"), None);
+        // ...and a full unknown name that IS terminated parses (the
+        // caller's known-channel check rejects it afterwards).
+        assert_eq!(
+            parse_channel_name(b"pipe:unknown_channel"),
+            Some(("unknown_channel", 5 + 16))
         );
     }
 
@@ -382,17 +441,21 @@ mod tests {
     fn read_channel_name_success() {
         let (mut server, mut client) = pair();
         client.write_all(b"pipe:opengles").unwrap();
-        let name = read_channel_name(&mut server).unwrap();
+        let (name, leftover) = read_channel_name(&mut server).unwrap();
         assert_eq!(name, "opengles");
+        assert!(leftover.is_empty());
     }
 
     #[test]
     fn read_channel_name_with_client_flags() {
-        // Guest writes channel name + clientFlags in one packet
+        // Guest writes channel name + clientFlags in one packet — the
+        // flags must come back as leftover (they were previously
+        // dropped, desyncing the wire protocol).
         let (mut server, mut client) = pair();
         client.write_all(b"pipe:opengles\x00\x00\x00\x00").unwrap();
-        let name = read_channel_name(&mut server).unwrap();
+        let (name, leftover) = read_channel_name(&mut server).unwrap();
         assert_eq!(name, "opengles");
+        assert_eq!(leftover, vec![0, 0, 0, 0]);
     }
 
     #[test]
@@ -519,15 +582,11 @@ mod tests {
         )
         .unwrap();
 
-        // Drop the proxy — should shut down the accept thread.
-        let path = proxy.path().to_string();
+        // Drop the proxy — should shut down the accept thread. If the
+        // accept thread ignored the shutdown flag, Drop's join() would
+        // hang this test — that hang IS the assertion.
+        let _path = proxy.path().to_string();
         drop(proxy);
-
-        // The accept thread should have exited. Verify by checking that
-        // the socket file may or may not exist (we don't unlink it in
-        // the proxy, the DeviceSocket does), but the thread is gone.
-        // If the thread didn't exit, this test would hang on Drop.
-        assert!(PathBuf::from(&path).exists() || !PathBuf::from(&path).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

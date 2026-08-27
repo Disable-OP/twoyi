@@ -207,9 +207,17 @@ public class AboutActivity extends AppCompatActivity {
                     .setTitle(R.string.about_feedback_title)
                     .setMessage(R.string.feedback_confirm)
                     .setPositiveButton(R.string.feedback_ok, (dialog, which) -> {
-                        Uri uri = Uri.parse("mailto:" + email);
-                        Intent intent = new Intent(Intent.ACTION_SENDTO, uri);
-                        intent.putExtra(Intent.EXTRA_SUBJECT, title); // 主题
+                        // 6-Z184: the mailto intent used to be built and
+                        // silently DISCARDED — the button did nothing.
+                        try {
+                            Uri uri = Uri.parse("mailto:" + email);
+                            Intent intent = new Intent(Intent.ACTION_SENDTO, uri);
+                            intent.putExtra(Intent.EXTRA_SUBJECT, title);
+                            startActivity(Intent.createChooser(intent, getString(R.string.about_feedback_title)));
+                        } catch (android.content.ActivityNotFoundException e) {
+                            Toast.makeText(AboutActivity.this,
+                                    R.string.error_generic, Toast.LENGTH_SHORT).show();
+                        }
                     }).setNegativeButton(R.string.read_faq_text, (dialog, which) -> {
                         UIHelper.showFAQ(this);
                     })

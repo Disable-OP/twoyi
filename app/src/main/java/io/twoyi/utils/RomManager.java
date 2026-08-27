@@ -348,8 +348,13 @@ public final class RomManager {
     }
 
     private static void killOrphanProcess() {
+        // 6-Z184: the old filter (`$3==1`, i.e. every PPID==1 process
+        // system-wide) attempted to kill hundreds of unrelated system
+        // daemons on every boot (each EPERM'd today, but would be lethal
+        // under an elevated shell). Filter to OUR OWN uid only.
         Shell shell = ShellUtil.newSh();
-        shell.newJob().add("ps -ef | awk '{if($3==1) print $2}' | xargs kill -9").exec();
+        shell.newJob().add("ps -ef | awk -v u=$(id -u) '{if($1==u && $3==1) print $2}'"
+                + " | xargs -r kill -9").exec();
     }
 
     private static void saveLastKmsg(Context context) {

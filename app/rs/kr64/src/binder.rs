@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -145,9 +138,12 @@
 //! * [`BinderProxy`] / [`BinderProxyHandle`] — owns the listener and
 //!   spawns one thread per guest connection (bounded by
 //!   [`MAX_PROXY_CONNECTIONS`]).
-//! * `ProxyShared` / `ConnState` — the shared servicemanager state:
-//!   the name registry, per-connection delivery queues, and the
-//!   pending-reply correlation map.
+//! * `ProxyShared` / `ConnState` — names for the shapes that hold the
+//!   servicemanager state (name registry + per-connection context).
+//!   NOTE: today the live state is the simpler `ServiceRegistry` +
+//!   `HandleTable`; the richer per-connection delivery-queue design
+//!   described by those names is NOT implemented — see "What is still
+//!   NOT here" above for the honest list.
 //! * `ParcelReader` / `ParcelWriter` — the libbinder Parcel codec
 //!   (interface token, string16, flat_binder_object).
 //! * `dispatch_request` / `handle_*` — per-ioctls handlers.
@@ -155,8 +151,9 @@
 //!   `forward_transaction_to_host` — the three transaction dispatch
 //!   paths (handle 0 → proxy servicemanager, fake handle → guest owner
 //!   connection, anything else → the host's real `/dev/binder`).
-//! * [`ThreadPool`] — kept from the skeleton era (no longer used by the
-//!   proxy: blocking idle reads would pin the fixed pool).
+//! * [`ThreadPool`] — kept from the skeleton era, exercised only by its
+//!   own unit test (the live proxy above spawns one bounded thread per
+//!   connection).
 //! * [`HandleTable`] — guest↔host handle translation table for the
 //!   future host-forwarding path (BINDER-3).
 //! * Protocol constants (`BINDER_*`, `BC_*`, `BR_*`, `SVC_MGR_*`) —
@@ -170,7 +167,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -880,9 +877,8 @@ pub const BINDER_CURRENT_PROTOCOL_VERSION: u32 = 8;
 
 /// Number of worker threads in the binder proxy's thread pool. Kept
 /// for the skeleton-era [`ThreadPool`] (now only exercised by its own
-/// unit test); the S1b proxy spawns one thread PER connection bounded
-/// by [`MAX_PROXY_CONNECTIONS`] instead, because blocking idle reads
-/// would pin every member of a fixed pool.
+/// unit test; the live proxy above spawns one thread PER connection
+/// bounded by [`MAX_PROXY_CONNECTIONS`]).
 pub const BINDER_THREAD_POOL_SIZE: usize = 4;
 
 /// Base of the proxy-allocated fake service handles: `0xF0000000 + n`
@@ -1426,17 +1422,13 @@ pub fn create_binder_device(rootfs: &str, vm_id: u32) -> std::io::Result<String>
         }
     }
 
-    // Bind the Unix listener. This creates the socket file as a side
-    // effect. (A production version would first `mknodat(S_IFSOCK|0666)`
-    // then `bind()` to it — matching VM's exact pattern at libkr64.so
-    // offset 0x11d770 — but `mknodat` requires CAP_MKNOD which is
-    // unavailable in many sandboxes. `UnixListener::bind` is the
-    // unprivileged fallback and works fine for the skeleton.)
-    let listener = UnixListener::bind(&sock_path)?;
-    #[cfg(unix)]
-    {
-        let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o666));
-    }
+    // NOTE: we deliberately do NOT bind the socket here. The only
+    // caller chain is create_binder_device() -> BinderProxy::new()
+    // (lib.rs:3385), and BinderProxy::new does its own unlink+bind+chmod
+    // of this exact path. Binding here as well would be dead work whose
+    // listener is immediately dropped and unlinked again. The symlinks
+    // below therefore dangle for a few instructions until the proxy
+    // binds — harmless, because the guest has not been exec'd yet.
 
     // Create the symlinks. Target is RELATIVE (`../vm{id}/dev/binder`)
     // so the kernel resolves it relative to the symlink's own location
@@ -1452,22 +1444,16 @@ pub fn create_binder_device(rootfs: &str, vm_id: u32) -> std::io::Result<String>
     }
 
     info!(
-        "[KR64][binder] created socket {} (fd={}) and 3 symlinks {{/dev/binder, /dev/hwbinder, /dev/vndbinder}} -> ../vm{}/dev/binder",
-        sock_path,
-        listener.as_raw_fd(),
-        vm_id
+        "[KR64][binder] prepared socket path {} and 3 symlinks {{/dev/binder, /dev/hwbinder, /dev/vndbinder}} -> ../vm{}/dev/binder (proxy binds next)",
+        sock_path, vm_id
     );
 
-    // Drop the listener — the caller will re-bind via BinderProxy::new.
-    // We unlink the socket file so the re-bind doesn't hit EADDRINUSE.
-    drop(listener);
-    let _ = fs::remove_file(&sock_path);
     Ok(sock_path)
 }
 
 // ============================================================================
-// Binder proxy — owns the listener + worker pool, accepts guest
-// connections, dispatches per-ioctl.
+// Binder proxy — owns the listener, accepts guest connections,
+// dispatches per-ioctl (one bounded thread per connection).
 // ============================================================================
 
 /// Owned binder proxy for one VM. Created via [`BinderProxy::new`],
@@ -1518,7 +1504,12 @@ impl BinderProxy {
         // Make the listening socket non-blocking so the accept thread
         // can poll the shutdown flag between accept attempts.
         let fd = listener.as_raw_fd();
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+        // Read-modify-write: OR O_NONBLOCK into the existing flags instead
+        // of clobbering them (F_SETFL replaces the whole status word).
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
 
         info!(
             "[KR64][binder][vm{}] proxy bound to {} (fd={}, non-blocking)",
@@ -1559,34 +1550,67 @@ impl BinderProxy {
         let accept_thread = thread::Builder::new()
             .name(format!("kr64-binder-accept-{}", vm_id))
             .spawn(move || {
-                // The pool lives inside the accept thread so its Drop
-                // (which joins workers) runs when the accept thread
-                // exits. This ensures workers are joined BEFORE the
-                // accept thread returns.
-                let pool = ThreadPool::new(BINDER_THREAD_POOL_SIZE);
+                // One thread PER CONNECTION, bounded by MAX_PROXY_CONNECTIONS.
+                // (An earlier revision used a fixed BINDER_THREAD_POOL_SIZE
+                // pool here — but handle_connection() serves a connection
+                // for its entire lifetime with blocking reads, so a fixed
+                // pool caps the number of SIMULTANEOUS guest binder clients
+                // at 4; the moment a 5th guest process connected, its first
+                // ioctl sat in the pool queue forever and the guest hung.)
+                // Connection threads are detached: they exit when the guest
+                // closes the socket (read_frame EOF) or the process dies —
+                // the counter is what enforces the bound, not joining.
+                let active = Arc::new(AtomicUsize::new(0));
                 info!(
-                    "[KR64][binder][vm{}] accept loop started (pool_size={})",
-                    vm_id, BINDER_THREAD_POOL_SIZE
+                    "[KR64][binder][vm{}] accept loop started (max_conns={})",
+                    vm_id, MAX_PROXY_CONNECTIONS
                 );
 
                 while !shutdown_for_thread.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _addr)) => {
+                            // Bound check BEFORE spawning: a connection over
+                            // the cap is dropped immediately (the guest sees
+                            // EOF on its next ioctl and may retry later).
+                            if active.load(Ordering::Acquire) >= MAX_PROXY_CONNECTIONS {
+                                warning!(
+                                    "[KR64][binder][vm{}] connection over cap ({}) dropped",
+                                    vm_id, MAX_PROXY_CONNECTIONS
+                                );
+                                drop(stream);
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                                continue;
+                            }
                             info!("[KR64][binder][vm{}] client connected", vm_id);
                             let host_fd = Arc::clone(&host_fd);
                             let handles = Arc::clone(&handles);
                             let services = Arc::clone(&services);
-                            pool.execute(move || {
-                                if let Err(e) =
-                                    handle_connection(stream, vm_id, &host_fd, &handles, &services)
-                                {
-                                    warning!(
-                                        "[KR64][binder][vm{}] connection handler ended: {}",
-                                        vm_id,
-                                        e
+                            let active_conn = Arc::clone(&active);
+                            active.fetch_add(1, Ordering::AcqRel);
+                            let spawned = thread::Builder::new()
+                                .name(format!("kr64-binder-conn-{}", vm_id))
+                                .spawn(move || {
+                                    let result = handle_connection(
+                                        stream, vm_id, &host_fd, &handles, &services,
                                     );
-                                }
-                            });
+                                    if let Err(e) = result {
+                                        warning!(
+                                            "[KR64][binder][vm{}] connection handler ended: {}",
+                                            vm_id, e
+                                        );
+                                    }
+                                    active_conn.fetch_sub(1, Ordering::AcqRel);
+                                });
+                            if spawned.is_err() {
+                                // Spawn failed: undo the counter bump so the
+                                // slot stays available to later connects.
+                                active.fetch_sub(1, Ordering::AcqRel);
+                                warning!(
+                                    "[KR64][binder][vm{}] conn-thread spawn failed",
+                                    vm_id
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             // No pending connection — sleep briefly so
@@ -1602,7 +1626,6 @@ impl BinderProxy {
                     }
                 }
                 info!("[KR64][binder][vm{}] accept loop exiting", vm_id);
-                // pool drops here → workers receive Terminate and join.
             })?;
 
         Ok(BinderProxyHandle {

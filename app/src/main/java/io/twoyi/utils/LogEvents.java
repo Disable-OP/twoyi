@@ -104,9 +104,9 @@ public class LogEvents {
      *  process would block {@link #getBugreport} indefinitely — and since
      *  getBugreport is called from {@link io.twoyi.Render2Activity#showBootingProcedure}
      *  on a background thread, that thread (named "waiting-boot") would be
-     *  stuck forever, never reaching the System.exit(0) that follows the
-     *  trackBootFailure call. 5 s is generous: cold logcat -d on a busy
-     *  device returns in <500 ms; ps -ef in <100 ms.
+     *  stuck forever, never finishing the boot-failure handling that
+     *  follows the trackBootFailure call. 5 s is generous: cold logcat -d
+     *  on a busy device returns in <500 ms; ps -ef in <100 ms.
      */
     private static final long BUGREPORT_CMD_TIMEOUT_SECONDS = 5;
 
@@ -149,7 +149,7 @@ public class LogEvents {
             // Fixed: waitFor() without a timeout can hang forever if logcat
             // blocks (e.g. circular log buffer corruption, SELinux denial
             // storm). Since this runs on the boot-failure reporting path,
-            // a hang here would prevent System.exit(0) from running and
+            // a hang here would block the boot-failure handling and
             // leave the app stuck on the boot screen.
             if (!process.waitFor(BUGREPORT_CMD_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 process.destroyForcibly();

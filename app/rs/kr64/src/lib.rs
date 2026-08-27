@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -8342,7 +8335,10 @@ fn spawn_accept_thread(mut dev: devices::DeviceSocket, name: &'static str) {
     // Make the listening socket non-blocking so the thread can poll
     // for shutdown signals (in the MVP we just loop forever).
     let fd = listener.as_raw_fd();
-    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
 
     std::thread::Builder::new()
         .name(format!("kr64-accept-{}", name))
@@ -8770,7 +8766,10 @@ fn spawn_touch_accept_thread(mut dev: devices::DeviceSocket, cfg: Config) {
     // Non-blocking so we can poll for shutdown (consistent with the
     // generic `spawn_accept_thread`).
     let fd = listener.as_raw_fd();
-    let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
 
     let width = cfg.width;
     let height = cfg.height;

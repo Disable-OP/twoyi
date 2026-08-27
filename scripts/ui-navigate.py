@@ -23,7 +23,6 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-import os
 
 PACKAGE = os.environ.get("TWOYI_PACKAGE", "io.twoyi")
 
@@ -175,13 +174,20 @@ def screenshot(name):
         data = _screencap_adb()
         if data:
             source = "adb"
+            # 6-Z184: reset the empty-streak on every SUCCESS — the old
+            # counter only ever incremented (reset only in the reconnect
+            # branch), so three NON-adjacent empty frames across steps
+            # 6b/7/8 spuriously declared adb dead mid-run.
+            _ADB_EMPTY_STREAK = 0
         else:
             _ADB_EMPTY_STREAK += 1
             if _ADB_EMPTY_STREAK >= _ADB_DEAD_THRESHOLD:
                 # One last reconnect attempt, then declare adb dead for the
                 # rest of the run (it does not come back once the TWRP
                 # container starts — verified across 33014296538…33062718661).
-                subprocess.run(["adb", "connect", ADB[-1]], capture_output=True, timeout=10)
+                # adb connect expects host:port — meaningless for a local emulator serial.
+                if ":" in ADB[-1]:
+                    subprocess.run(["adb", "connect", ADB[-1]], capture_output=True, timeout=10)
                 data = _screencap_adb()
                 if data:
                     source = "adb"
@@ -1206,8 +1212,8 @@ def main():
     if os.environ.get("TWOYI_NO_INPUT", "0") == "1":
         print("  6-Z180: TWOYI_NO_INPUT=1 — touching gate files in rootfs")
         for rootfs in (
-            "/data/user/0/io.twoyi.debug/rootfs",
-            "/data/user/0/io.twoyi.debug/profiles/default/rootfs",
+            f"/data/user/0/{PACKAGE}/rootfs",
+            f"/data/user/0/{PACKAGE}/profiles/default/rootfs",
         ):
             # adb shell 'touch' (run-as not needed for /data/user/0 app
             # dirs owned by the app); fall back silently if absent.
@@ -1218,7 +1224,7 @@ def main():
         subprocess.run(
             ["sudo", "docker", "exec", "redroid",
              "sh", "-c",
-             "for d in /data/user/0/io.twoyi.debug/rootfs /data/user/0/io.twoyi.debug/profiles/default/rootfs; do"
+             f"for d in /data/user/0/{PACKAGE}/rootfs /data/user/0/{PACKAGE}/profiles/default/rootfs; do"
              " [ -d \"$d\" ] && touch \"$d/dev/.twoyi-no-input\" \"$d/.twoyi-no-input\" 2>/dev/null; done; true"],
             capture_output=True,
         )
@@ -1413,11 +1419,6 @@ def main():
     subprocess.run(ADB + ["pull", f"/sdcard/Android/data/{PACKAGE}/files/log/",
                          os.path.join(ART, "app-logs/")],
                   capture_output=True, timeout=30)
-
-    # Try to pull kr64 logs
-    subprocess.run(ADB + ["pull", f"/data/data/{PACKAGE}/kr64-app-stderr.log",
-                         os.path.join(ART, "kr64-app-stderr.log")],
-                  capture_output=True, timeout=10)
 
     # ── 6-Z85: pull the app's FileLogger logs + kr64 stderr via run-as ──
     # These hold the APP-SIDE boot story (waitBoot polling, markCompleted
@@ -1675,17 +1676,21 @@ def main():
     #     may still be on disk and contain KLOG output. Mirrored to
     #     the external dir as `dev-__kmsg__` (flat name); missing file
     #     is not an error.
+    # 6-Z184: kr64 mirrors these to /sdcard/Download/twoyi-logs/ (public,
+    # adb-pullable on every build — see kr64 lib.rs ext_files_dir), and the
+    # run-as fallback must use the ACTIVE package (io.twoyi.debug in CI),
+    # not the hardcoded release id.
     pull_with_fallback(
-        "/sdcard/Android/data/io.twoyi/files/twrp-init.log",
-        "/data/user/0/io.twoyi/rootfs/twrp-init.log",
+        "/sdcard/Download/twoyi-logs/twrp-init.log",
+        f"/data/user/0/{PACKAGE}/rootfs/twrp-init.log",
         os.path.join(ART, "twrp-init.log"))
     pull_with_fallback(
-        "/sdcard/Android/data/io.twoyi/files/twrp-kmsg.log",
-        "/data/user/0/io.twoyi/rootfs/twrp-kmsg.log",
+        "/sdcard/Download/twoyi-logs/twrp-kmsg.log",
+        f"/data/user/0/{PACKAGE}/rootfs/twrp-kmsg.log",
         os.path.join(ART, "twrp-kmsg.log"))
     pull_with_fallback(
-        "/sdcard/Android/data/io.twoyi/files/dev-__kmsg__",
-        "/data/user/0/io.twoyi/rootfs/dev/__kmsg__",
+        "/sdcard/Download/twoyi-logs/dev-__kmsg__",
+        f"/data/user/0/{PACKAGE}/rootfs/dev/__kmsg__",
         os.path.join(ART, "dev-__kmsg__"))
 
     print()

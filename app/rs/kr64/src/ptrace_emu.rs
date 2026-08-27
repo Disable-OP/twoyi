@@ -11615,7 +11615,7 @@ pub fn run_ptrace_loop(
                         // WRONG for PR_CAPBSET_READ — init's
                         // ComputeLastValidCap probe loop (AOSP
                         // capabilities.cpp, our staged copy at
-                        // app/cpp/init/capabilities.cpp:86) terminates
+                        // docs/reference/aosp-init/capabilities.cpp:86) terminates
                         // ONLY on the kernel's -EINVAL for cap >
                         // CAP_LAST_CAP; fake success made it spin ~8M
                         // times (run 32859526781). The EXIT side now

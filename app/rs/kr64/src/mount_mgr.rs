@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -194,6 +187,86 @@ fn chroot(path: &str) -> IoResult<()> {
     check(r)
 }
 
+/// Recursively remount every mount under `root` (including `root`
+/// itself) read-only.
+///
+/// `MS_BIND|MS_REMOUNT|MS_RDONLY` is NOT recursive: it only flips the
+/// one mount it names, while sub-mounts that an earlier
+/// `MS_BIND|MS_REC` copied in stay writable. Walking
+/// `/proc/self/mountinfo` and remounting each descendant closes that
+/// hole (the portable pre-`mount_setattr(AT_RECURSIVE)` approach —
+/// the host device kernel can be far older than 5.12).
+///
+/// Field 5 of each mountinfo line is the mount point with octal
+/// escapes (\040 for space etc.), which we decode before comparing.
+fn remount_tree_read_only(root: &str) {
+    let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(s) => s,
+        Err(e) => {
+            warning!(
+                "[KR64][mount_mgr] cannot read /proc/self/mountinfo for RO remount of {}: {}",
+                root,
+                e
+            );
+            // Fall back to the old single-mount remount — better than
+            // nothing (top mount becomes RO, submounts may not).
+            if let Err(e) = mount("", root, "", MS_REMOUNT | MS_RDONLY | MS_BIND, None) {
+                warning!(
+                    "[KR64][mount_mgr] fallback RO remount of {} failed: {}",
+                    root, e
+                );
+            }
+            return;
+        }
+    };
+
+    let root = root.trim_end_matches('/');
+    let mut targets: Vec<String> = Vec::new();
+    for line in mountinfo.lines() {
+        let mut fields = line.split(' ');
+        let mp = fields.nth(4); // field 5 (0-indexed 4) = mount point
+        let Some(mp) = mp else { continue };
+        let mp = decode_mountinfo_path(mp);
+        if mp == root || mp.starts_with(&format!("{}/", root)) {
+            targets.push(mp);
+        }
+    }
+    // Deepest-first: children before parents, so a parent remount can
+    // never race a child created between the two (best effort).
+    targets.sort_by_key(|t| std::cmp::Reverse(t.matches('/').count()));
+    let n = targets.len();
+    for t in &targets {
+        if let Err(e) = mount("", t, "", MS_REMOUNT | MS_RDONLY | MS_BIND, None) {
+            warning!("[KR64][mount_mgr] RO remount of {} failed: {}", t, e);
+        }
+    }
+    info!(
+        "[KR64][mount_mgr] enforced read-only on {} ({} mounts under {})",
+        root, n, root
+    );
+}
+
+/// Decode the octal escapes mountinfo uses in mount-point fields
+/// (`\040` space, `\011` tab, `\134` backslash, `\012` newline).
+fn decode_mountinfo_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 4 <= bytes.len() {
+            let oct = &s[i + 1..i + 4];
+            if let Ok(v) = u8::from_str_radix(oct, 8) {
+                out.push(v as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 // ============================================================================
 // Public API.
 // ============================================================================
@@ -311,10 +384,11 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
     // Step 3: bind-mount ROM partitions into the rootfs.
     if let Some(rom_dir) = &cfg.rom_dir {
         if rom_dir != &cfg.rootfs {
-            let mut flags = MS_BIND | MS_REC;
-            if cfg.read_only_rom {
-                flags |= MS_RDONLY;
-            }
+            // NOTE: no MS_RDONLY here — bind mounts take their flags from
+            // the SOURCE, so MS_RDONLY on the initial bind is silently
+            // ignored; the RO enforcement happens in the explicit
+            // recursive remount below.
+            let flags = MS_BIND | MS_REC;
             for part in &["system", "vendor", "product", "system_ext"] {
                 let src = format!("{}/{}", rom_dir, part);
                 let dst = format!("{}/{}", cfg.rootfs, part);
@@ -330,10 +404,14 @@ pub fn setup_mounts(cfg: &MountConfig) -> IoResult<()> {
                             e
                         ),
                     }
-                    // Remount read-only (bind mounts inherit the source's
-                    // flags, so we need an explicit remount to enforce RO).
+                    // Enforce RO. A single non-recursive
+                    // MS_REMOUNT|MS_RDONLY|MS_BIND only flips the TOP
+                    // mount — submounts bound in by MS_REC stay
+                    // writable — so walk /proc/self/mountinfo and
+                    // remount every mount under dst (see
+                    // remount_tree_read_only).
                     if cfg.read_only_rom {
-                        let _ = mount("", &dst, "", MS_REMOUNT | MS_RDONLY | MS_BIND, None);
+                        remount_tree_read_only(&dst);
                     }
                 } else {
                     warning!(

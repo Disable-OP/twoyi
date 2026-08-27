@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -125,7 +118,7 @@ pub fn populate_proc(rootfs: &str, cpu_count: u32, mem_mb: u64) -> std::io::Resu
     }
 
     // vendor/default.prop — read by init's PropertyLoadBootDefaults()
-    // (app/cpp/init/property_service.cpp:891 — /vendor/default.prop is
+    // (docs/reference/aosp-init/property_service.cpp:891 — /vendor/default.prop is
     // one of the FIXED list of .prop files init loads, alongside
     // /system/build.prop, /vendor/build.prop, etc.). The CRITICAL key
     // is ro.hardware=goldfish which tells init to load AOSP Goldfish
@@ -433,20 +426,22 @@ fn write_proc_mounts(proc_dir: &str) -> std::io::Result<()> {
         "tmpfs /mnt tmpfs rw,seclabel,nosuid,nodev,noexec,relatime,mode=755,gid=1000 0 0\n",
         "tmpfs /storage tmpfs rw,seclabel,nosuid,nodev,noexec,relatime,mode=755,gid=1000 0 0\n",
     );
-    write_file(proc_dir, "mounts", content)?;
+    // NOTE: do NOT write {proc}/mounts as a regular file first — on a
+    // re-run /proc/mounts is already a SYMLINK to self/mounts, so that
+    // write would silently truncate the TARGET through the link (and
+    // could fail EACCES on the 0o444 chmod from the previous run).
+    // Write self/mounts first, then create the symlink below.
 
     // /proc/self/mounts — same content as /proc/mounts.
     // Use write_file (not fs::File::create) so the file gets the same
     // 0o444 mode + idempotency-chmod-to-writable-on-re-run treatment
-    // as every other /proc file. Without this, the second populate_proc
-    // call dies with EACCES here: write_file() above chmods the symlink
-    // TARGET (which is /proc/self/mounts) to 0o444, then this raw
-    // File::create can't open it.
+    // as every other /proc file.
     let self_dir = format!("{}/self", proc_dir);
     fs::create_dir_all(&self_dir)?;
     write_file(&self_dir, "mounts", content)?;
 
     // /proc/mounts → symlink to /proc/self/mounts (kernel convention).
+    // remove_file on an existing symlink removes the LINK, not its target.
     let _ = fs::remove_file(format!("{}/mounts", proc_dir));
     #[cfg(unix)]
     {
@@ -598,13 +593,17 @@ fn write_proc_sys(proc_dir: &str) -> std::io::Result<()> {
 
 /// Write the `ro.vm.*` system properties to `{rootfs}/system/etc/ro.vm.prop`.
 ///
-/// This mirrors VM's `VMPropSetter` (see `VM_KR64_ANALYSIS.md` §2.9) which
-/// injects a set of `ro.vm.*` properties into the guest's property service
-/// so guest apps and framework code can detect that they're running inside
-/// a VM (and query its capabilities). The guest's `init` loads `.prop`
-/// files from `/system/etc/` during early boot via the
-/// `load_system_props()` call in `system/core/init/property_service.cpp`,
-/// so dropping a file here is the canonical way to add new `ro.` props.
+/// This mirrors VM's `VMPropSetter` (see `VM_KR64_ANALYSIS.md` §2.9).
+///
+/// **Honest scope note:** init's `PropertyLoadBootDefaults()` loads a
+/// FIXED list of .prop files — `/system/etc/ro.vm.prop` is NOT one of
+/// them, and nothing in AOSP 11 reads this file directly either (see
+/// `write_boot_preset_properties` below, which injects the properties
+/// that init ACTUALLY loads via `/system/build.prop`). The file is kept
+/// as an informational marker of the VM environment (useful for shell
+/// debugging: `cat /system/etc/ro.vm.prop`) and for parity with the
+/// original VM's layout — but do not rely on `getprop ro.vm.*` seeing
+/// these values.
 ///
 /// # Properties written
 ///
@@ -810,7 +809,7 @@ pub fn write_boot_preset_properties(rootfs: &str) -> std::io::Result<()> {
 /// Write `{rootfs}/vendor/default.prop` with boot-critical properties.
 ///
 /// These properties are read by init's `PropertyLoadBootDefaults()` (see
-/// `app/cpp/init/property_service.cpp:891` — `/vendor/default.prop` is
+/// `docs/reference/aosp-init/property_service.cpp:891` — `/vendor/default.prop` is
 /// one of the FIXED list of `.prop` files init loads, alongside
 /// `/system/build.prop`, `/vendor/build.prop`, `/product/build.prop`,
 /// etc.) before `/dev/__properties__` is fully populated, to configure

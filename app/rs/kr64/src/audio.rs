@@ -1,10 +1,3 @@
-// Copyright Disclaimer: AI-Generated Content
-// This file was created by GitHub Copilot, an AI coding assistant.
-// AI-generated content is not subject to copyright protection and is provided
-// without any warranty, express or implied, including warranties of
-// merchantability, fitness for a particular purpose, or non-infringement.
-// Use at your own risk.
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://www.mozilla.org/MPL/2.0/.
@@ -570,7 +563,12 @@ impl AudioDevice {
         // can poll the shutdown flag between accept attempts (mirrors
         // BinderProxy::spawn in binder.rs).
         let fd = listener.as_raw_fd();
-        let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+        // Read-modify-write: OR O_NONBLOCK into the existing flags instead
+        // of clobbering them (F_SETFL replaces the whole status word).
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags >= 0 {
+            let _ = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        }
 
         // Clone the shutdown Arc twice: one for the accept thread, one
         // for the returned handle. Both share the same AtomicBool.

@@ -341,9 +341,19 @@ public class SettingsActivity extends AppCompatActivity {
             });
 
             export.setOnPreferenceClickListener(preference -> {
-                Intent intent = new Intent(Intent.ACTION_VIEW);
-                intent.setType(DocumentsContract.Document.MIME_TYPE_DIR);
-                startActivity(intent);
+                try {
+                    Intent intent = new Intent(Intent.ACTION_VIEW);
+                    intent.setType(DocumentsContract.Document.MIME_TYPE_DIR);
+                    startActivity(intent);
+                } catch (android.content.ActivityNotFoundException e) {
+                    // 6-Z184: devices without a documents-UI handler used to
+                    // crash here.
+                    Activity ctx = getActivity();
+                    if (ctx != null) {
+                        android.widget.Toast.makeText(ctx,
+                                getString(R.string.error_generic), android.widget.Toast.LENGTH_SHORT).show();
+                    }
+                }
                 return true;
             });
 
@@ -517,31 +527,56 @@ public class SettingsActivity extends AppCompatActivity {
                 // to leave a silently-corrupt rootfs that still reported SUCCESS
                 // (E2E run 32616016488: sbin/libminuitwrp.so = 0 bytes). The
                 // importer now detects and fails loudly; the retry re-imports
-                // from the same Uri into a freshly-cleared directory.
+                // from the same Uri into a freshly-cleared STAGING dir.
+                //
+                // 6-Z184 NON-DESTRUCTIVE IMPORT: all attempts extract into a
+                // staging sibling; the working rootfs is only replaced after
+                // an attempt succeeds. A failed import no longer destroys the
+                // previously-working ROM.
+                File stagingDir = new File(profileRootfsDir.getParentFile(),
+                        profileRootfsDir.getName() + ".importing");
                 final int MAX_IMPORT_ATTEMPTS = 2;
                 boolean success = false;
                 String errorMsg = null;
-                for (int attempt = 1; attempt <= MAX_IMPORT_ATTEMPTS && !success; attempt++) {
-                    // Clear existing rootfs (also wipes any partial state from a failed attempt)
-                    if (profileRootfsDir.exists()) {
-                        io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
-                    }
-                    profileRootfsDir.mkdirs();
+                try {
+                    for (int attempt = 1; attempt <= MAX_IMPORT_ATTEMPTS && !success; attempt++) {
+                        // Clear the staging dir (also wipes any partial state
+                        // from a failed attempt); the LIVE rootfs stays intact.
+                        if (stagingDir.exists()) {
+                            io.twoyi.utils.IOUtils.deleteDirectory(stagingDir);
+                        }
+                        stagingDir.mkdirs();
 
-                    try {
-                        success = io.twoyi.utils.RamdiskImporter.importRamdisk(activity, uri, profileRootfsDir);
-                    } catch (Exception e) {
-                        errorMsg = e.getMessage();
-                        Log.e("SettingsActivity", "Import attempt " + attempt + "/" + MAX_IMPORT_ATTEMPTS + " failed", e);
+                        try {
+                            success = io.twoyi.utils.RamdiskImporter.importRamdisk(activity, uri, stagingDir);
+                        } catch (Exception e) {
+                            errorMsg = e.getMessage();
+                            Log.e("SettingsActivity", "Import attempt " + attempt + "/" + MAX_IMPORT_ATTEMPTS + " failed", e);
+                        }
+                        if (!success && attempt < MAX_IMPORT_ATTEMPTS) {
+                            Log.w("SettingsActivity", "Import attempt " + attempt + " failed ("
+                                + (errorMsg != null ? errorMsg : "unknown") + ") — retrying once");
+                        }
                     }
-                    if (!success && attempt < MAX_IMPORT_ATTEMPTS) {
-                        Log.w("SettingsActivity", "Import attempt " + attempt + " failed ("
-                            + (errorMsg != null ? errorMsg : "unknown") + ") — retrying once");
-                    }
-                }
 
-                if (success) {
-                    RomManager.initRootfs(activity);
+                    if (success) {
+                        // Swap the verified staging dir into place (rename in
+                        // the same parent = same filesystem = atomic).
+                        if (profileRootfsDir.exists()) {
+                            io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
+                        }
+                        if (!stagingDir.renameTo(profileRootfsDir)) {
+                            success = false;
+                            errorMsg = "staging rename failed: " + stagingDir.getAbsolutePath();
+                            Log.e("SettingsActivity", errorMsg);
+                        } else {
+                            RomManager.initRootfs(activity);
+                        }
+                    }
+                } finally {
+                    if (stagingDir.exists()) {
+                        io.twoyi.utils.IOUtils.deleteDirectory(stagingDir);
+                    }
                 }
 
                 // Return error message if failed (for display to user)

@@ -16,7 +16,7 @@ import re
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path("/home/z/my-project/repos/twoyi")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 RES_DIR = REPO_ROOT / "app/src/main/res"
 
 DEFAULT_FILE = RES_DIR / "values" / "strings.xml"

@@ -87,13 +87,18 @@ pub unsafe extern "C" fn renderer_init(
     };
     let window_ptr = window.ptr().as_ptr() as *mut c_void;
 
-    // Acquire an extra reference to the ANativeWindow so it stays alive
-    // after this function returns and the NativeWindow wrapper is dropped.
-    // The renderer thread will use this pointer. Without this, the window
-    // is freed when the NativeWindow drops, causing a use-after-free.
-    unsafe {
-        ndk_sys::ANativeWindow_acquire(window_ptr as *mut ndk_sys::ANativeWindow);
-    }
+    // NOTE (ref-count audit): do NOT acquire an extra reference here.
+    // - TWRP mode: core::renderer_thread_main hands the pointer to
+    //   twrp_set_window(), which acquires its OWN reference and releases
+    //   the previous one — the ownership is fully managed there.
+    // - emugl mode: libOpenglRender stores the raw pointer; the Java
+    //   Surface object itself holds a reference for the surface's
+    //   lifetime, which keeps the window valid (the upstream-twoyi
+    //   ownership model, matched by renderer_reset_window's explicit
+    //   fromSurface/release pair in lib.rs).
+    // A manual acquire here leaked one ANativeWindow per surface
+    // recreation (each re-entering renderer_init pinned the window's
+    // gralloc buffer queue for the process lifetime).
 
     core::init_renderer(
         window_ptr,
@@ -369,7 +374,10 @@ unsafe fn register_natives(jvm: &JavaVM, class_name: &str, methods: &[NativeMeth
 
 #[no_mangle]
 #[allow(non_snake_case)]
-unsafe fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
+// extern "C" is REQUIRED: the JVM resolves JNI_OnLoad through the C
+// ABI table; Rust's default (unspecified) ABI happens to match C on
+// our targets but is not guaranteed to.
+pub unsafe extern "C" fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint {
     // Initialize logger - if this fails, continue anyway
     android_logger::init_once(
         Config::default()
@@ -421,25 +429,18 @@ pub extern "C" fn twoyi_start_input_system(width: i32, height: i32) {
 #[no_mangle]
 pub extern "C" fn twoyi_print_help() {
     use std::io::{self, Write};
-    let _ = writeln!(io::stdout(), "Twoyi Native Library - v0.1.0");
-    let _ = writeln!(io::stdout(), "\nExported Functions:");
+    let _ = writeln!(io::stdout(), "Twoyi Native Library (libtwoyi.so)");
+    let _ = writeln!(io::stdout(), "\nExported C functions (shell-accessible via dlopen/dlsym):");
     let _ = writeln!(
         io::stdout(),
-        "  twoyi_start_input_system(width, height) - Start input system"
+        "  twoyi_start_input_system(width, height) - Start the touch/key bridge"
     );
-    let _ = writeln!(io::stdout(), "  twoyi_print_help() - Show this help");
+    let _ = writeln!(io::stdout(), "  twoyi_send_keycode(keycode)       - Send a keycode event");
+    let _ = writeln!(io::stdout(), "  twoyi_print_help()                - Show this help");
+    let _ = writeln!(io::stdout(), "\nIn-app usage: System.loadLibrary(\"twoyi\") via the Twoyi app.");
     let _ = writeln!(
         io::stdout(),
-        "  twoyi_send_keycode(keycode) - Send a keycode event"
-    );
-    let _ = writeln!(io::stdout(), "\nUsage from shell:");
-    let _ = writeln!(
-        io::stdout(),
-        "  This library can be loaded via System.loadLibrary(\"twoyi\") in Android apps"
-    );
-    let _ = writeln!(
-        io::stdout(),
-        "  Or called from shell using the twoyi wrapper script"
+        "Shell usage: run via jniLibs/<abi>/twoyi (linker64 wrapper)."
     );
 }
 
@@ -460,8 +461,6 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i3
     use std::ffi::CStr;
     use std::io::{self, Write};
 
-    let _ = writeln!(io::stdout(), "Twoyi Renderer - Standalone Mode");
-
     // Parse arguments from argc/argv
     let mut args: Vec<String> = Vec::new();
 
@@ -470,7 +469,6 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i3
             for i in 0..argc as isize {
                 let arg_ptr = *argv.offset(i);
                 if !arg_ptr.is_null() {
-                    // arg_ptr is *const i8, CStr::from_ptr expects *const i8
                     if let Ok(arg_cstr) = CStr::from_ptr(arg_ptr).to_str() {
                         args.push(arg_cstr.to_string());
                     }
@@ -479,40 +477,22 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const libc::c_char) -> i3
         }
     }
 
-    let _ = writeln!(io::stdout(), "argc: {}", argc);
-    if !args.is_empty() {
-        let _ = writeln!(io::stdout(), "Arguments:");
-        for (i, arg) in args.iter().enumerate() {
-            let _ = writeln!(io::stdout(), "  [{}]: {}", i, arg);
-        }
-    }
-
-    let _ = writeln!(io::stdout(), "\nUsage: ./libtwoyi.so [OPTIONS]");
-    let _ = writeln!(io::stdout(), "Options:");
+    let _ = writeln!(io::stdout(), "Twoyi libtwoyi.so - standalone mode");
     let _ = writeln!(
         io::stdout(),
-        "  --help                Show this help message"
+        "\nUsage: twoyi [--width <w>] [--height <h>] [--start-input] [--help]"
     );
     let _ = writeln!(
         io::stdout(),
-        "  --width <width>       Set virtual display width (default: 720)"
+        "  --start-input         Start the touch/key bridge only (default 720x1280)"
     );
     let _ = writeln!(
         io::stdout(),
-        "  --height <height>     Set virtual display height (default: 1280)"
-    );
-    let _ = writeln!(io::stdout(), "  --loader <path>       Set loader path");
-    let _ = writeln!(
-        io::stdout(),
-        "  --start-input         Start input system only"
+        "\nThis library is primarily designed to be loaded by the Twoyi app via"
     );
     let _ = writeln!(
         io::stdout(),
-        "\nNote: This library is primarily designed to be loaded by the Twoyi app."
-    );
-    let _ = writeln!(
-        io::stdout(),
-        "For full functionality, use it as a JNI library via System.loadLibrary(\"twoyi\")"
+        "System.loadLibrary(\"twoyi\"); standalone mode exists for shell debugging."
     );
 
     // Parse arguments

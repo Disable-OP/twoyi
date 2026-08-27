@@ -42,6 +42,10 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
 
     private final AtomicBoolean mRendering = new AtomicBoolean(false);
 
+    /** Bumped on every onSurfaceTextureAvailable — see the loop-guard note there. */
+    private final java.util.concurrent.atomic.AtomicInteger mSurfaceGeneration =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
     // LimitedQueue is backed by java.util.concurrent.ConcurrentLinkedQueue, so
     // mutations and iterations are lock-free and thread-safe. The render loop
     // reads from this queue without holding any monitor — the previous
@@ -144,6 +148,14 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
     @Override
     public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surface, int width, int height) {
 
+        // 6-Z184: per-surface generation. A fast destroy/recreate cycle
+        // used to leave the OLD render loop running: the shared mRendering
+        // flag was set back to true by the new surface before the old
+        // loop checked it, so two (or more) 60 fps loops + logcat shells
+        // ran in parallel. Each loop now dies unless ITS generation is
+        // still the current one.
+        final int myGeneration = ++mSurfaceGeneration;
+
         Shell.EXECUTOR.execute(() -> {
             List<String> callbackList = new CallbackList<String>() {
                 @Override
@@ -164,10 +176,14 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
                 }
             };
 
+            // 6-Z184: quote the filter spec and use the canonical
+            // '*:I' form — the unquoted '*I' is glob-prone and parsed as
+            // a TAG literally named '*I' by strict logcat parsers (no
+            // output at all).
             Shell shell = ShellUtil.newSh();
-            shell.newJob().add("timeout -s 9 30 logcat -v brief *I").to(callbackList).submit();
+            shell.newJob().add("timeout -s 9 30 logcat -v brief '*:I'").to(callbackList).submit();
 
-            while (mRendering.get()) {
+            while (mRendering.get() && mSurfaceGeneration == myGeneration) {
                 render();
                 SystemClock.sleep(16);
             }
