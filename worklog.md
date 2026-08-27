@@ -11430,3 +11430,59 @@ Stage Summary:
 - Build APK + kr64 gates running on the push; arm64 + x86 E2E dispatched
   next; VLM verification of app-display screenshots (menu visible, BLUE
   theme correct, touch evidence) is the exit criterion, then README.
+
+---
+Task ID: 6-Z183 RESULTS — APP DISPLAY + TOUCH + COLORS VERIFIED ON BOTH ARCHES
+Agent: main
+Task: E2E verification of the 6-Z183 fixes (runs 33066698639 arm64,
+33066710564 + 33068577142 x86)
+
+ARM64 (33066698639) — SUCCESS:
+- ALL 21 navigation screenshots non-zero (70,505 B each, docker path;
+  "adb declared DEAD" short-circuit fired exactly as designed).
+- TWOYI_DIAG lines SURVIVE in logcat now (no flood rotation): init →
+  twrp_set_window → render loop started → **first frame blitted 0.5 s
+  after loop start** (11:21:45.303; TWRP started 11:21:44 — the trace
+  gating made first-frame latency ~1 s end to end).
+- VLM verdict on the app display: TWRP UI visible IN THE APP WINDOW,
+  header/status bar **BLUE/cyan — CORRECT** (was orange-swapped before
+  the format fix; was a black void before the window-tracking fix).
+- TOUCH: recovery.log shows Set page 'clear_vars' → 'main2' (gate
+  dismissed, main menu reached) and later 'system_readonly' — multiple
+  gesture-driven transitions. Final display (gate page) matches the
+  final recovery.log page exactly — display is truthful.
+- Tracer stderr: 392 KB (was 4.5 MB); "per-syscall trace logging: OFF"
+  confirmed in the log.
+
+X86 (33068710564 + re-run 33068577142) — SUCCESS:
+- Screenshots non-zero via adb (5.8 KB → 11.7 KB → 11.8 KB as TWRP's
+  theme renders in); VLM: TWRP gate visible in the app window, BLUE
+  header correct. The RGBA format fix works on the emulator gralloc too.
+- TOUCH: the new `adb run-as` recovery.log pull shows
+  `Set page: 'clear_vars'` → `Set page: 'main2'` — the first-run gate
+  swipe works end to end on x86 (app onTouch → touch socket → hook →
+  evdev → TWRP main menu).
+- Trace gating OFF confirmed; tracer stderr 455 KB.
+
+Stage Summary:
+- Both arches: TWRP menu DISPLAYED IN THE APP with correct colors AND
+  driven by touch. 0-byte screenshots eliminated; evidence pipeline is
+  app-display-first; repo decluttered (672 deletions, 17 renames);
+  README/CONTRIBUTING updated to the verified state.
+
+---
+Task ID: 6-Z183 FINAL
+Agent: main
+Task: README + evidence refresh, final commits
+
+- screenshots/: replaced the fb0-pull + black-surface-era framework
+  shot with twrp-arm64-app-display-720x1600.png and
+  twrp-x86-app-display.png (both are the APP'S OWN DISPLAY as captured
+  by framework screencap — what the user actually sees).
+- README.md: both TWRP rows now claim "with touch, displayed in the
+  app" with VLM-verified proof links; boot chain section documents the
+  RGBA_8888 + live-window display path and the TWOYI_TRACE_SYSCALLS
+  opt-in; CI matrix table updated (run-as recovery.log pull on x86).
+- x86 workflow: added the `adb exec-out run-as io.twoyi.debug cat
+  rootfs/tmp/recovery.log` evidence pull (no adb root — keeps the
+  unrooted-device premise).

@@ -57,8 +57,8 @@ verified end-to-end inside GitHub Actions.
 
 | Path | Arch | Status | Evidence |
 |---|---|---|---|
-| **TWRP boot → menu, with touch** | **arm64-v8a** | ✅ **WORKING E2E in CI** | `ui-e2e-test-arm64.yml` — boots TWRP 3.7.0-9 (angler) in a redroid container on `ubuntu-24.04-arm`, renders the menu at native 720×1600 into the virtual fb0, and dismisses the first-run gate via real gestures piped through the input bridge (`Set page: clear_vars → main2` in recovery.log). Proof: [`screenshots/twrp-arm64-menu-fb0-720x1600.png`](screenshots/twrp-arm64-menu-fb0-720x1600.png) |
-| **TWRP boot → menu** | x86_64 | ✅ WORKING E2E in CI | `ui-e2e-test.yml` — the original byt_t_crv2 image path on the x86_64 emulator (KVM). |
+| **TWRP boot → menu, with touch, displayed in the app** | **arm64-v8a** | ✅ **WORKING E2E in CI** | `ui-e2e-test-arm64.yml` — boots TWRP 3.7.0-9 (angler) in a redroid container on `ubuntu-24.04-arm`, renders at native 720×1600, **displays the menu inside the app window with correct colors**, and drives it with real gestures through the input bridge (`Set page: clear_vars → main2` transitions in recovery.log). Proof — the app's own display as captured by framework screencap: [`screenshots/twrp-arm64-app-display-720x1600.png`](screenshots/twrp-arm64-app-display-720x1600.png) |
+| **TWRP boot → menu, with touch, displayed in the app** | x86_64 | ✅ WORKING E2E in CI | `ui-e2e-test.yml` — the original byt_t_crv2 image path on the x86_64 emulator (KVM); TWRP rendered in the app window with the correct blue theme ([proof](screenshots/twrp-x86-app-display.png)) and driven by real gestures (`Set page: clear_vars → main2` in the `run-as` recovery.log pull) |
 | **Full Android (AOSP ROM) guest** | x86_64 | ✅ WORKING (inherited baseline) | The original twoyi use case; see `docs/reference/ARCHITECTURE.md`. |
 | **Full Android (AOSP ROM) guest** | arm64-v8a | 🟡 IN PROGRESS | Guest init boots through second-stage + services under the arm64 tracer; not yet a full framework boot. Tracked in [`worklog.md`](worklog.md) (6-series). |
 | Host device requirement | arm64 phones | ✅ runs natively | The APK builds `arm64-v8a` + `x86_64`; on a real arm64 device the TWRP path is the same code CI exercises. |
@@ -69,12 +69,17 @@ App launch → ROM import → *Boot to Recovery* → **Launch Container** →
 `kr64` jail (mount + PID namespaces, `pivot_root` with chroot fallback) →
 TWRP `init` parses `init.rc` → `recovery` service starts with the
 `libtwrp_fb_hook.so` preload → theme load → `gr_init` → **PixelFlinger renders
-at native 720×1600 into the virtual fb0** → app blits to the Surface.
+at native 720×1600 into the virtual fb0** → the app's render loop blits the
+frame into the `Render2Activity` surface (RGBA_8888, live-window tracked —
+the menu appears in the app window with correct colors within ~0.5 s of the
+first frame).
 Input: screen gestures → app `onTouch` → **abstract-namespace touch socket**
 (`\0io.twoyi.touch`, chroot-proof) → hook bridge → synthesized evdev stream →
-TWRP page navigation. The CI run proves every hop with artifacts: the raw fb0
-pull (pixel histogram = the classic TWRP palette), the framework screencap,
-TWRP's own `recovery.log`, and the full tracer log.
+TWRP page navigation. CI proves every hop with artifacts: framework screencaps
+of the app's own display, TWRP's `recovery.log` (page transitions = touch
+proof), and the full tracer log. Heavy per-syscall tracer logging is OFF by
+default (`TWOYI_TRACE_SYSCALLS=1` opts back in) so the container runs at full
+speed.
 
 ### Known gaps (non-blocking)
 
@@ -152,8 +157,8 @@ the menu appears in the app window and touch works.
 |---|---|
 | `build.yml` | APK builds for `arm64-v8a` + `x86_64` on every push |
 | `kr64-tests.yml` | `cargo fmt` + 560 unit tests + clippy `-D warnings` |
-| `ui-e2e-test.yml` | x86_64 TWRP boots to its menu on the KVM emulator |
-| `ui-e2e-test-arm64.yml` | **arm64 TWRP boots to its menu with touch on redroid** (`ubuntu-24.04-arm`); fully adb-independent evidence pipeline (docker-exec taps: full tracer stderr, raw fb0 + md5, framework screencap, TWRP recovery.log, per-restart maps trap) |
+| `ui-e2e-test.yml` | x86_64 TWRP boots to its menu **displayed in the app** on the KVM emulator; pulls TWRP's `recovery.log` via `run-as` for the touch-page proof |
+| `ui-e2e-test-arm64.yml` | **arm64 TWRP boots to its menu with touch on redroid** (`ubuntu-24.04-arm`); adb-independent evidence pipeline (docker-exec taps: app-display screencaps, TWRP recovery.log, tracer stderr) |
 | `ui-e2e-aosp(-arm64).yml` | Full-Android guest E2E (x86_64 green; arm64 WIP) |
 
 The arm64 TWRP workflow accepts inputs (`recovery_url`, `redroid_tag`,
