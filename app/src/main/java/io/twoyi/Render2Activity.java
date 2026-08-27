@@ -146,9 +146,11 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             }
         };
         IntentFilter filter = new IntentFilter("io.twoyi.debug.TOUCH");
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(mDebugTouchReceiver, filter,
-                    Context.RECEIVER_EXPORTED);
+        if (Build.VERSION.SDK_INT >= 26) {
+            // Context.RECEIVER_EXPORTED == 0x2 (constant added in
+            // compileSdk 33; the flag VALUE is stable since API 26 —
+            // use the literal so older compileSks build too).
+            registerReceiver(mDebugTouchReceiver, filter, 0x2);
         } else {
             registerReceiver(mDebugTouchReceiver, filter);
         }
