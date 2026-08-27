@@ -1202,33 +1202,10 @@ def main():
     print('  Step 6: Tap "Launch Container"')
     print("=" * 60)
 
-    # 6-Z180: optional no-input A/B probe. When TWOYI_NO_INPUT=1 is set
-    # (workflow input twrp_no_input), touch the hook's gate files INSIDE
-    # the container rootfs BEFORE the container boots — the fb hook then
-    # disables its input bridge for this run (real-open fallback), which
-    # isolates whether the deterministic input-tail SIGSEGV lives in the
-    # bridge. Default: NOT set — touch stays enabled (the production
-    # path must boot WITH touch).
-    if os.environ.get("TWOYI_NO_INPUT", "0") == "1":
-        print("  6-Z180: TWOYI_NO_INPUT=1 — touching gate files in rootfs")
-        for rootfs in (
-            f"/data/user/0/{PACKAGE}/rootfs",
-            f"/data/user/0/{PACKAGE}/profiles/default/rootfs",
-        ):
-            # adb shell 'touch' (run-as not needed for /data/user/0 app
-            # dirs owned by the app); fall back silently if absent.
-            subprocess.run(
-                ADB + ["shell", f"touch {rootfs}/dev/.twoyi-no-input {rootfs}/.twoyi-no-input 2>/dev/null; true"],
-                capture_output=True,
-            )
-        subprocess.run(
-            ["sudo", "docker", "exec", "redroid",
-             "sh", "-c",
-             f"for d in /data/user/0/{PACKAGE}/rootfs /data/user/0/{PACKAGE}/profiles/default/rootfs; do"
-             " [ -d \"$d\" ] && touch \"$d/dev/.twoyi-no-input\" \"$d/.twoyi-no-input\" 2>/dev/null; done; true"],
-            capture_output=True,
-        )
-        print("  6-Z180: gate files touched (input bridge will be OFF this run)")
+    # 6-Z185: the 6-Z180 no-input A/B probe (TWOYI_NO_INPUT) was
+    # REMOVED — the hook no longer reads gate files (touch is always
+    # on; the user vetoed input gating). The workflow input was
+    # removed with it.
 
     # Scroll back to top — swipe down multiple times
     for _ in range(8):
@@ -1407,6 +1384,69 @@ def main():
     dump_ui("08_final")
     print(f"  Final activity: {get_current_activity()}")
 
+    # ─────────────────────────────────────────────
+    # Step 8b (6-Z185): sandbox escape repro probe.
+    #
+    # Drives TWRP's File Manager to the /system listing and screenshots
+    # every step. The security bar: the /system listing must show the
+    # GUEST rootfs's own contents (the TWRP ramdisk ships only
+    # system/usr/share/zoneinfo/tzdata — so a listing of just "usr"),
+    # NOT the host device's real /system (dozens of app/lib/etc dirs).
+    # Before the 6-Z185 fix this exact path listed the HOST's real
+    # /system/app (observed live on a physical Honor Magic UI device).
+    #
+    # minui is not uiautomator-visible, so taps are fractional-screen
+    # candidates with a screenshot after every step; the verdict comes
+    # from analyzing the captures + the pulled rootfs/system listing
+    # (deterministic) + the tracer log's SANDBOX BACKSTOP lines.
+    # The CI rootfs is disposable per-run; every tapped target here is
+    # a navigation action, never a destructive confirm slider.
+    # ─────────────────────────────────────────────
+    if os.environ.get("TWOYI_PROBE_SYSTEM_APP", "0") == "1":
+        print()
+        print("=" * 60)
+        print("  Step 8b: sandbox probe — File Manager -> /system")
+        print("=" * 60)
+        screenshot("fm-00-baseline")
+        wait(1)
+        # Main menu grid candidates for "Advanced" (2-col x 4-row and
+        # 3-col layouts both put it on the LAST ROW, LEFT/CENTER side).
+        for i, (fx, fy) in enumerate([
+            (0.25, 0.84), (0.17, 0.82), (0.33, 0.85), (0.25, 0.90),
+        ]):
+            x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
+            print(f"  tap Advanced candidate {i}: ({x},{y})")
+            tap(x, y)
+            wait(1.5)
+            screenshot(f"fm-01-advanced-{i}")
+        # Advanced page: "File Manager" is a full-width list row near
+        # the top. Tap a few row candidates.
+        for i, fy in enumerate([0.22, 0.30, 0.38]):
+            x, y = SCREEN_W // 2, int(SCREEN_H * fy)
+            print(f"  tap File Manager candidate {i}: ({x},{y})")
+            tap(x, y)
+            wait(1.5)
+            screenshot(f"fm-02-open-{i}")
+        # File Manager lists "/" alphabetically; "system" sits past the
+        # first page. Scroll (swipe up) a few times, screenshot each.
+        for i in range(3):
+            swipe_up()
+            wait(1.0)
+            screenshot(f"fm-03-scroll-{i}")
+        # Tap "system" row candidates (lower half of the list).
+        for i, fy in enumerate([0.62, 0.70, 0.78, 0.55]):
+            x, y = SCREEN_W // 2, int(SCREEN_H * fy)
+            print(f"  tap 'system' candidate {i}: ({x},{y})")
+            tap(x, y)
+            wait(1.5)
+            screenshot(f"fm-04-system-{i}")
+        screenshot("fm-05-final")
+        # Back out of whatever page we ended on.
+        for _ in range(4):
+            adb_shell("input keyevent 4")
+            wait(0.5)
+        screenshot("fm-06-after-back")
+
     # Capture logcat
     print("  Capturing logcat...")
     logcat = adb("logcat", "-d", timeout=15)
@@ -1453,6 +1493,21 @@ def main():
         with open(os.path.join(ART, "rootfs-listing.txt"), "w", errors="replace") as f:
             f.write(listing)
         print(f"  pulled rootfs listing ({len(listing)} bytes)")
+    # 6-Z185 sandbox evidence: the GUEST's /system tree. The File
+    # Manager probe screenshots are compared against THIS listing — if
+    # the FM shows entries that are not here, the guest is seeing the
+    # HOST's /system (escape). For the TWRP ramdisk this listing is
+    # expected to be just usr/ (+ tzdata under it).
+    for remote, local in [
+        ("rootfs/system", "rootfs-system-listing.txt"),
+        ("rootfs/system/app", "rootfs-system-app-listing.txt"),
+        ("rootfs/vendor", "rootfs-vendor-listing.txt"),
+    ]:
+        out = adb_shell(f"run-as {PACKAGE} ls -la {remote}", timeout=30)
+        if out is not None:
+            with open(os.path.join(ART, local), "w", errors="replace") as f:
+                f.write(out)
+            print(f"  pulled sandbox evidence: {remote} ({len(out)} bytes)")
     for remote, local in [
         ("rootfs/tmp/recovery.log", "twrp-recovery.log"),
         ("rootfs/dev/__kmsg__", "kmsg-stub.txt"),

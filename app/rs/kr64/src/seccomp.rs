@@ -451,6 +451,17 @@ fn allowed_syscalls() -> HashSet<i32> {
     // NOTE: Linux exposes these as `fadvise64` and `fallocate` (not the
     // POSIX names `posix_fadvise` / `posix_fallocate`). The libc crate
     // follows the kernel's `__NR_*` naming.
+    //
+    // SECURITY NOTE (6-Z185): SYS_getdents64 stays in the ALLOW bucket —
+    // it must EXECUTE natively (the tracer does not marshal dirent
+    // structs; that would slow every directory read). The sandbox does
+    // NOT rely on this allowlist: in non-root ptrace mode every
+    // open/openat is translated into the rootfs by
+    // vfs::SandboxPolicy::translate_guest, and the tracer's entry-side
+    // backstop (ptrace_emu::sandbox_backstop_at_entry) additionally
+    // verifies each getdents64 fd's ORIGIN via /proc/<tid>/fd/<n> and
+    // denies (fake -EACCES) any fd resolving outside the sandbox. The
+    // allowlist entry is therefore safe-by-construction, not trusted.
     for &nr in &[
         SYS_getdents64,
         SYS_fallocate,

@@ -11532,3 +11532,114 @@ Stage Summary:
   the proven TWRP boot path except hardened edge cases).
 - Next: spawn 100 read-only OPUS sub-agents in ONE shot, one report file
   each under /home/z/my-project/bugreports/, then triage + fix + gates.
+
+---
+Task ID: 6-Z185 (SECURITY)
+Agent: main
+Task: URGENT sandbox-escape report — TWRP File Manager inside the twoyi
+guest listed the physical host's real /system/app (Honor Magic UI
+packages: AudioAccessoryManager, BluetoothMidiService,
+CaptivePortalLoginGoogle, com.google.mainline.adservices...). Confirm
+or disprove with evidence, find the root cause, fix it via vfs.rs as
+the centralized authority, add an independent enforcement backstop,
+and verify in non-root ptrace mode specifically (Stage A CI, Stage B
+real device). Also: fix the hanging qemu_pipe test; build-APK workflow
+to dispatch-only + release upload.
+
+Work Log:
+- STEP 1 (evidence chain, verified against source):
+  * ptrace_emu.rs translate_path (pre-fix) passed guest /system/* and
+    /vendor/* through UNTRANSLATED (comment: "the HOST's /system
+    provides the dynamic linker + bionic in non-root mode").
+  * In non-root ptrace mode — the ONLY mode that runs run_ptrace_loop
+    (lib.rs gates it behind !use_namespaces) — there is no chroot, so
+    guest open("/system/app") opened the REAL HOST directory.
+  * getdents64 had ZERO handling in ptrace_emu.rs (only a name-string
+    at the old line 3488) and sits in seccomp.rs's ALLOW bucket — so
+    the kernel enumerated whatever the fd pointed at: the host tree.
+    READ-ONLY listing + open-able host files under /system//vendor/;
+    directory listing and file reads are confirmed leak surfaces
+    (writes on the physical device would EACCES as untrusted_app).
+  * Extracted assets/twrp (twrp-3.7.0_9-0-byt_t_crv2.img) ramdisk and
+    PROVED TWRP is fully self-contained: 2975 /sbin entries incl.
+    sbin/linker + sbin/libc.so; every binary's PT_INTERP=/sbin/linker;
+    /system contains ONLY usr/share/zoneinfo/tzdata (+ empty dirs) —
+    the host-/system passthrough provided NOTHING to TWRP. Pure leak
+    surface. (angler arm64 uses PT_INTERP /system/bin/linker64 —
+    kernel-opened, outside tracer reach, unaffected by the fix.)
+- STEP 2 (root-cause fix, vfs.rs = the authority):
+  * NEW vfs::SandboxPolicy — translate_guest() absorbs translate_path
+    (ptrace_emu::translate_path is now a 1-line delegate, so all ~17
+    call sites route through the policy): /system, /vendor, /apex now
+    map into the rootfs; narrow kernel-PT_INTERP-parity host fallback
+    ONLY for /system/bin/linker{,64}, /system/lib{,64}/** (when the
+    rootfs ships no copy — mixed-ABI guests) and /apex/*/lib{,64}/**.
+    /system/app, /system/priv-app, /system/etc, /vendor/** etc. now
+    ENOENT honestly when the ROM lacks them.
+  * Canonical-rootfs handling: /data/user/0/<pkg> is a symlink to
+    /data/data/<pkg> on real devices — policy accepts BOTH forms.
+- STEP 3 (independent enforcement backstop):
+  * sandbox_backstop_at_entry() runs at the END of every syscall-ENTRY
+    stop (after all handlers staged rewrites, fresh regs = exactly
+    what the kernel will execute). Covers every path-taking syscall
+    that actually executes (open/openat(2), stat family incl.
+    stat64/newfstatat/statx/fstatat64, statfs family, access,
+    faccessat(2), chdir, readlink(at), unlink(at), mkdir(at),
+    mknod(at), chmod family, execve, rename(at)(2), link(at),
+    symlink(at), truncate, utimensat) + getdents64 via fd-ORIGIN
+    check (/proc/<tid>/fd/<n>, symlink-resolved).
+  * Deny = rewrite nr→getpid (established xattr-fake pattern) +
+    EXIT-side fake return: -EACCES, or 0 for the boot-critical
+    fake-success family (chmod/mkdir/mknod...) so their semantics
+    survive. EVERY block logged "SANDBOX BACKSTOP: DENIED …" + a
+    running counter every 50 blocks (a block = an upstream bug signal).
+  * Resolution: lexical .. normalization BEFORE canonicalize (blocks
+    {rootfs}/x/../../escapes), deepest-existing-ancestor canonicalize
+    for O_CREAT targets, symlink-following containment vs rootfs +
+    explicit allowlist (/proc/**, mirrored /dev char nodes, the linker/
+    lib fallback, {data_dir}/cache staging incl. twoyi_init/twoyi_sh/
+    twoyi_stage). Relative paths resolve against the *at dirfd
+    (/proc/<tid>/fd/<dirfd>) or cwd (/proc/<tid>/cwd).
+  * mount/chroot etc. deliberately EXCLUDED (seccomp-trapped +
+    EXIT-faked; rewriting them would break those fakes; kernel also
+    denies real mounts to untrusted uid).
+- ChildAbi: getdents64 field (i386 220 / x86_64 217 / aarch64 61) +
+  syscall_name label. seccomp.rs getdents64 comment documents the new
+  enforcement model (allowlist stays — the syscall must run natively;
+  safety comes from translated opens + the fd-origin backstop).
+- Removed the vetoed 6-Z180 no-input gate (hook + script + workflow
+  input) — touch is unconditionally ON per user directive.
+- qemu_pipe: fixed the hanging test + its failing sibling. Root cause:
+  parse_channel_name returned None for an unterminated name that can
+  NEVER become a known channel → proxy blocked on read forever.
+  New rule: unterminated names parse unless still a PROPER PREFIX of a
+  known channel ("pipe:open" waits for "opengles"; "pipe:unknown_channel"
+  parses → handler closes → EOF). Test also got a 3s read-timeout anti-
+  hang guard + fixed its wrong 5+16 consumed-count assertion (real:
+  5+15). Suite now: 569 passed / 0 failed / 0 hang.
+- build.yml: workflow_dispatch ONLY (push/PR triggers removed — pushes
+  stay gated by kr64-tests.yml); new inputs upload_release/tag/prerelease;
+  release step attaches the APK via gh release create --generate-notes
+  --clobber (auto-notes include Copilot PR summaries when Copilot is
+  enabled on the repo; no separate Actions API to invoke Copilot —
+  documented honestly). permissions: contents: write. APK artifact
+  upload retained only as opt-out fallback, 7-day retention.
+- Stage A tooling: TWOYI_PROBE_SYSTEM_APP=1 probes (both E2E workflows)
+  drive TWRP File Manager → /system with screenshots at every step
+  (fm-*.png), plus deterministic evidence pulls: rootfs/system,
+  rootfs/system/app, rootfs/vendor listings via run-as.
+- Gates: cargo fmt --check OK; cargo test 569/569 OK (host);
+  cargo clippy --all-targets -- -D warnings 0 warnings; cargo check
+  --target aarch64-linux-android OK (NDK r27c installed locally).
+
+Stage Summary:
+- Vulnerability CONFIRMED as real (not a false alarm): non-root ptrace
+  mode had no filesystem sandbox boundary for /system//vendor//apex —
+  guest directory listings AND file reads hit the real host.
+- Fix = translation (vfs::SandboxPolicy, single authority) + an
+  independent entry-side backstop that denies-with-logging anything
+  resolving outside the sandbox regardless of upstream bugs.
+- NOT yet resolved: Stage A (CI non-root E2E with the probe) dispatched
+  next; Stage B (physical Honor device, fresh APK + user screenshot)
+  REQUIRED before this is called fixed. Step 5 (100-agent fleet)
+  remains BLOCKED behind Stage B per the user's ordering.
