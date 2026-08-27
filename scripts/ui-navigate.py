@@ -50,19 +50,22 @@ def adb_shell(cmd, timeout=30):
     return adb("shell", cmd, timeout=timeout)
 
 def input_cmd(cmd):
-    """6-Z186 iter-4: run an `input ...` shell command on the device.
+    """6-Z186 iter-8: run an `input ...` shell command on the device.
 
-    PRIMARY: adb. FALLBACK: `sudo docker exec redroid sh -c '<cmd>'`
-    when adb is dead — redroid's adbd dies MID-RUN with no pattern
-    (run 33104264666: "adb declared DEAD" before the boot phase even
-    finished; every later input tap/swipe/keyevent went nowhere while
-    docker exec kept working, so the whole probe chain ran blind).
-    Liveness is probed with `adb get-state` (fast, no side effects) so
-    a dead adb is detected even if the screenshot ladder hasn't tripped
-    _ADB_DEAD yet. On the x86 emulator (no docker) the adb branch is
-    the only one that can succeed — identical to the old behavior.
-    Returns combined output (for error-signal checks in callers)."""
-    global _ADB_DEAD
+    Channel ladder:
+      1. adb (reviving it once with `adb connect` if dead — redroid's
+         adbd usually just needs a reconnect).
+      2. `sudo docker exec redroid sh -c '<cmd>'` (works most runs, but
+         silently no-op'd for a whole run in 33108190303 — hence 3).
+      3. sendevent to the touchscreen evdev node (kernel-level; cannot
+         silently fail — it writes the exact protocol-B event sequence
+         EventHub injects).
+
+    Supported by the sendevent path: `input tap X Y`,
+    `input swipe X1 Y1 X2 Y2 DUR` (duration honored by interpolating
+    moves), `input keyevent CODE` (via the keyboard node if present,
+    else falls back to `input`)."""
+    global _ADB_DEAD, _TOUCH_EVDEV, _TOUCH_RANGE, _KEY_EVDEV
     if not _ADB_DEAD:
         try:
             st = subprocess.run(ADB + ["get-state"], capture_output=True,
@@ -73,13 +76,187 @@ def input_cmd(cmd):
         if alive:
             return adb_shell(cmd, timeout=20) or ""
         _ADB_DEAD = True
-        print("  [input] adb dead (get-state) — routing input via docker exec")
+        print("  [input] adb dead (get-state) — attempting adb connect revival")
+        # Revival attempt: adbd inside redroid usually restarts; the
+        # serial is host:port so `adb connect` is the whole fix.
+        serial = os.environ.get("ADB_SERIAL", "emulator-5554")
+        if ":" in serial:
+            try:
+                r = subprocess.run(["adb", "connect", serial],
+                                   capture_output=True, text=True, timeout=10)
+                if "connected" in (r.stdout + r.stderr):
+                    st2 = subprocess.run(ADB + ["get-state"],
+                                         capture_output=True, text=True,
+                                         timeout=5)
+                    if "device" in (st2.stdout + st2.stderr):
+                        _ADB_DEAD = False
+                        print("  [input] adb REVIVED via connect")
+                        return adb_shell(cmd, timeout=20) or ""
+            except Exception:
+                pass
+        print("  [input] routing input via docker exec")
+    # Channel 2: docker exec `input`.
+    try:
+        r = subprocess.run(["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
+                           capture_output=True, text=True, timeout=20)
+        out = (r.stdout or "") + (r.stderr or "")
+        if r.returncode == 0 and "rror" not in out and "sage" not in out:
+            return out
+        print(f"  [input] docker `input` failed (rc={r.returncode}, "
+              f"out={out.strip()[:120]!r}) — trying sendevent")
+    except Exception as e:
+        print(f"  [input] docker exec threw {e!r} — trying sendevent")
+    # Channel 3: sendevent.
+    return _sendevent_cmd(cmd)
+
+
+def _sendevent_discover():
+    """Find the touchscreen evdev node + ABS_MT ranges inside redroid."""
+    global _TOUCH_EVDEV, _TOUCH_RANGE, _KEY_EVDEV
+    if _TOUCH_EVDEV is not None:
+        return
+    _TOUCH_EVDEV = ""
+    _TOUCH_RANGE = (0, 0, 0, 0)
+    _KEY_EVDEV = ""
+    try:
+        r = subprocess.run(
+            ["sudo", "docker", "exec", "redroid", "sh", "-c", "getevent -pl 2>/dev/null"],
+            capture_output=True, text=True, timeout=15)
+        text = r.stdout or ""
+    except Exception:
+        return
+    cur = None
+    for line in text.splitlines():
+        if "add device" in line and "name:" in line:
+            nm = line.split("name:")[-1].strip().strip('"')
+            cur = nm
+            continue
+        if "ABS_MT_POSITION_X" in line and cur is not None:
+            mx = re.search(r"ABS_MT_POSITION_X.*?max\s+(\d+)", line)
+            cur_ev = _first_evdev_for(text, cur)
+            if cur_ev:
+                _TOUCH_EVDEV = cur_ev
+                _TOUCH_RANGE = (0, int(mx.group(1)) if mx else 0, 0, 0)
+                cur = None
+                continue
+        if "KEY_BACK" in line and _KEY_EVDEV == "" and cur is not None:
+            ev = _first_evdev_for(text, cur)
+            if ev:
+                _KEY_EVDEV = ev
+    if _TOUCH_EVDEV:
+        # Fill Y max from the same device block.
+        try:
+            r = subprocess.run(
+                ["sudo", "docker", "exec", "redroid", "sh", "-c",
+                 f"getevent -pl 2>/dev/null | grep -A30 '{_TOUCH_EVDEV}' | "
+                 f"grep ABS_MT_POSITION_Y"],
+                capture_output=True, text=True, timeout=15)
+            my = re.search(r"max\s+(\d+)", r.stdout or "")
+            _, xm, _, _ = _TOUCH_RANGE
+            _TOUCH_RANGE = (0, xm, 0, int(my.group(1)) if my else 0)
+        except Exception:
+            pass
+        print(f"  [input] sendevent touchscreen: {_TOUCH_EVDEV} "
+              f"range x<= {_TOUCH_RANGE[1]} y<= {_TOUCH_RANGE[3]}")
+
+
+def _first_evdev_for(getevent_pl_text, dev_name):
+    """Map a device name from `getevent -pl` back to its event node by
+    re-running getevent -lp and correlating blocks (name precedes the
+    handlers line)."""
+    try:
+        r = subprocess.run(
+            ["sudo", "docker", "exec", "redroid", "sh", "-c",
+             "getevent -lp 2>/dev/null"],
+            capture_output=True, text=True, timeout=15)
+        for block in (r.stdout or "").split("add device"):
+            if dev_name in block:
+                m = re.search(r"/dev/input/event\d+", block)
+                if m:
+                    return m.group(0)
+    except Exception:
+        pass
+    return ""
+
+
+def _sendevent_cmd(cmd):
+    """Execute tap/swipe/keyevent via raw sendevent (protocol B)."""
+    global _TOUCH_EVDEV, _TOUCH_RANGE, _KEY_EVDEV
+    _sendevent_discover()
+    m = re.match(r"input tap (\d+) (\d+)", cmd)
+    if m and _TOUCH_EVDEV:
+        return _sendevent_tap(int(m.group(1)), int(m.group(2)))
+    m = re.match(r"input swipe (\d+) (\d+) (\d+) (\d+) (\d+)", cmd)
+    if m and _TOUCH_EVDEV:
+        return _sendevent_swipe(int(m.group(1)), int(m.group(2)),
+                                int(m.group(3)), int(m.group(4)),
+                                int(m.group(5)))
+    m = re.match(r"input keyevent (\S+)", cmd)
+    if m and _KEY_EVDEV:
+        code = m.group(1)
+        key = {"4": "158", "KEYCODE_BACK": "158"}.get(code, None)
+        if key:
+            for val in ("1", "0"):
+                subprocess.run(["sudo", "docker", "exec", "redroid", "sendevent",
+                                _KEY_EVDEV, "1", key, val],
+                               capture_output=True, timeout=10)
+                subprocess.run(["sudo", "docker", "exec", "redroid", "sendevent",
+                                _KEY_EVDEV, "0", "0", "0"],
+                               capture_output=True, timeout=10)
+            return ""
+    # Unknown shape or no nodes — last resort: docker `input` anyway.
     try:
         r = subprocess.run(["sudo", "docker", "exec", "redroid", "sh", "-c", cmd],
                            capture_output=True, text=True, timeout=20)
         return (r.stdout or "") + (r.stderr or "")
     except Exception:
         return ""
+
+
+def _se(*args):
+    subprocess.run(["sudo", "docker", "exec", "redroid", "sendevent"] +
+                   list(args), capture_output=True, timeout=10)
+
+
+def _sendevent_tap(x, y):
+    ev, xm, ym = _TOUCH_EVDEV, _TOUCH_RANGE[1], _TOUCH_RANGE[3]
+    sx = int(x * (xm / SCREEN_W)) if xm else x
+    sy = int(y * (ym / SCREEN_H)) if ym else y
+    _se(ev, "3", "57", "100")       # ABS_MT_TRACKING_ID
+    _se(ev, "3", "53", str(sx))     # ABS_MT_POSITION_X
+    _se(ev, "3", "54", str(sy))     # ABS_MT_POSITION_Y
+    _se(ev, "3", "48", "5")         # ABS_MT_TOUCH_MAJOR
+    _se(ev, "1", "330", "1")        # BTN_TOUCH down
+    _se(ev, "0", "0", "0")          # SYN
+    _se(ev, "3", "57", "-1")
+    _se(ev, "1", "330", "0")
+    _se(ev, "0", "0", "0")
+    return ""
+
+
+def _sendevent_swipe(x1, y1, x2, y2, dur_ms):
+    ev, xm, ym = _TOUCH_EVDEV, _TOUCH_RANGE[1], _TOUCH_RANGE[3]
+    sx1 = int(x1 * (xm / SCREEN_W)) if xm else x1
+    sy1 = int(y1 * (ym / SCREEN_H)) if ym else y1
+    sx2 = int(x2 * (xm / SCREEN_W)) if xm else x2
+    sy2 = int(y2 * (ym / SCREEN_H)) if ym else y2
+    steps = max(2, dur_ms // 40)
+    _se(ev, "3", "57", "101")
+    _se(ev, "3", "53", str(sx1))
+    _se(ev, "3", "54", str(sy1))
+    _se(ev, "1", "330", "1")
+    _se(ev, "0", "0", "0")
+    for i in range(1, steps + 1):
+        nx = sx1 + (sx2 - sx1) * i // steps
+        ny = sy1 + (sy2 - sy1) * i // steps
+        _se(ev, "3", "53", str(nx))
+        _se(ev, "3", "54", str(ny))
+        _se(ev, "0", "0", "0")
+        time.sleep(dur_ms / 1000.0 / steps)
+    _se(ev, "3", "57", "-1")
+    _se(ev, "1", "330", "0")
+    _se(ev, "0", "0", "0")
+    return ""
 
 def pull_via_run_as(remote_path, local_path, timeout=10):
     """Read a file from the app's private data dir via `adb shell run-as`.
@@ -196,6 +373,10 @@ def _screencap_docker():
 _ADB_DEAD = False
 _ADB_EMPTY_STREAK = 0
 _ADB_DEAD_THRESHOLD = 3
+# 6-Z186 iter-8: sendevent-fallback state (touchscreen node + ranges).
+_TOUCH_EVDEV = None
+_TOUCH_RANGE = (0, 0, 0, 0)
+_KEY_EVDEV = ""
 
 def screenshot(name):
     global _ADB_DEAD, _ADB_EMPTY_STREAK
