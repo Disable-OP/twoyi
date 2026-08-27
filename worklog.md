@@ -11723,3 +11723,68 @@ Stage Summary:
   via any intercepted syscall. One more arm64 run needed for the
   post-main-menu FM screenshots (probe fix), then VLM verdict closes
   Stage A.
+
+---
+Task ID: 6-Z186
+Agent: main
+Task: Physical-device escape STILL reproducible after 6-Z185 (exact repro
+chain supplied by user) + ROM re-import staging rename failure + terminal
+ioctl error spam.
+
+Work Log:
+- User supplied the missing repro chain: dismiss the AOSP "Viewing full
+  screen" FRAMEWORK overlay (GOT IT button) FIRST — it eats every tap;
+  TWRP main menu only flashes <1 ms before the read-only gate
+  (system_readonly page) takes over; swipe the slider -> real main menu
+  -> Advanced -> File Manager (sandboxed, empty root) -> bottom-right
+  File button -> Open Terminal -> ioctl(fd=0, 0x540e) errors +
+  "Child processes exited." x2 -> BACK -> File Manager AGAIN = ENTIRE
+  host FS visible (/data restricted).
+- Root-cause analysis: /data-restricted-but-/system-visible is the
+  app-uid untraced-process signature. Found the hole: ptrace_emu 6-Z126
+  ESCAPE_THRESHOLD(64) path PTRACE_DETACHes an ESRCH-streaking pid and
+  lets it RUN UNTRACED — no translation, no backstop. A terminal
+  fork/exit storm can ESRCH a healthy RUNNING tracee 64 rounds (restart
+  of a non-stopped tracee also returns ESRCH), so TWRP gets detached and
+  reads the real host FS.
+- 6-Z186 FIX (ptrace_emu.rs): discriminator BEFORE acting at threshold —
+  TracerPid (/proc/<pid>/status) == us => still traced, streak reset;
+  /proc gone => dead, fall through to 6-Z89; TracerPid==0/other =>
+  compare kernel starttime (/proc/<pid>/stat field 22) vs baseline
+  recorded at every tracked_pids registration point: match => GENUINE
+  escape => FAIL CLOSED (SIGKILL + reap — a lost tracee must die, never
+  run untraced); mismatch => pid recycled, drop without kill; unreadable
+  => conservative log+keep tracking (never risk an innocent pid).
+  Helpers proc_tracer_pid/proc_starttime; pid_starttimes map maintained
+  at all 4 registration sites.
+- Probe rewritten (ui-navigate.py Step 8c): uiautomator-driven GOT IT
+  dismissal (system window = dump-visible; bounds tap) before/between
+  every phase; gate detection via system_readonly marker + swipe;
+  main-menu confirmation = main2 marker AFTER gate; Advanced/FM taps
+  stop on first page-marker change; then the EXACT terminal chain with
+  term-04 BEFORE / term-09 AFTER comparison shots; recovery.log page
+  offsets as ground truth (redroid screencap of SurfaceView is stale —
+  21 byte-identical fm-* screenshots in run 33097926006 proved that).
+- ROM import fix: deleteDirectory now grants owner-write on all dirs
+  first (tar ships 0555 dirs; child delete needs parent WRITE — root
+  cause of ENOTEMPTY); both import paths (Render2Activity,
+  SettingsActivity) switched to the rename-aside atomic swap (old ->
+  rootfs.old, staging -> live, then best-effort delete; rollback keeps
+  the previous ROM bootable). No more gutted-rootfs "No ROM Installed"
+  limbo.
+- twrp_fb_hook.c: TIOCGWINSZ (0x540e) answered with 80x24 winsize when
+  the real fd can't (terminal-size query on a pipe/socket); the
+  unconditional ioctl diagnostic is rate-limited (FB-family + tracked
+  fds stay unlimited) — kills the terminal-screen error spam.
+- Gates: py_compile OK; cargo fmt OK; clippy -D warnings OK; 569/569
+  tests OK; cargo check --target aarch64-linux-android OK (NDK r27c).
+
+Stage Summary:
+- Escape mechanism identified (unconditional detach of a misclassified
+  "escaped" tracee) and closed fail-closed; exact-chain probe dispatched
+  to arm64 E2E for Stage-A confirmation (expect either "6-Z186 ...
+  TracerPid is STILL us" = misclassification fixed, or a kill line =
+  genuine escape contained; the tracer log decides).
+- ROM re-import and terminal ioctl spam fixed alongside; Stage B (user's
+  physical device, fresh APK from the release this push produces) still
+  required to close the security item.

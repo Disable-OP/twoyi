@@ -1405,15 +1405,11 @@ def main():
     if os.environ.get("TWOYI_PROBE_SYSTEM_APP", "0") == "1":
         print()
         print("=" * 60)
-        print("  Step 8b: sandbox probe — File Manager -> /system")
+        print("  Step 8c: sandbox-escape repro — EXACT physical-device chain")
+        print("  (GOT IT overlay -> gate swipe -> Advanced -> File Manager")
+        print("   -> bottom-right File -> Open Terminal -> BACK -> reopen FM)")
         print("=" * 60)
 
-        # The probe must run from the TWRP MAIN MENU. Both prior runs
-        # caught TWRP still on the first-run gate (the gate dismissal
-        # happens late). Wait for the main-menu marker in recovery.log
-        # (polling BOTH rootfs locations — the active profile's rootfs
-        # and the legacy rootfs dir), feeding gate gestures while we
-        # wait, and only then start the File Manager taps.
         def _read_recovery_log():
             for p in (
                 f"profiles/default/rootfs/tmp/recovery.log",
@@ -1425,67 +1421,194 @@ def main():
                     return out
             return ""
 
-        def wait_for_main_menu(timeout_s=150):
-            deadline = time.time() + timeout_s
-            gate_idx = 0
-            gates = [
-                f"input swipe {int(SCREEN_W * 0.19)} {int(SCREEN_H * 0.89)} "
-                f"{int(SCREEN_W * 0.88)} {int(SCREEN_H * 0.89)} 400",
-                f"input tap {SCREEN_W // 2} {SCREEN_H // 2}",
-            ]
-            while time.time() < deadline:
-                txt = _read_recovery_log()
-                if "Set page: 'main2'" in txt or "Set page: 'main1'" in txt:
-                    print("  main menu detected in recovery.log")
-                    return True
-                g = gates[gate_idx % len(gates)]
-                adb_shell(g)
-                gate_idx += 1
-                wait(6)
-            print("  WARNING: main menu not detected — probing anyway")
-            return False
+        def _pages():
+            """(char_offset, page) for every 'Set page:' marker in the
+            guest recovery.log. Offsets (not line numbers) make
+            'marker X must appear AFTER marker Y' checks trivial."""
+            txt = _read_recovery_log() or ""
+            return [(m.start(), m.group(1))
+                    for m in re.finditer(r"Set page: '([A-Za-z0-9_]+)'", txt)]
 
-        wait_for_main_menu()
-        wait(2)
-        screenshot("fm-00-baseline")
-        # Main menu grid candidates for "Advanced" (2-col x 4-row and
-        # 3-col layouts both put it on the LAST ROW, LEFT/CENTER side;
-        # higher rows first — the bottom edge may be navbar).
+        def dismiss_fullscreen_overlay(tag="ovl"):
+            """6-Z186: the AOSP 'Viewing full screen' immersive-training
+            overlay is a FRAMEWORK window (not app, not OEM-only) that
+            sits above the app and eats EVERY tap until its GOT IT
+            button is pressed. Being a system window, uiautomator CAN
+            see it — dump + bounds-tap is deterministic. Run this
+            before/between every tap phase; it no-ops when absent."""
+            dismissed_any = False
+            for attempt in range(4):
+                path = dump_ui(f"{tag}-{attempt}")
+                root = parse_ui(path)
+                hit = None
+                for needle in ("got it", "got_it", "understood"):
+                    hit = find_by_text(root, needle) if root is not None else None
+                    if hit:
+                        break
+                if hit is None and root is not None:
+                    marker = find_by_text(root, "full screen") or \
+                        find_by_text(root, "viewing")
+                    if marker is not None and attempt == 0:
+                        print("  [overlay] 'Viewing full screen' overlay text "
+                              "present (no GOT IT match?) — dumping for review")
+                if hit is not None:
+                    x, y, _ = hit
+                    print(f"  [overlay] GOT IT button at ({x},{y}) — tapping")
+                    tap(x, y)
+                    dismissed_any = True
+                    wait(1.2)
+                else:
+                    break
+            return dismissed_any
+
+        # ── 0) Kill the full-screen overlay FIRST (before ANY guest tap) ──
+        dismiss_fullscreen_overlay("pre-gate")
+
+        # ── 1) Wait for the read-only gate page (system_readonly). ──
+        # NOTE (physical-device lesson): TWRP's main menu only FLASHES
+        # (<1 ms) at boot before the read-only gate takes over, because
+        # the menu checks the read-only system state. Seeing 'main2' in
+        # recovery.log therefore does NOT mean the main menu is up. The
+        # gate is what's actually on screen; the swipe bar on it is how
+        # you reach the REAL main menu.
+        gate_pos = None
+        deadline = time.time() + 150
+        while time.time() < deadline:
+            pages = _pages()
+            gate_positions = [pos for pos, p in pages if p == "system_readonly"]
+            if gate_positions:
+                gate_pos = max(gate_positions)
+                print("  gate page 'system_readonly' is UP")
+                break
+            dismiss_fullscreen_overlay("gate-wait")
+            wait(5)
+        if gate_pos is None:
+            print("  WARNING: gate never appeared in recovery.log — "
+                  "proceeding anyway (gate may pre-date the log pull)")
+            gate_pos = 0
+        screenshot("term-00-gate")
+
+        # ── 2) Swipe the read-only slider -> REAL main menu (stays up) ──
+        for i in range(3):
+            y = int(SCREEN_H * 0.885)
+            adb_shell(f"input swipe {int(SCREEN_W * 0.15)} {y} "
+                      f"{int(SCREEN_W * 0.85)} {y} 350")
+            wait(2.5)
+            dismiss_fullscreen_overlay("post-swipe")
+            pages = _pages()
+            if any(p == "main2" and pos > gate_pos for pos, p in pages):
+                print("  main menu CONFIRMED after gate dismissal")
+                break
+        screenshot("term-01-main-menu")
+
+        # ── 3) Advanced (grid button, last row left/center in both layouts)
+        pages = _pages()
+        main_pos = max([pos for pos, p in pages if p == "main2"], default=0)
         for i, (fx, fy) in enumerate([
-            (0.25, 0.74), (0.28, 0.78), (0.25, 0.84), (0.17, 0.82),
+            (0.25, 0.74), (0.28, 0.80), (0.25, 0.86), (0.17, 0.83), (0.5, 0.86),
         ]):
             x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
             print(f"  tap Advanced candidate {i}: ({x},{y})")
+            dismiss_fullscreen_overlay("adv")
             tap(x, y)
-            wait(1.5)
-            screenshot(f"fm-01-advanced-{i}")
-        # Advanced page: "File Manager" is a full-width list row near
-        # the top. Tap a few row candidates.
-        for i, fy in enumerate([0.22, 0.30, 0.38]):
+            wait(2.0)
+            screenshot(f"term-02-advanced-{i}")
+            pages = _pages()
+            if any(pos > main_pos and p not in ("main2", "clear_vars")
+                   for pos, p in pages):
+                recent = [p for _, p in pages][-3:]
+                print(f"  page changed after Advanced tap: {recent} — good")
+                break
+        pages = _pages()
+        adv_pos = max([pos for pos, _ in pages], default=0)
+
+        # ── 4) File Manager row on the Advanced list ──
+        for i, fy in enumerate([0.30, 0.22, 0.38, 0.46]):
             x, y = SCREEN_W // 2, int(SCREEN_H * fy)
             print(f"  tap File Manager candidate {i}: ({x},{y})")
+            dismiss_fullscreen_overlay("fm")
+            tap(x, y)
+            wait(2.0)
+            screenshot(f"term-03-fm-{i}")
+            pages = _pages()
+            if any(pos > adv_pos and p not in ("main2", "clear_vars")
+                   for pos, p in pages):
+                break
+        pages = _pages()
+        fm_pos = max([pos for pos, _ in pages], default=0)
+        wait(1.0)
+        # BEFORE the terminal: the FM must show the sandboxed (near-empty)
+        # root. This screenshot is the baseline the post-terminal shot is
+        # compared against — same view, only the terminal episode differs.
+        screenshot("term-04-fm-root-BEFORE-terminal")
+
+        # ── 5) THE TERMINAL EPISODE (the escape trigger) ──
+        # Bottom-right File button opens "Choose Action in current
+        # folder"; "Open Terminal" is one of its rows. Both are
+        # guest-rendered inside the SurfaceView (invisible to
+        # uiautomator; redroid screencap may be stale) — tap by
+        # fractional candidates, verify via recovery.log markers and
+        # the tracer log pulled at the end.
+        for i, (fx, fy) in enumerate([
+            (0.90, 0.93), (0.94, 0.91), (0.86, 0.95), (0.93, 0.87), (0.80, 0.93),
+        ]):
+            x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
+            print(f"  tap bottom-right File button candidate {i}: ({x},{y})")
             tap(x, y)
             wait(1.5)
-            screenshot(f"fm-02-open-{i}")
-        # File Manager lists "/" alphabetically; "system" sits past the
-        # first page. Scroll (swipe up) a few times, screenshot each.
+            screenshot(f"term-05-filebtn-{i}")
+            # One menu-row attempt per File-button attempt (limit blind
+            # damage; the action list is centered, rows in the mid band).
+            for fy2 in (0.46,):
+                tx, ty = SCREEN_W // 2, int(SCREEN_H * fy2)
+                print(f"    tap Open Terminal row candidate: ({tx},{ty})")
+                tap(tx, ty)
+                wait(3.0)
+                screenshot(f"term-06-terminal-try-{i}")
+            pages = _pages()
+            new = [p for pos, p in pages if pos > fm_pos]
+            print(f"    pages since FM open: {new[-6:]}")
+            if any("terminal" in p.lower() or "action" in p.lower() for p in new):
+                print("    terminal/action marker seen — stopping candidates")
+                break
+
+        # Let the terminal children fork + die (Child processes exited x2)
+        wait(5.0)
+        screenshot("term-07-terminal-settled")
+
+        # ── 6) BACK (bottom nav bar) -> returns to the Advanced page ──
+        adb_shell("input keyevent 4")
+        wait(2.0)
+        screenshot("term-08-after-back")
+
+        # ── 7) Reopen File Manager — THE MONEY SHOT ──
+        # On the physical device this listing showed the ENTIRE host FS
+        # (/data restricted) after the failed terminal. Compare against
+        # term-04-fm-root-BEFORE-terminal: identical view + this step is
+        # the ONLY difference.
+        for fy in (0.30, 0.22, 0.38):
+            x, y = SCREEN_W // 2, int(SCREEN_H * fy)
+            print(f"  tap File Manager reopen candidate: ({x},{y})")
+            tap(x, y)
+            wait(2.5)
+            break  # first candidate (same row that worked in step 4)
+        screenshot("term-09-fm-AFTER-terminal")
         for i in range(3):
             swipe_up()
             wait(1.0)
-            screenshot(f"fm-03-scroll-{i}")
-        # Tap "system" row candidates (lower half of the list).
+            screenshot(f"term-10-scroll-{i}")
         for i, fy in enumerate([0.62, 0.70, 0.78, 0.55]):
             x, y = SCREEN_W // 2, int(SCREEN_H * fy)
-            print(f"  tap 'system' candidate {i}: ({x},{y})")
             tap(x, y)
             wait(1.5)
-            screenshot(f"fm-04-system-{i}")
-        screenshot("fm-05-final")
+            screenshot(f"term-11-system-{i}")
+        screenshot("term-12-final")
+
         # Back out of whatever page we ended on.
-        for _ in range(4):
+        for _ in range(6):
             adb_shell("input keyevent 4")
             wait(0.5)
-        screenshot("fm-06-after-back")
+        screenshot("term-13-after-back-all")
 
     # Capture logcat
     print("  Capturing logcat...")

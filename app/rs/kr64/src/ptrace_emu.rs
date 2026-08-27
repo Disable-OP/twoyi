@@ -7098,6 +7098,44 @@ fn traced_child_alive(pid: libc::pid_t) -> bool {
     }
 }
 
+/// 6-Z186 SECURITY: read `TracerPid` from /proc/<pid>/status.
+///
+/// Returns None when the /proc entry is gone (dead+reaped). A returned 0
+/// means "not traced by anyone"; any other value is the tracer's pid.
+/// This is the authoritative answer to "is this pid still OUR tracee?"
+/// — the question the 6-Z126 escape classifier previously guessed at
+/// from ESRCH streaks alone (and got wrong: a RUNNING tracee also
+/// ESRCHs a restart request, which let a terminal's fork/exit storm
+/// misclassify a healthy, still-traced TWRP as "escaped", DETACH it,
+/// and leave it running with full unintercepted host syscall access —
+/// the sandbox-escape reproduction from the physical device report:
+/// File Manager showed the real host /system//vendor//product after a
+/// failed Open Terminal, while /data stayed restricted exactly as an
+/// untraced app-uid process would see it).
+fn proc_tracer_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("TracerPid:") {
+            return rest.trim().parse::<libc::pid_t>().ok();
+        }
+    }
+    None
+}
+
+/// 6-Z186 SECURITY: the kernel `starttime` (field 22 of /proc/<pid>/stat)
+/// — the identity of a process ACROSS pid recycling. The escape
+/// classifier must never SIGKILL a pid number that a dead tracee's
+/// RECYCLED successor now holds; starttime equality is what makes the
+/// kill decision safe. Returns None when the /proc entry is gone.
+fn proc_starttime(pid: libc::pid_t) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Skip past the comm field "(...)": everything after it starts at
+    // field 3 (state). starttime is field 22 → the 20th token after it.
+    let rest = stat.rfind(')').map(|p| stat.get(p + 2..).unwrap_or(""))?;
+    let mut tokens = rest.split_whitespace();
+    tokens.nth(19).and_then(|t| t.parse::<u64>().ok())
+}
+
 /// Task 6-Z89 FIX 1a: the precise outcome of [`reap_child`].
 enum Reaped {
     /// Reaped — the status word carries WIFEXITED/WIFSIGNALED. The
@@ -9293,6 +9331,26 @@ pub fn run_ptrace_loop(
         std::collections::HashMap::new();
     const ESCAPE_THRESHOLD: u32 = 64;
 
+    // 6-Z186 SECURITY: kernel starttime baseline per tracked pid,
+    // recorded at EVERY registration point (seed, child-switch, fork
+    // event). The 6-Z126 escape classifier consults it before acting on
+    // an ESRCH streak: a SIGKILL is only ever issued when the pid's
+    // CURRENT starttime equals the baseline we recorded — a mismatch
+    // means the number was recycled to a different (possibly innocent
+    // host) process which must never be killed, and an unreadable
+    // baseline (0) keeps the decision conservative (log + keep
+    // tracking; no kill, no detach).
+    let mut pid_starttimes: std::collections::HashMap<libc::pid_t, u64> =
+        std::collections::HashMap::new();
+    pid_starttimes.insert(init_pid, proc_starttime(init_pid).unwrap_or(0));
+    if let Some(rec_pid) = recovery_child_pid {
+        if rec_pid != init_pid {
+            // (the tracked_pids seed above already pushed rec_pid —
+            // only the starttime baseline is recorded here)
+            pid_starttimes.insert(rec_pid, proc_starttime(rec_pid).unwrap_or(0));
+        }
+    }
+
     loop {
         // ── Deferred ABI reset (after execve EXIT) — PER CHILD ──
         //
@@ -9480,35 +9538,122 @@ pub fn run_ptrace_loop(
                     let streak = esrch_streak.entry(esrch_pid).or_insert(0);
                     *streak = streak.saturating_add(1);
                     if *streak >= ESCAPE_THRESHOLD {
-                        log(&format!(
-                            "6-Z126: pid {} ESRCHed {} consecutive times while /proc-alive — ESCAPED tracee; issuing best-effort PTRACE_DETACH and dropping it from the tracked set (it runs untraced; the supervisor serves the remaining children)",
-                            esrch_pid, *streak
-                        ));
-                        unsafe {
-                            libc::ptrace(libc::PTRACE_DETACH, esrch_pid, 0, 0);
-                        }
-                        tracked_pids.retain(|&p| p != esrch_pid);
-                        esrch_streak.remove(&esrch_pid);
-                        // Pick the next live child (or end the loop when
-                        // none remain) — same decision as the ALL-GONE
-                        // tail below, applied immediately.
-                        match any_traced_child_alive(&tracked_pids) {
-                            Some(live_pid) => {
+                        // ── 6-Z186 SECURITY: discriminate BEFORE acting ──
+                        //
+                        // The 6-Z126 behavior (unconditional PTRACE_DETACH
+                        // + drop, leaving the process running UNTRACED)
+                        // is a sandbox hole by construction: an untraced
+                        // guest process makes syscalls straight to the
+                        // host kernel with NO translation and NO backstop
+                        // — on the physical-device report it left TWRP
+                        // reading the real host /system//vendor//product
+                        // (File Manager full of Honor/Magic UI packages
+                        // after a failed Open Terminal), with /data
+                        // restricted exactly as an untraced app-uid
+                        // process sees it. An ESRCH streak alone does
+                        // NOT prove escape: a RUNNING (non-stopped)
+                        // tracee also ESRCHs a restart request, so a
+                        // fork/exit storm (terminal!) can burn 64 rounds
+                        // on a perfectly healthy tracee. Classify with
+                        // authority before acting:
+                        //   TracerPid == us    → still traced (running):
+                        //                        NOT an escape — reset the
+                        //                        streak and fall through to
+                        //                        the 6-Z89 reap/switch flow.
+                        //   /proc gone         → dead: fall through (reap).
+                        //   TracerPid == 0 (or someone else):
+                        //     starttime == baseline → GENUINE escape →
+                        //                        FAIL CLOSED: SIGKILL it.
+                        //                        Never let it keep running
+                        //                        untraced. (killing the
+                        //                        container is the correct
+                        //                        failure mode for a lost
+                        //                        tracee; a detached one is
+                        //                        an open hole.)
+                        //     starttime mismatch → the number was RECYCLED
+                        //                        to a new process (the
+                        //                        6-Z89 stale-pid case):
+                        //                        drop it, never kill.
+                        //     baseline unreadable → conservative: log,
+                        //                        keep tracking, no kill,
+                        //                        no detach.
+                        let tracer = proc_tracer_pid(esrch_pid);
+                        let my_pid = std::process::id() as libc::pid_t;
+                        if tracer == Some(my_pid) {
+                            log(&format!(
+                                "6-Z186: pid {} ESRCHed {} rounds while /proc-alive but TracerPid is STILL us — a RUNNING tracee, not an escape; streak reset, falling through to the 6-Z89 flow",
+                                esrch_pid, *streak
+                            ));
+                            esrch_streak.remove(&esrch_pid);
+                        } else if tracer.is_none() {
+                            log(&format!(
+                                "6-Z186: pid {} ESRCHed {} rounds and /proc is now GONE — dead/reaped; falling through to the 6-Z89 flow",
+                                esrch_pid, *streak
+                            ));
+                            esrch_streak.remove(&esrch_pid);
+                        } else {
+                            let baseline = *pid_starttimes.get(&esrch_pid).unwrap_or(&0);
+                            let current = proc_starttime(esrch_pid).unwrap_or(0);
+                            if baseline == 0 || current == 0 {
                                 log(&format!(
-                                    "6-Z126: after detaching {}, switching the ptrace loop to live child {}",
-                                    esrch_pid, live_pid
+                                    "6-Z186 SECURITY: pid {} ESRCHed {} rounds, TracerPid={} (not us), but starttime identity is unreadable (baseline={} current={}) — CONSERVATIVE: keeping it tracked (no kill, no detach) to avoid ever hitting an innocent pid",
+                                    esrch_pid, *streak, tracer.unwrap_or(-1), baseline, current
                                 ));
-                                current_pid = live_pid;
-                                skip_next_resume = true;
-                                continue;
-                            }
-                            None => {
+                                esrch_streak.remove(&esrch_pid);
+                            } else if current != baseline {
                                 log(&format!(
-                                    "6-Z126: after detaching {}, ALL TRACED CHILDREN GONE — ending the ptrace loop (return {})",
+                                    "6-Z186: pid {} ESRCHed {} rounds but starttime changed ({} -> {}) — pid RECYCLED to a new process; dropping from the tracked set without any kill",
+                                    esrch_pid, *streak, baseline, current
+                                ));
+                                tracked_pids.retain(|&p| p != esrch_pid);
+                                esrch_streak.remove(&esrch_pid);
+                                pid_starttimes.remove(&esrch_pid);
+                            } else {
+                                log(&format!(
+                                    "6-Z186 SECURITY: pid {} ESRCHed {} consecutive rounds while /proc-alive, TracerPid={} (not us), starttime matches — GENUINE ESCAPED TRACEE; FAILING CLOSED with SIGKILL (it must never run untraced against the host)",
+                                    esrch_pid, *streak, tracer.unwrap_or(-1)
+                                ));
+                                unsafe {
+                                    libc::kill(esrch_pid, libc::SIGKILL);
+                                }
+                                let killed = reap_child(esrch_pid);
+                                log(&format!(
+                                    "6-Z186 SECURITY: escaped tracee {} killed; reap outcome: {}",
                                     esrch_pid,
-                                    last_child_exit.unwrap_or(-1)
+                                    match killed {
+                                        Reaped::Dead(s) => format!("Dead(status={:#x})", s),
+                                        Reaped::AliveStopped(s) =>
+                                            format!("AliveStopped(status={:#x})", s),
+                                        Reaped::Running => "Running".to_string(),
+                                        Reaped::Gone => "Gone".to_string(),
+                                    }
                                 ));
-                                return last_child_exit.unwrap_or(-1);
+                                tracked_pids.retain(|&p| p != esrch_pid);
+                                esrch_streak.remove(&esrch_pid);
+                                pid_starttimes.remove(&esrch_pid);
+                                last_child_exit = Some(-libc::SIGKILL as i32);
+                            }
+                            // Pick the next live child (or end the loop
+                            // when none remain) — same decision as the
+                            // ALL-GONE tail below, applied immediately.
+                            match any_traced_child_alive(&tracked_pids) {
+                                Some(live_pid) => {
+                                    log(&format!(
+                                        "6-Z186: after disposing of ESRCH pid {}, switching the ptrace loop to live child {}",
+                                        esrch_pid, live_pid
+                                    ));
+                                    current_pid = live_pid;
+                                    skip_next_resume = true;
+                                    continue;
+                                }
+                                None => {
+                                    log(&format!(
+                                        "6-Z186: after disposing of ESRCH pid {}, ALL TRACED CHILDREN GONE — ending the ptrace loop (return {})",
+                                        esrch_pid,
+                                        last_child_exit.unwrap_or(-1)
+                                    ));
+                                    return last_child_exit.unwrap_or(-1);
+                                }
                             }
                         }
                     }
@@ -9673,9 +9818,11 @@ pub fn run_ptrace_loop(
             // branches scan for liveness and reap.
             if !tracked_pids.contains(&waited) {
                 tracked_pids.push(waited);
+                pid_starttimes.insert(waited, proc_starttime(waited).unwrap_or(0));
             }
             if !tracked_pids.contains(&current_pid) {
                 tracked_pids.push(current_pid);
+                pid_starttimes.insert(current_pid, proc_starttime(current_pid).unwrap_or(0));
             }
         }
         current_pid = waited;
@@ -10139,6 +10286,10 @@ pub fn run_ptrace_loop(
                             let new_child_pid = new_child_id as libc::pid_t;
                             if new_child_pid > 0 && !tracked_pids.contains(&new_child_pid) {
                                 tracked_pids.push(new_child_pid);
+                                pid_starttimes.insert(
+                                    new_child_pid,
+                                    proc_starttime(new_child_pid).unwrap_or(0),
+                                );
                                 log(&format!(
                                     "6-Z97: PTRACE_EVENT_{} — new child PID {} registered in the tracked set ({} tracked) before its first waitpid stop",
                                     event_name, new_child_pid, tracked_pids.len()

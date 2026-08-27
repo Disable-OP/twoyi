@@ -2115,21 +2115,52 @@ int ioctl(int fd, int request, ...) {
         if (r != -2) return r;
     }
 
-    // DIAGNOSTIC (Task 31): log EVERY ioctl() call to verify our hook is
-    // being invoked. Key ioctl numbers to watch for:
+    // 6-Z186: TIOCGWINSZ (0x540e) — TWRP's Open Terminal child queries the
+    // terminal size on stdin/stdout, which in the sandbox is a pipe or
+    // our socket (the REAL ioctl returns ENOTTY), and every failed call
+    // also hit the unconditional diagnostic log below. Both together are
+    // exactly the on-screen "errors" the physical device showed on the
+    // terminal page:
+    //     [twrp_fb_hook] ioctl(fd=0, req=0x540e) [trk=0]
+    //     Child processes exited.
+    // Answer the query with a standard 80x24 winsize when the real fd
+    // can't (what a terminal emulator does) so TWRP's terminal logic can
+    // proceed instead of looping on the failure.
+    if (req == 0x540eu) {
+        static int (*real_winsz)(int, int, ...) = NULL;
+        if (!real_winsz && dlsym)
+            real_winsz = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
+        int r = real_winsz ? real_winsz(fd, request, argp)
+                           : (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
+        if (r == 0) return 0;
+        if (argp) {
+            // struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel; }
+            unsigned short *ws = (unsigned short *)argp;
+            ws[0] = 24; ws[1] = 80; ws[2] = 80 * 8; ws[3] = 24 * 16;
+        }
+        return 0;
+    }
+
+    // DIAGNOSTIC (Task 31): log ioctl() calls to verify our hook is being
+    // invoked. Key ioctl numbers to watch for:
     //   FBIOGET_VSCREENINFO = 0x4600  (libminuitwrp reads screen size)
     //   FBIOGET_FSCREENINFO = 0x4602  (libminuitwrp reads smem_len for mmap)
     //   FBIOPUT_VSCREENINFO = 0x4601
     //   FBIOPAN_DISPLAY     = 0x4606
     //   FBIOBLANK            = 0x4611
-    // If our hook IS being called but recovery still segfaults, the issue
-    // is in our ioctl handling (wrong struct size, wrong values, etc.).
-    // If our hook is NOT being called, the issue is PLT interception.
+    // 6-Z186: RATE-LIMITED. The old unconditional log flooded the TWRP
+    // terminal screen with an "error" line per ioctl (the terminal page
+    // prints child stderr). FB-family requests (0x46xx) and tracked fds
+    // stay unlimited (diagnostic value); everything else is capped.
     {
         int tracked = fb_fd_is_tracked(fd);
-        write_str(2, "[twrp_fb_hook] ioctl(fd="); write_num(2, fd);
-        write_str(2, ", req=0x"); write_hex(2, req);
-        write_str(2, ") [trk="); write_num(2, tracked); write_str(2, "]\n");
+        static unsigned g_ioctl_diag_dropped;
+        if (tracked || (req >> 8) == 0x46u || g_ioctl_diag_dropped < 16) {
+            if (!tracked && (req >> 8) != 0x46u) g_ioctl_diag_dropped++;
+            write_str(2, "[twrp_fb_hook] ioctl(fd="); write_num(2, fd);
+            write_str(2, ", req=0x"); write_hex(2, req);
+            write_str(2, ") [trk="); write_num(2, tracked); write_str(2, "]\n");
+        }
     }
 
     // Fast path: not an fb0 fd, pass through.
