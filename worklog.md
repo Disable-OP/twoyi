@@ -12122,3 +12122,28 @@ Stage Summary:
   busybox ash (6-Z187), WINSZ 80x24 (arch-correct) — every stage
   virtualized generically.
 - Awaiting run 5 (pty verification) via monitor sub-agent.
+
+---
+Task ID: 6-Z188 iter-2
+Agent: main
+Task: Terminal page never reached in run 33123690562 (PTY unverified —
+UI navigation regression introduced by the 6-Z187 probe change).
+
+Work Log:
+- Monitor sub-agent verdict: FM PASS (populated before+after, same
+  guest root, guest-only clean, 0 exit-127, no "Child process exited"),
+  but 0 "Set page: 'terminalcommand'" — the terminal chain never
+  started; zero 6-Z188 pty markers (never exercised, not disproven).
+- VLM on term-05/term-06 frames: every shot shows the FM "Confirm
+  Action" page ("Moving /service_contexts to /proc", Swipe to Confirm).
+  ROOT CAUSE: the 6-Z187 probe's system-folder taps SELECTED the
+  service_contexts FILE at the root; the File button then opens the
+  move/copy confirm flow instead of the folder-action popup, and every
+  subsequent row tap hit a dead page. (No actual move happened.)
+- Probe fixes (commit a5773d9):
+  * filemanagerconfirm added to DANGER_PAGES (auto-BACK watchdog).
+  * After the folder exploration: BACK out until the frame matches the
+    settled 04c listing (nothing selected; up to 3 tries) before the
+    terminal episode starts.
+- Run 33125036396 dispatched on a5773d9 to exercise the 6-Z188 pty
+  end-to-end; monitoring delegated to a sub-agent.
