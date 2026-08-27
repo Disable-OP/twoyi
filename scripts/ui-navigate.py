@@ -65,7 +65,9 @@ def input_cmd(cmd):
     `input swipe X1 Y1 X2 Y2 DUR` (duration honored by interpolating
     moves), `input keyevent CODE` (via the keyboard node if present,
     else falls back to `input`)."""
-    global _ADB_DEAD, _TOUCH_EVDEV, _TOUCH_RANGE, _KEY_EVDEV
+    global _ADB_DEAD, _TOUCH_EVDEV, _TOUCH_RANGE, _KEY_EVDEV, _FORCE_SENDEVENT
+    if _FORCE_SENDEVENT:
+        return _sendevent_cmd(cmd)
     if not _ADB_DEAD:
         try:
             st = subprocess.run(ADB + ["get-state"], capture_output=True,
@@ -377,6 +379,11 @@ _ADB_DEAD_THRESHOLD = 3
 _TOUCH_EVDEV = None
 _TOUCH_RANGE = (0, 0, 0, 0)
 _KEY_EVDEV = ""
+# 6-Z186 iter-10: docker `input` sometimes silently no-ops for a whole
+# run (rc=0, no error text — 33108190303, 33110255428). Effect-based
+# escalation: the probe flips this after an input round shows ZERO
+# effect, after which input_cmd goes straight to sendevent.
+_FORCE_SENDEVENT = False
 
 def screenshot(name):
     global _ADB_DEAD, _ADB_EMPTY_STREAK
@@ -1822,6 +1829,7 @@ def main():
 
         gate_bytes = _shot_bytes("term-00-gate")
         menu_confirmed = False
+        global _FORCE_SENDEVENT
         for i in range(6):
             y = int(SCREEN_H * 0.88)
             input_cmd(f"input swipe {int(SCREEN_W * 0.10)} {y} "
@@ -1832,6 +1840,16 @@ def main():
             if any(p == "main2" and pos > gate_pos for pos, p in pages):
                 menu_confirmed = True
                 break
+            if i == 1:
+                # iter-10: TWO swipe rounds produced no new page marker.
+                # Either the gate needs a different gesture or docker
+                # `input` is silently dead (rc=0 no-op — runs 33108190303,
+                # 33110255428). Escalate to kernel-level sendevent NOW.
+                cur = _shot_bytes("term-00b-swipe-effect")
+                if cur == gate_bytes:
+                    print("  [input] swipe rounds show ZERO effect — "
+                          "escalating to sendevent-only input")
+                    _FORCE_SENDEVENT = True
         # Settle-wait: markers may lag; require visual stability.
         prev = b""
         for i in range(13):
