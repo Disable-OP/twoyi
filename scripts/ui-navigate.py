@@ -1930,6 +1930,25 @@ def main():
                 return True
             return False
 
+        def guest_back():
+            """BACK that works in escalated input mode too: keyevent
+            first, then taps on the guest TWRP navbar's back button
+            (bottom-left, y~1560; the exact pixel from VLM on the
+            console frame, corrected for its x-scale error)."""
+            marker_before = _last_page_after(0)
+            input_cmd("input keyevent 4")
+            wait(1.2)
+            if _last_page_after(0) != marker_before:
+                return True
+            for bx, by in ((166, 1560), (120, 1560), (220, 1560), (166, 1500)):
+                tap(bx, by)
+                wait(1.2)
+                if _last_page_after(0) != marker_before:
+                    print(f"  [back] navbar tap ({bx},{by}) worked")
+                    return True
+            return False
+
+
         # ── 3) Advanced — DETERMINISTIC geometry from the layout
         # analyzer on run 33106119333's main-menu frame: 2x4 grid,
         # columns x=192/528, row centers y=414/708/1002/1294.
@@ -2007,7 +2026,8 @@ def main():
         if fm_open:
             fm_frame = _shot_bytes("term-04b-fm-frame")
             for i, (bx, by) in enumerate([
-                (620, 1228), (528, 1228), (672, 1176), (560, 1300),
+                (624, 1372), (624, 1390), (672, 1372), (592, 1372),
+                (620, 1228), (560, 1300),
             ]):
                 print(f"  tap bottom-right File button candidate {i}: ({bx},{by})")
                 tap(bx, by)
@@ -2042,12 +2062,18 @@ def main():
             # FALLBACK: Advanced -> Terminal button (192,708).
             print("  [terminal fallback] BACK to Advanced, then Terminal "
                   "button (192,708)")
-            input_cmd("input keyevent 4")
-            wait(1.5)
-            input_cmd("input keyevent 4")
-            wait(1.5)
-            tail = [p for p_pos, p in _pages() if p_pos > fm_pos]
-            if "advanced" in tail or not fm_open:
+            guest_back()
+            wait(1.0)
+            cur = _shot_bytes("term-06e-after-back")
+            on_advanced = (cur == adv_frame) if cur else False
+            if not on_advanced:
+                # one more back, then re-check
+                guest_back()
+                wait(1.0)
+                cur = _shot_bytes("term-06e-after-back2")
+                on_advanced = (cur == adv_frame) if cur else False
+            if on_advanced or not fm_open:
+                print("  [terminal fallback] on Advanced — tapping Terminal")
                 tap(192, 708)
                 wait(3.0)
                 screenshot("term-06f-terminal-fallback")
@@ -2056,13 +2082,16 @@ def main():
                 if any("terminal" in p.lower() for p in new):
                     terminal_open = True
                     print("  TERMINAL OPENED via fallback — chain complete")
+            else:
+                print("  [terminal fallback] could not confirm Advanced — "
+                      "skipping the tap (safety)")
 
         # Let the terminal children fork + die (Child processes exited x2)
         wait(5.0)
         screenshot("term-07-terminal-settled")
 
         # ── 6) BACK (bottom nav bar) -> returns to the Advanced page ──
-        input_cmd("input keyevent 4")
+        guest_back()
         wait(2.0)
         screenshot("term-08-after-back")
 
@@ -2098,7 +2127,7 @@ def main():
 
         # Back out of whatever page we ended on.
         for _ in range(6):
-            input_cmd("input keyevent 4")
+            guest_back()
             wait(0.5)
         screenshot("term-13-after-back-all")
 
