@@ -1081,6 +1081,17 @@ struct ChildAbi {
     reg_arg5: usize,
     #[allow(dead_code)]
     reg_arg6: usize,
+    /// 6-Z187c: the HOOK→TRACER marker register — the fb_hook sets this to
+    /// TWOYI_SYSCALL_MARK ("twoyi123") on raw syscalls it issues with a
+    /// KNOWN-GOOD HOST path ({rootfs}-prefixed or cwd-relative under a
+    /// cwd it verified is the rootfs). When the tracer sees the marker
+    /// it leaves the syscall COMPLETELY untouched: no translation, no
+    /// +1 cwd-relative fallback (which would strip the leading '/' off
+    /// the hook's already-host-valid path and ENOENT it — run
+    /// 33120905168's via=1 retry corruption), no backstop fail-closed.
+    /// -1 = this ABI has no marker channel (x86: the register file is
+    /// fully used by syscall args).
+    reg_marker: i64,
     // Stack-pointer register index — used to reserve a scratch area
     // BELOW the child's current stack pointer for translated paths.
     // Translated paths are always longer than the originals (e.g.
@@ -1383,6 +1394,7 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     reg_arg5: 9, // r8
     #[allow(dead_code)]
     reg_arg6: 8, // r9
+    reg_marker: -1,
     reg_sp: 19, // rsp
 };
 
@@ -1755,6 +1767,7 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     reg_arg5: 14, // rdi (zero-extended edi)
     #[allow(dead_code)]
     reg_arg6: 4, // rbp (zero-extended ebp)
+    reg_marker: -1,
     // On a 32-bit child the kernel zero-extends `esp` into the 64-bit
     // `rsp` slot when reporting registers via PTRACE_GETREGS, so we
     // use the same index as the 64-bit ABI (19).
@@ -2086,6 +2099,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     reg_arg5: 4, // x4
     #[allow(dead_code)]
     reg_arg6: 5, // x5
+    reg_marker: 6, // x6 (aarch64 arg7 slot - free for openat/execve)
     // Aarch64 user_pt_regs is `u64 regs[31]` (x0..x30) followed by
     // `sp`, `pc`, `pstate`. The `sp` field is therefore at index 31
     // when reinterpreted as a flat `u64` array.
@@ -4074,6 +4088,13 @@ fn sandbox_backstop_may_apply(nr: i64, abi: &ChildAbi) -> bool {
     nr == abi.getdents64 || !sandbox_path_arg_slots(nr, abi).is_empty()
 }
 
+/// 6-Z187c: backstop-side marker check (the regs here are the
+/// backstop's FRESH snapshot; hook_marker_present takes &Regs too but the
+/// backstop's Regs type is the same — delegate).
+fn marker_present_in_regs(regs: &Regs, abi: &ChildAbi) -> bool {
+    hook_marker_present(regs, abi)
+}
+
 /// The backstop itself. See the module-style comment above. Returns
 /// and logs only; the pending map drives the EXIT-side fake return.
 fn sandbox_backstop_at_entry(
@@ -4144,7 +4165,8 @@ fn sandbox_backstop_at_entry(
             if nr == abi.execve && slot.path_reg == abi.reg_arg1 {
                 let claimed = execve_claim
                     .map(|(cpid, _how)| *cpid == pid)
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || marker_present_in_regs(&regs, abi);
                 if !claimed {
                     log(&format!(
                         "SANDBOX BACKSTOP: DENIED execve on pid {} — path UNREADABLE (PEEK+pvm+proc-mem blind) and not tracer-redirected — failing closed -13 (6-Z187)",
@@ -4749,6 +4771,25 @@ pub fn rom_config_override(rootfs: &str, path: &str, write_intent: bool) -> Opti
 }
 
 // ── String read/write helpers ──────────────────────────────────────
+
+/// 6-Z187c: the hook→tracer syscall marker value ("twoyi123" — matches
+/// TWOYI_SYSCALL_MARK in twrp_fb_hook.c).
+pub const HOOK_SYSCALL_MARKER: u64 = 0x7477_6f79_6931_3233;
+
+/// 6-Z187c: is THIS stop a hook-issued raw syscall carrying the
+/// known-good-host-path marker? (See ChildAbi::reg_marker.) The marker
+/// REGISTER VALUE survives to the syscall stop — the kernel preserves
+/// untouched arg registers.
+fn hook_marker_present(regs: &Regs, abi: &ChildAbi) -> bool {
+    if abi.reg_marker < 0 {
+        return false;
+    }
+    let idx = abi.reg_marker as usize;
+    let regs_ptr = regs as *const Regs as *const u64;
+    // SAFETY: reg_marker indexes within the arch register array (x6 on
+    // aarch64 user_pt_regs — always present).
+    unsafe { *regs_ptr.add(idx) == HOOK_SYSCALL_MARKER }
+}
 
 fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
     if addr == 0 {
@@ -9312,12 +9353,22 @@ pub fn run_ptrace_loop(
     // jailed /tmp/recovery.log fd=-1 (redroid /tmp exists but is not
     // app-writable → EACCES → fd=-1).
     let mut open_read_fail_diag_count: u64 = 0;
+    // 6-Z187c: how many hook-MARKED open/openat syscalls we honored
+    // (logged for the first 20; the hook only marks known-good host
+    // paths — see HOOK_SYSCALL_MARKER).
+    let mut open_hook_marked_count: u64 = 0;
     // 6-Z187: per-stop claim that THIS pid's execve was already rewritten
     // by the 6-Z187 arm (staged target written by the tracer itself, or the
     // +1 cwd-relative fallback whose path the backstop cannot read). The
     // backstop consumes it to avoid re-verifying (or fail-closing) a
     // redirect the tracer performed; it is refreshed at every execve ENTRY.
     let mut execve_rewrite_claim: Option<(libc::pid_t, String)> = None;
+    // 6-Z187c: execves whose ENTRY path was unreadable (the +1/marker
+    // branches) — the execve EXIT handler logs the kernel's verdict +
+    // the child's cwd for these (the two facts the next fix iteration
+    // needs).
+    let mut pending_blind_execve: std::collections::HashMap<libc::pid_t, String> =
+        std::collections::HashMap::new();
     // 6-Z167: how many /proc/<pid>/maps brackets we already dumped for the
     // 6-Z164 path-read-failure DIAG (first 3 — enough to name the region
     // class without flooding the log across TWRP's 10 service restarts).
@@ -11750,24 +11801,41 @@ pub fn run_ptrace_loop(
                                 // ENOENT on redroid, but a HOST SHELL on any
                                 // device whose /sbin/sh exists (Magisk!).
                                 //
-                                // THE +1 cwd-relative fallback (the execve
-                                // twin of the 6-Z170 open fix): rewrite
-                                // arg1 := path_addr + 1. The kernel then
-                                // resolves the same string one byte deeper
-                                // — sans its leading '/' — against the
-                                // child's cwd, WHICH IS THE ROOTFS. With
-                                // the 6-Z187 boot provisioning, {rootfs}/
-                                // sbin/sh is a REAL symlink to the STAGED
-                                // busybox (on the exec-able cache
-                                // partition), so this raw resolution both
-                                // SUCCEEDS and stays inside the sandbox.
-                                // argv/envp are untouched (execl-style
-                                // argv[0]="sh" keeps busybox's ash mode).
-                                if past_first_execve && path_addr_e != 0 {
+                                // 6-Z187c: if the HOOK issued this execve
+                                // with the known-good-path MARKER, leave it
+                                // COMPLETELY untouched — the hook already
+                                // resolved the host-valid form itself.
+                                if hook_marker_present(&regs, &abi) {
+                                    execve_rewrite_claim = Some((
+                                        pid,
+                                        "hook-marker (known-good host path)".to_string(),
+                                    ));
+                                    pending_blind_execve.insert(pid, "hook-marker".to_string());
+                                    log(&format!(
+                                        "6-Z187c: hook-marked execve on pid {} left untouched (hook issued a known-good host path)",
+                                        pid
+                                    ));
+                                } else if past_first_execve && path_addr_e != 0 {
+                                    //
+                                    // THE +1 cwd-relative fallback (the execve
+                                    // twin of the 6-Z170 open fix): rewrite
+                                    // arg1 := path_addr + 1. The kernel then
+                                    // resolves the same string one byte deeper
+                                    // — sans its leading '/' — against the
+                                    // child's cwd, WHICH IS THE ROOTFS. With
+                                    // the 6-Z187 boot provisioning, {rootfs}/
+                                    // sbin/sh is a REAL symlink to the STAGED
+                                    // busybox (on the exec-able cache
+                                    // partition), so this raw resolution both
+                                    // SUCCEEDS and stays inside the sandbox.
+                                    // argv/envp are untouched (execl-style
+                                    // argv[0]="sh" keeps busybox's ash mode).
                                     set_syscall_arg(&mut regs, abi.reg_arg1, path_addr_e + 1);
                                     if ptrace_setregs(pid, &regs, iov_len).is_ok() {
                                         execve_rewrite_claim =
                                             Some((pid, "cwd-relative+1".to_string()));
+                                        pending_blind_execve
+                                            .insert(pid, "cwd-relative+1".to_string());
                                         log(&format!(
                                             "6-Z187: execve ENTRY path-read FAILED pid={} path_addr={:#x} peek_errno={} — rewrote to cwd-relative +1 (kernel resolves against the rootfs cwd; {}/sbin/* are staged symlinks)",
                                             pid,
@@ -13382,49 +13450,72 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             } else if past_first_execve {
-                                // ── 6-Z164: open ENTRY path-read DIAG ──
-                                // read_child_string FAILED on the path
-                                // register (PTRACE_PEEKDATA EIO — the same
-                                // failure the DIAG write buffer readbacks
-                                // showed in run 32996812991). Historically
-                                // the open then ran UNTRANSLATED against
-                                // the host (redroid /twres, /etc/* → ENOENT
-                                // — exactly the run-33008669118 /twres
-                                // mystery: files present, loads failing,
-                                // PageManager reads via bionic-INTERNAL
-                                // openat so not even the fb_hook's PLT
-                                // wrapper sees them).
-                                //
-                                // ── 6-Z170: THE +1-POINTER cwd-relative
-                                // REWRITE ── THE wholesale fix for the
-                                // PEEK-blind open class — needs ZERO
-                                // memory reads: rewrite dirfd := AT_FDCWD
-                                // and path := path_addr + 1 (the kernel
-                                // reads the SAME string one byte deeper,
-                                // skipping the leading '/'), so an
-                                // absolute "/twres/splash.xml" resolves as
-                                // the cwd-relative "twres/splash.xml"
-                                // against the child's cwd — WHICH IS THE
-                                // ROOTFS. Never worse than the status quo:
-                                // a non-absolute path or a chdir'd child
-                                // just fails the way it already did.
-                                let rewrite_ok = {
-                                    let path_arg = if syscall_num == abi.open {
-                                        abi.reg_arg1
-                                    } else {
-                                        abi.reg_arg2
-                                    };
-                                    if syscall_num == abi.openat || syscall_num == abi.openat2 {
-                                        set_syscall_arg(&mut regs, abi.reg_arg1, (-100i64) as u64);
+                                // ── 6-Z187c: hook-marked opens are left
+                                // COMPLETELY untouched — the fb_hook issues
+                                // marked raw openats ONLY with host-valid
+                                // paths it built itself ({rootfs}-prefixed
+                                // retry forms). Run 33120905168: the +1
+                                // fallback below was CORRUPTING those very
+                                // retries (stripping the '/' off
+                                // "{rootfs}/..." → cwd-relative garbage →
+                                // the via=1 failures).
+                                if hook_marker_present(&regs, &abi) {
+                                    open_hook_marked_count =
+                                        open_hook_marked_count.saturating_add(1);
+                                    if open_hook_marked_count <= 20 {
+                                        log(&format!(
+                                            "6-Z187c: hook-marked open/openat on pid {} left untouched (hook issued a known-good host path)",
+                                            pid
+                                        ));
                                     }
-                                    set_syscall_arg(&mut regs, path_arg, path_addr + 1);
-                                    ptrace_setregs(pid, &regs, iov_len).is_ok()
-                                };
-                                open_read_fail_diag_count =
-                                    open_read_fail_diag_count.saturating_add(1);
-                                if open_read_fail_diag_count <= 60 {
-                                    let peek_err = peek_word_errno(pid, path_addr);
-                                    log(&format!(
+                                } else {
+                                    // ── 6-Z164: open ENTRY path-read DIAG ──
+                                    // read_child_string FAILED on the path
+                                    // register (PTRACE_PEEKDATA EIO — the same
+                                    // failure the DIAG write buffer readbacks
+                                    // showed in run 32996812991). Historically
+                                    // the open then ran UNTRANSLATED against
+                                    // the host (redroid /twres, /etc/* → ENOENT
+                                    // — exactly the run-33008669118 /twres
+                                    // mystery: files present, loads failing,
+                                    // PageManager reads via bionic-INTERNAL
+                                    // openat so not even the fb_hook's PLT
+                                    // wrapper sees them).
+                                    //
+                                    // ── 6-Z170: THE +1-POINTER cwd-relative
+                                    // REWRITE ── THE wholesale fix for the
+                                    // PEEK-blind open class — needs ZERO
+                                    // memory reads: rewrite dirfd := AT_FDCWD
+                                    // and path := path_addr + 1 (the kernel
+                                    // reads the SAME string one byte deeper,
+                                    // skipping the leading '/'), so an
+                                    // absolute "/twres/splash.xml" resolves as
+                                    // the cwd-relative "twres/splash.xml"
+                                    // against the child's cwd — WHICH IS THE
+                                    // ROOTFS. Never worse than the status quo:
+                                    // a non-absolute path or a chdir'd child
+                                    // just fails the way it already did.
+                                    let rewrite_ok = {
+                                        let path_arg = if syscall_num == abi.open {
+                                            abi.reg_arg1
+                                        } else {
+                                            abi.reg_arg2
+                                        };
+                                        if syscall_num == abi.openat || syscall_num == abi.openat2 {
+                                            set_syscall_arg(
+                                                &mut regs,
+                                                abi.reg_arg1,
+                                                (-100i64) as u64,
+                                            );
+                                        }
+                                        set_syscall_arg(&mut regs, path_arg, path_addr + 1);
+                                        ptrace_setregs(pid, &regs, iov_len).is_ok()
+                                    };
+                                    open_read_fail_diag_count =
+                                        open_read_fail_diag_count.saturating_add(1);
+                                    if open_read_fail_diag_count <= 60 {
+                                        let peek_err = peek_word_errno(pid, path_addr);
+                                        log(&format!(
                                         "6-Z170: open ENTRY path-read FAILED pid={} nr={} path_addr={:#x} peek_errno={} — rewrote to cwd-relative +1 ({}), kernel resolves against the rootfs cwd (occurrence {})",
                                         pid,
                                         syscall_num,
@@ -13433,26 +13524,29 @@ pub fn run_ptrace_loop(
                                         if rewrite_ok { "OK" } else { "SETREGS FAILED" },
                                         open_read_fail_diag_count
                                     ));
-                                    // 6-Z167: name the mapping class for the
-                                    // first 3 failing addresses (stack?
-                                    // hook .rodata? heap?) — settles WHY PEEK
-                                    // EIOs on kernel-readable pages.
-                                    if peek_maps_dumped < 3 {
-                                        peek_maps_dumped = peek_maps_dumped.saturating_add(1);
-                                        match std::fs::read_to_string(format!("/proc/{}/maps", pid))
-                                        {
-                                            Ok(content) => log(&format!(
-                                                "6-Z167: maps bracket for {:#x}:\n{}",
-                                                path_addr,
-                                                maps_bracket_in(&content, path_addr)
-                                            )),
-                                            Err(e) => log(&format!(
-                                                "6-Z167: maps read FAILED for pid={}: {}",
-                                                pid, e
-                                            )),
+                                        // 6-Z167: name the mapping class for the
+                                        // first 3 failing addresses (stack?
+                                        // hook .rodata? heap?) — settles WHY PEEK
+                                        // EIOs on kernel-readable pages.
+                                        if peek_maps_dumped < 3 {
+                                            peek_maps_dumped = peek_maps_dumped.saturating_add(1);
+                                            match std::fs::read_to_string(format!(
+                                                "/proc/{}/maps",
+                                                pid
+                                            )) {
+                                                Ok(content) => log(&format!(
+                                                    "6-Z167: maps bracket for {:#x}:\n{}",
+                                                    path_addr,
+                                                    maps_bracket_in(&content, path_addr)
+                                                )),
+                                                Err(e) => log(&format!(
+                                                    "6-Z167: maps read FAILED for pid={}: {}",
+                                                    pid, e
+                                                )),
+                                            }
                                         }
                                     }
-                                }
+                                } // 6-Z187c: end of the non-marked (+1) path
                             }
                         }
                         // Task 6-T: stat64 + lstat64 added to the
@@ -16252,6 +16346,32 @@ pub fn run_ptrace_loop(
                             "execve EXIT (pid {}) — will reset its cached ABI at next loop top",
                             exec_pid
                         ));
+                        // 6-Z187c: for execves whose ENTRY path was
+                        // UNREADABLE (the +1/marker branches), log the
+                        // KERNEL's verdict + the child's cwd — the two
+                        // facts that decide the next fix iteration.
+                        if let Some(how) = pending_blind_execve.remove(&exec_pid) {
+                            let mut regs_bx: Regs = unsafe { std::mem::zeroed() };
+                            if ptrace_getregs(exec_pid, &mut regs_bx).is_ok() {
+                                let ret = get_syscall_arg(&regs_bx, abi.reg_ret) as i64;
+                                let cwd_desc =
+                                    std::fs::read_link(format!("/proc/{}/cwd", exec_pid))
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|e| format!("<unreadable: {}>", e));
+                                log(&format!(
+                                    "6-Z187c: blind execve on pid {} ({}) kernel ret={} ({}) cwd={}",
+                                    exec_pid,
+                                    how,
+                                    ret,
+                                    if ret < 0 && ret > -4096 {
+                                        format!("-errno {}", -ret)
+                                    } else {
+                                        "SUCCESS".to_string()
+                                    },
+                                    cwd_desc
+                                ));
+                            }
+                        }
                     }
 
                     if pending_getpid.contains(&pid) {

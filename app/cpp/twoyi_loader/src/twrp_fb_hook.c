@@ -110,6 +110,10 @@ extern void *dlsym(void *handle, const char *symbol) __attribute__((weak));
 // cwd IS the rootfs, so "../dev/touch-events" resolves to the same file).
 extern char *getenv(const char *name) __attribute__((weak));
 
+// WEAK environ — for execv()'s default environment (see the 6-Z187c
+// exec interposition below).
+extern char **environ __attribute__((weak));
+
 // ---------------------------------------------------------------------------
 // CUSTOM LIBC FUNCTIONS — we build with -nostdlib, so we must provide our
 // own implementations of memset, strcmp, and strlen. Without these, the
@@ -217,6 +221,11 @@ static long raw_syscall4(long num, long a, long b, long c, long d) {
     return ret;
 }
 
+/* 6-Z187c: no marker channel on i386 (the register file is fully used by
+ * syscall args); the marked wrappers degrade to the plain ones. */
+#define raw_syscall4_marked raw_syscall4
+#define raw_syscall3_marked raw_syscall3
+
 #elif defined(__aarch64__)
 
 static long raw_syscall1(long num, long a) {
@@ -271,6 +280,43 @@ static long raw_syscall4(long num, long a, long b, long c, long d) {
         : "memory"
     );
     return x0;
+}
+
+/* ── 6-Z187c: the HOOK→TRACER syscall MARKER ────────────────────────────
+ *
+ * Run 33120905168: the tracer is PEEK/pvm/proc-mem BLIND on the pages
+ * the hook (and the linker-mapped guest image) live on, so every path
+ * the hook passes from its OWN buffers gets the tracer's +1 cwd-relative
+ * fallback applied — which STRIPS the leading '/' off already-host-valid
+ * {rootfs}-prefixed retry paths → ENOENT (the via=1 prefix retries were
+ * being corrupted by the very fallback meant to save them).
+ *
+ * THE MARKER: for syscalls the hook issues with a KNOWN-GOOD HOST path,
+ * set x6 (unused by openat/execve arg slots) to TWOYI_SYSCALL_MARK. The
+ * tracer sees the marker and leaves the syscall COMPLETELY untouched —
+ * no translation, no +1, no backstop fail-closed. The hook only uses
+ * marked calls for paths it built itself as {rootfs}-prefixed (or
+ * cwd-relative under a cwd it knows is the rootfs). */
+#define TWOYI_SYSCALL_MARK 0x74776f7969313233ULL /* "twoyi123" */
+
+static long raw_syscall4_marked(long num, long a, long b, long c, long d) {
+    register long x8 __asm__("x8") = num;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    register long x6 __asm__("x6") = (long)TWOYI_SYSCALL_MARK;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x6)
+        : "memory"
+    );
+    return x0;
+}
+
+static long raw_syscall3_marked(long num, long a, long b, long c) {
+    return raw_syscall4_marked(num, a, b, c, 0);
 }
 
 #else
@@ -709,12 +755,19 @@ static int rootfs_retry_open(const char *path, int abs_fd, int flags, int mode) 
     int via = 0;
     char *alt = rootfs_path_form(path);
     if (alt) {
-        rfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)alt, flags, mode);
+        /* 6-Z187c: MARKED — the prefix form is a host-valid path built by
+         * the hook; the tracer must not +1-corrupt it (it cannot read the
+         * hook's static buffer — that is exactly how the via=1 retries
+         * died in run 33120905168). */
+        rfd = (int)raw_syscall4_marked(SYS_openat, AT_FDCWD, (long)alt, flags, mode);
         via = 1;
     }
     if (rfd < 0 && alt && alt != path + 1) {
         // Prefix form failed (or env missing) — last resort: relative.
-        rfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)(path + 1),
+        // 6-Z187c: also MARKED — path+1 is cwd-relative and the guest cwd
+        // IS the rootfs (6-Z187b chdir); translation is a no-op for
+        // relative paths, but the +1-of-+1 corruption must not happen.
+        rfd = (int)raw_syscall4_marked(SYS_openat, AT_FDCWD, (long)(path + 1),
                                 flags, mode);
         via = 2;
     }
@@ -2126,6 +2179,89 @@ int close(int fd) {
 // want for LD_PRELOAD interposition — bionic's dynamic linker resolves
 // the first definition found in the link order, and LD_PRELOAD .so
 // entries come before the executable's own libs.
+// ---------------------------------------------------------------------------
+// ── 6-Z187c: EXEC INTERPOSITION ─────────────────────────────────────────
+//
+// TWRP's terminal (gui/terminal.cpp runSlave) does
+//   execl("/sbin/sh", "sh", NULL);
+//   _exit(127);
+// and run 33120905168 showed the tracer's +1 cwd-relative fallback for
+// the PEEK-blind execl path STILL ended in exit(127) — the terminal
+// prints "Child processes exited.". The HOOK can read its own address
+// space (the same pages the tracer cannot PEEK), so give exec the same
+// treatment as open: try the {rootfs}-prefix form FIRST via a MARKED
+// raw syscall (untouchable by the tracer — no translation, no +1),
+// then the raw form (the tracer translates it when it CAN read it),
+// then the cwd-relative form (cwd == rootfs per 6-Z187b). With the
+// 6-Z187 provisioning, {rootfs}/sbin/sh is a REAL symlink to the
+// STAGED busybox on the exec-able cache partition — the prefix form
+// succeeds and the terminal gets its shell.
+// ---------------------------------------------------------------------------
+
+static long hook_exec_common(const char *path, char *const argv[], char *const envp[]) {
+    if (!path) return -22; /* EINVAL */
+    write_str(2, "[twrp_fb_hook] exec path=\"");
+    write_str(2, path);
+    write_str(2, "\"\n");
+    if (path[0] == '/') {
+        char *alt = rootfs_path_form(path);
+        if (alt && alt != path + 1) {
+            long r = raw_syscall4_marked(SYS_execve, (long)alt,
+                                         (long)argv, (long)envp, 0);
+            write_str(2, "[twrp_fb_hook] exec prefix-form ret=");
+            write_num(2, (int)r);
+            write_str(2, "\n");
+            if (r == 0) return 0; /* never reached on success */
+        }
+        long r2 = raw_syscall4(SYS_execve, (long)path, (long)argv,
+                               (long)envp, 0);
+        write_str(2, "[twrp_fb_hook] exec raw-form ret=");
+        write_num(2, (int)r2);
+        write_str(2, "\n");
+        if (r2 < 0 && path[1] != '\0') {
+            long r3 = raw_syscall4_marked(SYS_execve, (long)(path + 1),
+                                          (long)argv, (long)envp, 0);
+            write_str(2, "[twrp_fb_hook] exec cwd-relative-form ret=");
+            write_num(2, (int)r3);
+            write_str(2, "\n");
+            return r3;
+        }
+        return r2;
+    }
+    return raw_syscall4(SYS_execve, (long)path, (long)argv,
+                         (long)envp, 0);
+}
+
+int execve(const char *path, char *const argv[], char *const envp[]) {
+    return (int)hook_exec_common(path, argv, envp);
+}
+
+int execv(const char *path, char *const argv[]) {
+    char *const empty_envp[1] = { 0 };
+    char **env = (environ && *environ) ? environ : (char **)empty_envp;
+    return (int)hook_exec_common(path, argv, env);
+}
+
+int execl(const char *path, const char *arg0, ...) {
+    /* Build argv from the varargs (arg0 .. NULL). TWRP's terminal calls
+     * execl("/sbin/sh", "sh", NULL) — tiny argv, stack buffer is fine. */
+    const char *argv_stack[33];
+    int n = 0;
+    va_list ap;
+    va_start(ap, arg0);
+    argv_stack[n++] = arg0;
+    while (n < 32) {
+        const char *a = va_arg(ap, const char *);
+        if (!a) break;
+        argv_stack[n++] = a;
+    }
+    va_end(ap);
+    argv_stack[n] = 0;
+    char *const empty_envp[1] = { 0 };
+    char **env = (environ && *environ) ? environ : (char **)empty_envp;
+    return (int)hook_exec_common(path, (char *const *)argv_stack, env);
+}
+
 int ioctl(int fd, int request, ...) {
     va_list ap;
     va_start(ap, request);
