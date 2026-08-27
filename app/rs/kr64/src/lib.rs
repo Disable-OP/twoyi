@@ -7830,6 +7830,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                         .checked_add((e_phentsize * e_phnum) as u64)
                                         .map_or(true, |end| end > file_len_hdr)
                                         == false;
+                                // 6-Z184: hoisted so the append path below
+                                // (which re-scans the phdr table) can use it;
+                                // only populated when table_ok.
+                                let mut phdrs_all: Vec<u8> = Vec::new();
                                 let interp: Option<(u64, usize)> = if !table_ok {
                                     warning!(
                                         "[KR64] PT_INTERP scan: implausible phdr table (phoff={}, phentsize={}, phnum={}, file_len={}) — skipping patch for this binary",
@@ -7840,9 +7844,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     );
                                     None
                                 } else {
-                                    let mut phdrs = vec![0u8; e_phentsize * e_phnum];
+                                    phdrs_all = vec![0u8; e_phentsize * e_phnum];
                                     let _ = file.seek(std::io::SeekFrom::Start(e_phoff));
-                                    let _ = file.read_exact(&mut phdrs);
+                                    let _ = file.read_exact(&mut phdrs_all);
+                                    let phdrs = &phdrs_all;
                                     let mut interp_offset = None;
                                     let mut interp_filesz = None;
                                     for i in 0..e_phnum {
@@ -7934,14 +7939,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                             // Update the PT_INTERP program header's p_offset and
                                             // p_filesz (6-Z157: class-aware field offsets + widths)
                                             let mut pt_interp_phdr_off = None;
+                                            let phdrs = &phdrs_all;
                                             for i in 0..e_phnum {
                                                 let off = i * e_phentsize;
-                                                let p_type = u32::from_le_bytes([
-                                                    phdrs[off],
-                                                    phdrs[off + 1],
-                                                    phdrs[off + 2],
-                                                    phdrs[off + 3],
-                                                ]);
+                                                let Some(p_type) = phdrs
+                                                    .get(off..off + 4)
+                                                    .map(|b| {
+                                                        u32::from_le_bytes([
+                                                            b[0], b[1], b[2], b[3],
+                                                        ])
+                                                    })
+                                                else {
+                                                    break;
+                                                };
                                                 if p_type == 3 {
                                                     pt_interp_phdr_off = Some(e_phoff + off as u64);
                                                     break;
