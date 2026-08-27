@@ -1411,13 +1411,41 @@ def main():
         print("=" * 60)
 
         def _read_recovery_log():
+            # 6-Z186 iter-3: on arm64 redroid, `run-as io.twoyi.debug cat`
+            # silently produces NOTHING (works on the x86 emulator, dead
+            # on redroid — every run-as pull in run 33102864178 was empty,
+            # so the gate/pages were invisible to the probe and the whole
+            # chain ran blind). docker exec reads the same file from the
+            # container FS as root — the SAME channel the workflow's own
+            # post-run pull uses (twrp-recovery-log-dockerexec.log), which
+            # demonstrably works. Try run-as first (no sudo needed on
+            # x86), then docker exec for each candidate path.
+            _diag_shown = getattr(_read_recovery_log, "_diag", False)
             for p in (
                 f"profiles/default/rootfs/tmp/recovery.log",
                 "rootfs/tmp/recovery.log",
-                "/tmp/recovery.log",
             ):
                 out = adb_shell(f"run-as {PACKAGE} cat {p}", timeout=10)
-                if out:
+                if out and len(out) > 200:
+                    return out
+                if out and not _diag_shown:
+                    _read_recovery_log._diag = True
+                    print(f"  [recovery.log] run-as returned unusable output "
+                          f"({len(out)} bytes, first 120: {out[:120]!r}) — "
+                          f"falling back to docker exec")
+            for p in (
+                f"/data/user/0/{PACKAGE}/profiles/default/rootfs/tmp/recovery.log",
+                f"/data/user/0/{PACKAGE}/rootfs/tmp/recovery.log",
+            ):
+                try:
+                    r = subprocess.run(
+                        ["sudo", "docker", "exec", "redroid", "sh", "-c",
+                         f"cat '{p}' 2>/dev/null"],
+                        capture_output=True, timeout=15)
+                    out = r.stdout.decode(errors="replace")
+                except Exception:
+                    out = ""
+                if out and len(out) > 200:
                     return out
             return ""
 
@@ -1429,13 +1457,20 @@ def main():
             return [(m.start(), m.group(1))
                     for m in re.finditer(r"Set page: '([A-Za-z0-9_]+)'", txt)]
 
-        def dismiss_fullscreen_overlay(tag="ovl"):
+        def dismiss_fullscreen_overlay(tag="ovl", blind=False):
             """6-Z186: the AOSP 'Viewing full screen' immersive-training
             overlay is a FRAMEWORK window (not app, not OEM-only) that
             sits above the app and eats EVERY tap until its GOT IT
-            button is pressed. Being a system window, uiautomator CAN
-            see it — dump + bounds-tap is deterministic. Run this
-            before/between every tap phase; it no-ops when absent."""
+            button is pressed. VLM analysis of run 33102864178's gate
+            frame pinned it: title ~(0.5, 0.13), GOT IT ~(0.77, 0.25).
+
+            uiautomator dump is the precise channel (system window) but
+            it FAILS while TWRP renders (45 fps SurfaceView = never
+            idle). So: dump+bounds first; when the dump is unavailable,
+            blind=True taps the VLM-derived candidate positions (all in
+            the TOP quarter — far above every TWRP gate/menu control at
+            y >= 0.6, so they are harmless when the overlay is absent).
+            blind is only used BEFORE the main menu is confirmed."""
             dismissed_any = False
             for attempt in range(4):
                 path = dump_ui(f"{tag}-{attempt}")
@@ -1457,12 +1492,24 @@ def main():
                     tap(x, y)
                     dismissed_any = True
                     wait(1.2)
+                elif attempt == 0 and (root is None or hit is None):
+                    # No dump (parse failed / empty) — blind candidates.
+                    if blind:
+                        for bfx, bfy in ((0.77, 0.25), (0.72, 0.22),
+                                         (0.82, 0.28), (0.5, 0.20)):
+                            bx, by = int(SCREEN_W * bfx), int(SCREEN_H * bfy)
+                            print(f"  [overlay] blind GOT IT candidate "
+                                  f"({bx},{by}) — tapping")
+                            tap(bx, by)
+                            wait(0.8)
+                        dismissed_any = True
+                    break
                 else:
                     break
             return dismissed_any
 
         # ── 0) Kill the full-screen overlay FIRST (before ANY guest tap) ──
-        dismiss_fullscreen_overlay("pre-gate")
+        dismiss_fullscreen_overlay("pre-gate", blind=True)
 
         # ── 1) Wait for the read-only gate page (system_readonly). ──
         # NOTE (physical-device lesson): TWRP's main menu only FLASHES
@@ -1480,7 +1527,7 @@ def main():
                 gate_pos = max(gate_positions)
                 print("  gate page 'system_readonly' is UP")
                 break
-            dismiss_fullscreen_overlay("gate-wait")
+            dismiss_fullscreen_overlay("gate-wait", blind=True)
             wait(5)
         if gate_pos is None:
             print("  WARNING: gate never appeared in recovery.log — "
@@ -1489,10 +1536,12 @@ def main():
         screenshot("term-00-gate")
 
         # ── 2) Swipe the read-only slider -> REAL main menu (stays up) ──
+        # VLM on the run-33102864178 gate frame: slider center y=0.88,
+        # horizontal span x 0.06..0.94.
         for i in range(3):
-            y = int(SCREEN_H * 0.885)
-            adb_shell(f"input swipe {int(SCREEN_W * 0.15)} {y} "
-                      f"{int(SCREEN_W * 0.85)} {y} 350")
+            y = int(SCREEN_H * 0.88)
+            adb_shell(f"input swipe {int(SCREEN_W * 0.10)} {y} "
+                      f"{int(SCREEN_W * 0.90)} {y} 350")
             wait(2.5)
             dismiss_fullscreen_overlay("post-swipe")
             pages = _pages()
