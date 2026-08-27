@@ -148,6 +148,10 @@ name: UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
         description: 'Native density for the redroid Android display (dpi). Only used when redroid_resolution is set'
         required: false
         default: '320'
+      twrp_no_input:
+        description: '6-Z180 A/B probe: 1 = touch the fb hook no-input gate files (input bridge OFF for the run); default 0 = bridge ON (touch enabled, production path)'
+        required: false
+        default: '0'
 
 concurrency:
   # Per-recovery group: different recovery images (recovery_name input)
@@ -573,6 +577,7 @@ jobs:
           BOOT_WAIT_SECONDS: ${{ github.event.inputs.boot_wait_seconds || '30' }}
           TWOYI_PACKAGE: io.twoyi.debug
           ADB_SERIAL: localhost:5555
+          TWOYI_NO_INPUT: ${{ github.event.inputs.twrp_no_input || '0' }}
         run: |
           mkdir -p /tmp/ui-e2e-artifacts
 

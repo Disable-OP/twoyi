@@ -1006,9 +1006,20 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
     char rootbuf[128];
     char relbuf[24];
     char *cands[3];
-    unsigned cand_lens[2];
+    /* 6-Z180 FIX: cand_lens was [2] while THREE candidates can be staged
+     * (/dev/.touch-sock + $TWOYI_ROOTFS + relative). With all three
+     * present, `cand_lens[ncands]` at ncands==2 wrote 4 bytes PAST the
+     * array onto this function's stack — a deterministic stack
+     * corruption inside the exact window every arm64 crash run died in
+     * (runs 33021261552/33021972679: socket -> fcntl -> fcntl -> SIGSEGV
+     * with a garbage sp). The array now holds all three lengths and
+     * every insert is bounds-guarded. */
+    unsigned cand_lens[3];
     int ncands = 0;
     long fd, i;
+
+    (void)my_memset(cand_lens, 0, sizeof(cand_lens));
+    (void)my_memset(cands, 0, sizeof(cands));
 
     *init_len = 0;
     *out_slot = 0;
@@ -1035,7 +1046,7 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
                 }
                 for (k = 0; pbuf[k]; k++) rootbuf[k] = pbuf[k];
                 rootbuf[k] = 0;
-                if (k > 0 && rootbuf[0] == '/') {
+                if (k > 0 && rootbuf[0] == '/' && ncands < 3) {
                     cands[ncands] = rootbuf; cand_lens[ncands] = (unsigned)k; ncands++;
                 }
             }
@@ -1046,7 +1057,7 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
         const char *root = getenv("TWOYI_ROOTFS");
         if (root && root[0] && my_strcmp(root, "/") != 0) {
             unsigned n = inbr_build_path(rootbuf, sizeof(rootbuf), root);
-            if (n > 0) { cands[ncands] = rootbuf; cand_lens[ncands] = n; ncands++; }
+            if (n > 0 && ncands < 3) { cands[ncands] = rootbuf; cand_lens[ncands] = n; ncands++; }
         }
     }
     /* candidate 1: relative ../dev/touch-events (guest cwd == rootfs) */
@@ -1056,8 +1067,10 @@ static int inbr_connect(struct inbr_slot **out_slot, unsigned char *init_bytes,
         unsigned j;
         my_memset(relbuf, 0, sizeof(relbuf));
         for (j = 0; j < n; j++) relbuf[j] = rel[j];
-        cands[ncands] = relbuf; cand_lens[ncands] = n; ncands++;
+        if (ncands < 3) { cands[ncands] = relbuf; cand_lens[ncands] = n; ncands++; }
     }
+    if (ncands == 0) return -1; /* unreachable (relative insert is
+                                 * unconditional) — kept for clarity */
 
     for (i = 0; i < ncands; i++) {
         long v;
@@ -1143,6 +1156,44 @@ static int is_input_path(const char *path) {
     return 0;
 }
 
+// 6-Z180: the no-input gate. The deterministic input-tail SIGSEGV (runs
+// 33021261552/33021972679) lands in the ev_init/input-bridge window; the
+// A/B probe is to run the SAME build with the bridge DISABLED and see
+// whether pixels reach fb0 (TWRP renders its menu without touch input —
+// plenty of devices boot recovery with no evdev nodes at all). Env vars
+// do NOT reliably reach the recovery process (6-Z175 — TWRP's init
+// rebuilds the service env from init.rc setenv), so the gate is FILE
+// based, mirroring .twoyi-fb-geometry (6-Z176):
+//   {rootfs}/dev/.twoyi-no-input   (opened via /dev/... -> rootfs/dev
+//                                   translation by the tracer)
+//   {rootfs}/.twoyi-no-input       (cwd-relative — guest cwd IS the
+//                                   rootfs)
+// Either file's EXISTENCE (any content, even empty) disables the bridge:
+// try_open_input_bridge() returns -2 (real open of the pre-created
+// probe file), minui sees a dumb device that reports no events, and the
+// render path runs untouched. The E2E workflow touches these files via
+// docker exec between the ROM import and the Launch Container tap.
+static int g_no_input_gate = -1;   /* -1 = not checked, 0 = on, 1 = off */
+
+static int no_input_gate(void) {
+    if (g_no_input_gate >= 0) return g_no_input_gate;
+    g_no_input_gate = 0;
+    {
+        int gfd = (int)raw_syscall4(SYS_openat, -100 /*AT_FDCWD*/,
+                                    (long)"/dev/.twoyi-no-input", 0, 0);
+        if (gfd < 0)
+            gfd = (int)raw_syscall4(SYS_openat, -100,
+                                    (long)".twoyi-no-input", 0, 0);
+        if (gfd >= 0) {
+            raw_syscall1(SYS_close, gfd);
+            g_no_input_gate = 1;
+            write_str(2, "[twrp_fb_hook] 6-Z180: no-input gate file present"
+                         " — INPUT bridge DISABLED (real open fallback)\n");
+        }
+    }
+    return g_no_input_gate;
+}
+
 // Attempt the input bridge for this open(). Returns the fd to hand to the
 // caller, or -2 to fall through to a real open().
 static int try_open_input_bridge(const char *path) {
@@ -1153,6 +1204,7 @@ static int try_open_input_bridge(const char *path) {
     int i;
 
     if (!is_input_path(path)) return -2;
+    if (no_input_gate()) return -2;
 
     fd = inbr_connect(&slot, init_bytes, &init_len);
     if (fd < 0) {
@@ -1595,7 +1647,15 @@ static void fatal_dump_maps(void);
 __attribute__((constructor))
 static void twrp_fb_hook_init(void) {
     int i;
-    write_str(2, "[twrp_fb_hook] loaded (i686 LD_PRELOAD for /dev/graphics/fb0)\n");
+    write_str(2, "[twrp_fb_hook] loaded ("
+#if defined(__aarch64__)
+                 "aarch64"
+#elif defined(__i386__)
+                 "i686"
+#else
+                 "unknown-arch"
+#endif
+                 " LD_PRELOAD for /dev/graphics/fb0)\n");
 
     // INPUT BRIDGE: initialize the slot table (bss-zeroed fd==0 would
     // otherwise alias stdin!). NO raw staging of /dev/input here:
@@ -1617,12 +1677,17 @@ static void twrp_fb_hook_init(void) {
     // the addresses of OUR definitions; if bionic's linker resolves
     // libminuitwrp's `open` PLT entry to a DIFFERENT address, that
     // would explain why our hook isn't being called.
-    write_str(2, "[twrp_fb_hook] addrs: open@"); write_hex(2, (unsigned int)(uintptr_t)&open);
-    write_str(2, " openat@"); write_hex(2, (unsigned int)(uintptr_t)&openat);
-    write_str(2, " __open_2@"); write_hex(2, (unsigned int)(uintptr_t)&__open_2);
-    write_str(2, " __openat_2@"); write_hex(2, (unsigned int)(uintptr_t)&__openat_2);
-    write_str(2, " close@"); write_hex(2, (unsigned int)(uintptr_t)&close);
-    write_str(2, " ioctl@"); write_hex(2, (unsigned int)(uintptr_t)(int(*)(int,int,...))&ioctl);
+    /* 6-Z180: full 64-bit addresses + the true arch label — run
+     * 33021972679's "addrs: open@0x8347270c" looked like a 32-bit
+     * hook inside an arm64 process because the banner said i686 and
+     * write_hex truncated to 32 bits. write_hex64 prints the real
+     * value (same digits on i386). */
+    write_str(2, "[twrp_fb_hook] addrs: open@"); write_hex64(2, (unsigned long long)(uintptr_t)&open);
+    write_str(2, " openat@"); write_hex64(2, (unsigned long long)(uintptr_t)&openat);
+    write_str(2, " __open_2@"); write_hex64(2, (unsigned long long)(uintptr_t)&__open_2);
+    write_str(2, " __openat_2@"); write_hex64(2, (unsigned long long)(uintptr_t)&__openat_2);
+    write_str(2, " close@"); write_hex64(2, (unsigned long long)(uintptr_t)&close);
+    write_str(2, " ioctl@"); write_hex64(2, (unsigned long long)(uintptr_t)(int(*)(int,int,...))&ioctl);
     write_str(2, "\n");
 
     // 6-Z176: dump /proc/self/maps ONCE AT LOAD. Run 33018901591: the

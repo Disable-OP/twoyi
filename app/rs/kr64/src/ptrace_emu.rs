@@ -2279,6 +2279,53 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
 /// `sizeof(user_regs_struct)` bytes and the value is ignored.
 #[cfg(target_arch = "aarch64")]
 fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Result<()> {
+    // ── 6-Z180: PC/SP SMOKE DETECTOR (aarch64) ──
+    //
+    // Every legitimate setregs call site in this tracer mutates the
+    // RETURN-VALUE register (x0) or an ARGUMENT register (x0..x5, x8)
+    // of a register snapshot taken from a FRESH getregs AT THE SAME
+    // STOP — pc/sp/pstate are always round-trip identical. A pc or sp
+    // that CHANGES can only come from a stale/cross-pid register
+    // struct — the exact corruption class that produces threads
+    // running on garbage stacks (runs 33021261552/33021972679:
+    // deterministic SIGSEGV, sp=0xffff.... unmapped). This detector
+    // logs every pc/sp-changing setregs RED-HANDED (rate-capped) with
+    // old->new values; combined with the [tid N] tags on the syscall
+    // log lines, the offending call site is identifiable from the
+    // surrounding log context in one run.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::cell::Cell;
+        thread_local! {
+            static SMOKE_COUNT: Cell<u32> = const { Cell::new(0) };
+        }
+        let new_pc = {
+            let rp = regs as *const Regs as *const u64;
+            unsafe { *rp.add(32) }
+        };
+        let new_sp = {
+            let rp = regs as *const Regs as *const u64;
+            unsafe { *rp.add(31) }
+        };
+        let mut old: Regs = unsafe { std::mem::zeroed() };
+        if ptrace_getregs(pid, &mut old).is_ok() {
+            let rp = &old as *const Regs as *const u64;
+            let old_pc = unsafe { *rp.add(32) };
+            let old_sp = unsafe { *rp.add(31) };
+            if old_pc != new_pc || old_sp != new_sp {
+                SMOKE_COUNT.with(|c| {
+                    let n = c.get();
+                    if n < 60 {
+                        c.set(n + 1);
+                        crate::info!(
+                            "6-Z180 SETREGS-SMOKE: pid={} pc {:#x} -> {:#x}, sp {:#x} -> {:#x} — STALE/CROSS-THREAD REGISTER WRITE (legitimate rewrites never touch pc/sp)",
+                            pid, old_pc, new_pc, old_sp, new_sp
+                        );
+                    }
+                });
+            }
+        }
+    }
     // libc::iovec has `iov_base: *mut c_void`; for SETREGSET we only
     // need `*const c_void` (the kernel reads from us), but the struct
     // layout is identical and the cast is safe — the kernel does not
@@ -3374,8 +3421,128 @@ fn syscall_name(nr: i64, abi: &ChildAbi) -> &'static str {
         "bind"
     } else if abi.listen_nr != -1 && nr == abi.listen_nr {
         "listen"
+    } else if abi.openat == 56 && abi.execve == 221 {
+        // 6-Z180: arm64 generic-name fallback. The aarch64 ABI carries
+        // dedicated fields only for the syscalls the tracer INTERCEPTS;
+        // every other asm-generic number printed "[unknown]" in the
+        // post-execve logs — the deterministic-crash tail read as
+        // "nr=25 [unknown], nr=25 [unknown]" instead of "fcntl F_GETFL /
+        // F_SETFL", hiding the input-bridge window for three sessions.
+        // The gate (openat==56 && execve==221) fingerprints the aarch64
+        // ABI — x86_64 (openat=257/execve=59) and i386 (openat=295/
+        // execve=11) keep their own tables untouched, so no existing
+        // label is shadowed (this arm is only reached when every
+        // dedicated branch above already missed). Entries cross-checked
+        // against the ABI_AARCH64 anchors already locked in this file
+        // (openat 56, close 57, read 63, write 64, writev 66, pread64
+        // 67, newfstatat 79, fstat 80, clone 220, execve 221, mmap 222,
+        // socket 198, bind 200, listen 201, connect 203, sendto 206,
+        // recvfrom 207, setsockopt 208, getsockopt 209, shutdown 210,
+        // sendmsg 211, recvmsg 212, wait4 260, exit_group 94, unshare
+        // 97, fchown 55, fchmod 52, capget 90, ioprio 31/30, getxattr
+        // 8/9/10, setxattr 5/6/7, fchmodat 53, fchownat 54, statx 291,
+        // statfs 43, fstatfs 44, mount 40, chroot 51, unlinkat 35,
+        // mkdirat 34, mknodat 33, setuid-family 146..159) — every name
+        // below NOT already anchored is a famous asm-generic constant
+        // (include/uapi/asm-generic/unistd.h).
+        arm64_generic_syscall_name(nr)
     } else {
         "unknown"
+    }
+}
+
+/// 6-Z180: asm-generic (aarch64) syscall-number → name for the numbers
+/// the arm64 boot path actually emits, used only via the aarch64
+/// fingerprint gate in [`syscall_name`]. Returns `"unknown"` for
+/// anything not in the table (the caller's fallthrough handles it).
+fn arm64_generic_syscall_name(nr: i64) -> &'static str {
+    match nr {
+        17 => "getcwd",
+        19 => "eventfd2",
+        20 => "epoll_create1",
+        21 => "epoll_ctl",
+        22 => "epoll_pwait",
+        23 => "dup",
+        24 => "dup3",
+        25 => "fcntl",
+        26 => "inotify_init1",
+        27 => "inotify_add_watch",
+        28 => "inotify_rm_watch",
+        29 => "ioctl",
+        30 => "ioprio_set",
+        31 => "ioprio_get",
+        32 => "flock",
+        36 => "symlinkat",
+        37 => "linkat",
+        38 => "renameat",
+        39 => "umount2",
+        40 => "mount",
+        41 => "pivot_root",
+        48 => "faccessat",
+        49 => "chdir",
+        58 => "pipe2",
+        61 => "getdents64",
+        62 => "lseek",
+        65 => "readv",
+        68 => "pwrite64",
+        72 => "pselect6",
+        73 => "ppoll",
+        93 => "exit",
+        95 => "waitid",
+        96 => "set_tid_address",
+        98 => "futex",
+        99 => "set_robust_list",
+        100 => "get_robust_list",
+        101 => "nanosleep",
+        113 => "clock_gettime",
+        114 => "clock_getres",
+        115 => "clock_nanosleep",
+        116 => "syslog",
+        117 => "ptrace",
+        124 => "sched_yield",
+        129 => "kill",
+        130 => "tkill",
+        131 => "tgkill",
+        132 => "sigaltstack",
+        133 => "rt_sigsuspend",
+        134 => "rt_sigaction",
+        135 => "rt_sigprocmask",
+        136 => "rt_sigpending",
+        139 => "rt_sigreturn",
+        165 => "getrusage",
+        163 => "getrlimit",
+        164 => "setrlimit",
+        167 => "prctl",
+        168 => "getcpu",
+        169 => "gettimeofday",
+        170 => "settimeofday",
+        174 => "gettid",
+        175 => "sysinfo",
+        199 => "socketpair",
+        202 => "accept",
+        204 => "getsockname",
+        205 => "getpeername",
+        215 => "munmap",
+        216 => "mremap",
+        217 => "add_key",
+        219 => "keyctl",
+        223 => "fadvise64",
+        226 => "mprotect",
+        227 => "msync",
+        228 => "mlock",
+        229 => "munlock",
+        230 => "mlockall",
+        231 => "munlockall",
+        232 => "mincore",
+        233 => "madvise",
+        261 => "prlimit64",
+        262 => "renameat2",
+        266 => "memfd_create",
+        278 => "getrandom",
+        281 => "epoll_pwait2",
+        435 => "clone3",
+        436 => "close_range",
+        _ => "unknown",
     }
 }
 
@@ -6769,6 +6936,8 @@ fn write_child_string_unchecked(pid: libc::pid_t, addr: u64, s: &str) -> bool {
 /// POKEDATA word chunks. Same contract as `write_child_string_unchecked`
 /// but for binary structs (translated sockaddr blobs).
 fn write_child_blob(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> bool {
+    // 6-Z180: POKE AUDIT (see write_child_bytes_pokedata).
+    poke_audit("blob", pid, addr, bytes);
     if addr == 0 || bytes.is_empty() {
         return false;
     }
@@ -7126,7 +7295,44 @@ fn mmap2_read_file_slice(
 ///
 /// Returns the number of content bytes successfully poked (stops at the
 /// first EIO — typically an unmapped address).
+/// 6-Z180: rate-limited audit of every tracer write into child memory.
+/// Pure diagnostic — names the (pid, addr, len, first bytes) of each
+/// poke so a write that lands on a sigframe, pthread struct or stack
+/// is identifiable in the next run's log. Zero behaviour change.
+fn poke_audit(kind: &str, pid: libc::pid_t, addr: u64, bytes: &[u8]) {
+    use std::cell::Cell;
+    thread_local! {
+        static POKE_COUNT: Cell<u32> = const { Cell::new(0) };
+    }
+    POKE_COUNT.with(|c| {
+        let n = c.get();
+        if n < 240 {
+            c.set(n + 1);
+            let head: String = bytes
+                .iter()
+                .take(8)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join("");
+            crate::info!(
+                "6-Z180 POKE[{}] #{}: pid={} addr={:#x} len={} head={}",
+                kind,
+                n,
+                pid,
+                addr,
+                bytes.len(),
+                head
+            );
+        }
+    });
+}
+
 fn write_child_bytes_pokedata(pid: libc::pid_t, addr: u64, bytes: &[u8]) -> usize {
+    // 6-Z180: POKE AUDIT — every tracer write into child memory is
+    // logged (rate-capped) so a poke that lands on a sigframe/pthread
+    // struct/stack is identifiable from the next run's log. Pure
+    // diagnostic; zero behaviour change.
+    poke_audit("pokedata", pid, addr, bytes);
     if addr == 0 || bytes.is_empty() {
         return 0;
     }
@@ -8328,6 +8534,10 @@ pub fn run_ptrace_loop(
     // accept4:    aarch64=242, x86_64=288, i386=364
     // epoll_pwait: aarch64=22,  x86_64=281, i386=319
     let mut spin_diag_accept4_count: u64 = 0;
+    // 6-Z180: rt_sigreturn sigframe dump rate cap (see the SIGFRAME
+    // FORENSICS block in the ENTRY handler).
+    #[allow(unused_mut, unused_variables)]
+    let mut sigreturn_dump_count: u64 = 0;
     let mut spin_diag_epoll_count: u64 = 0;
     let mut spin_diag_seen_fds: std::collections::HashSet<(libc::pid_t, i64)> =
         std::collections::HashSet::new();
@@ -10838,11 +11048,69 @@ pub fn run_ptrace_loop(
                         // verbatim (including every mprotect ENTRY).
                         if post_execve_syscall_count <= 20000 {
                             log(&format!(
-                                "post-execve syscall #{}: nr={} [{}]",
+                                "post-execve syscall #{}: [tid {}] nr={} [{}]",
                                 post_execve_syscall_count,
+                                pid,
                                 syscall_num,
                                 syscall_name(syscall_num, &abi)
                             ));
+                        }
+                        // ── 6-Z180: rt_sigreturn SIGFRAME FORENSICS (aarch64) ──
+                        //
+                        // The deterministic crash pattern (runs 33021261552 /
+                        // 33021972679): fault#1 at a VALID context -> TWRP's
+                        // handler runs (rt_sigaction + writev crash-log) ->
+                        // handler returns via the vDSO restorer -> rt_sigreturn
+                        // restores a CORRUPTED frame -> fault#2 with garbage
+                        // sp. The frame the kernel restores is sitting ON THE
+                        // THREAD'S STACK right now (sp at this ENTRY stop IS
+                        // the frame base). Dumping it BEFORE the restore shows
+                        // exactly which pc/sp/pstate the sigreturn will load —
+                        // and, diffed against the fault#2 registers, whether
+                        // the corruption was in the frame all along (written
+                        // over between delivery and return) or happened after.
+                        //
+                        // aarch64 rt_sigframe layout (arch/arm64/kernel/signal.c):
+                        //   siginfo@0..128, uc_flags@128, uc_link@136,
+                        //   uc_stack@144..168, uc_sigmask@168..176,
+                        //   __unused(glibc pad)@176..296,
+                        //   sigcontext: fault_address@296, x[0..30]@304..552,
+                        //   sp@552, pc@560, pstate@568. Total 576 bytes.
+                        #[cfg(target_arch = "aarch64")]
+                        if syscall_num == 139 {
+                            sigreturn_dump_count = sigreturn_dump_count.saturating_add(1);
+                            if sigreturn_dump_count <= 8 {
+                                let sp = get_syscall_arg(&regs, abi.reg_sp);
+                                let read64 = |off: u64| -> Option<u64> {
+                                    read_child_u64(pid, sp.wrapping_add(off))
+                                };
+                                log(&format!(
+                                    "6-Z180 SIGFRAME @ tid={} sp={:#x}: to-be-restored pc={:?} sp={:?} pstate={:?} fault_address={:?} lr(x30)={:?} fp(x29)={:?}",
+                                    pid,
+                                    sp,
+                                    read64(560).map(|v| format!("{:#x}", v)),
+                                    read64(552).map(|v| format!("{:#x}", v)),
+                                    read64(568).map(|v| format!("{:#x}", v)),
+                                    read64(296).map(|v| format!("{:#x}", v)),
+                                    read64(544).map(|v| format!("{:#x}", v)),
+                                    read64(536).map(|v| format!("{:#x}", v)),
+                                ));
+                                // 72 words, gap-marked (the frame may be
+                                // partially unmapped — that alone is signal).
+                                let mut words: Vec<String> = Vec::new();
+                                let mut off: u64 = 0;
+                                while off < 576 {
+                                    match read_child_u64(pid, sp.wrapping_add(off)) {
+                                        Some(v) => words.push(format!("+{}:{:#x}", off, v)),
+                                        None => words.push(format!("+{}:<gap>", off)),
+                                    }
+                                    off += 8;
+                                }
+                                log(&format!(
+                                    "6-Z180 SIGFRAME dump (off:word): {}",
+                                    words.join(" ")
+                                ));
+                            }
                         }
                         // ── 6-Z161: spin-fd DIAG (ENTRY side) — zero
                         // behaviour change. accept4 family: log fd+flags
@@ -12999,11 +13267,15 @@ pub fn run_ptrace_loop(
                     // init's timer-event processing wall-clock time to fire);
                     // every other child gets 10ms — still prevents a pure
                     // spin, but lets TWRP's loops run at ~100Hz.
-                    if syscall_num == abi.poll_nr {
+                    if abi.poll_nr != -1 && syscall_num == abi.poll_nr {
                         // 6-Z87: insert/refresh THIS pid's arm in the
                         // per-pid map (was: single Option<pid> slot that
                         // init's re-arms clobbered — see the 6-Z87 block
-                        // at the declaration).
+                        // at the declaration). 6-Z180: the `!= -1` gate
+                        // mirrors the EXIT-side guard — without it a
+                        // SIGSYS-desync stop (nr=-1) on aarch64 (where
+                        // poll_nr IS -1) armed the map + paid the sleep
+                        // for nothing.
                         pending_poll_fake.insert(pid, loop_count);
                         // 6-Z86: 100ms ONLY for init (POLLERR busy-spin
                         // culprit); 10ms for every forked child (TWRP's
@@ -14484,8 +14756,9 @@ pub fn run_ptrace_loop(
                             String::new()
                         };
                         log(&format!(
-                            "post-execve return #{}: {} nr={} -> {}{}",
+                            "post-execve return #{}: [tid {}] {} nr={} -> {}{}",
                             post_execve_syscall_count,
+                            pid,
                             syscall_name(syscall_num, &abi),
                             syscall_num,
                             ret_desc,
@@ -18326,13 +18599,64 @@ pub fn run_ptrace_loop(
                         let mut crash_regs: Regs = unsafe { std::mem::zeroed() };
                         if ptrace_getregs(pid, &mut crash_regs).is_ok() {
                             if let Some(a) = abi {
-                                // On x86_64 user_regs_struct, RIP is at
-                                // index 16 (byte offset 128). Each field
-                                // is u64 (8 bytes), so index 16 = offset
-                                // 16*8 = 128 bytes.
-                                let regs_ptr = &crash_regs as *const Regs as *const u64;
-                                let rip = unsafe { *regs_ptr.add(16) };
-                                let rsp = get_syscall_arg(&crash_regs, a.reg_sp);
+                                // ── 6-Z180: ARCH-CORRECT register read ──
+                                //
+                                // FORENSIC BUG FIXED HERE: this block read
+                                // "rip" via flat-index 16 — correct for the
+                                // x86_64 user_regs_struct, but on aarch64
+                                // (user_pt_regs = x0..x30, sp@31, pc@32,
+                                // pstate@33) index 16 is **x16**, the IP0
+                                // scratch register that compiler-generated
+                                // code routinely loads with sp+small_offset.
+                                // Every arm64 crash run's log therefore
+                                // showed "rip = rsp + 0xD0" — a LOCAL
+                                // VARIABLE ADDRESS, not the pc — and three
+                                // sessions chased a phantom "call into
+                                // 0xffff..." based on it. The real pc is
+                                // now read per-arch, the full register file
+                                // is dumped, and the crashing THREAD's
+                                // identity (/proc/<pid>/comm — waitpid
+                                // reports TIDs for threads) plus a stack
+                                // window land in the log so the next run
+                                // names the culprit thread outright.
+                                #[cfg(target_arch = "aarch64")]
+                                let (pc, sp_raw, extra_regs) = {
+                                    let rp = &crash_regs as *const Regs as *const u64;
+                                    let pc = unsafe { *rp.add(32) }; // user_pt_regs.pc
+                                    let sp = unsafe { *rp.add(a.reg_sp) }; // x-index 31
+                                                                           // x0..x30 compact dump (8 per line)
+                                    let mut s = String::new();
+                                    for row in 0..4 {
+                                        let mut line = String::new();
+                                        for col in 0..8 {
+                                            let idx = row * 8 + col;
+                                            if idx > 30 {
+                                                break;
+                                            }
+                                            let v = unsafe { *rp.add(idx) };
+                                            line.push_str(&format!(" x{}={:#x}", idx, v));
+                                        }
+                                        s.push_str(&format!("\n  SIGSEGV regs:{}", line));
+                                    }
+                                    (pc, sp, s)
+                                };
+                                #[cfg(target_arch = "x86_64")]
+                                let (pc, sp_raw, extra_regs) = {
+                                    // x86_64 user_regs_struct flat indices:
+                                    // 0:r15 1:r14 2:r13 3:r12 4:rbp 5:rbx 6:r11
+                                    // 7:r10 8:r9 9:r8 10:rax 11:rcx 12:rdx
+                                    // 13:rsi 14:rdi 15:orig_rax 16:rip ...
+                                    let rp = &crash_regs as *const Regs as *const u64;
+                                    let rip = unsafe { *rp.add(16) };
+                                    let sp = unsafe { *rp.add(a.reg_sp) }; // 19
+                                    let g = |i: usize| unsafe { *rp.add(i) };
+                                    let extra = format!(
+                                        "\n  SIGSEGV regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} rbp={:#x}",
+                                        g(10), g(5), g(11), g(12), g(13), g(14), g(9), g(8), g(7), g(6), g(3), g(2), g(1), g(0), g(4),
+                                    );
+                                    (rip, sp, extra)
+                                };
+                                let rsp = sp_raw;
                                 // siginfo fields: si_signo, si_errno, si_code
                                 // For SIGSEGV: si_addr is the faulting address
                                 // The siginfo_t layout is complex in Rust's
@@ -18342,9 +18666,67 @@ pub fn run_ptrace_loop(
                                 // si_addr is at offset 16 (on x86_64)
                                 let si_addr = unsafe { *(si_ptr.add(16) as *const u64) };
                                 log(&format!(
-                                    "SIGSEGV details: si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, rip={:#x}, rsp={:#x}",
-                                    si_code, si_addr, rip, rsp
+                                    "SIGSEGV details: tid={} si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, pc={:#x}, sp={:#x}{}",
+                                    pid, si_code, si_addr, pc, rsp, extra_regs
                                 ));
+                                // 6-Z180: crashing THREAD identity — waitpid
+                                // reports TIDs for threads, so /proc/<tid>/comm
+                                // names the exact thread ("RenderThread" vs
+                                // "recovery" vs a pthread name), and the
+                                // sibling-thread list shows who else was
+                                // alive at the crash.
+                                if let Ok(comm) =
+                                    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+                                {
+                                    log(&format!("SIGSEGV thread comm: {:?}", comm.trim_end()));
+                                }
+                                if let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", pid))
+                                {
+                                    let tids: Vec<String> = tasks
+                                        .filter_map(|e| e.ok())
+                                        .filter_map(|e| e.file_name().into_string().ok())
+                                        .collect();
+                                    log(&format!(
+                                        "SIGSEGV process threads: {} alive ({})",
+                                        tids.len(),
+                                        tids.join(",")
+                                    ));
+                                }
+                                // 6-Z180: stack window — 8 words below sp
+                                // and 24 above, word-PEEKed with the errno
+                                // dance so unmapped gaps are MARKED instead
+                                // of silently truncating (the read_child_*
+                                // helpers stop at the first fault). A thread
+                                // whose sp is garbage shows an all-gap
+                                // window; a valid sp with a smashed
+                                // sigframe/return-address chain shows the
+                                // garbage words in place.
+                                {
+                                    let base = rsp.saturating_sub(64);
+                                    let mut words: Vec<String> = Vec::new();
+                                    let mut addr = base;
+                                    while addr < rsp + 192 {
+                                        let _ = std::io::Error::last_os_error(); // clear errno
+                                        let w = unsafe {
+                                            libc::ptrace(libc::PTRACE_PEEKDATA, pid, addr as i64, 0)
+                                        };
+                                        let e = std::io::Error::last_os_error()
+                                            .raw_os_error()
+                                            .unwrap_or(0);
+                                        if w == -1 && e != 0 {
+                                            words.push(format!("{:#x}:<gap>", addr));
+                                        } else {
+                                            let rel = addr as i64 - rsp as i64;
+                                            words.push(format!("{:+#x}:{:#x}", rel, w as u64));
+                                        }
+                                        addr += 8;
+                                    }
+                                    log(&format!(
+                                        "SIGSEGV stack window (sp={:#x}, rel:word): {}",
+                                        rsp,
+                                        words.join(" ")
+                                    ));
+                                }
                                 // Task 6-Z37: dump /proc/<pid>/maps to identify
                                 // which library contains the crash address.
                                 let maps_path = format!("/proc/{}/maps", pid);
