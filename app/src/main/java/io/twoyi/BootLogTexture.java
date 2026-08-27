@@ -154,7 +154,7 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
         // loop checked it, so two (or more) 60 fps loops + logcat shells
         // ran in parallel. Each loop now dies unless ITS generation is
         // still the current one.
-        final int myGeneration = ++mSurfaceGeneration;
+        final int myGeneration = mSurfaceGeneration.incrementAndGet();
 
         Shell.EXECUTOR.execute(() -> {
             List<String> callbackList = new CallbackList<String>() {
@@ -183,7 +183,7 @@ public class BootLogTexture extends TextureView implements TextureView.SurfaceTe
             Shell shell = ShellUtil.newSh();
             shell.newJob().add("timeout -s 9 30 logcat -v brief '*:I'").to(callbackList).submit();
 
-            while (mRendering.get() && mSurfaceGeneration == myGeneration) {
+            while (mRendering.get() && mSurfaceGeneration.get() == myGeneration) {
                 render();
                 SystemClock.sleep(16);
             }
