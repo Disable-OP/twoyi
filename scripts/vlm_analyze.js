@@ -4,7 +4,7 @@ const fs = require('fs');
 async function main() {
     const imagePath = process.argv[2];
     const prompt = process.argv[3] || "Describe what you see in this Android screenshot.";
-    const model = process.argv[4] || "glm-4.6v";
+    const model = process.argv[4] || "glm-5.3-flash";
 
     const imgBuf = fs.readFileSync(imagePath);
     const imgB64 = imgBuf.toString('base64');
