@@ -23237,8 +23237,9 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         in_syscall_map.insert(pid, true);
         fake_netlink_fds.entry(pid).or_default().insert(0x6b00_0000);
         netlink_fd_next.insert(pid, 0x6b00_0001);
-        fake_propserv_fds.entry(pid).or_default().insert(5); // real kernel fd
-        // Sanity: all four maps have the pid entry before cleanup.
+        // Sanity: all four maps have the pid entry before cleanup
+        // (5 = a real kernel fd, 0x6b000000+ = synthetic fake fds).
+        fake_propserv_fds.entry(pid).or_default().insert(5);
         assert!(in_syscall_map.contains_key(&pid));
         assert!(fake_netlink_fds.contains_key(&pid));
         assert!(netlink_fd_next.contains_key(&pid));
