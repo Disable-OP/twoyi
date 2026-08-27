@@ -273,6 +273,11 @@ pub fn start_input_system(width: i32, height: i32) {
     thread::spawn(|| {
         touch_server();
     });
+    // 6-Z182: abstract-namespace mirror — the chroot-proof listener the
+    // jailed TWRP fb hook connects to (see touch_server_abstract).
+    thread::spawn(|| {
+        touch_server_abstract();
+    });
     thread::spawn(|| {
         key_server();
     });
@@ -565,6 +570,117 @@ fn touch_server() {
     }
 
     info!("[INPUT] drop touch-events listener!");
+}
+
+/// 6-Z182: ABSTRACT-namespace mirror of the touch-events socket.
+///
+/// WHY: the TWRP fb hook's INPUT bridge (twrp_fb_hook.c inbr_connect)
+/// runs INSIDE the jailed recovery process — after kr64's chroot/
+/// pivot_root, the jail's filesystem root IS the rootfs, so a connect()
+/// whose sockaddr carries the ABSOLUTE HOST path
+/// `/data/user/0/<pkg>/dev/touch-events` resolves INSIDE the jail and
+/// ENOENTs (run 33061152563: every filesystem candidate failed with
+/// read-verify -EINVAL — connect never happened). Abstract-namespace
+/// AF_UNIX sockets (`\0<name>`) are resolved in the NETWORK namespace,
+/// not the filesystem — the jail shares the host netns, so a chrooted
+/// guest connects with ZERO path translation. The filesystem listener
+/// above stays for compatibility (kr64's spawn_touch_accept_thread and
+/// the AOSP EventHub path still use it).
+///
+/// Wire format is IDENTICAL to the fs listener: accepted clients get
+/// 20-byte little-endian TouchMessage records from the same
+/// INPUT_SENDER channel (a client here REPLACES any fs-listener client
+/// — single-consumer semantics are preserved).
+const ABSTRACT_TOUCH_NAME: &[u8] = b"io.twoyi.touch";
+
+fn touch_server_abstract() {
+    unsafe {
+        let fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            log::error!(
+                "[INPUT] abstract touch socket(): {} — jailed TWRP touch bridge disabled",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        // sockaddr_un: u16 family + sun_path with LEADING NUL (abstract)
+        let mut addr: [u8; 2 + 1 + 32] = [0u8; 2 + 1 + 32];
+        addr[0] = AF_UNIX as u8;
+        // sun_path[0] stays 0 (abstract marker); name follows
+        let namelen = ABSTRACT_TOUCH_NAME.len().min(31);
+        addr[3..3 + namelen].copy_from_slice(&ABSTRACT_TOUCH_NAME[..namelen]);
+        let addrlen = 3 + namelen; // family(2) + leading NUL + name
+        if bind(fd, addr.as_ptr() as *const sockaddr, addrlen as u32) < 0 {
+            log::error!(
+                "[INPUT] abstract touch bind(\\0{}) failed: {}",
+                String::from_utf8_lossy(ABSTRACT_TOUCH_NAME),
+                std::io::Error::last_os_error()
+            );
+            close(fd);
+            return;
+        }
+        if listen(fd, 4) < 0 {
+            log::error!(
+                "[INPUT] abstract touch listen(): {}",
+                std::io::Error::last_os_error()
+            );
+            close(fd);
+            return;
+        }
+        info!(
+            "[INPUT] abstract touch-events IPC server listening (\\0{}) — chroot-proof path for the jailed TWRP fb hook",
+            String::from_utf8_lossy(ABSTRACT_TOUCH_NAME)
+        );
+        loop {
+            let client = accept4(fd, std::ptr::null_mut(), std::ptr::null_mut(), SOCK_CLOEXEC);
+            if client < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(EINTR) {
+                    continue;
+                }
+                log::error!("[INPUT] abstract touch accept(): {}", e);
+                return;
+            }
+            info!(
+                "[INPUT] jailed touch client connected to abstract touch socket (fd {})",
+                client
+            );
+            let (tx, rx) = channel::<TouchMessage>();
+            *INPUT_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+            // Mirror the fs-listener worker: drain the channel into the
+            // client fd; exit (releasing INPUT_SENDER) on write error.
+            thread::spawn(move || loop {
+                match rx.recv() {
+                    Ok(msg) => {
+                        let bytes = msg.to_bytes();
+                        let mut off = 0usize;
+                        let mut dead = false;
+                        while off < bytes.len() {
+                            let n = write(
+                                client,
+                                bytes[off..].as_ptr() as *const c_void,
+                                bytes.len() - off,
+                            );
+                            if n <= 0 {
+                                dead = true;
+                                break;
+                            }
+                            off += n as usize;
+                        }
+                        if dead {
+                            while rx.recv().is_ok() {}
+                            close(client);
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        close(client);
+                        return;
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// Set the bit at position `n` in a `key_bitmask` byte array.

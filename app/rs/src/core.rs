@@ -104,12 +104,7 @@ fn alog(msg: &str) {
         Err(_) => return,
     };
     unsafe {
-        __android_log_print(
-            ALOG_PRIO_INFO,
-            tag.as_ptr(),
-            fmt.as_ptr(),
-            msg_c.as_ptr(),
-        );
+        __android_log_print(ALOG_PRIO_INFO, tag.as_ptr(), fmt.as_ptr(), msg_c.as_ptr());
     }
 }
 
@@ -132,12 +127,7 @@ fn alog_error(msg: &str) {
         Err(_) => return,
     };
     unsafe {
-        __android_log_print(
-            ALOG_PRIO_ERROR,
-            tag.as_ptr(),
-            fmt.as_ptr(),
-            msg_c.as_ptr(),
-        );
+        __android_log_print(ALOG_PRIO_ERROR, tag.as_ptr(), fmt.as_ptr(), msg_c.as_ptr());
     }
 }
 
@@ -1213,9 +1203,7 @@ fn twrp_fb_render_loop(
                 fb_buf[total..].fill(0);
                 if short_read_logged < 5 {
                     short_read_logged += 1;
-                    let fsize = std::fs::metadata(&fb_path)
-                        .map(|m| m.len())
-                        .unwrap_or(0);
+                    let fsize = std::fs::metadata(&fb_path).map(|m| m.len()).unwrap_or(0);
                     log::warn!(
                         "[CORE][TWRP-FB] short read: got {}/{} bytes (fb0 file len={}) — rendering partial frame",
                         total,
