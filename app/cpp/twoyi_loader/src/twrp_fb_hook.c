@@ -630,19 +630,62 @@ static int ashmem_ioctl(int fd, unsigned req, unsigned long arg) {
 // otherwise path+1 (relative; cwd == rootfs). Returns NULL when the path
 // is not absolute. The result may point at a STATIC BUFFER (overwritten
 // per call) — callers must consume it before the next call.
+//
+// 6-Z187b: SECOND source — the {rootfs}/dev/.twoyi-rootfs file. Run
+// 33119446980: the UI recovery is exec'd by INIT, whose service env does
+// NOT carry TWOYI_ROOTFS (getenv returned NULL — the hook's via=1 prefix
+// form was unavailable and via=2 failed 166x). kr64's parent writes the
+// absolute rootfs path into /dev/.twoyi-rootfs at boot; the raw openat
+// below uses the ABSOLUTE guest path "/dev/.twoyi-rootfs", which the
+// tracer translates to {rootfs}/dev/.twoyi-rootfs in every mode (and
+// resolves natively in chroot/pivot_root modes). The value is read ONCE
+// and cached — the file lives on the pseudo-tmpfs {rootfs}/dev the
+// tracer materialized, so it is stable for the process lifetime.
 static char *rootfs_path_form(const char *path) {
     static char buf[512];
+    static char root_cache[256];
+    static int root_cache_state = 0; /* 0=untried, 1=loaded, 2=unavailable */
     if (!path || path[0] != '/') return NULL;
+    const char *root = NULL;
     if (getenv) {
-        const char *root = getenv("TWOYI_ROOTFS");
-        if (root && root[0] == '/') {
-            int i = 0;
-            while (root[i] && i < 400) { buf[i] = root[i]; i++; }
-            int j = 0;
-            while (path[j] && i < 510) { buf[i] = (char)path[j]; i++; j++; }
-            buf[i] = '\0';
-            return buf;
+        root = getenv("TWOYI_ROOTFS");
+    }
+    if (!root || root[0] != '/') {
+        /* 6-Z187b: file-based fallback (see the comment above). */
+        if (root_cache_state == 0) {
+            root_cache_state = 2;
+            int rfd = (int)raw_syscall4(SYS_openat, AT_FDCWD,
+                                        (long)"/dev/.twoyi-rootfs", 0 /*O_RDONLY*/, 0);
+            if (rfd >= 0) {
+                char rbuf[256];
+                long n = raw_syscall3(SYS_read, rfd, (long)rbuf,
+                                      (long)(sizeof(rbuf) - 1));
+                raw_syscall1(SYS_close, rfd);
+                if (n > 0) {
+                    rbuf[n] = '\0';
+                    /* strip trailing newline / whitespace */
+                    long end = n;
+                    while (end > 0 && (rbuf[end-1] == '\n' || rbuf[end-1] == '\r' ||
+                                       rbuf[end-1] == ' ' || rbuf[end-1] == '\t'))
+                        end--;
+                    rbuf[end] = '\0';
+                    if (end > 0 && rbuf[0] == '/' && end < (long)sizeof(root_cache)) {
+                        for (long k = 0; k <= end; k++) root_cache[k] = rbuf[k];
+                        root_cache_state = 1;
+                    }
+                }
+            }
         }
+        if (root_cache_state == 1)
+            root = root_cache;
+    }
+    if (root && root[0] == '/') {
+        int i = 0;
+        while (root[i] && i < 400) { buf[i] = root[i]; i++; }
+        int j = 0;
+        while (path[j] && i < 510) { buf[i] = (char)path[j]; i++; j++; }
+        buf[i] = '\0';
+        return buf;
     }
     return (char *)(path + 1);
 }
