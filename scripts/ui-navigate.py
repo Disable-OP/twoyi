@@ -1633,20 +1633,21 @@ def main():
                 break
         screenshot("term-01-main-menu")
 
-        # ── 3) Advanced (grid button, last row left/center in both layouts)
+        # ── 3) Advanced — DETERMINISTIC geometry from the layout
+        # analyzer on run 33106119333's main-menu frame: 2x4 grid,
+        # columns x=192/528, row centers y=414/708/1002/1294.
+        # Advanced = row 4 LEFT. (The old fractional guesses opened
+        # WIPE — (360,480) lands past Install's rect edge.)
         pages = _pages()
         main_pos = max([pos for pos, p in pages if p == "main2"], default=0)
-        for i, (fx, fy) in enumerate([
-            (0.25, 0.74), (0.28, 0.80), (0.25, 0.86), (0.17, 0.83), (0.5, 0.86),
-        ]):
-            x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
+        for i, (x, y) in enumerate([(192, 1294), (528, 1294), (192, 1002)]):
             print(f"  tap Advanced candidate {i}: ({x},{y})")
             dismiss_fullscreen_overlay("adv")
             tap(x, y)
             wait(2.0)
             screenshot(f"term-02-advanced-{i}")
             pages = _pages()
-            if any(pos > main_pos and p not in ("main2", "clear_vars")
+            if any(pos > main_pos and p not in ("main2", "clear_vars", "main")
                    for pos, p in pages):
                 recent = [p for _, p in pages][-3:]
                 print(f"  page changed after Advanced tap: {recent} — good")
@@ -1655,15 +1656,21 @@ def main():
         adv_pos = max([pos for pos, _ in pages], default=0)
 
         # ── 4) File Manager row on the Advanced list ──
-        for i, fy in enumerate([0.30, 0.22, 0.38, 0.46]):
-            x, y = SCREEN_W // 2, int(SCREEN_H * fy)
+        # Full-width rows; the analyzer puts row content in the
+        # y 320..530 band. SAFETY: never tap below y = 0.80*H on an
+        # unknown page — the y≈1228 band on Wipe/Install pages is the
+        # button/slider row ("Swipe to Factory Reset" lives there; a
+        # TAP cannot arm a slider, but we simply never go there).
+        for i, (x, y) in enumerate([
+            (360, 414), (360, 530), (360, 320), (360, 640),
+        ]):
             print(f"  tap File Manager candidate {i}: ({x},{y})")
             dismiss_fullscreen_overlay("fm")
             tap(x, y)
             wait(2.0)
             screenshot(f"term-03-fm-{i}")
             pages = _pages()
-            if any(pos > adv_pos and p not in ("main2", "clear_vars")
+            if any(pos > adv_pos and p not in ("main2", "clear_vars", "main")
                    for pos, p in pages):
                 break
         pages = _pages()
@@ -1675,28 +1682,29 @@ def main():
         screenshot("term-04-fm-root-BEFORE-terminal")
 
         # ── 5) THE TERMINAL EPISODE (the escape trigger) ──
-        # Bottom-right File button opens "Choose Action in current
-        # folder"; "Open Terminal" is one of its rows. Both are
-        # guest-rendered inside the SurfaceView (invisible to
-        # uiautomator; redroid screencap may be stale) — tap by
-        # fractional candidates, verify via recovery.log markers and
-        # the tracer log pulled at the end.
-        for i, (fx, fy) in enumerate([
-            (0.90, 0.93), (0.94, 0.91), (0.86, 0.95), (0.93, 0.87), (0.80, 0.93),
+        # Bottom-right File button (analyzer: FM bottom button row at
+        # y≈1228, right column x≈528-672), then "Open Terminal" in the
+        # centered Choose Action popup. Both are guest-rendered
+        # (uiautomator-invisible); recovery.log + tracer log are the
+        # runtime evidence, screenshots the visual record.
+        for i, (bx, by) in enumerate([
+            (620, 1228), (528, 1228), (672, 1176), (560, 1300), (672, 1300),
         ]):
-            x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
-            print(f"  tap bottom-right File button candidate {i}: ({x},{y})")
-            tap(x, y)
+            print(f"  tap bottom-right File button candidate {i}: ({bx},{by})")
+            tap(bx, by)
             wait(1.5)
             screenshot(f"term-05-filebtn-{i}")
-            # One menu-row attempt per File-button attempt (limit blind
-            # damage; the action list is centered, rows in the mid band).
-            for fy2 in (0.46,):
-                tx, ty = SCREEN_W // 2, int(SCREEN_H * fy2)
-                print(f"    tap Open Terminal row candidate: ({tx},{ty})")
-                tap(tx, ty)
+            # One menu-row attempt per File-button attempt; popup rows
+            # are centered, y 500..900 band.
+            for ty in (640, 520, 760):
+                print(f"    tap Open Terminal row candidate: (360,{ty})")
+                tap(360, ty)
                 wait(3.0)
-                screenshot(f"term-06-terminal-try-{i}")
+                screenshot(f"term-06-terminal-try-{i}-{ty}")
+                new = [p for pos, p in _pages() if pos > fm_pos]
+                if any("terminal" in p.lower() for p in new):
+                    print("    terminal page marker seen — stopping")
+                    break
             pages = _pages()
             new = [p for pos, p in pages if pos > fm_pos]
             print(f"    pages since FM open: {new[-6:]}")
@@ -1718,8 +1726,7 @@ def main():
         # (/data restricted) after the failed terminal. Compare against
         # term-04-fm-root-BEFORE-terminal: identical view + this step is
         # the ONLY difference.
-        for fy in (0.30, 0.22, 0.38):
-            x, y = SCREEN_W // 2, int(SCREEN_H * fy)
+        for (x, y) in [(360, 414), (360, 530), (360, 320)]:
             print(f"  tap File Manager reopen candidate: ({x},{y})")
             tap(x, y)
             wait(2.5)
@@ -1729,9 +1736,8 @@ def main():
             swipe_up()
             wait(1.0)
             screenshot(f"term-10-scroll-{i}")
-        for i, fy in enumerate([0.62, 0.70, 0.78, 0.55]):
-            x, y = SCREEN_W // 2, int(SCREEN_H * fy)
-            tap(x, y)
+        for i, y in enumerate([1002, 1100, 900, 800]):
+            tap(360, y)
             wait(1.5)
             screenshot(f"term-11-system-{i}")
         screenshot("term-12-final")
