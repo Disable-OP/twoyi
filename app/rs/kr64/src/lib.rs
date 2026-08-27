@@ -7819,10 +7819,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     && e_phnum <= 65535
                                     && e_phentsize >= min_phentsize
                                     && e_phentsize <= 4096
-                                    && e_phoff.checked_add(
-                                        (e_phentsize * e_phnum) as u64,
-                                    ).map_or(true, |end| end > file_len)
-                                    == false;
+                                    && e_phoff
+                                        .checked_add((e_phentsize * e_phnum) as u64)
+                                        .map_or(true, |end| end > file_len)
+                                        == false;
                                 let interp: Option<(u64, usize)> = if !table_ok {
                                     warning!(
                                         "[KR64] PT_INTERP scan: implausible phdr table (phoff={}, phentsize={}, phnum={}, file_len={}) — skipping patch for this binary",
@@ -7830,28 +7830,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     );
                                     None
                                 } else {
-                                let mut phdrs = vec![0u8; e_phentsize * e_phnum];
-                                let _ = file.seek(std::io::SeekFrom::Start(e_phoff));
-                                let _ = file.read_exact(&mut phdrs);
-                                let mut interp_offset = None;
-                                let mut interp_filesz = None;
-                                for i in 0..e_phnum {
-                                    let off = i * e_phentsize;
-                                    let Some(p_type) = phdrs.get(off..off + 4).map(|b| {
-                                        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-                                    }) else {
-                                        break;
-                                    };
-                                    if p_type == 3 {
-                                        let read_u =
-                                            |base: usize, field: u64, width: usize| -> u64 {
-                                                let s = base + field as usize;
-                                                let mut v = 0u64;
-                                                for b in (0..width).rev() {
-                                                    v = (v << 8) | phdrs[s + b] as u64;
-                                                }
-                                                v
-                                            };
+                                    let mut phdrs = vec![0u8; e_phentsize * e_phnum];
+                                    let _ = file.seek(std::io::SeekFrom::Start(e_phoff));
+                                    let _ = file.read_exact(&mut phdrs);
+                                    let mut interp_offset = None;
+                                    let mut interp_filesz = None;
+                                    for i in 0..e_phnum {
+                                        let off = i * e_phentsize;
+                                        let Some(p_type) = phdrs
+                                            .get(off..off + 4)
+                                            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                        else {
+                                            break;
+                                        };
+                                        if p_type == 3 {
+                                            let read_u =
+                                                |base: usize, field: u64, width: usize| -> u64 {
+                                                    let s = base + field as usize;
+                                                    let mut v = 0u64;
+                                                    for b in (0..width).rev() {
+                                                        v = (v << 8) | phdrs[s + b] as u64;
+                                                    }
+                                                    v
+                                                };
                                         interp_offset = Some(read_u(off, p_off_field, sz_bytes));
                                         interp_filesz =
                                             Some(read_u(off, p_sz_field, sz_bytes) as usize);
