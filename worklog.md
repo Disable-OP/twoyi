@@ -11832,3 +11832,59 @@ Stage Summary:
   in recovery.log + 6-Z186 classifier lines in the tracer log are the
   verdict. Fresh Stage-B APK already published
   (twoyi-build-ad3fe3e-20260827.apk, contains the fail-closed fix).
+
+---
+Task ID: 6-Z186 STAGE-A
+Agent: main
+Task: Reproduce the user's exact terminal-chain repro in CI (non-root
+ptrace mode) and verify the 6-Z186 fail-closed escape fix. Iters 5-12.
+
+Work Log:
+- iter-5/6: menu navigation reached the main menu (gate dismissed),
+  but fractional-coordinate guesses opened WIPE (slop past Install's
+  rect) — built analyze_twrp_layout.py (color-mask + connected
+  components) for DETERMINISTIC geometry: main menu 2x4 grid, cols
+  x=192/528, rows y=414/708/1002/1294 -> Advanced=(192,1294).
+- iter-7/8: gate->menu transition has multi-second latency (settle
+  wait added); 'advanced'/'filemanagerlist' markers verified every
+  step; danger-page watchdog (wipe/formatdata/install -> auto-BACK).
+  Advanced page is ALSO a 4-button grid: row1 CopyLog|ADB Sideload,
+  row2 Terminal|FileManager -> FM=(528,708), Terminal=(192,708).
+- Input reliability was THE battle: redroid `input` (adb AND docker
+  exec) silently no-ops entire runs (~50%), headless redroid has NO
+  evdev nodes (sendevent impossible), uiautomator can't dump while
+  TWRP renders (never idle). FIX: 6-Z186 debug touch receiver in
+  Render2Activity (io.twoyi.debug.TOUCH broadcast -> the production
+  onTouch -> mTouchMatrix -> Renderer.handleTouch path) — an
+  ActivityManager channel immune to the InputManager flakiness;
+  effect-based escalation flips input_cmd to broadcast after zero-
+  effect swipe rounds. guest_back() = keyevent + guest-navbar taps.
+- iter-12 (run 33114902086): THE FULL USER CHAIN EXECUTED — gate
+  swipe -> main menu -> Advanced -> File Manager (filemanagerlist
+  marker) -> FM File button (624,1372, analyzer-pinned) ->
+  filemanageroptions popup -> Open Terminal row -> TERMINALCOMMAND
+  page opened -> guest-navbar BACK -> Advanced -> FM REOPENED.
+- VERDICT (Stage A): FM BEFORE terminal = empty "/" (33048 B); FM
+  AFTER terminal = full "/" listing (64410 B) — and the listing is
+  the GUEST ROOTFS's own root (twrp-cmdline, twrp-init.log,
+  init.recovery.angler.rc at root — files a host / would never
+  have). NOT the host FS. Tracer: ZERO 6-Z186 classifier hits, zero
+  escapes/kills, all 12 ESRCH absorbed by 6-Z89, 12 backstop blocks
+  = known untranslated families + terminal child's
+  execve("/sbin/permissive.sh") DENIED -EACCES (the sandbox-holding
+  version of "Child processes exited" — the script doesn't exist in
+  the sandbox; this is also why the terminal isn't functional).
+- Release APK rebuilt from final main (includes the escape
+  classifier, atomic ROM import, TIOCGWINSZ hook answer, debug touch
+  receiver).
+
+Stage Summary:
+- STAGE A PASS (CI, arm64 redroid, non-root ptrace mode): the exact
+  physical-device chain runs end-to-end and the sandbox HOLDS —
+  no escape, no detach, terminal children contained.
+- STAGE B REQUIRED (per the user's own bar): the fresh release APK
+  on the physical Honor Magic UI device, same chain, FM after
+  terminal must show sandbox content only.
+- Fixes riding along: ROM re-import atomic swap (staging rename
+  failure + gutted-rootfs "No ROM Installed" limbo), TIOCGWINSZ
+  terminal answers + rate-limited ioctl spam.
