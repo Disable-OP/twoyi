@@ -4876,6 +4876,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let _ = std::fs::remove_file(&legacy_marker);
         let legacy_geom = format!("{}/.twoyi-fb-geometry", cfg.rootfs);
         let _ = std::fs::remove_file(&legacy_geom);
+        // 6-Z187b: the rootfs-path FILE — the fb_hook's env-independent
+        // rootfs source. Run 33119446980: the UI recovery is exec'd by
+        // init, whose service env does NOT carry TWOYI_ROOTFS — the hook's
+        // via=1 (prefix) open-retry form was unavailable and via=2
+        // (path+1, cwd-relative) failed 166x before the cwd fix. The hook
+        // reads this file through the tracer-translated absolute path
+        // "/dev/.twoyi-rootfs" and caches it, restoring the prefix form
+        // for EVERY process regardless of its env.
+        {
+            let rootfs_file = format!("{}/dev/.twoyi-rootfs", cfg.rootfs);
+            if let Err(e) = std::fs::write(&rootfs_file, format!("{}\n", cfg.rootfs)) {
+                warning!(
+                    "[KR64][symlinks] failed to write {}: {} (hook will rely on env/cwd fallbacks)",
+                    rootfs_file,
+                    e
+                );
+            }
+        }
         info!(
             "[KR64][symlinks] materialized {} real symlinks from .symlink sidecars (removed {}, skipped {}, busybox-staged={})",
             stats.links_created,
@@ -7740,6 +7758,33 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             }
         }
 
+        // 6-Z187b: set the GUEST INIT's working directory to the rootfs
+        // BEFORE execve. Run 33119446980 proved the UI recovery (init's
+        // service fork) inherits the APP's cwd (host "/") — every
+        // cwd-relative fallback then resolved against the WRONG directory:
+        // the fb_hook's via=2 retries failed 166x with ENOENT, the terminal
+        // execl("/sbin/sh") +1 rewrite resolved to the host's /sbin/sh
+        // (ENOENT → exit 127 → "Child processes exited."), and any
+        // path+1 open fallback missed. With cwd == {rootfs}, init and every
+        // process it forks resolve rootfs-relative paths CORRECTLY, and a
+        // guest chdir("/") is TRANSLATED by the tracer back to {rootfs}
+        // anyway — the invariant is self-healing.
+        {
+            let root_c = std::ffi::CString::new(cfg.rootfs.as_str()).unwrap_or_default();
+            let cr = unsafe { libc::chdir(root_c.as_ptr()) };
+            unsafe {
+                if cr == 0 {
+                    safe_write_err(
+                        b"[KR64 CHILD] 6-Z187b: chdir(rootfs) OK - guest cwd is the sandbox root\n",
+                    );
+                } else {
+                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    safe_write_err_errno(b"[KR64 CHILD] 6-Z187b: chdir(rootfs) FAILED errno=", e);
+                    safe_write_err(b" (cwd-relative fallbacks may miss)\n");
+                }
+            }
+        }
+
         let _r = unsafe { libc::execve(init_cstr.as_ptr(), argv.as_ptr(), env_ptrs.as_ptr()) };
         let exec_errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         unsafe {
@@ -8162,6 +8207,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     }
                     unsafe {
                         libc::raise(libc::SIGSTOP);
+                    }
+                    // 6-Z187b: cwd == rootfs for this child too (see the
+                    // init-child chdir above — the via=2/+1 cwd-relative
+                    // fallbacks depend on it).
+                    unsafe {
+                        let root_c =
+                            std::ffi::CString::new(cfg.rootfs.as_str()).unwrap_or_default();
+                        if libc::chdir(root_c.as_ptr()) != 0 {
+                            let msg = "6-Z187b: chdir(rootfs) FAILED in recovery child\n";
+                            libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                        }
                     }
                     let execve_ret = unsafe {
                         libc::execve(path_c.as_ptr(), argv_ptr.as_ptr(), envp_ptr.as_ptr())

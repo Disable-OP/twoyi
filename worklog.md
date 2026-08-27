@@ -11970,3 +11970,51 @@ Stage Summary:
 - The unreadable-execve host-escape class is closed fail-closed.
 - Next: dispatch arm64 ui-e2e, VLM-verify FM guest-only + terminal
   prompt + system-folder listings; then Stage B on the physical device.
+
+---
+Task ID: 6-Z187b
+Agent: main
+Task: Fix the two residual failures from run 33119446980 (first 6-Z187
+E2E): FM root still EMPTY on first open, terminal still "Child processes
+exited." (exit 127).
+
+Work Log:
+- Run 33119446980 positives: guest-only FM tree CONFIRMED (no
+  data_mirror/linkerconfig/metadata/.twoyi-*/sidecars; acct cache data
+  dev etc external_sd license oem proc res sbin sdcard sideload sys
+  system tmp twres); 1263 symlinks materialized; busybox staged+patched;
+  permissive.sh + pulldecryptfiles.sh execves rewritten to the staged sh;
+  the execve +1 fallback + backstop fail-closed armed.
+- NEW root cause (recovery.log + fb_hook log): the UI recovery is exec'd
+  BY INIT, so its env lacks TWOYI_ROOTFS (getenv NULL) AND its cwd is
+  the inherited APP cwd (host "/"), NOT the rootfs:
+  * fb_hook via=1 (prefix form) unavailable -> via=2 (path+1,
+    cwd-relative) failed 166x with ENOENT;
+  * the FM's open("/") +1 fallback produced the EMPTY string "" ->
+    ENOENT -> "I:Unable to open '/'" -> empty listing on first entry
+    (the post-terminal listing worked only because its path buffer was
+    PEEK-readable and got translated normally);
+  * the terminal execl("/sbin/sh") +1 fallback resolved "sbin/sh"
+    against the WRONG cwd -> host /sbin/sh -> ENOENT -> _exit(127).
+- 6-Z187b fixes:
+  1. chdir({rootfs}) in BOTH fork-children (guest-init child before its
+     execve + the 6-Z49 recovery child) — init, the UI recovery, and
+     every fork they make now inherit cwd == rootfs; a guest chdir("/")
+     is tracer-translated back to {rootfs}, so the invariant holds.
+  2. kr64 writes {rootfs}/dev/.twoyi-rootfs (one line: the absolute
+     rootfs path) at boot.
+  3. twrp_fb_hook rootfs_path_form: when TWOYI_ROOTFS env is absent,
+     read + cache the rootfs path from /dev/.twoyi-rootfs via a raw
+     openat (tracer-translated in ptrace mode, native in chroot modes)
+     — the via=1 prefix form is restored for EVERY process, fixing the
+     whole 166-failure class AND the FM's first open("/") (retry opens
+     "{rootfs}/" directly).
+- Gates: fmt, clippy -D warnings, 574/574 tests, aarch64-linux-android
+  check, gcc -fsyntax-only on the hook.
+
+Stage Summary:
+- With cwd == rootfs + the env-independent hook prefix form, ALL THREE
+  user asks are wired: FM always lists the guest root on first open,
+  the listing is guest-only, and the terminal child execs the staged
+  busybox ash (argv[0]="sh") instead of dying with 127.
+- Awaiting the next arm64 E2E run for confirmation.
