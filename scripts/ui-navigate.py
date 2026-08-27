@@ -1620,59 +1620,132 @@ def main():
 
         # ── 2) Swipe the read-only slider -> REAL main menu (stays up) ──
         # VLM on the run-33102864178 gate frame: slider center y=0.88,
-        # horizontal span x 0.06..0.94.
-        for i in range(3):
+        # horizontal span x 0.06..0.94. 6-Z186 iter-7: the gate->menu
+        # transition has MULTI-SECOND latency — a single marker check
+        # per swipe raced it in run 33107230132 (the "Advanced" tap hit
+        # the still-present gate; the next candidate then opened WIPE
+        # from the main menu). Now: keep swiping (up to 6) and then
+        # SETTLE-WAIT (up to 40 s) until main2-after-gate has appeared
+        # AND two screenshots 3 s apart are identical AND differ from
+        # the gate frame — the menu is then rendered and stable.
+        DANGER_PAGES = ("wipe", "formatdata", "install", "restore",
+                        "restoreconfirm", "reboot")
+
+        def _shot_bytes(name):
+            p = screenshot(name)
+            try:
+                with open(p, "rb") as f:
+                    return f.read()
+            except OSError:
+                return b""
+
+        gate_bytes = _shot_bytes("term-00-gate")
+        menu_confirmed = False
+        for i in range(6):
             y = int(SCREEN_H * 0.88)
             input_cmd(f"input swipe {int(SCREEN_W * 0.10)} {y} "
                       f"{int(SCREEN_W * 0.90)} {y} 350")
-            wait(2.5)
+            wait(3.0)
             dismiss_fullscreen_overlay("post-swipe")
             pages = _pages()
             if any(p == "main2" and pos > gate_pos for pos, p in pages):
-                print("  main menu CONFIRMED after gate dismissal")
+                menu_confirmed = True
                 break
+        # Settle-wait: markers may lag; require visual stability.
+        prev = b""
+        for i in range(13):
+            cur = _shot_bytes(f"term-01-settle-{i}") if i < 3 else b"x"
+            if i < 3:
+                if prev and cur == prev and cur != gate_bytes:
+                    menu_confirmed = True
+                    print("  main menu visually STABLE (2 identical non-gate "
+                          "frames)")
+                    break
+                prev = cur
+            pages = _pages()
+            if any(p == "main2" and pos > gate_pos for pos, p in pages):
+                menu_confirmed = True
+                if i >= 3:
+                    print("  main2 marker present; proceeding")
+                break
+            wait(3)
+        if not menu_confirmed:
+            print("  WARNING: main menu not confirmed — aborting the chain "
+                  "BEFORE any menu taps (safety; evidence captured)")
+            screenshot("term-01-abort-no-menu")
         screenshot("term-01-main-menu")
+
+        def _last_page_after(pos):
+            tail = [p for p_pos, p in _pages() if p_pos > pos]
+            return tail[-1] if tail else None
+
+        def _back_off_danger(pos):
+            last = _last_page_after(pos)
+            if last in DANGER_PAGES:
+                print(f"  [safety] danger page '{last}' open — pressing BACK")
+                input_cmd("input keyevent 4")
+                wait(1.5)
+                return True
+            return False
 
         # ── 3) Advanced — DETERMINISTIC geometry from the layout
         # analyzer on run 33106119333's main-menu frame: 2x4 grid,
         # columns x=192/528, row centers y=414/708/1002/1294.
         # Advanced = row 4 LEFT. (The old fractional guesses opened
         # WIPE — (360,480) lands past Install's rect edge.)
+        # iter-7: only tap when the menu was confirmed; verify by the
+        # 'advanced' page marker specifically; back off danger pages.
         pages = _pages()
         main_pos = max([pos for pos, p in pages if p == "main2"], default=0)
-        for i, (x, y) in enumerate([(192, 1294), (528, 1294), (192, 1002)]):
-            print(f"  tap Advanced candidate {i}: ({x},{y})")
-            dismiss_fullscreen_overlay("adv")
-            tap(x, y)
-            wait(2.0)
-            screenshot(f"term-02-advanced-{i}")
-            pages = _pages()
-            if any(pos > main_pos and p not in ("main2", "clear_vars", "main")
-                   for pos, p in pages):
-                recent = [p for _, p in pages][-3:]
-                print(f"  page changed after Advanced tap: {recent} — good")
-                break
+        adv_open = False
+        if menu_confirmed:
+            for i, (x, y) in enumerate([(192, 1294), (192, 1294)]):
+                print(f"  tap Advanced candidate {i}: ({x},{y})")
+                dismiss_fullscreen_overlay("adv")
+                tap(x, y)
+                wait(2.5)
+                screenshot(f"term-02-advanced-{i}")
+                _back_off_danger(main_pos)
+                tail = [p for p_pos, p in _pages() if p_pos > main_pos]
+                if any(p == "advanced" for p in tail):
+                    print("  'advanced' page marker seen — Advanced IS open")
+                    adv_open = True
+                    break
+                if tail:
+                    print(f"  page markers after tap: {tail[-4:]} (no 'advanced' yet)")
         pages = _pages()
         adv_pos = max([pos for pos, _ in pages], default=0)
 
         # ── 4) File Manager row on the Advanced list ──
         # Full-width rows; the analyzer puts row content in the
-        # y 320..530 band. SAFETY: never tap below y = 0.80*H on an
+        # y 320..640 band. SAFETY: never tap below y = 0.80*H on an
         # unknown page — the y≈1228 band on Wipe/Install pages is the
         # button/slider row ("Swipe to Factory Reset" lives there; a
         # TAP cannot arm a slider, but we simply never go there).
+        # iter-7: danger-watchdog guards every tap; stop at the first
+        # non-danger page change (the FM page may log 'filemanager').
+        fm_open = False
         for i, (x, y) in enumerate([
             (360, 414), (360, 530), (360, 320), (360, 640),
         ]):
+            if _back_off_danger(adv_pos):
+                continue
             print(f"  tap File Manager candidate {i}: ({x},{y})")
             dismiss_fullscreen_overlay("fm")
             tap(x, y)
             wait(2.0)
             screenshot(f"term-03-fm-{i}")
-            pages = _pages()
-            if any(pos > adv_pos and p not in ("main2", "clear_vars", "main")
-                   for pos, p in pages):
+            if _back_off_danger(adv_pos):
+                continue
+            tail = [p for p_pos, p in _pages() if p_pos > adv_pos]
+            if any(p in ("filemanager", "filemanagerlist", "filelist")
+                   or "file" in p.lower() for p in tail):
+                print(f"  file-manager-ish page marker seen: {tail[-4:]}")
+                fm_open = True
                 break
+            if tail and all(p in ("advanced", "clear_vars", "main", "main2")
+                            for p in tail[-2:]):
+                continue  # no visible change yet — try next row candidate
         pages = _pages()
         fm_pos = max([pos for pos, _ in pages], default=0)
         wait(1.0)
@@ -1687,30 +1760,39 @@ def main():
         # centered Choose Action popup. Both are guest-rendered
         # (uiautomator-invisible); recovery.log + tracer log are the
         # runtime evidence, screenshots the visual record.
-        for i, (bx, by) in enumerate([
-            (620, 1228), (528, 1228), (672, 1176), (560, 1300), (672, 1300),
-        ]):
-            print(f"  tap bottom-right File button candidate {i}: ({bx},{by})")
-            tap(bx, by)
-            wait(1.5)
-            screenshot(f"term-05-filebtn-{i}")
-            # One menu-row attempt per File-button attempt; popup rows
-            # are centered, y 500..900 band.
-            for ty in (640, 520, 760):
-                print(f"    tap Open Terminal row candidate: (360,{ty})")
-                tap(360, ty)
-                wait(3.0)
-                screenshot(f"term-06-terminal-try-{i}-{ty}")
-                new = [p for pos, p in _pages() if pos > fm_pos]
+        # iter-7: guarded — only when the FM page actually opened, and
+        # every tap is followed by the danger watchdog.
+        if fm_open:
+            for i, (bx, by) in enumerate([
+                (620, 1228), (528, 1228), (672, 1176), (560, 1300),
+            ]):
+                print(f"  tap bottom-right File button candidate {i}: ({bx},{by})")
+                tap(bx, by)
+                wait(1.5)
+                screenshot(f"term-05-filebtn-{i}")
+                if _back_off_danger(fm_pos):
+                    continue
+                # Menu rows in the centered popup, y 500..900 band.
+                for ty in (640, 520, 760):
+                    print(f"    tap Open Terminal row candidate: (360,{ty})")
+                    tap(360, ty)
+                    wait(3.0)
+                    screenshot(f"term-06-terminal-try-{i}-{ty}")
+                    if _back_off_danger(fm_pos):
+                        break
+                    new = [p for pos, p in _pages() if pos > fm_pos]
+                    if any("terminal" in p.lower() for p in new):
+                        print("    terminal page marker seen — stopping")
+                        break
+                pages = _pages()
+                new = [p for pos, p in pages if pos > fm_pos]
+                print(f"    pages since FM open: {new[-6:]}")
                 if any("terminal" in p.lower() for p in new):
-                    print("    terminal page marker seen — stopping")
+                    print("    TERMINAL OPENED — chain complete")
                     break
-            pages = _pages()
-            new = [p for pos, p in pages if pos > fm_pos]
-            print(f"    pages since FM open: {new[-6:]}")
-            if any("terminal" in p.lower() or "action" in p.lower() for p in new):
-                print("    terminal/action marker seen — stopping candidates")
-                break
+        else:
+            print("  [chain] FM page never confirmed — SKIPPING the "
+                  "terminal episode (safety; would tap blind)")
 
         # Let the terminal children fork + die (Child processes exited x2)
         wait(5.0)
@@ -1726,21 +1808,28 @@ def main():
         # (/data restricted) after the failed terminal. Compare against
         # term-04-fm-root-BEFORE-terminal: identical view + this step is
         # the ONLY difference.
-        for (x, y) in [(360, 414), (360, 530), (360, 320)]:
-            print(f"  tap File Manager reopen candidate: ({x},{y})")
-            tap(x, y)
-            wait(2.5)
-            break  # first candidate (same row that worked in step 4)
-        screenshot("term-09-fm-AFTER-terminal")
-        for i in range(3):
-            swipe_up()
-            wait(1.0)
-            screenshot(f"term-10-scroll-{i}")
-        for i, y in enumerate([1002, 1100, 900, 800]):
-            tap(360, y)
-            wait(1.5)
-            screenshot(f"term-11-system-{i}")
-        screenshot("term-12-final")
+        if fm_open:
+            for (x, y) in [(360, 414), (360, 530), (360, 320)]:
+                print(f"  tap File Manager reopen candidate: ({x},{y})")
+                tap(x, y)
+                wait(2.5)
+                if _back_off_danger(adv_pos):
+                    continue
+                break  # first candidate (same row that worked in step 4)
+            screenshot("term-09-fm-AFTER-terminal")
+            for i in range(3):
+                swipe_up()
+                wait(1.0)
+                screenshot(f"term-10-scroll-{i}")
+            for i, y in enumerate([1002, 1100, 900, 800]):
+                tap(360, y)
+                wait(1.5)
+                if _back_off_danger(adv_pos):
+                    continue
+                screenshot(f"term-11-system-{i}")
+            screenshot("term-12-final")
+        else:
+            screenshot("term-09-fm-AFTER-terminal-SKIPPED")
 
         # Back out of whatever page we ended on.
         for _ in range(6):
