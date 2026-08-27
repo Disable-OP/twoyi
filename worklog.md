@@ -12147,3 +12147,37 @@ Work Log:
     terminal episode starts.
 - Run 33125036396 dispatched on a5773d9 to exercise the 6-Z188 pty
   end-to-end; monitoring delegated to a sub-agent.
+
+---
+Task ID: 6-Z188b
+Agent: main
+Task: Probe still PAGE_NOT_REACHED in run 33125036396 — frame byte-
+compare defeated by the status-bar clock; drift to main menu.
+
+Work Log:
+- Run 33125036396: FM before = populated clean guest root (PASS);
+  terminal page count 0; pty markers 0 (never exercised). AFTER shot
+  drifted to the Restore page; log shows Set page 'installapp' +
+  'restore' = taps hit MAIN MENU items.
+- Root cause: the 6-Z188 clean-list check compared PNG BYTES against
+  the settled baseline — TWRP's status-bar CLOCK (4:50 PM) makes every
+  screenshot byte-unique, so the compare never matched, all 3 BACKs
+  fired, the probe left the FM, and the Advanced-grid taps (192,708)/
+  (528,708) landed on main-menu Backup/Restore/Mount instead.
+- Probe fixes (marker-based, deterministic — recovery.log 'Set page'
+  markers, immune to pixels):
+  * clean-fm loop: stop when the last Set page is filemanagerlist or
+    filemanageroptions (both = visually on the FM list, selection
+    cleared), max 3 BACKs; danger watchdog first.
+  * _ensure_advanced() for the FM reopen: enter Advanced from the main
+    menu (192,1294) when drifted; FM button taps only fire when the
+    marker == 'advanced'.
+  * Advanced-Terminal fallback: same marker gate (replaces the
+    frame-compare that the clock defeated); skips the tap when not on
+    Advanced (safety).
+- py_compile OK.
+
+Stage Summary:
+- Navigation is now fully marker-driven end to end. Next run should
+  finally reach the terminal page and exercise the 6-Z188 socketpair
+  pty + the staged busybox ash prompt.

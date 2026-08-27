@@ -2038,29 +2038,25 @@ def main():
             screenshot(f"term-04e-system-BEFORE-{i}")
             input_cmd("input keyevent 4")
             wait(1.0)
-        # 6-Z188: return to a CLEAN FM list (nothing selected) before the
-        # terminal episode. A selected file redirects the File-button flow
-        # to the Confirm-Action page instead of the folder-action popup —
-        # run 33123690562's exact failure. BACK out (selection popup /
-        # subfolder / confirm page all clear on BACK) until the frame
-        # matches the settled 04c listing again, or 3 tries.
-        clean_ref = _shot_bytes("term-04e-clean-ref")
-        base = None
-        ref_path = os.path.join(ART, "screenshot-term-04c-fm-root-BEFORE-settled.png")
-        if os.path.exists(ref_path):
-            with open(ref_path, "rb") as f:
-                base = f.read()
+        # 6-Z188b: return to the FM list MARKER-BASED (not frame bytes —
+        # the status-bar CLOCK makes every screenshot byte-different, and
+        # run 33125036396's byte-compare over-BACKed past the FM to the
+        # main menu, where the remaining taps hit Install/Restore).
+        # 'filemanagerlist' = folder navigated; 'filemanageroptions' = an
+        # action popup opened then dismissed (selection cleared) — both
+        # mean we are visually on the FM list.
         for bi in range(3):
             if _back_off_danger(fm_pos):
                 continue
-            if base is not None and clean_ref == base:
-                print(f"  [clean-fm] listing matches settled baseline (try {bi})")
+            last = _last_page_after(fm_pos)
+            if last in ("filemanagerlist", "filemanageroptions"):
+                print(f"  [clean-fm] on the FM list (marker '{last}', try {bi})")
                 break
             guest_back()
             wait(1.5)
-            clean_ref = _shot_bytes(f"term-04e-clean-back-{bi}")
         else:
-            print("  [clean-fm] could not confirm baseline — proceeding (danger watchdog armed)")
+            print("  [clean-fm] marker not confirmed — danger watchdog armed")
+        screenshot("term-04f-fm-clean")
 
         # ── 5) THE TERMINAL EPISODE (the escape trigger) ──
         # User's exact chain: FM bottom-right File button -> "Choose
@@ -2108,28 +2104,41 @@ def main():
                   "Advanced-page Terminal fallback")
         if not terminal_open:
             # FALLBACK: Advanced -> Terminal button (192,708).
-            print("  [terminal fallback] BACK to Advanced, then Terminal "
+            # 6-Z188b: MARKER-GATED (was frame-compare, which the
+            # status-bar clock defeated — run 33125036396 tapped the
+            # main menu's Backup/Restore instead).
+            print("  [terminal fallback] reaching Advanced, then Terminal "
                   "button (192,708)")
             guest_back()
             wait(1.0)
-            cur = _shot_bytes("term-06e-after-back")
-            on_advanced = (cur == adv_frame) if cur else False
-            if not on_advanced:
-                # one more back, then re-check
+            on_advanced = False
+            for _ in range(3):
+                if _back_off_danger(adv_pos):
+                    continue
+                last = _last_page_after(adv_pos)
+                if last == "advanced":
+                    on_advanced = True
+                    break
+                if last in ("main2", "main", "clear_vars"):
+                    tap(192, 1294)
+                    wait(2.5)
+                    continue
                 guest_back()
                 wait(1.0)
-                cur = _shot_bytes("term-06e-after-back2")
-                on_advanced = (cur == adv_frame) if cur else False
             if on_advanced or not fm_open:
-                print("  [terminal fallback] on Advanced — tapping Terminal")
-                tap(192, 708)
-                wait(3.0)
-                screenshot("term-06f-terminal-fallback")
-                new = [p for p_pos, p in _pages() if p_pos > fm_pos]
-                print(f"  [terminal fallback] pages after tap: {new[-5:]}")
-                if any("terminal" in p.lower() for p in new):
-                    terminal_open = True
-                    print("  TERMINAL OPENED via fallback — chain complete")
+                if _last_page_after(adv_pos) != "advanced" and fm_open:
+                    print("  [terminal fallback] not on Advanced — skipping "
+                          "the tap (safety)")
+                else:
+                    print("  [terminal fallback] on Advanced — tapping Terminal")
+                    tap(192, 708)
+                    wait(3.0)
+                    screenshot("term-06f-terminal-fallback")
+                    new = [p for p_pos, p in _pages() if p_pos > fm_pos]
+                    print(f"  [terminal fallback] pages after tap: {new[-5:]}")
+                    if any("terminal" in p.lower() for p in new):
+                        terminal_open = True
+                        print("  TERMINAL OPENED via fallback — chain complete")
             else:
                 print("  [terminal fallback] could not confirm Advanced — "
                       "skipping the tap (safety)")
@@ -2155,7 +2164,30 @@ def main():
         if fm_open:
             # BACK from the terminal returns to the FM (or Advanced);
             # navigate to the FM again via its Advanced-page button.
+            # 6-Z188b: MARKER-GATED — only tap FM/Terminal grid buttons
+            # when the last Set page is 'advanced'; if we drifted to the
+            # main menu (run 33125036396), enter Advanced first via its
+            # main-menu button (192,1294).
+            def _ensure_advanced(tag):
+                for _ in range(3):
+                    if _back_off_danger(adv_pos):
+                        continue
+                    last = _last_page_after(adv_pos)
+                    if last == "advanced":
+                        return True
+                    if last in ("main2", "main", "clear_vars"):
+                        tap(192, 1294)
+                        wait(2.5)
+                        continue
+                    guest_back()
+                    wait(1.5)
+                return _last_page_after(adv_pos) == "advanced"
+
+            if not _ensure_advanced("reopen"):
+                print("  [reopen] could not reach Advanced — skipping FM reopen taps")
             for (x, y) in [(528, 708), (528, 708)]:
+                if _last_page_after(adv_pos) != "advanced":
+                    break
                 print(f"  tap File Manager reopen candidate: ({x},{y})")
                 tap(x, y)
                 wait(2.5)
