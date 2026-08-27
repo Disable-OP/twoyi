@@ -192,6 +192,27 @@ public class IOUtils {
         if (directory == null) {
             return false;
         }
+        // 6-Z186: tar-extracted TWRP ramdisks ship mode-0555 directories
+        // (read+execute for all, NO write). Deleting a child entry needs
+        // WRITE on the PARENT directory, so a plain delete walk left every
+        // file inside those dirs behind — the caller then hit
+        // renameTo() == ENOTEMPTY ("staging rename failed"), with the old
+        // rootfs already gutted (its `init` deleted) leaving the app in
+        // "No ROM Installed" limbo where EVERY later import also failed.
+        // Pass 1 grants owner-write on every directory first (we own all
+        // of them — the app's own uid extracted the tree), pass 2 deletes.
+        try (java.util.stream.Stream<Path> prep = Files.walk(directory.toPath())) {
+            prep.filter(Files::isDirectory)
+                    .forEach(p -> {
+                        File d = p.toFile();
+                        if (!d.canWrite()) {
+                            d.setWritable(true, true);
+                        }
+                    });
+        } catch (IOException ignored) {
+            // Pass-2 will surface a real failure; an unreadable tree here
+            // just means the delete below will fail and report false.
+        }
         // Fixed: Files.walk() returns a Stream that holds open directory
         // descriptors. Must use try-with-resources to close them, otherwise
         // FDs leak and can exhaust the per-process FD limit.

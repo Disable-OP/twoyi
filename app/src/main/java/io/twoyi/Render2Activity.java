@@ -574,16 +574,35 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                 }
 
                 if (exitCode == 0) {
-                    // Swap: remove the old rootfs and move staging into place
-                    // (rename within the same parent directory = same
-                    // filesystem = atomic).
-                    if (profileRootfsDir.exists()) {
-                        io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
+                    // 6-Z186 ATOMIC SWAP (rename-aside dance): renaming a
+                    // directory needs only WRITE on the PARENT (which we
+                    // own), so read-only children can never block it. The
+                    // old delete-then-rename order gutted the working
+                    // rootfs (delete ran halfway) and then ENOTEMPTY'd the
+                    // rename — "staging rename failed" on every re-import
+                    // with the app left in "No ROM Installed" limbo.
+                    // Order now: old -> aside, staging -> live, then
+                    // best-effort delete of aside; on any failure the old
+                    // rootfs is rolled back and stays bootable.
+                    File parent = profileRootfsDir.getParentFile();
+                    File aside = new File(parent, profileRootfsDir.getName() + ".old");
+                    if (aside.exists()) {
+                        io.twoyi.utils.IOUtils.deleteDirectory(aside);
+                    }
+                    boolean oldMovedAside = !profileRootfsDir.exists()
+                            || profileRootfsDir.renameTo(aside);
+                    if (!oldMovedAside) {
+                        throw new IOException("cannot move old rootfs aside: "
+                                + profileRootfsDir.getAbsolutePath());
                     }
                     if (!stagingDir.renameTo(profileRootfsDir)) {
+                        if (aside.exists() && !profileRootfsDir.exists()) {
+                            aside.renameTo(profileRootfsDir);
+                        }
                         throw new IOException("staging rename failed: "
                                 + stagingPath + " -> " + profileRootfsDir.getAbsolutePath());
                     }
+                    io.twoyi.utils.IOUtils.deleteDirectory(aside);
                     RomManager.initRootfs(this);
                     return true;
                 }

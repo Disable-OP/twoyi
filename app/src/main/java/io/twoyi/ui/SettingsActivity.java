@@ -560,17 +560,45 @@ public class SettingsActivity extends AppCompatActivity {
                     }
 
                     if (success) {
-                        // Swap the verified staging dir into place (rename in
-                        // the same parent = same filesystem = atomic).
-                        if (profileRootfsDir.exists()) {
-                            io.twoyi.utils.IOUtils.deleteDirectory(profileRootfsDir);
-                        }
-                        if (!stagingDir.renameTo(profileRootfsDir)) {
+                        // 6-Z186 ATOMIC SWAP (rename-aside dance): move the
+                        // old rootfs ASIDE first (a dir rename needs only
+                        // parent-dir write, which we own — read-only
+                        // children never block it), then rename the
+                        // verified staging into place, and only then
+                        // best-effort-delete the aside copy. The old
+                        // delete-then-rename order gutted the working
+                        // rootfs halfway and then ENOTEMPTY'd the rename —
+                        // "staging rename failed" on every re-import with
+                        // the app left in "No ROM Installed" limbo.
+                        File parent = profileRootfsDir.getParentFile();
+                        File aside = new File(parent, profileRootfsDir.getName() + ".old");
+                        if (aside.exists() && !io.twoyi.utils.IOUtils.deleteDirectory(aside)) {
                             success = false;
-                            errorMsg = "staging rename failed: " + stagingDir.getAbsolutePath();
+                            errorMsg = "cannot clear stale backup: " + aside.getAbsolutePath();
                             Log.e("SettingsActivity", errorMsg);
                         } else {
-                            RomManager.initRootfs(activity);
+                            boolean oldMovedAside = !profileRootfsDir.exists()
+                                    || profileRootfsDir.renameTo(aside);
+                            if (!oldMovedAside) {
+                                success = false;
+                                errorMsg = "cannot move old rootfs aside: "
+                                        + profileRootfsDir.getAbsolutePath();
+                                Log.e("SettingsActivity", errorMsg);
+                            } else if (stagingDir.renameTo(profileRootfsDir)) {
+                                // New ROM is live. Best-effort cleanup of
+                                // the aside copy; a leftover .old is
+                                // harmless (cleared on the next import).
+                                io.twoyi.utils.IOUtils.deleteDirectory(aside);
+                                RomManager.initRootfs(activity);
+                            } else {
+                                // Roll back so the previous ROM stays bootable.
+                                if (aside.exists() && !profileRootfsDir.exists()) {
+                                    aside.renameTo(profileRootfsDir);
+                                }
+                                success = false;
+                                errorMsg = "staging rename failed: " + stagingDir.getAbsolutePath();
+                                Log.e("SettingsActivity", errorMsg);
+                            }
                         }
                     }
                 } finally {
