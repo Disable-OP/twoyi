@@ -312,6 +312,19 @@ jobs:
           mkdir -p /tmp/ui-e2e-artifacts
           python3 scripts/ui-navigate.py
 
+          # 6-Z183: TWRP's own recovery.log via `run-as` (debug app — no
+          # adb root needed, keeping the "unrooted user device" premise).
+          # Its `Set page:` transitions are the TOUCH proof: TWRP sits on
+          # the first-run gate until a real gesture arrives through the
+          # app → touch socket → hook → evdev chain, exactly like the
+          # arm64 workflow's docker-exec pull.
+          adb -s emulator-5554 exec-out run-as io.twoyi.debug \
+            cat rootfs/tmp/recovery.log \
+            > /tmp/ui-e2e-artifacts/twrp-recovery.log 2>&1 || true
+          echo "── recovery.log pages ──"
+          grep -a "Set page\|Switching packages" \
+            /tmp/ui-e2e-artifacts/twrp-recovery.log | tail -12 || true
+
       - name: Pack artifacts
         if: always()
         run: |
