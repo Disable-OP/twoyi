@@ -653,6 +653,162 @@ static int ashmem_ioctl(int fd, unsigned req, unsigned long arg) {
 }
 
 // ---------------------------------------------------------------------------
+// ── 6-Z188: SOCKETPAIR-BACKED PTY EMULATION ─────────────────────────────
+//
+// Run 33122549751 proved the terminal chain now reaches the shell:
+// the pty child forked, execl("/sbin/sh") SUCCEEDED via the 6-Z187
+// provisioning (+1 cwd-relative, ret=0) — and the shell immediately
+// exit_group(1)'d. Root cause: there is no real /dev/ptmx or /dev/pts/N
+// in the sandbox. Recovery terminal emulators do:
+//
+//     fdMaster = getpt();                    // open("/dev/ptmx")
+//     unlockpt(fdMaster);                    // ioctl TIOCSPTLCK 0
+//     pid = fork();
+//     child: fdSlave = open(ptsname(fdMaster));   // "/dev/pts/N" -> ENOENT
+//           dup2(fdSlave, 0/1/2); close(fdSlave);
+//           setsid(); ioctl(0, TIOCSCTTY, 1);
+//           execl("/sbin/sh", "sh", NULL);
+//
+// With fdSlave = -1 the dup2s fail and the shell runs with dead stdio
+// and exits 1. THE GENERIC FIX (no tracer changes, recovery-agnostic —
+// works for ANY recovery using the standard pty API): back the "pty"
+// with an AF_UNIX socketpair created at getpt() time:
+//
+//   open("/dev/ptmx")        -> socketpair(); return sv[0] as master,
+//                                stash sv[1] in slot i (pty index i)
+//   ioctl(TIOCSPTLCK)        -> 0        (unlockpt succeeds)
+//   ioctl(TIOCGPTN)          -> slot i   (ptsname builds /dev/pts/i)
+//   ptsname(fd)              -> "/dev/pts/<i>" (directly interposed too)
+//   ioctl(TIOCSCTTY)         -> 0        (session-ctty "grant")
+//   open("/dev/pts/<i>")     -> dup(stashed sv[1]) — the child inherited
+//                                the socket end at fork; reads/writes on
+//                                stdio reach the GUI's master fd directly.
+//
+// aarch64 only (i386 socketpair needs socketcall plumbing; x86 TWRP
+// images don't exercise the terminal in CI).
+// ---------------------------------------------------------------------------
+#if defined(__aarch64__)
+#define TWOYI_PTY_SLOTS 4
+static int  g_pty_master_fd[TWOYI_PTY_SLOTS];   /* sv[0] handed to caller */
+static int  g_pty_slave_fd[TWOYI_PTY_SLOTS];    /* sv[1] stashed          */
+
+static void pty_init_slots(void) {
+    static int inited = 0;
+    if (!inited) {
+        for (int i = 0; i < TWOYI_PTY_SLOTS; i++) {
+            g_pty_master_fd[i] = -1;
+            g_pty_slave_fd[i] = -1;
+        }
+        inited = 1;
+    }
+}
+
+static int is_ptmx_path(const char *path) {
+    if (!path) return 0;
+    if (my_strcmp(path, "/dev/ptmx") == 0) return 1;
+    if (my_strcmp(path, "/dev/pts/ptmx") == 0) return 1;
+    return 0;
+}
+
+/* open("/dev/ptmx") -> master socket end. -1 when no slot/kernel fail. */
+static int pty_open_master(int flags) {
+    (void)flags;
+    pty_init_slots();
+    int slot = -1;
+    for (int i = 0; i < TWOYI_PTY_SLOTS; i++) {
+        if (g_pty_master_fd[i] < 0) { slot = i; break; }
+    }
+    if (slot < 0) return -1;
+    long sv[2];
+    long r = raw_syscall4(199 /* SYS_socketpair aarch64 */,
+                          1 /*AF_UNIX*/, 1 /*SOCK_STREAM*/, 0,
+                          (long)sv);
+    if (r != 0) {
+        write_str(2, "[twrp_fb_hook] pty socketpair ret=");
+        write_num(2, (int)r);
+        write_str(2, "\n");
+        return -1;
+    }
+    g_pty_master_fd[slot] = (int)sv[0];
+    g_pty_slave_fd[slot]  = (int)sv[1];
+    write_str(2, "[twrp_fb_hook] pty master fd=");
+    write_num(2, (int)sv[0]);
+    write_str(2, " (slot ");
+    write_num(2, slot);
+    write_str(2, ", slave fd=");
+    write_num(2, (int)sv[1]);
+    write_str(2, ")\n");
+    return (int)sv[0];
+}
+
+static int pty_slot_of_master(int fd) {
+    pty_init_slots();
+    for (int i = 0; i < TWOYI_PTY_SLOTS; i++)
+        if (g_pty_master_fd[i] == fd) return i;
+    return -1;
+}
+
+/* open("/dev/pts/<n>") with n a live slot -> dup of the stashed slave. */
+static int pty_open_slave(const char *path) {
+    if (!path) return -2;
+    static const char pfx[] = "/dev/pts/";
+    for (int j = 0; j < 9; j++) {
+        if (path[j] != pfx[j]) {
+            if (path[j] == '\0') return -2;
+            break;
+        }
+    }
+    int n = 0; int any = 0;
+    for (const char *p = path + 9; *p >= '0' && *p <= '9'; p++) {
+        n = n * 10 + (*p - '0'); any = 1;
+    }
+    /* No digits after the prefix (or a trailing non-digit like
+     * "/dev/pts/ptmx") = not a slave-address form we serve: -2 lets the
+     * caller fall through to the real open (never shadow foreign paths). */
+    if (!any) return -2;
+    if (n < 0 || n >= TWOYI_PTY_SLOTS) return -1;
+    pty_init_slots();
+    if (g_pty_slave_fd[n] < 0) return -1;
+    long d = raw_syscall1(24 /* SYS_dup aarch64 */, (long)g_pty_slave_fd[n]);
+    write_str(2, "[twrp_fb_hook] pty slave open /dev/pts/");
+    write_num(2, n);
+    write_str(2, " -> fd=");
+    write_num(2, (int)d);
+    write_str(2, "\n");
+    return d >= 0 ? (int)d : -1;
+}
+
+/* ioctl on a tracked MASTER fd: the ptmx protocol. -2 = not ours. */
+static long pty_master_ioctl(int fd, unsigned req, unsigned long arg) {
+    int slot = pty_slot_of_master(fd);
+    if (slot < 0) return -2;
+    switch (req) {
+        case 0x40045431u: /* TIOCSPTLCK — unlockpt */
+            return 0;
+        case 0x80045431u: /* TIOCGPTLCK */
+            if (arg) *(int *)(long)arg = 0;
+            return 0;
+        case 0x80045430u: /* TIOCGPTN — pty number */
+            if (arg) *(unsigned int *)(long)arg = (unsigned int)slot;
+            return 0;
+        case 0x540Eu:     /* TIOCSCTTY (asm-generic) */
+            return 0;
+        case 0x5413u: {   /* TIOCGWINSZ (asm-generic) */
+            if (arg) {
+                unsigned short *ws = (unsigned short *)(long)arg;
+                ws[0] = 24; ws[1] = 80; ws[2] = 80 * 8; ws[3] = 24 * 16;
+            }
+            return 0;
+        }
+        case 0x5414u:     /* TIOCSWINSZ */
+            return 0;
+        default:
+            return -2;
+    }
+}
+#endif /* __aarch64__ */
+
+// ---------------------------------------------------------------------------
 // 6-Z165/6-Z166: absolute-open failure → rootfs-resolvable retry.
 //
 // Run 33002423676 (arm64 jail): the 6-Z164 tracer DIAG named the mechanism
@@ -1854,6 +2010,19 @@ int open(const char *path, int flags, ...) {
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
+#if defined(__aarch64__)
+    /* 6-Z188: PTY master — hand out a socketpair end instead of a
+     * (nonexistent) /dev/ptmx device. */
+    if (is_ptmx_path(path)) {
+        int pfd = pty_open_master(flags);
+        if (pfd >= 0) return pfd;
+    }
+    /* 6-Z188: PTY slave — dup of the stashed socket end. */
+    {
+        int sfd = pty_open_slave(path);
+        if (sfd != -2) return sfd;
+    }
+#endif
     {
         int in_fd = try_open_input_bridge(path);
         if (in_fd != -2) return in_fd;
@@ -1946,6 +2115,17 @@ int openat(int dirfd, const char *path, int flags, ...) {
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
     }
+#if defined(__aarch64__)
+    /* 6-Z188: PTY master/slave (see open()). */
+    if (is_ptmx_path(path)) {
+        int pfd = pty_open_master(flags);
+        if (pfd >= 0) return pfd;
+    }
+    {
+        int sfd = pty_open_slave(path);
+        if (sfd != -2) return sfd;
+    }
+#endif
     {
         int in_fd = try_open_input_bridge(path);
         if (in_fd != -2) return in_fd;
@@ -2262,6 +2442,45 @@ int execl(const char *path, const char *arg0, ...) {
     return (int)hook_exec_common(path, (char *const *)argv_stack, env);
 }
 
+#if defined(__aarch64__)
+// ── 6-Z188: ptsname/grantpt interposition (see the PTY block above).
+// bionic's ptsname() runs TIOCGPTN + builds "/dev/pts/%d" — both sides
+// are already virtualized, but interposing ptsname directly is the
+// robust path (some builds read /proc/self/fd/N instead). grantpt is a
+// no-op (permissions are ours). ──
+char *ptsname(int fd) {
+    static char name_buf[16];
+    int slot = pty_slot_of_master(fd);
+    if (slot < 0) return NULL;
+    char *p = name_buf;
+    const char *s = "/dev/pts/";
+    while (*s) *p++ = *s++;
+    if (slot >= 10) *p++ = '0' + (slot / 10) % 10;
+    *p++ = '0' + slot % 10;
+    *p = '\0';
+    write_str(2, "[twrp_fb_hook] ptsname(fd=");
+    write_num(2, fd);
+    write_str(2, ") -> ");
+    write_str(2, name_buf);
+    write_str(2, "\n");
+    return name_buf;
+}
+
+int ptsname_r(int fd, char *buf, size_t buflen) {
+    char *n = ptsname(fd);
+    if (!n) return 25; /* ENOTTY */
+    size_t l = 0;
+    while (n[l]) l++;
+    if (l + 1 > buflen) return 34; /* ERANGE */
+    for (size_t i = 0; i <= l; i++) buf[i] = n[i];
+    return 0;
+}
+
+int grantpt(int fd) {
+    return pty_slot_of_master(fd) >= 0 ? 0 : -1;
+}
+#endif
+
 int ioctl(int fd, int request, ...) {
     va_list ap;
     va_start(ap, request);
@@ -2301,18 +2520,30 @@ int ioctl(int fd, int request, ...) {
         if (r != -2) return r;
     }
 
-    // 6-Z186: TIOCGWINSZ (0x540e) — TWRP's Open Terminal child queries the
-    // terminal size on stdin/stdout, which in the sandbox is a pipe or
-    // our socket (the REAL ioctl returns ENOTTY), and every failed call
-    // also hit the unconditional diagnostic log below. Both together are
-    // exactly the on-screen "errors" the physical device showed on the
-    // terminal page:
-    //     [twrp_fb_hook] ioctl(fd=0, req=0x540e) [trk=0]
-    //     Child processes exited.
-    // Answer the query with a standard 80x24 winsize when the real fd
-    // can't (what a terminal emulator does) so TWRP's terminal logic can
-    // proceed instead of looping on the failure.
-    if (req == 0x540eu) {
+#if defined(__aarch64__)
+    // ── 6-Z188: PTY-master ioctls (TIOCSPTLCK/TIOCGPTN/TIOCSCTTY/
+    // TIOCGWINSZ on the socketpair-backed /dev/ptmx fd). Must run BEFORE
+    // the generic WINSZ handler below (the master fd IS a socket — the
+    // real ioctl would return ENOTTY). ──
+    {
+        long pr = pty_master_ioctl(fd, req, (unsigned long)argp);
+        if (pr != -2) return (int)pr;
+    }
+#endif
+
+    // 6-Z186: TIOCGWINSZ — answer with a standard 80x24 winsize when the
+    // real fd can't (what a terminal emulator does) so recovery terminal
+    // logic can proceed instead of looping on the failure.
+    // 6-Z188: ARCH-CORRECT codes. The old check was 0x540e ONLY — that is
+    // the x86 TIOCGWINSZ but the aarch64 (asm-generic) TIOCSCTTY! On
+    // arm64, ash's TIOCGWINSZ(0x5413) went unanswered while SCTTY got a
+    // bogus 8-byte winsize write. Handle BOTH arches' WINSZ codes, and
+    // answer SCTTY(0x540E asm-generic) with 0 on aarch64.
+#if defined(__aarch64__)
+    if (req == 0x5413u) {
+#else
+    if (req == 0x540eu || req == 0x5413u) {
+#endif
         static int (*real_winsz)(int, int, ...) = NULL;
         if (!real_winsz && dlsym)
             real_winsz = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
@@ -2326,6 +2557,14 @@ int ioctl(int fd, int request, ...) {
         }
         return 0;
     }
+#if defined(__aarch64__)
+    // 6-Z188: TIOCSCTTY (asm-generic 0x540E) on ANY fd — the terminal
+    // slave child's ioctl(0, TIOCSCTTY, 1) must "succeed" (there is no
+    // real controlling tty; ash degrades gracefully either way).
+    if (req == 0x540Eu) {
+        return 0;
+    }
+#endif
 
     // DIAGNOSTIC (Task 31): log ioctl() calls to verify our hook is being
     // invoked. Key ioctl numbers to watch for:
