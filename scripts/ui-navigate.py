@@ -2009,10 +2009,29 @@ def main():
         pages = _pages()
         fm_pos = max([pos for pos, _ in pages], default=0)
         wait(1.0)
-        # BEFORE the terminal: the FM must show the sandboxed (near-empty)
-        # root. This screenshot is the baseline the post-terminal shot is
-        # compared against — same view, only the terminal episode differs.
+        # BEFORE the terminal: the FM must show the sandboxed root.
+        # 6-Z187 "ALWAYS SHOW GUEST'S ROOTFS": the first-entry listing must
+        # be NON-EMPTY (was: blank until the terminal episode opened it).
+        # Capture EARLY (right after page-entry), SETTLED (+2.5s) and
+        # SCROLLED so the analysis can prove first-open correctness.
         screenshot("term-04-fm-root-BEFORE-terminal")
+        wait(2.5)
+        screenshot("term-04c-fm-root-BEFORE-settled")
+        swipe_up()
+        wait(1.0)
+        screenshot("term-04d-fm-root-BEFORE-scrolled")
+        # 6-Z187: press the `system` folder BEFORE the terminal as well —
+        # its listing must be GUEST content in BOTH episodes (the user's
+        # physical-device repro saw the HOST /system here).
+        for i, sy in enumerate([1170, 1050, 930, 810]):
+            print(f"  tap system-folder candidate BEFORE-{i}: (360,{sy})")
+            tap(360, sy)
+            wait(1.5)
+            if _back_off_danger(fm_pos):
+                continue
+            screenshot(f"term-04e-system-BEFORE-{i}")
+            input_cmd("input keyevent 4")
+            wait(1.0)
 
         # ── 5) THE TERMINAL EPISODE (the escape trigger) ──
         # User's exact chain: FM bottom-right File button -> "Choose
@@ -2086,9 +2105,13 @@ def main():
                 print("  [terminal fallback] could not confirm Advanced — "
                       "skipping the tap (safety)")
 
-        # Let the terminal children fork + die (Child processes exited x2)
-        wait(5.0)
+        # Let the terminal children settle. 6-Z187: with the terminal fix
+        # the pty child execs the STAGED busybox ash — give it 8s to draw
+        # a PROMPT (and NOT print "Child processes exited.").
+        wait(8.0)
         screenshot("term-07-terminal-settled")
+        wait(4.0)
+        screenshot("term-07b-terminal-prompt")
 
         # ── 6) BACK (bottom nav bar) -> returns to the Advanced page ──
         guest_back()
@@ -2111,16 +2134,21 @@ def main():
                     continue
                 break
             screenshot("term-09-fm-AFTER-terminal")
+            # 6-Z187: press `system` FIRST (unscrolled position — the
+            # user's complaint was that scrolling made the row unreachable).
+            for i, sy in enumerate([1170, 1050, 930, 810]):
+                print(f"  tap system-folder candidate AFTER-{i}: (360,{sy})")
+                tap(360, sy)
+                wait(1.5)
+                if _back_off_danger(fm_pos):
+                    continue
+                screenshot(f"term-11-system-{i}")
+                input_cmd("input keyevent 4")
+                wait(1.0)
             for i in range(3):
                 swipe_up()
                 wait(1.0)
                 screenshot(f"term-10-scroll-{i}")
-            for i, y in enumerate([1002, 1100, 900, 800]):
-                tap(360, y)
-                wait(1.5)
-                if _back_off_danger(adv_pos):
-                    continue
-                screenshot(f"term-11-system-{i}")
             screenshot("term-12-final")
         else:
             screenshot("term-09-fm-AFTER-terminal-SKIPPED")

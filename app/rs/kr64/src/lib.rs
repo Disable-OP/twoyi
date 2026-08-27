@@ -69,6 +69,7 @@ pub mod ptrace_emu;
 pub mod qemu_pipe;
 pub mod seccomp;
 pub mod sensors;
+pub mod symlinks;
 pub mod vfs;
 
 use std::ffi::CString;
@@ -4769,42 +4770,119 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
     // Pre-create directories that init and services expect to exist.
     // These are created in the rootfs so init's mkdir commands succeed.
+    //
+    // 6-Z187 ("MAKE IT ONLY SHOW GUESTS ONLY AND NOTHING ELSE"): in TWRP
+    // mode (boot_recovery) the Android-guest compatibility dirs are NO
+    // LONGER created — they are visible in TWRP's File Manager root as
+    // folders a real recovery would never have (metadata, linkerconfig,
+    // data_mirror, mnt/secure|asec|obb|user|installer|androidwritable|
+    // pass_through, acct/uid_*…), which the user correctly reads as host
+    // noise. TWRP's own init creates whatever mountpoints it needs inside
+    // the writable rootfs. Only the partition-probe dirs (cache +
+    // dev/block/by-name, needed by fstab handling before init runs) stay.
     {
         use std::os::unix::fs::PermissionsExt;
-        for dir in &[
-            "acct",
-            "acct/uid_0",
-            "acct/uid_1000",
-            "metadata",
-            "metadata/vold",
-            "metadata/bootstat",
-            "linkerconfig",
-            "linkerconfig/bootstrap",
-            "linkerconfig/default",
-            "mnt/secure",
-            "mnt/secure/staging",
-            "mnt/asec",
-            "mnt/obb",
-            "mnt/user",
-            "mnt/user/0",
-            "mnt/installer",
-            "mnt/androidwritable",
-            "mnt/pass_through",
-            "data_mirror",
-            "data_mirror/cur_profiles",
-            "data_mirror/data_de",
-            "data_mirror/data_ce",
-            "config",
-            "cache",
-            "dev/block",
-            "dev/block/by-name",
-            "dev/block/dm-5",
-        ] {
+        let dirs: &[&str] = if cfg.boot_recovery {
+            &["cache", "dev/block", "dev/block/by-name", "dev/block/dm-5"]
+        } else {
+            &[
+                "acct",
+                "acct/uid_0",
+                "acct/uid_1000",
+                "metadata",
+                "metadata/vold",
+                "metadata/bootstat",
+                "linkerconfig",
+                "linkerconfig/bootstrap",
+                "linkerconfig/default",
+                "mnt/secure",
+                "mnt/secure/staging",
+                "mnt/asec",
+                "mnt/obb",
+                "mnt/user",
+                "mnt/user/0",
+                "mnt/installer",
+                "mnt/androidwritable",
+                "mnt/pass_through",
+                "data_mirror",
+                "data_mirror/cur_profiles",
+                "data_mirror/data_de",
+                "data_mirror/data_ce",
+                "config",
+                "cache",
+                "dev/block",
+                "dev/block/by-name",
+                "dev/block/dm-5",
+            ]
+        };
+        for dir in dirs {
             let path = format!("{}/{}", rootfs_prefix, dir);
             let _ = std::fs::create_dir_all(&path);
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777));
         }
-        info!("[KR64] PARENT: pre-created boot directories in rootfs");
+        info!(
+            "[KR64] PARENT: pre-created boot directories in rootfs ({} dirs, {} mode)",
+            dirs.len(),
+            if cfg.boot_recovery {
+                "TWRP guest-only"
+            } else {
+                "Android guest"
+            }
+        );
+    }
+
+    // ── 6-Z187: TWRP terminal shell + REAL guest symlinks ──────────────
+    //
+    // The RamdiskImporter stores cpio symlinks as `<name>.symlink` text
+    // sidecars (Java cannot express them), so {rootfs}/sbin/sh did NOT
+    // exist — TWRP's terminal `execl("/sbin/sh", "sh", NULL)` ENOENT'd →
+    // "Child processes exited.", and the File Manager showed charger.symlink
+    // noise instead of the guest tree. Materialize EVERY sidecar as a real
+    // symlink, patch busybox's PT_INTERP to the rootfs linker64, pre-stage
+    // busybox under the /sbin/busybox + /sbin/sh keys (the rootfs partition
+    // is noexec; the cache staging dir is the executable place), and point
+    // busybox-targeted links at the staged copy so even RAW kernel execs of
+    // {rootfs}/sbin/sh succeed (belt-and-braces for the PEEK-blind execve
+    // ENTRY class — see ptrace_emu's 6-Z170 +1 fallback).
+    //
+    // Run in BOTH modes: an Android ROM rootfs has the same sidecars. In
+    // AOSP mode there is no busybox provisioning (staged_busybox=None).
+    {
+        let staged_busybox: Option<String> = if cfg.boot_recovery {
+            match crate::symlinks::provision_terminal_shell(&cfg.rootfs, &cfg.data_dir) {
+                Ok(p) => {
+                    info!(
+                        "[KR64][symlinks] TWRP terminal shell provisioned: busybox PT_INTERP patched + staged + /sbin/sh registered ({})",
+                        p
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64][symlinks] terminal shell provisioning FAILED: {} — terminal may stay dead",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let stats =
+            crate::symlinks::materialize_symlink_sidecars(&cfg.rootfs, staged_busybox.as_deref());
+        // 6-Z187: legacy in-rootfs artifacts from older installs — remove
+        // so the guest File Manager shows the guest tree only.
+        let legacy_marker = format!("{}/{}", cfg.rootfs, crate::ptrace_emu::STAGED_EXE_MARKER);
+        let _ = std::fs::remove_file(&legacy_marker);
+        let legacy_geom = format!("{}/.twoyi-fb-geometry", cfg.rootfs);
+        let _ = std::fs::remove_file(&legacy_geom);
+        info!(
+            "[KR64][symlinks] materialized {} real symlinks from .symlink sidecars (removed {}, skipped {}, busybox-staged={})",
+            stats.links_created,
+            stats.sidecars_removed,
+            stats.skipped,
+            staged_busybox.is_some()
+        );
     }
 
     // Pre-create defensive graphics device stubs in the guest rootfs.
@@ -7037,8 +7115,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                             // (ptrace_emu::append_staged_marker) exactly so
                             // the two writers stay interchangeable.
                             {
+                                // 6-Z187: the marker lives OUTSIDE the guest
+                                // rootfs (in {data_dir}/cache) so TWRP's File
+                                // Manager never shows it.
                                 let marker_path =
-                                    crate::ptrace_emu::staged_exes_marker_path(&cfg.rootfs);
+                                    crate::ptrace_emu::staged_exes_marker_path(&cfg.data_dir);
                                 let guest_key = cfg.init_path.clone();
                                 let cache_path_for_marker = cache_init.clone();
                                 let existing =

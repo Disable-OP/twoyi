@@ -398,7 +398,7 @@ static void fb_geometry_init(void) {
             return;
         }
     }
-    /* 6-Z176: geometry FILE fallback — {rootfs}/.twoyi-fb-geometry,
+    /* 6-Z176: geometry FILE fallback — {rootfs}/dev/.twoyi-fb-geometry,
      * written by kr64's parent at fb0-creation time ("WxH\n"). This
      * removes ALL env-plumbing dependencies (TWRP's old init builds the
      * service env from init.rc setenv options only — run 33018901591
@@ -406,9 +406,12 @@ static void fb_geometry_init(void) {
      * 6-Z175 init.rc patch, so the hook kept shrinking fb0 to the
      * 320x640 fallback). The file is opened via the same
      * jail-resolvable forms the hook already uses (rootfs-prefixed,
-     * cwd-relative fallback — the guest cwd IS the rootfs). */
+     * cwd-relative fallback — the guest cwd IS the rootfs).
+     * 6-Z187: the file moved from the rootfs ROOT into {rootfs}/dev/
+     * so TWRP's File Manager shows the guest tree only — all three
+     * candidate forms below updated in lockstep. */
     {
-        static const char *rel = ".twoyi-fb-geometry";
+        static const char *rel = "dev/.twoyi-fb-geometry";
         char pathbuf[560];
         const char *gp = NULL;
         if (getenv) {
@@ -427,15 +430,19 @@ static void fb_geometry_init(void) {
         if (gp) gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)gp, 0 /*O_RDONLY*/, 0);
         if (gfd < 0)
             gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)rel, 0, 0);
-        /* 6-Z182: the CHROOT-ABSOLUTE candidate "/.twoyi-fb-geometry".
+        /* 6-Z182: the CHROOT-ABSOLUTE candidate "/dev/.twoyi-fb-geometry".
          * Run 33061152563: TWOYI_ROOTFS env reached the hook but its
          * value is a HOST path that does not exist INSIDE the jail
          * (openat translated it to {rootfs}<host-path> -> ENOENT), and
          * the cwd-relative open also missed (recovery's cwd is not the
-         * rootfs root). The ABSOLUTE "/.twoyi-fb-geometry" is mapped by
-         * the tracer to {rootfs}/.twoyi-fb-geometry — exactly where
-         * kr64's create_twrp_framebuffer wrote it — and is correct in
-         * every jail mode (chroot, pivot_root, no-namespace). */
+         * rootfs root). The ABSOLUTE "/dev/.twoyi-fb-geometry" is mapped
+         * by the tracer to {rootfs}/dev/.twoyi-fb-geometry — exactly
+         * where kr64's create_twrp_framebuffer wrote it (6-Z187) — and is
+         * correct in every jail mode (chroot, pivot_root, no-namespace).
+         * LEGACY: the pre-6-Z187 "/.twoyi-fb-geometry" root candidate is
+         * kept as a LAST resort so an old rootfs still boots. */
+        if (gfd < 0)
+            gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)"/dev/.twoyi-fb-geometry", 0, 0);
         if (gfd < 0)
             gfd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)"/.twoyi-fb-geometry", 0, 0);
         if (gfd >= 0) {

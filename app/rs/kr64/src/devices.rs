@@ -1202,14 +1202,20 @@ pub fn create_twrp_framebuffer(rootfs: &str, width: u32, height: u32) -> std::io
     // recovery service env from init.rc setenv options and STILL did not
     // deliver TWOYI_FB_* (run 33018901591: the hook fell back to 320x640
     // and ftruncated this 4,608,000-byte file down to 819,200). The hook
-    // reads {rootfs}/.twoyi-fb-geometry ("WxH\n") — env first, then this
-    // file, then the 320x640 fallback.
+    // reads the file ("WxH\n") — env first, then this file, then the
+    // 320x640 fallback.
+    //
+    // 6-Z187 ("guest only, nothing else"): the file lives under
+    // {rootfs}/dev/ (implementation stub-land, never browsed) instead of
+    // the rootfs root, so TWRP's File Manager no longer shows
+    // .twoyi-fb-geometry at /. The hook's three read forms were updated
+    // in lockstep (TWOYI_ROOTFS-joined, cwd-relative, chroot-absolute).
     if let Err(e) = std::fs::write(
-        format!("{}/.twoyi-fb-geometry", rootfs),
+        format!("{}/dev/.twoyi-fb-geometry", rootfs),
         format!("{}x{}\n", fb_width, fb_height),
     ) {
         warning!(
-            "[KR64][devices] failed to write {}/.twoyi-fb-geometry: {} (hook will rely on env/fallback geometry)",
+            "[KR64][devices] failed to write {}/dev/.twoyi-fb-geometry: {} (hook will rely on env/fallback geometry)",
             rootfs, e
         );
     }
