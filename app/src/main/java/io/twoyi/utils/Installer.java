@@ -96,6 +96,13 @@ public class Installer {
         }
 
         if (!connected) {
+            // 6-Z184 AUDIT FIX (agent 80): release the adb-server shell on
+            // this early return too (the install callback that normally
+            // closes it never fires on this path).
+            try {
+                serverShell.close();
+            } catch (Throwable ignored) {
+            }
             if (callback != null) {
                 callback.onFail(files, "Adb connect failed!");
             }

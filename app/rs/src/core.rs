@@ -614,7 +614,27 @@ pub fn init_renderer(
         // managed by the root kr64.
         // -----------------------------------------------------------------
         let qemu_pipe_path = format!("{}/dev/qemu_pipe", working_dir);
-        let root_kr64_running = Path::new(&qemu_pipe_path).exists();
+        // 6-Z184 AUDIT FIX (agent 71): mere existence of the socket FILE
+        // used to mean "root kr64 running" — but the file survives
+        // crashes/force-stops (nothing unlinks it on app start), so every
+        // later launch falsely skipped the proxy AND the kr64 spawn →
+        // permanently dead session. Probe liveness: a stale file refuses
+        // connections (ECONNREFUSED) — remove it and proceed.
+        let mut root_kr64_running = false;
+        if Path::new(&qemu_pipe_path).exists() {
+            match std::os::unix::net::UnixStream::connect(&qemu_pipe_path) {
+                Ok(_) => {
+                    root_kr64_running = true;
+                }
+                Err(_) => {
+                    log::warn!(
+                        "[CORE] {} exists but refuses connections — stale socket from a dead kr64; removing",
+                        qemu_pipe_path
+                    );
+                    let _ = std::fs::remove_file(&qemu_pipe_path);
+                }
+            }
+        }
         if root_kr64_running {
             info!("[CORE] /dev/qemu_pipe already exists — root kr64 is running");
             info!("[CORE] Skipping app's kr64 launch + qemu_pipe proxy");
@@ -955,6 +975,12 @@ pub fn init_renderer(
             }
             Err(e) => {
                 log::error!("[CORE] FAILED to spawn container init: {}", e);
+                // 6-Z184 AUDIT FIX (agent 71): reset the in-memory flag too
+                // — the log line promises a retry, but RENDERER_STARTED
+                // staying true routed every later init_renderer to the
+                // "update window only" branch, so the retry never happened
+                // (and the pgrep-kill above had already killed the old kr64).
+                RENDERER_STARTED.store(false, Ordering::SeqCst);
                 alog_error(&format!(
                     "kr64 child spawn FAILED: {} (errno path; will NOT write lock so a retry can happen)",
                     e
