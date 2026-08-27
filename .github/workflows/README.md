@@ -5,9 +5,27 @@
 # fitness for a particular purpose, or non-infringement.
 # Use at your own risk.
 
-# GitHub Actions Build Workflow
+# GitHub Actions Workflows
 
-This repository includes a GitHub Actions workflow that automatically builds the Twoyi APK.
+## Workflow index
+
+| Workflow | What it does | Status |
+|---|---|---|
+| `build.yml` | Builds the APK (both ABIs), logs-only artifacts | green |
+| `kr64-tests.yml` | `cargo fmt` + `clippy -D warnings` + `cargo test` gates for the kr64 tracer crate | green |
+| `ui-e2e-test.yml` | TWRP boot E2E on a KVM x86_64 emulator — app UI navigation imports recovery.img and boots TWRP | green |
+| `ui-e2e-test-arm64.yml` | TWRP boot E2E on redroid arm64 (`ubuntu-24.04-arm`) — exercises the real aarch64 ptrace ABI | green |
+| `ui-e2e-aosp.yml` | Full-Android (AOSP 8.1) guest E2E on x86_64 — the original twoyi use case | green |
+| `ui-e2e-aosp-arm64.yml` | Full-Android guest E2E on arm64 redroid | WIP |
+
+(The QEMU-proof and emulator-investigation workflows from the arm64
+research phase were removed after redroid won — see the repo worklog for
+that history.)
+
+## The build workflow
+
+This repository includes a GitHub Actions workflow that automatically
+builds the Twoyi APK.
 
 ## Prerequisites
 

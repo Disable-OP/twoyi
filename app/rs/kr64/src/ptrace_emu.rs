@@ -8504,6 +8504,27 @@ pub fn run_ptrace_loop(
     // x86_64 execve nr=59 but blocks i386 execve nr=11).
     let mut pending_64bit_execve: bool = false;
     let mut post_execve_syscall_count: u64 = 0;
+    // ── 6-Z183 PERF: per-syscall trace logging is OFF by default. ──────
+    //
+    // The three `post_execve_syscall_count <= 20000` sites below logged
+    // the first 20k post-execve syscalls (ENTRY + RETURN + every
+    // path-bearing arg) unconditionally — ~40k+ stderr lines per traced
+    // binary, each mirrored into logcat by the app's FileLogger tee.
+    // Run 33062718661: the flood saturated logd (thousands of Log.i/s),
+    // rotated EVERY other log out of the ring buffer (TWOYI_DIAG app
+    // logs became unrecoverable), and stole whole cores from the ptrace
+    // emulation — TWRP booted, but the device was needlessly slow and
+    // blind. That era of crash-hunting is over: the logs stay available
+    // for future debugging behind an explicit opt-in — set
+    // TWOYI_TRACE_SYSCALLS=1 in the app/kr64 environment to re-enable
+    // the full per-syscall firehose (caps unchanged).
+    let trace_syscalls: bool = std::env::var("TWOYI_TRACE_SYSCALLS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    log(&format!(
+        "per-syscall trace logging: {} (set TWOYI_TRACE_SYSCALLS=1 to enable)",
+        if trace_syscalls { "ON" } else { "OFF" }
+    ));
     // 6-Z145 (Task 2): gate counter for the post-execve prctl-arg ENTRY
     // log below — identifies WHICH prctl option a spinning guest is
     // issuing (run 32835164907's ~15,700-call prctl spin was invisible:
@@ -11046,7 +11067,7 @@ pub fn run_ptrace_loop(
                         // whole exec'd lifetime (~4839 iterations ≈ 2400 syscall
                         // pairs) so the next run captures the child's path
                         // verbatim (including every mprotect ENTRY).
-                        if post_execve_syscall_count <= 20000 {
+                        if trace_syscalls && post_execve_syscall_count <= 20000 {
                             log(&format!(
                                 "post-execve syscall #{}: [tid {}] nr={} [{}]",
                                 post_execve_syscall_count,
@@ -11738,7 +11759,7 @@ pub fn run_ptrace_loop(
                     // lines identified the re-anchored child's /proc/self/comm
                     // + fstab probes in run 32663728329, and the #500 cutoff
                     // landed mid-linker-storm.
-                    if past_first_execve && post_execve_syscall_count <= 20000 {
+                    if trace_syscalls && past_first_execve && post_execve_syscall_count <= 20000 {
                         let path_idx = match syscall_num {
                             n if n == abi.open => Some(abi.reg_arg1),
                             n if n == abi.openat || n == abi.openat2 => Some(abi.reg_arg2),
@@ -14752,7 +14773,7 @@ pub fn run_ptrace_loop(
                             }
                         }
                     }
-                    if past_first_execve && post_execve_syscall_count <= 20000 {
+                    if trace_syscalls && past_first_execve && post_execve_syscall_count <= 20000 {
                         let ret_desc: String = if ret < 0 && ret > -4096 {
                             format!("{} (-errno {})", ret, -ret)
                         } else {
