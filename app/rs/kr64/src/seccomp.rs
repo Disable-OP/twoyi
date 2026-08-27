@@ -585,9 +585,9 @@ pub fn build_filter() -> Vec<SockFilter> {
     let trapped = trapped_syscalls();
     let killed = killed_syscalls();
 
-    let mut prog: Vec<SockFilter> = Vec::new();
-
     // (1) Load arch.
+    #[allow(clippy::vec_init_then_push)] // sequential BPF emit; a vec![] literal would hurt readability
+    let mut prog: Vec<SockFilter> = Vec::new();
     prog.push(bpf_ld_abs(OFF_ARCH));
     // (2-3) Arch gate: if the arch does not match, fall through into
     //     an IMMEDIATE KILL_PROCESS. The jump distances here are 1

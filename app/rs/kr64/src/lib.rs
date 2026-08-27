@@ -7824,10 +7824,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                     && e_phnum <= 65535
                                     && e_phentsize >= min_phentsize
                                     && e_phentsize <= 4096
-                                    && e_phoff
+                                    && !e_phoff
                                         .checked_add((e_phentsize * e_phnum) as u64)
-                                        .map_or(true, |end| end > file_len_hdr)
-                                        == false;
+                                        .map_or(true, |end| end > file_len_hdr);
                                 // 6-Z184: hoisted so the append path below
                                 // (which re-scans the phdr table) can use it;
                                 // only populated when table_ok.
