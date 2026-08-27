@@ -23233,24 +23233,16 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             libc::pid_t,
             std::collections::HashSet<i64>,
         > = std::collections::HashMap::new();
-        let mut prctl_rewritten_args: std::collections::HashMap<
-            libc::pid_t,
-            (u64, u64),
-        > = std::collections::HashMap::new();
-        let mut pending_epoll_readback: std::collections::HashMap<
-            libc::pid_t,
-            (i64, u64, usize),
-        > = std::collections::HashMap::new();
+        let mut prctl_rewritten_args: std::collections::HashMap<libc::pid_t, (u64, u64)> =
+            std::collections::HashMap::new();
+        let mut pending_epoll_readback: std::collections::HashMap<libc::pid_t, (i64, u64, usize)> =
+            std::collections::HashMap::new();
         let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
             std::collections::HashSet::new();
-        let mut pending_open_translated_path: std::collections::HashMap<
-            libc::pid_t,
-            String,
-        > = std::collections::HashMap::new();
-        let mut open_fd_owner_paths: std::collections::HashMap<
-            (libc::pid_t, i32),
-            String,
-        > = std::collections::HashMap::new();
+        let mut pending_open_translated_path: std::collections::HashMap<libc::pid_t, String> =
+            std::collections::HashMap::new();
+        let mut open_fd_owner_paths: std::collections::HashMap<(libc::pid_t, i32), String> =
+            std::collections::HashMap::new();
         let mut accept4_einval_streak: std::collections::HashMap<libc::pid_t, u64> =
             std::collections::HashMap::new();
         let mut esrch_streak: std::collections::HashMap<libc::pid_t, u32> =
