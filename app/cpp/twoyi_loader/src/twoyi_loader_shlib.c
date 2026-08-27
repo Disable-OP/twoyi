@@ -88,11 +88,19 @@ typedef struct prop_info prop_info;
   #define NR_getpid   39
   #define NR_setuid   105
   #define NR_setgid   106
-  #define NR_setgroups 118
-  #define NR_setresuid 113
-  #define NR_setresgid 114
+  // 6-Z184 AUDIT FIX (agent 1): these three were wrong by-transposition —
+  // 113/114/118 are setreuid/setregid/setresgid; setgroups/setresuid/
+  // setresgid are 116/117/119. The old values made the seccomp filter
+  // trap the WRONG syscalls on x86_64 (EPERM-ing setreuid/setregid and
+  // leaving setresuid/setresgid unvirtualized).
+  #define NR_setgroups 116
+  #define NR_setresuid 117
+  #define NR_setresgid 119
   #define NR_unshare  272
-  #define NR_rt_sigaction 134
+  // 6-Z184 AUDIT FIX (agent 1): rt_sigaction is 13 on x86_64 (134 is
+  // uselib — an aarch64 number copy-paste); the sigaction emulation arm
+  // could never fire.
+  #define NR_rt_sigaction 13
   #define NR_sched_yield 24
 
   #define GET_ARG(ctx, n) ({ \
@@ -2635,8 +2643,16 @@ static int prop_get(const char *key, char *value) {
     if (!key || !value) return 0;
     for (int i = 0; i < MAX_PROPS; i++) {
         if (g_props[i].used && strcmp(g_props[i].key, key) == 0) {
-            strncpy(value, g_props[i].value, 128);
-            return strlen(g_props[i].value);
+            // 6-Z184 AUDIT FIX (agent 1): callers pass a
+            // PROP_VALUE_MAX (92) byte buffer; the old strncpy(…, 128)
+            // zero-padded 128 bytes into it — a guaranteed 36-byte
+            // stack smash on every hit. Copy at most 91 bytes + NUL,
+            // matching the __system_property_get contract.
+            size_t len = strlen(g_props[i].value);
+            if (len > PROP_VALUE_MAX - 1) len = PROP_VALUE_MAX - 1;
+            memcpy(value, g_props[i].value, len);
+            value[len] = 0;
+            return (int)len;
         }
     }
     value[0] = 0;
@@ -3548,7 +3564,11 @@ static void init_real_funcs(void) {
 }
 
 // Path translation: prepend rootfs prefix for rootfs paths only
-static char g_translated[512];
+/* 6-Z184 AUDIT FIX (agent 2): thread-local — the old shared static was
+ * raced by every open-family hook from arbitrary guest threads (zygote
+ * children, SurfaceFlinger, binder threads): two threads' opens could
+ * each receive the OTHER's translated path. */
+static __thread char g_translated[512];
 static const char *translate(const char *path) {
     if (!path || !g_rootfs) return path;
     if (!should_translate(path)) return path; // kernel paths pass through
@@ -3634,9 +3654,12 @@ int openat(int dirfd, const char *path, int flags, ...) {
     }
 
     if (!real_openat) {
-        // real_openat not resolved — use direct syscall, then apply binder /
-        // qemu_pipe fallback if the path matches.
-        int fd = syscall(NR_openat, dirfd, path, flags, mode);
+        // real_openat not resolved — use direct syscall on the TRANSLATED
+        // path (6-Z184 AUDIT FIX (agent 2): the raw `path` used to go to
+        // the syscall untranslated, hitting the HOST filesystem for every
+        // guest absolute path), then apply binder / qemu_pipe fallback.
+        const char *translated = should_translate(path) ? translate(path) : path;
+        int fd = syscall(NR_openat, dirfd, translated, flags, mode);
         if (is_binder_device_path(path)) {
             int saved_errno = fd < 0 ? errno : 0;
             return binder_open_fallback(path, fd, saved_errno);
@@ -4312,6 +4335,18 @@ int __openat_2(int dirfd, const char *path, int flags) {
         int fd;
         if (real_openat2) fd = real_openat2(dirfd, translated, flags);
         else fd = (int)syscall(NR_openat, dirfd, translated, flags);
+        // 6-Z184 AUDIT FIX (agent 2): this translate branch was missing
+        // the binder/qemu_pipe fallbacks every sibling hook has — a
+        // fortified openat("/dev/binder") returned the raw ENXIO and
+        // libbinder aborted ("Binder driver could not be opened").
+        if (is_binder_device_path(path)) {
+            int saved_errno = fd < 0 ? errno : 0;
+            return binder_open_fallback(path, fd, saved_errno);
+        }
+        if (is_qemu_pipe_device_path(path)) {
+            int saved_errno = fd < 0 ? errno : 0;
+            return qemu_pipe_open_fallback(path, fd, saved_errno);
+        }
         return track_fb_fd(path, fd);
     }
     static int (*real_openat2)(int, const char *, int) = NULL;
@@ -4319,6 +4354,14 @@ int __openat_2(int dirfd, const char *path, int flags) {
     int fd;
     if (real_openat2) fd = real_openat2(dirfd, path, flags);
     else fd = (int)syscall(NR_openat, dirfd, path, flags);
+    if (is_binder_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return binder_open_fallback(path, fd, saved_errno);
+    }
+    if (is_qemu_pipe_device_path(path)) {
+        int saved_errno = fd < 0 ? errno : 0;
+        return qemu_pipe_open_fallback(path, fd, saved_errno);
+    }
     return track_fb_fd(path, fd);
 }
 

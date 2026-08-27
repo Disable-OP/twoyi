@@ -175,7 +175,7 @@ pub(crate) use warning;
 /// path. `write(2)` may write fewer bytes than requested (e.g. on a
 /// pipe with a small buffer) -- for short log lines on stderr this is
 /// acceptable and we do not retry partial writes.
-unsafe fn safe_write_err(msg: &[u8]) -> isize {
+pub(crate) unsafe fn safe_write_err(msg: &[u8]) -> isize {
     libc::write(
         libc::STDERR_FILENO,
         msg.as_ptr() as *const libc::c_void,
@@ -192,7 +192,7 @@ unsafe fn safe_write_err(msg: &[u8]) -> isize {
 /// room for a trailing NUL if the caller wants one.
 ///
 /// Handles negative values (writes a leading `-`).
-unsafe fn format_decimal(buf: &mut [u8; 12], n: i32) -> usize {
+pub(crate) unsafe fn format_decimal(buf: &mut [u8; 12], n: i32) -> usize {
     let mut len = 0usize;
     let mut v = n;
     let negative = v < 0;
@@ -4753,15 +4753,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     e
                 );
 
-                // Fallback: try to use the host's binder device directly
-                // by creating symlinks to the host's /dev/binder
-                for name in &["binder", "hwbinder", "vndbinder"] {
-                    let link_path = format!("{}/dev/{}", rootfs_prefix, name);
-                    let target = format!("/dev/{}", name);
-                    let _ = std::fs::remove_file(&link_path);
-                    let _ = std::os::unix::fs::symlink(&target, &link_path);
-                }
-                info!("[KR64] PARENT: using host binder devices (fallback)");
+                // 6-Z184 AUDIT FIX (agent 6): this fallback used to
+                // symlink("/dev/binder" -> "/dev/binder") — with
+                // rootfs_prefix == "" (the only mode this branch runs
+                // in, root mode post-pivot_root) link_path and target
+                // were IDENTICAL, producing a self-referential symlink
+                // that made every guest open("/dev/binder") fail with
+                // ELOOP. The host's /dev is unreachable by absolute
+                // path after pivot_root anyway — remove the broken
+                // fallback and say so; the binder proxy socket path
+                // (binder.rs) is the working mechanism in all modes.
+                info!("[KR64] PARENT: binderfs mount failed — the binder proxy socket (created separately) remains the guest's binder path");
             }
         }
     } // end if cfg.use_namespaces (binderfs mount)
@@ -4916,7 +4918,13 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // exec'd child's HOST CWD — not the rootfs — so it ENOENT'd).
         {
             let touch_sock = format!("{}/dev/touch-events", cfg.data_dir);
-            let sock_hint = format!("{}/dev/.touch-sock", cfg.rootfs);
+            // 6-Z184 AUDIT FIX (agent 6): rootfs_prefix, not cfg.rootfs —
+            // in root/KVM mode (post-pivot_root) the host-absolute
+            // cfg.rootfs path does not exist inside the new root, the
+            // write ENOENT'd and the fb hook's input bridge never found
+            // the hint → no touch in root mode. Every sibling staging
+            // step in this block already uses rootfs_prefix.
+            let sock_hint = format!("{}/dev/.touch-sock", rootfs_prefix);
             if let Err(e) = std::fs::write(&sock_hint, touch_sock.as_bytes()) {
                 warning!("[KR64] PARENT: failed to write {}: {}", sock_hint, e);
             } else {
@@ -6869,7 +6877,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // filter is not inherited, so close_range would work -- but we
         // keep the portable loop to avoid the seccomp trap on non-root
         // runs and because the cost is negligible.
-        for fd in 3..1024i32 {
+        // 6-Z184 AUDIT FIX (agent 7): close up to the REAL descriptor
+        // limit — fds >= 1024 survived execve into the guest (the
+        // comment says "everything >= 3"; now it means it too).
+        let fd_limit = unsafe {
+            let mut rl: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                rl.rlim_cur
+            } else {
+                1024
+            }
+        };
+        for fd in 3..(fd_limit as i32) {
             unsafe {
                 libc::close(fd);
             }
@@ -7788,6 +7807,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 // 6-Z157: phdr field offsets by class.
                                 let (p_off_field, p_sz_field, sz_bytes): (u64, u64, usize) =
                                     if is_elf64 { (8, 32, 8) } else { (4, 16, 4) };
+                                // 6-Z184 AUDIT FIX (agent 7): a corrupt or
+                                // malicious recovery image could carry
+                                // e_phentsize=0 (→ empty vec → index panic) or
+                                // an e_phentsize*e_phnum product large enough
+                                // to OOM-abort the tracer — which kills every
+                                // traced child via PTRACE_O_EXITKILL. Validate
+                                // the program-header table before allocating.
+                                let min_phentsize: usize = if is_elf64 { 56 } else { 32 };
+                                let table_ok = e_phnum > 0
+                                    && e_phnum <= 65535
+                                    && e_phentsize >= min_phentsize
+                                    && e_phentsize <= 4096
+                                    && e_phoff.checked_add(
+                                        (e_phentsize * e_phnum) as u64,
+                                    ).map_or(true, |end| end > file_len)
+                                    == false;
+                                let interp: Option<(u64, usize)> = if !table_ok {
+                                    warning!(
+                                        "[KR64] PT_INTERP scan: implausible phdr table (phoff={}, phentsize={}, phnum={}, file_len={}) — skipping patch for this binary",
+                                        e_phoff, e_phentsize, e_phnum, file_len
+                                    );
+                                    None
+                                } else {
                                 let mut phdrs = vec![0u8; e_phentsize * e_phnum];
                                 let _ = file.seek(std::io::SeekFrom::Start(e_phoff));
                                 let _ = file.read_exact(&mut phdrs);
@@ -7795,12 +7837,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 let mut interp_filesz = None;
                                 for i in 0..e_phnum {
                                     let off = i * e_phentsize;
-                                    let p_type = u32::from_le_bytes([
-                                        phdrs[off],
-                                        phdrs[off + 1],
-                                        phdrs[off + 2],
-                                        phdrs[off + 3],
-                                    ]);
+                                    let Some(p_type) = phdrs.get(off..off + 4).map(|b| {
+                                        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                                    }) else {
+                                        break;
+                                    };
                                     if p_type == 3 {
                                         let read_u =
                                             |base: usize, field: u64, width: usize| -> u64 {
@@ -7817,9 +7858,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                         break;
                                     }
                                 }
-                                if let (Some(p_offset), Some(p_filesz)) =
-                                    (interp_offset, interp_filesz)
-                                {
+                                match (interp_offset, interp_filesz) {
+                                    (Some(o), Some(s)) => Some((o, s)),
+                                    _ => None,
+                                }
+                                };
+                                if let Some((p_offset, p_filesz)) = interp {
                                     let _ = file.seek(std::io::SeekFrom::Start(p_offset));
                                     let mut interp_buf = vec![0u8; p_filesz];
                                     let _ = file.read_exact(&mut interp_buf);
@@ -8007,9 +8051,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
 
                 let new_pid = unsafe { libc::fork() };
                 if new_pid == 0 {
-                    // Child — 64-bit, async-signal-safe only
+                    // Child — 64-bit, async-signal-safe only.
+                    // 6-Z184 AUDIT FIX (agent 7): sanitize fds BEFORE
+                    // TRACEME/execve — the parent's binder proxy holds a
+                    // non-CLOEXEC /dev/binder fd plus log/config fds; the
+                    // first child closes 3..fd_limit for exactly this
+                    // reason, this child used to leak them into the
+                    // guest recovery process.
                     unsafe {
                         libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0);
+                        for fd in 3..1024i32 {
+                            libc::close(fd);
+                        }
                     }
                     unsafe {
                         libc::raise(libc::SIGSTOP);
