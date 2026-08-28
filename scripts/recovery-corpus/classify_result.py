@@ -77,6 +77,24 @@ elif "Failed to initialize property area" in kr or \
 else:
     result["boot"] = "BOOT_FAIL" if kr else "UNKNOWN"
 
+# ── 6-Z205: init-failure signature markers (§28 failure clustering) ──
+# Ordered by boot-phase depth: the FIRST signature found is the one that
+# killed init (deepest progress wins — later markers indicate the boot
+# advanced past earlier hazards).
+for sig, tag in [
+    ("Could not open uevent socket", "uevent_socket"),
+    ("ashmem_create_region failed", "ashmem"),
+    ("Init encountered errors starting first stage", "first_stage_checkcall"),
+    ("Failed to load serialized property info", "property_info_stat"),
+    ("Failed to initialize property area", "property_area"),
+    ("linker.*not found", "linker"),
+    ("CANNOT LINK EXECUTABLE", "linker"),
+    ("InitFatalReboot", "init_fatal_reboot"),
+]:
+    if re.search(sig, kr):
+        result["markers"].setdefault("failure", tag)
+        break
+
 # ── theme: the 2.8-class splash-hang signature ──────────────────────
 theme_fail = rec.count("Failed to load base packages") + \
     rec.count("unable to load theme")
