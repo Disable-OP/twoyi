@@ -324,13 +324,57 @@ public class RamdiskImporter {
                 // (LineageOS 22.2 nightly + AOSP mainline both default
                 // to it). Apache Commons Compress's XZCompressorInputStream
                 // handles the container → raw LZMA2 stream decode.
-                Log.i(TAG, "Ramdisk is XZ-compressed");
-                try (XZCompressorInputStream xzis = new XZCompressorInputStream(
-                         new java.io.ByteArrayInputStream(ramdiskCompressed));
-                     FileOutputStream fos = new FileOutputStream(cpioTemp)) {
-                    byte[] buf = new byte[8192];
-                    int n;
-                    while ((n = xzis.read(buf)) > 0) fos.write(buf, 0, n);
+                //
+                // 6-Z209a: The previous run (33206201353) showed the
+                // importer hanging silently after "Ramdisk is XZ-compressed"
+                // with no further log lines. Local reproduction with the
+                // same XZ stream + Apache Commons Compress 1.21 + xz 1.9
+                // completes in 967ms producing 35090944 bytes — so the
+                // XZ stream is valid + the library works. The CI hang
+                // is either (a) a real environment-specific slowdown on
+                // redroid/ARM64 ART, or (b) an exception being silently
+                // swallowed by the thread pool executor. To surface the
+                // truth: add diagnostic logging (per-MB progress + total
+                // bytes + wall-clock time) + use `!= -1` loop condition
+                // (defensive against InputStream contract violations) +
+                // wrap the block in a try/catch that re-throws as
+                // IOException with the cause chain intact.
+                Log.i(TAG, "Ramdisk is XZ-compressed (input=" + ramdiskCompressed.length + " bytes)");
+                long xzStart = System.currentTimeMillis();
+                long xzTotal = 0;
+                int xzChunks = 0;
+                try {
+                    try (XZCompressorInputStream xzis = new XZCompressorInputStream(
+                             new java.io.ByteArrayInputStream(ramdiskCompressed));
+                         FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        // 6-Z209a: `!= -1` is the canonical InputStream
+                        // contract — `> 0` exits prematurely if read()
+                        // ever returns 0 (which is technically only
+                        // valid for zero-length buffers, but defensive
+                        // against non-conforming InputStream wrappers).
+                        while ((n = xzis.read(buf)) != -1) {
+                            if (n > 0) {
+                                fos.write(buf, 0, n);
+                                xzTotal += n;
+                                xzChunks++;
+                                if (xzChunks % 512 == 0) {
+                                    Log.i(TAG, "XZ decode progress: " + xzTotal
+                                        + " bytes (" + (System.currentTimeMillis() - xzStart) + "ms)");
+                                }
+                            }
+                        }
+                    }
+                    Log.i(TAG, "XZ decode done: " + xzTotal + " bytes in "
+                        + (System.currentTimeMillis() - xzStart) + "ms ("
+                        + xzChunks + " chunks)");
+                } catch (Throwable t) {
+                    Log.e(TAG, "XZ decode FAILED at " + xzTotal + " bytes ("
+                        + (System.currentTimeMillis() - xzStart) + "ms): "
+                        + t.getClass().getName() + ": " + t.getMessage(), t);
+                    throw new IOException("XZ ramdisk decode failed at "
+                        + xzTotal + " bytes: " + t.getMessage(), t);
                 }
             } else if (ramdiskCompressed[0] == '0' && ramdiskCompressed[1] == '7') {
                 // Uncompressed cpio
