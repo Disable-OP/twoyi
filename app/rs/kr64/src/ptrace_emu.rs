@@ -7310,6 +7310,136 @@ fn proc_starttime(pid: libc::pid_t) -> Option<u64> {
     tokens.nth(19).and_then(|t| t.parse::<u64>().ok())
 }
 
+/// The PPID of a process (field 4 of /proc/<pid>/stat), or None when the
+/// /proc entry is unreadable/gone. Used by the 6-Z190 coverage sweep to
+/// decide "descendant of the guest tree" without touching the process.
+fn proc_ppid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // After the "(comm)" field: state (field 3), ppid (field 4).
+    let rest = stat.rfind(')').map(|p| stat.get(p + 2..).unwrap_or(""))?;
+    let mut tokens = rest.split_whitespace();
+    tokens.next()?; // state
+    tokens.next()?.parse::<libc::pid_t>().ok()
+}
+
+/// 6-Z190: coverage watchdog sweep — heal UNTRACED guest-tree processes.
+///
+/// EVIDENCE (TWRP 2.8.7.2 angler, run 33148931282): a THIRD recovery
+/// instance (pid 4326, forked ~4 min into the boot after the old-UI
+/// vibrator syscall storm tripped TWRP's internal watchdog re-exec)
+/// appeared in the guest's own recovery.log yet produced ZERO tracer
+/// stops — no auto-attach SIGSTOP, no syscall stops, nothing. Every one
+/// of its filesystem calls ran UNTRANSLATED against the host:
+/// `stat("/twres/ui.xml")` → host ENOENT → `PageManager::
+/// LoadFileToBuffer` returns NULL SILENTLY (its stat gate has no error
+/// log) → "Failed to load base packages" → "unable to load theme" →
+/// the infinite theme-retry loop users see as the SPLASH HANG.
+///
+/// Whether the fork event was missed because of a stop-queue race, an
+/// exotic clone path, or an exit-time fork, the CLASS is real: any
+/// process of the guest tree that escapes tracing silently loses ALL
+/// virtualization. This sweep is the generic backstop:
+///
+///   * scan /proc for numeric pids NOT in `tracked_pids`
+///   * keep only those whose PPID is in `tracked_pids` (strictly
+///     descendants of the guest tree — host processes never qualify,
+///     the tracer itself never qualifies)
+///   * PTRACE_ATTACH (bounded wait for the attach stop), set the full
+///     options mask (TRACESYSGOOD so syscall stops arrive as
+///     SIGTRAP|0x80, TRACEFORK so ITS children auto-attach, EXITKILL
+///     for tracer-death hygiene), then PTRACE_SYSCALL-resume into the
+///     normal loop — the kernel-authoritative stop-phase classifier
+///     (6-Z68/6-Z83) handles the late entry cleanly.
+///
+/// Cost: a /proc scan gated to at most one per SWEEP_MIN_INTERVAL and
+/// only on 25k-iteration boundaries, so a busy boot pays a few ms every
+/// handful of seconds. A healed process logs loudly — a sweep that
+/// fires is itself a bug signal (some fork path escaped), exactly like
+/// a SANDBOX BACKSTOP DENY.
+fn sweep_untraced_guest_processes(
+    tracked_pids: &mut Vec<libc::pid_t>,
+    pid_starttimes: &mut std::collections::HashMap<libc::pid_t, u64>,
+    in_syscall_map: &mut std::collections::HashMap<libc::pid_t, bool>,
+) -> usize {
+    let self_pid = std::process::id() as libc::pid_t;
+    let tracked: std::collections::HashSet<libc::pid_t> = tracked_pids.iter().copied().collect();
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut attached = 0usize;
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        let pid: libc::pid_t = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == self_pid || tracked.contains(&pid) {
+            continue;
+        }
+        // STRICT descendant-of-guest-tree filter: the candidate's parent
+        // must itself be tracked. Host processes (zygote children, other
+        // apps) have host parents and never qualify.
+        let ppid = match proc_ppid(pid) {
+            Some(p) => p,
+            None => continue,
+        };
+        if !tracked.contains(&ppid) {
+            continue;
+        }
+        // Attach. EPERM here usually means "already traced by us but its
+        // first stop is still queued" — skip harmlessly either way.
+        let r = unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid, 0, 0) };
+        if r == -1 {
+            continue;
+        }
+        // Bounded wait for the attach stop (a D-state tracee must never
+        // wedge the whole tracer loop).
+        let mut got_stop = false;
+        for _ in 0..20 {
+            let mut st: libc::c_int = 0;
+            let w = unsafe { libc::waitpid(pid, &mut st, libc::WNOHANG) };
+            if w == pid {
+                got_stop = true;
+                break;
+            }
+            if w == -1 {
+                break; // ECHILD: died between scan and attach
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if got_stop {
+            let opts: libc::c_int = (libc::PTRACE_O_TRACESYSGOOD
+                | libc::PTRACE_O_TRACEFORK
+                | libc::PTRACE_O_TRACECLONE
+                | libc::PTRACE_O_TRACEVFORK
+                | libc::PTRACE_O_TRACEVFORKDONE
+                | libc::PTRACE_O_TRACEEXEC
+                | libc::PTRACE_O_TRACEEXIT
+                | libc::PTRACE_O_EXITKILL) as libc::c_int;
+            let _ = unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts) };
+            let _ = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0) };
+            tracked_pids.push(pid);
+            pid_starttimes.insert(pid, proc_starttime(pid).unwrap_or(0));
+            in_syscall_map.entry(pid).or_insert(false);
+            attached += 1;
+            crate::info!(
+                "[KR64][ptrace] 6-Z190: coverage watchdog ATTACHED untraced guest-tree process {} (parent {}) — syscall translation restored ({} tracked)",
+                pid, ppid, tracked_pids.len()
+            );
+        } else {
+            // Never stopped within the budget — detach best-effort; a
+            // later sweep will retry if it is still around.
+            let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0) };
+        }
+    }
+    attached
+}
+
 /// Task 6-Z89 FIX 1a: the precise outcome of [`reap_child`].
 enum Reaped {
     /// Reaped — the status word carries WIFEXITED/WIFSIGNALED. The
@@ -9541,7 +9671,39 @@ pub fn run_ptrace_loop(
         }
     }
 
+    // ── 6-Z190: coverage watchdog cadence state ──
+    // One sweep shortly after the first execve (catches fast-boot
+    // stragglers), then on every 25k-iteration boundary but never more
+    // often than once per 5 s of wall clock (the /proc scan costs a few
+    // ms; under a syscall storm the iteration gate alone would spin it).
+    let mut last_coverage_sweep: Option<std::time::Instant> = None;
+    const COVERAGE_SWEEP_ITERATIONS: u64 = 25_000;
+    const COVERAGE_SWEEP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
     loop {
+        // ── 6-Z190: coverage watchdog — heal untraced guest-tree pids ──
+        // See `sweep_untraced_guest_processes` for the full rationale
+        // (TWRP 2.8.7.2 splash-hang forensics: an untraced third
+        // recovery instance silently lost ALL path translation).
+        {
+            let due = loop_count % COVERAGE_SWEEP_ITERATIONS == 0;
+            if due && past_first_execve {
+                let now = std::time::Instant::now();
+                let interval_ok = match last_coverage_sweep {
+                    None => true,
+                    Some(t) => now.duration_since(t) >= COVERAGE_SWEEP_MIN_INTERVAL,
+                };
+                if interval_ok {
+                    last_coverage_sweep = Some(now);
+                    sweep_untraced_guest_processes(
+                        &mut tracked_pids,
+                        &mut pid_starttimes,
+                        &mut in_syscall_map,
+                    );
+                }
+            }
+        }
+
         // ── Deferred ABI reset (after execve EXIT) — PER CHILD ──
         //
         // If the previous iteration armed `reset_abi_pid` (that child

@@ -63,6 +63,7 @@ pub mod battery;
 pub mod binder;
 pub mod compat_paths;
 pub mod devices;
+pub mod haptics;
 pub mod mount_mgr;
 pub mod proc_emu;
 pub mod ptrace_emu;
@@ -3497,6 +3498,37 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         Err(e) => {
             warning!(
                 "[KR64] failed to start battery HAL: {} -- guest will see no battery",
+                e
+            );
+            None
+        }
+    };
+
+    // ---------------------------------------------------------------
+    // Step 2.8b: virtual haptics + backlight sysfs (§13/§16).
+    //
+    // Legacy recoveries (TWRP 2.x/3.x era) poll
+    //   /sys/class/timed_output/vibrator/enable
+    // on EVERY page transition and probe
+    //   /sys/class/leds/lcd-backlight/brightness + /sys/class/backlight/*
+    // for the display brightness path. Missing surfaces cost a failed
+    // open through the whole hook-retry + tracer ladder per attempt —
+    // an observable syscall storm under old UIs. Materialising the
+    // standard ABI files removes the storm generically. Failure is
+    // non-fatal (warn only), mirroring the battery step above.
+    // ---------------------------------------------------------------
+    let _haptics_handle = match haptics::HapticsDevice::new(&cfg.rootfs).and_then(|dev| dev.spawn())
+    {
+        Ok(_h) => {
+            info!(
+                "[KR64] haptics + backlight sysfs materialised under {}/sys/class",
+                cfg.rootfs
+            );
+            Some(_h)
+        }
+        Err(e) => {
+            warning!(
+                "[KR64] failed to start haptics/backlight sysfs: {} -- guest vibrates will no-op",
                 e
             );
             None
