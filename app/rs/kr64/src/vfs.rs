@@ -141,6 +141,28 @@ impl Vfs {
         vfs
     }
 
+    /// 6-Z192: Vfs for a RECOVERY whose init speaks the NEW Android 8+
+    /// property-area format (probed via `properties_serial` in the init
+    /// binary — e.g. twrp-3.7.0_9-0-whyred).
+    ///
+    /// Such an init OWNS the property area: it parses the property
+    /// contexts, serializes the trie, writes `/dev/__properties__/
+    /// property_info` itself, and creates+mmaps `properties_serial`.
+    /// ANY VFS-served content for those paths is actively harmful —
+    /// the materialize-on-open would clobber the guest's freshly
+    /// written area (and the empty pre-created file fails
+    /// PropertyInfoAreaFile::LoadPath's `st_size >= sizeof(Property
+    /// InfoArea)` check). So: NO property entries at all — the files
+    /// under {rootfs}/dev/__properties__ are plain files the guest
+    /// creates and reads through the tracer's path translation.
+    /// Everything else matches `new_android` (/proc/self/* etc.).
+    pub fn new_recovery_new_format(pid: u32) -> Self {
+        let mut vfs = Self::new_android(pid);
+        vfs.entries.remove("/dev/__properties__/properties_serial");
+        vfs.entries.remove("/dev/__properties__");
+        vfs
+    }
+
     /// Create a Vfs pre-populated for Android-guest boot.
     ///
     /// `pid` is the tracee's PID (the init process). All `/proc/self/*`

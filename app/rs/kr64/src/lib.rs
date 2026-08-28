@@ -7967,14 +7967,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             } else if cfg.boot_recovery {
                 // 6-Z192: a recovery whose init speaks the NEW Android 8+
                 // property-area format (properties_serial/property_info in
-                // the init binary — e.g. twrp-3.7.0_9-0-whyred). The
-                // old-format `new_twrp()` override would pre-create a FILE
-                // where this init needs a DIRECTORY (ENOTDIR → "Failed to
-                // initialize property area" → init exit 127, run
-                // 33151412680). `new_android()` registers the subdirectory
-                // entries the new-format init expects.
-                info!("[KR64] PARENT: recovery boot with NEW-format init — using Vfs::new_android(pid={}) (Task 6-Z192)", pid);
-                vfs::Vfs::new_android(pid as u32)
+                // the init binary — e.g. twrp-3.7.0_9-0-whyred). Such an
+                // init OWNS the property area: it writes property_info and
+                // creates properties_serial itself. new_twrp()'s
+                // old-format FILE would ENOTDIR it, and new_android()'s
+                // Dynamic properties_serial node would CLOBBER the
+                // freshly-written area on every open (materialize-on-open)
+                // → the empty/garbage area fails LoadPath's size check →
+                // "Failed to initialize property area" → init exit. The
+                // new_recovery_new_format() VFS registers NO property
+                // entries: plain rootfs files, guest-owned end to end.
+                info!("[KR64] PARENT: recovery boot with NEW-format init — using Vfs::new_recovery_new_format(pid={}) (Task 6-Z192)", pid);
+                vfs::Vfs::new_recovery_new_format(pid as u32)
             } else {
                 info!("[KR64] PARENT: normal (AOSP) boot — using Vfs::new_android(pid={}) (Task 6-Z88)", pid);
                 vfs::Vfs::new_android(pid as u32)
