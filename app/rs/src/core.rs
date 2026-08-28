@@ -544,10 +544,7 @@ pub fn init_renderer(
             // byte; CString::new would fail and .expect() would unwind
             // across the JNI boundary. Sanitize instead: strip NULs (the
             // env var is best-effort for the renderer's socket path).
-            let sanitized: String = working_dir_for_env
-                .chars()
-                .filter(|c| *c != '\0')
-                .collect();
+            let sanitized: String = working_dir_for_env.chars().filter(|c| *c != '\0').collect();
             match std::ffi::CString::new(sanitized.as_str()) {
                 Ok(c_rootfs) => {
                     libc::setenv(
@@ -557,7 +554,10 @@ pub fn init_renderer(
                     );
                 }
                 Err(e) => {
-                    log::error!("[CORE] TWOYI_ROOTFS path not representable as C string: {:?}", e);
+                    log::error!(
+                        "[CORE] TWOYI_ROOTFS path not representable as C string: {:?}",
+                        e
+                    );
                 }
             }
         }

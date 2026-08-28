@@ -3238,18 +3238,28 @@ fn copy_hook_library_to_dev(cfg: &Config, lib_name: &str, dst: &str, not_found_m
 // ============================================================================
 
 /// 6-Z192: probe the guest's init binary for the Android 8+ property-area
-/// format. `properties_serial` is present in the init ELF's rodata iff
-/// the init writes `/dev/__properties__/properties_serial` (the NEW
-/// subdirectory layout); old-format inits (AOSP 5.1/6.0 bionic, e.g. the
-/// angler TWRP builds) only reference `/dev/__properties__` as a single
-/// file. Unreadable init → `false` (keep the legacy behavior).
+/// format. Two needles, ANY of which implies the NEW subdirectory layout:
+///   * `properties_serial` — present in inits that reference the serial
+///     file directly (e.g. twrp-3.7.0_9-0-whyred's init).
+///   * `property_info` — present in every AOSP 8+ system/core init
+///     (property_service.cpp's `CreateSerializedPropertyInfo()` writes
+///     kPropertyInfoPath). Empirically the ONLY needle in some builds:
+///     OrangeFox R12.0's /system/bin/init contains `property_info` (2x)
+///     but NOT `properties_serial` (the serial path literal lives in
+///     bionic's libc, not init) — run 33157500559 misdetected it as
+///     OLD format because the single-needle probe missed it.
+/// Old-format inits (AOSP 5.1/6.0 bionic, e.g. the angler TWRP builds —
+/// both 2.8.7.0 and 3.7.0_9-0) contain NEITHER literal (verified against
+/// the real binaries). Unreadable init → `false` (legacy behavior).
 fn probe_init_new_property_format(init_path: &str) -> bool {
-    const NEEDLE: &[u8] = b"properties_serial";
+    const NEEDLES: [&[u8]; 2] = [b"properties_serial", b"property_info"];
     match std::fs::read(init_path) {
         Ok(bytes) => {
             // Static init binaries are ≤ ~2 MB; a single linear scan at
             // boot is negligible. windows() over 2 MB ≈ single-digit ms.
-            bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+            NEEDLES
+                .iter()
+                .any(|needle| bytes.windows(needle.len()).any(|w| w == *needle))
         }
         Err(_) => false,
     }
@@ -3286,6 +3296,15 @@ fn z192_property_format_probe_detects_new_format() {
         b[100..117].copy_from_slice(b"properties_serial");
         b
     };
+    // 6-Z196: the OrangeFox shape — `property_info` present,
+    // `properties_serial` ABSENT (the serial literal lives in bionic's
+    // libc for AOSP system inits; init itself only writes the index).
+    let fox_init = {
+        let mut b = vec![0u8; 1024];
+        let path = b"/dev/__properties__/property_info";
+        b[80..80 + path.len()].copy_from_slice(path);
+        b
+    };
     // An old-format init: references /dev/__properties__ only.
     let old_init = {
         let mut b = vec![0u8; 1024];
@@ -3295,11 +3314,14 @@ fn z192_property_format_probe_detects_new_format() {
     let dir = std::env::temp_dir().join(format!("kr64-z192-probe-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let p_new = dir.join("init_new");
+    let p_fox = dir.join("init_fox");
     let p_old = dir.join("init_old");
     let p_missing = dir.join("init_missing");
     std::fs::write(&p_new, &new_init).unwrap();
+    std::fs::write(&p_fox, &fox_init).unwrap();
     std::fs::write(&p_old, &old_init).unwrap();
     assert!(probe_init_new_property_format(p_new.to_str().unwrap()));
+    assert!(probe_init_new_property_format(p_fox.to_str().unwrap()));
     assert!(!probe_init_new_property_format(p_old.to_str().unwrap()));
     assert!(!probe_init_new_property_format(p_missing.to_str().unwrap()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -6257,6 +6279,64 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 );
                 }
             }
+        } else if cfg.boot_recovery {
+            // ----- 6-Z196: NEW-format RECOVERY (Android 8+ init) -----
+            // The guest init OWNS the property area: it parses property
+            // contexts, serializes the trie, writes property_info itself
+            // (open O_CREAT|O_TRUNC) and — critically — opens
+            // properties_serial with O_CREAT|O_EXCL (bionic
+            // SystemProperties::area_init). ANY pre-existing file at
+            // either path breaks the boot:
+            //   * a stale properties_serial → open returns EEXIST →
+            //     __system_property_area_init() == -1 → init
+            //     LOG(FATAL) "Failed to initialize property area" →
+            //     exit 127 (run 33157498271: the parent pre-created a
+            //     0-byte properties_serial; property_info was written
+            //     fine — 8508 bytes — proving the guest got that far).
+            //   * a stale single FILE /dev/__properties__ (an old-format
+            //     run, or the probe's OLD default) → every child open
+            //     fails ENOTDIR → same FATAL.
+            // So: give init the same clean slate a fresh tmpfs /dev has
+            // on real hardware — remove stale artifacts, create ONLY
+            // the (empty) directory, pre-create NOTHING.
+            let rootfs_prop_dir = format!("{}/dev/__properties__", rootfs_prefix);
+            // (1) stale single FILE from an old-format boot → remove.
+            let rootfs_prop_md = std::fs::metadata(&rootfs_prop_dir);
+            if matches!(rootfs_prop_md, Ok(ref md) if md.is_file()) {
+                match std::fs::remove_file(&rootfs_prop_dir) {
+                    Ok(()) => info!(
+                        "[KR64] PARENT: removed stale OLD-format file {} (new-format recovery boot — 6-Z196)",
+                        rootfs_prop_dir
+                    ),
+                    Err(e) => error!(
+                        "[KR64] PARENT: failed to remove stale file {}: {}",
+                        rootfs_prop_dir, e
+                    ),
+                }
+            }
+            // (2) stale pre-created / prior-run property files → remove.
+            for fname in ["property_info", "properties_serial"] {
+                let path = format!("{}/{}", rootfs_prop_dir, fname);
+                if Path::new(&path).exists() {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => info!(
+                            "[KR64] PARENT: removed stale {} (guest init re-creates it with O_EXCL semantics — 6-Z196)",
+                            path
+                        ),
+                        Err(e) => error!(
+                            "[KR64] PARENT: failed to remove stale {}: {}",
+                            path, e
+                        ),
+                    }
+                }
+            }
+            // (3) the clean directory itself.
+            let _ = std::fs::create_dir_all(&rootfs_prop_dir);
+            let _ =
+                std::fs::set_permissions(&rootfs_prop_dir, std::fs::Permissions::from_mode(0o777));
+            info!(
+                "[KR64] PARENT: new-format recovery property area: clean dir at {}, NO files pre-created (guest owns them — 6-Z196)"
+            , rootfs_prop_dir);
         } else {
             // ----- Android-guest (NEW Android 8+ subdirectory format) -----
             // Create the directory on the host (if it doesn't exist)
@@ -7233,6 +7313,23 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                                 &cache_init,
                                 std::fs::Permissions::from_mode(0o755),
                             );
+                            // 6-Z196: run the init under the GUEST'S OWN
+                            // dynamic linker. The normal path re-stages
+                            // this copy via 6-Z102 (which patches PT_INTERP
+                            // itself), but the PEEK-blind raw-exec fallback
+                            // exec's THIS file directly — its bare guest
+                            // interp ("/system/bin/linker64") would load
+                            // the HOST's linker on Android hosts (API-level
+                            // mismatch → CANNOT LINK) or ENOENT elsewhere.
+                            if let Some(new_interp) =
+                                crate::symlinks::ensure_guest_interp(&cfg.rootfs, &cache_init)
+                            {
+                                unsafe {
+                                    safe_write_err(b"[KR64 CHILD] 6-Z196: init PT_INTERP -> ");
+                                    safe_write_err(new_interp.as_bytes());
+                                    safe_write_err(b" (guest's own linker)\n");
+                                }
+                            }
                             // 6-Z101 PART B: read-modify-write the
                             // .twoyi-staged marker keyed by cfg.init_path
                             // (re-run replaces its line, preserves future

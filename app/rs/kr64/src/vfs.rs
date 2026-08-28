@@ -1079,41 +1079,45 @@ impl SandboxPolicy {
         if path.starts_with("/sys/") || path == "/sys" {
             return format!("{}{}", self.rootfs.to_string_lossy(), path);
         }
-        // /apex/** — previously passed through (same leak class as
-        // /system; TWRP never reads it, the AOSP/ndk_translation
-        // experiment only needs its LIB trees, which
-        // is_runtime_host_fallback keeps available).
+        // /apex/** + /system/** — 6-Z185 mapped them into the rootfs (they
+        // used to pass through to the real host filesystem, which is how
+        // TWRP's File Manager listed the physical device's real Magic UI
+        // /system/app). 6-Z196 fixes the REMAINING priority inversion for
+        // the runtime-fallback class (the linkers + the bionic/APEX *lib*
+        // subtrees): those used to pass to the host UNCONDITIONALLY —
+        // even when the guest's own ramdisk SHIPPED the file — and then
+        // the enforcement backstop denied the host path when the host
+        // lacked it, making /system/lib64/* UNOPENABLE from either side.
+        // Run 33157500559 (OrangeFox R12.0): the guest linker searched
+        // /sbin (translated, absent) → /system/lib64/libbacktrace.so
+        // (host passthrough → DENIED -13) → /odm, /vendor (translated)
+        // → "CANNOT LINK EXECUTABLE /init: library libbacktrace.so not
+        // found" — while the file sat in the guest's own ramdisk at
+        // /system/lib64/libbacktrace.so the whole time.
+        //
+        // Rule now: ROOTFS COPY FIRST (the guest's own runtime — correct
+        // API level, correct ABI); host fallback ONLY when the rootfs
+        // copy is absent (e.g. TWRP ramdisks that keep their runtime in
+        // /sbin and ship no /system tree at all).
         if path.starts_with("/apex/") || path == "/apex" {
-            if self.is_runtime_host_fallback(Path::new(path)) {
+            let rootfs_copy = format!("{}{}", self.rootfs.to_string_lossy(), path);
+            if self.is_runtime_host_fallback(Path::new(path)) && !Path::new(&rootfs_copy).exists() {
                 // The guest ROM does not ship an APEX of its own — keep
                 // the kernel-PT_INTERP-parity lib path on the host.
                 return path.to_string();
             }
-            return format!("{}{}", self.rootfs.to_string_lossy(), path);
+            return rootfs_copy;
         }
-        // /system/** + /vendor/** (+ /odm, /system_ext, /product via the
-        // default arm below) — THE FIX. These used to pass through to
-        // the real host filesystem, which is how TWRP's File Manager
-        // listed the physical device's real Magic UI /system/app.
-        // Now they resolve inside the rootfs (ENOENT when the ROM does
-        // not ship them — the honest sandbox answer), with the sole
-        // exception of the linker + lib-subtree runtime fallback.
         if path.starts_with("/system/") || path == "/system" {
-            if self.is_runtime_host_fallback(Path::new(path)) {
-                // The kernel opens PT_INTERP="/system/bin/linker{,64}"
-                // itself during execve — outside tracer reach. Keep
-                // those two exact files (and the lib subtrees a mixed
-                // runtime still needs) reachable; EVERYTHING else under
-                // /system (app, priv-app, etc, ...) is rootfs-only.
-                return path.to_string();
-            }
             let rootfs_copy = format!("{}{}", self.rootfs.to_string_lossy(), path);
-            if self.is_lib_dir(path) && !Path::new(&rootfs_copy).exists() {
-                // Lib subtrees with no rootfs copy (a TWRP ramdisk keeps
-                // its runtime in /sbin): fall back to the host's lib
-                // tree so the bionic linker still satisfies DT_NEEDED.
-                // Read-only code paths only — is_runtime_host_fallback
-                // allowlists exactly this on the enforcement side too.
+            if self.is_runtime_host_fallback(Path::new(path)) && !Path::new(&rootfs_copy).exists() {
+                // Kernel-PT_INTERP parity: the kernel opens
+                // PT_INTERP="/system/bin/linker{,64}" itself during
+                // execve — outside tracer reach — and a mixed runtime
+                // still needs the host lib trees when the ROM ships
+                // none. Applies only when the rootfs copy is ABSENT;
+                // when the guest ships its own linker/libs (OrangeFox,
+                // Lineage, modern recoveries), the rootfs copy wins.
                 return path.to_string();
             }
             return rootfs_copy;
@@ -1126,10 +1130,11 @@ impl SandboxPolicy {
         format!("{}{}", self.rootfs.to_string_lossy(), path)
     }
 
-    /// Is `path` one of the runtime library subtrees?
-    fn is_lib_dir(&self, path: &str) -> bool {
-        path.starts_with("/system/lib/") || path.starts_with("/system/lib64/")
-    }
+    // (6-Z196: the old `is_lib_dir` helper was removed — its rootfs-first
+    // branch was unreachable dead code: `is_runtime_host_fallback`
+    // matched ALL of /system/lib{,64}/** first and passed them to the
+    // host unconditionally. The unified rule above now expresses the
+    // intended priority directly.)
 
     // ── Layer 2: enforcement backstop ───────────────────────────────
 
@@ -2195,6 +2200,132 @@ mod tests {
         assert!(
             s.contains("Pid:\t1"),
             "new_twrp() must use pid=1 for /proc/self/status; got: {s}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ===== 6-Z196: rootfs-first runtime translation (OrangeFox fix) =====
+
+    fn z196_tmp_rootfs(tag: &str) -> std::path::PathBuf {
+        let tmp =
+            std::env::temp_dir().join(format!("kr64_vfs_z196_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn z196_system_lib_rootfs_copy_wins_over_host() {
+        // The guest ships its own /system/lib64/libbacktrace.so — the
+        // translation MUST land on the rootfs copy, never the host tree
+        // (run 33157500559: host passthrough → backstop EACCES →
+        // "CANNOT LINK EXECUTABLE /init").
+        let tmp = z196_tmp_rootfs("lib_wins");
+        let rootfs = tmp.to_str().unwrap();
+        std::fs::create_dir_all(format!("{rootfs}/system/lib64")).unwrap();
+        std::fs::write(
+            format!("{rootfs}/system/lib64/libbacktrace.so"),
+            b"guest-lib",
+        )
+        .unwrap();
+        let p = SandboxPolicy::new(rootfs);
+        assert_eq!(
+            p.translate_guest("/system/lib64/libbacktrace.so"),
+            format!("{rootfs}/system/lib64/libbacktrace.so"),
+            "rootfs copy must win when the guest ships it"
+        );
+        // And the verdict for the translated (rootfs) path is Allow.
+        assert!(matches!(
+            p.verify_real_path(std::path::Path::new(&format!(
+                "{rootfs}/system/lib64/libbacktrace.so"
+            ))),
+            crate::vfs::SandboxVerdict::Allow
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z196_system_lib_host_fallback_when_rootfs_copy_absent() {
+        // A TWRP ramdisk ships no /system tree at all — the lib subtree
+        // falls back to the HOST (kernel-PT_INTERP parity for a mixed
+        // runtime), preserving the pre-6-Z196 behavior for that case.
+        let tmp = z196_tmp_rootfs("lib_fallback");
+        let rootfs = tmp.to_str().unwrap();
+        let p = SandboxPolicy::new(rootfs);
+        assert_eq!(
+            p.translate_guest("/system/lib64/libc.so"),
+            "/system/lib64/libc.so",
+            "host fallback applies only when the rootfs copy is absent"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z196_system_bin_linker_rootfs_copy_wins() {
+        // The guest's own linker (/system/bin/linker64 in the ramdisk —
+        // OrangeFox, Lineage, modern recoveries) must win over the
+        // host's Android-14 linker (API-level mismatch: host linker +
+        // guest libs = CANNOT LINK, observed run 32973154137).
+        let tmp = z196_tmp_rootfs("linker_wins");
+        let rootfs = tmp.to_str().unwrap();
+        std::fs::create_dir_all(format!("{rootfs}/system/bin")).unwrap();
+        std::fs::write(format!("{rootfs}/system/bin/linker64"), b"guest-linker").unwrap();
+        let p = SandboxPolicy::new(rootfs);
+        assert_eq!(
+            p.translate_guest("/system/bin/linker64"),
+            format!("{rootfs}/system/bin/linker64")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z196_system_non_runtime_paths_always_rootfs() {
+        // /system/app, /system/etc, /system/bin/toybox … are NOT runtime
+        // fallback paths — rootfs only (the 6-Z185 leak fix stands).
+        let tmp = z196_tmp_rootfs("non_runtime");
+        let rootfs = tmp.to_str().unwrap();
+        let p = SandboxPolicy::new(rootfs);
+        for path in [
+            "/system/app/Foo/Foo.apk",
+            "/system/etc/init/foo.rc",
+            "/system/bin/toybox",
+            "/system/build.prop",
+            "/system",
+        ] {
+            assert_eq!(
+                p.translate_guest(path),
+                format!("{rootfs}{path}"),
+                "{path} must map into the rootfs unconditionally"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn z196_apex_lib_rootfs_copy_wins() {
+        // APEX lib subtrees follow the same rootfs-first rule.
+        let tmp = z196_tmp_rootfs("apex_wins");
+        let rootfs = tmp.to_str().unwrap();
+        std::fs::create_dir_all(format!("{rootfs}/apex/com.android.runtime/lib64")).unwrap();
+        std::fs::write(
+            format!("{rootfs}/apex/com.android.runtime/lib64/libc.so"),
+            b"guest-apex-lib",
+        )
+        .unwrap();
+        let p = SandboxPolicy::new(rootfs);
+        assert_eq!(
+            p.translate_guest("/apex/com.android.runtime/lib64/libc.so"),
+            format!("{rootfs}/apex/com.android.runtime/lib64/libc.so")
+        );
+        // Absent rootfs copy → host fallback (parity).
+        assert_eq!(
+            p.translate_guest("/apex/com.android.runtime/lib64/libdl.so"),
+            "/apex/com.android.runtime/lib64/libdl.so"
+        );
+        // Non-lib apex content → rootfs only.
+        assert_eq!(
+            p.translate_guest("/apex/com.android.runtime/etc/foo"),
+            format!("{rootfs}/apex/com.android.runtime/etc/foo")
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
