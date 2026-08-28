@@ -233,6 +233,30 @@ dependencies {
     // Used by RamdiskImporter to handle LZMA-compressed TWRP ramdisks (arm64 images).
     implementation 'org.apache.commons:commons-compress:1.21'
 
+    // 6-Z209c: org.tukaani:xz — REQUIRED at runtime for XZCompressorInputStream
+    // to actually decode XZ streams. commons-compress declares xz as a
+    // 'compile' (transitive) dependency, but Android Gradle Plugin's
+    // 'useAndroidAnnotations' + proguard pruning strips the tukaani
+    // classes from the final APK when no direct reference exists in the
+    // app's own Java code (the app only directly references commons-
+    // compress classes like XZCompressorInputStream + LZMACompressorInputStream;
+    // XZCompressorInputStream's <init> calls `new org.tukaani.xz.SingleXZInputStream(...)`
+    // reflectively via Class.forName, so the AGP bytecode shrinker can't
+    // see the dependency).
+    //
+    // Without this direct dependency, run 33208876095 (lineage-22.2-sailfish
+    // on 559b9ca) crashed with:
+    //   java.lang.NoClassDefFoundError: Failed resolution of:
+    //     Lorg/tukaani/xz/SingleXZInputStream;
+    //   Caused by: java.lang.ClassNotFoundException: Didn't find class
+    //     "org.tukaani.xz.SingleXZInputStream" on path: DexPathList[...]
+    // The 6-Z209a diagnostic surfaced this — the previous code silently
+    // swallowed the NoClassDefFoundError as a hung import thread.
+    //
+    // Pin to 1.10 (latest stable as of 2024; commons-compress 1.21
+    // declares 1.9 transitively — 1.10 is API-compatible).
+    implementation 'org.tukaani:xz:1.10'
+
     // Multidex — required because commons-compress adds many methods
     implementation 'androidx.multidex:multidex:2.0.1'
     testImplementation 'junit:junit:4.13.2'
