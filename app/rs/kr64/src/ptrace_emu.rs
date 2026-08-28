@@ -4206,6 +4206,7 @@ fn guest_readlink_target(
                 if !cur.starts_with(&cache_prefix)
                     && cur != legacy_init
                     && !cur.starts_with(&staging_prefix)
+                    && !cur.starts_with(rootfs)
                 {
                     return Some(cur);
                 }
@@ -4216,12 +4217,28 @@ fn guest_readlink_target(
                 seen.insert(cur.clone());
                 // Look up `cur` as a value-derived target — find
                 // any entry whose VALUE equals `cur`, then take
-                // that entry's KEY as the next `cur`.
+                // that entry's KEY as the next `cur`. Prefer keys
+                // that DON'T start with rootfs (the raw form) so
+                // the walk converges to the original guest path
+                // rather than the rootfs-prefixed duplicate
+                // (parse_staged_exes registers BOTH forms — see
+                // the test failure where the random hash order
+                // returned "{rootfs}/init" instead of "/init").
                 let next = m
                     .iter()
                     .filter(|(_, v)| v.as_str() == cur)
+                    .filter(|(k, _)| !k.starts_with(rootfs))
                     .map(|(k, _)| k.clone())
-                    .next();
+                    .next()
+                    .or_else(|| {
+                        // Fallback: take any match (the
+                        // rootfs-prefixed form, then strip).
+                        m.iter()
+                            .filter(|(_, v)| v.as_str() == cur)
+                            .map(|(k, _)| k.clone())
+                            .next()
+                            .and_then(|k| k.strip_prefix(rootfs).map(|s| s.to_string()))
+                    });
                 match next {
                     Some(k) => cur = k,
                     None => return Some(cur),
