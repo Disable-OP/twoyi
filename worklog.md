@@ -12600,3 +12600,127 @@ Stage Summary:
   OrangeFox fixes dispatched for verification on 9e7a7ad. The corpus
   now has: manifest (9 images), inspector, dispatcher, in-run
   classifier, dashboard, nightly workflow.
+
+---
+Task ID: 6-Z196-VERIFY
+Agent: ci-monitor
+Task: Monitor verification runs 33164199222 (OrangeFox), 33164204067 (whyred), 33164208433 (angler regression) on 572b1e5
+
+Work Log:
+- Polled all three runs to completion (angler finished first, then
+  whyred, then OrangeFox; all workflow conclusions: success — but the
+  E2E classifier verdicts differ, see below). Downloaded + extracted
+  the ui-e2e-arm64-logs artifact of each into
+  ci-artifacts/monitor-6z196/{angler,whyred,fox}/ and analyzed
+  result.json + kr64-app-stderr logs + property-area-state.txt +
+  VLM on key screenshots. Compared against the 9e7a7ad baselines
+  (33157500559 OrangeFox / 33157498271 whyred) kept in ci-artifacts/.
+
+- OrangeFox 33164199222 (BOOT_FAIL_EARLY_INIT, exit_code=127 marker,
+  recovery_instances=0): ALL THREE 6-Z196 fixes ENGAGED and WORKED:
+  * line 108: probe now "NEW (Android 8+ subdirectory)" (was OLD —
+    fix B's property_info needle).
+  * line 109: "new-format recovery property area: clean dir ... NO
+    files pre-created (guest owns them — 6-Z196)".
+  * line 201: "[KR64 CHILD] 6-Z196: init PT_INTERP -> .../rootfs/
+    system/bin/linker64 (guest's own linker)".
+  * "CANNOT LINK EXECUTABLE /init: libbacktrace.so not found" is GONE
+    (was line 398-402 of run 33157500559); linker now maps libs from
+    rootfs/system/lib64 (twrp-init.log maps: liblzma, libpcre2,
+    libsquashfs_utils, libjsoncpp, libbacktrace @1048). ZERO
+    SANDBOX-BACKSTOP openat("/system/lib64") denies (5 denies total,
+    none lib-related). init ran 3958+4156 iterations under its OWN
+    linker (vs 507 before) and got through property setup with NO
+    property FATAL.
+  NEW BLOCKER (one layer deeper), lines 1006-1012:
+    "<3>init: mkdir(\"/dev/pts\", 0755) failed File exists" (x5: /dev/pts,
+    /dev/socket, /dev/dm-user, /mnt/vendor, /mnt/product) ->
+    "<2>init: Init encountered errors starting first stage, aborting" ->
+    "<3>init: InitFatalReboot: signal 6" -> "<6>init: Reboot ending,
+    jumping to kernel" -> init exit 0. Android-11-style first-stage
+    CHECKCALL treats EEXIST as fatal; kr64's pre-created/ramdisk dirs
+    collide. Secondary noise: line 207 "6-Z102: refusing to stage
+    .../rootfs/sbin/recovery — no ROM copy" + line 212 "EXECVE FAILED:
+    ret=-1, path=.../sbin/recovery" — the Task-6-Z49 proactive
+    recovery fork is a no-op for OrangeFox (sbin has foxstart.sh, no
+    recovery binary; this is also where the classifier's exit_code=127
+    marker comes from — child 2591).
+  Screenshot-08_final (VLM): the app's debug-log console (green-on-
+  black kr64 log, "EXECVE FAILED" visible) — no recovery UI.
+
+- whyred 33164204067 (BOOT_FAIL_EARLY_INIT, exit_code=127,
+  recovery_instances=0): fix A ENGAGED but did NOT cure:
+  * line 109: probe "NEW"; line 110: "new-format recovery property
+    area: clean dir ... NO files pre-created (guest owns them — 6-Z196)".
+  * "Failed to initialize property area" STILL PRESENT (line 495:
+    "<2>init: Failed to initialize property area") -> init
+    exit_group(127) (lines 499-508, "genuine init exit"). Same
+    signature as 9e7a7ad (its line 477).
+  * property-area-state.txt: property_info = 8508 bytes with valid
+    PropertyInfoArea header (guest-written, CreateSerializedPropertyInfo
+    SUCCEEDS) but properties_serial NEVER created (absent — vs 0-byte
+    pre-created before the clean-slate fix).
+  * NEW detail from the exit syscall window: openat -> fstat -> close
+    with NO intervening mmap(nr=222) right before the FATAL writev —
+    __system_property_area_init's LoadDefaultPath mmap of property_info
+    never executes/completes (every logged mmap is fd=-1 anon,
+    prop_fd=None). Also NO "6-Z196: patched staged PT_INTERP" line for
+    the second-stage execve("/init") (staged _init_430533c5d224,
+    2212256 bytes): whyred ships its linker at /sbin/linker64
+    (recovery-direct-linker.txt proves it runs) while init's PT_INTERP
+    is the bare /system/bin/linker64, which the HOST redroid (Android)
+    satisfies — the "guest binary under HOST linker" class the commit
+    message warns about (run 32973154137 class). The proactive-fork
+    /sbin/recovery (old 6-Z50 PT_INTERP -> rootfs/sbin/linker64) also
+    died 127 after 450 iterations.
+  * init console: first stage OK -> SELinux loaded -> "init second
+    stage started!" -> FATAL. Boot chain otherwise healthy (fstab,
+    property_contexts reads all translated fine).
+
+- angler 33164208433 (REGRESSION CHECK — PASS): overall UI_READY,
+  boot BOOT_OK, ui UI_READY, theme OK, vfs CLEAN, battery_ok true,
+  recovery_instances 2 (known-good dual instance), full page tour:
+  main2, advanced, terminalcommand, filemanagerlist,
+  filemanageroptions, choosedestinationfolder, ..., back to main.
+  * probe: "OLD (single file)" — correct, no misfire from fix B;
+    property-area-state.txt: single-file /dev/__properties__ 131072
+    bytes (old-format init happy).
+  * BACKSTOP denies: 11 (fchownat/chmod on /dev/socket/*, /dev/ion,
+    /dev/qseecom, /tmp — benign init housekeeping, faked 0); ZERO
+    openat("/system/lib64") denies. sigsegv_count 3 = benign
+    patch-skip INFO lines, no real segfault.
+  * terminal: classifier says FAIL (its heuristic wants "pty master"
+    in the kr64 log) BUT VLM on screenshot-term-07b shows the LIVE
+    busybox ash prompt — "sh: can't access tty; job control turned
+    off" + "~/user/0/io.twoyi.debug/profiles/default/rootfs $" — the
+    exact state 6-Z188 verified as WORKING on 33132782393. The
+    socketpair-pty path in this build doesn't emit the "pty master"
+    string, so the classifier field is a FALSE NEGATIVE; the terminal
+    itself did not regress. 08_final (VLM): the real TWRP "Unmodified
+    System Partition / Keep Read Only" dialog — UI renders perfectly.
+
+Stage Summary:
+- 33164208433 angler: NO REGRESSION — UI_READY/BOOT_OK/theme OK/vfs
+  CLEAN, FM guard pass, terminal prompt visually identical to the
+  verified baseline (classifier terminal=FAIL is a stale-heuristic
+  false negative worth fixing in classify_result.py).
+- 33164199222 OrangeFox: STILL-BROKEN but the 6-Z196 linker/PT_INTERP/
+  VFS fixes all verifiably ENGAGED — CANNOT LINK class eliminated,
+  init now runs its own linker + rootfs libs for thousands of
+  iterations. New blocker: first-stage CHECKCALL EEXIST fatal
+  (mkdir /dev/pts,/dev/socket,/dev/dm-user,/mnt/vendor,/mnt/product
+  "File exists" -> "Init encountered errors starting first stage,
+  aborting"). Next fix: pre-boot removal (or EEXIST-tolerant faking)
+  of those five dirs for new-format recoveries, + make Task-6-Z49's
+  proactive fork skip images without /sbin/recovery.
+- 33164204067 whyred: STILL-BROKEN, signature UNCHANGED ("Failed to
+  initialize property area" -> exit 127) despite the clean-slate fix
+  engaging. Fresh leads: (1) property_info IS guest-written (8508 B,
+  valid header) but properties_serial never appears and no file-backed
+  mmap is ever issued between open+fstat+close — suspect the tracer's
+  property-mmap handling (prop_fd tracking never fires for new-format
+  paths) swallows/fails LoadDefaultPath's mmap; (2) the second-stage
+  staged /init exec gets no 6-Z196 PT_INTERP patch (guest linker is at
+  /sbin/linker64, not /system/bin/linker64) so it runs under the HOST
+  redroid linker — needs an interp search/alias (sbin/linker64) or
+  rootfs symlink for system/bin/linker64.
