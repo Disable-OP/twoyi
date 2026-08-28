@@ -253,9 +253,17 @@ dependencies {
     // The 6-Z209a diagnostic surfaced this — the previous code silently
     // swallowed the NoClassDefFoundError as a hung import thread.
     //
-    // Pin to 1.10 (latest stable as of 2024; commons-compress 1.21
-    // declares 1.9 transitively — 1.10 is API-compatible).
-    implementation 'org.tukaani:xz:1.10'
+    // 6-Z209c-iter2 (run 33211102607 + 33211126083 on 73e9681): the
+    // initial pin to 1.10 BROKE THE BUILD — AGP's D8 dexer crashed
+    // with `java.lang.NullPointerException: Cannot invoke "String.length()"
+    // because "<parameter1>" is null` when dexing `jetified-xz-1.10.jar`.
+    // The 1.10 jar (released 2024) contains Java module system bytecode
+    // additions (module-info.class) that D8 cannot handle on AGP 8.x.
+    // Downgrade to 1.9 — the version commons-compress:1.21 declares
+    // transitively, predates the module-system bytecode, and is API-
+    // identical for SingleXZInputStream (the only class the app uses
+    // via commons-compress's XZCompressorInputStream).
+    implementation 'org.tukaani:xz:1.9'
 
     // Multidex — required because commons-compress adds many methods
     implementation 'androidx.multidex:multidex:2.0.1'
