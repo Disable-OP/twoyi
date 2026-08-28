@@ -3237,6 +3237,24 @@ fn copy_hook_library_to_dev(cfg: &Config, lib_name: &str, dst: &str, not_found_m
 // Daemon entry point.
 // ============================================================================
 
+/// 6-Z192: probe the guest's init binary for the Android 8+ property-area
+/// format. `properties_serial` is present in the init ELF's rodata iff
+/// the init writes `/dev/__properties__/properties_serial` (the NEW
+/// subdirectory layout); old-format inits (AOSP 5.1/6.0 bionic, e.g. the
+/// angler TWRP builds) only reference `/dev/__properties__` as a single
+/// file. Unreadable init → `false` (keep the legacy behavior).
+fn probe_init_new_property_format(init_path: &str) -> bool {
+    const NEEDLE: &[u8] = b"properties_serial";
+    match std::fs::read(init_path) {
+        Ok(bytes) => {
+            // Static init binaries are ≤ ~2 MB; a single linear scan at
+            // boot is negligible. windows() over 2 MB ≈ single-digit ms.
+            bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Run the daemon. Returns the exit code.
 ///
 /// This is the shared entry point called by both:
@@ -3256,6 +3274,37 @@ fn copy_hook_library_to_dev(cfg: &Config, lib_name: &str, dst: &str, not_found_m
 ///        echoes).
 ///   6. Wait for the child (the guest init) to exit; propagate its
 ///      exit code.
+// 6-Z192: unit-test the probe against REAL artifacts recorded from the
+// corpus: the whyred 3.7 init contains the literal, the angler 2.8/3.7
+// inits do not. (Embedded synthetic binaries keep the test hermetic.)
+#[cfg(test)]
+#[test]
+fn z192_property_format_probe_detects_new_format() {
+    // An init carrying the NEW-format rodata string.
+    let new_init = {
+        let mut b = vec![0u8; 1024];
+        b[100..117].copy_from_slice(b"properties_serial");
+        b
+    };
+    // An old-format init: references /dev/__properties__ only.
+    let old_init = {
+        let mut b = vec![0u8; 1024];
+        b[100..119].copy_from_slice(b"/dev/__properties__");
+        b
+    };
+    let dir = std::env::temp_dir().join(format!("kr64-z192-probe-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let p_new = dir.join("init_new");
+    let p_old = dir.join("init_old");
+    let p_missing = dir.join("init_missing");
+    std::fs::write(&p_new, &new_init).unwrap();
+    std::fs::write(&p_old, &old_init).unwrap();
+    assert!(probe_init_new_property_format(p_new.to_str().unwrap()));
+    assert!(!probe_init_new_property_format(p_old.to_str().unwrap()));
+    assert!(!probe_init_new_property_format(p_missing.to_str().unwrap()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     let mut cfg = match parse_args(args) {
         Ok(c) => c,
@@ -6048,6 +6097,39 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         }
     }
 
+    // ── 6-Z192: guest property-area FORMAT PROBE ──
+    //
+    // The pre-creation below used to hardcode "boot_recovery ⇒ OLD
+    // single-file format" — true for the angler-era TWRP inits (AOSP
+    // 5.1/6.0 bionic opens /dev/__properties__ as a FILE) but WRONG for
+    // newer recovery builds whose init speaks the Android 8+ SUBDIRECTORY
+    // format. Evidence (run 33151412680): twrp-3.7.0_9-0-whyred's init
+    // contains the strings `properties_serial`, `property_info`, and
+    // "Unable to write serialized property infos" — it tries to write
+    // /dev/__properties__/properties_serial, hits our pre-created FILE,
+    // gets ENOTDIR, logs "Failed to initialize property area", and
+    // exits 127 before any UI. The angler 3.7.0_9 init (same TWRP
+    // release, older device tree) has NONE of those strings — it is a
+    // pure old-format consumer.
+    //
+    // So the format is a PER-GUEST property, decided by probing the
+    // guest's OWN init binary for the `properties_serial` literal
+    // (present iff the init speaks the new format). Recovery-agnostic:
+    // any recovery family, any generation — the binary is the truth.
+    let guest_new_prop_format: bool =
+        probe_init_new_property_format(&format!("{}/init", rootfs_prefix));
+    if cfg.boot_recovery {
+        info!(
+            "[KR64] PARENT: guest init property-format probe: {} ({} format)",
+            if guest_new_prop_format {
+                "NEW (Android 8+ subdirectory)"
+            } else {
+                "OLD (single file)"
+            },
+            "boot_recovery=true — 6-Z192"
+        );
+    }
+
     // Pre-create /dev/__properties__/property_info on the HOST and in the
     // rootfs BEFORE forking. This is a defensive measure: even if our
     // LD_PRELOAD loader fails to be re-loaded after init's execv chain
@@ -6088,7 +6170,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // + rootfs, as before.
     {
         use std::os::unix::fs::PermissionsExt;
-        if cfg.boot_recovery {
+        if cfg.boot_recovery && !guest_new_prop_format {
             // Build the OLD-format prop_area bytes (128 KB) — magic=PROP,
             // version=0xfc6ed0ab, bytes_used=0, serial=0, then zero-padded
             // data area. init's __system_property_area_init will re-mmap + memset
@@ -7880,8 +7962,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // asks the Vfs to materialise synthetic files into rootfs
             // before the real kernel open() runs, replacing the
             // find_property binary patch (worklog 1-A F.1 + 1-B Task 3).
-            let vfs = if cfg.boot_recovery {
+            let vfs = if cfg.boot_recovery && !guest_new_prop_format {
                 vfs::Vfs::new_twrp()
+            } else if cfg.boot_recovery {
+                // 6-Z192: a recovery whose init speaks the NEW Android 8+
+                // property-area format (properties_serial/property_info in
+                // the init binary — e.g. twrp-3.7.0_9-0-whyred). The
+                // old-format `new_twrp()` override would pre-create a FILE
+                // where this init needs a DIRECTORY (ENOTDIR → "Failed to
+                // initialize property area" → init exit 127, run
+                // 33151412680). `new_android()` registers the subdirectory
+                // entries the new-format init expects.
+                info!("[KR64] PARENT: recovery boot with NEW-format init — using Vfs::new_android(pid={}) (Task 6-Z192)", pid);
+                vfs::Vfs::new_android(pid as u32)
             } else {
                 info!("[KR64] PARENT: normal (AOSP) boot — using Vfs::new_android(pid={}) (Task 6-Z88)", pid);
                 vfs::Vfs::new_android(pid as u32)
