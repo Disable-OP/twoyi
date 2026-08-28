@@ -12368,3 +12368,30 @@ Stage Summary:
   open (socketpair), unlockpt/grantpt, TIOCGPTN, ptsname (fd-number
   protocol), slave open (marked dup + backup), TIOCSCTTY, WINSZ, and
   now TCGETS/isatty. Next run should show the ash prompt.
+
+---
+Task ID: 6-Z188j
+Agent: main
+Task: Run 33130609939: TCGETS landed (isatty answered on fd0 in the
+fork child) but inside the EXEC'D sh the hook state resets — the
+monitor's own quote "ioctl(fd=0, req=0x05401) [trk=0]" shows fd0
+UNTRACKED in the shell process, so TCGETS fell through to ENOTTY and
+ash stayed non-interactive (cursor only).
+
+Work Log:
+- Evidence: full chain works to the shell (master fd=15 -> ptsname
+  /dev/pts/17 -> slave open fd=0 -> exec /sbin/sh, hook banner in the
+  child); the TCGETS hook works in the PRE-exec child but trk=0 after
+  exec (fresh constructor = empty bitmaps).
+- 6-Z188j FIX — STATELESS, EXEC-PROOF slave detection:
+  pty_fd_is_stream_socket(fd): a raw marked getsockopt(SOL_SOCKET,
+  SO_TYPE) succeeds exactly on sockets; inside the recovery sandbox
+  the only stream sockets on stdio are our pty ends. pty_slave_ioctl
+  now accepts: bitmap-tracked fds OR master-table hits OR any unix
+  stream socket — no per-process state required, survives execve.
+  (+ raw_syscall5_marked for the 5-arg marked call.)
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- The terminal stack is now fully stateless at the last hop. The ash
+  prompt should render in the next run.
