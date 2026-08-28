@@ -12434,3 +12434,41 @@ Work Log:
 Stage Summary:
 - F_DUPFD cannot return 0/1/2 by construction. This closes the
   stdio-range class entirely.
+
+---
+Task ID: 6-Z188 FINAL
+Agent: main
+Task: VERIFIED — the TWRP terminal renders a live busybox ash prompt
+(run 33132782393, e596fe5).
+
+Work Log:
+- VLM on term-07/07b: "sh: can't access tty; job control turned off"
+  (ash's normal no-controlling-tty banner) followed by the LIVE PROMPT
+  "~ /user/0/io.twoyi.debug/profiles/default/rootfs $" with the cursor
+  at its end.
+- Chain evidence in the same run: "pty master fd=15 (slot 0, slave
+  fd=17)" -> "ptsname(fd=15) -> /dev/pts/17" -> "pty slave open
+  /dev/pts/17 -> fd=18" -> "stdio-range escape -> fd=18" (F_DUPFD(3))
+  -> exec /sbin/sh (staged busybox, PT_INTERP patched) -> hook reloads
+  in the shell -> stateless TCGETS/isatty -> interactive ash prompt.
+- FM regression guard PASS across every run: guest root populated on
+  FIRST open, identical before/after the terminal, zero host-compat
+  dirs, zero twoyi markers.
+- Master-prompt core root causes 1-3 CLOSED:
+  1. FM empty-before-terminal: FIXED (6-Z187b cwd + hook prefix source).
+  2. host+guest VFS leakage: FIXED (6-Z187 dir gating + marker
+     relocation + guest-only rootfs).
+  3. Terminal "Child processes exited": FIXED via the generic pty
+     stack (6-Z187 staging/symlinks -> 6-Z188 socketpair pty ->
+     fd-number protocol -> marked dup/backup -> TCGETS stateless ->
+     F_DUPFD stdio escape), all recovery-agnostic.
+- Cosmetic follow-ups (not blocking): hook trace lines render on the
+  terminal console before the banner; ash shows the HOST rootfs path
+  in its prompt (getcwd interposition would fix).
+
+Stage Summary:
+- 16-iteration battle ended. The generic Android-recovery terminal
+  stack is complete: any recovery using getpt/unlockpt/ptsname/ptmx
+  ioctls gets a working shell. Next master-prompt item: the TWRP 2.8
+  angler splash hang (root-cause item 4), then the universal recovery
+  corpus + tiered CI.
