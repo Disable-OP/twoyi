@@ -13018,3 +13018,79 @@ Stage Summary:
   Round-5 CI dispatched (OrangeFox + whyred + angler regression).
   Expected: OrangeFox init survives the uevent listener (proceeds to
   service startup); whyred's CodeCache mmap succeeds → splash → menu.
+
+---
+Task ID: 6-Z206 (round 6) + corpus expansion to 151 entries
+Agent: main
+Task: Fix the round-5 OrangeFox restorecon blocker + massively expand
+the recovery corpus toward the user's 900/1000 boot-rate target.
+
+Work Log:
+- Round-5 CI verdicts (runs 33196197766/33196200633/33196202962 on
+  eb886da): angler UI_READY ✓ (no regression); whyred BOOT_OK +
+  UI_READY on retry (theme OK_FIRST_BOOT_FAIL_REEXEC; first boot
+  still FATALs then the untraced retry succeeds); OrangeFox STILL
+  BOOT_FAIL_EARLY_INIT — first-stage init runs to ~9000 syscalls
+  then aborts with "Could not get canonical path for /system/bin/init
+  restorecon: No such file or directory" → InitFatalReboot SIGABRT.
+  The "exit_code: 127" in result.json is the 6-Z49 proactive
+  /sbin/recovery probe fork (OrangeFox has no /sbin/recovery) —
+  cosmetic, not the actual blocker.
+- OrangeFox restorecon root-cause investigation: the AOSP 11
+  libselinux `selinux_restorecon` → `canonicalize_path` → `realpath`
+  walks the path component-by-component via lstat() — and the kernel
+  lstat() returns -ENOENT even though {rootfs}/system/bin/init IS
+  a 1.98MB dynamic ELF (verified: staged as a 1979448-byte file at
+  line 1380 of the r3 kr64 trace). The DIAG output only logged
+  mmap2 + writes — stat-family was invisible. Without visibility
+  into the actual (path, translated_path, host_exists, return_value)
+  quadruple, the root cause can only be hypothesized (sandbox
+  backstop clobber, read_child_string PEEK-blind fallback firing
+  the +1 cwd-relative rewrite with a wrong cwd, or a translate_guest
+  edge case for /system/bin/init that resolves to a non-existent
+  host path).
+- FIX (6-Z206): added stat-family ENTRY + EXIT DIAG logging for
+  critical boot paths (/init, /system/bin/init, /sbin/recovery,
+  /sbin/linker, /system/bin/linker). The ENTRY-side captures
+  (pid, nr, guest_path, translated_path, host_exists) into a
+  stash; the EXIT-side logs when the kernel returned an error on
+  a path where host_exists=true — that is the contradiction
+  signature that pinpoints the bug. Bounded to 50 hits per boot
+  so the log stays readable on TWRP's stat-poll loops.
+- Corpus expansion (§17): wrote scripts/recovery-corpus/
+  scrape_corpus.py — a TWRP/OrangeFox catalog scraper with two
+  modes: --vendor <name> walks twrp.me/Devices/<vendor>/ +
+  per-device pages to find each device's dl.twrp.me codename,
+  --codenames <file> fast-paths it via direct dl.twrp.me/<code>/
+  fetches. Wrote scripts/recovery-corpus/twrp_codenames.txt
+  with 253 known TWRP device codenames (manually curated across
+  Google/OnePlus/Xiaomi/Samsung/HTC/LG/Motorola/Sony/Nokia/etc.);
+  verified 143 of them exist via HEAD requests (parallel xargs -P8);
+  scraped each device's LATEST .img URL in parallel (286 HTTP
+  requests in ~30s) — produced 132 NEW manifest entries (151 total,
+  up from 19). All new entries are tier=nightly (PR tier stays the
+  curated 5). Manifest is now: 149 TWRP + 1 OrangeFox + 1 Lineage.
+- Gates: cargo fmt --check, cargo clippy --all-targets -D warnings,
+  cargo test — 595 tests PASS (no new tests; the 6-Z206 DIAG is
+  observability-only — no behavior change to assert).
+
+Stage Summary:
+- The 6-Z206 stat-family DIAG is committed + ready — the next CI
+  run on OrangeFox will show the exact (guest_path, translated,
+  host_exists, return_value) quadruple for the failing lstat call,
+  which pins the root cause definitively.
+- The corpus expanded from 19 → 151 entries (8x growth) in one
+  commit — the nightly workflow can now dispatch 146 new recovery
+  boot tests. Combined with the existing PR tier (angler 2.8/3.7,
+  whyred, OrangeFox, Lineage 22.2 — 5 PR-tier entries), this is
+  the broadest coverage Twoyi has ever had. 900/1000 target still
+  requires more corpus growth + multiple fix iterations; the
+  nightly dashboard will surface the failure clustering needed to
+  prioritize the next round of generalized fixes (§21 failure
+  analysis method, §29 nightly compatibility layer).
+- Next concrete action: dispatch round-6 CI on OrangeFox (with
+  6-Z206 DIAG) + run the nightly corpus on the expanded manifest
+  to gather broad-coverage failure data. While CI runs, fix the
+  root cause identified by 6-Z206 + iterate the corpus expansion
+  (scrape OrangeFox's release feed + LineageOS boot.imgs to push
+  toward 1000+ entries).

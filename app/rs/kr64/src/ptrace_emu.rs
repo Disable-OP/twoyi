@@ -9166,6 +9166,15 @@ pub fn run_ptrace_loop(
     // could be resolved NEITHER from open_fd_owner_paths NOR from the
     // /proc/<pid>/fd/<fd> readlink fallback (diagnostic only).
     let mut z198_unresolved_fstat: u32 = 0;
+    // 6-Z206: bounded counter for stat-family DIAG logs on critical boot
+    // paths (/init, /system/bin/init, /sbin/recovery, linker candidates)
+    // — keeps the log readable on TWRP init's stat-poll loops while
+    // still surfacing the ENOENT-on-existing-path cases that pin modern
+    // dynamic-init recoveries (OrangeFox R12's restorecon FATAL).
+    let mut z206_stat_diag_count: u32 = 0;
+    // 6-Z206: stash the most recent stat-family ENTRY for the EXIT-side
+    // ENOENT-correlation log. (pid, nr, guest_path, translated, host_exists).
+    let mut z206_pending_stat_path: Option<(libc::pid_t, i64, String, String, bool)> = None;
     // 6-Z199: ENTRY-side arg1 stash — (pid → (syscall_nr, fd)) captured
     // at the ENTRY stop of fd-taking syscalls, consumed by their EXIT
     // arms. On aarch64 x0 is BOTH arg1 and the return register, so the
@@ -14030,6 +14039,52 @@ pub fn run_ptrace_loop(
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
                                 let translated = translate_path(rootfs, &path);
+                                // ── 6-Z206 DIAG: stat-family on critical
+                                // boot paths — captures the EXACT guest
+                                // path + the translated host path so the
+                                // EXIT-side ENOENT/EACCES can be matched
+                                // up to a real (path, file_exists)
+                                // ground truth.
+                                //
+                                // Triggered for paths the master prompt
+                                // §9 cares about (the recovery's own
+                                // /init + /system/bin/init + /sbin/
+                                // recovery + linker candidates). Bounded
+                                // to first 50 hits per pid so the boot
+                                // log stays readable on TWRP loops.
+                                if z206_stat_diag_count < 50
+                                    && (path.contains("/system/bin/init")
+                                        || path == "/init"
+                                        || path.contains("/sbin/recovery")
+                                        || path.contains("/sbin/linker")
+                                        || path.contains("/system/bin/linker"))
+                                {
+                                    z206_stat_diag_count += 1;
+                                    let host_exists = std::path::Path::new(&translated).exists();
+                                    log(&format!(
+                                        "6-Z206 DIAG: stat-family ENTRY pid={} nr={} [{}] guest_path={:?} → translated={:?} host_exists={}",
+                                        pid,
+                                        syscall_num,
+                                        syscall_name(syscall_num, &abi),
+                                        path,
+                                        translated,
+                                        host_exists,
+                                    ));
+                                    // Stash for EXIT-side correlation:
+                                    // if the kernel returns ENOENT on a
+                                    // path where host_exists=true, that
+                                    // proves a virtualization-layer bug
+                                    // (sandbox backstop, path rewrite
+                                    // clobber, or read_child_string
+                                    // returning the wrong string).
+                                    z206_pending_stat_path = Some((
+                                        pid,
+                                        syscall_num,
+                                        path.clone(),
+                                        translated.clone(),
+                                        host_exists,
+                                    ));
+                                }
                                 // ── Task 6-Z71: arm the EXIT-side
                                 // stat64/lstat64 EMULATION record ──
                                 //
@@ -18141,6 +18196,40 @@ pub fn run_ptrace_loop(
                                 //      0xEE981000 → init wrote the property
                                 //      header to address 0 → SIGSEGV.
                                 let fresh_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                // ── 6-Z206 EXIT-side correlation: if the
+                                // ENTRY-side stat-family DIAG stash matches
+                                // this stop's (pid, nr) and the kernel
+                                // returned an error (especially -ENOENT=-2
+                                // or -EACCES=-13), log the contradiction
+                                // when host_exists=true. That is the
+                                // OrangeFox restorecon blocker signature
+                                // (run 33192824519): realpath() walks
+                                // /system/bin/init, the kernel lstat()
+                                // returns -ENOENT even though
+                                // {rootfs}/system/bin/init EXISTS as a
+                                // 1.98MB dynamic ELF — the guest's
+                                // canonicalize_path returns NULL with
+                                // ENOENT → selinux_restorecon FATALs →
+                                // InitFatalReboot (SIGABRT).
+                                if let Some((spid, snr, spath, strans, shost_exists)) =
+                                    z206_pending_stat_path.take()
+                                {
+                                    if spid == pid && snr == syscall_num && fresh_ret < 0 {
+                                        log(&format!(
+                                            "6-Z206 EXIT: stat-family returned {} (-errno {}) for guest_path={:?} translated={:?} host_exists={} {}",
+                                            fresh_ret,
+                                            -fresh_ret,
+                                            spath,
+                                            strans,
+                                            shost_exists,
+                                            if shost_exists {
+                                                "← BUG: kernel returned ENOENT/EACCES on a path that EXISTS on the host"
+                                            } else {
+                                                "(host path genuinely missing — translation gap)"
+                                            }
+                                        ));
+                                    }
+                                }
                                 // 6-Z145: the compute-table match is checked
                                 // FIRST and UNCONDITIONALLY. If
                                 // _forced_ret_opt.is_some() — the table
