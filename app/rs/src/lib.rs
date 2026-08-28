@@ -430,14 +430,26 @@ pub extern "C" fn twoyi_start_input_system(width: i32, height: i32) {
 pub extern "C" fn twoyi_print_help() {
     use std::io::{self, Write};
     let _ = writeln!(io::stdout(), "Twoyi Native Library (libtwoyi.so)");
-    let _ = writeln!(io::stdout(), "\nExported C functions (shell-accessible via dlopen/dlsym):");
+    let _ = writeln!(
+        io::stdout(),
+        "\nExported C functions (shell-accessible via dlopen/dlsym):"
+    );
     let _ = writeln!(
         io::stdout(),
         "  twoyi_start_input_system(width, height) - Start the touch/key bridge"
     );
-    let _ = writeln!(io::stdout(), "  twoyi_send_keycode(keycode)       - Send a keycode event");
-    let _ = writeln!(io::stdout(), "  twoyi_print_help()                - Show this help");
-    let _ = writeln!(io::stdout(), "\nIn-app usage: System.loadLibrary(\"twoyi\") via the Twoyi app.");
+    let _ = writeln!(
+        io::stdout(),
+        "  twoyi_send_keycode(keycode)       - Send a keycode event"
+    );
+    let _ = writeln!(
+        io::stdout(),
+        "  twoyi_print_help()                - Show this help"
+    );
+    let _ = writeln!(
+        io::stdout(),
+        "\nIn-app usage: System.loadLibrary(\"twoyi\") via the Twoyi app."
+    );
     let _ = writeln!(
         io::stdout(),
         "Shell usage: run via jniLibs/<abi>/twoyi (linker64 wrapper)."

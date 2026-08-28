@@ -168,6 +168,138 @@ pub fn patch_elf_interp(file_path: &Path, new_interp: &str) -> Result<(), String
     Err("PT_INTERP phdr vanished during append".to_string())
 }
 
+/// 6-Z196: read an ELF's current PT_INTERP string (the dynamic-linker
+/// path the kernel will open at execve time). Class-aware (ELF32 +
+/// ELF64). Returns:
+///   * `Ok(None)`    — valid ELF, but static (no PT_INTERP)
+///   * `Ok(Some(s))` — the interpreter path
+///   * `Err(msg)`    — not an ELF / unreadable / implausible phdrs
+pub fn read_elf_interp(path: &str) -> Result<Option<String>, String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open {}: {}", path, e))?;
+    let mut ehdr = [0u8; 64];
+    file.read_exact(&mut ehdr)
+        .map_err(|e| format!("read ehdr {}: {}", path, e))?;
+    if &ehdr[0..4] != b"\x7fELF" {
+        return Err("not an ELF".to_string());
+    }
+    let is64 = ehdr[4] == 2;
+    let (e_phoff, e_phentsize, e_phnum): (u64, usize, usize) = if is64 {
+        (
+            u64::from_le_bytes(ehdr[32..40].try_into().unwrap()),
+            u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as usize,
+            u16::from_le_bytes(ehdr[56..58].try_into().unwrap()) as usize,
+        )
+    } else {
+        (
+            u32::from_le_bytes(ehdr[28..32].try_into().unwrap()) as u64,
+            u16::from_le_bytes(ehdr[42..44].try_into().unwrap()) as usize,
+            u16::from_le_bytes(ehdr[44..46].try_into().unwrap()) as usize,
+        )
+    };
+    if e_phnum == 0 {
+        // No program headers at all — a well-defined "static" ELF.
+        return Ok(None);
+    }
+    let (p_off_field, p_sz_field, sz_bytes): (u64, u64, usize) =
+        if is64 { (8, 32, 8) } else { (4, 16, 4) };
+    let min_phentsize: usize = if is64 { 56 } else { 32 };
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+    if e_phentsize < min_phentsize
+        || e_phentsize > 4096
+        || e_phoff
+            .checked_add((e_phentsize * e_phnum) as u64)
+            .map_or(true, |end| end > file_len)
+    {
+        return Err(format!(
+            "implausible phdr table (phoff={}, phentsize={}, phnum={}, len={})",
+            e_phoff, e_phentsize, e_phnum, file_len
+        ));
+    }
+    let mut phdrs = vec![0u8; e_phentsize * e_phnum];
+    file.seek(SeekFrom::Start(e_phoff)).ok();
+    file.read_exact(&mut phdrs)
+        .map_err(|e| format!("read phdrs: {}", e))?;
+    for i in 0..e_phnum {
+        let off = i * e_phentsize;
+        let p_type = u32::from_le_bytes(phdrs[off..off + 4].try_into().unwrap());
+        if p_type == 3 {
+            let read_u = |field: u64| -> u64 {
+                let s = off + field as usize;
+                let mut v = 0u64;
+                for b in (0..sz_bytes).rev() {
+                    v = (v << 8) | phdrs[s + b] as u64;
+                }
+                v
+            };
+            let p_offset = read_u(p_off_field);
+            let p_filesz = read_u(p_sz_field);
+            if p_offset
+                .checked_add(p_filesz)
+                .map_or(true, |end| end > file_len)
+            {
+                return Err("PT_INTERP out of file bounds".to_string());
+            }
+            // The interp string lives at FILE offset p_offset — seek
+            // there and read it (NOT from the phdr table buffer).
+            let mut raw = vec![0u8; p_filesz as usize];
+            file.seek(SeekFrom::Start(p_offset)).ok();
+            file.read_exact(&mut raw)
+                .map_err(|e| format!("read interp string: {}", e))?;
+            let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            return Ok(Some(String::from_utf8_lossy(&raw[..nul]).into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// 6-Z196: make a STAGED executable run under the GUEST'S OWN dynamic
+/// linker. The kernel opens PT_INTERP itself during execve — outside
+/// tracer reach — so a staged copy whose PT_INTERP is a bare guest path
+/// (e.g. "/system/bin/linker64") resolves on the HOST:
+///   * on an Android host it loads the HOST's linker (API-level
+///     mismatch against the guest's libs — "CANNOT LINK EXECUTABLE",
+///     observed run 32973154137: Android-14 linker vs Android-6
+///     recovery; and run 33157500559: OrangeFox init under the host
+///     linker could not satisfy libbacktrace.so),
+///   * on a non-Android host it ENOENTs and execve fails outright.
+/// The fix: when the guest's ramdisk SHIPS the interpreter at
+/// {rootfs}<PT_INTERP>, rewrite the staged copy's PT_INTERP to that
+/// absolute host path — the kernel then loads the guest's own linker,
+/// giving a fully coherent guest runtime (guest linker + guest libs).
+/// Idempotent: an interp that already points under the rootfs (the
+/// 6-Z50/6-Z187 pre-patched forms) is left untouched. Returns the new
+/// interpreter path when a patch was applied.
+pub fn ensure_guest_interp(rootfs: &str, staged_path: &str) -> Option<String> {
+    let rootfs_p = if rootfs.ends_with('/') {
+        rootfs.to_string()
+    } else {
+        format!("{}/", rootfs)
+    };
+    // Not an ELF (scripts reach the staging engine too) / static →
+    // nothing to do. Errors are non-fatal: staging still succeeds.
+    let interp = match read_elf_interp(staged_path) {
+        Ok(Some(i)) => i,
+        _ => return None,
+    };
+    if !interp.starts_with('/') {
+        return None; // relative interp — nothing sane to map
+    }
+    if interp.starts_with(rootfs_p.as_str()) || interp == rootfs.trim_end_matches('/') {
+        return None; // already patched to a host-visible guest path
+    }
+    let host_interp = format!("{}{}", rootfs_p, interp.trim_start_matches('/'));
+    if !Path::new(&host_interp).exists() {
+        // The guest does not ship this interpreter — leave the staged
+        // copy alone (the host fallback may still resolve it).
+        return None;
+    }
+    match patch_elf_interp(Path::new(staged_path), &host_interp) {
+        Ok(()) => Some(host_interp),
+        Err(_) => None,
+    }
+}
+
 /// Lexically normalize a guest path ("/a/../b", "//x" …) without touching
 /// the filesystem. Returns None when the path climbs above "/" (nothing
 /// sensible to link to — the sidecar stays).
@@ -203,6 +335,45 @@ pub fn resolve_guest_target(dir: &str, target: &str) -> Option<String> {
     } else {
         normalize_guest_path(&format!("{}/{}", dir, target))
     }
+}
+
+/// 6-Z196: compute a guest-RELATIVE symlink target (the path from the
+/// link's directory to its target): `init -> system/bin/init` instead of
+/// the host-absolute `{rootfs}/system/bin/init`.
+///
+/// WHY: the previous materialization created links with HOST-ABSOLUTE
+/// targets — kernel resolution stayed inside the rootfs (correct), but
+/// the guest's `readlink("/init")` returned
+/// "/data/user/0/io.twoyi.debug/rootfs/system/bin/init" — the host
+/// backing path made VISIBLE as a guest pathname (the absolute VFS
+/// invariant: the host backing store must never leak into the guest
+/// namespace; File Manager `ls -l` showed it). A guest-relative target
+/// resolves to the SAME file on both sides and leaks nothing.
+pub fn guest_relative_target(link_guest_dir: &str, target_guest: &str) -> Option<String> {
+    if !link_guest_dir.starts_with('/') || !target_guest.starts_with('/') {
+        return None;
+    }
+    let dir_parts: Vec<&str> = link_guest_dir
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let tgt_parts: Vec<&str> = target_guest.split('/').filter(|p| !p.is_empty()).collect();
+    let mut common = 0;
+    while common < dir_parts.len()
+        && common < tgt_parts.len()
+        && dir_parts[common] == tgt_parts[common]
+    {
+        common += 1;
+    }
+    let ups = dir_parts.len() - common;
+    let mut parts: Vec<&str> = vec![".."; ups];
+    parts.extend_from_slice(&tgt_parts[common..]);
+    if parts.is_empty() {
+        // Target equals the link's own directory — no sensible relative
+        // form; caller falls back to the host-absolute materialization.
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 /// Result summary of a materialization run (for the boot log line).
@@ -367,15 +538,33 @@ pub fn materialize_symlink_sidecars(rootfs: &str, staged_busybox: Option<&str>) 
                 .unwrap_or("")
                 .trim_matches('/')
                 .to_string();
-            let Some(guest_target) = resolve_guest_target(&format!("/{}", parent_rel), &target)
-            else {
+            let guest_dir = format!("/{}", parent_rel);
+            let Some(guest_target) = resolve_guest_target(&guest_dir, &target) else {
                 stats.skipped += 1;
                 continue;
             };
-            // Host destination for the real symlink.
+            // Host-side symlink target.
+            //
+            // 6-Z196: guest-RELATIVE form ("system/bin/init", "../../sh")
+            // so readlink() in the guest shows a clean guest path — the
+            // previous host-absolute form
+            // ("{rootfs}/system/bin/init") leaked the host backing
+            // path into the guest namespace. Kernel resolution is
+            // unchanged: a relative target resolves INSIDE the rootfs
+            // exactly like the prefixed form did.
+            //
+            // EXCEPTION: links whose target is the pre-staged busybox
+            // keep pointing at the STAGED copy (the rootfs partition is
+            // noexec; the cache staging dir is the executable place —
+            // see provision_terminal_shell). Those links' readlink
+            // still shows the staged path; fixing that needs exit-side
+            // readlink rewriting in the tracer (follow-up).
             let host_target: String = match staged_busybox {
                 Some(sb) if guest_target == "/sbin/busybox" => sb.to_string(),
-                _ => format!("{}{}", rootfs_p, guest_target.trim_start_matches('/')),
+                _ => match guest_relative_target(&guest_dir, &guest_target) {
+                    Some(rel) => rel,
+                    None => format!("{}{}", rootfs_p, guest_target.trim_start_matches('/')),
+                },
             };
             let link_path = path.with_file_name(name.trim_end_matches(".symlink"));
             // Remove whatever occupies the destination (a previous
@@ -432,6 +621,35 @@ mod tests {
     }
 
     #[test]
+    fn guest_relative_target_basic() {
+        // OrangeFox shape: /init -> /system/bin/init at the root.
+        assert_eq!(
+            guest_relative_target("/", "/system/bin/init").as_deref(),
+            Some("system/bin/init")
+        );
+        // Same-dir target collapses to the bare name.
+        assert_eq!(
+            guest_relative_target("/sbin", "/sbin/busybox").as_deref(),
+            Some("busybox")
+        );
+        // Climb out of a subtree.
+        assert_eq!(
+            guest_relative_target("/sbin/etc/terminfo", "/sbin/sh").as_deref(),
+            Some("../../sh")
+        );
+        // No common prefix.
+        assert_eq!(
+            guest_relative_target("/system/bin", "/vendor/bin/x").as_deref(),
+            Some("../../vendor/bin/x")
+        );
+        // Target == link dir → None (fallback case).
+        assert_eq!(guest_relative_target("/sbin", "/sbin"), None);
+        // Non-absolute inputs → None.
+        assert_eq!(guest_relative_target("sbin", "/sbin/busybox"), None);
+        assert_eq!(guest_relative_target("/sbin", "busybox"), None);
+    }
+
+    #[test]
     fn materialize_creates_real_symlinks_and_removes_sidecars() {
         let tmp = TempGuard(tempdir_for_test());
         let root = tmp.0.to_str().unwrap().to_string();
@@ -447,25 +665,38 @@ mod tests {
         std::fs::write(format!("{}/sbin/cat.symlink", root), "busybox").unwrap();
         // charger -> /sbin/healthd (absolute, target absent)
         std::fs::write(format!("{}/charger.symlink", root), "/sbin/healthd").unwrap();
+        // init -> /system/bin/init (absolute, target absent — the
+        // OrangeFox symlink-init shape)
+        std::fs::write(format!("{}/init.symlink", root), "/system/bin/init").unwrap();
         // stub subtree that must be skipped
         std::fs::create_dir_all(format!("{}/proc/self", root)).unwrap();
         std::fs::write(format!("{}/proc/self/exe.symlink", root), "/sbin/busybox").unwrap();
 
         let stats = materialize_symlink_sidecars(&root, None);
-        assert_eq!(stats.sidecars_seen, 3);
-        assert_eq!(stats.links_created, 3);
-        assert_eq!(stats.sidecars_removed, 3);
+        assert_eq!(stats.sidecars_seen, 4);
+        assert_eq!(stats.links_created, 4);
+        assert_eq!(stats.sidecars_removed, 4);
 
         assert!(std::fs::symlink_metadata(format!("{}/sbin/sh", root))
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false));
+        // 6-Z196: targets are GUEST-RELATIVE — readlink() in the guest
+        // must never see the host backing path.
         let t = std::fs::read_link(format!("{}/sbin/sh", root)).unwrap();
-        assert_eq!(t, Path::new(&format!("{}/sbin/busybox", root)));
+        assert_eq!(t, Path::new("busybox"));
         let cat = std::fs::read_link(format!("{}/sbin/cat", root)).unwrap();
-        assert_eq!(cat, Path::new(&format!("{}/sbin/busybox", root)));
+        assert_eq!(cat, Path::new("busybox"));
+        let charger = std::fs::read_link(format!("{}/charger", root)).unwrap();
+        assert_eq!(charger, Path::new("sbin/healthd"));
+        let init = std::fs::read_link(format!("{}/init", root)).unwrap();
+        assert_eq!(init, Path::new("system/bin/init"));
         assert!(!Path::new(&format!("{}/sbin/sh.symlink", root)).exists());
         // stub subtree untouched
         assert!(Path::new(&format!("{}/proc/self/exe.symlink", root)).exists());
+        // Resolution equivalence: the relative link resolves to the same
+        // file the old host-absolute form pointed at.
+        let resolved = std::fs::read(format!("{}/sbin/sh", root)).unwrap();
+        assert_eq!(resolved, b"\x7fELFstatic-placeholder");
     }
 
     #[test]
@@ -503,6 +734,110 @@ mod tests {
         let _ = prestage_executable(&root, &data, "/sbin/busybox", "/sbin/sh").unwrap();
         let marker2 = std::fs::read_to_string(format!("{}/cache/twoyi-staged", data)).unwrap();
         assert_eq!(marker2.matches("/sbin/sh\t").count(), 1);
+    }
+
+    /// Build a minimal ELF64 with a single PT_INTERP phdr carrying `interp`.
+    fn synthetic_dynamic_elf(interp: &str) -> Vec<u8> {
+        let mut out = vec![0u8; 64]; // ELF64 ehdr
+        out[0..4].copy_from_slice(b"\x7fELF");
+        out[4] = 2; // ELFCLASS64
+        out[5] = 1; // ELFDATA2LSB
+        out[16..18].copy_from_slice(&2u16.to_le_bytes()); // e_type = EXEC
+        out[18..20].copy_from_slice(&0xB7u16.to_le_bytes()); // e_machine = aarch64
+        out[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        out[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        out[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        out[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        let mut interp_bytes = interp.as_bytes().to_vec();
+        interp_bytes.push(0);
+        let interp_off: u64 = 64 + 56;
+
+        let mut phdr = vec![0u8; 56];
+        phdr[0..4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+        phdr[4..8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+        phdr[8..16].copy_from_slice(&interp_off.to_le_bytes()); // p_offset
+        phdr[16..24].copy_from_slice(&interp_off.to_le_bytes()); // p_vaddr
+        phdr[24..32].copy_from_slice(&interp_off.to_le_bytes()); // p_paddr
+        phdr[32..40].copy_from_slice(&(interp_bytes.len() as u64).to_le_bytes()); // p_filesz
+        phdr[40..48].copy_from_slice(&(interp_bytes.len() as u64).to_le_bytes()); // p_memsz
+        phdr[48..56].copy_from_slice(&1u64.to_le_bytes()); // p_align
+
+        out.extend_from_slice(&phdr);
+        out.extend_from_slice(&interp_bytes);
+        out
+    }
+
+    #[test]
+    fn z196_read_elf_interp_class_aware() {
+        let tmp = TempGuard(tempdir_for_test());
+        let root = tmp.0.to_str().unwrap().to_string();
+        let dyn_path = format!("{}/dyn", root);
+        std::fs::write(&dyn_path, synthetic_dynamic_elf("/system/bin/linker64")).unwrap();
+        let static_path = format!("{}/stat", root);
+        let mut static_blob = b"\x7fELFstatic-placeholder".to_vec();
+        static_blob.resize(128, 0); // pad past the 64-byte ehdr read
+        std::fs::write(&static_path, &static_blob).unwrap();
+        let script_path = format!("{}/script", root);
+        std::fs::write(&script_path, b"#!/sbin/sh\n").unwrap();
+
+        assert_eq!(
+            read_elf_interp(&dyn_path).unwrap().as_deref(),
+            Some("/system/bin/linker64")
+        );
+        assert_eq!(read_elf_interp(&static_path).unwrap(), None);
+        assert!(read_elf_interp(&script_path).is_err());
+        assert!(read_elf_interp(&format!("{}/missing", root)).is_err());
+    }
+
+    #[test]
+    fn z196_ensure_guest_interp_patches_to_guest_linker() {
+        let tmp = TempGuard(tempdir_for_test());
+        let root = tmp.0.to_str().unwrap().to_string();
+        // The guest ships its own linker at {root}/system/bin/linker64.
+        std::fs::create_dir_all(format!("{}/system/bin", root)).unwrap();
+        std::fs::write(
+            format!("{}/system/bin/linker64", root),
+            b"\x7fELF-linker-placeholder",
+        )
+        .unwrap();
+        // A staged executable with the bare guest interp.
+        let staged = format!("{}/staged_init", root);
+        std::fs::write(&staged, synthetic_dynamic_elf("/system/bin/linker64")).unwrap();
+
+        let patched = ensure_guest_interp(&root, &staged);
+        let expected = format!("{}/system/bin/linker64", root);
+        assert_eq!(patched.as_deref(), Some(expected.as_str()));
+        // The staged copy now carries the host-visible guest linker path.
+        assert_eq!(
+            read_elf_interp(&staged).unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+        // Idempotent: an already-patched interp is left untouched.
+        assert_eq!(ensure_guest_interp(&root, &staged), None);
+    }
+
+    #[test]
+    fn z196_ensure_guest_interp_noop_when_guest_lacks_linker() {
+        let tmp = TempGuard(tempdir_for_test());
+        let root = tmp.0.to_str().unwrap().to_string();
+        // No {root}/system/bin/linker64 — the guest does not ship the
+        // interpreter; the staged copy must be left alone (host fallback
+        // may still resolve it). Also covers static binaries.
+        std::fs::create_dir_all(format!("{}/sbin", root)).unwrap();
+        let staged = format!("{}/staged_init", root);
+        std::fs::write(&staged, synthetic_dynamic_elf("/system/bin/linker64")).unwrap();
+        assert_eq!(ensure_guest_interp(&root, &staged), None);
+        assert_eq!(
+            read_elf_interp(&staged).unwrap().as_deref(),
+            Some("/system/bin/linker64")
+        );
+        // Static ELF (padded past the ehdr) → no PT_INTERP → no-op.
+        let staged_static = format!("{}/staged_static", root);
+        let mut static_blob2 = b"\x7fELFstatic-placeholder".to_vec();
+        static_blob2.resize(128, 0);
+        std::fs::write(&staged_static, &static_blob2).unwrap();
+        assert_eq!(ensure_guest_interp(&root, &staged_static), None);
     }
 
     fn tempdir_for_test() -> std::path::PathBuf {

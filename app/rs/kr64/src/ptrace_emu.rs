@@ -4627,6 +4627,15 @@ fn stage_guest_executable_capped(
     // Cache hit on an identical-length existing copy = Reused.
     if let Ok(existing_md) = std::fs::metadata(&cache_path) {
         if existing_md.is_file() && existing_md.len() == bytes {
+            // 6-Z196: cache copies staged by an OLDER build may carry a
+            // bare guest PT_INTERP — normalize them too (idempotent).
+            if let Some(new_interp) = crate::symlinks::ensure_guest_interp(rootfs, &cache_path) {
+                crate::info!(
+                    "[ptrace] 6-Z196: patched staged PT_INTERP of {} -> {} (guest's own linker)",
+                    cache_path,
+                    new_interp
+                );
+            }
             append_staged_marker(data_dir, &guest_key, &cache_path);
             return StageOutcome::Reused { cache_path, bytes };
         }
@@ -4648,6 +4657,20 @@ fn stage_guest_executable_capped(
     }
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&cache_path, std::fs::Permissions::from_mode(0o755));
+    // 6-Z196: run dynamic guest executables under the GUEST'S OWN
+    // linker. The kernel opens PT_INTERP during execve outside tracer
+    // reach — a bare guest interp ("/system/bin/linker64") would load
+    // the HOST's linker (API-level mismatch → CANNOT LINK, run
+    // 33157500559/32973154137) or ENOENT on non-Android hosts. When the
+    // guest's ramdisk ships the interpreter, rewrite the staged copy's
+    // PT_INTERP to the host-visible {rootfs}<interp> path.
+    if let Some(new_interp) = crate::symlinks::ensure_guest_interp(rootfs, &cache_path) {
+        crate::info!(
+            "[ptrace] 6-Z196: patched staged PT_INTERP of {} -> {} (guest's own linker)",
+            cache_path,
+            new_interp
+        );
+    }
     append_staged_marker(data_dir, &guest_key, &cache_path);
     StageOutcome::Staged { cache_path, bytes }
 }

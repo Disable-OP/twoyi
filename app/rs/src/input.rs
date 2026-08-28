@@ -566,7 +566,10 @@ fn touch_server() {
                 // A transient accept error (EMFILE, ENOMEM, EINTR…) must
                 // not kill the touch server for the rest of the session —
                 // back off briefly and keep serving.
-                info!("[INPUT] touch-events server accept error: {} — continuing", e);
+                info!(
+                    "[INPUT] touch-events server accept error: {} — continuing",
+                    e
+                );
                 thread::sleep(std::time::Duration::from_millis(100));
             }
         }
@@ -648,7 +651,10 @@ fn touch_server_abstract() {
                     e.raw_os_error(),
                     Some(EMFILE) | Some(ENOMEM) | Some(ENFILE) | Some(ECONNABORTED)
                 ) {
-                    log::warn!("[INPUT] abstract touch accept() transient: {} — retrying", e);
+                    log::warn!(
+                        "[INPUT] abstract touch accept() transient: {} — retrying",
+                        e
+                    );
                     thread::sleep(std::time::Duration::from_millis(100));
                     continue;
                 }
@@ -680,8 +686,7 @@ fn touch_server_abstract() {
                                 // EINTR before any byte was written: retry,
                                 // don't kill a healthy connection over a
                                 // spurious signal.
-                                if std::io::Error::last_os_error().raw_os_error()
-                                    == Some(EINTR)
+                                if std::io::Error::last_os_error().raw_os_error() == Some(EINTR)
                                     && off == 0
                                 {
                                     continue;
