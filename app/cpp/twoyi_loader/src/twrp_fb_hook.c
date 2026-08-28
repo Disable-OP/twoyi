@@ -790,7 +790,10 @@ static int pty_slot_of_master(int fd) {
     return -1;
 }
 
-/* open("/dev/pts/<n>") with n a live slot -> dup of the stashed slave. */
+/* open("/dev/pts/<n>") — 6-Z188f: n is the SLAVE FD NUMBER itself
+ * (see ptsname): the fork child INHERITED that exact fd, so dup(n)
+ * works with ZERO per-process hook state. Processes holding the slot
+ * table (the creator) resolve identically via the table. */
 static int pty_open_slave(const char *path) {
     if (!path) return -2;
     static const char pfx[] = "/dev/pts/";
@@ -808,15 +811,19 @@ static int pty_open_slave(const char *path) {
      * "/dev/pts/ptmx") = not a slave-address form we serve: -2 lets the
      * caller fall through to the real open (never shadow foreign paths). */
     if (!any) return -2;
-    if (n < 0 || n >= TWOYI_PTY_SLOTS) return -1;
-    pty_init_slots();
-    if (g_pty_slave_fd[n] < 0) {
+    if (n < 0 || n >= 1024) return -1;
+    /* Verify n is a LIVE fd in THIS process (the inherited socket end).
+     * fcntl(n, F_GETFD) >= 0 proves it; a stale/guessed number fails
+     * cleanly instead of dup'ing something unrelated. */
+    long fcntl_ret = raw_syscall3(25 /* SYS_fcntl aarch64 */, (long)n,
+                                  1 /* F_GETFD */, 0);
+    if (fcntl_ret < 0) {
         write_str(2, "[twrp_fb_hook] pty slave open /dev/pts/");
         write_num(2, n);
-        write_str(2, " MISS (slot dead — opening from a process without the creating hook state?)\n");
+        write_str(2, " MISS (fd not live in this process)\n");
         return -1;
     }
-    long d = raw_syscall1(24 /* SYS_dup aarch64 */, (long)g_pty_slave_fd[n]);
+    long d = raw_syscall1(24 /* SYS_dup aarch64 */, (long)n);
     write_str(2, "[twrp_fb_hook] pty slave open /dev/pts/");
     write_num(2, n);
     write_str(2, " -> fd=");
@@ -835,9 +842,15 @@ static long pty_master_ioctl(int fd, unsigned req, unsigned long arg) {
         case 0x80045431u: /* TIOCGPTLCK */
             if (arg) *(int *)(long)arg = 0;
             return 0;
-        case 0x80045430u: /* TIOCGPTN — pty number */
-            if (arg) *(unsigned int *)(long)arg = (unsigned int)slot;
+        case 0x80045430u: { /* TIOCGPTN — pty number: the SLAVE FD
+                             * NUMBER (6-Z188f — matches ptsname). */
+            int slot = pty_slot_of_master(fd);
+            if (slot < 0) return -2;
+            if (arg)
+                *(unsigned int *)(long)arg =
+                    (unsigned int)g_pty_slave_fd[slot];
             return 0;
+        }
         case 0x540Eu:     /* TIOCSCTTY (asm-generic) */
             return 0;
         case 0x5413u: {   /* TIOCGWINSZ (asm-generic) */
@@ -2505,11 +2518,18 @@ char *ptsname(int fd) {
     static char name_buf[16];
     int slot = pty_slot_of_master(fd);
     if (slot < 0) return NULL;
+    /* 6-Z188f: the name carries the SLAVE FD NUMBER — the fork child
+     * inherited that exact fd, so its open("/dev/pts/<n>") dups it
+     * with zero per-process state (run 33128456506: the slot-table
+     * lookup MISSed in the child and the dup got faked -22). */
+    int slave = g_pty_slave_fd[slot];
+    if (slave < 0) return NULL;
     char *p = name_buf;
     const char *s = "/dev/pts/";
     while (*s) *p++ = *s++;
-    if (slot >= 10) *p++ = '0' + (slot / 10) % 10;
-    *p++ = '0' + slot % 10;
+    if (slave >= 100) *p++ = '0' + (slave / 100) % 10;
+    if (slave >= 10)  *p++ = '0' + (slave / 10) % 10;
+    *p++ = '0' + slave % 10;
     *p = '\0';
     write_str(2, "[twrp_fb_hook] ptsname(fd=");
     write_num(2, fd);
