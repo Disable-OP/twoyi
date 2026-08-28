@@ -177,3 +177,119 @@ images:
   # PitchBlack:      sourceforge.net/projects/pitchblack-twrp (same)
   # AOSP recovery:   built from source or extracted from factory images
   # OEM/stock:       factory images (angler N6P: developers.google.com)
+
+  # ── TWRP angler generation ladder completion (3.1 → 3.7) ──
+  - name: twrp-3.1.1-0-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "7.0"
+    tier: nightly
+    url: https://dl.twrp.me/angler/twrp-3.1.1-0-angler.img
+    referer: https://dl.twrp.me/angler/twrp-3.1.1-0-angler.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      3.1.x era (Android 7 base). Pre-ashmem-emulation, pre-dynamic-partition
+      generation. Fills the gap between 2.8.7 and 3.2.3 on the same device.
+
+  - name: twrp-3.3.1-0-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "9"
+    tier: nightly
+    url: https://dl.twrp.me/angler/twrp-3.3.1-0-angler.img
+    referer: https://dl.twrp.me/angler/twrp-3.3.1-0-angler.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      3.3.x era (Android 9 base). First generation with the modern property
+      area layout on many devices.
+
+  - name: twrp-3.5.2_9-0-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "10"
+    tier: nightly
+    url: https://dl.twrp.me/angler/twrp-3.5.2_9-0-angler.img
+    referer: https://dl.twrp.me/angler/twrp-3.5.2_9-0-angler.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      3.5.2_9 era (Android 9/10 base). Same device, one more linker/bionic
+      generation on the ladder to 3.7.0_9.
+
+  # ── SoC diversity: MediaTek / Exynos / Kirin / second Nexus ──
+  - name: twrp-3.5.2_9-0-flounder
+    family: TWRP
+    device: flounder
+    arch: arm64
+    generation: "10"
+    tier: nightly
+    url: https://dl.twrp.me/flounder/twrp-3.5.2_9-0-flounder.img
+    referer: https://dl.twrp.me/flounder/twrp-3.5.2_9-0-flounder.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      Nexus 9 (Tegra K1). A second Nexus-family device with a different SoC
+      vendor baseline than angler's Snapdragon.
+
+  - name: twrp-3.5.2_9-0-begonia
+    family: TWRP
+    device: begonia
+    arch: arm64
+    generation: "10"
+    tier: nightly
+    url: https://dl.twrp.me/begonia/twrp-3.5.2_9-0-begonia.img
+    referer: https://dl.twrp.me/begonia/twrp-3.5.2_9-0-begonia.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      Redmi Note 8 Pro (MediaTek Helio G90T). First MediaTek SoC in the
+      corpus — different ueventd.rc expectations, MTK-specific init services.
+
+  - name: twrp-3.7.0_9-0-merlin
+    family: TWRP
+    device: merlin
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/merlin/twrp-3.7.0_9-0-merlin.img
+    referer: https://dl.twrp.me/merlin/twrp-3.7.0_9-0-merlin.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      Redmi Note 9 (MediaTek Helio G85). A SECOND MediaTek device on the
+      modern 3.7.0_9 generation for SoC-family coverage at the top of the
+      ladder.
+
+  - name: twrp-3.7.0_9-0-starlte
+    family: TWRP
+    device: starlte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/starlte/twrp-3.7.0_9-0-starlte.img
+    referer: https://dl.twrp.me/starlte/twrp-3.7.0_9-0-starlte.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      Galaxy S9 (Samsung Exynos 9810). Samsung recoveries expect EMMC block
+      device naming (/dev/block/mmcblk*), RILD/OEM property sets, and Samsung
+      -specific fstab layouts.
+
+  - name: twrp-3.7.0_9-0-berkeley
+    family: TWRP
+    device: berkeley
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/berkeley/twrp-3.7.0_9-0-berkeley.img
+    referer: https://dl.twrp.me/berkeley/twrp-3.7.0_9-0-berkeley.img.html
+    md5: ""
+    sha256: ""
+    notes: >-
+      Honor View 10 (HiSilicon Kirin 970). Huawei's recovery layout: no
+      fastboot-recovery duality, Kirin-specific uevent/fstab assumptions.

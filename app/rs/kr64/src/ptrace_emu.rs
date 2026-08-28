@@ -9166,11 +9166,16 @@ pub fn run_ptrace_loop(
     // could be resolved NEITHER from open_fd_owner_paths NOR from the
     // /proc/<pid>/fd/<fd> readlink fallback (diagnostic only).
     let mut z198_unresolved_fstat: u32 = 0;
-    // 6-Z199: ENTRY-side arg1 stash — (pid → fd) captured at the ENTRY
-    // stop of close/fstat/fstat64, consumed by their EXIT arms. On
-    // aarch64 x0 is BOTH arg1 and the return register, so the fd is
-    // unrecoverable from the EXIT snapshot alone.
-    let mut pending_entry_fd: std::collections::HashMap<libc::pid_t, i64> =
+    // 6-Z199: ENTRY-side arg1 stash — (pid → (syscall_nr, fd)) captured
+    // at the ENTRY stop of fd-taking syscalls, consumed by their EXIT
+    // arms. On aarch64 x0 is BOTH arg1 and the return register, so the
+    // fd is unrecoverable from the EXIT snapshot alone. Round-5
+    // evidence (run 33192824519 OrangeFox): the 6-Z99 socket-family
+    // follow-up arms read "fd" = the RETURN value at EXIT — the
+    // setsockopt(SO_RCVBUFFORCE) EPERM fake never matched fd 5 →
+    // uevent_open_socket returned -1 → "Could not open uevent socket"
+    // FATAL even though the rewritten socket() had SUCCEEDED.
+    let mut pending_entry_fd: std::collections::HashMap<libc::pid_t, (i64, i64)> =
         std::collections::HashMap::new();
     // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
     // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
@@ -11674,19 +11679,44 @@ pub fn run_ptrace_loop(
                     //     registration instead of the closed fd's,
                     //     leaving every real registration stale (fd
                     //     recycling then maps OLD paths onto NEW fds).
+                    //   * the 6-Z99 socket-family follow-ups
+                    //     (bind/setsockopt/recv*/send*) read "fd" =
+                    //     the return value → the boot-critical fakes
+                    //     never matched (run 33192824519: OrangeFox's
+                    //     uevent setsockopt EPERM leaked through).
                     // On the x86 ABIs arg1 (rdi/ebx) is NOT the return
                     // register, so this never bit there — which is why
                     // the 6-Z121 fix verified fine on x86_64 (run
                     // 32745030268) but never fired on aarch64.
                     //
-                    // Stash arg1 at ENTRY — where x0 still holds the
-                    // argument — for exactly the syscalls whose EXIT
-                    // arms need the fd: close/fstat/fstat64.
-                    if syscall_num == abi.close_nr
-                        || (abi.fstat != -1 && syscall_num == abi.fstat)
-                        || (abi.fstat64 != -1 && syscall_num == abi.fstat64)
+                    // Stash (syscall_nr, arg1) at ENTRY — where x0
+                    // still holds the argument — for every fd-taking
+                    // syscall whose EXIT arms need the fd. The EXIT
+                    // consumers match on the syscall number so a
+                    // desynced/stale entry cannot be misattributed.
                     {
-                        pending_entry_fd.insert(pid, get_syscall_arg(&regs, abi.reg_arg1) as i64);
+                        let fd_taking = syscall_num == abi.close_nr
+                            || (abi.fstat != -1 && syscall_num == abi.fstat)
+                            || (abi.fstat64 != -1 && syscall_num == abi.fstat64)
+                            || (abi.bind_nr != -1 && syscall_num == abi.bind_nr)
+                            || (abi.listen_nr != -1 && syscall_num == abi.listen_nr)
+                            || (abi.setsockopt_nr != -1 && syscall_num == abi.setsockopt_nr)
+                            || (abi.getsockopt_nr != -1 && syscall_num == abi.getsockopt_nr)
+                            || (abi.shutdown_nr != -1 && syscall_num == abi.shutdown_nr)
+                            || (abi.connect_nr != -1 && syscall_num == abi.connect_nr)
+                            || (abi.sendto_nr != -1 && syscall_num == abi.sendto_nr)
+                            || (abi.sendmsg_nr != -1 && syscall_num == abi.sendmsg_nr)
+                            || (abi.recvfrom_nr != -1 && syscall_num == abi.recvfrom_nr)
+                            || (abi.recvmsg_nr != -1 && syscall_num == abi.recvmsg_nr)
+                            || (abi.write != -1 && syscall_num == abi.write)
+                            || (abi.writev_nr != -1 && syscall_num == abi.writev_nr)
+                            || (abi.read != -1 && syscall_num == abi.read);
+                        if fd_taking {
+                            pending_entry_fd.insert(
+                                pid,
+                                (syscall_num, get_syscall_arg(&regs, abi.reg_arg1) as i64),
+                            );
+                        }
                     }
 
                     // Record the syscall number in the rolling "all
@@ -15351,7 +15381,7 @@ pub fn run_ptrace_loop(
                     if syscall_num == abi.close_nr {
                         let stashed_closed_fd = pending_entry_fd.remove(&pid);
                         let closed_fd = match stashed_closed_fd {
-                            Some(fd) if fd >= 0 => fd as i32,
+                            Some((nr, fd)) if nr == syscall_num && fd >= 0 => fd as i32,
                             _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
                         };
                         let ret_c = get_syscall_arg(&regs, abi.reg_ret) as i64;
@@ -15858,7 +15888,7 @@ pub fn run_ptrace_loop(
                             // property area", run 33167135134).
                             let stashed_fd = pending_entry_fd.remove(&pid);
                             let fd = match stashed_fd {
-                                Some(f) if f >= 0 => f as i32,
+                                Some((nr, f)) if nr == syscall_num && f >= 0 => f as i32,
                                 _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
                             };
                             // 6-Z198: resolve the fd's file BOTH from the
@@ -15965,7 +15995,7 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                             }
-                            if let Some(p) = resolved_path {
+                            if let Some(ref p) = resolved_path {
                                 if resolved_is_property_file {
                                     if let Some((mode_off, uid_off, gid_off)) =
                                         stat_ownership_layout(abi.fstat)
@@ -16014,6 +16044,73 @@ pub fn run_ptrace_loop(
                                                         ));
                                                     }
                                                 }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // ── 6-Z203b: ashmem stand-in fstat →
+                                // CHARACTER-DEVICE virtualization ──
+                                //
+                                // Android 10/11 libcutils'
+                                // __ashmem_open_locked() VALIDATES the fd
+                                // right after opening /dev/ashmem:
+                                //   fstat(fd, &st);
+                                //   if (!S_ISCHR(st.st_mode) || !st.st_rdev) {
+                                //       close(fd); errno = ENOTTY; return -1;
+                                //   }
+                                // Our /dev/ashmem is a REGULAR FILE
+                                // stand-in → the check fails → errno=ENOTTY
+                                // → ashmem_create_region returns -1 →
+                                // "Creating code cache, ashmem_create_region
+                                // failed with error 'Not a typewriter'" →
+                                // LOG_ALWAYS_FATAL_IF abort (run 33192826927
+                                // whyred, frozen at splash). NOTE: no ioctl
+                                // ever executes — the ENOTTY is SET BY
+                                // LIBCUTILS, not by a failed ioctl. Rewrite
+                                // the statbuf so the guest sees a char
+                                // device with a nonzero st_rdev, exactly
+                                // like the real /dev/ashmem misc device.
+                                if let Some(p) = resolved_path.as_deref() {
+                                    if is_ashmem_backing_path(p) {
+                                        let mode_off = match stat_ownership_layout(abi.fstat) {
+                                            Some((m, _, _)) => m,
+                                            None => 0,
+                                        };
+                                        let rdev_off = if abi.fstat == 5 {
+                                            40 // x86_64 st_rdev
+                                        } else {
+                                            32 // aarch64 st_rdev
+                                        };
+                                        let buf = get_syscall_arg(&regs, abi.reg_arg2);
+                                        if buf != 0 {
+                                            if let Some(bytes) =
+                                                read_child_bytes(pid, buf, rdev_off + 8)
+                                            {
+                                                let mode = u32::from_ne_bytes(
+                                                    bytes[mode_off..mode_off + 4]
+                                                        .try_into()
+                                                        .unwrap_or([0u8; 4]),
+                                                );
+                                                const S_IFMT_MASK: u32 = 0o170000;
+                                                const S_IFCHR_BITS: u32 = 0o020000;
+                                                let new_mode = (mode & !S_IFMT_MASK) | S_IFCHR_BITS;
+                                                let mut patched = bytes.clone();
+                                                patched[mode_off..mode_off + 4]
+                                                    .copy_from_slice(&new_mode.to_ne_bytes());
+                                                // st_rdev = makedev(10, 1) — the misc
+                                                // major, any nonzero minor.
+                                                patched[rdev_off..rdev_off + 8]
+                                                    .copy_from_slice(&0x0a01u64.to_ne_bytes());
+                                                let wrote = write_child_bytes_pokedata(
+                                                    pid,
+                                                    buf + mode_off as u64,
+                                                    &patched[mode_off..rdev_off + 8],
+                                                );
+                                                log(&format!(
+                                                "6-Z203b: fstat(fd={}) on {} -> virtualized S_IFCHR char device (mode {:#o} -> {:#o}, rdev 0x0a01; wrote {} bytes) — libcutils' ashmem S_ISCHR check passes (6-Z203)",
+                                                fd, p, mode, new_mode, wrote
+                                            ));
                                             }
                                         }
                                     }
@@ -18430,7 +18527,20 @@ pub fn run_ptrace_loop(
                             | NetlinkOp::GetSockOpt
                             | NetlinkOp::Fcntl
                             | NetlinkOp::Close => {
-                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                // 6-Z199: the fd comes from the ENTRY-side
+                                // stash — on aarch64 reg_arg1 (x0) at the
+                                // EXIT stop is the RETURN value, so the
+                                // register read never matched the fd and
+                                // the boot-critical setsockopt/bind fakes
+                                // silently never fired (run 33192824519:
+                                // uevent_open_socket's SO_RCVBUFFORCE
+                                // EPERM leaked → "Could not open uevent
+                                // socket" FATAL despite the rewritten
+                                // socket() having SUCCEEDED).
+                                let fd = match pending_entry_fd.get(&pid) {
+                                    Some((nr, f)) if *nr == syscall_num => *f,
+                                    _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                                };
                                 if fake_netlink_fds
                                     .get(&pid)
                                     .map_or(false, |s| s.contains(&fd))
@@ -18510,7 +18620,11 @@ pub fn run_ptrace_loop(
                                 }
                             }
                             NetlinkOp::RecvFrom | NetlinkOp::RecvMsg => {
-                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
+                                let fd = match pending_entry_fd.get(&pid) {
+                                    Some((nr, f)) if *nr == syscall_num => *f,
+                                    _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                                };
                                 if fake_netlink_fds
                                     .get(&pid)
                                     .map_or(false, |s| s.contains(&fd))
@@ -18535,7 +18649,11 @@ pub fn run_ptrace_loop(
                                 }
                             }
                             NetlinkOp::SendTo | NetlinkOp::SendMsg => {
-                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
+                                let fd = match pending_entry_fd.get(&pid) {
+                                    Some((nr, f)) if *nr == syscall_num => *f,
+                                    _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                                };
                                 if fake_netlink_fds
                                     .get(&pid)
                                     .map_or(false, |s| s.contains(&fd))
