@@ -150,11 +150,30 @@ images:
     sha256: ""
     notes: >-
       OrangeFox R12.0 stable (zip, 68MB; workflow extracts recovery.img).
-      First non-TWRP family in the corpus.
+      First non-TWRP family in the corpus. Symlink-init (/init ->
+      /system/bin/init, dynamic, PT_INTERP=/system/bin/linker64) — the
+      6-Z196 PT_INTERP + rootfs-first-lib fixes target exactly this shape.
+
+  # ── LineageOS recovery-in-boot (newest generation, A/B) ──
+  - name: lineage-22.2-sailfish
+    family: Lineage
+    device: sailfish
+    arch: arm64
+    generation: "15"
+    tier: pr
+    url: https://mirrorbits.lineageos.org/full/sailfish/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: be5fe3e3ba1aa07e172030325e7e1cb264d06997b8727744e171bda7527907c5
+    notes: >-
+      LineageOS 22.2 nightly (Android 15, SDK 35). A/B recovery-in-boot:
+      the boot.img ramdisk IS the recovery (init.recovery.sailfish.rc,
+      xz-compressed ramdisk, dynamic binaries with
+      PT_INTERP=/system/bin/linker64). The newest generation in the
+      corpus — exercises the Android-15 init + linker expectations.
 
   # ── future expansions (URLs verified as CI proves them) ──
-  # SHRP / SkyHawk:  sourceforge.net/projects/shrp-project (verify from runner)
-  # Lineage recovery: download.lineageos.org (recovery.img inside OTA zip)
-  # PitchBlack:      sourceforge.net/projects/pitchblack-twrp
+  # SHRP / SkyHawk:  sourceforge.net/projects/shrp-project (SF unreachable from the dev box — verify from the CI runner)
+  # PitchBlack:      sourceforge.net/projects/pitchblack-twrp (same)
   # AOSP recovery:   built from source or extracted from factory images
   # OEM/stock:       factory images (angler N6P: developers.google.com)

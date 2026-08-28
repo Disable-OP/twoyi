@@ -244,14 +244,27 @@ def detect_family(files: dict, cmdline: str):
     if any("shrp" in n.lower() for n in names) or b"SkyHawk" in text or \
             b"SHRP" in text:
         fam["family"] = "SHRP"
-    if fam["family"] in ("unknown",) and "init.rc" in names:
-        rc = files["init.rc"][2]
-        if rc:
-            t = rc.decode("utf-8", "replace")
-            if "LineageOS" in t or "lineage" in t:
-                fam["family"] = "Lineage"
-            else:
-                fam["family"] = "AOSP-like"
+    # Lineage recovery-in-boot (A/B): init.recovery.<device>.rc at the
+    # ramdisk root + no twres/fox markers; the boot.img ramdisk IS the
+    # recovery. Verified on lineage-22.2-20260823-nightly-sailfish.
+    if fam["family"] in ("unknown",):
+        if any(n.startswith("init.recovery.") and n.endswith(".rc")
+               for n in names):
+            fam["family"] = "Lineage"
+            for cand in ("default.prop", "prop.default"):
+                if cand in files and files[cand][2]:
+                    t = files[cand][2].decode("utf-8", "replace")
+                    for line in t.splitlines():
+                        if "ro.lineage.build.version" in line and "=" in line:
+                            fam["version"] = line.split("=", 1)[1].strip()
+        elif "init.rc" in names:
+            rc = files["init.rc"][2]
+            if rc:
+                t = rc.decode("utf-8", "replace")
+                if "LineageOS" in t or "lineage" in t:
+                    fam["family"] = "Lineage"
+                else:
+                    fam["family"] = "AOSP-like"
     return fam
 
 
