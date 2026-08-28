@@ -676,6 +676,19 @@ jobs:
             > /tmp/ui-e2e-artifacts/container-state.txt 2>&1 || true
           exit $RC
 
+      # §27/§33: machine-readable result classification — turns the raw
+      # evidence into result.json INSIDE the artifact so downstream
+      # aggregation (the compatibility dashboard) never re-parses logs.
+      - name: Classify result (machine-readable)
+        if: always()
+        run: |
+          python3 scripts/recovery-corpus/classify_result.py \
+            /tmp/ui-e2e-artifacts \
+            /tmp/ui-e2e-artifacts/result.json \
+            > /tmp/ui-e2e-artifacts/result-pretty.json 2>&1 || true
+          echo "── result.json ──"
+          cat /tmp/ui-e2e-artifacts/result.json || true
+
       - name: Pack artifacts
         if: always()
         run: |
