@@ -422,6 +422,87 @@ public final class RomManager {
         return initSidecar.exists();
     }
 
+    /**
+     * 6-Z209b: detect whether the imported recovery is TWRP-style
+     * (use {@code --boot-recovery} kr64 mode) or AOSP-style (use the
+     * normal AOSP boot path with init_path=/system/bin/init).
+     *
+     * TWRP-style layout — use --boot-recovery:
+     *   - /init is a regular file (TWRP statically-linked init), OR
+     *   - /sbin/recovery exists (TWRP's recovery binary)
+     *
+     * AOSP-style layout — do NOT use --boot-recovery:
+     *   - /init is a .symlink sidecar (modern OrangeFox, AOSP, Lineage
+     *     recovery-in-boot), AND
+     *   - /sbin/recovery doesn't exist (the recovery binary is at
+     *     /system/bin/recovery, not /sbin/recovery)
+     *
+     * The 6-Z207 round-7 OrangeFox R12.0 lavender failure (run 33206081307):
+     * the CI test forced Boot to Recovery ON for an AOSP-style recovery,
+     * kr64 set init_path=/init AND enabled TWRP-specific staging (which
+     * tries to stage /sbin/recovery → ENOENT because /sbin/recovery
+     * doesn't exist in OrangeFox), and the traced init execve'd the
+     * staged path /data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_
+     * recovery_<hash> which doesn't exist → child exited 127 → boot
+     * never reached the recovery UI.
+     *
+     * Auto-detection happens after the RamdiskImporter finishes (so
+     * the .symlink sidecars exist for the sidecar form check) and
+     * BEFORE the Settings UI is shown (so the user sees the correct
+     * checkbox state for their imported recovery).
+     *
+     * Master prompt §22 (no device-specific hacks): the detection is
+     * based on actual filesystem structure (file vs. sidecar; /sbin/
+     * recovery present vs. absent), NOT on device name / recovery
+     * version / family string. Any recovery that ships /init as a
+     * symlink AND /system/bin/recovery as the binary will be correctly
+     * classified as AOSP-style — this covers OrangeFox R12, modern
+     * TWRP-with-symlink-init, Lineage recovery-in-boot, AOSP recovery,
+     * and any future recovery that follows the same layout convention.
+     */
+    public static boolean isTwrpLayout(Context context) {
+        File rootfs = getRootfsDir(context);
+        // TWRP-style: /init is a regular file (statically-linked init).
+        // Java's File.exists() follows symlinks; for a .symlink sidecar
+        // (which is a TEXT file, not a symlink), File.exists() returns
+        // false because the sidecar is named "init.symlink" not "init".
+        File initFile = new File(rootfs, "init");
+        if (initFile.exists()) {
+            return true;
+        }
+        // TWRP-style: /sbin/recovery exists (as a regular file OR a
+        // .symlink sidecar — TWRP sometimes ships recovery as a real
+        // file, sometimes as a symlink; either counts as TWRP).
+        File sbinRecovery = new File(rootfs, "sbin/recovery");
+        if (sbinRecovery.exists()) {
+            return true;
+        }
+        File sbinRecoverySidecar = new File(rootfs, "sbin/recovery.symlink");
+        if (sbinRecoverySidecar.exists()) {
+            return true;
+        }
+        // AOSP-style: /init is a .symlink sidecar AND /sbin/recovery
+        // is absent — the recovery binary lives at /system/bin/recovery.
+        return false;
+    }
+
+    /**
+     * 6-Z209b: auto-set the boot_recovery preference based on the
+     * imported recovery's layout. Called after a successful import
+     * so the user doesn't have to manually toggle the checkbox (and
+     * so CI tests that just import + launch don't accidentally force
+     * the wrong boot mode).
+     */
+    public static void autoSetBootRecovery(Context context) {
+        boolean isTwrp = isTwrpLayout(context);
+        boolean current = ProfileSettings.isBootRecoveryEnabled(context);
+        if (current != isTwrp) {
+            ProfileSettings.setBootRecovery(context, isTwrp);
+            Log.i(TAG, "6-Z209b: auto-set boot_recovery=" + isTwrp
+                + " (was " + current + ") based on the imported recovery layout");
+        }
+    }
+
     public static boolean needsUpgrade(Context context) {
         // No longer supporting automatic upgrades from assets
         return false;

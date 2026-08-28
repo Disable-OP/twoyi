@@ -8,7 +8,7 @@ Simulates a real user navigating the app entirely via UI taps:
   3. Tap it → file picker opens
   4. Navigate file picker to /sdcard/Download/ → tap recovery.img
   5. Wait for import to complete
-  6. Scroll to find "Boot to Recovery" checkbox → enable it
+  6. Scroll to find "Boot to Recovery" checkbox → VERIFY its state (auto-set by app — 6-Z209b: do NOT force-enable for non-TWRP recoveries)
   7. Scroll back to top → tap "Launch Container"
   8. Wait for boot, taking screenshots every 5s to capture the TWRP screen
   9. Pull app logs
@@ -1478,26 +1478,37 @@ def main():
     print("  ✓ ROM import verified — continuing to Step 5.")
 
     # ─────────────────────────────────────────────
-    # Step 5: Enable "Boot to Recovery" checkbox
+    # Step 5: VERIFY "Boot to Recovery" checkbox state (do NOT force)
     # ─────────────────────────────────────────────
     print()
     print("=" * 60)
-    print('  Step 5: Enable "Boot to Recovery" checkbox')
+    print('  Step 5: Verify "Boot to Recovery" checkbox state (auto-set by app)')
     print("=" * 60)
-    # We should be back on SettingsActivity now. Scroll to find it.
+    # 6-Z209b: the Twoyi app auto-sets boot_recovery based on the
+    # imported recovery's layout (RomManager.autoSetBootRecovery
+    # called from SettingsActivity.importRomForActiveProfile right
+    # after the staging→live rename). TWRP-style (/init regular file
+    # OR /sbin/recovery present) → boot_recovery=true; AOSP-style
+    # (/init symlink + /system/bin/recovery) → boot_recovery=false.
+    #
+    # Previously this step FORCE-ENABLED the checkbox for every
+    # recovery, which broke AOSP-style recoveries (OrangeFox R12
+    # lavender run 33206081307): kr64 with --boot-recovery tried to
+    # stage /sbin/recovery → ENOENT (OrangeFox ships /system/bin/
+    # recovery instead) → child exited 127 → recovery UI never
+    # rendered.
+    #
+    # Now we only READ the checkbox state to confirm the app's
+    # auto-detection worked. If the user (or the app) had it set
+    # the other way, we DO NOT override — the app's auto-detection
+    # is authoritative for the imported recovery's layout.
     result = scroll_to_find("Boot to Recovery", max_scrolls=5, exact=False)
     if result:
         cx, cy, node = result
         checked = node.get("checked", "false")
-        print(f"  Found 'Boot to Recovery' at ({cx}, {cy}), checked={checked}")
-        if checked == "false":
-            print("  Tapping to enable")
-            tap(cx, cy)
-            wait(1)
-        else:
-            print("  Already enabled")
+        print(f"  Found 'Boot to Recovery' at ({cx}, {cy}), checked={checked} (auto-set by app — not overriding)")
     else:
-        print("  ✗ Could not find 'Boot to Recovery'")
+        print("  ⚠ Could not find 'Boot to Recovery' (may have scrolled off — the app's auto-set still applies)")
 
     # ─────────────────────────────────────────────
     # Step 6: Scroll to top and tap "Launch Container"
