@@ -13094,3 +13094,52 @@ Stage Summary:
   root cause identified by 6-Z206 + iterate the corpus expansion
   (scrape OrangeFox's release feed + LineageOS boot.imgs to push
   toward 1000+ entries).
+
+---
+Task ID: 6-Z206b — corpus expansion 151→597 (round 6 continued)
+Agent: main
+Task: Continue corpus growth toward the 900/1000 boot-rate target
+while the round-6 CI runs.
+
+Work Log:
+- Scraped OrangeFox's full device catalog via parallel fetches of all
+  150 /device/<id>/ pages on orangefox.download — extracted each
+  device's codename from the page <title> + the latest release ID
+  (the first /release/<id>/ link). The download URL pattern is
+  https://api.orangefox.download/release/<id>/dl — direct zip
+  download; the CI workflow's zip-extraction step (already in
+  ui-e2e-test-arm64.yml line 380-386) handles the recovery.img
+  extraction. Added 150 NEW OrangeFox entries to the manifest.
+- Scraped LineageOS recovery-in-boot catalog via the
+  download.lineageos.org/api/v2/devices/<codename>/builds JSON
+  endpoint — the API returns the build list with sha256, filename,
+  and direct URL for every file in the build (boot.img, dtbo.img,
+  init_boot.img, vendor_boot.img). For each of the 565 LineageOS
+  devices listed at wiki.lineageos.org/devices/, fetched the latest
+  build + extracted boot.img URL (falling back to vendor_boot.img
+  / init_boot.img for newer A/B devices that ship recovery-in-boot
+  there). 296 devices returned a usable boot.img — added each as
+  a manifest entry. (The other 269 are either retired from the
+  active build list or only ship vendor_boot recovery we'd need a
+  different extractor for — left for a follow-up round.)
+- Manifest growth: 19 → 151 (commit 008a1ce) → 597 (this commit).
+  Distribution: 149 TWRP + 151 OrangeFox + 297 Lineage.
+  All new entries are tier=nightly (PR tier stays the curated 5).
+
+Stage Summary:
+- 597 corpus entries is 31x the original 19; the nightly workflow
+  now has the broadest coverage Twoyi has ever had. Even at ~15
+  GHA minutes per E2E run, the corpus is bounded by the nightly
+  job's 180-minute dashboard timeout — dispatch_corpus.sh will
+  need to wave through the entries sequentially per concurrency
+  group (per §18: "Test recoveries one by one where resource
+  constraints require sequential execution").
+- Round-6 CI still in_progress on the OrangeFox (with 6-Z206
+  DIAG) + angler regression + 5 sample nightly entries (enchilada
+  + fajita + cepheus + raphael + starlte). Two of the 5 samples
+  failed: enchilada 404'd (my dispatch used the wrong URL — the
+  manifest has the correct 3.7.0_11-0 URL); starlte timed out at
+  UI navigation (no ROM was imported — the recovery.img was
+  downloaded fine but the UI navigation script aborted at the
+  "abort_no_rom" check; needs investigation — could be a UI
+  script issue specific to certain TWRP versions).
