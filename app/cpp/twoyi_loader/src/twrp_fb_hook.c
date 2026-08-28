@@ -319,6 +319,24 @@ static long raw_syscall3_marked(long num, long a, long b, long c) {
     return raw_syscall4_marked(num, a, b, c, 0);
 }
 
+/* 6-Z188j: 5-arg MARKED syscall (getsockopt) — same marker contract. */
+static long raw_syscall5_marked(long num, long a, long b, long c, long d, long e) {
+    register long x8 __asm__("x8") = num;
+    register long x0 __asm__("x0") = a;
+    register long x1 __asm__("x1") = b;
+    register long x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d;
+    register long x4 __asm__("x4") = e;
+    register long x6 __asm__("x6") = (long)TWOYI_SYSCALL_MARK;
+    __asm__ volatile (
+        "svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x6)
+        : "memory"
+    );
+    return x0;
+}
+
 #else
 #error "twrp_fb_hook.c: unsupported architecture (need __i386__ or __aarch64__)"
 #endif
@@ -708,6 +726,22 @@ static int pty_is_slave_fd(int fd) {
     return (g_pty_slave_fds[fd >> 3] >> (fd & 7)) & 1;
 }
 
+/* 6-Z188j: STATELESS slave detection — is `fd` a connected unix stream
+ * socket? After execve("/sbin/sh") the hook state RESETS (fresh
+ * constructor, empty bitmaps — run 33130609939: "ioctl(fd=0, 0x5401)
+ * [trk=0]" in the sh process, isatty failed again). But the fds
+ * THEMSELVES survive exec: a raw getsockopt(SO_TYPE) succeeds exactly
+ * on sockets, and inside the recovery sandbox the only stream sockets
+ * on stdio are our pty ends. No state, exec-proof, generic. */
+static int pty_fd_is_stream_socket(int fd) {
+    long val = 0;
+    long len = 4;
+    long r = raw_syscall5_marked(209 /* SYS_getsockopt aarch64 */,
+                                 (long)fd, 1 /*SOL_SOCKET*/, 3 /*SO_TYPE*/,
+                                 (long)&val, (long)&len);
+    return (r == 0 && val == 1 /*SOCK_STREAM*/) ? 1 : 0;
+}
+
 static void pty_init_slots(void) {
     static int inited = 0;
     if (!inited) {
@@ -876,8 +910,12 @@ static int pty_open_slave(const char *path) {
  * bare cursor). Answer TCGETS with a sane cooked termios (isatty==1
  * => interactive ash => prompt) and accept the TCSETS family. ── */
 static long pty_slave_ioctl(int fd, unsigned req, unsigned long arg) {
-    if (!pty_is_slave_fd(fd)) {
-        if (pty_slot_of_master(fd) < 0) return -2;
+    /* 6-Z188j: bitmap first (pre-exec processes), then the STATELESS
+     * socket check (post-exec processes like the shell itself). */
+    if (!pty_is_slave_fd(fd)
+        && pty_slot_of_master(fd) < 0
+        && !pty_fd_is_stream_socket(fd)) {
+        return -2;
     }
     switch (req) {
         case 0x5401u: { /* TCGETS */
