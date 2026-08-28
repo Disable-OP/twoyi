@@ -293,3 +293,1719 @@ images:
     notes: >-
       Honor View 10 (HiSilicon Kirin 970). Huawei's recovery layout: no
       fastboot-recovery duality, Kirin-specific uevent/fstab assumptions.
+  - name: twrp-3.2.3-1-NB1
+    family: TWRP
+    device: NB1
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/NB1/twrp-3.2.3-1-NB1.img
+    referer: "https://dl.twrp.me/NB1/twrp-3.2.3-1-NB1.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: NB1, latest version 3.2.3-1).
+
+  - name: twrp-3.3.1-1-PL2
+    family: TWRP
+    device: PL2
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/PL2/twrp-3.3.1-1-PL2.img
+    referer: "https://dl.twrp.me/PL2/twrp-3.3.1-1-PL2.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: PL2, latest version 3.3.1-1).
+
+  - name: twrp-3.7.0_9-0-PLE
+    family: TWRP
+    device: PLE
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/PLE/twrp-3.7.0_9-0-PLE.img
+    referer: "https://dl.twrp.me/PLE/twrp-3.7.0_9-0-PLE.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: PLE, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-Z00T
+    family: TWRP
+    device: Z00T
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/Z00T/twrp-3.7.0_9-0-Z00T.img
+    referer: "https://dl.twrp.me/Z00T/twrp-3.7.0_9-0-Z00T.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: Z00T, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-Z01RD
+    family: TWRP
+    device: Z01RD
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/Z01RD/twrp-3.7.1_12-0-Z01RD.img
+    referer: "https://dl.twrp.me/Z01RD/twrp-3.7.1_12-0-Z01RD.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: Z01RD, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-a30
+    family: TWRP
+    device: a30
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/a30/twrp-3.7.0_9-0-a30.img
+    referer: "https://dl.twrp.me/a30/twrp-3.7.0_9-0-a30.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: a30, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-a40
+    family: TWRP
+    device: a40
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/a40/twrp-3.7.0_9-0-a40.img
+    referer: "https://dl.twrp.me/a40/twrp-3.7.0_9-0-a40.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: a40, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-a5xelte
+    family: TWRP
+    device: a5xelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/a5xelte/twrp-3.7.0_9-0-a5xelte.img
+    referer: "https://dl.twrp.me/a5xelte/twrp-3.7.0_9-0-a5xelte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: a5xelte, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-a70q
+    family: TWRP
+    device: a70q
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/a70q/twrp-3.7.0_9-0-a70q.img
+    referer: "https://dl.twrp.me/a70q/twrp-3.7.0_9-0-a70q.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: a70q, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-a7xelte
+    family: TWRP
+    device: a7xelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/a7xelte/twrp-3.7.0_9-0-a7xelte.img
+    referer: "https://dl.twrp.me/a7xelte/twrp-3.7.0_9-0-a7xelte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: a7xelte, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-addison
+    family: TWRP
+    device: addison
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/addison/twrp-3.7.0_9-0-addison.img
+    referer: "https://dl.twrp.me/addison/twrp-3.7.0_9-0-addison.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: addison, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-ali
+    family: TWRP
+    device: ali
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/ali/twrp-3.7.0_9-0-ali.img
+    referer: "https://dl.twrp.me/ali/twrp-3.7.0_9-0-ali.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: ali, latest version 3.7.0_9-0).
+
+  - name: twrp-3.2.1-0-athene
+    family: TWRP
+    device: athene
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/athene/twrp-3.2.1-0-athene.img
+    referer: "https://dl.twrp.me/athene/twrp-3.2.1-0-athene.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: athene, latest version 3.2.1-0).
+
+  - name: twrp-3.6.2_9-0-bacon
+    family: TWRP
+    device: bacon
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/bacon/twrp-3.6.2_9-0-bacon.img
+    referer: "https://dl.twrp.me/bacon/twrp-3.6.2_9-0-bacon.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: bacon, latest version 3.6.2_9-0).
+
+  - name: twrp-3.7.0_9-0-begonia
+    family: TWRP
+    device: begonia
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/begonia/twrp-3.7.0_9-0-begonia.img
+    referer: "https://dl.twrp.me/begonia/twrp-3.7.0_9-0-begonia.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: begonia, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-berlin
+    family: TWRP
+    device: berlin
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/berlin/twrp-3.7.0_9-0-berlin.img
+    referer: "https://dl.twrp.me/berlin/twrp-3.7.0_9-0-berlin.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: berlin, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-beryllium
+    family: TWRP
+    device: beryllium
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/beryllium/twrp-3.7.0_9-0-beryllium.img
+    referer: "https://dl.twrp.me/beryllium/twrp-3.7.0_9-0-beryllium.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: beryllium, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-1-beyondx
+    family: TWRP
+    device: beyondx
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/beyondx/twrp-3.7.0_9-1-beyondx.img
+    referer: "https://dl.twrp.me/beyondx/twrp-3.7.0_9-1-beyondx.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: beyondx, latest version 3.7.0_9-1).
+
+  - name: twrp-3.7.1_12-0-blueline
+    family: TWRP
+    device: blueline
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/blueline/twrp-3.7.1_12-0-blueline.img
+    referer: "https://dl.twrp.me/blueline/twrp-3.7.1_12-0-blueline.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: blueline, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.1_12-1-bonito
+    family: TWRP
+    device: bonito
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/bonito/twrp-3.7.1_12-1-bonito.img
+    referer: "https://dl.twrp.me/bonito/twrp-3.7.1_12-1-bonito.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: bonito, latest version 3.7.1_12-1).
+
+  - name: twrp-3.7.0_9-0-cactus
+    family: TWRP
+    device: cactus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/cactus/twrp-3.7.0_9-0-cactus.img
+    referer: "https://dl.twrp.me/cactus/twrp-3.7.0_9-0-cactus.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: cactus, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-capricorn
+    family: TWRP
+    device: capricorn
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/capricorn/twrp-3.7.0_9-0-capricorn.img
+    referer: "https://dl.twrp.me/capricorn/twrp-3.7.0_9-0-capricorn.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: capricorn, latest version 3.7.0_9-0).
+
+  - name: twrp-3.5.2_9-0-cedric
+    family: TWRP
+    device: cedric
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/cedric/twrp-3.5.2_9-0-cedric.img
+    referer: "https://dl.twrp.me/cedric/twrp-3.5.2_9-0-cedric.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: cedric, latest version 3.5.2_9-0).
+
+  - name: twrp-3.5.2_9-0-cepheus
+    family: TWRP
+    device: cepheus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/cepheus/twrp-3.5.2_9-0-cepheus.img
+    referer: "https://dl.twrp.me/cepheus/twrp-3.5.2_9-0-cepheus.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: cepheus, latest version 3.5.2_9-0).
+
+  - name: twrp-3.4.0-1-cheeseburger
+    family: TWRP
+    device: cheeseburger
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/cheeseburger/twrp-3.4.0-1-cheeseburger.img
+    referer: "https://dl.twrp.me/cheeseburger/twrp-3.4.0-1-cheeseburger.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: cheeseburger, latest version 3.4.0-1).
+
+  - name: twrp-3.7.0_9-0-cherry
+    family: TWRP
+    device: cherry
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/cherry/twrp-3.7.0_9-0-cherry.img
+    referer: "https://dl.twrp.me/cherry/twrp-3.7.0_9-0-cherry.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: cherry, latest version 3.7.0_9-0).
+
+  - name: twrp-3.3.1-1-chiron
+    family: TWRP
+    device: chiron
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/chiron/twrp-3.3.1-1-chiron.img
+    referer: "https://dl.twrp.me/chiron/twrp-3.3.1-1-chiron.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: chiron, latest version 3.3.1-1).
+
+  - name: twrp-3.7.0_9-0-clark
+    family: TWRP
+    device: clark
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/clark/twrp-3.7.0_9-0-clark.img
+    referer: "https://dl.twrp.me/clark/twrp-3.7.0_9-0-clark.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: clark, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-coral
+    family: TWRP
+    device: coral
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/coral/twrp-3.7.1_12-0-coral.img
+    referer: "https://dl.twrp.me/coral/twrp-3.7.1_12-0-coral.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: coral, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.1_12-0-crosshatch
+    family: TWRP
+    device: crosshatch
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/crosshatch/twrp-3.7.1_12-0-crosshatch.img
+    referer: "https://dl.twrp.me/crosshatch/twrp-3.7.1_12-0-crosshatch.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: crosshatch, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-1-d1
+    family: TWRP
+    device: d1
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/d1/twrp-3.7.0_9-1-d1.img
+    referer: "https://dl.twrp.me/d1/twrp-3.7.0_9-1-d1.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: d1, latest version 3.7.0_9-1).
+
+  - name: twrp-3.7.0_9-1-d1x
+    family: TWRP
+    device: d1x
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/d1x/twrp-3.7.0_9-1-d1x.img
+    referer: "https://dl.twrp.me/d1x/twrp-3.7.0_9-1-d1x.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: d1x, latest version 3.7.0_9-1).
+
+  - name: twrp-3.7.0_9-1-d2s
+    family: TWRP
+    device: d2s
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/d2s/twrp-3.7.0_9-1-d2s.img
+    referer: "https://dl.twrp.me/d2s/twrp-3.7.0_9-1-d2s.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: d2s, latest version 3.7.0_9-1).
+
+  - name: twrp-3.7.0_9-0-dipper
+    family: TWRP
+    device: dipper
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/dipper/twrp-3.7.0_9-0-dipper.img
+    referer: "https://dl.twrp.me/dipper/twrp-3.7.0_9-0-dipper.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: dipper, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-discovery
+    family: TWRP
+    device: discovery
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/discovery/twrp-3.7.0_9-0-discovery.img
+    referer: "https://dl.twrp.me/discovery/twrp-3.7.0_9-0-discovery.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: discovery, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-dora
+    family: TWRP
+    device: dora
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/dora/twrp-3.7.0_9-0-dora.img
+    referer: "https://dl.twrp.me/dora/twrp-3.7.0_9-0-dora.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: dora, latest version 3.7.0_9-0).
+
+  - name: twrp-3.5.1_9-0-dumpling
+    family: TWRP
+    device: dumpling
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/dumpling/twrp-3.5.1_9-0-dumpling.img
+    referer: "https://dl.twrp.me/dumpling/twrp-3.5.1_9-0-dumpling.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: dumpling, latest version 3.5.1_9-0).
+
+  - name: twrp-3.7.0_11-0-enchilada
+    family: TWRP
+    device: enchilada
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/enchilada/twrp-3.7.0_11-0-enchilada.img
+    referer: "https://dl.twrp.me/enchilada/twrp-3.7.0_11-0-enchilada.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: enchilada, latest version 3.7.0_11-0).
+
+  - name: twrp-3.5.2_10-0-equuleus
+    family: TWRP
+    device: equuleus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/equuleus/twrp-3.5.2_10-0-equuleus.img
+    referer: "https://dl.twrp.me/equuleus/twrp-3.5.2_10-0-equuleus.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: equuleus, latest version 3.5.2_10-0).
+
+  - name: twrp-3.7.0_9-0-evert
+    family: TWRP
+    device: evert
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/evert/twrp-3.7.0_9-0-evert.img
+    referer: "https://dl.twrp.me/evert/twrp-3.7.0_9-0-evert.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: evert, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-fajita
+    family: TWRP
+    device: fajita
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/fajita/twrp-3.7.0_9-0-fajita.img
+    referer: "https://dl.twrp.me/fajita/twrp-3.7.0_9-0-fajita.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: fajita, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-flame
+    family: TWRP
+    device: flame
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/flame/twrp-3.7.1_12-0-flame.img
+    referer: "https://dl.twrp.me/flame/twrp-3.7.1_12-0-flame.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: flame, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-flounder
+    family: TWRP
+    device: flounder
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/flounder/twrp-3.7.0_9-0-flounder.img
+    referer: "https://dl.twrp.me/flounder/twrp-3.7.0_9-0-flounder.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: flounder, latest version 3.7.0_9-0).
+
+  - name: twrp-3.6.0_9-0-fugu
+    family: TWRP
+    device: fugu
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/fugu/twrp-3.6.0_9-0-fugu.img
+    referer: "https://dl.twrp.me/fugu/twrp-3.6.0_9-0-fugu.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: fugu, latest version 3.6.0_9-0).
+
+  - name: twrp-3.7.0_9-0-g4
+    family: TWRP
+    device: g4
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/g4/twrp-3.7.0_9-0-g4.img
+    referer: "https://dl.twrp.me/g4/twrp-3.7.0_9-0-g4.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: g4, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-ginkgo
+    family: TWRP
+    device: ginkgo
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/ginkgo/twrp-3.7.1_12-0-ginkgo.img
+    referer: "https://dl.twrp.me/ginkgo/twrp-3.7.1_12-0-ginkgo.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: ginkgo, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-gracelte
+    family: TWRP
+    device: gracelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/gracelte/twrp-3.7.0_9-0-gracelte.img
+    referer: "https://dl.twrp.me/gracelte/twrp-3.7.0_9-0-gracelte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: gracelte, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-greatlte
+    family: TWRP
+    device: greatlte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/greatlte/twrp-3.7.0_9-0-greatlte.img
+    referer: "https://dl.twrp.me/greatlte/twrp-3.7.0_9-0-greatlte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: greatlte, latest version 3.7.0_9-0).
+
+  - name: twrp-3.3.1-0-griffin
+    family: TWRP
+    device: griffin
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/griffin/twrp-3.3.1-0-griffin.img
+    referer: "https://dl.twrp.me/griffin/twrp-3.3.1-0-griffin.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: griffin, latest version 3.3.1-0).
+
+  - name: twrp-3.7.0_9-0-grouper
+    family: TWRP
+    device: grouper
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/grouper/twrp-3.7.0_9-0-grouper.img
+    referer: "https://dl.twrp.me/grouper/twrp-3.7.0_9-0-grouper.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: grouper, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-grus
+    family: TWRP
+    device: grus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/grus/twrp-3.7.0_9-0-grus.img
+    referer: "https://dl.twrp.me/grus/twrp-3.7.0_9-0-grus.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: grus, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-guacamole
+    family: TWRP
+    device: guacamole
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/guacamole/twrp-3.7.1_12-0-guacamole.img
+    referer: "https://dl.twrp.me/guacamole/twrp-3.7.1_12-0-guacamole.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: guacamole, latest version 3.7.1_12-0).
+
+  - name: twrp-3.6.0_9-0-h811
+    family: TWRP
+    device: h811
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/h811/twrp-3.6.0_9-0-h811.img
+    referer: "https://dl.twrp.me/h811/twrp-3.6.0_9-0-h811.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: h811, latest version 3.6.0_9-0).
+
+  - name: twrp-3.7.0_9-0-h830
+    family: TWRP
+    device: h830
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/h830/twrp-3.7.0_9-0-h830.img
+    referer: "https://dl.twrp.me/h830/twrp-3.7.0_9-0-h830.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: h830, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-h850
+    family: TWRP
+    device: h850
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/h850/twrp-3.7.0_9-0-h850.img
+    referer: "https://dl.twrp.me/h850/twrp-3.7.0_9-0-h850.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: h850, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-h990
+    family: TWRP
+    device: h990
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/h990/twrp-3.7.0_9-0-h990.img
+    referer: "https://dl.twrp.me/h990/twrp-3.7.0_9-0-h990.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: h990, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-hammerhead
+    family: TWRP
+    device: hammerhead
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/hammerhead/twrp-3.7.0_9-0-hammerhead.img
+    referer: "https://dl.twrp.me/hammerhead/twrp-3.7.0_9-0-hammerhead.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: hammerhead, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-harpia
+    family: TWRP
+    device: harpia
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/harpia/twrp-3.7.0_9-0-harpia.img
+    referer: "https://dl.twrp.me/harpia/twrp-3.7.0_9-0-harpia.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: harpia, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-1-hero2lte
+    family: TWRP
+    device: hero2lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/hero2lte/twrp-3.7.0_9-1-hero2lte.img
+    referer: "https://dl.twrp.me/hero2lte/twrp-3.7.0_9-1-hero2lte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: hero2lte, latest version 3.7.0_9-1).
+
+  - name: twrp-3.7.0_9-1-herolte
+    family: TWRP
+    device: herolte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/herolte/twrp-3.7.0_9-1-herolte.img
+    referer: "https://dl.twrp.me/herolte/twrp-3.7.0_9-1-herolte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: herolte, latest version 3.7.0_9-1).
+
+  - name: twrp-3.7.0_11-0-hotdog
+    family: TWRP
+    device: hotdog
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/hotdog/twrp-3.7.0_11-0-hotdog.img
+    referer: "https://dl.twrp.me/hotdog/twrp-3.7.0_11-0-hotdog.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: hotdog, latest version 3.7.0_11-0).
+
+  - name: twrp-3.7.0_11-0-hotdogv2
+    family: TWRP
+    device: hotdogv2
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/hotdogv2/twrp-3.7.0_11-0-hotdogv2.img
+    referer: "https://dl.twrp.me/hotdogv2/twrp-3.7.0_11-0-hotdogv2.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: hotdogv2, latest version 3.7.0_11-0).
+
+  - name: twrp-3.7.0_9-0-huashan
+    family: TWRP
+    device: huashan
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/huashan/twrp-3.7.0_9-0-huashan.img
+    referer: "https://dl.twrp.me/huashan/twrp-3.7.0_9-0-huashan.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: huashan, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-hydrogen
+    family: TWRP
+    device: hydrogen
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/hydrogen/twrp-3.7.0_9-0-hydrogen.img
+    referer: "https://dl.twrp.me/hydrogen/twrp-3.7.0_9-0-hydrogen.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: hydrogen, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-ido
+    family: TWRP
+    device: ido
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/ido/twrp-3.7.0_9-0-ido.img
+    referer: "https://dl.twrp.me/ido/twrp-3.7.0_9-0-ido.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: ido, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_11-0-instantnoodle
+    family: TWRP
+    device: instantnoodle
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/instantnoodle/twrp-3.7.0_11-0-instantnoodle.img
+    referer: "https://dl.twrp.me/instantnoodle/twrp-3.7.0_11-0-instantnoodle.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: instantnoodle, latest version 3.7.0_11-0).
+
+  - name: twrp-3.7.0_9-0-james
+    family: TWRP
+    device: james
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/james/twrp-3.7.0_9-0-james.img
+    referer: "https://dl.twrp.me/james/twrp-3.7.0_9-0-james.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: james, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-jasmine_sprout
+    family: TWRP
+    device: jasmine_sprout
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/jasmine_sprout/twrp-3.7.0_9-0-jasmine_sprout.img
+    referer: "https://dl.twrp.me/jasmine_sprout/twrp-3.7.0_9-0-jasmine_sprout.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: jasmine_sprout, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-kagura
+    family: TWRP
+    device: kagura
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/kagura/twrp-3.7.0_9-0-kagura.img
+    referer: "https://dl.twrp.me/kagura/twrp-3.7.0_9-0-kagura.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: kagura, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_11-0-kebab
+    family: TWRP
+    device: kebab
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/kebab/twrp-3.7.0_11-0-kebab.img
+    referer: "https://dl.twrp.me/kebab/twrp-3.7.0_11-0-kebab.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: kebab, latest version 3.7.0_11-0).
+
+  - name: twrp-3.7.0_9-0-kenzo
+    family: TWRP
+    device: kenzo
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/kenzo/twrp-3.7.0_9-0-kenzo.img
+    referer: "https://dl.twrp.me/kenzo/twrp-3.7.0_9-0-kenzo.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: kenzo, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-kinzie
+    family: TWRP
+    device: kinzie
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/kinzie/twrp-3.7.0_9-0-kinzie.img
+    referer: "https://dl.twrp.me/kinzie/twrp-3.7.0_9-0-kinzie.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: kinzie, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-kirin
+    family: TWRP
+    device: kirin
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/kirin/twrp-3.7.0_9-0-kirin.img
+    referer: "https://dl.twrp.me/kirin/twrp-3.7.0_9-0-kirin.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: kirin, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-kugo
+    family: TWRP
+    device: kugo
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/kugo/twrp-3.7.0_9-0-kugo.img
+    referer: "https://dl.twrp.me/kugo/twrp-3.7.0_9-0-kugo.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: kugo, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-lake
+    family: TWRP
+    device: lake
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/lake/twrp-3.7.0_9-0-lake.img
+    referer: "https://dl.twrp.me/lake/twrp-3.7.0_9-0-lake.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: lake, latest version 3.7.0_9-0).
+
+  - name: twrp-3.6.2_9-0-land
+    family: TWRP
+    device: land
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/land/twrp-3.6.2_9-0-land.img
+    referer: "https://dl.twrp.me/land/twrp-3.6.2_9-0-land.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: land, latest version 3.6.2_9-0).
+
+  - name: twrp-3.7.1_12-0-lemonadep
+    family: TWRP
+    device: lemonadep
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/lemonadep/twrp-3.7.1_12-0-lemonadep.img
+    referer: "https://dl.twrp.me/lemonadep/twrp-3.7.1_12-0-lemonadep.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: lemonadep, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-ls997
+    family: TWRP
+    device: ls997
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/ls997/twrp-3.7.0_9-0-ls997.img
+    referer: "https://dl.twrp.me/ls997/twrp-3.7.0_9-0-ls997.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: ls997, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-lux
+    family: TWRP
+    device: lux
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/lux/twrp-3.7.0_9-0-lux.img
+    referer: "https://dl.twrp.me/lux/twrp-3.7.0_9-0-lux.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: lux, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-m7
+    family: TWRP
+    device: m7
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/m7/twrp-3.7.0_9-0-m7.img
+    referer: "https://dl.twrp.me/m7/twrp-3.7.0_9-0-m7.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: m7, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-m8
+    family: TWRP
+    device: m8
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/m8/twrp-3.7.0_9-0-m8.img
+    referer: "https://dl.twrp.me/m8/twrp-3.7.0_9-0-m8.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: m8, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-mako
+    family: TWRP
+    device: mako
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/mako/twrp-3.7.0_9-0-mako.img
+    referer: "https://dl.twrp.me/mako/twrp-3.7.0_9-0-mako.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: mako, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-manta
+    family: TWRP
+    device: manta
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/manta/twrp-3.7.0_9-0-manta.img
+    referer: "https://dl.twrp.me/manta/twrp-3.7.0_9-0-manta.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: manta, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-marlin
+    family: TWRP
+    device: marlin
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/marlin/twrp-3.7.0_9-0-marlin.img
+    referer: "https://dl.twrp.me/marlin/twrp-3.7.0_9-0-marlin.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: marlin, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-mermaid
+    family: TWRP
+    device: mermaid
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/mermaid/twrp-3.7.0_9-0-mermaid.img
+    referer: "https://dl.twrp.me/mermaid/twrp-3.7.0_9-0-mermaid.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: mermaid, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-messi
+    family: TWRP
+    device: messi
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/messi/twrp-3.7.0_9-0-messi.img
+    referer: "https://dl.twrp.me/messi/twrp-3.7.0_9-0-messi.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: messi, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-mido
+    family: TWRP
+    device: mido
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/mido/twrp-3.7.0_9-0-mido.img
+    referer: "https://dl.twrp.me/mido/twrp-3.7.0_9-0-mido.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: mido, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-monet
+    family: TWRP
+    device: monet
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/monet/twrp-3.7.1_12-0-monet.img
+    referer: "https://dl.twrp.me/monet/twrp-3.7.1_12-0-monet.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: monet, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-montana
+    family: TWRP
+    device: montana
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/montana/twrp-3.7.0_9-0-montana.img
+    referer: "https://dl.twrp.me/montana/twrp-3.7.0_9-0-montana.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: montana, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-nash
+    family: TWRP
+    device: nash
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/nash/twrp-3.7.0_9-0-nash.img
+    referer: "https://dl.twrp.me/nash/twrp-3.7.0_9-0-nash.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: nash, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-nitrogen
+    family: TWRP
+    device: nitrogen
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/nitrogen/twrp-3.7.0_9-0-nitrogen.img
+    referer: "https://dl.twrp.me/nitrogen/twrp-3.7.0_9-0-nitrogen.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: nitrogen, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-o7prolte
+    family: TWRP
+    device: o7prolte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/o7prolte/twrp-3.7.0_9-0-o7prolte.img
+    referer: "https://dl.twrp.me/o7prolte/twrp-3.7.0_9-0-o7prolte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: o7prolte, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_11-0-ocean
+    family: TWRP
+    device: ocean
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/ocean/twrp-3.7.0_11-0-ocean.img
+    referer: "https://dl.twrp.me/ocean/twrp-3.7.0_11-0-ocean.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: ocean, latest version 3.7.0_11-0).
+
+  - name: twrp-3.2.1-0-oneplus2
+    family: TWRP
+    device: oneplus2
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/oneplus2/twrp-3.2.1-0-oneplus2.img
+    referer: "https://dl.twrp.me/oneplus2/twrp-3.2.1-0-oneplus2.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: oneplus2, latest version 3.2.1-0).
+
+  - name: twrp-3.7.0_9-0-oneplus3
+    family: TWRP
+    device: oneplus3
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/oneplus3/twrp-3.7.0_9-0-oneplus3.img
+    referer: "https://dl.twrp.me/oneplus3/twrp-3.7.0_9-0-oneplus3.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: oneplus3, latest version 3.7.0_9-0).
+
+  - name: twrp-3.4.0-0-onyx
+    family: TWRP
+    device: onyx
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/onyx/twrp-3.4.0-0-onyx.img
+    referer: "https://dl.twrp.me/onyx/twrp-3.4.0-0-onyx.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: onyx, latest version 3.4.0-0).
+
+  - name: twrp-3.7.0_9-0-osprey
+    family: TWRP
+    device: osprey
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/osprey/twrp-3.7.0_9-0-osprey.img
+    referer: "https://dl.twrp.me/osprey/twrp-3.7.0_9-0-osprey.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: osprey, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-oxygen
+    family: TWRP
+    device: oxygen
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/oxygen/twrp-3.7.1_12-0-oxygen.img
+    referer: "https://dl.twrp.me/oxygen/twrp-3.7.1_12-0-oxygen.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: oxygen, latest version 3.7.1_12-0).
+
+  - name: twrp-3.5.2_10-0-parker
+    family: TWRP
+    device: parker
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/parker/twrp-3.5.2_10-0-parker.img
+    referer: "https://dl.twrp.me/parker/twrp-3.5.2_10-0-parker.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: parker, latest version 3.5.2_10-0).
+
+  - name: twrp-3.7.1_12-0-payton
+    family: TWRP
+    device: payton
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/payton/twrp-3.7.1_12-0-payton.img
+    referer: "https://dl.twrp.me/payton/twrp-3.7.1_12-0-payton.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: payton, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-perry
+    family: TWRP
+    device: perry
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/perry/twrp-3.7.0_9-0-perry.img
+    referer: "https://dl.twrp.me/perry/twrp-3.7.0_9-0-perry.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: perry, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-perseus
+    family: TWRP
+    device: perseus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/perseus/twrp-3.7.0_9-0-perseus.img
+    referer: "https://dl.twrp.me/perseus/twrp-3.7.0_9-0-perseus.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: perseus, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-pioneer
+    family: TWRP
+    device: pioneer
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/pioneer/twrp-3.7.0_9-0-pioneer.img
+    referer: "https://dl.twrp.me/pioneer/twrp-3.7.0_9-0-pioneer.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: pioneer, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-pme
+    family: TWRP
+    device: pme
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/pme/twrp-3.7.0_9-0-pme.img
+    referer: "https://dl.twrp.me/pme/twrp-3.7.0_9-0-pme.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: pme, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-polaris
+    family: TWRP
+    device: polaris
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/polaris/twrp-3.7.0_9-0-polaris.img
+    referer: "https://dl.twrp.me/polaris/twrp-3.7.0_9-0-polaris.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: polaris, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-potter
+    family: TWRP
+    device: potter
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/potter/twrp-3.7.0_9-0-potter.img
+    referer: "https://dl.twrp.me/potter/twrp-3.7.0_9-0-potter.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: potter, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-pyxis
+    family: TWRP
+    device: pyxis
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/pyxis/twrp-3.7.0_9-0-pyxis.img
+    referer: "https://dl.twrp.me/pyxis/twrp-3.7.0_9-0-pyxis.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: pyxis, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-1-raphael
+    family: TWRP
+    device: raphael
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/raphael/twrp-3.7.1_12-1-raphael.img
+    referer: "https://dl.twrp.me/raphael/twrp-3.7.1_12-1-raphael.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: raphael, latest version 3.7.1_12-1).
+
+  - name: twrp-3.7.0_11-0-redfin
+    family: TWRP
+    device: redfin
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/redfin/twrp-3.7.0_11-0-redfin.img
+    referer: "https://dl.twrp.me/redfin/twrp-3.7.0_11-0-redfin.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: redfin, latest version 3.7.0_11-0).
+
+  - name: twrp-3.7.1_12-0-rhode
+    family: TWRP
+    device: rhode
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/rhode/twrp-3.7.1_12-0-rhode.img
+    referer: "https://dl.twrp.me/rhode/twrp-3.7.1_12-0-rhode.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: rhode, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-sanders
+    family: TWRP
+    device: sanders
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/sanders/twrp-3.7.0_9-0-sanders.img
+    referer: "https://dl.twrp.me/sanders/twrp-3.7.0_9-0-sanders.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: sanders, latest version 3.7.0_9-0).
+
+  - name: twrp-3.6.2_9-0-santoni
+    family: TWRP
+    device: santoni
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/santoni/twrp-3.6.2_9-0-santoni.img
+    referer: "https://dl.twrp.me/santoni/twrp-3.6.2_9-0-santoni.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: santoni, latest version 3.6.2_9-0).
+
+  - name: twrp-3.7.1_12-1-sargo
+    family: TWRP
+    device: sargo
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/sargo/twrp-3.7.1_12-1-sargo.img
+    referer: "https://dl.twrp.me/sargo/twrp-3.7.1_12-1-sargo.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: sargo, latest version 3.7.1_12-1).
+
+  - name: twrp-3.7.0_9-0-shamu
+    family: TWRP
+    device: shamu
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/shamu/twrp-3.7.0_9-0-shamu.img
+    referer: "https://dl.twrp.me/shamu/twrp-3.7.0_9-0-shamu.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: shamu, latest version 3.7.0_9-0).
+
+  - name: twrp-3.0.2-0-sirius
+    family: TWRP
+    device: sirius
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/sirius/twrp-3.0.2-0-sirius.img
+    referer: "https://dl.twrp.me/sirius/twrp-3.0.2-0-sirius.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: sirius, latest version 3.0.2-0).
+
+  - name: twrp-3.7.0_9-0-star2lte
+    family: TWRP
+    device: star2lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/star2lte/twrp-3.7.0_9-0-star2lte.img
+    referer: "https://dl.twrp.me/star2lte/twrp-3.7.0_9-0-star2lte.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: star2lte, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-surnia
+    family: TWRP
+    device: surnia
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/surnia/twrp-3.7.0_9-0-surnia.img
+    referer: "https://dl.twrp.me/surnia/twrp-3.7.0_9-0-surnia.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: surnia, latest version 3.7.0_9-0).
+
+  - name: twrp-3.0.2-0-t6
+    family: TWRP
+    device: t6
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/t6/twrp-3.0.2-0-t6.img
+    referer: "https://dl.twrp.me/t6/twrp-3.0.2-0-t6.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: t6, latest version 3.0.2-0).
+
+  - name: twrp-3.7.0_9-0-taimen
+    family: TWRP
+    device: taimen
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/taimen/twrp-3.7.0_9-0-taimen.img
+    referer: "https://dl.twrp.me/taimen/twrp-3.7.0_9-0-taimen.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: taimen, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-thea
+    family: TWRP
+    device: thea
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/thea/twrp-3.7.0_9-0-thea.img
+    referer: "https://dl.twrp.me/thea/twrp-3.7.0_9-0-thea.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: thea, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-tilapia
+    family: TWRP
+    device: tilapia
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/tilapia/twrp-3.7.0_9-0-tilapia.img
+    referer: "https://dl.twrp.me/tilapia/twrp-3.7.0_9-0-tilapia.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: tilapia, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-tissot
+    family: TWRP
+    device: tissot
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/tissot/twrp-3.7.0_9-0-tissot.img
+    referer: "https://dl.twrp.me/tissot/twrp-3.7.0_9-0-tissot.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: tissot, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-titan
+    family: TWRP
+    device: titan
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/titan/twrp-3.7.0_9-0-titan.img
+    referer: "https://dl.twrp.me/titan/twrp-3.7.0_9-0-titan.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: titan, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_9-0-tucana
+    family: TWRP
+    device: tucana
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/tucana/twrp-3.7.0_9-0-tucana.img
+    referer: "https://dl.twrp.me/tucana/twrp-3.7.0_9-0-tucana.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: tucana, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.0_11-0-venus
+    family: TWRP
+    device: venus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/venus/twrp-3.7.0_11-0-venus.img
+    referer: "https://dl.twrp.me/venus/twrp-3.7.0_11-0-venus.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: venus, latest version 3.7.0_11-0).
+
+  - name: twrp-3.7.0_9-0-victara
+    family: TWRP
+    device: victara
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/victara/twrp-3.7.0_9-0-victara.img
+    referer: "https://dl.twrp.me/victara/twrp-3.7.0_9-0-victara.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: victara, latest version 3.7.0_9-0).
+
+  - name: twrp-3.7.1_12-0-vince
+    family: TWRP
+    device: vince
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/vince/twrp-3.7.1_12-0-vince.img
+    referer: "https://dl.twrp.me/vince/twrp-3.7.1_12-0-vince.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: vince, latest version 3.7.1_12-0).
+
+  - name: twrp-3.7.0_9-0-vs995
+    family: TWRP
+    device: vs995
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/vs995/twrp-3.7.0_9-0-vs995.img
+    referer: "https://dl.twrp.me/vs995/twrp-3.7.0_9-0-vs995.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: vs995, latest version 3.7.0_9-0).
+
+  - name: twrp-3.3.0-0-walleye
+    family: TWRP
+    device: walleye
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/walleye/twrp-3.3.0-0-walleye.img
+    referer: "https://dl.twrp.me/walleye/twrp-3.3.0-0-walleye.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: walleye, latest version 3.3.0-0).
+
+  - name: twrp-3.7.0_9-0-wayne
+    family: TWRP
+    device: wayne
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/wayne/twrp-3.7.0_9-0-wayne.img
+    referer: "https://dl.twrp.me/wayne/twrp-3.7.0_9-0-wayne.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: wayne, latest version 3.7.0_9-0).
+
+  - name: twrp-3.6.2_9-0-woods
+    family: TWRP
+    device: woods
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/woods/twrp-3.6.2_9-0-woods.img
+    referer: "https://dl.twrp.me/woods/twrp-3.6.2_9-0-woods.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: woods, latest version 3.6.2_9-0).
+
+  - name: twrp-3.5.0_9-0-xt1032
+    family: TWRP
+    device: xt1032
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/xt1032/twrp-3.5.0_9-0-xt1032.img
+    referer: "https://dl.twrp.me/xt1032/twrp-3.5.0_9-0-xt1032.img.html"
+    md5: ""
+    sha256: ""
+    notes: >-
+      Scraped from TWRP catalog (codename: xt1032, latest version 3.5.0_9-0).
+
