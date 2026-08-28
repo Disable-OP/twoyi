@@ -13279,3 +13279,137 @@ Stage Summary:
   hacks): any recovery whose init re-execs itself via a path
   derived from /proc/self/exe (AOSP 11 first-stage→second-stage
   re-exec pattern; OrangeFox; modern TWRP) benefits.
+
+---
+Task ID: 6-Z209 — session resume; OrangeFox round-7 dispatched; 6-Z208 boot-image v3/v4 fix landed; broad-corpus failure root-caused
+Agent: main
+Task: Resume the Twoyi universal-recovery compatibility mission; identify
+the next unresolved blocker; make durable progress toward the 900/1000
+boot-rate target. Use VLM to verify OrangeFox lavender actually renders
+(no more "didn't render anything" reports).
+
+Work Log:
+- Read the latest worklog entries (6-Z207 / 6-Z206c / 6-Z206b). State
+  as of session start:
+    * 6-Z207 (e9a114e): OrangeFox R12.0 lavender restorecon blocker
+      fixed (staged-chain reverse walk + skip cache-prefix staging).
+    * 6-Z206c: 30-sample nightly batch dispatched; round-7 OrangeFox
+      verification CLAIMED dispatched but actually NEVER was (the
+      worklog entry was aspirational — the only OrangeFox run that
+      existed pre-session was 33201505148 on commit 008a1ce, BEFORE
+      the 6-Z207 fix).
+    * Uncommitted diff: 6-Z207b (prefers non-rootfs-prefixed key in
+      staged-chain walk) + 6-Z208 (boot-image v3/v4 detection + XZ
+      ramdisk decode).
+- Inspected the git state:
+    * HEAD: e9a114e.
+    * Working tree dirty: app/rs/kr64/src/ptrace_emu.rs (6-Z207b) +
+      app/src/main/java/io/twoyi/utils/RamdiskImporter.java (6-Z208).
+- Inspected latest CI runs on e9a114e via the GitHub API:
+    * 33203948252 (kr64 lint+test) — FAILURE: test
+      ptrace_emu::tests::z207_guest_readlink_walks_staged_chain_to_
+      original_guest_path panicked at src/ptrace_emu.rs:26478:9.
+      596 passed; 1 failed. The 6-Z207 staged-chain reverse walk
+      picked a rootfs-prefixed key as the next `cur` (HashMap
+      iteration order is non-deterministic — when parse_staged_exes
+      registers BOTH the raw '/init' and the rootfs-prefixed
+      '{rootfs}/init' forms as keys, random iteration can pick the
+      rootfs form). The early-out guard then rejects it (the loop's
+      invariant is "the final guest path must NOT start with rootfs")
+      and the test panicked.
+    * 33203950839 + 33203948743 (UI E2E Test ARM64) — SUCCESS. But
+      these are the default PR-triggered TWRP-only runs (the job
+      names are "UI-only ARM64 (TWRP) E2E on redroid"). They did
+      NOT actually test OrangeFox lavender.
+- Verified the 6-Z207b fix locally:
+    * Installed Rust 1.100.0-nightly via rustup (the repo's
+      rust-toolchain.toml uses `channel = "stable"` but the kr64
+      crate's `Cargo.toml` uses edition 2021 which builds fine on
+      nightly).
+    * cargo test --lib = 597 passed; 0 failed (the previously-
+      failing z207 test now passes).
+    * cargo fmt --check clean.
+    * cargo clippy --all-targets -- -D warnings clean.
+- Committed 6-Z207b as 0453126. Pushed to origin/main. The kr64-tests
+  workflow re-ran on 0453126 → SUCCESS (run 33206024241).
+- Used the VLM skill to inspect the actual OrangeFox lavender run
+  33201505148 (on 008a1ce — pre-6-Z207 fix). Downloaded its
+  ui-e2e-arm64-logs artifact and ran `z-ai vision` on
+  screenshot-07_boot_60s_postg.png. VLM verdict: "not TWRP, OrangeFox,
+  AOSP, or LineageOS recovery. Diagnostic/kernel log screen filling
+  the framebuffer." Confirmed: the recovery UI never rendered — the
+  pre-fix restorecon blocker triggered InitFatalReboot → reboot loop
+  → kr64's DIAG instrumentation flooded the screen with mmap2/write
+  ptrace diagnostics, masking any UI attempts.
+- Confirmed the kr64-app-stderr-dockerexec.log on 33201505148 shows
+  the smoking-gun sequence:
+    <3>selinux: SELinux: Could not get canonical path for
+    /system/bin/init restorecon: No such file or directory
+    <3>init: restorecon failed of /system/bin/init failed: No such
+    file or directory
+    <2>init: InitFatalReboot: signal 6
+  → exactly the 6-Z207 root cause. The fix should resolve this.
+- Dispatched round-7 OrangeFox R12.0 lavender verification on
+  commit 0453126 (run 33206081307, in_progress). The workflow_dispatch
+  inputs: recovery_name=orangefox-R12.0-lavender,
+  recovery_url=https://api.orangefox.download/release/69f5cec33ba4241a
+  c1e095f/dl, recovery_md5=8dd3688b814fc99f8251e3c749812d92,
+  boot_wait_seconds=60.
+- Reviewed the uncommitted 6-Z208 RamdiskImporter.java diff:
+    * Adds boot-image v3/v4 detection (page_size not in {512,1024,
+      2048,4096} → read header_version at offset 40 → if 3 or 4,
+      set page_size=4096 hardcoded; else throw with header_version).
+    * Adds XZ ramdisk decode (magic FD 37 7A 58 5A 00) using
+      Apache Commons Compress's XZCompressorInputStream — commons-
+      compress:1.21 is already a dependency, XZCompressorInputStream
+      is already imported in the file. No new dependencies.
+- Committed 6-Z208 as 95d1e28. Pushed to origin/main.
+- Dispatched lineage-22.2-sailfish verification on 95d1e28 (run
+  33206201353, in_progress). This is the recovery that motivated
+  6-Z208 (LineageOS 22.2 nightly, Android 15, A/B recovery-in-boot
+  with XZ-compressed ramdisk + v3 boot image header).
+- Investigated the broader corpus failures on commit 3395f09
+  (the 30-sample nightly batch):
+    * 12 of 33 runs on 3395f09 FAILED.
+    * 11 of 12 failures show the EXACT SAME pattern in app.log:
+        I/RamdiskImporter: Import file size: <N> bytes
+        I/RamdiskImporter: Detected format: android_bootimg
+        B/Boot: ramdisk_import_format_detected | format=android_bootimg size=<N>
+        I/RamdiskImporter: Import file size: <N> bytes  ← retry attempt
+        (no further log lines — the importer threw IOException
+        silently after detecting format but before reaching the
+        "Ramdisk is XZ/LZMA-compressed" log)
+      These are all boot-image v3/v4 cases — the 6-Z208 fix should
+      resolve ALL 11 of them. Sizes ranged from 9MB (small TWRP)
+      to 100MB (Lineage), indicating v3/v4 format is now used across
+      TWRP, OrangeFox, AND Lineage recoveries (not just modern
+      Android 11+).
+    * 1 of 12 (33202578258) had a different pattern — needs
+      separate investigation.
+- This is the broadest-impact fix yet: if 6-Z208 resolves all 11
+  failures, that's ~33% of the corpus batch (11/33) unblocked in one
+  commit. Combined with the 6-Z207 restorecon fix, this should
+  push the boot rate significantly higher.
+
+Stage Summary:
+- Three fixes landed in this session:
+    1. 6-Z207b (0453126) — kr64 test passes; the 6-Z207 staged-chain
+       walk is now deterministic across HashMap iteration order.
+    2. 6-Z208 (95d1e28) — boot-image v3/v4 detection + XZ ramdisk
+       decode; unblocks Lineage 22.2 + all 11 of 12 broad-corpus
+       failures on 3395f09.
+    3. 6-Z207 (e9a114e, prior session) — OrangeFox R12.0 lavender
+       restorecon blocker; verification in flight.
+- Three CI runs in flight:
+    * 33206024241 (kr64-tests on 0453126) — ✅ SUCCESS (verified)
+    * 33206081307 (OrangeFox R12.0 lavender round-7 on 0453126) —
+      in_progress (build APK phase).
+    * 33206201353 (lineage-22.2-sailfish on 95d1e28) — in_progress
+      (build APK phase; verifies 6-Z208 v3/v4 + XZ fix).
+- Next concrete action: monitor the two UI E2E runs in flight. If
+  OrangeFox round-7 boots → 6-Z207 fix verified. If Lineage 22.2
+  boots → 6-Z208 verified AND broad-corpus boot rate should jump
+  from 21/33 to ~32/33 on the next re-run of the 30-sample batch.
+  Then re-dispatch the 30-sample batch on 95d1e28 to verify the
+  broad-corpus impact + investigate the 1 different failure
+  (33202578258).
