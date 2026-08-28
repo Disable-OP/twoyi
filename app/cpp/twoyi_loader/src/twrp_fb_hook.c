@@ -880,15 +880,20 @@ static int pty_open_slave(const char *path) {
     /* 6-Z188k: NEVER return fd 0/1/2. Run 33131312944: the dup landed
      * on fd 0 (freed earlier in the child) and TWRP's runSlave then did
      * dup2(slave,0/1/2); close(slave) — closing fd 0 == closing STDIN
-     * — ash read EOF and died silently (cursor forever). The classic
-     * daemon rule: escape the stdio range before handing an fd out. */
+     * — ash read EOF and died silently. Run 33132103848: the plain
+     * re-dup ALSO landed in 0..2 (the child had closed fd1/2 as well)
+     * so the escape never fired. fcntl(d, F_DUPFD, 3) is deterministic:
+     * the lowest free fd >= 3, always. */
     if (d >= 0 && d <= 2) {
-        long d2 = raw_syscall3_marked(24, d, 0, 0);
-        if (d2 > 2) {
+        long d2 = raw_syscall3_marked(25 /* SYS_fcntl */, d,
+                                      0 /* F_DUPFD */, 3 /* min fd */);
+        if (d2 >= 3) {
             raw_syscall1(SYS_close, (int)d);
             d = d2;
-            write_str(2, " (stdio-range escaped)");
         }
+        write_str(2, "[twrp_fb_hook] pty slave stdio-range escape -> fd=");
+        write_num(2, (int)d);
+        write_str(2, "\n");
     }
     if (d < 0) {
         /* Backup fd from the fork-inherited slot table (the direct fork

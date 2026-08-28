@@ -12419,3 +12419,18 @@ Work Log:
 Stage Summary:
 - This was the last mechanical gap. With stdin intact, interactive ash
   should finally print its prompt next run.
+
+---
+Task ID: 6-Z188k iter-2
+Agent: main
+Task: Run 33132103848: escape never fired — the plain re-dup ALSO
+landed in 0..2 (the child had closed fd1/2 too), leaving d=0 silently.
+
+Work Log:
+- Replaced the re-dup with fcntl(d, F_DUPFD, 3) — deterministic lowest
+  free fd >= 3 — plus an unconditional escape log line.
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- F_DUPFD cannot return 0/1/2 by construction. This closes the
+  stdio-range class entirely.
