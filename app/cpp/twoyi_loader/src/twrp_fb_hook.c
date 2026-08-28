@@ -695,6 +695,18 @@ static int  g_pty_backup_fd[TWOYI_PTY_SLOTS];   /* 6-Z188g: extra dup of the
                                                    slave — survives a
                                                    targeted close of the
                                                    original number      */
+static unsigned char g_pty_slave_fds[(1024 + 7) / 8]; /* every fd that is a
+                                                   live slave socket end */
+
+static void pty_mark_slave_fd(int fd) {
+    if (fd < 0 || fd >= 1024) return;
+    g_pty_slave_fds[fd >> 3] |= (unsigned char)(1u << (fd & 7));
+}
+
+static int pty_is_slave_fd(int fd) {
+    if (fd < 0 || fd >= 1024) return 0;
+    return (g_pty_slave_fds[fd >> 3] >> (fd & 7)) & 1;
+}
 
 static void pty_init_slots(void) {
     static int inited = 0;
@@ -745,6 +757,8 @@ static int pty_open_master(int flags) {
              * copy (whatever fd the kernel picks) survives that. */
             long b = raw_syscall3_marked(24 /* SYS_dup */, (long)sv_fds[1], 0, 0);
             g_pty_backup_fd[slot] = (b >= 0 && b < 1024) ? (int)b : -1;
+            pty_mark_slave_fd(sv_fds[1]);
+            if (g_pty_backup_fd[slot] >= 0) pty_mark_slave_fd(g_pty_backup_fd[slot]);
             write_str(2, "[twrp_fb_hook] pty master fd=");
             write_num(2, sv_fds[0]);
             write_str(2, " (slot ");
@@ -792,6 +806,8 @@ static int pty_open_dispatch(const char *path, int flags) {
     if (sfd != -2) return sfd;
     return -2;
 }
+
+static int pty_slot_of_master(int fd); /* fwd — used by pty_slave_ioctl */
 
 static int pty_slot_of_master(int fd) {
     pty_init_slots();
@@ -850,7 +866,49 @@ static int pty_open_slave(const char *path) {
     write_str(2, " -> fd=");
     write_num(2, (int)d);
     write_str(2, "\n");
+    if (d >= 0) pty_mark_slave_fd((int)d);
     return d >= 0 ? (int)d : -1;
+}
+
+/* ── 6-Z188i: the TTYS protocol on slave fds. Run 33129910056: the
+ * slave open finally SUCCEEDED (fd=0) but the socket is not a tty —
+ * isatty() fails and busybox ash runs NON-interactive (no prompt,
+ * bare cursor). Answer TCGETS with a sane cooked termios (isatty==1
+ * => interactive ash => prompt) and accept the TCSETS family. ── */
+static long pty_slave_ioctl(int fd, unsigned req, unsigned long arg) {
+    if (!pty_is_slave_fd(fd)) {
+        if (pty_slot_of_master(fd) < 0) return -2;
+    }
+    switch (req) {
+        case 0x5401u: { /* TCGETS */
+            if (arg) {
+                unsigned int *t = (unsigned int *)(long)arg;
+                t[0] = 0x500u;   /* c_iflag: ICRNL|IXON */
+                t[1] = 0x5u;     /* c_oflag: OPOST|ONLCR */
+                t[2] = 0xBFu;    /* c_cflag: B38400|CS8|CREAD */
+                t[3] = 0x800Bu;  /* c_lflag: ISIG|ICANON|ECHO|IEXTEN */
+                unsigned char *cc = (unsigned char *)(long)(arg + 16);
+                for (int k = 0; k < 20; k++) cc[k] = 0;
+                cc[6] = 1;       /* VMIN = 1 */
+            }
+            return 0;
+        }
+        case 0x5402u: case 0x5403u: case 0x5404u: /* TCSETS* — accept */
+            return 0;
+        case 0x5413u: { /* TIOCGWINSZ */
+            if (arg) {
+                unsigned short *ws = (unsigned short *)(long)arg;
+                ws[0] = 24; ws[1] = 80; ws[2] = 80 * 8; ws[3] = 24 * 16;
+            }
+            return 0;
+        }
+        case 0x5414u:
+            return 0;
+        case 0x540Eu: /* TIOCSCTTY */
+            return 0;
+        default:
+            return -2;
+    }
 }
 
 /* ioctl on a tracked MASTER fd: the ptmx protocol. -2 = not ours. */
@@ -2615,13 +2673,17 @@ int ioctl(int fd, int request, ...) {
     }
 
 #if defined(__aarch64__)
-    // ── 6-Z188: PTY-master ioctls (TIOCSPTLCK/TIOCGPTN/TIOCSCTTY/
-    // TIOCGWINSZ on the socketpair-backed /dev/ptmx fd). Must run BEFORE
-    // the generic WINSZ handler below (the master fd IS a socket — the
-    // real ioctl would return ENOTTY). ──
+    // ── 6-Z188: PTY ioctls — MASTER protocol (TIOCSPTLCK/TIOCGPTN/...)
+    // first, then the SLAVE tty protocol (TCGETS so isatty() succeeds —
+    // 6-Z188i). Both must run BEFORE the generic handlers (these fds
+    // are sockets/files; the real ioctl would ENOTTY). ──
     {
         long pr = pty_master_ioctl(fd, req, (unsigned long)argp);
         if (pr != -2) return (int)pr;
+    }
+    {
+        long sr = pty_slave_ioctl(fd, req, (unsigned long)argp);
+        if (sr != -2) return (int)sr;
     }
 #endif
 

@@ -12334,3 +12334,37 @@ Stage Summary:
 - If the dup was faked -> fix 1 wins; if the fd was closed -> fix 2
   wins; if both -> the RECOVERED log names it and the next iteration
   targets the closer.
+
+---
+Task ID: 6-Z188i
+Agent: main
+Task: Run 33129910056: THE SLAVE OPEN SUCCEEDED ("pty slave open
+/dev/pts/17 -> fd=0" — the marked dup won, RECOVERED=0, MISS=0, sh
+garbage errors GONE). The full pty chain is mechanically complete.
+Remaining: ash runs NON-interactive because the socket is not a tty —
+isatty() fails, so no prompt renders (bare cursor).
+
+Work Log:
+- Evidence: master fd=15/slave fd=17 -> ptsname /dev/pts/17 -> slave
+  dup fd=0 -> exec /sbin/sh with the hook reloading in the child (its
+  stderr now goes to the pty, visible on the terminal screen).
+  "Unable to switch to Terminal" only on a later re-entry attempt.
+- 6-Z188i FIX — the TTYS protocol on tracked pty fds:
+  * g_pty_slave_fds bitmap tracks every live slave socket end (the
+    stashed slave, the backup dup, every returned open("/dev/pts/N")).
+  * pty_slave_ioctl: TCGETS (0x5401) answers a sane cooked termios
+    (ICRNL|IXON / OPOST|ONLCR / B38400|CS8|CREAD / ISIG|ICANON|ECHO|
+    IEXTEN, VMIN=1) so isatty() returns 1 => busybox ash goes
+    INTERACTIVE and prints its prompt; TCSETS* accepted; WINSZ 80x24;
+    TIOCSCTTY 0. Master fds also accepted (TWRP may tcsetattr the
+    master).
+- The FM "root swap" flagged by monitors is the same-guest-root
+  dirs-section vs files-section scroll artifact (proven identical in
+  run 5's detailed check); breadcrumb "/" in both.
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- Every layer of the generic terminal stack is now virtualized: ptmx
+  open (socketpair), unlockpt/grantpt, TIOCGPTN, ptsname (fd-number
+  protocol), slave open (marked dup + backup), TIOCSCTTY, WINSZ, and
+  now TCGETS/isatty. Next run should show the ash prompt.
