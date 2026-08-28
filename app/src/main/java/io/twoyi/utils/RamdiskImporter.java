@@ -227,6 +227,45 @@ public class RamdiskImporter {
             int ramdiskSize = bb.getInt(16);
             int pageSize = bb.getInt(36);
 
+            // 6-Z208: boot-image v3/v4 detection.
+            //
+            // Android 10+ A/B devices ship recovery-in-boot images in
+            // the v3/v4 boot-image format (boot_signature + 4KiB page
+            // + no dt_size field + different header layout). The v0/v1/
+            // v2 layout — which this importer was written against —
+            // has page_size at offset 36; v3/v4's offset 36 holds
+            // part of os_version/header_size, which decodes to a non-
+            // power-of-2 page_size and triggers the "Invalid boot
+            // image" IOException at line 230 — the LineageOS-22.2
+            // failure mode (run 33202601022 lineage-r0s: pageSize=0
+            // ramdiskSize=536871336 — the importer read header_size +
+            // reserved[0] in place of pageSize + dt_size).
+            //
+            // Detection (mirrors scripts/recovery-corpus/
+            // inspect_image.py): if the page_size at offset 36 isn't
+            // in {512, 1024, 2048, 4096}, read the header_version at
+            // offset 40; if it's 3 or 4, switch to v3/v4 layout:
+            //   page_size = 4096 (hardcoded by spec)
+            //   ramdisk_offset = page_size + ceil(kernel_size / page_size) * page_size
+            // (no dt_size + no second_size field; the kernel_size and
+            // ramdisk_size fields at offsets 8/16 are COMMON across
+            // all versions).
+            if (pageSize != 512 && pageSize != 1024
+                    && pageSize != 2048 && pageSize != 4096) {
+                // Candidate v3/v4 — verify header_version.
+                int headerVersion = bb.getInt(40);
+                if (headerVersion == 3 || headerVersion == 4) {
+                    pageSize = 4096;
+                    Log.i(TAG, "Boot image: v" + headerVersion
+                        + " layout detected (page_size=4096 hardcoded)");
+                } else {
+                    throw new IOException("Invalid boot image: pageSize="
+                        + pageSize + " ramdiskSize=" + ramdiskSize
+                        + " header_version=" + headerVersion
+                        + " (not v0/v1/v2/v3/v4 — unrecognized format)");
+                }
+            }
+
             if (pageSize == 0 || ramdiskSize == 0) {
                 throw new IOException("Invalid boot image: pageSize=" + pageSize + " ramdiskSize=" + ramdiskSize);
             }
@@ -272,6 +311,26 @@ public class RamdiskImporter {
                     byte[] buf = new byte[8192];
                     int n;
                     while ((n = lzis.read(buf)) > 0) fos.write(buf, 0, n);
+                }
+            } else if (ramdiskCompressed.length >= 6
+                    && (ramdiskCompressed[0] & 0xFF) == 0xfd
+                    && (ramdiskCompressed[1] & 0xFF) == 0x37
+                    && (ramdiskCompressed[2] & 0xFF) == 0x7a
+                    && (ramdiskCompressed[3] & 0xFF) == 0x58
+                    && (ramdiskCompressed[4] & 0xFF) == 0x5a
+                    && (ramdiskCompressed[5] & 0xFF) == 0x00) {
+                // 6-Z208: XZ container (magic FD 37 7A 58 5A 00) — the
+                // standard format for Android 11+ boot-image ramdisks
+                // (LineageOS 22.2 nightly + AOSP mainline both default
+                // to it). Apache Commons Compress's XZCompressorInputStream
+                // handles the container → raw LZMA2 stream decode.
+                Log.i(TAG, "Ramdisk is XZ-compressed");
+                try (XZCompressorInputStream xzis = new XZCompressorInputStream(
+                         new java.io.ByteArrayInputStream(ramdiskCompressed));
+                     FileOutputStream fos = new FileOutputStream(cpioTemp)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = xzis.read(buf)) > 0) fos.write(buf, 0, n);
                 }
             } else if (ramdiskCompressed[0] == '0' && ramdiskCompressed[1] == '7') {
                 // Uncompressed cpio
