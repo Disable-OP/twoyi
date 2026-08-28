@@ -2009,3 +2009,6247 @@ images:
     notes: >-
       Scraped from TWRP catalog (codename: xt1032, latest version 3.5.0_9-0).
 
+  - name: orangefox-mido
+    family: OrangeFox
+    device: mido
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/664c9e7e84cde7c4d32d3cc9/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 4 (mido) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 664c9e7e84cde7c4d32d3cc9).
+
+  - name: orangefox-z00ed
+    family: OrangeFox
+    device: z00ed
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adafc581a884ee4374fe6/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Asus Zenfone 2 Laser ZE500KL (z00ed) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adafc581a884ee4374fe6).
+
+  - name: orangefox-cereus
+    family: OrangeFox
+    device: cereus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/62408b076a44bc73841965cd/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 6 (cereus) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 62408b076a44bc73841965cd).
+
+  - name: orangefox-daisy
+    family: OrangeFox
+    device: daisy
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60a29455e805649489f06b38/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi A2 Lite (daisy) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60a29455e805649489f06b38).
+
+  - name: orangefox-dipper
+    family: OrangeFox
+    device: dipper
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/67f284d2724ba9ed7374ce37/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi 8 (dipper) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 67f284d2724ba9ed7374ce37).
+
+  - name: orangefox-nitrogen
+    family: OrangeFox
+    device: nitrogen
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e600e83b64ceb812d1eff50/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi Max 3 (nitrogen) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e600e83b64ceb812d1eff50).
+
+  - name: orangefox-riva
+    family: OrangeFox
+    device: riva
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f9ebcaa18a4f5027b20c8e6/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 5A (riva) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f9ebcaa18a4f5027b20c8e6).
+
+  - name: orangefox-santoni
+    family: OrangeFox
+    device: santoni
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60d8a8441dad67bacebb976e/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 4X (santoni) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60d8a8441dad67bacebb976e).
+
+  - name: orangefox-tulip
+    family: OrangeFox
+    device: tulip
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6116393925238080d04b6981/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 6 Pro (tulip) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6116393925238080d04b6981).
+
+  - name: orangefox-ugglite
+    family: OrangeFox
+    device: ugglite
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adafe581a884ee4374fee/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 5A/Y1 Lite (ugglite) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adafe581a884ee4374fee).
+
+  - name: orangefox-vince
+    family: OrangeFox
+    device: vince
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f17717026d98d90b4cbc009/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 5 Plus (vince) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f17717026d98d90b4cbc009).
+
+  - name: orangefox-violet
+    family: OrangeFox
+    device: violet
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f5d1e63ba4241a6c1e096b/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 7 Pro (violet) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f5d1e63ba4241a6c1e096b).
+
+  - name: orangefox-whyred
+    family: OrangeFox
+    device: whyred
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60fb0b93462e0f766bc300a5/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 5 / 5 Pro (whyred) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60fb0b93462e0f766bc300a5).
+
+  - name: orangefox-x00t
+    family: OrangeFox
+    device: x00t
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60f6977202b94e9fef887204/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Asus ZenFone Max Pro M1 (x00t) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60f6977202b94e9fef887204).
+
+  - name: orangefox-ysl
+    family: OrangeFox
+    device: ysl
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5fda55d483c562e6dadda463/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi S2 (ysl) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5fda55d483c562e6dadda463).
+
+  - name: orangefox-x01bd
+    family: OrangeFox
+    device: x01bd
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60c907ffab6a49957f0d6ebe/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Asus Zenfone Max Pro M2 (x01bd) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60c907ffab6a49957f0d6ebe).
+
+  - name: orangefox-beryllium
+    family: OrangeFox
+    device: beryllium
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60d709741dad67bacebb975e/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Poco F1 (beryllium) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60d709741dad67bacebb975e).
+
+  - name: orangefox-clover
+    family: OrangeFox
+    device: clover
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adaff581a884ee4374ff7/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi Pad 4/4 Plus (clover) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adaff581a884ee4374ff7).
+
+  - name: orangefox-ido
+    family: OrangeFox
+    device: ido
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb00581a884ee4374ffa/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 3/3pro (ido) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb00581a884ee4374ffa).
+
+  - name: orangefox-kenzo
+    family: OrangeFox
+    device: kenzo
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/609d0989e805649489f06aeb/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 3 (kenzo) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 609d0989e805649489f06aeb).
+
+  - name: orangefox-lavender
+    family: OrangeFox
+    device: lavender
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 7 (lavender) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f5cec33ba4241a6c1e095f).
+
+  - name: orangefox-polaris
+    family: OrangeFox
+    device: polaris
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/672918fd3f1fba6ccf4ddcb0/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi Mix 2S (polaris) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 672918fd3f1fba6ccf4ddcb0).
+
+  - name: orangefox-raphael
+    family: OrangeFox
+    device: raphael
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/620177b16a44bc7384192986/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi K20 Pro (raphael) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 620177b16a44bc7384192986).
+
+  - name: orangefox-rmx1851
+    family: OrangeFox
+    device: rmx1851
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5fbbe3d729aaa50ddd9dadd8/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme 3 Pro (rmx1851) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5fbbe3d729aaa50ddd9dadd8).
+
+  - name: orangefox-seed
+    family: OrangeFox
+    device: seed
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb02581a884ee4375009/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for General Mobile 4G (seed) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb02581a884ee4375009).
+
+  - name: orangefox-shamrock
+    family: OrangeFox
+    device: shamrock
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb02581a884ee437500a/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for General Mobile 5 Plus (shamrock) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb02581a884ee437500a).
+
+  - name: orangefox-wayne
+    family: OrangeFox
+    device: wayne
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5a6f7c77c93477b2bff0ef/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi 6X (wayne) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5a6f7c77c93477b2bff0ef).
+
+  - name: orangefox-zenfone3
+    family: OrangeFox
+    device: zenfone3
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb03581a884ee437500c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Asus Zenfone 3 (zenfone3) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb03581a884ee437500c).
+
+  - name: orangefox-rmx1901
+    family: OrangeFox
+    device: rmx1901
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb03581a884ee437500d/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme X (rmx1901) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb03581a884ee437500d).
+
+  - name: orangefox-chiron
+    family: OrangeFox
+    device: chiron
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5efde4683eb6b5fdff753bf4/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi Mix 2 (chiron) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5efde4683eb6b5fdff753bf4).
+
+  - name: orangefox-jasmine_sprout
+    family: OrangeFox
+    device: jasmine_sprout
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/623406ea6a44bc7384195a50/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi A2 (jasmine_sprout) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 623406ea6a44bc7384195a50).
+
+  - name: orangefox-rmx1811
+    family: OrangeFox
+    device: rmx1811
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb03581a884ee4375011/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme C1 (rmx1811) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb03581a884ee4375011).
+
+  - name: orangefox-laurel_sprout
+    family: OrangeFox
+    device: laurel_sprout
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb04581a884ee4375012/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi A3 (laurel_sprout) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb04581a884ee4375012).
+
+  - name: orangefox-j6primelte
+    family: OrangeFox
+    device: j6primelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f17785d26d98d90b4cc826e/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J6+ (j6primelte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f17785d26d98d90b4cc826e).
+
+  - name: orangefox-j4primelte
+    family: OrangeFox
+    device: j4primelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f1777d726d98d90b4cc73dd/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J4+ (j4primelte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f1777d726d98d90b4cc73dd).
+
+  - name: orangefox-ginkgo
+    family: OrangeFox
+    device: ginkgo
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61d0754bf2082f874065c5df/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 8 (ginkgo) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61d0754bf2082f874065c5df).
+
+  - name: orangefox-c5lte
+    family: OrangeFox
+    device: c5lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb04581a884ee4375016/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy C5 (c5lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb04581a884ee4375016).
+
+  - name: orangefox-olive
+    family: OrangeFox
+    device: olive
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61067874dfa9fd3c4edb57d0/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 8 (olive) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61067874dfa9fd3c4edb57d0).
+
+  - name: orangefox-davinci
+    family: OrangeFox
+    device: davinci
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/606656e955b3af435f10e02e/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi 9T (davinci) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 606656e955b3af435f10e02e).
+
+  - name: orangefox-olivelite
+    family: OrangeFox
+    device: olivelite
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6117995c25238080d04b698c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 8a (olivelite) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6117995c25238080d04b698c).
+
+  - name: orangefox-j4corelte
+    family: OrangeFox
+    device: j4corelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f17790926d98d90b4cc9537/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J4 Core (j4corelte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f17790926d98d90b4cc9537).
+
+  - name: orangefox-oxygen
+    family: OrangeFox
+    device: oxygen
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6358535a3c05f43c193c391a/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi Max 2 (oxygen) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6358535a3c05f43c193c391a).
+
+  - name: orangefox-j53gxx
+    family: OrangeFox
+    device: j53gxx
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6112c215dfa9fd3c4edb5845/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J5 (2015) 3G (j53gxx) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6112c215dfa9fd3c4edb5845).
+
+  - name: orangefox-j5lte
+    family: OrangeFox
+    device: j5lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6112c2acdfa9fd3c4edb584a/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J5 (2015) LTE (j5lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6112c2acdfa9fd3c4edb584a).
+
+  - name: orangefox-j5ltechn
+    family: OrangeFox
+    device: j5ltechn
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6112c2d2dfa9fd3c4edb584b/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J5 (2015) LTE China (j5ltechn) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6112c2d2dfa9fd3c4edb584b).
+
+  - name: orangefox-j5nlte
+    family: OrangeFox
+    device: j5nlte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6112c31bdfa9fd3c4edb584c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J5 (2015) NFC LTE (j5nlte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6112c31bdfa9fd3c4edb584c).
+
+  - name: orangefox-crackling
+    family: OrangeFox
+    device: crackling
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adaff581a884ee4374ff8/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Wileyfox Swift (crackling) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adaff581a884ee4374ff8).
+
+  - name: orangefox-hermes
+    family: OrangeFox
+    device: hermes
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb00581a884ee4374ff9/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 2 (hermes) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb00581a884ee4374ff9).
+
+  - name: orangefox-j5xnlte
+    family: OrangeFox
+    device: j5xnlte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb00581a884ee4374ffb/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J5 (2016) (j5xnlte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb00581a884ee4374ffb).
+
+  - name: orangefox-markw
+    family: OrangeFox
+    device: markw
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb01581a884ee4374fff/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 4 Prime (markw) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb01581a884ee4374fff).
+
+  - name: orangefox-platina
+    family: OrangeFox
+    device: platina
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e7b91508be4fd968abffb95/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi 8 Lite (platina) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e7b91508be4fd968abffb95).
+
+  - name: orangefox-sagit
+    family: OrangeFox
+    device: sagit
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb02581a884ee4375007/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi 6 (sagit) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb02581a884ee4375007).
+
+  - name: orangefox-sanders
+    family: OrangeFox
+    device: sanders
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5e5adb02581a884ee4375008/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Motorola G5s Plus (sanders) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5e5adb02581a884ee4375008).
+
+  - name: orangefox-cepheus
+    family: OrangeFox
+    device: cepheus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60a4bb3ee805649489f06b53/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi 9 (cepheus) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60a4bb3ee805649489f06b53).
+
+  - name: orangefox-karate
+    family: OrangeFox
+    device: karate
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f177cb626d98d90b4ccfc4c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Lenovo K6 Power (karate) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f177cb626d98d90b4ccfc4c).
+
+  - name: orangefox-rmx1921
+    family: OrangeFox
+    device: rmx1921
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f22cb8594a8ed5b899071aa/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme XT (rmx1921) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f22cb8594a8ed5b899071aa).
+
+  - name: orangefox-rmx1992
+    family: OrangeFox
+    device: rmx1992
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60cf8e141dad67bacebb9723/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme X2 (rmx1992) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60cf8e141dad67bacebb9723).
+
+  - name: orangefox-rmx1971
+    family: OrangeFox
+    device: rmx1971
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f22cbd194a8ed5b89907b9c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme 5 Pro (rmx1971) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f22cbd194a8ed5b89907b9c).
+
+  - name: orangefox-onclite
+    family: OrangeFox
+    device: onclite
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/666d9582611edee0c1306a95/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 7/Y3 (onclite) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 666d9582611edee0c1306a95).
+
+  - name: orangefox-mblu2
+    family: OrangeFox
+    device: mblu2
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f47839694a8ed5b89d1f330/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Meizu M2 (mblu2) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f47839694a8ed5b89d1f330).
+
+  - name: orangefox-h830
+    family: OrangeFox
+    device: h830
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5eb4131b77b022754ff3b225/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for LG G5 (H830) (h830) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5eb4131b77b022754ff3b225).
+
+  - name: orangefox-h850
+    family: OrangeFox
+    device: h850
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5eb4150477b022754ff3e421/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for LG G5 (H850) (h850) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5eb4150477b022754ff3e421).
+
+  - name: orangefox-rs988
+    family: OrangeFox
+    device: rs988
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5eb4173077b022754ff41fb1/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for LG G5 (RS988) (rs988) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5eb4173077b022754ff41fb1).
+
+  - name: orangefox-begonia
+    family: OrangeFox
+    device: begonia
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f1d951294a8ed5b89fa00d0/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 8 Pro (begonia) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f1d951294a8ed5b89fa00d0).
+
+  - name: orangefox-rmx2030
+    family: OrangeFox
+    device: rmx2030
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f020b383eb6b5fdfff139d5/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme 5i (rmx2030) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f020b383eb6b5fdfff139d5).
+
+  - name: orangefox-sakura
+    family: OrangeFox
+    device: sakura
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6056efa3ee1435a74b093dd6/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 6 Pro (sakura) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6056efa3ee1435a74b093dd6).
+
+  - name: orangefox-x00r
+    family: OrangeFox
+    device: x00r
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f1c774994a8ed5b89db8217/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Asus Zenfone Lite L1 (x00r) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f1c774994a8ed5b89db8217).
+
+  - name: orangefox-d2q
+    family: OrangeFox
+    device: d2q
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f23280094a8ed5b899b4fb6/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy Note 10+ (snapdragon) (d2q) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f23280094a8ed5b899b4fb6).
+
+  - name: orangefox-starqltechn
+    family: OrangeFox
+    device: starqltechn
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60c7a2e1ab6a49957f0d6e95/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S9 (Qualcomm) (starqltechn) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60c7a2e1ab6a49957f0d6e95).
+
+  - name: orangefox-star2qltechn
+    family: OrangeFox
+    device: star2qltechn
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60c7a32cab6a49957f0d6e96/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S9+ (Qualcomm) (star2qltechn) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60c7a32cab6a49957f0d6e96).
+
+  - name: orangefox-crownqltechn
+    family: OrangeFox
+    device: crownqltechn
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60c7a2a7ab6a49957f0d6e94/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy Note 9 (Qualcomm) (crownqltechn) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60c7a2a7ab6a49957f0d6e94).
+
+  - name: orangefox-tucana
+    family: OrangeFox
+    device: tucana
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60d4b7241dad67bacebb974f/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi Note 10 (tucana) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60d4b7241dad67bacebb974f).
+
+  - name: orangefox-a3y17lte
+    family: OrangeFox
+    device: a3y17lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103c4f3dfa9fd3c4edb575f/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A3 2017 (a3y17lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103c4f3dfa9fd3c4edb575f).
+
+  - name: orangefox-a6lte
+    family: OrangeFox
+    device: a6lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103be0fdfa9fd3c4edb575b/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A6 2018 (a6lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103be0fdfa9fd3c4edb575b).
+
+  - name: orangefox-j5y17lte
+    family: OrangeFox
+    device: j5y17lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103c04cdfa9fd3c4edb575d/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J5 2017 (j5y17lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103c04cdfa9fd3c4edb575d).
+
+  - name: orangefox-j6lte
+    family: OrangeFox
+    device: j6lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103be60dfa9fd3c4edb575c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J6 2018 (j6lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103be60dfa9fd3c4edb575c).
+
+  - name: orangefox-j7velte
+    family: OrangeFox
+    device: j7velte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103cb9ddfa9fd3c4edb5762/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J7 Nxt (j7velte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103cb9ddfa9fd3c4edb5762).
+
+  - name: orangefox-j7xelte
+    family: OrangeFox
+    device: j7xelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103c750dfa9fd3c4edb5761/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J7 2016 (j7xelte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103c750dfa9fd3c4edb5761).
+
+  - name: orangefox-j7y17lte
+    family: OrangeFox
+    device: j7y17lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103c2e4dfa9fd3c4edb575e/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J7 2017 (j7y17lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103c2e4dfa9fd3c4edb575e).
+
+  - name: orangefox-on7xelte
+    family: OrangeFox
+    device: on7xelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103cf25dfa9fd3c4edb5763/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J7 Prime (on7xelte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103cf25dfa9fd3c4edb5763).
+
+  - name: orangefox-marmite
+    family: OrangeFox
+    device: marmite
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f358d08df373607167b4d2c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Wileyfox Swift 2/2 Plus/2 X (marmite) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f358d08df373607167b4d2c).
+
+  - name: orangefox-rmx1911
+    family: OrangeFox
+    device: rmx1911
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f72aac1dabb059129b8a2e2/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme 5 (rmx1911) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f72aac1dabb059129b8a2e2).
+
+  - name: orangefox-rmx1931
+    family: OrangeFox
+    device: rmx1931
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5fbbc8f729aaa50ddd9a5bc4/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme X2 Pro (rmx1931) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5fbbc8f729aaa50ddd9a5bc4).
+
+  - name: orangefox-klte
+    family: OrangeFox
+    device: klte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6105649cdfa9fd3c4edb57bc/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S5(Qualcomm) (klte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6105649cdfa9fd3c4edb57bc).
+
+  - name: orangefox-on5xelte
+    family: OrangeFox
+    device: on5xelte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f5610601dedb007d4784dfd/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J5 Prime (on5xelte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f5610601dedb007d4784dfd).
+
+  - name: orangefox-a20
+    family: OrangeFox
+    device: a20
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60de46bb4447b54af15acbce/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A20 (a20) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60de46bb4447b54af15acbce).
+
+  - name: orangefox-kltekdi
+    family: OrangeFox
+    device: kltekdi
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5f5b8b3fdabb059129301183/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S5 JPN (Qualcomm) (kltekdi) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5f5b8b3fdabb059129301183).
+
+  - name: orangefox-klteduos
+    family: OrangeFox
+    device: klteduos
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61056b20dfa9fd3c4edb57bd/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S5 Duos (Qualcomm) (klteduos) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61056b20dfa9fd3c4edb57bd).
+
+  - name: orangefox-j4ltexx
+    family: OrangeFox
+    device: j4ltexx
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/604e3e1ae4534f7cb0c48e7f/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy J4 (j4ltexx) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 604e3e1ae4534f7cb0c48e7f).
+
+  - name: orangefox-judyln
+    family: OrangeFox
+    device: judyln
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60e838434447b54af15acc2a/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for LG G7 ThinQ (judyln) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60e838434447b54af15acc2a).
+
+  - name: orangefox-a40
+    family: OrangeFox
+    device: a40
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103d96fdfa9fd3c4edb576a/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A40 (a40) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103d96fdfa9fd3c4edb576a).
+
+  - name: orangefox-a30
+    family: OrangeFox
+    device: a30
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103d13fdfa9fd3c4edb5764/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A30 (a30) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103d13fdfa9fd3c4edb5764).
+
+  - name: orangefox-a30s
+    family: OrangeFox
+    device: a30s
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103d3ecdfa9fd3c4edb5765/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A30s (a30s) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103d3ecdfa9fd3c4edb5765).
+
+  - name: orangefox-m30lte
+    family: OrangeFox
+    device: m30lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6103d7c9dfa9fd3c4edb5769/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy M30 (m30lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6103d7c9dfa9fd3c4edb5769).
+
+  - name: orangefox-curtana_obsolete
+    family: OrangeFox
+    device: curtana_obsolete
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5fa6d6fe29aaa50dddc3590f/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 9S (curtana) (curtana_obsolete) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5fa6d6fe29aaa50dddc3590f).
+
+  - name: orangefox-shamu
+    family: OrangeFox
+    device: shamu
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5fa71b7029aaa50dddcce00f/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Motorola Nexus 6 (shamu) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5fa71b7029aaa50dddcce00f).
+
+  - name: orangefox-jason
+    family: OrangeFox
+    device: jason
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61e2d4e4eff912e9c6328135/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi Note 3 (jason) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61e2d4e4eff912e9c6328135).
+
+  - name: orangefox-dumpling
+    family: OrangeFox
+    device: dumpling
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5fe2aa2c2bff7b008c1c7949/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for OnePlus 5T (dumpling) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5fe2aa2c2bff7b008c1c7949).
+
+  - name: orangefox-cheeseburger
+    family: OrangeFox
+    device: cheeseburger
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5fe4308c2bff7b008c49dc5e/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for OnePlus 5 (cheeseburger) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5fe4308c2bff7b008c49dc5e).
+
+  - name: orangefox-ks01lte
+    family: OrangeFox
+    device: ks01lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/5feb68a62bff7b008c279d04/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S4 LTE-A (ks01lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 5feb68a62bff7b008c279d04).
+
+  - name: orangefox-miatoll
+    family: OrangeFox
+    device: miatoll
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f5d15d3ba4241a6c1e0969/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 9S, Redmi Note 9 Pro, Redmi Note 9 Pro Max, POCO M2 Pro (miatoll) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f5d15d3ba4241a6c1e0969).
+
+  - name: orangefox-a51nsxx
+    family: OrangeFox
+    device: a51nsxx
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60f42a7d02b94e9fef8871de/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A51 (a51nsxx) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60f42a7d02b94e9fef8871de).
+
+  - name: orangefox-test_device, another_codename
+    family: OrangeFox
+    device: test_device, another_codename
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69b60af71ad523aa8e7f88b5/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Test Testing device, iPhone 19 (test_device, another_codename) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69b60af71ad523aa8e7f88b5).
+
+  - name: orangefox-gauguin
+    family: OrangeFox
+    device: gauguin
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60d63c071dad67bacebb9756/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi 10T Lite (gauguin) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60d63c071dad67bacebb9756).
+
+  - name: orangefox-a6020
+    family: OrangeFox
+    device: a6020
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61240ce825238080d04b69ea/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Lenovo Vibe K5/K5 Plus (a6020) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61240ce825238080d04b69ea).
+
+  - name: orangefox-dreamlte
+    family: OrangeFox
+    device: dreamlte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/62e3a2273977762f778225e3/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S8 (dreamlte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 62e3a2273977762f778225e3).
+
+  - name: orangefox-picasso
+    family: OrangeFox
+    device: picasso
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/680532391880128d054d5440/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi K30 5G (picasso) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 680532391880128d054d5440).
+
+  - name: orangefox-phoenix
+    family: OrangeFox
+    device: phoenix
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/612b7c9eab267b843a242688/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi POCO X2 / Redmi K30 (phoenix) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 612b7c9eab267b843a242688).
+
+  - name: orangefox-x00qd
+    family: OrangeFox
+    device: x00qd
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/63c95d8140b5fa07e92a7ea5/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Asus ZenFone 5 (x00qd) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 63c95d8140b5fa07e92a7ea5).
+
+  - name: orangefox-citrus
+    family: OrangeFox
+    device: citrus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/607ecf43250d6e47d09a2095/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Poco M3 (citrus) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 607ecf43250d6e47d09a2095).
+
+  - name: orangefox-a10
+    family: OrangeFox
+    device: a10
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/637faae440b5fa07e92a3b33/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A10 (a10) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 637faae440b5fa07e92a3b33).
+
+  - name: orangefox-m20lte
+    family: OrangeFox
+    device: m20lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61a1229b2324ba244e9518e3/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy M20 (m20lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61a1229b2324ba244e9518e3).
+
+  - name: orangefox-alice
+    family: OrangeFox
+    device: alice
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61083cbcdfa9fd3c4edb57df/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Huawei P8 Lite (alice) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61083cbcdfa9fd3c4edb57df).
+
+  - name: orangefox-dream2lte
+    family: OrangeFox
+    device: dream2lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/62e3a31d3977762f778225e5/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy S8+ (dream2lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 62e3a31d3977762f778225e5).
+
+  - name: orangefox-cloud_q11
+    family: OrangeFox
+    device: cloud_q11
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61e9abd3eff912e9c63287c2/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Intex Cloud Q11 (cloud_q11) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61e9abd3eff912e9c63287c2).
+
+  - name: orangefox-hotdog
+    family: OrangeFox
+    device: hotdog
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60ec71854447b54af15acc5c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for OnePlus 7T (Pro) (hotdog) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60ec71854447b54af15acc5c).
+
+  - name: orangefox-cactus
+    family: OrangeFox
+    device: cactus
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/62408c446a44bc73841965cf/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 6a (cactus) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 62408c446a44bc73841965cf).
+
+  - name: orangefox-exynos9611
+    family: OrangeFox
+    device: exynos9611
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/60fad965462e0f766bc300a1/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy M21/M31/F41 (exynos9611) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 60fad965462e0f766bc300a1).
+
+  - name: orangefox-rmx2001
+    family: OrangeFox
+    device: rmx2001
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6171a09f2db022eb2d056cfc/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Realme 6/6i/6s/7 (rmx2001) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6171a09f2db022eb2d056cfc).
+
+  - name: orangefox-vayu
+    family: OrangeFox
+    device: vayu
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f5cb063ba4241a6c1e0957/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Poco X3 Pro (vayu) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f5cb063ba4241a6c1e0957).
+
+  - name: orangefox-mojito
+    family: OrangeFox
+    device: mojito
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/61d1e061f2082f874065c72b/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 10 (mojito) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 61d1e061f2082f874065c72b).
+
+  - name: orangefox-gta3xlwifi
+    family: OrangeFox
+    device: gta3xlwifi
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/621787f36a44bc7384193eae/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy Tab A 10.1 (2019) (gta3xlwifi) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 621787f36a44bc7384193eae).
+
+  - name: orangefox-m1721
+    family: OrangeFox
+    device: m1721
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/62acc24b6a44bc738419cabd/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Meizu M6 Note (m1721) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 62acc24b6a44bc738419cabd).
+
+  - name: orangefox-sweet
+    family: OrangeFox
+    device: sweet
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6a107f7a192e80d0717207e1/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 10 Pro / Pro Max (sweet) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6a107f7a192e80d0717207e1).
+
+  - name: orangefox-a5y17lte
+    family: OrangeFox
+    device: a5y17lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/624ef2386a44bc73841973f8/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A5 (2017) (a5y17lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 624ef2386a44bc73841973f8).
+
+  - name: orangefox-garden
+    family: OrangeFox
+    device: garden
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/62bb16c36a44bc738419d9bb/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi 9A, Redmi 9C, Redmi 9i, Redmi 9AT, Redmi 9A Sport, Redmi 9 Activ, POCO C3, Redmi 10A (garden) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 62bb16c36a44bc738419d9bb).
+
+  - name: orangefox-a7y17lte
+    family: OrangeFox
+    device: a7y17lte
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6268ff106a44bc7384198ce4/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A7 (2017) (a7y17lte) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6268ff106a44bc7384198ce4).
+
+  - name: orangefox-alioth
+    family: OrangeFox
+    device: alioth
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f5d0c83ba4241a6c1e0967/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Poco F3, Xiaomi Mi 11X, Redmi K40 (alioth) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f5d0c83ba4241a6c1e0967).
+
+  - name: orangefox-a52q
+    family: OrangeFox
+    device: a52q
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6396d33a40b5fa07e92a5056/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A52 (a52q) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6396d33a40b5fa07e92a5056).
+
+  - name: orangefox-a72q
+    family: OrangeFox
+    device: a72q
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6396d3d140b5fa07e92a5057/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A72 (a72q) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6396d3d140b5fa07e92a5057).
+
+  - name: orangefox-a52sxq
+    family: OrangeFox
+    device: a52sxq
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6336f9c53c05f43c193c1919/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A52s (a52sxq) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6336f9c53c05f43c193c1919).
+
+  - name: orangefox-munch
+    family: OrangeFox
+    device: munch
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/67f520de33482976f0b31233/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi POCO F4 (munch) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 67f520de33482976f0b31233).
+
+  - name: orangefox-enchilada
+    family: OrangeFox
+    device: enchilada
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/635928283c05f43c193c39e2/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for OnePlus 6 (enchilada) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 635928283c05f43c193c39e2).
+
+  - name: orangefox-biloba
+    family: OrangeFox
+    device: biloba
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/639c887440b5fa07e92a55e1/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 8 (2021) (biloba) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 639c887440b5fa07e92a55e1).
+
+  - name: orangefox-m31
+    family: OrangeFox
+    device: m31
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/651706d567d66175d4001f95/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy M31 (m31) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 651706d567d66175d4001f95).
+
+  - name: orangefox-Pong
+    family: OrangeFox
+    device: Pong
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6a4cf37bbd81d72bb74ecb8b/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Nothing Phone (2) (Pong) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6a4cf37bbd81d72bb74ecb8b).
+
+  - name: orangefox-spes
+    family: OrangeFox
+    device: spes
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6a6410962d4c8dcb3f4200d1/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 11 (spes) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6a6410962d4c8dcb3f4200d1).
+
+  - name: orangefox-mondrian
+    family: OrangeFox
+    device: mondrian
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69fcbfa83b39d159d4d2ceba/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Poco F5 Pro (mondrian) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69fcbfa83b39d159d4d2ceba).
+
+  - name: orangefox-topaz, tapas, sapphire, creek
+    family: OrangeFox
+    device: topaz, tapas, sapphire, creek
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f5d0333ba4241a6c1e0965/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 12 4G, Redmi Note 13 4G (topaz, tapas, sapphire, creek) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f5d0333ba4241a6c1e0965).
+
+  - name: orangefox-pissarro
+    family: OrangeFox
+    device: pissarro
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6620d50145a61189337f0e97/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 11 Pro/Pro+ 5G / Mi 11i / 11i Hypercharge (pissarro) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6620d50145a61189337f0e97).
+
+  - name: orangefox-tissot
+    family: OrangeFox
+    device: tissot
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/68113f26be6181e2fdf2a29c/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Mi A1 (tissot) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 68113f26be6181e2fdf2a29c).
+
+  - name: orangefox-garnet
+    family: OrangeFox
+    device: garnet
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f5ce2f3ba4241a6c1e095d/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Redmi Note 13 Pro 5G, POCO X6 5G (garnet) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f5ce2f3ba4241a6c1e095d).
+
+  - name: orangefox-dodge, CPH2653, CPH2649, CPH2655, PJZ110
+    family: OrangeFox
+    device: dodge, CPH2653, CPH2649, CPH2655, PJZ110
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f791533ba4241a6c1e09af/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for OnePlus 13 (dodge, CPH2653, CPH2649, CPH2655, PJZ110) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f791533ba4241a6c1e09af).
+
+  - name: orangefox-a55x
+    family: OrangeFox
+    device: a55x
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6a33568928cee9015687fc1d/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A55 (a55x) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6a33568928cee9015687fc1d).
+
+  - name: orangefox-a33x
+    family: OrangeFox
+    device: a33x
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69396710902e7d0208fec480/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A33 5G (SM-A336B) (a33x) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69396710902e7d0208fec480).
+
+  - name: orangefox-a23xq
+    family: OrangeFox
+    device: a23xq
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/693969e7902e7d0208fec486/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Samsung Galaxy A23 5G (a23xq - SM-A236B) (a23xq) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 693969e7902e7d0208fec486).
+
+  - name: orangefox-CPH1989
+    family: OrangeFox
+    device: CPH1989
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6a083f1d0bc90c0d8efdefc3/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Oppo Reno 2F (CPH1989) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6a083f1d0bc90c0d8efdefc3).
+
+  - name: orangefox-peridot
+    family: OrangeFox
+    device: peridot
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6a5cef4d2d4c8dcb3f4200a7/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Xiaomi Poco F6 (peridot) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6a5cef4d2d4c8dcb3f4200a7).
+
+  - name: orangefox-infiniti, CPH2747, CPH2745, CPH2749, PLK110
+    family: OrangeFox
+    device: infiniti, CPH2747, CPH2745, CPH2749, PLK110
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/69f78ad93ba4241a6c1e09a9/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for OnePlus 15 (infiniti, CPH2747, CPH2745, CPH2749, PLK110) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 69f78ad93ba4241a6c1e09a9).
+
+  - name: orangefox-X505X, TB-X505X
+    family: OrangeFox
+    device: X505X, TB-X505X
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://api.orangefox.download/release/6a54047ee494c90c37bba312/dl
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      OrangeFox stable for Lenovo Lenovo Tab M10 (HD) (X505X, TB-X505X) - OrangeFox Recovery. Direct download via
+      api.orangefox.download release endpoint (id 6a54047ee494c90c37bba312).
+
+  - name: lineage-a21s
+    family: Lineage
+    device: a21s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/a21s/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device a21s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-a52q
+    family: Lineage
+    device: a52q
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/a52q/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device a52q.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-a52sxq
+    family: Lineage
+    device: a52sxq
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/a52sxq/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device a52sxq.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-a71
+    family: Lineage
+    device: a71
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/a71/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device a71.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-a72q
+    family: Lineage
+    device: a72q
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/a72q/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device a72q.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-a73xq
+    family: Lineage
+    device: a73xq
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/a73xq/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device a73xq.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-akari
+    family: Lineage
+    device: akari
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/akari/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device akari.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-akatsuki
+    family: Lineage
+    device: akatsuki
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/akatsuki/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device akatsuki.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-akershus
+    family: Lineage
+    device: akershus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/akershus/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device akershus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-akita
+    family: Lineage
+    device: akita
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/akita/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device akita.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-alioth
+    family: Lineage
+    device: alioth
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/alioth/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device alioth.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-apollon
+    family: Lineage
+    device: apollon
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/apollon/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device apollon.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-aston
+    family: Lineage
+    device: aston
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/aston/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device aston.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-astonc
+    family: Lineage
+    device: astonc
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/astonc/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device astonc.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-audi
+    family: Lineage
+    device: audi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/audi/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device audi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-aura
+    family: Lineage
+    device: aura
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/aura/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device aura.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-aurora
+    family: Lineage
+    device: aurora
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/aurora/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device aurora.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-avalon
+    family: Lineage
+    device: avalon
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/avalon/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device avalon.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-avatrn
+    family: Lineage
+    device: avatrn
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/avatrn/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device avatrn.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-axolotl
+    family: Lineage
+    device: axolotl
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/axolotl/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device axolotl.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-b0s
+    family: Lineage
+    device: b0s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/b0s/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device b0s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-bale
+    family: Lineage
+    device: bale
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/bale/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device bale.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-bangkk
+    family: Lineage
+    device: bangkk
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/bangkk/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device bangkk.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-baracus
+    family: Lineage
+    device: baracus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/baracus/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device baracus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-baracus_tab
+    family: Lineage
+    device: baracus_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/baracus_tab/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device baracus_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-barbet
+    family: Lineage
+    device: barbet
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/barbet/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device barbet.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-bathena
+    family: Lineage
+    device: bathena
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/bathena/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device bathena.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-beckham
+    family: Lineage
+    device: beckham
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/beckham/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device beckham.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-benz
+    family: Lineage
+    device: benz
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/benz/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device benz.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-berlin
+    family: Lineage
+    device: berlin
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/berlin/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device berlin.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-berlna
+    family: Lineage
+    device: berlna
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/berlna/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device berlna.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-beryllium
+    family: Lineage
+    device: beryllium
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/beryllium/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device beryllium.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-beyond0lte
+    family: Lineage
+    device: beyond0lte
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/beyond0lte/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device beyond0lte.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-beyond1lte
+    family: Lineage
+    device: beyond1lte
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/beyond1lte/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device beyond1lte.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-beyond2lte
+    family: Lineage
+    device: beyond2lte
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/beyond2lte/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device beyond2lte.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-beyondx
+    family: Lineage
+    device: beyondx
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/beyondx/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device beyondx.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-bluejay
+    family: Lineage
+    device: bluejay
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/bluejay/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device bluejay.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-blueline
+    family: Lineage
+    device: blueline
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/blueline/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device blueline.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-bonito
+    family: Lineage
+    device: bonito
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/bonito/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device bonito.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-borneo
+    family: Lineage
+    device: borneo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/borneo/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device borneo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-bramble
+    family: Lineage
+    device: bramble
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/bramble/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device bramble.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-bronco
+    family: Lineage
+    device: bronco
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/bronco/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device bronco.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-caihong
+    family: Lineage
+    device: caihong
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/caihong/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device caihong.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-caiman
+    family: Lineage
+    device: caiman
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/caiman/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device caiman.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-capri
+    family: Lineage
+    device: capri
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/capri/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device capri.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-caprip
+    family: Lineage
+    device: caprip
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/caprip/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device caprip.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-cas
+    family: Lineage
+    device: cas
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/cas/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device cas.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-casuarina
+    family: Lineage
+    device: casuarina
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/casuarina/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device casuarina.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-caymanslm
+    family: Lineage
+    device: caymanslm
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/caymanslm/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device caymanslm.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-cebu
+    family: Lineage
+    device: cebu
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/cebu/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device cebu.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-channel
+    family: Lineage
+    device: channel
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/channel/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device channel.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-cheeseburger
+    family: Lineage
+    device: cheeseburger
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/cheeseburger/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device cheeseburger.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-cheetah
+    family: Lineage
+    device: cheetah
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/cheetah/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device cheetah.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-cheryl
+    family: Lineage
+    device: cheryl
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/cheryl/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device cheryl.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-chiron
+    family: Lineage
+    device: chiron
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/chiron/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device chiron.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-cmi
+    family: Lineage
+    device: cmi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/cmi/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device cmi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-comet
+    family: Lineage
+    device: comet
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/comet/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device comet.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-coral
+    family: Lineage
+    device: coral
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/coral/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device coral.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-corvette
+    family: Lineage
+    device: corvette
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/corvette/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device corvette.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-crosshatch
+    family: Lineage
+    device: crosshatch
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/crosshatch/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device crosshatch.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-cupid
+    family: Lineage
+    device: cupid
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/cupid/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device cupid.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-d1
+    family: Lineage
+    device: d1
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/d1/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device d1.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-d1x
+    family: Lineage
+    device: d1x
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/d1x/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device d1x.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-d2s
+    family: Lineage
+    device: d2s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/d2s/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device d2s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-d2x
+    family: Lineage
+    device: d2x
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/d2x/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device d2x.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-davinci
+    family: Lineage
+    device: davinci
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/davinci/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device davinci.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-deadpool
+    family: Lineage
+    device: deadpool
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/deadpool/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device deadpool.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-denver
+    family: Lineage
+    device: denver
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/denver/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device denver.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-devon
+    family: Lineage
+    device: devon
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/devon/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device devon.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-dipper
+    family: Lineage
+    device: dipper
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/dipper/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device dipper.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-discovery
+    family: Lineage
+    device: discovery
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/discovery/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device discovery.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-diting
+    family: Lineage
+    device: diting
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/diting/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device diting.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-dm1q
+    family: Lineage
+    device: dm1q
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/dm1q/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device dm1q.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-dodge
+    family: Lineage
+    device: dodge
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/dodge/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device dodge.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-dopinder
+    family: Lineage
+    device: dopinder
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/dopinder/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device dopinder.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-dre
+    family: Lineage
+    device: dre
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/dre/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device dre.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-dubai
+    family: Lineage
+    device: dubai
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/dubai/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device dubai.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-dumpling
+    family: Lineage
+    device: dumpling
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/dumpling/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device dumpling.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-earth
+    family: Lineage
+    device: earth
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/earth/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device earth.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-enchilada
+    family: Lineage
+    device: enchilada
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/enchilada/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device enchilada.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-eqs
+    family: Lineage
+    device: eqs
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/eqs/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device eqs.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-equuleus
+    family: Lineage
+    device: equuleus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/equuleus/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device equuleus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-erhai
+    family: Lineage
+    device: erhai
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/erhai/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device erhai.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-evert
+    family: Lineage
+    device: evert
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/evert/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device evert.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-f62
+    family: Lineage
+    device: f62
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/f62/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device f62.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-fajita
+    family: Lineage
+    device: fajita
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/fajita/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device fajita.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-felix
+    family: Lineage
+    device: felix
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/felix/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device felix.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-flame
+    family: Lineage
+    device: flame
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/flame/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device flame.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-fogo
+    family: Lineage
+    device: fogo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/fogo/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device fogo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-fogos
+    family: Lineage
+    device: fogos
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/fogos/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device fogos.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-foster
+    family: Lineage
+    device: foster
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/foster/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device foster.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-foster_tab
+    family: Lineage
+    device: foster_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/foster_tab/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device foster_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-fuxi
+    family: Lineage
+    device: fuxi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/fuxi/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device fuxi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-g0s
+    family: Lineage
+    device: g0s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/g0s/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device g0s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-g710n
+    family: Lineage
+    device: g710n
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/g710n/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device g710n.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-g710ulm
+    family: Lineage
+    device: g710ulm
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/g710ulm/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device g710ulm.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-garnet
+    family: Lineage
+    device: garnet
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/garnet/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device garnet.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gauguin
+    family: Lineage
+    device: gauguin
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gauguin/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gauguin.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gemini
+    family: Lineage
+    device: gemini
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gemini/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gemini.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-genevn
+    family: Lineage
+    device: genevn
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/genevn/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device genevn.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-ginkgo
+    family: Lineage
+    device: ginkgo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/ginkgo/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device ginkgo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-giulia
+    family: Lineage
+    device: giulia
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/giulia/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device giulia.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-giuliac
+    family: Lineage
+    device: giuliac
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/giuliac/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device giuliac.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-grus
+    family: Lineage
+    device: grus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/grus/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device grus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gta4l
+    family: Lineage
+    device: gta4l
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gta4l/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gta4l.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gta4lwifi
+    family: Lineage
+    device: gta4lwifi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gta4lwifi/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gta4lwifi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gta4xl
+    family: Lineage
+    device: gta4xl
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gta4xl/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gta4xl.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gta4xlswifi
+    family: Lineage
+    device: gta4xlswifi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gta4xlswifi/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gta4xlswifi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gta4xlwifi
+    family: Lineage
+    device: gta4xlwifi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gta4xlwifi/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gta4xlwifi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gtowifi
+    family: Lineage
+    device: gtowifi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gtowifi/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gtowifi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gts4lv
+    family: Lineage
+    device: gts4lv
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gts4lv/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gts4lv.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gts4lvwifi
+    family: Lineage
+    device: gts4lvwifi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gts4lvwifi/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gts4lvwifi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gts7l
+    family: Lineage
+    device: gts7l
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gts7l/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gts7l.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gts7lwifi
+    family: Lineage
+    device: gts7lwifi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gts7lwifi/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gts7lwifi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-guacamole
+    family: Lineage
+    device: guacamole
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/guacamole/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device guacamole.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-guacamoleb
+    family: Lineage
+    device: guacamoleb
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/guacamoleb/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device guacamoleb.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-guam
+    family: Lineage
+    device: guam
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/guam/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device guam.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-guamp
+    family: Lineage
+    device: guamp
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/guamp/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device guamp.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-gunnar
+    family: Lineage
+    device: gunnar
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/gunnar/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device gunnar.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h830
+    family: Lineage
+    device: h830
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h830/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h830.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h850
+    family: Lineage
+    device: h850
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h850/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h850.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h870
+    family: Lineage
+    device: h870
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h870/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h870.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h870d
+    family: Lineage
+    device: h870d
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h870d/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h870d.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h872
+    family: Lineage
+    device: h872
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h872/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h872.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h873
+    family: Lineage
+    device: h873
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h873/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h873.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h910
+    family: Lineage
+    device: h910
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h910/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h910.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h918
+    family: Lineage
+    device: h918
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h918/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h918.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-h990
+    family: Lineage
+    device: h990
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/h990/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device h990.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-hawao
+    family: Lineage
+    device: hawao
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/hawao/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device hawao.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-haydn
+    family: Lineage
+    device: haydn
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/haydn/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device haydn.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-heart
+    family: Lineage
+    device: heart
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/heart/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device heart.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-hotdog
+    family: Lineage
+    device: hotdog
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/hotdog/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device hotdog.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-hotdogb
+    family: Lineage
+    device: hotdogb
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/hotdogb/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device hotdogb.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-husky
+    family: Lineage
+    device: husky
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/husky/20260821/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device husky.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-ibiza
+    family: Lineage
+    device: ibiza
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/ibiza/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device ibiza.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-ingot
+    family: Lineage
+    device: ingot
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/ingot/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device ingot.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-instantnoodle
+    family: Lineage
+    device: instantnoodle
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/instantnoodle/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device instantnoodle.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-instantnoodlep
+    family: Lineage
+    device: instantnoodlep
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/instantnoodlep/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device instantnoodlep.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-joan
+    family: Lineage
+    device: joan
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/joan/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device joan.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-judyln
+    family: Lineage
+    device: judyln
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/judyln/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device judyln.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-judyp
+    family: Lineage
+    device: judyp
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/judyp/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device judyp.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-judypn
+    family: Lineage
+    device: judypn
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/judypn/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device judypn.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-kane
+    family: Lineage
+    device: kane
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/kane/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device kane.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-kebab
+    family: Lineage
+    device: kebab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/kebab/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device kebab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-kiev
+    family: Lineage
+    device: kiev
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/kiev/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device kiev.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-kirin
+    family: Lineage
+    device: kirin
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/kirin/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device kirin.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-komodo
+    family: Lineage
+    device: komodo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/komodo/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device komodo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-l01k
+    family: Lineage
+    device: l01k
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/l01k/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device l01k.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lake
+    family: Lineage
+    device: lake
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lake/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lake.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lamu
+    family: Lineage
+    device: lamu
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lamu/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lamu.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-larry
+    family: Lineage
+    device: larry
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/larry/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device larry.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lemonade
+    family: Lineage
+    device: lemonade
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lemonade/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lemonade.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lemonadep
+    family: Lineage
+    device: lemonadep
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lemonadep/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lemonadep.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lemonades
+    family: Lineage
+    device: lemonades
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lemonades/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lemonades.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lexus
+    family: Lineage
+    device: lexus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lexus/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lexus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lisa
+    family: Lineage
+    device: lisa
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lisa/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lisa.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lmi
+    family: Lineage
+    device: lmi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lmi/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lmi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-ls997
+    family: Lineage
+    device: ls997
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/ls997/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device ls997.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-luigi
+    family: Lineage
+    device: luigi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/luigi/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device luigi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-lynx
+    family: Lineage
+    device: lynx
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/lynx/20260821/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device lynx.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-m5
+    family: Lineage
+    device: m5
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/m5/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device m5.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-m52xq
+    family: Lineage
+    device: m52xq
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/m52xq/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device m52xq.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-m5_tab
+    family: Lineage
+    device: m5_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/m5_tab/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device m5_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-manaus
+    family: Lineage
+    device: manaus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/manaus/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device manaus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-marble
+    family: Lineage
+    device: marble
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/marble/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device marble.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-marlin
+    family: Lineage
+    device: marlin
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/marlin/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device marlin.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-mars
+    family: Lineage
+    device: mars
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/mars/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device mars.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-martini
+    family: Lineage
+    device: martini
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/martini/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device martini.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-mata
+    family: Lineage
+    device: mata
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/mata/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device mata.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-mayfly
+    family: Lineage
+    device: mayfly
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/mayfly/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device mayfly.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-mermaid
+    family: Lineage
+    device: mermaid
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/mermaid/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device mermaid.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-messi
+    family: Lineage
+    device: messi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/messi/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device messi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-miami
+    family: Lineage
+    device: miami
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/miami/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device miami.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-miatoll
+    family: Lineage
+    device: miatoll
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/miatoll/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device miatoll.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-milanf
+    family: Lineage
+    device: milanf
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/milanf/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device milanf.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-mondrian
+    family: Lineage
+    device: mondrian
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/mondrian/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device mondrian.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-munch
+    family: Lineage
+    device: munch
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/munch/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device munch.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nairo
+    family: Lineage
+    device: nairo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nairo/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nairo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nash
+    family: Lineage
+    device: nash
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nash/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nash.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-natrium
+    family: Lineage
+    device: natrium
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/natrium/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device natrium.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nicepool
+    family: Lineage
+    device: nicepool
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nicepool/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nicepool.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nicepool_rtk
+    family: Lineage
+    device: nicepool_rtk
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nicepool_rtk/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nicepool_rtk.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nicole
+    family: Lineage
+    device: nicole
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nicole/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nicole.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nio
+    family: Lineage
+    device: nio
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nio/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nio.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nuwa
+    family: Lineage
+    device: nuwa
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nuwa/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nuwa.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nx
+    family: Lineage
+    device: nx
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nx/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nx.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nx563j
+    family: Lineage
+    device: nx563j
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nx563j/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nx563j.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nx606j
+    family: Lineage
+    device: nx606j
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nx606j/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nx606j.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nx616j
+    family: Lineage
+    device: nx616j
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nx616j/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nx616j.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nx619j
+    family: Lineage
+    device: nx619j
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nx619j/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nx619j.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nx659j
+    family: Lineage
+    device: nx659j
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nx659j/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nx659j.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-nx_tab
+    family: Lineage
+    device: nx_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/nx_tab/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device nx_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-ocean
+    family: Lineage
+    device: ocean
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/ocean/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device ocean.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-odin_m0
+    family: Lineage
+    device: odin_m0
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/odin_m0/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device odin_m0.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-odin_m2
+    family: Lineage
+    device: odin_m2
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/odin_m2/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device odin_m2.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-odroidc4
+    family: Lineage
+    device: odroidc4
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/odroidc4/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device odroidc4.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-odroidc4_tab
+    family: Lineage
+    device: odroidc4_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/odroidc4_tab/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device odroidc4_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-ohm
+    family: Lineage
+    device: ohm
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/ohm/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device ohm.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-oriole
+    family: Lineage
+    device: oriole
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/oriole/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device oriole.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-oscar
+    family: Lineage
+    device: oscar
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/oscar/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device oscar.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-oscaro
+    family: Lineage
+    device: oscaro
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/oscaro/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device oscaro.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-otter
+    family: Lineage
+    device: otter
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/otter/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device otter.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-panther
+    family: Lineage
+    device: panther
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/panther/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device panther.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-payton
+    family: Lineage
+    device: payton
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/payton/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device payton.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx203
+    family: Lineage
+    device: pdx203
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx203/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx203.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx206
+    family: Lineage
+    device: pdx206
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx206/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx206.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx214
+    family: Lineage
+    device: pdx214
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx214/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx214.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx215
+    family: Lineage
+    device: pdx215
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx215/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx215.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx223
+    family: Lineage
+    device: pdx223
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx223/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx223.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx224
+    family: Lineage
+    device: pdx224
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx224/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx224.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx225
+    family: Lineage
+    device: pdx225
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx225/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx225.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx234
+    family: Lineage
+    device: pdx234
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx234/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx234.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx235
+    family: Lineage
+    device: pdx235
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx235/20260821/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx235.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx237
+    family: Lineage
+    device: pdx237
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx237/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx237.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx245
+    family: Lineage
+    device: pdx245
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx245/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx245.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pdx257
+    family: Lineage
+    device: pdx257
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pdx257/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pdx257.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-peridot
+    family: Lineage
+    device: peridot
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/peridot/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device peridot.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-perseus
+    family: Lineage
+    device: perseus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/perseus/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device perseus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pioneer
+    family: Lineage
+    device: pioneer
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pioneer/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pioneer.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-polaris
+    family: Lineage
+    device: polaris
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/polaris/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device polaris.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-porg
+    family: Lineage
+    device: porg
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/porg/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device porg.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-porg_tab
+    family: Lineage
+    device: porg_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/porg_tab/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device porg_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pro1
+    family: Lineage
+    device: pro1
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pro1/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pro1.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pro1x
+    family: Lineage
+    device: pro1x
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pro1x/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pro1x.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pstar
+    family: Lineage
+    device: pstar
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pstar/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pstar.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pyrite
+    family: Lineage
+    device: pyrite
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pyrite/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pyrite.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-pyxis
+    family: Lineage
+    device: pyxis
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/pyxis/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device pyxis.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-quill
+    family: Lineage
+    device: quill
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/quill/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device quill.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-quill_tab
+    family: Lineage
+    device: quill_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/quill_tab/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device quill_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-r0s
+    family: Lineage
+    device: r0s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/r0s/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device r0s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-r8q
+    family: Lineage
+    device: r8q
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/r8q/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device r8q.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-r8s
+    family: Lineage
+    device: r8s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/r8s/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device r8s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-racer
+    family: Lineage
+    device: racer
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/racer/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device racer.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-radxa0
+    family: Lineage
+    device: radxa0
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/radxa0/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device radxa0.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-radxa02
+    family: Lineage
+    device: radxa02
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/radxa02/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device radxa02.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-radxa02_tab
+    family: Lineage
+    device: radxa02_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/radxa02_tab/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device radxa02_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-radxa0_tab
+    family: Lineage
+    device: radxa0_tab
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/radxa0_tab/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device radxa0_tab.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-raven
+    family: Lineage
+    device: raven
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/raven/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device raven.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-redfin
+    family: Lineage
+    device: redfin
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/redfin/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device redfin.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-renoir
+    family: Lineage
+    device: renoir
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/renoir/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device renoir.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-rhode
+    family: Lineage
+    device: rhode
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/rhode/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device rhode.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-rhodep
+    family: Lineage
+    device: rhodep
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/rhodep/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device rhodep.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-river
+    family: Lineage
+    device: river
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/river/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device river.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-rosemary
+    family: Lineage
+    device: rosemary
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/rosemary/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device rosemary.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-rs988
+    family: Lineage
+    device: rs988
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/rs988/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device rs988.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-rtwo
+    family: Lineage
+    device: rtwo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/rtwo/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device rtwo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sabrina
+    family: Lineage
+    device: sabrina
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sabrina/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sabrina.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sagit
+    family: Lineage
+    device: sagit
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sagit/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sagit.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sailfish
+    family: Lineage
+    device: sailfish
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sailfish/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sailfish.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sake
+    family: Lineage
+    device: sake
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sake/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sake.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-salami
+    family: Lineage
+    device: salami
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/salami/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device salami.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sargo
+    family: Lineage
+    device: sargo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sargo/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sargo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-scorpio
+    family: Lineage
+    device: scorpio
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/scorpio/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device scorpio.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-shark
+    family: Lineage
+    device: shark
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/shark/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device shark.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-shiba
+    family: Lineage
+    device: shiba
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/shiba/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device shiba.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sif
+    family: Lineage
+    device: sif
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sif/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sif.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-socrates
+    family: Lineage
+    device: socrates
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/socrates/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device socrates.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-style3lm
+    family: Lineage
+    device: style3lm
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/style3lm/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device style3lm.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sunfish
+    family: Lineage
+    device: sunfish
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sunfish/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sunfish.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-surya
+    family: Lineage
+    device: surya
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/surya/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device surya.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-sweet
+    family: Lineage
+    device: sweet
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/sweet/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device sweet.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-taimen
+    family: Lineage
+    device: taimen
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/taimen/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device taimen.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-tangorpro
+    family: Lineage
+    device: tangorpro
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/tangorpro/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device tangorpro.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-tegu
+    family: Lineage
+    device: tegu
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/tegu/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device tegu.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-thor
+    family: Lineage
+    device: thor
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/thor/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device thor.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-thyme
+    family: Lineage
+    device: thyme
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/thyme/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device thyme.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-timelm
+    family: Lineage
+    device: timelm
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/timelm/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device timelm.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-tokay
+    family: Lineage
+    device: tokay
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/tokay/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device tokay.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-trident
+    family: Lineage
+    device: trident
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/trident/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device trident.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-troika
+    family: Lineage
+    device: troika
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/troika/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device troika.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-tucana
+    family: Lineage
+    device: tucana
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/tucana/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device tucana.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-tundra
+    family: Lineage
+    device: tundra
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/tundra/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device tundra.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-umi
+    family: Lineage
+    device: umi
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/umi/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device umi.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-unicorn
+    family: Lineage
+    device: unicorn
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/unicorn/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device unicorn.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-ursa
+    family: Lineage
+    device: ursa
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/ursa/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device ursa.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-us996
+    family: Lineage
+    device: us996
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/us996/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device us996.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-us996d
+    family: Lineage
+    device: us996d
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/us996d/20260824/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device us996d.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-us997
+    family: Lineage
+    device: us997
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/us997/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device us997.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-vayu
+    family: Lineage
+    device: vayu
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/vayu/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device vayu.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-vela
+    family: Lineage
+    device: vela
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/vela/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device vela.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-venus
+    family: Lineage
+    device: venus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/venus/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device venus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-vermeer
+    family: Lineage
+    device: vermeer
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/vermeer/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device vermeer.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-violet
+    family: Lineage
+    device: violet
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/violet/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device violet.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-voyager
+    family: Lineage
+    device: voyager
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/voyager/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device voyager.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-vs995
+    family: Lineage
+    device: vs995
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/vs995/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device vs995.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-wade
+    family: Lineage
+    device: wade
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/wade/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device wade.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-waffle
+    family: Lineage
+    device: waffle
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/waffle/20260827/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device waffle.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-walleye
+    family: Lineage
+    device: walleye
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/walleye/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device walleye.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-x1s
+    family: Lineage
+    device: x1s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/x1s/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device x1s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-xpeng
+    family: Lineage
+    device: xpeng
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/xpeng/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device xpeng.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-xz2c
+    family: Lineage
+    device: xz2c
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/xz2c/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device xz2c.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-y2s
+    family: Lineage
+    device: y2s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/y2s/20260822/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device y2s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-z3s
+    family: Lineage
+    device: z3s
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/z3s/20260823/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device z3s.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-zeus
+    family: Lineage
+    device: zeus
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/zeus/20260825/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device zeus.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-zippo
+    family: Lineage
+    device: zippo
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/zippo/20260828/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device zippo.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
+  - name: lineage-zizhan
+    family: Lineage
+    device: zizhan
+    arch: arm64
+    generation: "15"
+    tier: nightly
+    url: https://mirrorbits.lineageos.org/full/zizhan/20260826/boot.img
+    referer: ""
+    md5: ""
+    sha256: ""
+    notes: >-
+      LineageOS recovery-in-boot via boot.img for device zizhan.
+      Modern Android 14/15 recovery shape (A/B + dynamic partitions).
+
