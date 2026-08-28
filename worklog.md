@@ -12908,3 +12908,62 @@ Stage Summary:
   whyred init survives property init (6-Z121 now fires on the correct
   fd) → the traced recovery service starts → theme loads via the
   TRANSLATED path (angler precedent) instead of the untraced retry.
+
+---
+Task ID: 6-Z202 + 6-Z203 + 6-Z204 (round 4)
+Agent: main
+Task: Fix the round-3 next-layer blockers (runs 33189882415 OrangeFox /
+33189885036 whyred / 33189887334 angler on da91004).
+
+Work Log:
+- Round-3 verdicts (from the ci-monitor sub-agent): angler UI_READY NO
+  REGRESSION ✓. OrangeFox: first-stage abort GONE (6-Z197 round-2 faked
+  all five boot dirs incl. the /dev/dm-user socket case) — new blocker
+  "<2>init: Could not open uevent socket" → InitFatalReboot (the 6-Z99
+  uevent emulation exists but its synthetic fd 0x6b00_0000 is
+  FD_SETSIZE-unsafe for TWRP's select() loop → it was gated OFF in
+  recovery mode). whyred: property area FIXED (6-Z121 fired 6× with the
+  correct fds; properties_serial created by init; "Failed to initialize
+  property area" GONE), 6-Z200/6-Z200b engaged, recovery starts TRACED
+  on the FIRST boot and the THEME LOADS (round-2's
+  LoadLanguageListDir/Failed-to-load-base-packages class eliminated) —
+  new blocker: libpixelflinger CodeCache's
+  ashmem_create_region("CodeFlinger code cache") → the ASHMEM_SET_NAME/
+  SET_SIZE ioctls run REAL against the regular-file /dev/ashmem
+  stand-in → ENOTTY → "Creating code cache, ashmem_create_region failed
+  with error 'Not a typewriter'" → LOG_ALWAYS_FATAL_IF abort at splash
+  (Android 8+ bionic calls ioctl through an internal path the
+  LD_PRELOAD interposer cannot catch — same intra-libc class as 6-Z199).
+- FIX (6-Z202): uevent netlink socket via ENTRY-side arg REWRITE —
+  socket(AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) becomes
+  socket(AF_UNIX, SOCK_DGRAM|flags, 0): a REAL low FD_SET-safe kernel
+  fd. An unconnected nonblocking AF_UNIX dgram socket natively behaves
+  exactly like a uevent socket with no uevents (recv* → -EAGAIN, poll
+  never-readable). The EXIT arm registers the returned fd into the
+  existing 6-Z99 fake_netlink_fds machinery (bind/listen/setsockopt →
+  0). Works in BOTH recovery and AOSP modes; the old synthetic-fd path
+  stays as a dead-code fallback.
+- FIX (6-Z203): tracer-level ashmem ioctl virtualization — new
+  ioctl_nr ABI field (i386 54 / x86_64 16 / aarch64 29); ashmem fds
+  tracked at open EXIT (is_ashmem_backing_path: final component
+  "ashmem"); at ioctl ENTRY, requests with type byte 0x77 on tracked
+  fds are faked: SET_SIZE also ftruncates the backing file (so the
+  caller's file-backed MAP_SHARED mmap has room), GET_SIZE returns the
+  tracked size, SET_NAME/PIN/UNPIN/… → 0. Cleaned at close EXIT (with
+  the 6-Z199 stashed fd). Coexists with the hook's PLT-level 6-Z171c
+  path (whichever layer sees the call handles it; the hook's fakes
+  never reach the syscall layer).
+- FIX (6-Z204): classify_result.py — the terminal screenshot-name
+  fallback is now gated on ui == UI_READY (run 33189885036 credited a
+  FROZEN SPLASH via staged screenshot names).
+- Gates: fmt + clippy -D warnings + 595 tests PASS (2 new:
+  ashmem_ioctl_nr type-0x77 extraction incl. 32/64-bit size encodings,
+  ashmem backing-path matcher).
+
+Stage Summary:
+- Committed + pushed; round-4 CI dispatched (OrangeFox + whyred +
+  angler regression). Expected: OrangeFox init survives the uevent
+  FATAL and proceeds into service startup (next-layer blocker will
+  surface); whyred's CodeCache mmap succeeds → splash → main menu
+  (UI_READY candidate). The corpus still needs broadening (§17) — next
+  local task while CI runs.

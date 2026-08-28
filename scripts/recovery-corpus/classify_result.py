@@ -128,8 +128,14 @@ terminal_signals = [
 ]
 if "terminalcommand" in rec or "Set page: 'terminal" in rec:
     result["terminal"] = "OK" if any(terminal_signals) else "FAIL"
-elif any("term-07" in os.path.basename(p)
-         for p in glob.glob(os.path.join(ART, "screenshot-*"))):
+elif result["ui"] == "UI_READY" and any(
+        "term-07" in os.path.basename(p)
+        for p in glob.glob(os.path.join(ART, "screenshot-*"))):
+    # 6-Z204: gate the screenshot-name fallback on UI_READY — run
+    # 33189885036 (whyred) credited a FROZEN SPLASH screen because the
+    # probe's screenshot filenames are stage-scripted, not evidence of
+    # a live terminal (the classifier must not trust staged names when
+    # the UI never reached a menu).
     result["terminal"] = "OK"
 elif result["ui"] == "UI_READY":
     result["terminal"] = "NOT_REACHED"

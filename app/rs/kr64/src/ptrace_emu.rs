@@ -966,6 +966,15 @@ struct ChildAbi {
     // are locked in for completeness (bionic i386 normally multiplexes via
     // socketcall nr=102 — handled by the dedicated subcall arm). -1
     // sentinels mirror the socketcall_nr / poll_nr precedent.
+    // ── 6-Z203: ioctl syscall numbers for the tracer-level ashmem
+    // ioctl virtualization (the LD_PRELOAD hook only sees PLT calls —
+    // Android 8+ bionic's ashmem_create_region calls ioctl via an
+    // internal path the interposer cannot catch, so the ioctl runs
+    // REAL against the regular-file /dev/ashmem stand-in and fails
+    // with ENOTTY → LOG_ALWAYS_FATAL_IF abort in libpixelflinger's
+    // CodeCache, run 33189885036 whyred).
+    //   i386 54, x86_64 16, aarch64 29 (asm-generic).
+    ioctl_nr: i64,
     socket_nr: i64,
     bind_nr: i64,
     listen_nr: i64,
@@ -1350,6 +1359,7 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // mirroring the ABI_AARCH64.open precedent.
     set_thread_area_nr: -1,
     socket_nr: 41,
+    ioctl_nr: 16, // x86_64 ioctl
     bind_nr: 49,
     listen_nr: 50,
     sendto_nr: 44,
@@ -1711,6 +1721,7 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // to install the %gs-based TLS thread pointer (Task 6-Z69).
     set_thread_area_nr: 243,
     socket_nr: 359,
+    ioctl_nr: 54, // i386 ioctl
     bind_nr: 360,
     listen_nr: 362,
     sendto_nr: 369,
@@ -2053,6 +2064,7 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // via tpidr_el0, configured by clone()) → sentinel -1.
     set_thread_area_nr: -1,
     socket_nr: 198,
+    ioctl_nr: 29, // asm-generic ioctl
     bind_nr: 200,
     listen_nr: 201,
     sendto_nr: 206,
@@ -4107,6 +4119,26 @@ fn subst_proc_self(path: &str, pid: libc::pid_t) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// 6-Z203: extract the ashmem ioctl "nr" (the low byte) when the
+/// request's type byte is 0x77 (bionic's ashmem ioctls are built with
+/// _IOW(0x77, nr, T) — both the 32-bit 0x400877xx and 64-bit 0x401077xx
+/// size encodings share the type byte + nr). Returns 0 for non-ashmem
+/// requests.
+fn ashmem_ioctl_nr(req: u64) -> u8 {
+    if ((req >> 8) & 0xff) == 0x77 {
+        (req & 0xff) as u8
+    } else {
+        0
+    }
+}
+
+/// 6-Z203: does this host path point at the /dev/ashmem regular-file
+/// stand-in? Matches both the bare guest spelling and the
+/// translate_path-mangled rootfs form (anchored on the final component).
+fn is_ashmem_backing_path(path: &str) -> bool {
+    path.starts_with('/') && path.rsplit('/').next() == Some("ashmem")
 }
 
 /// 6-Z200b: rewrite a readlink result so the guest never sees a host
@@ -9139,6 +9171,19 @@ pub fn run_ptrace_loop(
     // aarch64 x0 is BOTH arg1 and the return register, so the fd is
     // unrecoverable from the EXIT snapshot alone.
     let mut pending_entry_fd: std::collections::HashMap<libc::pid_t, i64> =
+        std::collections::HashMap::new();
+    // 6-Z202: pids whose in-flight socket() ENTRY was rewritten from
+    // (AF_NETLINK, *, NETLINK_KOBJECT_UEVENT) to (AF_UNIX, SOCK_DGRAM,
+    // 0) — the EXIT arm turns the returned REAL fd into a tracked
+    // fake-uevent fd (the 6-Z99 follow-up machinery then fakes
+    // bind/setsockopt→0 and lets the kernel's natural -EAGAIN stand in
+    // for recv*).
+    let mut pending_uevent_socket: std::collections::HashSet<libc::pid_t> =
+        std::collections::HashSet::new();
+    // 6-Z203: (pid, fd) → last ASHMEM_SET_SIZE for fds opened on the
+    // {rootfs}/dev/ashmem regular-file stand-in. The tracer-level ioctl
+    // virtualization needs the size for GET_SIZE + ftruncate on SET_SIZE.
+    let mut ashmem_fd_sizes: std::collections::HashMap<(libc::pid_t, i32), i64> =
         std::collections::HashMap::new();
     const Z121_LOG_CAP: u32 = 60;
 
@@ -14958,6 +15003,118 @@ pub fn run_ptrace_loop(
                             // Not an intercepted syscall — let it through.
                         }
                     }
+                    // ── 6-Z202: uevent netlink socket → REAL AF_UNIX
+                    // DGRAM socket (ENTRY-side arg rewrite) ──
+                    //
+                    // Android 10+ init (both stages) does:
+                    //   fd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|
+                    //               SOCK_NONBLOCK, NETLINK_KOBJECT_UEVENT);
+                    //   if (fd == -1) PLOG(FATAL) << "Could not open
+                    //   uevent socket";
+                    // The untrusted-app seccomp filter denies the
+                    // AF_NETLINK socket with ERRNO → init aborts
+                    // (run 33189882415 OrangeFox R12.0: past first
+                    // stage, killed exactly here). The old 6-Z99
+                    // EXIT-side fake fd (0x6b00_0000) is disabled in
+                    // recovery mode — TWRP's select() loop FD_SETs the
+                    // fd and bionic's _FORTIFY_SOURCE aborts on
+                    // "fd >= FD_SETSIZE". THE FIX: rewrite the
+                    // syscall's OWN arguments to create a REAL
+                    // AF_UNIX SOCK_DGRAM socket (a low, FD_SET-safe
+                    // kernel fd): an unconnected nonblocking dgram
+                    // socket natively behaves exactly like a
+                    // uevent socket with no uevents (recv* →
+                    // -EAGAIN, poll never-readable). The EXIT arm
+                    // registers the returned fd into the 6-Z99
+                    // fake_netlink_fds set so bind()/setsockopt()
+                    // get their boot-critical 0s.
+                    if abi.socket_nr != -1 && syscall_num == abi.socket_nr {
+                        const AF_NETLINK_Z202: u64 = 16;
+                        const AF_UNIX_Z202: u64 = 1;
+                        const NETLINK_KOBJECT_UEVENT_Z202: u64 = 15;
+                        let domain = get_syscall_arg(&regs, abi.reg_arg1);
+                        let sock_type = get_syscall_arg(&regs, abi.reg_arg2);
+                        let protocol = get_syscall_arg(&regs, abi.reg_arg3);
+                        if domain == AF_NETLINK_Z202 && protocol == NETLINK_KOBJECT_UEVENT_Z202 {
+                            // SOCK_TYPE_MASK = 0xFF: keep the flag
+                            // bits (SOCK_CLOEXEC 0x80000,
+                            // SOCK_NONBLOCK 0x800), force the base
+                            // type to SOCK_DGRAM (AF_UNIX has no
+                            // SOCK_RAW).
+                            let new_type = (sock_type & !0xff) | 2;
+                            set_syscall_arg(&mut regs, abi.reg_arg1, AF_UNIX_Z202);
+                            set_syscall_arg(&mut regs, abi.reg_arg2, new_type);
+                            set_syscall_arg(&mut regs, abi.reg_arg3, 0);
+                            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                pending_uevent_socket.insert(pid);
+                                log(&format!(
+                                    "6-Z202: socket(AF_NETLINK, {:#x}, NETLINK_KOBJECT_UEVENT) rewritten to socket(AF_UNIX, SOCK_DGRAM|flags, 0) — real FD_SET-safe fd; bind/setsockopt faked by 6-Z99, recv* natively -EAGAIN",
+                                    sock_type
+                                ));
+                            }
+                        }
+                    }
+                    // ── 6-Z203: tracer-level ashmem ioctl
+                    // virtualization (ENTRY) ──
+                    //
+                    // Android 8+ bionic's ashmem_create_region calls
+                    // ioctl() through an internal path the
+                    // LD_PRELOAD interposer cannot catch (run
+                    // 33189885036 whyred: the ioctl ran REAL against
+                    // the regular-file /dev/ashmem stand-in → ENOTTY
+                    // → "Creating code cache, ashmem_create_region
+                    // failed with error 'Not a typewriter'" →
+                    // LOG_ALWAYS_FATAL_IF abort in libpixelflinger's
+                    // CodeCache). Fake the whole ASHMEM_* ioctl
+                    // protocol at the SYSCALL level: SET_SIZE also
+                    // ftruncates the backing file so the caller's
+                    // file-backed MAP_SHARED mmap has room; GET_SIZE
+                    // returns the tracked size; everything else → 0.
+                    if abi.ioctl_nr != -1 && syscall_num == abi.ioctl_nr {
+                        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                        let req = get_syscall_arg(&regs, abi.reg_arg2);
+                        let arg = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                        let nr = ashmem_ioctl_nr(req);
+                        if nr != 0 && ashmem_fd_sizes.contains_key(&(pid, fd)) {
+                            let mut fake_ret: i64 = 0;
+                            if nr == 0x03 {
+                                // ASHMEM_SET_SIZE: arg IS the size.
+                                let size = if arg < 0 { 0 } else { arg };
+                                let backed =
+                                    open_fd_owner_paths.get(&(pid, fd)).cloned().or_else(|| {
+                                        std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                            .ok()
+                                            .map(|t| t.to_string_lossy().into_owned())
+                                    });
+                                if let Some(path) = backed {
+                                    if let Ok(f) =
+                                        std::fs::OpenOptions::new().write(true).open(&path)
+                                    {
+                                        let r = f.set_len(size as u64);
+                                        if let Err(e) = r {
+                                            log(&format!(
+                                                "6-Z203: ASHMEM_SET_SIZE({}) ftruncate of {} failed: {} — the caller's mmap may still fail",
+                                                size, path, e
+                                            ));
+                                        }
+                                    }
+                                }
+                                ashmem_fd_sizes.insert((pid, fd), size);
+                                fake_ret = 0;
+                            } else if nr == 0x04 {
+                                // ASHMEM_GET_SIZE: the tracked size.
+                                fake_ret = ashmem_fd_sizes.get(&(pid, fd)).copied().unwrap_or(0);
+                            }
+                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                pending_sandbox_deny.insert(pid, fake_ret);
+                                log(&format!(
+                                    "6-Z203: ioctl(fd={}, req={:#x}) ASHMEM nr={} on the /dev/ashmem stand-in -> faked {} (6-Z203)",
+                                    fd, req, nr, fake_ret
+                                ));
+                            }
+                        }
+                    }
 
                     // Task 6-Z28: poll() interception. init's main event
                     // loop calls poll() which returns POLLERR immediately
@@ -15201,6 +15358,9 @@ pub fn run_ptrace_loop(
                         if ret_c == 0 && closed_fd >= 0 {
                             open_fd_paths.remove(&closed_fd);
                             open_fd_owner_paths.remove(&(pid, closed_fd));
+                            // 6-Z203: stop faking ASHMEM_* ioctls on the
+                            // recycled fd number.
+                            ashmem_fd_sizes.remove(&(pid, closed_fd));
                         }
                     }
                     // Task 6-V Part A2 — open()/openat()/openat2() EXIT:
@@ -15292,6 +15452,18 @@ pub fn run_ptrace_loop(
                                 // has no entry (e.g. an fd opened before the
                                 // loop attached — those are skipped anyway).
                                 open_fd_owner_paths.insert((pid, ret as i32), p.clone());
+                                // ── 6-Z203: track ashmem stand-in fds ──
+                                // (Android 8+ bionic calls the ASHMEM_*
+                                // ioctls through an internal path the
+                                // LD_PRELOAD interposer cannot catch, so
+                                // the tracer fakes the ioctl protocol.)
+                                if is_ashmem_backing_path(&p) {
+                                    ashmem_fd_sizes.insert((pid, ret as i32), 0);
+                                    log(&format!(
+                                        "6-Z203: open() returned fd={} for the {} ashmem stand-in — ASHMEM_* ioctls on it will be faked",
+                                        ret, p
+                                    ));
+                                }
                                 // Task 6-Y: track __properties__ fd for
                                 // the mmap2 MAP_SHARED → MAP_ANONYMOUS
                                 // rewrite. The translated path covers both
@@ -18180,6 +18352,25 @@ pub fn run_ptrace_loop(
                                 let domain = get_syscall_arg(&regs, abi.reg_arg1) as i64;
                                 let sock_type = get_syscall_arg(&regs, abi.reg_arg2) as i64;
                                 let protocol = get_syscall_arg(&regs, abi.reg_arg3) as i64;
+                                // ── 6-Z202: the ENTRY-side rewrite created a
+                                // REAL AF_UNIX DGRAM socket (FD_SET-safe).
+                                // Register the returned fd into the 6-Z99
+                                // follow-up machinery (bind/setsockopt → 0)
+                                // and let the kernel's native -EAGAIN on the
+                                // unconnected dgram socket stand in for
+                                // recv*. This replaces the synthetic
+                                // 0x6b00_0000 fd path in recovery mode
+                                // (whose FD_SETSIZE abort forced the
+                                // !boot_recovery gate — run 33189882415
+                                // OrangeFox died at "Could not open uevent
+                                // socket" because of that gate).
+                                if pending_uevent_socket.remove(&pid) && ret >= 0 {
+                                    fake_netlink_fds.entry(pid).or_default().insert(ret);
+                                    log(&format!(
+                                        "6-Z202: uevent socket() -> real fd {} registered as fake-uevent (bind/listen/setsockopt faked 0, recv* native -EAGAIN)",
+                                        ret
+                                    ));
+                                }
                                 const AF_NETLINK_Z99: i64 = 16;
                                 const NETLINK_KOBJECT_UEVENT_Z99: i64 = 15;
                                 if domain == AF_NETLINK_Z99
@@ -26000,5 +26191,39 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!is_property_metadata_file("/dev/__properties__/sub/file"));
         assert!(!is_property_metadata_file("/dev/__properties__x/file"));
         assert!(!is_property_metadata_file("relative"));
+    }
+    // ── 6-Z203: ashmem ioctl request parsing (mirrors the hook's
+    // 6-Z171c constants — run 33189885036 whyred's CodeCache abort) ────
+
+    #[test]
+    fn z203_ashmem_ioctl_nr_extracts_type_0x77_requests() {
+        // ASHMEM_SET_NAME (_IOW(0x77, 2, char[256])) — 64-bit size field:
+        assert_eq!(ashmem_ioctl_nr(0x4100_7702), 0x02);
+        // ASHMEM_SET_SIZE (_IOW(0x77, 3, size_t)) — 32-bit 0x400877xx:
+        assert_eq!(ashmem_ioctl_nr(0x4008_7703), 0x03);
+        // 64-bit long-sized encoding 0x401077xx:
+        assert_eq!(ashmem_ioctl_nr(0x4010_7703), 0x03);
+        // ASHMEM_GET_SIZE (_IO(0x77, 4)):
+        assert_eq!(ashmem_ioctl_nr(0x0000_7704), 0x04);
+        // ASHMEM_SET_PROT_MASK:
+        assert_eq!(ashmem_ioctl_nr(0x4008_7705), 0x05);
+        // Non-ashmem ioctls (terminal TCGETS 0x5401, fb 0x4600, etc.):
+        assert_eq!(ashmem_ioctl_nr(0x0000_5401), 0);
+        assert_eq!(ashmem_ioctl_nr(0x4600), 0);
+        assert_eq!(ashmem_ioctl_nr(0x4008_6602), 0);
+        assert_eq!(ashmem_ioctl_nr(0), 0);
+    }
+
+    #[test]
+    fn z203_ashmem_backing_path_matches_both_spellings() {
+        assert!(is_ashmem_backing_path("/dev/ashmem"));
+        assert!(is_ashmem_backing_path(
+            "/data/user/0/io.twoyi.debug/rootfs/dev/ashmem"
+        ));
+        // Not the ashmem stand-in:
+        assert!(!is_ashmem_backing_path("/dev/__ashmem__"));
+        assert!(!is_ashmem_backing_path("/dev/graphics/fb0"));
+        assert!(!is_ashmem_backing_path("/dev/pmsg0"));
+        assert!(!is_ashmem_backing_path("ashmem"));
     }
 }
