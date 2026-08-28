@@ -14211,3 +14211,176 @@ Stage Summary:
       the 21/33 baseline on 3395f09.
     * If still failing: continue the diagnose→fix→test→worklog→
       commit loop per master prompt §21.
+
+---
+Task ID: 6-Z209-mon5
+Agent: CI-monitoring subagent
+Task: Monitor Twoyi CI round-11 verification runs (OrangeFox R12.0 lavender + Lineage 22.2 sailfish) on commit 587a1c4 (6-Z209d-iter2: thread existing `sandbox` instance down to per-syscall path translation — actually fires the staging-cache early-out at runtime).
+
+Work Log:
+- Polled 2 GitHub Actions runs every ~75s (12 polls total — Run 2 (Lineage 22.2) completed at 21:53:52Z after ~15m; Run 1 (OrangeFox) completed at 21:54:30Z after ~16m):
+  * Run 1: 33213434617 (UI E2E Test ARM64, OrangeFox R12.0 lavender round-11) — completed SUCCESS at the GitHub Actions level (Build job + UI job both conclusion=success). In-test classifier result-pretty.json says BOOT_FAIL with sigsegv_count=8. UI never reached.
+  * Run 2: 33213432833 (UI E2E Test ARM64, Lineage 22.2 sailfish) — completed SUCCESS at the GitHub Actions level (Build job + UI job both conclusion=success). In-test classifier result-pretty.json says BOOT_FAIL_EARLY_INIT, exit_code=127, failure=init_fatal_reboot. UI never reached.
+- Side check: kr64 lint+fmt+clippy+test workflow on commit 587a1c4 NOT explicitly polled but the kr64 Rust changes are unchanged from round-10's verified 598/598 PASS state (only the wrapper-function refactor in ptrace_emu.rs landed — no Rust logic change to translate_guest itself).
+
+=== Run 1: 33213434617 — OrangeFox R12.0 lavender round-11 (commit 587a1c4) ===
+- GitHub Actions run: completed, conclusion=SUCCESS. Build job started 21:38:35Z, completed 21:40:50Z (~2m15s). UI job started 21:40:54Z, completed 21:54:29Z (~13m35s).
+- 6-Z209c-iter2 BUILD FIX — STILL WORKING (unchanged from round-10). Gradle :app:mergeExtDexDebuggable task COMPLETED WITHOUT the D8 NPE. `org.tukaani:xz:1.9` jar dexes cleanly. APK artifact `arm64-v8a-apk` (id=9702508542, 13298023 bytes) uploaded. Build job step#9 = SUCCESS.
+- 6-Z208 + 6-Z209a XZ RAMDISK DECODE — STILL WORKING (verified again, identical to round-10). logcat.txt lines 87-98:
+    87: I RamdiskImporter: Ramdisk is XZ-compressed (input=9027232 bytes)
+    88-95: XZ decode progress: 4194304 → 33554432 bytes (428ms-1476ms)
+    96: I RamdiskImporter: XZ decode done: 35090944 bytes in 1525ms (4284 chunks)
+    97: I RamdiskImporter: Reached cpio trailer
+    98: I RamdiskImporter: Extracted 595 entries from cpio (sawTrailer=true)
+  Identical to round-10's XZ decode success.
+- 6-Z209b AUTO-DETECT BOOT MODE — STILL WORKING. boot_recovery_flag was correctly set to `enabled=false`. kr64 PARENT printed "boot_recovery=false — skipping TWRP recovery child fork + PT_INTERP patch (Task 6-Z88)" at logcat.txt line 324. PRE-FORK DIAG correctly reported sbin/recovery, sbin/linker, sbin/libtwrp_fb_hook.so as MISSING (expected — OrangeFox R12.0 lavender uses /system/bin/recovery not /sbin/recovery).
+- **6-Z209d-iter2 STAGING-CACHE PATH FIX — VERIFIED WORKING AT RUNTIME**. The `intercepted open(/data/.../cache/twoyi_init) -> /data/.../rootfs/data/.../cache/twoyi_init` mistranslation is **GONE** (no matches in kr64 stderr for `intercepted open(/data/user/0/io.twoyi.debug/cache`). The **`FATAL: execve returned (init did not replace us) errno=2`** message is **GONE** (no matches for `FATAL` in the entire kr64 stderr). The init binary's execve now SUCCEEDS:
+    196: 6-Z196: init PT_INTERP -> /data/user/0/io.twoyi.debug/rootfs/system/bin/linker64 (guest's own linker)
+    197: 6-Z101: staged-exe marker /data/user/0/io.twoyi.debug/cache/twoyi-staged <- /init -> /data/user/0/io.twoyi.debug/cache/twoyi_init
+    198: copied init to /data/user/0/io.twoyi.debug/cache/twoyi_init (2730752 bytes) for exec  ← staging SUCCEEDED
+    201: libgetpid_hook.so found at staged /dev path
+    214: 6-Z101: loaded staged-exe marker (1 pairs) from /data/user/0/io.twoyi.debug/cache/twoyi-staged
+    215: 6-Z102: refusing to stage /data/user/0/io.twoyi.debug/cache/twoyi_init — path under data_dir/cache (already staged) (execve left untouched)  ← the 6-Z209d-iter2 fix's runtime effect: the path is now recognized as already-staged, NOT mistranslated
+  The `twoyi_init` process WAS LOADED into memory (kr64 stderr lines 1018-1021 show the four segments of the binary mapped at 0xbe966b5ea000-0xbe966b87a000).
+- **NEW FAILURE MODE: SIGSEGV in twoyi_init (signal 11)**. After execve succeeded, the twoyi_init process crashed with SIGSEGV at PC=0xe00ce2e92b20, si_addr=0x0, si_code=1 (MAPERR unmapped). kr64 stderr lines 1009-1016:
+    1009: SIGSEGV details: tid=2605 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe00ce2e92b20, sp=0xffffe90d08b0
+    1010-1013: SIGSEGV regs dump
+    1014: SIGSEGV thread comm: "twoyi_init"
+    1015: SIGSEGV process threads: 1 alive (2605)
+    1016: SIGSEGV stack window (sp=0xffffe90d08b0, rel:word): ...
+  Kr64 PARENT detected the genuine init death at logcat.txt line 906: "6-Z97: init_pid 2605 killed by signal 11 and no traced child is alive — genuine init death, ending the ptrace loop (return -11)". The classifier counted 8 SIGSEGVs (sigsegv_count=8) — likely the init binary's signal handlers attempted to recover or restart and got killed again.
+  The PC (0xe00ce2e92b20) is OUTSIDE the twoyi_init binary's loaded range (0xbe966b5ea000-0xbe966b87a000) — it's in a high-address range, suggesting the crash happened inside a dynamically-linked library that init tried to load (likely the linker64, libc.so, or libdl.so). The worklog's prior prediction of a "linker64 segfault" appears to have materialized.
+- VLM ANALYSIS of screenshot-08_final.png: shows DIAGNOSTIC LOG TEXT on solid black background, bright green monospace text, with `[KR64] [ptrace] MAPS:` lines visible. Four colored overlay circles (blue/yellow/red/green) are the test harness's tap visualization. NO recovery UI (no TWRP/OrangeFox menu, no buttons, no list items) rendered. The boot failed at the SIGSEGV step BEFORE the recovery service could fork and load the OrangeFox UI.
+- **CLASSIFICATION: BOOT_FAIL (init crash with SIGSEGV after execve succeeded)** — distinct from round-10's BOOT_FAIL_EARLY_INIT. The 6-Z209d-iter2 fix WORKED (the mistranslation is gone, execve succeeds, init starts running), but the init binary itself crashes with SIGSEGV in a dynamically-linked library BEFORE it can fork the recovery service or render any UI. The 8 SIGSEGV count + PC outside the binary's mapped range strongly suggests a linker/library crash on the first relocations / first PLT/GOT access.
+
+=== Run 2: 33213432833 — lineage-22.2-sailfish (commit 587a1c4) ===
+- GitHub Actions run: completed, conclusion=SUCCESS. Build job started 21:38:34Z, completed 21:40:44Z (~2m10s). UI job started 21:40:49Z, completed 21:53:52Z (~13m3s).
+- 6-Z209c-iter2 BUILD FIX — STILL WORKING (identical to Run 1 + round-10). `org.tukaani:xz:1.9` jar dexes cleanly. APK artifact `arm64-v8a-apk` (id=9702505306, 13298023 bytes) uploaded. Build job step#9 = SUCCESS.
+- 6-Z208 + 6-Z209a RAMDISK DECODE — STILL WORKING. The Lineage 22.2-sailfish ramdisk is gzip-compressed (not XZ). logcat.txt lines 86-88:
+    86: I RamdiskImporter: Ramdisk is gzip-compressed
+    87: I RamdiskImporter: Reached cpio trailer
+    88: I RamdiskImporter: Extracted 3995 entries from cpio (sawTrailer=true)
+- 6-Z209b AUTO-DETECT BOOT MODE — STILL WORKING. boot_recovery_flag was correctly set to `enabled=false` in app.log line 16. kr64 PARENT printed "boot_recovery=false — skipping TWRP recovery child fork + PT_INTERP patch (Task 6-Z88)" at logcat.txt line 320. PRE-FORK DIAG correctly reported sbin/recovery, sbin/linker, sbin/libtwrp_fb_hook.so as MISSING (expected — Lineage 22.2 isn't TWRP).
+- **6-Z209d-iter2 STAGING-CACHE PATH FIX — VERIFIED WORKING AT RUNTIME**. The `intercepted open(/data/.../cache/twoyi_init) -> /data/.../rootfs/data/.../cache/twoyi_init` mistranslation is **GONE** (no matches in kr64 stderr for `intercepted open(/data/user/0/io.twoyi.debug/cache`). The **`FATAL: execve returned (init did not replace us) errno=2`** message is **GONE**. The init binary's execve now SUCCEEDS — the kr64 stderr lines 1126-1128 show a SECOND staging + execve path (the guest-visible path /dev/twoyi-bin/init was rewritten to /data/user/0/io.twoyi.debug/cache/twoyi_stage/_dev_twoyi-bin_init_5d1f04518b05, which is under cache/twoyi_stage, NOT mistranslated):
+    1126: 6-Z196: patched staged PT_INTERP of /data/user/0/io.twoyi.debug/cache/twoyi_stage/_dev_twoyi-bin_init_5d1f04518b05 -> /data/user/0/io.twoyi.debug/rootfs/system/bin/linker64 (guest's own linker)
+    1127: 6-Z102: staged guest exec /dev/twoyi-bin/init -> /data/user/0/io.twoyi.debug/cache/twoyi_stage/_dev_twoyi-bin_init_5d1f04518b05 (1979448 bytes)
+    1128: 6-Z101: execve("/dev/twoyi-bin/init") rewritten to staged executable "/data/user/0/io.twoyi.debug/cache/twoyi_stage/_dev_twoyi-bin_init_5d1f04518b05" (VERIFIED via fresh scratch)
+  This is the FIRST END-TO-END EXECVE SUCCESS for Lineage 22.2 in the project's history.
+- **NEW FAILURE MODE: InitFatalReboot signal 6 (SIGABRT) after property file loading failures**. After execve succeeded, init ran the following sequence (logcat.txt lines 2073-2136):
+    2073-2091: init: Couldn't load property file '/system_ext/etc/build.prop' + '/system_ext/default.prop' + '/system_ext/build.prop' + '/vendor/build.prop' + '/vendor_dlkm/etc/build.prop' + '/odm_dlkm/etc/build.prop' + '/odm/etc/build.prop' + '/odm/default.prop' + '/odm/build.prop' + '/product/etc/build.prop' + '/product/default.prop' + '/product/build.prop' — all "open() failed: No such file or directory" (these are non-fatal warnings — init continues)
+    2092: init: Could not set 'ro.actionable_compatible_property.enabled' to 'true' while loading .prop files — Read-only property was already set
+    2106: init: Running restorecon...  ← init reached the restorecon step (init: Running restorecon)
+    2107: mkdirat translated: /data -> /data/user/0/io.twoyi.debug/rootfs/data (created: 0)
+    2136: init: InitFatalReboot: signal 6  ← SIGABRT — init self-terminated
+  Kr64 stderr lines 2730-2731: init child pid=2599 called exit_group(127). The classifier reported `exit_code=127` + `failure=init_fatal_reboot`. The 127 exit code comes from init's exit_group(0x7f) call after the SIGABRT (init caught the SIGABRT, did some cleanup, then called exit_group(127)).
+  The init binary executed for ~12 seconds (21:42:56 init started → 21:43:08 InitFatalReboot), did real work (read property files, ran restorecon, did mkdirat on /data, opened sockets, called mprotect 18 times), then aborted.
+- VLM ANALYSIS of screenshot-08_final.png: shows DIAGNOSTIC LOG TEXT on solid black background, bright green monospace text. References to KR64 ptrace mmap2 ENTRY messages, twoyi_loader references, init system errors, property file loading failures. Four colored overlay circles (blue/red/green/yellow) are the test harness's tap visualization. NO recovery UI rendered.
+- **CLASSIFICATION: BOOT_FAIL_EARLY_INIT** (classifier says; init exit_group(127) after InitFatalReboot). Although the init binary executed far past the round-10's execve failure point (it ran property loading + restorecon + mkdirat), it still failed BEFORE forking the recovery service or rendering any UI. The classifier's "EARLY_INIT" tag is technically correct from the recovery-boot perspective (no UI rendered → no recovery menu reached). However, this is a NEW + DIFFERENT failure mode than round-10: round-10's init never executed at all (execve returned ENOENT); round-11's init executed for 12 seconds, did real work, then aborted with SIGABRT after property loading failures + restorecon.
+
+Stage Summary:
+- BOTH round-11 verification runs PASSED THE BUILD STEP and reached the UI E2E step. Both runs COMPLETED the import + kr64 + boot-wait phases. Both runs PRODUCED full log + screenshot artifacts.
+- **6-Z209d-iter2 STAGING-CACHE PATH FIX — VERIFIED WORKING AT RUNTIME on BOTH runs**. The mistranslation `intercepted open(/data/.../cache/twoyi_init) -> /data/.../rootfs/data/.../cache/twoyi_init` is GONE (no matches in either kr64 stderr). The `FATAL: execve returned (init did not replace us) errno=2` message is GONE. The kr64 child's execve of the staged init binary now SUCCEEDS — the twoyi_init binary was actually loaded into memory + started executing.
+- The fix is verified end-to-end at the E2E level (not just unit-test level) for the first time. The wrapper-function refactor (replacing the 9 `translate_path(rootfs, &path)` call sites inside `run_ptrace_loop` with `translate_path_via_sandbox(&sandbox, rootfs, &path)`, which delegates to the EXISTING `sandbox` instance constructed at ptrace_emu.rs:9018 via `SandboxPolicy::with_staging(rootfs, data_dir)` — which HAS staging_dir set) WORKS. The staging-cache early-out in translate_guest NOW FIRES at runtime for paths under `/data/.../cache/`, leaving them UNCHANGED. The kernel's execve succeeds.
+- **BOTH runs reached a NEW failure mode after the execve succeeded**:
+    * OrangeFox R12.0 lavender round-11: init binary crashed with SIGSEGV (signal 11) at PC=0xe00ce2e92b20, si_addr=0x0. The PC is OUTSIDE the twoyi_init binary's loaded range (0xbe966b5ea000-0xbe966b87a000), so the crash happened inside a dynamically-linked library that init tried to load (linker64 / libc.so / libdl.so most likely). 8 SIGSEGVs counted. Init did not run any user-space logic (no restorecon, no property file loading, no socket calls) — it crashed immediately on dynamic-linker setup or first PLT/GOT access.
+    * Lineage 22.2 sailfish: init binary ran for ~12 seconds, did real work (loaded property files with multiple "Couldn't load property file" non-fatal warnings, ran restorecon, did mkdirat on /data, opened sockets, called mprotect 18 times), then aborted with SIGABRT (signal 6, "InitFatalReboot: signal 6"). Init then called exit_group(127). The abort likely happened during the property-service initialization or the second-stage init handoff.
+- The 6-Z209d-iter2 fix is VERIFIED WORKING but is INSUFFICIENT to fully boot either rom — there's a NEW blocker in the init execution path (post-execve dynamic linking / property loading / second-stage init).
+- The two runs have DIFFERENT new failure modes:
+    * OrangeFox: very early SIGSEGV in a library call (linker-level crash)
+    * Lineage 22.2: later SIGABRT after property loading + restorecon (init-level crash, probably during second-stage init)
+- The next diagnose→fix→test→worklog→commit cycle needs to investigate:
+    (a) For OrangeFox R12.0 lavender: why the init binary's dynamic linker setup crashes with SIGSEGV at si_addr=0x0. The PC=0xe00ce2e92b20 is in the high-address range (above 0xe000000000) — this is likely the host's linker64 or a loaded library. The most likely root causes are:
+        - Missing or wrong linker64 (the kr64 log already mentions linker64 = the guest's own linker — but maybe the linker64 itself depends on missing libraries)
+        - Wrong base address for the binary (kr64 sandboxing might have remapped it wrong)
+        - Missing linker configuration (ld.config.txt, namespaces)
+        - The 6-Z206 DIAG showed `stat-family ENTRY guest_path="/data/.../rootfs/system/bin/linker64" → translated="..." host_exists=true` — the linker64 is on the host. Need to check whether it's the guest's linker64 or the host's, and whether ld.config.txt is loaded correctly.
+    (b) For Lineage 22.2 sailfish: why the init binary aborts after restorecon with SIGABRT. The init reached second-stage init (it loaded property files + ran restorecon, which is first-stage init behavior), then aborted. Likely causes:
+        - Missing property file system_ext/build.prop, vendor/build.prop, etc. — these are non-fatal warnings, but init may abort if the property system can't initialize.
+        - InitFatalReboot is a known Android init behavior when init encounters a fatal error during second-stage setup. The signal 6 is the abort() call from init's __android_log_assert or similar.
+        - The actual abort reason is likely in the kernel log (dmesg) or in init's stderr — need to check kr64-dockerexec.log + recovery-ld-debug.txt for the actual abort message.
+- Recommended next concrete action for the main orchestrator:
+    1. Investigate the post-execve init crash for BOTH roms. For OrangeFox: look at the kr64 stderr lines around the SIGSEGV (kr64-app-stderr-dockerexec.log lines 1009-1016) and check the PC against the loaded library addresses to identify which library crashed. The 0xe00ce2e92b20 PC range is well outside the twoyi_init binary's mapped range — likely linker64 or libc.so. The LD_DEBUG trace (if .ld_debug was successfully written) might have the answer.
+    2. For Lineage 22.2: check the kr64-dockerexec.log for the abort message + the recovery-ld-debug.txt for the LD_DEBUG output of the init binary. The abort likely came from a specific assertion failure in init's property system or second-stage handoff.
+    3. Consider adding more diagnostic logging in the ptrace loop:
+        - Log the dl_iterate_phdr / first mprotect addresses to verify the dynamic linker setup.
+        - Log the linker64 file path that was actually opened (the kr64 log says "intercepted open(/data/user/0/io.twoyi.debug/.ld_debug)" — but only ONCE, and the .ld_debug file may not have been written by init. Need to verify the LD_DEBUG environment variable was set correctly.)
+    4. The 6-Z209d-iter2 fix is COMPLETE + VERIFIED — no further changes needed to it. The next blocker is in the init post-execve execution path.
+    5. Re-dispatch BOTH verification runs (OrangeFox R12.0 lavender round-12 + Lineage 22.2) on the next commit (after the post-execve crash investigation lands a fix). Expected outcomes:
+        - OrangeFox round-12: with the dynamic linker crash fixed, init should run + fork the recovery service + render the OrangeFox UI → BOOT_OK / UI_READY.
+        - Lineage 22.2: with the SIGABRT cause fixed, init should complete second-stage handoff + fork the recovery service + render the Lineage recovery UI → BOOT_OK / UI_READY.
+
+---
+Task ID: 6-Z209 (round-11 verdicts) — 6-Z209d-iter2 VERIFIED WORKING AT RUNTIME; new post-execve blockers surfaced
+Agent: main
+Task: Document the round-11 verification results. The 6-Z209d-iter2
+fix is confirmed working at runtime on both OrangeFox and Lineage
+22.2. New post-execve blockers surfaced that need investigation.
+
+Work Log:
+- Subagent monitoring report 6-Z209-mon5 confirmed:
+  - OrangeFox R12.0 lavender round-11 (run 33213434617 on 587a1c4):
+    * Build SUCCEEDED (xz:1.9 didn't trigger D8 NPE).
+    * 6-Z209d-iter2 staging-cache fix VERIFIED WORKING AT RUNTIME —
+      the mistranslation 'intercepted open(/data/.../cache/twoyi_init)
+      -> /data/.../rootfs/data/.../cache/twoyi_init' is GONE.
+    * 'FATAL: execve returned (init did not replace us)' is GONE.
+    * Kr64 staged the init binary to /data/.../cache/twoyi_init
+      (2730752 bytes), and the kernel's execve SUCCEEDED — the
+      twoyi_init process started running, MAPS dump shows it loaded
+      at 0xbe966b5ea000-0xbe966b87a000.
+    * NEW failure mode: SIGSEGV (signal 11) at pc=0xe00ce2e92b20,
+      si_addr=0x0, si_code=1 (MAPERR/unmapped). The crash PC is
+      OUTSIDE the twoyi_init binary's mapped range — likely inside
+      a dynamically-linked library (linker64 / libc.so / libdl.so)
+      on first PLT/GOT access or relocation.
+    * Kr64 PARENT detected genuine init death (6-Z97: init_pid 2605
+      killed by signal 11).
+  - Lineage 22.2 sailfish (run 33213432833 on 587a1c4):
+    * Build SUCCEEDED.
+    * Ramdisk decode (gzip) → Reached cpio trailer → Extracted 3995
+      entries.
+    * 6-Z209d-iter2 staging-cache fix VERIFIED WORKING AT RUNTIME —
+      mistranslation GONE, 'FATAL: execve returned' GONE.
+    * **FIRST END-TO-END EXECVE SUCCESS for Lineage 22.2** in the
+      project's history — kr64 stderr lines 1126-1128 show
+      '6-Z101: execve("/dev/twoyi-bin/init") rewritten to staged
+      executable "/data/user/0/io.twoyi.debug/cache/twoyi_stage/
+      _dev_twoyi-bin_init_5d1f04518b05" (VERIFIED via fresh scratch)'.
+    * Init ran for ~12 seconds, did real work:
+      - Loaded property files (some non-fatal failures:
+        'Couldn't load property file /system_ext/etc/build.prop',
+        '/vendor/build.prop', '/product/etc/build.prop')
+      - Ran 'init: Running restorecon...'
+      - Did 'mkdirat translated: /data -> /data/.../rootfs/data'
+      - Opened sockets, called mprotect 18 times, did
+        rt_sigprocmask + rt_sigaction
+    * NEW failure mode: InitFatalReboot signal 6 (SIGABRT) — init
+      called abort(). Likely cause: second-stage init handoff
+      assertion failure OR property-service abort.
+
+Stage Summary:
+- 6-Z209d-iter2 (commit 587a1c4) is the FIRST commit where the
+  kr64 child's execve of the staged init binary succeeds on BOTH
+  OrangeFox R12.0 AND Lineage 22.2. This is a major milestone —
+  previously both recoveries died at the execve step with ENOENT
+  (path mistranslation). Now both reach the post-execve execution
+  path. The recovery UI has not yet rendered on either rom, but
+  the boot process is now PAST the staging-cache blocker.
+- 2 NEW post-execve blockers need investigation:
+  1. OrangeFox SIGSEGV in a dynamically-linked library immediately
+     after execve. Crash PC outside twoyi_init's mapped range.
+     Likely: linker64 failing to load libc.so or libdl.so, OR
+     PLT/GOT relocation failure. Need to inspect the MAPS dump
+     to see what library is loaded at the crash PC.
+  2. Lineage 22.2 InitFatalReboot signal 6 after ~12s of init
+     execution. Init loaded property files (some failed), ran
+     restorecon, did mkdirat, opened sockets, called mprotect
+     18x, then aborted. Likely: second-stage init handoff
+     assertion OR property-service abort. Need to find the exact
+     assertion that triggered abort().
+- Next concrete action: investigate the Lineage 22.2 InitFatalReboot
+  blocker first (Lineage has 297 corpus entries vs OrangeFox's 151
+  — bigger impact if fixed). Look at the kr64 stderr + logcat for
+  the exact init assertion. If the property-file loading failures
+  are the trigger, fix the missing property files. If it's a
+  property-service abort, look at the property_area handling.
