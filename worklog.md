@@ -12249,3 +12249,31 @@ Stage Summary:
 - The pty chain is now robust to the observed corruption class and
   fails closed when it cannot provide a real channel. Next run either
   shows the ash prompt or an sv[] dump that names the drift exactly.
+
+---
+Task ID: 6-Z188e
+Agent: main
+Task: THE socketpair root cause found from run 33127733712's decisive
+dump: sv=[-1 N -1 -1].
+
+Work Log:
+- Run 33127733712 (54d90a8): terminal page reached; NO stub fallthrough
+  (E:Error 2 on getpt x3 = my clean ENOENT policy working); sh
+  corruption bugs GONE (0 "File name too long"/"syntax error"); FM
+  stable before+after; but 3x3 retries all logged
+  "pty socketpair BAD ret=0 sv=[-1 N -1 -1]".
+- DIAGNOSIS: with the out-pointer at &sv[1] (long array), only sv[1]'s
+  LOW half changed — socketpair's out-param is `int sv[2]` (TWO 32-BIT
+  INTS, 8 BYTES TOTAL), not two longs! Both fds were written INSIDE my
+  first long element (fd0 | fd1<<32): (int) prints showed fd0 only,
+  and the <1024 check on the huge long always failed. Every prior
+  "corruption" (garbage -45511424, off-by-8 theory) was this type
+  error viewed through (int) casts.
+- FIX: int sv_fds[2] with the real kernel type; success requires
+  r==0 + two distinct sane fds; BAD dumps keep the int pair + attempt.
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- One-word-class fix (long[] -> int[2]). The whole pty chain (marked
+  socketpair -> master -> ptsname -> slave dup -> exec /sbin/sh ->
+  staged busybox ash) should now complete end-to-end.
