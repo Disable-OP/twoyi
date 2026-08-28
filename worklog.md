@@ -12277,3 +12277,31 @@ Stage Summary:
 - One-word-class fix (long[] -> int[2]). The whole pty chain (marked
   socketpair -> master -> ptsname -> slave dup -> exec /sbin/sh ->
   staged busybox ash) should now complete end-to-end.
+
+---
+Task ID: 6-Z188f
+Agent: main
+Task: Run 33128456506: socketpair WORKS (master fd=15, slave fd=17,
+BAD=0) and busybox ash EXECUTES behind the terminal — but the forked
+child's open("/dev/pts/N") missed the per-process slot table (state
+lost across the process boundary) and the dup got faked -22, so ash
+inherited the recovery's fds and read garbage.
+
+Work Log:
+- Evidence: "pty master fd=15 (slot 0, slave fd=17)" (int[2] fix
+  WORKS); slave opens = 2x "MISS (slot dead...)" + 1x "-> fd=-22";
+  "sh: <binary garbage>: File name too long" (ash alive, bad stdin —
+  a CONSEQUENCE of the failed slave open, not a separate input bug).
+- 6-Z188f FIX — the fd number IS the protocol:
+  * ptsname(master) returns "/dev/pts/<SLAVE-FD-NUMBER>" (not the slot
+    index); TIOCGPTN likewise returns the slave fd number.
+  * open("/dev/pts/<n>"): verify n is a LIVE fd in THIS process via
+    fcntl(n, F_GETFD), then dup(n). The fork child INHERITED that exact
+    fd number from fork — zero per-process hook state needed, immune to
+    slot-table loss and to whatever faked the -22 (no table lookup).
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- The pty channel now crosses the fork boundary via the natural fd
+  inheritance mechanism. ash should get a clean socket stdio and draw
+  its prompt.
