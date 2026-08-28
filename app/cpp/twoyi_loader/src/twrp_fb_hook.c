@@ -877,6 +877,19 @@ static int pty_open_slave(const char *path) {
      * came back -EBADF while fcntl said live (a faked dup). A marked
      * dup is left untouched — the KERNEL decides. */
     long d = raw_syscall3_marked(24 /* SYS_dup aarch64 */, (long)n, 0, 0);
+    /* 6-Z188k: NEVER return fd 0/1/2. Run 33131312944: the dup landed
+     * on fd 0 (freed earlier in the child) and TWRP's runSlave then did
+     * dup2(slave,0/1/2); close(slave) — closing fd 0 == closing STDIN
+     * — ash read EOF and died silently (cursor forever). The classic
+     * daemon rule: escape the stdio range before handing an fd out. */
+    if (d >= 0 && d <= 2) {
+        long d2 = raw_syscall3_marked(24, d, 0, 0);
+        if (d2 > 2) {
+            raw_syscall1(SYS_close, (int)d);
+            d = d2;
+            write_str(2, " (stdio-range escaped)");
+        }
+    }
     if (d < 0) {
         /* Backup fd from the fork-inherited slot table (the direct fork
          * child HAS the table — ptsname worked there in every run). */
