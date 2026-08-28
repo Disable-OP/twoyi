@@ -14384,3 +14384,78 @@ Stage Summary:
   the exact init assertion. If the property-file loading failures
   are the trigger, fix the missing property files. If it's a
   property-service abort, look at the property_area handling.
+
+---
+Task ID: 6-Z209e (investigation) — Lineage 22.2 InitFatalReboot root cause = /apex remount EBUSY
+Agent: main
+Task: Investigate the Lineage 22.2 InitFatalReboot signal 6 blocker
+that surfaced after the 6-Z209d-iter2 fix made the kr64 child's
+execve of the staged init binary succeed (round-11, run 33213432833).
+
+Work Log:
+- Downloaded the Lineage 22.2 round-11 artifacts (artifact
+  9702828242). Grepped kr64-app-stderr-dockerexec.log for the
+  exact abort cause.
+- Found the chain (kr64 stderr lines 2699-2703):
+    2699: <3>init: Failed to remount /apex as 40000: Device or
+          resource busy
+    2700: [glog F/abort] SetupMountNamespaces failed: Device or
+          resource busy
+    2703: <2>init: SetupMountNamespaces failed: Device or resource
+          busy
+- Followed by:
+    2711: <3>init: InitFatalReboot: signal 6
+    2730: Task-6-S ENTRY: pid=2599 exit_group nr=94 args=0x7f
+    2731: 6-Z98 DIAG: init child pid=2599 exit_group(127) at ENTRY
+- So the EXACT abort cause is:
+  1. Init's SetupMountNamespaces (in mount_namespace.cpp) called
+     mount() with MS_REMOUNT (flag 0x40000) for /apex.
+  2. The kernel returned -EBUSY (Device or resource busy).
+  3. Init logged "Failed to remount /apex as 40000".
+  4. SetupMountNamespaces returned the EBUSY error.
+  5. Init's fatal-error handler triggered InitFatalReboot.
+  6. Init called abort() (signal 6 / SIGABRT).
+  7. Init exited with code 127.
+- This is the classic AOSP first-stage→second-stage transition:
+  first-stage init mounts /apex as a tmpfs, second-stage init
+  tries to remount it. The remount fails with EBUSY when:
+  - The mount source doesn't match the existing mount, OR
+  - /apex is busy (files are open on it), OR
+  - The mount flags don't differ from the existing mount (Linux
+    kernel returns EBUSY for MS_REMOUNT with no flag changes).
+- Kr64's mount handling (mount_mgr.rs) — for boot_recovery=true
+  (TWRP), kr64 skips namespace setup entirely. For boot_recovery=
+  false (AOSP), kr64's mount_mgr tries unshare(CLONE_NEWNS) +
+  pivot_root, but use_namespaces=false skips both. So the guest
+  init is running WITHOUT a private mount namespace, and its
+  mount syscalls hit the HOST's mount table — but kr64's seccomp
+  filter blocks mount() for the guest (SIGSYS).
+- BUT — the kr64 TRACER intercepts the guest's mount syscalls.
+  For TWRP, the tracer fakes mount returns. For AOSP, the tracer
+  should ALSO fake mount returns (especially MS_REMOUNT) so init
+  thinks the remount succeeded.
+- The kr64 source has a "mount/mkdir/chmod/chroot/unshare block"
+  (per ptrace_emu.rs comments at lines 2564, 2595, 2647). This
+  block currently fakes these syscalls for TWRP — but the same
+  logic should apply to AOSP-mode boots.
+- The fix direction: ensure the kr64 tracer fakes the mount return
+  value (return 0 = success) for the guest's MS_REMOUNT calls in
+  AOSP mode. This is the same pattern as the existing getpid()=1
+  fake + the mount fake for TWRP. The guest init will think the
+  remount succeeded + continue with SetupMountNamespaces →
+  no abort → recovery proceeds to UI.
+
+Stage Summary:
+- The Lineage 22.2 InitFatalReboot blocker is NOT a new
+  architectural issue — it's the SAME class as the existing
+  mount/getpid fakes in kr64. The fix is to extend the existing
+  mount-fake logic to AOSP-mode boots (boot_recovery=false).
+- The OrangeFox SIGSEGV blocker (pc outside twoyi_init's mapped
+  range) is a different class — likely a linker64 issue. Needs
+  separate investigation of the MAPS dump to identify which
+  library is loaded at the crash PC.
+- Next concrete action: implement the mount-remount fake for
+  AOSP-mode boots. The kr64 source's "mount/mkdir/chmod/chroot/
+  unshare block" at ptrace_emu.rs:2564+ is the place to extend.
+  Add a regression test that verifies the guest's mount(/apex,
+  MS_REMOUNT) returns 0 in AOSP mode.
