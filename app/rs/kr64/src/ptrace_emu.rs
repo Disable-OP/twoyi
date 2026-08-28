@@ -16743,7 +16743,11 @@ pub fn run_ptrace_loop(
                     if past_first_execve && syscall_num == abi.write {
                         let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if ret < 0 {
-                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
+                            let fd = match pending_entry_fd.get(&pid) {
+                                Some((nr, f)) if *nr == syscall_num => *f as i32,
+                                _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                            };
                             if let Some(path) = open_fd_paths.get(&fd) {
                                 if path.contains("attr/exec") {
                                     let count = get_syscall_arg(&regs, abi.reg_arg3) as i64;
@@ -18762,7 +18766,11 @@ pub fn run_ptrace_loop(
                                 // graceful pattern as the working run 32656407287).
                                 if boot_recovery {
                                     if ret >= 0 {
-                                        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                        // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
+                                        let fd = match pending_entry_fd.get(&pid) {
+                                            Some((nr, f)) if *nr == syscall_num => *f as i32,
+                                            _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                                        };
                                         let sockaddr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                                         let addrlen = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                                         if let Some(kind) = sockaddr_un_is_property_service(
@@ -18795,7 +18803,11 @@ pub fn run_ptrace_loop(
                                     // TWRP mode + ret < 0: leave the real failure
                                     // untouched; TWRP's init handles it gracefully.
                                 } else if ret < 0 && ret > -4096 {
-                                    let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                                    // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
+                                    let fd = match pending_entry_fd.get(&pid) {
+                                        Some((nr, f)) if *nr == syscall_num => *f as i32,
+                                        _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                                    };
                                     let sockaddr_ptr = get_syscall_arg(&regs, abi.reg_arg2);
                                     let addrlen = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                                     if let Some(kind) = sockaddr_un_is_property_service(
@@ -18836,7 +18848,11 @@ pub fn run_ptrace_loop(
                             | PropServOp::GetSockOpt
                             | PropServOp::Fcntl
                             | PropServOp::Close => {
-                                let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
+                                let fd = match pending_entry_fd.get(&pid) {
+                                    Some((nr, f)) if *nr == syscall_num => *f,
+                                    _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                                };
                                 let is_tracked = fake_propserv_fds
                                     .get(&pid)
                                     .map_or(false, |s| s.contains(&fd));
@@ -18959,7 +18975,11 @@ pub fn run_ptrace_loop(
                     // __system_property_set uses), exactly mirroring
                     // the RecvFrom/RecvMsg handling above.
                     if abi.read != -1 && syscall_num == abi.read {
-                        let fd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                        // 6-Z199: ENTRY-stash fd (aarch64 x0-at-EXIT).
+                        let fd = match pending_entry_fd.get(&pid) {
+                            Some((nr, f)) if *nr == syscall_num => *f,
+                            _ => get_syscall_arg(&regs, abi.reg_arg1) as i64,
+                        };
                         let is_tracked = fake_propserv_fds
                             .get(&pid)
                             .map_or(false, |s| s.contains(&fd));
