@@ -4177,13 +4177,57 @@ fn guest_readlink_target(
         // rootfs-prefixed duplicate; fall back to stripping the
         // prefix off the prefixed key.
         let m = staged_exes?;
+        // 6-Z207: also used by the staged-chain recursive walk
+        // below (the marker key returned by the first filter may
+        // ITSELF be a staged path under data_dir/cache).
+        let cache_prefix = format!("{}/cache/", data_dir);
         let raw = m
             .iter()
             .filter(|(k, v)| !k.starts_with(rootfs) && v.as_str() == target)
             .map(|(k, _)| k.clone())
             .next();
         if let Some(guest) = raw {
-            return Some(guest);
+            // 6-Z207: the marker key returned here may ITSELF be a
+            // staged path (a re-staged cache binary). Walk back the
+            // staging chain recursively until we get a key that is
+            // NOT under data_dir/cache — that's the original guest
+            // path the user actually wants to see in readlink's
+            // result. Without this, the rewrite leaks the host
+            // cache path into the guest namespace (master prompt
+            // §6/§24), causing OrangeFox's restorecon path argument
+            // to be the host "/data/user/0/io.twoyi.debug/cache/
+            // twoyi_init" instead of "/system/bin/init" or "/init",
+            // and realpath() ENOENT-FATALS → InitFatalReboot.
+            let mut seen = std::collections::HashSet::new();
+            let mut cur = guest;
+            // Bound the walk at 8 hops — pathological recursion
+            // caps here so a circular marker can't loop forever.
+            for _ in 0..8 {
+                if !cur.starts_with(&cache_prefix)
+                    && cur != legacy_init
+                    && !cur.starts_with(&staging_prefix)
+                {
+                    return Some(cur);
+                }
+                if seen.contains(&cur) {
+                    // Circular — bail out with the current key.
+                    return Some(cur);
+                }
+                seen.insert(cur.clone());
+                // Look up `cur` as a value-derived target — find
+                // any entry whose VALUE equals `cur`, then take
+                // that entry's KEY as the next `cur`.
+                let next = m
+                    .iter()
+                    .filter(|(_, v)| v.as_str() == cur)
+                    .map(|(k, _)| k.clone())
+                    .next();
+                match next {
+                    Some(k) => cur = k,
+                    None => return Some(cur),
+                }
+            }
+            return Some(cur);
         }
         return m
             .iter()
@@ -4717,6 +4761,22 @@ fn stage_guest_executable_capped(
 ) -> StageOutcome {
     if !guest_path.starts_with('/') {
         return StageOutcome::Skip("relative path");
+    }
+    // 6-Z207: refuse to stage paths under the app's own cache dir
+    // (data_dir/cache/...). Those paths are ALREADY staged copies — the
+    // staging engine must never re-stage them, because the marker file
+    // would then carry a HOST cache path as its key (e.g.
+    // "/data/user/0/io.twoyi.debug/cache/twoyi_init"), and
+    // guest_readlink_target's reverse lookup would return that HOST
+    // path as the "guest path" — leaking the host backing path into
+    // the guest namespace (master prompt §6/§24). The traced execve
+    // of a cache-resident binary is left to the existing legacy_init
+    // special-case in guest_readlink_target's first branch (the path
+    // starts_with the legacy_init prefix → handled as a staged
+    // executable, returning the reverse-marker RAW guest key).
+    let cache_prefix = format!("{}/cache/", data_dir);
+    if guest_path.starts_with(&cache_prefix) {
+        return StageOutcome::Skip("path under data_dir/cache (already staged)");
     }
     // Normalize a rootfs-prefixed input back to the raw guest key.
     let rootfs_prefix = if rootfs.ends_with('/') {
@@ -26370,6 +26430,110 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
             guest_readlink_target("/system/bin/toybox", rootfs, data_dir, None),
             None
         );
+    }
+
+    // ── 6-Z207: the staged-chain recursive walk ──
+    //
+    // The bug (run 33201505148 OrangeFox R12.0 lavender): the staging
+    // engine wrote the marker with a HOST cache path as its key when
+    // the child exec'd an already-staged binary (e.g.
+    // "/data/user/0/io.twoyi.debug/cache/twoyi_init"). The reverse
+    // lookup then returned that HOST path as the guest path → readlink
+    // of /proc/self/exe leaked the host backing path into the guest →
+    // libselinux's restorecon path argument was the host path →
+    // realpath() ENOENT-FATALed → InitFatalReboot SIGABRT.
+    //
+    // The recursive walk in guest_readlink_target now chases the
+    // staged-chain backward until it finds a key that is NOT under
+    // data_dir/cache. That key is the original guest path the user
+    // expects to see in readlink's result.
+
+    #[test]
+    fn z207_guest_readlink_walks_staged_chain_to_original_guest_path() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        let data_dir = "/data/user/0/io.twoyi.debug";
+        let mut m = std::collections::HashMap::new();
+        // First staging: /init → cache/twoyi_init (the legacy init copy).
+        m.insert(
+            "/init".to_string(),
+            format!("{}/cache/twoyi_init", data_dir),
+        );
+        m.insert(
+            format!("{}/init", rootfs),
+            format!("{}/cache/twoyi_init", data_dir),
+        );
+        // Second staging: the marker key is the cache/twoyi_init HOST
+        // path (the bug class — staging should refuse this, but if it
+        // happened before the 6-Z207 fix landed, the marker carries
+        // the host path as its key).
+        m.insert(
+            format!("{}/cache/twoyi_init", data_dir),
+            format!(
+                "{}/cache/twoyi_stage/_data_user_0_io.twoyi.debug_cache_twoyi_init_ad0ee0b7ddec",
+                data_dir
+            ),
+        );
+        // readlink of the SECOND-staged path should walk back through
+        // cache/twoyi_init → /init (the original guest path).
+        assert_eq!(
+            guest_readlink_target(
+                &format!("{}/cache/twoyi_stage/_data_user_0_io.twoyi.debug_cache_twoyi_init_ad0ee0b7ddec", data_dir),
+                rootfs,
+                data_dir,
+                Some(&m),
+            )
+            .as_deref(),
+            Some("/init")
+        );
+        // readlink of the FIRST-staged path (legacy_init form) should
+        // return /init directly (one hop).
+        assert_eq!(
+            guest_readlink_target(
+                &format!("{}/cache/twoyi_init", data_dir),
+                rootfs,
+                data_dir,
+                Some(&m),
+            )
+            .as_deref(),
+            Some("/init")
+        );
+    }
+
+    #[test]
+    fn z207_stage_guest_executable_skips_paths_under_data_dir_cache() {
+        // The 6-Z207 fix: stage_guest_executable_capped returns Skip
+        // for guest paths under {data_dir}/cache/ — those are
+        // already-staged copies and re-staging them would write a
+        // host cache path as the marker key (the bug class above).
+        let rootfs = "/tmp/test_rootfs_z207";
+        // data_dir matches the guest_path's prefix so the cache-prefix
+        // check is actually exercised (the cache_prefix computed
+        // inside the function is "{data_dir}/cache/").
+        let data_dir = "/data/user/0/io.twoyi.debug";
+        let out = stage_guest_executable_capped(
+            rootfs,
+            data_dir,
+            "/data/user/0/io.twoyi.debug/cache/twoyi_init",
+            100,
+            500 * 1024 * 1024,
+        );
+        assert!(matches!(out, StageOutcome::Skip(_)));
+        if let StageOutcome::Skip(reason) = out {
+            assert!(
+                reason.contains("cache"),
+                "expected cache-prefix skip, got: {}",
+                reason
+            );
+        }
+        // Same for the staging prefix.
+        let out2 = stage_guest_executable_capped(
+            rootfs,
+            data_dir,
+            "/data/user/0/io.twoyi.debug/cache/twoyi_stage/_system_bin_init_8d58dbd62cc8",
+            100,
+            500 * 1024 * 1024,
+        );
+        assert!(matches!(out2, StageOutcome::Skip(_)));
     }
 
     // ── 6-Z197: first-stage boot dir coverage (regression: the

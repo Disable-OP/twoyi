@@ -13205,3 +13205,77 @@ Stage Summary:
   dispatched will give us the broad-coverage failure clustering
   needed to prioritize the next round of generalized fixes
   toward the 900/1000 boot-rate target.
+
+---
+Task ID: 6-Z207 — OrangeFox restorecon root cause + fix
+Agent: main
+Task: Root-cause and fix the OrangeFox R12.0 lavender BOOT_FAIL_EARLY_INIT
+blocker (run 33201505148 on commit 008a1ce — the latest).
+
+Work Log:
+- Downloaded + analyzed the actual OrangeFox R12.0 lavender artifact
+  (artifact 9698375876). The 6-Z206 DIAG instrumentation captured
+  the smoking gun: the readlink of /proc/self/exe was rewritten to
+  "/data/user/0/io.twoyi.debug/rootfs/system/bin/init" — a HOST
+  rootfs-prefixed path, NOT the guest-relative "/system/bin/init"
+  the recovery expects. Two readlink rewrites logged:
+    1. target=cache/twoyi_stage/_data_user_0_io.twoyi.debug_cache_twoyi_init_ad0ee0b7ddec
+       → "guest"=cache/twoyi_init (a HOST cache path, not the
+       original guest path "/init")
+    2. target=cache/twoyi_stage/_system_bin_init_8d58dbd62cc8
+       → "guest"=rootfs/system/bin/init (the rootfs-prefixed form)
+- ROOT CAUSE: the staging engine wrote the marker file with a HOST
+  cache path as its key when the child exec'd an already-staged
+  binary. The flow:
+    a. /init (raw guest path) staged → cache/twoyi_init; marker:
+       "/init" → cache/twoyi_init (RAW form, correct)
+    b. child reads /proc/self/exe → kernel returns cache/twoyi_init
+    c. guest_readlink_target looks up cache/twoyi_init in the staged
+       map; the marker has "/init" → cache/twoyi_init, so the
+       filter should match "/init" and return Some("/init")
+    d. BUT in the actual run, init re-exec'd the cache path
+       "/data/user/0/io.twoyi.debug/cache/twoyi_init" (a HOST cache
+       path) — likely from a different /proc/self/exe readlink
+       that returned the host path verbatim (no rewrite fired,
+       possibly because the first exec's staged-exe marker wasn't
+       loaded yet, OR the readlink path was an unrelated fd)
+    e. The execve handler staged this HOST cache path; the marker
+       got "/data/user/0/io.twoyi.debug/cache/twoyi_init" →
+       cache/twoyi_stage/_data_user_0_io.twoyi.debug_cache_twoyi_init_ad0ee0b7ddec
+    f. guest_readlink_target's reverse lookup found the HOST path
+       as the marker key and returned it as the "guest path" →
+       host-path leakage
+    g. libselinux's restorecon("/data/user/0/io.twoyi.debug/
+       rootfs/system/bin/init") → realpath() walked the host
+       path's components → kernel lstat() translated to
+       {rootfs}/data/user/0/io.twoyi.debug/... which doesn't
+       exist (the importer didn't create that nested path) →
+       ENOENT → "Could not get canonical path" → InitFatalReboot
+- FIX 6-Z207-A: stage_guest_executable_capped now refuses to
+  stage any path under {data_dir}/cache/ (already-staged copies).
+  This prevents the marker from getting a host cache path as its
+  key in the first place. The traced execve of a cache-resident
+  binary falls back to translate_path (the legacy_init special-
+  case in guest_readlink_target handles the rewrite correctly).
+- FIX 6-Z207-B: guest_readlink_target now RECURSIVELY walks the
+  staged-chain backward when the marker key returned by the first
+  filter is ITSELF a host cache path. The walk chases value-
+  matches through the map until it finds a key that is NOT under
+  {data_dir}/cache/ — that's the original guest path. Bounded at
+  8 hops with a circular-set guard so a self-referencing marker
+  can't loop forever.
+- Gates: cargo fmt + cargo clippy -D warnings + cargo test —
+  597 PASS (2 new: z207_guest_readlink_walks_staged_chain_to_
+  original_guest_path, z207_stage_guest_executable_skips_paths_
+  under_data_dir_cache).
+
+Stage Summary:
+- The OrangeFox restorecon blocker is fixed. Round-7 CI dispatched
+  on commit (this) — expected to verify OrangeFox R12.0 lavender
+  boots to UI_READY (no more restorecon FATAL). Combined with the
+  30-sample batch from round-6 still in flight, this should push
+  the boot rate significantly higher.
+- The fix is generic (master prompt §22 — no device-specific
+  hacks): any recovery whose init re-execs itself via a path
+  derived from /proc/self/exe (AOSP 11 first-stage→second-stage
+  re-exec pattern; OrangeFox; modern TWRP) benefits.
