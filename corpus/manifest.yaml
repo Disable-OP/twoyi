@@ -1,0 +1,160 @@
+# Twoyi Universal Recovery Corpus Manifest (§23–§25)
+#
+# Every entry is a recovery image Twoyi should boot. CI dedupes by sha256
+# after download; md5 (when known) is verified pre-boot. The manifest is
+# data, not code: adding a recovery = adding an entry, never editing the
+# workflow (§32).
+#
+# Fields:
+#   name        unique label (also the CI concurrency group)
+#   family      TWRP | OrangeFox | SHRP | Lineage | AOSP | OEM | custom
+#   device      codename
+#   arch        arm64 | arm | x86_64 | x86
+#   generation  android generation this recovery was built for
+#   tier        pr   → runs on every PR CI (small representative set)
+#               nightly → runs in the nightly full corpus
+#   url         direct URL of the image (.img, or .zip containing recovery.img)
+#   referer     optional Referer header (dl.twrp.me anti-leech)
+#   md5         optional md5 verification
+#   sha256      known sha256 (filled by the inspector; empty = computed at CI)
+#   notes       free-form context (known behaviors, upstream status…)
+#
+# Ground truth rule (§24): "official" ≠ known-good. Results come only from
+# actually booting the artifact.
+
+images:
+  # ── TWRP angler version ladder (same device, every generation) ──
+  - name: twrp-2.8.7.0-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "6.0"
+    tier: pr
+    url: https://dl.twrp.me/angler/twrp-2.8.7.0-angler.img
+    referer: https://dl.twrp.me/angler/twrp-2.8.7.0-angler.img.html
+    md5: 5bdfdfa41716ff7f74eca636eb2ab88f
+    sha256: ""
+    notes: >-
+      PRIMARY old-recovery target (user-specified). Static init (ELF64),
+      critical services ueventd+healthd, adbd auto-starts (ro.debuggable=1),
+      LD_LIBRARY_PATH ".:/sbin" (relative!), 2.8-era libminuitwrp fbdev
+      double-buffering. Known-bad: splash hang.
+
+  - name: twrp-2.8.7.2-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "6.0"
+    tier: nightly
+    url: https://dl.twrp.me/angler/twrp-2.8.7.2-angler.img
+    referer: https://dl.twrp.me/angler/twrp-2.8.7.2-angler.img.html
+    md5: c5d2eecfa70dbdf962a49042493358c6
+    sha256: ""
+    notes: Last 2.8.x for angler. Comparative evidence for the 2.8 splash hang.
+
+  - name: twrp-3.0.0-0-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "6.0-7.0"
+    tier: nightly
+    url: https://dl.twrp.me/angler/twrp-3.0.0-0-angler.img
+    referer: https://dl.twrp.me/angler/twrp-3.0.0-0-angler.img.html
+    md5: ""
+    sha256: ""
+    notes: The 3.0 generation gap — TWRP-Quinoa era theme changes.
+
+  - name: twrp-3.2.3-0-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "8.0"
+    tier: nightly
+    url: https://dl.twrp.me/angler/twrp-3.2.3-0-angler.img
+    referer: https://dl.twrp.me/angler/twrp-3.2.3-0-angler.img.html
+    md5: ""
+    sha256: ""
+    notes: Middle generation.
+
+  - name: twrp-3.7.0_9-0-angler
+    family: TWRP
+    device: angler
+    arch: arm64
+    generation: "11"
+    tier: pr
+    url: https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img
+    referer: https://dl.twrp.me/angler/twrp-3.7.0_9-0-angler.img.html
+    md5: cf9a9067d18f64ed6992514826e1f9df
+    sha256: ""
+    notes: KNOWN-GOOD baseline (boots to menu, terminal verified run 33132782393).
+
+  # ── TWRP other devices (device/SoC diversity, modern) ──
+  - name: twrp-3.7.0_9-0-whyred
+    family: TWRP
+    device: whyred
+    arch: arm64
+    generation: "11"
+    tier: pr
+    url: https://dl.twrp.me/whyred/twrp-3.7.0_9-0-whyred.img
+    referer: https://dl.twrp.me/whyred/twrp-3.7.0_9-0-whyred.img.html
+    md5: 114999d9da6c6c1756628940a32bc9ab
+    sha256: ""
+    notes: Xiaomi Redmi Note 5 (SD636). Different SoC + A/B-adjacent layout.
+
+  - name: twrp-3.7.0_9-0-lavender
+    family: TWRP
+    device: lavender
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/lavender/twrp-3.7.0_9-0-lavender.img
+    referer: https://dl.twrp.me/lavender/twrp-3.7.0_9-0-lavender.img.html
+    md5: 873609f9bad460a4e6431bc08ff226d9
+    sha256: ""
+    notes: Xiaomi Redmi Note 7 (SD660).
+
+  - name: twrp-3.7.0_9-0-sailfish
+    family: TWRP
+    device: sailfish
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/sailfish/twrp-3.7.0_9-0-sailfish.img
+    referer: https://dl.twrp.me/sailfish/twrp-3.7.0_9-0-sailfish.img.html
+    md5: a3471e90b6af8f19286540adcb043f23
+    sha256: ""
+    notes: Google Pixel (marlin/sailfish, SD821). A/B-partition-era Google layout.
+
+  - name: twrp-3.7.0_9-0-bullhead
+    family: TWRP
+    device: bullhead
+    arch: arm64
+    generation: "11"
+    tier: nightly
+    url: https://dl.twrp.me/bullhead/twrp-3.7.0_9-0-bullhead.img
+    referer: https://dl.twrp.me/bullhead/twrp-3.7.0_9-0-bullhead.img.html
+    md5: ""
+    sha256: ""
+    notes: Nexus 5X (SD808).
+
+  # ── OrangeFox (different recovery family) ──
+  - name: orangefox-R12.0-lavender
+    family: OrangeFox
+    device: lavender
+    arch: arm64
+    generation: "11"
+    tier: pr
+    url: https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl
+    referer: ""
+    md5: 8dd3688b814fc99f8251e3c749812d92
+    sha256: ""
+    notes: >-
+      OrangeFox R12.0 stable (zip, 68MB; workflow extracts recovery.img).
+      First non-TWRP family in the corpus.
+
+  # ── future expansions (URLs verified as CI proves them) ──
+  # SHRP / SkyHawk:  sourceforge.net/projects/shrp-project (verify from runner)
+  # Lineage recovery: download.lineageos.org (recovery.img inside OTA zip)
+  # PitchBlack:      sourceforge.net/projects/pitchblack-twrp
+  # AOSP recovery:   built from source or extracted from factory images
+  # OEM/stock:       factory images (angler N6P: developers.google.com)

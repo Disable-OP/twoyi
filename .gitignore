@@ -97,3 +97,7 @@ ehthumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 scripts/__pycache__/
+
+# Universal recovery corpus: manifest is tracked, images/extracted trees are NOT
+corpus/images/
+corpus/results/
