@@ -3679,6 +3679,34 @@ pub fn translate_path(rootfs: &str, path: &str) -> String {
     crate::vfs::SandboxPolicy::new(rootfs).translate_guest(path)
 }
 
+/// 6-Z209d-iter2: production-path translate that uses the EXISTING
+/// `sandbox` instance (constructed once at run_ptrace_loop entry via
+/// `SandboxPolicy::with_staging(rootfs, data_dir)`). The standalone
+/// `translate_path()` above constructs a FRESH `SandboxPolicy::new(rootfs)`
+/// each call — staging_dir is None, so the 6-Z209d staging-cache early-out
+/// in translate_guest NEVER FIRES → the /data/* rule mistranslates host
+/// cache paths like /data/.../cache/twoyi_init to {rootfs}/data/.../cache/
+/// twoyi_init → ENOENT → execve of the staged init binary fails →
+/// kr64 child "FATAL: execve returned" → exit 127 → recovery never boots.
+///
+/// This wrapper takes the existing `sandbox` (which has staging_dir set)
+/// and delegates to `translate_guest`. The `rootfs` parameter is kept for
+/// API compatibility with the existing call sites but is unused (the
+/// sandbox already knows its rootfs).
+///
+/// Run 33211612065 (OrangeFox R12.0 lavender round-10 on f05a534) +
+/// run 33211610484 (lineage-22.2-sailfish on f05a534): both confirmed
+/// the 6-Z209d fix is logically correct at the method level but BYPASSED
+/// at runtime because the call sites used translate_path() (which
+/// constructs a fresh SandboxPolicy without staging_dir).
+pub fn translate_path_via_sandbox(
+    sandbox: &crate::vfs::SandboxPolicy,
+    _rootfs: &str,
+    path: &str,
+) -> String {
+    sandbox.translate_guest(path)
+}
+
 // ── Security fix 6-Z185: sandbox enforcement backstop ───────────────
 //
 // The LAST line of defense against guest filesystem escapes. Runs at
@@ -13851,7 +13879,7 @@ pub fn run_ptrace_loop(
                                         ));
                                         rom_copy
                                     }
-                                    None => translate_path(rootfs, &path),
+                                    None => translate_path_via_sandbox(&sandbox, rootfs, &path),
                                 };
                                 // ── Task 6-U: KLOG fd tracking (ENTRY side) ──
                                 //
@@ -14115,7 +14143,8 @@ pub fn run_ptrace_loop(
                             };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
-                                let translated = translate_path(rootfs, &path);
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
                                 // ── 6-Z206 DIAG: stat-family on critical
                                 // boot paths — captures the EXACT guest
                                 // path + the translated host path so the
@@ -14308,7 +14337,8 @@ pub fn run_ptrace_loop(
                             };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
-                                let translated = translate_path(rootfs, &path);
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
@@ -14341,7 +14371,8 @@ pub fn run_ptrace_loop(
                             };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
-                                let translated = translate_path(rootfs, &path);
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
@@ -14360,7 +14391,8 @@ pub fn run_ptrace_loop(
                         n if n == abi.chdir => {
                             let path_addr = get_syscall_arg(&regs, abi.reg_arg1);
                             if let Some(path) = read_child_string(pid, path_addr) {
-                                let translated = translate_path(rootfs, &path);
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
@@ -14574,7 +14606,8 @@ pub fn run_ptrace_loop(
                             };
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
-                                let translated = translate_path(rootfs, &path);
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
                                 if translated != path
                                     && !write_translated_path(
                                         pid,
@@ -14671,7 +14704,8 @@ pub fn run_ptrace_loop(
                             let path_arg_index = abi.reg_arg1;
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if let Some(path) = read_child_string(pid, path_addr) {
-                                let translated = translate_path(rootfs, &path);
+                                let translated =
+                                    translate_path_via_sandbox(&sandbox, rootfs, &path);
                                 if translated != path && loop_count <= 500 {
                                     log(&format!("intercepted statfs({}) -> {}", path, translated));
                                 }
@@ -14766,7 +14800,8 @@ pub fn run_ptrace_loop(
                             let path_addr = get_syscall_arg(&regs, path_arg_index);
                             if path_addr != 0 {
                                 if let Some(path) = read_child_string(pid, path_addr) {
-                                    let translated = translate_path(rootfs, &path);
+                                    let translated =
+                                        translate_path_via_sandbox(&sandbox, rootfs, &path);
                                     if translated != path {
                                         // 1. Rewrite the path register so
                                         //    the kernel mkdir/mkdirat
@@ -18480,7 +18515,8 @@ pub fn run_ptrace_loop(
                                     let path_addr = get_syscall_arg(&regs2, path_idx);
                                     if path_addr != 0 {
                                         if let Some(path) = read_child_string(pid, path_addr) {
-                                            let real_path = translate_path(rootfs, &path);
+                                            let real_path =
+                                                translate_path_via_sandbox(&sandbox, rootfs, &path);
                                             if let Some(parent) =
                                                 std::path::Path::new(&real_path).parent()
                                             {
