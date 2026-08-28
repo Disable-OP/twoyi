@@ -12532,3 +12532,71 @@ Stage Summary:
   the missing legacy vibrator ABI. Both fixed generically. The
   known-good 3.7 baseline should be unaffected (additive sysfs +
   a sweep that only fires on escapees).
+
+---
+Task ID: 6-Z192 + 6-Z193 + 6-Z194 + CI layer
+Agent: main
+Task: Verify the splash-hang fix; attack the next two corpus blockers
+(whyred init exit 127, OrangeFox silent no-boot); build the machine-
+readable results + nightly CI layer.
+
+Work Log:
+- VERIFIED (monitor sub-agent, runs 33153676433/33153678309): the TWRP
+  2.8 splash-hang fix WORKS. twrp-2.8.7.0-angler BOOTS TO MENU (main2,
+  advanced, filemanagerlist, deep FM navigation); 2.8.7.2's fatal
+  "Failed to load base packages" is GONE from first boot (the late
+  watchdog re-exec instance still re-hits it — tail issue, not
+  blocking). Vibrator opens now succeed (fd=14, storm gone). 6-Z190
+  never fired (no coverage escapes observed on these runs).
+- whyred (33151412680 old / 33155134297 new-code iter-1):
+  * OLD: init exit 127 + "Unable to write serialized property infos:
+    Not a directory" — kr64 hardcoded boot_recovery ⇒ OLD single-FILE
+    /dev/__properties__; whyred's init speaks the Android 8+ format.
+  * Binary-proven differentiator: the whyred init contains
+    properties_serial/property_info literals; the angler 2.8 AND 3.7
+    inits contain neither.
+  * 6-Z192 fix: probe the guest's /init for "properties_serial" →
+    NEW format ⇒ pre-create the DIRECTORY tree + skip the old-format
+    machinery. Verified locally against all three real inits.
+  * iter-1 run: probe fired correctly, "Not a directory" GONE, but
+    init still died: "Failed to initialize property area". Android-9
+    flow reconstructed from source (property_service.cpp +
+    contexts_serialized.cpp): property_init() →
+    CreateSerializedPropertyInfo() [writes property_info] →
+    __system_property_area_init() → LoadDefaultPath() which requires
+    st_size ≥ sizeof(PropertyInfoArea). The new_android() VFS's
+    Dynamic properties_serial node clobbers the guest's written area
+    on every open (materialize-on-open) — the guest must OWN these
+    files in the new format.
+  * iter-2 fix: Vfs::new_recovery_new_format() (new_android minus
+    ALL property entries) + property-area-state.txt evidence capture
+    (file sizes + hexdump) in the E2E artifact for conclusive
+    disambiguation on the next run.
+- OrangeFox R12.0 lavender (33151414232): the RamdiskImporter
+  extracted the 64MB image fine, but Render2Activity logged
+  "bootSystem: romExist=false" and kr64 never started (0-byte log).
+  Root cause: OrangeFox ships /init as a SYMLINK (→ /system/bin/init,
+  verified in the artifact: mode 0o120750); the importer stores cpio
+  symlinks as <name>.symlink sidecars; kr64's 6-Z187-C materializer
+  turns them into real symlinks AT BOOT, but romExist() runs in the
+  app BEFORE kr64. 6-Z193 fix: romExist also accepts init.symlink.
+  (Also: inspector now detects OrangeFox via sbin/foxstart.sh +
+  sbin/fox_list_apps markers.)
+- CI layer (§27/§31/§33/§35/§36):
+  * classify_result.py — runs INSIDE the E2E job; emits result.json
+    into the artifact (boot/ui/theme/terminal/vfs categories +
+    overall verdict; distinguishes OK_FIRST_BOOT_FAIL_REEXEC).
+    Verified against the 2.8.7.2 artifacts (UI_READY + re-exec tail)
+    and whyred (BOOT_FAIL_EARLY_INIT).
+  * dashboard.py — aggregates result.json (local dir and/or GitHub
+    artifacts) into summary.json + dashboard.md with failure
+    clustering by subsystem.
+  * recovery-corpus-nightly.yml — 03:00 UTC full-corpus dispatch +
+    bounded-wait dashboard job (30-day artifacts). PR CI stays manual
+    (E2E minutes budget).
+
+Stage Summary:
+- User targets: 2.8.7.0 angler WORKS (menu + FM verified). whyred +
+  OrangeFox fixes dispatched for verification on 9e7a7ad. The corpus
+  now has: manifest (9 images), inspector, dispatcher, in-run
+  classifier, dashboard, nightly workflow.
