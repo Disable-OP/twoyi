@@ -653,6 +653,21 @@ jobs:
           sudo docker exec redroid sh -c \
             "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/socket/ 2>/dev/null" \
             > /tmp/ui-e2e-artifacts/rootfs-socket-dir.txt 2>&1 || true
+          # 6-Z192: the property-area file states — the decisive evidence
+          # for new-format (Android 8+) init debugging. property_info must
+          # be >= sizeof(PropertyInfoArea) (~40 bytes) after init's
+          # WriteStringToFile; properties_serial must be a real area (128K
+          # default) after __system_property_area_init. 0-byte files mean
+          # the guest's write path failed; a minimal 128K file with the
+          # PROP magic means the VFS synthetic clobbered it.
+          sudo docker exec redroid sh -c \
+            "ls -la /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/ 2>/dev/null; \
+             for f in /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/property_info \
+                      /data/user/0/io.twoyi.debug/rootfs/dev/__properties__/properties_serial; do \
+               [ -f \$f ] && echo \"== \$f (\$(stat -c%s \$f) bytes) first 32 hex:\" && od -A x -t x1 -N 32 \$f; \
+             done; \
+             ls -la /data/user/0/io.twoyi.debug/rootfs/dev/__properties__ 2>/dev/null | head -3" \
+            > /tmp/ui-e2e-artifacts/property-area-state.txt 2>&1 || true
           # 6-Z183: THE PIXEL TRUTH is what the APP DISPLAYS — framework
           # screencaps of the app's own SurfaceView, captured twice (5 s
           # apart; identical content = a stable rendered menu, not a
