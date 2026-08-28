@@ -236,7 +236,8 @@ def detect_family(files: dict, cmdline: str):
     # OrangeFox: specific markers only (the terminfo 'fox' entry in
     # sbin/etc/terminfo/f/fox is a terminal database, NOT OrangeFox).
     ofx_names = ("sbin/fox", "fox.rc", "init.fox.rc", "foxfmttools",
-                 "sbin/foxlib", "fox.prop")
+                 "sbin/foxlib", "fox.prop", "sbin/foxstart.sh",
+                 "sbin/fox_list_apps")
     if any(n in names for n in ofx_names) or \
             b"OrangeFox" in text or b"orangefox." in text:
         fam["family"] = "OrangeFox"
