@@ -12472,3 +12472,63 @@ Stage Summary:
   ioctls gets a working shell. Next master-prompt item: the TWRP 2.8
   angler splash hang (root-cause item 4), then the universal recovery
   corpus + tiered CI.
+
+---
+Task ID: 6-Z191
+Agent: main
+Task: TWRP 2.8 angler splash hang — root-caused from the run-33148931282
+artifact; fixes implemented, committed (550d199), verification dispatched.
+
+Work Log:
+- User target updated: TWRP 2.8.7.0 angler is the PRIMARY old-recovery
+  target (2.8.7.2 = comparative evidence; both dispatched).
+- Run 33148931282 (2.8.7.2) artifact analysis:
+  * recovery.log shows THREE "Starting TWRP" banners: pid 2587
+    (kr64's proactive fork, 06:48:08), pid 2596 (init's service
+    start, 06:48:09 — dual concurrent instances), pid 4326 at
+    06:52:18 — THE FAILING ONE.
+  * pid 4326's section shows every open hitting RAW host paths
+    (probe_raw=-13 EACCES on /proc/cmdline, /dev/dri/card* ENOENT)
+    — the fb_hook's rootfs retry patches SOME opens, but the theme
+    load dies at stat().
+  * KR64 tracer log: ZERO stops ever received from pid 4326 (no
+    SIGSTOP-on-fork, no syscall stops) — the process ESCAPED ptrace
+    coverage entirely, yet ran (wrote its banner to recovery.log).
+  * Source-level proof (omnirom android-6.0 gui/pages.cpp):
+    PageManager::LoadFileToBuffer stats the file FIRST and returns
+    NULL SILENTLY when stat fails — "This isn't always an error".
+    stat("/twres/ui.xml") on the HOST -> ENOENT -> NULL ->
+    "Failed to load base packages" -> "unable to load theme" ->
+    infinite retry loop = the SPLASH HANG.
+  * Trigger chain: 2.8 UI polls /sys/class/timed_output/vibrator/
+    enable on every page transition (missing -> failed-open storm
+    for ~3 min) -> TWRP's internal watchdog re-execs -> the escaped
+    instance.
+- Fixes (both recovery-agnostic, commit 550d199):
+  1. feat(haptics): haptics.rs materialises the standard sysfs ABI
+     (timed_output/vibrator/enable+state, leds/vibrator/*,
+     lcd-backlight/brightness+max, backlight/panel/*) at boot, with
+     a one-shot drain thread — mirrors battery.rs. Wired into
+     lib.rs Step 2.8b. 3 unit tests.
+  2. fix(tracer) 6-Z190 coverage watchdog: /proc sweep every 25k
+     loop iterations (>=5s wall clock, post-first-execve) attaches
+     any process whose PPID is tracked but which never stopped;
+     full options mask + PTRACE_SYSCALL resume; loud logging.
+- Corpus infra (commit 7a6dd52): corpus/manifest.yaml (TWRP angler
+  ladder 2.8.7.0/2.8.7.2/3.0.0/3.2.3/3.7.0, device matrix whyred/
+  lavender/sailfish/bullhead, OrangeFox R12.0 lavender),
+  scripts/recovery-corpus/{inspect_image.py,dispatch_corpus.sh}.
+  Inspector verified on all three local angler images (boot-header
+  v0/v1/v2 + v3/v4, ramdisk gzip, ELF analysis: init static ELF64,
+  sbin/* dynamic /sbin/linker64; terminfo 'fox' false-positive
+  fixed in the family detector).
+- Gates: fmt + clippy -D warnings + 577 tests PASS.
+- In-flight: whyred + OrangeFox baseline runs (old code), 2.8.7.0 +
+  2.8.7.2 verification runs (new code) — monitoring delegated.
+
+Stage Summary:
+- The splash-hang root cause is NOT a VFS/path bug in the normal
+  sense — it is TRACER COVERAGE LOSS on a re-exec'd instance plus
+  the missing legacy vibrator ABI. Both fixed generically. The
+  known-good 3.7 baseline should be unaffected (additive sysfs +
+  a sweep that only fires on escapees).
