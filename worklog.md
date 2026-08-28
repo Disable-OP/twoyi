@@ -12724,3 +12724,79 @@ Stage Summary:
   /sbin/linker64, not /system/bin/linker64) so it runs under the HOST
   redroid linker — needs an interp search/alias (sbin/linker64) or
   rootfs symlink for system/bin/linker64.
+
+---
+Task ID: 6-Z196 + 6-Z197 + 6-Z198 (rounds 1-2)
+Agent: main
+Task: Root-cause + fix the OrangeFox R12.0 and whyred corpus blockers
+(verification runs on 9e7a7ad both BOOT_FAIL_EARLY_INIT exit 127).
+
+Work Log:
+- Downloaded + statically analyzed the REAL OrangeFox R12.0 image
+  (api.orangefox.download, md5 verified): /init is a symlink (mode
+  0o120750) -> /system/bin/init (1979448-byte dynamic ELF64,
+  PT_INTERP=/system/bin/linker64); the ramdisk SHIPS
+  /system/lib64/libbacktrace.so (159648 bytes, 183 libs total).
+- ORANGEFOX ROOT CAUSE 1 (linker): translate_guest passed
+  /system/lib64/** to the HOST unconditionally (is_runtime_host_fallback
+  matched first — the rootfs-first branch below it was DEAD CODE), and
+  the 6-Z185 backstop then DENIED the host path (host lacks the file)
+  → libbacktrace.so unopenable from EITHER side → CANNOT LINK. FIX
+  (6-Z196-C1): rootfs copy FIRST for the runtime-fallback class
+  (linkers + /system,/apex lib subtrees), host only when the rootfs
+  copy is absent.
+- ORANGEFOX ROOT CAUSE 2 (interpreter): the staged /init ran under the
+  HOST's Android-14 linker64 (kernel opens PT_INTERP outside tracer
+  reach). FIX (6-Z196-C2): ensure_guest_interp() rewrites the staged
+  copy's PT_INTERP to {rootfs}<interp> when the guest ships its own
+  linker — applied in stage_guest_executable_capped (Staged + Reused)
+  and the child's cache/twoyi_init. THE generic external-ELF fix.
+- ORANGEFOX ROOT CAUSE 3 (probe): the 6-Z192 property-format probe's
+  single needle missed OrangeFox (its init contains property_info 2x
+  but NOT properties_serial — that literal lives in bionic, not init).
+  FIX (6-Z196-B): two-needle probe. Empirical matrix on real binaries:
+  angler 2.8.7.0/3.7.0 contain NEITHER (still OLD — no regression),
+  whyred contains both, OrangeFox property_info only.
+- WHYRED ROOT CAUSE 1 (property EEXIST): the parent pre-created
+  properties_serial; Android 8+ init opens it O_CREAT|O_EXCL → EEXIST
+  → LOG(FATAL) "Failed to initialize property area". FIX (6-Z196-A):
+  new-format recovery boots get a CLEAN slate (stale single-file +
+  stale pre-created files removed, empty dir only).
+- VFS invariant leak (6-Z196-D): materialized symlinks carried
+  HOST-ABSOLUTE targets ({rootfs}/system/bin/init) — guest readlink()
+  showed the host backing path. FIX: guest-relative targets
+  ("system/bin/init"); busybox-staged links keep the staged-copy
+  target (noexec rootfs needs the executable cache path).
+- ROUND 1 VERIFICATION (572b1e5, runs 33164199222/33164204067/
+  33164208433): angler 3.7.0 BOOT_OK (NO regression — pages advanced/
+  terminal/filemanagerlist all reached). OrangeFox: PT_INTERP patch
+  fired, CANNOT LINK GONE, /proc/self/maps renders, init loaded its
+  OWN full lib stack from the ramdisk and ran 3958 syscalls to a clean
+  exit — but died at first-stage: five CHECKCALL mkdirs EEXIST-failed
+  (/dev/pts, /dev/socket, /dev/dm-user, /mnt/vendor, /mnt/product) →
+  "Init encountered errors starting first stage, aborting" →
+  InitFatalReboot. The exit-127 in result.json is kr64's OWN stale
+  /sbin/recovery probe fork (OrangeFox has none — cosmetic).
+  whyred: property FATAL persists with a CLEAN dir; syscall tail shows
+  LoadDefaultPath open+fstat+close with NO mmap — the 6-Z121 fstat
+  ownership virtualization never fired (no (pid,fd) registration at
+  the fstat EXIT).
+- FIX (6-Z197): mkdir/mkdirat EEXIST→0 for the canonical first-stage
+  boot dir set (fresh-ramdisk illusion; other mkdirs keep honest
+  semantics). FIX (6-Z198): fstat ownership resolution gains a
+  registration-independent /proc/<pid>/fd/<fd> readlink fallback +
+  bounded unresolved-fstat diagnostics.
+- Gates round 1 + 2: cargo fmt --check, cargo clippy --all-targets
+  -D warnings, cargo test — 587 PASS (10 new tests: probe matrix,
+  rootfs-first translation, relative targets, ELF interp
+  read/patch/idempotency).
+
+Stage Summary:
+- Committed 572b1e5 (6-Z196 A-D) and 43f695a (6-Z197/6-Z198), pushed.
+- Round-2 verification dispatched: OrangeFox (33165387047-class run)
+  + whyred on 43f695a; angler regression already proven on 572b1e5.
+- KNOWN REMAINING (next iterations): readlink of busybox-staged links
+  still shows the cache path (needs EXIT-side readlink rewriting);
+  /proc/self/exe backstop-denied (linker namespace probe survives via
+  auxv fallback); the {rootfs}/data-as-host-symlink question (staging
+  of /data/...-prefixed execs resolves through it — needs an audit).
