@@ -12305,3 +12305,32 @@ Stage Summary:
 - The pty channel now crosses the fork boundary via the natural fd
   inheritance mechanism. ash should get a clean socket stdio and draw
   its prompt.
+
+---
+Task ID: 6-Z188g
+Agent: main
+Task: Run 33129187020: fd-number protocol works
+(ptsname -> /dev/pts/17) but the child's dup(17) returned -EBADF while
+fcntl said the fd was live — a faked dup (the tracer's socket-fd
+bookkeeping never saw the MARKED socketpair) or a targeted close of the
+slave number alone.
+
+Work Log:
+- Evidence: "pty master fd=15 (slot 0, slave fd=17)" OK; "ptsname(fd=15)
+  -> /dev/pts/17" OK; "pty slave open /dev/pts/17 -> fd=-9" (-EBADF);
+  MISS=0 (the fcntl precheck PASSED — so fcntl was faked non-negative
+  or the fd really closed between).
+- 6-Z188g FIX (belt + suspenders, each surviving one failure mode):
+  1. MARKED dup — raw_syscall3_marked(SYS_dup, ...) so the tracer
+     leaves the dup alone and the KERNEL decides EBADF.
+  2. BACKUP dup at master-creation time (g_pty_backup_fd[slot]): a
+     second kernel copy of the slave socket that survives any single-
+     fd targeted close; the fork child finds it via the fork-inherited
+     slot table (proven present — ptsname works in the child).
+  3. fcntl precheck dropped (it lied); dup's own result is the check.
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- If the dup was faked -> fix 1 wins; if the fd was closed -> fix 2
+  wins; if both -> the RECOVERED log names it and the next iteration
+  targets the closer.
