@@ -405,7 +405,21 @@ public final class RomManager {
 
     public static boolean romExist(Context context) {
         File initFile = new File(getRootfsDir(context), "init");
-        return initFile.exists();
+        if (initFile.exists()) {
+            return true;
+        }
+        // 6-Z193: modern recoveries (OrangeFox, newer TWRP/SkyHawk trees)
+        // ship /init as a SYMLINK (e.g. -> /system/bin/init). The
+        // RamdiskImporter stores cpio symlinks as `<name>.symlink` TEXT
+        // sidecars (Java's File API cannot create symlinks), and kr64's
+        // boot-time materializer (symlinks.rs 6-Z187-C) turns them into
+        // REAL symlinks before the guest forks. This check runs in the
+        // app BEFORE kr64 starts, so the sidecar form must count as a
+        // valid ROM too — otherwise the app refuses to boot a perfectly
+        // imported recovery (run 33151414232: OrangeFox R12.0 imported
+        // fine, romExist=false, boot never started).
+        File initSidecar = new File(getRootfsDir(context), "init.symlink");
+        return initSidecar.exists();
     }
 
     public static boolean needsUpgrade(Context context) {
