@@ -1,0 +1,135 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Universal recovery corpus — nightly full run + dashboard (§23/§31/§35).
+#
+# Tiering (cost control — each E2E run is ~10-20 GHA minutes):
+#   * PR CI:       NOT automated. Dispatch `scripts/recovery-corpus/
+#                  dispatch_corpus.sh pr 60` manually for the small
+#                  representative set (old TWRP + modern TWRP +
+#                  OrangeFox + the primary user target).
+#   * Nightly:     THIS workflow — the complete corpus (every manifest
+#                  entry with tier: nightly or pr).
+#   * Release:     workflow_dispatch with tier=all on a tag.
+#
+# Job 2 (dashboard) waits for all dispatched runs to finish (bounded
+# poll), then aggregates result.json from the artifacts into
+# corpus/results/summary.json + dashboard.md and uploads them. Failure
+# clustering (§36) makes one-subsystem-many-images regressions visible.
+---
+name: Recovery Corpus (Nightly)
+
+'on':
+  schedule:
+    # 03:00 UTC nightly — low-usage window for shared ARM64 runners.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'Corpus tier to run: pr | nightly | all | <image-name>'
+        required: false
+        default: 'nightly'
+      boot_wait_seconds:
+        description: 'Boot wait per image (seconds)'
+        required: false
+        default: '60'
+
+concurrency:
+  group: recovery-corpus-nightly
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch corpus tier
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git credentials (workflow token)
+        run: |
+          # dispatch_corpus.sh reads the token from ~/.git-credentials.
+          printf 'https://Disable-OP:%s@github.com\n' \
+            "${{ secrets.GITHUB_TOKEN }}" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Dispatch every manifest entry in the tier
+        run: |
+          chmod +x scripts/recovery-corpus/dispatch_corpus.sh
+          ./scripts/recovery-corpus/dispatch_corpus.sh \
+            "${{ github.event.inputs.tier || 'nightly' }}" \
+            "${{ github.event.inputs.boot_wait_seconds || '60' }}"
+
+      - name: Record the dispatch window start
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/dispatch-start.txt
+          cat /tmp/dispatch-start.txt
+
+  dashboard:
+    name: Aggregate results + compatibility dashboard
+    needs: dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure git credentials (workflow token)
+        run: |
+          printf 'https://Disable-OP:%s@github.com\n' \
+            "${{ secrets.GITHUB_TOKEN }}" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Wait for the dispatched E2E runs to complete
+        run: |
+          set -u
+          # Poll the workflow runs created since the dispatch window
+          # started; finish when none are in_progress/queued, or after
+          # ~150 minutes (the corpus tier runs are concurrency-grouped
+          # per image, so a full nightly waves through in ~1-2 h).
+          cat > /tmp/pending.py <<'PYEOF'
+          import json, sys
+          start = sys.argv[1]
+          d = json.load(sys.stdin)
+          n = 0
+          for r in d.get('workflow_runs', []):
+              if 'UI E2E Test (ARM64' in r.get('name', '') \
+                      and r.get('status') in ('in_progress', 'queued', 'waiting') \
+                      and r.get('created_at', '') >= start:
+                  n += 1
+          print(n)
+          PYEOF
+          START=$(cat /tmp/dispatch-start.txt 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+          TOKEN=$(sed -n 's|https://Disable-OP:\([^@]*\)@github.com|\1|p' ~/.git-credentials)
+          for i in $(seq 1 90); do
+            PENDING=$(curl -s -H "Authorization: token ${TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+              | python3 /tmp/pending.py "${START}")
+            echo "poll $i: ${PENDING} run(s) still pending"
+            [ "${PENDING}" = "0" ] && break
+            sleep 100
+          done
+
+      - name: Build the dashboard
+        run: |
+          python3 scripts/recovery-corpus/dashboard.py \
+            --from-github 6 \
+            --out-md corpus/results/dashboard.md \
+            --out-json corpus/results/summary.json
+
+      - name: Upload dashboard artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-compatibility-dashboard
+          path: |
+            corpus/results/dashboard.md
+            corpus/results/summary.json
+          retention-days: 30
+          if-no-files-found: warn
