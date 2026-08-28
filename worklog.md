@@ -12967,3 +12967,54 @@ Stage Summary:
   surface); whyred's CodeCache mmap succeeds → splash → main menu
   (UI_READY candidate). The corpus still needs broadening (§17) — next
   local task while CI runs.
+
+---
+Task ID: 6-Z199b + 6-Z203b + corpus round-5 (round 5)
+Agent: main
+Task: Fix the round-4 next-layer blockers (runs 33192824519 OrangeFox /
+33192826927 whyred / 33192829279 angler on e1c3eac) + expand the corpus.
+
+Work Log:
+- Round-4 verdicts: angler UI_READY NO REGRESSION ✓ (full page tour + real
+  "pty master fd=15" terminal evidence). OrangeFox: 6-Z202 ENGAGED (socket
+  rewritten, real fd 5 registered) but init STILL died at "Could not open
+  uevent socket". whyred: 6-Z203 registered the ashmem fd but the ioctl
+  fakes never fired; the CodeCache ENOTTY abort remained (splash frozen).
+- ROOT CAUSE 1 (OrangeFox — 6-Z199 extension): the 6-Z99 socket-family
+  follow-up arms (bind/listen/setsockopt/getsockopt/shutdown/close) read
+  the fd from reg_arg1 AT THE EXIT STOP — on aarch64 that is the RETURN
+  VALUE, so the setsockopt(SO_RCVBUFFORCE) EPERM fake never matched fd 5.
+  libcutils' uevent_open_socket (AOSP 11): setsockopt(SO_RCVBUF) +
+  getsockopt readback + [readback < 2*buf] → setsockopt(SO_RCVBUFFORCE)
+  → EPERM for untrusted_app → close(s) → return -1 → the UeventListener
+  constructor LOG(FATAL)s "Could not open uevent socket" EVEN THOUGH the
+  socket() itself had SUCCEEDED. THE FIX: extended the 6-Z199 ENTRY-side
+  stash to ALL fd-taking syscalls (bind/listen/setsockopt/getsockopt/
+  shutdown/connect/sendto/sendmsg/recvfrom/recvmsg/read/write/writev +
+  close/fstat/fstat64) storing (syscall_nr, fd); all 6-Z99 arms now
+  consume the nr-matched stash.
+- ROOT CAUSE 2 (whyred — 6-Z203b): ZERO ioctl syscalls appeared in the
+  whole whyred trace — the ENOTTY never came from an ioctl! Android 10/11
+  libcutils __ashmem_open_locked() fstats the /dev/ashmem fd and requires
+  S_ISCHR(st.st_mode) && st.st_rdev; our regular-file stand-in fails the
+  check → close(fd) → errno=ENOTTY → ashmem_create_region returns -1 →
+  "Creating code cache, ashmem_create_region failed with error 'Not a
+  typewriter'" → LOG_ALWAYS_FATAL_IF abort. (angler's older libcutils
+  lacks the check — that's why angler's PLT-level ioctl path worked.)
+  THE FIX: the 6-Z121 fstat EXIT arm now ALSO virtualizes ashmem backing
+  fds: st_mode type bits → S_IFCHR, st_rdev → 0x0a01 (misc major) — the
+  fd then passes libcutils' validation, the ASHMEM_SET_NAME/SET_SIZE
+  ioctls reach my 6-Z203 ENTRY fakes, and the caller's file-backed mmap
+  lands on the ftruncate'd backing file.
+- Corpus (§17): +8 entries — angler ladder completion (3.1.1, 3.3.1,
+  3.5.2_9) + SoC diversity: flounder (Tegra), begonia + merlin
+  (MediaTek), starlte (Exynos), berkeley (Kirin). All URLs verified 200
+  with Referer. Manifest now 19 images.
+- Gates: fmt + clippy -D warnings + 595 tests PASS.
+
+Stage Summary:
+- The x0-at-EXIT fd bug is now fixed across ALL functional EXIT-side
+  consumers; the ashmem stand-in now masquerades as a char device.
+  Round-5 CI dispatched (OrangeFox + whyred + angler regression).
+  Expected: OrangeFox init survives the uevent listener (proceeds to
+  service startup); whyred's CodeCache mmap succeeds → splash → menu.
