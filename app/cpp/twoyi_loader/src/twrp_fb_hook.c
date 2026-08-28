@@ -691,6 +691,10 @@ static int ashmem_ioctl(int fd, unsigned req, unsigned long arg) {
 #define TWOYI_PTY_SLOTS 4
 static int  g_pty_master_fd[TWOYI_PTY_SLOTS];   /* sv[0] handed to caller */
 static int  g_pty_slave_fd[TWOYI_PTY_SLOTS];    /* sv[1] stashed          */
+static int  g_pty_backup_fd[TWOYI_PTY_SLOTS];   /* 6-Z188g: extra dup of the
+                                                   slave — survives a
+                                                   targeted close of the
+                                                   original number      */
 
 static void pty_init_slots(void) {
     static int inited = 0;
@@ -735,6 +739,12 @@ static int pty_open_master(int flags) {
                    && sv_fds[0] != sv_fds[1]) {
             g_pty_master_fd[slot] = sv_fds[0];
             g_pty_slave_fd[slot]  = sv_fds[1];
+            /* 6-Z188g: a BACKUP dup of the slave — run 33129187020 saw
+             * the child's dup(slave) return -EBADF while the master fd
+             * lived: something closed the slave number alone. A second
+             * copy (whatever fd the kernel picks) survives that. */
+            long b = raw_syscall3_marked(24 /* SYS_dup */, (long)sv_fds[1], 0, 0);
+            g_pty_backup_fd[slot] = (b >= 0 && b < 1024) ? (int)b : -1;
             write_str(2, "[twrp_fb_hook] pty master fd=");
             write_num(2, sv_fds[0]);
             write_str(2, " (slot ");
@@ -812,18 +822,29 @@ static int pty_open_slave(const char *path) {
      * caller fall through to the real open (never shadow foreign paths). */
     if (!any) return -2;
     if (n < 0 || n >= 1024) return -1;
-    /* Verify n is a LIVE fd in THIS process (the inherited socket end).
-     * fcntl(n, F_GETFD) >= 0 proves it; a stale/guessed number fails
-     * cleanly instead of dup'ing something unrelated. */
-    long fcntl_ret = raw_syscall3(25 /* SYS_fcntl aarch64 */, (long)n,
-                                  1 /* F_GETFD */, 0);
-    if (fcntl_ret < 0) {
-        write_str(2, "[twrp_fb_hook] pty slave open /dev/pts/");
-        write_num(2, n);
-        write_str(2, " MISS (fd not live in this process)\n");
-        return -1;
+    /* 6-Z188g: MARKED dup — the tracer's socket-fd bookkeeping never
+     * saw the marked socketpair, and run 33129187020's plain dup(17)
+     * came back -EBADF while fcntl said live (a faked dup). A marked
+     * dup is left untouched — the KERNEL decides. */
+    long d = raw_syscall3_marked(24 /* SYS_dup aarch64 */, (long)n, 0, 0);
+    if (d < 0) {
+        /* Backup fd from the fork-inherited slot table (the direct fork
+         * child HAS the table — ptsname worked there in every run). */
+        pty_init_slots();
+        for (int i = 0; i < TWOYI_PTY_SLOTS; i++) {
+            if (g_pty_slave_fd[i] == n && g_pty_backup_fd[i] >= 0) {
+                long d2 = raw_syscall3_marked(24, (long)g_pty_backup_fd[i], 0, 0);
+                if (d2 >= 0) {
+                    write_str(2, "[twrp_fb_hook] pty slave open RECOVERED via backup ");
+                    write_num(2, g_pty_backup_fd[i]);
+                    write_str(2, " -> fd=");
+                    write_num(2, (int)d2);
+                    write_str(2, "\n");
+                    return (int)d2;
+                }
+            }
+        }
     }
-    long d = raw_syscall1(24 /* SYS_dup aarch64 */, (long)n);
     write_str(2, "[twrp_fb_hook] pty slave open /dev/pts/");
     write_num(2, n);
     write_str(2, " -> fd=");
