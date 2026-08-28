@@ -7093,6 +7093,46 @@ fn is_kmsg_path(path: &str) -> bool {
     path.rsplit('/').next() == Some("__kmsg__")
 }
 
+/// 6-Z197: is this guest path one of the canonical Android
+/// first-stage-init CHECKCALL boot directories?
+///
+/// AOSP FirstStageMain (system/core/init/first_stage_init.cpp, Android
+/// 10+) runs every mkdir/mount through the CHECKCALL macro, which
+/// COLLECTS failures and ends with
+///   `LOG(FATAL) << "Init encountered errors starting first stage,
+///    aborting"` → InitFatalReboot → exit.
+/// On real hardware these mkdirs succeed because the freshly-mounted
+/// tmpfs hides any pre-existing directory. Twoyi's rootfs is a
+/// PERSISTENT directory tree (ramdisk import + kr64's own pre-created
+/// boot dirs), and the pseudo-mount cannot hide existing children —
+/// so mkdir("/dev/pts"), mkdir("/mnt/vendor"), … return EEXIST and
+/// KILL the boot (run 33164199222, OrangeFox R12.0: five CHECKCALL
+/// mkdir failures → first-stage abort).
+///
+/// The fix: for exactly this canonical set, an EEXIST directory is
+/// rewritten to mkdir-SUCCESS — the "fresh ramdisk" illusion where it
+/// is boot-critical. Shell-level `mkdir <existing>` keeps its honest
+/// EEXIST for every other path.
+fn is_first_stage_boot_dir(guest_path: &str) -> bool {
+    const BOOT_DIRS: &[&str] = &[
+        "/dev",
+        "/dev/pts",
+        "/dev/socket",
+        "/dev/dm-user",
+        "/dev/block",
+        "/proc",
+        "/sys",
+        "/sys/fs/selinux",
+        "/mnt",
+        "/mnt/vendor",
+        "/mnt/product",
+        "/mnt/debug_ramdisk",
+        "/debug_ramdisk",
+        "/second_stage_resources",
+    ];
+    BOOT_DIRS.contains(&guest_path)
+}
+
 /// Classify an open() path as the Android property-area file
 /// `/dev/__properties__`.
 ///
@@ -8994,6 +9034,10 @@ pub fn run_ptrace_loop(
     // exec'd guest process; a reboot-looping init would flood the
     // log otherwise).
     let mut z121_log_count: u32 = 0;
+    // 6-Z198: bounded counter for fstat-EXIT stops where the fd's file
+    // could be resolved NEITHER from open_fd_owner_paths NOR from the
+    // /proc/<pid>/fd/<fd> readlink fallback (diagnostic only).
+    let mut z198_unresolved_fstat: u32 = 0;
     const Z121_LOG_CAP: u32 = 60;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
@@ -14416,6 +14460,42 @@ pub fn run_ptrace_loop(
                                             "{} translated: {} -> {} (created: {})",
                                             name, path, translated, created
                                         ));
+                                        // ── 6-Z197: fresh-ramdisk illusion
+                                        // for first-stage boot dirs ──
+                                        //
+                                        // Android 10+ FirstStageMain
+                                        // CHECKCALLs its mkdir/mount list
+                                        // and LOG(FATAL)s on ANY error
+                                        // ("Init encountered errors
+                                        // starting first stage, aborting"
+                                        // → InitFatalReboot). The
+                                        // persistent rootfs already
+                                        // contains the canonical boot
+                                        // dirs, and the pseudo-mount
+                                        // cannot hide them the way a
+                                        // real tmpfs mount does — the
+                                        // kernel mkdir returns EEXIST
+                                        // and init aborts (run
+                                        // 33164199222, OrangeFox R12.0:
+                                        // five CHECKCALL mkdir
+                                        // failures). Rewrite the syscall
+                                        // to getpid + arm the fake-return
+                                        // 0 (the same mechanism the
+                                        // sandbox backstop uses), so the
+                                        // boot-critical mkdirs report
+                                        // success exactly like a fresh
+                                        // ramdisk. Non-boot-dir mkdirs
+                                        // keep honest semantics.
+                                        if existed && is_first_stage_boot_dir(&path) {
+                                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                                            if ptrace_setregs(pid, &regs, iov_len).is_ok() {
+                                                pending_sandbox_deny.insert(pid, 0);
+                                                log(&format!(
+                                                    "6-Z197: {}({}) — first-stage boot dir already exists; faking mkdir success (fresh-ramdisk illusion)",
+                                                    name, path
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -15340,7 +15420,41 @@ pub fn run_ptrace_loop(
                         let fstat_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if fstat_ret >= 0 {
                             let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
-                            if let Some(p) = open_fd_owner_paths.get(&(pid, fd)).cloned() {
+                            // 6-Z198: resolve the fd's file BOTH from the
+                            // open-time registration AND — as a robust
+                            // fallback — from the LIVE /proc/<pid>/fd/<fd>
+                            // symlink. Run 33164204067 (whyred, aarch64):
+                            // init wrote a VALID 8508-byte property_info,
+                            // then LoadDefaultPath's fstat check killed the
+                            // boot ("Failed to initialize property area")
+                            // with the 6-Z121 virtualization NEVER firing —
+                            // the (pid, fd) registration was missing at the
+                            // fstat EXIT (fd-number recycling after the
+                            // WriteStringToFile close, or a registration
+                            // path that did not run). The /proc readlink is
+                            // registration-independent: the fd is OPEN at
+                            // the fstat EXIT by construction, so its
+                            // readlink always resolves.
+                            let resolved_path =
+                                open_fd_owner_paths.get(&(pid, fd)).cloned().or_else(|| {
+                                    std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
+                                        .ok()
+                                        .map(|t| t.to_string_lossy().into_owned())
+                                });
+                            // 6-Z198 DIAG: bounded log when a property-area
+                            // fstat is seen WITHOUT any resolvable path —
+                            // the next run must show why the fallback
+                            // missed (if it ever does).
+                            if resolved_path.is_none() {
+                                z198_unresolved_fstat += 1;
+                                if z198_unresolved_fstat <= 10 {
+                                    log(&format!(
+                                        "6-Z198 DIAG: fstat(fd={}) on pid {} resolved NEITHER from open_fd_owner_paths NOR from /proc/{}/fd/{} — ownership virtualization skipped",
+                                        fd, pid, pid, fd
+                                    ));
+                                }
+                            }
+                            if let Some(p) = resolved_path {
                                 if is_property_metadata_file(&p) {
                                     if let Some((mode_off, uid_off, gid_off)) =
                                         stat_ownership_layout(abi.fstat)
