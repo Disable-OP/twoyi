@@ -12395,3 +12395,27 @@ Work Log:
 Stage Summary:
 - The terminal stack is now fully stateless at the last hop. The ash
   prompt should render in the next run.
+
+---
+Task ID: 6-Z188k
+Agent: main
+Task: Run 33131312944: the console trace showed the ENTIRE chain works
+— hook lines + exec /sbin/sh + hook banner + TCGETS on fd0 — then
+silence. The slave dup had returned fd=0 (fd 0 was free in the child),
+and TWRP's runSlave does dup2(slave,0/1/2); close(slave); — closing
+fd 0 CLOSED STDIN. ash read EOF and died silently.
+
+Work Log:
+- Evidence on the terminal screen itself: "[twrp_fb_hook] close(fd=0)
+  (was tracked fb0 fd)" (fd0 freed BEFORE the slave open — that's why
+  the dup got 0) ... "pty slave open /dev/pts/17 -> fd=0" ...
+  ioctl(0, TCGETS) — then nothing.
+- 6-Z188k FIX: pty_open_slave NEVER returns fd 0/1/2 — if the marked
+  dup lands in the stdio range, dup again and close the low copy
+  (classic daemon fd hygiene). TWRP's close(fdSlave) then closes a
+  harmless high fd, and stdin stays = the dup2'd socket.
+- Gates: gcc -fsyntax-only clean.
+
+Stage Summary:
+- This was the last mechanical gap. With stdin intact, interactive ash
+  should finally print its prompt next run.
