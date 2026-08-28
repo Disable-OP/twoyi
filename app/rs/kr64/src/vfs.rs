@@ -1042,6 +1042,50 @@ impl SandboxPolicy {
         if self.under_rootfs(path) {
             return path.to_string();
         }
+        // 6-Z209d: staging-cache paths are HOST paths — they live at
+        // {data_dir}/cache/{twoyi_init, twoyi_stage/...} which is
+        // OUTSIDE the rootfs (the rootfs partition is noexec; the
+        // staging cache is the executable place). The /data/* rule
+        // below would otherwise translate these to {rootfs}/data/...
+        // which doesn't exist → ENOENT → execve of the staged init
+        // binary fails → "FATAL: execve returned (init did not
+        // replace us)" → exit 127 → recovery never reaches UI.
+        //
+        // Run 33208843829 (OrangeFox R12.0 lavender round-8 on
+        // 559b9ca): the importer correctly extracted /init (a symlink
+        // → /system/bin/init) AND /system/bin/init (1.9MB regular
+        // file); kr64 correctly staged /init → /data/user/0/io.twoyi.
+        // debug/cache/twoyi_init (1979448 bytes copied, 6-Z101 marker
+        // registered, PT_INTERP patched to /system/bin/linker64);
+        // then the kr64 child called execve("/init") which the
+        // tracer rewrote to the staged path /data/user/0/io.twoyi.
+        // debug/cache/twoyi_init; the kernel's execve then internally
+        // opened the staged binary — but the OPEN went through
+        // translate_guest (called by the openat ENTRY handler) which
+        // applied the /data/* rule and rewrote the path to
+        // /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.
+        // debug/cache/twoyi_init → ENOENT (the rootfs doesn't have
+        // a /data/user/0/... subdirectory). The execve returned →
+        // kr64 child printed "FATAL: execve returned" and exited
+        // 127. The "host_exists=true" DIAG for /system/bin/linker64
+        // was a RED HERRING — that file's open was NOT under the
+        // cache dir so the /data/* rule's reach was contained.
+        //
+        // The fix: before applying ANY prefix-translation rule, check
+        // whether the path is under the staging_dir (data_dir/cache).
+        // If yes, return the path UNCHANGED — it's a host backing
+        // path that the kernel + the tracer's execve staging both
+        // already know about.
+        if let Some(ref staging) = self.staging_dir {
+            let staging_str = staging.to_string_lossy();
+            let staging_str = staging_str.as_ref();
+            // Match either /data/.../cache (the dir itself) or
+            // /data/.../cache/... (anything under it). Both are
+            // host backing paths.
+            if path == staging_str || path.starts_with(&format!("{}/", staging_str)) {
+                return path.to_string();
+            }
+        }
         // /proc/cmdline — synthetic cmdline (host's is EACCES/real).
         if path == "/proc/cmdline" {
             return format!("{}/twrp-cmdline", self.rootfs.to_string_lossy());
@@ -1408,6 +1452,62 @@ mod sandbox_policy_tests {
         );
         assert_eq!(p.translate_guest("relative/path"), "relative/path");
         assert_eq!(p.translate_guest("./x"), "./x");
+    }
+
+    /// 6-Z209d regression: staging-cache paths under {data_dir}/cache
+    /// are HOST backing paths (outside the rootfs) and MUST NOT be
+    /// translated to rootfs-prefixed paths. The /data/* rule would
+    /// otherwise rewrite /data/user/0/io.twoyi.debug/cache/twoyi_init
+    /// → /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/
+    /// cache/twoyi_init — a path that doesn't exist on disk — and the
+    /// kernel's execve of the staged init binary returns ENOENT →
+    /// kr64 child "FATAL: execve returned (init did not replace us)"
+    /// → exit 127 → recovery never reaches the UI.
+    ///
+    /// Run 33208843829 (OrangeFox R12.0 lavender round-8 on 559b9ca):
+    /// the staging succeeded (1979448 bytes copied, 6-Z101 marker
+    /// registered, PT_INTERP patched) but the subsequent execve
+    /// failed because the openat ENTRY handler called translate_guest
+    /// on the staged path, the /data/* rule fired, and the kernel
+    /// got a non-existent rootfs-prefixed path.
+    #[test]
+    fn z209d_staging_cache_paths_left_untouched_by_translate_guest() {
+        let p = SandboxPolicy::with_staging(
+            "/data/user/0/io.twoyi.debug/rootfs",
+            "/data/user/0/io.twoyi.debug",
+        );
+        // The staging dir itself.
+        assert_eq!(
+            p.translate_guest("/data/user/0/io.twoyi.debug/cache"),
+            "/data/user/0/io.twoyi.debug/cache"
+        );
+        // The legacy init staging path (6-Z101 PART D).
+        assert_eq!(
+            p.translate_guest("/data/user/0/io.twoyi.debug/cache/twoyi_init"),
+            "/data/user/0/io.twoyi.debug/cache/twoyi_init"
+        );
+        // The generic staging tree (6-Z102).
+        assert_eq!(
+            p.translate_guest("/data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_busybox_abc"),
+            "/data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_busybox_abc"
+        );
+        // The staged-exe marker file.
+        assert_eq!(
+            p.translate_guest("/data/user/0/io.twoyi.debug/cache/twoyi-staged"),
+            "/data/user/0/io.twoyi.debug/cache/twoyi-staged"
+        );
+        // Sanity: a non-staging /data/* path STILL gets rootfs-prefixed
+        // (the rule is unchanged for non-staging /data paths).
+        assert_eq!(
+            p.translate_guest("/data/media/TWRP"),
+            "/data/user/0/io.twoyi.debug/rootfs/data/media/TWRP"
+        );
+        // Sanity: the rootfs prefix itself is still untouched (the
+        // under_rootfs early-out is unchanged).
+        assert_eq!(
+            p.translate_guest("/data/user/0/io.twoyi.debug/rootfs/system/bin/init"),
+            "/data/user/0/io.twoyi.debug/rootfs/system/bin/init"
+        );
     }
 
     #[test]
