@@ -590,6 +590,20 @@ public class SettingsActivity extends AppCompatActivity {
                                 // harmless (cleared on the next import).
                                 io.twoyi.utils.IOUtils.deleteDirectory(aside);
                                 RomManager.initRootfs(activity);
+                                // 6-Z209b: auto-set boot_recovery based
+                                // on the imported recovery's layout.
+                                // TWRP-style (/init regular file OR
+                                // /sbin/recovery) → boot_recovery=true;
+                                // AOSP-style (/init symlink + /system/bin/
+                                // recovery) → boot_recovery=false. This
+                                // runs AFTER the import finishes AND
+                                // AFTER the staging→live rename, so
+                                // isTwrpLayout() inspects the live
+                                // rootfs. The CI test no longer needs to
+                                // force the checkbox on/off — the app
+                                // picks the right boot mode for the
+                                // imported recovery automatically.
+                                RomManager.autoSetBootRecovery(activity);
                             } else {
                                 // Roll back so the previous ROM stays bootable.
                                 if (aside.exists() && !profileRootfsDir.exists()) {
