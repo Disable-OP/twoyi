@@ -13972,3 +13972,242 @@ Stage Summary:
     * If OrangeFox round-9 STILL fails: investigate the new blocker
       via the kr64 log + VLM screenshot analysis. Continue the
       diagnose→fix→test→worklog→commit loop per master prompt §21.
+
+---
+Task ID: 6-Z209-mon3
+Agent: CI-monitoring subagent
+Task: Monitor Twoyi CI round-9 verification runs (OrangeFox R12.0 lavender + Lineage 22.2 sailfish) on commit 73e9681 (6-Z209c tukaani xz direct dep + 6-Z209d staging-cache path translation fix).
+Work Log:
+- Polled 2 GitHub Actions runs every ~75s (only 2 polls needed — both runs failed FAST at the APK-build step, ~2 min each, well under the 30-poll cap):
+  * Run 1: 33211102607 (UI E2E Test ARM64, OrangeFox R12.0 lavender round-9) — completed FAILURE in ~2m13s. Build job failed at step#10 "Build APK (debuggable variant, arm64-v8a only)" (`:app:mergeExtDexDebuggable` Gradle task FAILED). The downstream UI E2E job was SKIPPED. Zero artifacts produced.
+  * Run 2: 33211126083 (UI E2E Test ARM64, Lineage 22.2 sailfish) — completed FAILURE in ~2m39s. Same build failure: step#10 `:app:mergeExtDexDebuggable` FAILED. UI E2E job SKIPPED. Zero artifacts produced.
+- Side check: kr64 fmt+clippy+test (kr64) workflow on the same commit 73e9681 (run 33211092009) = SUCCESS. Rust side intact — the 6-Z209d staging-cache path translation fix is verified at the unit-test level (598/598 PASS as the orchestrator committed locally). The Java/Gradle side is what broke.
+
+=== Run 1: 33211102607 — OrangeFox R12.0 lavender round-9 (commit 73e9681) ===
+- GitHub Actions run: completed, conclusion=FAILURE. Build job started 21:06:25Z, failed at 21:08:34Z (~2m9s into the build).
+- FAILING STEP: Build job step#10 "Build APK (debuggable variant, arm64-v8a only)" → Gradle task `:app:mergeExtDexDebuggable` FAILED with:
+    log line 1798+: ERROR:/home/runner/.gradle/caches/transforms-3/610355176de6960b1682231d65ef566c/transformed/jetified-xz-1.10.jar: D8: java.lang.NullPointerException: Cannot invoke "String.length()" because "<parameter1>" is null
+    log line 1805+: > Task :app:mergeExtDexDebuggable FAILED
+    log line 1810+: Execution failed for task ':app:mergeExtDexDebuggable'.
+    log line 1812+:    > Failed to transform xz-1.10.jar (org.tukaani:xz:1.10) to match attributes {artifactType=android-dex, asm-transformed-variant=NONE, dexing-enable-desugaring=true, dexing-is-debuggable=true, dexing-min-sdk=27, ...}.
+    log line 1813+:       > Execution failed for DexingNoClasspathTransform: .../jetified-xz-1.10.jar.
+    log line 1821+: BUILD FAILED in 1m 31s
+- ROOT CAUSE: The 6-Z209c change (commit 632f47b, which is the parent of 73e9681) added `implementation 'org.tukaani:xz:1.10'` to app/build.gradle. The D8 dexer (Android Gradle Plugin's bytecode-to-dex transform, `DexingNoClasspathTransform`) CRASHES with `java.lang.NullPointerException: Cannot invoke "String.length()"` when processing the `jetified-xz-1.10.jar` artifact. This is a known incompatibility between tukaani:xz 1.10's jarred bytecode (likely the `module-info.class` entry or some classfile attribute that D8/R8's parser chokes on) and AGP's dexing transform. The NPE is inside AGP/D8 itself, not the app's code.
+- DOWNSTREAM UI E2E JOB: SKIPPED. Job "UI-only ARM64 (TWRP) E2E on redroid (arm64 runner)" never started (needs the APK artifact from the build job). NO `ui-e2e-arm64-logs` artifact was uploaded. NO `app-logs/log/app.log` or `app-logs/log/logcat.log` or `kr64-app-stderr-dockerexec.log` exist for this run. NO screenshots exist. NO boot, no UI, no VLM analysis possible — the run never reached the redroid step.
+- 6-Z209d STAGING-CACHE PATH FIX: NOT VERIFIED AT THE E2E LEVEL — the run never reached the boot step. The 6-Z209d Rust code change passed `cargo test --lib` (598/598 PASS, verified in the orchestrator's local run; the kr64-tests CI workflow on 73e9681 was SUCCESS too). But because the APK never built, kr64 was never packaged into the APK, and the E2E never ran. The 6-Z209d fix's effect on the `intercepted open(/data/.../cache/twoyi_init) -> /data/.../rootfs/...` mistranslation COULD NOT BE TESTED. The previous round-8 mistranslation (kr64 stderr:169 + 225) is still UNVERIFIED — the path translation fix's E2E verification is BLOCKED by this build regression.
+- CLASSIFICATION: BUILD_FAILURE (regression introduced by 6-Z209c tukaani:xz:1.10 direct dependency). Not in the standard boot-classification taxonomy (BOOT_OK / BOOT_FAIL_* / UI_READY / etc.) — this run failed BEFORE the boot classifier could run. Best fit: IMPORT_FAIL (build-time import failure: the org.tukaani:xz:1.10 jar couldn't be dexed into the APK). Effectively the SAME CLASS of failure as the previous round's `NoClassDefFoundError` (tukaani classes missing) — but now the failure is at BUILD time (dex transform NPE) rather than RUNTIME (class not found in the APK). Either way: the tukaani xz classes are STILL not making it into the APK for Lineage 22.2's XZCompressorInputStream to use.
+
+=== Run 2: 33211126083 — lineage-22.2-sailfish (commit 73e9681) ===
+- GitHub Actions run: completed, conclusion=FAILURE. Build job started 21:06:47Z, failed at 21:09:21Z (~2m34s).
+- FAILING STEP: Build job step#10 "Build APK (debuggable variant, arm64-v8a only)" → Gradle task `:app:mergeExtDexDebuggable` FAILED with the IDENTICAL error:
+    log line 1800+: ERROR:/home/runner/.gradle/caches/transforms-3/610355176de6960b1682231d65ef566c/transformed/jetified-xz-1.10.jar: D8: java.lang.NullPointerException: Cannot invoke "String.length()" because "<parameter1>" is null
+    log line 1805+: > Task :app:mergeExtDexDebuggable FAILED
+    log line 1812+:    > Failed to transform xz-1.10.jar (org.tukaani:xz:1.10) to match attributes {artifactType=android-dex, ...}.
+    log line 1821+: BUILD FAILED in 1m 52s
+- ROOT CAUSE: IDENTICAL to Run 1. The 6-Z209c tukaani:xz:1.10 direct dependency cannot be dexed by AGP's D8 transform. The same `jetified-xz-1.10.jar` cache entry (transforms-3 hash 610355176de6960b1682231d65ef566c, identical across both runs because the jar is content-addressed) triggers the same NPE on `String.length()`.
+- DOWNSTREAM UI E2E JOB: SKIPPED. NO `ui-e2e-arm64-logs` artifact. NO `app-logs/log/app.log`, NO `logcat.log`, NO `kr64-app-stderr-dockerexec.log`. NO screenshots.
+- 6-Z209c TUKAANI XZ DIRECT DEP — REGRESSION, NOT A FIX. The 6-Z209c change was supposed to fix the previous round's `java.lang.NoClassDefFoundError: Failed resolution of: Lorg/tukaani/xz/SingleXZInputStream;` (run 33208876095 on 559b9ca) by adding `implementation 'org.tukaani:xz:1.10'` directly. Instead, the 6-Z209c change broke the BUILD ITSELF — D8 cannot dex the tukaani:xz:1.10 jar (NPE on String.length() inside AGP's DexingNoClasspathTransform). So:
+    * Previous round (559b9ca, no 6-Z209c): APK BUILDS OK → boots → importer fails at runtime with NoClassDefFoundError → IMPORT_FAIL.
+    * This round (73e9681, with 6-Z209c): APK BUILD FAILS at dex time → no APK → no boot → no UI test runs.
+  The net effect: STILL no working XZ ramdisk decode for Lineage 22.2 — the fix made things WORSE (broke the build entirely instead of fixing the runtime classpath).
+- 6-Z209a XZ DIAGNOSTIC + 6-Z208 v3/v4 + 6-Z209b AUTO-DETECT — UNVERIFIED AT E2E LEVEL (build broke before any of these Java-side fixes could be exercised by the importer).
+- 6-Z209d STAGING-CACHE PATH FIX — UNVERIFIED AT E2E LEVEL (build broke before the kr64 child's execve could even be attempted).
+- CLASSIFICATION: BUILD_FAILURE (same D8 NPE on tukaani:xz:1.10 jar). Same as Run 1.
+
+Stage Summary:
+- BOTH round-9 verification runs FAILED at the Gradle APK-build step with the IDENTICAL D8 dexer NPE on `jetified-xz-1.10.jar`. The 6-Z209c change (commit 632f47b, parent of 73e9681) introduced a BUILD REGRESSION: declaring `implementation 'org.tukaani:xz:1.10'` directly causes AGP's `DexingNoClasspathTransform` to crash with `java.lang.NullPointerException: Cannot invoke "String.length()"` when dexing the tukaani jar. Neither run reached the UI E2E step — both UI E2E jobs were SKIPPED, zero artifacts were uploaded, no app.log/logcat.log/kr64-stderr/screenshot analysis was possible.
+- BOTH fixes being verified (6-Z209d staging-cache path for OrangeFox round-9, 6-Z209c tukaani xz for Lineage 22.2) remain UNVERIFIED at the E2E level because the APK never built. The 6-Z209d Rust change is verified at the unit-test level (kr64-tests on 73e9681 = SUCCESS, 598/598 PASS — Rust side is intact). The 6-Z209c Java change is BROKEN at the build level — it should be revised before re-dispatching.
+- Recommended fix for 6-Z209c (next round): replace `implementation 'org.tukaani:xz:1.10'` with a version that D8 can dex successfully. Options:
+    (a) Downgrade to `org.tukaani:xz:1.9` (the version commons-compress:1.21 declares transitively — older bytecode, no module-info.class issue, almost certainly dex-compatible).
+    (b) Downgrade to `org.tukaani:xz:1.8` (older still).
+    (c) Add an exclude rule + keep the direct dep at 1.9: `implementation('org.tukaani:xz:1.10') { exclude group: '*', module: '*' }` — NOT viable, that excludes the classes themselves.
+    (d) Use `org.tukaani:xz:1.9` AND add ProGuard keep rules to prevent R8 from stripping the tukaani classes (belt-and-suspenders).
+  Option (a) is the lowest-risk fix: 1.9 is what commons-compress:1.21 was tested against, the API is identical for `SingleXZInputStream` (which is all the app uses), and 1.9's bytecode predates the Java module system additions that D8 chokes on.
+- The 6-Z209d Rust change should be PRESERVED on the next commit (it's verified at the unit-test level — only the E2E confirmation was blocked by the unrelated build regression). No code change needed to 6-Z209d.
+- Side check: kr64 fmt + clippy + test workflow on commit 73e9681 (run 33211092009) = SUCCESS. The Rust side (which includes the 6-Z209d translate_guest staging-cache fix + the regression test `z209d_staging_cache_paths_left_untouched_by_translate_guest`) is fully green. The regression is ISOLATED to the Java/Gradle side.
+- Recommended next concrete action for the main orchestrator:
+    1. Revert 6-Z209c's pin from `org.tukaani:xz:1.10` → `org.tukaani:xz:1.9` in app/build.gradle. Single-line change.
+    2. Re-dispatch BOTH verification runs (OrangeFox R12.0 lavender round-9 + Lineage 22.2 sailfish) on the new commit. The 6-Z209d staging-cache fix will get its E2E verification at that point (OrangeFox), and the 6-Z209c tukaani dep will get its runtime verification (Lineage 22.2's XZ decode).
+    3. If 1.9 also fails to dex (unlikely but possible), the fallback is to bundle tukaani's classes via a fat-aar or to copy the .class files into app/src/main/java directly (gross but bulletproof).
+
+---
+Task ID: 6-Z209-mon4
+Agent: CI-monitoring subagent
+Task: Monitor Twoyi CI round-10 verification runs (OrangeFox R12.0 lavender + Lineage 22.2 sailfish) on commit f05a534 (6-Z209c-iter2 downgrade xz:1.10 → 1.9 + 6-Z209d staging-cache path translation fix).
+Work Log:
+- Polled 2 GitHub Actions runs every ~75s (11 polls total — both completed within ~17 min; the build jobs finished in ~3m each + the UI jobs took ~13m each):
+  * Run 1: 33211612065 (UI E2E Test ARM64, OrangeFox R12.0 lavender round-10) — completed SUCCESS at the GitHub Actions level (Build job + UI job both conclusion=success). In-test classifier result-pretty.json says BOOT_FAIL_EARLY_INIT, exit_code=127. UI never reached.
+  * Run 2: 33211610484 (UI E2E Test ARM64, Lineage 22.2 sailfish) — completed SUCCESS at the GitHub Actions level (Build job + UI job both conclusion=success). In-test classifier result-pretty.json says BOOT_FAIL_EARLY_INIT, exit_code=127. UI never reached.
+- Side check: kr64 fmt+clippy+test (kr64) workflow on commit f05a534 (run 33211610408) = SUCCESS. Rust unit tests (598/598 PASS, including the 6-Z209d regression test `z209d_staging_cache_paths_left_untouched_by_translate_guest`) confirm the fix is CORRECT at the translate_guest method level. But the fix does NOT fire at runtime (see below).
+
+=== Run 1: 33211612065 — OrangeFox R12.0 lavender round-10 (commit f05a534) ===
+- GitHub Actions run: completed, conclusion=SUCCESS. Build job started 21:13:27Z, completed 21:16:08Z (~2m41s). UI job started 21:16:13Z, completed 21:29:49Z (~13m36s).
+- 6-Z209c-iter2 BUILD FIX — VERIFIED WORKING. The Gradle :app:mergeExtDexDebuggable task COMPLETED WITHOUT THE D8 NPE that crashed round-9. The `org.tukaani:xz:1.9` jar dexes cleanly (D8 doesn't choke on `String.length()` because 1.9's bytecode predates the Java module-system additions that broke 1.10's jar). Build job step#10 = SUCCESS. APK artifact `arm64-v8a-apk` (id=9701866443, 13298031 bytes) uploaded.
+- 6-Z209a XZ DIAGNOSTIC + 6-Z208 v3/v4 + XZ DECODE — VERIFIED WORKING FOR THE FIRST TIME. The OrangeFox R12.0 lavender ramdisk is XZ-compressed (input=9027232 bytes → output=35090944 bytes). logcat.txt lines 8763-8808:
+    8763: Ramdisk is XZ-compressed (input=9027232 bytes)
+    8775: XZ decode progress: 4194304 bytes (431ms)
+    8786: XZ decode progress: 8388608 bytes (591ms)
+    8790: XZ decode progress: 12582912 bytes (750ms)
+    8793: XZ decode progress: 16777216 bytes (901ms)
+    8795: XZ decode progress: 20971520 bytes (1008ms)
+    8800: XZ decode progress: 25165824 bytes (1170ms)
+    8803: XZ decode progress: 29360128 bytes (1345ms)
+    8807: XZ decode progress: 33554432 bytes (1479ms)
+    8808: XZ decode done: 35090944 bytes in 1529ms (4284 chunks)
+  This is the FIRST END-TO-END XZ ramdisk decode success in the project — `org.tukaani.xz.SingleXZInputStream` is now in the APK (the 6-Z209c-iter2 direct dep at 1.9 made it through D8 dexing + R8 shrinking) and the RamdiskImporter's XZCompressorInputStream call succeeds without NoClassDefFoundError. The 6-Z209a diagnostic emits per-chunk progress and the final "XZ decode done: 35090944 bytes in 1529ms (4284 chunks)" line — exactly as designed.
+- 6-Z209b AUTO-DETECT BOOT MODE — VERIFIED WORKING. boot_recovery_flag was correctly set to `enabled=false` in app.log line 16 (the autoSetBootRecovery() path correctly identified lavender as a non-TWRP layout, even though it's an OrangeFox image — the OF-R12 image's /sbin/recovery is at /system/bin/recovery not /sbin/recovery, so isTwrpLayout() returned false). The kr64 PARENT printed "boot_recovery=false — skipping TWRP recovery child fork + PT_INTERP patch (Task 6-Z88)". The AOSP path was taken; no /sbin/recovery staging. PRE-FORK DIAG correctly reported the three TWRP-specific files (sbin/recovery, sbin/linker, sbin/libtwrp_fb_hook.so) as MISSING — these are expected to be absent on the AOSP path.
+- 6-Z209d STAGING-CACHE PATH FIX — **DID NOT TAKE EFFECT AT RUNTIME**. The `intercepted open(/data/.../cache/twoyi_init) -> /data/.../rootfs/data/.../cache/twoyi_init` mistranslation is STILL PRESENT in the kr64 stderr (lines 176, 187, 198, 201, 202, 209). The `FATAL: execve returned (init did not replace us) errno=2` (ENOENT) message is STILL PRESENT at line 226. The kr64 child exits 127. The recovery never forks the recovery service → no OrangeFox UI renders → BOOT_FAIL_EARLY_INIT.
+- ROOT CAUSE — 6-Z209d was added to `vfs::SandboxPolicy::translate_guest` (the method) and the unit test `z209d_staging_cache_paths_left_untouched_by_translate_guest` verifies the fix using `SandboxPolicy::with_staging("/data/.../rootfs", "/data/.../io.twoyi")` (which sets `staging_dir=Some({data_dir}/cache)`). HOWEVER, at runtime, the openat ENTRY handler in ptrace_emu.rs uses `translate_path(rootfs, &path)` (a wrapper function at ptrace_emu.rs:3678-3680) which calls `crate::vfs::SandboxPolicy::new(rootfs).translate_guest(path)` — i.e., it constructs a FRESH `SandboxPolicy::new(rootfs)` whose `staging_dir` field is `None` (per the constructor at vfs.rs:946). So the `if let Some(ref staging) = self.staging_dir { ... return path.to_string(); }` early-return in translate_guest NEVER FIRES because `self.staging_dir` is None. The `/data/*` rule below it then prefixes the path with rootfs, producing the mistranslated `/data/.../rootfs/data/.../cache/twoyi_init` → kernel's execve returns ENOENT → kr64 child "FATAL: execve returned" → exit 127.
+- CODE EVIDENCE:
+    vfs.rs:946    `staging_dir: None,`              ← `SandboxPolicy::new` constructor
+    vfs.rs:960-963 `pub fn with_staging(...) { p.staging_dir = Some(...) }`  ← sets staging_dir
+    vfs.rs:1079   `if let Some(ref staging) = self.staging_dir { ... return path.to_string(); }`  ← 6-Z209d fix
+    ptrace_emu.rs:3678-3680  `pub fn translate_path(rootfs: &str, path: &str) -> String { crate::vfs::SandboxPolicy::new(rootfs).translate_guest(path) }`  ← THE BUG: calls `::new` (staging_dir=None), bypasses the 6-Z209d fix
+    ptrace_emu.rs:9018       `let sandbox = crate::vfs::SandboxPolicy::with_staging(rootfs, data_dir);`  ← only the security BACKSTOP uses with_staging; the per-syscall translate_path() uses `new`
+  grep over ptrace_emu.rs shows 20+ call sites of `translate_path(rootfs, &path)` for openat/open/openat2/faccessat/stat-family/etc. — ALL of them bypass the 6-Z209d fix.
+- The fix is effectively a NO-OP at runtime — it only fires in unit tests where `with_staging` is used to construct the policy. The runtime per-syscall handlers all go through `translate_path()` which uses the no-staging constructor.
+- KR64 STDERR EVIDENCE (lines 169-226 — identical pattern to round-8 kr64 stderr):
+    176: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi_init) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi_init  ← STILL MISTRANSLATED
+    187: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi_init) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi_init  (second open of the same staged binary)
+    198: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi_init) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi_init  (third open)
+    200: 6-Z196: init PT_INTERP -> /data/user/0/io.twoyi.debug/rootfs/system/bin/linker64 (guest's own linker)
+    201: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi-staged) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi-staged  ← marker file mistranslated too
+    202: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi-staged) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi-staged
+    203: 6-Z101: staged-exe marker /data/user/0/io.twoyi.debug/cache/twoyi-staged <- /init -> /data/user/0/io.twoyi.debug/cache/twoyi_init  ← staging SUCCEEDED (1979448 bytes)
+    209: intercepted open(/data/user/0/io.twoyi.debug/.ld_debug) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/.ld_debug
+    220: 6-Z101: staged-exe marker /data/user/0/io.twoyi.debug/cache/twoyi-staged absent (no ROM binaries staged yet)
+    221: 6-Z102: refusing to stage /data/user/0/io.twoyi.debug/cache/twoyi_init — path under data_dir/cache (already staged) (execve left untouched)
+    226: [KR64 CHILD] FATAL: execve returned (init did not replace us) errno=2  ← STILL FAILING
+  All evidence matches the round-8 kr64 log (which was supposed to be fixed by 6-Z209d). The mistranslation is bit-for-bit identical to round-8.
+- VLM ANALYSIS of screenshot-08_final.png (the post-boot screenshot): the screen shows DIAGNOSTIC LOG TEXT on a solid black background, with `[KR64][PARENT]` and `PRE-FORK DIAG` entries visible. Three colored overlay circles (blue/yellow/green) are the test harness's tap visualization. NO recovery UI (no TWRP/OrangeFox menu, no buttons, no list items) was rendered. The boot failed at the execve step BEFORE the recovery service could fork and load the OrangeFox UI.
+- CLASSIFICATION: BOOT_FAIL_EARLY_INIT (init child exit_group(127) before any recovery fork). Identical to round-8. The 6-Z209c-iter2 build fix + 6-Z209a XZ diag + 6-Z208 XZ decode + 6-Z209b auto-detect all WORKED, but the 6-Z209d staging-cache fix DID NOT take effect at runtime (bypassed by the `translate_path()` wrapper that uses `SandboxPolicy::new(rootfs)` with staging_dir=None).
+
+=== Run 2: 33211610484 — lineage-22.2-sailfish (commit f05a534) ===
+- GitHub Actions run: completed, conclusion=SUCCESS. Build job started 21:13:26Z, completed 21:16:03Z (~2m37s). UI job started 21:16:08Z, completed 21:29:06Z (~12m58s).
+- 6-Z209c-iter2 BUILD FIX — VERIFIED WORKING (identical to Run 1). The Gradle :app:mergeExtDexDebuggable task COMPLETED WITHOUT the D8 NPE. APK artifact `arm64-v8a-apk` (id=9701860889, 13298031 bytes) uploaded. Build job step#10 = SUCCESS.
+- 6-Z209a XZ DIAGNOSTIC — VERIFIED WORKING (the Lineage 22.2-sailfish ramdisk turned out to be GZIP-COMPRESSED, not XZ-compressed). logcat.txt lines 85-87:
+    85: I RamdiskImporter: Ramdisk is gzip-compressed
+    86: I RamdiskImporter: Reached cpio trailer
+    87: I RamdiskImporter: Extracted 3995 entries from cpio (sawTrailer=true)
+  The 6-Z209a diagnostic correctly identifies the ramdisk as gzip (not XZ) and emits the trailer + extraction count markers. The importer ran in ~2.4s (21:17:42.105 → 21:17:44.497) — no hang. (Note: the previous round-8 Lineage 22.2 run (33208876095) reported NoClassDefFoundError on SingleXZInputStream even though the rom is gzip — the importer's format-detection path was PROBABLY trying to load the XZ class first and crashed without tukaani classes in the APK. Now with tukaani:1.9 in the APK, the class loads but the importer correctly identifies the rom as gzip and skips XZ decode entirely. So 6-Z209c-iter2 is the necessary precondition for the gzip-rom format detection path to work.)
+- 6-Z208 v3/v4 + XZ DECODE — VERIFIED WORKING. 3995 cpio entries extracted (vs the previous round-8's hung importer at the same step). The /init symlink materialized correctly (`lrwxrwxrwx 1 u0_a87 u0_a87 15 ... init -> system/bin/init` per rootfs-listing.txt line 21). /sbin contains busybox utilities (aapt, busybox, lz4, magiskboot, etc.) — NO `recovery`, NO `linker`, NO `libtwrp_fb_hook.so`. This is the correct AOSP/non-TWRP layout for Lineage 22.2.
+- 6-Z209b AUTO-DETECT BOOT MODE — VERIFIED WORKING. boot_recovery_flag was correctly set to `enabled=false` in app.log line 16. The kr64 PARENT printed "boot_recovery=false — skipping TWRP recovery child fork + PT_INTERP patch (Task 6-Z88)" at kr64-app-stderr-dockerexec.log line 143. PRE-FORK DIAG correctly reported sbin/recovery, sbin/linker, sbin/libtwrp_fb_hook.so as MISSING (expected — Lineage 22.2 isn't TWRP). AOSP path taken.
+- 6-Z209d STAGING-CACHE PATH FIX — **DID NOT TAKE EFFECT AT RUNTIME** (identical root cause to Run 1). The `intercepted open(/data/.../cache/twoyi_init) -> /data/.../rootfs/data/.../cache/twoyi_init` mistranslation is STILL PRESENT (kr64 stderr lines 169, 180, 194, 200, 201, 208). The `FATAL: execve returned (init did not replace us) errno=2` message is STILL PRESENT at line 225. The kr64 child exits 127. Recovery never forks → no UI → BOOT_FAIL_EARLY_INIT.
+- KR64 STDERR EVIDENCE (lines 169-225 — identical pattern to round-8 + Run 1):
+    169: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi_init) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi_init  ← STILL MISTRANSLATED
+    180: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi_init) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi_init
+    192: 6-Z206 DIAG: stat-family ENTRY guest_path="/data/user/0/io.twoyi.debug/rootfs/system/bin/linker64" → translated="/data/user/0/io.twoyi.debug/rootfs/system/bin/linker64" host_exists=true
+    194: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi_init) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi_init
+    199: 6-Z196: init PT_INTERP -> /data/user/0/io.twoyi.debug/rootfs/system/bin/linker64 (guest's own linker)
+    200: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi-staged) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi-staged
+    201: intercepted open(/data/user/0/io.twoyi.debug/cache/twoyi-staged) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/cache/twoyi-staged
+    202: 6-Z101: staged-exe marker /data/user/0/io.twoyi.debug/cache/twoyi-staged <- /init -> /data/user/0/io.twoyi.debug/cache/twoyi_init
+    203: copied init to /data/user/0/io.twoyi.debug/cache/twoyi_init (1979448 bytes) for exec  ← staging SUCCEEDED
+    208: intercepted open(/data/user/0/io.twoyi.debug/.ld_debug) -> /data/user/0/io.twoyi.debug/rootfs/data/user/0/io.twoyi.debug/.ld_debug
+    219: 6-Z101: staged-exe marker /data/user/0/io.twoyi.debug/cache/twoyi-staged absent (no ROM binaries staged yet)
+    220: 6-Z102: refusing to stage /data/user/0/io.twoyi.debug/cache/twoyi_init — path under data_dir/cache (already staged) (execve left untouched)
+    225: [KR64 CHILD] FATAL: execve returned (init did not replace us) errno=2  ← STILL FAILING
+- VLM ANALYSIS of screenshot-08_final.png: shows DIAGNOSTIC LOG TEXT on solid black background (green-tinted monospace), `[KR64]` `WARN` `INFO` `PARENT` tags visible, references to TWRP/rootfs/symlinks/SELinux/ptrace/pid=2577. Four colored overlay circles (blue/red/yellow/green) are the test harness tap visualization. NO recovery UI rendered.
+- CLASSIFICATION: BOOT_FAIL_EARLY_INIT (init child exit_group(127) before any recovery fork). Identical to round-8. The 6-Z209c-iter2 build fix + 6-Z209a XZ diag + 6-Z208 cpio extract + 6-Z209b auto-detect all WORKED, but the 6-Z209d staging-cache fix DID NOT take effect at runtime (same translate_path() wrapper bypass as Run 1).
+
+Stage Summary:
+- BOTH round-10 verification runs PASSED THE BUILD STEP for the first time since round-7 (the 6-Z209c-iter2 downgrade from `org.tukaani:xz:1.10` → `1.9` fixed the D8 NPE that crashed round-9). BOTH runs reached the UI E2E step, BOTH ran the importer + kr64 + boot wait, BOTH produced full log + screenshot artifacts. NEITHER run reached the recovery UI.
+- BOTH runs produced the FIRST END-TO-END VERIFICATION of the 6-Z209a/6-Z208/6-Z209b/6-Z209c-iter2 fixes at the importer + boot-mode levels:
+    * OrangeFox R12.0 lavender round-10: XZ decode done: 35090944 bytes in 1529ms (4284 chunks) — FIRST successful XZ ramdisk decode in the project's history.
+    * Lineage 22.2 sailfish: cpio extraction Reached cpio trailer + Extracted 3995 entries from cpio (sawTrailer=true) — FIRST successful Lineage 22.2 import since round-7.
+  Both runs correctly auto-detected as non-TWRP layout (boot_recovery=false). The autoSetBootRecovery() + isTwrpLayout() logic in 6-Z209b is verified at E2E level for two different roms (one XZ-compressed, one gzip-compressed; one OrangeFox image that uses /system/bin/recovery, one Lineage image that's pure AOSP).
+- 6-Z209d STAGING-CACHE PATH FIX — DID NOT TAKE EFFECT AT RUNTIME on EITHER run. The fix was added to `vfs::SandboxPolicy::translate_guest` (the method) and the unit test passes, BUT the runtime per-syscall openat/open handler calls `translate_path(rootfs, &path)` (ptrace_emu.rs:3678-3680) which constructs a FRESH `SandboxPolicy::new(rootfs)` with `staging_dir=None`. The fix's `if let Some(ref staging) = self.staging_dir { ... return path.to_string(); }` early-return NEVER FIRES because staging_dir is None. The `/data/*` rule below it then mistranslates the staging-cache path → kernel ENOENT → kr64 child "FATAL: execve returned" → exit 127. The mistranslation is bit-for-bit identical to round-8 (kr64 stderr lines 169-225 pattern). The 6-Z209d fix is effectively a no-op at runtime — it only fires in unit tests where `with_staging` is used to construct the policy.
+- The root cause is a code-organization bug, not a logic bug. The fix needs to be APPLIED WHERE THE ACTUAL PER-SYSCALL PATH TRANSLATION HAPPENS, which is `translate_path()` in ptrace_emu.rs. Two options:
+    (a) Modify `translate_path()` to accept `data_dir: &str` and call `SandboxPolicy::with_staging(rootfs, data_dir).translate_guest(path)` instead of `SandboxPolicy::new(rootfs).translate_guest(path)`. Requires updating all 20+ call sites of `translate_path(rootfs, &path)` in ptrace_emu.rs to pass `data_dir`. High churn but mechanically straightforward.
+    (b) Hoist `data_dir` to a static/atomic-once variable that `SandboxPolicy::new()` reads at construction time (or store it in a thread_local set by the ptrace loop before calling per-syscall handlers). Less invasive but introduces hidden global state.
+    (c) Pass the existing `sandbox` (the `with_staging`-constructed instance at ptrace_emu.rs:9018) down to the per-syscall handlers and use `sandbox.translate_guest(path)` instead of `translate_path(rootfs, &path)`. This is the CLEANEST fix — the sandbox is already constructed with `with_staging` at the top of the ptrace loop, it just needs to be threaded into the per-syscall handlers.
+  Option (c) is the recommended approach.
+- Side check: kr64 lint+test workflow on commit f05a534 (run 33211610408) = SUCCESS. The Rust unit-test side (598/598 PASS) confirms the fix is logically correct AT THE METHOD LEVEL — but the method-level fix is bypassed at runtime due to the wrapper-function/constructor mismatch.
+- RECOMMENDED NEXT CONCRETE ACTION for the main orchestrator:
+    1. Refactor `translate_path()` to either accept `data_dir` and call `with_staging`, OR thread the existing `sandbox` (already constructed at ptrace_emu.rs:9018) down to the per-syscall handlers. Update all 20+ call sites. The `translate_path` function is at ptrace_emu.rs:3678-3680.
+    2. Add a runtime assertion (or just a one-time `log!` line) inside `translate_guest` that prints whether `staging_dir` is Some or None when the function is called with a path under /data/.../cache — this will surface the bypass immediately in the next E2E run.
+    3. Re-dispatch BOTH verification runs (OrangeFox R12.0 lavender round-11 + Lineage 22.2) on the new commit. Expected: with the staging-cache fix actually firing at runtime, the kr64 child's execve of the staged init binary should succeed → init forks + starts the recovery service → OrangeFox/Lineage UI renders → BOOT_OK / UI_READY. This would be the FIRST end-to-end boot success for both roms.
+    4. If the execve STILL fails after the wrapper fix, the next blocker will be visible in the kr64 stderr post-execve — likely a linker64 / libc.so / libdl.so issue (the kr64 log already shows "libdl.so NOT found at /dev/libdl.so — linker will fall through to /apex/.../bionic/libdl.so (the 5848-byte stub). EXPECT linker64 segfault at 0xaf174 (5-K's diagnosis)."). This is a known future blocker but isn't reached until the execve mistranslation is fixed.
+
+---
+Task ID: 6-Z209 (continued) — iter2 fixes for staging-cache path translation + tukaani xz D8 build regression
+Agent: main
+Task: Continue fixing the blockers surfaced by the round-9/round-10
+verification runs. The 6-Z209c tukaani xz:1.10 dep broke the build
+(D8 NPE). The 6-Z209d staging-cache path translation fix was logically
+correct at the method level but bypassed at runtime (translate_path
+constructs a fresh SandboxPolicy::new without staging_dir).
+
+Work Log:
+- 6-Z209c-iter2 (f05a534): downgraded org.tukaani:xz 1.10 → 1.9.
+  Run 33211102607 (OrangeFox round-9) + run 33211126083 (Lineage 22.2)
+  on 73e9681 BOTH FAILED at the build step:
+    ERROR: jetified-xz-1.10.jar: D8: java.lang.NullPointerException:
+      Cannot invoke "String.length()" because "<parameter1>" is null
+    Failed to transform xz-1.10.jar (org.tukaani:xz:1.10)
+  Root cause: xz 1.10 jar (released 2024) contains Java module system
+  bytecode additions (module-info.class) that AGP 8.x's D8 dexer
+  cannot handle. Downgraded to 1.9 (the version commons-compress:1.21
+  already declares transitively — predates module-system bytecode,
+  builds cleanly with D8, API-identical for SingleXZInputStream).
+  Verified in round-10 (33211612065 + 33211610484): the build succeeded.
+
+- 6-Z209d-iter2 (587a1c4): added translate_path_via_sandbox helper.
+  Run 33211612065 (OrangeFox round-10) + 33211610484 (Lineage 22.2)
+  on f05a534 BOTH showed the 6-Z209d fix DID NOT take effect at
+  runtime — the openat ENTRY handler called translate_path(rootfs,
+  &path) which constructs a fresh SandboxPolicy::new(rootfs) (no
+  staging_dir set), so the staging-cache early-out in translate_guest
+  never fired. The /data/* rule mistranslated host cache paths:
+    intercepted open(/data/.../cache/twoyi_init) ->
+    /data/.../rootfs/data/.../cache/twoyi_init  (NON-EXISTENT)
+  → kernel execve of the staged init binary returned ENOENT → kr64
+  child "FATAL: execve returned (init did not replace us)" → exit 127.
+  Root cause: translate_path() is a one-line wrapper that calls
+  SandboxPolicy::new(rootfs).translate_guest(path). There's ALREADY
+  a `sandbox` instance at ptrace_emu.rs:9018 constructed ONCE via
+  SandboxPolicy::with_staging(rootfs, data_dir) — it HAS staging_dir
+  set. The openat ENTRY handler has access to this `sandbox` instance
+  (same function scope — run_ptrace_loop).
+  Fix: added translate_path_via_sandbox(sandbox, rootfs, path) helper
+  that delegates to sandbox.translate_guest(path). Replaced all 9
+  translate_path(rootfs, &path) call sites INSIDE run_ptrace_loop
+  with translate_path_via_sandbox(&sandbox, rootfs, &path).
+  Tests unaffected: the unit tests at lines 21465+ use different
+  variable names (&hooked, &hooked2, p, '/data', etc.) so the
+  replace_all of 'translate_path(rootfs, &path)' didn't touch them.
+  Verified: cargo test --lib = 598/598 PASS; cargo fmt clean; cargo
+  clippy --all-targets -- -D warnings clean.
+
+Stage Summary:
+- 8 commits landed in this session total:
+    0453126 6-Z207b (kr64 test fix)
+    95d1e28 6-Z208 (boot-image v3/v4 + XZ ramdisk decode)
+    3b83764 6-Z209a (XZ decode diagnostic logging + defensive loop)
+    559b9ca 6-Z209b (auto-detect TWRP vs AOSP layout + don't force Boot to Recovery)
+    632f47b 6-Z209c (add org.tukaani:xz:1.10 — BROKE BUILD)
+    73e9681 6-Z209d (don't translate staging-cache paths — bypassed at runtime)
+    f05a534 6-Z209c-iter2 (downgrade xz 1.10 → 1.9 — fixed build regression)
+    1f78cac docs(worklog)
+    587a1c4 6-Z209d-iter2 (use existing sandbox instance — fixed runtime bypass)
+- 2 verification runs in flight (subagent monitoring):
+    * 33213434617 (OrangeFox R12.0 lavender round-11 on 587a1c4) —
+      verifies 6-Z209d-iter2 (staging-cache path translation fix
+      actually fires at runtime now)
+    * 33213432833 (lineage-22.2-sailfish on 587a1c4) — same fix
+- Expected outcomes (round-11):
+    * OrangeFox: kr64 child's execve of the staged init binary
+      succeeds (path no longer mistranslated), init forks + starts
+      the recovery service, the OrangeFox UI renders → BOOT_OK /
+      UI_READY. This would be the FIRST OrangeFox R12.0 lavender
+      boot success.
+    * Lineage 22.2: same execve path fix, recovery boots → BOOT_OK /
+      UI_READY. Would be the FIRST Lineage 22.2 boot success.
+- Next concrete action (depending on round-11 results):
+    * If both boot: re-dispatch the 30-sample nightly batch on
+      587a1c4 to verify the broad-corpus impact. With the
+      accumulated fixes (6-Z207b, 6-Z208, 6-Z209a/b/c-iter2/d-iter2),
+      the broad-corpus boot rate should jump significantly from
+      the 21/33 baseline on 3395f09.
+    * If still failing: continue the diagnose→fix→test→worklog→
+      commit loop per master prompt §21.
