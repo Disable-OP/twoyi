@@ -4081,6 +4081,98 @@ fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> Vec<(PathArgSlot, bool)> {
     v
 }
 
+/// 6-Z200: substitute "/proc/self/" (and "/proc/thread-self/") in a
+/// path with "/proc/<pid>/" — so the TRACER resolves procfs
+/// self-references against the TRACED CHILD, not itself.
+///
+/// canonicalize("/proc/self/exe") executed in the tracer daemon
+/// resolves "self" to the DAEMON's own executable
+/// (…/lib/arm64/libkr64.so) — outside the rootfs sandbox — and the
+/// backstop would then DENY the child's legitimate self-exe probe
+/// with -EACCES. Android 8+ bionic linkers (linker_main.cpp
+/// get_executable_info) FATAL on that:
+///   async_safe_fatal("unable to stat \"/proc/self/exe\": %s")
+/// → exit 127 — killing EVERY staged dynamic guest binary that is
+/// not first-stage init (run 33167135134: whyred's forked recovery
+/// died exactly here). Substituting the child's pid makes the
+/// resolution land on the CHILD's own /proc/<pid>/exe (the staged
+/// binary — allowed by the staging-dir allowlist rule), while the
+/// child's syscall argument stays "/proc/self/exe" so the KERNEL
+/// resolves it in the child's context too.
+fn subst_proc_self(path: &str, pid: libc::pid_t) -> String {
+    if let Some(rest) = path.strip_prefix("/proc/self/") {
+        format!("/proc/{}/{}", pid, rest)
+    } else if let Some(rest) = path.strip_prefix("/proc/thread-self/") {
+        format!("/proc/{}/{}", pid, rest)
+    } else {
+        path.to_string()
+    }
+}
+
+/// 6-Z200b: rewrite a readlink result so the guest never sees a host
+/// path (master prompt §6/§24 — the host stays behind the
+/// virtualization boundary).
+///
+/// Two classes of host target appear in readlink results:
+///   1. **Staged executables** — readlink("/proc/self/exe") (or
+///      /proc/<pid>/exe) returns the staged copy under
+///      {data_dir}/cache/twoyi_stage/ (or the legacy
+///      {data_dir}/cache/twoyi_init). The Android 8+ bionic linker
+///      REQUIRES this readlink to succeed (linker_main.cpp
+///      get_executable_info FATALS otherwise), so it cannot be
+///      blocked — instead it is rewritten to the GUEST-visible path
+///      via the reverse of the staged-exe marker map (6-Z101).
+///   2. **Rootfs-prefixed paths** — readlink("/proc/self/fd/<n>") and
+///      readlink("/proc/self/cwd") return the TRANSLATED
+///      {rootfs}/… path of the open file/dir. Strip the prefix so the
+///      guest sees its own guest path.
+///
+/// Materialized guest symlinks already carry guest-relative targets
+/// (6-Z196-D) and pass through untouched (None). Returns the
+/// guest-visible replacement, or None when the target is already
+/// guest-clean.
+fn guest_readlink_target(
+    target: &str,
+    rootfs: &str,
+    data_dir: &str,
+    staged_exes: Option<&std::collections::HashMap<String, String>>,
+) -> Option<String> {
+    let staging_prefix = format!("{}/cache/twoyi_stage/", data_dir);
+    let legacy_init = format!("{}/cache/twoyi_init", data_dir);
+    if target.starts_with(&staging_prefix) || target.starts_with(&legacy_init) {
+        // Staged executable → guest path from the reverse marker map.
+        // Prefer the RAW guest key (e.g. /sbin/recovery) over the
+        // rootfs-prefixed duplicate; fall back to stripping the
+        // prefix off the prefixed key.
+        let m = staged_exes?;
+        let raw = m
+            .iter()
+            .filter(|(k, v)| !k.starts_with(rootfs) && v.as_str() == target)
+            .map(|(k, _)| k.clone())
+            .next();
+        if let Some(guest) = raw {
+            return Some(guest);
+        }
+        return m
+            .iter()
+            .filter(|(_, v)| v.as_str() == target)
+            .map(|(k, _)| k.clone())
+            .next()
+            .and_then(|k| k.strip_prefix(rootfs).map(|s| s.to_string()));
+    }
+    if target.starts_with(rootfs) {
+        let guest = target[rootfs.len()..].to_string();
+        // The rootfs itself reads back as "/" (readlink("/proc/self/cwd")
+        // with the guest cwd at guest-root).
+        return Some(if guest.is_empty() {
+            "/".to_string()
+        } else {
+            guest
+        });
+    }
+    None
+}
+
 /// Does this syscall number need the backstop at all? (Cheap pre-filter
 /// on the stop's OWN register snapshot — zero cost for the ~90% of
 /// syscalls that take no path.)
@@ -4251,6 +4343,10 @@ fn sandbox_backstop_at_entry(
             continue;
         }
         // Absolute: resolve + verify.
+        //
+        // ── 6-Z200: /proc/self/* must resolve against the TRACED CHILD,
+        // not the TRACER ── (see subst_proc_self for the full rationale)
+        let path = subst_proc_self(&path, pid);
         match sandbox.resolve_as_kernel(&path, None) {
             Some(real) => {
                 if let crate::vfs::SandboxVerdict::Deny(errno, why) =
@@ -9038,6 +9134,12 @@ pub fn run_ptrace_loop(
     // could be resolved NEITHER from open_fd_owner_paths NOR from the
     // /proc/<pid>/fd/<fd> readlink fallback (diagnostic only).
     let mut z198_unresolved_fstat: u32 = 0;
+    // 6-Z199: ENTRY-side arg1 stash — (pid → fd) captured at the ENTRY
+    // stop of close/fstat/fstat64, consumed by their EXIT arms. On
+    // aarch64 x0 is BOTH arg1 and the return register, so the fd is
+    // unrecoverable from the EXIT snapshot alone.
+    let mut pending_entry_fd: std::collections::HashMap<libc::pid_t, i64> =
+        std::collections::HashMap::new();
     const Z121_LOG_CAP: u32 = 60;
 
     // ── Task 6-U diagnostic state ────────────────────────────────────
@@ -11507,6 +11609,40 @@ pub fn run_ptrace_loop(
                 if is_entry {
                     // ── Syscall ENTRY ──
                     in_syscall = true;
+
+                    // ── 6-Z199: ENTRY-side arg1 (fd) stash for
+                    // EXIT-side consumers ──
+                    //
+                    // On aarch64 the FIRST argument register (x0)
+                    // doubles as the RETURN-value register: at a
+                    // syscall-EXIT stop x0 holds the syscall's RETURN,
+                    // NOT the first argument. Any EXIT-side handler
+                    // that recovers arg1 from the register snapshot
+                    // therefore reads the return value on aarch64:
+                    //   * the 6-Z121 fstat-ownership virtualization
+                    //     read "fd 0" (the fstat's success return) and
+                    //     SILENTLY skipped the property-area patch —
+                    //     whyred's init then died at LoadPath's
+                    //     st_uid != 0 check ("Failed to initialize
+                    //     property area", run 33167135134).
+                    //   * the 6-Z132 close() cleanup removed fd 0's
+                    //     registration instead of the closed fd's,
+                    //     leaving every real registration stale (fd
+                    //     recycling then maps OLD paths onto NEW fds).
+                    // On the x86 ABIs arg1 (rdi/ebx) is NOT the return
+                    // register, so this never bit there — which is why
+                    // the 6-Z121 fix verified fine on x86_64 (run
+                    // 32745030268) but never fired on aarch64.
+                    //
+                    // Stash arg1 at ENTRY — where x0 still holds the
+                    // argument — for exactly the syscalls whose EXIT
+                    // arms need the fd: close/fstat/fstat64.
+                    if syscall_num == abi.close_nr
+                        || (abi.fstat != -1 && syscall_num == abi.fstat)
+                        || (abi.fstat64 != -1 && syscall_num == abi.fstat64)
+                    {
+                        pending_entry_fd.insert(pid, get_syscall_arg(&regs, abi.reg_arg1) as i64);
+                    }
 
                     // Record the syscall number in the rolling "all
                     // syscalls" buffer. This captures UNintercepted
@@ -14486,13 +14622,48 @@ pub fn run_ptrace_loop(
                                         // success exactly like a fresh
                                         // ramdisk. Non-boot-dir mkdirs
                                         // keep honest semantics.
-                                        if existed && is_first_stage_boot_dir(&path) {
+                                        //
+                                        // 6-Z199 (round-2 evidence, runs
+                                        // 33167135134/33167130307 on
+                                        // 43f695a): the ORIGINAL
+                                        // `existed && …` gate had TWO
+                                        // holes that each still killed
+                                        // OrangeFox at first stage:
+                                        //   (a) /mnt/vendor + /mnt/product
+                                        //       were ABSENT at mkdir
+                                        //       ENTRY, so our own
+                                        //       create_dir_all() above
+                                        //       pre-created them — and
+                                        //       the kernel mkdir then
+                                        //       returned EEXIST for the
+                                        //       dir we JUST made
+                                        //       (self-sabotage).
+                                        //   (b) /dev/dm-user exists as a
+                                        //       UNIX SOCKET (twoyi's own
+                                        //       devices layer binds it
+                                        //       for the Android 12+
+                                        //       dm-user interface), so
+                                        //       is_dir()=false, no fake
+                                        //       fired, and the kernel
+                                        //       mkdir returned EEXIST
+                                        //       for the socket.
+                                        // Fix: fake success
+                                        // UNCONDITIONALLY for the
+                                        // canonical set — the backing
+                                        // entry is created above only
+                                        // when absent (never clobbering
+                                        // the dm-user socket), and the
+                                        // kernel mkdir never executes
+                                        // for these paths at all.
+                                        if is_first_stage_boot_dir(&path) {
                                             set_syscall_num(&mut regs, &abi, abi.getpid);
                                             if ptrace_setregs(pid, &regs, iov_len).is_ok() {
                                                 pending_sandbox_deny.insert(pid, 0);
                                                 log(&format!(
-                                                    "6-Z197: {}({}) — first-stage boot dir already exists; faking mkdir success (fresh-ramdisk illusion)",
-                                                    name, path
+                                                    "6-Z197: {}({}) — first-stage boot dir; faking mkdir success (fresh-ramdisk illusion, entry {})",
+                                                    name,
+                                                    path,
+                                                    if existed { "already present" } else { "created" }
                                                 ));
                                             }
                                         }
@@ -15013,8 +15184,19 @@ pub fn run_ptrace_loop(
                     // the fd number (run 32790504763's deterministic
                     // mid-link SIGSEGV storm: rip inside linker64 text
                     // right after opening the next .so).
+                    //
+                    // 6-Z199: the closed fd comes from the ENTRY-side
+                    // stash — on aarch64 reg_arg1 (x0) at the EXIT stop
+                    // holds the RETURN value, so the old register read
+                    // always saw "0" and removed fd 0's entry instead
+                    // of the closed fd's (every real registration went
+                    // stale).
                     if syscall_num == abi.close_nr {
-                        let closed_fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                        let stashed_closed_fd = pending_entry_fd.remove(&pid);
+                        let closed_fd = match stashed_closed_fd {
+                            Some(fd) if fd >= 0 => fd as i32,
+                            _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                        };
                         let ret_c = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if ret_c == 0 && closed_fd >= 0 {
                             open_fd_paths.remove(&closed_fd);
@@ -15379,6 +15561,81 @@ pub fn run_ptrace_loop(
                         pending_open_original_path.remove(&pid);
                     }
 
+                    // ── 6-Z200b: readlink/readlinkat EXIT → guest-side
+                    // target rewriting (no host-path leakage) ──
+                    //
+                    // The kernel just wrote the REAL target of the
+                    // readlink into the child's buffer. Two classes of
+                    // target are HOST paths that the guest must never
+                    // see (master prompt §6/§24):
+                    //   1. /proc/self/exe (and /proc/<pid>/exe) → the
+                    //      STAGED executable copy under
+                    //      {data_dir}/cache/twoyi_stage/. The Android
+                    //      8+ bionic linker FATALS if this readlink
+                    //      fails (linker_main.cpp
+                    //      get_executable_info), so it must SUCCEED —
+                    //      but the result is rewritten to the
+                    //      GUEST-visible path from the staged-exe
+                    //      marker (6-Z101) before the guest sees it.
+                    //   2. /proc/self/fd/<n> + /proc/self/cwd → the
+                    //      TRANSLATED {rootfs}/… path of the open
+                    //      file/dir. Strip the rootfs prefix so the
+                    //      guest sees its own guest path.
+                    // Materialized guest symlinks already carry
+                    // guest-relative targets (6-Z196-D) and pass
+                    // through untouched.
+                    if (abi.readlink != -1 && syscall_num == abi.readlink)
+                        || (abi.readlinkat != -1 && syscall_num == abi.readlinkat)
+                    {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret > 0 && ret < 4096 {
+                            let buf_reg = if syscall_num == abi.readlink {
+                                abi.reg_arg2
+                            } else {
+                                abi.reg_arg3
+                            };
+                            let buf = get_syscall_arg(&regs, buf_reg);
+                            if buf != 0 {
+                                if let Some(bytes) = read_child_bytes(pid, buf, ret as usize) {
+                                    let target = String::from_utf8_lossy(&bytes).into_owned();
+                                    if let Some(guest) = guest_readlink_target(
+                                        &target,
+                                        rootfs,
+                                        data_dir,
+                                        staged_exes.as_ref(),
+                                    ) {
+                                        log(&format!(
+                                            "6-Z200b: readlink target {} rewritten to guest path {} (host-path illusion)",
+                                            target, guest
+                                        ));
+                                        let out = guest.into_bytes();
+                                        if out.len() <= ret as usize {
+                                            // readlink does NOT
+                                            // NUL-terminate; write the
+                                            // bytes and fix the return
+                                            // value (new length).
+                                            if write_child_bytes_pokedata(pid, buf, &out) > 0 {
+                                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                                if ptrace_getregs(pid, &mut regs2).is_ok() {
+                                                    set_syscall_ret(
+                                                        &mut regs2,
+                                                        &abi,
+                                                        out.len() as i64,
+                                                    );
+                                                    let _ = ptrace_setregs(
+                                                        pid,
+                                                        &regs2,
+                                                        std::mem::size_of::<Regs>(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // ── 6-Z121: plain-fstat EXIT → root-ownership
                     // virtualization for the guest's /dev/__properties__/*
                     // metadata files ──
@@ -15419,7 +15676,19 @@ pub fn run_ptrace_loop(
                     if abi.fstat != -1 && syscall_num == abi.fstat {
                         let fstat_ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
                         if fstat_ret >= 0 {
-                            let fd = get_syscall_arg(&regs, abi.reg_arg1) as i32;
+                            // 6-Z199: the fd comes from the ENTRY-side
+                            // stash — on aarch64 reg_arg1 (x0) at the
+                            // EXIT stop holds the RETURN value (0), so
+                            // the old register read ALWAYS resolved
+                            // "fd 0" (stdin) and the ownership patch
+                            // silently never applied to the property
+                            // files (whyred "Failed to initialize
+                            // property area", run 33167135134).
+                            let stashed_fd = pending_entry_fd.remove(&pid);
+                            let fd = match stashed_fd {
+                                Some(f) if f >= 0 => f as i32,
+                                _ => get_syscall_arg(&regs, abi.reg_arg1) as i32,
+                            };
                             // 6-Z198: resolve the fd's file BOTH from the
                             // open-time registration AND — as a robust
                             // fallback — from the LIVE /proc/<pid>/fd/<fd>
@@ -15435,7 +15704,7 @@ pub fn run_ptrace_loop(
                             // registration-independent: the fd is OPEN at
                             // the fstat EXIT by construction, so its
                             // readlink always resolves.
-                            let resolved_path =
+                            let mut resolved_path =
                                 open_fd_owner_paths.get(&(pid, fd)).cloned().or_else(|| {
                                     std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd))
                                         .ok()
@@ -15454,8 +15723,78 @@ pub fn run_ptrace_loop(
                                     ));
                                 }
                             }
+                            // ── 6-Z199b: inode-verification fallback ──
+                            //
+                            // Even when the fd resolves to a path that
+                            // is_property_metadata_file() rejects, or
+                            // resolution fails entirely, the statbuf
+                            // the kernel just filled in carries the
+                            // REAL (st_dev, st_ino) of the stat-ed
+                            // file. Match those against every file in
+                            // {rootfs}/dev/__properties__/ — if one
+                            // matches, the fstat IS on a property
+                            // metadata file (a process statting its
+                            // own property area) and the ownership
+                            // patch must apply. This is completely
+                            // registration-independent and survives fd
+                            // recycling, stop desyncs, and stale maps.
+                            // (Run 33167135134: whyred init wrote a
+                            // valid 8508-byte property_info, then
+                            // LoadPath's st_uid != 0 check killed the
+                            // boot with the registration path silently
+                            // missing.)
+                            let mut resolved_is_property_file = resolved_path
+                                .as_deref()
+                                .map(is_property_metadata_file)
+                                .unwrap_or(false);
+                            if !resolved_is_property_file {
+                                {
+                                    let buf = get_syscall_arg(&regs, abi.reg_arg2);
+                                    if buf != 0 {
+                                        if let Some(bytes) = read_child_bytes(pid, buf, 16) {
+                                            // st_dev@0(8) + st_ino@8(8) — the
+                                            // same offsets in BOTH 64-bit
+                                            // struct stat layouts.
+                                            let stat_dev = u64::from_ne_bytes(
+                                                bytes[0..8].try_into().unwrap_or([0u8; 8]),
+                                            );
+                                            let stat_ino = u64::from_ne_bytes(
+                                                bytes[8..16].try_into().unwrap_or([0u8; 8]),
+                                            );
+                                            if let Ok(prop_dir) = std::path::Path::new(rootfs)
+                                                .join("dev/__properties__")
+                                                .read_dir()
+                                            {
+                                                for entry in prop_dir.flatten() {
+                                                    if !entry.path().is_file() {
+                                                        continue;
+                                                    }
+                                                    if let Ok(md) = std::fs::metadata(entry.path())
+                                                    {
+                                                        use std::os::unix::fs::MetadataExt;
+                                                        if md.dev() == stat_dev
+                                                            && md.ino() == stat_ino
+                                                        {
+                                                            resolved_is_property_file = true;
+                                                            if resolved_path.is_none() {
+                                                                resolved_path = Some(
+                                                                    entry
+                                                                        .path()
+                                                                        .to_string_lossy()
+                                                                        .into_owned(),
+                                                                );
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(p) = resolved_path {
-                                if is_property_metadata_file(&p) {
+                                if resolved_is_property_file {
                                     if let Some((mode_off, uid_off, gid_off)) =
                                         stat_ownership_layout(abi.fstat)
                                     {
@@ -25513,5 +25852,153 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         let overflows = "/".to_string() + &"a".repeat(107);
         assert_eq!(overflows.len(), 108);
         assert!(build_translated_unix_sockaddr(&overflows).is_none());
+    }
+
+    // ── 6-Z200: /proc/self resolution against the TRACED CHILD ──────
+
+    #[test]
+    fn z200_subst_proc_self_exe_and_maps() {
+        // The linker's fatal self-probe (run 33167135134: whyred's
+        // forked recovery died at stat("/proc/self/exe") → denied).
+        assert_eq!(subst_proc_self("/proc/self/exe", 2581), "/proc/2581/exe");
+        assert_eq!(subst_proc_self("/proc/self/maps", 42), "/proc/42/maps");
+        assert_eq!(subst_proc_self("/proc/thread-self/exe", 7), "/proc/7/exe");
+        // Untouched classes:
+        assert_eq!(subst_proc_self("/proc/self", 5), "/proc/self");
+        assert_eq!(subst_proc_self("/proc/1/maps", 5), "/proc/1/maps");
+        assert_eq!(subst_proc_self("/dev/null", 5), "/dev/null");
+        assert_eq!(subst_proc_self("relative/path", 5), "relative/path");
+        // /proc/selfx must NOT match (superstring guard):
+        assert_eq!(subst_proc_self("/proc/selfoo/bar", 5), "/proc/selfoo/bar");
+    }
+
+    // ── 6-Z200b: readlink results never leak host paths ──────────────
+
+    #[test]
+    fn z200b_guest_readlink_target_rewrites_staged_exe() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        let data_dir = "/data/user/0/io.twoyi.debug";
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            "/sbin/recovery".to_string(),
+            format!("{}/cache/twoyi_stage/_sbin_recovery_0bf19504b502", data_dir),
+        );
+        // Both key forms registered (parse_staged_exes registers both):
+        m.insert(
+            format!("{}/sbin/recovery", rootfs),
+            format!("{}/cache/twoyi_stage/_sbin_recovery_0bf19504b502", data_dir),
+        );
+        // The Android 11 linker's readlink("/proc/self/exe") result:
+        assert_eq!(
+            guest_readlink_target(
+                "/data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_recovery_0bf19504b502",
+                rootfs,
+                data_dir,
+                Some(&m),
+            )
+            .as_deref(),
+            Some("/sbin/recovery")
+        );
+        // The legacy twoyi_init copy:
+        assert_eq!(
+            guest_readlink_target(
+                "/data/user/0/io.twoyi.debug/cache/twoyi_init",
+                rootfs,
+                data_dir,
+                Some(&m),
+            ),
+            None // not in the marker map → no rewrite (no wrong guess)
+        );
+    }
+
+    #[test]
+    fn z200b_guest_readlink_target_strips_rootfs_prefix() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        let data_dir = "/data/user/0/io.twoyi.debug";
+        // readlink("/proc/self/fd/3") → translated rootfs path:
+        assert_eq!(
+            guest_readlink_target(
+                "/data/user/0/io.twoyi.debug/rootfs/system/bin/init",
+                rootfs,
+                data_dir,
+                None,
+            )
+            .as_deref(),
+            Some("/system/bin/init")
+        );
+        // readlink("/proc/self/cwd") → rootfs itself:
+        assert_eq!(
+            guest_readlink_target(rootfs, rootfs, data_dir, None).as_deref(),
+            Some("/")
+        );
+    }
+
+    #[test]
+    fn z200b_guest_readlink_target_leaves_guest_paths_alone() {
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        let data_dir = "/data/user/0/io.twoyi.debug";
+        // Materialized symlink with a guest-relative target (6-Z196-D):
+        assert_eq!(
+            guest_readlink_target("system/bin/init", rootfs, data_dir, None),
+            None
+        );
+        assert_eq!(guest_readlink_target("/init", rootfs, data_dir, None), None);
+        assert_eq!(
+            guest_readlink_target("/sbin/busybox", rootfs, data_dir, None),
+            None
+        );
+        // Guest absolute symlink target — untouched:
+        assert_eq!(
+            guest_readlink_target("/system/bin/toybox", rootfs, data_dir, None),
+            None
+        );
+    }
+
+    // ── 6-Z197: first-stage boot dir coverage (regression: the
+    // dm-user socket + self-sabotaged fresh-create both fatal init) ──
+
+    #[test]
+    fn z197_boot_dir_set_covers_round2_failures() {
+        for p in [
+            "/dev/dm-user",
+            "/mnt/vendor",
+            "/mnt/product",
+            "/dev/pts",
+            "/dev/socket",
+        ] {
+            assert!(
+                is_first_stage_boot_dir(p),
+                "{} must be in the first-stage boot dir set",
+                p
+            );
+        }
+        // Non-boot-dir mkdirs keep honest semantics:
+        assert!(!is_first_stage_boot_dir("/data/local/tmp"));
+        assert!(!is_first_stage_boot_dir("/sdcard"));
+        assert!(!is_first_stage_boot_dir("/dev/dm-user/sub"));
+    }
+
+    // ── 6-Z121/6-Z199: the property-file matcher must accept the
+    // rootfs-prefixed spelling (the readlink fallback yields it) ──────
+
+    #[test]
+    fn z121_property_metadata_matches_rootfs_prefixed_and_bare() {
+        assert!(is_property_metadata_file(
+            "/dev/__properties__/property_info"
+        ));
+        assert!(is_property_metadata_file(
+            "/data/user/0/io.twoyi.debug/rootfs/dev/__properties__/property_info"
+        ));
+        assert!(is_property_metadata_file(
+            "/data/user/0/io.twoyi.debug/rootfs/dev/__properties__/properties_serial"
+        ));
+        assert!(is_property_metadata_file(
+            "/data/user/0/io.twoyi.debug/rootfs/dev/__properties__/u:object_r:default_prop:s0"
+        ));
+        // Rejects: the old single-file form, deeper paths, superstrings:
+        assert!(!is_property_metadata_file("/dev/__properties__"));
+        assert!(!is_property_metadata_file("/dev/__properties__/sub/file"));
+        assert!(!is_property_metadata_file("/dev/__properties__x/file"));
+        assert!(!is_property_metadata_file("relative"));
     }
 }

@@ -12800,3 +12800,111 @@ Stage Summary:
   /proc/self/exe backstop-denied (linker namespace probe survives via
   auxv fallback); the {rootfs}/data-as-host-symlink question (staging
   of /data/...-prefixed execs resolves through it — needs an audit).
+
+---
+Task ID: 6-Z199 + 6-Z200 + 6-Z200b + 6-Z201 (round 3)
+Agent: main
+Task: Root-cause + fix the round-2 blockers (runs 33167135134 whyred TWRP
+3.7.0_9 / 33167130307 OrangeFox R12.0, both on 43f695a).
+
+Work Log:
+- Downloaded + analyzed both round-2 artifacts (auth OK after re-providing
+  the PAT). NOTE the run<->recovery mapping: 33167135134 (221KB artifact)
+  = WHYRED TWRP 3.7.0_9; 33167130307 (17MB artifact) = ORANGEFOX R12.0.
+- whyred round-2 verdict: BOOT_OK + SPLASH_HANG + THEME_FAIL (was
+  BOOT_FAIL_EARLY_INIT). HUGE progress: init got past first stage and
+  second stage, and the recovery PROCESS started ("Starting TWRP
+  3.7.0_9-0-9d26b749 (pid 7786)" at 11:39:43) — but in an UNTRACED
+  retry boot (init itself still died at 11:30: "Failed to initialize
+  property area" → exit_group(127); the app/probe retried 9 min later
+  without ptrace translation). The retry recovery's theme load failed:
+  "E:LoadLanguageListDir '/twres/languages/' path not found" +
+  "E:Package TWRP failed to load" — ZERO fb_hook/tracer traces for the
+  /twres opens: bionic's fopen/opendir make INTRA-libc openat calls
+  that LD_PRELOAD cannot interpose, so an untraced recovery cannot see
+  ANY guest file via stdio. CONCLUSION: fix init's property FATAL (the
+  traced first boot) and the theme follows the traced path (angler
+  precedent).
+- whyred property FATAL root cause (6-Z199): the 6-Z121 fstat-ownership
+  virtualization NEVER FIRED on aarch64 — and neither did the 6-Z198
+  readlink fallback (no 6-Z198 DIAG line). Reason: on aarch64
+  reg_arg1 == reg_ret == x0, so reading "arg1" at a syscall-EXIT stop
+  yields the RETURN VALUE (0), not the fd. The arm always looked up
+  "fd 0" (stdin), resolved it via readlink (succeeds → no 6-Z198 DIAG),
+  is_property_metadata_file(stdin-path) = false → SILENT skip →
+  LoadPath's st_uid != 0 check killed init. On x86_64 (rax≠rdi) the
+  same code works — which is why the 6-Z121 fix verified on run
+  32745030268 but never fired on any aarch64 run. Verified against
+  AOSP 11 sources: bionic ContextsSerialized::Initialize →
+  LoadDefaultPath → PropertyInfoAreaFile::LoadPath (open O_NOFOLLOW,
+  fstat, reject st_uid!=0/st_gid!=0/group-write/size<sizeof) — the
+  observed openat→fstat→close→FATAL writev tail matches the check
+  failure exactly. property_info (8508 bytes, valid header) written;
+  properties_serial never created.
+- FIX (6-Z199): ENTRY-side fd stash (pending_entry_fd) for
+  close/fstat/fstat64 — x0 still holds the argument at ENTRY; the EXIT
+  arms consume the stash. Fixed BOTH the 6-Z121 arm (fd for the
+  ownership patch) and the 6-Z132 close cleanup (previously removed
+  fd 0's registration on every close → ALL registrations stale on
+  aarch64). PLUS 6-Z199b: an inode-verification fallback — read
+  (st_dev, st_ino) from the child's statbuf and match against every
+  file in {rootfs}/dev/__properties__/; registration-independent,
+  survives fd recycling and stop desyncs.
+- OrangeFox round-2 verdict: still first-stage abort, but the mkdir
+  failure set SHRANK to exactly {/dev/dm-user, /mnt/vendor,
+  /mnt/product}: 6-Z197 faked /dev/pts + /dev/socket (existed) but
+  (a) /mnt/vendor + /mnt/product were ABSENT at ENTRY → the tracer's
+  own create_dir_all() pre-created them → kernel mkdir returned EEXIST
+  for the dir we JUST made (self-sabotage; `existed` was false → no
+  fake), and (b) /dev/dm-user exists as a UNIX SOCKET (twoyi's own
+  devices layer binds it for Android 12+ dm-user) → is_dir()=false →
+  no fake → kernel mkdir EEXIST. FIX (6-Z197 round 2): fake mkdir
+  success UNCONDITIONALLY for the canonical boot-dir set (kernel mkdir
+  never executes; backing dir created only when absent — never
+  clobbering the dm-user socket).
+- /proc/self/exe root cause (6-Z200): run 33167135134 whyred's 6-Z49
+  proactive recovery fork (pid 2581) died with exit 127 at
+  "unable to stat \"/proc/self/exe\": Permission denied" — the sandbox
+  backstop's canonicalize("/proc/self/exe") resolved "self" as the
+  TRACER daemon (libkr64.so — outside the sandbox) → DENIED -EACCES.
+  Android 8+ bionic linkers FATAL there (linker_main.cpp
+  get_executable_info: async_safe_fatal) — killing EVERY staged
+  dynamic guest binary that is not first-stage init. (OrangeFox's init
+  survived only because the same accidental denial made
+  is_first_stage_init() — getpid()==1 && access("/proc/self/exe",
+  F_OK)==-1 — take the /init branch.) FIX: subst_proc_self() —
+  substitute "/proc/<pid>/" for "/proc/self/" IN THE BACKSTOP'S
+  RESOLUTION ONLY; the child's syscall argument is untouched so the
+  kernel resolves it in the CHILD's context (the staged binary,
+  allowed by the staging-dir allowlist rule).
+- 6-Z200b: readlink/readlinkat EXIT rewrite — readlink("/proc/self/exe")
+  must SUCCEED (linker FATALS otherwise) but its result leaks the
+  staged host path. New guest_readlink_target(): staged paths → the
+  guest path via the REVERSE staged-exe marker map; {rootfs}-prefixed
+  results (from /proc/self/fd/N + /proc/self/cwd readlinks) → prefix
+  stripped; materialized guest symlinks (guest-relative targets,
+  6-Z196-D) pass through untouched. Return value fixed to the new
+  length. This also closes the known-TODO "readlink of busybox-staged
+  links shows the cache path".
+- 6-Z201: classify_result.py terminal verdict no longer gates on the
+  single "pty master" tracer string (the socketpair-pty path never
+  emits it; 6-Z188 + VLM proved the live prompt). Accepts any of:
+  pty-master trace / pty+socketpair-or-slave activity / ash's
+  "can't access tty; job control turned off" banner. Verified against
+  both round-2 artifacts (whyred → UI_HANG/terminal OK; fox →
+  BOOT_FAIL_EARLY_INIT/terminal OK).
+- Gates: cargo fmt --check, cargo clippy --all-targets -D warnings,
+  cargo test — 593 PASS (6 new: subst_proc_self, guest_readlink_target
+  staged/rootfs/guest-clean, boot-dir set round-2 coverage, property
+  matcher rootfs-prefixed forms).
+
+Stage Summary:
+- Three independent aarch64-specific virtualization bugs fixed (fd-at-
+  EXIT x0 clash, /proc/self resolution, unconditional boot-dir fake) +
+  the classifier heuristic. Round-3 CI dispatched on the new commit:
+  OrangeFox R12.0 + whyred TWRP 3.7.0_9 + angler 3.7.0_9 regression.
+- EXPECTED next-layer blockers (if the fixes land): OrangeFox first
+  stage proceeds past the mkdirs (the property area worked in round 2);
+  whyred init survives property init (6-Z121 now fires on the correct
+  fd) → the traced recovery service starts → theme loads via the
+  TRANSLATED path (angler precedent) instead of the untraced retry.

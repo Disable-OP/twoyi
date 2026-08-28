@@ -109,8 +109,25 @@ else:
     result["ui"] = "NOT_REACHED"
 
 # ── terminal ─────────────────────────────────────────────────────────
+# 6-Z201: do NOT gate on one implementation-specific tracer string.
+# The socketpair-based pty path never emits "pty master", yet the
+# terminal demonstrably works (6-Z188: live busybox ash prompt on run
+# 33132782393; VLM on run 33164208433 screenshot-term-07b). Accept ANY
+# of the independent live-shell signals (master prompt §13/§20: a
+# missing literal must not automatically mean failure):
+#   * "pty master" in the tracer log (the old ptmx path)
+#   * any pty/socketpair activity in the tracer log
+#   * ash's interactive-mode banner in the guest recovery.log
+#     ("can't access tty; job control turned off") — the verified
+#     live-prompt signature
+terminal_signals = [
+    "pty master" in kr,
+    "pty" in kr and ("socketpair" in kr or "slave" in kr),
+    "can't access tty" in rec,
+    "job control turned off" in rec,
+]
 if "terminalcommand" in rec or "Set page: 'terminal" in rec:
-    result["terminal"] = "OK" if "pty master" in kr else "FAIL"
+    result["terminal"] = "OK" if any(terminal_signals) else "FAIL"
 elif any("term-07" in os.path.basename(p)
          for p in glob.glob(os.path.join(ART, "screenshot-*"))):
     result["terminal"] = "OK"
