@@ -18215,3 +18215,365 @@ Stage Summary:
 - result-pretty.json (OrangeFox r22): BOOT_FAIL_EARLY_INIT
   (init_fatal_reboot, exit_code=127). IDENTICAL TO r14-r21.
   The 6-Z211h+i FIX is NOT observable in the boot result.
+
+---
+Task ID: 6-Z211j-mon1
+Agent: CI-monitoring subagent
+Task: Monitor the OrangeFox R12.0 lavender round-23 UI E2E run on
+commit df1e29a (6-Z211j: round-robin resume ALL STOPPED tracked
+pids — the r22-recommended fix for hypothesis (e) "the parent's
+mount ENTRY syscall-stop is queued by the kernel but never
+returned by waitpid because the dispatcher keeps processing the
+new child's stops").
+
+Work Log:
+- Read worklog.md tail (last ~600 lines, ending at the 6-Z211i-
+  mon1 entry for r22 on commit f837403). Key state going in: r22
+  (6-Z211h+i FIX on commit f837403) CONFIRMED the 6-Z211i
+  skip_next_resume FIX WORKED for its immediate goal (prevented
+  the double-resume ESRCH on the parent that r21 had — "reap loop
+  consumed a pending ptrace stop" fired ZERO times vs r21's 2),
+  BUT the boot outcome was BYTE-FOR-BYTE IDENTICAL to r14-r21:
+  BOOT_FAIL_EARLY_INIT, exit_code=127, ZERO nr=40 (mount) in the
+  broad DIAG, ZERO pre-dispatch DIAG fires, ZERO 6-Z210
+  classification fires, SetupMountNamespaces/EBUSY/InitFatalReboot
+  chain STILL at lines 4717-4736. The r22 worklog identified NEW
+  hypothesis (e): "the parent's mount ENTRY syscall-stop is QUEUED
+  by the kernel but NEVER RETURNED BY waitpid because the
+  dispatcher keeps processing the new child's stops and never
+  gets back to the parent" — supported by the fact that between
+  the child switch (line 4706) and the parent's write EXIT
+  reporting -EBUSY (line 4717), there were 11 logged stops for
+  the new child and ZERO logged stops for the parent. The r22
+  recommended next concrete action: ROUND-ROBIN ALL TRACKED PIDS
+  (resume each STOPPED tracked pid with PTRACE_SYSCALL, not just
+  current_pid) so the parent's pending mount ENTRY stop is
+  returned by waitpid. Commit df1e29a was pushed to implement
+  this (the 6-Z211j FIX). The new DIAG tag "6-Z211j FIX: round-
+  robin resume — resumed STOPPED pid=NNNN (was not current_pid=
+  NNNN) — its pending syscall-stops will now be delivered to
+  waitpid" was added to confirm the round-robin resume fires.
+- Fetched latest workflow runs on main at 10:19:55 UTC:
+    33247535382  UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)  df1e29ad  in_progress  2026-08-29T10:19:00Z  run#188
+    33247528102  kr64 lint + test  df1e29ad  completed  2026-08-29T10:18:45Z
+    33246414930  UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)  f837403e  completed (r22)
+    33246403903  kr64 lint + test  f837403e  completed
+  Confirmed run 33247535382 (run_number 188) is on commit
+  df1e29ad — the 6-Z211j round-robin-resume fix commit. Only
+  ONE UI E2E Test run was dispatched for this commit.
+- Polled run status every ~60s. Status timeline:
+    10:20:02  in_progress (Build APK phase)
+    10:21:06–10:33:57  in_progress (12 more polls, all
+                        in_progress — the kr64 ptrace loop ran
+                        for ~13 minutes inside the redroid
+                        container, same as r22)
+    10:35:03  COMPLETED, conclusion=success
+  Total wall time: ~16 minutes. Well under the 25-minute budget.
+- Downloaded the `ui-e2e-arm64-logs` artifact (artifact ID
+  9713488140, 12,856,242 bytes ~12.9MB — slightly LARGER than
+  r22's 11.5MB because the 6-Z211j FIX added 34 log lines plus
+  the kr64 log grew from 4801 to 4820 lines). Unzipped outer zip
+  → extracted ui-e2e-logs.tar.xz → tar extracted to
+  /home/z/my-project/artifacts/ofox-r23/tmp/tmp/tmp/ui-e2e-
+  artifacts/ → moved contents up to:
+    /home/z/my-project/artifacts/ofox-r23/ui-e2e-artifacts/
+- Inspected OrangeFox r23 kr64-app-stderr-dockerexec.log (4820
+  lines, +19 lines vs r22's 4801 — the +19 are the 34 new 6-Z211j
+  FIX messages minus 15 lines shifted by the larger 6-Z211j FIX
+  block in the fork sequence):
+  *** CRITICAL: the 6-Z211j FIX (round-robin resume) fires 34
+  times — 8 on the parent (pid=2588), 21 on the new child from
+  CLONE (pid=2687), and 5 on the new child from FORK (pid=2688).
+  The FIX message is:
+    "6-Z211j FIX: round-robin resume — resumed STOPPED pid=2588
+    (was not current_pid=2687) — its pending syscall-stops will
+    now be delivered to waitpid"
+  The first 6-Z211j FIX on the parent fires at line 4712 (right
+  after the new child's auto-attach SIGSTOP was consumed and the
+  child switch to 2687 happened at line 4708). The 6-Z211j FIX
+  then fires 7 MORE times on the parent (lines 4723, 4724, 4725,
+  4726, 4734, 4754, 4757) interleaved with 21 fires on the new
+  child 2687 and 5 on 2688. The 6-Z211j FIX IS RESUMING THE
+  PARENT IN ROUND-ROBIN — the immediate goal of the fix IS
+  achieved.
+  *** CRITICAL: the 6-Z211h+i FIX still fires EXACTLY TWICE —
+  once after PTRACE_EVENT_CLONE (line 4701) and once after
+  PTRACE_EVENT_FORK (line 4745). The "(was true)" parenthetical
+  confirms the in_syscall flag WAS true at the moment the FIX ran
+  (FIFTH confirmation after r20-r22). The skip_next_resume=true
+  tail is set. The 6-Z211e DIAG skip fires 4 times (skips #1-4
+  of 200) — SAME as r22. The "reap loop consumed a pending ptrace
+  stop" count is ZERO — SAME as r22 (the 6-Z211i FIX still
+  prevents the reap-loop drain). ESRCH count: 12 (SAME as r22).
+  6-Z89 count: 7 (SAME as r22). 6-Z122 count: 2 (SAME as r22).
+  *** HOWEVER: the broad DIAG STILL shows ZERO nr=40 (mount)
+  syscall-stops, the pre-dispatch DIAG STILL fires ZERO times,
+  and the 6-Z210 classification block STILL fires ZERO times.
+  The SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL
+  appears at lines 4735-4760 (shifted +18 lines vs r22's 4717-
+  4736 due to the 34 new 6-Z211j FIX messages). RESULT IS BYTE-
+  FOR-BYTE IDENTICAL TO r14-r22. ***
+  Detailed counts for OrangeFox r23:
+    Total log lines: 4820  (+19 vs r22's 4801)
+    6-Z211j FIX count: 34  (NEW — was 0 in r22)
+      on parent 2588: 8
+      on child  2687: 21
+      on child  2688: 5
+    6-Z211h+i FIX count: 2 (lines 4701 + 4745) ← SAME as r22
+    6-Z211e DIAG skip count: 4 (lines 4702 + 4746 + 2 more
+                              post-failure) ← SAME as r22
+    Broad DIAG count: 2000 (cap reached at line 2681,
+                          loop_count=2000 — SAME as r14-r22)
+    Broad DIAG nr=40 (mount) count: 0  ← IDENTICAL to r14-r22
+                           (INCONCLUSIVE — cap hit BEFORE the
+                           CLONE event at loop_count=14149)
+    Pre-dispatch mount DIAG count: 0  ← IDENTICAL to r14-r22
+                           (DEFINITIVE — no cap, fires for EVERY
+                           mount syscall-stop; 0 means the
+                           parent's mount() syscall-stops are
+                           NEVER delivered to waitpid and
+                           dispatched)
+    6-Z210 classification block count: 0  ← IDENTICAL
+    Total nr=40 occurrences in entire log: 0  ← IDENTICAL
+    ESRCH count: 12  (SAME as r22 — all on pid 2744-equivalent
+                      during the post-failure reap phase; ZERO
+                      on the parent)
+    6-Z89 count: 7  (SAME as r22)
+    6-Z122 count: 2  (SAME as r22)
+    reap loop consumed count: 0  (SAME as r22 — the 6-Z211i FIX
+                                  still prevents the drain)
+    Failed to remount /apex count: 1 (line 4735) ← SAME as r22
+    SetupMountNamespaces failed count: 3 (lines 4736, 4738,
+                                          4739) ← SAME as r22
+    InitFatalReboot count: 2 (lines 4755 + 4760) ← SAME as r22
+  *** KEY OBSERVATION: The 6-Z211j FIX correctly resumes the
+  parent with PTRACE_SYSCALL (ret=0 implied — no ESRCH on the
+  parent) when current_pid is the new child. The parent's pending
+  syscall-stops should be delivered to waitpid. BUT the pre-
+  dispatch DIAG fires ZERO times — the parent's mount() syscall-
+  stops are NEVER delivered to waitpid and dispatched through the
+  broad DIAG / pre-dispatch DIAG / 6-Z210 classification code
+  path. ***
+  *** NEW ROOT CAUSE IDENTIFIED (hypothesis g): The 6-Z211j FIX
+  is COUNTERPRODUCTIVE — it CONSUMES the parent's syscall-stops
+  by resuming the parent with PTRACE_SYSCALL when the parent is
+  STOPPED at a syscall-stop. Here's the mechanism:
+    1. 6-Z211h+i FIX at line 4701: explicit PTRACE_SYSCALL on
+       parent (ret=0). Parent RUNS.
+    2. Loop-top: skip_next_resume=TRUE → skip the loop-top's own
+       PTRACE_SYSCALL on current_pid (2588).
+    3. 6-Z211j FIX at line 4703: resume OTHER tracked pids (the
+       new child 2687, auto-attached, STOPPED at SIGSTOP). New
+       child RUNS.
+    4. waitpid: returns the parent's clone EXIT stop (nr=220) at
+       line 4704. Dispatcher processes it (fork-family EXIT,
+       Task-6-S EXIT).
+    5. Loop-top: resume current_pid (2588, parent) with
+       PTRACE_SYSCALL. Parent RUNS.
+    6. 6-Z211j FIX at line 4706: resume OTHER tracked pids (the
+       new child 2687, now STOPPED at its first syscall-stop).
+       New child RUNS.
+    7. waitpid: returns... the new child's next stop (line 4708:
+       child switch 2588 → 2687). The parent's mount ENTRY stop
+       was QUEUED by the kernel but waitpid returned the new
+       child's stop FIRST.
+    8. Dispatcher processes the new child's stop (prctl-sample,
+       prctl-deep).
+    9. Loop-top: resume current_pid (2687, new child) with
+       PTRACE_SYSCALL. New child RUNS.
+    10. 6-Z211j FIX at line 4712: resume OTHER tracked pids (the
+        parent 2588, now STOPPED at its mount ENTRY syscall-stop).
+        PTRACE_SYSCALL on the parent CONSUMES the mount ENTRY
+        stop — the parent ADVANCES past it, RUNS the mount()
+        syscall AGAINST THE HOST KERNEL (returning -EBUSY), and
+        stops at the mount EXIT stop.
+    11. waitpid: returns... the new child's next stop (not the
+        parent's mount EXIT). The parent's mount EXIT stop was
+        QUEUED but waitpid returned the new child's stop FIRST.
+    12. 6-Z211j FIX at line 4723: resume the parent AGAIN (now
+        STOPPED at its mount EXIT syscall-stop). PTRACE_SYSCALL
+        CONSUMES the mount EXIT stop — the parent ADVANCES past
+        it, RUNS the next syscall (write to log "Failed to
+        remount /apex"), and stops at the write EXIT stop.
+    13. ... this repeats 8 times total on the parent, each time
+         CONSUMING a syscall-stop without letting waitpid return
+         it to the dispatcher.
+    14. The parent eventually calls write() to log "Failed to
+        remount /apex" (line 4735) — this write EXIT stop IS
+        returned by waitpid (the dispatcher logs it as a DIAG
+        write), but the mount ENTRY and EXIT stops were CONSUMED
+        by the 6-Z211j FIX and NEVER returned to the dispatcher.
+  *** The 6-Z211j FIX's flaw: it calls PTRACE_SYSCALL on ANY
+  STOPPED tracked pid (regardless of whether the stop is a
+  syscall-stop, signal-stop, or auto-attach SIGSTOP). Resuming a
+  pid that is STOPPED at a syscall-stop CONSUMES that stop — the
+  pid advances to the next syscall boundary, and the dispatcher
+  NEVER sees the consumed stop via waitpid. The parent's mount
+  ENTRY and EXIT stops are silently consumed by the 6-Z211j FIX's
+  round-robin resume. ***
+  *** SOURCE CODE CONFIRMATION (app/rs/kr64/src/ptrace_emu.rs
+  lines 10215-10246): the 6-Z211j FIX iterates over tracked_pids
+  and calls `ptrace(PTRACE_SYSCALL, tpid, 0, 0)` on each pid
+  where `tpid != current_pid`. It checks `if rr_r == 0` (success
+  = the pid was STOPPED, now resumed) and logs the FIX message.
+  It does NOT check WHAT KIND OF STOP the pid was stopped at —
+  it blindly resumes ANY stopped pid. This is the flaw: it
+  consumes syscall-stops as well as signal-stops. ***
+- result-pretty.json (OrangeFox r23): BOOT_FAIL_EARLY_INIT
+  (overall=BOOT_FAIL_EARLY_INIT, boot=BOOT_FAIL, failure=
+  init_fatal_reboot, exit_code=127, backstop_denied=2,
+  recovery_instances=0, ui=NOT_REACHED, vfs=CLEAN,
+  terminal=NOT_APPLICABLE). IDENTICAL TO r14, r15, r16, r17,
+  r18, r19, r20, r21, r22. The 6-Z211j FIX is NOT observable in
+  the boot result — it neither helped nor hurt the boot outcome
+  (the boot was already failing the same way before, and
+  continues to fail the same way after).
+- container-state.txt (OrangeFox r23): status=running exit=0
+  oom=false (same as r14-r22).
+
+Stage Summary:
+- *** THE 6-Z211j FIX (round-robin resume ALL STOPPED tracked
+  pids) IS ACTIVE AND FIRING — 34 times (8 on the parent, 21 on
+  the CLONE child, 5 on the FORK child). The fix IS resuming the
+  parent in round-robin fashion when current_pid is the new
+  child. The immediate goal of the fix IS achieved. ***
+- *** BUT THE BOOT OUTCOME IS BYTE-FOR-BYTE IDENTICAL TO r14-r22:
+  BOOT_FAIL_EARLY_INIT, exit_code=127, init_fatal_reboot. The
+  broad DIAG STILL shows ZERO nr=40 (mount) syscall-stops
+  (INCONCLUSIVE — cap hit before the CLONE event), the pre-
+  dispatch DIAG STILL fires ZERO times (DEFINITIVE — no cap,
+  fires for EVERY mount syscall-stop; 0 means the parent's
+  mount() syscall-stops are NEVER delivered to waitpid and
+  dispatched), the 6-Z210 classification block STILL fires ZERO
+  times, the SetupMountNamespaces/EBUSY/InitFatalReboot chain
+  STILL at lines 4735-4760. The parent's mount() STILL runs
+  against the host kernel and returns -EBUSY. ***
+- *** NEW ROOT CAUSE IDENTIFIED (hypothesis g): The 6-Z211j FIX
+  is COUNTERPRODUCTIVE — it CONSUMES the parent's syscall-stops
+  by blindly resuming ANY STOPPED tracked pid with
+  PTRACE_SYSCALL. When the parent is STOPPED at its mount ENTRY
+  syscall-stop, the 6-Z211j FIX's PTRACE_SYSCALL resume ADVANCES
+  the parent past the ENTRY stop (running mount() against the
+  host kernel, returning -EBUSY) to the EXIT stop. Then the
+  6-Z211j FIX runs AGAIN and CONSUMES the EXIT stop too. The
+  dispatcher NEVER sees either stop via waitpid — they are
+  silently consumed by the 6-Z211j FIX's round-robin resume.
+  This is CONFIRMED by the source code (ptrace_emu.rs lines
+  10215-10246): the FIX calls ptrace(PTRACE_SYSCALL, tpid, 0, 0)
+  on any tracked pid where tpid != current_pid, WITHOUT checking
+  what kind of stop the pid was stopped at. ***
+- *** HYPOTHESIS CHAIN UPDATE: ***
+  r17 hypothesis (a): "the parent is resumed with PTRACE_CONT
+  (instead of PTRACE_SYSCALL) after the fork event" — RULED
+  OUT by r19 6-Z211f DIAG.
+  r19 hypothesis (b): "the in_syscall flag is not reset to
+  false after the fork event, causing the parent's next
+  syscall-stop to be mis-classified as EXIT" — CONFIRMED by
+  r20 6-Z211g FIX. Necessary but not sufficient.
+  r20 hypothesis (c): "the parent is NEVER PTRACE_SYSCALL-
+  resumed at the loop-top after the child switch" — CONFIRMED
+  by r21 6-Z211h FIX (explicit resume ret=0). Necessary but
+  not sufficient.
+  r21 hypothesis (d): "the 6-Z89 ESRCH-fallback reap loop is
+  SILENTLY DRAINING the parent's pending syscall-stops (status
+  0x857f)" — CONFIRMED by r22 6-Z211i FIX (the skip_next_resume
+  prevented the double-resume ESRCH, the reap loop fired 0
+  "consumed" messages). Necessary but not sufficient.
+  r22 hypothesis (e): "the parent's mount ENTRY syscall-stop is
+  QUEUED by the kernel but is NEVER RETURNED BY waitpid because
+  the dispatcher keeps processing the new child's stops and never
+  gets back to the parent" — REFUTED by r23 6-Z211j FIX. The
+  6-Z211j FIX resumed the parent in round-robin (8 times), but
+  the parent's mount() syscall-stops are STILL NEVER delivered
+  to waitpid. Hypothesis (e) is INCORRECT — the issue is NOT
+  that waitpid doesn't return the parent's stops; the issue is
+  that the 6-Z211j FIX CONSUMES those stops by resuming the
+  parent.
+  r23 NEW hypothesis (g): "the 6-Z211j FIX's round-robin resume
+  CONSUMES the parent's syscall-stops by blindly resuming ANY
+  STOPPED tracked pid with PTRACE_SYSCALL, without checking
+  what kind of stop the pid was stopped at. Resuming a pid that
+  is STOPPED at a syscall-stop CONSUMES that stop — the pid
+  advances to the next syscall boundary, and the dispatcher
+  NEVER sees the consumed stop via waitpid." — CONFIRMED by the
+  source code (ptrace_emu.rs lines 10215-10246) and the r23 log
+  (8 6-Z211j FIX resumes on the parent, ZERO pre-dispatch DIAG
+  fires).
+- *** NEXT CONCRETE ACTION for the main orchestrator: ***
+  The 6-Z211j FIX is COUNTERPRODUCTIVE and should be REVERTED
+  or MODIFIED. Two options:
+  (1) REVERT the 6-Z211j FIX entirely (go back to the r22 state
+      with 6-Z211h+i FIX only). The r22 state had the SAME boot
+      outcome (BOOT_FAIL_EARLY_INIT) but at least the parent's
+      stops were NOT being consumed by a counterproductive round-
+      robin resume. The r22 hypothesis (e) was REFUTED by r23 —
+      the issue is NOT that waitpid doesn't return the parent's
+      stops; the issue is deeper.
+  (2) MODIFY the 6-Z211j FIX to ONLY resume pids that are
+      STOPPED at a NON-syscall-stop (e.g., auto-attach SIGSTOP,
+      signal-delivery-stop). Use PTRACE_GET_SYCALL_INFO (or
+      PTRACE_GETSIGINFO) to check the stop type BEFORE resuming.
+      Do NOT resume pids that are STOPPED at a syscall-stop
+      (their stops should be returned by waitpid first, then
+      processed by the dispatcher, then resumed for the next
+      syscall). This requires tracking per-pid state (RUNNING vs
+      STOPPED, and if STOPPED, what kind of stop).
+  (3) ALTERNATIVE ROOT-CAUSE INVESTIGATION: The 6-Z98 syscall
+      history (line 4768) shows the parent's last 50 syscalls
+      before exit_group: nr=64 (write) ×2, nr=167 (prctl),
+      nr=226 (mprotect) ×25, nr=215 (munmap), nr=226 ×2,
+      nr=98 (futex), nr=64 ×3, nr=198 (socket), nr=203, nr=57,
+      nr=66, nr=135 (rt_sigprocmask), nr=172 (getpid), nr=178
+      (gettid), nr=240, nr=134 (rt_sigaction), nr=135, nr=172,
+      nr=178, nr=240, nr=94. ZERO nr=40 (mount) in the last 50
+      — but the 50-entry buffer may have pushed mount() out (the
+      parent executed >50 syscalls between mount() and
+      exit_group: 25× mprotect alone). The 6-Z98 history is
+      INCONCLUSIVE. BUT the pre-dispatch DIAG (which fires for
+      EVERY mount syscall-stop with NO cap interaction) fires
+      ZERO times — this is DEFINITIVE. The parent's mount()
+      syscall-stops are NEVER delivered to waitpid and
+      dispatched. The 6-Z211j FIX did NOT fix this — it made it
+      WORSE by consuming the parent's stops.
+  (4) RECOMMENDED: Revert the 6-Z211j FIX (option 1) AND raise
+      the broad DIAG cap from 2000 to 20000 (or remove it for
+      debug builds) so we can see ALL the parent's stops leading
+      up to and after the CLONE event. The current cap of 2000
+      is hit at line 2681 (loop_count=2000), which is WAY
+      BEFORE the CLONE event at loop_count=14149. We are BLIND
+      for the critical 12000+ iterations between the cap and
+      the CLONE event. Without seeing the parent's stops in
+      this window, we CANNOT determine whether the parent's
+      mount() syscall-stops are being delivered to waitpid at
+      all (and just not classified), or whether they are NEVER
+      delivered. The pre-dispatch DIAG says NEVER delivered, but
+      we need the broad DIAG to CONFIRM the surrounding context.
+  (5) KEEP the 6-Z211h+i FIX (it's correct and necessary —
+      prevents the double-resume ESRCH and the reap-loop drain).
+      KEEP the 6-Z211g in_syscall reset. KEEP the 6-Z211h
+      explicit PTRACE_SYSCALL resume on the parent. KEEP the
+      libdl.so unversioned path fix. KEEP the 6-Z211f post-fork
+      DIAG and the 6-Z210 broad DIAG and the pre-dispatch DIAG
+      and the 6-Z211e skip_next_resume DIAG — they are all
+      working correctly.
+- *** SUMMARY: The 6-Z211j round-robin-resume FIX is
+  COUNTERPRODUCTIVE — it CONSUMES the parent's syscall-stops by
+  blindly resuming ANY STOPPED tracked pid with PTRACE_SYSCALL.
+  The boot outcome is BYTE-FOR-BYTE IDENTICAL to r14-r22:
+  BOOT_FAIL_EARLY_INIT, exit_code=127, ZERO nr=40 (mount)
+  syscall-stops in the broad DIAG (INCONCLUSIVE — cap hit
+  before the CLONE event), ZERO pre-dispatch mount DIAG fires
+  (DEFINITIVE — the parent's mount() syscall-stops are NEVER
+  delivered to waitpid and dispatched), ZERO 6-Z210
+  classification block fires, SetupMountNamespaces/EBUSY/
+  InitFatalReboot chain STILL at lines 4735-4760. The r22
+  hypothesis (e) was REFUTED — the issue is NOT that waitpid
+  doesn't return the parent's stops; the issue is that the
+  6-Z211j FIX CONSUMES those stops. REVERT the 6-Z211j FIX and
+  raise the broad DIAG cap to see the parent's stops in the
+  critical window. ***
+- result-pretty.json (OrangeFox r23): BOOT_FAIL_EARLY_INIT
+  (init_fatal_reboot, exit_code=127). IDENTICAL TO r14-r22.
+  The 6-Z211j FIX is NOT observable in the boot result — and
+  it CONSUMED the parent's syscall-stops that the previous
+  fixes had preserved.
