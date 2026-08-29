@@ -7327,11 +7327,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Minimal Android boot parameters that TWRP init expects.
         // androidboot.hardware is particularly important — init uses it
         // to find the right init.{hardware}.rc file.
-        // CRITICAL: /proc/cmdline uses NUL (\0) as item separator,
-        // NOT spaces. AOSP init's process_kernel_cmdline() reads the
-        // file and splits on \0. With spaces, the entire file is one
-        // big string with no NUL → no key=value pairs found →
-        // ro.hardware='' (empty) → boot sequence failure (Task 6-Y).
+        // CRITICAL (format, 6-Z223): TWO consumer families parse this
+        // file and they split DIFFERENTLY — see join_hybrid_cmdline()
+        // for the full dual-parser rationale:
+        //   * OLD init (TWRP 2.8, Task 6-Y): NUL / C-string iteration —
+        //     a pure-space file made item 1's VALUE swallow the rest
+        //     (ro.hardware garbage → boot sequence failure).
+        //   * MODERN libfstab (Android 12+, 6-Z223): SPACE splitting —
+        //     a pure-NUL file made every key after the first invisible
+        //     ("Error updating for slotselect", run 33275526098, even
+        //     with 6-Z219's slot_suffix written).
+        // The HYBRID "item\0 item\0 … item" layout satisfies both.
         // 6-Z159: derive androidboot.hardware from the ACTUAL recovery
         // image instead of hardcoding ranchu. The ranchu value matched
         // the x86 emulator rootfs but broke every real-device image:
@@ -7457,28 +7463,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 slot_suffix
             );
         }
-        let slot_suffix_part = if slot_suffix.is_empty() {
-            // A-only image: provide NO slot_suffix key. An empty
-            // `androidboot.slot_suffix=` would poison fs_mgr_get_boot_config()
-            // ("found but empty" short-circuits the DT/bootconfig fallbacks).
-            String::new()
-        } else {
-            format!("androidboot.slot_suffix={}\0", slot_suffix)
-        };
-        let cmdline_content = format!(
-            "androidboot.hardware={}\0{}androidboot.serialno=twoyi\0androidboot.boot_devices=pci0000:00/0000:00:03.0\0androidboot.verifiedbootstate=orange\0androidboot.flash.locked=0\0{}androidboot.vbmeta.size=0\0{}",
-            hw,
-            // ranchu-only extras (emulator gralloc/vulkan) preserved for
-            // the x86 rootfs; meaningless for real-device images
-            if hw == "ranchu" {
-                "androidboot.hardware.gralloc=ranchu\0androidboot.hardware.vulkan=ranchu\0"
-            } else {
-                ""
-            },
-            // 6-Z219: guest-derived slot suffix (omitted entirely for A-only)
-            slot_suffix_part,
-            if hw == "ranchu" { "qemu=1\0qemu.avd_name=twoyi_test\0" } else { "" }
-        );
+        // 6-Z219: guest-derived slot suffix ("" = A-only → key omitted —
+        // an empty `androidboot.slot_suffix=` would poison
+        // fs_mgr_get_boot_config: "found but empty" short-circuits the
+        // DT/bootconfig fallbacks).
+        // 6-Z223: build + join the cmdline in the HYBRID format — see
+        // join_hybrid_cmdline() for the full dual-parser rationale (old
+        // init splits the buffer on NUL, Android 12+ libfstab splits on
+        // SPACE; the legacy pure-NUL file made slot_suffix invisible to
+        // libfstab → "Error updating for slotselect", run 33275526098,
+        // even with 6-Z219's value present).
+        let cmdline_items = build_cmdline_items(&hw, &slot_suffix);
+        let cmdline_content = join_hybrid_cmdline(&cmdline_items);
         match std::fs::write(&cmdline_path, &cmdline_content) {
             Ok(_) => {
                 let _ =
@@ -10101,6 +10097,86 @@ pub fn detect_guest_slot_suffix(rootfs_prefix: &str) -> String {
         }
     }
     String::new()
+}
+
+/// 6-Z223: build the ordered androidboot.* item list for the guest
+/// /proc/cmdline. `hw` is the detected androidboot.hardware (6-Z159);
+/// `slot_suffix` is 6-Z219's guest-derived value ("_a") or "" for A-only
+/// images (the key is omitted entirely — an empty value would poison
+/// fs_mgr_get_boot_config's DT/bootconfig fallbacks). Ranchu-only
+/// emulator extras (gralloc/vulkan/qemu) are emitted only for hw ==
+/// "ranchu"; they are meaningless for real-device recovery images.
+///
+/// ORDERING INVARIANT: slot_suffix, when present, is the FINAL item —
+/// join_hybrid_cmdline() leaves the final item's value NUL-free, and
+/// libfstab's A/B consumers compare the slot suffix with std::string
+/// equality (slotselect.cpp other_suffix(): `slot_suffix == "_a"`) and
+/// splice it into entry.logical_partition_name, which is matched against
+/// super-partition metadata by std::string equality for dynamic-
+/// partition devices. A trailing NUL on that value would fail both.
+pub fn build_cmdline_items(hw: &str, slot_suffix: &str) -> Vec<String> {
+    let mut items = vec![format!("androidboot.hardware={}", hw)];
+    if hw == "ranchu" {
+        items.push("androidboot.hardware.gralloc=ranchu".to_string());
+        items.push("androidboot.hardware.vulkan=ranchu".to_string());
+    }
+    items.push("androidboot.serialno=twoyi".to_string());
+    items.push("androidboot.boot_devices=pci0000:00/0000:00:03.0".to_string());
+    items.push("androidboot.verifiedbootstate=orange".to_string());
+    items.push("androidboot.flash.locked=0".to_string());
+    items.push("androidboot.vbmeta.size=0".to_string());
+    if hw == "ranchu" {
+        items.push("qemu=1".to_string());
+        items.push("qemu.avd_name=twoyi_test".to_string());
+    }
+    if !slot_suffix.is_empty() {
+        items.push(format!("androidboot.slot_suffix={}", slot_suffix));
+    }
+    items
+}
+
+/// 6-Z223: HYBRID cmdline join — "item\0 item\0 … item" (space BETWEEN
+/// items, NUL after every item EXCEPT the last). TWO consumer families
+/// must both parse every key:
+///   * OLD init (TWRP 2.8's static Android-5.x init): import_kernel_cmdline
+///     reads the file, self-terminates the buffer (cmdline[n] = 0), then
+///     walks SPACE-delimited pieces with C-string semantics — strchr stops
+///     at the FIRST item's NUL, so item 1 (androidboot.hardware, the boot-
+///     critical key for TWRP's init.<hw>.rc lookup) is imported exactly as
+///     under the legacy pure-NUL format and the walk never reaches items
+///     2+. Even a hypothetical NUL-iterating reader sees items 2+ only as
+///     leading-space keys (invisible; cosmetic loss identical to the
+///     legacy format hiding them from every space-splitting parser).
+///   * MODERN init + libfstab (Android 12+; property_service.cpp's
+///     ProcessKernelCmdline and fstab's fs_mgr_get_boot_config use
+///     android::fs_mgr::ImportKernelCmdlineFromString, which splits on
+///     SPACE and '"', never NUL). With the legacy pure-NUL format the
+///     whole cmdline was ONE space-piece: only androidboot.hardware (the
+///     first '=' pair) was discoverable and EVERY later key — including
+///     6-Z219's androidboot.slot_suffix — was invisible → Android 12+
+///     libfstab aborted the A/B recovery's fstab ("Error updating for
+///     slotselect", run 33275526098) even with slot_suffix present in
+///     the file. Space-splitting now yields one piece per key.
+///
+/// VALUE-NUL RULE: non-final items keep their NUL (C-string terminator
+/// for old parsers; every modern consumer of those values is C-string-
+/// based: property storage, mount(2)/open(2) paths, strtoull). The FINAL
+/// item is emitted WITHOUT a trailing NUL because build_cmdline_items()
+/// places slot_suffix last and libfstab compares that value with
+/// std::string equality (other_suffix) and splices it into
+/// entry.logical_partition_name for super-partition matching.
+pub fn join_hybrid_cmdline(items: &[String]) -> String {
+    let mut out = String::new();
+    for (n, item) in items.iter().enumerate() {
+        if n > 0 {
+            out.push(' ');
+        }
+        out.push_str(item);
+        if n + 1 < items.len() {
+            out.push('\0');
+        }
+    }
+    out
 }
 
 // ============================================================================
@@ -13638,6 +13714,163 @@ mod tests {
         );
         assert_eq!(detect_guest_slot_suffix(dir.to_str().unwrap()), "_a");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 6-Z223: hybrid cmdline format regression tests ────────────────
+    //
+    // Run 33275526098 proved the pure-NUL legacy format is invisible to
+    // Android 12+ libfstab (space-splitting ImportKernelCmdlineFromString):
+    // the host wrote slot_suffix=_a (6-Z219 log line present) yet the
+    // guest still aborted with "Error updating for slotselect". These
+    // tests simulate BOTH consumer families byte-exactly.
+
+    #[test]
+    fn cmdline_items_contents_and_gating() {
+        // A/B device image (e.g. lineage-22.2-sailfish): slot key present.
+        let ab = build_cmdline_items("sailfish", "_a");
+        assert_eq!(ab[0], "androidboot.hardware=sailfish");
+        assert!(ab.iter().any(|i| i == "androidboot.slot_suffix=_a"));
+        // ORDERING INVARIANT: the slot suffix is the FINAL item —
+        // join_hybrid_cmdline() leaves the final item NUL-free, and
+        // libfstab compares that value via std::string equality
+        // (other_suffix) and splices it into logical_partition_name
+        // (super-partition match for dynamic-partition devices).
+        assert_eq!(
+            ab.last().map(String::as_str),
+            Some("androidboot.slot_suffix=_a")
+        );
+        // A-only image: the key must be ABSENT, not empty-valued.
+        let a_only = build_cmdline_items("angler", "");
+        assert!(!a_only
+            .iter()
+            .any(|i| i.starts_with("androidboot.slot_suffix")));
+        // Real-device images must NOT carry ranchu emulator extras.
+        for it in build_cmdline_items("sailfish", "_a") {
+            assert!(!it.starts_with("androidboot.hardware.gralloc"));
+            assert!(!it.starts_with("androidboot.hardware.vulkan"));
+            assert!(!it.starts_with("qemu"));
+        }
+        // ranchu keeps its emulator extras.
+        let ranchu = build_cmdline_items("ranchu", "");
+        assert!(ranchu
+            .iter()
+            .any(|i| i == "androidboot.hardware.gralloc=ranchu"));
+        assert!(ranchu
+            .iter()
+            .any(|i| i == "androidboot.hardware.vulkan=ranchu"));
+        assert!(ranchu.iter().any(|i| i == "qemu=1"));
+        assert!(ranchu.iter().any(|i| i == "qemu.avd_name=twoyi_test"));
+    }
+
+    #[test]
+    fn hybrid_cmdline_nul_parser_sees_clean_first_item() {
+        // OLD init (TWRP 2.8's static Android-5.x init) reads /proc/cmdline,
+        // SELF-TERMINATES its buffer (cmdline[n] = 0 in
+        // import_kernel_cmdline), then walks space-delimited pieces with
+        // C-string semantics — the first strchr(' ') operates on the C
+        // string that ends at item 1's NUL, so the boot-critical
+        // androidboot.hardware is imported byte-identically to the legacy
+        // pure-NUL format and the walk stops there.
+        let items = build_cmdline_items("angler", "");
+        let content = join_hybrid_cmdline(&items);
+        let first = content.split('\0').next().unwrap();
+        assert_eq!(first, "androidboot.hardware=angler");
+        // The buffer does NOT end with NUL (the final item stays NUL-free
+        // for libfstab's std::string consumers) — safe because old init
+        // self-terminates its read buffer and never reads past item 1.
+        assert!(!content.ends_with('\0'));
+        // Even a NUL-iterating reader on a self-terminated buffer stays
+        // well-formed: every piece is a key=value item (items 2+ carry a
+        // leading space — invisible to them by design), none empty.
+        let terminated = format!("{}\0", content);
+        for piece in terminated.split_terminator('\0') {
+            assert!(!piece.is_empty());
+            assert!(piece.contains('='), "piece {:?} is not key=value", piece);
+        }
+    }
+
+    #[test]
+    fn hybrid_cmdline_space_parser_discovers_every_key() {
+        // MODERN libfstab (AOSP 15 boot_config.cpp): GetKernelCmdline does
+        // Trim(cmdline) then ImportKernelCmdlineFromString — split on ' '
+        // (quote spans; none emitted), split each piece at the first '='.
+        // The legacy pure-NUL format collapsed everything into ONE piece
+        // (only the first '=' pair discoverable); the hybrid format must
+        // make EVERY key visible.
+        //
+        // Downstream consumers (fs_mgr_get_boot_config):
+        //   * slotselect.cpp other_suffix(): `slot_suffix == "_a"` is a
+        //     std::string comparison, and the suffix is spliced into
+        //     entry.logical_partition_name for super-partition matching —
+        //     the FINAL item's value must be NUL-FREE.
+        //   * Everything else consumes values via C-string semantics
+        //     (property storage, mount(2)/open(2), strtoull) — a trailing
+        //     NUL on non-final items is harmless and required so old
+        //     C-string parsers always terminate correctly.
+        let items = build_cmdline_items("sailfish", "_a");
+        let content = join_hybrid_cmdline(&items);
+        let mut found: Vec<(String, String)> = Vec::new();
+        for entry in content.split(' ') {
+            let (k, v) = entry
+                .split_once('=')
+                .unwrap_or_else(|| panic!("piece {:?} has no '='", entry));
+            // Key must be NUL-free for libfstab's config_key == key match.
+            assert!(!k.contains('\0'), "key {} contains NUL", k);
+            let clean = v.trim_end_matches('\0');
+            assert!(!clean.contains('\0'), "value of {} has an embedded NUL", k);
+            assert!(
+                v == clean || (v.len() == clean.len() + 1 && v.ends_with('\0')),
+                "value of {} must be clean or carry exactly one trailing NUL: {:?}",
+                k,
+                v
+            );
+            found.push((k.to_string(), clean.to_string()));
+        }
+        let get =
+            |key: &str| -> Option<&String> { found.iter().find(|(k, _)| k == key).map(|(_, v)| v) };
+        assert_eq!(
+            get("androidboot.hardware").map(String::as_str),
+            Some("sailfish")
+        );
+        assert_eq!(
+            get("androidboot.slot_suffix").map(String::as_str),
+            Some("_a")
+        );
+        assert_eq!(
+            get("androidboot.boot_devices").map(String::as_str),
+            Some("pci0000:00/0000:00:03.0")
+        );
+        assert_eq!(
+            get("androidboot.serialno").map(String::as_str),
+            Some("twoyi")
+        );
+        // The slot suffix piece must be byte-identical to the literal the
+        // A/B machinery compares against (std::string ==, not C string):
+        // last position AND NUL-free.
+        assert_eq!(
+            content.split(' ').next_back(),
+            Some("androidboot.slot_suffix=_a")
+        );
+    }
+
+    #[test]
+    fn hybrid_cmdline_legacy_purenul_vs_hybrid_diff() {
+        // Documents the actual bug: with the LEGACY format, a space-split
+        // parser finds only ONE key. Keep this test as the regression
+        // guard that the hybrid format never collapses back.
+        let items = build_cmdline_items("sailfish", "_a");
+        let legacy = items.join("\0"); // pre-6-Z223 format
+        let legacy_keys: Vec<&str> = legacy
+            .split(' ')
+            .filter_map(|e| e.split('=').next())
+            .collect();
+        assert_eq!(legacy_keys.len(), 1, "legacy pure-NUL collapses to 1 piece");
+        let hybrid_content = join_hybrid_cmdline(&items);
+        let hybrid_keys: Vec<&str> = hybrid_content
+            .split(' ')
+            .filter_map(|e| e.split('=').next())
+            .collect();
+        assert_eq!(hybrid_keys.len(), items.len(), "hybrid exposes every key");
     }
 
     /// Fake ROM bionic: system/lib64/{libc,libdl,libm,libdl_android}.so
