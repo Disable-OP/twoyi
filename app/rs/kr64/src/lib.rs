@@ -1413,9 +1413,30 @@ fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
     patch_twrp_init_rc_recovery_service_with_env(content, "")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn patch_twrp_init_rc_recovery_service_with_env(
     content: &str,
     extra_setenv: &str,
+) -> Option<String> {
+    patch_twrp_init_rc_recovery_service_full(
+        content,
+        extra_setenv,
+        "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so",
+        "",
+    )
+}
+
+/// 6-Z220: mode-aware recovery-service patcher.
+///
+/// `preload_line`  — the full `    setenv LD_PRELOAD <chain>` option line
+///                   to inject (legacy /sbin fb-hook for 32-bit TWRP, or
+///                   the full AOSP chain for native-arch layouts).
+/// `extra_options` — additional service option lines (e.g. `\n    stdio_to_kmsg`).
+pub fn patch_twrp_init_rc_recovery_service_full(
+    content: &str,
+    extra_setenv: &str,
+    preload_line: &str,
+    extra_options: &str,
 ) -> Option<String> {
     // Find the "service recovery" line. It may be "service recovery /sbin/recovery"
     // or "service recovery /sbin/recovery\r" (CRLF). We match the prefix
@@ -1431,11 +1452,25 @@ fn patch_twrp_init_rc_recovery_service_with_env(
     let mut result = String::with_capacity(content.len() + 96);
     let mut found = false;
     for (idx, line) in all_lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        // 6-Z220: INSIDE the recovery service block, drop any PREVIOUS
+        // `setenv LD_PRELOAD` option (from an earlier boot's patch with a
+        // different chain) and any previous stdio_to_kmsg — we re-emit
+        // exactly one of each so a boot-mode flip can never leave BOTH
+        // chains in the block (init's last-setenv-wins would hide which
+        // chain actually applied; duplicate stdio_to_kmsg is sloppy).
+        if found
+            && !trimmed.is_empty()
+            && (trimmed.starts_with("setenv LD_PRELOAD ")
+                || trimmed.starts_with("setenv  LD_PRELOAD ")
+                || trimmed == "stdio_to_kmsg")
+        {
+            continue;
+        }
         result.push_str(line);
         // Check if this line starts the recovery service definition.
         // We check the trimmed start to handle leading whitespace (shouldn't
         // happen for service definitions, but be defensive).
-        let trimmed = line.trim_start();
         if !found && trimmed.starts_with("service recovery ") {
             // This is the recovery service line. Insert the setenv directive
             // as the next line (indented with 4 spaces, matching init.rc
@@ -1456,7 +1491,7 @@ fn patch_twrp_init_rc_recovery_service_with_env(
                 .take_while(|l| l.starts_with(' ') || l.starts_with('\t') || l.trim().is_empty())
                 .any(|l| l.trim_start().starts_with("seclabel"));
             result.push('\n');
-            result.push_str("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so");
+            result.push_str(preload_line);
             // 6-Z175: the native-resolution + rootfs env lines (see
             // twrp_recovery_setenv_lines — TWRP init does not inherit
             // kr64's environ into services).
@@ -1467,7 +1502,18 @@ fn patch_twrp_init_rc_recovery_service_with_env(
             // this, the linker only searches /system/lib/ (default) → the
             // libraries aren't found → the recovery binary exits 127 after
             // 1163 iterations (lazy load failure on first call to a missing lib).
-            result.push_str("\n    setenv LD_LIBRARY_PATH /sbin:/system/lib:/system/lib64");
+            // 6-Z220: legacy 32-bit chain ONLY — for the native-arch AOSP
+            // chain the service inherits init's 12-dir LD_LIBRARY_PATH
+            // (which includes /dev, /apex/*, /system/lib64, ...); hard-
+            // coding the 32-bit trio here would OVERRIDE that inherited
+            // value and break native library resolution.
+            if preload_line.starts_with("    setenv LD_PRELOAD /sbin/") {
+                result.push_str("\n    setenv LD_LIBRARY_PATH /sbin:/system/lib:/system/lib64");
+            }
+            // 6-Z220: extra service options (stdio_to_kmsg when the guest
+            // init supports it) — makes the recovery service's stderr
+            // (hook + linker + glog diagnostics) visible in kmsg.
+            result.push_str(extra_options);
             // Task 6-Z29: NOW adding seclabel u:r:recovery:s0 AGAIN. The
             // setexeccon EINVAL is handled by a NEW ptrace_emu fake: writes
             // to /proc/self/attr/exec (setexeccon's implementation) are
@@ -1494,11 +1540,66 @@ fn patch_twrp_init_rc_recovery_service_with_env(
     }
 }
 
-/// Marker string that, when present in a .rc file, indicates the
-/// `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so` line has already been
-/// injected into the recovery service definition. Used by the
-/// orchestrator below to make the patch IDEMPOTENT across boots.
+/// 6-Z220: the legacy TWRP recovery-service preload option line. Kept as
+/// a named constant for tests and for the None-branch of the patcher; the
+/// idempotence check now keys on the CURRENT chain (6-Z220) rather than
+/// this legacy marker, so a boot-mode flip re-patches instead of skipping.
+#[cfg(test)]
+#[allow(dead_code)]
 const TWRP_LD_PRELOAD_PATCH_MARKER: &str = "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so";
+
+/// 6-Z220: the recovery-service preload chain for AOSP-layout (native
+/// arch) boots, without the "LD_PRELOAD=" prefix. The chain matches
+/// AOSP_LD_PRELOAD_ENV (same order — FB hook BEFORE the shlib, 6-Z218a).
+/// Init.rc `setenv LD_PRELOAD <chain>` injects it directly into the
+/// forked recovery service so the service does not depend on inheriting
+/// kr64's exec env through init (stock AOSP init DOES inherit environ,
+/// but any init variant or rc-level `setenv`/`unsetenv` churn in a
+/// vendor tree can silently drop it — the service MUST carry the full
+/// virtualization stack explicitly, §22).
+pub const AOSP_SERVICE_PRELOAD_CHAIN: &str =
+    "/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so";
+
+/// 6-Z220: returns true when the init binary at `{rootfs}/<path>`
+/// contains `needle` anywhere in its raw bytes. Used as a SAFE binary
+/// indicator for init.rc feature options (§10 pattern — probe the
+/// actual guest binary, never guess from a version string). Currently
+/// used for `stdio_to_kmsg` (Android 11+ service option): older init
+/// parsers treat unknown service options as parse errors and would
+/// DROP the recovery service, so we only emit the option when the
+/// guest's own init binary literally contains the option name.
+fn binary_contains_string(path: &str, needle: &str) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    // Streaming overlap search over fixed-size chunks (init binaries are
+    // a few MB; keep memory bounded).
+    let mut tail: Vec<u8> = Vec::with_capacity(needle.len() - 1);
+    let mut buf = [0u8; 65536];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let window = tail
+                    .iter()
+                    .chain(buf[..n].iter())
+                    .cloned()
+                    .collect::<Vec<u8>>();
+                if window.windows(needle.len()).any(|w| w == needle) {
+                    return true;
+                }
+                tail = window[window.len().saturating_sub(needle.len() - 1)..].to_vec();
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
 
 /// 6-Z218a: LD_PRELOAD for non-TWRP (AOSP-layout) boots. The FB hook
 /// MUST precede libtwoyi_loader_shlib.so: bionic resolves PLT entries
@@ -1591,8 +1692,36 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(
     rootfs_prefix: &str,
     fb_width: i32,
     fb_height: i32,
+    service_preload_chain: Option<&str>,
 ) {
     let extra_setenv = twrp_recovery_setenv_lines(fb_width, fb_height, rootfs_prefix);
+    // 6-Z220: the LD_PRELOAD chain written into the recovery service.
+    //   None                      → legacy TWRP 32-bit hook (unchanged).
+    //   Some(chain)               → full AOSP virtualization stack for
+    //                               native-arch AOSP-layout recoveries.
+    let preload_line = match service_preload_chain {
+        Some(chain) => format!("    setenv LD_PRELOAD {}", chain),
+        None => "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so".to_string(),
+    };
+    // 6-Z220: route the recovery service's stdio to /dev/__kmsg__ so the
+    // hook libraries' diagnostics (fd 2) and any guest linker/glog output
+    // are CAPTURED in the run artifacts. OrangeFox run 33271278540: the
+    // recovery service crash-looped at gr_fb_width() with ALL of its
+    // stderr invisible (init redirects non-console service stdio to
+    // /dev/null) — every [twrp_fb_hook] ioctl diagnostic was lost and the
+    // root cause had to be inferred from maps alone. The option exists
+    // since Android 11; older init parsers reject unknown service options
+    // and would DROP the recovery service, so emit it ONLY when the
+    // guest's own init binary contains the option name (binary indicator,
+    // never a version guess — §10/§22).
+    let stdio_line = if binary_contains_string(
+        &format!("{}/system/bin/init", rootfs_prefix),
+        "stdio_to_kmsg",
+    ) {
+        "\n    stdio_to_kmsg"
+    } else {
+        ""
+    };
     // -----------------------------------------------------------------
     // Step 1: build the candidate .rc file list (ordered, deduplicated).
     // -----------------------------------------------------------------
@@ -1670,16 +1799,23 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(
 
     // -----------------------------------------------------------------
     // Step 2: idempotence check. If ANY candidate already contains the
-    // patch marker, we're done (a previous boot patched it). We check
-    // ALL candidates (not just the first) because the marker may have
-    // been written to a non-init.rc file by an earlier boot.
+    // CURRENT patch marker (the exact preload chain we would write, plus
+    // stdio_to_kmsg when applicable), we're done (a previous boot patched
+    // it). We check ALL candidates (not just the first) because the marker
+    // may have been written to a non-init.rc file by an earlier boot.
+    // 6-Z220: a DIFFERENT chain (e.g. the legacy /sbin marker on a
+    // boot-mode flip) does NOT satisfy idempotence — the stale setenv is
+    // dropped by the patcher below and re-emitted with the current chain.
     // -----------------------------------------------------------------
     for path in &candidate_files {
         if let Ok(content) = std::fs::read_to_string(path) {
-            if content.contains(TWRP_LD_PRELOAD_PATCH_MARKER) {
+            if content.contains(&preload_line)
+                && (stdio_line.is_empty() || content.contains("stdio_to_kmsg"))
+            {
                 info!(
-                    "[KR64] PARENT: {} already patched with LD_PRELOAD for recovery service (idempotent skip)",
-                    path
+                    "[KR64] PARENT: {} already patched with {:?} for recovery service (idempotent skip)",
+                    path,
+                    preload_line.trim()
                 );
                 return;
             }
@@ -1697,14 +1833,20 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(
             Ok(c) => c,
             Err(_) => continue, // missing/unreadable — skip silently
         };
-        if let Some(patched) = patch_twrp_init_rc_recovery_service_with_env(&content, &extra_setenv)
-        {
+        if let Some(patched) = patch_twrp_init_rc_recovery_service_full(
+            &content,
+            &extra_setenv,
+            &preload_line,
+            stdio_line,
+        ) {
             match std::fs::write(path, &patched) {
                 Ok(()) => info!(
-                    "[KR64] PARENT: patched {} — added 'setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so' + TWOYI_FB_WIDTH/HEIGHT/ROOTFS env (native res {}x{}) to recovery service",
+                    "[KR64] PARENT: patched {} — added {:?} + TWOYI_FB_WIDTH/HEIGHT/ROOTFS env (native res {}x{}){} to recovery service",
                     path,
+                    preload_line.trim(),
                     if fb_width > 0 { fb_width } else { 320 },
-                    if fb_height > 0 { fb_height } else { 640 }
+                    if fb_height > 0 { fb_height } else { 640 },
+                    if stdio_line.is_empty() { "" } else { " + stdio_to_kmsg" }
                 ),
                 Err(e) => warning!(
                     "[KR64] PARENT: failed to write patched {}: {} (recovery will crash in libminuitwrp.so)",
@@ -1741,13 +1883,27 @@ fn patch_twrp_init_rc_recovery_service_in_rootfs(
     // is preserved literally (a backslash-newline continuation in a
     // normal string literal would STRIP the leading whitespace, which
     // would break init.rc's service-option indentation requirement).
+    // 6-Z220: the authored service uses the CURRENT chain (legacy /sbin
+    // fb-hook or the full AOSP chain) and, when the guest init supports
+    // it, stdio_to_kmsg. For the AOSP chain the service binary is
+    // /system/bin/recovery (the AOSP-layout path), not /sbin/recovery.
+    let (svc_binary, svc_preload_line) = match service_preload_chain {
+        Some(chain) => (
+            "/system/bin/recovery",
+            format!("    setenv LD_PRELOAD {}", chain),
+        ),
+        None => (
+            "/sbin/recovery",
+            "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so".to_string(),
+        ),
+    };
     let twoyi_rc_content = format!(
         concat!(
-            "service recovery /sbin/recovery\n",
-            "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so{}\n",
-            "    seclabel u:r:recovery:s0\n",
+            "service recovery {}\n",
+            "{}{}\n",
+            "{}\n    seclabel u:r:recovery:s0\n",
         ),
-        extra_setenv
+        svc_binary, svc_preload_line, extra_setenv, stdio_line
     );
     if let Err(e) = std::fs::write(&twoyi_rc_path, twoyi_rc_content) {
         warning!(
@@ -5745,9 +5901,31 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //
     // The patch is IDEMPOTENT: if the setenv line is already present
     // (e.g., from a previous boot), we skip the write.
-    if cfg.boot_recovery {
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs_prefix, cfg.width, cfg.height);
+    // 6-Z220: the rc patcher now runs for BOTH boot modes.
+    //   * TWRP mode (boot_recovery=true): legacy /sbin fb-hook chain for
+    //     the 32-bit i386 recovery (unchanged behavior — angler guard).
+    //   * AOSP-layout mode (boot_recovery=false): the recovery service is
+    //     forked by the ROM's own init from /system/bin/recovery. Stock
+    //     AOSP init inherits environ, but relying on inheritance through
+    //     arbitrary vendor init trees is fragile (any rc-level
+    //     setenv/unsetenv churn silently drops the chain). The service
+    //     MUST carry the full virtualization stack explicitly: inject
+    //     AOSP_SERVICE_PRELOAD_CHAIN via the same init.rc setenv patch.
+    //     The stub rc in the x86 emulator rootfs has no `service recovery`
+    //     line → the patcher is a no-op there, preserving x86 behavior.
+    let service_preload_chain: Option<&str> = if cfg.boot_recovery {
+        None // legacy 32-bit TWRP: /sbin/libtwrp_fb_hook.so
+    } else {
+        Some(AOSP_SERVICE_PRELOAD_CHAIN)
+    };
+    patch_twrp_init_rc_recovery_service_in_rootfs(
+        &rootfs_prefix,
+        cfg.width,
+        cfg.height,
+        service_preload_chain,
+    );
 
+    if cfg.boot_recovery {
         // TWRP BOOT: DELETE /property_contexts ENTIRELY.
         // The TWRP ramdisk's /property_contexts file has `#line 1 "..."`
         // on line 1 (leftover from the AOSP build process). init's parser
@@ -7265,8 +7443,30 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 rootfs_prefix, listing
             );
         }
+        // 6-Z219: derive androidboot.slot_suffix from the guest's OWN
+        // fstab content instead of hard-coding an empty value. A/B
+        // recovery images (e.g. lineage-22.2-sailfish) carry `slotselect`
+        // flags; Android 12+ libfstab aborts the fstab parse (and the
+        // recovery binary then CHECK-aborts on the empty fstab) unless a
+        // non-empty slot suffix is discoverable. See the long comment on
+        // detect_guest_slot_suffix() for the full evidence chain.
+        let slot_suffix = detect_guest_slot_suffix(&rootfs_prefix);
+        if !slot_suffix.is_empty() {
+            info!(
+                "[KR64] PARENT: 6-Z219: guest fstab uses slotselect → androidboot.slot_suffix={:?} (A/B recovery image)",
+                slot_suffix
+            );
+        }
+        let slot_suffix_part = if slot_suffix.is_empty() {
+            // A-only image: provide NO slot_suffix key. An empty
+            // `androidboot.slot_suffix=` would poison fs_mgr_get_boot_config()
+            // ("found but empty" short-circuits the DT/bootconfig fallbacks).
+            String::new()
+        } else {
+            format!("androidboot.slot_suffix={}\0", slot_suffix)
+        };
         let cmdline_content = format!(
-            "androidboot.hardware={}\0{}androidboot.serialno=twoyi\0androidboot.boot_devices=pci0000:00/0000:00:03.0\0androidboot.verifiedbootstate=orange\0androidboot.flash.locked=0\0androidboot.slot_suffix=\0androidboot.vbmeta.size=0\0{}",
+            "androidboot.hardware={}\0{}androidboot.serialno=twoyi\0androidboot.boot_devices=pci0000:00/0000:00:03.0\0androidboot.verifiedbootstate=orange\0androidboot.flash.locked=0\0{}androidboot.vbmeta.size=0\0{}",
             hw,
             // ranchu-only extras (emulator gralloc/vulkan) preserved for
             // the x86 rootfs; meaningless for real-device images
@@ -7275,6 +7475,8 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             } else {
                 ""
             },
+            // 6-Z219: guest-derived slot suffix (omitted entirely for A-only)
+            slot_suffix_part,
             if hw == "ranchu" { "qemu=1\0qemu.avd_name=twoyi_test\0" } else { "" }
         );
         match std::fs::write(&cmdline_path, &cmdline_content) {
@@ -9810,6 +10012,98 @@ extern "C" {
 static INTERP_REF: &[u8; 0] = unsafe { &INTERP };
 
 // ============================================================================
+// 6-Z219: guest-derived androidboot.slot_suffix (A/B recovery images).
+// ============================================================================
+// Android 12+ libfstab (fs_mgr/libfstab/slotselect.cpp) makes a fstab
+// containing `slotselect` flags FATAL to parse when the slot suffix
+// resolves empty:
+//
+//     fs_mgr_update_for_slotselect(): if any entry has slot_select and
+//     fs_mgr_get_slot_suffix() == ""  →  return false
+//         → "Error updating for slotselect"
+//         → ReadFstabFromFileCommon fails → empty fstab
+//         → recovery binary: glog CHECK(!fstab.empty()) → abort
+//
+// Evidence chain (run 33271279412, lineage-22.2-sailfish, 2026-08-29):
+//   "<3>init: [libfstab] Error updating for slotselect"
+//   "<3>init: [libfstab] ReadFstabFromFileCommon(): failed to load fstab
+//        from : '/etc/recovery.fstab'"
+//   "[glog F/abort] Check failed: !fstab.empty()"   (strings(1) of the
+//        guest system/bin/recovery confirms the CHECK lives there)
+//
+// Twoyi hard-coded `androidboot.slot_suffix=` (EMPTY) in the synthetic
+// /proc/cmdline. On a real A/B device the bootloader passes
+// androidboot.slot_suffix=_a; the empty value poisons every lookup:
+// fs_mgr_get_boot_config("slot_suffix") finds the key in /proc/cmdline and
+// returns true with an EMPTY value, and DT/bootconfig fallbacks never run.
+//
+// GENERIC FIX (§22 — keyed on image content, not device identity): the
+// recovery image itself tells us whether its device is A/B. If any fstab
+// file shipped in the guest rootfs uses the `slotselect` flag, the guest
+// expects an A/B device, so we provide androidboot.slot_suffix=_a (the
+// default boot slot on every A/B device). When no fstab uses slotselect
+// we provide NO slot_suffix key at all — identical semantics for A-only
+// images (angler, whyred, lavender, x86 ranchu) and no poisoning.
+//
+// The empty-string value is also deliberately NOT emitted: an empty
+// `androidboot.slot_suffix=` is worse than an absent key because modern
+// fs_mgr_get_boot_config() treats "found but empty" as authoritative.
+pub fn detect_guest_slot_suffix(rootfs_prefix: &str) -> String {
+    // fstab files can live in any of these locations across Android
+    // generations and ramdisk layouts (legacy top-level, recovery
+    // ramdisks, first_stage_ramdisk layouts, system-as-root):
+    const SCAN_DIRS: &[&str] = &[
+        "",
+        "etc",
+        "system/etc",
+        "system/system_ext/etc",
+        "vendor/etc",
+        "odm/etc",
+        "first_stage_ramdisk",
+        "first_stage_ramdisk/etc",
+    ];
+    for dir in SCAN_DIRS {
+        let full = if dir.is_empty() {
+            rootfs_prefix.to_string()
+        } else {
+            format!("{}/{}", rootfs_prefix, dir)
+        };
+        let rd = match std::fs::read_dir(&full) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !(name == "recovery.fstab" || name.starts_with("fstab")) {
+                continue;
+            }
+            let path = format!("{}/{}", full, name);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let has_slotselect = content.lines().any(|line| {
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    return false;
+                }
+                // fs_mgr_flags are the last whitespace-separated field of
+                // an fstab line; be lenient about which field carries the
+                // flag but exact about the token itself so a hypothetical
+                // block device named *slotselect* cannot trip this.
+                t.split_whitespace()
+                    .flat_map(|f| f.split(','))
+                    .any(|flag| flag.trim() == "slotselect" || flag.trim() == "slotselect_other")
+            });
+            if has_slotselect {
+                return "_a".to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+// ============================================================================
 // Tests -- exercise arg parsing and config defaults.
 // ============================================================================
 
@@ -10720,7 +11014,7 @@ mod tests {
     fn rootfs_patcher_patches_init_rc_when_service_recovery_is_in_init_rc() {
         let dir = make_test_rootfs("service recovery /sbin/recovery\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert!(
             init_rc.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
@@ -10749,7 +11043,7 @@ mod tests {
         )
         .unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         // init.rc should be UNTOUCHED (no service recovery line, no patch).
         let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert!(
@@ -10786,7 +11080,7 @@ mod tests {
         )
         .unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         // init.rc should be UNTOUCHED.
         let init_rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert!(
@@ -10826,7 +11120,7 @@ mod tests {
         )
         .unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         let imported = std::fs::read_to_string(dir.join("init.recovery.qcom.rc")).unwrap();
         assert!(
             imported.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
@@ -10845,7 +11139,7 @@ mod tests {
     fn rootfs_patcher_falls_back_to_init_twoyi_rc_when_no_service_found() {
         let dir = make_test_rootfs("service ueventd /sbin/ueventd\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
 
         // init.twoyi.rc should be created with the expected content.
         let twoyi_rc_path = dir.join("init.twoyi.rc");
@@ -10887,9 +11181,9 @@ mod tests {
     fn rootfs_patcher_is_idempotent_when_service_in_init_rc() {
         let dir = make_test_rootfs("service recovery /sbin/recovery\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         let init_rc_after_first = std::fs::read_to_string(dir.join("init.rc")).unwrap();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         let init_rc_after_second = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert_eq!(
             init_rc_after_first, init_rc_after_second,
@@ -10912,9 +11206,9 @@ mod tests {
     fn rootfs_patcher_fallback_is_idempotent_for_import_line() {
         let dir = make_test_rootfs("service ueventd /sbin/ueventd\n");
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         let init_rc_after_first = std::fs::read_to_string(dir.join("init.rc")).unwrap();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         let init_rc_after_second = std::fs::read_to_string(dir.join("init.rc")).unwrap();
         assert_eq!(
             init_rc_after_first, init_rc_after_second,
@@ -10940,13 +11234,149 @@ mod tests {
         let dir = make_test_rootfs("import extra.rc\nservice ueventd /sbin/ueventd\n");
         std::fs::write(dir.join("extra.rc"), "service recovery /sbin/recovery\n").unwrap();
         let rootfs = dir.to_string_lossy().into_owned();
-        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600);
+        patch_twrp_init_rc_recovery_service_in_rootfs(&rootfs, 720, 1600, None);
         let extra = std::fs::read_to_string(dir.join("extra.rc")).unwrap();
         assert!(
             extra.contains("    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so"),
             "relative-imported extra.rc should be patched. Got:\n{}",
             extra
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── 6-Z220: AOSP-layout service patch + stdio_to_kmsg gating ────────
+
+    #[test]
+    fn binary_contains_string_finds_and_rejects() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z220-bcs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("init");
+        // spanning-boundary content: 'o' at end of one chunk, "stdio_to_kmsg"
+        // split across the 64 KiB boundary is exercised via the overlap tail.
+        let mut big = vec![b'x'; 64 * 1024];
+        big.extend_from_slice(b"junkstdio_to_kmsgtail");
+        std::fs::write(&p, &big).unwrap();
+        assert!(binary_contains_string(p.to_str().unwrap(), "stdio_to_kmsg"));
+        assert!(!binary_contains_string(
+            p.to_str().unwrap(),
+            "NOT_PRESENT_TOKEN"
+        ));
+        // missing file → false (no crash)
+        assert!(!binary_contains_string(
+            dir.join("absent").to_str().unwrap(),
+            "stdio_to_kmsg"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rootfs_patcher_aosp_chain_and_stdio_to_kmsg() {
+        let dir = make_test_rootfs(
+            "service recovery /system/bin/recovery\n    seclabel u:r:recovery:s0\n",
+        );
+        // Fake a modern init that understands stdio_to_kmsg.
+        std::fs::create_dir_all(dir.join("system/bin")).unwrap();
+        std::fs::write(
+            dir.join("system/bin/init"),
+            b"binary with stdio_to_kmsg option table",
+        )
+        .unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(
+            &rootfs,
+            720,
+            1600,
+            Some(AOSP_SERVICE_PRELOAD_CHAIN),
+        );
+        let rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert!(
+            rc.contains(&format!(
+                "    setenv LD_PRELOAD {}",
+                AOSP_SERVICE_PRELOAD_CHAIN
+            )),
+            "AOSP chain must be injected. Got:\n{}",
+            rc
+        );
+        assert!(
+            rc.contains("    stdio_to_kmsg"),
+            "stdio_to_kmsg must be emitted for a modern init"
+        );
+        assert!(
+            !rc.contains("setenv LD_LIBRARY_PATH /sbin"),
+            "32-bit LD_LIBRARY_PATH must NOT be set for the native chain"
+        );
+        // FB hook precedes shlib inside the injected chain (6-Z218a order).
+        let fb = rc.find("libtwrp_fb_hook.so").unwrap();
+        let shlib = rc.find("libtwoyi_loader_shlib.so").unwrap();
+        assert!(
+            fb < shlib,
+            "fb hook must precede shlib in the service chain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rootfs_patcher_stale_legacy_chain_is_replaced_not_duplicated() {
+        // A previous boot in TWRP mode left the /sbin chain; an AOSP-mode
+        // boot must REPLACE it (exactly one setenv LD_PRELOAD survives).
+        let dir = make_test_rootfs(
+            "service recovery /system/bin/recovery\n    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so\n",
+        );
+        // init WITHOUT the stdio_to_kmsg literal (old init) → option skipped.
+        std::fs::create_dir_all(dir.join("system/bin")).unwrap();
+        std::fs::write(dir.join("system/bin/init"), b"old init binary").unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(
+            &rootfs,
+            720,
+            1600,
+            Some(AOSP_SERVICE_PRELOAD_CHAIN),
+        );
+        let rc = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        let count = rc.matches("setenv LD_PRELOAD").count();
+        assert_eq!(
+            count, 1,
+            "exactly one LD_PRELOAD setenv must survive. Got:\n{}",
+            rc
+        );
+        assert!(rc.contains(&format!(
+            "    setenv LD_PRELOAD {}",
+            AOSP_SERVICE_PRELOAD_CHAIN
+        )));
+        assert!(
+            !rc.contains("/sbin/libtwrp_fb_hook.so"),
+            "stale legacy chain must be gone"
+        );
+        assert!(
+            !rc.contains("stdio_to_kmsg"),
+            "stdio_to_kmsg must be skipped for old init"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rootfs_patcher_aosp_idempotent_on_second_call() {
+        let dir = make_test_rootfs("service recovery /system/bin/recovery\n");
+        std::fs::create_dir_all(dir.join("system/bin")).unwrap();
+        std::fs::write(dir.join("system/bin/init"), b"stdio_to_kmsg here").unwrap();
+        let rootfs = dir.to_string_lossy().into_owned();
+        patch_twrp_init_rc_recovery_service_in_rootfs(
+            &rootfs,
+            720,
+            1600,
+            Some(AOSP_SERVICE_PRELOAD_CHAIN),
+        );
+        let once = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        patch_twrp_init_rc_recovery_service_in_rootfs(
+            &rootfs,
+            720,
+            1600,
+            Some(AOSP_SERVICE_PRELOAD_CHAIN),
+        );
+        let twice = std::fs::read_to_string(dir.join("init.rc")).unwrap();
+        assert_eq!(once, twice, "second AOSP-mode call must be a no-op");
+        assert_eq!(twice.matches("setenv LD_PRELOAD").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13116,6 +13546,98 @@ mod tests {
         // or libminuitwrp's open/ioctl PLT entries resolve to the
         // shlib and framebuffer virtualization never fires.
         assert_aosp_preload_order();
+    }
+
+    // ── 6-Z219: detect_guest_slot_suffix ────────────────────────────────
+
+    /// Writes `content` to `{root}/{sub}` creating parents as needed.
+    fn write_fstab(root: &std::path::Path, sub: &str, content: &str) {
+        let p = root.join(sub);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+
+    #[test]
+    fn detect_slot_suffix_recovery_fstab_slotselect() {
+        // lineage-22.2-sailfish layout: /etc/recovery.fstab (materialized
+        // from the etc→/system/etc symlink) with slotselect entries.
+        let dir = std::env::temp_dir().join(format!("twoyi-6z219-etc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_fstab(
+            &dir,
+            "etc/recovery.fstab",
+            "# comment\n/dev/block/by-name/system /system ext4 ro,barrier=1 wait,slotselect,verify,first_stage_mount\n/dev/block/by-name/userdata /data ext4 errors=panic wait\n",
+        );
+        assert_eq!(detect_guest_slot_suffix(dir.to_str().unwrap()), "_a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_slot_suffix_first_stage_ramdisk_fstab() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z219-fsr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_fstab(
+            &dir,
+            "first_stage_ramdisk/fstab.sailfish",
+            "/dev/block/by-name/vendor /vendor ext4 ro wait,slotselect,first_stage_mount\n",
+        );
+        assert_eq!(detect_guest_slot_suffix(dir.to_str().unwrap()), "_a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_slot_suffix_comment_or_aonly_is_empty() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z219-aonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only a COMMENT mentions slotselect — must NOT count.
+        write_fstab(
+            &dir,
+            "etc/recovery.fstab",
+            "# wait,slotselect,verify\n/dev/block/mmcblk0p1 /system ext4 ro wait,verify\n",
+        );
+        assert_eq!(detect_guest_slot_suffix(dir.to_str().unwrap()), "");
+        // A/B comment token must also not match as a bare substring of a
+        // longer flag (e.g. "slotselectfoo" is not slotselect).
+        write_fstab(
+            &dir,
+            "etc/recovery.fstab",
+            "/dev/x /mnt ext4 ro wait,slotselectfoo\n",
+        );
+        assert_eq!(detect_guest_slot_suffix(dir.to_str().unwrap()), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_slot_suffix_no_fstab_and_missing_rootfs() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z219-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(detect_guest_slot_suffix(dir.to_str().unwrap()), "");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Entirely missing rootfs must be safe (x86 ranchu pre-rootfs call).
+        assert_eq!(
+            detect_guest_slot_suffix(&format!("{}/does-not-exist-6z219", dir.to_str().unwrap())),
+            ""
+        );
+    }
+
+    #[test]
+    fn detect_slot_suffix_uses_default_slot_a_not_b() {
+        // The returned suffix must be the DEFAULT boot slot "_a" —
+        // other_suffix("_a") = "_b" is only for slot_select_other lookups.
+        let dir = std::env::temp_dir().join(format!("twoyi-6z219-odm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_fstab(
+            &dir,
+            "odm/etc/fstab.default",
+            "/dev/block/by-name/system /system ext4 ro wait,slotselect_other\n",
+        );
+        assert_eq!(detect_guest_slot_suffix(dir.to_str().unwrap()), "_a");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Fake ROM bionic: system/lib64/{libc,libdl,libm,libdl_android}.so
