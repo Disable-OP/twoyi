@@ -16998,3 +16998,457 @@ Stage Summary:
   exit_code=127). IDENTICAL TO r14, r15, r16, r17, r18. The
   6-Z211f post-fork DIAG change is NOT observable in the boot
   result — it neither helped nor hurt the boot outcome.
+
+---
+Task ID: 6-Z211g-mon1
+Agent: CI-monitoring subagent
+Task: Monitor TWO GitHub Actions UI E2E runs on commit 35b08a4
+(6-Z211g: reset in_syscall=false after PTRACE_EVENT_CLONE/FORK
+handler):
+1. OrangeFox R12.0 lavender round-20 — UI E2E Test ARM64 (the
+   in_syscall reset fix should allow mount() ENTRY to be correctly
+   classified, firing the pre-dispatch DIAG + 6-Z210
+   classification).
+2. Lineage 22.2 sailfish round-15 — UI E2E Test ARM64 (the
+   in_syscall reset fix + libdl.so unversioned path fix from
+   6-Z211b).
+
+Work Log:
+- Read worklog.md tail (last 450 lines) to load full r14–r19
+  context. Key state going in: round-19 (6-Z211f post-fork DIAG on
+  commit 5f0dd509) produced BYTE-FOR-BYTE IDENTICAL results to
+  r14–r18 — broad DIAG count 2000 (cap reached at line 635/
+  loop_count=2000), ZERO nr=40 (mount) syscall-stops captured,
+  ZERO pre-dispatch mount DIAG fires, ZERO 6-Z210 classification
+  block fires, SetupMountNamespaces/EBUSY/InitFatalReboot chain
+  STILL at lines 4703-4723, result BOOT_FAIL_EARLY_INIT exit 127.
+  CRITICAL discovery in r19: the 6-Z211f DIAG (which fires INSIDE
+  the PTRACE_EVENT_CLONE/FORK handler) confirmed the parent's
+  in_syscall flag is TRUE after the fork event — this is the
+  smoking gun for the in_syscall flag desync. Hypothesis (b)
+  from r17 is CONFIRMED: with in_syscall=true after the fork
+  event, the parent's NEXT syscall-stop (mount ENTRY) is mis-
+  classified as a syscall-EXIT, so the pre-dispatch DIAG (which
+  fires only on ENTRY) is skipped, and the 6-Z210 classification
+  block (which also fires only on ENTRY) is skipped.
+  Commit 35b08a4 was pushed to fix this: explicitly reset the
+  parent's in_syscall flag to false inside the post-fork handler
+  (right after the fork event is processed), with a new
+  "6-Z211g FIX" log line that fires when the reset is applied.
+- Fetched latest workflow runs on main:
+    33244372050  UI E2E Test  35b08a49  in_progress  2026-08-29T08:58:14Z
+    33244371301  UI E2E Test  35b08a49  in_progress  2026-08-29T08:58:13Z
+    33244360135  kr64 lint + test  35b08a49  completed
+    33243421624  UI E2E Test  5f0dd509  completed (r19)
+  Confirmed BOTH runs are on commit 35b08a49 (6-Z211g fix commit).
+  Run numbers: 184 and 185 (different from the r18/r19 single-run
+  dispatches — this is a PARALLEL dispatch of two recovery targets
+  on the same commit, the first such parallel dispatch in the
+  r14-r20 series).
+- Identified which run is which device by fetching each UI E2E
+  job's logs after both runs completed (job logs API returns an
+  Azure BlobNotFound error while the job is in_progress — only
+  available after completion). The first step "Download arm64
+  recovery image" prints RECOVERY_NAME and RECOVERY_URL via
+  env-vars-from-inputs echo:
+    Run 33244371301 (run_number 184): RECOVERY_NAME:
+      orangefox-R12.0-lavender
+      RECOVERY_URL: https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl
+      → OrangeFox R12.0 lavender round-20
+    Run 33244372050 (run_number 185): RECOVERY_NAME:
+      lineage-22.2-sailfish
+      RECOVERY_URL: https://mirrorbits.lineageos.org/full/sailfish/20260823/boot.img
+      → Lineage 22.2 sailfish round-15
+- Polled both runs every ~60-90s. Status timeline (parallel):
+    08:58:13/14  both in_progress (Build APK phase on x86_64 runner)
+    09:00:25     run 33244371301 Build APK done; UI E2E started
+    09:01:36     run 33244372050 Build APK done; UI E2E started
+    09:14:31     BOTH runs COMPLETED success
+  Total wall time: ~16 minutes for both. Well under the 25-minute
+  budget. The parallel dispatch worked correctly (the workflow's
+  concurrency group is keyed on github.event.inputs.recovery_name,
+  so the two different recoveries did NOT cancel each other).
+- Downloaded the `ui-e2e-arm64-logs` artifact for each run:
+    OrangeFox r20: artifact ID 9712538304, 20,776,194 bytes (~20.8MB)
+    Lineage  r15: artifact ID 9712538427, 14,650,830 bytes (~14.6MB)
+  Unzipped the outer zip → extracted ui-e2e-logs.tar.xz → tar
+  extracted to /tmp/ui-e2e-artifacts/ — moved up to:
+    /home/z/my-project/artifacts/ofox-r20/ui-e2e-artifacts/
+    /home/z/my-project/artifacts/lineage-r15/ui-e2e-artifacts/
+- Inspected OrangeFox r20 kr64-app-stderr-dockerexec.log (4800
+  lines, ~600 KB):
+  *** CRITICAL: the 6-Z211g FIX log fires EXACTLY TWICE — once
+  after PTRACE_EVENT_CLONE (line 4704, loop_count=14167) and once
+  after PTRACE_EVENT_FORK (line 4728, loop_count=14236). The FIX
+  message is IDENTICAL in both cases:
+    "6-Z211g FIX: post-PTRACE_EVENT_CLONE handler — reset
+    in_syscall=false for parent pid=2566 current_pid=2566 (was
+    true — the desync caused mount() ENTRY to be mis-classified
+    as EXIT, skipping the 6-Z210 classification) tracked_pids=
+    [2566, 2665]"
+    "6-Z211g FIX: post-PTRACE_EVENT_FORK handler — reset
+    in_syscall=false for parent pid=2566 current_pid=2566 (was
+    true — ...) tracked_pids=[2566, 2665, 2666]"
+  This CONFIRMS the fix is ACTIVE in the deployed binary on
+  commit 35b08a4. The "(was true ...)" parenthetical confirms
+  the in_syscall flag WAS true at the moment the FIX ran — i.e.
+  the r19 root-cause DIAG was correct.
+  *** HOWEVER: the broad DIAG still shows ZERO nr=40 (mount)
+  syscall-stops, the pre-dispatch DIAG still fires ZERO times,
+  and the 6-Z210 classification block STILL fires ZERO times.
+  The SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL
+  appears at lines 4718-4736. RESULT IS BYTE-FOR-BYTE IDENTICAL
+  TO r14-r19. ***
+  Detailed counts for OrangeFox r20:
+    Total log lines: 4800
+    6-Z211g FIX count: 2 (lines 4704 + 4728)
+    Broad DIAG count: 2000 (cap reached at line 2681,
+                          loop_count=2000 — SAME as r14-r19)
+    Broad DIAG nr=40 (mount) count: 0  ← IDENTICAL to r14-r19
+    Pre-dispatch mount DIAG count: 0  ← IDENTICAL to r14-r19
+    6-Z210 classification block count: 0  ← IDENTICAL to r14-r19
+    Total nr=40 occurrences in entire log: 0  ← IDENTICAL
+    Failed to remount /apex count: 1 (line 4718)
+    SetupMountNamespaces failed count: 3 (lines 4719, 4721, 4722)
+    InitFatalReboot count: 1 (line 4736)
+    SIGSEGV count: 0 (no SIGSEGVs — different from Lineage r15)
+  *** SEQUENCE around the mount failure (lines 4700-4732) ***
+    line 4699: DIAG fork-family ENTRY: nr=220 (pid=2566),
+               loop_count=14167, in_syscall_was=true (parent
+               clone ENTRY)
+    line 4700: Task-6-S ENTRY: pid=2566 clone nr=220
+    line 4701: SIGTRAP stop (no 0x80) on pid=2566:
+               status=0x0003057f, ptrace_event=3 (CLONE event)
+    line 4702: PTRACE_EVENT_CLONE: parent 2566 forked — new
+               child PID 2665
+    line 4703: 6-Z97: PTRACE_EVENT_CLONE — new child PID 2665
+               registered (2 tracked)
+    line 4704: 6-Z211g FIX: post-PTRACE_EVENT_CLONE handler —
+               reset in_syscall=false for parent pid=2566
+               current_pid=2566 (was true — ...)
+    line 4705: DIAG child switch: 2566 → 2665 — new child,
+               in_syscall=false (Task 6-Z54)  ← current_pid
+               becomes 2665, NOT 2566
+    line 4706: SIGSTOP on forked child 2665 — consuming
+               (auto-attach stop) and resuming with signal=0
+    line 4707: DIAG fork-family EXIT: nr=220 returned 2665
+               (parent's clone EXIT — processed in the same
+               waitpid iteration as the CLONE event)
+    line 4708: Task-6-S EXIT: pid=2566 clone nr=220 -> 2665
+    lines 4709-4717: child 2665 stops (bitness, prctl-sample
+               ×3, prctl-deep ×3, mmap2 ENTRY ×2) — NO
+               parent 2566 stops in this interval
+    line 4718: DIAG write(fd=67, ret=67): "<3>init: Failed
+               to remount /apex as 40000: Device or resource
+               busy" (parent 2566's write EXIT — the parent
+               DID execute mount("/apex",...) and got -EBUSY
+               in this interval, but NO mount() syscall-stop
+               was logged for the parent)
+    line 4719-4722: more SetupMountNamespaces failed writes
+               on parent 2566
+    line 4723: DIAG fork-family ENTRY: nr=220 (pid=2566),
+               loop_count=14236, in_syscall_was=true (parent
+               FORK ENTRY — the abort-initiated second fork)
+    line 4725: SIGTRAP stop (no 0x80) on pid=2566:
+               ptrace_event=1 (FORK event)
+    line 4728: 6-Z211g FIX: post-PTRACE_EVENT_FORK handler —
+               reset in_syscall=false for parent pid=2566
+    line 4736: DIAG write(fd=35, ret=35): "<3>init:
+               InitFatalReboot: signal 6" (parent 2566's
+               abort/InitFatalReboot write)
+  *** KEY OBSERVATION: Between line 4708 (parent clone EXIT
+  stop processed) and line 4718 (parent write EXIT stop with
+  the EBUSY message), there are NO syscall-stops logged for
+  parent 2566 — only child 2665's stops (prctl-sample, prctl-
+  deep, mmap2 ENTRY). Yet the parent MUST have executed
+  mount("/apex", ...) in that interval (the write at line
+  4718 reports the EBUSY from that mount call). So the
+  parent's mount() syscall-stop is STILL being SKIPPED in
+  the dispatch loop somewhere between the clone EXIT
+  processing (line 4708) and the next parent syscall-stop
+  (the write EXIT at line 4718). IDENTICAL failure mode to
+  r14/r15/r16/r17/r18/r19.
+  *** KEY DISCOVERY: After the 6-Z211g FIX resets in_syscall=
+  false on the parent (line 4704), the NEXT line (line 4705)
+  is "DIAG child switch: 2566 → 2665 — new child, in_syscall=
+  false (Task 6-Z54)". This is the child switch — current_pid
+  changes from 2566 (parent) to 2665 (new child). The dispatch
+  loop's loop-top then PTRACE_SYSCALL-resumes current_pid (=2665),
+  NOT the parent. The parent (pid 2566) is NOT PTRACE_SYSCALL-
+  resumed at the loop-top after the child switch. ***
+  So the 6-Z211g FIX correctly reset in_syscall=false on the
+  parent, but the parent is NEVER PTRACE_SYSCALL-resumed at
+  the loop-top after the child switch — the loop-top resumes
+  current_pid (the new child), and the parent's next syscall
+  boundary (mount ENTRY) is therefore NEVER delivered to the
+  tracer as a syscall-stop. The parent runs mount() "in the
+  background" (without ptrace syscall-stop interception)
+  because the tracer stopped issuing PTRACE_SYSCALL on it after
+  the child switch. The parent's mount() call therefore
+  executes natively against the host kernel, which returns
+  -EBUSY (because the parent's mount namespace already has
+  /apex mounted).
+  *** This explains why the broad DIAG shows ZERO nr=40 stops
+  even with the 6-Z211g FIX active: the parent's mount()
+  syscall-stops are NEVER DELIVERED to the tracer's waitpid
+  because the parent is not being PTRACE_SYSCALL-resumed.
+  The 6-Z211g FIX was a NECESSARY precondition (the in_syscall
+  flag WAS true after the fork event, which would mis-classify
+  the next syscall-stop as EXIT), but it is NOT SUFFICIENT —
+  there's a SEPARATE root cause: the parent is left in a
+  paused/CONT-resumed state after the child switch, and its
+  mount() syscall-stops are never delivered.
+  *** 6-Z98 syscall history buffer (last 50 ALL syscalls
+  before exit): on the final init child pid=2666 (line 4785),
+  the ring buffer shows: nr=135 [rt_sigprocmask], nr=172,
+  nr=178, nr=240, nr=94, nr=64, nr=167 [prctl], (×24 nr=226
+  mprotect), nr=215 unmap], (×2 nr=226 mprotect), nr=98
+  [futex], (×3 nr=64 write), nr=198 [socket], nr=203, nr=57
+  [close], nr=66, nr=135 [rt_sigprocmask], nr=172, nr=178,
+  nr=240, nr=134 [rt_sigaction], nr=135 [rt_sigprocmask],
+  nr=172, nr=178, nr=240, nr=94. ZERO nr=40 (mount) anywhere
+  in the syscall history. So the tracer NEVER sees mount() as
+  a syscall-stop that it classifies as an ENTRY — IDENTICAL
+  to r14/r15/r16/r17/r18/r19.
+- result-pretty.json (OrangeFox r20): BOOT_FAIL_EARLY_INIT
+  (overall=BOOT_FAIL_EARLY_INIT, boot=BOOT_FAIL, failure=
+  init_fatal_reboot, exit_code=127, backstop_denied=2,
+  recovery_instances=0, ui=NOT_REACHED, vfs=CLEAN,
+  terminal=NOT_APPLICABLE). IDENTICAL TO r14, r15, r16, r17,
+  r18, r19. The 6-Z211g FIX is NOT observable in the boot
+  result — it neither helped nor hurt the boot outcome (the
+  boot was already failing the same way before, and continues
+  to fail the same way after).
+- container-state.txt (OrangeFox r20): status=running exit=0
+  oom=false (same as r14-r19).
+- Inspected Lineage r15 kr64-app-stderr-dockerexec.log (3244
+  lines, ~409 KB — MUCH SMALLER than OrangeFox r20's 4800
+  lines because the Lineage run SIGSEGVs very early):
+  *** CRITICAL: the libdl.so fix from 6-Z211b WORKED ***
+    Line 83: "[KR64 INFO] [KR64][apex_extract] found real
+    libdl.so (136608 bytes) at /apex/com.android.runtime/
+    lib64/bionic/libdl.so (unversioned alternative path)"
+  This is EXACTLY what 6-Z211b was supposed to do — extract
+  the real libdl.so via the unversioned alternative path
+  (when the versioned /apex/com.android.runtime/lib64/libdl.so
+  path failed). The fix is ACTIVE in the deployed binary.
+  *** HOWEVER: the guest STILL SIGSEGVs. ***
+  Total SIGSEGV count: 12 occurrences in the log (8 unique
+  SIGSEGV events per result-pretty.json markers.sigsegv_count).
+  The FIRST SIGSEGV is at line 3011:
+    "forwarding signal 11 to child"
+    "SIGSEGV details: tid=2577 si_code=1 (1=MAPERR unmapped,
+      2=ACCERR permission), si_addr=0x0, pc=0xfac65189cb20,
+      sp=0xffffc76cbae0"
+    "SIGSEGV thread comm: \"twoyi_init\""
+    "SIGSEGV process threads: 1 alive (2577)"
+  The crash is a NULL pointer dereference (si_addr=0x0,
+  si_code=1=MAPERR) in the twoyi_init process (PID 2577).
+  The crash PC=0xfac65189cb20 falls WITHIN the libc.so
+  executable mapping:
+    MAPS: fac65188d000-fac651914000 r-xp 00050000 00:34
+          5800952 /apex/com.android.runtime/lib64/bionic/libc.so
+  So the crash is INSIDE libc.so, executing libc code with a
+  NULL argument (x1=0x0 in the SIGSEGV regs). The return
+  address x30=0xfac6519068d4 is also inside libc.so — so
+  libc called another libc function and dereferenced NULL.
+  This is consistent with a pthread_mutex_lock(NULL) or
+  similar libc entry point that dereferences a NULL arg.
+  *** The SIGSEGV happens IMMEDIATELY AFTER the twoyi_loader
+  logs "runtime ready — guest can boot" (lines 3004-3005).
+  The next log line is mmap2 ENTRY at line 3010, then SIGSEGV
+  at line 3011. So the guest crashed within ~1 syscall of
+  the runtime being marked ready. ***
+  *** The guest NEVER reaches the SetupMountNamespaces mount
+  point — SetupMountNamespaces / Failed to remount /apex /
+  InitFatalReboot do NOT appear anywhere in the Lineage r15
+  log. The 6-Z211g FIX also does NOT fire (0 occurrences) —
+  the guest SIGSEGVs BEFORE the PTRACE_EVENT_CLONE/FORK
+  point that would trigger the fix. ***
+  *** Broad DIAG count: 2000 (cap reached — but capped at
+  ~loop_count=2000, far before the SIGSEGV at line 3011 which
+  corresponds to a much higher loop_count). The broad DIAG
+  cap is the same as OrangeFox r20 (cap=2000).
+  *** Broad DIAG nr=40 (mount) count: 0 — but this is
+  expected because the guest SIGSEGVs before reaching the
+  mount() call. Total nr=40 anywhere in log: 0.
+  *** Pre-dispatch mount DIAG count: 0 (same reason).
+  *** 6-Z210 classification block count: 0 (same reason).
+  *** 6-Z211g FIX count: 0 (never reaches the fork event).
+  *** Final exit: child 2577 killed by signal 11 after 3746
+  iterations. Init_pid 2577 killed by signal 11 and no traced
+  child is alive — genuine init death, ending the ptrace loop
+  (return -11). Child exit code: -11.
+  *** 6-Z98 syscall history at SIGSEGV (line 3233, last 5):
+  nr=226 protect], nr=135 [rt_sigprocmask], nr=222, nr=226
+  protect], nr=135 [rt_sigprocmask]. (Last 50 ALL syscalls at
+  line 3235: mostly nr=226 mprotect, with a few nr=135
+  rt_sigprocmask and one nr=222 mmap2 — no nr=40 mount, no
+  nr=64 write, no nr=98 futex — the guest is still in early
+  init mprotect/rt_sigprocmask syscalls when it crashes.)
+- result-pretty.json (Lineage r15): BOOT_FAIL (overall=
+  BOOT_FAIL, boot=BOOT_FAIL, markers.sigsegv_count=8,
+  backstop_denied=2, recovery_instances=0, ui=NOT_REACHED,
+  vfs=CLEAN, terminal=NOT_APPLICABLE, theme=N/A). NOTE: this
+  is a DIFFERENT verdict from OrangeFox r20 — Lineage r15 has
+  NO "failure: init_fatal_reboot" and NO "exit_code: 127"
+  markers (because the guest was killed by signal 11, not by
+  init_fatal_reboot exit 127). This is a NEW failure mode that
+  has not been seen in r14-r19 (those were all OrangeFox
+  rounds on TWRP-angler or OrangeFox-lavender, all ending
+  BOOT_FAIL_EARLY_INIT exit 127). The Lineage sailfish target
+  is being exercised here for the FIRST time at round-15.
+- container-state.txt (Lineage r15): status=running exit=0
+  oom=false (same as OrangeFox r20).
+
+Stage Summary:
+- *** THE 6-Z211g FIX IS ACTIVE BUT DID NOT FIX THE ORANGEFOX
+  BOOT FAILURE. ***
+  The 6-Z211g FIX log fires exactly twice (lines 4704 + 4728)
+  in OrangeFox r20 — once after PTRACE_EVENT_CLONE and once
+  after PTRACE_EVENT_FORK. The "(was true ...)" parenthetical
+  confirms the in_syscall flag WAS true at the moment the FIX
+  ran, so the r19 root-cause DIAG was correct. The fix
+  correctly resets in_syscall=false on the parent.
+  *** BUT the boot outcome is BYTE-FOR-BYTE IDENTICAL to
+  r14-r19: BOOT_FAIL_EARLY_INIT, exit_code=127, ZERO nr=40
+  (mount) syscall-stops in the broad DIAG, ZERO pre-dispatch
+  mount DIAG fires, ZERO 6-Z210 classification block fires,
+  SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL at
+  lines 4718-4736. ***
+- *** NEW ROOT CAUSE IDENTIFIED: After the 6-Z211g FIX resets
+  in_syscall=false on the parent (line 4704), the IMMEDIATELY
+  FOLLOWING line (line 4705) is "DIAG child switch: 2566 →
+  2665 — new child, in_syscall=false (Task 6-Z54)". This is
+  the child switch — current_pid changes from 2566 (parent)
+  to 2665 (new child). The dispatch loop's loop-top then
+  PTRACE_SYSCALL-resumes current_pid (=2665, the new child),
+  NOT the parent (2566). The parent is left in a paused or
+  PTRACE_CONT-resumed state — its next syscall boundary
+  (mount ENTRY) is NEVER delivered to the tracer's waitpid
+  as a syscall-stop, so the pre-dispatch DIAG never fires
+  and the 6-Z210 classification block never fires. ***
+- This is consistent with the r17 hypothesis (a) — "the
+  parent is resumed with PTRACE_CONT (instead of PTRACE_
+  SYSCALL) after the fork event" — but the r19 6-Z211f DIAG
+  RULED OUT hypothesis (a) by stating "the loop-top
+  PTRACE_SYSCALL will resume current_pid=2586 next iteration".
+  The r19 DIAG was technically correct: the loop-top DOES
+  PTRACE_SYSCALL-resume current_pid — but current_pid is
+  the CHILD (after the child switch), not the parent. The
+  parent (the original current_pid before the switch) is
+  no longer current_pid and is NOT PTRACE_SYSCALL-resumed
+  at the loop-top. So the parent runs mount() "in the
+  background" without ptrace syscall-stop interception,
+  getting -EBUSY from the host kernel.
+- *** THE LIBDL.SO FIX (6-Z211b) WORKED for Lineage r15 ***
+  Line 83: "found real libdl.so (136608 bytes) at /apex/com.
+  android.runtime/lib64/bionic/libdl.so (unversioned
+  alternative path)". The fix correctly falls back to the
+  unversioned path when the versioned path fails.
+- *** BUT the Lineage guest STILL SIGSEGVs ***
+  12 SIGSEGV occurrences (8 unique events). The FIRST
+  SIGSEGV is at line 3011, on tid=2577 (process name
+  "twoyi_init"), inside libc.so (pc=0xfac65189cb20 falls
+  within the libc.so executable mapping fac65188d000-
+  fac651914000). The crash is a NULL pointer dereference
+  (si_addr=0x0, si_code=1=MAPERR). The crash happens
+  IMMEDIATELY after the twoyi_loader logs "runtime ready —
+  guest can boot" (line 3004) — within ~1 syscall of the
+  runtime being marked ready. The guest NEVER reaches the
+  SetupMountNamespaces mount point. The 6-Z211g FIX never
+  fires (the guest SIGSEGVs before reaching the fork
+  event). Result: BOOT_FAIL, sigsegv_count=8, exit code -11
+  (killed by signal 11).
+- *** NEXT CONCRETE ACTION for the main orchestrator: ***
+  TWO PARALLEL ROOT CAUSES NEED INVESTIGATION:
+  (1) ORANGEFOX BLOCKER — PARENT NOT PTRACE_SYSCALL-RESUMED
+      AFTER CHILD SWITCH. The 6-Z211g FIX correctly reset
+      in_syscall=false on the parent, but immediately
+      afterwards, the child switch (Task 6-Z54 at line 4705)
+      changes current_pid from parent (2566) to new child
+      (2665). The dispatch loop's loop-top then PTRACE_
+      SYSCALL-resumes current_pid (=2665), NOT the parent
+      (2566). The parent is left in a paused or PTRACE_CONT-
+      resumed state — its next syscall boundary (mount
+      ENTRY) is NEVER delivered to the tracer. The fix is
+      to EXPLICITLY PTRACE_SYSCALL-resume BOTH the parent
+      AND the new child after the fork event, not just
+      current_pid. Concretely, in the dispatch loop's fork
+      handler (app/rs/kr64/src/ptrace_emu.rs — the file
+      modified by 6-Z211c/d/e/f/g), after registering the
+      new child and switching current_pid to the new child,
+      issue an EXPLICIT PTRACE_SYSCALL on the parent (pid
+      2566) BEFORE returning to the loop-top. This ensures
+      the parent's NEXT syscall boundary (mount ENTRY) is
+      delivered to waitpid as a syscall-stop, which the
+      6-Z211g-reset in_syscall=false then correctly
+      classifies as ENTRY, firing the pre-dispatch DIAG and
+      the 6-Z210 classification block.
+      Alternative implementation: change the dispatch loop
+      to NOT switch current_pid on PTRACE_EVENT_CLONE/FORK.
+      Instead, keep dispatching the parent (current_pid
+      stays at 2566), and let the new child's auto-attach
+      SIGSTOP be consumed lazily on the next waitpid(-1)
+      iteration that returns the child's stop. This is the
+      "round-robin all tracked pids" approach mentioned in
+      the r16 next-action #3.
+  (2) LINEAGE BLOCKER — SIGSEGV IN LIBC.SO IMMEDIATELY
+      AFTER RUNTIME READY. The libdl.so fix (6-Z211b)
+      correctly extracted the real libdl.so via the
+      unversioned alternative path (line 83 confirms). But
+      the guest twoyi_init process (PID 2577) SIGSEGVs at
+      pc=0xfac65189cb20 inside libc.so (NULL pointer
+      dereference, si_addr=0x0, si_code=1=MAPERR) within
+      ~1 syscall of the twoyi_loader logging "runtime
+      ready — guest can boot" (line 3004). The crash is a
+      libc function (likely pthread_mutex_lock or similar)
+      being called with a NULL argument. The fix is
+      NOT in the libdl.so extraction path (that already
+      works). The fix is somewhere in the runtime/
+      loader setup that's leaving a NULL pointer where
+      libc expects a non-NULL one. Concretely:
+      (a) Decode the crash PC: the libc.so executable
+          region is at fac65188d000-fac651914000 with
+          file offset 0x50000. The crash PC=0xfac65189cb20
+          → file offset 0x50000 + (0xfac65189cb20 -
+          0xfac65188d000) = 0x50000 + 0xfb20 = 0x5fb20.
+          Use addr2line or objdump -d on the Lineage 22.2
+          sailfish libc.so to find which function is at
+          file offset 0x5fb20. The function name will
+          tell us which libc API is being called with NULL.
+      (b) Look at x1=0x0 in the SIGSEGV regs — the second
+          argument to the crashing function is NULL. For
+          pthread_mutex_lock, x1 would be the mutex pointer.
+          So this is likely a NULL mutex being locked.
+      (c) Look at the Lineage-specific twoyi_init binary
+          (the Lineage recovery's init, NOT the twoyi
+          host runtime) — it's at /data/user/0/io.twoyi.
+          debug/cache/twoyi_init (mapped at c1c659487000-
+          c1c659717000 per the maps at lines 3021-3024).
+          The Lineage init binary calls into libc with a
+          NULL mutex pointer immediately after the runtime
+          is ready. Investigate why the mutex is NULL —
+          likely the runtime setup is leaving a pthread
+          mutex struct uninitialized, or the twoyi host
+          is intercepting a syscall that initializes the
+          mutex and the syscall is being mis-emulated.
+  (3) KEEP the 6-Z211g FIX (it's correct and necessary,
+      just not sufficient for OrangeFox). KEEP the libdl.so
+      unversioned path fix (it's correct and works). KEEP
+      the 6-Z211f post-fork DIAG and the 6-Z210 broad DIAG
+      and the pre-dispatch DIAG — they are working correctly.
+- *** SUMMARY: The 6-Z211g in_syscall reset is necessary but
+  not sufficient for OrangeFox — there's a SEPARATE root
+  cause (the parent is not PTRACE_SYSCALL-resumed after the
+  child switch). The libdl.so unversioned path fix works for
+  Lineage but the guest SIGSEGVs in libc.so immediately
+  after runtime ready. Both runs continue to fail. ***
+- result-pretty.json (OrangeFox r20): BOOT_FAIL_EARLY_INIT
+  (init_fatal_reboot, exit_code=127). IDENTICAL TO r14-r19.
+  The 6-Z211g FIX is NOT observable in the boot result.
+- result-pretty.json (Lineage r15): BOOT_FAIL (sigsegv_count=8,
+  exit code -11). NEW failure mode — Lineage sailfish target
+  is being exercised at round-15 for the first time. The
+  libdl.so fix worked but the guest SIGSEGVs in libc.so
+  before reaching the SetupMountNamespaces mount point.
