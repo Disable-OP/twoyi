@@ -19242,3 +19242,59 @@ Work Log:
 Stage Summary:
 - The OrangeFox crash class is "modern bionic open64 bypasses open/openat hooks" — an ENTIRE CLASS (any Android 11+ AOSP-layout recovery's native graphics path), fixed generically.
 - NEXT: commit 6-Z222, dispatch orangefox + lineage + guards re-verification. Then start the corpus waves (batch:0:60) for the 90% goal.
+
+---
+Task ID: 6-Z223
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Root-cause why lineage-22.2-sailfish STILL aborted with "Error updating for slotselect" on 83fddc3 (6-Z219 active), fix generically; prep verification round for both A/B recoveries (lineage + orangefox).
+
+Work Log:
+- 83fddc3 lineage verdict (run 33275526098, artifacts artifacts/ver83fd/run_33275526098):
+  HOST wrote the 6-Z219 suffix (kr64-app-stderr.log: "[KR64] PARENT: 6-Z219: guest fstab
+  uses slotselect → androidboot.slot_suffix=\"_a\"") yet guest kmsg STILL shows
+  "<3>recovery: [libfstab] Error updating for slotselect" ×3 (recovery ×2 + ueventd).
+  Key present in the served file but invisible to the guest parser.
+- ROOT CAUSE (mechanism-level; AOSP sources re-fetched and read — fs_mgr/libfstab/
+  boot_config.cpp + slotselect.cpp @ main): fs_mgr_get_boot_config → GetKernelCmdline →
+  ImportKernelCmdlineFromString splits /proc/cmdline on SPACE (plus '"' quote spans),
+  NEVER on NUL. The legacy pure-NUL cmdline ("item\0item\0…") is ONE space-piece: only
+  the first '=' pair (androidboot.hardware) discoverable; EVERY later key — including
+  6-Z219's androidboot.slot_suffix — invisible to Android 12+ libfstab. TWRP 2.8's old
+  init never noticed (Task 6-Y guards stayed green) because its importer consumes the
+  file with NUL/C-string semantics.
+- VALUE-NUL ANALYSIS (slotselect.cpp): other_suffix() compares `slot_suffix == "_a"`
+  with std::string equality AND fs_mgr_update_for_slotselect splices the suffix into
+  entry.logical_partition_name (super-partition metadata matching — std::string equality
+  for dynamic-partition devices). A trailing NUL on the slot_suffix VALUE would fail
+  both → the suffix piece must be NUL-FREE. Non-final items KEEP their NUL: every
+  modern consumer of those values is C-string-based (property storage, mount(2)/
+  open(2) paths, strtoull) and old parsers need the terminator.
+- FIX (6-Z223, generic §22): extracted the inline cmdline builder into
+  build_cmdline_items(hw, slot_suffix) + join_hybrid_cmdline(items). Format:
+  "item\0 item\0 … item" — space BETWEEN items, NUL after every item EXCEPT the last;
+  slot_suffix, when present, is the FINAL item (ordering invariant → NUL-free value).
+  OLD init: item 1 byte-identical to legacy (boot-critical androidboot.hardware; walk
+  stops at its NUL exactly as before; even a NUL-iterating reader stays well-formed on
+  a self-terminated buffer). MODERN libfstab: one piece per key; slot_suffix value
+  byte-identical to the "_a" literal. Stale Task-6-Y format comment at the pre-create
+  site updated to document BOTH parser families.
+- TESTS: 4 new regression tests (634 total, all green; fmt + clippy -D warnings clean):
+  item contents/gating (A/B vs A-only vs ranchu extras + last-position invariant),
+  old-init first-item byte-identity + self-terminated NUL-walk well-formedness,
+  exact libfstab space-split simulation (every key discoverable; keys NUL-free; values
+  clean-or-single-trailing-NUL; suffix piece byte-identical "_a"), legacy-vs-hybrid
+  piece-count diff guard.
+- RESIDUAL RISK documented: non-final NUL-carrying values are C-string-safe everywhere
+  traced; if a future failure class does std::string comparisons on OTHER cmdline
+  values (e.g. boot_devices), the same NUL-free-tail pattern applies (move to last).
+
+Stage Summary:
+- The lineage failure class is "cmdline format invisible to space-splitting libfstab":
+  6-Z219 was NECESSARY (value derivation) but NOT SUFFICIENT (delivery format). Both
+  now correct. User confirmation honored: the "Boot to recovery" unselected theory is
+  DEAD — the real mechanisms are code-level (6-Z222 open64 bypass for OrangeFox;
+  6-Z223 cmdline format for lineage), per-design boot_recovery=false noted in 6-Z220.
+- CI DISPATCH (2026-08-30, on 6-Z223 head): 5× ui-e2e-test-arm64 (workflow_dispatch):
+  lineage-22.2-sailfish (6-Z219+6-Z223 verify), orangefox-R12.0-lavender (6-Z222
+  verify), twrp-2.8.7.0-angler + twrp-3.7.0_9-0-angler + twrp-3.7.0_9-0-whyred (guards).
