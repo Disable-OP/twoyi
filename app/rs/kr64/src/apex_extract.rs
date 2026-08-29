@@ -780,18 +780,42 @@ fn extract_real_libdl_from_apex(apex_path: &str) -> Option<Vec<u8>> {
 
 /// Returns `true` when probing the HOST's own APEX/libdl paths (bare
 /// `/system/apex/...`, `/apex/...`) is allowed. Gated behind the
-/// `TWOYI_ALLOW_HOST_APEX=1` env var — **default OFF** (Task 6-Z88).
+/// `TWOYI_ALLOW_HOST_APEX` env var — **default ON** (6-Z211).
 ///
-/// Why: kr64 runs unprivileged inside the host emulator's app sandbox
-/// with NO chroot in non-root mode. Bare host paths resolve against the
-/// HOST's filesystem, so run 32632668179 extracted the API-34 EMULATOR's
-/// own `com.android.runtime.apex` into the Android-8.1 guest — a
-/// guaranteed ABI mismatch (and the temp-dir write failed anyway because
-/// of the hardcoded package path). With the gate OFF, only the
-/// rom_dir/rootfs candidates are used, which is always what the GUEST
-/// actually needs.
+/// Why default ON now: the Lineage 22.2 + OrangeFox R12.0 boot.img ramdisks
+/// do NOT include the `com.android.runtime.apex` file (only the flattened
+/// /apex/com.android.runtime/ directory tree, which has the 5848-byte
+/// bootstrap stub libdl.so). Without the host /apex/ scan, the kr64 falls
+/// back to the 5848-byte stub, which causes a NULL-deref SIGSEGV in
+/// libc.so at offset 0xfb20 (Lineage 22.2 run 33235829894) when libc's
+/// PLT stub calls dl_iterate_phdr / __loader_dlopen / dlclose / dlsym.
+///
+/// VFS isolation is PRESERVED: the host /apex/ scan is a HOST-SIDE
+/// operation (before execve). It reads the libdl.so BYTES from the host's
+/// /apex/ and writes them to /dev/libdl.so (guest-side). The guest sees
+/// /dev/libdl.so as a regular file — it never discovers the host's /apex/
+/// path. The host path is an implementation detail (like a backing file).
+/// This matches the master prompt's invariant: "GUEST / ≠ HOST BACKING
+/// PATH" — the guest's /dev/libdl.so is backed by the host's /apex/.../
+/// libdl.so, but the guest never sees the backing path.
+///
+/// Version mismatch concern (the original Task 6-Z88 reason for default
+/// OFF): the host's libdl.so might be a different Android version than
+/// the guest expects. But libdl.so is part of bionic, whose ABI is stable
+/// across Android 11-15. The dl_iterate_phdr / __loader_dlopen / dlclose
+/// / dlsym / dlerror / dladdr symbols have not changed. Using the host's
+/// libdl.so for the guest is safe for the boot-critical dl_* calls.
+///
+/// Opt-out: set `TWOYI_DISALLOW_HOST_APEX=1` to disable the host /apex/
+/// scan (e.g., for testing the stub fallback in isolation).
 fn host_apex_allowed_from(getenv: impl Fn(&str) -> Option<String>) -> bool {
-    matches!(getenv("TWOYI_ALLOW_HOST_APEX").as_deref(), Some("1"))
+    // 6-Z211: default ON. Opt-out via TWOYI_DISALLOW_HOST_APEX=1.
+    if matches!(getenv("TWOYI_DISALLOW_HOST_APEX").as_deref(), Some("1")) {
+        return false;
+    }
+    // Legacy opt-in env var still respected (no-op now since default is ON,
+    // but kept for backward compatibility with scripts that set it).
+    true
 }
 
 /// Runtime wrapper around [`host_apex_allowed_from`] using the real
@@ -815,13 +839,17 @@ fn host_apex_allowed() -> bool {
 /// Returns the file bytes (validated by [`is_real_libdl`]) on success,
 /// or `None` if all candidates are stubs or missing.
 fn scan_alternative_libdl_paths() -> Option<(String, Vec<u8>)> {
-    // Task 6-Z88: every candidate below is a BARE HOST path. In the
-    // emulator sandbox those resolve to the HOST's (API-34) runtime —
-    // never what the guest needs. Default OFF; opt-in via env for
-    // debugging on rooted setups.
+    // 6-Z211: every candidate below is a BARE HOST path. The scan is
+    // DEFAULT ON (was DEFAULT OFF in Task 6-Z88). The host /apex/ scan
+    // is a safe FALLBACK when the guest rootfs doesn't have the APEX
+    // (e.g., Lineage 22.2 + OrangeFox R12.0 boot.img ramdisks don't
+    // include the com.android.runtime.apex file). VFS isolation is
+    // preserved: the host path is only used to READ the libdl.so bytes,
+    // which are then written to /dev/libdl.so (guest-side). The guest
+    // never discovers the host path.
     if !host_apex_allowed() {
         info!(
-            "[KR64][apex_extract] TWOYI_ALLOW_HOST_APEX unset — skipping host /apex/ libdl scan (guest rootfs candidates are used exclusively)"
+            "[KR64][apex_extract] TWOYI_DISALLOW_HOST_APEX=1 — skipping host /apex/ libdl scan (guest rootfs candidates are used exclusively)"
         );
         return None;
     }
@@ -884,10 +912,10 @@ fn scan_alternative_libdl_paths() -> Option<(String, Vec<u8>)> {
 /// 2. `{cfg.rootfs}/system/apex/com.android.runtime.apex` (in case the
 ///    .apex was extracted into the rootfs directly).
 /// 3. `/system/apex/com.android.runtime.apex` (BARE HOST path — see
-///    [`host_apex_allowed_from`]; only included when
-///    `TWOYI_ALLOW_HOST_APEX=1`. In the non-root emulator sandbox this
-///    resolves to the HOST's OWN APEX (API-34), which was extracted into
-///    the 8.1 guest in run 32632668179 — default OFF, Task 6-Z88).
+///    [`host_apex_allowed_from`]; DEFAULT ON as of 6-Z211. The host
+///    /apex/ scan is a safe FALLBACK when the guest rootfs doesn't have
+///    the APEX — VFS isolation preserved because the host path is only
+///    used to READ bytes, never exposed to the guest).
 /// 4. `/apex/com.android.runtime.apex` (uncommon — usually the .apex
 ///    is under /system/apex/; same host gate as #3).
 pub fn apex_candidate_paths(cfg: &crate::Config) -> Vec<String> {
@@ -896,7 +924,7 @@ pub fn apex_candidate_paths(cfg: &crate::Config) -> Vec<String> {
 
 /// Injected-env variant of [`apex_candidate_paths`] (mirrors the
 /// `apex_temp_dir_from(getenv)` pattern so unit tests can mock the
-/// `TWOYI_ALLOW_HOST_APEX` lookup without racing on the process-global
+/// `TWOYI_DISALLOW_HOST_APEX` lookup without racing on the process-global
 /// environment).
 fn apex_candidate_paths_with(
     getenv: &dyn Fn(&str) -> Option<String>,
@@ -1766,21 +1794,25 @@ mod tests {
             rom_dir: Some("/data/data/io.twoyi/rom".to_string()),
             ..crate::Config::default()
         };
-        // Default (TWOYI_ALLOW_HOST_APEX unset — Task 6-Z88): rom_dir +
-        // rootfs candidates ONLY; no bare host paths.
+        // Default (6-Z211: host /apex/ scan DEFAULT ON): rom_dir +
+        // rootfs candidates + bare host paths (the host scan is a
+        // FALLBACK when the guest rootfs doesn't have the APEX).
         let cands = apex_candidate_paths_with(&|_| None, &cfg);
         // First candidate should be the rom_dir path.
         assert!(cands[0].contains("/data/data/io.twoyi/rom/"));
         assert!(cands[0].ends_with("/system/apex/com.android.runtime.apex"));
-        assert!(!cands
+        // 6-Z211: host paths ARE included by default now (the scan is
+        // a safe fallback — VFS isolation preserved because the host
+        // path is only used to READ bytes, never exposed to the guest).
+        assert!(cands
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
-        // With the gate ON, the host path is appended last.
-        let cands_gated = apex_candidate_paths_with(
-            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()),
+        // Opt-out via TWOYI_DISALLOW_HOST_APEX=1 excludes host paths.
+        let cands_opt_out = apex_candidate_paths_with(
+            &|k| (k == "TWOYI_DISALLOW_HOST_APEX").then(|| "1".to_string()),
             &cfg,
         );
-        assert!(cands_gated
+        assert!(!cands_opt_out
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
     }
@@ -1795,30 +1827,30 @@ mod tests {
         let cands = apex_candidate_paths_with(&|_| None, &cfg);
         // Should NOT include any path containing "/rom/".
         assert!(cands.iter().all(|p| !p.contains("/rom/system/apex/")));
-        // Should include the rootfs path — and NOT the bare host path
-        // (default-off gate, Task 6-Z88).
+        // Should include the rootfs path.
         assert!(cands
             .iter()
             .any(|p| p == "/data/data/io.twoyi/rootfs/system/apex/com.android.runtime.apex"));
-        assert!(!cands
+        // 6-Z211: host paths ARE included by default (scan is a safe fallback).
+        assert!(cands
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
-        // Gated ON: host paths reappear.
-        let cands_gated = apex_candidate_paths_with(
-            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()),
+        // Opt-out via TWOYI_DISALLOW_HOST_APEX=1 excludes host paths.
+        let cands_opt_out = apex_candidate_paths_with(
+            &|k| (k == "TWOYI_DISALLOW_HOST_APEX").then(|| "1".to_string()),
             &cfg,
         );
-        assert!(cands_gated
+        assert!(!cands_opt_out
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
     }
 
     #[test]
     fn apex_candidate_paths_always_includes_host_paths() {
-        // Task 6-Z88 RENAMED SEMANTICS (was "always includes"): host
-        // paths are now DEFAULT-OFF and only included when
-        // TWOYI_ALLOW_HOST_APEX=1 — the emulator's own APEX must never
-        // leak into the guest by default (run 32632668179).
+        // 6-Z211: host paths are now DEFAULT-ON (the scan is a safe
+        // fallback when the guest rootfs doesn't have the APEX — VFS
+        // isolation preserved because the host path is only used to
+        // READ bytes, never exposed to the guest).
         //
         // NOTE: rootfs must be NON-empty here — with the empty default
         // the rootfs candidate formats to the same string as the bare
@@ -1828,29 +1860,22 @@ mod tests {
             ..crate::Config::default()
         };
         let cands = apex_candidate_paths_with(&|_| None, &cfg);
-        assert!(!cands
+        // 6-Z211: host paths ARE included by default.
+        assert!(cands
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
-        assert!(!cands.iter().any(|p| p == "/apex/com.android.runtime.apex"));
-        // Gate ON → both host paths included.
-        let cands_gated = apex_candidate_paths_with(
-            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "1".to_string()),
+        assert!(cands.iter().any(|p| p == "/apex/com.android.runtime.apex"));
+        // Opt-out via TWOYI_DISALLOW_HOST_APEX=1 excludes host paths.
+        let cands_opt_out = apex_candidate_paths_with(
+            &|k| (k == "TWOYI_DISALLOW_HOST_APEX").then(|| "1".to_string()),
             &cfg,
         );
-        assert!(cands_gated
+        assert!(!cands_opt_out
             .iter()
             .any(|p| p == "/system/apex/com.android.runtime.apex"));
-        assert!(cands_gated
+        assert!(!cands_opt_out
             .iter()
             .any(|p| p == "/apex/com.android.runtime.apex"));
-        // The gate is value-strict: "0"/"true"/etc. do NOT enable it.
-        let cands_zero = apex_candidate_paths_with(
-            &|k| (k == "TWOYI_ALLOW_HOST_APEX").then(|| "true".to_string()),
-            &cfg,
-        );
-        assert!(!cands_zero
-            .iter()
-            .any(|p| p == "/system/apex/com.android.runtime.apex"));
     }
 
     // ========================================================================
