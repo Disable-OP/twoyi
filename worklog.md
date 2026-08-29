@@ -19092,3 +19092,94 @@ Work Log:
 Stage Summary:
 - Terminal for TWRP-3.7 angler is FUNCTIONAL; classifier corrected. The REAL fix of this round is the getcwd host-path leak (a §6 invariant violation visible in the guest UI).
 - Awaiting f9ad745 CI round (6-Z215 guest-bionic-first + 6-Z216 FB hook): orangefox + lineage + 2 guards; whyred re-dispatch still in flight.
+
+---
+Task ID: 6-Z218
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-29
+Task: Analyze the f9ad745 verification round (4 E2E runs) and root-cause the two remaining boot blockers.
+
+Work Log:
+- f9ad745 round verdicts (runs on the 6-Z215+6-Z216 head):
+  * 33269278644 twrp-3.7.0_9-0-whyred: BOOT_OK UI_READY terminal OK (guard green; rename-loop pages).
+  * 33269275931 twrp-3.7.0_9-0-angler: BOOT_OK UI_READY terminal FAIL — classifier on this head
+    predates 6-Z217c; pages show filemanager rename loop, no terminalcommand page reached this
+    time (navigation variance). Re-check on de94ac3+.
+  * 33269272962 lineage-22.2-sailfish: BOOT_FAIL sigsegv_count=8 — 6-Z215 DID NOT fully fix.
+  * 33269270911 orangefox-R12.0-lavender: BOOT_OK but sigsegv_count=208 (=26 crashes) — 6-Z216 DID NOT fix.
+- LINEAGE ROOT CAUSE (crash maps, run 33269272962): guest init used the GUEST's own linker64
+  (08:01 rootfs — PT_INTERP patch works) and libc++/libbase/etc. resolved via /dev (6-Z215 farm
+  staged 69/69 ROM libs — the "host-absent only" log string is stale; count says all staged).
+  BUT libc.so + libdl.so came from HOST /system/lib64/bootstrap/libc.so|libdl.so (00:34) →
+  Android-14 host libc inside an Android-15 guest init → SIGSEGV si_addr=0 during early
+  property-area init (mprotect/rt_sigprocmask storm then crash).
+  MECHANISM: bionic's linker special-cases the libc.so lookup for init (bootstrap mode): it
+  resolves libc from the hard-coded /system/lib64/bootstrap/ path WITHOUT consulting
+  LD_LIBRARY_PATH — the /dev farm never gets a chance for libc specifically. The guest ramdisk
+  ships no system/lib64/bootstrap/ dir, so the lookup fell through the VFS to the HOST's
+  bootstrap libc (§23 host-fallback violation — a DIFFERENT ABI's libc is a "resource the
+  guest does have", not a resource the guest lacks).
+- ORANGEFOX ROOT CAUSE (crash maps + dynsym, run 33269270911): 26 crashes, two classes.
+  (a) keystore2 (guest's own, staged to /dev/twoyi-bin) crashed at
+  libbinder.so Parcel::readInt32 (file off 0x5146c), x0=0 — binder-proxy semantics, secondary;
+  (b) the recovery binary itself: theme engine opens twres/splash.xml (6-Z169 occurrence 20)
+  then SIGSEGV at libminuitwrp.so file offset 0x1d000+0x327c = 0x2027c = gr_fb_width() —
+  the SAME null-deref as the pre-6-Z216 round, even though libtwrp_fb_hook.so IS mapped in the
+  crashed process. ROOT CAUSE: bionic symbol resolution order is exe → LD_PRELOAD in order →
+  DT_NEEDED. 6-Z216 appended the FB hook AFTER libtwoyi_loader_shlib.so:
+  "/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so:/dev/libtwrp_fb_hook.so". loader_shlib
+  EXPORTS open/openat/__open_2/__openat_2/close/ioctl/mmap/stat/access/mkdir/mount/prctl/
+  mprotect — so libminuitwrp's open@plt/ioctl@plt resolved to LOADER_SHLIB, the FB hook's
+  interposition never fired, /dev/graphics/fb0 opens went untranslated, gr_init failed,
+  gr_fb_width deref'd NULL. (TWRP-mode boot sets ONLY the fb hook via init.rc setenv — no
+  shadowing — which is why TWRP boots kept working.)
+- FIX PLAN (6-Z218, generic, §22):
+  1. 6-Z218a: reorder the AOSP-layout LD_PRELOAD to
+     "/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so".
+     Safe: every fb_hook hook (open/openat/__open_2/__openat_2/close/ioctl/read/poll) chains
+     via dlsym(RTLD_NEXT) → loader_shlib for everything it does not special-case (fb0/input/
+     ashmem fds only), so loader path translation + property virtualization still run.
+  2. 6-Z218b: for native-guest mode, stage the ROM's own bionic into
+     {rootfs}/system/lib64/bootstrap/ (and {rootfs}/apex/com.android.runtime/lib64/bootstrap/)
+     via relative symlinks when the guest lacks them: the bootstrap libc lookup then finds
+     GUEST libc — exactly what real recovery ramdisks that ship bootstrap/ provide.
+- Artifacts: /home/z/my-project/artifacts/verf9ad/run_<id>/ (result.json + logs extracted).
+
+Stage Summary:
+- Two root causes identified with full evidence chains: (1) bionic bootstrap-libc lookup
+  bypasses LD_LIBRARY_PATH → host bootstrap libc leak → lineage init SIGSEGV;
+  (2) LD_PRELOAD symbol shadowing neutralizes the FB hook → OrangeFox gr_fb_width crash loop.
+- whyred guard green; twrp-3.7-angler terminal verdict needs a de94ac3+ re-run (classifier fix).
+- NEXT: implement 6-Z218a+b + unit tests, run local gates, commit, dispatch lineage+orangefox
+  verification + TWRP guards.
+
+---
+Task ID: 6-Z218 (implementation)
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-29
+Task: Implement the two fixes root-caused above and commit.
+
+Work Log:
+- 6-Z218a (app/rs/kr64/src/lib.rs): AOSP-layout LD_PRELOAD reordered to
+  "/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so".
+  Extracted to pub const AOSP_LD_PRELOAD_ENV + #[cfg(test)]
+  assert_aosp_preload_order() + unit test aosp_preload_order_fb_hook_before_shlib.
+- 6-Z218b (app/rs/kr64/src/lib.rs): new pub fn stage_guest_bootstrap_bionic()
+  — stages relative symlinks for the ROM's own libc.so/libdl.so/libm.so/
+  libdl_android.so (regular files only) into {rootfs}/system/lib64/bootstrap/
+  and {rootfs}/apex/com.android.runtime/lib64/bootstrap/ when the guest lacks
+  them; idempotent, never overwrites. Wired after the /dev farm staging
+  (same gate: !boot_recovery && !use_namespaces) with a summary INFO line
+  "6-Z218b: staged N bootstrap-bionic symlinks".
+- 4 new unit tests for the staging helper (all-trio-both-dirs incl. relative
+  target checks, missing-name skip, idempotency+never-overwrite,
+  symlinked-source skip). cargo fmt --check clean; cargo clippy --all-targets
+  -D warnings clean; cargo test → 621 passed / 0 failed (was 616).
+
+Stage Summary:
+- Both fixes are generic (§22): (a) keys on the LD_PRELOAD symbol-resolution
+  order, (b) keys on native-guest bionic presence — no device/recovery
+  identity involved.
+- NEXT: commit 6-Z218, dispatch CI: orangefox-R12.0-lavender +
+  lineage-22.2-sailfish (verification) + twrp-2.8.7.0-angler,
+  twrp-3.7.0_9-0-angler, twrp-3.7.0_9-0-whyred (regression guards).
