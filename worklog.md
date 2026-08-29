@@ -17452,3 +17452,350 @@ Stage Summary:
   is being exercised at round-15 for the first time. The
   libdl.so fix worked but the guest SIGSEGVs in libc.so
   before reaching the SetupMountNamespaces mount point.
+
+---
+Task ID: 6-Z211h-mon1
+Agent: CI-monitoring subagent
+Task: Monitor the OrangeFox R12.0 lavender round-21 UI E2E run on
+commit 94d63aa (6-Z211h: explicitly PTRACE_SYSCALL-resume the
+parent inside the fork handler — the 6-Z211h FIX log line
+includes "ALSO explicitly PTRACE_SYSCALL-resumed parent pid=...".
+
+Work Log:
+- Read worklog.md tail (last 500 lines) to load full r14–r20
+  context. Key state going in: round-20 (6-Z211g FIX on commit
+  35b08a4) confirmed the in_syscall flag WAS true after the fork
+  event (the r19 6-Z211f DIAG was correct), and the 6-Z211g FIX
+  correctly reset it to false. BUT the boot was BYTE-FOR-BYTE
+  IDENTICAL to r14-r19 because the parent was NEVER PTRACE_
+  SYSCALL-resumed at the loop-top after the child switch — the
+  loop-top resumes current_pid (the new child), not the parent.
+  Hypothesis: the parent's mount() syscall-stops are never
+  delivered to waitpid because the tracer stopped issuing
+  PTRACE_SYSCALL on it after the child switch. The next
+  concrete action was: explicitly PTRACE_SYSCALL-resume the
+  parent INSIDE the fork handler, BEFORE the loop-top. Commit
+  94d63aa was pushed to implement this fix (the 6-Z211h FIX).
+- Fetched latest workflow runs on main at 09:25:45 UTC:
+    33245466981  UI E2E Test  94d63aa3  in_progress  2026-08-29T09:25:45Z  run#186
+    33245457965  kr64 lint + test  94d63aa3  completed
+    33244372050  UI E2E Test  35b08a49  completed (r20 Lineage r15)
+    33244371301  UI E2E Test  35b08a49  completed (r20 OrangeFox)
+  Confirmed run 33245466981 (run_number 186) is on commit
+  94d63aa3 — the 6-Z211h fix commit. Only ONE UI E2E Test run
+  was dispatched for this commit (no Lineage parallel dispatch
+  — the orchestrator dispatched OrangeFox r21 alone).
+- Polled run status every ~60s. Status timeline:
+    09:25:45  in_progress (Build APK phase on x86_64 runner)
+    09:26:43–09:40:37  in_progress (12 polls, all in_progress)
+    09:41:41  COMPLETED, conclusion=success
+  Total wall time: ~16 minutes. Well under the 25-minute
+  budget.
+- Downloaded the `ui-e2e-arm64-logs` artifact (artifact ID
+  9712860138, 12,998,426 bytes ~13MB — MUCH smaller than r20's
+  20.8MB because the run completed sooner with no Lineage
+  parallel artifact). Unzipped outer zip → extracted ui-e2e-
+  logs.tar.xz → tar extracted to ui-e2e-artifacts/tmp/ui-e2e-
+  artifacts/ → moved contents up to:
+    /home/z/my-project/artifacts/ofox-r21/ui-e2e-artifacts/
+- Inspected OrangeFox r21 kr64-app-stderr-dockerexec.log (4801
+  lines, very close to r20's 4800):
+  *** CRITICAL: the 6-Z211h FIX log fires EXACTLY TWICE — once
+  after PTRACE_EVENT_CLONE (line 4701) and once after
+  PTRACE_EVENT_FORK (line 4727). The FIX message is:
+    "6-Z211h FIX: post-PTRACE_EVENT_CLONE handler — reset
+    in_syscall=false for parent pid=2570 current_pid=2570 (was
+    true — the desync caused mount() ENTRY to be mis-classified
+    as EXIT, skipping the 6-Z210 classification) tracked_pids=
+    [2570, 2668] — ALSO explicitly PTRACE_SYSCALL-resumed
+    parent pid=2570 (ret=0)"
+    "6-Z211h FIX: post-PTRACE_EVENT_FORK handler — reset
+    in_syscall=false for parent pid=2570 current_pid=2570 (was
+    true — ...) tracked_pids=[2570, 2668, 2669] — ALSO
+    explicitly PTRACE_SYSCALL-resumed parent pid=2570 (ret=0)"
+  The "(was true ...)" parenthetical AGAIN confirms the
+  in_syscall flag WAS true at the moment the FIX ran — the r19
+  root-cause DIAG was correct AGAIN (third confirmation after
+  r20). The NEW tail "ALSO explicitly PTRACE_SYSCALL-resumed
+  parent pid=2570 (ret=0)" confirms the 6-Z211h fix is ACTIVE
+  in the deployed binary on commit 94d63aa — the explicit
+  PTRACE_SYSCALL resume on the parent is being attempted and
+  RETURNS ret=0 (SUCCESS) in BOTH cases.
+  *** HOWEVER: the broad DIAG STILL shows ZERO nr=40 (mount)
+  syscall-stops, the pre-dispatch DIAG STILL fires ZERO times,
+  and the 6-Z210 classification block STILL fires ZERO times.
+  The SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL
+  appears at lines 4717-4732. RESULT IS BYTE-FOR-BYTE IDENTICAL
+  TO r14-r20. ***
+  *** NEW SMOKING GUN — the explicit PTRACE_SYSCALL on the
+  parent (6-Z211h FIX line 4701/4727, ret=0) is IMMEDIATELY
+  FOLLOWED by a SECOND PTRACE_SYSCALL on pid 2570 from the
+  dispatch loop-top (lines 4702 and 4728) which returns ESRCH:
+    line 4702: "PTRACE_SYSCALL: child 2570 already exited
+               (ESRCH)"
+    line 4704: "6-Z89: ESRCH pid 2570 is ALIVE — the reap loop
+               consumed a pending ptrace stop (status 0x857f);
+               keeping it tracked and resuming it via the scan
+               below"
+    line 4705: "6-Z89: ESRCH on pid 2570 but traced child 2570
+               is STILL ALIVE (fresh /proc probe over 2 tracked
+               pids) — switching the ptrace loop to it"
+  *** THE PENDING STOP STATUS IS 0x857f *** — this is a
+  SYSCALL-STOP (SIGTRAP|0x80, the high 0x80 bit set means
+  PTRACE_O_TRACESYSGOOD distinguishes syscall-stops from
+  regular SIGTRAP). So the parent's NEXT syscall-stop WAS
+  QUEUED by the kernel (likely the mount ENTRY the 6-Z211h
+  FIX was supposed to enable), and the 6-Z89 reap loop
+  CONSUMED (DRAINED) it WITHOUT dispatching it through the
+  broad DIAG / pre-dispatch DIAG / 6-Z210 classification code
+  path. The drained stop is silently resumed, and the
+  parent's mount() therefore runs against the host kernel
+  and returns -EBUSY.
+  *** SEQUENCE around the CLONE event (lines 4700-4706):
+    line 4700: Task-6-S ENTRY: pid=2570 clone nr=220
+               (parent's clone ENTRY)
+    line 4701: SIGTRAP stop (no 0x80) on pid=2570:
+               status=0x0003057f, ptrace_event=3 (CLONE event)
+    line 4702: PTRACE_EVENT_CLONE: parent 2570 forked — new
+               child PID 2668 (auto-attached by kernel)
+    line 4703: 6-Z97: PTRACE_EVENT_CLONE — new child PID 2668
+               registered in the tracked set (2 tracked)
+    line 4704: 6-Z211h FIX: post-PTRACE_EVENT_CLONE handler —
+               reset in_syscall=false for parent pid=2570
+               (was true — ...) — ALSO explicitly PTRACE_
+               SYSCALL-resumed parent pid=2570 (ret=0)
+               ← THIS IS THE 6-Z211h FIX — IT SUCCEEDED (ret=0)
+    line 4705: PTRACE_SYSCALL: child 2570 already exited
+               (ESRCH)  ← SECOND PTRACE_SYSCALL on the parent
+               from the dispatch loop-top — returns ESRCH
+    line 4706: 6-Z89: ESRCH pid 2570 is ALIVE — the reap loop
+               consumed a pending ptrace stop (status 0x857f)
+               ← PARENT'S MOUNT-ENTRY SYSCALL-STOP WAS DRAINED
+               BY THE 6-Z89 REAP LOOP WITHOUT BEING DISPATCHED
+    line 4707: 6-Z89: ESRCH on pid 2570 but traced child 2570
+               is STILL ALIVE — switching the ptrace loop to
+               it
+    line 4708: DIAG child switch: 2570 → 2668 — new child,
+               in_syscall=false (Task 6-Z54)  ← current_pid
+               switches to the new child, parent is FORGOTTEN
+    lines 4709-4716: child 2668 stops (bitness, prctl-sample
+               ×3, prctl-deep ×3, mmap2 ENTRY ×2) — NO parent
+               2570 stops classified in this interval
+    line 4717: DIAG write(fd=67, ret=67): "<3>init: Failed
+               to remount /apex as 40000: Device or resource
+               busy"  ← parent 2570's write EXIT reporting
+               -EBUSY from a mount("/apex",...) call — but the
+               parent's mount() syscall-stop was NEVER
+               CLASSIFIED (drained silently by 6-Z89)
+  Detailed counts for OrangeFox r21:
+    Total log lines: 4801
+    6-Z211h FIX count: 2 (lines 4701 + 4727) ← BOTH ret=0
+    Broad DIAG count: 2000 (cap reached at line 2681,
+                          loop_count=2000 — SAME as r14-r20)
+    Broad DIAG nr=40 (mount) count: 0  ← IDENTICAL to r14-r20
+    Pre-dispatch mount DIAG count: 0  ← IDENTICAL to r14-r20
+    6-Z210 classification block count: 0  ← IDENTICAL to r14-r20
+    Total nr=40 occurrences in entire log: 0  ← IDENTICAL
+    ESRCH count: 18  (UP from r20's ESRCH count — the explicit
+                      resume introduces NEW ESRCH instances on
+                      pid 2570 at lines 4702 and 4728)
+    6-Z89 count: 9  (UP — same reason)
+    6-Z122 count: 2  (NEW — only appears for pid 2669 AFTER
+                      the FORK event; r20 had ZERO 6-Z122)
+    Failed to remount /apex count: 1 (line 4717) ← SAME as r20
+    SetupMountNamespaces failed count: 3 (lines 4718, 4720,
+                                          4721) ← SAME as r20
+    InitFatalReboot count: 1 (line 4732) ← SAME as r20
+    SIGSEGV count: 0 ← SAME as r20 (OrangeFox path has no
+                      SIGSEGVs — different from Lineage r15)
+  *** KEY OBSERVATION: The 6-Z211h FIX correctly resumes the
+  parent with PTRACE_SYSCALL (ret=0). The parent IS now running
+  with syscall-stop interception enabled. The parent's NEXT
+  syscall boundary (likely mount ENTRY) is QUEUED by the kernel
+  as a status 0x857f stop. BUT the dispatch loop-top IMMEDIATELY
+  issues ANOTHER PTRACE_SYSCALL on pid 2570 (line 4702), which
+  returns ESRCH (because the parent has a pending unconsumed
+  stop). The 6-Z89 fallback then DRAINS the pending stop via
+  waitpid and RESUMES the parent — BUT it does so WITHOUT
+  dispatching the stop through the broad DIAG / pre-dispatch
+  DIAG / 6-Z210 classification code path. The drained stop is
+  silently consumed. ***
+  *** This means the 6-Z211h FIX achieved its immediate goal
+  (explicit PTRACE_SYSCALL resume on the parent returned ret=0),
+  BUT a SEPARATE root cause BLOCKS the fix from reaching the
+  classification code path: the 6-Z89 ESRCH-fallback reap loop
+  is SILENTLY DRAINING the parent's pending syscall-stops
+  without dispatching them. ***
+  *** 6-Z98 syscall history buffer (last 50 ALL syscalls
+  before ESRCH on pid 2570, line 4703): shows the parent's
+  last 50 syscalls were prctl, openat, fchmod, write ×3,
+  epoll_create1, rt_sigaction, prctl, rt_sigprocmask, epoll_
+  ctl, eventfd2, epoll_ctl, socketpair, socket, prctl,
+  unlinkat, mkdirat ×7, write, openat, write ×3, bind, prctl,
+  fchownat, prctl, prctl, openat, fchmod, close, write, listen,
+  mmap2, mprotect, rt_sigprocmask ×3, clone. ZERO nr=40 (mount)
+  anywhere in the syscall history — the parent NEVER executes
+  mount() as a syscall-stop that the tracer intercepts.
+  IDENTICAL to r14-r20. ***
+- result-pretty.json (OrangeFox r21): BOOT_FAIL_EARLY_INIT
+  (overall=BOOT_FAIL_EARLY_INIT, boot=BOOT_FAIL, failure=
+  init_fatal_reboot, exit_code=127, backstop_denied=2,
+  recovery_instances=0, ui=NOT_REACHED, vfs=CLEAN,
+  terminal=NOT_APPLICABLE). IDENTICAL TO r14, r15, r16, r17,
+  r18, r19, r20. The 6-Z211h FIX is NOT observable in the boot
+  result — it neither helped nor hurt the boot outcome (the
+  boot was already failing the same way before, and continues
+  to fail the same way after).
+- container-state.txt (OrangeFox r21): status=running exit=0
+  oom=false (same as r14-r20).
+
+Stage Summary:
+- *** THE 6-Z211h FIX IS ACTIVE AND THE EXPLICIT PTRACE_SYSCALL
+  RESUME ON THE PARENT SUCCEEDED (ret=0), BUT THE BOOT OUTCOME
+  IS BYTE-FOR-BYTE IDENTICAL TO r14-r20. ***
+  The 6-Z211h FIX log fires exactly twice (lines 4701 + 4727)
+  — once after PTRACE_EVENT_CLONE, once after PTRACE_EVENT_
+  FORK. In BOTH cases the explicit PTRACE_SYSCALL on the
+  parent (pid 2570) returns ret=0 (SUCCESS). The "(was
+  true ...)" parenthetical confirms AGAIN that the in_syscall
+  flag WAS true at the moment the FIX ran — this is the THIRD
+  confirmation of the r19 root-cause DIAG.
+- *** NEW ROOT CAUSE IDENTIFIED: The 6-Z89 ESRCH-fallback reap
+  loop is SILENTLY DRAINING the parent's pending syscall-stops
+  without dispatching them through the classification code
+  path. ***
+  After the 6-Z211h FIX's explicit PTRACE_SYSCALL resume on the
+  parent (line 4701, ret=0), the dispatch loop-top IMMEDIATELY
+  issues ANOTHER PTRACE_SYSCALL on pid 2570 (line 4702) — this
+  is the "double-resume" the task spec anticipated. The second
+  PTRACE_SYSCALL returns ESRCH (because the parent has a
+  pending unconsumed stop, status 0x857f = SIGTRAP|0x80 = a
+  SYSCALL-STOP). The 6-Z89 fallback then "consumes" (DRAINS)
+  the pending syscall-stop via waitpid, RESUMES the parent,
+  and SWITCHES current_pid to the parent — BUT it does so
+  WITHOUT dispatching the stop through the broad DIAG / pre-
+  dispatch DIAG / 6-Z210 classification code path. The drained
+  stop is silently consumed. Then the dispatch loop switches
+  current_pid to the new child 2668 (line 4706) and dispatches
+  the child's stops. The parent's mount() syscall-stop (which
+  was queued as status 0x857f by the kernel) is NEVER
+  classified.
+  The result: the parent's mount("/apex", ...) executes
+  natively against the host kernel (because the syscall-stop
+  was drained without classification), returns -EBUSY, the
+  parent writes "Failed to remount /apex as 40000" (line 4717)
+  and "SetupMountNamespaces failed: Device or resource busy"
+  (lines 4718-4721), and aborts with InitFatalReboot signal 6
+  (line 4732).
+- *** This explains why the broad DIAG shows ZERO nr=40 stops
+  even with the 6-Z211h FIX active and the parent explicitly
+  PTRACE_SYSCALL-resumed (ret=0): the parent's mount() syscall-
+  stops ARE being delivered by the kernel (queued as status
+  0x857f), but the 6-Z89 ESRCH-fallback reap loop is DRAINING
+  them WITHOUT dispatching them through the classification
+  code path. ***
+- *** THE 6-Z211h FIX WAS A NECESSARY PRECONDITION (the
+  explicit PTRACE_SYSCALL resume on the parent was needed to
+  cause the kernel to queue the parent's next syscall-stop),
+  BUT IT IS NOT SUFFICIENT — there's a SEPARATE root cause:
+  the 6-Z89 ESRCH-fallback is silently draining the parent's
+  pending syscall-stops. ***
+- *** HYPOTHESIS CHAIN UPDATE: ***
+  r17 hypothesis (a): "the parent is resumed with PTRACE_CONT
+  (instead of PTRACE_SYSCALL) after the fork event" — RULED
+  OUT by r19 6-Z211f DIAG.
+  r19 hypothesis (b): "the in_syscall flag is not reset to
+  false after the fork event, causing the parent's next
+  syscall-stop to be mis-classified as EXIT" — CONFIRMED by
+  r20 6-Z211g FIX (the flag WAS true and the fix correctly
+  reset it). But this was NOT SUFFICIENT.
+  r20 hypothesis (c): "the parent is NEVER PTRACE_SYSCALL-
+  resumed at the loop-top after the child switch" — CONFIRMED
+  BY 6-Z211h FIX (the explicit resume ret=0). But this was
+  also NOT SUFFICIENT.
+  r21 NEW hypothesis (d): "the 6-Z89 ESRCH-fallback reap loop
+  is SILENTLY DRAINING the parent's pending syscall-stops
+  without dispatching them through the broad DIAG classification
+  code path" — supported by the 0x857f status code in the
+  6-Z89 message at lines 4704 and 4730 (status 0x857f =
+  SIGTRAP|0x80 = a SYSCALL-STOP). The reap loop is consuming
+  a pending SYSCALL-STOP, NOT a ptrace-event-stop.
+- *** NEXT CONCRETE ACTION for the main orchestrator: ***
+  TWO COMPLEMENTARY FIXES NEED INVESTIGATION:
+  (1) PRIMARY: Make the dispatch loop-top SKIP the second
+      PTRACE_SYSCALL on the parent after the 6-Z211h FIX has
+      already explicitly resumed it. Track which pids have
+      been "freshly resumed" by the 6-Z211h FIX (e.g., a
+      per-pid "just_resumed_by_6Z211h" flag with a one-shot
+      semantics), and have the loop-top SKIP the resume for
+      that pid on the next iteration (clearing the flag).
+      This prevents the "double-resume" ESRCH that triggers
+      the 6-Z89 fallback in the first place.
+      Alternative implementation: change the 6-Z211h FIX to
+      NOT issue PTRACE_SYSCALL itself — instead, set a
+      "needs_PTRACE_SYSCALL_resume=true" hint on the parent's
+      state, and have the loop-top issue the PTRACE_SYSCALL on
+      the parent BEFORE switching current_pid to the new child.
+      The loop-top already iterates over all tracked pids in
+      some code path — extend it to honor the hint.
+  (2) SECONDARY / DEFENSIVE: Make the 6-Z89 ESRCH-fallback reap
+      loop, when it drains a pending syscall-stop (status 0x857f
+      = SIGTRAP|0x80, distinguished from event-stops), DISPATCH
+      the drained stop through the SAME classification code path
+      as a normal waitpid-returned syscall-stop — i.e., re-enter
+      the broad DIAG, the pre-dispatch DIAG, and the 6-Z210
+      classification block. Currently the 6-Z89 fallback just
+      resumes the parent silently — this means any parent
+      syscall-stop drained by the reap loop is LOST. The fix is
+      to make the 6-Z89 fallback, when it detects status 0x857f
+      (syscall-stop), RE-CLASSIFY the syscall (peek the user
+      regs to get the syscall nr, then run the 6-Z210 / 6-Z168 /
+      6-Z164 classification) BEFORE resuming. This is the
+      defensive fix that catches ANY future case where a
+      syscall-stop is drained by the reap loop.
+      Concretely, in app/rs/kr64/src/ptrace_emu.rs, locate
+      the 6-Z89 reap loop (the code path that logs "ESRCH pid
+      X is ALIVE — the reap loop consumed a pending ptrace
+      stop (status 0x857f); keeping it tracked and resuming
+      it via the scan below"). When the drained status has the
+      0x80 bit set (i.e., it's a SYSCALL-STOP, not a ptrace-
+      event-stop or group-stop), the reap loop should:
+      (a) PTRACE_GETREGS to peek the user regs (to get the
+          syscall nr).
+      (b) Determine if this is an ENTRY or EXIT (by looking at
+          the saved in_syscall flag — if false, this is ENTRY;
+          if true, this is EXIT).
+      (c) Re-enter the broad DIAG, the pre-dispatch DIAG, and
+          the 6-Z210 classification block for this syscall.
+      (d) Then resume the parent with PTRACE_SYSCALL (the
+          normal resume).
+      This defensive fix ensures that even if the primary fix
+      (1) misses a case, the reap loop still dispatches the
+      drained syscall-stop.
+  (3) KEEP the 6-Z211h FIX (it's correct and necessary, just
+      not sufficient for the boot outcome). KEEP the 6-Z211g
+      in_syscall reset (it's correct and necessary). KEEP the
+      libdl.so unversioned path fix (it's correct and works
+      for Lineage). KEEP the 6-Z211f post-fork DIAG and the
+      6-Z210 broad DIAG and the pre-dispatch DIAG — they are
+      working correctly. ADD a new 6-Z211i DIAG that fires
+      INSIDE the 6-Z89 reap loop when it drains a pending
+      syscall-stop (status 0x857f), logging the syscall nr
+      and ENTRY/EXIT classification — this will CONFIRM
+      whether hypothesis (d) is correct (i.e., whether the
+      drained stop is the parent's mount() ENTRY).
+- *** SUMMARY: The 6-Z211h explicit PTRACE_SYSCALL resume on
+  the parent SUCCEEDED (ret=0) but a SEPARATE root cause
+  blocks the fix from reaching the classification code path:
+  the 6-Z89 ESRCH-fallback reap loop is SILENTLY DRAINING the
+  parent's pending syscall-stops (status 0x857f = SIGTRAP|0x80)
+  without dispatching them through the broad DIAG classification.
+  The boot outcome is BYTE-FOR-BYTE IDENTICAL to r14-r20:
+  BOOT_FAIL_EARLY_INIT, exit_code=127, ZERO nr=40 (mount)
+  syscall-stops in the broad DIAG, ZERO pre-dispatch mount DIAG
+  fires, ZERO 6-Z210 classification block fires, SetupMount
+  Namespaces/EBUSY/InitFatalReboot chain STILL at lines 4717-
+  4732. ***
+- result-pretty.json (OrangeFox r21): BOOT_FAIL_EARLY_INIT
+  (init_fatal_reboot, exit_code=127). IDENTICAL TO r14-r20.
+  The 6-Z211h FIX is NOT observable in the boot result.

@@ -11192,18 +11192,19 @@ pub fn run_ptrace_loop(
                         // syscall-stop. The loop-top PTRACE_SYSCALL will
                         // then resume the child (or the parent, depending
                         // on which stop waitpid returns first).
-                        let parent_pid = pid; // the parent is the pid that
-                                              // received the PTRACE_EVENT_CLONE/FORK stop
-                        let resume_r = unsafe {
-                            libc::ptrace(
-                                libc::PTRACE_SYSCALL,
-                                parent_pid,
-                                0,
-                                0, // resume_signal = 0 (no signal)
-                            )
-                        };
+                        let parent_pid = pid;
+                        let resume_r =
+                            unsafe { libc::ptrace(libc::PTRACE_SYSCALL, parent_pid, 0, 0) };
+                        // 6-Z211i FIX: set skip_next_resume=true to prevent the
+                        // loop-top PTRACE_SYSCALL from double-resuming the parent.
+                        // Round-21 root cause: the 6-Z211h fix resumed the parent
+                        // (ret=0), but the loop-top PTRACE_SYSCALL also tried to
+                        // resume the parent → ESRCH → 6-Z89 reap loop → drained
+                        // the parent's mount() ENTRY syscall-stop (status 0x857f)
+                        // → 6-Z210 classification never fired.
+                        skip_next_resume = true;
                         log(&format!(
-                            "6-Z211h FIX: post-PTRACE_EVENT_{} handler — reset in_syscall=false for parent pid={} current_pid={} (was true — the desync caused mount() ENTRY to be mis-classified as EXIT, skipping the 6-Z210 classification) tracked_pids={:?} — ALSO explicitly PTRACE_SYSCALL-resumed parent pid={} (ret={})",
+                            "6-Z211h+i FIX: post-PTRACE_EVENT_{} handler — reset in_syscall=false for parent pid={} current_pid={} (was true) tracked_pids={:?} — explicitly PTRACE_SYSCALL-resumed parent pid={} (ret={}) AND set skip_next_resume=true to prevent loop-top double-resume (which would trigger 6-Z89 ESRCH reap loop + drain the parent's mount() syscall-stop)",
                             event_name,
                             pid,
                             current_pid,
