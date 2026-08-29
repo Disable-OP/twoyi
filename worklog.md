@@ -16604,3 +16604,206 @@ Stage Summary:
   NOT observable in the boot result — it neither helped nor hurt
   the boot outcome (the boot was already failing the same way
   before, and continues to fail the same way after).
+
+---
+Task ID: 6-Z211e-mon1
+Agent: CI-monitoring subagent
+Task: Monitor the OrangeFox R12.0 lavender round-18 UI E2E run on
+commit cb47f12 (resume DIAG: logs every PTRACE_SYSCALL resume +
+skip_next_resume event).
+
+Work Log:
+- Read worklog.md tail (last 350 lines) to load full r14–r17 context.
+  Key state going in: round-17 (__WALL fix in waitpid) produced
+  BYTE-FOR-BYTE IDENTICAL results to r16 — broad DIAG count 2000
+  (cap reached), ZERO nr=40 (mount) syscall-stops captured, ZERO
+  pre-dispatch mount DIAG fires, ZERO 6-Z210 classification block
+  fires, SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL at
+  line 4710–4731, result BOOT_FAIL_EARLY_INIT exit 127. __WALL did
+  not change anything observably. The 6-Z211e resume DIAG was
+  added on commit cb47f12 to log every PTRACE_SYSCALL resume +
+  every skip_next_resume event, so we can see which pids are
+  resumed around the fork event.
+- Fetched latest workflow runs on main:
+    33242560937  UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
+                  cb47f12f  in_progress  2026-08-29T08:11:19Z
+    33242551664  kr64 lint + test  cb47f12f  completed  2026-08-29T08:11:04Z
+    33241808209  UI E2E Test  08493aea  completed (r17)
+    33241799893  kr64 lint + test  08493aea  completed (r17)
+  Confirmed the OrangeFox round-18 run is run ID 33242560937 on
+  commit cb47f12f.
+- Polled every ~60–90s. Status timeline:
+    08:11:24  in_progress (build APK)
+    08:13:44  Build APK completed success; UI-only ARM64 E2E started
+    ~08:24   overall run COMPLETED success
+  Total wall time: ~13 minutes. Well under the 25-minute budget.
+- Downloaded the `ui-e2e-arm64-logs` artifact (artifact ID
+  9711963894, 21.19 MB), unzipped the outer zip, extracted the
+  inner ui-e2e-logs.tar.xz (the extraction nested one extra
+  tmp/tmp/ui-e2e-artifacts/ — reorganized by moving ui-e2e-artifacts/
+  to the expected path /home/z/my-project/artifacts/ofox-r18/).
+- Inspected kr64-app-stderr-dockerexec.log (4996 lines, 622 KB).
+  *** CRITICAL: the resume DIAG cap is 200, and it was reached
+  VERY EARLY — at line 635, loop_count=198. The fork event
+  happens at line 4896, loop_count=14149. So ZERO resume DIAGs
+  are emitted around the fork event. ***
+  Resume DIAG count: 200 (cap reached)
+  Skip_next_resume count: 2 (BOTH at the very END of the run, on
+    pid=2678, during ESRCH-on-running-pid handling — not related
+    to the mount failure event)
+  Broad DIAG count: 2000 (cap reached, line 2881 at loop_count=2000)
+  Broad DIAG nr=40 (mount) count: 0  ← IDENTICAL to r14/r15/r16/r17
+  Pre-dispatch mount DIAG count: 0  ← IDENTICAL
+  6-Z210 classification block count: 0  ← IDENTICAL
+  Total nr=40 occurrences in entire log: 0  ← IDENTICAL
+- Showed resume DIAG lines around the "Failed to remount /apex"
+  write (lines 4884–4924). ZERO resume DIAG lines in that range
+  (because the cap was hit at line 635). The lines in that range
+  are:
+    line 4896: "DIAG fork-family ENTRY: nr=220 (pid=2575),
+               loop_count=14149, in_syscall_was=true" (parent
+               clone ENTRY)
+    line 4899: "PTRACE_EVENT_CLONE: parent 2575 forked — new
+               child PID 2677"
+    line 4900: "6-Z97: PTRACE_EVENT_CLONE — new child PID 2677
+               registered (2 tracked)"
+    line 4901: "DIAG child switch: 2575 → 2677 — new child,
+               in_syscall=false"
+    line 4902: "SIGSTOP on forked child 2677 — consuming
+               (auto-attach stop) and resuming with signal=0"
+    line 4903: "DIAG fork-family EXIT: nr=220 returned 2677"
+    line 4904: "Task-6-S EXIT: pid=2575 clone nr=220 -> 2677"
+    lines 4905–4913: child 2677 stops (prctl-sample/deep, mmap2
+               ENTRY) — NO parent stops in this interval
+    line 4914: "DIAG write(fd=67, ret=67): '<3>init: Failed to
+               remount /apex as 40000: Device or resource busy'"
+               (parent 2575's write EXIT, after running mount())
+    lines 4915, 4917, 4918: more SetupMountNamespaces failed
+               writes on parent 2575
+    line 4919: "DIAG fork-family ENTRY: nr=220 (pid=2575),
+               loop_count=14218" — second fork (PTRACE_EVENT_FORK)
+    line 4922: "PTRACE_EVENT_FORK: parent 2575 forked — new
+               child PID 2678"
+    line 4931: "DIAG write(fd=35, ret=35): '<3>init:
+               InitFatalReboot: signal 6'"
+  *** KEY OBSERVATION: Between line 4903 (parent clone EXIT stop)
+  and line 4914 (parent write EXIT stop with the EBUSY message),
+  there are NO syscall-stops logged for parent 2575 — only child
+  2677's stops (prctl-sample, prctl-deep, mmap2 ENTRY). Yet the
+  parent MUST have executed mount("/apex", ...) in that interval
+  (the write at line 4914 reports the EBUSY from that mount call).
+  So the parent's mount() syscall-stop is being SKIPPED somewhere
+  in the dispatch loop after PTRACE_EVENT_CLONE — IDENTICAL to
+  the r17 hypothesis (a) the parent is resumed with PTRACE_CONT
+  instead of PTRACE_SYSCALL, or (b) in_syscall flag desync causes
+  the next stop to be classified as an EXIT (so pre-dispatch DIAG
+  is skipped). ***
+- The two skip_next_resume events are at:
+    line 4958: "skip_next_resume=TRUE for pid=2678 loop_count=14409
+                [skip #1/200]" (during 6-Z122 ESRCH handling —
+                pid 2678 is RUNNING not stopped, so the resume is
+                skipped)
+    line 4968: "skip_next_resume=TRUE for pid=2678 loop_count=14409
+                [skip #2/200]" (same, after re-anchoring init_pid
+                to 2678 and re-probing)
+  These are NOT the cause of the mount() miss — they happen AFTER
+  the mount failure (at line 4914) and only relate to the 6-Z89/6-Z122
+  ESRCH-on-running-pid logic at the end of the run.
+- 6-Z98 syscall history buffer (last 50 ALL syscalls before exit):
+  on both pid=2575 (parent) and pid=2678 (final init child), the
+  ring buffer shows: nr=135, nr=172, nr=178, nr=240, nr=94, nr=64,
+  nr=167 [prctl], (×19 nr=226 mprotect), nr=215 [munmap], (×2 nr=226
+  mprotect), nr=98 [futex], (×3 nr=64 write), nr=198 [socket],
+  nr=203, nr=57 [close], nr=66, (×2 nr=135 rt_sigprocmask),
+  (×2 sets of nr=172,178,240), nr=134 [rt_sigaction], nr=94 [exit_group].
+  ZERO nr=40 (mount) anywhere in the syscall history. So the
+  tracer NEVER sees mount() as a syscall-stop — IDENTICAL to
+  r14/r15/r16/r17.
+- result-pretty.json: BOOT_FAIL_EARLY_INIT (overall=BOOT_FAIL_EARLY_INIT,
+  boot=BOOT_FAIL, failure=init_fatal_reboot, exit_code=127,
+  backstop_denied=2, recovery_instances=0, ui=NOT_REACHED,
+  vfs=CLEAN, terminal=NOT_APPLICABLE).
+  IDENTICAL TO r14, r15, r16, r17. The 6-Z211e resume DIAG change
+  is NOT observable in the boot result — it neither helped nor
+  hurt the boot outcome.
+- container-state.txt: status=running exit=0 oom=false (same as
+  r14–r17).
+
+Stage Summary:
+- *** THE RESUME DIAG (6-Z211e) DID NOT CAPTURE USEFUL DATA
+  AROUND THE FORK EVENT. ***
+  The cap of 200 resumes was hit at line 635 (loop_count=198).
+  The fork event is at line 4896 (loop_count=14149) — ~14000
+  iterations AFTER the cap was reached. So ZERO resume DIAGs are
+  emitted around the fork event. The 2 skip_next_resume events
+  are at lines 4958 and 4968 (both on pid=2678 at loop_count=14409,
+  during ESRCH-on-running-pid handling at the very END of the run,
+  NOT around the mount failure).
+- *** ROOT CAUSE STILL UNRESOLVED ***
+  Same as r14–r17: parent 2575 executes mount("/apex", ...) and
+  gets -EBUSY (logged at line 4914 via the write DIAG), but the
+  tracer NEVER receives the mount() syscall-stop. The broad DIAG
+  (cap 2000) shows ZERO nr=40 syscall-stops. The pre-dispatch
+  mount DIAG fires ZERO times. The 6-Z210 classification block
+  fires ZERO times. Between line 4903 (parent's clone EXIT stop)
+  and line 4914 (parent's write EXIT stop with the EBUSY message),
+  there are ZERO parent syscall-stops logged — only child 2677's
+  stops. The parent's mount() syscall-stop is being SKIPPED in
+  the dispatch loop somewhere between the clone EXIT handling and
+  the next syscall-stop processing. IDENTICAL failure mode to
+  r14/r15/r16/r17.
+- *** NEXT CONCRETE ACTION for the main orchestrator: ***
+  Two parallel actions are needed:
+  (1) RAISE THE RESUME DIAG CAP. The current cap of 200 is far
+      too low — it's hit at loop_count=198, but the relevant fork
+      event is at loop_count=14149. To actually see what's
+      happening around the fork event, raise the cap to at least
+      14500 (or remove it entirely, or change it to log only
+      stops where pid switches / after fork-family events). Without
+      this, the resume DIAG gives NO useful info about the
+      critical dispatch window between clone EXIT and the next
+      parent syscall-stop.
+  (2) ADD A "POST-FORK RESUME" DIAG. Specifically, when handling
+      PTRACE_EVENT_CLONE/FORK on the parent (line 4899/4922),
+      log IMMEDIATELY:
+        * which PTRACE_* request is issued on the parent
+          (PTRACE_SYSCALL vs PTRACE_CONT vs PTRACE_DETACH).
+        * whether the in_syscall flag is reset on the parent
+          before the resume.
+        * whether a `skip_next_resume` flag is set on the parent.
+      This will directly answer the question: "Is the parent
+      resumed with PTRACE_SYSCALL after PTRACE_EVENT_CLONE?" If
+      NOT, that's the root cause — the parent should be resumed
+      with PTRACE_SYSCALL so its mount() syscall-stop is delivered
+      as a syscall-ENTRY (which the pre-dispatch DIAG fires on).
+  (3) Independently of the DIAG, the likely root cause per r17
+      analysis is in the dispatch path after PTRACE_EVENT_CLONE
+      on the parent: the parent's clone EXIT stop is consumed
+      (line 4903-4904), the tracer switches focus to the new
+      child and resumes the child, but the parent is left paused
+      OR is resumed with PTRACE_CONT (instead of PTRACE_SYSCALL)
+      so its next syscall-stop (mount) is delivered as a plain
+      SIGTRAP without the syscall-stop bit, OR the in_syscall
+      flag on the parent is left in the wrong state so the next
+      stop is mis-classified as a syscall-EXIT (skipping the
+      pre-dispatch DIAG). Read the fork-follow / dispatch logic
+      in app/rs/kr64/src/ptrace_emu.rs (the file modified by
+      6-Z211c/d/e) and check what happens to the parent between
+      PTRACE_EVENT_CLONE handling and the next iteration of the
+      dispatch loop. The fix is likely:
+        * After handling PTRACE_EVENT_CLONE on the parent, issue
+          PTRACE_SYSCALL (not PTRACE_CONT) on the parent.
+        * Reset the parent's in_syscall flag to false before
+          resuming it, so the next syscall-stop is treated as an
+          ENTRY (firing the pre-dispatch DIAG and the 6-Z210
+          classification).
+- DO NOT remove the 6-Z211e resume DIAG or the 6-Z210 broad DIAG
+  or the pre-dispatch DIAG — they are working correctly. The cap
+  of 200 on the resume DIAG is too low and needs to be raised;
+  the cap of 2000 on the broad DIAG is also too low (also hit
+  before the fork event). The actual blocker is in the dispatch
+  loop, not in the diagnostic.
+- result-pretty.json: BOOT_FAIL_EARLY_INIT (init_fatal_reboot,
+  exit_code=127). IDENTICAL TO r14, r15, r16, r17. The 6-Z211e
+  resume DIAG is NOT observable in the boot result — it neither
+  helped nor hurt the boot outcome.
