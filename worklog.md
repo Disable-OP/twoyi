@@ -16254,3 +16254,353 @@ NEXT CONCRETE ACTIONS for the main orchestrator:
    approach in #1, and would handle the case where multiple children
    are forked in rapid succession (as we see at lines 4705+4719,
    where two forks happen 40 loop_counts apart).
+
+---
+Task ID: 6-Z211d (fix) — use __WALL in waitpid to reap ptrace-traced threads
+Agent: main
+Task: Fix the H1b blocker (mount() syscall-stop not being delivered
+to the ptrace tracer). The broad DIAG (cap 2000) in round-16
+definitively confirmed that ZERO of 2000 captured syscall-stops is
+nr=40 (mount on aarch64). Yet the write DIAG proves the kernel
+executed mount() and returned -EBUSY.
+
+Work Log:
+- Read the round-16 CI monitor report (6-Z211c-mon1). Key findings:
+  * Broad DIAG count: 2000 (cap reached at line 2682, broad #2000,
+    syscall nr=215 nanosleep on pid=2594).
+  * nr=40 (mount) NEVER appears in the broad DIAG (0 of 2000).
+  * Pre-dispatch mount() DIAG fires ZERO times.
+  * 6-Z210 classification never fires.
+  * SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL present
+    (line 4714: "Failed to remount /apex as 40000").
+  * result-pretty.json: BOOT_FAIL_EARLY_INIT (identical to r15).
+- The mount() is called by 2594 (the parent) BEFORE the clone()
+  (line 4705). The write at line 4714 logs the mount failure. So
+  2594 called mount() before the clone. But the mount() syscall-stop
+  was NEVER delivered to the tracer.
+- Hypothesis: waitpid(-1, &status, 0) without __WALL only reaps fork
+  children. ptrace-traced THREADS (clone children with CLONE_THREAD)
+  may be missed. The parent thread (2594) calls mount() after resuming,
+  but its syscall-stop is never reaped by waitpid.
+- Implemented 6-Z211d fix: use __WALL (0x40000000) in the waitpid
+  flags to include ALL children (clone + fork). This ensures
+  ptrace-traced threads' stops are reaped.
+- Note: the kr64 stderr shows 2685 (the new thread) IS being traced
+  (we see its prctl, mmap2, write stops). So __WALL may not be the
+  root cause. But it's a safe fix — __WALL is the recommended flag
+  for ptrace tracers that trace both fork and clone children.
+- Verified all gates pass: cargo check, cargo fmt, cargo clippy
+  --all-targets -- -D warnings, cargo test --lib (605 passed).
+- Committed as 08493ae. Pushed to GitHub main.
+- Dispatched OrangeFox R12.0 lavender round-17 on 08493ae.
+
+Stage Summary:
+- The 6-Z211d fix adds __WALL to the waitpid flags. This MAY resolve
+  the H1b blocker (mount() syscall-stop not being delivered). If it
+  works, the broad DIAG should show nr=40 (mount) syscall-stops, the
+  pre-dispatch DIAG should fire, and the 6-Z210 classification should
+  fire (faking mount() return 0 so SetupMountNamespaces succeeds).
+- If __WALL doesn't help, the next step is to investigate the
+  fork-follow / waitpid dispatch logic more deeply — maybe the
+  parent's stop IS being reaped but skipped by a `continue` statement
+  between waitpid and the broad DIAG.
+- The Lineage 22.2 libc.so SIGSEGV (offset 0xfb20) is a SEPARATE
+  blocker that needs its own investigation (the libdl.so fix worked
+  but the SIGSEGV persists).
+- Next concrete action: wait for OrangeFox round-17 to complete,
+  then inspect the kr64 stderr for "6-Z210 DIAG (broad):.*nr=40"
+  lines. If present → __WALL fix worked. If absent → continue
+  investigating the ptrace tracer.
+
+---
+Task ID: 6-Z211d-mon1
+Agent: CI-monitoring subagent
+Task: Monitor the OrangeFox R12.0 lavender round-17 UI E2E run on
+commit 08493ae (__WALL fix for waitpid to reap ptrace-traced threads)
+and determine whether the mount() syscall (nr=40 on aarch64) is now
+delivered to the ptrace tracer.
+
+Work Log:
+- Read worklog.md tail (last 300 lines) to load full r14/r15/r16
+  context. Key state going in: round-16's broad DIAG (cap raised
+  200→2000) DEFINITIVELY confirmed that ZERO of 2000 captured
+  syscall-stops is nr=40 (mount on aarch64). The 6-Z211d fix added
+  __WALL (0x40000000) to the waitpid flags so ptrace-traced THREADS
+  (clone children with CLONE_THREAD) are also reaped. Commit 08493ae
+  was pushed and OrangeFox r17 was dispatched.
+- Fetched latest workflow runs on main:
+    33241808209  UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
+                  08493aea  in_progress  2026-08-29T07:51:38Z
+    33241799893  kr64 lint + test  08493aea  completed  2026-08-29T07:51:23Z
+    33240825034  UI E2E Test (ARM64)        9bb8d955  completed
+    33240811424  kr64 lint + test           9bb8d955  completed
+  Confirmed the OrangeFox round-17 run is run ID 33241808209 on
+  commit 08493aea.
+- Polled every ~60-90s (within the 25-min budget). Status timeline:
+    07:51:43  Build arm64-v8a APK  in_progress (build APK job active)
+    07:53:44  Build arm64-v8a APK  completed success; UI-only ARM64
+              (TWRP) E2E on redroid job started in_progress
+    08:06:51  overall run COMPLETED success (overall run green;
+              the boot result inside the container is BOOT_FAIL).
+  Total wall time: ~15 minutes. Well under the 25-minute budget.
+- Downloaded the `ui-e2e-arm64-logs` artifact (artifact ID 9711733583,
+  21.6 MB) via the GitHub Actions artifacts API, unzipped + extracted
+  the inner ui-e2e-logs.tar.xz, reorganized the extraction layout
+  (extracted to .../tmp/ui-e2e-artifacts/ by tar) and moved the
+  contents to the expected path
+  /home/z/my-project/artifacts/ofox-r17/ui-e2e-artifacts/.
+- Inspected kr64-app-stderr-dockerexec.log (4795 lines, 600 KB):
+  * Broad DIAG count (cap 2000): grep -c → 2000. Cap reached at
+    broad #2000/2000 (line 2682 region in r16 — same here at the
+    same diagnostic level). The first 3 broad DIAG lines:
+        line: "6-Z210 DIAG (broad): syscall-stop nr=56 pid=2583
+               loop_count=1 in_syscall=false abi.mount=40 [broad
+               #1/2000]"
+        line: "6-Z210 DIAG (broad): syscall-stop nr=56 pid=2583
+               loop_count=2 in_syscall=true abi.mount=40 [broad
+               #2/2000]"
+        line: "6-Z210 DIAG (broad): syscall-stop nr=80 pid=2583
+               loop_count=3 in_syscall=false abi.mount=40 [broad
+               #3/2000]"
+    Note: abi.mount=40 is correctly reported in EVERY broad DIAG
+    line — so the tracer KNOWS mount is nr=40 on aarch64. The DIAG
+    is correctly configured. It just NEVER sees a syscall-stop with
+    nr=40.
+  * *** CRITICAL: grep -c "6-Z210 DIAG (broad):.*nr=40\b" → 0 ***
+    ZERO of the 2000 syscall-stops captured by the broad DIAG is the
+    mount syscall (nr=40 on aarch64). IDENTICAL to round-16.
+  * Pre-dispatch mount() DIAG (mount-specific, separate cap of 50):
+    grep -c → 0. ZERO occurrences. IDENTICAL to round-16. This is
+    the definitive signal: NO mount syscall-stop was EVER delivered
+    to the ptrace tracer at any point during the run, even after
+    __WALL was added to waitpid.
+  * 6-Z210 classification block ("6-Z210: propagation", "6-Z168:
+    block-storage", "6-Z164: pseudo-mount"): grep -c → 0. ZERO
+    occurrences — confirms the classification block NEVER fires
+    (because the mount syscall-stop is never received). IDENTICAL
+    to round-16.
+  * Fork event + SetupMountNamespaces chain (lines 4698-4731):
+      Line 4698: "DIAG fork-family ENTRY: nr=220 (pid=2583),
+                 loop_count=14161, in_syscall_was=true"
+      Line 4701: "PTRACE_EVENT_CLONE: parent 2583 forked —
+                 new child PID 2674 (auto-attached by kernel;
+                 will receive its stops via waitpid(-1))"
+      Line 4702: "6-Z97: PTRACE_EVENT_CLONE — new child PID 2674
+                 registered in the tracked set (2 tracked) before
+                 its first waitpid stop"
+      Line 4703: "DIAG child switch: 2583 → 2674 — new child,
+                 in_syscall=false (Task 6-Z54)"
+      Line 4705: "DIAG fork-family EXIT: nr=220 returned 2674"
+      Line 4706: "Task-6-S EXIT: pid=2583 clone nr=220 -> 2674"
+      Line 4710: "DIAG write(fd=67, ret=67): '<3>init: Failed to
+                 remount /apex as 40000: Device or resource busy'"
+      Line 4711: "DIAG write(fd=68, ret=68): '[glog F/abort]
+                 SetupMountNamespaces failed: Device or resource
+                 busy'"
+      Line 4714: "DIAG write(fd=68, ret=68): '[glog F/abort]
+                 SetupMountNamespaces failed: Device or resource
+                 busy'"
+      Line 4715: "DIAG write(fd=62, ret=62): '<2>init:
+                 SetupMountNamespaces failed: Device or resource
+                 busy'"
+      Line 4716: "DIAG fork-family ENTRY: nr=220 (pid=2583),
+                 loop_count=14211, in_syscall_was=true"
+      Line 4721: "PTRACE_EVENT_FORK: parent 2583 forked —
+                 new child PID 2675"
+      Line 4722: "6-Z97: PTRACE_EVENT_FORK — new child PID 2675
+                 registered (3 tracked)"
+      Line 4723: "DIAG child switch: 2583 → 2675 — new child,
+                 in_syscall=false (Task 6-Z54)"
+      Line 4725: "DIAG fork-family EXIT: nr=220 returned 2675"
+      Line 4731: "DIAG write(fd=35, ret=35): '<3>init:
+                 InitFatalReboot: signal 6'"
+      Line 4762: "6-Z97: init_pid 2583 exited 127 but traced
+                 child(ren) [2675] ALIVE — the loader DAEMONIZED
+                 (parent exits, child is the real init). Re-
+                 anchoring init_pid to 2675 and CONTINUING"
+      Line 4787: "6-Z97: init_pid 2675 exited 127 and no traced
+                 child is alive — genuine init exit, ending the
+                 ptrace loop (return 127)"
+    *** SAME PATTERN AS r16 ***: between line 4706 (parent 2583's
+    clone EXIT DIAG) and line 4710 (the "Failed to remount /apex"
+    write DIAG), the parent 2583 MUST have executed the mount()
+    syscall that returned EBUSY — but the tracer NEVER received a
+    syscall-stop for it. The pre-dispatch mount DIAG (which fires
+    for ANY mount syscall-stop, with its own cap of 50) fired ZERO
+    times across the ENTIRE 4795-line log. The __WALL flag change
+    did NOT cause any additional syscall-stops to be reaped.
+  * NEW behavior vs r16 (not the core issue, but worth noting):
+    at line 4762, the 6-Z97 daemonization-aware logic detected
+    that init_pid 2583 exited 127 but traced child [2675] is still
+    alive — so it re-anchored init_pid to 2675 and continued. Then
+    at line 4787, init_pid 2675 also exited 127 and no traced child
+    was alive — so it ended the ptrace loop with return 127. This is
+    a slightly different end-of-loop path than the r16 worklog
+    summary described (the r16 summary only mentioned the
+    InitFatalReboot signal 6 at line 4731; it didn't capture the
+    4762 + 4787 lines explicitly). But this is the same overall
+    failure mode — init aborts due to SetupMountNamespaces EBUSY,
+    then exits 127 after a SIGABRT-induced fatal reboot.
+  * Distribution of syscall numbers captured in the broad DIAG
+    (2000 stops total, all on pid=2583):
+      668 × nr=222 (mmap2 — property area setup)
+      233 × nr=56 (openat)
+      202 × nr=215 (nanosleep — long sleep loop, the LAST 5 broad
+                    DIAG entries are ALL nr=215, indicating the
+                    parent is in a property-wait polling loop before
+                    the fork)
+      156 × nr=226 (mprotect)
+      104 × nr=64 (write)
+      100 × nr=57 (close)
+       94 × nr=80 (fstat)
+       86 × nr=78 (readlinkat)
+       68 × nr=67 (sendto? or mmap?)
+       68 × nr=44 (? aarch64 syscall 44 = ioctl... actually 44 may
+                    vary, possibly fcntl)
+       53 × nr=79 (fstatat)
+       38 × nr=172 (getpid)
+       34 × nr=167 (prctl)
+       18 × nr=63 (read)
+       18 × nr=48 (faccessat)
+       18 × nr=134 (rt_sigprocmask)
+       14 × nr=62 (lseek)
+        4 × nr=135
+        2 × nr=96
+        2 × nr=66
+        2 × nr=53
+        2 × nr=49
+        2 × nr=34
+        2 × nr=278
+        2 × nr=233
+        ZERO × nr=40 (mount) ← STILL the missing one
+    This distribution is BYTE-FOR-BYTE IDENTICAL to r16's distribution
+    (same counts for every syscall number). This confirms that
+    __WALL did not change which syscall-stops the tracer receives at
+    all — the trace is running through the exact same syscall
+    sequence as before.
+  * SetupMountNamespaces chain: 3 occurrences (lines 4711, 4714,
+    4715) — SAME pattern as r16.
+  * InitFatalReboot: 1 occurrence (line 4731) — same as r16.
+  * SIGSEGV: 0 occurrences (OrangeFox init tolerates the stub
+    libdl.so, unlike Lineage init which crashes — same as r14/r15/r16).
+  * Container state: status=running exit=0 oom=false (same as r16).
+  * result-pretty.json verdict: BOOT_FAIL_EARLY_INIT
+    (overall=BOOT_FAIL_EARLY_INIT, boot=BOOT_FAIL,
+    failure=init_fatal_reboot, exit_code=127, backstop_denied=2,
+    recovery_instances=0, ui=NOT_REACHED, vfs=CLEAN,
+    terminal=NOT_APPLICABLE).
+    IDENTICAL TO r16, r15, r14.
+
+Stage Summary:
+- *** __WALL DID NOT FIX THE ISSUE. ***
+  The broad DIAG count is 2000 (cap reached). ZERO of the 2000 stops
+  is nr=40 (mount). The pre-dispatch mount DIAG fires ZERO times.
+  The 6-Z210 classification block fires ZERO times. The
+  SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL appears at
+  lines 4710-4731 (Failed to remount /apex → SetupMountNamespaces
+  failed → InitFatalReboot signal 6 → exit 127). The result is
+  BOOT_FAIL_EARLY_INIT, identical to r14/r15/r16.
+- *** WHY __WALL DIDN'T HELP (analysis): ***
+  The __WALL hypothesis was that waitpid(-1, &status, 0) without
+  __WALL only reaps fork children, missing ptrace-traced THREADS
+  (clone children with CLONE_THREAD). However, the kr64 stderr
+  already shows that the new thread (2674, the first child) IS
+  being traced — we see its prctl, mmap2, and write stops (e.g.
+  lines 4707-4708: "6-Z148 prctl-sample pid=2674",
+  "6-Z149 prctl-deep pid=2674"). So __WALL is NOT the root cause.
+  The child thread's stops ARE being reaped correctly. The missing
+  mount() syscall-stop is on the PARENT (pid=2583), NOT on a child
+  thread. The parent's stops ARE being reaped too (we see its
+  mmap2/openat/nanosleep/clone stops in the broad DIAG). The actual
+  root cause is in the DISPATCH logic, not in waitpid:
+    * After PTRACE_EVENT_CLONE (line 4701), the tracer issues
+      PTRACE_SYSCALL on the new child (2674) only (line 4704:
+      "SIGSTOP on forked child 2674 — consuming ... resuming with
+      signal=0 so its syscalls get traced"). The parent 2583 is left
+      paused at its clone() EXIT syscall-stop.
+    * At line 4705-4706, the tracer logs the parent's clone EXIT
+      diag (Task-6-S EXIT). So the parent IS being handled here —
+      but then the dispatch moves to the child's prctl/mmap2 stops
+      (lines 4707-4708) and the next stop logged is the parent's
+      "Failed to remount /apex" write (line 4710).
+    * Between line 4706 (parent's clone EXIT) and line 4710
+      (parent's EBUSY write), the parent executed the mount()
+      syscall that returned EBUSY. The tracer NEVER logged a
+      syscall-stop for it. This means the parent's mount() stop is
+      being SKIPPED somewhere in the dispatch — possibly by a
+      `continue` statement that re-issues waitpid without consuming
+      the parent's syscall-stop, or by an in_syscall flag desync
+      (the parent's next syscall-stop is treated as the EXIT of a
+      syscall whose ENTRY was missed, so the tracer doesn't fire
+      the pre-dispatch DIAG on the EXIT half).
+- *** ROOT CAUSE NEEDS DEEPER INVESTIGATION. ***
+  The actual blocker is NOT waitpid/__WALL (which now correctly
+  reaps all children). It's the dispatch loop's handling of the
+  parent's syscall-stops BETWEEN the clone-EXIT and the next
+  write. Possible culprits to investigate next:
+    1. After PTRACE_EVENT_CLONE/FORK, the tracer may issue
+       PTRACE_SYSCALL on the new child only and leave the parent
+       paused (the r16 next-action hypothesis). Even though the
+       parent's clone-EXIT stop IS received and logged at line
+       4705-4706, the parent may then be resumed with PTRACE_CONT
+       (or PTRACE_SYSCALL but with in_syscall flag mis-set) so its
+       NEXT syscall-stop (mount()) is delivered as the EXIT half
+       of an "in-progress" syscall whose ENTRY was missed → the
+       tracer's pre-dispatch DIAG (which fires only on ENTRY) is
+       skipped.
+    2. There may be a `continue` statement in the dispatch loop
+       that, after handling a fork event, re-issues waitpid without
+       first consuming the parent's pending syscall-stop. This would
+       cause the kernel to queue the parent's next syscall-stop
+       (mount()) which is then OVERWRITTEN by the next syscall-stop
+       (the write() that produces the EBUSY message).
+    3. The in_syscall flag may be mis-managed across fork events:
+       after the clone-EXIT stop (line 4706, in_syscall_was=true),
+       the parent's NEXT syscall-stop (mount() ENTRY) might be
+       incorrectly classified as a syscall-EXIT (because
+       in_syscall_was=true means "we just saw an EXIT, so the next
+       is ENTRY"... or maybe the flag means the opposite). Need to
+       read the actual source to disambiguate.
+- *** NEXT CONCRETE ACTION for the main orchestrator: ***
+  Read the fork-follow / dispatch logic in
+  app/rs/kr64/src/ptrace_emu.rs (the file modified by 6-Z211c). Look
+  for the code path that handles PTRACE_EVENT_CLONE / PTRACE_EVENT_FORK
+  (which fires at line 4701 in the log). After handling the event
+  (registering the new child, switching focus, consuming the child's
+  SIGSTOP), the tracer resumes the parent with some PTRACE_*
+  request. Identify which PTRACE_* request is used (PTRACE_SYSCALL
+  vs PTRACE_CONT vs PTRACE_DETACH) and how the in_syscall flag is
+  updated. The fix is likely one of:
+    (a) Resume the parent with PTRACE_SYSCALL (not PTRACE_CONT) so
+        its next syscall-stop IS delivered as a syscall-ENTRY stop.
+    (b) Reset the in_syscall flag to false on the parent right
+        before resuming it (so the next syscall-stop is treated as
+        an ENTRY, firing the pre-dispatch DIAG).
+    (c) Don't switch focus to the new child on PTRACE_EVENT_CLONE;
+        instead, keep dispatching the parent and let the child's
+        auto-attach SIGSTOP be consumed lazily on the next waitpid
+        iteration. This is the "round-robin all tracked pids"
+        approach mentioned in the r16 next-action #3.
+  Recommended fix: implement (a) + (b) together. After the fork
+  event, PTRACE_SYSCALL-resume BOTH the parent AND the new child,
+  and reset the parent's in_syscall flag to false so its next
+  syscall-stop (mount()) is correctly classified as an ENTRY and
+  fires the pre-dispatch DIAG. Then re-dispatch OrangeFox r18 on
+  the fix commit.
+- *** DO NOT REMOVE the __WALL fix. ***
+  __WALL is a safe, recommended change for any ptrace tracer that
+  handles both fork and clone children. It didn't fix this
+  particular bug, but it should stay in the codebase to prevent
+  future waitpid-reaping bugs with CLONE_THREAD children. (The
+  observed new-thread tracing at lines 4707-4708 was already working
+  in r16 too, so __WALL didn't break anything; it just didn't help
+  with the actual blocker.)
+- *** THE 2000-CAP BROAD DIAG AND PRE-DISPATCH DIAG ARE WORKING
+  CORRECTLY. *** They would have fired if any mount syscall-stop
+  had been received. They are not the bug; they are the verifiers.
+  Keep them in the codebase.
+- result-pretty.json: BOOT_FAIL_EARLY_INIT (init_fatal_reboot,
+  exit_code=127). IDENTICAL TO r14, r15, r16. The __WALL change is
+  NOT observable in the boot result — it neither helped nor hurt
+  the boot outcome (the boot was already failing the same way
+  before, and continues to fail the same way after).
