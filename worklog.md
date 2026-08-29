@@ -15547,3 +15547,467 @@ Stage Summary:
      classification block can stay as-is (it's verified correct
      in code; it just doesn't fire because the syscall-stop isn't
      delivered).
+
+---
+Task ID: 6-Z211b-mon1
+Agent: CI-monitoring subagent
+Task: Monitor TWO GitHub Actions UI E2E runs on commit d3491ae
+(broad syscall-stop DIAG + libdl.so unversioned path fix):
+  1. OrangeFox R12.0 lavender round-15 — UI E2E Test ARM64
+     (broad DIAG will show ALL syscalls being caught, to definitively
+     answer whether mount() syscall-stops are being delivered).
+  2. Lineage 22.2 sailfish round-14 — UI E2E Test ARM64
+     (the libdl.so unversioned path fix should find
+     /apex/com.android.runtime/lib64/bionic/libdl.so on the
+     redroid container).
+
+Work Log:
+- Read worklog.md tail (last 250 lines) to understand the latest
+  state. Previous rounds:
+  * r14 (commit 707e9d3, run 33238299535 = OrangeFox r14):
+    pre-dispatch mount() DIAG = 0 occurrences; SetupMountNamespaces
+    failure chain = 3 occurrences; result=BOOT_FAIL_EARLY_INIT
+    (init_fatal_reboot, exit_code=127).
+  * r13 (commit 96e6e2d, run 33238428628 = Lineage r13):
+    libdl.so scan found NOTHING (only @N versioned paths tried);
+    "FAILED to find real libdl.so anywhere — guest init will use
+    the 5848-byte stub" = 1 occurrence (line 83); result=BOOT_FAIL
+    (sigsegv_count=8, SIGSEGV at offset 0xfb20 in libc.so r-xp
+    segment, pc=0xe8acbf6d1b20).
+- Fetched recent GitHub Actions runs on branch=main via:
+    GET /repos/Disable-OP/twoyi/actions/runs?per_page=8&branch=main
+  Identified the two runs on commit d3491ae (run 33239449434 =
+  run_number 178, started 06:50:46Z; run 33239450357 = run_number
+  179, started 06:50:47Z — both within 1 second of each other so
+  the GitHub REST API does not expose which dispatch input
+  (recovery_name) was used for each run).
+- Polled both runs every ~60s for ~15 minutes total (the
+  in_progress bash poll loop hit the 10-minute bash timeout once,
+  was restarted, and both runs completed at iteration 4 of the
+  second poll loop at 07:06:58Z).
+- Build arm64-v8a APK job (job_id 99066147421 for run 178 /
+  99066150138 for run 179): ran 06:50:49Z → 06:53:18Z (~2 min 29s,
+  conclusion=success). UI-only ARM64 (TWRP) E2E on redroid job
+  (job_id 99066338315 for run 178 / 99066371373 for run 179): ran
+  06:53:24Z → 07:06:25Z (~12 min 41s for run 178 / ~12 min 40s
+  for run 179, conclusion=success for BOTH). Run-level conclusion
+  for BOTH = success.
+- After completion, listed artifacts:
+  * Run 33239449434 (run_number 178): ui-e2e-arm64-logs artifact
+    id=9711061076 (size 21478246 bytes ≈ 21.48 MB) +
+    arm64-v8a-apk artifact id=9710919305 (13.30 MB).
+  * Run 33239450357 (run_number 179): ui-e2e-arm64-logs artifact
+    id=9711059927 (size 17459902 bytes ≈ 17.46 MB) +
+    arm64-v8a-apk artifact id=9710922679 (13.30 MB).
+  Note: OrangeFox r14's artifact was 21.86 MB; Lineage r13's was
+  14.46 MB. The 21.48 MB artifact (run 178) and 17.46 MB artifact
+  (run 179) suggest 178 = OrangeFox r15 and 179 = Lineage r14
+  (OrangeFox produces more log lines due to the broad DIAG, which
+  fires 200 capped stops).
+- Downloaded both ui-e2e-arm64-logs artifacts via:
+    curl -sL -H "Authorization: token $PAT" -o /tmp/dl/run_<id>.zip <archive_download_url>
+  Then `unzip` → `tar xJf ui-e2e-logs.tar.xz` → extracted to
+  /tmp/dl/ofox-extract and /tmp/dl/lineage-extract.
+- IDENTIFICATION OF RUNS:
+  * Grepped kr64-app-stderr-dockerexec.log of run 178 (artifact
+    9711061076) for "lavender|sailfish|orangefox|lineage":
+    → Found: "DIAG write(fd=145, ret=145):
+      '<6>init: Setting property \'ro.build.fingerprint\' to
+      \'xiaomi/lavender/lavender:99.87.36/SP2A.220405.004/...\'"
+    → Confirms run 33239449434 = OrangeFox R12.0 lavender round-15.
+  * Grepped kr64-app-stderr-dockerexec.log of run 179 (artifact
+    9711059927):
+    → Found: "[KR64 INFO] [KR64] PARENT: 6-Z159: androidboot.hardware
+      detected from recovery image = \"sailfish\" (was hardcoded ranchu)"
+    → Confirms run 33239450357 = Lineage 22.2 sailfish round-14.
+- Copied the extracted ui-e2e-artifacts/ to final destinations:
+    /home/z/my-project/artifacts/ofox-r15/ui-e2e-artifacts/
+      (138 files; kr64-app-stderr-dockerexec.log = 2993 lines,
+      368 KB)
+    /home/z/my-project/artifacts/lineage-r14/ui-e2e-artifacts/
+      (135 files; kr64-app-stderr-dockerexec.log = 1440 lines,
+      177 KB)
+
+- ORANGEFOX r15 kr64 stderr inspection (commit d3491ae):
+  * `grep -c "6-Z210 DIAG (broad)"` → 200 (TWO HUNDRED occurrences
+    — the broad DIAG FIRED for the first 200 syscall-stops, then
+    silently stopped emitting per its 200-cap design).
+  * `grep -c "6-Z210 DIAG (pre-dispatch)"` → 0 (ZERO occurrences
+    — the mount-specific pre-dispatch DIAG (capped at 50, NOT
+    200) NEVER fires; mount() syscall-stops are NOT being delivered
+    to the ptrace tracer).
+  * `grep -c "6-Z210 DIAG: mount() ENTRY"` → 0 (ZERO occurrences).
+  * `grep -c "6-Z210: propagation"` → 0 (ZERO occurrences).
+  * `grep -E "6-Z210 DIAG \(broad\):.*nr=40\b" | wc -l` → 0 (ZERO
+    occurrences of nr=40 (mount on aarch64) in the broad DIAG).
+  * All broad DIAG lines are on pid=2613 (single-threaded init
+    phase, before any fork — the tracer is following ONE pid).
+  * Distribution of syscall_num in the broad DIAG:
+      94 nr=64 (write)
+      14 nr=63 (read)
+      14 nr=62 (lseek)
+      14 nr=56 (openat)
+      12 nr=48 (faccessat)
+      10 nr=57 (close)
+       6 nr=80 (fstat)
+       6 nr=222 (mmap2)
+       4 nr=79 (fstatat)
+       4 nr=172 (getpid)
+       2 nr=96 (exit_group)
+       2 nr=53 (socketpair? — actually nr=53 is dup3? no, dup3=24;
+         nr=53 is likely socketpair)
+       2 nr=49 (fchdir)
+       2 nr=34 (dup3)
+       2 nr=278 (? — getrandom maybe)
+       2 nr=233 (madvise)
+       2 nr=226 (mprotect)
+       2 nr=167 (prctl)
+       2 nr=132 (rt_sigprocmask / sigprocmask)
+       2 nr=120 (? clone3 or accept4?)
+       1 nr=221 (execve)
+       1 nr=0 (io_setup?)
+    Total: 200 syscall-stops captured. ZERO are nr=40 (mount).
+  * FIRST 30 broad DIAG lines (verbatim):
+    [broad #1/200]  nr=56 pid=2613 loop_count=1 in_syscall=false abi.mount=40
+    [broad #2/200]  nr=56 pid=2613 loop_count=2 in_syscall=true  abi.mount=40
+    [broad #3/200]  nr=80 pid=2613 loop_count=3 in_syscall=false abi.mount=40
+    [broad #4/200]  nr=80 pid=2613 loop_count=4 in_syscall=true  abi.mount=40
+    [broad #5/200]  nr=63 pid=2613 loop_count=5 in_syscall=false abi.mount=40
+    [broad #6/200]  nr=63 pid=2613 loop_count=6 in_syscall=true  abi.mount=40
+    [broad #7/200]  nr=63 pid=2613 loop_count=7 in_syscall=false abi.mount=40
+    [broad #8/200]  nr=63 pid=2613 loop_count=8 in_syscall=true  abi.mount=40
+    [broad #9/200]  nr=57 pid=2613 loop_count=9 in_syscall=false abi.mount=40
+    [broad #10/200] nr=57 pid=2613 loop_count=10 in_syscall=true abi.mount=40
+    [broad #11/200] nr=34 pid=2613 loop_count=11 in_syscall=false abi.mount=40
+    [broad #12/200] nr=34 pid=2613 loop_count=12 in_syscall=true abi.mount=40
+    [broad #13/200] nr=79 pid=2613 loop_count=13 in_syscall=false abi.mount=40
+    [broad #14/200] nr=79 pid=2613 loop_count=14 in_syscall=true abi.mount=40
+    [broad #15/200] nr=56 pid=2613 loop_count=15 in_syscall=false abi.mount=40
+    [broad #16/200] nr=56 pid=2613 loop_count=16 in_syscall=true abi.mount=40
+    [broad #17/200] nr=64 pid=2613 loop_count=17 in_syscall=false abi.mount=40
+    [broad #18/200] nr=64 pid=2613 loop_count=18 in_syscall=true abi.mount=40
+    [broad #19/200] nr=57 pid=2613 loop_count=19 in_syscall=false abi.mount=40
+    [broad #20/200] nr=57 pid=2613 loop_count=20 in_syscall=true abi.mount=40
+    [broad #21/200] nr=53 pid=2613 loop_count=21 in_syscall=false abi.mount=40
+    [broad #22/200] nr=53 pid=2613 loop_count=22 in_syscall=true abi.mount=40
+    [broad #23/200] nr=56 pid=2613 loop_count=23 in_syscall=false abi.mount=40
+    [broad #24/200] nr=56 pid=2613 loop_count=24 in_syscall=true abi.mount=40
+    [broad #25/200] nr=63 pid=2613 loop_count=25 in_syscall=false abi.mount=40
+    [broad #26/200] nr=63 pid=2613 loop_count=26 in_syscall=true abi.mount=40
+    [broad #27/200] nr=80 pid=2613 loop_count=27 in_syscall=false abi.mount=40
+    [broad #28/200] nr=80 pid=2613 loop_count=28 in_syscall=true abi.mount=40
+    [broad #29/200] nr=62 pid=2613 loop_count=29 in_syscall=false abi.mount=40
+    [broad #30/200] nr=62 pid=2613 loop_count=30 in_syscall=true abi.mount=40
+  * Note: every syscall in the broad DIAG is captured in ENTRY+EXIT
+    pairs (in_syscall=false then in_syscall=true for the same
+    nr=...). This proves the ptrace tracer IS correctly handling
+    ENTRY/EXIT classification for syscalls it DOES receive stops
+    for. The mount() syscall simply isn't being delivered.
+  * Cap reached at line 440 (broad #200/200, syscall nr=172 getpid).
+    The actual mount() that returns EBUSY happens at line 2914
+    (AFTER the cap), so the broad DIAG can't show the syscall
+    sequence AROUND the failed mount. But the pre-dispatch DIAG
+    (mount-specific, capped at 50 — UNRELATED to the 200-cap) ALSO
+    fires ZERO times, which is the definitive signal: NO mount
+    syscall-stop was ever delivered to the ptrace tracer at any
+    point during the run.
+  * SetupMountNamespaces chain STILL present (3 occurrences at
+    lines 2915, 2917, 2918):
+    Line 2914: "DIAG write(fd=67, ret=67): '<3>init: Failed to
+      remount /apex as 40000: Device or resource busy\n'"
+    Line 2915: "DIAG write(fd=68, ret=68): '[glog F/abort]
+      SetupMountNamespaces failed: Device or resource busy\n'"
+    Line 2917: "DIAG write(fd=68, ret=68): '[glog F/abort]
+      SetupMountNamespaces failed: Device or resource busy\n'"
+    Line 2918: "DIAG write(fd=62, ret=62): '<2>init:
+      SetupMountNamespaces failed: Device or resource busy\n'"
+  * InitFatalReboot: 1 occurrence (line 2931: "DIAG write(fd=35,
+    ret=35): '<3>init: InitFatalReboot: signal 6\n'").
+  * "Reboot ending, jumping to kernel" appears at line 2935 —
+    init's normal reboot path after fatal error.
+  * SIGSEGV: 0 occurrences (OrangeFox init tolerates the 5848-byte
+    stub libdl.so, unlike Lineage init which crashes — same as r14).
+  * Container state: status=running exit=0 oom=false.
+  * result-pretty.json verdict: BOOT_FAIL_EARLY_INIT (overall=
+    BOOT_FAIL_EARLY_INIT, boot=BOOT_FAIL, failure=
+    init_fatal_reboot, exit_code=127, backstop_denied=2,
+    recovery_instances=0, ui=NOT_REACHED, vfs=CLEAN,
+    terminal=NOT_APPLICABLE). IDENTICAL TO r14.
+
+- LINEAGE r14 kr64 stderr inspection (commit d3491ae, 6-Z211b fix):
+  * `grep -c "extracted real libdl"` → 0 (no occurrence of the
+    "extracted real libdl" log phrase — but the new "found real
+    libdl.so (NNN bytes) at PATH (unversioned alternative path)"
+    phrase is the actual marker — see next item).
+  * `grep -c "unversioned alternative path"` → 1 (line 83: "found
+    real libdl.so (136608 bytes) at /apex/com.android.runtime/
+    lib64/bionic/libdl.so (unversioned alternative path)").
+    *** THE 6-Z211b FIX WORKED. ***
+  * `grep -c "FAILED to find real libdl"` → 0 (ZERO occurrences
+    — vs 1 in r13. The scan no longer falls through to "FAILED
+    to find real libdl.so anywhere".)
+  * `grep -c "TWOYI_ALLOW_HOST_APEX unset"` → 0 (ZERO — the OLD
+    "skipping host /apex/ libdl scan" log line is NOT emitted,
+    confirming the 6-Z211 host_apex_allowed_from() returns TRUE
+    by default, AND the new 6-Z211b unversioned path is the FIRST
+    candidate tried before falling through to @N versioned paths
+    or read_dir.)
+  * `grep -c "com.android.runtime@"` → 0 (ZERO occurrences of ANY
+    /apex/com.android.runtime@N/ versioned path being tried or
+    scanned — the unversioned path succeeded on the FIRST
+    candidate so the scan short-circuited.)
+  * `grep -c "/apex/com.android.runtime/lib64/bionic/libdl.so"` → 3
+    occurrences (lines 83, 88, 89) — the unversioned path is used
+    as the source for the libdl.so extraction.
+  * Line 71: "Option D: asset at /data/user/0/io.twoyi.debug/files/
+    libdl.so is 5848 bytes but NOT ELF magic — placeholder or
+    corrupted. Rejecting + falling through to APEX extraction."
+  * Line 78: no longer "all .apex candidates exhausted" — the
+    unversioned path is tried FIRST and succeeds.
+  * Line 83: "found real libdl.so (136608 bytes) at
+    /apex/com.android.runtime/lib64/bionic/libdl.so (unversioned
+    alternative path)" — REAL libdl.so (136608 bytes vs the 5848-
+    byte stub).
+  * Line 88: "PARENT: writing real libdl.so (136608 bytes, source:
+    /apex/com.android.runtime/lib64/bionic/libdl.so) to /data/
+    user/0/io.twoyi.debug/rootfs/dev/libdl.so (guest /dev staging
+    dir)"
+  * Line 89: "PARENT: wrote libdl.so (136608 bytes)
+    /apex/com.android.runtime/lib64/bionic/libdl.so ->
+    /data/user/0/io.twoyi.debug/rootfs/dev/libdl.so (AFTER
+    pivot_root, tmpfs, mode 0755) (Task 6-Z40: executable for
+    LD_PRELOAD)"
+  * Line 90 (CHILD log): "libdl.so (REAL, from APEX) found at
+    /dev/libdl.so — linker should resolve DT_NEEDED:libdl.so via
+    /dev/ FIRST"
+  * MAPS (crash diagnostic, line 1241-1248):
+      fa9953ec2000-fa9953ec3000 r--p 00000000 08:01 5808276
+        /data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/libdl.so
+      fa9953ec3000-fa9953ed2000 ---p 00000000 00:00 0 (anonymous gap)
+      fa9953ed2000-fa9953ed3000 r-xp 00010000 08:01 5808276
+        /data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/libdl.so
+      fa9953ed3000-fa9953ee2000 ---p 00000000 00:00 0 (anonymous gap)
+      fa9953ee2000-fa9953ee3000 r--p 00020000 08:01 5808276
+        /data/user/0/io.twoyi.debug/profiles/default/rootfs/dev/libdl.so
+    The libdl.so IS loaded from /dev/libdl.so (the guest /dev path)
+    — the linker resolved DT_NEEDED:libdl.so via /dev/ FIRST as
+    the LD_LIBRARY_PATH starts with /dev. Three PT_LOAD segments
+    at file_offset 0x0 (rodata), 0x10000 (text), 0x20000 (data).
+    Each is 4KB — small (typical AOSP stub-like libdl.so layout
+    where the actual dlopen/dlclose implementations live in the
+    linker itself, libdl.so only provides the entry-point symbols).
+  * SIGSEGV count: 8 (per result-pretty.json — same as r13).
+    But the kr64-app-stderr-dockerexec.log only emits ONE actual
+    SIGSEGV event (line 1211): "SIGSEGV details: tid=2570
+    si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=
+    0x0, pc=0xfa995409cb20, sp=0xffffe3e18a90". The 8 in the
+    result-pretty.json likely counts the broader logcat.txt
+    tombstone/signal mentions (redroid container processes
+    crashing with SIGABRT etc.).
+  * SIGSEGV at SAME OFFSET in libc.so as r13:
+    - MAPS at line 1296-1302: libc.so r-xp segment at
+      fa995408d000-fa9954114000 with file_offset=0x50000.
+    - pc=0xfa995409cb20 → offset within r-xp segment = 0xfb20.
+    - SAME OFFSET 0xfb20 in libc.so r-xp segment as r13 (which had
+      pc=0xe8acbf6d1b20 with libc.so r-xp at file_offset=0x50000).
+  * *** CRITICAL: despite the libdl.so fix WORKING (real 136608-
+    byte libdl.so loaded from /dev/libdl.so, confirmed by MAPS),
+    the SIGSEGV in libc.so at offset 0xfb20 STILL happens. This
+    DISPROVES the r13 hypothesis that the libdl.so stub caused
+    the libc.so SIGSEGV. ***
+  * The kr64 log just BEFORE the SIGSEGV (lines 1190-1211):
+    - Line 1190: "[twoyi_loader] pre-created init directories in
+      rootfs"
+    - Lines 1191-1194: mkdirat translated: /data, /data/user,
+      /data/user/0, /data/user/0/io.twoyi.debug (all already
+      existed)
+    - Line 1195: "6-Z111: property-area fd captured: open()
+      returned fd=3 for pid=2570 /data/user/0/io.twoyi.debug/
+      rootfs/dev/__properties__/properties_serial — fd registered
+      for the area-write broadcaster"
+    - Lines 1196-1201: "[twoyi_loader] created property_info on
+      host" (×2 — once via DIAG write to fd=45 then again via
+      DIAG write to fd=68)
+    - Lines 1203-1209: "[twoyi_loader] runtime ready — guest
+      can boot" (×2 — once via DIAG write to fd=48 then again
+      via DIAG write to fd=71)
+    - Line 1210: "DIAG mmap2 ENTRY: nr=222 flags=0x4022
+      (MAP_SHARED=false,MAP_PRIVATE=true,MAP_ANONYMOUS=true) fd=-1
+      prop_fd=None" — this is the GUEST INIT'S FIRST mmap2 call
+      (anonymous private mapping). NOT from the loader.
+    - Line 1211: "forwarding signal 11 to child" + SIGSEGV details
+      (the guest crashed in libc.so at offset 0xfb20 immediately
+      after its first mmap2 syscall).
+  * SetupMountNamespaces: 0 occurrences (guest NEVER reaches the
+    mount syscall — it crashes BEFORE that, in libc.so at offset
+    0xfb20).
+  * 6-Z210 DIAG (broad): 200 occurrences, all on pid=2570 (similar
+    distribution to OrangeFox r15 — NO mount, NO nr=40 in broad
+    DIAG; the guest crashes BEFORE the mount syscall).
+  * pre-dispatch DIAG: 0 occurrences.
+  * 6-Z210 DIAG: mount() ENTRY: 0 occurrences.
+  * 6-Z210: propagation: 0 occurrences.
+  * InitFatalReboot: 0 occurrences (the failure mode is a SIGSEGV
+    crash, NOT an init_fatal_reboot — different from OrangeFox).
+  * "Failed to remount /apex": 0 occurrences (the guest never
+    reaches the mount syscall).
+  * Container state: status=running exit=0 oom=false.
+  * result-pretty.json verdict: BOOT_FAIL (overall=BOOT_FAIL,
+    boot=BOOT_FAIL, sigsegv_count=8, NO init_fatal_reboot failure
+    marker — the failure mode is a SIGSEGV crash, NOT an
+    init_fatal_reboot. backstop_denied=2, recovery_instances=0,
+    ui=NOT_REACHED, vfs=CLEAN, terminal=NOT_APPLICABLE). IDENTICAL
+    TO r13.
+
+Stage Summary:
+- *** CRITICAL CONFIRMATION FOR OrangeFox r15 (commit d3491ae)
+  broad DIAG DEFINITIVELY CONFIRMS H1b. ***
+  The broad DIAG fires for the first 200 syscall-stops on
+  pid=2613 (the active init), showing the FULL syscall sequence
+  during early boot. Distribution: 94×write(64), 14×read(63),
+  14×lseek(62), 14×openat(56), 12×faccessat(48), 10×close(57),
+  6×fstat(80), 6×mmap2(222), 4×fstatat(79), 4×getpid(172),
+  plus other infrequent syscalls (dup3, execve, mprotect, prctl,
+  sigprocmask, exit_group, etc.). ZERO of the 200 stops is
+  nr=40 (mount). The mount-specific pre-dispatch DIAG (which
+  fires ONLY when syscall_num == abi.mount, capped at 50 — NOT
+  200) also fires ZERO times. The "Failed to remount /apex as
+  40000: Device or resource busy" write DIAG at line 2914
+  (AFTER the broad cap) proves the kernel DID execute mount()
+  and returned EBUSY. So the kernel executed the syscall, but
+  the ptrace tracer NEVER received the syscall-stop. Conclusion:
+  H1b is DEFINITIVELY CONFIRMED — the ptrace tracer is missing
+  the mount() syscall-ENTRY stop entirely. The root cause is the
+  fork-follow / waitpid dispatch bug identified in 6-Z210-mon2:
+  after PTRACE_EVENT_CLONE/FORK, the tracer issues PTRACE_SYSCALL
+  only on the "active" (newly-switched) child and leaves the
+  parent paused, so the parent's next syscall-stop (the mount()
+  that returns EBUSY) is orphaned and the kernel queues only ONE
+  syscall-stop per syscall — when the tracer eventually returns
+  to waitpid(-1), the mount() stop has been consumed/skipped by
+  the kernel. result-pretty.json: BOOT_FAIL_EARLY_INIT
+  (init_fatal_reboot, exit_code=127). SAME AS r14.
+
+- *** CRITICAL CONFIRMATION FOR Lineage r14 (commit d3491ae)
+  6-Z211b libdl.so unversioned path fix WORKED — but the libc.so
+  SIGSEGV at offset 0xfb20 PERSISTS, so the libdl.so stub was NOT
+  the root cause of the libc.so crash. ***
+  The new "unversioned alternative path" candidate
+  (/apex/com.android.runtime/lib64/bionic/libdl.so) succeeds on
+  the FIRST scan iteration (vs r13 where ALL 3 @N versioned
+  candidates failed silently). The PARENT writes 136608 bytes to
+  /dev/libdl.so in the guest rootfs (vs r13 where the 5848-byte
+  stub was used). The guest linker loads the real libdl.so
+  (confirmed by MAPS: /dev/libdl.so mapped at 3 PT_LOAD segments
+  file_offset 0x0/0x10000/0x20000). BUT the SIGSEGV at offset
+  0xfb20 in libc.so r-xp segment (pc=0xfa995409cb20) STILL happens
+  — SAME pc-offset-as-r13 pattern. SetupMountNamespaces count =
+  0 (guest crashes BEFORE reaching the mount syscall). This
+  DISPROVES the r13 worklog hypothesis that the libdl.so stub
+  caused the libc.so SIGSEGV. The real root cause of the libc.so
+  crash is a SEPARATE issue — see "RECOMMENDED NEXT ACTIONS" #2.
+  result-pretty.json: BOOT_FAIL (sigsegv_count=8). SAME AS r13.
+
+- NEXT CONCRETE ACTIONS for the main orchestrator:
+  1. (6-Z210 ptrace tracer fix — STILL the priority for OrangeFox)
+     The broad DIAG definitively confirms H1b: NO mount syscall-
+     stop is delivered to the ptrace tracer. The fix MUST land in
+     the fork-follow / waitpid dispatch logic in ptrace_emu.rs:
+     * After PTRACE_EVENT_FORK / PTRACE_EVENT_CLONE, the tracer
+       currently issues PTRACE_SYSCALL on the "active" (newly-
+       switched) child only and leaves the parent paused. Fix:
+       PTRACE_SYSCALL-resume the parent TOO so its next syscall
+       (mount()) is delivered as a syscall-stop.
+     * Specifically, the kr64 log shows (lines 2922-2928): "DIAG
+       child switch: 2613 → 2716 — new child, in_syscall=false
+       (Task 6-Z54)" + "SIGSTOP on forked child 2716 — consuming
+       (auto-attach stop) and resuming with signal=0 so its
+       syscalls get traced". The parent (2613) is NEVER explicitly
+       PTRACE_SYSCALL-resumed after this child switch — its next
+       syscall (mount()) is lost.
+     * Re-dispatch OrangeFox r16 on the fix commit. Expected
+       outcomes:
+       - broad DIAG shows nr=40 (mount) syscall-stops being
+         delivered (the [broad #N/200] sequence will include
+         "nr=40 pid=2613 loop_count=K in_syscall=false/true").
+       - pre-dispatch DIAG fires ("6-Z210 DIAG (pre-dispatch):
+         mount() syscall-stop nr=40 pid=2613 ... [diag #1/50]").
+       - 6-Z210 classification block fires, fakes the mount()
+         return 0 so SetupMountNamespaces succeeds.
+       - Overall: BOOT_OK or BOOT_FAIL with a DIFFERENT failure
+         marker (e.g. later-stage init failure or UI timeout).
+
+  2. (6-Z211b libdl.so fix — WORKED but did NOT resolve the
+     libc.so SIGSEGV; the SIGSEGV is a SEPARATE issue that needs
+     independent investigation.)
+     The real libdl.so IS loaded (confirmed by MAPS), but the
+     guest init crashes in libc.so r-xp at offset 0xfb20
+     IMMEDIATELY after its first anonymous mmap2 syscall. The
+     crash is a NULL-deref (si_addr=0x0) and the same offset
+     (0xfb20) appears in r12, r13, r14, r15 — it's a
+     DETERMINISTIC crash. Likely causes:
+     (a) Some global pointer in libc.so (e.g.,
+         __system_property_init state, locale/global state) is
+         NULL because the property area content is empty/NULL
+         even though the fd was captured (kr64 log line 1195:
+         "6-Z111: property-area fd captured: open() returned
+         fd=3 for pid=2570"). NOTE: the kr64 log does NOT log
+         the property area's actual content or size — only that
+         the fd was captured. It might be empty (0 bytes), or
+         the wrong file was opened.
+     (b) Some LD_PRELOAD symbol resolution is failing — the
+         LD_PRELOAD is /dev/libgetpid_hook.so (size 6776,
+         mode 0755) and /dev/libtwoyi_loader_shlib.so (size
+         199512, mode 0755) per kr64 log lines 931-942. If
+         these .so files are missing a symbol that libc.so
+         expects at startup, the linker might leave a NULL GOT
+         slot that gets dereferenced later.
+     (c) The guest init's first mmap2 call returns a pointer
+         that's then passed to a libc function which dereferences
+         it as NULL — i.e., a bad calling convention or wrong
+         struct layout.
+     DEBUGGING STEPS:
+     * Disassemble libc.so at file_offset 0x50000 + 0xfb20 =
+       0x5fb20 to identify the function being called (likely
+       a small helper, perhaps pthread_mutex_lock, __cxa_*,
+       or __system_property_*).
+     * Add a DIAG log in twoyi_loader just BEFORE handing off
+       to the guest init that dumps:
+       (i) the size of /dev/__properties__/properties_serial,
+       (ii) the LD_PRELOAD .so file's symbol table (the
+       exported symbols of libgetpid_hook.so and
+       libtwoyi_loader_shlib.so), and
+       (iii) the first 0x100 bytes of each LD_PRELOAD .so
+       file's .text section.
+     * Add a DIAG log in ptrace_emu.rs around the guest's
+       first mmap2 to capture the return value and the next
+       1-2 syscalls (to confirm the mmap2 succeeded and to
+       see what gets called immediately before the SIGSEGV).
+     * Re-dispatch Lineage r15 on the diag commit. Expected
+       outcome: the new diag logs will pinpoint the function
+       being called at offset 0xfb20 in libc.so, and the
+       root cause of the NULL-deref will be clear.
+
+  3. (Suggested sequence) Land BOTH:
+       (i) the 6-Z210 fork-follow fix (resume parent after
+       PTRACE_EVENT_CLONE/FORK), and
+       (ii) the 6-Z211c libc.so SIGSEGV diag (disassembly +
+       diag logs to identify the function at offset 0xfb20),
+     in a single commit, then re-dispatch BOTH OrangeFox r16
+     AND Lineage r15. Expected outcomes:
+       * OrangeFox r16: 6-Z210 DIAG pre-dispatch appears,
+         6-Z210 classification block fires, mount() fakes 0,
+         guest reaches past SetupMountNamespaces.
+       * Lineage r15: the diag logs pinpoint the libc.so
+         function at offset 0xfb20, and the next fix can
+         target that specific issue.
+
+  4. Do NOT remove the broad DIAG (6-Z210 DIAG (broad)) — it's
+     a valuable runtime verifier for the ptrace-tracer fix
+     (you can see EXACTLY which syscalls are being caught).
+     Also keep the pre-dispatch DIAG and the mount() ENTRY DIAG
+     as mount-specific verifiers. The 200-cap on broad DIAG is
+     sufficient because the mount() syscall happens well after
+     the cap (line 440 cap vs line 2914 mount) — and the
+     uncapped pre-dispatch DIAG (cap 50, but mount never
+     appears even once) is the definitive signal.
