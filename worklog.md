@@ -19072,3 +19072,23 @@ Stage Summary:
 - 6-Z216 (FB hook for AOSP-layout recoveries) targets the OrangeFox recovery gr_fb_width crash loop; needs CI round.
 - Known remaining: twrp-3.7.0_9-0-angler terminal FAIL regression; lineage re-verification; possible binder Parcel secondary issue for OrangeFox.
 - Artifacts: /home/z/my-project/artifacts/ver8e2/<run-id>/ + /home/z/my-project/artifacts/orangefox-img/ofx/ (extracted system/bin/recovery, libminuitwrp.so, libbinder.so for symbolization).
+
+---
+Task ID: 6-Z217
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-29
+Task: twrp-3.7.0_9-0-angler terminal verdict investigation + the VFS host-path leak found under it.
+
+Work Log:
+- Terminal "regression" analysis (run 33267265616, twrp-3.7.0_9-0-angler, verdict terminal=FAIL):
+  * Native vision on screenshot-term-07b-terminal-prompt.png: LIVE ash prompt — "sh: can't access tty; job control turned off" + cursor prompt with keyboard. THE TERMINAL WORKS (§13: a live prompt is the success signal).
+  * All four classifier signals were absent in the logs: the 6-Z188 socketpair-pty path never logs "pty" (the fb hook's fd=2 pty diagnostics go to the TERMINAL SCREEN — the shell's stdio IS the pty slave — visible mixed into the screenshot output), and the ash banner goes to the pty screen, not to twrp-recovery-log-dockerexec.log. So the "terminalcommand reached → OK if any signal else FAIL" branch structurally misfires post-6-Z188.
+  * CLASSIFIER FIX (6-Z217c): when the terminal page was reached and ui==UI_READY, the scripted term-07 screenshots override a signal-FAIL with OK (+ marker terminal_evidence). The whyred frozen-splash false positive (33189885036) had ui!=UI_READY so the gate still guards it. Verified: this flips run 33267265616 to terminal=OK.
+- THE REAL BUG FOUND UNDERNEATH (§6/§7 VFS violation): the ash prompt reads "~/user/0/io.twoyi.debug/profiles/default/rootfs $" — busybox ash printed getcwd() = the HOST backing path of the guest root. Every guest process cwd'd into {rootfs} (6-Z187b) sees the HOST path via getcwd(2).
+  * FIX (6-Z217): EXIT-side getcwd virtualization in the tracer, mirroring the 6-Z200b readlink rewrite: if the returned path starts with the rootfs prefix, rewrite the buffer in place to the guest-relative path ("/" exact, "/<suffix>" deeper) and fix the return value (Linux getcwd returns the byte length incl. NUL). ABI table gained getcwd: i386=183, x86_64=87, aarch64=17. Pure helper guest_cwd_of() with 5 unit tests (exact-root, subpath, trailing-slash rootfs, superstring rejection, empty-prefix/root-mode no-op). 616 tests pass; fmt + clippy -D warnings clean.
+  * readlink("/proc/self/cwd") was already covered by 6-Z200b class-2; getcwd closes the direct-syscall leak path.
+- Late-run adbd restart loop noted (80 execve ENTRYs, /sbin/adbd staged-exec rewrites every ~2-3k iterations) — benign (container has no USB), but it spams socketpair/listen tracer noise; classified nothing. Left as-is.
+
+Stage Summary:
+- Terminal for TWRP-3.7 angler is FUNCTIONAL; classifier corrected. The REAL fix of this round is the getcwd host-path leak (a §6 invariant violation visible in the guest UI).
+- Awaiting f9ad745 CI round (6-Z215 guest-bionic-first + 6-Z216 FB hook): orangefox + lineage + 2 guards; whyred re-dispatch still in flight.

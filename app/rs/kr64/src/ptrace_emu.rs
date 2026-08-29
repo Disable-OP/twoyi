@@ -369,6 +369,18 @@ struct ChildAbi {
     readlink: i64,
     readlinkat: i64,
     chdir: i64,
+    // 6-Z217: getcwd — virtualized at EXIT so the guest never sees the
+    // HOST backing path of its own cwd (master prompt §6/§7). The
+    // tracer chdir()s the guest to {rootfs} (6-Z187b "guest cwd is the
+    // sandbox root"), so the kernel's getcwd() returns the HOST path
+    // (e.g. /data/user/0/io.twoyi.debug/profiles/default/rootfs) and
+    // busybox ash prints it verbatim as its prompt (`~/user/0/
+    // io.twoyi.debug/profiles/default/rootfs $` — run 33267265616
+    // screenshot-term-07b-terminal-prompt.png). Numbers verified:
+    //   i386:   __NR_getcwd 183
+    //   x86_64: __NR_getcwd 87
+    //   aarch64 (asm-generic): __NR_getcwd 17
+    getcwd: i64,
     // unlink / unlinkat — path-taking file-deletion syscalls. Task 6-Y:
     // these were MISSING from ChildAbi, so the path-translation match
     // arm did NOT cover them → init's unlink("/dev/socket/property_service")
@@ -1195,6 +1207,8 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     readlink: 89,
     readlinkat: 267,
     chdir: 80,
+    // x86_64 __NR_getcwd = 87 (asm/unistd_64.h) — 6-Z217 EXIT rewrite.
+    getcwd: 87,
     // x86_64 unlink=87, unlinkat=263 (Task 6-Y; verified against
     // /usr/include/x86_64-linux-gnu/asm/unistd_64.h). Path-translated so
     // init's unlink("/dev/socket/property_service") hits the rootfs.
@@ -1495,6 +1509,8 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     readlink: 85,
     readlinkat: 303,
     chdir: 12,
+    // i386 __NR_getcwd = 183 (asm/unistd_32.h) — 6-Z217 EXIT rewrite.
+    getcwd: 183,
     // i386 unlink=10, unlinkat=301 (Task 6-Y; verified against
     // /usr/include/x86_64-linux-gnu/asm/unistd_32.h). Path-translated so
     // init's unlink("/dev/socket/property_service") hits the rootfs, not
@@ -1839,6 +1855,8 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     readlink: -1,
     readlinkat: 78,
     chdir: 49,
+    // aarch64 (asm-generic) __NR_getcwd = 17 — 6-Z217 EXIT rewrite.
+    getcwd: 17,
     // aarch64 (asm-generic): unlink=-1 (dropped; uses unlinkat=35).
     // Task 6-Y; verified against /usr/include/asm-generic/unistd.h.
     unlink: -1,
@@ -4227,6 +4245,35 @@ fn ashmem_ioctl_nr(req: u64) -> u8 {
 /// translate_path-mangled rootfs form (anchored on the final component).
 fn is_ashmem_backing_path(path: &str) -> bool {
     path.starts_with('/') && path.rsplit('/').next() == Some("ashmem")
+}
+
+/// 6-Z217: derive the GUEST-visible cwd from a kernel getcwd() result.
+///
+/// The guest's cwd physically lives under the host rootfs backing dir,
+/// so the kernel returns a HOST path (master prompt §6/§7 — the guest
+/// must never see it). Returns:
+///   * Some("/")          when cwd == rootfs exactly,
+///   * Some("/<suffix>")  when cwd == {rootfs}/<suffix>,
+///   * None               when cwd is not under rootfs (leave untouched).
+fn guest_cwd_of(cwd: &str, rootfs: &str) -> Option<String> {
+    // Root mode (use_namespaces=true) uses an empty prefix — the
+    // kernel's cwd IS the guest view already; never rewrite.
+    let rootfs = if rootfs.ends_with('/') {
+        &rootfs[..rootfs.len() - 1]
+    } else {
+        rootfs
+    };
+    if rootfs.is_empty() {
+        return None;
+    }
+    if cwd == rootfs {
+        return Some("/".to_string());
+    }
+    if cwd.len() > rootfs.len() && cwd.starts_with(rootfs) && cwd.as_bytes()[rootfs.len()] == b'/' {
+        Some(cwd[rootfs.len()..].to_string())
+    } else {
+        None
+    }
 }
 
 /// 6-Z200b: rewrite a readlink result so the guest never sees a host
@@ -16383,6 +16430,68 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // ── 6-Z217: getcwd EXIT → guest-side cwd rewriting
+                    // (no host-path leakage) ──
+                    //
+                    // The tracer chdir()s the guest into {rootfs}
+                    // (6-Z187b "guest cwd is the sandbox root") so RELATIVE
+                    // execs and file ops resolve inside the sandbox. The
+                    // kernel's getcwd() then returns the HOST backing path
+                    // (e.g. /data/user/0/io.twoyi.debug/profiles/default/
+                    // rootfs) and any guest code that prints its cwd
+                    // exposes the host namespace: busybox ash's prompt is
+                    // the confirmed live case (run 33267265616
+                    // screenshot-term-07b-terminal-prompt.png shows
+                    // `~/user/0/io.twoyi.debug/profiles/default/rootfs $`
+                    // — a §6 violation in the guest's own UI).
+                    //
+                    // Fix: on a SUCCESSFUL getcwd whose returned path starts
+                    // with the rootfs prefix, rewrite the buffer IN PLACE to
+                    // the guest-relative path (exact match → "/", else
+                    // "/<suffix>") and fix the return value to the new
+                    // length (Linux getcwd returns the byte length INCLUDING
+                    // the terminating NUL). The rewritten path is always
+                    // shorter than the host path, so it always fits in the
+                    // buffer the kernel already sized (ret bytes).
+                    if abi.getcwd != -1 && syscall_num == abi.getcwd {
+                        let ret = get_syscall_arg(&regs, abi.reg_ret) as i64;
+                        if ret > 0 && ret < 4096 {
+                            let buf = get_syscall_arg(&regs, abi.reg_arg1);
+                            if buf != 0 {
+                                if let Some(bytes) = read_child_bytes(pid, buf, ret as usize) {
+                                    let cwd = String::from_utf8_lossy(&bytes)
+                                        .trim_end_matches('\0')
+                                        .to_string();
+                                    if let Some(guest_cwd) = guest_cwd_of(&cwd, rootfs) {
+                                        log(&format!(
+                                            "6-Z217: getcwd {} rewritten to guest path {} (host-path illusion)",
+                                            cwd, guest_cwd
+                                        ));
+                                        let mut out = guest_cwd.into_bytes();
+                                        out.push(b'\0');
+                                        if out.len() <= ret as usize {
+                                            if write_child_bytes_pokedata(pid, buf, &out) > 0 {
+                                                let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                                                if ptrace_getregs(pid, &mut regs2).is_ok() {
+                                                    set_syscall_ret(
+                                                        &mut regs2,
+                                                        &abi,
+                                                        out.len() as i64,
+                                                    );
+                                                    let _ = ptrace_setregs(
+                                                        pid,
+                                                        &regs2,
+                                                        std::mem::size_of::<Regs>(),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // ── 6-Z121: plain-fstat EXIT → root-ownership
                     // virtualization for the guest's /dev/__properties__/*
                     // metadata files ──
@@ -26888,6 +26997,69 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
     }
 
     // ── 6-Z200b: readlink results never leak host paths ──────────────
+
+    // ── 6-Z217: getcwd results never leak host paths ─────────────────
+
+    #[test]
+    fn z217_guest_cwd_of_rootfs_exact_is_root() {
+        let rootfs = "/data/user/0/io.twoyi.debug/profiles/default/rootfs";
+        assert_eq!(
+            guest_cwd_of(rootfs, rootfs),
+            Some("/".to_string()),
+            "cwd == rootfs must present as the guest's / (the terminal-prompt leak)"
+        );
+    }
+
+    #[test]
+    fn z217_guest_cwd_of_subpath_strips_prefix() {
+        let rootfs = "/data/user/0/io.twoyi.debug/profiles/default/rootfs";
+        assert_eq!(
+            guest_cwd_of(&format!("{}/system/bin", rootfs), rootfs),
+            Some("/system/bin".to_string())
+        );
+        assert_eq!(
+            guest_cwd_of(&format!("{}/", rootfs), rootfs),
+            Some("/".to_string())
+        );
+    }
+
+    #[test]
+    fn z217_guest_cwd_of_trailing_slash_rootfs() {
+        // Defensive: a rootfs configured with a trailing slash must not
+        // produce "//"-prefixed results.
+        let rootfs = "/data/data/io.twoyi/rootfs/";
+        assert_eq!(
+            guest_cwd_of("/data/data/io.twoyi/rootfs", rootfs),
+            Some("/".to_string())
+        );
+        assert_eq!(
+            guest_cwd_of("/data/data/io.twoyi/rootfs/data", rootfs),
+            Some("/data".to_string())
+        );
+    }
+
+    #[test]
+    fn z217_guest_cwd_of_prefix_superstring_is_rejected() {
+        // "/data/.../rootfs2" must NOT be treated as under
+        // "/data/.../rootfs" (superstring guard, same class as the
+        // /proc/selfx guard above).
+        let rootfs = "/data/user/0/io.twoyi.debug/rootfs";
+        assert_eq!(
+            guest_cwd_of("/data/user/0/io.twoyi.debug/rootfs2", rootfs),
+            None
+        );
+        assert_eq!(guest_cwd_of("/data", rootfs), None);
+        assert_eq!(guest_cwd_of("/data/user/0", rootfs), None);
+    }
+
+    #[test]
+    fn z217_guest_cwd_of_empty_rootfs_leaves_untouched() {
+        // root mode (use_namespaces=true) uses an empty prefix — the
+        // kernel cwd IS the guest root already; rewriting must not fire
+        // (a "/"-prefix match would rewrite EVERY path).
+        assert_eq!(guest_cwd_of("/system/bin", ""), None);
+        assert_eq!(guest_cwd_of("/", ""), None);
+    }
 
     #[test]
     fn z200b_guest_readlink_target_rewrites_staged_exe() {
