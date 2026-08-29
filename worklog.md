@@ -19298,3 +19298,6 @@ Stage Summary:
 - CI DISPATCH (2026-08-30, on 6-Z223 head): 5× ui-e2e-test-arm64 (workflow_dispatch):
   lineage-22.2-sailfish (6-Z219+6-Z223 verify), orangefox-R12.0-lavender (6-Z222
   verify), twrp-2.8.7.0-angler + twrp-3.7.0_9-0-angler + twrp-3.7.0_9-0-whyred (guards).
+- Run IDs (head 537e617, all in_progress at 22:45:33Z): 33279356812, 33279357961,
+  33279359112, 33279360223, 33279361259. Mapping run→recovery via each E2E job's
+  RECOVERY_NAME env dump at completion (dispatch POST returns no body).
