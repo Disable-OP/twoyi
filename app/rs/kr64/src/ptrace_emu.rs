@@ -11651,6 +11651,31 @@ pub fn run_ptrace_loop(
 
                 let syscall_num = get_syscall_num(&regs, &abi);
 
+                // 6-Z210 DIAG (broad): fires for EVERY syscall-stop (capped
+                // at 200) to see the full sequence of syscalls being caught
+                // around the mount() call. This is the DEFINITIVE diagnostic
+                // for H1b (mount() syscall-stop not being delivered).
+                // If mount() (nr=40 on aarch64) NEVER appears in this broad
+                // log, the ptrace tracer is NOT receiving the mount()
+                // syscall-stop at all — investigate fork-follow gap,
+                // ESRCH race, or PTRACE_O_TRACECLONE auto-attach timing.
+                {
+                    static BROAD_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = BROAD_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 200 {
+                        log(&format!(
+                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} [broad #{}/200]",
+                            syscall_num,
+                            pid,
+                            loop_count,
+                            in_syscall,
+                            abi.mount,
+                            n + 1,
+                        ));
+                    }
+                }
+
                 // 6-Z210 DIAG (pre-dispatch): fires for EVERY mount() syscall-stop
                 // BEFORE the ENTRY/EXIT classification. This distinguishes:
                 // - H1a: the syscall-stop IS delivered but classified as EXIT

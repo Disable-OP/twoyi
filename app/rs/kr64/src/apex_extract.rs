@@ -859,31 +859,72 @@ fn scan_alternative_libdl_paths() -> Option<(String, Vec<u8>)> {
     // If the symlink target is the stub, the versioned path might
     // still be the stub too — but try anyway in case apexd was
     // re-run with a newer APEX.
-    for n in 1..=3 {
-        let p = format!("/apex/com.android.runtime@{}/lib64/bionic/libdl.so", n);
-        if let Ok(b) = std::fs::read(&p) {
+    // 6-Z211b: ALSO try the UNVERSIONED path first (the redroid
+    // container has /apex/com.android.runtime/ as a real directory,
+    // not a symlink to @N). The unversioned path is the most common
+    // layout on redroid and Android 14+ containers.
+    let unversioned = "/apex/com.android.runtime/lib64/bionic/libdl.so";
+    match std::fs::read(unversioned) {
+        Ok(b) => {
             if is_real_libdl(&b) {
                 info!(
-                    "[KR64][apex_extract] found real libdl.so ({} bytes) at {} (alternative path)",
+                    "[KR64][apex_extract] found real libdl.so ({} bytes) at {} (unversioned alternative path)",
                     b.len(),
-                    p
+                    unversioned
                 );
-                return Some((p, b));
+                return Some((unversioned.to_string(), b));
             } else {
                 info!(
-                    "[KR64][apex_extract] alternative path {} exists but is stub ({} bytes)",
-                    p,
+                    "[KR64][apex_extract] unversioned alternative path {} exists but is stub ({} bytes)",
+                    unversioned,
                     b.len()
+                );
+            }
+        }
+        Err(e) => {
+            info!(
+                "[KR64][apex_extract] unversioned alternative path {} read FAILED: {} (continuing to @N scan)",
+                unversioned,
+                e
+            );
+        }
+    }
+    for n in 1..=3 {
+        let p = format!("/apex/com.android.runtime@{}/lib64/bionic/libdl.so", n);
+        match std::fs::read(&p) {
+            Ok(b) => {
+                if is_real_libdl(&b) {
+                    info!(
+                        "[KR64][apex_extract] found real libdl.so ({} bytes) at {} (alternative path)",
+                        b.len(),
+                        p
+                    );
+                    return Some((p, b));
+                } else {
+                    info!(
+                        "[KR64][apex_extract] alternative path {} exists but is stub ({} bytes)",
+                        p,
+                        b.len()
+                    );
+                }
+            }
+            Err(e) => {
+                info!(
+                    "[KR64][apex_extract] alternative path {} read FAILED: {} (continuing)",
+                    p, e
                 );
             }
         }
     }
 
-    // Scan /apex/ for any com.android.runtime@N directories we didn't try.
+    // Scan /apex/ for any com.android.runtime directories we didn't try.
+    // 6-Z211b: broadened from starts_with("com.android.runtime@") to
+    // starts_with("com.android.runtime") — matches both the unversioned
+    // directory AND the @N versioned directories.
     if let Ok(entries) = std::fs::read_dir("/apex/") {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("com.android.runtime@") {
+                if name.starts_with("com.android.runtime") {
                     let p = format!("/apex/{}/lib64/bionic/libdl.so", name);
                     if let Ok(b) = std::fs::read(&p) {
                         if is_real_libdl(&b) {

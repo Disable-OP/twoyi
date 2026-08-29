@@ -15189,3 +15189,361 @@ Stage Summary:
      until the ptrace-tracer fix is verified on OrangeFox round-14.
      Without the tracer fix, every other ROM with the same
      SetupMountNamespaces pattern will fail identically.
+
+---
+Task ID: 6-Z211 (fix) — enable host /apex/ scan by default for libdl.so
+Agent: main
+Task: Fix the Lineage 22.2 libdl.so stub blocker. The guest init
+crashes with a NULL-deref SIGSEGV in libc.so at offset 0xfb20
+BEFORE reaching SetupMountNamespaces, because the kr64 falls back
+to the 5848-byte stub libdl.so (the boot.img ramdisks for Lineage
+22.2 + OrangeFox R12.0 don't include the com.android.runtime.apex
+file).
+
+Work Log:
+- Inspected the OrangeFox round-12 kr64 stderr (artifact
+  9710041879) and confirmed the libdl.so stub issue:
+  * Line 68-73: apex_extract Option D (APK asset) — the asset at
+    /data/user/0/io.twoyi.debug/files/libdl.so is 5848 bytes but
+    NOT ELF magic (placeholder). Rejecting.
+  * Line 75-77: searching for real libdl.so in guest rootfs —
+    candidate /data/user/0/io.twoyi.debug/rootfs/system/apex/
+    com.android.runtime.apex does not exist — skipping.
+  * Line 79: TWOYI_ALLOW_HOST_APEX unset — skipping host /apex/
+    libdl scan.
+  * Line 80: FAILED to find real libdl.so anywhere — guest init
+    will use the 5848-byte stub.
+- Confirmed the guest rootfs has NO /system/apex/com.android.runtime.apex
+  file (the OrangeFox R12.0 boot.img ramdisk doesn't include it).
+  The rootfs-listing.txt shows /apex/ as an empty directory.
+- Changed host_apex_allowed_from() in apex_extract.rs to return
+  TRUE by default (was FALSE by default in Task 6-Z88). The host
+  /apex/ scan is now a safe FALLBACK when the guest rootfs doesn't
+  have the APEX.
+- VFS isolation analysis: the host /apex/ scan is a HOST-SIDE
+  operation (before execve). It reads the libdl.so BYTES from the
+  host's /apex/ and writes them to /dev/libdl.so (guest-side).
+  The guest sees /dev/libdl.so as a regular file — it never
+  discovers the host's /apex/ path. The host path is an
+  implementation detail (like a backing file).
+- Version mismatch analysis: libdl.so is part of bionic, whose
+  ABI is stable across Android 11-15. The dl_iterate_phdr /
+  __loader_dlopen / dlclose / dlsym / dlerror / dladdr symbols
+  have not changed. Using the host's libdl.so for the guest is
+  safe for the boot-critical dl_* calls.
+- Added opt-out env var TWOYI_DISALLOW_HOST_APEX=1 (for testing
+  the stub fallback in isolation).
+- Updated 3 apex_extract tests to reflect the new default-ON
+  behavior:
+  * apex_candidate_paths_with_default_off_includes_rom_and_rootfs
+    → renamed comment to "default ON"
+  * apex_candidate_paths_omits_rom_dir_when_none → asserts host
+    paths ARE included by default
+  * apex_candidate_paths_always_includes_host_paths → asserts
+    host paths ARE included by default + opt-out excludes them
+- Verified all gates pass: cargo check, cargo fmt, cargo clippy
+  --all-targets -- -D warnings, cargo test --lib (605 passed).
+- Committed as 96e6e2d. Pushed to GitHub main.
+- Dispatched Lineage 22.2 sailfish verification on 96e6e2d.
+- Also dispatched OrangeFox R12.0 lavender round-14 on 707e9d3
+  (pre-dispatch mount() DIAG log to distinguish H1a vs H1b for
+  the mount() syscall-stop not being delivered to the tracer).
+
+Stage Summary:
+- The 6-Z211 fix enables the host /apex/ scan by default. This
+  should resolve the Lineage 22.2 libdl.so stub blocker — the
+  kr64 will find the real libdl.so on the redroid container's
+  /apex/ and copy it to /dev/libdl.so (guest-side). The guest
+  init will then load the real libdl.so instead of the 5848-byte
+  stub, avoiding the NULL-deref SIGSEGV in libc.so.
+- Expected Lineage 22.2 round-13 outcome: with the real libdl.so
+  available, the guest init should reach SetupMountNamespaces
+  (where the 6-Z210 fix would apply IF the mount() syscall-stop
+  is delivered to the tracer).
+- The 6-Z210 fix is still NOT firing at runtime (H1 confirmed by
+  the round-13 DIAG log absence). The pre-dispatch DIAG log in
+  commit 707e9d3 will distinguish H1a (ENTRY/EXIT misclassification)
+  from H1b (stop not delivered).
+- Next concrete action: wait for both verification runs to
+  complete, then inspect the artifacts:
+  * OrangeFox round-14: look for "6-Z210 DIAG (pre-dispatch)"
+    lines. If present → H1a (ENTRY/EXIT misclassification). If
+    absent → H1b (stop not delivered — investigate fork-follow
+    gap / ESRCH race).
+  * Lineage 22.2 round-13: look for "extracted real libdl.so"
+    lines. If present → the libdl.so fix worked, and the guest
+    should reach SetupMountNamespaces (where the 6-Z210 fix
+    would apply IF the mount() stop is delivered).
+
+---
+Task ID: 6-Z211-mon1
+Agent: CI-monitoring subagent
+Task: Monitor TWO GitHub Actions UI E2E runs:
+  1. Run 33238299535 — OrangeFox R12.0 lavender round-14 on
+     commit 707e9d3 (pre-dispatch mount() DIAG log to distinguish
+     H1a [stop delivered but misclassified as EXIT] vs H1b [stop
+     not delivered] for the mount() syscall-stop that the 6-Z210
+     fix depends on).
+  2. Run 33238428628 — Lineage 22.2 sailfish round-13 on commit
+     96e6e2d (6-Z211: enable host /apex/ scan by default for
+     libdl.so, to resolve the 5848-byte stub blocker that crashes
+     the Lineage guest init in libc.so at offset 0xfb20 before
+     SetupMountNamespaces is reached).
+
+Work Log:
+- Polled both runs via GitHub Actions REST API every ~60 s.
+  * OrangeFox r14 (33238299535): run_started_at=2026-08-29T06:22:17Z.
+    Build arm64-v8a APK job ran 06:22:20→06:24:06Z (~1 min 46 s,
+    conclusion=success). UI-only ARM64 (TWRP) E2E on redroid job
+    ran 06:24:10→06:37:14Z (~13 min 4 s, conclusion=success). Run
+    conclusion=success. TOTAL ~15 min.
+  * Lineage r13 (33238428628): run_started_at=2026-08-29T06:25:33Z.
+    Build arm64-v8a APK job ran 06:25:36→06:27:16Z (~1 min 40 s,
+    conclusion=success). UI-only ARM64 (TWRP) E2E on redroid job
+    ran 06:27:20→06:40:26Z (~13 min 6 s, conclusion=success). Run
+    conclusion=success. TOTAL ~15 min.
+- Downloaded ui-e2e-arm64-logs artifacts:
+  * OrangeFox r14: artifact id=9710751040 (21.86 MB), extracted to
+    /home/z/my-project/artifacts/ofox-r14/ui-e2e-artifacts/
+    (kr64-app-stderr-dockerexec.log: 2781 lines, 341 KB).
+  * Lineage r13: artifact id=9710786102 (14.46 MB), extracted to
+    /home/z/my-project/artifacts/lineage-r13/ui-e2e-artifacts/
+    (kr64-app-stderr-dockerexec.log: 1243 lines, 153 KB).
+
+- ORANGEFOX r14 kr64 stderr inspection (commit 707e9d3):
+  * `grep -c "6-Z210 DIAG (pre-dispatch)"` → 0 (ZERO occurrences).
+  * `grep -c "6-Z210 DIAG: mount() ENTRY"` → 0 (ZERO occurrences).
+  * `grep -c "6-Z210: propagation\|6-Z168: block-storage\|6-Z164: pseudo-mount"` → 0 (ZERO).
+  * `grep -cE "nr=40[^0-9]"` → 0 (ZERO mount syscalls anywhere).
+  * `grep -c "6-Z164"` → 12 (BUT all 12 are `6-Z164: open FAILED` —
+    the OPEN-path translation code, NOT the pseudo-mount code. The
+    open-side 6-Z164 path IS firing, which proves the syscall-ENTRY
+    handler is alive for open() syscalls on the active pid).
+  * Distribution of all ENTRY DIAGs: only nr=220 (clone, 4
+    occurrences) and nr=222 (mmap2, 1253 occurrences). NO other
+    syscall number is logged as an ENTRY DIAG.
+  * SetupMountNamespaces chain STILL present (3 occurrences): the
+    failed remount write at line 2699 ("Failed to remount /apex as
+    40000: Device or resource busy"), the glog F/abort at lines
+    2700/2704, and the init:2 log at line 2705.
+  * InitFatalReboot: 1 occurrence (line 2716: "signal 6").
+  * SIGSEGV count: 0 (ZERO — the OrangeFox init does NOT crash on
+    the 5848-byte stub libdl.so, unlike the Lineage init).
+  * Line 79: "TWOYI_ALLOW_HOST_APEX unset — skipping host /apex/
+    libdl scan" → confirms 707e9d3 does NOT include the 6-Z211
+    fix (the OLD code path, host /apex/ scan is OFF by default).
+  * Line 80: "FAILED to find real libdl.so anywhere — guest init
+    will use the 5848-byte stub" → OrangeFox also uses the stub.
+    BUT OrangeFox init tolerates the stub (no SIGSEGV), while
+    Lineage init crashes (NULL-deref in libc.so at offset 0xfb20).
+  * result-pretty.json verdict: BOOT_FAIL_EARLY_INIT (overall=
+    BOOT_FAIL_EARLY_INIT, boot=BOOT_FAIL, failure=init_fatal_reboot,
+    exit_code=127, backstop_denied=2, recovery_instances=0,
+    ui=NOT_REACHED, vfs=CLEAN).
+
+- ORANGEFOX r14 — Exit-event timeline (kr64 stderr):
+  * Line 2691: pid=2579 clone() ENTRY (nr=220) — fork for thread
+    2679 (CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|
+    CLONE_NEWNS|CLONE_PARENT_SETTID|...).
+  * Line 2694: SIGTRAP stop (no 0x80) ptrace_event=3
+    (PTRACE_EVENT_CLONE) on 2579; new child PID 2679 registered.
+  * Line 2697: DIAG fork-family EXIT: nr=220 returned 2679.
+  * Line 2698: Task-6-S EXIT: pid=2579 clone nr=220 -> 2679.
+  * Line 2699: DIAG write(fd=67, ret=67): "<3>init: Failed to
+    remount /apex as 40000: Device or resource busy\n" — the
+    mount() must have happened between line 2698 and line 2699,
+    but NO mount() syscall-stop DIAG (pre-dispatch or post-ENTRY)
+    was emitted.
+  * Lines 2700-2705: SetupMountNamespaces failure chain (glog F/abort
+    + init:2 log).
+  * Line 2706: pid=2579 clone() ENTRY (nr=220) again, flags=0x1200011
+    (CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|SIGCHLD) → real fork()
+    (PTRACE_EVENT_FORK), child PID 2680.
+  * Line 2716: InitFatalReboot: signal 6.
+  * Confirms H1b: the pre-dispatch DIAG (which fires for EVERY
+    mount() syscall-stop regardless of ENTRY/EXIT classification,
+    right after `let syscall_num = get_syscall_num(&regs, &abi);`
+    in ptrace_emu.rs line ~11652) appears ZERO times — meaning the
+    kernel executed mount() (returned EBUSY, provable from the
+    "Failed to remount" write DIAG), but the ptrace tracer NEVER
+    received a syscall-stop for the mount() call.
+
+- LINEAGE r13 kr64 stderr inspection (commit 96e6e2d, 6-Z211 fix):
+  * `grep -c "extracted real libdl.so"` → 0 (ZERO occurrences).
+  * `grep -c "FAILED to find real libdl.so"` → 1 (line 83).
+  * `grep -c "com.android.runtime@"` → 0 (ZERO occurrences of ANY
+    /apex/com.android.runtime@N/ path being tried or scanned).
+  * `grep -c "TWOYI_ALLOW_HOST_APEX unset"` → 0 (the OLD "skipping
+    host /apex/ libdl scan" log line does NOT appear — this
+    CONFIRMS the 6-Z211 fix IS active: host_apex_allowed_from()
+    returns TRUE by default, scan_alternative_libdl_paths() enters
+    the for-loop body).
+  * Line 71: "Option D: asset at .../files/libdl.so is 5848 bytes
+    but NOT ELF magic — placeholder or corrupted. Rejecting + falling
+    through to APEX extraction."
+  * Line 78: "all .apex candidates exhausted — falling back to
+    alternative path scan" (no .apex file exists in guest rootfs).
+  * Line 83: "FAILED to find real libdl.so anywhere — guest init
+    will use the 5848-byte stub and likely crash at offset 0xaf174
+    in linker64 (5-K's diagnosis)".
+  * Line 88: "PARENT: real libdl.so NOT extracted — guest init will
+    use the 5848-byte stub at /apex/com.android.runtime/lib64/bionic/
+    libdl.so".
+  * SILENT FAILURE MODE: the 6-Z211 scan_alternative_libdl_paths()
+    function entered its body (no skipping log emitted), tried the
+    3 versioned APEX paths:
+      /apex/com.android.runtime@1/lib64/bionic/libdl.so
+      /apex/com.android.runtime@2/lib64/bionic/libdl.so
+      /apex/com.android.runtime@3/lib64/bionic/libdl.so
+    Each `std::fs::read(&p)` returned an Err silently (NO log line
+    emitted on read failure), then `read_dir("/apex/")` either
+    failed silently OR returned no entries starting with
+    "com.android.runtime@". The kr64 process runs as untrusted_app
+    (u0_a87), so it likely either:
+      (a) hit EACCES on /apex/com.android.runtime@N/ (untrusted_app
+          has no read perm on versioned APEX dirs in the redroid
+          container), OR
+      (b) the redroid container's /apex/ has only the symlink
+          /apex/com.android.runtime/ -> /apex/com.android.runtime@N/
+          (the unversioned path) but NOT the @N versioned
+          directory itself (because redroid may mount the APEX as
+          a flattened /apex/com.android.runtime/ directory).
+  * SIGSEGV count: 8 (EIGHT occurrences — guest crashes repeatedly).
+  * Line 1011: SIGSEGV details: tid=2579 si_code=1 (MAPERR unmapped),
+    si_addr=0x0 (NULL deref), pc=0xe8acbf6d1b20, sp=0xfffff5c10ca0.
+  * Line 1124 maps: libc.so r-xp segment at e8acbf6c2000-e8acbf749000
+    with file_offset=0x50000. pc=0xe8acbf6d1b20 → offset within
+    r-xp segment = 0xfb20. THIS MATCHES the previous round-12
+    diagnosis of "offset 0xfb20 in libc.so r-xp segment".
+  * Line 205 (CHILD): "libdl.so NOT found at /dev/libdl.so —
+    linker will fall through to /apex/.../bionic/libdl.so (the
+    5848-byte stub). EXPECT linker64 segfault at 0xaf174".
+  * `grep -c "SetupMountNamespaces"` → 0 (ZERO — guest NEVER reaches
+    SetupMountNamespaces; the SIGSEGV in libc.so at offset 0xfb20
+    happens BEFORE the mount() syscall).
+  * `grep -c "6-Z210 DIAG"` → 0 (N/A — the mount syscall is never
+    reached on Lineage because the libdl.so stub crashes the guest
+    earlier; this is independent of the H1a/H1b ptrace tracer
+    question which is only testable on OrangeFox r14).
+  * result-pretty.json verdict: BOOT_FAIL (overall=BOOT_FAIL,
+    boot=BOOT_FAIL, sigsegv_count=8, NO init_fatal_reboot failure
+    marker — the failure mode is a SIGSEGV crash, NOT an
+    init_fatal_reboot. backstop_denied=2, recovery_instances=0,
+    ui=NOT_REACHED, vfs=CLEAN, terminal=NOT_APPLICABLE).
+  * Container state: status=running exit=0 oom=false.
+
+Stage Summary:
+- ORANGEFOX r14 (commit 707e9d3) — H1b CONFIRMED with DEFINITIVE
+  EVIDENCE: the pre-dispatch mount() DIAG log appears ZERO times in
+  the kr64 stderr, but the "Failed to remount /apex as 40000:
+  Device or resource busy" write DIAG (line 2699) proves the mount()
+  syscall WAS executed by the kernel and returned -EBUSY. The
+  pre-dispatch DIAG fires unconditionally for EVERY mount()
+  syscall-stop (regardless of ENTRY/EXIT classification), right
+  after `let syscall_num = get_syscall_num(&regs, &abi);` at line
+  ~11652 of ptrace_emu.rs. Its ZERO occurrences proves the ptrace
+  tracer NEVER received a syscall-stop for the mount() call. The
+  post-ENTRY DIAG is also ZERO (consistent). The syscall-ENTRY
+  handler IS alive (proven by 12 occurrences of "6-Z164: open
+  FAILED" — the open-path translation code). So:
+    H1a (stop delivered but misclassified as EXIT): REJECTED
+        (the pre-dispatch DIAG would fire in this case).
+    H1b (stop NOT delivered): CONFIRMED. The ptrace tracer is
+        missing the mount() syscall-ENTRY stop entirely.
+  Root cause remains the multi-pid fork-follow / waitpid dispatch
+  bug identified in 6-Z210-mon2: after PTRACE_EVENT_CLONE/FORK,
+  the tracer issues PTRACE_SYSCALL only on the "active" (newly-
+  switched) child and leaves the parent paused, so the parent's
+  next syscall-stop (the mount() that returns EBUSY) is orphaned
+  and the kernel queues only ONE syscall-stop per syscall — when
+  the tracer eventually returns to waitpid(-1), the mount() stop
+  has been consumed/skipped by the kernel.
+
+- LINEAGE r13 (commit 96e6e2d) — 6-Z211 FIX DID NOT RESOLVE THE
+  LIBDL.SO STUB BLOCKER. The fix correctly enabled the host /apex/
+  scan (the OLD "TWOYI_ALLOW_HOST_APEX unset — skipping" log line
+  does NOT appear, confirming host_apex_allowed_from() returns TRUE
+  by default), but the scan found nothing:
+  * The 3 versioned APEX paths /apex/com.android.runtime@1/@2/@3/
+    lib64/bionic/libdl.so do not exist OR are not readable by
+    untrusted_app (u0_a87) on the redroid container — the
+    `std::fs::read()` calls returned Err silently (NO log line
+    emitted on read failure in scan_alternative_libdl_paths).
+  * `read_dir("/apex/")` either failed silently (EACCES for
+    untrusted_app) OR returned no entries starting with
+    "com.android.runtime@" (the redroid container may have only
+    the unversioned symlink /apex/com.android.runtime/, not the
+    @N versioned directory).
+  * The guest init still loads the 5848-byte stub libdl.so, still
+    crashes with SIGSEGV at pc=0xe8acbf6d1b20 (offset 0xfb20 in
+    libc.so r-xp segment, NULL deref si_addr=0x0), still does NOT
+    reach SetupMountNamespaces (0 occurrences).
+  * result-pretty.json: BOOT_FAIL (sigsegv_count=8). Different
+    failure mode than OrangeFox (BOOT_FAIL_EARLY_INIT,
+    init_fatal_reboot) because Lineage crashes BEFORE reaching
+    SetupMountNamespaces.
+
+- NEXT CONCRETE ACTIONS for the main orchestrator:
+  1. (6-Z210 ptrace tracer fix — STILL the priority for OrangeFox)
+     Inspect ptrace_emu.rs around the fork-follow / waitpid loop:
+     * After PTRACE_EVENT_FORK / PTRACE_EVENT_CLONE, the tracer
+       must issue PTRACE_SYSCALL on BOTH the parent and the new
+       child (so both pids' next syscalls are caught). The current
+       code seems to PTRACE_SYSCALL only the "active" (newly-
+       switched) pid and leave the parent paused. Specifically,
+       after the "DIAG child switch 2579 → 2679 — new child,
+       in_syscall=false (Task 6-Z54)" log line, the parent (2579)
+       is left paused and its next syscall (mount()) is lost.
+     * Fix: after the child switch, the parent should be
+       PTRACE_SYSCALL-resumed so its next syscall (mount()) is
+       delivered. Re-dispatch OrangeFox r15 on the fix commit;
+       expect 1+ "6-Z210 DIAG (pre-dispatch): mount() syscall-stop
+       nr=40 pid=2579 loop_count=... in_syscall=... abi.mount=40
+       [diag #1/50]" lines, and the 6-Z210 classification block
+       firing to fake the mount() return 0 so SetupMountNamespaces
+       succeeds.
+  2. (6-Z211 libdl.so fix — INCOMPLETE, needs revision)
+     The scan_alternative_libdl_paths() function currently only
+     tries /apex/com.android.runtime@N/lib64/bionic/libdl.so (3
+     versioned paths + read_dir matching "com.android.runtime@*").
+     This misses the COMMON case where the redroid container has
+     /apex/com.android.runtime/ (unversioned, possibly a flattened
+     APEX directory or a symlink that doesn't start with
+     "com.android.runtime@"). FIX:
+     * Add a candidate for the unversioned path
+       /apex/com.android.runtime/lib64/bionic/libdl.so (BEFORE the
+       versioned @N scan).
+     * Add DEBUG-level logging on EACH std::fs::read() failure
+       (with the os error) so silent failures are visible in the
+       kr64 log. Currently the for-loop silently falls through on
+       read errors — that's why we couldn't distinguish "path
+       doesn't exist" from "EACCES for untrusted_app" from "is
+       real libdl but stub".
+     * Possibly ALSO scan /apex/com.android.runtime/lib64/bionic/
+       libdl.so via `read_dir("/apex/")` matching entries starting
+       with "com.android.runtime" (with OR without @ suffix).
+     * Re-dispatch Lineage r14 on the revised commit. Expectation:
+       if the redroid host has /apex/com.android.runtime/lib64/
+       bionic/libdl.so (the unversioned symlink/dir), the scan
+       finds it, copies it to /dev/libdl.so, the guest init loads
+       the real libdl.so, no SIGSEGV in libc.so, and the guest
+       reaches SetupMountNamespaces (where the 6-Z210 fix would
+       then apply IF the ptrace tracer fix is also landed).
+  3. (Suggested sequence) Land BOTH fixes (ptrace tracer + libdl.so
+     scan unversioned path) in a single commit, then re-dispatch
+     BOTH OrangeFox r15 AND Lineage r14. Expected outcomes:
+     * OrangeFox r15: 6-Z210 DIAG pre-dispatch appears, 6-Z210
+       classification block fires, mount() fakes 0, guest reaches
+       past SetupMountNamespaces. Overall: BOOT_OK or BOOT_FAIL
+       with a DIFFERENT failure marker (e.g. later-stage init
+       failure or UI timeout).
+     * Lineage r14: libdl.so extracted from /apex/com.android.runtime/
+       lib64/bionic/libdl.so, guest reaches SetupMountNamespaces
+       (where the 6-Z210 fix applies IF the tracer fix is also
+       landed). Overall: BOOT_OK or BOOT_FAIL with a different
+       failure marker.
+  4. Do NOT remove the 6-Z210 DIAG (pre-dispatch) log — keep it
+     as a runtime verifier for the ptrace-tracer fix. The 6-Z210
+     classification block can stay as-is (it's verified correct
+     in code; it just doesn't fire because the syscall-stop isn't
+     delivered).
