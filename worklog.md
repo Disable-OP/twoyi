@@ -19008,3 +19008,34 @@ Stage Summary:
      run 33132782393) — bisect between then and f0ac758.
 - NEXT: commit 6-Z214, dispatch the two failing recoveries + the three
   regression guards (TWRP 2.8/3.7/whyred must stay green).
+
+---
+Task ID: 6-Z215
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-29
+Task: Root-cause the lineage-22.2-sailfish SIGSEGV (sigsegv_count=8, pre-mount, r25 run 33261943269) and implement a generic fix.
+
+Work Log:
+- Downloaded the r25 lineage artifact (9717680934) and re-analyzed the full crash window.
+- Crash forensics: single fatal SIGSEGV in the guest init thread "twoyi_init" (tid 2583) after 3740 syscall iterations. si_code=1 (MAPERR), si_addr=0x0, pc=0xe3a8d1264b20. All 8 counted "sigsegv" log lines belong to ONE crash's diagnostic dump (details line + 2 regs lines + comm + threads + stack window = 8 matches for the grep "SIGSEGV" used by the classifier — classifier note below).
+- pc/x30/stack-return-addresses ALL resolve inside /apex/com.android.runtime/lib64/bionic/libc.so (device 00:34 = HOST /apex mount) via the logged /proc/<pid>/maps crash dump.
+- THE ROOT CAUSE (found in the maps + env): the guest's Android-15 linker64 (rootfs 08:01) linked the guest init against the HOST's Android-14 libc.so + libdl.so:
+  * LD_LIBRARY_PATH=/dev:/apex/com.android.runtime/lib64/bionic:/apex/com.android.runtime/lib64:...:/system/lib64:... — the host-bionic /apex paths come BEFORE /system/lib64.
+  * The rootfs /apex tree is EMPTY (lineage ramdisk ships no apex payload), so the /apex opens fell through to the HOST's /apex (device 00:34) — the HOST's libc.so/libdl.so were mapped into the guest process.
+  * The ROM's OWN bionic (system/lib64/libc.so 1,114,608 bytes, libdl.so 13,896 bytes, linker64 2,192,888 bytes — verified by downloading boot.img be5fe3e3... and unpacking the ramdisk) was bypassed: libc++.so/liblog.so/libbase.so came from the ROM (08:01) but libc.so/libdl.so came from the host (00:34).
+  * Private-ABI mismatch (Android-15 linker+init + Android-14 host libc) → SIGSEGV null-deref during early property-area init (the last kernel-visible activity: open properties_serial fd=3 → interposer "created property_info on host" → mprotect/rt_sigprocmask storm → SIGSEGV).
+  * Cross-check: OrangeFox R12 (Android-12 init, same AOSP-layout path, same host libc) survives far enough to hit SetupMountNamespaces — older init tolerates the host libc; Lineage's Android-15 init does not. Same bug class, different crash threshold.
+- WHY THE ROM'S LIBS WERE SHADOWED: the 6-Z93 "host-presence filter" in the /dev library-symlink farm deliberately excludes host-present names (libc.so etc.) from LD_LIBRARY_PATH[0]=/dev so the x86_64 binfmt runner keeps resolving them from its own trees. Correct for runner mode; WRONG for native-arch guests (arm64 E2E, real arm64 devices) where the guest init is a REAL same-machine process and must use its own bionic.
+- THE FIX (6-Z215, generic — keys on ELF e_machine, not device/recovery identity):
+  1. New helpers: elf_machine_from_bytes()/elf_machine() (ELF32+ELF64, LE+BE, offset-18 read), host_arch_machine() fallback, host_bionic_machine() (host /apex libc → host /system/lib64 libc → compile-time arch), guest_bionic_is_native() (guest rootfs libc.so machine == host bionic machine).
+  2. /dev farm: when native_guest, the 6-Z93 host-presence filter is DISABLED — every ROM library (libc.so, libm.so, libdl.so, ...) gets the relative symlink {rootfs}/dev/<lib>.so -> ../system/lib64/<lib>.so and wins at LD_LIBRARY_PATH[0]=/dev BEFORE any /apex entry. Host trees remain the fallback for names the ROM lacks. Runner mode (machine mismatch) keeps 6-Z93 unchanged — x86_64 full-Android cannot regress.
+  3. libdl staging: in native mode, if the ROM ships its own system/lib64/libdl.so, /dev/libdl.so becomes a RELATIVE symlink to it (replacing the host-extracted bytes; host bytes remain the fallback otherwise).
+- Tests: 6 new unit tests (ELF parse all Android machines incl. BE, non-ELF/short rejects, missing-file, native-vs-runner decisions with synthetic temp rootfs). Full gates: cargo fmt --check, clippy --all-targets -D warnings, cargo test --lib → 611 passed / 0 failed.
+- CLASSIFIER NOTE (for a later task): the r25 lineage result.json sigsegv_count=8 came from grepping "SIGSEGV" in kr64-app-stderr-dockerexec.log; the crash produces 8 matching lines (1 details + 2 regs + comm + threads + stack window + 2 in surrounding events). The count is "1 crash" semantically. If counts matter for clustering, count "SIGSEGV details:" lines instead.
+
+Stage Summary:
+- ROOT CAUSE (lineage-22.2-sailfish): host libc.so/libdl.so mapped into the guest init because LD_LIBRARY_PATH prefers /apex/com.android.runtime (which falls through to the HOST's apex) over the ROM's own /system/lib64, and the 6-Z93 filter refuses to stage host-present names into /dev. Generic mechanism bug, not device-specific.
+- FIX: guest-bionic-first staging for native-arch guests (e_machine-equality gate); runner mode unchanged. Also removes the guest's hidden dependency on host apex files (§6/§23: host fallback only when the guest lacks the resource).
+- PENDING VERIFICATION: 5 CI runs dispatched on 8e51482 (6-Z214 /apex EBUSY fix): orangefox-R12.0-lavender, lineage-22.2-sailfish, twrp-2.8.7.0-angler, twrp-3.7.0_9-0-angler (terminal regression), twrp-3.7.0_9-0-whyred. The 6-Z215 commit will need ANOTHER CI round on top.
+- REMAINING BLOCKERS: (1) twrp-3.7.0_9-0-angler terminal FAIL regression (ash banner absent); (2) possible property clean-slate need for AOSP-layout boots (6-Z196 extension) — only if lineage still fails at property init AFTER 6-Z215 (evidence so far says the shlib interposer serves it, as for OrangeFox); (3) corpus expansion toward the 90%-boot goal.
+- Artifacts: /home/z/my-project/artifacts/r25/{lineage,orangefox,whyred}/ + /home/z/my-project/artifacts/lineage-img/ (boot.img + unpacked ramdisk with system/bin/{init,linker64} + system/lib64/{libc,libdl}.so).
