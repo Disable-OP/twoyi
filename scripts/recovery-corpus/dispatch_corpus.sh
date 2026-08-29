@@ -25,19 +25,55 @@ MANIFEST="${SCRIPT_DIR}/../../corpus/manifest.yaml"
 ENTRIES=$(python3 - "$MANIFEST" "$SELECT" <<'EOF'
 import sys, json
 path, select = sys.argv[1], sys.argv[2]
+# 6-Z221: batch selector — "batch:N:M" dispatches entries [N, M) of the
+# full manifest (0-based, half-open) so a long corpus can be verified in
+# controlled waves (§28 resource budget) instead of one 592-run burst.
+# "batch:N" dispatches entries [N, end). Interleaves families so every
+# wave exercises TWRP + OrangeFox + Lineage together (failure clustering
+# needs family diversity per wave, §36).
+def interleave(items):
+    by_fam = {}
+    order = []
+    for it in items:
+        fam = it.get("family", "?")
+        if fam not in by_fam:
+            by_fam[fam] = []
+            order.append(fam)
+        by_fam[fam].append(it)
+    out = []
+    while any(by_fam[f] for f in order):
+        for f in order:
+            if by_fam[f]:
+                out.append(by_fam[f].pop(0))
+    return out
 try:
     import yaml
     data = yaml.safe_load(open(path))
     images = (data or {}).get("images", [])
-    out = []
-    for img in images:
-        if select in ("all", img.get("tier")) or select == img.get("name"):
-            out.append({
-                "name": img.get("name", ""),
-                "url": img.get("url", ""),
-                "referer": img.get("referer", "") or "",
-                "md5": img.get("md5", "") or "",
-            })
+    if select.startswith("batch"):
+        parts = select.split(":")
+        lo = int(parts[1]) if len(parts) > 1 and parts[1] != "" else 0
+        hi = int(parts[2]) if len(parts) > 2 else len(images)
+        sel_imgs = interleave(images[lo:hi])
+        out = sel_imgs
+    else:
+        out = []
+        for img in images:
+            if select in ("all", img.get("tier")) or select == img.get("name"):
+                out.append(img)
+        out = [{
+            "name": i.get("name", ""),
+            "url": i.get("url", ""),
+            "referer": i.get("referer", "") or "",
+            "md5": i.get("md5", "") or "",
+        } for i in out]
+    if select.startswith("batch"):
+        out = [{
+            "name": i.get("name", ""),
+            "url": i.get("url", ""),
+            "referer": i.get("referer", "") or "",
+            "md5": i.get("md5", "") or "",
+        } for i in out]
     print(json.dumps(out))
 except ImportError:
     # naive fallback: parse the flat 2-space-indented list
