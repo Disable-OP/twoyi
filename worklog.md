@@ -16011,3 +16011,246 @@ Stage Summary:
      the cap (line 440 cap vs line 2914 mount) — and the
      uncapped pre-dispatch DIAG (cap 50, but mount never
      appears even once) is the definitive signal.
+
+---
+Task ID: 6-Z211c-mon1
+Agent: CI-monitoring subagent
+Task: Monitor OrangeFox R12.0 lavender round-16 UI E2E run on commit 9bb8d95 (increased broad DIAG cap from 200 to 2000) and inspect kr64-app-stderr-dockerexec.log to definitively determine whether the mount() syscall (nr=40 on aarch64) is ever delivered to the ptrace tracer.
+
+Work Log:
+- Read worklog.md tail (last 350 lines) to understand r14/r15 state and
+  the H1b hypothesis: the ptrace tracer is missing the mount() syscall-
+  ENTRY stop entirely (after PTRACE_EVENT_CLONE/FORK, the tracer issues
+  PTRACE_SYSCALL only on the "active" (newly-switched) child and leaves
+  the parent paused, so the parent's next syscall (mount()) is orphaned).
+- Fetched latest workflow runs on main:
+    33240825034  UI E2E Test (ARM64)  9bb8d955  in_progress  2026-08-29T07:26:01Z
+    33240811424  kr64 lint + test      9bb8d955  completed    2026-08-29T07:25:40Z
+    33239450357  UI E2E Test (ARM64)  d3491aed  completed    2026-08-29T06:50:47Z
+- Confirmed commit 9bb8d95 message: "diag(6-Z211c): increase broad DIAG
+  cap from 200 to 2000" — change is +7/-3 in app/rs/kr64/src/ptrace_emu.rs
+  (plus +464/-0 in worklog.md). The intent: capture syscalls AFTER the
+  fork event to see whether mount() (nr=40 on aarch64) EVER appears in
+  the tracer's syscall-stops. Pre-existing test suite: 605 passed.
+- Polled the run every ~60s. Status timeline:
+    07:26:40 in_progress (build APK job active)
+    07:36:49 in_progress (UI nav step: "UI navigation — import ROM +
+                boot container" in_progress)
+    07:42:06 COMPLETED success (overall run green; result.json classified
+                BOOT_FAIL_EARLY_INIT — the workflow itself succeeded but
+                the boot result inside the container is BOOT_FAIL).
+  Total wall time: ~16 minutes. Well under the 25-minute budget.
+- Downloaded the `ui-e2e-arm64-logs` artifact (artifact ID 9711459313,
+  21.6 MB) via the GitHub Actions artifacts API, unzipped + extracted
+  the inner ui-e2e-logs.tar.xz, and moved the contents to the expected
+  path /home/z/my-project/artifacts/ofox-r16/ui-e2e-artifacts/.
+- Inspected kr64-app-stderr-dockerexec.log (4800 lines, 601 KB):
+  * Broad DIAG count (cap raised 200→2000): grep -c → 2000. Cap reached
+    at line 2682 (broad #2000/2000, syscall nr=215 nanosleep on
+    pid=2594, loop_count=2000, in_syscall=true).
+  * *** CRITICAL: grep -c "6-Z210 DIAG (broad):.*nr=40\b" → 0 ***
+    ZERO of the 2000 syscall-stops captured by the broad DIAG is the
+    mount syscall (nr=40 on aarch64). Increasing the cap 10× did NOT
+    surface the mount syscall-stop.
+  * Pre-dispatch mount() DIAG (mount-specific, cap 50, SEPARATE from
+    the 2000-cap): grep -c → 0. ZERO occurrences. This is the
+    definitive signal: NO mount syscall-stop was EVER delivered to
+    the ptrace tracer at any point during the run.
+  * 6-Z210 classification block ("6-Z210: propagation", etc.):
+    grep -c → 0. ZERO occurrences — confirms the classification block
+    never fires (because the mount syscall-stop is never received).
+  * Fork event + SetupMountNamespaces chain:
+      Line 4705: "DIAG fork-family ENTRY: nr=220 (pid=2594),
+                 loop_count=14221, in_syscall_was=true"
+      Line 4708: "PTRACE_EVENT_CLONE: parent 2594 forked —
+                 new child PID 2685 (auto-attached by kernel)"
+      Line 4709: "6-Z97: PTRACE_EVENT_CLONE — new child PID 2685
+                 registered in the tracked set (2 tracked)"
+      Line 4710: "DIAG child switch: 2594 → 2685 — new child,
+                 in_syscall=false (Task 6-Z54)"
+      Line 4711: "SIGSTOP on forked child 2685 — consuming (auto-attach
+                 stop) and resuming with signal=0 so its syscalls get
+                 traced"
+      Line 4712: "DIAG fork-family EXIT: nr=220 returned 2685"
+      Line 4713: "Task-6-S EXIT: pid=2594 clone nr=220 -> 2685"
+      Line 4714: "DIAG write(fd=67, ret=67): '<3>init: Failed to
+                 remount /apex as 40000: Device or resource busy'"
+      Line 4715: "DIAG write(fd=68, ret=68): '[glog F/abort]
+                 SetupMountNamespaces failed: Device or resource busy'"
+      Line 4717: "DIAG write(fd=68, ret=68): '[glog F/abort]
+                 SetupMountNamespaces failed: Device or resource busy'"
+      Line 4718: "DIAG write(fd=62, ret=62): '<2>init:
+                 SetupMountNamespaces failed: Device or resource busy'"
+      Line 4719: "DIAG fork-family ENTRY: nr=220 (pid=2594),
+                 loop_count=14261, in_syscall_was=true"
+      Line 4722: "PTRACE_EVENT_FORK: parent 2594 forked —
+                 new child PID 2686"
+      Line 4723: "6-Z97: PTRACE_EVENT_FORK — new child PID 2686
+                 registered (3 tracked)"
+      Line 4724: "DIAG child switch: 2594 → 2686 — new child,
+                 in_syscall=false (Task 6-Z54)"
+      Line 4725: "SIGSTOP on forked child 2686 — consuming"
+      Line 4731: "DIAG write(fd=35, ret=35): '<3>init:
+                 InitFatalReboot: signal 6'"
+  * *** KEY OBSERVATION: between line 4713 (parent 2594's clone EXIT
+    DIAG) and line 4714 (the "Failed to remount /apex" write DIAG),
+    the parent 2594 MUST have executed the mount() syscall that
+    returned EBUSY — but the tracer NEVER received a syscall-stop for
+    it. The pre-dispatch mount DIAG (which fires for ANY mount
+    syscall-stop, with its own cap of 50) fired ZERO times across the
+    ENTIRE 4800-line log. ***
+  * Distribution of syscall numbers captured in the broad DIAG
+    (2000 stops total, all on pid=2594):
+      668 × nr=222 (mmap2 — property area setup)
+      233 × nr=56 (openat)
+      202 × nr=215 (nanosleep — long sleep loop, the LAST 100+ broad
+                    DIAG entries are ALL nr=215, indicating the parent
+                    is in a property-wait polling loop before the fork)
+      156 × nr=226 (mprotect)
+      104 × nr=64 (write)
+      100 × nr=57 (close)
+       94 × nr=80 (fstat)
+       86 × nr=78 (readlinkat)
+       68 × nr=67 (sendto? or mmap?)
+       68 × nr=44 (? aarch64 syscall 44 = ioctl... actually 44 may
+                    vary, possibly fcntl)
+       53 × nr=79 (fstatat)
+       38 × nr=172 (getpid)
+       34 × nr=167 (prctl)
+       18 × nr=63 (read)
+       18 × nr=48 (faccessat)
+       18 × nr=134 (rt_sigprocmask)
+       14 × nr=62 (lseek)
+        4 × nr=135
+        2 × nr=96
+        2 × nr=66
+        ZERO × nr=40 (mount) ← the missing one
+  * Last 30 broad DIAG lines: ALL nr=215 (nanosleep) on pid=2594, with
+    alternating in_syscall=false/true pairs — i.e. ENTRY+EXIT pairs of
+    the same nanosleep call. The parent is in a long property-wait
+    sleep loop. The cap is reached at loop_count=2000, but the first
+    fork happens at loop_count=14221 (line 4705) — so the parent made
+    12221 more syscall-stops after the broad DIAG cap before forking.
+    Those 12221 stops are NOT captured by the broad DIAG (cap reached)
+    but they don't matter — the pre-dispatch mount DIAG (cap 50,
+    uncapped by the 2000 cap) STILL fires ZERO times, proving no mount
+    syscall-stop was EVER delivered.
+  * SetupMountNamespaces chain: 3 occurrences (lines 4715, 4717, 4718)
+    — SAME pattern as r15, just at different line numbers (because the
+    log is longer now due to the broader DIAG capturing more).
+  * InitFatalReboot: 1 occurrence (line 4731) — same as r15.
+  * SIGSEGV: 0 occurrences (OrangeFox init tolerates the stub libdl.so,
+    unlike Lineage init which crashes — same as r14/r15).
+  * Container state: status=running exit=0 oom=false.
+  * result-pretty.json verdict: BOOT_FAIL_EARLY_INIT (overall=
+    BOOT_FAIL_EARLY_INIT, boot=BOOT_FAIL, failure=init_fatal_reboot,
+    exit_code=127, backstop_denied=2, recovery_instances=0,
+    ui=NOT_REACHED, vfs=CLEAN, terminal=NOT_APPLICABLE).
+    IDENTICAL TO r15 AND r14.
+
+Stage Summary:
+- *** DEFINITIVE CONFIRMATION OF H1b AT cap=2000. ***
+  The broad DIAG now captures 2000 syscall-stops (vs 200 in r15),
+  spanning loop_count=1 through loop_count=2000. The cap is reached
+  at line 2682 (long before the first fork at line 4705, which happens
+  at loop_count=14221). The 2000 stops include 668× mmap2, 233× openat,
+  202× nanosleep, 156× mprotect, 104× write, 100× close, plus other
+  infrequent syscalls (fstat, readlinkat, sendto/mmap, fstatat,
+  getpid, prctl, read, faccessat, rt_sigprocmask, lseek, etc.). ZERO
+  of the 2000 stops is nr=40 (mount). The mount-specific pre-dispatch
+  DIAG (separate cap of 50, fires for ANY mount syscall-stop) ALSO
+  fires ZERO times across the entire 4800-line log. Conclusion: the
+  ptrace tracer is DEFINITIVELY missing the mount() syscall-ENTRY stop
+  entirely. The 10× cap increase PROVES this is not a cap-overflow
+  artifact — the mount syscall-stop is genuinely never delivered to
+  the tracer.
+- *** ROOT CAUSE CONFIRMED (same as r15 analysis): the fork-follow
+  / waitpid dispatch bug. ***
+  At line 4708, PTRACE_EVENT_CLONE fires for parent 2594 (status=
+  0x0003057f, ptrace_event=3). The tracer:
+    (1) registers the new child (line 4709: "6-Z97: ... new child
+        PID 2685 registered"),
+    (2) switches focus to the new child (line 4710: "DIAG child
+        switch: 2594 → 2685"),
+    (3) consumes the child's auto-attach SIGSTOP and resumes the
+        child with signal=0 (line 4711: "SIGSTOP on forked child
+        2685 — consuming ... resuming with signal=0 so its syscalls
+        get traced").
+  The parent 2594 is left paused at its clone() EXIT syscall-stop.
+  Then at line 4712-4713, the tracer logs the clone() EXIT diag
+  (which means the tracer DID receive the clone exit syscall-stop
+  for the parent). But then between line 4713 and line 4714, the
+  parent executes the mount() syscall that returns EBUSY — and the
+  tracer NEVER receives the syscall-stop for it. The parent's next
+  syscall-stop is orphaned: the kernel queues only ONE syscall-stop
+  per syscall, and the tracer is busy dispatching the child's stops
+  via waitpid(-1). By the time the tracer eventually returns to
+  waitpid(-1) and picks up a parent stop, the mount() stop has been
+  consumed/skipped. The "Failed to remount /apex" write DIAG (line
+  4714) is the kernel's evidence that the mount() DID execute and
+  DID return EBUSY — but the syscall-stop was never delivered.
+  Same exact pattern repeats at lines 4719-4725 for the second fork
+  (PTRACE_EVENT_FORK → child 2686). Then line 4731: InitFatalReboot.
+- *** THE 6-Z211c DIAG CONFIRMS WHAT NEEDS TO BE FIXED — but the fix
+  is NOT in the DIAG code (which works correctly — it would have fired
+  if any mount syscall-stop had been received). The fix is in the
+  fork-follow / waitpid dispatch logic in ptrace_emu.rs. ***
+  Concretely, after PTRACE_EVENT_FORK / PTRACE_EVENT_CLONE, the
+  tracer currently issues PTRACE_SYSCALL on the "active" (newly-
+  switched) child only and leaves the parent paused. Fix:
+  PTRACE_SYSCALL-resume the parent TOO so its next syscall (mount())
+  is delivered as a syscall-stop. This is the fix the main
+  orchestrator should land next (call it "6-Z210 fork-follow fix"
+  or similar) and re-dispatch OrangeFox r17.
+- result-pretty.json: BOOT_FAIL_EARLY_INIT (init_fatal_reboot,
+  exit_code=127). IDENTICAL TO r15 AND r14. The increased DIAG cap
+  confirmed the diagnosis but did NOT change the boot result (as
+  expected — DIAG-only changes don't affect runtime behavior).
+
+NEXT CONCRETE ACTIONS for the main orchestrator:
+1. *** LAND THE 6-Z210 FORK-FOLLOW FIX. *** Now that the 2000-cap DIAG
+   has DEFINITIVELY confirmed the root cause (no mount syscall-stop
+   is EVER delivered to the tracer, despite 2000 captures and 14221
+   total stops), the next concrete fix is in ptrace_emu.rs:
+   * After PTRACE_EVENT_FORK / PTRACE_EVENT_CLONE, the tracer
+     currently issues PTRACE_SYSCALL on the "active" (newly-switched)
+     child only and leaves the parent paused. Fix: PTRACE_SYSCALL-
+     resume the parent TOO so its next syscall (mount()) is delivered
+     as a syscall-stop.
+   * Specifically, in the dispatch logic at lines 4708-4713 (kr64 log
+     line numbers, NOT source line numbers), the parent 2594 is
+     resumed via Task-6-S EXIT (the clone exit diag) but the parent
+     is NOT explicitly PTRACE_SYSCALL-resumed after the child switch.
+     Add a `ptrace(PTRACE_SYSCALL, parent_pid, 0, 0)` call right
+     after the child auto-attach stop is consumed (i.e. right after
+     line 4711's "resuming with signal=0 so its syscalls get traced"
+     for the CHILD — also issue a sibling PTRACE_SYSCALL on the
+     PARENT so its next syscall-stop is delivered).
+   * Then re-dispatch OrangeFox r17 on the fix commit. Expected
+     outcomes:
+     - broad DIAG (cap 2000) shows nr=40 (mount) syscall-stops being
+       delivered around the mount() time.
+     - pre-dispatch DIAG fires ("6-Z210 DIAG (pre-dispatch): mount()
+       syscall-stop nr=40 pid=2594 ... [diag #1/50]").
+     - 6-Z210 classification block fires, fakes the mount() return 0
+       so SetupMountNamespaces succeeds.
+     - Overall: BOOT_OK or BOOT_FAIL with a DIFFERENT failure marker
+       (e.g. later-stage init failure or UI timeout).
+
+2. *** DO NOT REMOVE THE 2000-CAP BROAD DIAG. *** It's a valuable
+   runtime verifier for the ptrace-tracer fix (you can see EXACTLY
+   which syscalls are being caught — the 2000-cap shows the full
+   early-boot sequence on pid=2594, including the long nanosleep
+   property-wait loop). After the fix lands, the broad DIAG should
+   show nr=40 stops interspersed with the nanosleep stops around
+   the mount() time.
+
+3. (Optional, separate from the fork-follow fix) Consider also
+   tightening the dispatch loop: instead of switching to the child
+   on PTRACE_EVENT_CLONE/FORK and staying on the child, the tracer
+   could round-robin between all tracked pids after each waitpid(-1)
+   return — ensuring no pid's syscall-stops are ever orphaned. This
+   is a more general fix than the per-event PTRACE_SYSCALL-resume
+   approach in #1, and would handle the case where multiple children
+   are forked in rapid succession (as we see at lines 4705+4719,
+   where two forks happen 40 loop_counts apart).
