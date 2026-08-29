@@ -1107,6 +1107,46 @@ int unsetenv(const char *name) {
 static int (*real_mount)(const char *, const char *, const char *,
                          unsigned long, const void *) = NULL;
 
+// 6-Z214: is this mount() flags value a mount-PROPAGATION / REMOUNT /
+// MOVE operation rather than a fresh filesystem mount?
+//
+// ROOT CAUSE THIS FIXES (OrangeFox R12.1 lavender / Lineage 22.2 init,
+// 10 investigation rounds r14-r24 + the r25 6-Z213 raw-stop census that
+// finally localized it): AOSP init's SetupMountNamespaces calls
+//   mount(nullptr, "/apex", nullptr, MS_PRIVATE (0x40000) [, MS_REC])
+// after /apex was ALREADY recorded in the loader's virtual mount table
+// by an earlier guest mount() call. The old interposer only special-
+// cased MS_REMOUNT — a propagation-only flags value fell through to the
+// "duplicate mount" branch and returned -EBUSY:
+//
+//   <3>init: Failed to remount /apex as 40000: Device or resource busy
+//   [glog F/abort] SetupMountNamespaces failed: Device or resource busy
+//   <3>init: InitFatalReboot: signal 6      → exit_group(127)
+//
+// CRITICAL COROLLARY (explains the r14-r24 ptrace mystery): the
+// interposer returns WITHOUT issuing a real mount(2) syscall, so the
+// kernel NEVER generates a ptrace syscall-stop for it — the r25 6-Z213
+// RAW STOP census (14503 syscall-stops, ZERO nr=40/39/41, every other
+// stop accounted for) is exactly what a PLT-interposed mount looks
+// like to the tracer. The Rust-side 6-Z210 fake-success could never
+// fire because there was no syscall to intercept. The fix MUST live
+// here, at the interposer, for every dynamically-linked guest.
+//
+// Real Linux mount(2) semantics for these flags: MS_PRIVATE/SLAVE/
+// SHARED/UNBINDABLE change the propagation TYPE of the EXISTING mount
+// at target (do_change_type); MS_REMOUNT re-configures its flags
+// (do_remount); MS_MOVE relocates it. NONE of them create a duplicate
+// mount, so the EBUSY "already mounted" path does not apply. The
+// kernel CAN return EBUSY for these on a busy bind mount — but the
+// loader's mount namespace is fully virtualized, so faking success is
+// the correct virtualization semantics (same decision as the Rust-side
+// is_mount_propagation_or_remount_op, commit 2258271).
+static int is_mount_propagation_op(unsigned long flags) {
+    const unsigned long MS_PROP_MASK = MS_PRIVATE | MS_SLAVE | MS_SHARED |
+                                       MS_UNBINDABLE | MS_REMOUNT | MS_MOVE;
+    return (flags & MS_PROP_MASK) != 0;
+}
+
 int mount(const char *source, const char *target, const char *fstype,
           unsigned long flags, const void *data) {
     if (!real_mount) real_mount = dlsym(RTLD_NEXT, "mount");
@@ -1124,11 +1164,21 @@ int mount(const char *source, const char *target, const char *fstype,
     for (int i = 0; i < MAX_MOUNTS; i++) {
         if (g_mounts[i].active && target &&
             strncmp(g_mounts[i].target, target, 256) == 0) {
-            if (flags & MS_REMOUNT) {
+            // 6-Z214: propagation / remount / move ops reconfigure the
+            // EXISTING entry — never a duplicate-mount EBUSY. MS_BIND
+            // onto an already-mounted target is ALSO legal Linux
+            // semantics (stacked bind mounts — AOSP init's MountDir
+            // does mkdir + MS_BIND onto live dirs), so allow it too:
+            // record success without clobbering the original entry's
+            // fstype/source (a bind mount has no fstype of its own).
+            if (is_mount_propagation_op(flags) ||
+                (flags & MS_BIND)) {
                 g_mounts[i].flags = flags;
                 pthread_mutex_unlock(&g_mount_lock);
                 return 0;
             }
+            // Plain (non-bind, non-propagation) re-mount of a live
+            // target: real kernel returns EBUSY — keep that semantic.
             pthread_mutex_unlock(&g_mount_lock);
             errno = EBUSY;
             return -1;
@@ -3181,6 +3231,9 @@ static void wait_ready(void) {
 // =========================================================================
 // Mount emulation (VM mount_mgr at 0x8618)
 // =========================================================================
+// 6-Z214: is_mount_propagation_op is defined above (before the PLT
+// mount() interposer) — shared by the interposer AND this SIGSYS-path
+// emulation so both paths carry identical semantics.
 static long emu_mount(const char *src, const char *tgt, const char *fs,
                       unsigned long flags, const void *data) {
     (void)data; // wait_ready() removed — runtime is always ready when handler runs
@@ -3193,8 +3246,20 @@ static long emu_mount(const char *src, const char *tgt, const char *fs,
     pthread_mutex_lock(&g_mount_lock);
     for (int i=0;i<MAX_MOUNTS;i++) {
         if (g_mounts[i].active && strncmp(g_mounts[i].target,tgt,256)==0) {
-            if (flags & MS_REMOUNT) { g_mounts[i].flags=flags; pthread_mutex_unlock(&g_mount_lock); return 0; }
-            if ((flags & MS_BIND) && src && strncmp(src,tgt,256)==0) { pthread_mutex_unlock(&g_mount_lock); return -EINVAL; }
+            // 6-Z214: propagation/remount/move ops (and bind-onto-live-
+            // target) reconfigure the EXISTING entry — the old code
+            // returned -EBUSY for everything except MS_REMOUNT, which
+            // made AOSP init's SetupMountNamespaces
+            // mount(nullptr,"/apex",nullptr,MS_PRIVATE) abort fatally
+            // with InitFatalReboot (the r14-r25 OrangeFox/Lineage
+            // blocker). Keep only the plain-duplicate-mount EBUSY.
+            if (is_mount_propagation_op(flags)) {
+                g_mounts[i].flags=flags; pthread_mutex_unlock(&g_mount_lock); return 0;
+            }
+            if (flags & MS_BIND) {
+                if (src && strncmp(src,tgt,256)==0) { pthread_mutex_unlock(&g_mount_lock); return -EINVAL; }
+                g_mounts[i].flags=flags; pthread_mutex_unlock(&g_mount_lock); return 0;
+            }
             pthread_mutex_unlock(&g_mount_lock); return -EBUSY;
         }
     }

@@ -93,6 +93,18 @@ jobs:
         working-directory: app/rs/kr64
         run: cargo test --no-fail-fast 2>&1 | tee cargo-test.log
 
+      - name: Run loader mount-table C tests (6-Z214)
+        # Host-compiled regression test for the loader's virtual mount
+        # table — the SetupMountNamespaces /apex EBUSY blocker (OrangeFox
+        # R12.1 lavender / Lineage 22.2 init, rounds r14-r25). mount_table.c
+        # is portable C, so the host gcc is enough; no NDK required.
+        shell: bash
+        working-directory: app/cpp/twoyi_loader
+        run: |
+          gcc -D_GNU_SOURCE -I include -o /tmp/test_mount_table \
+            test_mount_table.c src/mount_table.c
+          /tmp/test_mount_table
+
       - name: Pack test results
         # Logs-only, xz-compressed, 7-day retention. See build.yml for
         # the storage-budget rationale (deleted 1217 old artifacts to
