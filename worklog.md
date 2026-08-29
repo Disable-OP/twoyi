@@ -14459,3 +14459,180 @@ Stage Summary:
   unshare block" at ptrace_emu.rs:2564+ is the place to extend.
   Add a regression test that verifies the guest's mount(/apex,
   MS_REMOUNT) returns 0 in AOSP mode.
+
+---
+Task ID: 6-Z210 (fix) — mount propagation/remount op fake-success for /apex EBUSY blocker (Lineage 22.2 InitFatalReboot)
+Agent: main
+Task: Implement the mount-remount fake for AOSP-mode boots per the
+6-Z209e investigation's next-action recommendation. The kr64 tracer
+currently classifies any mount() with NULL/empty fstype as
+block_storage_mount (→ -ENODEV), which makes Lineage 22.2's
+SetupMountNamespaces MS_PRIVATE call on /apex fail fatally →
+InitFatalReboot (SIGABRT) → exit_group(127).
+
+Work Log:
+- Read worklog tail (6-Z209, 6-Z209-mon5, 6-Z209e) to confirm the
+  exact blocker chain. The worklog's 6-Z209e entry documents:
+    2699: <3>init: Failed to remount /apex as 40000: Device or
+          resource busy
+    2700: [glog F/abort] SetupMountNamespaces failed: Device or
+          resource busy
+    2711: <3>init: InitFatalReboot: signal 6
+  Where "40000" in init's log is the std::hex representation of
+  MS_PRIVATE (1<<18 = 0x40000 = 262144 decimal). The AOSP init
+  source in system/core/init/mount_namespace.cpp's
+  SetupMountNamespaces calls mount(nullptr, "/apex", nullptr,
+  MS_PRIVATE | MS_REC, nullptr) — this reconfigures the EXISTING
+  /apex mount's propagation type, NOT a fresh filesystem mount.
+  The kr64 rootfs bind-mounts the HOST's /apex into the guest
+  rootfs (mount_mgr.rs:505), making /apex a busy bind-mount that
+  the kernel refuses to mark PRIVATE → -EBUSY. Init treats this
+  as fatal → SIGABRT → exit_group(127) → BOOT_FAIL_EARLY_INIT.
+- Inspected the existing mount handling in ptrace_emu.rs:
+  * is_pseudo_fs_type (line ~2990): classifies pseudo fs types
+    (tmpfs, devpts, proc, sysfs, etc.) — these get fake success (0)
+    + rootfs side-effect ops.
+  * compute_exit_return_value (line ~2704): returns Some(0) for
+    ALL mount syscalls (regardless of ABI) — the EXIT handler's
+    generic fake-success for permission-blocked family.
+  * ENTRY-side classification (line ~13608+): for post-execve
+    mount() calls, classifies based on fstype:
+    - Pseudo fs → materialize {rootfs}{target} dir
+    - Block-storage fs (vfat/ext4) OR NULL/empty fstype → add to
+      pending_mount_enodev (the EXIT handler returns -ENODEV for
+      these pids, overriding the compute table's Some(0)).
+  * SIGSYS mount arm (line ~20350+): for seccomp-trapped mount
+    calls (root mode only), same pseudo-vs-block-storage fork:
+    - Pseudo fs → 0 + rootfs side effect
+    - Block-storage fs OR NULL/empty fstype → -ENODEV
+  * The "NULL/empty fstype → block_storage_mount = true" branch
+    is the root cause of the Lineage 22.2 blocker: a mount() with
+    MS_PRIVATE flag has NULL fstype (propagation ops don't use
+    fstype), so it's classified as block_storage and gets -ENODEV.
+    Init sees this as a fatal SetupMountNamespaces failure.
+  * Note: the actual return the guest sees is -EBUSY (kernel's
+    actual return), NOT -ENODEV. This is because in non-root mode
+    (use_namespaces=false, the typical Android app context), the
+    seccomp filter is intentionally SKIPPED (lib.rs:7260 — AUDIT_ARCH
+    mismatch on i386-on-x86_64). The mount() syscall goes to the
+    real kernel, which returns -EBUSY on the busy /apex bind-mount.
+    The EXIT handler's forced_value=Some(0) from the compute table
+    SHOULD override this, but the pending_mount_enodev override
+    (-ENODEV) takes priority — and if the EBUSY leaks through, it
+    means the EXIT handler's forced_value isn't being applied to
+    this particular mount (possible explanation: the mount is
+    happening in a forked child whose pid isn't in
+    pending_mount_enodev, so the compute-table Some(0) applies —
+    but the kernel's actual EBUSY still leaks because the EXIT
+    handler's logic preserves the real kernel return for non-faked
+    cases. The 6-Z145 hoisting of the compute-table match makes
+    forced_value=Some(0) authoritative, so the EBUSY shouldn't
+    leak — but the worklog's evidence shows it does. The fix below
+    makes the propagation/remount case explicitly bypass the
+    pending_mount_enodev override so the compute table's Some(0) is
+    the final authoritative rax write.)
+
+- Implemented 6-Z210 fix in app/rs/kr64/src/ptrace_emu.rs:
+  1. Added helper `is_mount_propagation_or_remount_op(flags: u64)
+     -> bool` right after `pseudo_mount_target` (line ~3030+).
+     Returns true when the flags arg has any of:
+       MS_REMOUNT (32 = 1<<5)
+       MS_MOVE (8192 = 1<<13)
+       MS_UNBINDABLE (1<<17)
+       MS_PRIVATE (1<<18)
+       MS_SLAVE (1<<19)
+       MS_SHARED (1<<20)
+     Intentionally does NOT include MS_BIND (4096) — bind mounts
+     create a new mount point and may reference real block-storage
+     sources (/dev/block/sda1). Including MS_BIND would defeat the
+     6-Z91 -ENODEV semantics that TWRP's recovery.fstab storage
+     mounts rely on (TWRP marks the partition unmountable and boot
+     proceeds). The MS_BIND self-bind-to-make-mountpoint pattern
+     is kr64's own mount_mgr.rs concern (host side, pre-execve),
+     not a guest post-execve syscall that this helper gates.
+  2. Modified the ENTRY-side classification (line ~13698+):
+     - Read the flags arg (arg4) via get_syscall_arg.
+     - Compute is_propagation_or_remount via the new helper.
+     - When is_propagation_or_remount is true:
+       * Do NOT add the pid to pending_mount_enodev (so the EXIT
+         handler's compute-table Some(0) is the final rax the
+         guest sees — the kernel's actual -EBUSY is overridden).
+       * Log a 6-Z210 message (rate-limited via mount_enodev_logged
+         cap of 30, same as the 6-Z168 block-storage log).
+     - The block_storage_mount match now also gates on
+       `!is_propagation_or_remount` for the None-fstype arm: when
+       flags indicate a propagation/remount op, the call is NOT
+       classified as block-storage even though fstype is empty.
+  3. Modified the SIGSYS mount arm (line ~20487+):
+     - Read the flags arg (arg4) via get_syscall_arg.
+     - Added a new arm BEFORE the pseudo-vs-block-storage fork:
+       if is_mount_propagation_or_remount_op(flags_raw) → return 0
+       (fake success) with a 6-Z210 sigsys_log message.
+     - This arm fires ONLY in root mode (use_namespaces=true,
+       seccomp installed) — in non-root mode the SIGSYS handler
+       doesn't fire (seccomp is skipped), so the EXIT-side fix
+       above is the authoritative path.
+  4. Added 7 unit tests for the new helper:
+     - is_mount_propagation_or_remount_op_detects_ms_private
+     - is_mount_propagation_or_remount_op_detects_ms_remount
+     - is_mount_propagation_or_remount_op_detects_other_propagation_flags
+     - is_mount_propagation_or_remount_op_rejects_pseudo_fs_mount
+     - is_mount_propagation_or_remount_op_rejects_block_storage_mount
+     - is_mount_propagation_or_remount_op_rejects_zero_flags
+     - is_mount_propagation_or_remount_op_does_not_include_ms_bind
+- Verified all gates pass locally (cargo 1.98.0 on x86_64 Linux):
+  * cargo check --lib: clean
+  * cargo test --lib: 605 passed; 0 failed; 0 ignored (was 598
+    before, +7 new tests for is_mount_propagation_or_remount_op)
+  * cargo fmt --check: clean
+  * cargo clippy --all-targets -- -D warnings: clean
+
+Stage Summary:
+- The 6-Z210 fix implements the 6-Z209e investigation's
+  recommended next action: "ensure the kr64 tracer fakes the
+  mount return value (return 0 = success) for the guest's
+  MS_REMOUNT calls in AOSP mode."
+- The fix is generic (not a Lineage-specific hack):
+  * It detects mount-PROPAGATION/REMOUNT operations by their
+    flags bit pattern, not by device/recovery name. It applies to
+    ANY recovery that calls mount() with MS_PRIVATE | MS_SLAVE |
+    MS_SHARED | MS_UNBINDABLE | MS_REMOUNT | MS_MOVE.
+  * It does NOT touch the existing 6-Z91 fstype-aware path for
+    TWRP — TWRP's storage mounts use fstype="vfat"/"ext4" (not
+    empty) and don't have propagation flags, so they continue to
+    get -ENODEV as before.
+  * It does NOT include MS_BIND, preserving the 6-Z91 semantics
+    for bind mounts that may reference block-storage sources.
+- Expected impact:
+  * Lineage 22.2 sailfish: SetupMountNamespaces' MS_PRIVATE call
+    on /apex now returns 0 (success) → init proceeds past
+    SetupMountNamespaces → no SIGABRT → no InitFatalReboot →
+    init reaches second-stage handoff + recovery service fork →
+    potential BOOT_OK / UI_READY (the FIRST Lineage 22.2 boot
+    success in the project's history).
+  * Other Lineage recoveries (297 entries in the corpus): the
+    MS_PRIVATE | MS_REC pattern is standard AOSP init behavior
+    for /apex, /sys/fs/cgroup, and other mount-namespace setup.
+    All Lineage Android-11+ recoveries should benefit.
+  * OrangeFox R12.0 lavender: this fix does NOT address the
+    OrangeFox SIGSEGV blocker (different class — linker-level
+    crash, not mount-namespace). OrangeFox needs separate
+    investigation of the SIGSEGV PC=0xe00ce2e92b20 outside
+    twoyi_init's mapped range (likely linker64 / libc.so on
+    first PLT/GOT access).
+- Next concrete action:
+  1. Commit 6-Z210 fix (this change).
+  2. Push to GitHub.
+  3. Dispatch Lineage 22.2 sailfish round-12 verification on the
+     new commit (expected: BOOT_OK / UI_READY — first Lineage
+     boot success).
+  4. While that CI runs, investigate the OrangeFox SIGSEGV
+     blocker (the high-address PC outside the twoyi_init binary's
+     mapped range — needs MAPS dump analysis to identify which
+     library crashed). OrangeFox has 151 corpus entries — fixing
+     it is the second-biggest impact after Lineage.
+  5. After Lineage 22.2 verification, re-dispatch the 30-sample
+     nightly batch to measure the broad-corpus impact (the
+     accumulated fixes 6-Z207b/6-Z208/6-Z209a/b/c-iter2/d-iter2
+     + 6-Z210 should jump the boot rate significantly from the
+     21/33 baseline on 3395f09).
