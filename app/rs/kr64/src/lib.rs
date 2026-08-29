@@ -1222,6 +1222,77 @@ pub fn guest_bionic_is_native(rootfs_prefix: &str) -> bool {
     guest == host && guest != 0
 }
 
+/// 6-Z218b: stage the ROM's own bionic into the bootstrap library
+/// directories the guest linker hard-codes, when the guest lacks them.
+///
+/// ROOT CAUSE (r25 lineage-22.2-sailfish, run 33269272962): bionic's
+/// linker resolves libc.so/libdl.so for init (bootstrap mode) from the
+/// hard-coded path /system/lib64/bootstrap/libc.so WITHOUT consulting
+/// LD_LIBRARY_PATH — the 6-Z215 /dev farm (LD_LIBRARY_PATH[0]=/dev)
+/// never gets a chance for libc specifically. The lineage ramdisk
+/// ships no system/lib64/bootstrap/ directory, so the lookup fell
+/// through the VFS to the HOST's bootstrap libc (device 00:34), and
+/// the Android-14 host libc inside an Android-15 guest init SIGSEGV'd
+/// during early property-area init (si_addr=0x0, pc inside the host
+/// libc.so mapping).
+///
+/// THE FIX: when the guest rootfs ships its own bionic (native-guest
+/// mode, see [`guest_bionic_is_native`]) and lacks the bootstrap
+/// directory, stage relative symlinks for the bionic set (libc.so,
+/// libdl.so, libm.so, libdl_android.so — only names the ROM actually
+/// ships as regular files) from the ROM's own system/lib64 into BOTH
+/// bootstrap locations the linker is known to search:
+///   * {rootfs}/system/lib64/bootstrap/
+///   * {rootfs}/apex/com.android.runtime/lib64/bootstrap/
+///
+/// This mirrors exactly what real recovery ramdisks that DO ship a
+/// bootstrap directory provide, and keeps every resolution inside the
+/// guest rootfs (§23: host fallback only for resources the guest
+/// lacks — a DIFFERENT ABI's libc is not such a resource).
+///
+/// NEVER overwrites an existing entry (idempotent, hooks/ROM wins).
+/// Returns (staged, already_present).
+pub fn stage_guest_bootstrap_bionic(rootfs_prefix: &str) -> (usize, usize) {
+    const BIONIC_NAMES: [&str; 4] = ["libc.so", "libdl.so", "libm.so", "libdl_android.so"];
+    // (guest-relative dir, .. segments needed to reach the rootfs root)
+    const BOOTSTRAP_DIRS: [(&str, usize); 2] = [
+        ("system/lib64/bootstrap", 3),
+        ("apex/com.android.runtime/lib64/bootstrap", 4),
+    ];
+    // Only stage when the ROM's own bionic exists as a regular file.
+    let rom_lib64 = format!("{}/system/lib64", rootfs_prefix);
+    let mut staged = 0usize;
+    let mut already = 0usize;
+    for (dir, depth) in BOOTSTRAP_DIRS {
+        let dst_dir = format!("{}/{}", rootfs_prefix, dir);
+        if std::fs::create_dir_all(&dst_dir).is_err() {
+            continue;
+        }
+        for name in BIONIC_NAMES {
+            let src_path = format!("{}/{}", rom_lib64, name);
+            match std::fs::symlink_metadata(&src_path) {
+                Ok(md) if md.is_file() => {}
+                _ => continue,
+            }
+            // Relative symlink target, e.g. from system/lib64/bootstrap:
+            // ../../../system/lib64/libc.so
+            let mut target = String::with_capacity(depth * 3 + 24);
+            for _ in 0..depth {
+                target.push_str("../");
+            }
+            target.push_str("system/lib64/");
+            target.push_str(name);
+            let dst = format!("{}/{}", dst_dir, name);
+            match std::os::unix::fs::symlink(&target, &dst) {
+                Ok(()) => staged += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => already += 1,
+                Err(_) => {}
+            }
+        }
+    }
+    (staged, already)
+}
+
 /// Write hook-library bytes to `/dev/<lib>` (tmpfs) and chmod 0644.
 ///
 /// This is the "write" phase of the hook-library copy. It MUST be called
@@ -1428,6 +1499,35 @@ fn patch_twrp_init_rc_recovery_service_with_env(
 /// injected into the recovery service definition. Used by the
 /// orchestrator below to make the patch IDEMPOTENT across boots.
 const TWRP_LD_PRELOAD_PATCH_MARKER: &str = "    setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so";
+
+/// 6-Z218a: LD_PRELOAD for non-TWRP (AOSP-layout) boots. The FB hook
+/// MUST precede libtwoyi_loader_shlib.so: bionic resolves PLT entries
+/// against LD_PRELOAD libs in order, and the shlib exports
+/// open/openat/__open_2/__openat_2/close/ioctl — with the shlib first,
+/// libminuitwrp's PLT entries resolved to the shlib, the FB hook was
+/// fully shadowed and gr_init() crash-looped (run 33269270911: 26
+/// gr_fb_width SIGSEGVs). All fb-hook hooks chain via
+/// dlsym(RTLD_NEXT), so shlib behavior for every other fd is kept.
+pub const AOSP_LD_PRELOAD_ENV: &str =
+    "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so";
+
+#[cfg(test)]
+fn assert_aosp_preload_order() {
+    // The FB hook must appear BEFORE the shlib so its open/ioctl
+    // interposition wins PLT resolution (6-Z218a).
+    let fb = AOSP_LD_PRELOAD_ENV.find("libtwrp_fb_hook.so");
+    let shlib = AOSP_LD_PRELOAD_ENV.find("libtwoyi_loader_shlib.so");
+    assert!(fb.is_some() && shlib.is_some(), "both hooks must be set");
+    assert!(
+        fb.unwrap() < shlib.unwrap(),
+        "libtwrp_fb_hook.so must precede libtwoyi_loader_shlib.so in LD_PRELOAD (bionic resolves PLT entries in preload order)"
+    );
+    // The getpid hook stays first (cheap, affects only getpid).
+    assert!(
+        AOSP_LD_PRELOAD_ENV.starts_with("LD_PRELOAD=/dev/libgetpid_hook.so:"),
+        "getpid hook must remain first"
+    );
+}
 
 /// Patch TWRP init to inject `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so`
 /// into the recovery service definition, wherever it lives.
@@ -4708,6 +4808,23 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             );
         }
         info!("{}", summary);
+
+        // 6-Z218b: native-guest bootstrap-bionic staging. The bionic
+        // linker's special libc lookup for init resolves libc.so from
+        // the hard-coded /system/lib64/bootstrap/ path WITHOUT
+        // consulting LD_LIBRARY_PATH (so the /dev farm above cannot
+        // serve it). When the guest rootfs lacks a bootstrap dir, that
+        // lookup leaks to the HOST's bootstrap libc (r25 lineage:
+        // Android-14 host libc inside Android-15 init → SIGSEGV).
+        // Stage the ROM's own bionic into the bootstrap dirs so the
+        // lookup resolves inside the guest rootfs.
+        let (boot_staged, boot_already) = stage_guest_bootstrap_bionic(&rootfs_prefix);
+        if boot_staged > 0 || boot_already > 0 {
+            info!(
+                "[KR64] 6-Z218b: staged {} bootstrap-bionic symlinks ({} already present) into {{rootfs}}/system/lib64/bootstrap + {{rootfs}}/apex/com.android.runtime/lib64/bootstrap — the guest linker's bootstrap libc lookup now resolves to the ROM's own bionic",
+                boot_staged, boot_already
+            );
+        }
     }
 
     // Change SELinux label of /dev/lib*.so to system_file so that
@@ -7896,8 +8013,25 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // (launched by init from /system/bin/recovery, never touched
             // by the TWRP init.rc patch) get framebuffer virtualization.
             // Inert for processes that never open /dev/graphics/fb0.
-            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so:/dev/libtwrp_fb_hook.so"
-                .to_string()
+            //
+            // 6-Z218a ORDER FIX: the FB hook MUST come BEFORE
+            // libtwoyi_loader_shlib.so. bionic resolves a caller's PLT
+            // entry against the executable, then the LD_PRELOAD libs IN
+            // ORDER, then DT_NEEDED. libtwoyi_loader_shlib.so exports
+            // open/openat/__open_2/__openat_2/close/ioctl — with the old
+            // order (shlib before fb hook) every libminuitwrp PLT entry
+            // for those names resolved to the SHLIB, the FB hook was
+            // completely shadowed, /dev/graphics/fb0 opens went
+            // untracked, FBIOGET_VSCREENINFO failed, gr_init() failed
+            // and the theme engine crash-looped in gr_fb_width()
+            // (libminuitwrp.so file offset 0x2027c, si_addr=0x0 — 26
+            // crashes in run 33269270911). With the FB hook first, its
+            // hooks special-case ONLY fb0/input/ashmem fds and chain
+            // everything else through dlsym(RTLD_NEXT) → the shlib, so
+            // path translation and property-area virtualization are
+            // preserved for every other fd. Order asserted by
+            // assert_aosp_preload_order() + AOSP_LD_PRELOAD_ENV.
+            AOSP_LD_PRELOAD_ENV.to_string()
         };
         // TWRP BOOT: use a minimal env that mirrors TWRP's init.rc exports.
         // TWRP's init.rc does its own:
@@ -12969,6 +13103,125 @@ mod tests {
         std::fs::create_dir_all(&libc_dir).unwrap();
         std::fs::write(libc_dir.join("libc.so"), make_elf_hdr(2, 1, other_m)).unwrap();
         assert!(!guest_bionic_is_native(dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // 6-Z218b: bootstrap-bionic staging tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn aosp_preload_order_fb_hook_before_shlib() {
+        // 6-Z218a regression guard: the FB hook must precede the shlib
+        // or libminuitwrp's open/ioctl PLT entries resolve to the
+        // shlib and framebuffer virtualization never fires.
+        assert_aosp_preload_order();
+    }
+
+    /// Fake ROM bionic: system/lib64/{libc,libdl,libm,libdl_android}.so
+    /// as regular files (content irrelevant — staging never reads it).
+    fn make_rom_libs(dir: &std::path::Path) {
+        let libc_dir = dir.join("system/lib64");
+        std::fs::create_dir_all(&libc_dir).unwrap();
+        for name in ["libc.so", "libdl.so", "libm.so", "libdl_android.so"] {
+            std::fs::write(libc_dir.join(name), b"fakelib").unwrap();
+        }
+    }
+
+    #[test]
+    fn stage_guest_bootstrap_bionic_stages_all_trio_into_both_dirs() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z218-stages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        make_rom_libs(&dir);
+
+        let (staged, already) = stage_guest_bootstrap_bionic(dir.to_str().unwrap());
+        // 4 names × 2 bootstrap dirs = 8 staged, 0 already-present.
+        assert_eq!((staged, already), (8, 0));
+
+        // Both bootstrap dirs exist and each symlink resolves inside
+        // the rootfs to the ROM's own file.
+        let sys_boot = dir.join("system/lib64/bootstrap/libc.so");
+        let apex_boot = dir.join("apex/com.android.runtime/lib64/bootstrap/libdl.so");
+        assert!(sys_boot.is_file(), "system bootstrap libc must resolve");
+        assert!(apex_boot.is_file(), "apex bootstrap libdl must resolve");
+        assert_eq!(
+            std::fs::read_link(&sys_boot).unwrap().to_str().unwrap(),
+            "../../../system/lib64/libc.so"
+        );
+        assert_eq!(
+            std::fs::read_link(&apex_boot).unwrap().to_str().unwrap(),
+            "../../../../system/lib64/libdl.so"
+        );
+
+        // Names the ROM does NOT ship must not appear (no libm in the
+        // ROM → no symlink anywhere for it).
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_guest_bootstrap_bionic_skips_missing_rom_names() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z218-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let libc_dir = dir.join("system/lib64");
+        std::fs::create_dir_all(&libc_dir).unwrap();
+        // ROM ships ONLY libc.so (no libdl/libm/libdl_android).
+        std::fs::write(libc_dir.join("libc.so"), b"fakelib").unwrap();
+
+        let (staged, already) = stage_guest_bootstrap_bionic(dir.to_str().unwrap());
+        assert_eq!((staged, already), (2, 0), "only libc.so into 2 dirs");
+
+        // libdl must NOT be staged anywhere.
+        assert!(!dir.join("system/lib64/bootstrap/libdl.so").exists());
+        assert!(!dir
+            .join("apex/com.android.runtime/lib64/bootstrap/libdl.so")
+            .exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_guest_bootstrap_bionic_is_idempotent_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z218-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        make_rom_libs(&dir);
+
+        // First pass stages 8; second pass finds all 8 already present.
+        let (s1, a1) = stage_guest_bootstrap_bionic(dir.to_str().unwrap());
+        assert_eq!((s1, a1), (8, 0));
+        let (s2, a2) = stage_guest_bootstrap_bionic(dir.to_str().unwrap());
+        assert_eq!((s2, a2), (0, 8), "idempotent: nothing new staged");
+
+        // A PRE-EXISTING real file (not our symlink) must be preserved
+        // — never overwritten.
+        let existing = dir.join("system/lib64/bootstrap/libm.so");
+        std::fs::write(&existing, b"guest-owns-this").unwrap();
+        let (_s3, a3) = stage_guest_bootstrap_bionic(dir.to_str().unwrap());
+        assert_eq!(a3, 8);
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"guest-owns-this",
+            "existing file must win over staging"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stage_guest_bootstrap_bionic_skips_symlinked_rom_sources() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z218-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let libc_dir = dir.join("system/lib64");
+        std::fs::create_dir_all(&libc_dir).unwrap();
+        // ROM's libc.so is itself a SYMLINK (vendor-redirected) — the
+        // farm rule (regular files only) must apply here too, so the
+        // bootstrap dir never chains link→link→….
+        std::os::unix::fs::symlink("../libc_real.so", libc_dir.join("libc.so")).unwrap();
+        std::fs::write(libc_dir.join("libc_real.so"), b"real").unwrap();
+
+        let (staged, already) = stage_guest_bootstrap_bionic(dir.to_str().unwrap());
+        assert_eq!(
+            (staged, already),
+            (0, 0),
+            "symlinked ROM source must not be staged"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
