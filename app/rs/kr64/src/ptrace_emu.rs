@@ -10212,6 +10212,38 @@ pub fn run_ptrace_loop(
                 )
             }
         };
+        // 6-Z211j FIX: round-robin resume ALL STOPPED tracked pids, not just
+        // current_pid. After a fork event, the parent might be STOPPED (at
+        // the clone EXIT stop) while current_pid switched to the new child.
+        // Without this fix, the parent's pending syscall-stops (mount ENTRY)
+        // are starved — the tracer keeps processing the child's stops, and
+        // the parent's stops are never delivered to waitpid.
+        // The fix: after resuming current_pid, iterate over tracked_pids and
+        // resume each STOPPED pid (PTRACE_SYSCALL returns 0). Skip RUNNING
+        // pids (PTRACE_SYSCALL returns ESRCH — ignore it, don't trigger the
+        // 6-Z89 reap loop).
+        // This is the "round-robin all tracked pids" approach recommended
+        // by the round-22 CI monitor (6-Z211i-mon1, hypothesis e).
+        if tracked_pids.len() > 1 {
+            for &tpid in tracked_pids.iter() {
+                if tpid == current_pid {
+                    continue; // already resumed above
+                }
+                // Try to resume tpid. If it's STOPPED, PTRACE_SYSCALL
+                // returns 0 (success). If it's RUNNING, returns ESRCH.
+                // We IGNORE ESRCH here — do NOT enter the 6-Z89 reap
+                // loop (which would drain pending stops).
+                let rr_r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, tpid, 0, 0) };
+                if rr_r == 0 {
+                    log(&format!(
+                        "6-Z211j FIX: round-robin resume — resumed STOPPED pid={} (was not current_pid={}) — its pending syscall-stops will now be delivered to waitpid",
+                        tpid, current_pid
+                    ));
+                }
+                // If rr_r == -1 (ESRCH), the pid is RUNNING — skip it.
+                // Do NOT log ESRCH (too noisy) and do NOT trigger 6-Z89.
+            }
+        }
         // Reset for the next iteration — only set again if a
         // signal-delivery branch below populates it.
         resume_signal = 0;
