@@ -11652,20 +11652,24 @@ pub fn run_ptrace_loop(
                 let syscall_num = get_syscall_num(&regs, &abi);
 
                 // 6-Z210 DIAG (broad): fires for EVERY syscall-stop (capped
-                // at 200) to see the full sequence of syscalls being caught
+                // at 2000) to see the full sequence of syscalls being caught
                 // around the mount() call. This is the DEFINITIVE diagnostic
                 // for H1b (mount() syscall-stop not being delivered).
                 // If mount() (nr=40 on aarch64) NEVER appears in this broad
                 // log, the ptrace tracer is NOT receiving the mount()
                 // syscall-stop at all — investigate fork-follow gap,
                 // ESRCH race, or PTRACE_O_TRACECLONE auto-attach timing.
+                // 6-Z211c: increased cap from 200 to 2000 to capture
+                // syscalls AFTER the fork event (the mount() happens at
+                // line ~2914, well past the old 200 cap which was reached
+                // at line ~440).
                 {
                     static BROAD_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let n = BROAD_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 200 {
+                    if n < 2000 {
                         log(&format!(
-                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} [broad #{}/200]",
+                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} [broad #{}/2000]",
                             syscall_num,
                             pid,
                             loop_count,
