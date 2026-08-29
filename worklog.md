@@ -16807,3 +16807,194 @@ Stage Summary:
   exit_code=127). IDENTICAL TO r14, r15, r16, r17. The 6-Z211e
   resume DIAG is NOT observable in the boot result — it neither
   helped nor hurt the boot outcome.
+
+---
+Task ID: 6-Z211f-mon1
+Agent: CI-monitoring subagent
+Task: Monitor the OrangeFox R12.0 lavender round-19 UI E2E run on
+commit 5f0dd50 (post-fork DIAG + only log resume after fork event).
+
+Work Log:
+- Read worklog.md tail (last 400 lines) to load full r14–r18 context.
+  Key state going in: round-18 (6-Z211e resume DIAG with cap 200)
+  produced BYTE-FOR-BYTE IDENTICAL results to r14–r17 — broad DIAG
+  count 2000 (cap reached at line 635), ZERO nr=40 (mount)
+  syscall-stops captured, ZERO pre-dispatch mount DIAG fires, ZERO
+  6-Z210 classification block fires, SetupMountNamespaces/EBUSY/
+  InitFatalReboot chain STILL at lines 4914-4931, result
+  BOOT_FAIL_EARLY_INIT exit 127. The 6-Z211e resume DIAG was
+  supposed to log every PTRACE_SYSCALL resume + skip_next_resume
+  event, but the cap of 200 was hit at line 635 (loop_count=198),
+  far before the fork event at line 4896 (loop_count=14149). So
+  ZERO resume DIAGs were emitted around the fork event. Commit
+  5f0dd50 was pushed to fix this: (1) add a 6-Z211f post-fork DIAG
+  that fires INSIDE the PTRACE_EVENT_CLONE/FORK handler and shows
+  the parent pid, current_pid, in_syscall, skip_next_resume,
+  resume_signal, tracked_pids — explicitly stating whether the
+  parent will be PTRACE_SYSCALL-resumed at the loop-top; (2) change
+  the 6-Z211e resume DIAG to ONLY log skip_next_resume=TRUE events
+  (no cap hit issue), so we can see if any resume is being skipped
+  around the fork event.
+- Fetched latest workflow runs on main:
+    33243421624  UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)
+                  5f0dd509  in_progress  2026-08-29T08:33:05Z
+    33243413523  kr64 lint + test  5f0dd509  completed  2026-08-29T08:32:51Z
+    33242560937  UI E2E Test  cb47f12f  completed (r18)
+    33242551664  kr64 lint + test  cb47f12f  completed (r18)
+  Confirmed the OrangeFox round-19 run is run ID 33243421624 on
+  commit 5f0dd509.
+- Polled every ~60–180s. Status timeline:
+    08:33:05  in_progress (build APK + ARM64 E2E running)
+    08:48:18  overall run COMPLETED success
+  Total wall time: ~15 minutes. Well under the 25-minute budget.
+- Downloaded the `ui-e2e-arm64-logs` artifact (artifact ID
+  9712233600, 12.78 MB), unzipped the outer zip, extracted the
+  inner ui-e2e-logs.tar.xz (the extraction nested one extra
+  tmp/ui-e2e-artifacts/ — reorganized by moving files up to
+  /home/z/my-project/artifacts/ofox-r19/ui-e2e-artifacts/).
+- Inspected kr64-app-stderr-dockerexec.log (4784 lines, ~622 KB).
+  *** CRITICAL: the 6-Z211f post-fork DIAG fires EXACTLY TWICE —
+  once after PTRACE_EVENT_CLONE (line 4700, loop_count=14145) and
+  once after PTRACE_EVENT_FORK (line 4713, loop_count=14185).
+  Both DIAG messages are IDENTICAL in their key fields:
+    parent pid=2586 current_pid=2586 in_syscall=true
+    skip_next_resume=false resume_signal=0
+    "the loop-top PTRACE_SYSCALL will resume current_pid=2586
+    next iteration"
+  The only difference is the tracked_pids list:
+    line 4700 (post-CLONE): tracked_pids=[2586, 2684]
+    line 4713 (post-FORK):  tracked_pids=[2586, 2684, 2685]
+  This DIRECTLY ANSWERS the r17/r18 next-action question: "Is the
+  parent resumed with PTRACE_SYSCALL after PTRACE_EVENT_CLONE?"
+  ANSWER: YES. The parent pid 2586 IS current_pid, skip_next_resume
+  is FALSE, and the DIAG explicitly states "the loop-top
+  PTRACE_SYSCALL will resume current_pid=2586 next iteration". So
+  hypothesis (a) from r17 (the parent is left paused or resumed
+  with PTRACE_CONT instead of PTRACE_SYSCALL) is RULED OUT.
+- *** THE SMOKING GUN IS in_syscall=true ***
+  After PTRACE_EVENT_CLONE/FORK (which fires at the EXIT of the
+  clone syscall), the parent's in_syscall flag should be FALSE
+  (the clone has EXITED, we're outside any syscall). But the
+  6-Z211f DIAG shows in_syscall=TRUE after the post-fork handler
+  runs. This is the in_syscall flag desync that hypothesis (b)
+  from r17 predicted. With in_syscall=true at the time of the
+  loop-top PTRACE_SYSCALL resume, the parent's NEXT syscall-stop
+  (the mount() ENTRY) is mis-classified as a syscall-EXIT
+  (because the tracer's logic says: "in_syscall was true, so this
+  must be an EXIT"). The pre-dispatch DIAG (which fires only on
+  ENTRY) is SKIPPED. The 6-Z210 classification block (which also
+  fires only on ENTRY) is SKIPPED. The mount() syscall-stop is
+  received but discarded as a stale EXIT.
+- *** THE SEQUENCE around the mount failure (lines 4700-4703) ***
+    line 4700: 6-Z211f DIAG post-CLONE handler — in_syscall=true
+               skip_next_resume=false
+    line 4701: DIAG fork-family EXIT: nr=220 returned 2684
+    line 4702: Task-6-S EXIT: pid=2586 clone nr=220 -> 2684
+    line 4703: DIAG write(fd=67, ret=67): "<3>init: Failed to
+               remount /apex as 40000: Device or resource busy"
+  Between line 4702 (Task-6-S EXIT) and line 4703 (the write EXIT
+  reporting EBUSY), the parent MUST have executed mount("/apex",
+  ...) which returned -EBUSY. But NO syscall-stop DIAG is emitted
+  for the mount() ENTRY in that interval — confirming the mount
+  syscall-stop is being mis-classified as an EXIT and silently
+  discarded. IDENTICAL failure mode to r14/r15/r16/r17/r18.
+- The 6-Z211e resume DIAG (now only logging skip_next_resume=TRUE
+  events) fires EXACTLY ONCE — at line 4757, on pid=2685 at
+  loop_count=14382, during ESRCH-on-running-pid handling at the
+  very END of the run. This is NOT around the mount failure event.
+  So the resume DIAG gives NO useful info about the critical
+  dispatch window, same as r18 (but for a different reason — now
+  it only logs skip events, and the only skip event is at the end).
+- 6-Z98 syscall history buffer (last 50 ALL syscalls before exit):
+  on both pid=2586 (parent) and pid=2685 (final init child), the
+  ring buffer shows ZERO nr=40 (mount) anywhere in the syscall
+  history. So the tracer NEVER sees mount() as a syscall-stop
+  that it classifies as an ENTRY — IDENTICAL to r14/r15/r16/r17/r18.
+- DIAG counts:
+    Total log lines: 4784
+    6-Z211f DIAG count: 2 (both fork events, lines 4700 + 4713)
+    6-Z211e DIAG count: 1 (only the end-of-run skip, line 4757)
+    Broad DIAG count: 2000 (cap reached, far before fork event)
+    Broad DIAG nr=40 (mount) count: 0  ← IDENTICAL to r14-r18
+    Pre-dispatch mount DIAG count: 0  ← IDENTICAL
+    6-Z210 classification block count: 0  ← IDENTICAL
+    Failed to remount /apex count: 1 (line 4703)
+    SetupMountNamespaces failed count: 3 (lines 4704, 4706, 4708)
+    InitFatalReboot count: 1 (line 4723)
+- result-pretty.json: BOOT_FAIL_EARLY_INIT (overall=BOOT_FAIL_EARLY_INIT,
+  boot=BOOT_FAIL, failure=init_fatal_reboot, exit_code=127,
+  backstop_denied=2, recovery_instances=0, ui=NOT_REACHED,
+  vfs=CLEAN, terminal=NOT_APPLICABLE).
+  IDENTICAL TO r14, r15, r16, r17, r18. The 6-Z211f post-fork DIAG
+  change is NOT observable in the boot result — it neither helped
+  nor hurt the boot outcome (the boot was already failing the same
+  way before, and continues to fail the same way after).
+- container-state.txt: status=running exit=0 oom=false (same as
+  r14-r18).
+
+Stage Summary:
+- *** THE 6-Z211f POST-FORK DIAG CONFIRMS THE ROOT CAUSE ***
+  The DIAG fires twice (lines 4700, 4713) and shows the parent
+  pid 2586 IS current_pid, IS going to be PTRACE_SYSCALL-resumed
+  at the loop-top (skip_next_resume=false), BUT in_syscall=TRUE
+  after the post-fork handler. This is the in_syscall flag desync
+  that hypothesis (b) from r17 predicted. After PTRACE_EVENT_CLONE/
+  FORK (which fires at the EXIT of clone), in_syscall should be
+  FALSE — but it's TRUE. The parent's NEXT syscall-stop (mount()
+  ENTRY) is mis-classified as a syscall-EXIT and silently
+  discarded, so the pre-dispatch DIAG never fires and the
+  6-Z210 classification block never fires. IDENTICAL failure mode
+  to r14/r15/r16/r17/r18.
+- *** HYPOTHESIS (a) FROM r17 IS RULED OUT ***
+  The 6-Z211f DIAG explicitly states "the loop-top PTRACE_SYSCALL
+  will resume current_pid=2586 next iteration" and skip_next_resume
+  is FALSE. So the parent IS being PTRACE_SYSCALL-resumed. The
+  parent is NOT left paused, NOT resumed with PTRACE_CONT, NOT
+  detached. The r17 hypothesis (a) (parent left paused or resumed
+  with wrong PTRACE_* request) is WRONG.
+- *** HYPOTHESIS (b) FROM r17 IS CONFIRMED ***
+  The in_syscall=TRUE in the 6-Z211f DIAG is the smoking gun. The
+  in_syscall flag is NOT being reset to false after the fork event
+  (which fires at the EXIT of clone). With in_syscall=true, the
+  next syscall-stop on the parent (mount ENTRY) is mis-classified
+  as a syscall-EXIT, so the pre-dispatch DIAG (which fires only
+  on ENTRY) is skipped. The 6-Z210 classification block (which also
+  fires only on ENTRY) is also skipped.
+- *** NEXT CONCRETE ACTION for the main orchestrator: ***
+  Read the post-fork handler code in app/rs/kr64/src/ptrace_emu.rs
+  (the file modified by 6-Z211c/d/e/f). Locate the code path that
+  handles PTRACE_EVENT_CLONE / PTRACE_EVENT_FORK on the parent
+  (which fires the 6-Z211f DIAG at line 4700 / 4713 in the log).
+  The fix is to EXPLICITLY reset the parent's in_syscall flag to
+  false inside the post-fork handler, RIGHT BEFORE the DIAG fires
+  (or right after, but BEFORE the loop-top PTRACE_SYSCALL resume).
+  Concretely, add a line like:
+    parent_state.in_syscall = false;
+  inside the post-fork handler, after the fork event is processed
+  (new child registered, etc.) and before the function returns to
+  the main dispatch loop. This will ensure the parent's NEXT
+  syscall-stop (mount ENTRY) is correctly classified as an ENTRY,
+  firing the pre-dispatch DIAG and the 6-Z210 classification block,
+  so the tracer can intercept and emulate the mount() syscall.
+  After the fix, re-dispatch OrangeFox r20 on the fix commit.
+- *** ALTERNATIVE ROOT CAUSE (less likely but possible): ***
+  It's also possible that the EXIT classification (Task-6-S EXIT,
+  line 4702 / 4716) is SUPPOSED to reset in_syscall to false but
+  DOESN'T for the fork-event case (only for the normal non-fork
+  EXIT case). If so, the fix is to make the EXIT classification
+  reset in_syscall to false for ALL EXIT stops, including the
+  fork-event case. Either way, the net effect is the same: after
+  the fork event, in_syscall must be false. The 6-Z211f DIAG
+  confirms it's currently true, which is the bug.
+- *** DO NOT REMOVE the 6-Z211f post-fork DIAG or the 6-Z211e
+  resume DIAG or the 6-Z210 broad DIAG or the pre-dispatch DIAG.
+  They are working correctly. The 6-Z211f DIAG is the KEY piece of
+  evidence that confirmed the in_syscall flag desync root cause.
+  The cap of 2000 on the broad DIAG is still too low (hit before
+  the fork event), but that's a separate issue — the broad DIAG
+  is no longer the primary diagnostic for this bug (the 6-Z211f
+  post-fork DIAG is).
+- result-pretty.json: BOOT_FAIL_EARLY_INIT (init_fatal_reboot,
+  exit_code=127). IDENTICAL TO r14, r15, r16, r17, r18. The
+  6-Z211f post-fork DIAG change is NOT observable in the boot
+  result — it neither helped nor hurt the boot outcome.

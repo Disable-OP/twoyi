@@ -11146,19 +11146,43 @@ pub fn run_ptrace_loop(
                         // is 0 (no signal to deliver). The loop-top
                         // PTRACE_SYSCALL will resume `current_pid` (the
                         // parent) on the next iteration.
+                        //
+                        // 6-Z211g FIX: reset `in_syscall = false` here.
+                        // PTRACE_EVENT_CLONE/FORK fires at the EXIT of
+                        // the clone() syscall. After this event, the
+                        // parent is NO LONGER inside a syscall — the
+                        // clone() has returned. But the `in_syscall`
+                        // flag is still `true` (set when the clone()
+                        // ENTRY stop was processed). This desync causes
+                        // the parent's NEXT syscall-stop (mount()) to be
+                        // mis-classified as an EXIT stop (because
+                        // `in_syscall=true`), which means the ENTRY
+                        // handler never runs, the 6-Z210 classification
+                        // never fires, and the mount() return value is
+                        // NOT faked to 0 — the kernel's -EBUSY leaks
+                        // through → SetupMountNamespaces fails →
+                        // InitFatalReboot.
+                        //
+                        // The 6-Z211f DIAG confirmed this: after the
+                        // PTRACE_EVENT_CLONE handler, `in_syscall=true`
+                        // (round-19, kr64 stderr line 4700). With this
+                        // fix, `in_syscall` is reset to `false`, so the
+                        // parent's next syscall-stop (mount()) is
+                        // correctly classified as an ENTRY stop, the
+                        // pre-dispatch DIAG fires, the 6-Z210
+                        // classification fires, and the mount() return
+                        // is faked to 0.
+                        in_syscall = false;
+                        in_syscall_map.insert(current_pid, false);
                         // 6-Z211f DIAG: log the post-fork state to
                         // understand why the parent's next syscall
                         // (mount()) is NOT being delivered.
                         log(&format!(
-                            "6-Z211f DIAG: post-PTRACE_EVENT_{} handler — parent pid={} current_pid={} in_syscall={} skip_next_resume={} resume_signal={} tracked_pids={:?} — the loop-top PTRACE_SYSCALL will resume current_pid={} next iteration",
+                            "6-Z211g FIX: post-PTRACE_EVENT_{} handler — reset in_syscall=false for parent pid={} current_pid={} (was true — the desync caused mount() ENTRY to be mis-classified as EXIT, skipping the 6-Z210 classification) tracked_pids={:?}",
                             event_name,
                             pid,
                             current_pid,
-                            in_syscall,
-                            skip_next_resume,
-                            resume_signal,
                             tracked_pids,
-                            current_pid,
                         ));
                         continue;
                     }
