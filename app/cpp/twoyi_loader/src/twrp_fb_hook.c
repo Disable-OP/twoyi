@@ -2394,6 +2394,29 @@ int openat(int dirfd, const char *path, int flags, ...) {
     return fd;
 }
 
+// 6-Z222: open64 / openat64 — modern bionic (Android 11+) exports these
+// as REAL symbols, so libraries built against it (e.g. a 64-bit TWRP
+// image's libminuitwrp) bind their open64@plt directly to libc and
+// bypass the open/openat hooks above. The fb0 fd then never lands in
+// g_fb_fds and every FB ioctl passes through as ENOTTY (zeroed
+// screeninfo → gr_fb_width NULL crash). These thin aliases route through
+// the SAME openat() hook body — identical pty/input/fb0/ashmem handling.
+int open64(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+    }
+    return openat(AT_FDCWD, path, flags, mode);
+}
+
+int openat64(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+    }
+    return openat(dirfd, path, flags, mode);
+}
+
 // bionic's fortified open variants. These are called by code compiled with
 // -D_FORTIFY_SOURCE (most of AOSP). They have the same path-tracking logic.
 int __open_2(const char *path, int flags) {

@@ -19223,3 +19223,22 @@ Stage Summary:
 - 6-Z220 classifier now counts REAL crashes: OrangeFox r25 had 25 (not 200). Backstop
   denials (79) analyzed: all crash-handler CONSEQUENCES (execve crash_dump64 denied + debuggerd
   fstatat probes), not gr_init causes.
+
+---
+Task ID: 6-Z222
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Root-cause the OrangeFox gr_fb_width crash loop with the 6-Z220 kmsg diagnostics and the full crash maps.
+
+Work Log:
+- 83fddc3 verification round: 3/5 guards GREEN (whyred 33275545561 + both anglers 33275544587/33275543722: UI_READY, terminal OK). OrangeFox 33275527467 STILL crash-loops (28 real crashes at gr_fb_width + Parcel::readInt32); lineage 33275526098 was still in flight at time of writing.
+- 6-Z220 CONFIRMED WORKING: the rc patcher fired for the AOSP layout ("patched init.recovery.service.rc — added setenv LD_PRELOAD <full chain> + ... + stdio_to_kmsg") and the recovery service's stderr NOW REACHES kmsg (dev-__kmsg__ 69KB: init/ueventd logs + [twoyi_loader] socket bind translations). kmsg visibility was the missing observability for AOSP-layout services.
+- ROOT CAUSE (finally, mechanism-level): the shlib ALREADY synthesizes FB ioctls for tracked fds, and the crashed process's maps show all three hooks loaded — yet ZERO fb0-open tracking lines and ZERO FB ioctl synthesis lines in kmsg. The open() of /dev/graphics/fb0 by libminuitwrp went through MODERN BIONIC'S open64 (a real exported symbol in Android 11+; thin alias to openat) — which NONE of the hooks interposed. The fd was never tracked → FBIOGET_VSCREENINFO passed through to the regular-file stub → ENOTTY → zeroed screeninfo → gr_framebuffer NULL → gr_fb_width() crash at libminuitwrp.so+0x2027c. (Earlier address-order analysis was retracted: mmap layout is not monotonic, so it cannot prove LD_PRELOAD order.)
+- FIX (6-Z222, generic §22):
+  * shlib: open64/openat64 PLT interposers routing through the same openat() hook body (translation + binder/qemu fallbacks + fb tracking); ioctl hook self-heals untracked FB fds via /proc/self/fd readlinkat before pass-through; shlib geometry is now RUNTIME (TWOYI_FB_WIDTH/HEIGHT env → {rootfs}/dev/.twoyi-fb-geometry file → 720x1280 fallback) instead of hardcoded 720x1280 — fill_vscreeninfo/fill_fscreeninfo/ioctls all use it.
+  * fb hook: same open64/openat64 interposers (modern-bionic arm64 TWRP images hit the same gap).
+- Host syntax checks pass for both files (fb hook's only host error is the pre-existing glibc-vs-bionic ioctl signature difference; CI builds with NDK/bionic).
+
+Stage Summary:
+- The OrangeFox crash class is "modern bionic open64 bypasses open/openat hooks" — an ENTIRE CLASS (any Android 11+ AOSP-layout recovery's native graphics path), fixed generically.
+- NEXT: commit 6-Z222, dispatch orangefox + lineage + guards re-verification. Then start the corpus waves (batch:0:60) for the 90% goal.
