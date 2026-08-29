@@ -19183,3 +19183,32 @@ Stage Summary:
 - NEXT: commit 6-Z218, dispatch CI: orangefox-R12.0-lavender +
   lineage-22.2-sailfish (verification) + twrp-2.8.7.0-angler,
   twrp-3.7.0_9-0-angler, twrp-3.7.0_9-0-whyred (regression guards).
+
+---
+Task ID: 6-Z219 + 6-Z220
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Analyze the 701909a verification round (5 runs, dispatched 19:35Z), root-cause the two remaining boot blockers, implement generic fixes.
+
+Work Log:
+- 701909a round verdicts (runs on the 6-Z218 head, all pulled to /home/z/my-project/artifacts/ver7019/run_<id>/):
+  * 33271277765 twrp-3.7.0_9-0-whyred: BOOT_OK UI_READY terminal OK theme OK (guard green).
+  * 33271276956 + 33271275875 twrp anglers (2.8/3.7): BOOT_OK UI_READY terminal OK (guards green).
+  * 33271279412 lineage-22.2-sailfish: BOOT_FAIL — NEW failure site, property init now PASSES (6-Z218b verified: "staged 8 bootstrap-bionic symlinks", property_info 116196 bytes valid).
+  * 33271278540 orangefox-R12.0-lavender: BOOT_OK, recovery still crash-loops (25 crashes at libminuitwrp.so+0x2027c gr_fb_width + libbinder.so+0x5146c Parcel::readInt32).
+- LINEAGE ROOT CAUSE (6-Z219): guest init/recovery aborts with "[glog F/abort] Check failed: !fstab.empty()" after "<3>init: [libfstab] Error updating for slotselect". Downloaded be5fe3e3... boot.img, unpacked ramdisk (595 entries): /etc is a SYMLINK to /system/etc, fstab ships as system/etc/recovery.fstab + first_stage_ramdisk/fstab.sailfish (1708 bytes, matches what the guest served). sailfish is an A/B device; its fstab has 3 slotselect entries. Android 12+ libfstab (slotselect.cpp, android-15.0.0_r1 fetched and read): fs_mgr_update_for_slotselect returns FALSE when an entry has slot_select and fs_mgr_get_slot_suffix() is empty. Twoyi hard-coded `androidboot.slot_suffix=` (EMPTY) in /proc/cmdline — the empty value short-circuits fs_mgr_get_boot_config ("found but empty" is authoritative; DT/bootconfig fallbacks never run). The recovery binary itself carries the CHECK (strings(1) on system/bin/recovery).
+- 6-Z219 FIX: pub fn detect_guest_slot_suffix(rootfs_prefix) — scans fstab files in 8 candidate dirs ("", etc, system/etc, system/system_ext/etc, vendor/etc, odm/etc, first_stage_ramdisk, first_stage_ramdisk/etc) for non-comment lines with the exact token slotselect/slotselect_other (comma-split field check, not substring). Found → "_a" (the default boot slot every A/B device boots); not found → NO slot_suffix key at all (empty value is worse than absent). Wired into the cmdline builder next to 6-Z159 hardware detection. 5 unit tests (etc layout, first_stage_ramdisk layout, comment-only rejection, missing rootfs, slotselect_other).
+- ORANGEFOX ROOT CAUSE (6-Z220): the full crashed-process maps (358 map paths — the earlier 120-line parse window had TRUNCATED the block; getpid_hook, shlib AND fb_hook are ALL mapped from rootfs/dev/, so the 6-Z216/6-Z218a env DOES reach the service and the "missing shlib" theory is DEAD for this run) + gr_fb_width disassembly (adrp x8 [0x4fa20]; ldr x8; ldr w0 [x8] → gr_framebuffer==NULL → gr_init() failed). EVERYTHING the service needs is loaded, yet gr_init fails with ALL its diagnostics invisible: AOSP init redirects non-console service stdio to /dev/null, so every [twrp_fb_hook] ioctl/open diagnostic (the hook logs ioctls with a 16-drop cap) is lost — root cause had to be inferred from maps alone. NOTE (user-provided context): a previous session manually disabled the "Boot to recovery" profile option hoping to fix a failure; the option persisted disabled. For OrangeFox the app's auto-set (RomManager.autoSetBootRecovery: AOSP-style → false) coincides with that state, so boot_recovery=false is per-design here; the actionable gap was elsewhere (below).
+- 6-Z220 FIX (generic, §22): patch_twrp_init_rc_recovery_service_in_rootfs now runs for BOTH boot modes:
+  * TWRP mode (None): legacy "setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so" (unchanged, angler guard).
+  * AOSP-layout mode (Some(AOSP_SERVICE_PRELOAD_CHAIN)): the recovery service explicitly carries the FULL virtualization stack "/dev/libgetpid_hook.so:/dev/libtwrp_fb_hook.so:/dev/libtwoyi_loader_shlib.so" (6-Z218a order asserted) via init.rc setenv — the service no longer depends on inheriting kr64's exec env through arbitrary vendor init trees. The 32-bit LD_LIBRARY_PATH trio is NOT emitted for the native chain (would override init's inherited 12-dir path).
+  * stdio_to_kmsg option emitted ONLY when the guest's OWN init binary contains the literal "stdio_to_kmsg" (binary indicator, §10 pattern — Android ≤10 parsers reject unknown service options and would DROP the service). This makes the recovery service's stderr (hook + linker + glog diagnostics) land in /dev/__kmsg__ → captured in future run artifacts (§25 observability).
+  * Idempotence now keys on the CURRENT chain; a boot-mode flip (stale /sbin marker) REPATCHES, and the patcher drops any pre-existing setenv LD_PRELOAD / stdio_to_kmsg lines inside the recovery block (exactly one of each survives).
+- Tests: 5× detect_guest_slot_suffix + binary_contains_string (incl. 64KiB boundary spanning) + aosp chain injection + stale-chain replacement + aosp idempotence. Gates: cargo fmt --check, clippy --all-targets -D warnings, cargo test --lib → 630 passed / 0 failed.
+- CLASSIFIER NOTE: 33271278540 result.json had no sigsegv count surfaced in my extraction; crash count = 25 "SIGSEGV details" lines (≈3 real crashes ×8 grep lines + binder class).
+
+Stage Summary:
+- 6-Z219: A/B recoveries (any image whose fstab uses slotselect) now get androidboot.slot_suffix=_a derived from their own fstab content. lineage-22.2-sailfish's fstab-empty CHECK abort is the direct target.
+- 6-Z220: recovery service carries the full preload chain explicitly in AOSP-layout boots + stdio_to_kmsg diagnostics visibility when init supports it.
+- Guards: whyred + 2× angler UI_READY/terminal OK on the same head — no regressions from 6-Z218.
+- NEXT: commit both, dispatch CI: lineage-22.2-sailfish (6-Z219 verify) + orangefox-R12.0-lavender (6-Z220 verify) + the 3 guards. If OrangeFox still fails, the NEW stdio_to_kmsg diagnostics should capture the exact failing ioctl/open in kmsg artifacts.
