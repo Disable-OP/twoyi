@@ -10066,12 +10066,23 @@ pub fn run_ptrace_loop(
 
     // ── 6-Z190: coverage watchdog cadence state ──
     // One sweep shortly after the first execve (catches fast-boot
-    // stragglers), then on every 25k-iteration boundary but never more
-    // often than once per 5 s of wall clock (the /proc scan costs a few
-    // ms; under a syscall storm the iteration gate alone would spin it).
+    // stragglers), then on every iteration boundary but never more
+    // often than once per interval of wall clock (the /proc scan costs a
+    // few ms; under a syscall storm the iteration gate alone would spin
+    // it).
+    //
+    // 6-Z213: 25000 iterations / 5 s was far too lax — the OrangeFox
+    // (Lineage 22.2) boot FAILED at loop_count ~14200, so the sweep never
+    // fired even once in that boot. Any untraced guest-tree process
+    // (thread auto-attach missed, fork before SETOPTIONS, re-parented
+    // daemon) accumulated syscalls against the HOST kernel for the whole
+    // boot — an §6 isolation violation AND the prime suspect for the
+    // never-intercepted mount() calls (r24 log: 14252 syscall-stops,
+    // ZERO nr=40, while init demonstrably executed mount()). 4000
+    // iterations / 2 s gives ~3 sweeps before that failure point.
     let mut last_coverage_sweep: Option<std::time::Instant> = None;
-    const COVERAGE_SWEEP_ITERATIONS: u64 = 25_000;
-    const COVERAGE_SWEEP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+    const COVERAGE_SWEEP_ITERATIONS: u64 = 4_000;
+    const COVERAGE_SWEEP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
     loop {
         // ── 6-Z190: coverage watchdog — heal untraced guest-tree pids ──
@@ -10186,21 +10197,28 @@ pub fn run_ptrace_loop(
             }
             0 // pretend success — nothing to resume, straight to waitpid
         } else {
-            // 6-Z211e DIAG: log the PTRACE_SYSCALL resume (which pid is
-            // being resumed). Only log AFTER a fork event (tracked_pids
-            // > 1) to avoid hitting the cap before the fork event.
-            // Capped at 500 to avoid log spam.
+            // 6-Z213 (was 6-Z211e): log EVERY loop-top PTRACE_SYSCALL
+            // resume. The previous gate (n < 500 && tracked_pids.len() > 1)
+            // was USELESS in practice: the fetch_add counter ran from the
+            // first iteration (tracked_pids.len()==1 → not logged but
+            // counted), so by the FIRST fork event the 500 budget was
+            // already exhausted — r24's log contained ZERO resume lines.
+            // Paired with the 6-Z213 RAW STOP log (same 30000 cap), every
+            // kernel-reported stop can now be correlated with the resume
+            // that preceded it: a guest syscall that executes with NO
+            // intervening resume+stop pair proves the tracee ran with
+            // PTRACE_SYSCALL disarmed (the stop-consumption smoking gun).
             static RESUME_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = RESUME_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 500 && tracked_pids.len() > 1 {
+            if n < 30000 {
                 log(&format!(
-                    "6-Z211e DIAG: PTRACE_SYSCALL resume pid={} loop_count={} resume_signal={} tracked_pids={:?} [resume #{}/500]",
+                    "6-Z213 RESUME #{}: pid={} loop_count={} resume_signal={} tracked_pids={:?}",
+                    n + 1,
                     current_pid,
                     loop_count,
                     resume_signal,
                     tracked_pids,
-                    n + 1,
                 ));
             }
             unsafe {
@@ -10578,6 +10596,41 @@ pub fn run_ptrace_loop(
             let e = std::io::Error::last_os_error();
             log(&format!("waitpid failed: {}", e));
             return -1;
+        }
+        // ── 6-Z213 RAW STOP FORENSICS ──────────────────────────────────
+        //
+        // r24 (run 33248496503, commit 2db54ec) established a HARD fact:
+        // across 14252 broad-DIAG syscall-stops, ZERO were mount (nr=40),
+        // umount2 (39) or pivot_root (41) — while guest init demonstrably
+        // EXECUTED mount() in the same window (its "Failed to remount
+        // /apex" kmsg write is a DIAG'd syscall EXIT right after). Every
+        // SIGTRAP|0x80 stop that reaches the dispatcher IS logged by the
+        // broad DIAG (it sits before any classification and only the
+        // getregs-failure path skips it — 0 occurrences). Therefore either
+        //   (a) the kernel never delivers mount() syscall-stops at all, or
+        //   (b) they arrive with an unexpected status shape and are routed
+        //       into a branch that does not log (event stops / signal
+        //       delivery stops / group stops).
+        // This raw log answers that DEFINITIVELY: it prints EVERY waitpid
+        // return (pid + raw status word) BEFORE any classification, so a
+        // mount syscall-stop (status 0x0000857f) can be matched against the
+        // guest's actual mount calls regardless of how the dispatcher
+        // classifies it. Cap 30000 > a full boot's ~15k stops, so we keep
+        // COMPLETE coverage including the fatal window.
+        {
+            static RAW_STOP_LOGGED: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = RAW_STOP_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 30000 {
+                log(&format!(
+                    "6-Z213 RAW STOP #{}: pid={} status=0x{:08x} wstopsig={} ptrace_event={}",
+                    n + 1,
+                    waited,
+                    status as u32,
+                    libc::WSTOPSIG(status),
+                    ((status as u32) >> 16) & 0xFFFF,
+                ));
+            }
         }
         // 6-Z126: a successfully received stop proves the tracee
         // relationship is healthy — reset its ESRCH streak (the streak
