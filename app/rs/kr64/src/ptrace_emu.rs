@@ -3027,6 +3027,66 @@ fn pseudo_mount_target(rootfs: &str, tgt: Option<&str>, fstype: Option<&str>) ->
     }
 }
 
+/// 6-Z210: Is this mount() flags value a "propagation / remount" operation
+/// rather than a fresh filesystem mount?
+///
+/// Mount propagation flags (MS_PRIVATE, MS_SLAVE, MS_SHARED, MS_UNBINDABLE)
+/// don't actually mount a new filesystem — they change the propagation type
+/// of an EXISTING mount. The kernel can return EBUSY for these calls when
+/// the target mount is busy (e.g., a bind-mounted /apex with files open,
+/// which is exactly the Lineage 22.2 SetupMountNamespaces failure mode
+/// observed in run 33213432833 on commit 587a1c4):
+///
+///   <3>init: Failed to remount /apex as 40000: Device or resource busy
+///   [glog F/abort] SetupMountNamespaces failed: Device or resource busy
+///   <3>init: InitFatalReboot: signal 6
+///
+/// "40000" in init's log is the hex representation of MS_PRIVATE (1<<18 =
+/// 0x40000 = 262144). The AOSP init source prints the flags with `std::hex`
+/// in mount_namespace.cpp's SetupMountNamespaces, and the failing call is
+/// `mount(nullptr, "/apex", nullptr, MS_PRIVATE | MS_REC, nullptr)` (or
+/// MS_PRIVATE alone). The kr64 rootfs bind-mounts the HOST's /apex into
+/// the guest rootfs (mount_mgr.rs:505) — making /apex a busy bind-mount
+/// that the kernel refuses to mark PRIVATE, returning EBUSY. init treats
+/// this as a fatal SetupMountNamespaces failure → SIGABRT → exit_group(127)
+/// → InitFatalReboot.
+///
+/// MS_REMOUNT re-configures an existing mount's flags (e.g., to make it
+/// read-only); same EBUSY risk when the mount is busy.
+/// MS_MOVE relocates an existing mount; same risk.
+///
+/// For these operations, the kr64 sandbox must fake success (return 0) so
+/// the guest's SetupMountNamespaces continues. The mount namespace is
+/// already virtualized — the guest sees its own coherent mount state
+/// regardless of whether the kernel actually changed the propagation type.
+/// The guest never probes /proc/self/mountinfo in a way that would expose
+/// the lie (and even if it did, the kr64 proc_emu.rs layer can rewrite
+/// mountinfo entries — see §24 of the master prompt).
+///
+/// This helper does NOT include MS_BIND (4096): bind mounts CREATE a new
+/// mount point and may reference real block-storage sources
+/// (/dev/block/sda1). Classifying them as "propagation" would defeat the
+/// 6-Z91 -ENODEV semantics that TWRP's recovery.fstab storage mounts rely
+/// on (the partition is marked unmountable and boot proceeds). AOSP init
+/// uses MS_BIND only for self-bind-to-make-mountpoint before pivot_root,
+/// which is kr64's own mount_mgr.rs concern (host side, pre-execve), not
+/// a guest post-execve syscall that this helper gates.
+fn is_mount_propagation_or_remount_op(flags: u64) -> bool {
+    // Linux UAPI mount(2) flags — see include/uapi/linux/fs.h.
+    // Defined locally because libc::MS_* coverage varies by libc crate
+    // version + target; apex_extract.rs:622 already uses libc::MS_RDONLY
+    // | libc::MS_SILENT, but the propagation constants aren't guaranteed.
+    const MS_REMOUNT: u64 = 32; // 1 << 5
+    const MS_MOVE: u64 = 8192; // 1 << 13
+    const MS_UNBINDABLE: u64 = 1 << 17;
+    const MS_PRIVATE: u64 = 1 << 18;
+    const MS_SLAVE: u64 = 1 << 19;
+    const MS_SHARED: u64 = 1 << 20;
+    const PROPAGATION_MASK: u64 =
+        MS_REMOUNT | MS_MOVE | MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
+    (flags & PROPAGATION_MASK) != 0
+}
+
 /// Task 6-Z60: is this i386 syscall number one whose FIRST argument is a
 /// file descriptor? Used to detect fcntl64/ftruncate/dup2/close calls that
 /// target the FAKE properties fd (42) — the synthetic fd the properties
@@ -13646,11 +13706,50 @@ pub fn run_ptrace_loop(
                         // the GUI never started. Honest -ENODEV for block
                         // fstypes makes TWRP mark the partition unmountable
                         // and MOVE ON (the documented 6-Z91 behavior).
+                        //
+                        // 6-Z210: skip the block-storage classification when
+                        // the flags arg indicates a propagation / remount
+                        // operation (MS_PRIVATE | MS_SLAVE | MS_SHARED |
+                        // MS_UNBINDABLE | MS_REMOUNT | MS_MOVE). These ops
+                        // don't mount a new fs — they reconfigure an
+                        // EXISTING mount's propagation/flags. The kernel
+                        // returns EBUSY for them when the target mount is
+                        // busy (e.g., Lineage 22.2's /apex MS_PRIVATE call
+                        // against the kr64-bind-mounted /apex — run
+                        // 33213432833 → InitFatalReboot). Allowing the
+                        // -ENODEV classification here would make init's
+                        // SetupMountNamespaces fail fatally. Instead, leave
+                        // the pid out of pending_mount_enodev so the EXIT
+                        // handler's compute-table Some(0) is applied — the
+                        // guest sees the propagation/remount as succeeded
+                        // and continues. See is_mount_propagation_or_remount_op
+                        // for the full rationale.
+                        let flags_addr = get_syscall_arg(&regs, abi.reg_arg4);
+                        let flags_raw = flags_addr as u64;
+                        let is_propagation_or_remount =
+                            is_mount_propagation_or_remount_op(flags_raw);
                         let block_storage_mount = match fs.as_deref() {
                             Some(f) => !f.is_empty() && !is_pseudo_fs_type(f),
-                            None => true, // NULL/empty fstype: bind/remount — deny (6-Z91 semantics)
+                            None => !is_propagation_or_remount, // NULL/empty fstype: bind/remount — deny (6-Z91 semantics), UNLESS flags indicate a propagation/remount op (6-Z210)
                         };
-                        if block_storage_mount {
+                        if is_propagation_or_remount {
+                            // 6-Z210: propagation/remount op — fake success.
+                            // Don't insert into pending_mount_enodev so the
+                            // EXIT handler's compute-table Some(0) is the
+                            // final rax the guest sees. The kernel may
+                            // actually return EBUSY (when the mount is busy),
+                            // but the EXIT-side forced_value overrides it.
+                            mount_enodev_logged = mount_enodev_logged.saturating_add(1);
+                            if mount_enodev_logged <= 30 {
+                                log(&format!(
+                                    "6-Z210: propagation/remount mount op target={:?} fstype={:?} flags={:#x} classified at ENTRY — EXIT will return 0 (fake success: kernel may return EBUSY but guest's SetupMountNamespaces must proceed) [{} /30]",
+                                    tgt.as_deref().unwrap_or("?"),
+                                    fs.as_deref().unwrap_or("(null)"),
+                                    flags_raw,
+                                    mount_enodev_logged
+                                ));
+                            }
+                        } else if block_storage_mount {
                             pending_mount_enodev.insert(pid);
                             mount_enodev_logged = mount_enodev_logged.saturating_add(1);
                             if mount_enodev_logged <= 30 {
@@ -20388,6 +20487,7 @@ pub fn run_ptrace_loop(
                             let src_addr = get_syscall_arg(&sigsys_regs, a.reg_arg1);
                             let tgt_addr = get_syscall_arg(&sigsys_regs, a.reg_arg2);
                             let fs_addr = get_syscall_arg(&sigsys_regs, a.reg_arg3);
+                            let flags_addr = get_syscall_arg(&sigsys_regs, a.reg_arg4);
                             let src = if src_addr != 0 {
                                 read_child_string(pid, src_addr)
                             } else {
@@ -20403,7 +20503,37 @@ pub fn run_ptrace_loop(
                             } else {
                                 String::new()
                             };
-                            if is_pseudo_fs_type(&fstype) {
+                            let flags_raw = flags_addr as u64;
+                            // 6-Z210: propagation / remount ops (MS_PRIVATE |
+                            // MS_SLAVE | MS_SHARED | MS_UNBINDABLE |
+                            // MS_REMOUNT | MS_MOVE) get fake success (0)
+                            // BEFORE the pseudo-vs-block-storage fork below.
+                            // These ops reconfigure an EXISTING mount's
+                            // propagation/flags; the kernel can return EBUSY
+                            // when the target mount is busy (the Lineage 22.2
+                            // /apex MS_PRIVATE case — run 33213432833). The
+                            // fstype for these ops is NULL/empty (which the
+                            // block-storage arm below would otherwise DENY with
+                            // -ENODEV → SetupMountNamespaces fails fatally →
+                            // InitFatalReboot). Fake success lets the guest's
+                            // mount-namespace setup continue.
+                            if is_mount_propagation_or_remount_op(flags_raw) {
+                                if mount_denied_logged < MOUNT_DENY_LOG_CAP {
+                                    // Reuse the deny-log cap (it's a mount-
+                                    // classification counter, not strictly
+                                    // "denials" — the name is historical).
+                                    mount_denied_logged = mount_denied_logged.saturating_add(1);
+                                    sigsys_log(&format!(
+                                        "6-Z210: SIGSYS propagation/remount mount op target={:?} fstype={:?} flags={:#x} -> 0 (fake success: kernel would return EBUSY on the busy bind-mounted /apex; guest's SetupMountNamespaces must proceed) [sig #{}/{}]",
+                                        tgt.as_deref().unwrap_or("(null)"),
+                                        fstype,
+                                        flags_raw,
+                                        mount_denied_logged,
+                                        MOUNT_DENY_LOG_CAP
+                                    ));
+                                }
+                                0
+                            } else if is_pseudo_fs_type(&fstype) {
                                 // Pseudo fs — preserve the pre-6-Z91
                                 // behaviour EXACTLY: for tmpfs/devpts
                                 // create the mount-point directory in the
@@ -21462,6 +21592,81 @@ mod tests {
         // Missing args → None (bind mounts with NULL fstype).
         assert_eq!(pseudo_mount_target("/r", Some("/mnt"), None), None);
         assert_eq!(pseudo_mount_target("/r", None, Some("tmpfs")), None);
+    }
+
+    #[test]
+    fn is_mount_propagation_or_remount_op_detects_ms_private() {
+        // 6-Z210: Lineage 22.2's SetupMountNamespaces calls
+        // mount(nullptr, "/apex", nullptr, MS_PRIVATE, nullptr). The kernel
+        // returns EBUSY on the kr64-bind-mounted /apex. The fix fakes
+        // success — this test pins the bit pattern that triggers it.
+        const MS_PRIVATE: u64 = 1 << 18; // 0x40000 = 262144
+        assert!(is_mount_propagation_or_remount_op(MS_PRIVATE));
+        // The actual AOSP call uses MS_PRIVATE | MS_REC.
+        const MS_REC: u64 = 1 << 14; // 0x4000
+        assert!(is_mount_propagation_or_remount_op(MS_PRIVATE | MS_REC));
+    }
+
+    #[test]
+    fn is_mount_propagation_or_remount_op_detects_ms_remount() {
+        // MS_REMOUNT (0x20 = 32) — the classic remount pattern.
+        const MS_REMOUNT: u64 = 32;
+        const MS_RDONLY: u64 = 1;
+        const MS_NOSUID: u64 = 2;
+        const MS_NODEV: u64 = 4;
+        assert!(is_mount_propagation_or_remount_op(MS_REMOUNT));
+        assert!(is_mount_propagation_or_remount_op(MS_REMOUNT | MS_RDONLY));
+        assert!(is_mount_propagation_or_remount_op(
+            MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV
+        ));
+    }
+
+    #[test]
+    fn is_mount_propagation_or_remount_op_detects_other_propagation_flags() {
+        // MS_SLAVE | MS_SHARED | MS_UNBINDABLE | MS_MOVE — all the other
+        // propagation-related ops that reconfigure existing mounts.
+        assert!(is_mount_propagation_or_remount_op(1 << 19)); // MS_SLAVE
+        assert!(is_mount_propagation_or_remount_op(1 << 20)); // MS_SHARED
+        assert!(is_mount_propagation_or_remount_op(1 << 17)); // MS_UNBINDABLE
+        assert!(is_mount_propagation_or_remount_op(1 << 13)); // MS_MOVE
+    }
+
+    #[test]
+    fn is_mount_propagation_or_remount_op_rejects_pseudo_fs_mount() {
+        // A fresh pseudo-fs mount (e.g., tmpfs on /dev with no propagation
+        // flag) must NOT be classified as a propagation/remount op — the
+        // existing is_pseudo_fs_type arm handles it.
+        const MS_NOSUID: u64 = 2;
+        const MS_NOEXEC: u64 = 8;
+        assert!(!is_mount_propagation_or_remount_op(MS_NOSUID | MS_NOEXEC));
+    }
+
+    #[test]
+    fn is_mount_propagation_or_remount_op_rejects_block_storage_mount() {
+        // A block-storage mount (vfat/ext4 with no propagation flag) must
+        // NOT be classified as a propagation/remount op — the 6-Z91
+        // -ENODEV arm handles it (TWRP marks partition unmountable).
+        const MS_RDONLY: u64 = 1;
+        const MS_NOSUID: u64 = 2;
+        assert!(!is_mount_propagation_or_remount_op(MS_RDONLY | MS_NOSUID));
+    }
+
+    #[test]
+    fn is_mount_propagation_or_remount_op_rejects_zero_flags() {
+        // Zero flags = no mount operation at all — should not match.
+        assert!(!is_mount_propagation_or_remount_op(0));
+    }
+
+    #[test]
+    fn is_mount_propagation_or_remount_op_does_not_include_ms_bind() {
+        // MS_BIND (0x1000 = 4096) is intentionally NOT in the propagation
+        // set — bind mounts create a new mount point and may reference
+        // block-storage sources. TWRP's recovery.fstab storage mounts rely
+        // on the 6-Z91 -ENODEV path.
+        const MS_BIND: u64 = 4096;
+        const MS_REC: u64 = 1 << 14;
+        assert!(!is_mount_propagation_or_remount_op(MS_BIND));
+        assert!(!is_mount_propagation_or_remount_op(MS_BIND | MS_REC));
     }
 
     #[test]
