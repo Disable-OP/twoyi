@@ -10187,16 +10187,19 @@ pub fn run_ptrace_loop(
             0 // pretend success — nothing to resume, straight to waitpid
         } else {
             // 6-Z211e DIAG: log the PTRACE_SYSCALL resume (which pid is
-            // being resumed). Capped at 200 to avoid log spam.
+            // being resumed). Only log AFTER a fork event (tracked_pids
+            // > 1) to avoid hitting the cap before the fork event.
+            // Capped at 500 to avoid log spam.
             static RESUME_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = RESUME_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 200 {
+            if n < 500 && tracked_pids.len() > 1 {
                 log(&format!(
-                    "6-Z211e DIAG: PTRACE_SYSCALL resume pid={} loop_count={} resume_signal={} [resume #{}/200]",
+                    "6-Z211e DIAG: PTRACE_SYSCALL resume pid={} loop_count={} resume_signal={} tracked_pids={:?} [resume #{}/500]",
                     current_pid,
                     loop_count,
                     resume_signal,
+                    tracked_pids,
                     n + 1,
                 ));
             }
@@ -11143,6 +11146,20 @@ pub fn run_ptrace_loop(
                         // is 0 (no signal to deliver). The loop-top
                         // PTRACE_SYSCALL will resume `current_pid` (the
                         // parent) on the next iteration.
+                        // 6-Z211f DIAG: log the post-fork state to
+                        // understand why the parent's next syscall
+                        // (mount()) is NOT being delivered.
+                        log(&format!(
+                            "6-Z211f DIAG: post-PTRACE_EVENT_{} handler — parent pid={} current_pid={} in_syscall={} skip_next_resume={} resume_signal={} tracked_pids={:?} — the loop-top PTRACE_SYSCALL will resume current_pid={} next iteration",
+                            event_name,
+                            pid,
+                            current_pid,
+                            in_syscall,
+                            skip_next_resume,
+                            resume_signal,
+                            tracked_pids,
+                            current_pid,
+                        ));
                         continue;
                     }
                     ev if ev == libc::PTRACE_EVENT_EXIT as u32 => {
