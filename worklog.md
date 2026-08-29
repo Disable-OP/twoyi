@@ -14636,3 +14636,309 @@ Stage Summary:
      accumulated fixes 6-Z207b/6-Z208/6-Z209a/b/c-iter2/d-iter2
      + 6-Z210 should jump the boot rate significantly from the
      21/33 baseline on 3395f09).
+
+---
+Task ID: 6-Z210-mon1
+Agent: CI-monitoring subagent
+Task: Monitor two GitHub Actions UI E2E ARM64 runs on
+commit 22582710 (the 6-Z210 mount-propagation/remount fake-success
+fix for the Lineage 22.2 SetupMountNamespaces /apex EBUSY blocker).
+Identify which run is lineage-22.2-sailfish vs orangefox-R12.0-
+lavender, poll both every ~60s (up to 25 min), download the
+result-pretty.json + kr64 stderr artifacts, and verify whether
+the 6-Z210 fix worked at runtime.
+
+Work Log:
+- Read worklog tail (6-Z209, 6-Z209-mon5, 6-Z209e, 6-Z210) to
+  understand the latest state. The 6-Z210 entry documented:
+  * The Lineage 22.2 SetupMountNamespaces blocker chain:
+    <3>init: Failed to remount /apex as 40000: Device or resource busy
+    [glog F/abort] SetupMountNamespaces failed: Device or resource busy
+    <3>init: InitFatalReboot: signal 6
+    (0x40000 = MS_PRIVATE, the AOSP init call is
+    mount(nullptr, "/apex", nullptr, MS_PRIVATE | MS_REC, nullptr))
+  * The fix added is_mount_propagation_or_remount_op(flags) and
+    modified the mount() ENTRY-side classification (line ~13706+
+    of ptrace_emu.rs) + the SIGSYS mount arm (line ~20487+).
+  * Expected: 6-Z210 log line "6-Z210: propagation/remount mount
+    op target=\"/apex\" ... flags=0x40000 ... classified at ENTRY
+    — EXIT will return 0 (fake success...)" rate-limited to 30.
+- Set up PAT (base64-encoded, length 93) via env-var pattern.
+  Verified via /rate_limit endpoint (5000 remaining).
+- Queried both runs (33235829894 + 33235828721) on commit
+  225827101939de4db0e5e5930b25307a9eaa4226. Both run_number
+  174 (lineage) + 173 (orangefox); both event=workflow_dispatch;
+  both started 2026-08-29T05:17:4{5,6}Z.
+- Identified recoveries: the GitHub Actions REST + GraphQL APIs
+  do NOT expose workflow_dispatch inputs (the run object has no
+  `inputs` field; GraphQL's WorkflowRun.inputs is undefinedField).
+  Mid-run e2e job logs are also unavailable (job logs endpoint
+  returns HTTP 404 BlobNotFound until the job completes). So I
+  waited for completion and then fetched the e2e job's logs,
+  which echo the runner-expanded `RECOVERY_NAME`/`RECOVERY_URL`
+  env vars in the "Set up env" step. Recoveries confirmed:
+    run 33235829894 (run_number 174) = lineage-22.2-sailfish
+      (RECOVERY_URL: https://mirrorbits.lineageos.org/full/sailfish/20260823/boot.img)
+    run 33235828721 (run_number 173) = orangefox-R12.0-lavender
+      (RECOVERY_URL: https://api.orangefox.download/release/69f5cec33ba4241a6c1e095f/dl)
+- Polled both runs every ~60s for ~13 min total (10 iters in the
+  first chunk + 3 iters in the second chunk). Build-apk job
+  (ubuntu-latest/x86_64) completed/success for both at
+  05:19:2{6,4}Z. E2E job (ubuntu-24.04-arm) ran ~13 min and
+  completed/success for both at 05:32:4{8,9}Z. Workflow
+  conclusion: SUCCESS for both (the e2e harness ran to
+  completion and produced a result-pretty.json; the BOOT
+  verdict inside is separate).
+- Downloaded the `ui-e2e-arm64-logs` artifact for both runs
+  (lineage: 16846386 bytes; orangefox: 21408230 bytes). Each is
+  a zip containing a single `ui-e2e-logs.tar.xz` which unpacks
+  to /tmp/ui-e2e-artifacts/ with ~60 files (result-pretty.json,
+  kr64-app-stderr.log, kr64-app-stderr-dockerexec.log,
+  kr64-dockerexec.log [empty], app-logs/log/kr64.log [same
+  content + header/footer], redroid.log, recovery-ld-debug.txt,
+  twrp-recovery-log-dockerexec.log [empty for lineage], many
+  screenshots + uiautomator XML dumps).
+- result-pretty.json classifier verdicts:
+  * Lineage 22.2 sailfish (run 33235829894):
+      overall: BOOT_FAIL
+      boot: BOOT_FAIL
+      ui: NOT_REACHED
+      markers: { backstop_denied: 2, sigsegv_count: 8, pages: [] }
+      (NO `failure` tag, NO `exit_code` — classifier does NOT
+      categorize this as BOOT_FAIL_EARLY_INIT because exit_code
+      != 127 and no init-failure signature matched.)
+  * OrangeFox R12.0 lavender (run 33235828721):
+      overall: BOOT_FAIL_EARLY_INIT
+      boot: BOOT_FAIL
+      ui: NOT_REACHED
+      markers: { backstop_denied: 2, exit_code: "127",
+                 failure: "init_fatal_reboot", pages: [] }
+      (SAME classifier verdict as the pre-6-Z210 round-11
+      Lineage run 33213432833 — the SetupMountNamespaces /
+      InitFatalReboot blocker chain persists on OrangeFox.)
+- kr64 stderr analysis (the authoritative runtime evidence):
+  * Lineage kr64-app-stderr-dockerexec.log (1238 lines):
+      - Line 80: [KR64 ERROR] [KR64][apex_extract] FAILED to
+        find real libdl.so anywhere — guest init will use the
+        5848-byte stub and likely crash at offset 0xaf174 in
+        linker64 (5-K's diagnosis).
+      - Line 85: [KR64 WARN] PARENT: real libdl.so NOT extracted
+        — guest init will use the 5848-byte stub.
+      - Line 202: [KR64 CHILD] libdl.so NOT found at /dev/libdl.so
+        -- linker will fall through to /apex/.../bionic/libdl.so
+        (the 5848-byte stub). EXPECT linker64 segfault at 0xaf174.
+      - Line 1007-1015: SIGSEGV details: tid=2575 si_code=1
+        (MAPERR unmapped), si_addr=0x0 (NULL DEREF), pc=0xe3d09627fb20,
+        sp=0xffffdf6a26e0. SIGSEGV thread comm: "twoyi_init".
+        The pc 0xe3d09627fb20 falls in libc.so's r-xp segment
+        (MAPS: e3d096270000-e3d0962f7000 r-xp, offset 0xfb20).
+        So this is a NULL-deref INSIDE bionic libc.so at offset
+        0xfb20 — NOT in linker64 at offset 0xaf174 (the 5-K
+        prediction was directionally right — incomplete libdl.so
+        stub → NULL deref when libc.so calls a dl_* function —
+        but the actual crash site is in libc.so's PLT stub for
+        the dl_* call, not in linker64).
+      - Line 1226-1230: child 2575 killed by signal 11 (SIGSEGV)
+        after 3748 ptrace iterations; 6-Z97: init_pid 2575 killed
+        by signal 11 — genuine init death (return -11).
+      - Count of "SetupMountNamespaces" mentions: 0.
+      - Count of "InitFatalReboot" mentions: 0.
+      - Count of "signal 6"/SIGABRT mentions: 0.
+      - Count of "EBUSY"/"Device or resource busy" mentions: 0.
+      - Count of "6-Z210" mentions: 0.
+      - Count of "6-Z91" mentions: 0 (NO block-storage -ENODEV
+        classification log either).
+      => The Lineage boot crashed in libc.so BEFORE reaching
+      SetupMountNamespaces. The 6-Z210 fix's mount-ENTRY-side
+      classification path was NEVER exercised — no 6-Z210 log
+      line, no SetupMountNamespaces message, no InitFatalReboot,
+      no EBUSY. The previous round-11 InitFatalReboot blocker
+      did NOT recur (the failure CLASS changed from
+      BOOT_FAIL_EARLY_INIT/init_fatal_reboot/signal 6 to
+      BOOT_FAIL/sigsegv/signal 11), but this is NOT because
+      6-Z210 worked — it's because the boot crashed in a
+      DIFFERENT, earlier code path (libc.so NULL deref from the
+      incomplete libdl.so stub).
+  * OrangeFox kr64-app-stderr-dockerexec.log (2790 lines):
+      - Line 80: same [KR64 ERROR] apex_extract FAILED to find
+        real libdl.so anywhere (same pre-existing 5-K diagnosis).
+      - Line 2710: DIAG write(fd=67, ret=67):
+        "<3>init: Failed to remount /apex as 40000: Device or
+        resource busy\n"  ← THIS IS THE EXACT BLOCKER THE 6-Z210
+        FIX WAS SUPPOSED TO ELIMINATE.
+      - Line 2711/2713: "[glog F/abort] SetupMountNamespaces
+        failed: Device or resource busy\n"
+      - Line 2714: "<2>init: SetupMountNamespaces failed: Device
+        or resource busy\n"
+      - Line 2727: "<3>init: InitFatalReboot: signal 6\n"
+      - Line 2737-2738: 6-Z98 DIAG: init child pid=2586
+        exit_group(127) — last 50 ALL syscalls don't include
+        nr=165 (mount) because the mount happened >50 syscalls
+        before exit.
+      - Line 2743: PTRACE_EVENT_EXIT pid=2690 status=0x7f00
+        (exit code 127) — forked child also died.
+      - Line 2757: 6-Z97: init_pid 2586 exited 127 but traced
+        child [2691] ALIVE — the loader DAEMONIZED. Re-anchoring
+        init_pid to 2691 and CONTINUING.
+      - Line 2774-2775: 6-Z98 DIAG: init child pid=2691
+        exit_group(127) — the re-anchored init ALSO died.
+      - Line 2783: ptrace emulation loop ended — child exit
+        code: 127.
+      - Count of "6-Z210" mentions: 0.
+      - Count of "6-Z91" mentions: 0.
+      - Count of "SetupMountNamespaces" mentions: 4.
+      - Count of "InitFatalReboot" mentions: 1.
+      - Count of "EBUSY"/"Device or resource busy" mentions: 4.
+      => The OrangeFox boot DID reach SetupMountNamespaces (init
+      logged the EBUSY), but the 6-Z210 fix did NOT fire — no
+      6-Z210 log line, the kernel's -EBUSY leaked through to the
+      guest, and init aborted with InitFatalReboot (signal 6) →
+      exit_group(127). The SetupMountNamespaces blocker is
+      UNCHANGED from round-11. The 6-Z210 fix's ENTRY-side
+      classification path was NOT exercised on OrangeFox either.
+- Verified the 6-Z210 fix IS in commit 22582710 (fetched the
+  patch: app/rs/kr64/src/ptrace_emu.rs +208 -3; the
+  is_mount_propagation_or_remount_op helper + ENTRY-side
+  classification + SIGSYS arm + 7 unit tests are all present).
+  The fix code is correct in the abstract (the helper correctly
+  detects MS_PRIVATE | MS_SLAVE | MS_SHARED | MS_UNBINDABLE |
+  MS_REMOUNT | MS_MOVE). But the runtime kr64 stderr shows it
+  NEVER fires. Root cause hypotheses (needs main-agent
+  investigation):
+    (a) The mount() ENTRY-side classification at line ~13706 is
+      GATED on "post-execve mount() calls" (per the patch's
+      surrounding comment). If the SetupMountNamespaces mount
+      happens in a code path that the gate doesn't cover (e.g.,
+      pre-second-stage-execve, or in a forked child whose
+      ptrace-state isn't "post-execve"), the 6-Z210 classification
+      is skipped.
+    (b) The compute-table Some(0) at the EXIT handler is supposed
+      to be authoritative (6-Z145 hoisting), but the kernel's
+      actual -EBUSY is still leaking through. This means the
+      EXIT handler's forced_value=Some(0) isn't being applied
+      to this particular mount — possible explanations:
+        - The mount is in a forked child (OrangeFox forks 2690,
+          2691) whose pid isn't in the EXIT handler's compute
+          table at the time of the mount.
+        - The EXIT handler has a code path that preserves the
+          real kernel return for "non-faked" cases, and the
+          mount() classification didn't mark this pid as "faked".
+    (c) The kr64 stderr's per-syscall trace logging is OFF
+      (TWOYI_TRACE_SYSCALLS=1 not set), so we can't see the
+      mount() ENTRY/EXIT directly — only the SIDE EFFECTS
+      (init's log output via DIAG write). To diagnose, re-run
+      with TWOYI_TRACE_SYSCALLS=1 to capture every mount()
+      ENTRY/EXIT and verify whether the 6-Z210 classification
+      is even being reached.
+- Confirmed both runs' final state via the GitHub API:
+    run 33235829894 (lineage): status=completed, conclusion=success,
+      run_number=174, updated_at=2026-08-29T05:32:49Z
+    run 33235828721 (orangefox): status=completed, conclusion=success,
+      run_number=173, updated_at=2026-08-29T05:32:30Z
+  Both e2e jobs: started 05:19:3{0,4}Z, completed 05:32:2{9,8}Z
+  (~13 min e2e runtime each).
+
+Stage Summary:
+- The 6-Z210 fix did NOT achieve its runtime goal on EITHER run.
+  * Lineage 22.2 sailfish: BOOT_FAIL (sigsegv_count=8). The boot
+    crashed in libc.so at offset 0xfb20 (NULL deref, signal 11)
+    BEFORE reaching SetupMountNamespaces. The crash is the
+    pre-existing 5-K diagnosis (incomplete 5848-byte libdl.so
+    stub — the apex_extract step FAILED to find real libdl.so).
+    This is a DIFFERENT, EARLIER blocker than what 6-Z210 was
+    designed to fix. The 6-Z210 fix's code path was not
+    exercised (no 6-Z210 log lines, no SetupMountNamespaces
+    message, no InitFatalReboot, no EBUSY). NOTE: this is a
+    REGRESSION from round-11 — round-11 (run 33213432833 on
+    587a1c4) reached SetupMountNamespaces per the 6-Z210 commit
+    message, but round-12 crashes in libc.so before that. The
+    only diff between 587a1c4 and 22582710 is the 6-Z210 fix
+    itself, but the 6-Z210 fix only touches the mount-ENTRY
+    classification + SIGSYS arm — it shouldn't cause a new crash
+    in libc.so. The regression is likely NON-DETERMINISTIC (the
+    libdl.so stub issue is borderline — depending on ASLR /
+    library load order / init's first dl_* call, it may or may
+    not crash before reaching SetupMountNamespaces).
+  * OrangeFox R12.0 lavender: BOOT_FAIL_EARLY_INIT
+    (failure=init_fatal_reboot, exit_code=127). The boot DID
+    reach SetupMountNamespaces, but the 6-Z210 fix did NOT fire
+    — no 6-Z210 log lines, the kernel's -EBUSY leaked through,
+    and init aborted with InitFatalReboot (signal 6) →
+    exit_group(127). The SetupMountNamespaces blocker is
+    UNCHANGED from round-11. The 6-Z210 fix has a BUG: it's not
+    catching the actual mount() call that init makes.
+- The 6-Z210 fix's expected log line
+  ("6-Z210: propagation/remount mount op target=\"/apex\" ...
+   flags=0x40000 ... classified at ENTRY — EXIT will return 0
+   (fake success...)") appears NOWHERE in either run's kr64
+  stderr. Both runs also have ZERO 6-Z91 (block-storage
+  -ENODEV) log lines, which suggests the mount() ENTRY-side
+  classification path (the whole match arm at ptrace_emu.rs
+  ~13706+) is NOT being reached for the actual mount() calls
+  that init makes.
+- New post-fix blocker (Lineage): NULL-deref SIGSEGV in bionic
+  libc.so at offset 0xfb20 (pc=0xe3d09627fb20, si_addr=0x0,
+  si_code=1 MAPERR). Root cause is the pre-existing incomplete
+  libdl.so stub — the apex_extract step FAILED to extract the
+  real libdl.so from the com.android.runtime.apex (the .apex
+  file doesn't exist in the guest rootfs: `candidate
+  /data/user/0/io.twoyi.debug/rootfs/system/apex/com.android.runtime.apex
+  does not exist — skipping`). The 5848-byte stub at
+  /apex/com.android.runtime/lib64/bionic/libdl.so doesn't have
+  the real dl_* function bodies, so when libc.so's PLT stub
+  calls into libdl.so, it derefs NULL → SIGSEGV.
+- 6-Z210 fix did NOT address OrangeFox (as expected per the
+  worklog's 6-Z210 stage summary: "OrangeFox R12.0 lavender:
+  this fix does NOT address the OrangeFox SIGSEGV blocker
+  (different class — linker-level crash, not mount-namespace)").
+  The actual OrangeFox blocker turned out to be the SAME
+  SetupMountNamespaces/EBUSY/InitFatalReboot chain as Lineage
+  round-11 — NOT a SIGSEGV/linker crash as the worklog assumed.
+  So the worklog's 6-Z209e OrangeFox analysis (SIGSEGV at
+  pc=0xe00ce2e92b20 outside twoyi_init's mapped range) was for
+  a DIFFERENT OrangeFox run, not round-12. Round-12 OrangeFox
+  dies via InitFatalReboot (signal 6/SIGABRT), NOT SIGSEGV.
+- Next concrete action for the main orchestrator:
+  1. The 6-Z210 fix has a runtime-verification gap. The fix's
+     mount-ENTRY-side classification path is NOT being reached
+     for the actual SetupMountNamespaces mount() call. Re-dispatch
+     OrangeFox R12.0 lavender with TWOYI_TRACE_SYSCALLS=1 env
+     (or add a temporary unconditional log at the very top of
+     the mount() ENTRY handler, BEFORE the post-execve gate) to
+     capture every mount() ENTRY/EXIT and confirm whether the
+     6-Z210 classification is even being entered. Suspect: the
+     classification is gated on "post-execve" but the
+     SetupMountNamespaces mount happens in a context the gate
+     doesn't recognize (e.g., in a forked child of init that
+     re-execed, or in second-stage init before the kr64's
+     "post-execve" flag is set for that pid).
+  2. The Lineage 22.2 round-12 regression (libc.so NULL deref
+     from incomplete libdl.so stub) is the pre-existing 5-K
+     blocker. To verify 6-Z210 actually works on Lineage, the
+     libdl.so stub issue must be resolved first so the boot can
+     REACH SetupMountNamespaces. Options:
+       (a) Run scripts/extract_libdl_from_apex.sh on the
+         Lineage boot.img's ramdisk to extract the real
+         com.android.runtime.apex → drop the real libdl.so as
+         a Twoyi APK asset (the apex_extract Option D path)
+         that the kr64 daemon will pick up at /data/user/0/
+         io.twoyi.debug/files/libdl.so.
+       (b) Set TWOYI_ALLOW_HOST_APEX=1 to let the kr64 scan the
+         host's /apex/ for libdl.so (works only if the redroid
+         container has a real /apex/com.android.runtime.apex).
+       (c) Implement a more complete libdl.so stub that has
+         real (or no-op-but-non-NULL) implementations of
+         dl_iterate_phdr, __loader_dlopen, dlclose, dlsym,
+         dlerror — enough to let libc.so's PLT stub not deref
+         NULL.
+  3. Do NOT re-dispatch the 30-sample nightly corpus batch yet
+     — the 6-Z210 fix is unverified at runtime. If the fix's
+     ENTRY-side classification is gated on a condition that
+     real recoveries don't meet, broad-corpus dispatch would
+     just produce more BOOT_FAIL_EARLY_INIT results (same as
+     round-11).
+  4. Once 6-Z210 is verified to actually fire (6-Z210 log line
+     appears + SetupMountNamespaces mount returns 0 + no
+     InitFatalReboot), re-dispatch OrangeFox R12.0 lavender
+     AND Lineage 22.2 sailfish (the latter with the libdl.so
+     fix from step 2) to confirm BOOT_OK / UI_READY.

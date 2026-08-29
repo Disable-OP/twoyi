@@ -13490,6 +13490,60 @@ pub fn run_ptrace_loop(
                         }
                     }
 
+                    // 6-Z210 DIAG: unconditional mount() ENTRY log — fires for
+                    // EVERY mount() call regardless of past_first_execve /
+                    // post_execve_syscall_count gates. Purpose: diagnose
+                    // whether the mount() syscall-ENTRY stop is even being
+                    // delivered to the tracer (run 33235828721 showed ZERO
+                    // 6-Z210/6-Z168/6-Z91/6-Z164 mount classification logs
+                    // despite init clearly calling mount() — the "Failed to
+                    // remount /apex" error message reached the write DIAG).
+                    // This log answers: is the ENTRY handler running for
+                    // mount() at all? If YES, the classification block at
+                    // line ~13668 has a gate bug. If NO, the ptrace tracer
+                    // is missing the syscall-ENTRY stop (PTRACE_SYSCALL
+                    // skip / ESRCH race / fork-follow gap).
+                    // Capped at 50 logs to avoid log spam.
+                    if syscall_num == abi.mount {
+                        static MOUNT_ENTRY_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = MOUNT_ENTRY_DIAG_LOGGED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 50 {
+                            let src_addr = get_syscall_arg(&regs, abi.reg_arg1);
+                            let tgt_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let fs_addr = get_syscall_arg(&regs, abi.reg_arg3);
+                            let flags_addr = get_syscall_arg(&regs, abi.reg_arg4);
+                            let src = if src_addr != 0 {
+                                read_child_string(pid, src_addr)
+                            } else {
+                                None
+                            };
+                            let tgt = if tgt_addr != 0 {
+                                read_child_string(pid, tgt_addr)
+                            } else {
+                                None
+                            };
+                            let fs = if fs_addr != 0 {
+                                read_child_string(pid, fs_addr)
+                            } else {
+                                None
+                            };
+                            log(&format!(
+                                "6-Z210 DIAG: mount() ENTRY nr={} pid={} past_first_execve={} post_execve_syscall_count={} src={:?} tgt={:?} fstype={:?} flags={:#x} [diag #{}/50]",
+                                syscall_num,
+                                pid,
+                                past_first_execve,
+                                post_execve_syscall_count,
+                                src.as_deref().unwrap_or("(null)"),
+                                tgt.as_deref().unwrap_or("(null)"),
+                                fs.as_deref().unwrap_or("(null)"),
+                                flags_addr as u64,
+                                n + 1,
+                            ));
+                        }
+                    }
+
                     // Task 6-Z98: exit_group DIAG for the CURRENT init child
                     // (the possibly re-anchored "real init").
                     //
