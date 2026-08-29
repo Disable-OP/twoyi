@@ -11174,15 +11174,42 @@ pub fn run_ptrace_loop(
                         // is faked to 0.
                         in_syscall = false;
                         in_syscall_map.insert(current_pid, false);
-                        // 6-Z211f DIAG: log the post-fork state to
-                        // understand why the parent's next syscall
-                        // (mount()) is NOT being delivered.
+                        // 6-Z211h FIX: explicitly PTRACE_SYSCALL-resume the
+                        // parent HERE, inside the fork handler, BEFORE the
+                        // `continue`. This ensures the parent is resumed
+                        // EVEN IF the loop-top PTRACE_SYSCALL resumes a
+                        // different pid (the new child, after the DIAG
+                        // child switch).
+                        // Without this, the parent is left STOPPED at the
+                        // PTRACE_EVENT_CLONE stop. Its next syscall (the
+                        // clone EXIT, then mount()) would NOT be delivered
+                        // because the loop-top PTRACE_SYSCALL resumes
+                        // current_pid, which might have switched to the
+                        // child by then.
+                        // PTRACE_SYSCALL is ONE-SHOT: after this resume,
+                        // the parent runs until the next syscall boundary
+                        // (clone EXIT), which the kernel delivers as a
+                        // syscall-stop. The loop-top PTRACE_SYSCALL will
+                        // then resume the child (or the parent, depending
+                        // on which stop waitpid returns first).
+                        let parent_pid = pid; // the parent is the pid that
+                                              // received the PTRACE_EVENT_CLONE/FORK stop
+                        let resume_r = unsafe {
+                            libc::ptrace(
+                                libc::PTRACE_SYSCALL,
+                                parent_pid,
+                                0,
+                                0, // resume_signal = 0 (no signal)
+                            )
+                        };
                         log(&format!(
-                            "6-Z211g FIX: post-PTRACE_EVENT_{} handler — reset in_syscall=false for parent pid={} current_pid={} (was true — the desync caused mount() ENTRY to be mis-classified as EXIT, skipping the 6-Z210 classification) tracked_pids={:?}",
+                            "6-Z211h FIX: post-PTRACE_EVENT_{} handler — reset in_syscall=false for parent pid={} current_pid={} (was true — the desync caused mount() ENTRY to be mis-classified as EXIT, skipping the 6-Z210 classification) tracked_pids={:?} — ALSO explicitly PTRACE_SYSCALL-resumed parent pid={} (ret={})",
                             event_name,
                             pid,
                             current_pid,
                             tracked_pids,
+                            parent_pid,
+                            resume_r,
                         ));
                         continue;
                     }
