@@ -10170,8 +10170,36 @@ pub fn run_ptrace_loop(
         // received the child's next stop.
         let r = if skip_next_resume {
             skip_next_resume = false;
+            // 6-Z211e DIAG: log when skip_next_resume is set (the parent
+            // is NOT being resumed — this is the suspected root cause of
+            // the mount() syscall-stop not being delivered).
+            static SKIP_RESUME_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = SKIP_RESUME_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 200 {
+                log(&format!(
+                    "6-Z211e DIAG: skip_next_resume=TRUE for pid={} loop_count={} — SKIPPING PTRACE_SYSCALL resume (the child is NOT being resumed) [skip #{}/200]",
+                    current_pid,
+                    loop_count,
+                    n + 1,
+                ));
+            }
             0 // pretend success — nothing to resume, straight to waitpid
         } else {
+            // 6-Z211e DIAG: log the PTRACE_SYSCALL resume (which pid is
+            // being resumed). Capped at 200 to avoid log spam.
+            static RESUME_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = RESUME_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 200 {
+                log(&format!(
+                    "6-Z211e DIAG: PTRACE_SYSCALL resume pid={} loop_count={} resume_signal={} [resume #{}/200]",
+                    current_pid,
+                    loop_count,
+                    resume_signal,
+                    n + 1,
+                ));
+            }
             unsafe {
                 libc::ptrace(
                     libc::PTRACE_SYSCALL,
