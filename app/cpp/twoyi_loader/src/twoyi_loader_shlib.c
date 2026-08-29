@@ -884,6 +884,11 @@ static void fb_fd_clear(int fd) {
     pthread_mutex_unlock(&g_fb_fd_lock);
 }
 
+// 6-Z222: forward declaration — the ioctl hook (below) calls this to
+// self-heal untracked fb0 fds; the definition lives next to the open64
+// hooks near the end of this file.
+static void fb_fd_selfheal(int fd);
+
 // Returns 1 if path is /dev/graphics/fb0 or /dev/fb0 (exact match).
 // These are the framebuffer device paths that libminuitwrp opens.
 static int is_fb_path(const char *path) {
@@ -925,18 +930,79 @@ static int track_fb_fd(const char *path, int fd) {
 #define TWOYI_FB_HEIGHT         1280
 #define TWOYI_FB_BPP            32
 #define TWOYI_FB_BYTES_PER_PIX  4
-#define TWOYI_FB_LINE_LENGTH    (TWOYI_FB_WIDTH * TWOYI_FB_BYTES_PER_PIX)  /* 2880 */
-#define TWOYI_FB_SMEM_LEN       (TWOYI_FB_WIDTH * TWOYI_FB_HEIGHT * TWOYI_FB_BYTES_PER_PIX)  /* 3686400 */
+// 6-Z222: RUNTIME geometry — the shlib must NOT hardcode 720x1280. The
+// resolution chain is TWOYI_FB_WIDTH/HEIGHT env (the 6-Z220 rc setenv
+// adds it to the recovery service) → {rootfs}/dev/.twoyi-fb-geometry
+// file ("WxH\n", written by kr64's parent at fb0-creation time) →
+// 720x1280 fallback. Must match kr64's fb0 file size so mmap succeeds
+// and core.rs's blit reads a matching frame.
+static int g_twoyi_fb_rt_w = 0;
+static int g_twoyi_fb_rt_h = 0;
 
-// Fill struct fb_var_screeninfo with valid 720x1280@32bpp RGBA8888.
+static int twoyi_fb_atoi_pos(const char *s) {
+    if (!s) return 0;
+    int v = 0, seen = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (v < 100000) v = v * 10 + (*s - '0');
+        s++; seen = 1;
+    }
+    return seen ? v : 0;
+}
+
+static void fb_geometry_init_shlib(void) {
+    if (g_twoyi_fb_rt_w > 0) return;
+    g_twoyi_fb_rt_w = TWOYI_FB_WIDTH;
+    g_twoyi_fb_rt_h = TWOYI_FB_HEIGHT;
+    const char *wenv = getenv("TWOYI_FB_WIDTH");
+    const char *henv = getenv("TWOYI_FB_HEIGHT");
+    int w = twoyi_fb_atoi_pos(wenv);
+    int h = twoyi_fb_atoi_pos(henv);
+    if (w > 0 && h > 0) {
+        g_twoyi_fb_rt_w = w;
+        g_twoyi_fb_rt_h = h;
+        return;
+    }
+    // Geometry FILE fallback: {rootfs}/dev/.twoyi-fb-geometry ("WxH\n").
+    if (g_rootfs) {
+        char p[512];
+        snprintf(p, sizeof(p), "%s/dev/.twoyi-fb-geometry", g_rootfs);
+        int fd = (int)syscall(SYS_openat, AT_FDCWD, p, 0 /*O_RDONLY*/, 0);
+        if (fd >= 0) {
+            char buf[64] = {0};
+            long n = syscall(SYS_read, fd, buf, (long)(sizeof(buf) - 1));
+            syscall(SYS_close, fd);
+            if (n > 0) {
+                buf[n] = '\0';
+                char *x = strchr(buf, 'x');
+                if (x) {
+                    *x = '\0';
+                    int fw = twoyi_fb_atoi_pos(buf);
+                    int fh = twoyi_fb_atoi_pos(x + 1);
+                    if (fw > 0 && fh > 0) {
+                        g_twoyi_fb_rt_w = fw;
+                        g_twoyi_fb_rt_h = fh;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static int fb_w_rt(void) { fb_geometry_init_shlib(); return g_twoyi_fb_rt_w; }
+static int fb_h_rt(void) { fb_geometry_init_shlib(); return g_twoyi_fb_rt_h; }
+static long fb_line_length_rt(void) { return (long)fb_w_rt() * TWOYI_FB_BYTES_PER_PIX; }
+static long fb_smem_len_rt(void)    { return (long)fb_w_rt() * (long)fb_h_rt() * TWOYI_FB_BYTES_PER_PIX; }
+
+// Fill struct fb_var_screeninfo with valid runtime-geometry @32bpp RGBA8888.
 // libminuitwrp reads xres, yres, bits_per_pixel, and the color channel
 // offsets/lengths to configure its software renderer.
 static void fill_vscreeninfo(struct fb_var_screeninfo *v) {
     memset(v, 0, sizeof(*v));
-    v->xres = TWOYI_FB_WIDTH;
-    v->yres = TWOYI_FB_HEIGHT;
-    v->xres_virtual = TWOYI_FB_WIDTH;
-    v->yres_virtual = TWOYI_FB_HEIGHT;
+    fb_geometry_init_shlib();
+    v->xres = (__u32)g_twoyi_fb_rt_w;
+    v->yres = (__u32)g_twoyi_fb_rt_h;
+    v->xres_virtual = (__u32)g_twoyi_fb_rt_w;
+    v->yres_virtual = (__u32)g_twoyi_fb_rt_h;
     v->xoffset = 0;
     v->yoffset = 0;
     v->bits_per_pixel = TWOYI_FB_BPP;
@@ -978,14 +1044,14 @@ static void fill_fscreeninfo(struct fb_fix_screeninfo *f) {
     // smem_start is an unsigned long — we set it to 0 (libminuitwrp
     // doesn't dereference it; it only uses smem_len for the mmap size).
     f->smem_start = 0;
-    f->smem_len = TWOYI_FB_SMEM_LEN;
+    f->smem_len = (__u32)fb_smem_len_rt();
     f->type = 0;  // FB_TYPE_PACKED_PIXELS
     f->type_aux = 0;
     f->visual = 2;  // FB_VISUAL_TRUECOLOR
     f->xpanstep = 0;
     f->ypanstep = 0;
     f->ywrapstep = 0;
-    f->line_length = TWOYI_FB_LINE_LENGTH;
+    f->line_length = (__u32)fb_line_length_rt();
     f->mmio_start = 0;
     f->mmio_len = 0;
     f->accel = 0;
@@ -1811,11 +1877,24 @@ int ioctl(int fd, unsigned long request, ...) {
     // only tracks fb0 paths, not binder paths), so this check is mutually
     // exclusive with the binder logic below.
     // -----------------------------------------------------------------------
+    if (!fb_fd_is_tracked(fd) && ((req & 0xff00) == 0x4600u || req == 0x40044620u)) {
+        // 6-Z222: an FB ioctl on an untracked fd — self-heal before giving
+        // up. Catches every open variant that bypassed the open hooks
+        // (open64 pre-fix, dup()ed fds, future bypasses) by verifying the
+        // fd's /proc/self/fd target really is an fb0 path.
+        fb_fd_selfheal(fd);
+    }
     if (fb_fd_is_tracked(fd)) {
         switch (req) {
             case 0x4600u: {  // FBIOGET_VSCREENINFO
                 if (argp) fill_vscreeninfo((struct fb_var_screeninfo *)argp);
-                write_str(2, "[twoyi_loader] ioctl(FBIOGET_VSCREENINFO) -> 720x1280@32bpp\n");
+                {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                        "[twoyi_loader] ioctl(FBIOGET_VSCREENINFO) -> %dx%d@32bpp\n",
+                        fb_w_rt(), fb_h_rt());
+                    write_str(2, msg);
+                }
                 return 0;
             }
             case 0x4601u: {  // FBIOPUT_VSCREENINFO — accept the mode change
@@ -1824,7 +1903,13 @@ int ioctl(int fd, unsigned long request, ...) {
             }
             case 0x4602u: {  // FBIOGET_FSCREENINFO
                 if (argp) fill_fscreeninfo((struct fb_fix_screeninfo *)argp);
-                write_str(2, "[twoyi_loader] ioctl(FBIOGET_FSCREENINFO) -> smem_len=3686400 line_length=2880\n");
+                {
+                    char msg[160];
+                    snprintf(msg, sizeof(msg),
+                        "[twoyi_loader] ioctl(FBIOGET_FSCREENINFO) -> smem_len=%ld line_length=%ld\n",
+                        fb_smem_len_rt(), fb_line_length_rt());
+                    write_str(2, msg);
+                }
                 return 0;
             }
             case 0x4603u: {  // FBIOPUT_FSCREENINFO — accept
@@ -3858,6 +3943,64 @@ int open(const char *path, int flags, ...) {
         return qemu_pipe_open_fallback(path, fd, saved_errno);
     }
     return track_fb_fd(path, fd);
+}
+
+// 6-Z222: open64 / openat64 PLT interposition.
+//
+// Modern bionic (Android 11+) exports open64/openat64 as REAL symbols
+// (thin aliases that call openat). Libraries built against that bionic —
+// OrangeFox R12's libminuitwrp.so opens /dev/graphics/fb0 via open64 —
+// bind their open64@plt DIRECTLY to libc, bypassing the open()/openat()
+// hooks above. The fb0 fd was therefore never TRACKED, the ioctl hook
+// passed FBIOGET_VSCREENINFO through to the regular-file stub (ENOTTY),
+// the screeninfo struct stayed zeroed, and the theme engine crashed at
+// gr_fb_width() (libminuitwrp.so+0x2027c, si_addr=0) in a crash loop —
+// with all three hook libraries correctly loaded and the 6-Z218a preload
+// order intact (run 33275527467). Both thin aliases route through the
+// SAME openat() hook body so tracking/translation/fallbacks behave
+// identically for 64-bit callers.
+int open64(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+    }
+    return openat(AT_FDCWD, path, flags, mode);
+}
+
+int openat64(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+    }
+    return openat(dirfd, path, flags, mode);
+}
+
+// 6-Z222: self-healing fb0 fd tracking for the ioctl path. When an FB
+// ioctl arrives on an fd we did NOT track at open time (an open variant
+// that slipped every hook, a dup()ed fd, or a library that resolved its
+// open through some future bypass), read /proc/self/fd/<fd> and mark the
+// fd when it actually resolves to an fb0 path. This keeps the FB ioctl
+// synthesis working no matter which open flavor a guest library uses.
+static void fb_fd_selfheal(int fd) {
+    if (fd < 0) return;
+    if (fb_fd_is_tracked(fd)) return;
+    char path[128];
+    char target[256];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    // Raw readlinkat syscall — no dependency on dlsym ordering, and the
+    // tracer translates /proc/self/fd like any other /proc path.
+    long n = syscall(SYS_readlinkat, AT_FDCWD, path, target, sizeof(target) - 1);
+    if (n <= 0) return;
+    target[n] = '\0';
+    // Match the TAIL of the target against the fb0 names so both the
+    // guest-absolute and the {rootfs}-prefixed host forms resolve.
+    if (n >= 8 && strcmp(target + n - 8, "/dev/fb0") == 0) {
+        fb_fd_mark(fd);
+        return;
+    }
+    if (n >= 18 && strcmp(target + n - 18, "/dev/graphics/fb0") == 0) {
+        fb_fd_mark(fd);
+    }
 }
 
 // selinuxfs fopen helper (6-Z120b): /sys/fs/selinux/* must resolve to the
