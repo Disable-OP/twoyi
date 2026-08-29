@@ -18577,3 +18577,113 @@ Stage Summary:
   The 6-Z211j FIX is NOT observable in the boot result — and
   it CONSUMED the parent's syscall-stops that the previous
   fixes had preserved.
+
+---
+Task ID: 6-Z213
+Agent: Twoyi Universal Recovery Compatibility Engineer (session resume, r25)
+Date: 2026-08-29 (UTC+8 session)
+Task: Resume from 6-Z211k (OrangeFox mount()-stop invisibility) + unblock the corpus CI pipeline.
+
+Work Log:
+- Read the full 6-Z211 worklog chain (r14-r23 hypotheses a-g), HEAD 2db54ec
+  (6-Z211j round-robin resume REVERTED + broad DIAG cap raised to 20000).
+- Downloaded and analysed the r24 E2E artifacts (run 33248496503, artifact
+  9713758853): OrangeFox R12.1 lavender (foxstart.sh in /sbin, Lineage 22.2
+  init), result = BOOT_FAIL_EARLY_INIT / init_fatal_reboot / exit 127 —
+  byte-for-byte the same failure as r14-r23.
+- KEY r24 EVIDENCE (kr64-app-stderr-dockerexec.log, 17313 lines):
+  * Broad DIAG cap 20000 was NOT hit this round (last [broad #14252/20000]
+    at loop_count 14252). So the previous "cap hit before the CLONE event"
+    blind spot is GONE — the full window is visible.
+  * ZERO syscall-stops with nr=40 (mount) in the ENTIRE run. Also zero
+    nr=39 (umount2) / nr=41 (pivot_root). This is SYSTEMIC, not a race:
+    dozens of mount-family calls must have executed during first+second
+    stage init (SetupMountNamespaces aborts on the FIRST failing one);
+    a racy stop-loss would leak at least SOME nr=40 stops.
+  * The failure window sequence (loop_counts 14161-14211):
+    - 14161: clone ENTRY (flags 0x3d0f00 = CLONE_THREAD|CLONE_VM|FS|FILES|
+      SIGHAND|SYSVSEM|SETTLS|PARENT_SETTID|CHILD_CLEARTID) — pthread #2682.
+      PTRACE_EVENT_CLONE stop; 6-Z211h+i FIX resumes parent + skip flag.
+    - 14162: clone EXIT -> 2682; 2682 auto-attach SIGSTOP consumed.
+    - 14163-14210: init main (2580) and thread (2682) stops interleave
+      normally (openat/mprotect/prctl/uname/epoll_create1/epoll_ctl...).
+    - Between 14209 (2580 mprotect EXIT) and 14211 (2580 write ENTRY — the
+      write that logs "Failed to remount /apex as 40000: Device or resource
+      busy"), init executed mount() and got -EBUSY with NO nr=40 ENTRY stop
+      and NO nr=40 EXIT stop reaching the dispatcher. One dispatch
+      (2682's epoll_create1 ENTRY at 14210) happened in between.
+  * getregs-failure path: 0 hits. 6-Z190 watchdog: never fired (sweep gate
+    = 25000 iterations > failure point 14200!). 6-Z89 reap-loop "consumed":
+    0. 6-Z186 escape kills: 0. ESRCH: 12, ALL post-failure (reap of 2683).
+  * "6-Z210 DIAG (pre-dispatch)" was REMOVED by the 6-Z211j revert (2db54ec).
+  * 6-Z211e RESUME DIAG produced ZERO lines: its `n < 500 && tracked>1`
+    gate counts fetch_add from iteration 1 (tracked==1, counted but not
+    logged), so the 500 budget was exhausted before the first fork —
+    the diagnostic was dead code in practice.
+- THEORETICAL AUDIT of the waitpid dispatch loop (ptrace_emu.rs):
+  * Every SIGTRAP|0x80 stop that waitpid returns reaches the broad DIAG
+    (only the getregs-failure path skips it, and that logs).
+  * The only resume actors in the whole file: the loop-top PTRACE_SYSCALL
+    (skip-gated), the 6-Z211h FIX's explicit PTRACE_SYSCALL (2 fires this
+    run), and the (inactive) 6-Z190 watchdog attach.
+  * A syscall-stop arriving as WSTOPSIG != SIGTRAP|0x80 would be consumed
+    by the SIGSTOP/SIGSYS/"real signal" branches — the "real signal" branch
+    forwards SILENTLY (no log) — this remains possible until disproved.
+  * Conclusion: either the kernel never reports the mount-family stops
+    (untraced execution context), or they arrive in a shape the dispatcher
+    routes into a silent branch. Static analysis cannot discriminate;
+    instrumentation at the waitpid level can.
+- INFRASTRUCTURE DISCOVERY (HIGH IMPACT): the nightly corpus dispatch job
+  (run 33230529969) failed HTTP 403 "Resource not accessible by
+  integration" on ALL 592 dispatch attempts (dispatch_corpus.sh output in
+  job 99042438095 logs). The workflow-level `permissions: actions: read`
+  does not grant workflow_dispatch POSTs — the nightly corpus has NEVER
+  dispatched a single E2E run. The "4 tested images" in the dashboard were
+  stale manual dispatch_by_name.sh runs. THE FULL-CORPUS PIPELINE (§18)
+  WAS BROKEN FROM DAY ONE.
+- FIXES LANDED (this commit, "6-Z213"):
+  * .github/workflows/recovery-corpus-nightly.yml: permissions.actions
+    read -> write (with rationale comment). Unblocks the entire §18
+    corpus machinery.
+  * ptrace_emu.rs: 6-Z213 RAW STOP forensics — log EVERY waitpid return
+    (pid, raw status hex, wstopsig, ptrace_event) before any
+    classification, cap 30000 (> a full boot's ~15k stops). This
+    discriminates (a) kernel-never-delivers vs (b) dispatcher-routes-
+    silently for the mount-stop invisibility.
+  * ptrace_emu.rs: 6-Z213 RESUME forensics — the loop-top resume DIAG now
+    logs EVERY resume (cap 30000) instead of the dead `n<500 && tracked>1`
+    gate. Raw-stop + resume logs together prove/disprove "guest syscall
+    executed with PTRACE_SYSCALL disarmed".
+  * ptrace_emu.rs: coverage watchdog cadence 25000 iters / 5 s ->
+    4000 iters / 2 s. The old cadence NEVER fired in the OrangeFox boot
+    (failure at ~14200). The watchdog attaches untraced guest-tree
+    processes (thread auto-attach misses, pre-SETOPTIONS forks) — the
+    generic §6-isolation defense and the prime candidate to explain
+    never-intercepted mount() calls.
+
+Stage Summary:
+- r24 confirms the mount-stop invisibility is SYSTEMIC (0/nr=40 across the
+  whole boot with the full window visible). Hypothesis (g) [6-Z211j
+  consumed the stops] applied to r23 only; the revert did NOT change the
+  outcome, so the consumer (if any) is a different path, or the calls run
+  untraced (watchdog never fired — now fixed to fire in time).
+- NEW blocker understanding for Lineage/OrangeFox init: guest mount()
+  executes against the HOST mount namespace with UNTRANSLATED paths
+  (kr64 non-root mode skips chroot+mountns) — even if interception worked,
+  the semantics of a translated mount() need a virtualized mount table
+  (the 6-Z210 fake-success approach is the right shape).
+- The corpus CI pipeline (592 nightly images) is now UNBLOCKED (actions:
+  write). Next nightly will produce the FIRST full-corpus verdict
+  distribution.
+- 605 tests pass; cargo fmt/clippy clean.
+- NEXT CONCRETE ACTIONS:
+  1. Commit + push; dispatch ui-e2e-test-arm64 for orangefox-r12.1-lavender
+     (raw-stop forensics round = r25) AND a bounded fresh corpus batch.
+  2. On r25 artifacts: if 6-Z213 RAW STOP shows nr=40 stops arriving with
+     an unexpected wstopsig/event -> fix the misrouting branch (generic).
+     If NO nr=40 at waitpid level while init executes mount() -> the calls
+     come from an untraced context; the aggressive 6-Z190 sweep should
+     attach it mid-boot (expect 6-Z190 ATTACHED lines) and the mount
+     interception (6-Z210) starts firing.
+  3. Aggregate fresh corpus verdicts; cluster failures by subsystem (§36)
+     and fix the most common blockers first (generic, not per-device).

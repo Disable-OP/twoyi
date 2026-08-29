@@ -40,7 +40,15 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  actions: read
+  # 6-Z212: actions WRITE is required — the dispatch job POSTs
+  # workflow_dispatch events for every corpus entry via the REST API.
+  # With the previous `actions: read` every POST failed with
+  # HTTP 403 "Resource not accessible by integration" (592/592
+  # failures in run 33230529969) — the nightly corpus has never
+  # actually dispatched a single E2E run. contents:read is kept for
+  # the checkout; the dashboard job also needs actions:read (already
+  # implied by write).
+  actions: write
   contents: read
 
 jobs:
