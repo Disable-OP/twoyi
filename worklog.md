@@ -19216,3 +19216,10 @@ Stage Summary:
   lineage-22.2-sailfish (6-Z219 verify), orangefox-R12.0-lavender (6-Z220 verify),
   twrp-2.8.7.0-angler + twrp-3.7.0_9-0-angler + twrp-3.7.0_9-0-whyred (guards).
   Concurrency group per recovery_name → parallel. Delegate artifact analysis to the next session step.
+- 83fddc3 round partial results (3/5): twrp-3.7.0_9-0-whyred (33275545561) UI_READY/terminal OK,
+  twrp-2.8.7.0-angler + twrp-3.7.0_9-0-angler (33275544587/33275543722) UI_READY/terminal OK —
+  guards GREEN on the 6-Z219/6-Z220 head. Remaining in flight: lineage-22.2-sailfish
+  (33275526098, 6-Z219 verify) + orangefox-R12.0-lavender (33275527467, 6-Z220 verify).
+- 6-Z220 classifier now counts REAL crashes: OrangeFox r25 had 25 (not 200). Backstop
+  denials (79) analyzed: all crash-handler CONSEQUENCES (execve crash_dump64 denied + debuggerd
+  fstatat probes), not gr_init causes.
