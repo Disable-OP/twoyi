@@ -19212,3 +19212,7 @@ Stage Summary:
 - 6-Z220: recovery service carries the full preload chain explicitly in AOSP-layout boots + stdio_to_kmsg diagnostics visibility when init supports it.
 - Guards: whyred + 2× angler UI_READY/terminal OK on the same head — no regressions from 6-Z218.
 - NEXT: commit both, dispatch CI: lineage-22.2-sailfish (6-Z219 verify) + orangefox-R12.0-lavender (6-Z220 verify) + the 3 guards. If OrangeFox still fails, the NEW stdio_to_kmsg diagnostics should capture the exact failing ioctl/open in kmsg artifacts.
+- CI DISPATCH (2026-08-30, on 83fddc3): 5× ui-e2e-test-arm64 (workflow_dispatch):
+  lineage-22.2-sailfish (6-Z219 verify), orangefox-R12.0-lavender (6-Z220 verify),
+  twrp-2.8.7.0-angler + twrp-3.7.0_9-0-angler + twrp-3.7.0_9-0-whyred (guards).
+  Concurrency group per recovery_name → parallel. Delegate artifact analysis to the next session step.
