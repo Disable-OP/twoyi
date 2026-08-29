@@ -1123,6 +1123,105 @@ fn find_and_read_hook_library(
     None
 }
 
+// ============================================================
+// 6-Z215: ELF-machine helpers + native-guest detection.
+// ============================================================
+
+/// ELF `e_machine` values kr64 can encounter for Android guests/hosts.
+const EM_386: u16 = 3;
+const EM_ARM: u16 = 40;
+const EM_X86_64: u16 = 62;
+const EM_AARCH64: u16 = 183;
+
+/// Parse `e_machine` from an in-memory ELF image (handles ELF32/ELF64,
+/// little- and big-endian). Returns `None` if the bytes don't look like
+/// an ELF header.
+///
+/// Layout (Simplified/Combined ELF spec):
+///   e_ident[0..4] = \x7fELF, e_ident[EI_CLASS=4] = 1 (32-bit) | 2 (64-bit),
+///   e_ident[EI_DATA=5] = 1 (LE) | 2 (BE),
+///   ELF64: e_type@16(2) e_machine@18(2), ELF32: e_type@16(2) e_machine@18(2)
+///   — the e_machine field is at offset 18 in BOTH classes.
+pub fn elf_machine_from_bytes(data: &[u8]) -> Option<u16> {
+    if data.len() < 20 {
+        return None;
+    }
+    if data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+    let le = match data[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    // e_machine is a 16-bit field at offset 18 in both ELF32 and ELF64.
+    let raw = [data[18], data[19]];
+    Some(if le {
+        u16::from_le_bytes(raw)
+    } else {
+        u16::from_be_bytes(raw)
+    })
+}
+
+/// Parse `e_machine` from a file on the filesystem. `None` = unreadable
+/// or not an ELF (missing file, permission, truncated, ...).
+pub fn elf_machine(path: &str) -> Option<u16> {
+    // Only the first 64 bytes are needed; a bounded read avoids pulling
+    // megabytes of libc.so into memory on every boot.
+    let mut f = std::fs::File::open(path).ok()?;
+    use std::io::Read;
+    let mut hdr = [0u8; 64];
+    let n = f.read(&mut hdr).ok()?;
+    elf_machine_from_bytes(&hdr[..n])
+}
+
+/// Map the compile-time host architecture to its ELF e_machine. Used as
+/// a LAST-RESORT fallback when the host's bionic files cannot be read —
+/// the kr64 binary itself runs on the host, so its arch IS the host arch.
+fn host_arch_machine() -> u16 {
+    match std::env::consts::ARCH {
+        "x86" => EM_386,
+        "x86_64" => EM_X86_64,
+        "arm" => EM_ARM,
+        "aarch64" => EM_AARCH64,
+        _ => 0, // unknown — will never equal a guest machine value
+    }
+}
+
+/// Determine the HOST's bionic e_machine: prefer the host's own
+/// runtime-APEX libc.so (exactly the file the guest would otherwise
+/// resolve through /apex/com.android.runtime/lib64/bionic), then the
+/// host's /system/lib64/libc.so, then the compile-time arch.
+fn host_bionic_machine() -> u16 {
+    elf_machine("/apex/com.android.runtime/lib64/bionic/libc.so")
+        .or_else(|| elf_machine("/system/lib64/libc.so"))
+        .unwrap_or_else(host_arch_machine)
+}
+
+/// 6-Z215: TRUE when the guest rootfs ships its own libc.so whose ELF
+/// machine matches the HOST's bionic machine — i.e. guest processes
+/// execute natively (arm64-on-arm64, x86_64-on-x86_64) with NO binfmt
+/// runner between them. In that mode the ROM's OWN bionic must take
+/// priority over the host's (private-ABI mismatch otherwise).
+///
+/// FALSE when:
+///   * the ROM does not ship {rootfs}/system/lib64/libc.so (nothing to
+///     prefer — the host's trees remain the only provider), or
+///   * the machines differ (x86_64-host + arm64-ROM = binfmt runner
+///     mode — the runner must keep using its own host trees, the
+///     6-Z93 narrowing stays in force), or
+///   * the guest's libc.so is not a readable ELF (treat as runner mode:
+///     conservative default that preserves pre-6-Z215 behavior).
+pub fn guest_bionic_is_native(rootfs_prefix: &str) -> bool {
+    let guest_libc = format!("{}/system/lib64/libc.so", rootfs_prefix);
+    let guest = match elf_machine(&guest_libc) {
+        Some(m) => m,
+        None => return false,
+    };
+    let host = host_bionic_machine();
+    guest == host && guest != 0
+}
+
 /// Write hook-library bytes to `/dev/<lib>` (tmpfs) and chmod 0644.
 ///
 /// This is the "write" phase of the hook-library copy. It MUST be called
@@ -4126,6 +4225,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // — the child will log "libgetpid_hook.so NOT found at staged /dev
     // path" and init will crash, but with clear diagnostics.
     let dev_stage_dir = format!("{}/dev", rootfs_prefix);
+
+    // ---------------------------------------------------------------
+    // 6-Z215: native-guest detection (computed once, used by BOTH the
+    // libdl staging below and the /dev library-symlink farm below).
+    //
+    // TRUE when the guest rootfs ships its own libc.so whose ELF
+    // e_machine matches the HOST's bionic — i.e. the guest executes as
+    // a REAL same-machine process (arm64-on-arm64) with no binfmt
+    // runner in between. In that mode the ROM's OWN bionic must win
+    // over the host's (the host's libc/libdl are private-ABI
+    // incompatible with the ROM's linker even though the machine
+    // matches — see the 6-Z215 block at the /dev farm for the full
+    // root-cause analysis).
+    // ---------------------------------------------------------------
+    let native_guest =
+        !cfg.boot_recovery && !cfg.use_namespaces && guest_bionic_is_native(&rootfs_prefix);
     if let Err(e) = std::fs::create_dir_all(&dev_stage_dir) {
         warning!(
             "[KR64] PARENT: failed to create dev dir {} for hook libraries: {} (errno={})",
@@ -4221,7 +4336,61 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // still prepends /dev/ — that's safe because if /dev/libdl.so
     // doesn't exist, the linker just falls through to the next entry
     // (/apex/com.android.runtime/lib64/bionic/libdl.so = the stub).
-    if let Some((src, content)) = &real_libdl {
+    //
+    // 6-Z215: NATIVE-GUEST OVERRIDE — if the ROM ships its OWN libdl.so
+    // ({rootfs}/system/lib64/libdl.so, e.g. Lineage 22.2 ships the real
+    // Android-15 13,896-byte libdl) AND the guest is native-arch, stage
+    // a RELATIVE symlink /dev/libdl.so -> ../system/lib64/libdl.so
+    // instead of the host-extracted bytes. The host's libdl is built for
+    // the HOST's bionic version; the ROM's linker64 must see ITS OWN
+    // libdl (the linker implements dlopen/dlsym internally; libdl.so
+    // only carries the symbol entries). Mixing the host's libdl with the
+    // ROM's linker is the same private-ABI mismatch class as the libc.so
+    // mismatch that killed lineage-22.2-sailfish (r25 run 33261943269).
+    // The relative target keeps the resolution inside the rootfs (§8:
+    // never an absolute host path).
+    let native_guest_libdl = format!("{}/system/lib64/libdl.so", rootfs_prefix);
+    let native_guest_libdl_ok = native_guest && std::path::Path::new(&native_guest_libdl).is_file();
+    if native_guest_libdl_ok {
+        let link_path = format!("{}/libdl.so", dev_stage_dir);
+        let target = "../system/lib64/libdl.so";
+        let staged = match std::fs::symlink_metadata(&link_path) {
+            Ok(md) if md.file_type().is_symlink() => match std::fs::read_link(&link_path) {
+                Ok(t) if t == std::path::Path::new(target) => true,
+                // A stale /dev/libdl.so symlink (e.g. pointing at a
+                // previous host-backed target) — replace it.
+                _ => match std::fs::remove_file(&link_path) {
+                    Ok(()) => std::os::unix::fs::symlink(target, &link_path).is_ok(),
+                    Err(_) => false,
+                },
+            },
+            // A real file (previous host-extracted libdl write) —
+            // replace it with the ROM's own symlink.
+            Ok(_) => match std::fs::remove_file(&link_path) {
+                Ok(()) => std::os::unix::fs::symlink(target, &link_path).is_ok(),
+                Err(_) => false,
+            },
+            Err(_) => std::os::unix::fs::symlink(target, &link_path).is_ok(),
+        };
+        if staged {
+            info!(
+                "[KR64] 6-Z215: staged {} -> {} (ROM's own libdl.so wins over the host-extracted copy — native-guest bionic-first)",
+                link_path, native_guest_libdl
+            );
+        } else {
+            warning!(
+                "[KR64] 6-Z215: failed to stage {} -> {} — falling back to the host-extracted libdl.so",
+                link_path,
+                native_guest_libdl
+            );
+        }
+    }
+    let real_libdl_still_needed = if native_guest_libdl_ok {
+        None
+    } else {
+        real_libdl.as_ref()
+    };
+    if let Some((src, content)) = real_libdl_still_needed {
         info!(
             "[KR64] PARENT: writing real libdl.so ({} bytes, source: {}) to {}/libdl.so (guest /dev staging dir)",
             content.len(),
@@ -4329,6 +4498,48 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // (use_namespaces=true) does not need it either: after pivot_root
     // the guest's /system/lib64 IS the ROM's, so the linker already
     // finds the ROM's libs without any /dev indirection.
+    //
+    // ----------------------------------------------------------------
+    // 6-Z215: GUEST-BIONIC-FIRST POLICY FOR NATIVE-ARCH GUESTS.
+    //
+    // The 6-Z93 host-presence filter above made sense ONLY for the
+    // x86_64-host binfmt_misc runner mode: the runner is a HOST x86_64
+    // bionic executable whose linker fatally rejects the ROM's ARM64
+    // ELFs (EM_AARCH64 != EM_X86_64), so host-present names had to be
+    // left to the host's own trees.
+    //
+    // On an arm64 host (redroid E2E, or a real arm64 device running the
+    // guest natively) there IS no translation runner: the guest init is
+    // a REAL arm64 process, and the host bionic is arm64 too — so the
+    // host-presence filter instead hands the guest the HOST's bionic
+    // (libc.so from the host's /apex/com.android.runtime) even when the
+    // ROM ships its OWN bionic in {rootfs}/system/lib64/. Result (r25,
+    // run 33261943269, lineage-22.2-sailfish): the guest's Android-15
+    // linker64 + init linked against the HOST's Android-14 libc.so +
+    // libdl.so (maps: device 00:34 host /apex) while libc++/liblog/
+    // libbase came from the ROM (device 08:01 rootfs) → private-ABI
+    // mismatch → SIGSEGV si_addr=0x0 inside libc at libc+0x5fb20 during
+    // early property-area init. The ROM's own libc.so (1,114,608 bytes,
+    // Android 15) was bypassed because LD_LIBRARY_PATH[1] is
+    // /apex/com.android.runtime/lib64/bionic which appears BEFORE
+    // /system/lib64 (position 7).
+    //
+    // THE FIX (generic, §22/§23/§37): when the guest rootfs ships its
+    // own libc.so whose ELF e_machine matches the HOST's bionic e_machine
+    // (i.e. guest processes execute natively against the host's trees —
+    // no binfmt runner in between), stage EVERY ROM library (including
+    // host-present names like libc.so/libm.so/libdl.so) into /dev via
+    // relative symlinks, so LD_LIBRARY_PATH[0]=/dev resolves them to the
+    // ROM's own copies BEFORE any /apex entry can hit the host. The
+    // host's trees remain the fallback for names the ROM does not ship.
+    // In runner mode (guest ELF machine != host bionic machine) the
+    // 6-Z93 filter is kept unchanged, so the x86_64 full-Android mode
+    // cannot regress.
+    if native_guest {
+        info!(
+            "[KR64] 6-Z215: native-arch guest with its own bionic detected — /dev library staging will prefer the ROM's own libc.so/libm.so/libdl.so over the host's (guest-first, runner mode filter disabled)"
+        );
+    }
     if cfg.boot_recovery {
         info!("[KR64] TWRP boot: skipping /dev ROM library symlinks (TWRP init is statically linked; LD_LIBRARY_PATH=/sbin)");
     } else if cfg.use_namespaces {
@@ -4392,7 +4603,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 // Task 6-Z93: names the HOST can resolve itself must NOT
                 // be symlinked into /dev — see the OVERREACH note above
                 // (the EM_AARCH64-vs-EM_X86_64 fatal on /dev/liblog.so).
-                if host_provides(&name) {
+                //
+                // 6-Z215 EXCEPTION: in native-guest mode the guest is a
+                // REAL same-machine process (no binfmt runner) and MUST
+                // get the ROM's own bionic — the host's is ABI-incompatible
+                // even though the machine matches (r25 lineage SIGSEGV).
+                // So the host-presence filter is skipped entirely and
+                // every ROM library wins at LD_LIBRARY_PATH[0]=/dev.
+                if host_provides(&name) && !native_guest {
                     host_present_skipped += 1;
                     continue;
                 }
@@ -12597,6 +12815,134 @@ mod tests {
         assert!(dir.join("sys").is_dir());
         assert!(dir.join("sys/class").is_dir());
         assert!(dir.join("sys/fs/selinux/enforce").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ============================================================
+    // 6-Z215: ELF-machine helpers + native-guest detection tests.
+    // ============================================================
+
+    /// Build a minimal ELF header image with the given EI_CLASS (1=32,
+    /// 2=64), EI_DATA (1=LE, 2=BE) and e_machine value. The header is
+    /// long enough for offset-18/19 reads in both classes.
+    fn make_elf_hdr(class_: u8, data: u8, machine: u16) -> Vec<u8> {
+        let mut v = vec![0u8; 64];
+        v[0] = 0x7f;
+        v[1] = b'E';
+        v[2] = b'L';
+        v[3] = b'F';
+        v[4] = class_;
+        v[5] = data;
+        let raw = if data == 1 {
+            machine.to_le_bytes()
+        } else {
+            machine.to_be_bytes()
+        };
+        v[18] = raw[0];
+        v[19] = raw[1];
+        v
+    }
+
+    #[test]
+    fn elf_machine_from_bytes_parses_all_android_machines() {
+        // ELF64 LE (the only layout Android ships in practice).
+        assert_eq!(
+            elf_machine_from_bytes(&make_elf_hdr(2, 1, EM_AARCH64)),
+            Some(EM_AARCH64)
+        );
+        assert_eq!(
+            elf_machine_from_bytes(&make_elf_hdr(2, 1, EM_X86_64)),
+            Some(EM_X86_64)
+        );
+        // ELF32 LE (legacy 32-bit TWRP images).
+        assert_eq!(
+            elf_machine_from_bytes(&make_elf_hdr(1, 1, EM_ARM)),
+            Some(EM_ARM)
+        );
+        assert_eq!(
+            elf_machine_from_bytes(&make_elf_hdr(1, 1, EM_386)),
+            Some(EM_386)
+        );
+        // Big-endian ELF32 (exotic but must not misparse).
+        assert_eq!(
+            elf_machine_from_bytes(&make_elf_hdr(1, 2, EM_ARM)),
+            Some(EM_ARM)
+        );
+    }
+
+    #[test]
+    fn elf_machine_from_bytes_rejects_non_elf_and_short_input() {
+        assert_eq!(elf_machine_from_bytes(&[]), None);
+        assert_eq!(elf_machine_from_bytes(&[0u8; 19]), None);
+        // 20 bytes but wrong magic.
+        let mut not_elf = vec![0u8; 64];
+        not_elf[0] = b'P';
+        not_elf[1] = b'K';
+        assert_eq!(elf_machine_from_bytes(&not_elf), None);
+        // Valid magic but invalid EI_DATA.
+        let mut bad_data = make_elf_hdr(2, 1, EM_AARCH64);
+        bad_data[5] = 9;
+        assert_eq!(elf_machine_from_bytes(&bad_data), None);
+    }
+
+    #[test]
+    fn elf_machine_file_missing_returns_none() {
+        assert_eq!(elf_machine("/nonexistent/twoyi-test/nope.so"), None);
+    }
+
+    #[test]
+    fn guest_bionic_is_native_false_when_guest_libc_missing() {
+        // An empty temp dir: no {rootfs}/system/lib64/libc.so → the
+        // detection MUST return false (conservative: keep the 6-Z93
+        // runner-mode behavior).
+        let dir = std::env::temp_dir().join(format!("twoyi-6z215-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!guest_bionic_is_native(dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_bionic_is_native_false_when_guest_libc_not_elf() {
+        // A text file at the libc path (corrupt import) must NOT trip
+        // the native detection.
+        let dir = std::env::temp_dir().join(format!("twoyi-6z215-text-{}", std::process::id()));
+        let libc_dir = dir.join("system/lib64");
+        std::fs::create_dir_all(&libc_dir).unwrap();
+        std::fs::write(libc_dir.join("libc.so"), b"definitely not an elf").unwrap();
+        assert!(!guest_bionic_is_native(dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guest_bionic_is_native_matches_runner_and_native_modes() {
+        // Host bionic machine as resolved in THIS test environment
+        // (the CI/test host has no Android libc, so this falls back to
+        // the compile-time arch — deterministic on any runner).
+        let host_m = host_bionic_machine();
+        assert_ne!(host_m, 0, "host machine must resolve on any runner");
+
+        // Case 1: guest libc with the SAME machine as the host → native
+        // mode (arm64 guest on arm64 host / x86_64 on x86_64).
+        let dir = std::env::temp_dir().join(format!("twoyi-6z215-same-{}", std::process::id()));
+        let libc_dir = dir.join("system/lib64");
+        std::fs::create_dir_all(&libc_dir).unwrap();
+        std::fs::write(libc_dir.join("libc.so"), make_elf_hdr(2, 1, host_m)).unwrap();
+        assert!(guest_bionic_is_native(dir.to_str().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Case 2: guest libc with a DIFFERENT machine than the host →
+        // binfmt runner mode (x86_64 host + arm64 ROM) → NOT native,
+        // 6-Z93 filter stays in force.
+        let other_m = if host_m == EM_AARCH64 {
+            EM_X86_64
+        } else {
+            EM_AARCH64
+        };
+        let dir = std::env::temp_dir().join(format!("twoyi-6z215-diff-{}", std::process::id()));
+        let libc_dir = dir.join("system/lib64");
+        std::fs::create_dir_all(&libc_dir).unwrap();
+        std::fs::write(libc_dir.join("libc.so"), make_elf_hdr(2, 1, other_m)).unwrap();
+        assert!(!guest_bionic_is_native(dir.to_str().unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
