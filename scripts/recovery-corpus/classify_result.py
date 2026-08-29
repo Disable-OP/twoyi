@@ -55,6 +55,14 @@ rec = read("twrp-recovery-log-dockerexec.log")
 kr = read("kr64-app-stderr-dockerexec.log", 16 * 1024 * 1024)
 ps = read("ps-dockerexec.txt")
 logcat = read("logcat-dockerexec.txt", 16 * 1024 * 1024)
+# 6-Z220: with the recovery service's `stdio_to_kmsg` option (emitted when
+# the guest init supports it), the recovery process's stderr — hook
+# diagnostics, linker errors, glog fatals — lands in /dev/__kmsg__ and is
+# captured here. It is the ONLY place those diagnostics are visible for
+# AOSP-layout services (init redirects non-console service stdio to
+# /dev/null, so the tracer DIAG capture never sees them).
+kmsg = read("kmsg-stub.txt", 8 * 1024 * 1024)
+kr_and_kmsg = kr + "\n" + kmsg
 
 # ── recovery instances + family banner ───────────────────────────────
 banners = re.findall(
@@ -90,8 +98,13 @@ for sig, tag in [
     ("linker.*not found", "linker"),
     ("CANNOT LINK EXECUTABLE", "linker"),
     ("InitFatalReboot", "init_fatal_reboot"),
+    # 6-Z219: Android 12+ libfstab aborts a slotselect fstab when the
+    # slot suffix is empty (A/B recovery images on a non-A/B cmdline);
+    # the recovery binary then glog-CHECKs on the empty fstab.
+    ("Error updating for slotselect", "slotselect_fstab"),
+    ("Check failed: !fstab\\.empty\\(\\)", "fstab_empty"),
 ]:
-    if re.search(sig, kr):
+    if re.search(sig, kr_and_kmsg):
         result["markers"].setdefault("failure", tag)
         break
 
@@ -191,10 +204,15 @@ bat = 'open("/sys/class/power_supply/battery/capacity"' in rec
 result["battery_ok"] = bat if bat else None
 
 # ── crash signals ────────────────────────────────────────────────────
+# 6-Z216 classifier note: a single crash produces EIGHT raw "SIGSEGV"
+# grep-matches (details line + 2 regs + comm + threads + stack window +
+# event lines). Count the DETAILS lines — one per real crash.
 for sig in ("SIGSEGV", "SIGILL", "SIGBUS"):
-    n = kr.count(sig)
+    n = len(re.findall(rf"{sig} details:", kr))
     if n:
         result["markers"][f"{sig.lower()}_count"] = n
+    elif kr.count(sig):
+        result["markers"][f"{sig.lower()}_count"] = kr.count(sig)
 if "FATAL EXCEPTION" in logcat:
     result["markers"]["java_fatal"] = logcat.count("FATAL EXCEPTION")
 
