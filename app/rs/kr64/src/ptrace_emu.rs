@@ -11651,6 +11651,35 @@ pub fn run_ptrace_loop(
 
                 let syscall_num = get_syscall_num(&regs, &abi);
 
+                // 6-Z210 DIAG (pre-dispatch): fires for EVERY mount() syscall-stop
+                // BEFORE the ENTRY/EXIT classification. This distinguishes:
+                // - H1a: the syscall-stop IS delivered but classified as EXIT
+                //   (in_syscall parity flip / PTRACE_GET_SYSCALL_INFO misreport)
+                //   → the ENTRY handler never runs, so the post-ENTRY DIAG at
+                //   line ~13493 also never fires.
+                // - H1b: the syscall-stop is NOT delivered at all (ptrace tracer
+                //   missing the stop entirely — fork-follow gap, ESRCH race).
+                // If this pre-dispatch DIAG fires but the post-ENTRY DIAG doesn't,
+                // the issue is the ENTRY/EXIT classification (H1a).
+                // If neither fires, the stop isn't being delivered (H1b).
+                if syscall_num == abi.mount {
+                    static MOUNT_PRE_DISPATCH_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = MOUNT_PRE_DISPATCH_DIAG_LOGGED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 50 {
+                        log(&format!(
+                            "6-Z210 DIAG (pre-dispatch): mount() syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} [diag #{}/50]",
+                            syscall_num,
+                            pid,
+                            loop_count,
+                            in_syscall,
+                            abi.mount,
+                            n + 1,
+                        ));
+                    }
+                }
+
                 // ── Task 6-Z68: DEFINITIVE syscall ENTRY/EXIT classification ──
                 //
                 // ROOT CAUSE this fixes (E2E run 32604929372): the recovery

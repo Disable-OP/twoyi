@@ -14942,3 +14942,250 @@ Stage Summary:
      InitFatalReboot), re-dispatch OrangeFox R12.0 lavender
      AND Lineage 22.2 sailfish (the latter with the libdl.so
      fix from step 2) to confirm BOOT_OK / UI_READY.
+
+---
+Task ID: 6-Z210-mon1 verdict + 6-Z210 DIAG follow-up
+Agent: main
+Task: Document the round-12 verification results and the DIAG follow-up.
+
+Work Log:
+- CI monitoring subagent (6-Z210-mon1) reported round-12 verdicts:
+  * OrangeFox R12.0 lavender round-12 (run 33235828721 on 22582710):
+    - 6-Z210 fix DID NOT fire at runtime. ZERO 6-Z210 log lines.
+    - 6-Z91/6-Z168/6-Z164 mount classification logs also ABSENT.
+    - SAME SetupMountNamespaces/EBUSY/InitFatalReboot chain as round-11.
+    - Kernel's -EBUSY leaked through → init aborts → exit_group(127).
+  * Lineage 22.2 sailfish round-12 (run 33235829894 on 22582710):
+    - 6-Z210 fix NOT exercised — boot crashed BEFORE SetupMountNamespaces.
+    - NEW earlier blocker: NULL-deref SIGSEGV in bionic libc.so at offset
+      0xfb20 (signal 11, NOT signal 6). Root cause: apex_extract FAILED
+      to find real libdl.so (the 5848-byte stub is being used).
+      kr64 stderr line 80: "[KR64][apex_extract] FAILED to find real
+      libdl.so anywhere — guest init will use the 5848-byte stub and
+      likely crash at offset 0xaf174 in linker64 (5-K's diagnosis)".
+- Inspected the OrangeFox round-12 kr64-app-stderr-dockerexec.log
+  (artifact 9710041879, 2790 lines) to find evidence of why the 6-Z210
+  classification block at ptrace_emu.rs ~13668 isn't firing:
+  * Line 81: use_namespaces=false — confirms non-root mode.
+  * Line 96: PARENT skipping binderfs mount (seccomp blocks mount()).
+  * Line 141: CHILD skipping mount+chroot (seccomp blocks both).
+  * Line 151: detected child bitness: 64-bit (aarch64) (pid=2586).
+  * Line 2746: "no SIGSYS interceptions recorded during this run" —
+    confirms seccomp is NOT installed (skipped in non-root mode per
+    lib.rs:7260 because of AUDIT_ARCH mismatch on i386-on-x86_64; for
+    aarch64-on-aarch64 there's no mismatch, but the same skip path
+    fires because use_namespaces=false).
+  * Syscall numbers logged: nr=222 (mmap), nr=226 (mprotect), nr=64
+    (write), nr=57 (close), nr=94 (exit_group), nr=220 (clone), nr=221
+    (execve), nr=172 (getpid), nr=178 (gettid), nr=135 (rt_sigprocmask),
+    nr=240, nr=270, nr=167 (prctl), nr=215 (munmap), nr=98 (futex),
+    nr=198 (socket), nr=203 (connect), nr=66 (writev), nr=134
+    (rt_sigaction), nr=63 (read), nr=56 (openat).
+  * ZERO nr=40 (aarch64 mount) entries anywhere in the kr64 stderr.
+  * "last 50 ALL syscalls" buffer at pid 2586 exit shows ZERO mount
+    calls — but the write DIAG shows init DID write "Failed to remount
+    /apex", which means mount() was called. The mount() syscall must
+    have happened MORE than 50 syscalls before the exit_group (the
+    buffer is a sliding window of 50).
+  * The 6-Z164/6-Z168/6-Z210 classification block at line ~13668 is
+    gated on `past_first_execve && syscall_num == abi.mount`. If this
+    block ran, it would log (rate-limited to 30). ZERO log lines means
+    the block is NOT running.
+- Two hypotheses for why the classification block isn't running:
+  H1: The mount() syscall-ENTRY stop is NOT being delivered to the
+      tracer. The 6-Z122 ESRCH-running skip (line ~2753 of the kr64
+      stderr: "ESRCH'd pid 2691 is RUNNING (not stopped) — next
+      iteration skips the resume and waits for its next stop (no
+      PTRACE_SYSCALL ping-pong)") is a prime suspect. When a pid is
+      RUNNING (ESRCH on PTRACE_SYSCALL), the tracer SKIPS the resume.
+      This means the next syscall-stop won't be delivered until the
+      pid stops for some other reason. The mount() call by a forked
+      child (pid 2690 or 2691) might be missed if the tracer is in
+      this skip mode for that pid.
+  H2: The classification block IS running but `syscall_num !=
+      abi.mount` due to ABI mismatch. The kr64 detected aarch64, so
+      abi.mount should be 40. But maybe the guest is using a different
+      syscall (e.g., mount_setattr 442) — but the kernel is 6.17.0
+      which supports it, and the kr64 stderr shows NO nr=442 either.
+- Added an unconditional mount() ENTRY DIAG log (commit 3181b3a) at
+  ptrace_emu.rs ~13493 to definitively answer H1 vs H2. The DIAG log
+  fires for EVERY mount() syscall-ENTRY stop, UNGATED by past_first_
+  execve / post_execve_syscall_count / trace_syscalls. It logs:
+  syscall_num, pid, past_first_execve, post_execve_syscall_count,
+  src/tgt/fstype strings, flags (raw u64). Capped at 50 logs.
+- Pushed commit 3181b3a + dispatched OrangeFox R12.0 lavender round-13
+  verification (will identify the run ID after the build job starts).
+
+Stage Summary:
+- The 6-Z210 fix is VERIFIED CORRECT in unit tests (605 passed) but
+  does NOT fire at runtime on OrangeFox R12.0 lavender round-12. The
+  root cause is that the mount() syscall-ENTRY stop is NOT reaching
+  the classification block. Two hypotheses (H1: ptrace tracer missing
+  the stop; H2: ABI/syscall_num mismatch) — the DIAG log in commit
+  3181b3a will distinguish them.
+- The Lineage 22.2 blocker is a SEPARATE issue: the libdl.so stub
+  causes a NULL-deref SIGSEGV in libc.so before SetupMountNamespaces
+  is even reached. This must be fixed (by extracting the real libdl.so
+  from the APEX package) before 6-Z210 can be verified on Lineage.
+- Next concrete action: wait for OrangeFox round-13 (with DIAG log)
+  to complete, then inspect the kr64 stderr for "6-Z210 DIAG: mount()
+  ENTRY" lines. If present → the classification block has a gate bug
+  (likely past_first_execve is false for the forked child). If absent
+  → the ptrace tracer is missing the syscall-ENTRY stop (investigate
+  the 6-Z122 ESRCH-running skip + fork-follow logic).
+
+---
+Task ID: 6-Z210-mon2
+Agent: CI-monitoring subagent
+Task: Monitor OrangeFox R12.0 lavender round-13 UI E2E run on commit 3181b3a
+(which adds an unconditional mount() ENTRY DIAG log, ungated by
+past_first_execve / post_execve_syscall_count / trace_syscalls, to
+definitively answer H1 (ptrace tracer missing the syscall-ENTRY stop)
+vs H2 (ABI/syscall_num mismatch) for why the 6-Z210 fix doesn't fire
+at runtime on round-12).
+
+Work Log:
+- Polled GitHub Actions run 33237232943 every 60s. Total runtime
+  ~15 min 24 s (run_started_at=2026-08-29T05:54:33Z; completed at
+  2026-08-29T06:09:57Z). Build arm64-v8a APK job ran 05:54:36→05:56:46Z
+  (~2 min 10 s, conclusion=success). UI-only ARM64 (TWRP) E2E on
+  redroid job ran 05:56:50→06:09:57Z (~13 min 7 s, conclusion=success).
+  Run conclusion=success, both jobs succeeded.
+- Downloaded ui-e2e-arm64-logs artifact (id=9710431858, 21 MB) and
+  extracted to /home/z/my-project/artifacts/ofox-r13/ui-e2e-artifacts/.
+- Inspected kr64-app-stderr-dockerexec.log (2786 lines, 343 KB):
+  * `grep -c "6-Z210 DIAG: mount() ENTRY"` → 0 (ZERO occurrences).
+  * `grep -c "6-Z210"` → 0 (ZERO occurrences of ANY 6-Z210 marker).
+  * `grep -cE "6-Z168|6-Z91:"` → 0 (ZERO mount-classification markers).
+  * `grep -c "6-Z164"` → 12 (BUT all 12 are `6-Z164: open FAILED` —
+    the OPEN-path translation code, NOT the pseudo-mount code. The
+    open-side 6-Z164 path IS firing, which proves the syscall-ENTRY
+    handler is alive for open() syscalls on the active pid).
+  * `grep -cE "nr=40[^0-9]"` → 0 (ZERO mount syscalls anywhere).
+  * SetupMountNamespaces chain STILL present (3 occurrences): the
+    failed remount write at line 2698 ("Failed to remount /apex as
+    40000: Device or resource busy"), the glog F/abort at lines
+    2699/2701, and the init:2 log at line 2702.
+  * InitFatalReboot: 1 occurrence (line 2715: "signal 6").
+  * The 6-Z89/6-Z122 ESRCH-running skip pattern fires 4 times (lines
+    2747/2749/2756/2758), all on pid 2678, all AFTER the abort
+    sequence — so it's not the cause of the missed mount() stop.
+- result-pretty.json verdict: BOOT_FAIL_EARLY_INIT
+  (boot=BOOT_FAIL, failure=init_fatal_reboot, exit_code=127,
+  backstop_denied=2, recovery_instances=0, ui=NOT_REACHED,
+  vfs=CLEAN, terminal=NOT_APPLICABLE, theme=N/A).
+  Container state: status=running exit=0 oom=false.
+- Exit-event timeline (from kr64 stderr):
+  * Line 2688: pid=2586 clone() ENTRY (nr=220) — first fork.
+  * Line 2690: PTRACE_EVENT_CLONE → child PID 2677 created
+    (clone flags=0x3d0f00 = CLONE_VM|CLONE_FS|CLONE_FILES|
+    CLONE_SIGHAND|CLONE_THREAD|CLONE_NEWNS|CLONE_PARENT_SETTID|...,
+    so 2677 is a THREAD of init, in a NEW mount namespace).
+  * Line 2693: DIAG child switch 2586 → 2677 (Task 6-Z54).
+  * Line 2694: SIGSTOP on 2677 auto-attach stop consumed, resumed
+    with signal=0 "so its syscalls get traced".
+  * Line 2695-2696: clone EXIT on 2586 returns child pid 2677.
+  * Line 2697: detected child bitness 64-bit (aarch64) for pid 2677
+    (implies the tracer DID see at least one syscall-stop on 2677
+    after the SIGSTOP resume).
+  * Line 2698: DIAG write "Failed to remount /apex as 40000:
+    Device or resource busy" (fd=67, ret=67) — the mount() must
+    have happened somewhere between line 2696 and line 2698, but
+    NO mount() syscall ENTRY log was emitted.
+  * Lines 2703-2709: pid=2586 clone() ENTRY (nr=220) again, this
+    time flags=0x1200011 = CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID|
+    SIGCHLD → real fork() (PTRACE_EVENT_FORK), child PID 2678.
+  * Line 2715: InitFatalReboot: signal 6.
+  * Lines 2736/2739/2773: PTRACE_EVENT_EXIT for pids 2586, 2677,
+    and 2678 respectively, all exit code 127.
+  * Lines 2741/2750/2775: actual exits (after 14391/14481 iters).
+- The "last 50 ALL syscalls" sliding-window buffers (lines 2734, 2743,
+  2746, 2752, 2755, 2771, 2777) for pids 2586, 2677, 2678 all show
+  the SAME trailing ~10 syscalls: rt_sigprocmask→getpid→gettid→wait4
+  (or waitid)→[rt_sigaction]→rt_sigprocmask→getpid→gettid→wait4→
+  exit_group. NO nr=40 (mount) anywhere in any of these buffers —
+  but the buffer only captures the LAST 50 syscalls before exit, and
+  the exit path (epoll_create1, epoll_ctl, epoll_pwait, mprotect×30,
+  munmap, futex, write×3, socket, connect, close, writev,
+  rt_sigprocmask, getpid, gettid, wait4, ...) overflows the 50-slot
+  window before reaching back to the mount() call.
+  The 6-Z98 DIAG at line 2734 shows pid=2586 exit_group(127) at
+  ENTRY with rip=0xe884f795bf48 (same code page as 2677/2678's
+  prctl-sample rip=0xe884f795bbd8 — confirms all three pids share
+  the same init binary, i.e. they're forks/threads of init).
+
+Stage Summary:
+- HYPOTHESIS H1 IS CONFIRMED: the ptrace tracer is NOT receiving
+  the mount() syscall-ENTRY stop for the actual mount() call that
+  init makes. The unconditional 6-Z210 DIAG log "mount() ENTRY"
+  (which is the very FIRST statement in the mount() ENTRY handler,
+  firing for every mount() syscall-ENTRY stop with NO gate on
+  past_first_execve / post_execve_syscall_count / trace_syscalls)
+  appears ZERO times in the kr64 stderr. Yet the write DIAG for
+  "Failed to remount /apex as 40000: Device or resource busy"
+  proves init DID call mount() and it returned -EBUSY. The syscall
+  ENTRY handler IS alive (proven by 12 occurrences of
+  "6-Z164: open FAILED" — the open-path translation code — which
+  fires from the same syscall-ENTRY handler). So the syscall-ENTRY
+  handler works for open() but not for mount() on the same pid(s).
+- The 6-Z210 fix code is CORRECT (it would fire IF the mount
+  syscall-ENTRY stop were delivered), but the underlying ptrace
+  tracer is failing to deliver the mount() syscall-ENTRY stop.
+  This is NOT a 6-Z210 gate bug; it's a deeper ptrace-loop bug,
+  almost certainly in the multi-pid fork-follow / waitpid dispatch.
+- SetupMountNamespaces/EBUSY/InitFatalReboot chain STILL appears
+  identically to round-12 (failed remount write → SetupMountNamespaces
+  failed → InitFatalReboot signal 6 → exit_group(127)). The 6-Z210
+  fix did NOT fire this time either — confirming the tracer-side
+  miss is the root cause, not a fix-side bug.
+- verdict: BOOT_FAIL_EARLY_INIT (overall=BOOT_FAIL_EARLY_INIT,
+  boot=BOOT_FAIL, failure=init_fatal_reboot, exit_code=127,
+  ui=NOT_REACHED, vfs=CLEAN).
+- The likely root cause (for the main orchestrator to confirm in
+  code): the tracer uses waitpid(-1) but only does PTRACE_SYSCALL
+  on the "active" pid (the one that just stopped). After the
+  fork-follow child switch to 2677 (line 2693 "DIAG child switch
+  2586 → 2677"), the tracer does PTRACE_SYSCALL on 2677 but NOT
+  on 2586 (which is paused at its clone-EXIT). When 2586 is
+  resumed (presumably via a PTRACE_CONT or PTRACE_SYSCALL at line
+  2696 "Task-6-S EXIT: pid=2586 clone nr=220 -> 2677"), its
+  next syscall-stop should be delivered to waitpid(-1) — but the
+  tracer may have already entered its inner loop processing 2677's
+  stops and not checked waitpid(-1) for 2586's stop. The mount()
+  syscall stop on 2586 (or 2677, or 2678) is thus orphaned in
+  ptrace-stop state and the tracer never picks it up. The
+  subsequent write() syscall-stop IS picked up (we see the write
+  DIAG), which suggests the tracer's loop does eventually return
+  to waitpid(-1) — but by that point the mount() syscall-ENTRY
+  stop has already been consumed/skipped (the kernel only queues
+  ONE syscall-ENTRY stop; if the tracee continues past it without
+  the tracer seeing it, the stop is lost).
+- Next concrete action for the main orchestrator:
+  1. The 6-Z210 mount-classification block is verified correct
+     (would fire IF the syscall-ENTRY stop were delivered) — the
+     6-Z210 fix can stay as-is. The remaining work is on the
+     PTRACE TRACER side: fix the multi-pid fork-follow so that
+     mount() syscall-ENTRY stops on ALL tracked pids (2586, 2677,
+     2678) are delivered to the tracer's waitpid loop.
+  2. Inspect ptrace_emu.rs around the fork-follow / waitpid loop:
+     * After PTRACE_EVENT_FORK / PTRACE_EVENT_CLONE, the tracer
+       must issue PTRACE_SYSCALL on BOTH the parent and the new
+       child (so both pids' next syscalls are caught). The current
+       code seems to PTRACE_SYSCALL only the "active" (newly-
+       switched) pid and leave the parent paused.
+     * The "DIAG child switch" log at line 2693 is suspicious —
+       switching the "active pid" to the child without resuming the
+       parent may be the bug. After the child switch, the parent
+       should still be PTRACE_SYSCALL-resumed so its next syscall
+       (mount()) is delivered.
+  3. Re-dispatch OrangeFox R12.0 lavender round-14 after the
+     tracer-side fix (do NOT remove the 6-Z210 DIAG log — keep it
+     as a runtime verifier). Expectation: the DIAG log should
+     appear 1+ times (showing mount() with flags=0x40000 = MS_REMOUNT,
+     target="/apex"), and the 6-Z210 classification block should
+     then fire and return 0 (fake success) so SetupMountNamespaces
+     succeeds.
+  4. Do NOT re-dispatch the broad corpus (Lineage, other ROMs)
+     until the ptrace-tracer fix is verified on OrangeFox round-14.
+     Without the tracer fix, every other ROM with the same
+     SetupMountNamespaces pattern will fail identically.
