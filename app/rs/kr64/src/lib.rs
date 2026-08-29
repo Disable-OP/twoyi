@@ -3834,17 +3834,27 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             "seccomp virtualization disabled",
         )
     };
-    // TWRP-mode i686 FB ioctl hook (separate from the x86_64 main loader).
-    // Loaded ONLY in TWRP mode; written to /sbin/libtwrp_fb_hook.so.
-    let hook_lib_twrp_fb = if cfg.boot_recovery {
-        find_and_read_hook_library(
-            &cfg,
-            "libtwrp_fb_hook.so",
-            "TWRP framebuffer virtualization disabled (recovery will crash in libminuitwrp.so)",
-        )
-    } else {
-        None
-    };
+    // FB ioctl hook. Loaded for BOTH boot modes:
+    //   * TWRP mode: written to /sbin/libtwrp_fb_hook.so and injected via
+    //     the init.rc setenv patch (the recovery service's LD_PRELOAD).
+    //   * AOSP-layout mode (6-Z216): written to /dev/libtwrp_fb_hook.so
+    //     and appended to the env LD_PRELOAD (see the ld_preload_str
+    //     build below). ROOT CAUSE (6-Z216, ver8e2 run 33267257605,
+    //     OrangeFox R12.0 lavender): the AOSP-layout recovery binary is
+    //     launched by init from /system/bin/recovery — NOT via the
+    //     /sbin/recovery service the init.rc patch targets — so it
+    //     inherited only libgetpid_hook.so + libtwoyi_loader_shlib.so,
+    //     /dev/graphics/fb0 had no FB interposer, gr_init() failed,
+    //     and the theme engine's gr_fb_width() deref'd the null
+    //     framebuffer (libminuitwrp.so+0x2027c, si_addr=0x0) in a
+    //     20-restart crash loop — UI never reached.
+    //     The hook is inert for processes that never open
+    //     /dev/graphics/fb0, so loading it unconditionally is safe.
+    let hook_lib_twrp_fb = find_and_read_hook_library(
+        &cfg,
+        "libtwrp_fb_hook.so",
+        "framebuffer virtualization disabled (recovery will crash in libminuitwrp.so gr_fb_width)",
+    );
 
     // ---------------------------------------------------------------
     // Step 3.7: extract the REAL libdl.so from the APEX ext4 image
@@ -4294,6 +4304,9 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // directory may not exist yet on the host (the rootfs image may not ship
     // with an empty sbin, or it may have been stripped).
     if let Some((src, content)) = &hook_lib_twrp_fb {
+        // (a) TWRP path: /sbin/libtwrp_fb_hook.so (the init.rc setenv
+        //     LD_PRELOAD target — the ptrace emulator translates the
+        //     path at runtime).
         let sbin_dir = format!("{}/sbin", rootfs_prefix);
         if let Err(e) = std::fs::create_dir_all(&sbin_dir) {
             error!(
@@ -4306,6 +4319,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             let twrp_fb_hook_dst = format!("{}/sbin/libtwrp_fb_hook.so", rootfs_prefix);
             write_hook_library_to_dev("libtwrp_fb_hook.so", src, content, &twrp_fb_hook_dst);
         }
+        // (b) 6-Z216 AOSP-layout path: ALSO stage it at /dev/ so the
+        //     env LD_PRELOAD chain (getpid_hook:loader_shlib:fb_hook)
+        //     resolves it for every guest process, including the
+        //     /system/bin/recovery service that the init.rc patch never
+        //     touches. write_hook_library_to_dev is idempotent (plain
+        //     overwrite) so restaging on every boot is safe.
+        let fb_hook_dev_dst = format!("{}/libtwrp_fb_hook.so", dev_stage_dir);
+        write_hook_library_to_dev("libtwrp_fb_hook.so", src, content, &fb_hook_dev_dst);
     }
 
     // ---------------------------------------------------------------
@@ -7871,7 +7892,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         let ld_preload_str = if cfg.boot_recovery {
             "LD_PRELOAD=/sbin/libtwrp_fb_hook.so".to_string()
         } else {
-            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so".to_string()
+            // 6-Z216: append the FB hook so AOSP-layout recoveries
+            // (launched by init from /system/bin/recovery, never touched
+            // by the TWRP init.rc patch) get framebuffer virtualization.
+            // Inert for processes that never open /dev/graphics/fb0.
+            "LD_PRELOAD=/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so:/dev/libtwrp_fb_hook.so"
+                .to_string()
         };
         // TWRP BOOT: use a minimal env that mirrors TWRP's init.rc exports.
         // TWRP's init.rc does its own:
