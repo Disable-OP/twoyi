@@ -19039,3 +19039,36 @@ Stage Summary:
 - PENDING VERIFICATION: 5 CI runs dispatched on 8e51482 (6-Z214 /apex EBUSY fix): orangefox-R12.0-lavender, lineage-22.2-sailfish, twrp-2.8.7.0-angler, twrp-3.7.0_9-0-angler (terminal regression), twrp-3.7.0_9-0-whyred. The 6-Z215 commit will need ANOTHER CI round on top.
 - REMAINING BLOCKERS: (1) twrp-3.7.0_9-0-angler terminal FAIL regression (ash banner absent); (2) possible property clean-slate need for AOSP-layout boots (6-Z196 extension) — only if lineage still fails at property init AFTER 6-Z215 (evidence so far says the shlib interposer serves it, as for OrangeFox); (3) corpus expansion toward the 90%-boot goal.
 - Artifacts: /home/z/my-project/artifacts/r25/{lineage,orangefox,whyred}/ + /home/z/my-project/artifacts/lineage-img/ (boot.img + unpacked ramdisk with system/bin/{init,linker64} + system/lib64/{libc,libdl}.so).
+
+---
+Task ID: 6-Z216
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-29
+Task: Analyze the 8e51482 verification round (5 runs) and fix the OrangeFox post-/apex-fix blocker.
+
+Work Log:
+- 8e51482 verification round verdicts (my dispatch batch 18:04Z):
+  * 33267257605 orangefox-R12.0-lavender: BOOT_OK (SetupMountNamespaces /apex EBUSY GONE — 6-Z214 VERIFIED at the init level), ui NOT_REACHED, overall TIMEOUT_OR_UNKNOWN, 20 SIGSEGV crash dumps of the recovery binary, ~932k ptrace iterations of guest activity.
+  * 33267259956 lineage-22.2-sailfish: BOOT_FAIL sigsegv_count=8 (pre-6-Z215 head — expected; needs re-run on 0c66e4e+).
+  * 33267262914 twrp-2.8.7.0-angler: UI_READY terminal OK filemanager 12 pages (guard green).
+  * 33267265616 twrp-3.7.0_9-0-angler: UI_READY terminal FAIL (known regression; terminalcommand page reached).
+  * whyred run 33267268349: BUILD infra failure ("Failed to install SDK components: build-tools;30.0.3" — transient), re-dispatched.
+- OrangeFox crash analysis (crash dumps have /proc/pid/maps):
+  * ALL crashed-process libs (recovery binary, libc.so, libdl.so, linker64, libbinder, libminuitwrp, libc++) are 08:01 rootfs files — the recovery binary resolved its OWN bionic correctly (unlike lineage init — the /apex fall-through worked here).
+  * pc symbolized (dynsym, exact file offsets from r-xp mapping offsets): libminuitwrp.so+0x2027c = gr_fb_width(); libbinder.so+0x5146c = android::Parcel::readInt32(int*). si_addr=0x0 in all dumps.
+  * gr_fb_width() null-deref = gr_init() failed = no framebuffer interposer. Crashed-process maps show libgetpid_hook.so + libtwoyi_loader_shlib.so loaded but NO libtwrp_fb_hook.so.
+  * ROOT CAUSE: AOSP-layout recoveries launch recovery from /system/bin/recovery (not the /sbin/recovery service that the TWRP init.rc setenv patch targets). The env LD_PRELOAD for non-TWRP boots was "/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so" — no FB hook → /dev/graphics/fb0 unvirtualized → gr_init fails → theme engine (opened twres/splash.xml right before crash) calls gr_fb_width() → NULL → crash → init restarts the service → 20-restart crash loop → UI never reached.
+  * The binder proxy (binder.rs vm0) IS working (VERSION→8, servicemanager transactions, looper state) — Parcel::readInt32 crash likely secondary (recovery restart churn); re-check after the FB fix.
+- FIX (6-Z216):
+  1. hook_lib_twrp_fb now read for BOTH boot modes (was boot_recovery-only).
+  2. libtwrp_fb_hook.so staged BOTH at /sbin (TWRP init.rc patch target — unchanged) AND at {dev_stage_dir}/libtwrp_fb_hook.so (AOSP path).
+  3. Non-TWRP env LD_PRELOAD extended to "/dev/libgetpid_hook.so:/dev/libtwoyi_loader_shlib.so:/dev/libtwrp_fb_hook.so" — every guest process (incl. the /system/bin/recovery service, which inherits init's env) gets the FB interposer. Inert for processes that never open /dev/graphics/fb0.
+- Gates: fmt, clippy -D warnings, 611 tests — all pass.
+- CLASSIFIER NOTE: sigsegv_count=160 for this run = 20 real crashes × 8 grep-matching lines each; recommend counting "SIGSEGV details:" lines (20) instead.
+
+Stage Summary:
+- 6-Z214 /apex fix VERIFIED at init level (OrangeFox init passes SetupMountNamespaces; TWRP guards stay green).
+- 6-Z215 (guest-bionic-first, commit 0c66e4e) targets the lineage init host-libc mismatch; needs CI round.
+- 6-Z216 (FB hook for AOSP-layout recoveries) targets the OrangeFox recovery gr_fb_width crash loop; needs CI round.
+- Known remaining: twrp-3.7.0_9-0-angler terminal FAIL regression; lineage re-verification; possible binder Parcel secondary issue for OrangeFox.
+- Artifacts: /home/z/my-project/artifacts/ver8e2/<run-id>/ + /home/z/my-project/artifacts/orangefox-img/ofx/ (extracted system/bin/recovery, libminuitwrp.so, libbinder.so for symbolization).
