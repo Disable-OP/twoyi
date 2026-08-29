@@ -10525,7 +10525,16 @@ pub fn run_ptrace_loop(
         // NEW forked child stops before the resumed child does. We
         // update `current_pid` to the actually-waited child below.
         let mut status: libc::c_int = 0;
-        let waited = unsafe { libc::waitpid(-1, &mut status, 0) };
+        // 6-Z211d: use __WALL to ensure ptrace-traced THREADS (clone
+        // children with CLONE_THREAD) are reaped. Without __WALL,
+        // waitpid(-1, 0) only reaps fork children — ptrace-traced
+        // threads may be missed if the kernel doesn't auto-include
+        // them. This is the suspected root cause of the mount()
+        // syscall-stop not being delivered (H1b): the parent thread
+        // (2594) calls mount() after resuming, but its syscall-stop
+        // is never reaped by waitpid because __WALL was not set.
+        // __WALL = 0x40000000 (include all children, clone + fork).
+        let waited = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
         if waited == -1 {
             let e = std::io::Error::last_os_error();
             log(&format!("waitpid failed: {}", e));
