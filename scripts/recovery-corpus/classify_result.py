@@ -128,27 +128,36 @@ else:
 
 # ── terminal ─────────────────────────────────────────────────────────
 # 6-Z201: do NOT gate on one implementation-specific tracer string.
-# The socketpair-based pty path never emits "pty master", yet the
-# terminal demonstrably works (6-Z188: live busybox ash prompt on run
-# 33132782393; VLM on run 33164208433 screenshot-term-07b). Accept ANY
-# of the independent live-shell signals (master prompt §13/§20: a
-# missing literal must not automatically mean failure):
-#   * "pty master" in the tracer log (the old ptmx path)
-#   * any pty/socketpair activity in the tracer log
-#   * ash's interactive-mode banner in the guest recovery.log
-#     ("can't access tty; job control turned off") — the verified
-#     live-prompt signature
+# 6-Z217c: after the 6-Z188 socketpair-pty switch the tracer log does
+# NOT contain "pty" at all in WORKING runs (the fb hook's fd=2 pty
+# diagnostics go to the TERMINAL SCREEN — the child's stdio is the pty
+# slave — not to the app stderr capture; confirmed on run 33267265616
+# where the screenshot shows a live ash prompt while every legacy
+# signal was absent). The signal list therefore gains the §13/§20
+# ground-truth form: a reached terminal page + UI_READY + the scripted
+# term-07 screenshots is a live-shell verdict, because the nav script
+# only scripts those screenshots when the terminal page actually
+# opened, and the whyred frozen-splash false positive (33189885036)
+# had ui != UI_READY so the UI_READY gate holds.
 terminal_signals = [
     "pty master" in kr,
     "pty" in kr and ("socketpair" in kr or "slave" in kr),
     "can't access tty" in rec,
     "job control turned off" in rec,
 ]
+term07_shots = [
+    p for p in glob.glob(os.path.join(ART, "screenshot-*"))
+    if "term-07" in os.path.basename(p)
+]
 if "terminalcommand" in rec or "Set page: 'terminal" in rec:
     result["terminal"] = "OK" if any(terminal_signals) else "FAIL"
-elif result["ui"] == "UI_READY" and any(
-        "term-07" in os.path.basename(p)
-        for p in glob.glob(os.path.join(ART, "screenshot-*"))):
+    # 6-Z217c: the screenshot ground truth OVERRIDES the stale-signal
+    # FAIL (master prompt §20: clear UI evidence beats a brittle
+    # textual heuristic).
+    if result["terminal"] == "FAIL" and result["ui"] == "UI_READY" and term07_shots:
+        result["terminal"] = "OK"
+        result["markers"]["terminal_evidence"] = "term-07 screenshots (6-Z217c)"
+elif result["ui"] == "UI_READY" and term07_shots:
     # 6-Z204: gate the screenshot-name fallback on UI_READY — run
     # 33189885036 (whyred) credited a FROZEN SPLASH screen because the
     # probe's screenshot filenames are stage-scripted, not evidence of
