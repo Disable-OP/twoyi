@@ -40,6 +40,12 @@
 #define TWOYI_MS_BIND         4096
 #define TWOYI_MS_REC          16384
 #define TWOYI_MS_REMOUNT      32
+// 6-Z214: propagation flags — mount-namespace reconfiguration ops.
+#define TWOYI_MS_UNBINDABLE   131072  /* 1 << 17 */
+#define TWOYI_MS_PRIVATE      262144  /* 1 << 18 */
+#define TWOYI_MS_SLAVE        524288  /* 1 << 19 */
+#define TWOYI_MS_SHARED       1048576 /* 1 << 20 */
+#define TWOYI_MS_MOVE         8192    /* 1 << 13 */
 
 // A single mount entry in the virtual mount table.
 struct twoyi_mount_entry {

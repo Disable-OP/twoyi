@@ -198,22 +198,39 @@ static long emulate_mount(const char *source, const char *target,
         if (g_mount_table[i].active &&
             strncmp(g_mount_table[i].target, target, MOUNT_PATH_MAX) == 0) {
 
-            // Handle MS_REMOUNT (VM: "mount_mgr: already latest")
-            if (flags & MS_REMOUNT) {
+            // 6-Z214: propagation / remount / move ops reconfigure the
+            // EXISTING entry — never a duplicate-mount EBUSY. AOSP init's
+            // SetupMountNamespaces issues mount(nullptr, "/apex", nullptr,
+            // MS_PRIVATE) on an already-recorded /apex; the old code
+            // returned -EBUSY and init aborted fatally with
+            // InitFatalReboot (the r14-r25 OrangeFox/Lineage blocker).
+            // Semantics mirror is_mount_propagation_op in
+            // twoyi_loader_shlib.c (see the full rationale there).
+            {
+                const unsigned long prop_mask = MS_REMOUNT | MS_MOVE |
+                                                MS_UNBINDABLE | MS_PRIVATE |
+                                                MS_SLAVE | MS_SHARED;
+                if (flags & prop_mask) {
+                    g_mount_table[i].flags = flags;
+                    pthread_mutex_unlock(&g_mount_lock);
+                    return 0;
+                }
+            }
+
+            // Bind-mount ONTO an already-mounted target is legal Linux
+            // semantics (stacked bind mounts). Virtualize as success.
+            if (flags & MS_BIND) {
+                if (source && strncmp(source, target, MOUNT_PATH_MAX) == 0) {
+                    pthread_mutex_unlock(&g_mount_lock);
+                    return -EINVAL; // self-bind loop (unchanged)
+                }
                 g_mount_table[i].flags = flags;
                 pthread_mutex_unlock(&g_mount_lock);
                 return 0;
             }
 
-            // Handle MS_BIND — check for bind loop
-            // (VM: "mount_mgr: bind loop detected %s")
-            if ((flags & MS_BIND) && source &&
-                strncmp(source, target, MOUNT_PATH_MAX) == 0) {
-                pthread_mutex_unlock(&g_mount_lock);
-                return -EINVAL;
-            }
-
-            // Duplicate mount — return EBUSY
+            // Plain (non-bind, non-propagation) re-mount of a live
+            // target: real kernel returns EBUSY — keep that semantic.
             pthread_mutex_unlock(&g_mount_lock);
             return -EBUSY;
         }

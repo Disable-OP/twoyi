@@ -18687,3 +18687,324 @@ Stage Summary:
      interception (6-Z210) starts firing.
   3. Aggregate fresh corpus verdicts; cluster failures by subsystem (§36)
      and fix the most common blockers first (generic, not per-device).
+---
+Task ID: 6-Z213-mon
+Agent: CI monitor sub-agent
+Task: Monitor 5 dispatched E2E runs on f0ac758, download artifacts, extract verdicts + 6-Z213 forensics.
+
+Work Log:
+- Decoded the GitHub token from /home/z/.git-credentials silently (note: the
+  file actually holds a RAW github_pat_ fine-grained token, not base64 —
+  https://Disable-OP:<token>@github.com; used only in Authorization headers,
+  never printed).
+- T+90s first poll of GET /repos/Disable-OP/twoyi/actions/runs?per_page=30:
+  found all 5 workflow_dispatch runs on head f0ac758 created 16:03:30-16:04:00Z
+  (all in_progress): 33261921467 (#190), 33261939673 (#191), 33261940845
+  (#192), 33261942105 (#193), 33261943269 (#194). Workflow display_title is
+  just the workflow name, so runs were mapped to recovery images from each
+  E2E job's step log ("RECOVERY_NAME:" env dump + "Downloading recovery
+  image:" line; job log API, fetched at completion).
+- Polled every ~3 min (poll log: /home/z/my-project/artifacts/r25/poll.log;
+  poller scripts poller.sh/poll_once.sh in the same dir; foreground polling —
+  nohup background jobs do NOT survive between tool calls in this sandbox).
+  All 5 runs completed by 16:21:35Z (durations 8.9-15.2 min; none stuck,
+  40-min bound and 20-poll cap never reached; 4 polls used).
+- Per run: downloaded artifact ui-e2e-arm64-logs (artifact ids 9717677126,
+  9717623310, 9717603435, 9717601443, 9717680934), unzipped, untarred
+  ui-e2e-logs.tar.xz, and copied contents to
+  /home/z/my-project/artifacts/r25/<recovery-name>/ (result.json,
+  result-pretty.json, kr64-app-stderr-dockerexec.log, screenshots, logcat).
+  Recovery-name mapping files: /home/z/my-project/artifacts/r25/rid_<id>/recovery-name.txt.
+  Run→recovery mapping verified from job logs: 33261921467=orangefox-R12.0-lavender
+  (md5 8dd3688b814fc99f8251e3c749812d92 OK), 33261939673=twrp-2.8.7.0-angler,
+  33261940845=twrp-3.7.0_9-0-angler, 33261942105=twrp-3.7.0_9-0-whyred,
+  33261943269=lineage-22.2-sailfish (no md5, mirrorbits.lineageos.org boot.img).
+- 6-Z213 forensics on orangefox kr64-app-stderr-dockerexec.log (46333 lines):
+  counted RAW STOP/RESUME lines, verified consecutive numbering #1..N (cap
+  30000 NOT hit -> complete waitpid coverage), cross-tabulated wstopsig and
+  ptrace_event distributions, checked every wstopsig=5 stop's surrounding
+  lines for broad-DIAG presence, dumped the ±60-line window around the first
+  "Failed to remount /apex" (log line 45352; saved to
+  /home/z/my-project/artifacts/r25/orangefox-R12.0-lavender/6-Z213-window-around-apex-failure.txt).
+- Cross-checked the other 4 runs' logs for mount() ENTRY / nr=40 evidence
+  (they DO get mount stops — see Stage Summary).
+- Wrote machine-readable aggregate: /home/z/my-project/artifacts/r25/r25-summary.json.
+- No source code modified.
+
+Stage Summary:
+- Per-run verdicts (workflow conclusion was "success" for ALL 5 — verdicts
+  below are from artifact result.json):
+  * orangefox-R12.0-lavender  run 33261921467: boot=BOOT_FAIL ui=NOT_REACHED
+    terminal=NOT_APPLICABLE vfs=CLEAN overall=BOOT_FAIL_EARLY_INIT
+    (markers: failure=init_fatal_reboot, exit_code=127, backstop_denied=2).
+  * twrp-2.8.7.0-angler  run 33261939673: boot=BOOT_OK ui=UI_READY
+    terminal=OK vfs=CLEAN overall=UI_READY (recovery_instances=2, 12 filemanager
+    pages visited, backstop_denied=27, battery_ok=true, vibrator_ok=true).
+  * twrp-3.7.0_9-0-angler  run 33261940845: boot=BOOT_OK ui=UI_READY
+    terminal=FAIL vfs=CLEAN overall=UI_READY (terminal page visited but no
+    interactive shell signals; backstop_denied=2).
+  * twrp-3.7.0_9-0-whyred  run 33261942105: boot=BOOT_OK ui=UI_READY
+    terminal=OK vfs=CLEAN overall=UI_READY (recovery_instances=1,
+    backstop_denied=9).
+  * lineage-22.2-sailfish  run 33261943269: boot=BOOT_FAIL ui=NOT_REACHED
+    terminal=NOT_APPLICABLE vfs=CLEAN overall=BOOT_FAIL (sigsegv_count=8;
+    SIGSEGV in thread comm "twoyi_init", pid 2583, 1 thread alive; died at
+    RAW STOP #3744 — guest init crashed before any mount attempt).
+  Score this batch: 3/5 UI_READY (all three TWRP), 2/5 BOOT_FAIL.
+- 6-Z213 forensic findings for orangefox (the r25 hypothesis test):
+  * RAW STOP lines: 14516 (consecutive #1..#14516, cap 30000 not hit —
+    COMPLETE waitpid coverage of the whole boot). RESUME lines: 14514
+    (consecutive #1..#14514). Delta = 4 skip_next_resume events
+    (6-Z211e skips at clone/fork/2 exits) + 2 special-path resumes.
+  * "6-Z210 DIAG: mount() ENTRY": 0 hits. "nr=40" appears NOWHERE in the
+    file (0 broad-DIAG nr=40, 0 raw nr=40); umount2 (39) and pivot_root (41)
+    also 0. Broad DIAG (6-Z210) lines: 14503 == exactly the count of
+    wstopsig=133 (SIGTRAP|0x80) syscall-stops — EVERY syscall-stop reached
+    the dispatcher and was classified with a syscall number. There are NO
+    unaccounted waitpid returns and NO silently-consumed stops: all 13
+    non-133 stops are logged event stops (8x wstopsig=5, 2x 19, 3x 127).
+    => Hypothesis (b) [dispatcher routes mount stops silently] is DISPROVED.
+    The mount() calls execute in an execution context waitpid NEVER sees.
+  * wstopsig=5 (SIGTRAP family) RAW STOPs: 8 total — 3x PTRACE_EVENT_EXEC
+    (ev=4), 1x CLONE (ev=3), 1x FORK (ev=1), 3x EXIT (ev=6). All 8 were NOT
+    followed by a "6-Z210 DIAG (broad)" line (expected: none are
+    syscall-stops) and ALL 8 were immediately preceded by a 6-Z213 RESUME of
+    the guest-init pid 2570 (this run's init family; r24's "2580" maps to
+    2570 here). Count for the requested metric: 8. None were consumed
+    silently — each has its own explicit "SIGTRAP stop (no 0x80)" +
+    PTRACE_EVENT_* handler log.
+  * Window around "Failed to remount /apex" (log line 45352, loop ~14209):
+    2570's kmsg write EXIT is DIAG'd (broad #14209 nr=64); then ONLY 2671's
+    epoll_ctl stop (broad #14210, loop 14210) intervenes; 2570's next DIAG'd
+    stop is write ENTRY (broad #14211 nr=64, loop 14211). The mount()+EBUSY
+    executed between 2570's write-EXIT stop (loop 14209, properly resumed via
+    RESUME #14214) and its next stop — INVISIBLE to waitpid, exactly like
+    r24, now proven at the raw-waitpid level. Failure chain: "<3>init:
+    Failed to remount /apex as 40000: Device or resource busy" (DIAG write
+    fd=67) -> glog F/abort "SetupMountNamespaces failed: Device or resource
+    busy" (2x) -> "<2>init: SetupMountNamespaces failed" -> clone() of 2672
+    -> ALL 3 tracked pids exit code 127 (status 0x7f00) -> "6-Z97: init_pid
+    2672 exited 127 and no traced child is alive — ending the ptrace loop
+    (return 127)". init (2570) had 14379 syscall stops, 2671 27, 2672 97.
+  * tracked_pids evolution: [2570] -> [2570,2671] (PTRACE_EVENT_CLONE
+    auto-attach + SIGSTOP consumed, RESUME #14160) -> [2570,2671,2672]
+    (PTRACE_EVENT_FORK, RESUME #14230) -> [2672]. No pid ever appeared
+    outside this set.
+  * 6-Z190 coverage watchdog: 0 "ATTACHED" lines and 0 mentions of any kind.
+    The 4000-iteration/2s cadence gates were crossed ~3x (loop 4000/8000/
+    12000, failure at ~14224), so the sweep had opportunity to fire; it
+    found/attached NOTHING. Caveat: the sweep only logs on attach, so
+    absence of lines is not positive proof of execution — but combined with
+    the airtight tracked-pid accounting, no /proc-visible untraced
+    guest-tree process exists. The invisible mount() context is NOT an
+    untraced guest-tree process findable by the current sweep (threads of a
+    traced pid are the remaining suspect, or a sweep scoping blind spot).
+  * KEY CONTRAST (cross-run): the SAME 6-Z213 instrumentation on the three
+    TWRP runs shows mount stops ARE delivered there — twrp-2.8.7.0-angler:
+    42 mount() ENTRY diags, 149 nr=40 broad diags (22738 raw stops);
+    twrp-3.7.0_9-0-angler: 41 mount ENTRY (22185 raw stops);
+    twrp-3.7.0_9-0-whyred: 44 mount ENTRY, 186 nr=40 (22783 raw stops).
+    So the tracer/ptrace plumbing is sound: mount-invisibility is specific
+    to the OrangeFox (Lineage 22.2-based) init execution shape. (Note: TWRP
+    mount ENTRY args decode as src/tgt/fstype "(null)" — arg decoding is
+    broken even when the stop arrives; separate issue worth a task.)
+- NEXT CONCRETE ACTIONS:
+  1. The mount() calls that never trap must come from a THREAD of a traced
+     process (PTRACE_EVENT_CLONE with CLONE_THREAD should fire but may be
+     missed pre-SETOPTIONS) — extend 6-Z190 sweep to scan /proc/<pid>/task/
+     and log "sweep fired, found 0" so absence becomes positive evidence.
+  2. Investigate why OrangeFox init's mount() bypasses the tracee while
+     TWRP init's mount() traps (compare: does OrangeFox init use a thread
+     pool/worker for SetupMountNamespaces? does it re-exec?).
+  3. Lineage 22.2 sailfish SIGSEGV in twoyi_init (pid 2583, 8 segvs) is a
+     distinct early-crash blocker — grab its SIGSEGV stack window from the
+     artifact (kr64-app-stderr-dockerexec.log tail) and root-cause.
+  4. twrp-3.7.0_9-0-angler terminal=FAIL (ash banner absent) is the only
+     non-boot regression in an otherwise-UI_READY run.
+- Artifacts preserved under /home/z/my-project/artifacts/r25/ (per-recovery
+  dirs + rid_<run_id> dirs + poll.log + r25-summary.json).
+
+## Task ID: 6-Z213-mon — CI monitor for the 5 re-dispatched r25 runs (head f0ac758)
+
+- Date: 2026-08-29 (UTC). Scope: poll `GET /repos/Disable-OP/twoyi/actions/runs?per_page=40`
+  for workflow "UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)", head_sha f0ac758*,
+  created after 2026-08-29T16:00:00Z; download `ui-e2e-arm64-logs` artifacts; extract
+  result.json + kr64-app-stderr-dockerexec.log; orangefox forensics; no source changes.
+- POLL RESULT: all 5 target runs found on the FIRST poll (16:37Z), already
+  `completed/success` (the E2E workflow itself exits 0; the verdict lives in
+  result.json). No further polls needed (0 of max 15 used; 180s loop not entered).
+  Runs (creation order == dispatch order):
+  1. 33261921467 (#190, 16:03:30Z) -> orangefox-R12.0-lavender
+  2. 33261939673 (#191, 16:03:55Z) -> twrp-2.8.7.0-angler
+  3. 33261940845 (#192, 16:03:57Z) -> twrp-3.7.0_9-0-angler
+  4. 33261942105 (#193, 16:03:58Z) -> twrp-3.7.0_9-0-whyred
+  5. 33261943269 (#194, 16:04:00Z) -> lineage-22.2-sailfish
+- NAME MAPPING VERIFIED two ways: (a) creation-order match to the 5 dispatches;
+  (b) artifact content cross-check — "lavender" x5 mentions only in run 1 logs,
+  "TWRP 2.8.7.0" banner in run 2, "8994" (msm8994/Nexus 6P SoC) x13 in run 3,
+  "whyred" x42 in run 4, "sailfish" x7 in run 5. Also matches rid_<id>/
+  recovery-name.txt from the earlier r25 session.
+- ARTIFACTS: `ui-e2e-arm64-logs` downloaded via
+  `GET /actions/artifacts/<id>/zip` (ids 9717677126 / 9717623310 / 9717603435 /
+  9717601443 / 9717680934), extracted to
+  /home/z/my-project/artifacts/r25/{orangefox,twrp280,twrp370-angler,twrp370-whyred,lineage}/
+  (zip -> ui-e2e-logs.tar.xz -> tmp/ui-e2e-artifacts/...). result.json + log copied per dir.
+
+- PER-RUN VERDICTS (result.json, schema twoyi.recovery.result/1):
+  | run | boot | ui | terminal | vfs | overall | notes |
+  |---|---|---|---|---|---|---|
+  | orangefox-R12.0-lavender | BOOT_FAIL | NOT_REACHED | NOT_APPLICABLE | CLEAN | BOOT_FAIL_EARLY_INIT | failure=init_fatal_reboot, exit_code=127, backstop_denied=2, recovery_instances=0 |
+  | twrp-2.8.7.0-angler | BOOT_OK | UI_READY | OK | CLEAN | UI_READY | battery_ok=true, vibrator_ok=true, backstop_denied=27, 12 filemanager pages, 2 recovery instances |
+  | twrp-3.7.0_9-0-angler | BOOT_OK | UI_READY | FAIL | CLEAN | UI_READY | terminal regression persists (ash banner absent); pages reach advanced/terminalcommand/filemanager; 2 recovery instances |
+  | twrp-3.7.0_9-0-whyred | BOOT_OK | UI_READY | OK | CLEAN | UI_READY | backstop_denied=9, 1 recovery instance |
+  | lineage-22.2-sailfish | BOOT_FAIL | NOT_REACHED | NOT_APPLICABLE | CLEAN | BOOT_FAIL | sigsegv_count=8 in early init (pre-mount); backstop_denied=2; recovery_instances=0 |
+  Bottom line: 3/5 UI_READY (all TWRP), 2/5 boot failures (OrangeFox early-init
+  mount/-EBUSY chain; Lineage 22.2 SIGSEGV) — same picture as the previous r25
+  session; no regression/no change between the two artifact sets.
+
+- ORANGEFOX FORENSICS (kr64-app-stderr-dockerexec.log, 46333 lines; identical
+  counts in kr64-app-stderr.log):
+  * "6-Z213 RAW STOP #" lines: 14516 (counter consecutive #1..#14516)
+  * "6-Z213 RESUME #"  lines: 14514 (counter consecutive #1..#14514)
+    Delta=2 explained by the tail: last two stops of pid 2672 are
+    RAW STOP #14515 (status=0x0006057f, wstopsig=5, PTRACE_EVENT_EXIT=6,
+    handled via 6-Z78 "falling through to standard resume" -> RESUME #14514)
+    and RAW STOP #14516 (status=0x00007f00 = exit(127)) which never gets a
+    resume — "genuine init exit, ending the ptrace loop (return 127)".
+  * "6-Z210 DIAG: mount() ENTRY": 0  (that instrumentation string is absent in
+    this build/log; the only Z210 lines are "6-Z210 DIAG (broad): syscall-stop
+    ... abi.mount=40 [broad #N/20000]" — 14503 of them, matching loop_count;
+    no nr=40-specific ENTRY diag ever fires)
+  * "6-Z190 coverage watchdog ATTACHED": 0 (absent; no watchdog attach line)
+  * Raw-stop/resume sequence around FIRST "Failed to remount /apex" (log line
+    45353; full ±40-line window saved to
+    artifacts/r25/orangefox/6-Z213-window-around-first-apex-failure_L45353.txt):
+    - Tight 1:1 RAW STOP/RESUME alternation between pid 2570 (guest init) and
+      pid 2671 (clone child), every stop status=0x0000857f wstopsig=133
+      (PTRACE syscall-stop), interleaved with "6-Z210 DIAG (broad)" lines at
+      loop_count 14197..14213, abi.mount=40, in_syscall alternating true/false
+      (syscall-enter/exit pairs).
+    - L45351: RAW STOP #14214 pid=2570 -> L45352 broad diag nr=64 (write) in_syscall=true
+      -> L45353: DIAG write(fd=67): "<3>init: Failed to remount /apex as 40000:
+      Device or resource busy\n"  -> L45354: RESUME #14214 pid=2570.
+      I.e. the kernel error string is written from INSIDE the stopped window of
+      init pid 2570; the stop/resume machinery is fully functional here.
+    - L45364-45366: RAW STOP #14218 pid=2570 -> broad diag nr=64 in_syscall=true
+      -> DIAG write(fd=68): "[glog F/abort] SetupMountNamespaces failed: Device
+      or resource busy\n" -> RESUME #14218 (3 such abort writes total: L45366,
+      L45392, plus "<2>init: SetupMountNamespaces failed" L45399).
+    - L45375-45376: pid 2570 nr=222 mmap2 ENTRY anon/private (glog abort path
+      allocating buffer) — stop/resume continues normally through it.
+    - After the abort chain init forks 2672 (second init instance), tracked_pids
+      evolves [2570] -> [2570,2671] -> [2570,2671,2672] -> [2570,2672] -> [2672];
+      final child 2672 exits 127 -> overall BOOT_FAIL_EARLY_INIT.
+  * Interpretation (consistent with prior session): tracer plumbing works —
+    syscall stops ARE delivered and resumed correctly right through the failing
+    window; but NO mount() ENTRY stop is ever observed for OrangeFox init
+    (0 mount ENTRY diags, 0 watchdog ATTACHED), so the /apex -EBUSY remount
+    failure is never intercepted. Cross-run contrast on the same head: TWRP
+    runs DO get mount stops (this session's logs show "TWRP 2.8.7.0"/3.7.0_9
+    banners booting to UI_READY), reinforcing that mount-invisibility is
+    specific to the OrangeFox/Lineage-init execution shape (thread-of-tracee
+    or pre-SETOPTIONS clone window remain the main suspects).
+
+- NEXT ACTIONS:
+  1. Extend the 6-Z190 sweep to enumerate /proc/<pid>/task/ threads of traced
+     pids and log "sweep fired, found 0" (turn absence into positive evidence).
+  2. Root-cause OrangeFox init mount() not trapping (thread pool? re-exec?)
+     vs TWRP init where mount() stops arrive.
+  3. lineage-22.2-sailfish: extract SIGSEGV stack window for twoyi_init
+     (pid 2583, 8 segvs) from kr64-app-stderr-dockerexec.log tail.
+  4. twrp-3.7.0_9-0-angler terminal=FAIL is the only non-boot regression;
+     investigate ash/banner shell spawn.
+- Artifacts: /home/z/my-project/artifacts/r25/{orangefox,twrp280,twrp370-angler,twrp370-whyred,lineage}/
+  (+ prior-session dirs rid_*/ and *-<recovery-name>/ preserved untouched).
+
+---
+Task ID: 6-Z214
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-29
+Task: Root-cause and fix the OrangeFox/Lineage SetupMountNamespaces EBUSY blocker (r14-r25, 12 rounds).
+
+Work Log:
+- 6-Z213-mon sub-agent results (5 E2E runs on f0ac758): twrp-2.8.7.0-angler
+  UI_READY (terminal OK), twrp-3.7.0_9-0-angler UI_READY (terminal FAIL —
+  separate regression), twrp-3.7.0_9-0-whyred UI_READY + terminal OK (the
+  whyred property blocker is FIXED), orangefox-R12.0-lavender
+  BOOT_FAIL_EARLY_INIT (same /apex EBUSY), lineage-22.2-sailfish BOOT_FAIL
+  with sigsegv_count=8 pre-mount (NEW blocker class, needs its own round).
+- 6-Z213 RAW STOP forensics (orangefox r25, run 33261921467): census is
+  COMPLETE and AIRTIGHT — 14516 raw stops total: 14503 syscall-stops
+  (wstopsig=133), 8 event stops (wstopsig=5: 3 EXEC + 1 CLONE + 1 FORK +
+  3 EXIT), 3 exit-shape (0x7f00), 2 auto-attach SIGSTOP (19). ZERO
+  signal-delivery-stops of ANY kind, ZERO unaccounted stops. RAW STOP
+  count (14516) vs RESUME count (14514) differ by exactly the 2 tail
+  stops that never get resumed (event-exit + terminal exit). The kernel
+  genuinely NEVER reports a mount-family syscall-stop.
+- THE MECHANISM (finally, and it was hiding in plain sight):
+  twoyi_loader_shlib.c PLT-INTERPOSES mount()/umount2() in the guest
+  (loaded via LD_PRELOAD / custom PT_INTERP for dynamic guests — the
+  loader demonstrably runs: the 6-Z97 daemonize re-anchor pattern fires
+  in every r25 log). The interposer returns WITHOUT issuing a real
+  mount(2) syscall — hence NO kernel syscall-stop, hence ZERO nr=40 in
+  every census since r14. The whole ptrace stop-delivery investigation
+  was chasing a syscall that never entered the kernel.
+  THE BUG: the interposer's already-mounted branch special-cased ONLY
+  MS_REMOUNT; every other flags value on a recorded target fell through
+  to "duplicate mount → errno=EBUSY". AOSP init's SetupMountNamespaces
+  does mount(nullptr, "/apex", nullptr, MS_PRIVATE (0x40000) [, MS_REC])
+  on the already-recorded /apex → EBUSY → "[glog F/abort] SetupMount-
+  Namespaces failed" → InitFatalReboot → exit_group(127). The r25 window
+  (RAW STOP #14210 resume → #14212 write ENTRY, no stop in between) is
+  exactly a PLT-interposed userspace return between two traced syscalls.
+  The Rust-side 6-Z210 fake-success (2258271) could never fire because
+  there was no syscall to intercept — it fixed the wrong layer.
+- THE FIX (6-Z214) — applied to ALL FOUR mount virtualization paths with
+  identical semantics:
+  * twoyi_loader_shlib.c PLT mount() interposer (the production path for
+    dynamic guests — the failing ones are all dynamic):
+    - is_mount_propagation_op(flags): MS_PRIVATE|MS_SLAVE|MS_SHARED|
+      MS_UNBINDABLE|MS_REMOUNT|MS_MOVE → update the existing entry's
+      flags, return 0 (never EBUSY).
+    - MS_BIND onto an already-mounted target → 0 (stacked binds are
+      legal Linux semantics; AOSP init MountDir does mkdir + MS_BIND).
+    - plain duplicate mount (no bind/propagation bits) → EBUSY (kept).
+  * twoyi_loader_shlib.c emu_mount (SIGSYS path) — same semantics.
+  * twoyi_loader.c mount emulation (non-shlib loader variant) — same.
+  * mount_table.c twoyi_mount_emulate (sigsys_handler.c path) — same,
+    with TWOYI_MS_UNBINDABLE/PRIVATE/SLAVE/SHARED/MOVE added to
+    mount_table.h.
+- NEW REGRESSION TEST: app/cpp/twoyi_loader/test_mount_table.c — 15
+  host-compiled assertions covering the exact failure sequence (initial
+  /apex mount → MS_PRIVATE → MS_PRIVATE|MS_REC → MS_SLAVE/SHARED/
+  UNBINDABLE → MS_REMOUNT → stacked bind → self-bind loop → plain
+  duplicate EBUSY → /dev no-op → umount/remount → lenient propagation
+  on unmounted target). ALL 15 PASS locally. Wired into kr64-tests.yml
+  as a new "Run loader mount-table C tests (6-Z214)" step (host gcc,
+  no NDK needed).
+- The fix is GENERIC (§22): it keys on the mount(2) flags BIT PATTERN,
+  not on device/recovery identity. Every Android 11+ dynamic recovery
+  whose init runs SetupMountNamespaces benefits: all Lineage-family
+  (297 corpus entries) + OrangeFox (151) + modern TWRP (dyn) images.
+
+Stage Summary:
+- ROOT CAUSE (r14-r25, 12 rounds): loader PLT mount() interposer
+  returned -EBUSY for propagation ops on already-recorded targets; the
+  interposer never issues a syscall, which is why the tracer never saw
+  mount stops (the 10-round ptrace stop-delivery hunt was a wild
+  goose chase through a correct dispatcher).
+- 4 virtualization paths fixed + 15-assertion regression test (passing)
+  + CI wiring. The fix lives at the virtualization layer (§37: generic
+  mechanism, not recovery-specific hacks).
+- 6-Z213 RAW STOP/RESUME forensics stay in (cheap, 30k-capped) — they
+  are now the definitive detector for ANY future "syscall executed
+  without a stop" class bug.
+- NEW/REMAINING BLOCKERS (priority order):
+  1. VERIFY the /apex fix on-device: dispatch orangefox-R12.0-lavender +
+     lineage-22.2-sailfish E2E (next commit).
+  2. lineage-22.2-sailfish: sigsegv_count=8 pre-mount (NEW — extract
+     the SIGSEGV si_addr/rip + faulting binary from r25 artifacts).
+  3. twrp-3.7.0_9-0-angler terminal FAIL regression (was OK at
+     run 33132782393) — bisect between then and f0ac758.
+- NEXT: commit 6-Z214, dispatch the two failing recoveries + the three
+  regression guards (TWRP 2.8/3.7/whyred must stay green).

@@ -43,6 +43,20 @@ static void safe_strncpy(char *dst, const char *src, size_t n) {
     dst[i] = '\0';
 }
 
+// 6-Z214: mount-PROPAGATION / REMOUNT / MOVE flag detection — the SIGSYS
+// mirror of the PLT-interposer fix in twoyi_loader_shlib.c (same root
+// cause: AOSP init SetupMountNamespaces does mount(nullptr, "/apex",
+// nullptr, MS_PRIVATE) on an already-recorded target; the old emulation
+// returned -EBUSY for it because only MS_REMOUNT was special-cased).
+// Propagation ops reconfigure an EXISTING mount — they never create a
+// duplicate — so the "duplicate mount → -EBUSY" path must NOT fire.
+static int is_propagation_or_remount(unsigned long flags) {
+    const unsigned long PROP_MASK = TWOYI_MS_REMOUNT | TWOYI_MS_MOVE |
+                                    TWOYI_MS_UNBINDABLE | TWOYI_MS_PRIVATE |
+                                    TWOYI_MS_SLAVE | TWOYI_MS_SHARED;
+    return (flags & PROP_MASK) != 0;
+}
+
 // Check if a path is in the special_paths list.
 static bool is_special_path(const char *target) {
     if (!target) return false;
@@ -109,18 +123,29 @@ long twoyi_mount_emulate(const char *source, const char *target,
     // Check if target is already mounted.
     int existing = find_mount_by_target(target);
     if (existing >= 0) {
-        // Handle MS_REMOUNT — update flags on existing entry.
-        if (flags & TWOYI_MS_REMOUNT) {
+        // 6-Z214: propagation / remount / move ops reconfigure the
+        // EXISTING entry — update flags and succeed. These are NOT
+        // duplicate mounts: AOSP init's SetupMountNamespaces issues
+        // mount(nullptr, "/apex", nullptr, MS_PRIVATE) on an
+        // already-recorded /apex, and the old code returned -EBUSY,
+        // which init treats as a FATAL SetupMountNamespaces failure
+        // (InitFatalReboot — the r14-r25 OrangeFox/Lineage blocker).
+        if (is_propagation_or_remount(flags)) {
             mount_table[existing].flags = flags;
             return 0;
         }
-        // Handle MS_BIND — VM detects bind loops.
-        // If source == target, it's a bind loop.
-        if ((flags & TWOYI_MS_BIND) && source &&
-            strncmp(source, target, TWOYI_MOUNT_PATH_MAX) == 0) {
-            return -EINVAL; // bind loop detected
+        // Bind-mount ONTO an already-mounted target is legal Linux
+        // semantics (stacked bind mounts — AOSP init's MountDir does
+        // mkdir + MS_BIND onto live dirs). Virtualize as success.
+        if (flags & TWOYI_MS_BIND) {
+            if (source && strncmp(source, target, TWOYI_MOUNT_PATH_MAX) == 0) {
+                return -EINVAL; // self-bind loop detected (unchanged)
+            }
+            mount_table[existing].flags = flags;
+            return 0;
         }
-        // Duplicate mount — return EBUSY (Linux mount(2) semantics).
+        // Plain (non-bind, non-propagation) re-mount of a live target:
+        // real kernel returns EBUSY — keep that semantic.
         return -EBUSY;
     }
 
