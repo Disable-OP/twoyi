@@ -185,15 +185,25 @@ if fb_lines:
 # (core.rs twrp_fb_render_loop) logs one TWOYI_DIAG line per milestone:
 #   "TWRP-FB first frame blitted to surface (...)"
 #   "TWRP-FB frame #<n> blitted digest=<fnv1a> center=[r,g,b,a]"
-# (the digest line is rate-capped to every ~120th changed frame).
+# (the digest line is rate-capped to every ~20th changed frame).
 # >= 2 DISTINCT digests with a rising frame counter = live, CHANGING
 # guest frames reached the screen (page transitions included) — the
 # acceptance signal for the OrangeFox display fix (run 33317227548:
 # guest UI alive internally but ZERO blit lines, screen stayed on the
 # loading texture forever).
+# Evidence source: the docker-exec logcat window often MISSES the app
+# process's own tags (the capture runs before/around the boot window),
+# so ALSO scan the FileLogger archives (app-logs/log/logcat.log*) that
+# the E2E pulls off /sdcard at teardown — verify run 33322760296: the
+# "Recovery (loader path) flag: true" + blit lines were ONLY in the
+# archives, the classifier then falsely read display_mode=gl.
+app_logcat = ""
+for _p in sorted(glob.glob(os.path.join(ART, "app-logs", "log", "logcat.log*"))):
+    app_logcat += read(os.path.relpath(_p, ART), 32 * 1024 * 1024)
+presentation_logcat = logcat + "\n" + app_logcat
 blit_frames = re.findall(
     r"TWOYI_DIAG.*?TWRP-FB frame #(\d+) blitted digest=([0-9a-f]+)",
-    logcat)
+    presentation_logcat)
 if blit_frames:
     last_n = max(int(n) for n, _ in blit_frames)
     digests = {d for _, d in blit_frames}
@@ -208,9 +218,9 @@ if blit_frames:
 else:
     result["markers"]["presentation"] = "NONE"
 # Which display mode did the app select? (Render2Activity logs both.)
-if re.search(r"Recovery \(loader path\) flag: true", logcat):
+if re.search(r"Recovery \(loader path\) flag: true", presentation_logcat):
     result["markers"]["display_mode"] = "recovery_loader"
-elif re.search(r"Boot Recovery \(TWRP\) flag: true", logcat):
+elif re.search(r"Boot Recovery \(TWRP\) flag: true", presentation_logcat):
     result["markers"]["display_mode"] = "twrp"
 else:
     result["markers"]["display_mode"] = "gl"
