@@ -16813,7 +16813,27 @@ pub fn run_ptrace_loop(
                             if dirfd == AT_FDCWD {
                                 if let Some(path) = read_child_string(pid, path_addr) {
                                     if path.starts_with('/') {
-                                        let translated = translate_path(rootfs, &path);
+                                        // 6-Z258c: use the SANDBOX translator —
+                                        // the standalone translate_path()
+                                        // constructs a fresh SandboxPolicy
+                                        // WITHOUT staging_dir, so its /data/*
+                                        // rule mistranslates the child's own
+                                        // host bootstrap paths
+                                        // ({data_dir}/cache/twoyi_init — the
+                                        // staged init copy!) into the sandbox
+                                        // where they don't exist → ENOENT →
+                                        // masked 0 → the exec bit never set →
+                                        // execve EACCES → loader exit 127 →
+                                        // the 781887c-wave linker64 crash
+                                        // class (MON-4: cereus/daisy/whyred,
+                                        // runs 33330412661/13764/17214). The
+                                        // 6-Z209d-iter2 wrapper is the
+                                        // production translator every other
+                                        // arm uses — with the staging-cache
+                                        // early-out that leaves the child's
+                                        // own paths untouched.
+                                        let translated =
+                                            translate_path_via_sandbox(&sandbox, rootfs, &path);
                                         if translated != path && scratch_addr != 0 {
                                             translated_applied = write_translated_path(
                                                 pid,
@@ -23563,6 +23583,47 @@ mod tests {
     // resolving against the HOST root; cereus's init survival was
     // host-socket timing luck). The kernel truncates dirfd to int —
     // the tracer must too.
+    // ── 6-Z258c: the fchmodat/fchownat arm MUST use the sandbox
+    // translator (staging-aware), never the standalone translate_path.
+    // MON-4 (runs 33330412661/13764/17214): the standalone version
+    // mistranslated the kr64 child's own bootstrap chmod of the staged
+    // init copy ({data_dir}/cache/twoyi_init) into the sandbox → ENOENT
+    // → masked 0 → exec bit never set → execve EACCES → loader exit
+    // 127 → a fresh linker64 crash class. The 6-Z209d-iter2 wrapper's
+    // staging-cache early-out is the difference. This test locks it.
+    #[test]
+    fn z258c_chmod_translation_must_use_staging_aware_translator() {
+        let rootfs = "/data/user/0/io.twoyi/rootfs";
+        let data_dir = "/data/user/0/io.twoyi";
+        let bootstrap_path = format!("{}/cache/twoyi_init", data_dir);
+        // The STANDALONE translator mistranslates the child's own host
+        // bootstrap path (this is the BUG — shown here to prove the
+        // hazard is real, mirroring the 6-Z209d evidence chain).
+        let mistranslated = translate_path(rootfs, &bootstrap_path);
+        assert_eq!(
+            mistranslated,
+            format!("{}/data/user/0/io.twoyi/cache/twoyi_init", rootfs),
+            "the standalone translator demonstrably mistranslates the \
+             staged-init chmod (the 6-Z258c hazard)"
+        );
+        // The SANDBOX translator (with staging_dir) leaves it untouched.
+        let sandbox = crate::vfs::SandboxPolicy::with_staging(rootfs, data_dir);
+        let translated = translate_path_via_sandbox(&sandbox, rootfs, &bootstrap_path);
+        assert_eq!(
+            translated, bootstrap_path,
+            "the staging-aware translator must pass the child's own \
+             bootstrap paths through untouched"
+        );
+        // ...while still translating genuine guest paths (the arm's
+        // real purpose — the property-socket chmod).
+        let guest_socket = "/dev/socket/property_service";
+        assert_eq!(
+            translate_path_via_sandbox(&sandbox, rootfs, guest_socket),
+            format!("{}{}", rootfs, guest_socket),
+            "guest /dev/socket paths must still translate (the 6-Z258 goal)"
+        );
+    }
+
     #[test]
     fn z258b_dirfd_reads_kernel_semantics() {
         // Zero-extended -100 (aarch64 w0 write, arm32/x86-compat slots).
