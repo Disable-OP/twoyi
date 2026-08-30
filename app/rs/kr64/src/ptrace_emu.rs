@@ -11332,10 +11332,16 @@ pub fn run_ptrace_loop(
             static RAW_STOP_LOGGED: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = RAW_STOP_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 30000 {
+            // 6-Z248: same treatment as the broad DIAG — hard cap 30000
+            // then 1-in-256 sampling, so the raw stop feed never fully
+            // goes dark on long boots (the ocean/kebab spin class ran
+            // its whole interesting window past this cap).
+            let sampled = n >= 30000 && (n % 256) == 0;
+            if n < 30000 || sampled {
                 log(&format!(
-                    "6-Z213 RAW STOP #{}: pid={} status=0x{:08x} wstopsig={} ptrace_event={}",
+                    "6-Z213 RAW STOP #{}{}: pid={} status=0x{:08x} wstopsig={} ptrace_event={}",
                     n + 1,
+                    if sampled { " (sampled)" } else { "" },
                     waited,
                     status as u32,
                     libc::WSTOPSIG(status),
@@ -12591,15 +12597,31 @@ pub fn run_ptrace_loop(
                     static BROAD_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let n = BROAD_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 20000 {
+                    // 6-Z248: the hard `n < 20000` cap blinded every long
+                    // boot past stop #20000 — the 3.7.0_11 AOSP-layout
+                    // spins (ocean/kebab run 33317324720) showed a
+                    // 30000-stop RAW STOP feed with ZERO syscall
+                    // identification in the interesting window (the RAW
+                    // STOP lines carry no syscall number; the informative
+                    // broad lines stopped 10000 stops earlier). Keep full
+                    // logging to 20000, then SAMPLE 1-in-64 (tagged) so a
+                    // spin loop's syscall SHAPE stays on the record for
+                    // the whole boot without flooding the log.
+                    let sampled = n >= 20000 && (n % 64) == 0;
+                    if n < 20000 || sampled {
+                        let tag = if n < 20000 {
+                            format!("broad #{}/20000", n + 1)
+                        } else {
+                            format!("sampled #{} past cap", n + 1)
+                        };
                         log(&format!(
-                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} [broad #{}/20000]",
+                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} [{}]",
                             syscall_num,
                             pid,
                             loop_count,
                             in_syscall,
                             abi.mount,
-                            n + 1,
+                            tag
                         ));
                     }
                 }
