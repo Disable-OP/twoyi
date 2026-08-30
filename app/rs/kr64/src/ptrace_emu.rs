@@ -10516,6 +10516,8 @@ pub fn run_ptrace_loop(
     // diverge from what the jailed child actually saw).
     let mut twres_diag_count: u64 = 0;
     let mut twres_dir_dumped: bool = false;
+    // 6-Z243: /twres stat-family result DIAG counter (first 40).
+    let mut twres_stat_diag_count: u64 = 0;
     // 6-Z170: stat-family +1-rewrite counter (first 20 logged).
     let mut stat_read_fail_rw_count: u64 = 0;
     // 6-Z173: unlink/unlinkat +1-rewrite counter (first 20 logged). Run
@@ -17129,6 +17131,43 @@ pub fn run_ptrace_loop(
                                         log(&format!(
                                             "6-Z169: open twres {:?} -> fd {} (occurrence {})",
                                             p, ret, twres_diag_count
+                                        ));
+                                    }
+                                }
+                                // ── 6-Z243: /twres stat-family result DIAG ──
+                                // Grouper class (run 33315005068): "E:Package
+                                // splash failed to load" with NO openat of
+                                // splash.xml in the trace — TWRP's
+                                // PageManager::LoadFileToBuffer stats the file
+                                // FIRST and skips the load when the stat
+                                // fails, so the open never happens and the
+                                // existing open-side DIAGs stay silent. Log
+                                // the stat-family EXIT result for every /twres
+                                // path (un-gated first 40) — settles
+                                // ENOENT-vs-parse on the next run.
+                                if past_first_execve
+                                    && p.contains("/twres")
+                                    && (syscall_num == abi.newfstatat
+                                        || syscall_num == abi.statx
+                                        || (abi.fstatat64_nr != -1
+                                            && syscall_num == abi.fstatat64_nr)
+                                        || syscall_num == abi.stat
+                                        || syscall_num == abi.stat64)
+                                {
+                                    twres_stat_diag_count = twres_stat_diag_count.saturating_add(1);
+                                    if twres_stat_diag_count <= 40 {
+                                        log(&format!(
+                                            "6-Z243: stat twres \"{}\" -> {} ({}) pid={} loop={} (occurrence {})",
+                                            p,
+                                            ret,
+                                            if ret < 0 {
+                                                format!("-errno {}", -ret)
+                                            } else {
+                                                "ok".to_string()
+                                            },
+                                            pid,
+                                            loop_count,
+                                            twres_stat_diag_count
                                         ));
                                     }
                                 }
