@@ -20947,3 +20947,33 @@ Stage Summary:
   (60 runs), plus the parallel session's forensics round.
 - NEXT: collect all rounds; analyze the arm32 UI class via the /twres
   stat DIAG + the 6-Z243 forensics; cherry's 0x1404b4 crash class.
+
+---
+Task ID: 6-Z245
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: hw_random EOF persisted — found the second writer truncating the 6-Z242 entropy file to zero; removed the clobber.
+
+Work Log:
+- 84afbf6 (6-Z242) round results: whyred/starlte UI_READY; h830 +
+  montana advanced to UI_HANG (init SURVIVED entropy on some boots);
+  the rest of the property class still died — kmsg "Failed to read
+  from /dev/hw_random: EOF" → "Security failure; rebooting...".
+- ROOT CAUSE: the run log shows BOTH staging lines in order:
+    "[KR64][devices] TWRP entropy dev: .../dev/hw_random (512 bytes
+     readable ... 6-Z242)"          ← create_twrp_misc_devs (Step 4.6)
+    "[KR64] PARENT: pre-created .../dev/hw_random (mode=100666, size=0)"
+  — the 6-Z10-era regular_files list (Step 8, runs LATER) still listed
+  dev/hw_random and did remove_file + create + truncate, re-creating
+  the exact EOF the 6-Z242 fix targets. The old 6-Z10 "init reads
+  0 bytes and continues" assumption only held for the angler-era x86
+  init; pi/older inits HARD FAIL the entropy action on EOF.
+- FIX: removed dev/hw_random from the regular_files list (the entropy
+  file is owned by devices::create_twrp_misc_devs alone).
+- GATES: 658 host tests green (incl. the parallel session's forensics
+  tests); clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- The hw_random class should now actually receive 512 entropy bytes.
+- In flight: wave-3 (batch:120:180 on c8458a1) + the parallel session's
+  rounds. NEXT: push + dispatch the property class on this head.
