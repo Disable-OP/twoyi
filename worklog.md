@@ -21642,3 +21642,52 @@ Stage Summary:
 - NEXT: commit+push; dispatch ocean+kebab; collect the /twres theme
   evidence + titan 6-Z250 stage evidence when they land.
 >>>>>>> 66f1b0b (fix(kr64): 6-Z251 tgkill ENTRY DIAG — the 3.7.0_11 AOSP spin (init, ~240k iterations) names its tgid/tid/sig)
+
+---
+Task ID: 6-Z254
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: THE systemic arm32 EXIT-path register-read corruption — every EXIT decision made from a raw 272-byte getregs on an AArch32 compat child reads interleaved-garbage; fixed with an ABI-aware wrapper at all 45 fresh-read sites.
+
+Work Log:
+- SMOKING-GUN EVIDENCE (grouper run 33321897731 on 39233aa): the
+  6-Z60 preserve path logged "PRESERVING real return
+  -1449944623706275837" — an impossible value. Combined with the
+  CHRONIC "fresh-regs2 syscall_num=-1542791040932091243 — snapshot
+  diverged" noise on EVERY arm32 EXIT, the arithmetic decodes:
+  * the compat NT_PRSTATUS regset is 72 bytes = 9 u64 slots; the
+    raw ptrace_getregs leaves slots 9+ stale-zero;
+  * get_syscall_num(regs2, ABI_ARM32 reg_syscall=r7) reads slot 7
+    = (r14 | pc<<32) — lr|pc pairs, NOT r7;
+  * get_syscall_arg(regs2, reg_ret=r0) reads slot 0 = (r0|r1<<32)
+    — the high half poisons every fresh_ret comparison;
+  * arg slots 1..5 are (r2|r3)..(r10|r11) pairs — every EXIT-side
+    arg recovery (xattr name, fd checks, readlink bufs) garbage.
+- IMPACT on arm32 children (all silent):
+  1. fresh_ret == -38 (seccomp ENOSYS) NEVER matches → the
+     ENOSYS fakes never fire → guests see raw -ENOSYS;
+  2. fresh_ret == -9 fd-42 fakes never fire;
+  3. xattr/rmdir/unlink-at virtualization reads garbage args and
+     silently does nothing;
+  4. 119 write_translated_path-adjacent corruption windows in the
+     grouper boot alone; the 6-Z60 preserve DIAG prints garbage.
+  This single defect plausibly explains most of the residual arm32
+  instability (theme/fstab/stat failures that "have no syscalls").
+- FIX 6-Z254: ptrace_getregs_wide(pid, &mut regs) — aarch64 hosts:
+  dispatch to ptrace_getregs_arm32 (72-byte regset + widen) for
+  registered arm32 pids, else the plain 272-byte read; x86_64 hosts:
+  identity (PTRACE_GETREGS zero-extends i386 already). Wrapped ALL
+  EXIT-path fresh reads: 28+4 regs2 sites, vr, regs_pr, fresh,
+  readback, verify_regs, regs_le, sigsys_regs (45 total). NOT
+  wrapped: the loop-top read (has its own 6-Z228 re-read), the
+  6-Z243 crash path (its own re-read), the setregs smoke detector
+  (logging only), the initial-attach fetch.
+- GATES: 658 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- The arm32 EXIT-decision corruption is closed at the source. Every
+  faked/preserved return, arg recovery, and -38/-9 gate now sees
+  real values on arm32 children.
+- NEXT: commit+push; dispatch the full arm32 verify set (grouper,
+  osprey, lux, m8, titan, merlin, onyx, shamu) + ocean/kebab; this
+  is the highest-impact single change of the session.
