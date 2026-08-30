@@ -21529,7 +21529,7 @@ Stage Summary:
   spin class (ocean/kebab on b85cb30) results pending.
 
 ---
-Task ID: 6-Z251
+Task ID: 6-Z253 (renumbered — the parallel display fix took 6-Z251 first)
 Agent: Twoyi Recovery Display Engineer
 Date: 2026-08-30
 Task: ROOT CAUSE + FIX — OrangeFox (AOSP-style loader-path recoveries) never renders in Render2Activity although the guest UI is fully alive (touch works, pages change). Reference run 33317227548 (orangefox-lavender).
@@ -21604,3 +21604,41 @@ Stage Summary:
   URL as 33317227548) + twrp-angler regression; acceptance = OrangeFox UI
   visible in Render2Activity screenshots + presentation=FLOWING in
   result.json + multiple page transitions from touch.
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: identify the 3.7.0_11 AOSP-layout spin — the 6-Z248 sampling worked on the first try; add tgkill arg diagnostics for the next round.
+
+Work Log:
+- 6-Z248 VERIFIED (ocean run 33321548615 on b85cb30): the sampled
+  broad DIAG kept recording past the caps and named the spin —
+  pid 2625 = THE GUEST INIT ITSELF, syscall nr=131 (aarch64 tgkill),
+  looping from loop_count 22593 to the end of the boot window
+  (samples at 25921/62593/102593/142593/182593/222593/259201/
+  259265 — ~40k iterations per sample gap). ZERO child stops
+  interleaved: init spins tgkill with NO live traced children.
+- BOOT-PATH CONFIRMED CORRECT: kr64 logged boot_recovery=false with
+  the 6-Z216..6-Z220 AOSP-layout machinery (bootstrap libs mapped,
+  rc files parsed) — the 3.7.0_11 generation is the INTENDED
+  AOSP-style class; the bug is INSIDE the AOSP-mode boot flow, not
+  the mode selection.
+- GUEST LOGS EMPTY: the ocean artifact carries no guest kmsg/logcat
+  (AOSP-mode logs land in logcat; logd never ran) — guest-side truth
+  unavailable.
+- CANDIDATE MECHANISMS (to be discriminated by the new DIAG):
+  init self-wake (tgkill(getpid, main_tid, SIGCHLD)) when a dead
+  service cannot be reaped; bionic abort()->tgkill(self, SIGABRT)
+  in a restart loop; Service::Start failure retry without backoff.
+  All are distinguishable by (tgid, tid, sig): sig=9/6 vs sig=17
+  (SIGCHLD), tid==pid vs tid!=pid.
+- FIX 6-Z253 (ptrace_emu.rs): tgkill ENTRY DIAG — first 24 calls
+  with tgid/tid/sig/loop_count, aarch64 children only
+  (n==131 && abi.open == -1; x86_64 children share getpid==39 but
+  their nr 131 is rt_sigtimedwait — the getpid discriminator would
+  misfire there).
+- GATES: 658 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- The spin is init-internal tgkill; next round names tgid/tid/sig.
+- NEXT: commit+push; dispatch ocean+kebab; collect the /twres theme
+  evidence + titan 6-Z250 stage evidence when they land.
+>>>>>>> 66f1b0b (fix(kr64): 6-Z251 tgkill ENTRY DIAG — the 3.7.0_11 AOSP spin (init, ~240k iterations) names its tgid/tid/sig)

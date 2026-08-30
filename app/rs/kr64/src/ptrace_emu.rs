@@ -15117,6 +15117,39 @@ pub fn run_ptrace_loop(
                                 log("intercepted getppid() -> will return 1");
                             }
                         }
+                        // ── 6-Z251: tgkill ENTRY DIAG (the 3.7.0_11 spin class) ──
+                        //
+                        // The AOSP-layout generation (ocean/kebab/
+                        // hotdog/instantnoodle) reaches init's rc/service
+                        // phase then spins in an ENDLESS tgkill loop
+                        // (run 33321548615: pid 2625 = the guest init,
+                        // sampled DIAG shows nr=131 from loop 22593 to
+                        // the end of the boot window, ~240k iterations,
+                        // ZERO child stops interleaved). tgkill is NOT
+                        // intercepted, so the target tgid/tid/signal
+                        // were never on the record — the loop's OWNER
+                        // (init self-wake? a dying service? a blocked
+                        // reap?) is unidentifiable. Log the first 24
+                        // calls with all three args; a repeating
+                        // (tgid, tid, sig) pattern names the loop.
+                        n if n == 131 && abi.open == -1 => {
+                            // aarch64 children only: on aarch64 nr 131 is
+                            // tgkill, and ABI_AARCH64 is the only ABI with
+                            // open == -1 (x86_64 children share getpid==39
+                            // but their nr 131 is rt_sigtimedwait).
+                            static TGKILL_DIAG: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n = TGKILL_DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n < 24 {
+                                let tgid = get_syscall_arg(&regs, abi.reg_arg1);
+                                let tid = get_syscall_arg(&regs, abi.reg_arg2);
+                                let sig = get_syscall_arg(&regs, abi.reg_arg3);
+                                log(&format!(
+                                    "6-Z253: tgkill ENTRY (broad) tgid={} tid={} sig={} pid={} loop_count={} [tgkill #{}/24]",
+                                    tgid, tid, sig, pid, loop_count, n + 1
+                                ));
+                            }
+                        }
                         n if n == abi.open || n == abi.openat || n == abi.openat2 => {
                             let path_arg_index = if syscall_num == abi.open {
                                 abi.reg_arg1
