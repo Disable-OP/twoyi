@@ -10260,6 +10260,11 @@ pub fn run_ptrace_loop(
     // log their translated path + return value — settles whether TWRP's
     // /tmp/recovery.log logger open succeeds inside the jail).
     let mut tmp_diag_count: u64 = 0;
+    // 6-Z229: bounded result diag for property-area opens (capricorn/
+    // cedric "Failed to initialize property area" — the failing openat
+    // between mkdirat(/dev/__properties__) and the LOG(FATAL) wrote no
+    // evidence because every existing open log is loop_count-gated).
+    let mut prop_area_diag_count: u64 = 0;
     let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     // 6-Z168: log cap for the block-storage mount -ENODEV overrides (the
@@ -13820,11 +13825,44 @@ pub fn run_ptrace_loop(
                                         // 6-Z110 intercepts their connect()
                                         // and fakes the whole protocol (they
                                         // never touch the real path).
-                                        let host_path = format!(
-                                            "{}.{}",
-                                            translate_path(rootfs, &guest_path),
-                                            pid
-                                        );
+                                        //
+                                        // 6-Z229 (starlte/chiron run evidence):
+                                        // the blanket .pid suffix BREAKS init's
+                                        // own socket bootstrap. Init does
+                                        // bind("/dev/socket/property_service")
+                                        // then fchownat/fchmodat THE CANONICAL
+                                        // NAME — with the suffix the node lands
+                                        // at property_service.<pid> and the
+                                        // canonical fchmodat ENOENTs:
+                                        //   "Failed to fchmodat socket
+                                        //    '/dev/socket/property_service': No
+                                        //    such file or directory" →
+                                        //   "start_property_service socket
+                                        //    creation failed" → LOG(FATAL)
+                                        //   → exit 127 (runs 33286288959
+                                        //   starlte / 33286315888 chiron).
+                                        // The per-pid suffix is only REQUIRED
+                                        // for the binder-proxy class (the path
+                                        // the TRACER itself pre-binds — its
+                                        // live listener would EADDRINUSE the
+                                        // guest's bind, and clients are
+                                        // 6-Z110-intercepted anyway). For every
+                                        // other bind the CANONICAL translated
+                                        // path is correct: the parent-side
+                                        // prep below removes any stale node
+                                        // first, so the real bind succeeds at
+                                        // the name init's follow-up ops use.
+                                        let translated_bind_path =
+                                            translate_path(rootfs, &guest_path);
+                                        const BINDER_PROXY_GUEST_PATHS: &[&str] =
+                                            &["/dev/binder", "/dev/hwbinder", "/dev/vndbinder"];
+                                        let host_path = if BINDER_PROXY_GUEST_PATHS
+                                            .contains(&guest_path.as_str())
+                                        {
+                                            format!("{}.{}", translated_bind_path, pid)
+                                        } else {
+                                            translated_bind_path
+                                        };
                                         if let Some(new_sa) =
                                             build_translated_unix_sockaddr(&host_path)
                                         {
@@ -14293,6 +14331,44 @@ pub fn run_ptrace_loop(
                                 tail.len(),
                                 format_syscall_buffer(&tail, Some(abi))
                             ));
+                        }
+                        // ── 6-Z229: fresh-ephemeral-/dev per boot cycle ──
+                        //
+                        // Real hardware gives every boot cycle a FRESH
+                        // tmpfs /dev, so init's property area bootstrap
+                        // (properties_serial created with O_CREAT|O_EXCL)
+                        // can never collide with a previous cycle. Twoyi's
+                        // {rootfs}/dev is PERSISTENT, so a guest restart
+                        // (InitFatalReboot → init re-runs) hits its OWN
+                        // previous cycle's property files → open returns
+                        // EEXIST → "Failed to initialize property area"
+                        // → LOG(FATAL) → exit (the capricorn/cedric
+                        // class: kmsg = "init second stage started!" +
+                        // the property-area FATAL, nothing else — the
+                        // FIRST cycle died elsewhere, the SECOND died
+                        // here). Fix: when init exits, reset the
+                        // boot-ephemeral property files so the next
+                        // cycle — like real hardware — starts clean.
+                        // Safe for surviving children: unlink() does not
+                        // break an existing mmap of the file, and any
+                        // still-running recovery keeps its mapped area.
+                        {
+                            let prop_dir = format!("{}/dev/__properties__", rootfs);
+                            for fname in ["property_info", "properties_serial"] {
+                                let path = format!("{}/{}", prop_dir, fname);
+                                if std::path::Path::new(&path).exists() {
+                                    match std::fs::remove_file(&path) {
+                                        Ok(()) => log(&format!(
+                                            "6-Z229: init exited — removed per-cycle property file {} (fresh-ephemeral-/dev semantics; next boot cycle re-creates it)",
+                                            path
+                                        )),
+                                        Err(e) => log(&format!(
+                                            "6-Z229: failed to remove {} on init exit: {}",
+                                            path, e
+                                        )),
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -16485,6 +16561,28 @@ pub fn run_ptrace_loop(
                                                 "fd".to_string()
                                             },
                                             tmp_diag_count
+                                        ));
+                                    }
+                                }
+                                // ── 6-Z229: property-area open-result DIAG ──
+                                // Not loop_count-gated: the capricorn-class
+                                // failure happens past loop 500. Logs the
+                                // raw ret/errno of EVERY open whose
+                                // translated path is under
+                                // /dev/__properties__ (first 40).
+                                if is_property_metadata_file(&p) || p.ends_with("__properties__") {
+                                    prop_area_diag_count += 1;
+                                    if prop_area_diag_count <= 40 {
+                                        log(&format!(
+                                            "6-Z229: open(\"{}\") -> {} ({}) (occurrence {})",
+                                            p,
+                                            ret,
+                                            if ret < 0 {
+                                                format!("-errno {}", -ret)
+                                            } else {
+                                                "fd".to_string()
+                                            },
+                                            prop_area_diag_count
                                         ));
                                     }
                                 }
