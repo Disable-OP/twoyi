@@ -21969,3 +21969,29 @@ Stage Summary:
   (UI_READY guard) + retry whyred/starlte guards; after the display
   track lands its loader-path fix, re-run nitrogen/riva to confirm
   the full OrangeFox family.
+
+---
+Task ID: 6-Z258-CI
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: record the 6-Z258 verification wave (head e4dd7a6).
+
+Work Log:
+- Pushed e4dd7a6 (rebased over the parallel 6-Z251g input fix; gates
+  re-verified post-rebase: 665 tests green).
+- Dispatched 4 E2E runs at 2026-08-30T18:52:02-13Z, all head e4dd7a6:
+  * 33329277798 orangefox-cereus (init-survival anchor: EXPECT
+    "init: Created socket '/dev/socket/property_service'" and NO
+    "start_property_service socket creation failed" in kmsg)
+  * 33329279170 orangefox-daisy (UI_READY regression guard)
+  * 33329282625 twrp-3.7.0_9-0-whyred (guard retry after the
+    dl.twrp.me mirror refusal)
+  * 33329285807 twrp-3.7.0_9-0-starlte (guard retry)
+- ACCEPTANCE: init survives the property socket on cereus; daisy
+  stays UI_READY; whyred/starlte guards complete (workflow-level
+  success this time).
+
+Stage Summary:
+- Wave recorded; monitoring delegated; local work continues on the
+  arm32 libtwrp_fb_hook.so sp-0x24 crash class (10 builds) using the
+  MON-1 crash dumps + the local disas scripts.
