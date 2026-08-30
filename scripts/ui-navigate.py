@@ -1988,37 +1988,64 @@ def main():
         if no_gate_family and menu_confirmed:
             menu_frame = _shot_bytes("term-01-main-menu")
 
-            def _fox_nav_tap(fx, fy, tag):
-                marker_before = _last_page_after(0)
-                x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
-                print(f"  [fox-nav] tap {tag} at ({x},{y})")
-                tap(x, y)
-                wait(2.5)
+            def _fox_effect(after_bytes, before_bytes, marker_before):
                 page_after = _last_page_after(0)
-                frame = _shot_bytes(tag)
-                changed = frame != menu_frame
                 new_page = (page_after is not None
                             and page_after != marker_before)
-                print(f"  [fox-nav] {tag}: new_page_marker={page_after} "
-                      f"({new_page}), frame_changed={changed}")
-                return frame, new_page or changed
+                changed = after_bytes != before_bytes
+                return new_page or changed, page_after, changed
 
-            menu_frame2, ok1 = _fox_nav_tap(0.875, 0.937, "term-02-fox-menu")
+            def _fox_nav_tap(fx, fy, tag, ref_frame):
+                """Tap with DELIVERY VERIFICATION + channel escalation.
+                redroid's `input tap` no-ops with rc=0 for entire runs
+                (runs 33325977950 / 33327023870: the whole chain silently
+                did nothing) — so verify the EFFECT and escalate:
+                broadcast (debug TOUCH receiver -> production onTouch)
+                -> adb tap -> forced sendevent. 3 rounds max."""
+                x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
+                marker_before = _last_page_after(0)
+                for attempt in range(3):
+                    if attempt == 0:
+                        # The debug broadcast is InputManager-independent
+                        # (ActivityManager delivers it) and feeds the
+                        # EXACT production onTouch path.
+                        amcmd = (f"am broadcast -a io.twoyi.debug.TOUCH "
+                                 f"--es action tap --ei x {x} --ei y {y}")
+                        r = subprocess.run(
+                            ["sudo", "docker", "exec", "redroid", "sh", "-c", amcmd],
+                            capture_output=True, text=True, timeout=20)
+                        out = (r.stdout or "") + (r.stderr or "")
+                        print(f"  [fox-nav] {tag} attempt 0: DEBUG BROADCAST "
+                              f"({x},{y}) rc={r.returncode} "
+                              f"out={out.strip()[:60]!r}")
+                    else:
+                        print(f"  [fox-nav] {tag} attempt {attempt}: "
+                              f"no effect yet — escalating "
+                              f"({'sendevent' if attempt == 2 else 'adb tap'})")
+                        if attempt == 2:
+                            global _FORCE_SENDEVENT
+                            _FORCE_SENDEVENT = True
+                        tap(x, y)
+                    wait(2.5)
+                    frame = _shot_bytes(tag)
+                    ok, page_after, changed = _fox_effect(
+                        frame, ref_frame, marker_before)
+                    print(f"  [fox-nav] {tag} attempt {attempt}: "
+                          f"page={page_after} frame_changed={changed} "
+                          f"-> {'HIT' if ok else 'miss'}")
+                    if ok:
+                        return frame, True
+                return frame, False
+
+            menu_frame2, ok1 = _fox_nav_tap(0.875, 0.937,
+                                            "term-02-fox-menu", menu_frame)
             ok2 = False
             if ok1:
-                prev_frame = menu_frame2
-                x, y = int(SCREEN_W * 0.125), int(SCREEN_H * 0.937)
-                print(f"  [fox-nav] tap Files (back) at ({x},{y})")
-                marker_before = _last_page_after(0)
-                tap(x, y)
-                wait(2.5)
-                back_frame = _shot_bytes("term-02b-fox-files-back")
-                page_after = _last_page_after(0)
-                ok2 = (back_frame != prev_frame
-                       or (page_after is not None
-                           and page_after != marker_before))
-                print(f"  [fox-nav] Files-back: page_marker={page_after}, "
-                      f"frame_changed={back_frame != prev_frame}")
+                back_frame, ok2 = _fox_nav_tap(0.125, 0.937,
+                                               "term-02b-fox-files-back",
+                                               menu_frame2)
+            else:
+                _shot_bytes("term-02b-fox-files-back")
             print(f"  [fox-nav] round-trip result: menu_open={ok1} "
                   f"files_back={ok2}")
         elif no_gate_family:
