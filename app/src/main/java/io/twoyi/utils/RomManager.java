@@ -635,6 +635,58 @@ public final class RomManager {
         }
     }
 
+    /**
+     * 6-Z262: record the identity of a successfully imported image into
+     * {@code <rootfs>/rom.ini} so About → current-ROM and the settings
+     * UI reflect the import even after process restarts. NOTHING in the
+     * app ever wrote this file before (it was only ever READ), so the
+     * About screen permanently showed "-unknown" for imported images.
+     *
+     * @param displayName the human-visible import file name (may be null)
+     */
+    public static void writeImportedRomInfo(Context context, String displayName) {
+        try {
+            File infoFile = new File(getRootfsDir(context), ROM_INFO_FILE);
+            Properties prop = new Properties();
+            String name = (displayName == null || displayName.isEmpty())
+                    ? DEFAULT_INFO : displayName;
+            prop.setProperty("author", "twoyi import");
+            prop.setProperty("code", String.valueOf(System.currentTimeMillis() / 1000L));
+            prop.setProperty("version", name);
+            prop.setProperty("desc", name);
+            prop.setProperty("md5", "");
+            try (java.io.OutputStream out = new java.io.FileOutputStream(infoFile)) {
+                prop.store(out, "written by twoyi at import time (6-Z262)");
+            }
+            Log.i(TAG, "6-Z262: wrote " + infoFile.getAbsolutePath() + " (version=" + name + ")");
+        } catch (Throwable e) {
+            // Non-fatal: the label is cosmetic; the import itself already
+            // succeeded and must not be reported as failed because of it.
+            Log.w(TAG, "6-Z262: writeImportedRomInfo failed", e);
+        }
+    }
+
+    /**
+     * 6-Z262: a best-effort display label for the currently installed
+     * image, for the 'Select ROM' preference summary. Prefers the
+     * recorded import name, then the rom.ini version field, then null
+     * (no ROM installed / nothing recorded).
+     */
+    public static String getInstalledRomLabel(Context context) {
+        if (!romExist(context)) {
+            return null;
+        }
+        String last = ProfileSettings.getLastImportedRom(context);
+        if (last != null && !last.isEmpty()) {
+            return last;
+        }
+        RomInfo info = getCurrentRomInfo(context);
+        if (info != null && info.version != null && !info.version.equals(DEFAULT_INFO)) {
+            return info.version;
+        }
+        return "";
+    }
+
     public static String getLoaderPath(Context context) {
         ApplicationInfo applicationInfo = context.getApplicationInfo();
         return new File(applicationInfo.nativeLibraryDir, LOADER_FILE).getAbsolutePath();

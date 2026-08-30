@@ -43,6 +43,17 @@ public class ProfileSettings {
     public static final String BOOT_RECOVERY = "boot_recovery";
 
     /**
+     * 6-Z262: display name of the last successfully imported image file
+     * (as shown in the file picker). Backs the 'Select ROM' preference
+     * summary so it survives fragment/activity recreation — previously
+     * the summary was ONLY written as a side effect of a live import,
+     * so any recreation reset it to the generic "Import rootfs…"
+     * prompt and the user could no longer tell a ROM was already
+     * installed (the "import description only updates once" report).
+     */
+    public static final String LAST_IMPORTED_ROM = "last_imported_rom";
+
+    /**
      * Get SharedPreferences for the active profile
      */
     private static SharedPreferences getProfilePrefs(Context context) {
@@ -326,5 +337,20 @@ public class ProfileSettings {
      */
     public static void setBootRecovery(Context context, boolean enabled) {
         setBoolean(context, BOOT_RECOVERY, enabled);
+    }
+
+    /**
+     * 6-Z262: record the display name of the last imported image for
+     * the active profile.
+     */
+    public static void setLastImportedRom(Context context, String name) {
+        setString(context, LAST_IMPORTED_ROM, name);
+    }
+
+    /**
+     * 6-Z262: the display name of the last imported image, or null.
+     */
+    public static String getLastImportedRom(Context context) {
+        return getString(context, LAST_IMPORTED_ROM, null);
     }
 }
