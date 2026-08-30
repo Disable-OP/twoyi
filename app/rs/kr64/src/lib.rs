@@ -8120,12 +8120,18 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // Regular files init expects to create/open.
         // Use OpenOptions (same pattern as /dev/__kmsg__ creation above)
         // and log success/failure for each file.
+        //
+        // 6-Z242: /dev/hw_random is DELIBERATELY NOT in this list — it is
+        // staged by devices::create_twrp_misc_devs with 512 bytes of real
+        // entropy, and THIS loop used to run afterwards and truncate it to
+        // zero ("pre-created ... size=0" in the logs), re-creating the
+        // exact EOF failure 6-Z242 fixed: pi/older init generations HARD
+        // FAIL their mix-hwrng-into-linux-rng action on EOF
+        // ("Security failure; rebooting into recovery mode", capricorn
+        // class). The old 6-Z10 "init reads 0 bytes and continues"
+        // assumption only held for the angler-era x86 init.
         use std::os::unix::fs::OpenOptionsExt;
-        let regular_files: &[(&str, u32)] = &[
-            ("dev/.booting", 0o666),
-            ("dev/__null__", 0o666),
-            ("dev/hw_random", 0o666),
-        ];
+        let regular_files: &[(&str, u32)] = &[("dev/.booting", 0o666), ("dev/__null__", 0o666)];
         for (rel, mode) in regular_files {
             let file_path = format!("{}/{}", rootfs_prefix, rel);
             // Remove existing file first (in case it was unlinked by a
