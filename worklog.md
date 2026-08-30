@@ -19597,3 +19597,8 @@ Stage Summary:
   (ashmem) and let the classifier's AOSP detector see a live dim cycle there too.
 - NEXT: dispatch round 3 (lineage + orangefox + 3 guards). If both go UI_READY, start
   the corpus waves (batch:0:60) toward the 90% goal.
+- CI DISPATCH round 3 (2026-08-30, on 53b8575 / 6-Z224b): 5x ui-e2e-test-arm64 —
+  run IDs 33284465172, 33284465977, 33284466840, 33284467693, 33284468812
+  (lineage + orangefox verify with ashmem + battery type + AOSP classifier; 3 guards).
+  kr64 lint+test on 53b8575: SUCCESS. Expect: lineage UI_READY (aosp_minui),
+  orangefox past the ashmem abort toward the dim cycle, guards unchanged.
