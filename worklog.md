@@ -20655,3 +20655,81 @@ Stage Summary:
 - starlte 3x green (6-Z229 regression-stable).
 - NEXT: implement 6-Z236/6-Z237/6-Z238, host gates, commit, push, dispatch
   capricorn + merlin + cherry + starlte (regression) + wave-2 batch.
+
+---
+Task ID: 6-Z240
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: ROOT CAUSE of the ELF32 linker class — 6-Z227's ABI_ARM32 mmap2=192 re-armed the i386-only anonymous-mmap rewrite; fixed via an explicit per-ABI gate.
+
+Work Log:
+- WAVE-2 BATCH RESULTS (batch:60:120 + 4 focused verifies, head 0e22465,
+  63 classified runs): 24 UI_READY (38%), 7 UI_HANG, 32 boot-fail.
+  Failure clusters: linker=13 (onyx-3.4.0, grouper, hammerhead, harpia,
+  james, lux, m7, m8, mako, manta, merlin, o7prolte, osprey — ALL ELF32
+  EM_ARM devices), property_area=10 (griffin-3.3.1, capricorn, h830,
+  h850, h990, ido, kinzie, ls997, montana, perry), UI_HANG=7
+  (oneplus2-3.2.1, parker, hydrogen, kenzo, ginkgo, guacamole, payton),
+  BOOT_FAIL/None=6 (hotdog, hotdogv2, instantnoodle, kebab, ocean —
+  the 3.7.0_11 generation — plus cherry).
+- FOCUSED-RUN EVIDENCE (6-Z237/6-Z238 landed in 0e22465):
+  * capricorn (33310479551): 6-Z238 execve env scan captured BOTH chains —
+    init exec gets LD_PRELOAD=/sbin/libtwrp_fb_hook.so; the recovery
+    service exec gets the rootfs-prefixed chain. 6-Z231 ENTRY DIAGs fired
+    for /dev/__properties__ opens (flags=0xa8000 O_EXCL=false — READERS).
+  * cherry (33310480708): the recovery execve env scan shows the 6-Z236
+    shim chain ACTIVE: LD_PRELOAD=/sbin/libbionic_compat.so:/sbin/
+    libtwrp_fb_hook.so ✓. 6-Z231 saw /dev/__properties__ DIR opens
+    (flags=0x88000 — O_DIRECTORY reader probes, no O_EXCL creates).
+  * merlin (33310476565): 6-Z238 fd-dump at the boot-time open of
+    sbin/libtwrp_fb_hook.so: "ELF32 machine=40 size=162480 e_shoff=161360
+    e_shnum=28 e_shentsize=40 SHT_DYNAMIC=shdr[11] off=0x7cb4 size=0x90
+    link=3 PT_DYNAMIC=off=0x7cb4" — BYTE-PERFECT (0x27650 = 161360; my
+    earlier 161104 was an arithmetic slip — file == asset). The SAME file
+    loads fine in the CI ld-debug probe. The linker STILL fails
+    ".dynamic section header was not found" → the corruption happens
+    INSIDE THE GUEST, after the open.
+- ROOT CAUSE (decisive): kr64.log shows "DIAG mmap2 REWRITE: fd=3
+  flags=0x2 (file-backed) → MAP_ANONYMOUS|MAP_PRIVATE fd=-1" — fd=3 IS
+  the hook's fd (the 6-Z238 dump proves it). The Task 6-Z2/6-Y/6-Z62
+  ENTRY-side rewrite converts EVERY file-backed mmap2 of the child to
+  ANONYMOUS (+ 6-Z62 EXIT-side content injection) and its gate was
+  `abi.mmap2 != -1`. 6-Z133 had narrowed this to i386-only BECAUSE the
+  rewrite+inject corrupted 64-bit library mmaps ("missing PT_DYNAMIC in
+  libbinder.so" class). 6-Z227 then added mmap2=192 to the NEW ABI_ARM32
+  for syscall-table completeness — silently RE-ARMING the rewrite for
+  arm32 guests on arm64 hosts: the guest linker's MAP_PRIVATE
+  shdr-table mmap of fd=3 was rewritten to anonymous, the injection
+  served wrong/zero content, and bionic's ReadDynamicSection found no
+  SHT_DYNAMIC → CANNOT LINK. THE ENTIRE wave-2 linker class is ELF32
+  EM_ARM — all 13 recoveries hit this single generic bug.
+- FIX 6-Z240: new ChildAbi field `mmap2_rewrite_for_seccomp` — TRUE for
+  ABI_X86_32 ONLY (the x86_64 zygote's seccomp blocks file-backed mmap2
+  for i386 compat children — the original 6-Z2 evidence), FALSE for
+  ABI_X86_64/ABI_AARCH64/ABI_ARM32 (native file-backed mmaps; the arm32
+  probe mapped 30+ libs natively, so no seccomp block exists on the
+  redroid/arm64 path). The rewrite arm's gate now requires the field.
+  Regression test z240_mmap2_rewrite_is_i386_only (aarch64-ABI asserts
+  cfg-gated — those consts only exist on aarch64 host builds).
+- OTHER EVIDENCE NOTES:
+  * The arm32 fb_hook probe banner says "(unknown-arch ...)" — the hook's
+    own arch label doesn't know arm32 yet (cosmetic; the 6-Z227 ARM block
+    works — the hook RAN in the probe).
+  * The aarch64 mmap DIAG fires with prop_fd=Some(3) while the fd is 0 —
+    the properties_fd tracker is loop-global, not per-process; harmless
+    for the aarch64 gate (mmap2 sentinel) but a future hazard for any
+    fd-matching logic (§10 instrument note).
+  * Artifact download 403s via urllib (Authorization forwarded through
+    the blob redirect) — use curl for artifact downloads.
+- GATES: 653 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- The ELF32 linker class (13 wave-2 failures) root-caused to a single
+  generic bug: the i386-only anonymous-mmap rewrite leaking into ABI_ARM32.
+  6-Z240 restores the 6-Z133 contract with an explicit per-ABI gate.
+- Expected impact: merlin + grouper + hammerhead + mako + m7 + m8 + lux +
+  harpia + james + osprey + onyx + o7prolte + manta should advance past
+  the linker to their NEXT blocker.
+- NEXT: push; dispatch the linker-class recoveries + capricorn/cherry +
+  starlte/whyred regression on the new head; analyze the next blocker
+  layer (property_area class is now the biggest remaining family).
