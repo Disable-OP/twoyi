@@ -101,6 +101,64 @@
 extern void *dlsym(void *handle, const char *symbol) __attribute__((weak));
 #define RTLD_NEXT ((void *)-1L)
 
+// ── 6-Z246: RTLD_NEXT self-resolution guard ──────────────────────────
+//
+// Old arm32 bionic linkers (the Android M/N-era soinfo traversal that
+// old-platform TWRP ramdisks ship: lux/m8/osprey/surnia/thea/titan/
+// seed/victara/xt1032/woods — the whole TWRP 3.7.0_9 arm32 class) can
+// resolve dlsym(RTLD_NEXT, X) FROM AN LD_PRELOADed LIBRARY to the
+// PRELOAD'S OWN EXPORT of X. Evidence (run 33317153489, osprey, decoded
+// with the 6-Z243 compat forensics): the arm32 __open_2's
+// `if (real_open2) blx r2` call site re-entered the hook's own
+// __open_2 endlessly — 0x28-byte frames with the same path/flags
+// arguments, si_addr = sp-0x24 at a helper's prologue push, [stack]
+// grown to its full 16 MB — the guest died of main-stack exhaustion
+// before the first open ever completed. The crashing register x2 even
+// HELD the address of the hook's own __open_2.
+//
+// The generic defense: after every dlsym(RTLD_NEXT), REJECT any result
+// that lies inside the hook's own executable segment and fall back to
+// the raw-syscall path exactly as if dlsym had failed (the pre-6-Z246
+// contract for weak-dlsym-unresolved). The segment range is derived at
+// first use from the interposers' own addresses (they all live in that
+// one segment), so no linker-specific APIs are needed.
+static unsigned long hook_own_lo = 0;
+static unsigned long hook_own_hi = 0;
+static int hook_own_diag = 0;
+
+/* forward declarations — the guard sits before these definitions */
+static void write_str(int fd, const char *s);
+ssize_t read(int fd, void *buf, size_t count);
+void __assert2(const char *file, int line, const char *expr);
+
+static void *hook_de_self(void *p, const char *what) {
+    unsigned long v = (unsigned long)p;
+    if (p == 0) return 0;
+    if (hook_own_lo == 0) {
+        /* one-time: bracket the hook's own exec segment with two
+         * interposer addresses guaranteed to be its first and last
+         * exported code (read is .text's first export, __assert2 sits
+         * at its tail). Round to page granularity so internal helpers
+         * between them are covered too. */
+        unsigned long a = (unsigned long)(void *)&read;
+        unsigned long b = (unsigned long)(void *)&__assert2;
+        if (a > b) { unsigned long t = a; a = b; b = t; }
+        hook_own_lo = a & ~0xFFFUL;
+        hook_own_hi = (b + 0xFFFUL) & ~0xFFFUL;
+    }
+    if (v >= hook_own_lo && v < hook_own_hi) {
+        if (hook_own_diag < 8) {
+            hook_own_diag++;
+            write_str(2, "[twrp_fb_hook] 6-Z246: dlsym(RTLD_NEXT, \"");
+            write_str(2, what);
+            write_str(2, "\") resolved INSIDE the hook itself — old-bionic "
+                         "RTLD_NEXT quirk, using raw-syscall fallback\n");
+        }
+        return 0;
+    }
+    return p;
+}
+
 // WEAK getenv declaration — used to locate the host touch-events socket
 // via $TWOYI_ROOTFS (kr64 puts TWOYI_ROOTFS=<absolute host rootfs path> in
 // the guest child env; {data_dir} = dirname(rootfs), so the app's socket
@@ -1882,7 +1940,8 @@ ssize_t read(int fd, void *buf, size_t count) {
 
     if (!s) {
         if (!real_read && dlsym) {
-            real_read = (ssize_t (*)(int, void *, size_t))dlsym(RTLD_NEXT, "read");
+            real_read = (ssize_t (*)(int, void *, size_t))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "read"), "read"); /* 6-Z246 */
         }
         if (real_read) return real_read(fd, buf, count);
         return (ssize_t)raw_syscall3(SYS_read, fd, (long)buf, (long)count);
@@ -1958,7 +2017,8 @@ int poll(struct pollfd *fds, unsigned long nfds, int timeout_ms) {
     }
     if (!has_input) {
         if (!real_poll && dlsym) {
-            real_poll = (int (*)(struct pollfd *, unsigned long, int))dlsym(RTLD_NEXT, "poll");
+            real_poll = (int (*)(struct pollfd *, unsigned long, int))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "poll"), "poll"); /* 6-Z246 */
         }
         if (real_poll) return real_poll(fds, nfds, timeout_ms);
 #if defined(__i386__)
@@ -2332,8 +2392,10 @@ static void init_real_funcs(void) {
     // dlsym may be NULL (weak unresolved on old bionic without libdl).
     // In that case real_open / real_openat stay NULL and callers fall
     // back to raw_syscall4(SYS_openat, ...).
-    if (!real_open   && dlsym) real_open   = (int (*)(const char *, int, ...))dlsym(RTLD_NEXT, "open");
-    if (!real_openat && dlsym) real_openat = (int (*)(int, const char *, int, ...))dlsym(RTLD_NEXT, "openat");
+    if (!real_open   && dlsym) real_open   = (int (*)(const char *, int, ...))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "open"), "open"); /* 6-Z246 */
+    if (!real_openat && dlsym) real_openat = (int (*)(int, const char *, int, ...))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "openat"), "openat"); /* 6-Z246 */
 }
 
 int open(const char *path, int flags, ...) {
@@ -2571,7 +2633,8 @@ int __open_2(const char *path, int flags) {
     }
     init_real_funcs();
     static int (*real_open2)(const char *, int) = NULL;
-    if (!real_open2 && dlsym) real_open2 = (int (*)(const char *, int))dlsym(RTLD_NEXT, "__open_2");
+    if (!real_open2 && dlsym) real_open2 = (int (*)(const char *, int))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "__open_2"), "__open_2"); /* 6-Z246 */
     int fd;
     if (real_open2) fd = real_open2(path, flags);
     else            fd = (int)raw_syscall4(SYS_openat, AT_FDCWD, (long)path, flags, 0);
@@ -2611,7 +2674,8 @@ int __openat_2(int dirfd, const char *path, int flags) {
     }
     init_real_funcs();
     static int (*real_openat2)(int, const char *, int) = NULL;
-    if (!real_openat2 && dlsym) real_openat2 = (int (*)(int, const char *, int))dlsym(RTLD_NEXT, "__openat_2");
+    if (!real_openat2 && dlsym) real_openat2 = (int (*)(int, const char *, int))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "__openat_2"), "__openat_2"); /* 6-Z246 */
     int fd;
     if (real_openat2) fd = real_openat2(dirfd, path, flags);
     else              fd = (int)raw_syscall4(SYS_openat, dirfd, (long)path, flags, 0);
@@ -2666,7 +2730,8 @@ int close(int fd) {
         write_str(2, ") (was tracked ashmem fd)\n");
     }
     static int (*real_close)(int) = NULL;
-    if (!real_close && dlsym) real_close = (int (*)(int))dlsym(RTLD_NEXT, "close");
+    if (!real_close && dlsym) real_close = (int (*)(int))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "close"), "close"); /* 6-Z246 */
     if (real_close) return real_close(fd);
     return (int)raw_syscall1(SYS_close, fd);
 }
@@ -2875,7 +2940,8 @@ int ioctl(int fd, int request, ...) {
         }
         /* unknown evdev ioctl — pass through to the socket (ENOTTY) */
         static int (*real_ioctl_in)(int, int, ...) = NULL;
-        if (!real_ioctl_in && dlsym) real_ioctl_in = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
+        if (!real_ioctl_in && dlsym) real_ioctl_in = (int (*)(int, int, ...))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "ioctl"), "ioctl"); /* 6-Z246 */
         if (real_ioctl_in) return real_ioctl_in(fd, request, argp);
         return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
     }
@@ -2917,7 +2983,8 @@ int ioctl(int fd, int request, ...) {
 #endif
         static int (*real_winsz)(int, int, ...) = NULL;
         if (!real_winsz && dlsym)
-            real_winsz = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
+            real_winsz = (int (*)(int, int, ...))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "ioctl"), "ioctl"); /* 6-Z246 */
         int r = real_winsz ? real_winsz(fd, request, argp)
                            : (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
         if (r == 0) return 0;
@@ -2962,7 +3029,8 @@ int ioctl(int fd, int request, ...) {
     // Fast path: not an fb0 fd, pass through.
     if (!fb_fd_is_tracked(fd)) {
         static int (*real_ioctl)(int, int, ...) = NULL;
-        if (!real_ioctl && dlsym) real_ioctl = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
+        if (!real_ioctl && dlsym) real_ioctl = (int (*)(int, int, ...))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "ioctl"), "ioctl"); /* 6-Z246 */
         if (real_ioctl) return real_ioctl(fd, request, argp);
         return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
     }
@@ -3019,7 +3087,8 @@ int ioctl(int fd, int request, ...) {
             }
             // Non-FB ioctl on an fb0 fd — shouldn't happen, but pass through.
             static int (*real_ioctl)(int, int, ...) = NULL;
-            if (!real_ioctl && dlsym) real_ioctl = (int (*)(int, int, ...))dlsym(RTLD_NEXT, "ioctl");
+            if (!real_ioctl && dlsym) real_ioctl = (int (*)(int, int, ...))hook_de_self(
+                (void *)dlsym(RTLD_NEXT, "ioctl"), "ioctl"); /* 6-Z246 */
             if (real_ioctl) return real_ioctl(fd, request, argp);
             return (int)raw_syscall3(SYS_ioctl, fd, request, (long)argp);
         }

@@ -21330,3 +21330,54 @@ Stage Summary:
   5. [arm32] rootfs/sbin/libc.so r-xp, si_addr=0x90 x2: twrp-3.0.2-0 sirius, t6 -> BOOT_FAIL_EARLY_INIT (legacy TWRP struct deref).
 - NEXT: (a) trace-coverage fix for the 7 property_area no-decode runs (m7, kenzo-twrp, z00ed, potter, vince-orangefox, x00t, vs995 — child dies without a traced stop); (b) aarch64 libc.so null-call class (class 3); (c) fb_hook sp-0x24 fix (class 1, now reproducible with named library+offset); (d) recovery 0x2c struct deref (class 2); (e) libbinder crash-loop is cosmetic but noisy (110+ SIGSEGv per boot) worth silencing; (f) re-run merlin/cherry on bb132ef to confirm class 1 decode on their own dumps.
 - Artifacts: artifacts/run-<id>/ for all 83 runs; results TSV artifacts/mon1-results-final.tsv; raw verbatim lines artifacts/mon1-kr64-verbatim.txt; driver scripts/mon1_driver.py (idempotent, token never printed, <=3 retries/call).
+
+---
+Task ID: 6-Z246
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: ROOT CAUSE + FIX of the arm32 fb_hook stack-exhaustion class (10 recoveries: lux, m8, osprey, surnia, thea, titan, seed, victara, xt1032, woods — the single largest remaining boot-fail family).
+
+Work Log:
+- DECODED from the MON-1 collected artifacts + 6-Z243 forensics
+  (osprey run 33317153489): every member crashes with si_addr = sp-0x24
+  (MAPERR) inside libtwrp_fb_hook.so, sp at the LOW edge of a fully
+  grown 16 MB [stack] (maps: fe988000-ff988000 rw-p), repeating
+  0x28-byte frames, crashing x2 register = &__open_2 of the hook.
+- ROOT CAUSE: the hook's __open_2 does
+    real_open2 = dlsym(RTLD_NEXT, "__open_2");
+    if (real_open2) fd = real_open2(path, flags);   // blx r2
+  On old arm32 bionic linkers (the M/N-era soinfo traversal shipped by
+  old-platform TWRP 3.7.0_9 ramdisks) dlsym(RTLD_NEXT) from an
+  LD_PRELOAD resolves to the PRELOAD'S OWN EXPORT — real_open2 ==
+  &__open_2 (the hook) — so every fortified open recurses into itself
+  with ~0x1B0 bytes per cycle until the main stack is exhausted
+  (~86k cycles, no syscalls between). arm64 guests are unaffected
+  (modern linkers resolve RTLD_NEXT correctly), which is why the same
+  hook logic is green on aarch64.
+- STATIC CONFIRMATION: disassembled the arm32 asset
+  (assets/libtwrp_fb_hook_arm32.so from the CI APK artifact, capstone):
+  __open_2 (vma 0x3F10) at +0xE8 is `blx r2` with the r2 = real_open2
+  load immediately before; the hook's own load-time DIAG printed
+  "__open_2@ 0xebaa8f10" = exactly the crashing x2. Export table +
+  runtime print give load bias +0x5000; all addresses reconcile.
+- FIX 6-Z246 (twrp_fb_hook.c): hook_de_self() guard applied to ALL 11
+  dlsym(RTLD_NEXT) sites (read, poll, open, openat, __open_2,
+  __openat_2, close, ioctl x3). Any resolution landing inside the
+  hook's own exec segment (range derived once from the interposers'
+  own addresses, page-rounded) is treated as unresolved -> the
+  existing raw_syscall fallback runs (the same contract as the
+  weak-dlsym-unresolved case). One-shot rate-capped DIAG names the
+  symbol so verification is visible in kr64 logs.
+- GATES: gcc -fsyntax-only clean for -D__arm__ and -D__i386__ (only
+  pre-existing host-glibc ioctl-signature noise; bionic signature is
+  the build target); NDK arm32/arm64/i386 builds exercised by CI.
+  Rust gates untouched by this commit.
+
+Stage Summary:
+- The fb_hook self-recursion class (10+ recoveries, largest active
+  boot-fail family) fixed at the hook layer, generically for every
+  interposed symbol and every ABI.
+- NEXT: commit+push; dispatch lux/m8/osprey/titan/victara/woods
+  verifies; the grouper-class 0x2c recovery-internal deref and the
+  aarch64 libc.so null-call class (20 orangefox builds) are the next
+  fronts; libbinder crash-loop silencing after that.
