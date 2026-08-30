@@ -20204,3 +20204,95 @@ Stage Summary:
   are 64-bit; ELF32 EM_ARM guests on the arm64 host get garbage register
   views (72-byte compat user_regs_struct read into the 272-byte user_pt_regs
   view). Watch merlin run 33299552663 for the concrete failure signature.
+
+---
+Task ID: 6-Z228
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: kr64 ABI_ARM32 — teach the tracer about ELF32 EM_ARM children on arm64 hosts (AArch32 compat).
+
+Work Log:
+- ROOT MECHANISM: kr64's aarch64 path assumed "no 32-bit userspace" — the loop
+  used ABI_AARCH64 unconditionally and read every child through the 272-byte
+  user_pt_regs view. An ELF32 EM_ARM guest on the arm64 redroid runs in AArch32
+  compat mode where NT_PRSTATUS is the 72-byte arm user_regs_struct; the kernel
+  CLAMPS the 272-byte GETREGSET iov to 72 and fills the RAW compat layout, so
+  every "u64 register" the tracer read was two 32-bit registers merged —
+  garbage syscall numbers/args/returns for the whole 32-bit class.
+- IMPLEMENTATION (app/rs/kr64/src/ptrace_emu.rs):
+  * Arm32CompatRegs (72B, uregs[18], compile-time size assert) + widen_arm32
+    (raw → 64-bit view: r0-r12→regs[0..13], r13→sp, r14→regs[30], r15→pc,
+    r16→pstate; orig_r0/uregs[17] NOT mapped) + narrow_arm32 (view → CURRENT
+    compat state; preserves orig_r0/cpsr for syscall-restart correctness).
+  * Per-pid ARM32_PIDS thread_local registry maintained at BOTH abi-detection
+    sites (syscall-stop + SIGSYS paths); selection = detect_child_is_64bit
+    (EI_CLASS precedence, EM_ARM lands on ELFCLASS32 → Some(false)).
+  * ptrace_getregs_arm32: GETREGSET 72 + widen. The main loop and the SIGSYS
+    path RE-READ compat children after ABI detection (the first 272-byte read
+    only yields the raw prefix); failure path preserves the phase-flip sync
+    discipline of the surrounding loop.
+  * aarch64 ptrace_setregs: compat children route through get-current →
+    narrow_arm32 → SETREGSET 72 (preserves orig_r0); the 6-Z180 pc/sp smoke
+    detector stays on the 64-bit path only (its flat indices 31/32 don't
+    exist in the compat layout).
+  * ABI_ARM32 const: full ChildAbi, numbers VERIFIED against
+    torvalds/linux arch/arm/tools/syscall.tbl + bionic libc/SYSCALLS.TXT
+    lp32 mappings: openat=322, open=5, stat=106/lstat=107/fstat=108,
+    stat64=195/lstat64=196/fstat64=197, fstatat64=327, unlinkat=328,
+    readlinkat=332, fchmodat=333, faccessat=334, unshare=337, socket=281,
+    bind=282, connect=283, sendto=290, recvfrom=292, setsockopt=294,
+    getsockopt=295, execve=11, mount=21, chroot=61, mkdir=39, mkdirat=323,
+    mknod=14/mknodat=324, setxattr=226/227/228, getxattr=229/230/231,
+    shmget=307/shmat=305/shmctl=308, pause=29, clone=120, fork=2, vfork=190,
+    wait4=114, exit_group=248, write=4/read=3, mmap2=192 (mmap=-1: bionic
+    lp32 only uses mmap2), poll=168, ioctl=54, close=6, fcntl=55, writev=146,
+    getdents64=217, pread64=180, access=33, rt_sigprocmask=175, readlink=85,
+    chdir=12, getcwd=183, capget=184/capset=185, ioprio=314/315, statx=397,
+    setuid32=213/setgid32=214/setresuid32=208/setresgid32=210/setgroups32=206/
+    fchown32=207 (bionic lp32 emits the *32 variants), chown32=212/
+    lchown32=198 (no bionic lp32 chown/lchown wrappers — they route through
+    fchownat; the fields cover old static binaries), newfstatat=-1,
+    openat2=-1, socketcall=-1 (arm bionic uses direct socket syscalls),
+    set_thread_area=-1 (x86-only). Register indices: reg_syscall=7 (r7),
+    ret/args=r0-r5, reg_marker=6 (r6), reg_sp=31 (widened view sp slot).
+  * hook_marker_present: accepts the LOW 32 BITS of HOOK_SYSCALL_MARKER
+    (0x69313233 "i123") alongside the full 64-bit value — arm32 fb_hook sets
+    r6 to the 32-bit marker (6-Z227).
+  * 6-Z42 HOST GATE (audit fix): the i386 execve-skip + 64-bit-execve-
+    injection machinery (writes x86 `0f 05` + rax=59) keyed on
+    abi.execve == 11 — which NOW ALSO MATCHES arm32 (execve=11). Gated both
+    blocks with cfg!(target_arch = "x86_64"): on aarch64 hosts Android app
+    seccomp ALLOWS compat execve (nothing to bypass) and x86 machine code
+    would be fatal; arm32-on-x86_64 does not exist, so the gate is exact.
+  * rename/link/symlink path-arg tuple: added an arm32 branch (reg_syscall==7
+    discriminator) — arm32 *at numbers (renameat=329/linkat=330/symlinkat=331/
+    renameat2=382) DIFFER from i386 (302/303/304); the old execve==11 shortcut
+    would have mis-directed translation. Plain numbers (38/9/83/92) are shared.
+  * exit_group hardcode fixes: i386 252 → abi.exit_group_nr (arm32=248) in the
+    6-Z60 fresh-return gate and the never-fake exclusion. AUDITED-OK (correct
+    for arm32 as-is): prctl/setrlimit/ugetrlimit gates (172/75/191 — arm32
+    shares the legacy numbers), fcntl64==221 gate (arm32 fcntl64=221 ✓),
+    iovec/msghdr is_i386 switches (32-bit layout ✓), packed epoll_event 12B
+    (✓ all 32-bit), mmap 32-bit address bound (✓), ENOSYS exit override
+    (generic ✓).
+  * abi_label: arm32 now logs "32-bit (arm compat)" on aarch64.
+  * Tests: ABI_ARM32 number table (45 asserts), register indices,
+    widen/narrow round-trip incl. orig_r0 preservation (aarch64), ret-write
+    narrow (-1 → 0xffffffff), marker low-32, EM_ARM ELF classification.
+    644 host tests green (8 consecutive runs after one transient flake);
+    clippy -D warnings clean on x86_64 AND aarch64-linux-android; fmt clean.
+- LOCAL TOOLING: rustup stable + NDK r27c cross-check (CC/AR env) — the whole
+  aarch64-only surface compiles BEFORE pushing; CI never compiles the kr64
+  TEST profile for aarch64 (pre-existing: apex_extract.rs tests have ~121
+  E0308/E0425 errors on that target, verified via git stash — NOT this task).
+
+Stage Summary:
+- The tracer can now follow ELF32 EM_ARM guests end-to-end on the arm64 host:
+  bitness detection → widened register views → arm32 syscall table →
+  compat-safe setregs → marker channel.
+- Combined with 6-Z227 (armv7a hook chain), the 32-bit class has both halves
+  it needs: a bitness-correct LD_PRELOAD chain INSIDE the guest and a
+  register-correct tracer OUTSIDE it.
+- NEXT: collect merlin verify 33299552663 (dispatched on 728785c, pre-6-Z228);
+  if it fails on tracer register garbage (expected without 6-Z228), dispatch
+  the 5 ELF32 verifies again on the 6-Z228 head — that is the decisive run.
