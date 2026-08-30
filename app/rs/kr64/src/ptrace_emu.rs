@@ -80,7 +80,11 @@
 //     which exposes no iov_len at all, so we now use the ELF header
 //     as the single source of truth for bitness.
 //     the ELF header as the single source of truth for bitness.
-//   - On aarch64 there is no 32-bit userspace, so we always use
+//   - 6-Z228: on aarch64, 32-bit children DO exist — ELF32 EM_ARM
+//     guests on an arm64 host run in AArch32 compat mode (CONFIG_COMPAT).
+//     They are detected via the same ELF-header classifier and served
+//     through ABI_ARM32 + the 72-byte compat regset path
+//     (ptrace_getregs_arm32 / narrow_arm32). 64-bit children keep
 //     ABI_AARCH64.
 //
 //   Path translation rules:
@@ -111,9 +115,12 @@
 //     interface: arch/arm64 has no PTRACE_GETREGS/SETREGS at all (the
 //     request is rejected with EIO even though bionic's sys/ptrace.h
 //     still defines the macros). The one true path is
-//     PTRACE_GETREGSET/SETREGSET with NT_PRSTATUS, which always yields
-//     the 272-byte `struct user_pt_regs` — there is no 32-bit userspace
-//     on this target, so there is exactly one register layout.
+//     PTRACE_GETREGSET/SETREGSET with NT_PRSTATUS, which yields the
+//     272-byte `struct user_pt_regs` for a 64-bit child — and the
+//     72-byte arm compat `user_regs_struct` for an ELF32 EM_ARM child
+//     in AArch32 compat mode (6-Z228): the kernel clamps the iovec and
+//     fills only the first 72 bytes, so compat children are re-read
+//     through ptrace_getregs_arm32 and widened into the 64-bit view.
 //
 //   * On x86_64 the legacy PTRACE_GETREGS/SETREGS is the layout-correct
 //     choice for this codebase: `Regs` IS `user_regs_struct` (216 bytes)
@@ -190,6 +197,133 @@ type Regs = Aarch64Regs;
 #[cfg(target_arch = "aarch64")]
 const _: () = assert!(std::mem::size_of::<Aarch64Regs>() == 272);
 
+// ── 6-Z228: ARM (AArch32) compat register support ──────────────────
+//
+// The wave-1 corpus contains ELF32 EM_ARM recoveries (merlin/ali/
+// athene/bacon/a7xelte). On an arm64 HOST (redroid arm64, CONFIG_COMPAT)
+// those children run in AArch32 compat mode, where NT_PRSTATUS exposes
+// the 72-byte arm `user_regs_struct` (18 × u32) — NOT the 272-byte
+// `user_pt_regs`. Reading a compat child through the 64-bit view
+// produces garbage register values (every "u64 slot" straddles two
+// 32-bit registers), so every syscall number / argument / return-value
+// access would be wrong.
+//
+// Strategy: read the raw 72-byte compat layout, then WIDEN it into the
+// tracer's existing 64-bit `Regs` view:
+//   view.regs[0..13]  = r0..r12
+//   view.sp           = r13 (sp)
+//   view.regs[30]     = r14 (lr)
+//   view.pc           = r15 (pc)
+//   view.pstate       = r16 (cpsr)
+//   uregs[17]         = orig_r0 — preserved, never widened (no
+//                       ChildAbi field reads it, but the kernel needs
+//                       it intact across syscall restarts).
+// Rewrites go the other way through `narrow_arm32`, which overwrites
+// only the mapped slots of the CURRENT compat state (so orig_r0 and
+// anything we never model survive round-trips).
+//
+// ABI_ARM32 register indices against the widened view:
+//   reg_syscall=7 (r7), reg_ret=0 / args 0-5 (r0-r5),
+//   reg_marker=6 (r6 — the fb_hook marker channel; the arm32 hook
+//   sets r6 = low 32 bits of HOOK_SYSCALL_MARKER because a 32-bit
+//   register cannot hold the full 64-bit "twoyi123" constant),
+//   reg_sp=31 (view.sp slot).
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Arm32CompatRegs {
+    uregs: [u32; 18],
+}
+
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(std::mem::size_of::<Arm32CompatRegs>() == 72);
+
+/// Widen the raw 72-byte AArch32 compat register state into the
+/// tracer's 64-bit `Regs` view (see the block comment above).
+#[cfg(target_arch = "aarch64")]
+fn widen_arm32(raw: &Arm32CompatRegs, view: &mut Regs) {
+    *view = unsafe { std::mem::zeroed() };
+    for i in 0..13 {
+        view.regs[i] = raw.uregs[i] as u64;
+    }
+    view.sp = raw.uregs[13] as u64;
+    view.regs[30] = raw.uregs[14] as u64; // r14 (lr) -> x30 slot
+    view.pc = raw.uregs[15] as u64;
+    view.pstate = raw.uregs[16] as u64;
+    // raw.uregs[17] = orig_r0: intentionally not mapped.
+}
+
+/// Narrow the tracer's 64-bit view back onto the CURRENT AArch32
+/// compat state. Only the mapped slots are overwritten; `cur` must be
+/// the child's current register set (fetched in the same stop) so that
+/// orig_r0 (uregs[17]) and any state we never model survive.
+#[cfg(target_arch = "aarch64")]
+fn narrow_arm32(view: &Regs, cur: &mut Arm32CompatRegs) {
+    for i in 0..13 {
+        cur.uregs[i] = view.regs[i] as u32;
+    }
+    cur.uregs[13] = view.sp as u32;
+    cur.uregs[14] = view.regs[30] as u32;
+    cur.uregs[15] = view.pc as u32;
+    cur.uregs[16] = view.pstate as u32;
+}
+
+// Per-pid registry of AArch32-compat children, maintained at the two
+// ABI-detection sites (syscall-stop and SIGSYS paths). Consulted by
+// ptrace_getregs/ptrace_setregs — whose signatures and ~30 call sites
+// stay untouched — and by the re-read after ABI detection.
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    static ARM32_PIDS: std::cell::RefCell<std::collections::HashSet<libc::pid_t>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+#[cfg(target_arch = "aarch64")]
+fn register_arm32_pid(pid: libc::pid_t) {
+    ARM32_PIDS.with(|s| {
+        s.borrow_mut().insert(pid);
+    });
+}
+
+#[cfg(target_arch = "aarch64")]
+fn unregister_arm32_pid(pid: libc::pid_t) {
+    ARM32_PIDS.with(|s| {
+        s.borrow_mut().remove(&pid);
+    });
+}
+
+#[cfg(target_arch = "aarch64")]
+fn pid_is_arm32(pid: libc::pid_t) -> bool {
+    ARM32_PIDS.with(|s| s.borrow().contains(&pid))
+}
+
+/// 6-Z228: GETREGSET through the AArch32 compat layout and widen into
+/// the 64-bit view. Always requests exactly the compat regset size —
+/// on a compat child the kernel clamps a larger iov anyway, but asking
+/// for 72 explicitly makes the intent (and the return value) precise.
+#[cfg(target_arch = "aarch64")]
+fn ptrace_getregs_arm32(pid: libc::pid_t, view: &mut Regs) -> std::io::Result<usize> {
+    let mut raw = Arm32CompatRegs { uregs: [0u32; 18] };
+    let mut iov = libc::iovec {
+        iov_base: &mut raw as *mut _ as *mut libc::c_void,
+        iov_len: std::mem::size_of::<Arm32CompatRegs>(),
+    };
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_ptrace,
+            libc::PTRACE_GETREGSET as libc::c_long,
+            pid as libc::c_long,
+            NT_PRSTATUS,
+            &mut iov as *mut libc::iovec,
+        )
+    };
+    if r == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    widen_arm32(&raw, view);
+    Ok(iov.iov_len)
+}
+
 /// `NT_PRSTATUS` — the ELF note type identifying the general-purpose
 /// register regset; passed as the `addr` argument of
 /// `PTRACE_GETREGSET`/`PTRACE_SETREGSET`.
@@ -227,7 +361,9 @@ const NT_PRSTATUS: libc::c_long = 1;
 // the single source of truth.)
 // iov_len — so the ELF header is now the single source of truth.)
 //
-// On aarch64 there is no 32-bit userspace, so we always use ABI_AARCH64.
+// On aarch64, 32-bit children DO exist on arm64 hosts (AArch32 compat,
+// 6-Z228): ABI selection uses detect_child_is_64bit — ELFCLASS32 →
+// ABI_ARM32, everything else → ABI_AARCH64 (safe default).
 
 /// Runtime-detected syscall numbers and register layout for the traced
 /// child. All fields are valid for the child's actual bitness — callers
@@ -2163,6 +2299,128 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     reg_sp: 31, // sp
 };
 
+// ── 6-Z228: ABI_ARM32 — ELF32 EM_ARM children on an arm64 host ─────
+//
+// AArch32 compat mode (CONFIG_COMPAT): the kernel exposes the 72-byte
+// arm user_regs_struct via NT_PRSTATUS; ptrace_getregs_arm32 widens it
+// into the same 64-bit view the register-index fields below index.
+//
+// All syscall numbers VERIFIED against torvalds/linux
+// arch/arm/tools/syscall.tbl (not memory). The setuid/setgid family
+// follows bionic SYSCALLS.TXT lp32 mappings (setuid32=213, setgid32=214,
+// setresuid32=208, setresgid32=210, setgroups32=206, fchown32=207) —
+// bionic on 32-bit ARM issues the *32 variants. chown/lchown have NO
+// bionic lp32 libc wrapper (they route through fchownat), so the
+// chown/lchown fields cover old static binaries via their *32 variants.
+// mmap: bionic lp32 only uses mmap2 ("32-bit bionic only uses the
+// 64-bit call" — SYSCALLS.TXT); plain mmap(90) has old_mmap semantics
+// on arm and is left un-trapped. stat/lstat have no bionic lp32
+// wrapper either (fstatat64 covers them); the direct stat/lstat/stat64
+// numbers are kept for old static binaries.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+const ABI_ARM32: ChildAbi = ChildAbi {
+    getpid: 20,
+    getppid: 64,
+    open: 5, // arm32 still has open(5); modern bionic uses openat
+    openat: 322,
+    openat2: -1, // arm32 never got openat2 (64-bit-only addition)
+    stat: 106,
+    lstat: 107,
+    fstat: 108,
+    newfstatat: -1, // arm32 has no newfstatat — fstatat64 instead
+    statx: 397,
+    stat64: 195,
+    lstat64: 196,
+    fstat64: 197,
+    statfs_nr: 99,
+    fstatfs_nr: 100,
+    statfs64_nr: 266,
+    fstatfs64_nr: 267,
+    fstatat64_nr: 327,
+    getdents64: 217,
+    pread64: 180,
+    access: 33,
+    faccessat: 334,
+    rt_sigprocmask: 175,
+    readlink: 85,
+    readlinkat: 332,
+    chdir: 12,
+    getcwd: 183,
+    unlink: 10,
+    unlinkat: 328,
+    fchown: 207, // fchown32 — bionic lp32 mapping
+    fchmod: 94,
+    capget: 184,
+    capset: 185,
+    ioprio_get: 315,
+    ioprio_set: 314,
+    chmod: 15,
+    lchown: 198, // lchown32
+    chown: 212,  // chown32
+    fchmodat: 333,
+    fchownat: 325,
+    execve: 11, // SYS_execve (arm32)
+    mknodat: 324,
+    mount: 21,
+    chroot: 61,
+    mkdir: 39,
+    mkdirat: 323,
+    unshare: 337,
+    mknod: 14,
+    setxattr: 226,
+    lsetxattr: 227,
+    fsetxattr: 228,
+    shmget: 307,
+    shmat: 305,
+    shmctl: 308,
+    pause: 29,
+    clone_nr: 120,
+    fork_nr: 2,
+    vfork_nr: 190,
+    wait4_nr: 114,
+    exit_group_nr: 248,
+    write: 4,
+    read: 3,
+    mmap: -1, // arm plain mmap(90) = old_mmap semantics — unused by bionic
+    mmap2: 192,
+    socketcall_nr: -1, // arm bionic uses DIRECT socket syscalls (281+)
+    poll_nr: 168,
+    set_thread_area_nr: -1, // x86-only; arm TLS uses the private ARM_NR range
+    socket_nr: 281,
+    ioctl_nr: 54,
+    bind_nr: 282,
+    listen_nr: 284,
+    sendto_nr: 290,
+    sendmsg_nr: 296,
+    recvfrom_nr: 292,
+    recvmsg_nr: 297,
+    shutdown_nr: 293,
+    setsockopt_nr: 294,
+    getsockopt_nr: 295,
+    close_nr: 6,
+    fcntl_nr: 55,
+    connect_nr: 283,
+    writev_nr: 146,
+    setuid_nr: 213,    // setuid32 (bionic lp32)
+    setgid_nr: 214,    // setgid32
+    setresuid_nr: 208, // setresuid32
+    setresgid_nr: 210, // setresgid32
+    setgroups_nr: 206, // setgroups32
+    getxattr_nr: 229,
+    lgetxattr_nr: 230,
+    fgetxattr_nr: 231,
+    reg_syscall: 7, // r7 (arm EABI syscall number register)
+    reg_ret: 0,     // r0
+    reg_arg1: 0,    // r0
+    reg_arg2: 1,    // r1
+    reg_arg3: 2,    // r2
+    reg_arg4: 3,    // r3
+    reg_arg5: 4,    // r4
+    reg_arg6: 5,    // r5
+    reg_marker: 6,  // r6 (fb_hook marker channel; low 32 of the marker)
+    reg_sp: 31,     // widened view sp slot (r13 -> view.sp)
+};
+
 /// Detect whether the traced child is a 32-bit (i386) or 64-bit (x86_64)
 /// ELF by reading its `/proc/<pid>/exe` symlink target and parsing the
 /// ELF header.
@@ -2191,16 +2449,21 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
 ///
 /// # Return value
 ///
-/// - `Some(true)`  → 64-bit (x86_64) child
-/// - `Some(false)` → 32-bit (i386 compat) child
+/// - `Some(true)`  → 64-bit (x86_64 / aarch64) child
+/// - `Some(false)` → 32-bit (i386 compat on x86_64, arm compat on
+///   aarch64) child
 /// - `None`        → detection failed (file missing, not an ELF, I/O
 ///   error, …). Callers fall back to the 64-bit ABI on `None`, which
 ///   matches the historical behaviour.
 ///
-/// On aarch64 this function does not exist — aarch64 has no 32-bit
-/// userspace, so the child is unconditionally 64-bit and the loop uses
-/// `ABI_AARCH64` directly without any detection step.
-#[cfg(target_arch = "x86_64")]
+/// On aarch64 this function previously did not exist (the loop used
+/// `ABI_AARCH64` unconditionally); 6-Z228 compiles it there too for the
+/// AArch32-compat guest case.
+///
+/// 6-Z228: also compiled on aarch64 — ELF32 EM_ARM guests make the
+/// AArch32-compat case real there. The classifier is architecture-
+/// generic (EI_CLASS precedence), so the same function serves both.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn detect_child_is_64bit(pid: libc::pid_t) -> Option<bool> {
     use std::io::Read;
 
@@ -2374,6 +2637,54 @@ fn ptrace_getregs(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
 /// `sizeof(user_regs_struct)` bytes and the value is ignored.
 #[cfg(target_arch = "aarch64")]
 fn ptrace_setregs(pid: libc::pid_t, regs: &Regs, iov_len: usize) -> std::io::Result<()> {
+    // ── 6-Z228: AArch32 compat dispatch ──
+    //
+    // An ELF32 EM_ARM child exposes the 72-byte compat NT_PRSTATUS
+    // regset. Writing the 272-byte 64-bit view straight back would be
+    // rejected/misinterpreted, and the smoke-detector indices below
+    // (31=sp, 32=pc in the flat u64 view) do not exist in the compat
+    // layout. Route compat children through narrow_arm32: fetch the
+    // CURRENT compat state (preserving orig_r0/cpsr and anything the
+    // view doesn't model), overwrite the mapped slots from the view,
+    // and SETREGSET exactly 72 bytes.
+    if pid_is_arm32(pid) {
+        let mut cur = Arm32CompatRegs { uregs: [0u32; 18] };
+        let mut iov_get = libc::iovec {
+            iov_base: &mut cur as *mut _ as *mut libc::c_void,
+            iov_len: std::mem::size_of::<Arm32CompatRegs>(),
+        };
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_ptrace,
+                libc::PTRACE_GETREGSET as libc::c_long,
+                pid as libc::c_long,
+                NT_PRSTATUS,
+                &mut iov_get as *mut libc::iovec,
+            )
+        };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        narrow_arm32(regs, &mut cur);
+        let mut iov_set = libc::iovec {
+            iov_base: &mut cur as *mut _ as *mut libc::c_void,
+            iov_len: std::mem::size_of::<Arm32CompatRegs>(),
+        };
+        let r2 = unsafe {
+            libc::syscall(
+                libc::SYS_ptrace,
+                libc::PTRACE_SETREGSET as libc::c_long,
+                pid as libc::c_long,
+                NT_PRSTATUS,
+                &mut iov_set as *mut libc::iovec,
+            )
+        };
+        if r2 == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+
     // ── 6-Z180: PC/SP SMOKE DETECTOR (aarch64) ──
     //
     // Every legitimate setregs call site in this tracer mutates the
@@ -3736,9 +4047,13 @@ fn abi_label(abi: ChildAbi) -> &'static str {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        // On aarch64 there is no 32-bit userspace, so the child is
-        // always 64-bit. The `abi` parameter is unused on this target.
-        "64-bit (aarch64)"
+        // 6-Z228: distinguish ABI_ARM32 (reg_syscall=7 is arm-only) in
+        // the per-stop logs.
+        if abi.reg_syscall == 7 {
+            "32-bit (arm compat)"
+        } else {
+            "64-bit (aarch64)"
+        }
     }
 }
 
@@ -4086,8 +4401,15 @@ fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> Vec<(PathArgSlot, bool)> {
     //   truncate:  92 / 76 / -1
     //   utimensat: 320 / 280 / 88
     //   faccessat2: 439 / 439 / 439
-    // (Derived from the ABI's execve number, which is unique per ABI:
-    // 11=i386, 59=x86_64, 221=aarch64.)
+    // (Derived from ABI-unique fields: reg_syscall==7 → arm32 (6-Z228);
+    // execve 11=i386, 59=x86_64, 221=aarch64.)
+    // arm32 numbers (arch/arm/tools/syscall.tbl): rename=38, renameat=329,
+    // renameat2=382, link=9, linkat=330, symlink=83, symlinkat=331,
+    // truncate=92, utimensat=320, faccessat2=439. NOTE: the plain
+    // (non-*at) numbers happen to be shared with i386, but the *at
+    // numbers are NOT (i386 linkat=303 vs arm32 linkat=330) — the old
+    // "execve==11 → i386 tuple" shortcut would have mis-directed path
+    // translation for arm32 renameat/linkat/symlinkat.
     let (
         rename,
         renameat,
@@ -4099,7 +4421,10 @@ fn sandbox_path_arg_slots(nr: i64, abi: &ChildAbi) -> Vec<(PathArgSlot, bool)> {
         truncate,
         utimensat,
         faccessat2,
-    ) = if abi.execve == 11 {
+    ) = if abi.reg_syscall == 7 {
+        // 6-Z228: arm32 (reg_syscall=7 = r7 is arm-only)
+        (38i64, 329, 382, 9, 330, 83, 331, 92, 320, 439)
+    } else if abi.execve == 11 {
         (38i64, 264, 353, 9, 303, 83, 304, 92, 320, 439)
     } else if abi.execve == 59 {
         (82, 292, 316, 86, 265, 88, 266, 76, 280, 439)
@@ -5188,8 +5513,18 @@ fn hook_marker_present(regs: &Regs, abi: &ChildAbi) -> bool {
     let idx = abi.reg_marker as usize;
     let regs_ptr = regs as *const Regs as *const u64;
     // SAFETY: reg_marker indexes within the arch register array (x6 on
-    // aarch64 user_pt_regs — always present).
-    unsafe { *regs_ptr.add(idx) == HOOK_SYSCALL_MARKER }
+    // aarch64 user_pt_regs — always present; r6 on the arm32 widened
+    // view, same index 6).
+    unsafe {
+        let v = *regs_ptr.add(idx);
+        // 6-Z228: a 32-bit register cannot hold the full 64-bit
+        // "twoyi123" marker — the arm32 fb_hook sets r6 to the LOW 32
+        // BITS (0x69313233, "i123"). Accept either the full value
+        // (aarch64) or the low-32 value (arm32); a legit non-marker
+        // x6/r6 carries pointer-sized data whose exact match against
+        // BOTH constants is astronomically unlikely.
+        v == HOOK_SYSCALL_MARKER || v == (HOOK_SYSCALL_MARKER & 0xffff_ffff)
+    }
 }
 
 fn read_child_string(pid: libc::pid_t, addr: u64) -> Option<String> {
@@ -11888,7 +12223,20 @@ pub fn run_ptrace_loop(
                         ),
                     };
                     #[cfg(target_arch = "aarch64")]
-                    let (picked, bitness_label) = (ABI_AARCH64, "64-bit (aarch64)");
+                    // 6-Z228: aarch64 hosts CAN run 32-bit children —
+                    // ELF32 EM_ARM guests on an arm64 redroid run in
+                    // AArch32 compat mode. Detect via the child's ELF
+                    // header (same classifier the x86_64 path uses;
+                    // EI_CLASS takes precedence over e_machine).
+                    let child_is_arm32 = matches!(detect_child_is_64bit(pid), Some(false));
+                    #[cfg(target_arch = "aarch64")]
+                    let (picked, bitness_label) = if child_is_arm32 {
+                        register_arm32_pid(pid);
+                        (ABI_ARM32, "32-bit (arm compat)")
+                    } else {
+                        unregister_arm32_pid(pid);
+                        (ABI_AARCH64, "64-bit (aarch64)")
+                    };
                     log(&format!(
                         "detected child bitness: {} (pid={})",
                         bitness_label, pid
@@ -11900,6 +12248,39 @@ pub fn run_ptrace_loop(
                 // an entry for `pid` if it was missing.
                 abi = Some(*abi_map.get(&pid).unwrap());
                 let abi = abi.unwrap();
+
+                // 6-Z228: an AArch32-compat child's NT_PRSTATUS is 72
+                // bytes — the 272-byte GETREGSET above filled only the
+                // first 72 bytes with the RAW compat layout (iov_len
+                // was clamped to 72). Re-read through the compat path
+                // so `regs` is the widened 64-bit view every ABI helper
+                // below expects. (Cost: one extra GETREGSET per stop,
+                // 32-bit children only.)
+                #[cfg(target_arch = "aarch64")]
+                let mut regs = if pid_is_arm32(pid) {
+                    let mut v: Regs = unsafe { std::mem::zeroed() };
+                    if let Err(e) = ptrace_getregs_arm32(pid, &mut v) {
+                        log(&format!(
+                            "ptrace_getregs_arm32 failed: {} (iteration {})",
+                            e, loop_count
+                        ));
+                        // Same sync-preservation as the getregs failure
+                        // path above: flip the phase so the next stop is
+                        // still classified correctly.
+                        in_syscall = !in_syscall;
+                        if recent_stops.len() == RECENT_STOPS_CAP {
+                            recent_stops.pop_front();
+                        }
+                        recent_stops.push_back(format!(
+                            "(loop={},pid={},syscall?,getregs32-FAILED)",
+                            loop_count, pid
+                        ));
+                        continue;
+                    }
+                    v
+                } else {
+                    regs
+                };
 
                 let syscall_num = get_syscall_num(&regs, &abi);
 
@@ -12778,6 +13159,14 @@ pub fn run_ptrace_loop(
                         }
 
                         // Task 6-Z42: inject a 64-bit execve to bypass seccomp.
+                        // 6-Z228 HOST GATE: this machinery is x86_64-host-only
+                        // (it writes an x86 `0f 05` syscall byte sequence and
+                        // sets rax=59). On aarch64 hosts ABI_ARM32 children
+                        // (execve=11 — the SAME number as i386!) must take the
+                        // NORMAL execve path: Android app seccomp on arm64
+                        // allows compat execve, so there is nothing to bypass,
+                        // and executing x86 machine code would be fatal.
+                        // arm32-on-x86_64 does not exist, so the gate is exact.
                         // The zygote's seccomp filter blocks i386 execve (nr=11)
                         // → returns -38 (ENOSYS). But it ALLOWS x86_64 execve
                         // (nr=59) — init's own first execve (nr=59) succeeds.
@@ -12804,7 +13193,10 @@ pub fn run_ptrace_loop(
                         // to an infinite loop (init's waitpid blocks — init thinks
                         // the service is "running"), and kr64 forks a NEW 64-bit
                         // child that calls x86_64 execve(nr=59, allowed by seccomp).
-                        if abi.execve == 11 && recovery_child_pid.is_none() {
+                        if abi.execve == 11
+                            && recovery_child_pid.is_none()
+                            && cfg!(target_arch = "x86_64")
+                        {
                             let path_addr_i386 = get_syscall_arg(&regs, abi.reg_arg1);
                             let argv_addr_i386 = get_syscall_arg(&regs, abi.reg_arg2);
                             let envp_addr_i386 = get_syscall_arg(&regs, abi.reg_arg3);
@@ -13102,7 +13494,14 @@ pub fn run_ptrace_loop(
                         // kept running INIT'S OWN IMAGE after the fork, acting
                         // as a duplicate init (re-parsing .rc, re-forking) and
                         // corrupting the boot state.
-                        if abi.execve == 11 && recovery_child_pid.is_some() {
+                        // 6-Z228: x86_64-host-only (see the 6-Z42 HOST GATE
+                        // note above) — abi.execve == 11 also matches
+                        // ABI_ARM32 children on aarch64 hosts, which must
+                        // never enter this skip path.
+                        if abi.execve == 11
+                            && recovery_child_pid.is_some()
+                            && cfg!(target_arch = "x86_64")
+                        {
                             // bootfix FIX 3: read + ALWAYS log the execve
                             // pathname BEFORE the skip decision. In run
                             // 32612016071 the TWRP helper's (pid 6306)
@@ -18794,7 +19193,10 @@ pub fn run_ptrace_loop(
                         ));
                     }
                     if _forced_ret_opt.is_some()
-                        || (abi.execve == 11 && syscall_num != 1 && syscall_num != 252)
+                        || (abi.execve == 11
+                            && syscall_num != 1
+                            && syscall_num != abi.exit_group_nr)
+                    // 6-Z228: 252=i386 exit_group, 248=arm32 — use the ABI field
                     {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
                         match ptrace_getregs(pid, &mut regs2) {
@@ -18905,7 +19307,10 @@ pub fn run_ptrace_loop(
                                 } else if _forced_ret_opt.is_some() {
                                     _forced_ret_opt
                                 } else if abi.execve == 11 {
-                                    if syscall_num == 1 || syscall_num == 252 {
+                                    // 6-Z228: abi.exit_group_nr (252 on i386,
+                                    // 248 on arm32) instead of the old i386
+                                    // hardcode — arm32 children reach here now.
+                                    if syscall_num == 1 || syscall_num == abi.exit_group_nr {
                                         None // exit / exit_group — never fake
                                     } else if fresh_ret == -38 {
                                         Some(i386_enosys_fake_value(syscall_num))
@@ -20481,7 +20886,17 @@ pub fn run_ptrace_loop(
                                 ),
                             };
                             #[cfg(target_arch = "aarch64")]
-                            let (picked, bitness_label) = (ABI_AARCH64, "64-bit (aarch64)");
+                            // 6-Z228: same AArch32-compat detection as
+                            // the syscall-stop path (see that block).
+                            let child_is_arm32 = matches!(detect_child_is_64bit(pid), Some(false));
+                            #[cfg(target_arch = "aarch64")]
+                            let (picked, bitness_label) = if child_is_arm32 {
+                                register_arm32_pid(pid);
+                                (ABI_ARM32, "32-bit (arm compat)")
+                            } else {
+                                unregister_arm32_pid(pid);
+                                (ABI_AARCH64, "64-bit (aarch64)")
+                            };
                             log(&format!(
                                 "detected child bitness (SIGSYS path): {} (pid={})",
                                 bitness_label, pid
@@ -20492,6 +20907,22 @@ pub fn run_ptrace_loop(
                         // per-pid map (same as the SIGTRAP|0x80 path).
                         abi = Some(*abi_map.get(&pid).unwrap());
                         let a = abi.unwrap();
+
+                        // 6-Z228: re-read AArch32-compat children through
+                        // the compat regset path (the getregs above read
+                        // only the raw 72-byte prefix into the 272-byte
+                        // view). Mutable shadow: set_syscall_ret rewrites
+                        // the return-value register further below.
+                        #[cfg(target_arch = "aarch64")]
+                        let mut sigsys_regs = if pid_is_arm32(pid) {
+                            let mut v: Regs = unsafe { std::mem::zeroed() };
+                            match ptrace_getregs_arm32(pid, &mut v) {
+                                Ok(_) => v,
+                                Err(_) => sigsys_regs,
+                            }
+                        } else {
+                            sigsys_regs
+                        };
 
                         // Read the ORIGINAL syscall number BEFORE rewriting
                         // it. This is the syscall that seccomp blocked —
@@ -21983,6 +22414,170 @@ mod tests {
             Some(true),
             "the test binary itself is a 64-bit x86_64 ELF"
         );
+    }
+
+    // ── 6-Z228: AArch32-compat (ABI_ARM32) tests ────────────────────
+
+    #[test]
+    fn abi_arm32_key_syscall_numbers_6z228() {
+        // Numbers verified against torvalds/linux arch/arm/tools/syscall.tbl
+        // and bionic libc/SYSCALLS.TXT lp32 mappings.
+        assert_eq!(ABI_ARM32.openat, 322);
+        assert_eq!(ABI_ARM32.open, 5);
+        assert_eq!(ABI_ARM32.mkdirat, 323);
+        assert_eq!(ABI_ARM32.mknodat, 324);
+        assert_eq!(ABI_ARM32.fchownat, 325);
+        assert_eq!(ABI_ARM32.fstatat64_nr, 327);
+        assert_eq!(ABI_ARM32.unlinkat, 328);
+        assert_eq!(ABI_ARM32.readlinkat, 332);
+        assert_eq!(ABI_ARM32.fchmodat, 333);
+        assert_eq!(ABI_ARM32.faccessat, 334);
+        assert_eq!(ABI_ARM32.unshare, 337);
+        assert_eq!(ABI_ARM32.socket_nr, 281);
+        assert_eq!(ABI_ARM32.bind_nr, 282);
+        assert_eq!(ABI_ARM32.connect_nr, 283);
+        assert_eq!(ABI_ARM32.sendto_nr, 290);
+        assert_eq!(ABI_ARM32.recvfrom_nr, 292);
+        assert_eq!(ABI_ARM32.setsockopt_nr, 294);
+        assert_eq!(ABI_ARM32.getsockopt_nr, 295);
+        assert_eq!(ABI_ARM32.execve, 11);
+        assert_eq!(ABI_ARM32.mount, 21);
+        assert_eq!(ABI_ARM32.chroot, 61);
+        assert_eq!(ABI_ARM32.getpid, 20);
+        assert_eq!(ABI_ARM32.getppid, 64);
+        assert_eq!(ABI_ARM32.close_nr, 6);
+        assert_eq!(ABI_ARM32.write, 4);
+        assert_eq!(ABI_ARM32.read, 3);
+        assert_eq!(ABI_ARM32.mmap2, 192);
+        assert_eq!(ABI_ARM32.wait4_nr, 114);
+        assert_eq!(ABI_ARM32.exit_group_nr, 248);
+        assert_eq!(ABI_ARM32.clone_nr, 120);
+        assert_eq!(ABI_ARM32.ioctl_nr, 54);
+        // bionic lp32 emits the *32 uid variants:
+        assert_eq!(ABI_ARM32.setuid_nr, 213);
+        assert_eq!(ABI_ARM32.setgid_nr, 214);
+        assert_eq!(ABI_ARM32.setresuid_nr, 208);
+        assert_eq!(ABI_ARM32.setresgid_nr, 210);
+        assert_eq!(ABI_ARM32.setgroups_nr, 206);
+        assert_eq!(ABI_ARM32.fchown, 207);
+        // 64-bit-only / not-wired slots stay negative:
+        assert_eq!(ABI_ARM32.newfstatat, -1);
+        assert_eq!(ABI_ARM32.openat2, -1);
+        assert_eq!(ABI_ARM32.mmap, -1);
+        assert_eq!(ABI_ARM32.socketcall_nr, -1);
+        assert_eq!(ABI_ARM32.set_thread_area_nr, -1);
+    }
+
+    #[test]
+    fn abi_arm32_register_indices_6z228() {
+        // EABI: syscall number in r7, args r0-r5, marker in r6.
+        // All indices are against the WIDENED 64-bit view where
+        // r0-r12 map to regs[0..13] and sp/lr/pc map to their slots.
+        assert_eq!(ABI_ARM32.reg_syscall, 7);
+        assert_eq!(ABI_ARM32.reg_ret, 0);
+        assert_eq!(ABI_ARM32.reg_arg1, 0);
+        assert_eq!(ABI_ARM32.reg_arg2, 1);
+        assert_eq!(ABI_ARM32.reg_arg3, 2);
+        assert_eq!(ABI_ARM32.reg_arg4, 3);
+        assert_eq!(ABI_ARM32.reg_arg5, 4);
+        assert_eq!(ABI_ARM32.reg_arg6, 5);
+        assert_eq!(ABI_ARM32.reg_marker, 6);
+        assert_eq!(ABI_ARM32.reg_sp, 31);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn widen_narrow_arm32_roundtrip_6z228() {
+        let mut raw = Arm32CompatRegs { uregs: [0u32; 18] };
+        for i in 0..13 {
+            raw.uregs[i] = 0x1000_0000u32 * (i as u32 + 1);
+        }
+        raw.uregs[13] = 0xbeef_0000; // sp
+        raw.uregs[14] = 0xbeef_0001; // lr
+        raw.uregs[15] = 0xbeef_0002; // pc
+        raw.uregs[16] = 0x0000_0010; // cpsr
+        raw.uregs[17] = 0xdead_0000; // orig_r0 (must survive narrow)
+
+        let mut view: Regs = unsafe { std::mem::zeroed() };
+        widen_arm32(&raw, &mut view);
+        // r0..r12 zero-extended into regs[0..13]:
+        for i in 0..13 {
+            assert_eq!(view.regs[i], raw.uregs[i] as u64, "r{}", i);
+        }
+        assert_eq!(view.sp, 0xbeef_0000);
+        assert_eq!(view.regs[30], 0xbeef_0001); // lr -> x30 slot
+        assert_eq!(view.pc, 0xbeef_0002);
+        assert_eq!(view.pstate, 0x0000_0010);
+        // The unused view slots must be ZERO (no stray 64-bit merges):
+        for i in 13..30 {
+            assert_eq!(view.regs[i], 0, "unused slot regs[{}]", i);
+        }
+
+        // Narrow back onto a CURRENT state whose orig_r0 differs —
+        // the narrow must NOT clobber it, and must reproduce every
+        // mapped slot exactly (32-bit truncation of the view).
+        let mut cur = Arm32CompatRegs { uregs: [0u32; 18] };
+        cur.uregs[17] = 0xdead_0000; // kernel-recorded orig_r0
+        cur.uregs[16] = 0x0000_0010;
+        narrow_arm32(&view, &mut cur);
+        for i in 0..13 {
+            assert_eq!(cur.uregs[i], raw.uregs[i], "narrow r{}", i);
+        }
+        assert_eq!(cur.uregs[13], 0xbeef_0000);
+        assert_eq!(cur.uregs[14], 0xbeef_0001);
+        assert_eq!(cur.uregs[15], 0xbeef_0002);
+        assert_eq!(cur.uregs[16], 0x0000_0010);
+        assert_eq!(cur.uregs[17], 0xdead_0000, "orig_r0 must be preserved");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn arm32_ret_write_narrows_correctly_6z228() {
+        // set_syscall_ret writes regs[0] (64-bit); narrowing must yield
+        // the low 32 bits (a -1 return becomes 0xffffffff in the child).
+        let raw = Arm32CompatRegs { uregs: [0u32; 18] };
+        let mut view: Regs = unsafe { std::mem::zeroed() };
+        widen_arm32(&raw, &mut view);
+        set_syscall_ret(&mut view, &ABI_ARM32, -1);
+        let mut cur = Arm32CompatRegs { uregs: [0u32; 18] };
+        narrow_arm32(&view, &mut cur);
+        assert_eq!(cur.uregs[0], 0xffff_ffff);
+    }
+
+    #[test]
+    fn hook_marker_low32_accepted_6z228() {
+        // The arm32 fb_hook sets r6 to the low 32 bits of the marker
+        // (a 32-bit register cannot hold "twoyi123"). The widened view
+        // value is the zero-extended u32 — must be accepted.
+        let full = HOOK_SYSCALL_MARKER; // 0x74776f7969313233
+        let low = full & 0xffff_ffff; // 0x69313233 ("i123")
+        assert_eq!(low, 0x6931_3233);
+        // ABI_ARM32 must use the r6 slot (index 6) so the check fires:
+        assert_eq!(ABI_ARM32.reg_marker, 6);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(ABI_AARCH64.reg_marker, 6);
+    }
+
+    #[test]
+    fn classify_elf_bitness_arm32_header_6z228() {
+        // ELF32 little-endian EM_ARM header prefix: EI_CLASS=1 (32-bit).
+        // EI_CLASS takes precedence, so this classifies as 32-bit on
+        // the aarch64 host too.
+        let mut hdr = [0u8; 20];
+        hdr[0..4].copy_from_slice(b"\x7fELF");
+        hdr[4] = 1; // ELFCLASS32
+        hdr[5] = 1; // little-endian
+        hdr[18] = 40; // EM_ARM low byte
+        hdr[19] = 0; // EM_ARM high byte
+        assert_eq!(classify_elf_bitness(&hdr), Some(false));
+        // And the aarch64 ELF64 header (EI_CLASS=2):
+        let mut hdr64 = [0u8; 20];
+        hdr64[0..4].copy_from_slice(b"\x7fELF");
+        hdr64[4] = 2;
+        hdr64[5] = 1;
+        hdr64[18] = 183; // EM_AARCH64 = 0xB7
+        hdr64[19] = 0;
+        assert_eq!(classify_elf_bitness(&hdr64), Some(true));
     }
 
     // ── translate_path tests ────────────────────────────────────────
