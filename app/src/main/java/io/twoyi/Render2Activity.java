@@ -193,6 +193,23 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             Log.i(TAG, "Boot Recovery (TWRP) flag: " + bootRecovery);
             FileLogger.boot("boot_recovery_flag", "enabled=" + bootRecovery);
 
+            // Loader-path recovery display mode (OrangeFox-class fix, run
+            // 33317227548): when the imported ROM is an AOSP-STYLE recovery
+            // (dynamic /init symlink + /system/bin/recovery, no /sbin/
+            // recovery), boot_recovery stays FALSE — the guest boots through
+            // the normal loader path with the LD_PRELOAD fb-hook chain and
+            // its minui draws into the hooked /dev/graphics/fb0 regular
+            // file. The native core must then start the fb0 → SurfaceView
+            // blit loop (as in TWRP mode) INSTEAD of the emugl GL renderer,
+            // which a recovery never uses. Without this, the guest UI was
+            // alive internally (touch + page transitions) but the app showed
+            // the black loading screen forever — nobody read fb0.
+            boolean recoveryLoader = !bootRecovery
+                    && io.twoyi.utils.RomManager.isAospRecoveryLayout(getApplicationContext());
+            Renderer.setRecoveryLoader(recoveryLoader);
+            Log.i(TAG, "Recovery (loader path) flag: " + recoveryLoader);
+            FileLogger.boot("recovery_loader_flag", "enabled=" + recoveryLoader);
+
             // Calculate proper DPI based on physical screen and virtual display scaling
             WindowManager windowManager = getWindowManager();
             Display defaultDisplay = windowManager.getDefaultDisplay();
