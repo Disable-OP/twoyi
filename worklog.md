@@ -19301,3 +19301,138 @@ Stage Summary:
 - Run IDs (head 537e617, all in_progress at 22:45:33Z): 33279356812, 33279357961,
   33279359112, 33279360223, 33279361259. Mapping run→recovery via each E2E job's
   RECOVERY_NAME env dump at completion (dispatch POST returns no body).
+
+---
+Task ID: 6-Z223-mon
+Agent: CI monitor subagent
+Task: Monitor the 5-run verification round on head 537e617 (6-Z222+6-Z223).
+
+Work Log:
+- Polling: first check 22:52:48Z (all 5 in_progress), then 22:56:54Z (3 done:
+  33279356812/33279357961/33279359112 success), then 23:02:26Z (all 5 completed,
+  every run conclusion=success; E2E jobs ran ~8-14 min; total monitor time ~17 min,
+  well under the 35-min cap). In-progress job log fetch returned BlobNotFound
+  (log blob not flushed yet), so RECOVERY_NAME mapping was done after completion.
+- Mapping via GET /actions/jobs/<job_id>/logs, grep RECOVERY_NAME:
+  33279356812→twrp-2.8.7.0-angler, 33279357961→twrp-3.7.0_9-0-angler,
+  33279359112→twrp-3.7.0_9-0-whyred, 33279360223→orangefox-R12.0-lavender,
+  33279361259→lineage-22.2-sailfish.
+- Artifacts: downloaded ui-e2e-arm64-logs for all 5 (artifact IDs 9722628506,
+  9722606029, 9722600759, 9722673612, 9722671719; 1.3-17.2 MB zips), unzipped +
+  untarred (ui-e2e-logs.tar.xz → tmp/ui-e2e-artifacts/) under
+  /home/z/my-project/artifacts/ver537e617/run_<run_id>/.
+- Classification: ran scripts/recovery-corpus/classify_result.py <artifact_dir>
+  for all 5; results byte-identical to the in-job result.json. NOTE: all 5
+  workflow conclusions are "success" — the workflow does NOT gate exit code on
+  the E2E verdict; verdict lives only in result.json / job log.
+- Evidence greps: dev-__kmsg__, kmsg-stub.txt, twrp-recovery.log,
+  twrp-recovery-log-dockerexec.log, kr64-app-stderr-dockerexec.log per run
+  (slotselect / gr_fb_width / fb0-tracking / SIGSEGV-details / InitFatalReboot).
+
+Stage Summary:
+- 33279356812 → twrp-2.8.7.0-angler → success → UI_READY (boot BOOT_OK, theme OK,
+  terminal OK, vfs CLEAN; pages end in filemanagerlist; backstop_denied=24;
+  2 recovery instances; vibrator+battery OK).
+- 33279357961 → twrp-3.7.0_9-0-angler → success → UI_READY (terminal OK via
+  term-07 screenshots; pages reach main2; backstop_denied=2).
+- 33279359112 → twrp-3.7.0_9-0-whyred → success → UI_READY (pages reach main2;
+  backstop_denied=9; 1 instance). Guards: 3/3 green, no regressions.
+- 33279360223 → orangefox-R12.0-lavender → success(job) → CRASH_LOOP /
+  TIMEOUT_OR_UNKNOWN (boot BOOT_OK, ui NOT_REACHED, sigsegv_count=30,
+  init_fatal_reboot). KEY: gr_fb_width signature GONE (0 hits anywhere) — 6-Z222
+  verified at its target: "[twoyi_loader] open(/dev/graphics/fb0) -> fd=N
+  (tracking for FB ioctls)" + 26× "[FB0 TRACKED]" hook lines, OrangeFox boots deep
+  (banner, fox.cfg, fstab, brightness 1950, keystore partition). NEW failure mode:
+  27 guest boot cycles ("Starting OrangeFox ... pid 1" ×27 in recovery.log),
+  26× keystore2 SIGSEGV NULL-deref (comm "_system_bin_key", si_addr=0x0, same page
+  offset pc+0x46c across ASLR bases) + 4× recovery SIGSEGV (comm "_system_bin_rec",
+  pc+0x27c), dev-__kmsg__ "init: InitFatalReboot: signal 6" right at keystore2.rc
+  late-init → guest reboots, loop never reaches UI.
+- 33279361259 → lineage-22.2-sailfish → success(job) → classifier BOOT_FAIL, but
+  boot actually OK — UI never reached. 6-Z223 VERIFIED: "Error updating for
+  slotselect" = 0 hits in dev-__kmsg__, kmsg-stub.txt AND kr logs (also 0 in
+  recovery.log); libfstab parses served cmdline cleanly (only "unknown flag:
+  verify" warnings); "I:Starting recovery (pid 1)" banner at t=42.7s; no
+  InitFatalReboot/property_area/linker signatures. NEW blocker: AOSP minui fbdev
+  path — FBIOGET_FSCREENINFO/VSCREENINFO interposed OK (320x640@32bpp fallback),
+  but ioctls 0xc0046209 + 0xc004620d pass through to the real fb → errno 25
+  ENOTTY ("[twoyi_loader] ioctl(fd=7 real, req=0xc0046209) -> -1 (errno=25)") →
+  "failed to mmap framebuffer: Inappropriate ioctl for device" ×500 (t=10.1→42.2s
+  retry loop) → "cannot open any framebuffer" → headless recovery → "Rebooting..."
+  at t=163.1s. Classifier false-negative note: its banner regex needs the pid on
+  the line AFTER "Starting recovery", but lineage prints
+  "I:Starting recovery (pid 1) on <date>" on ONE line → recovery_instances=0 →
+  boot misjudged BOOT_FAIL from non-empty kr; consider allowing pid-on-same-line.
+- Net: 6-Z222 and 6-Z223 both did their jobs (old signatures gone, boot advances
+  past both old blockers); guards intact; two NEW next-step blockers identified —
+  orangefox: keystore2/recovery SIGSEGV crash-reboot loop; lineage: minui fbdev
+  mmap path (uninterposed fb ioctls 0xc0046209/0xc004620d → ENOTTY).
+- Local artifact cache: /home/z/my-project/artifacts/ver537e617/run_<run_id>/.
+- Source code untouched; no git push; only this worklog append.
+
+---
+Task ID: 6-Z224
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Root-cause the two NEW blockers from the 537e617 verification round (lineage headless exit + OrangeFox boot loop), fix generically, prep verification round 2.
+
+Work Log:
+- VERIFICATION ROUND 1 RESULTS (head 537e617, artifacts artifacts/ver537e617/): 6-Z223
+  VERIFIED for lineage ("Error updating for slotselect" GONE from all logs; recovery
+  boots 163s, no init fatal) and 6-Z222 VERIFIED for OrangeFox (gr_fb_width crash GONE;
+  fb0 opens tracked, 26x [FB0 TRACKED]). Guards 3/3 GREEN. New blockers below.
+- LINEAGE BLOCKER (run 33279361259): minui fbdev Init — open fb0 OK, FBIOGET_FSCREENINFO
+  OK (smem_len=819200), FBIOGET_VSCREENINFO OK (320x640@32bpp), then mmap MAP_FAILED ->
+  "failed to mmap framebuffer" x500 -> "cannot open any framebuffer" -> headless ->
+  "Rebooting..." at 163.1s. kmsg showed ioctl(fd, 0xc0046209/0xc004620d) ENOTTY right
+  before each failure — decoded: BINDER_VERSION (_IOWR('b',9,4)) + 'b'+13 — NOT fb
+  ioctls at all. Char-level tracer DIAG writes (6-Z213) proved those probe lines come
+  from the SHLIB's OWN mmap hook (twoyi_loader_shlib.c defines BP_IOC_VERSION_GUEST/
+  ALT and probes failed mmaps with them).
+- SHLIB MMAP HOOK BUGS (generic): (1) the binder probe ran BEFORE the mmap-failure
+  errno was read — the probe's ENOTTY REPLACED the real mmap errno, so minui's perror
+  printed "Inappropriate ioctl for device" for what were actually DIFFERENT errors;
+  (2) OrangeFox's real error is now PROVEN: its minui opens fb0 __open_2(fl=0x2 =
+  O_RDONLY — run 33279360223 twrp-recovery.log) then maps PROT_READ|PROT_WRITE|MAP_SHARED
+  -> kernel EACCES on a read-only fd; (3) for lineage the fd was O_RDWR — the new
+  diagnostics will print its real errno next run.
+- ORANGEFOX BLOCKER #2 (run 33279360223): 27 boot cycles. kmsg: "init: processing
+  action (init) from servicemanager.rc:1 -> starting service 'servicemanager'... ->
+  cannot set capabilities for logd -> InitFatalReboot: signal 6". AOSP init/service.cpp
+  line ~250: SetCapsForExec() failure -> LOG(FATAL) -> SIGABRT; the FORKED SERVICE
+  CHILD inherits init's SIGABRT handler and reboots the whole guest. SetCapsForExec
+  fails because capset() is NOT fake-succeeded by the tracer: ChildAbi had capget but
+  NO capset field (aarch64 capset=91, asm-generic/unistd.h). x86_64 guests never hit
+  this because the table had "capget: 125" — 125 is actually CAPSET on x86_64 (124 is
+  capget): x86 fake-succeeded capset BY ACCIDENT for years. (Also found: keystore2
+  SIGSEGV x26 pc+0x46c — non-fatal once init stops rebooting; re-classify after.)
+- FIXES (6-Z224, generic §22):
+  * capset fake-success: ChildAbi.capset field + per-ABI numbers (aarch64=91,
+    x86_64=125, i386=185) + wired into compute_exit_return_value + syscall_name().
+    FIXED the x86_64 misnumbering: capget 125->124. 2 regression tests (all-ABI
+    fake-success + collision/adjacency invariants; aarch64 arms cfg-gated per the
+    existing pattern). 636 total, all green.
+  * shlib mmap hook: save+log the REAL errno (bounded, first 8, with fd identity via
+    /proc/self/fd readlinkat) BEFORE the binder probe; FB-tracked fds now RETRY via
+    an O_RDWR re-open of /dev/graphics/fb0 (raw syscall, tracer-translated — mapping
+    of the SAME file, so the pixel pipeline stays intact) then a MAP_ANONYMOUS|MAP_SHARED
+    last resort; the binder probe no longer runs for fb fds; original errno restored
+    on final MAP_FAILED.
+  * create_twrp_framebuffer is NO LONGER gated on cfg.boot_recovery: lineage's
+    boot_recovery=false (per-design) skipped it, so {rootfs}/dev/.twoyi-fb-geometry
+    was never written (hook: "env+file missing") and fb0 stayed a stub-sized file.
+    Now every boot mode gets the full-size fb0 (cfg.width*height*4) + the geometry
+    file; idempotent, harmless for full-Android guest boots.
+  * classify_result.py: banner regex now ALSO matches the same-line pid layout
+    ("Starting recovery (pid 1) on <date>") — the old regex required the pid on the
+    NEXT line and misjudged the fully-booted lineage recovery as BOOT_FAIL
+    (recovery_instances=0).
+
+Stage Summary:
+- Both blockers are mechanism-level, generic classes: (1) "capset EPERM in an init
+  fork child reboots the guest via the inherited InitFatalReboot handler" — affects
+  EVERY modern-rc recovery whose services declare capabilities; (2) "mmap-hook probe
+  masks the real fb mmap errno + O_RDONLY fb fds cannot be mapped" — affects every
+  minui-era recovery (AOSP 10+ layout).
+- NEXT: dispatch CI round 2 (lineage + orangefox + 3 guards) on the 6-Z224 head; then
+  corpus waves for the 90% goal.

@@ -5552,21 +5552,34 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     }
 
     // TWRP BOOT: replace the /dev/graphics/fb0 + /dev/fb0 symlinks (which
-    // point to /dev/null) with regular files of 3,686,400 bytes (720x1280x4
-    // RGBA8888). This makes open() succeed and mmap() work naturally, so
-    // libminuitwrp's graphics_fbdev_init can proceed past the open+mmap
-    // stage. The FB ioctls themselves are intercepted by the i686
-    // `libtwrp_fb_hook.so` (LD_PRELOAD'd into the recovery process). See
-    // `devices::create_twrp_framebuffer` for the full rationale.
+    // point to /dev/null) with regular files of cfg.width*cfg.height*4
+    // bytes. This makes open() succeed and mmap() work naturally, so
+    // libminuitwrp's/lineage-minui's graphics_fbdev_init can proceed past
+    // the open+mmap stage. The FB ioctls themselves are intercepted by
+    // the `libtwrp_fb_hook.so` / twoyi_loader shlib (LD_PRELOAD'd into
+    // the recovery process). See `devices::create_twrp_framebuffer` for
+    // the full rationale.
+    //
+    // 6-Z224: NO LONGER gated on cfg.boot_recovery. Run 33279361259
+    // (lineage-22.2-sailfish, boot_recovery=false — the per-design
+    // RomManager auto-set): the geometry file {rootfs}/dev/.twoyi-fb-
+    // geometry was never written (it lives inside create_twrp_framebuffer,
+    // behind this gate), the fb hook fell back to 320x640, and minui's
+    // mmap failed on the stub-sized fb0 — "cannot open any framebuffer"
+    // at t=10.1s, headless boot, UI never reached. AOSP-layout recovery
+    // boots (the 6-Z220 preload chain) need the same full-size fb0 +
+    // geometry file as TWRP boots. The creation is idempotent and
+    // harmless for full-Android guest boots (modern Android never opens
+    // /dev/graphics/fb0 — its graphics go through the host renderer).
+    if let Err(e) =
+        devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width as u32, cfg.height as u32)
+    {
+        warning!(
+            "[KR64] PARENT: failed to create TWRP framebuffer: {} (recovery will crash in libminuitwrp.so)",
+            e
+        );
+    }
     if cfg.boot_recovery {
-        if let Err(e) =
-            devices::create_twrp_framebuffer(&rootfs_prefix, cfg.width as u32, cfg.height as u32)
-        {
-            warning!(
-                "[KR64] PARENT: failed to create TWRP framebuffer: {} (recovery will crash in libminuitwrp.so)",
-                e
-            );
-        }
         // 6-Z171c: /dev/ashmem + /dev/pmsg0 stand-ins (regular files) so
         // minui's opens succeed; the hook fakes the ASHMEM_* ioctls.
         if let Err(e) = devices::create_twrp_misc_devs(&rootfs_prefix) {

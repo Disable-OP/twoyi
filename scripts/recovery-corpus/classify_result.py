@@ -65,9 +65,22 @@ kmsg = read("kmsg-stub.txt", 8 * 1024 * 1024)
 kr_and_kmsg = kr + "\n" + kmsg
 
 # ── recovery instances + family banner ───────────────────────────────
+# 6-Z224: TWO banner layouts, matching the real recovery print formats:
+#   * TWRP/OrangeFox (legacy): "Starting TWRP <version>" newline
+#     "(pid <n>)" — the pid line is separate.
+#   * AOSP/lineage (minui-era, run 33279361259): "Starting recovery
+#     (pid 1) on <date>" — the pid is on the SAME line. The old
+#     same-line-only regex missed it and counted recovery_instances=0,
+#     which misjudged a fully-booted recovery as BOOT_FAIL.
 banners = re.findall(
     r"Starting (TWRP|OrangeFox|SkyHawk|SHRP|recovery)[^\n]*\n\s*\(pid (\d+)\)",
     rec)
+banners += [
+    (fam, pid) for fam, pid in re.findall(
+        r"Starting (TWRP|OrangeFox|SkyHawk|SHRP|recovery)[^\n]*\(pid (\d+)\)[^\n]*",
+        rec)
+    if (fam, pid) not in banners
+]
 result["recovery_instances"] = len({pid for _, pid in banners})
 if banners:
     result["markers"]["family_banner"] = sorted({f for f, _ in banners})

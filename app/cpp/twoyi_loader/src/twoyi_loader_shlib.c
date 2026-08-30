@@ -2035,24 +2035,98 @@ int ioctl(int fd, unsigned long request, ...) {
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
     static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
     if (!real_mmap) real_mmap = dlsym(RTLD_NEXT, "mmap");
-    
-    // Check if fd is a binder device by checking if the ioctl works
-    // (we can't easily check without a syscall, so just check if
-    // BINDER_VERSION ioctl would succeed on this fd)
-    // Simpler: just try real mmap first, and if it fails with a binder
-    // fd, fall back to MAP_ANONYMOUS
+
     if (real_mmap) {
         void *result = real_mmap(addr, length, prot, flags, fd, offset);
         if (result != MAP_FAILED) return result;
-        
-        // mmap failed — check if this might be a binder fd
-        // by trying BINDER_VERSION ioctl
+
+        // ── 6-Z224: SAVE the real mmap errno BEFORE anything else can
+        // overwrite it. The pre-6-Z224 code probed with BINDER_VERSION
+        // ioctls FIRST and the probe's ENOTTY (25) replaced the real
+        // errno — run 33279360223 (OrangeFox) and run 33279361259
+        // (lineage) both printed "failed to mmap framebuffer:
+        // Inappropriate ioctl for device", a pure artifact of the probe:
+        // OrangeFox's REAL error was EACCES (its minui opened fb0
+        // O_RDONLY — __open_2 fl=0x2 — then mapped PROT_READ|PROT_WRITE
+        // MAP_SHARED, which the kernel refuses on a read-only fd), and
+        // the wrong errno misdirected an entire analysis session.
+        int saved_errno = errno;
+        int fb_tracked = fb_fd_is_tracked(fd);
+        if (!fb_tracked) fb_fd_selfheal(fd);  // 6-Z222 self-heal (dup'd/untracked opens)
+        fb_tracked = fb_fd_is_tracked(fd);
+
+        // Bounded diagnostic (first 8 failures per process): fd identity
+        // via /proc/self/fd readlinkat so the artifacts show WHAT the
+        // failed mmap actually pointed at.
+        static unsigned mmap_fail_log = 0;
+        if (mmap_fail_log < 8) {
+            mmap_fail_log++;
+            char target[256];
+            target[0] = '\0';
+            char linkpath[128];
+            snprintf(linkpath, sizeof(linkpath), "/proc/self/fd/%d", fd);
+            long n = syscall(SYS_readlinkat, AT_FDCWD, linkpath, target,
+                             (long)(sizeof(target) - 1));
+            if (n < 0) n = 0;
+            target[n] = '\0';
+            char msg[640];
+            snprintf(msg, sizeof(msg),
+                "[twoyi_loader] mmap FAILED fd=%d (fb_tracked=%d) len=%zu "
+                "prot=0x%x flags=0x%x errno=%d (%s) -> %s\n",
+                fd, fb_tracked, length, prot, flags, saved_errno,
+                strerror(saved_errno), n > 0 ? target : "?");
+            write_str(2, msg);
+        }
+
+        // ── 6-Z224: FB-tracked fd recovery. minui/libminuitwrp mmaps the
+        // virtual framebuffer; the file itself is app-owned and writable,
+        // but the CALLER's fd may be read-only (OrangeFox) or otherwise
+        // unmappable. Fix: re-open /dev/graphics/fb0 O_RDWR (raw syscall,
+        // tracer path translation — the same mechanism the fb hook's
+        // create branch uses) and mmap THAT fd. The re-opened fd maps the
+        // SAME underlying regular file, so the pixel pipeline (guest
+        // writes -> file pages -> kr64's blit) stays intact. The mapping
+        // survives close() of the temporary fd.
+        if (fb_tracked) {
+            int wfd = (int)twoyi_sys_open("/dev/graphics/fb0", O_RDWR | O_CLOEXEC, 0);
+            if (wfd < 0)
+                wfd = (int)twoyi_sys_open("/dev/fb0", O_RDWR | O_CLOEXEC, 0);
+            if (wfd >= 0) {
+                void *r2 = real_mmap(addr, length, prot, flags, wfd, offset);
+                syscall(NR_close, wfd);
+                if (r2 != MAP_FAILED) {
+                    write_str(2, "[twoyi_loader] mmap fb-tracked fd -> recovered via O_RDWR re-open\n");
+                    return r2;
+                }
+            }
+            // Last resort: shared anonymous mapping — keeps minui running
+            // (no "cannot open any framebuffer" headless exit) at the cost
+            // of the host blit seeing a stale frame. Strictly better than
+            // MAP_FAILED; the diagnostic above carries the real errno for
+            // the next iteration.
+            void *r3 = real_mmap(addr, length, prot,
+                                 (flags & ~(MAP_PRIVATE | MAP_SHARED))
+                                     | MAP_ANONYMOUS | MAP_SHARED,
+                                 -1, 0);
+            if (r3 != MAP_FAILED) {
+                write_str(2, "[twoyi_loader] mmap fb-tracked fd -> MAP_ANONYMOUS|MAP_SHARED fallback\n");
+                return r3;
+            }
+            errno = saved_errno;
+            return MAP_FAILED;
+        }
+
+        // mmap failed on a NON-fb fd — check if this might be a binder fd
+        // by trying BINDER_VERSION ioctl (pre-6-Z224 behavior, but now
+        // skipped for fb fds: probing an fb fd with binder ioctls is what
+        // produced the misleading ENOTTY).
         int vers = 0;
         if (ioctl(fd, 0xc0046209, &vers) == 0 || ioctl(fd, 0xc004620d, &vers) == 0) {
             // This is a binder fd — return anonymous mapping
             write_str(2, "[twoyi_loader] mmap on binder fd -> using MAP_ANONYMOUS\n");
             return real_mmap(addr, length, prot, flags | MAP_ANONYMOUS, -1, 0);
         }
+        errno = saved_errno;
         return MAP_FAILED;
     }
     return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
