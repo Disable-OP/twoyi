@@ -39,6 +39,35 @@ public class Renderer {
     public static native void setDataDir(String dataDir);
 
     /**
+     * Set whether the next container launch boots an AOSP-STYLE recovery
+     * (OrangeFox R12, Lineage recovery-in-boot, modern AOSP recovery, …)
+     * through the NORMAL loader path. When {@code true}:
+     * <ul>
+     *   <li>{@code --boot-recovery} is <b>NOT</b> passed to kr64 (the
+     *       guest init is dynamic — {@code /init} → {@code /system/bin/init}
+     *       — and the recovery binary lives at {@code /system/bin/recovery},
+     *       exec'd with the LD_PRELOAD hook chain);</li>
+     *   <li>the native core starts the fb0 → SurfaceView blit loop
+     *       (exactly like TWRP mode) instead of the AOSP emugl GL
+     *       renderer — the recovery's minui draws into the
+     *       LD_PRELOAD-hooked {@code /dev/graphics/fb0} regular file and
+     *       never speaks GL.</li>
+     * </ul>
+     * Without this flag the loader-path recovery rendered into fb0 with
+     * nobody reading it: the app showed the black loading screen forever
+     * while the guest UI was alive internally (OrangeFox-lavender run
+     * 33317227548).
+     *
+     * Detected by {@link io.twoyi.utils.RomManager#isAospRecoveryLayout}.
+     * Must be called before {@code init()}. The value is reset to
+     * {@code false} on process restart.
+     *
+     * @param enabled {@code true} to present an AOSP-style loader-path
+     *                recovery through the fb0 blit loop
+     */
+    public static native void setRecoveryLoader(boolean enabled);
+
+    /**
      * Set whether the next container launch should boot a TWRP recovery
      * image instead of full Android. When {@code true}, the native
      * renderer core passes {@code --boot-recovery} to kr64, which:

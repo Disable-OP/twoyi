@@ -213,6 +213,35 @@ fn mark_renderer_initialized_for_this_process() {
 /// list of what changes in TWRP mode.
 static BOOT_RECOVERY: AtomicBool = AtomicBool::new(false);
 
+/// When true, the container boots an AOSP-STYLE RECOVERY (OrangeFox R12,
+/// Lineage recovery-in-boot, modern AOSP recovery, …) through the NORMAL
+/// loader path — i.e. `boot_recovery` is FALSE: the guest init is dynamic
+/// (`/init` → `/system/bin/init`) and the recovery binary lives at
+/// `/system/bin/recovery`, exec'd with the LD_PRELOAD hook chain
+/// (libgetpid_hook + libtwrp_fb_hook + libtwoyi_loader_shlib).
+///
+/// Display path for such guests: the recovery's minui opens the hooked
+/// `/dev/graphics/fb0` REGULAR FILE, mmaps it file-backed (aarch64 never
+/// rewrites the mmap), and draws every frame directly into the file.
+/// The AOSP emugl GL renderer is USELESS here — a recovery never speaks
+/// GL — so the fb0 → SurfaceView blit loop must own the display path
+/// exactly like TWRP mode. The ONLY difference from TWRP mode is the
+/// kr64 boot mode (NO `--boot-recovery` flag is passed).
+///
+/// Background (OrangeFox-lavender run 33317227548): with this flag
+/// missing, `renderer_thread_main` started the GL renderer instead of
+/// the fb0 blit loop, nobody ever read the guest's fb0 file, and the
+/// app showed the black loading/bootlog screen forever while the guest
+/// UI was alive internally (pages changed on touch — the input IPC path
+/// is independent of the display path).
+///
+/// Set from Java via `Renderer.setRecoveryLoader(boolean)` before
+/// `Renderer.init()`. Java detects the layout with
+/// `RomManager.isAospRecoveryLayout()` (`/init` is a symlink sidecar +
+/// `/system/bin/recovery` exists + `/sbin/recovery` absent).
+/// Defaults to false; reset on process restart like BOOT_RECOVERY.
+static RECOVERY_LOADER: AtomicBool = AtomicBool::new(false);
+
 /// Current ANativeWindow* target for the TWRP framebuffer blit loop.
 ///
 /// 6-Z183 FIX (black app surface): the render loop used to capture the
@@ -265,6 +294,40 @@ pub fn set_boot_recovery(enabled: bool) {
 /// decide whether to pass `--boot-recovery` to kr64.
 pub fn is_boot_recovery_enabled() -> bool {
     BOOT_RECOVERY.load(Ordering::SeqCst)
+}
+
+/// Set the Recovery-via-Loader flag. Called from JNI
+/// (`set_recovery_loader` in lib.rs) before `init_renderer`.
+pub fn set_recovery_loader(enabled: bool) {
+    RECOVERY_LOADER.store(enabled, Ordering::SeqCst);
+    info!(
+        "[CORE] Recovery (loader path, AOSP-style) flag set to: {}",
+        enabled
+    );
+}
+
+/// Read the Recovery-via-Loader flag.
+pub fn is_recovery_loader_enabled() -> bool {
+    RECOVERY_LOADER.load(Ordering::SeqCst)
+}
+
+/// True when the GUEST'S DISPLAY OUTPUT flows through the guest fb0
+/// file and must be presented by the fb0 → SurfaceView blit loop
+/// (`twrp_fb_render_loop`). True for BOTH recovery display modes:
+///
+///   * TWRP mode (`BOOT_RECOVERY`) — static init, kr64 `--boot-recovery`;
+///   * Loader-recovery mode (`RECOVERY_LOADER`) — AOSP-style init
+///     booted through the normal loader path with the LD_PRELOAD fb
+///     hook (OrangeFox R12, Lineage recovery-in-boot, …).
+///
+/// False for full-Android boots, which render through the emugl GL
+/// path. All DISPLAY-path decisions (which renderer to start, where
+/// `reset_window`/`remove_window` route a (re)created surface) must
+/// gate on THIS — not on `is_boot_recovery_enabled()`, which also
+/// selects the kr64 boot mode and is false for loader recoveries
+/// (the OrangeFox-lavender black-screen class, run 33317227548).
+fn is_recovery_blit_enabled() -> bool {
+    BOOT_RECOVERY.load(Ordering::SeqCst) || RECOVERY_LOADER.load(Ordering::SeqCst)
 }
 
 /// The app's data directory, set from Java via `set_data_dir()`.
@@ -375,9 +438,17 @@ fn renderer_thread_main(
     let window = window_sp.0;
     info!("[CORE] Renderer thread started, window: {:?}", window);
 
-    if is_boot_recovery_enabled() {
-        info!("[CORE] TWRP boot: starting framebuffer reader thread (fb0 → SurfaceView)");
-        alog("renderer_thread_main: TWRP mode — fb0 reader thread starting");
+    // Display-path gate (NOT the kr64 boot-mode gate): BOTH recovery
+    // display modes — TWRP (--boot-recovery) and loader-path recoveries
+    // (OrangeFox AOSP-style, boot_recovery=false) — present through the
+    // fb0 blit loop; only full Android uses the GL renderer.
+    if is_recovery_blit_enabled() {
+        info!(
+            "[CORE] Recovery boot (blit mode: twrp={} loader={}): starting framebuffer reader thread (fb0 → SurfaceView)",
+            is_boot_recovery_enabled(),
+            is_recovery_loader_enabled()
+        );
+        alog("renderer_thread_main: recovery mode — fb0 reader thread starting");
         let rootfs = get_rootfs_dir();
         let fb_path = format!("{}/dev/graphics/fb0", rootfs);
         let vw = virtual_width;
@@ -452,11 +523,11 @@ pub fn init_renderer(
         alog("init_renderer: file-guard HOLDS for this PID — refreshing window only, NO kr64 spawn (Task 6-Z24)");
         // The first kr64 child is still running (it's blocked in the
         // ptrace loop). Just update the window so the surface is fresh.
-        // 6-Z184: in TWRP mode the emugl renderer was never started —
-        // resetSubWindow would poke uninitialized emugl state and the
-        // blit loop would keep the STALE window. Route to the TWRP
-        // window swap instead (mirrors reset_window below).
-        if is_boot_recovery_enabled() {
+        // 6-Z184: in recovery-blit mode the emugl renderer was never
+        // started — resetSubWindow would poke uninitialized emugl state
+        // and the blit loop would keep the STALE window. Route to the
+        // TWRP window swap instead (mirrors reset_window below).
+        if is_recovery_blit_enabled() {
             twrp_set_window(window);
         } else {
             unsafe {
@@ -492,9 +563,9 @@ pub fn init_renderer(
     {
         eprintln!("[CORE] Renderer already started — updating window only (no kr64 re-spawn)");
         info!("[CORE] Renderer already started, updating window");
-        // Renderer already started, just update window (TWRP-mode branch
-        // mirrors the file-guard path above).
-        if is_boot_recovery_enabled() {
+        // Renderer already started, just update window (recovery-blit-mode
+        // branch mirrors the file-guard path above).
+        if is_recovery_blit_enabled() {
             twrp_set_window(window);
         } else {
             unsafe {
@@ -1015,11 +1086,12 @@ pub fn reset_window(
     fb_width: i32,
     fb_height: i32,
 ) {
-    // 6-Z183: in TWRP mode the emugl subwindow is not running — the fb0
+    // 6-Z183: in recovery-blit mode (TWRP or loader-path recovery) the
+    // emugl subwindow is not running — the fb0
     // blit loop owns the display path. Route the (possibly RECREATED)
     // surface to it so blits always target the live window; the loop
     // sees the swap and force-re-blits the current frame.
-    if is_boot_recovery_enabled() {
+    if is_recovery_blit_enabled() {
         twrp_set_window(window);
         return;
     }
@@ -1032,10 +1104,11 @@ pub fn reset_window(
 
 /// Remove a window.
 pub fn remove_window(window: *mut c_void) {
-    // 6-Z183: TWRP mode — detaching the blit target pauses rendering
+    // 6-Z183: recovery-blit mode (TWRP or loader-path recovery) —
+    // detaching the blit target pauses rendering
     // (the loop idles at 200 ms ticks with zero fb reads until a fresh
     // surfaceCreated/reset_window publishes a new window).
-    if is_boot_recovery_enabled() {
+    if is_recovery_blit_enabled() {
         twrp_set_window(std::ptr::null_mut());
         return;
     }
@@ -1371,6 +1444,14 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
     let mut last_blit: Vec<u8> = Vec::with_capacity(fb_size);
     let mut idle_ticks: u32 = 0;
     let mut short_read_logged: u32 = 0;
+    // Recovery-blit DIAGNOSTIC (OrangeFox verification): count CHANGED
+    // frames and periodically log an FNV-1a digest of the framebuffer +
+    // the center pixel. This is the CI-verifiable proof that guest
+    // pixels are actually FLOWING (and changing across page
+    // transitions), not merely that a single stale frame was posted
+    // once. Rate: one line per ~120 changed frames (~4 s at 30 fps) —
+    // silent while the screen is static.
+    let mut changed_frames: u64 = 0;
 
     // Render loop: read fb0 → (dirty-check) → blit to the LIVE window.
     loop {
@@ -1449,6 +1530,30 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
             let ok = unsafe { twrp_blit_to_surface(window, &fb_buf, fb_w, fb_h, fb_bpp) };
             if ok {
                 last_window = window as usize;
+                changed_frames = changed_frames.saturating_add(1);
+                // Periodic frame-flow digest (see changed_frames above):
+                // proves the blit loop is presenting LIVE, CHANGING guest
+                // frames — the acceptance signal for page transitions.
+                if changed_frames == 1 || changed_frames % 120 == 0 {
+                    let mut hash: u64 = 0xcbf29ce484222325;
+                    for chunk in fb_buf.chunks_exact(8) {
+                        for &b in chunk {
+                            hash ^= b as u64;
+                            hash = hash.wrapping_mul(0x100000001b3);
+                        }
+                    }
+                    let cx = fb_h / 2 * fb_w + fb_w / 2;
+                    let px = [
+                        fb_buf[cx * 4],
+                        fb_buf[cx * 4 + 1],
+                        fb_buf[cx * 4 + 2],
+                        fb_buf[cx * 4 + 3],
+                    ];
+                    alog(&format!(
+                        "TWRP-FB frame #{} blitted digest={:016x} center=[{},{},{},{}]",
+                        changed_frames, hash, px[0], px[1], px[2], px[3]
+                    ));
+                }
                 if !first_blit_logged {
                     first_blit_logged = true;
                     alog(&format!(

@@ -144,6 +144,23 @@ pub extern "C" fn set_boot_recovery(_env: JNIEnv, _clz: jclass, enabled: jni::sy
     core::set_boot_recovery(flag);
 }
 
+/// JNI entry point for `Renderer.setRecoveryLoader(boolean)`. Stores the
+/// flag in a static `AtomicBool` that the DISPLAY-path decisions read
+/// (`core::is_recovery_blit_enabled`). When true, the next
+/// `init_renderer` call starts the fb0 → SurfaceView blit loop instead
+/// of the AOSP emugl GL renderer — the guest is an AOSP-style recovery
+/// (OrangeFox R12, Lineage recovery-in-boot, …) booted through the
+/// NORMAL loader path (`--boot-recovery` is NOT passed; its minui
+/// renders into the LD_PRELOAD-hooked `/dev/graphics/fb0` file).
+///
+/// Must be called BEFORE `Renderer.init()`. The flag is reset to
+/// `false` on process restart (the static is initialized to false).
+#[no_mangle]
+pub extern "C" fn set_recovery_loader(_env: JNIEnv, _clz: jclass, enabled: jni::sys::jboolean) {
+    let flag = enabled != 0;
+    core::set_recovery_loader(flag);
+}
+
 #[no_mangle]
 /// # Safety
 /// JNI entry point invoked by the JVM. `surface` must refer to a live
@@ -409,6 +426,7 @@ pub unsafe extern "C" fn JNI_OnLoad(jvm: JavaVM, _reserved: *mut c_void) -> jint
         jni_method!(sendKeycode, send_key_code, "(I)V"),
         jni_method!(setDataDir, set_data_dir, "(Ljava/lang/String;)V"),
         jni_method!(setBootRecovery, set_boot_recovery, "(Z)V"),
+        jni_method!(setRecoveryLoader, set_recovery_loader, "(Z)V"),
     ];
 
     let result = register_natives(&jvm, class_name, jni_methods.as_ref());

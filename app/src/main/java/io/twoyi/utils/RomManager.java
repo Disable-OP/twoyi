@@ -561,6 +561,66 @@ public final class RomManager {
         }
     }
 
+    /**
+     * Detect an AOSP-STYLE recovery layout — a recovery whose guest boots
+     * through the NORMAL loader path (boot_recovery=false) with the
+     * LD_PRELOAD fb-hook chain, and whose display output therefore lands
+     * in the hooked {@code /dev/graphics/fb0} REGULAR FILE.
+     *
+     * Layout signature (same structural rules as {@link #isTwrpLayout} —
+     * filesystem structure, never device/family names):
+     * <ul>
+     *   <li>{@code /init} is a symlink (imported as the {@code init.symlink}
+     *       sidecar — the guest init is dynamic {@code /system/bin/init}), AND</li>
+     *   <li>{@code /system/bin/recovery} exists (regular file OR
+     *       {@code .symlink} sidecar — the recovery binary location for
+     *       OrangeFox R12 / Lineage recovery-in-boot / modern AOSP
+     *       recovery), AND</li>
+     *   <li>{@code /sbin/recovery} is absent (a {@code /sbin/recovery}
+     *       presence would make {@link #isTwrpLayout} true instead).</li>
+     * </ul>
+     *
+     * Why this matters (OrangeFox-lavender run 33317227548): for such
+     * recoveries the app must ALSO route the display through the fb0 →
+     * SurfaceView blit loop ({@code Renderer.setRecoveryLoader(true)}).
+     * With boot_recovery=false the native core used to start the AOSP
+     * emugl GL renderer instead — a recovery never speaks GL — so
+     * nobody read the guest's fb0 file and the screen stayed on the
+     * black loading texture forever while the recovery UI was alive
+     * internally (touch worked, pages changed, nothing was visible).
+     *
+     * A full-Android GSI does NOT match: its {@code /init} may also be a
+     * symlink, but {@code /system/bin/recovery} is not part of a system
+     * image (recovery binaries live in the boot/recovery ramdisk).
+     *
+     * @return true when the imported rootfs is an AOSP-style recovery
+     */
+    public static boolean isAospRecoveryLayout(Context context) {
+        File rootfs = getRootfsDir(context);
+        // /init must be the SYMLINK form (dynamic AOSP init). Accept BOTH
+        // representations: the .symlink sidecar (fresh import — kr64 has
+        // not materialized it yet) AND a REAL symlink (any boot after the
+        // first: symlinks.rs removes the sidecar when materializing).
+        // Java's File.exists() follows symlinks, so the real-symlink form
+        // needs an explicit isSymbolicLink check (API 26+; minSdk 27).
+        boolean initIsSymlink = new File(rootfs, "init.symlink").exists()
+                || java.nio.file.Files.isSymbolicLink(
+                        java.nio.file.Paths.get(rootfs.getAbsolutePath(), "init"));
+        if (!initIsSymlink) {
+            return false;
+        }
+        // /sbin/recovery must be absent (otherwise it's TWRP-style).
+        if (new File(rootfs, "sbin/recovery").exists()
+                || new File(rootfs, "sbin/recovery.symlink").exists()) {
+            return false;
+        }
+        // The recovery binary must live at /system/bin/recovery (regular
+        // file or .symlink sidecar — the importer stores cpio symlinks
+        // as sidecars and kr64 materializes them at boot).
+        return new File(rootfs, "system/bin/recovery").exists()
+                || new File(rootfs, "system/bin/recovery.symlink").exists();
+    }
+
     public static boolean needsUpgrade(Context context) {
         // No longer supporting automatic upgrades from assets
         return false;
