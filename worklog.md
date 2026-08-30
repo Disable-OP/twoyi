@@ -20487,3 +20487,69 @@ Stage Summary:
   open still fails, will be on the record via 6-Z231 FAILED DIAG).
 - NEXT: push; dispatch capricorn + starlte (regression) + whyred (NEW-format
   class per §31) + merlin (ELF32 on 6-Z228+ head) on the new head; analyze.
+
+---
+Task ID: 6-Z232..6-Z234
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: analyze 6-Z231 verify round (capricorn UI_HANG, merlin linker fail) — root-cause the libdl stub class + add passthrough-open diagnostics.
+
+Work Log:
+- VERIFY ROUND on 695c875 (delegated monitor, artifacts in
+  /home/z/my-project/artifacts/run-<id>): starlte UI_READY (6-Z229 fix
+  regression-stable), whyred UI_READY (NEW-format property class CLOSED —
+  File Manager + terminal page navigation green), capricorn UI_HANG
+  (boot=BOOT_OK, splash black at 40s, sigsegv_count=3, theme_fail=2),
+  merlin BOOT_FAIL (markers.failure=linker).
+- MERLIN ROOT CAUSE (evidence: run 33305055239 + local image analysis):
+  "libdl.so NOT found at /dev/libdl.so -- linker will fall through to
+  /apex/.../bionic/libdl.so (the 5848-byte stub). EXPECT linker64 segfault
+  at 0xaf174" → CANNOT LINK EXECUTABLE → recovery child exit 1 → init exit 6.
+  The APK asset app/src/main/assets/libdl.so is STILL the 5848-byte "PLAC"
+  PLACEHOLDER (magic PLAC — is_real_libdl rejects it) and the APEX
+  extraction pipeline needs CAP_MKNOD/CAP_SYS_ADMIN/loop (dead on redroid,
+  5-L..5-U) → /dev/libdl.so never staged. Merlin is ELF32 EM_ARM (init AND
+  sbin/libdl.so 10064-byte EM_ARM) — the 6-Z227/6-Z228 arm32 chain got it
+  to the linker, which then died on the stub.
+- CAPRICORN same class: run 33305049683 PARENT log "real libdl.so NOT
+  extracted" + CHILD "libdl.so NOT found at /dev/libdl.so ... EXPECT
+  linker64 segfault at 0xaf174". The recovery child exec'd fine
+  (6-Z49/6-Z101/6-Z102 staging + PT_INTERP /sbin/linker64 verified), then
+  the stub-libdl link → SIGSEGV x3 → UI dead → black splash. The UI_HANG
+  classification is a SECONDARY symptom; the property_area failure marker
+  in the result reflects the FIRST-cycle property FATAL (see 6-Z234 below)
+  that init later survived.
+- LOCAL CORPUS ANALYSIS: downloaded + extracted capricorn and merlin boot
+  images (LZMA ramdisks, 3294/3506 entries). BOTH ship their OWN libdl.so
+  in /sbin (capricorn: 5968B aarch64; merlin: 10064B EM_ARM). The guest's
+  own copy is the ABI-correct choice — better than any host-extracted one.
+- FIX 6-Z233 (app/rs/kr64/src/lib.rs Step 4.6.1): guest-ramdisk libdl
+  preference — when 6-Z215's native-guest /system/lib64 symlink does not
+  apply, try {rootfs}/sbin/libdl.so, {rootfs}/system/lib64/libdl.so,
+  {rootfs}/system/lib/libdl.so; accept a candidate only when its
+  e_machine matches the guest recovery's (elf_machine(sbin/recovery),
+  fallback sbin/libc.so — same derivation as 6-Z230); COPY its bytes into
+  {dev_stage_dir}/libdl.so via write_hook_library_to_dev (0755, §6-safe).
+  z233_staged flag prevents the host-asset write from clobbering the slot.
+  Priority now: 6-Z215 ROM symlink > 6-Z233 guest ramdisk > host asset >
+  APEX extraction.
+- 6-Z234 (app/rs/kr64/src/ptrace_emu.rs): PASSTHROUGH-open DIAG — the
+  capricorn property FATAL's openat (loop 549) produced ZERO diagnostics
+  because its path matched neither is_property_metadata_file nor
+  ends_with("__properties__") AND read_child_string succeeded (no 6-Z170).
+  New DIAG logs every open whose translated == path (host-resolving
+  passthrough: relative paths, /proc/**, /system fallbacks) inside the
+  second-stage property window (loop_count 500-700, first 40) — the next
+  capricorn run will NAME the path.
+- GATES: 649 host tests green; clippy -D warnings clean (x86_64); fmt
+  clean. aarch64 cross-check still NDK-gated locally (no NDK in sandbox);
+  diff is target-independent (lib.rs staging + ptrace DIAG logging).
+
+Stage Summary:
+- libdl stub class root-caused to the placeholder APK asset + dead APEX
+  fallback; the generic guest-ramdisk preference removes the host
+  dependency for every recovery that ships its own libdl (most TWRPs).
+- whyred + starlte now green; capricorn expected to advance past the
+  linker segfault; merlin expected to reach its NEXT blocker.
+- NEXT: commit, push, dispatch capricorn + merlin + starlte (regression)
+  + cherry (6-Z230 verify); analyze the 6-Z234 passthrough evidence.
