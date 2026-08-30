@@ -22051,3 +22051,55 @@ Work Log:
 
 Stage Summary:
 - Wave recorded; monitoring delegated.
+
+---
+Task ID: 6-Z258c
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: fix the REGRESSION MON-4 caught — the 6-Z258 arm used the standalone translate_path(), which mistranslated the kr64 child's own bootstrap chmod of the staged init copy into the sandbox → exec bit never set → execve EACCES → loader exit 127 → a fresh linker64 crash class (cereus/daisy/whyred regressed on 781887c).
+
+Work Log:
+- MON-4 RESULTS: the dirfd fix WORKS (translate-variant fired:
+  cereus 1/1, daisy 1/1, whyred 1/1, starlte 4/4 — zero
+  dirfd=4294967196 variants left); starlte = FULL UI_READY PASS
+  (12-page nav, presentation=FLOWING, vfs CLEAN — the TWRP guard
+  holds); the dl.twrp.me referer fix WORKS (both guards downloaded
+  real boot images). BUT cereus/daisy/whyred REGRESSED to a new
+  crash class: pc in rootfs/sbin/linker64 r-xp, single-shot, right
+  after "the loader exits 127 and daemonizes".
+- ROOT CAUSE (the monitor's suspicion confirmed against the source):
+  the 6-Z258 arm called translate_path() — the STANDALONE translator
+  that constructs a fresh SandboxPolicy WITHOUT staging_dir — so its
+  /data/* rule mistranslated the child's own host bootstrap path
+  /data/.../cache/twoyi_init (the staged init copy!) to
+  {rootfs}/data/.../cache/twoyi_init → chmod ENOENT → masked 0 by the
+  6-Z257 family fake → the staged copy's exec bit never set → execve
+  EACCES → exit 127. This EXACT hazard is documented at
+  6-Z209d-iter2: the production translator is
+  translate_path_via_sandbox(&sandbox, rootfs, path) with the
+  staging-cache early-out — every other arm uses it; my arm was the
+  one exception.
+- FIX 6-Z258c: the arm now calls translate_path_via_sandbox (the
+  staging-aware production translator). Child bootstrap paths pass
+  through untouched; guest /dev/socket paths still translate.
+- REGRESSION TEST: z258c_chmod_translation_must_use_staging_aware_
+  translator — locks BOTH the hazard (standalone mistranslates the
+  staged-init chmod) and the requirement (staging-aware passes it
+  through while still translating guest /dev/socket paths).
+- GATES: 667 host tests green; clippy -D warnings clean; fmt clean.
+- ALSO NOTED (not mine): the workflow at 781887c stopped emitting
+  dev-__kmsg__ / rootfs-socket-dir.txt / property-area-state.txt in
+  the artifacts (even on the passing starlte run) — the parallel
+  6-Z251e/f workflow edits changed the packing. Init-survival checks
+  are blind until restored; flagged for the display-track owner.
+
+Stage Summary:
+- 6-Z258 series now has all three defects closed: scope (sandbox
+  translator), dirfd semantics (kernel int ABI), and the fallback
+  ladder. The 667-test gate is green.
+- NEXT: commit+push; re-dispatch cereus + daisy (determinism anchor:
+  BOTH must show init survival + zero linker64 crashes) + whyred
+  (regression check vs its MON-1 UI_READY baseline); keep starlte as
+  the periodic guard. If init survives deterministically, the
+  property-service chain is closed and the remaining OrangeFox hang
+  surface is the 6-Z251d/e/f display track.
