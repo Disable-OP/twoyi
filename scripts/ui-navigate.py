@@ -1836,16 +1836,26 @@ def main():
         # ── 0) Kill the full-screen overlay FIRST (before ANY guest tap) ──
         dismiss_fullscreen_overlay("pre-gate", blind=True)
 
-        # ── 1) Wait for the read-only gate page (system_readonly). ──
-        # NOTE (physical-device lesson): TWRP's main menu only FLASHES
-        # (<1 ms) at boot before the read-only gate takes over, because
-        # the menu checks the read-only system state. Seeing 'main2' in
-        # recovery.log therefore does NOT mean the main menu is up. The
-        # gate is what's actually on screen; the swipe bar on it is how
-        # you reach the REAL main menu.
-        gate_pos = None
+        # ── 0b) 6-Z251e: family-aware gate phase. ──
+        # The TWRP welcome gate ("system_readonly" page + read-only
+        # slider) exists ONLY in TWRP-family recoveries. OrangeFox and
+        # AOSP-layout recoveries boot STRAIGHT to their main menu:
+        #   * the gate wait would blind-spam GOT IT taps for 150 s
+        #     (run 33325977950: ~120 pointless taps into the top of a
+        #     perfectly-rendered OrangeFox UI), and
+        #   * the settle check would NEVER confirm — gate frame ==
+        #     menu frame — so the chain aborted at term-01-abort-no-menu
+        #     and no touch transition was ever exercised.
+        rec_head = _read_recovery_log() or ""
+        no_gate_family = ("Starting OrangeFox" in rec_head
+                          or "Starting recovery (pid" in rec_head)
+        if no_gate_family:
+            print("  no-gate family (OrangeFox/AOSP layout) — skipping "
+                  "TWRP gate wait + slider swipes; menu is already up")
+            gate_pos = 0
+        gate_pos = None if not no_gate_family else 0
         deadline = time.time() + 150
-        while time.time() < deadline:
+        while time.time() < deadline and not no_gate_family:
             pages = _pages()
             gate_positions = [pos for pos, p in pages if p == "system_readonly"]
             if gate_positions:
@@ -1887,10 +1897,12 @@ def main():
             except OSError:
                 return b""
 
-        gate_bytes = _shot_bytes("term-00-gate")
+        gate_bytes = b"" if no_gate_family else _shot_bytes("term-00-gate")
         menu_confirmed = False
         global _FORCE_SENDEVENT
-        for i in range(6):
+        # 6-Z251e: the read-only slider only exists on the TWRP gate —
+        # for no-gate families go straight to the settle check below.
+        for i in range(0 if no_gate_family else 6):
             y = int(SCREEN_H * 0.88)
             input_cmd(f"input swipe {int(SCREEN_W * 0.10)} {y} "
                       f"{int(SCREEN_W * 0.90)} {y} 350")
@@ -1964,6 +1976,53 @@ def main():
                     print(f"  [back] navbar tap ({bx},{by}) worked")
                     return True
             return False
+
+        # ── 6-Z251e: no-gate families — deterministic TOUCH round-trip. ──
+        # OrangeFox's own bottom navbar: Files (0.125W) / Backups /
+        # Wipe / Menu (0.875W) at ~0.937H (720x1600 frame geometry;
+        # screen-relative so it scales). Two taps, each verified by BOTH
+        # a new 'Set page:' marker after the tap AND a screenshot that
+        # DIFFERS from the previous frame — this is the acceptance
+        # evidence that touchscreen input changes UI state AND the new
+        # page VISIBLY renders (the OrangeFox display-fix acceptance).
+        if no_gate_family and menu_confirmed:
+            menu_frame = _shot_bytes("term-01-main-menu")
+
+            def _fox_nav_tap(fx, fy, tag):
+                marker_before = _last_page_after(0)
+                x, y = int(SCREEN_W * fx), int(SCREEN_H * fy)
+                print(f"  [fox-nav] tap {tag} at ({x},{y})")
+                tap(x, y)
+                wait(2.5)
+                page_after = _last_page_after(0)
+                frame = _shot_bytes(tag)
+                changed = frame != menu_frame
+                new_page = (page_after is not None
+                            and page_after != marker_before)
+                print(f"  [fox-nav] {tag}: new_page_marker={page_after} "
+                      f"({new_page}), frame_changed={changed}")
+                return frame, new_page or changed
+
+            menu_frame2, ok1 = _fox_nav_tap(0.875, 0.937, "term-02-fox-menu")
+            ok2 = False
+            if ok1:
+                prev_frame = menu_frame2
+                x, y = int(SCREEN_W * 0.125), int(SCREEN_H * 0.937)
+                print(f"  [fox-nav] tap Files (back) at ({x},{y})")
+                marker_before = _last_page_after(0)
+                tap(x, y)
+                wait(2.5)
+                back_frame = _shot_bytes("term-02b-fox-files-back")
+                page_after = _last_page_after(0)
+                ok2 = (back_frame != prev_frame
+                       or (page_after is not None
+                           and page_after != marker_before))
+                print(f"  [fox-nav] Files-back: page_marker={page_after}, "
+                      f"frame_changed={back_frame != prev_frame}")
+            print(f"  [fox-nav] round-trip result: menu_open={ok1} "
+                  f"files_back={ok2}")
+        elif no_gate_family:
+            print("  [fox-nav] SKIPPED — menu not confirmed")
 
 
         # ── 3) Advanced — DETERMINISTIC geometry from the layout
