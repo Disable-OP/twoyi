@@ -141,6 +141,56 @@ typedef struct prop_info prop_info;
 
   #define GET_ARG(ctx, n) ((unsigned long)(ctx)->uc_mcontext.regs[n])
   #define SET_RET(ctx, val) (ctx)->uc_mcontext.regs[0] = (uint64_t)(val)
+#elif defined(__arm__) && !defined(__aarch64__)
+  // 6-Z227: ARMv7 (AArch32) — the ELF32 EM_ARM guest hook builds
+  // (armeabi-v7a, build.sh) compile this file with
+  // -target armv7a-linux-androideabi24. All numbers are the EABI
+  // syscall table (arch/arm/tools/syscall.tbl), __NR_SYSCALL_BASE=0.
+  #define TWOYI_AUDIT_ARCH 0x40000028U  // AUDIT_ARCH_ARM (EM_ARM|32BIT)
+  #define NR_mount    21
+  #define NR_umount2  52
+  #define NR_chroot   61
+  #define NR_mknod    14
+  #define NR_mknodat  324
+  #define NR_openat   322
+  #define NR_mkdirat  323
+  #define NR_unlinkat 328
+  #define NR_fchmodat 333
+  #define NR_fchownat 325
+  #define NR_close    6
+  #define NR_write    4
+  #define NR_getpid   20
+  // 6-Z227: bionic on arm32 issues the *32 uid-syscall variants (the
+  // plain-number slots are the 16-bit uid legacy entries). Verified
+  // against arch/arm/tools/syscall.tbl: setuid32=213, setgid32=214,
+  // setgroups32=206, setresuid32=208, setresgid32=210.
+  #define NR_setuid   213
+  #define NR_setgid   214
+  #define NR_setgroups 206
+  #define NR_setresuid 208
+  #define NR_setresgid 210
+  #define NR_unshare  337
+  #define NR_rt_sigaction 174
+  #define NR_sched_yield 158
+  // 6-Z227: arm32 has NO newfstatat / SYS_mmap — the *64 variants are
+  // the wired syscalls (fstatat64=327 fills struct stat64; mmap2=192
+  // takes the file offset in page units). See twoyi_sys_fstatat and
+  // the mmap() hook tail below.
+  #define NR_fstatat64 327
+  #define NR_mmap2    192
+
+  #define GET_ARG(ctx, n) ({ \
+      unsigned long _a; \
+      switch(n) { \
+          case 0: _a = (ctx)->uc_mcontext.arm_r0; break;  \
+          case 1: _a = (ctx)->uc_mcontext.arm_r1; break;  \
+          case 2: _a = (ctx)->uc_mcontext.arm_r2; break;  \
+          case 3: _a = (ctx)->uc_mcontext.arm_r3; break;  \
+          case 4: _a = (ctx)->uc_mcontext.arm_r4; break;  \
+          case 5: _a = (ctx)->uc_mcontext.arm_r5; break; \
+          default: _a = 0; break; \
+      } _a; })
+  #define SET_RET(ctx, val) (ctx)->uc_mcontext.arm_r0 = (unsigned long)(val)
 #endif
 
 // Legacy fallback defines for bionic API 24 compatibility (x86_64 only).
@@ -260,6 +310,43 @@ static inline long twoyi_sys_chown(const char *path, uid_t owner, gid_t group) {
     return syscall(SYS_chown, path, owner, group);
 #else
     return syscall(NR_fchownat, AT_FDCWD, path, owner, group, 0);
+#endif
+}
+
+// 6-Z227: portable fstatat-into-struct-stat. arm32 has no SYS_newfstatat;
+// the wired syscall is fstatat64, which fills a struct stat64 (different
+// field widths/layout from struct stat). The 64-bit targets keep the
+// direct newfstatat syscall (identical behavior to before). The
+// conversion only matters on the dlsym-failure fallback paths — bionic's
+// own wrappers are always preferred by the callers.
+static inline int twoyi_sys_fstatat(int dirfd, const char *path,
+                                    struct stat *buf, int flags) {
+#if defined(__arm__) && !defined(__aarch64__)
+    struct stat64 st64;
+    if (syscall(NR_fstatat64, dirfd, path, &st64, flags) != 0) return -1;
+    memset(buf, 0, sizeof(*buf));
+    buf->st_dev = st64.st_dev;
+    buf->st_mode = st64.st_mode;
+    buf->st_uid = st64.st_uid;
+    buf->st_gid = st64.st_gid;
+    buf->st_rdev = st64.st_rdev;
+    buf->st_size = st64.st_size;
+    buf->st_blksize = st64.st_blksize;
+    buf->st_blocks = st64.st_blocks;
+    buf->st_nlink = st64.st_nlink;
+    buf->st_ino = st64.st_ino;
+    // st_atime/st_mtime/st_ctime (+ _nsec) are the portable spellings:
+    // every bionic generation either exposes them as direct fields or
+    // as macros over st_atim.tv_sec / .tv_nsec (glibc-style).
+    buf->st_atime = st64.st_atime;
+    buf->st_atime_nsec = st64.st_atime_nsec;
+    buf->st_mtime = st64.st_mtime;
+    buf->st_mtime_nsec = st64.st_mtime_nsec;
+    buf->st_ctime = st64.st_ctime;
+    buf->st_ctime_nsec = st64.st_ctime_nsec;
+    return 0;
+#else
+    return syscall(SYS_newfstatat, dirfd, path, buf, flags);
 #endif
 }
 
@@ -2129,7 +2216,21 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
         errno = saved_errno;
         return MAP_FAILED;
     }
+#if defined(__arm__) && !defined(__aarch64__)
+    // 6-Z227: arm32 has no SYS_mmap — the wired file-backed syscall is
+    // mmap2, which takes the offset in PAGE units (not bytes). This is
+    // the real_mmap==NULL fallback path; offsets we are ever handed
+    // here (fb/shlib loading) are page-aligned, but reject unaligned
+    // ones explicitly instead of silently mapping the wrong window.
+    if (offset < 0 || (offset & 4095) != 0) {
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    return (void *)syscall(NR_mmap2, addr, length, prot, flags, fd,
+                           (long)(offset / 4096));
+#else
     return (void *)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+#endif
 }
 
 // Hook close — clear binder fallback fd tracking when an fd is closed.
@@ -2317,12 +2418,12 @@ int lstat(const char *path, struct stat *buf) {
         static int (*real_lstat)(const char *, struct stat *) = NULL;
         if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
         if (real_lstat) return real_lstat(translated, buf);
-        return syscall(SYS_newfstatat, AT_FDCWD, translated, buf, AT_SYMLINK_NOFOLLOW);
+        return twoyi_sys_fstatat(AT_FDCWD, translated, buf, AT_SYMLINK_NOFOLLOW);
     }
     static int (*real_lstat)(const char *, struct stat *) = NULL;
     if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
     if (real_lstat) return real_lstat(path, buf);
-    return syscall(SYS_newfstatat, AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
+    return twoyi_sys_fstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
 }
 
 // Hook stat — translate paths to rootfs (6-Z120: the secilc wall).
@@ -2346,12 +2447,12 @@ int stat(const char *path, struct stat *buf) {
         static int (*real_stat)(const char *, struct stat *) = NULL;
         if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat");
         if (real_stat) return real_stat(translated, buf);
-        return syscall(SYS_newfstatat, AT_FDCWD, translated, buf, 0);
+        return twoyi_sys_fstatat(AT_FDCWD, translated, buf, 0);
     }
     static int (*real_stat)(const char *, struct stat *) = NULL;
     if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat");
     if (real_stat) return real_stat(path, buf);
-    return syscall(SYS_newfstatat, AT_FDCWD, path, buf, 0);
+    return twoyi_sys_fstatat(AT_FDCWD, path, buf, 0);
 }
 
 // Hook fstatat — translate ABSOLUTE guest paths to rootfs (6-Z120).
@@ -2367,12 +2468,12 @@ int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
         static int (*real_fstatat)(int, const char *, struct stat *, int) = NULL;
         if (!real_fstatat) real_fstatat = dlsym(RTLD_NEXT, "fstatat");
         if (real_fstatat) return real_fstatat(dirfd, translated, buf, flags);
-        return syscall(SYS_newfstatat, dirfd, translated, buf, flags);
+        return twoyi_sys_fstatat(dirfd, translated, buf, flags);
     }
     static int (*real_fstatat)(int, const char *, struct stat *, int) = NULL;
     if (!real_fstatat) real_fstatat = dlsym(RTLD_NEXT, "fstatat");
     if (real_fstatat) return real_fstatat(dirfd, path, buf, flags);
-    return syscall(SYS_newfstatat, dirfd, path, buf, flags);
+    return twoyi_sys_fstatat(dirfd, path, buf, flags);
 }
 
 // Hook lchown — translate paths to rootfs
@@ -3085,7 +3186,7 @@ static const char *translate_exec_path(const char *path) {
         static char dev_bin_path[512];
         snprintf(dev_bin_path, sizeof(dev_bin_path), "/dev/twoyi-bin/%s", basename);
         struct stat st;
-        int rc = syscall(SYS_newfstatat, AT_FDCWD, dev_bin_path, &st, 0);
+        int rc = twoyi_sys_fstatat(AT_FDCWD, dev_bin_path, &st, 0);
         if (rc == 0 && (st.st_mode & 0111)) {
             char msg[600];
             snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: %s -> %s (dev/twoyi-bin, mode=0%o)\n",
@@ -3100,7 +3201,7 @@ static const char *translate_exec_path(const char *path) {
     snprintf(translated, sizeof(translated), "%s%s", g_rootfs, path);
     // Verify the translated file exists using direct syscall (bypasses our hooks)
     struct stat st;
-    int rc = syscall(SYS_newfstatat, AT_FDCWD, translated, &st, 0);
+    int rc = twoyi_sys_fstatat(AT_FDCWD, translated, &st, 0);
     if (rc == 0) {
         char msg[600];
         snprintf(msg, sizeof(msg), "[twoyi_loader] translate_exec_path: %s -> %s (exists, mode=0%o)\n",
