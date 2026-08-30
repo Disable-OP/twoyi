@@ -97,7 +97,6 @@
     <string name="settings_key_select_rom">选择 ROM</string>
     <string name="settings_select_rom_summary">导入 rootfs (.tar)、启动镜像 (.img)、ramdisk (.cpio/.cpio.gz) 或包含 ramdisk 的 ZIP 文件</string>
     <string name="settings_boot_recovery_title">启动到恢复模式</string>
-    <string name="settings_boot_recovery_summary">启动恢复镜像（如 TWRP）而不是完整 Android。先通过「选择 ROM」导入 .img、.cpio 或 .zip ramdisk 文件，然后启用此选项。</string>
     <string name="settings_key_profile_manager">配置文件管理器</string>
     <string name="settings_profile_manager_summary">管理不同的配置文件</string>
     <string name="profile_manager_title">配置文件管理器</string>
