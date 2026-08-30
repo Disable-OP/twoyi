@@ -21782,3 +21782,95 @@ Stage Summary:
   evidence) with TWRP unregressed. Round-3 (run 33325977950, 988dc94)
   verifies the complete acceptance chain: opaque UI with NO overlay,
   digest lines every 20 changed frames, page transitions visible.
+
+Task ID: 6-Z256 + 6-Z257
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: close the two root causes named by the cereus run 33323583991 analysis — (1) the 6-Z49 proactive recovery child exec's envp carries ZERO standard Android vars (the 20-build OrangeFox strlen(getenv("ANDROID_ROOT")) class); (2) init dies at the property-service socket bootstrap when one fchmodat errno leaks through a missed tracer stop.
+
+Work Log:
+- SESSION START: cloned the repo fresh (local workspace was stale at
+  MON-1); reconciled with the remote worklog head 6-Z255. CI state:
+  fae4870 (6-Z251c) lint green; ad3a109 (6-Z251b opaque blit) E2E in
+  flight; 18f5155 (6-Z255) cereus E2E completed 33323583991.
+- ANALYZED cereus run 33323583991 artifact locally (result.json:
+  boot=BOOT_OK ui=SPLASH_HANG sigsegv=1 theme_fail_events=2
+  display_mode=gl — cereus moved BOOT_FAIL_EARLY_INIT → BOOT_OK on
+  the 6-Z254/6-Z255 heads but still dies in the recovery process).
+- ENV-LOSS DECODE (6-Z256): the 6-Z238/6-Z255 scan lines show the
+  recovery execve envp = `LD env: LD_PRELOAD=<rootfs>/sbin/
+  libtwrp_fb_hook.so | LD_LIBRARY_PATH=<rootfs>/sbin:... | std-vars
+  0/4 present [] total_entries=4` — total_entries=4 matches Task
+  6-Z49's hardcoded envp EXACTLY (LD_PRELOAD, LD_LIBRARY_PATH, PATH,
+  TWOYI_ROOTFS). DECISIVE: init NEVER forks recovery for TWRP-family
+  boots (the 6-Z49 proactive fork IS the exec), so init.rc line 34
+  `export ANDROID_ROOT /system` (verified in the extracted cereus
+  ramdisk, `on init` section) never reaches the recovery process.
+  Not a guest bug, not an rc-parsing bug — the losing stage is our
+  own execve envp staging.
+- FIX 6-Z256 (lib.rs): `build_recovery_service_envp()` — a pure,
+  unit-locked 3-layer builder: (1) twoyi's virtualization stack
+  (LD_PRELOAD with the FORTIFY shim prepended when staged — now
+  CONSISTENT with the 6-Z220 rc-patch chain, LD_LIBRARY_PATH, PATH,
+  TWOYI_ROOTFS), (2) the guest's own rc `export NAME VALUE` lines
+  collected from init.rc + imports + init.recovery.*.rc via
+  `collect_guest_rc_exports()`/`parse_rc_export_lines()` (guest-owned
+  truth — carries ENV/LD_CONFIG_FILE-class extras), (3)
+  ANDROID_STD_ENV_DEFAULTS (ANDROID_ROOT=/system, ANDROID_DATA=/data,
+  EXTERNAL_STORAGE=/sdcard, ANDROID_BOOTLOGO=1) for names still
+  absent. Guest rc exports never override twoyi-owned keys
+  (LD_*/PATH/TWOYI_*); duplicate names impossible (execve UB guard).
+  The fork logs the final envp (count + rc-export count + values).
+- INIT-DEATH DECODE (6-Z257): guest init's second stage died with the
+  6-Z98 exit-trail signature (mprotect sweep → exit_group(127)) right
+  after `init: Failed to fchmodat socket '/dev/socket/property_service':
+  No such file or directory` + `start_property_service socket creation
+  failed`. The chmod/chown family is blanket-faked to 0 at EXIT
+  (compute_exit_return_value) and the 6-Z185 backstop fake-0s
+  out-of-sandbox fchownat — a real errno can only leak when the EXIT
+  stop for that syscall never reaches the tracer (the 6-Z210
+  missed-stop class: PTRACE_SYSCALL skip / ESRCH race / fork-follow
+  gap). Also observed: the 6-Z163 bind rewrite produced ZERO lines
+  (not even the 6-Z163b/c skip DIAGs) while 6-Z101's EXIT fake fired —
+  the outer gate (`boot_recovery && bind_nr && socketcall_nr==-1 &&
+  scratch_addr!=0`) is the last silent branch and is now instrumented.
+- FIX 6-Z257 (ptrace_emu.rs): (a) fchmodat/fchownat ENTRY → rewrite to
+  getpid (the proven 6-Z9 xattr pattern) with per-pid
+  pending_chmod_fake_pid consumed at the matching EXIT (force ret 0);
+  the family fake no longer depends on seeing the original syscall's
+  EXIT stop — a missed/desynced stop cannot leak a raw errno into
+  init's create_socket anymore. Semantics preserved exactly: the
+  family was ALREADY blanket-0 and fchmodat/fchownat are not in the
+  path-translation slot set (raw syscalls resolved against the HOST
+  root and were masked — now they never touch the host at all, a VFS
+  hygiene win). (b) EXIT-side family fake + 6-Z185 backstop remain as
+  backstops for a failed ENTRY rewrite. (c) 6-Z163 outer-gate skip
+  DIAG names which gate condition failed (first 12). (d) per-pid
+  hygiene for pending_chmod_fake_pid at both child-death sites.
+- REGRESSION TESTS: 7 new — z256_envp_includes_standard_android_vars,
+  z256_envp_rc_exports_override_defaults_but_not_twoyi_keys,
+  z256_envp_compat_shim_prepends_to_preload_chain,
+  z256_parse_rc_export_lines_guest_truth,
+  z256_parse_rc_export_lines_keeps_multiword_value,
+  z257_chmod_family_numbers_reachable_in_entry_dispatch (locks the
+  ENTRY dispatch reachability per ABI — first-match-wins collision
+  guard), z257_chmod_family_exit_fake_backstop_intact.
+- GATES: 665 host tests green (was 658); cargo clippy --all-targets
+  -D warnings clean; cargo fmt --check clean.
+
+Stage Summary:
+- The 20-build aarch64 OrangeFix strlen(NULL) class now has its
+  standard Android environment restored at the exec site; the guest's
+  own rc exports ride along (guest-owned truth). init's property-
+  service bootstrap can no longer be killed by a single missed
+  tracer stop on the chmod family. 6-Z163's silent outer-gate skip is
+  instrumented.
+- NEXT: commit+push; dispatch a focused aarch64 wave on this head —
+  cereus + daisy + nitrogen + riva (the 1-instance strlen class) +
+  whyred + starlte (UI_READY regression guards); collect the
+  in-flight ad3a109 (6-Z251b opaque blit) result; the arm32 wave
+  (grouper/osprey/lux/m8/titan/merlin/onyx/shamu) for 6-Z254 remains
+  the second priority; watch for init SURVIVING past the property
+  socket (kmsg shows no "start_property_service socket creation
+  failed") and for the 6-Z257/6-Z163 DIAG lines naming any residual
+  gate skip.

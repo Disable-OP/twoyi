@@ -9948,6 +9948,13 @@ pub fn run_ptrace_loop(
     // consumer additionally requires the poll syscall number + expires
     // after 2000 loop iterations).
     let mut pending_xattr_fake_pid: Option<libc::pid_t> = None;
+    // 6-Z257: pending flag for the fchmodat/fchownat ENTRY rewrite (the
+    // 6-Z9 xattr pattern). Set at the ENTRY stop when the guest calls
+    // fchmodat/fchownat, consumed at the matching EXIT stop (fake return
+    // 0). Kills the missed-EXIT-stop errno-leak class that let a raw
+    // ENOENT reach init's create_socket → LOG(FATAL) → the
+    // mprotect-sweep death (run 33323583991). Per-pid (6-Z83).
+    let mut pending_chmod_fake_pid: Option<libc::pid_t> = None;
     // Task 6-Z28: pending flag for poll() return fake. Set at the ENTRY
     // stop (when init calls poll), consumed at the EXIT stop (fake return 0).
     // 6-Z83: PER-PID (see the block comment above) + arming loop_count for
@@ -11494,6 +11501,11 @@ pub fn run_ptrace_loop(
             if pending_kmsg_open_pid == Some(pid) {
                 pending_kmsg_open_pid = None;
             }
+            // 6-Z257 hygiene: drop the dead pid's pending chmod fake so a
+            // pid-reused successor can never inherit it (same 6-Z83 rule).
+            if pending_chmod_fake_pid == Some(pid) {
+                pending_chmod_fake_pid = None;
+            }
             // ── Task 6-Z110: per-pid fd-table cleanup ──
             //
             // Drop the dead pid's per-pid fd-table state so a
@@ -11676,6 +11688,11 @@ pub fn run_ptrace_loop(
             }
             if pending_kmsg_open_pid == Some(pid) {
                 pending_kmsg_open_pid = None;
+            }
+            // 6-Z257 hygiene (WIFSIGNALED mirror): drop the killed pid's
+            // pending chmod fake.
+            if pending_chmod_fake_pid == Some(pid) {
+                pending_chmod_fake_pid = None;
             }
             // ── Task 6-Z110: per-pid fd-table cleanup (WIFSIGNALED mirror)
             // ──
@@ -14165,6 +14182,33 @@ pub fn run_ptrace_loop(
                         // bind; init's own unlinkat was TRANSLATED and
                         // already removed the guest-path copy, but a
                         // crash between runs can leave stragglers).
+                        // 6-Z257 DIAG: the OUTER gate itself is still
+                        // silent when it fails — a failed gate produces
+                        // NO 6-Z163 line at all (the 6-Z163b/c DIAGs only
+                        // fire INSIDE the gate), which is exactly what
+                        // happened on run 33323583991 (cereus): init's
+                        // property-service bind produced only the 6-Z101
+                        // EXIT fake, zero 6-Z163* lines, and the un-bound
+                        // socket fchmodat ENOENT killed init. Name the
+                        // failing condition (first 12) so the next run
+                        // closes the question.
+                        if abi.bind_nr != -1
+                            && syscall_num == abi.bind_nr
+                            && !(boot_recovery && abi.socketcall_nr == -1 && scratch_addr != 0)
+                        {
+                            spin_diag_bind_skip_count = spin_diag_bind_skip_count.saturating_add(1);
+                            if spin_diag_bind_skip_count <= 12 {
+                                log(&format!(
+                                    "6-Z257: bind(fd={}) — OUTER gate NOT satisfied: boot_recovery={} bind_nr={} socketcall_nr={} scratch_addr={:#x} (occurrence {})",
+                                    get_syscall_arg(&regs, abi.reg_arg1),
+                                    boot_recovery,
+                                    abi.bind_nr,
+                                    abi.socketcall_nr,
+                                    scratch_addr,
+                                    spin_diag_bind_skip_count
+                                ));
+                            }
+                        }
                         if boot_recovery
                             && abi.bind_nr != -1
                             && syscall_num == abi.bind_nr
@@ -16670,6 +16714,72 @@ pub fn run_ptrace_loop(
                                     "DIAG xattr ENTRY REWRITE FAILED: {} nr={} → getpid: ptrace_setregs: {} — kernel will execute the xattr syscall (EXIT will still fake return 0 via pending_xattr_fake)",
                                     syscall_name(syscall_num, &abi),
                                     syscall_num,
+                                    e
+                                )),
+                            }
+                        }
+                        // ── 6-Z257: fchmodat/fchownat ENTRY → rewrite to
+                        // getpid (the proven 6-Z9 xattr pattern) ──
+                        //
+                        // ROOT CAUSE (cereus OrangeFox R11, run
+                        // 33323583991): init's property-service socket
+                        // bootstrap died at create_socket's
+                        //   fchmodat(AT_FDCWD, "/dev/socket/property_service",
+                        //            0666, AT_SYMLINK_NOFOLLOW)
+                        // — the REAL ENOENT reached the guest ("Failed to
+                        // fchmodat socket '/dev/socket/property_service': No
+                        // such file or directory" → "start_property_service
+                        // socket creation failed" → LOG(FATAL) → the
+                        // mprotect-sweep death → exit_group(127)). The
+                        // 6-Z229-era guarantee was: the chmod/chown family
+                        // is blanket-faked to 0 at the EXIT stop
+                        // (compute_exit_return_value "always fake 0" for
+                        // untrusted_app), and the 6-Z185 backstop ALSO
+                        // fake-0s out-of-sandbox fchownat — so a real
+                        // errno can never leak. The leak path is the
+                        // MISSED-STOP class (6-Z210: "PTRACE_SYSCALL skip /
+                        // ESRCH race / fork-follow gap"): when the EXIT
+                        // stop for a given fchmodat never reaches the
+                        // tracer (or arrives desynced), the raw errno
+                        // flows to userspace and init dies.
+                        //
+                        // THE FIX mirrors 6-Z9: at the ENTRY stop rewrite
+                        // the syscall to getpid BEFORE the kernel executes
+                        // it; at the matching EXIT stop consume
+                        // pending_chmod_fake and force the return to 0.
+                        // The fake no longer depends on seeing a stop for
+                        // the ORIGINAL syscall's exit — the getpid pair
+                        // (ENTRY rewrite + EXIT consume) is itself the
+                        // synchronization point.
+                        //
+                        // SEMANTICS (§22 — no behavioral lie beyond what
+                        // the guest already accepted): the family fake was
+                        // ALREADY blanket-0 ("always fake 0" — real ENOENT/
+                        // EPERM never surfaced). Real chmod effects never
+                        // landed in the sandbox either: fchmodat/fchownat
+                        // are NOT in the path-translation slot set, so the
+                        // raw syscall always resolved against the HOST
+                        // root (EACCES/EPERM/ENOENT for untrusted_app —
+                        // masked by the same fake). Returning 0 WITHOUT
+                        // executing the host-path syscall is therefore the
+                        // same observable contract, with two improvements:
+                        // no errno leak on a missed stop, and no host-path
+                        // chmod/chown attempt from guest content (VFS
+                        // hygiene §7). The EXIT-side family fake stays as
+                        // belt-and-suspenders for any rewrite failure.
+                        n if n == abi.fchmodat || n == abi.fchownat => {
+                            pending_chmod_fake_pid = Some(pid); // 6-Z83: per-pid
+                            set_syscall_num(&mut regs, &abi, abi.getpid);
+                            match ptrace_setregs(pid, &regs, iov_len) {
+                                Ok(()) => log(&format!(
+                                    "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (kernel will execute getpid; EXIT will fake return 0) — chmod/chown family fake is now missed-stop-proof (the raw-ENOENT leak killed init's property service on run 33323583991)",
+                                    syscall_name(syscall_num, &abi),
+                                    syscall_num,
+                                    abi.getpid
+                                )),
+                                Err(e) => log(&format!(
+                                    "6-Z257: {} ENTRY REWRITE FAILED: ptrace_setregs: {} — kernel will execute the real syscall (EXIT-side family fake + 6-Z185 backstop remain)",
+                                    syscall_name(syscall_num, &abi),
                                     e
                                 )),
                             }
@@ -19400,6 +19510,42 @@ pub fn run_ptrace_loop(
                                 // fake ran. 6-Z9 surfaces the failure.
                                 log(&format!(
                                     "DIAG xattr EXIT: ptrace_getregs FAILED: {} — cannot fake return 0; child will see getpid's return for the xattr SET",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+
+                    // ── 6-Z257: fchmodat/fchownat EXIT consumption ──
+                    // Consume the pending flag armed by the ENTRY rewrite
+                    // (the 6-Z9 pattern): force the return to 0. getpid
+                    // returns the traced pid (positive) — without this
+                    // consumption the guest would see a pid where it
+                    // expects chmod/chown success.
+                    if pending_chmod_fake_pid == Some(pid) {
+                        pending_chmod_fake_pid = None;
+                        let exit_syscall_num = syscall_num;
+                        let mut regs2: Regs = unsafe { std::mem::zeroed() };
+                        match ptrace_getregs_wide(pid, &mut regs2) {
+                            Ok(len) => {
+                                let original_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
+                                set_syscall_ret(&mut regs2, &abi, 0);
+                                match ptrace_setregs(pid, &regs2, len) {
+                                    Ok(()) => log(&format!(
+                                        "6-Z257: fchmodat/fchownat EXIT: faked return 0 (underlying return {}; exit-syscall_num={} [{}]) — child sees chmod/chown success (missed-stop-proof family fake)",
+                                        original_ret,
+                                        exit_syscall_num,
+                                        syscall_name(exit_syscall_num, &abi)
+                                    )),
+                                    Err(e) => log(&format!(
+                                        "6-Z257: fchmodat/fchownat EXIT FAKE FAILED: ptrace_setregs: {} — child will see {} (NOT 0)",
+                                        e, original_ret
+                                    )),
+                                }
+                            }
+                            Err(e) => {
+                                log(&format!(
+                                    "6-Z257: fchmodat/fchownat EXIT: ptrace_getregs FAILED: {} — cannot fake return 0",
                                     e
                                 ));
                             }
@@ -23299,6 +23445,130 @@ pub fn run_ptrace_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 6-Z257: fchmodat/fchownat ENTRY-rewrite reachability ─────────
+    //
+    // The 6-Z257 arm lives in the ENTRY `match syscall_num` block after
+    // the earlier dedicated arms (getpid/getppid/open*/stat*/pread64/
+    // access/readlink/chdir/mmap*/unlink*/poll/xattr/set_thread_area).
+    // Match arms are first-match-wins, so if any ABI's fchmodat/fchownat
+    // number COLLIDES with one of those earlier arms' numbers, the
+    // 6-Z257 arm is silently unreachable and the missed-stop errno leak
+    // it fixes comes back. This test locks the collision-free property
+    // for every supported ABI (the arm's dispatch reachability).
+    #[test]
+    fn z257_chmod_family_numbers_reachable_in_entry_dispatch() {
+        fn check(abi_name: &str, abi: &ChildAbi) {
+            // The earlier dispatch arms' syscall numbers (keep in sync
+            // with the match block — these are the arms that come
+            // BEFORE the 6-Z257 arm).
+            let earlier_arm_numbers: Vec<i64> = vec![
+                abi.getpid,
+                abi.getppid,
+                abi.open,
+                abi.openat,
+                abi.openat2,
+                abi.stat,
+                abi.lstat,
+                abi.newfstatat,
+                abi.statx,
+                abi.fstat64,
+                abi.pread64,
+                abi.access,
+                abi.faccessat,
+                abi.readlink,
+                abi.readlinkat,
+                abi.chdir,
+                abi.mmap,
+                abi.mmap2,
+                abi.unlink,
+                abi.unlinkat,
+                abi.poll_nr,
+                abi.setxattr,
+                abi.lsetxattr,
+                abi.fsetxattr,
+                abi.set_thread_area_nr,
+            ];
+            for target in [abi.fchmodat, abi.fchownat] {
+                if target == -1 {
+                    continue; // ABI without the number — EXIT fake only.
+                }
+                assert!(
+                    !earlier_arm_numbers.contains(&target),
+                    "{}: nr={} (fchmodat/fchownat) collides with an earlier \
+                     dispatch arm — the 6-Z257 ENTRY rewrite would be \
+                     unreachable and the missed-stop errno leak returns",
+                    abi_name,
+                    target
+                );
+            }
+        }
+        check("x86_64", &ABI_X86_64);
+        check("i386", &ABI_X86_32);
+        // ABI_ARM32 is defined on every host (dead-code-allowed off
+        // aarch64) — the arm32 compat children run through the same
+        // ENTRY dispatch on x86_64 hosts.
+        check("arm32", &ABI_ARM32);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z257_chmod_family_numbers_reachable_in_entry_dispatch_aarch64() {
+        let abi = ABI_AARCH64;
+        // aarch64: the arms before 6-Z257 use 17(chdir) 35(unlinkat)
+        // 48(faccessat) 56(openat) 67(pread64) 78(readlink) 79(newfstatat)
+        // 172/173(getpid/getppid) 222(mmap) 291(statx) — fchmodat=53 and
+        // fchownat=54 sit between them with no collision.
+        for target in [abi.fchmodat, abi.fchownat] {
+            assert!(target != 17 && target != 35 && target != 48 && target != 56);
+            assert!(target != 67 && target != 78 && target != 79);
+            assert!(target != 172 && target != 173 && target != 222 && target != 291);
+        }
+        assert_eq!(abi.fchmodat, 53);
+        assert_eq!(abi.fchownat, 54);
+    }
+
+    #[test]
+    fn z257_chmod_family_exit_fake_backstop_intact() {
+        // The EXIT-side family fake must stay as the belt-and-suspenders
+        // backstop behind the ENTRY rewrite (a failed ENTRY rewrite must
+        // still be masked at EXIT).
+        for (abi_name, abi) in [
+            ("x86_64", &ABI_X86_64),
+            ("i386", &ABI_X86_32),
+            ("arm32", &ABI_ARM32),
+        ] {
+            if abi.fchmodat != -1 {
+                assert_eq!(
+                    compute_exit_return_value(abi.fchmodat, abi),
+                    Some(0),
+                    "{}: fchmodat EXIT backstop missing",
+                    abi_name
+                );
+            }
+            if abi.fchownat != -1 {
+                assert_eq!(
+                    compute_exit_return_value(abi.fchownat, abi),
+                    Some(0),
+                    "{}: fchownat EXIT backstop missing",
+                    abi_name
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn z257_chmod_family_exit_fake_backstop_intact_aarch64() {
+        assert_eq!(
+            compute_exit_return_value(ABI_AARCH64.fchmodat, &ABI_AARCH64),
+            Some(0)
+        );
+        assert_eq!(
+            compute_exit_return_value(ABI_AARCH64.fchownat, &ABI_AARCH64),
+            Some(0)
+        );
+    }
 
     /// Build a synthetic 20-byte ELF header with the given EI_CLASS
     /// and e_machine values. All other bytes are zero — they're not
