@@ -22103,3 +22103,23 @@ Stage Summary:
   the periodic guard. If init survives deterministically, the
   property-service chain is closed and the remaining OrangeFox hang
   surface is the 6-Z251d/e/f display track.
+
+---
+Task ID: 6-Z258c-CI
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: record the 6-Z258c verification wave (head 139c013).
+
+Work Log:
+- Dispatched 3 E2E runs (run IDs recorded by MON-5 from the actions
+  list; head 139c013): orangefox-cereus + orangefox-daisy
+  (determinism anchor — BOTH must show init survival + zero
+  linker64 crashes) and twrp-3.7.0_9-0-whyred (regression check vs
+  its MON-1 UI_READY baseline) with the manifest referer input.
+- ACCEPTANCE: zero "linker64 r-xp" crash dumps anywhere; the ONLY
+  6-Z258 translate lines name guest paths (no cache/twoyi_init
+  translations); init survival on both OrangeFox runs; whyred
+  returns to BOOT_OK/UI_READY.
+
+Stage Summary:
+- Wave recorded; monitoring delegated (MON-5).
