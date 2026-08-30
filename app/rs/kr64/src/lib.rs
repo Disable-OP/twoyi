@@ -812,6 +812,10 @@ pub fn clear_zombie_processes() {
 /// diagnostic log honest.
 ///
 /// The caller picks the first candidate that exists on disk.
+/// 6-Z226: candidate #4b — {data_dir}/files/<name> is where RomManager
+/// extracts the APK assets — the 32-bit hook variants (lib*_arm32.so,
+/// see detect_guest_recovery_bitness/guest_hook_lib_name) ship as assets
+/// because the package manager extracts only the device's ABI jniLibs.
 fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(8);
     // Candidate #0: cfg.native_lib_dir (Java-passed nativeLibraryDir).
@@ -822,12 +826,21 @@ fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
             out.push(format!("{}/{}", trimmed, lib_name));
         }
     }
+    // 6-Z226 candidate #4b: {data_dir}/files/<name> — where RomManager
+    // extracts the APK ASSETS at app init (the libdl.so Option-D pattern).
+    // The 32-bit hook variants (lib*_arm32.so) live here: Android's
+    // package manager extracts only the DEVICE's ABI libs from jniLibs,
+    // so the armeabi-v7a builds must ship as assets instead. Placed AFTER
+    // the rootfs symlink candidates: for the regular 64-bit names the
+    // rootfs paths are the historically-proven sources, and for the
+    // _arm32 names the asset file is the only one that exists.
     // Candidates #1-#4: rootfs and app-level rootfs paths (RomManager's
     // ensureLibSymlink targets).
     out.push(format!("{}/{}", cfg.rootfs, lib_name));
     out.push(format!("{}/system/lib64/{}", cfg.rootfs, lib_name));
     out.push(format!("{}/rootfs/system/lib64/{}", cfg.data_dir, lib_name));
     out.push(format!("{}/rootfs/{}", cfg.data_dir, lib_name));
+    out.push(format!("{}/files/{}", cfg.data_dir, lib_name));
     // Candidate #5+: scan the APK's native library directory directly.
     // This bypasses the rootfs symlink entirely -- the APK lib dir is
     // the canonical source. See `apk_native_lib_candidates` for the
@@ -843,6 +856,58 @@ fn hook_library_candidates(cfg: &Config, lib_name: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     out.retain(|p| seen.insert(p.clone()));
     out
+}
+
+/// 6-Z226: ELF bitness of the GUEST recovery binary. Reads the 6-byte
+/// ELF header (magic + EI_CLASS) of the first candidate that opens.
+/// Returns Some(true) for ELFCLASS64, Some(false) for ELFCLASS32, None
+/// when no recovery binary exists/is readable (caller defaults to the
+/// 64-bit chain — the historic behavior for every arm64 image).
+/// Wave-1 corpus runs 251/265/266/267/263 (merlin/ali/athene/bacon/
+/// a7xelte): the guest recovery is ELF32 EM_ARM and the staged aarch64
+/// hook chain made bionic refuse the preload ("... is 64-bit instead of
+/// 32-bit") → init exit 1 — the single largest wave-1 failure class.
+pub fn detect_guest_recovery_bitness(rootfs_prefix: &str) -> Option<bool> {
+    const CANDIDATES: &[&str] = &["sbin/recovery", "system/bin/recovery"];
+    for c in CANDIDATES {
+        let p = format!("{}/{}", rootfs_prefix, c);
+        let mut hdr = [0u8; 6];
+        match std::fs::File::open(&p).and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut hdr)
+        }) {
+            Ok(()) if hdr[0..4] == *b"\x7fELF" => {
+                return Some(hdr[4] == 2); // EI_CLASS: 1 = 32-bit, 2 = 64-bit
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+/// 6-Z226: the hook-library FILE NAME for the guest's bitness. The 32-bit
+/// variants are built by app/cpp/build.sh (armeabi-v7a target) into the
+/// APK (jniLibs/armeabi-v7a/) AND as APK assets extracted by RomManager
+/// to {data_dir}/files/ at app init. Destination paths in the guest
+/// (sbin/libtwrp_fb_hook.so, /dev/... in the LD_PRELOAD chain) are
+/// UNCHANGED — only the staged CONTENT differs.
+pub fn guest_hook_lib_name(base: &str, guest_is_64: bool) -> String {
+    if guest_is_64 {
+        base.to_string()
+    } else {
+        match base {
+            "libtwrp_fb_hook.so" => "libtwrp_fb_hook_arm32.so".to_string(),
+            "libtwoyi_loader_shlib.so" => "libtwoyi_loader_shlib_arm32.so".to_string(),
+            "libgetpid_hook.so" => "libgetpid_hook_arm32.so".to_string(),
+            other => {
+                // Generic: insert _arm32 before the extension.
+                match other.rsplit_once('.') {
+                    Some((stem, ext)) => format!("{}_arm32.{}", stem, ext),
+                    None => format!("{}_arm32", other),
+                }
+            }
+        }
+    }
 }
 
 /// Scan the APK native library directory for a given library name.
@@ -4171,11 +4236,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //
     // We do NOT load libgetpid_hook.so in TWRP mode (recovery doesn't
     // need to fake PID 1 — only init does, and init is static).
+    // 6-Z226: detect the GUEST recovery binary's bitness and use the
+    // matching hook variants (see detect_guest_recovery_bitness). The
+    // DEST paths are unchanged — only the staged content differs. If no
+    // recovery binary is found (or it isn't ELF), default to the 64-bit
+    // chain: the historic behavior for every arm64 image.
+    // NOTE: cfg.rootfs (the host-side rootfs path) is used here —
+    // rootfs_prefix ("" in root mode) is not computed until the sbin
+    // staging block below, and cfg.rootfs always resolves to real files.
+    let guest_is_64 = detect_guest_recovery_bitness(&cfg.rootfs).unwrap_or(true);
+    if !guest_is_64 {
+        info!(
+            "[KR64] PARENT: 6-Z226: guest recovery is ELF32 — staging the armeabi-v7a hook chain"
+        );
+    }
     let hook_lib_getpid = if cfg.boot_recovery {
         info!("[KR64] TWRP boot: skipping libgetpid_hook.so read (init is statically linked)");
         None
     } else {
-        find_and_read_hook_library(&cfg, "libgetpid_hook.so", "LD_PRELOAD will fail")
+        find_and_read_hook_library(
+            &cfg,
+            &guest_hook_lib_name("libgetpid_hook.so", guest_is_64),
+            "LD_PRELOAD will fail",
+        )
     };
     let hook_lib_loader = if cfg.boot_recovery {
         info!(
@@ -4185,7 +4268,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     } else {
         find_and_read_hook_library(
             &cfg,
-            "libtwoyi_loader_shlib.so",
+            &guest_hook_lib_name("libtwoyi_loader_shlib.so", guest_is_64),
             "seccomp virtualization disabled",
         )
     };
@@ -4207,7 +4290,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //     /dev/graphics/fb0, so loading it unconditionally is safe.
     let hook_lib_twrp_fb = find_and_read_hook_library(
         &cfg,
-        "libtwrp_fb_hook.so",
+        &guest_hook_lib_name("libtwrp_fb_hook.so", guest_is_64),
         "framebuffer virtualization disabled (recovery will crash in libminuitwrp.so gr_fb_width)",
     );
 
@@ -10535,13 +10618,15 @@ mod tests {
         // If we get here without panicking, the test passes.
     }
 
-    /// `hook_library_candidates` must START with the 4 documented
-    /// candidate paths in priority order (the app-level rootfs path that
+    /// `hook_library_candidates` must START with the 5 documented
+    /// candidate paths in priority order (6-Z226 added candidate #0b:
+    /// {data_dir}/files/<name> — the RomManager asset-extraction path
+    /// for the 32-bit hook variants; the app-level rootfs path that
     /// RomManager's `ensureLibSymlink` ACTUALLY uses, which is NOT the
     /// same as `cfg.rootfs` for per-profile rootfs). The list may be
     /// followed by APK native lib dir scan results (candidate #5+) if
     /// `/data/app/` exists -- on the Linux devcontainer test runner it
-    /// doesn't, so the list is exactly 4 here.
+    /// doesn't, so the list is exactly 5 here.
     #[test]
     fn hook_library_candidates_starts_with_four_documented_paths() {
         let cfg = Config {
@@ -10550,32 +10635,36 @@ mod tests {
             ..Config::default()
         };
         let cands = hook_library_candidates(&cfg, "libgetpid_hook.so");
-        // The first 4 candidates are the documented symlink paths. The
-        // APK dir scan (candidate #5+) returns 0 entries on Linux.
+        // The first 5 candidates are the documented paths (6-Z226 added
+        // the files-dir asset candidate at #5). The APK dir scan
+        // (candidate #6+) returns 0 entries on Linux.
         assert!(
-            cands.len() >= 4,
-            "expected at least 4 candidates, got {}: {:?}",
+            cands.len() >= 5,
+            "expected at least 5 candidates, got {}: {:?}",
             cands.len(),
             cands
         );
-        // 1. Direct rootfs (historical fallback).
+        // 0. Direct rootfs (historical fallback).
         assert_eq!(
             cands[0],
             "/data/data/io.twoyi/profiles/default/rootfs/libgetpid_hook.so"
         );
-        // 2. Profile rootfs system/lib64 (RomManager per-profile symlink).
+        // 1. Profile rootfs system/lib64 (RomManager per-profile symlink).
         assert_eq!(
             cands[1],
             "/data/data/io.twoyi/profiles/default/rootfs/system/lib64/libgetpid_hook.so"
         );
-        // 3. App-level rootfs system/lib64 -- the CONFIRMED working path
+        // 2. App-level rootfs system/lib64 -- the CONFIRMED working path
         //    from logcat (ensureLibSymlink target).
         assert_eq!(
             cands[2],
             "/data/data/io.twoyi/rootfs/system/lib64/libgetpid_hook.so"
         );
-        // 4. App-level rootfs root (alternative).
+        // 3. App-level rootfs root (alternative).
         assert_eq!(cands[3], "/data/data/io.twoyi/rootfs/libgetpid_hook.so");
+        // 4. 6-Z226: {data_dir}/files — RomManager asset extraction
+        //    (the _arm32 hook variants live here).
+        assert_eq!(cands[4], "/data/data/io.twoyi/files/libgetpid_hook.so");
     }
 
     /// `hook_library_candidates` must use the passed-in library name
@@ -10785,29 +10874,34 @@ mod tests {
             ..Config::default()
         };
         let cands = hook_library_candidates(&cfg, "libtwrp_fb_hook.so");
-        // The 4 documented candidates collapse to 2 unique paths after
-        // dedup (rootfs/{lib} == data_dir/rootfs/{lib}, and
-        // rootfs/system/lib64/{lib} == data_dir/rootfs/system/lib64/{lib}).
-        // The APK dir scan returns 0 entries on Linux.
+        // The 5 documented candidates + the 6-Z226 files-dir candidate
+        // collapse to 3 unique paths after dedup (rootfs/{lib} ==
+        // data_dir/rootfs/{lib}, and rootfs/system/lib64/{lib} ==
+        // data_dir/rootfs/system/lib64/{lib}; data_dir/files/<lib> is
+        // always unique). The APK dir scan returns 0 entries on Linux.
         assert_eq!(
             cands.len(),
-            2,
-            "expected 2 UNIQUE candidates after dedup (rootfs == {{data_dir}}/rootfs), got {}: {:?}",
+            3,
+            "expected 3 UNIQUE candidates after dedup (rootfs == {{data_dir}}/rootfs + the 6-Z226 files-dir candidate), got {}: {:?}",
             cands.len(),
             cands
         );
-        // Verify both unique paths are present.
+        // Verify all unique paths are present (including 6-Z226's).
+        let has_files_dir = cands
+            .iter()
+            .any(|p| p == "/data/user/11/io.twoyi/files/libtwrp_fb_hook.so");
+        assert!(has_files_dir, "missing files-dir candidate: {:?}", cands);
         let has_rootfs_root = cands
             .iter()
             .any(|p| p == "/data/user/11/io.twoyi/rootfs/libtwrp_fb_hook.so");
-        let has_rootfs_lib64 = cands
-            .iter()
-            .any(|p| p == "/data/user/11/io.twoyi/rootfs/system/lib64/libtwrp_fb_hook.so");
         assert!(
             has_rootfs_root,
             "missing rootfs/<lib> candidate: {:?}",
             cands
         );
+        let has_rootfs_lib64 = cands
+            .iter()
+            .any(|p| p == "/data/user/11/io.twoyi/rootfs/system/lib64/libtwrp_fb_hook.so");
         assert!(
             has_rootfs_lib64,
             "missing rootfs/system/lib64/<lib> candidate: {:?}",
@@ -13768,6 +13862,81 @@ mod tests {
     }
 
     // ── 6-Z225: capabilities-option stripping ────────────────────────
+
+    // ── 6-Z226: guest bitness detection + hook name selection ─────────
+
+    #[test]
+    fn guest_hook_lib_name_maps_all_three_hooks_6z226() {
+        // 64-bit guests keep the canonical names.
+        assert_eq!(
+            guest_hook_lib_name("libtwrp_fb_hook.so", true),
+            "libtwrp_fb_hook.so"
+        );
+        assert_eq!(
+            guest_hook_lib_name("libgetpid_hook.so", true),
+            "libgetpid_hook.so"
+        );
+        assert_eq!(
+            guest_hook_lib_name("libtwoyi_loader_shlib.so", true),
+            "libtwoyi_loader_shlib.so"
+        );
+        // 32-bit guests get the _arm32 asset names (built by
+        // app/cpp/build.sh's armeabi-v7a section; extracted by RomManager
+        // to {data_dir}/files/).
+        assert_eq!(
+            guest_hook_lib_name("libtwrp_fb_hook.so", false),
+            "libtwrp_fb_hook_arm32.so"
+        );
+        assert_eq!(
+            guest_hook_lib_name("libgetpid_hook.so", false),
+            "libgetpid_hook_arm32.so"
+        );
+        assert_eq!(
+            guest_hook_lib_name("libtwoyi_loader_shlib.so", false),
+            "libtwoyi_loader_shlib_arm32.so"
+        );
+        // Generic fallback inserts _arm32 before the extension.
+        assert_eq!(guest_hook_lib_name("other.so", false), "other_arm32.so");
+    }
+
+    #[test]
+    fn detect_guest_recovery_bitness_reads_elf_class_6z226() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z226-elf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sbin")).unwrap();
+        // 32-bit ARM recovery: ELF magic + EI_CLASS=1.
+        let mut elf32 = b"\x7fELF".to_vec();
+        elf32.push(1);
+        elf32.extend_from_slice(&[1, 1, 0]);
+        std::fs::write(dir.join("sbin/recovery"), &elf32).unwrap();
+        assert_eq!(
+            detect_guest_recovery_bitness(dir.to_str().unwrap()),
+            Some(false)
+        );
+        // 64-bit: EI_CLASS=2 (system/bin/recovery candidate path).
+        let dir64 = std::env::temp_dir().join(format!("twoyi-6z226-elf64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir64);
+        std::fs::create_dir_all(dir64.join("system/bin")).unwrap();
+        let mut elf64 = b"\x7fELF".to_vec();
+        elf64.push(2);
+        elf64.extend_from_slice(&[1, 1, 0]);
+        std::fs::write(dir64.join("system/bin/recovery"), &elf64).unwrap();
+        assert_eq!(
+            detect_guest_recovery_bitness(dir64.to_str().unwrap()),
+            Some(true)
+        );
+        // Missing binary -> None (caller defaults to the 64-bit chain).
+        let empty = std::env::temp_dir().join(format!("twoyi-6z226-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(detect_guest_recovery_bitness(empty.to_str().unwrap()), None);
+        // Non-ELF file -> skipped, falls through to None.
+        std::fs::write(dir.join("sbin/recovery"), b"#!/system/bin/sh\n").unwrap();
+        assert_eq!(detect_guest_recovery_bitness(dir.to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir64);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
 
     #[test]
     fn strip_caps_options_strips_all_spellings_and_keeps_rest_6z225() {
