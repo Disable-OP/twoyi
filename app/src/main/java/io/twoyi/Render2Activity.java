@@ -140,7 +140,7 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     // WrongConstant: the RECEIVER_EXPORTED flag must stay a literal until
     // compileSdk reaches 33 (see the call site below).
-    @androidx.annotation.SuppressLint("WrongConstant")
+    //noinspection WrongConstant
     private void registerDebugTouchReceiver() {
         mDebugTouchReceiver = new BroadcastReceiver() {
             @Override
