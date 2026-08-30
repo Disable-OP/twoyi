@@ -20782,3 +20782,56 @@ Stage Summary:
   capricorn/cherry + starlte regression) on c188c28.
 - NEXT: commit+push 6-Z241; collect the 6-Z240 round; dispatch
   capricorn + property-class verifies on the 6-Z241 head.
+
+---
+Task ID: 6-Z242
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: 6-Z241 verification round — property class advanced to the hw_random entropy blocker; /dev/hw_random stand-in added.
+
+Work Log:
+- COLLECTED the 12-run 17c573b (6-Z241) round: whyred + starlte
+  UI_READY (regression green). The 10 property-class recoveries
+  (griffin, capricorn, h830, h850, h990, ido, kinzie, ls997, montana,
+  perry) ALL advanced past property init — the kmsg now shows
+  "(Loading properties from /default.prop took 0.00s.)", rc parsing,
+  ueventd coldboot. The 6-Z241 fix WORKED for its target class.
+- NEW BLOCKER (uniform across the class): init's
+  mix-hwrng-into-linux-rng boot action fails —
+    "Failed to read from /dev/hw_random: EOF"
+    "Unable to set adequate mmap entropy value!"
+    "Security failure; rebooting into recovery mode..."
+    "android_reboot: Failed to open sysrq-trigger."
+  /dev/hw_random does not exist in the staged dev tree → init's read
+  fails → the entropy-mix action hard-fails → the guest reboots itself.
+  Real devices: /dev/hw_random is the hardware RNG char device.
+- COLLECTED the 12-run c188c28 (6-Z240) round: THE LINKER CLASS IS
+  FIXED — zero "CANNOT LINK"/".dynamic section header was not found"
+  lines anywhere. 10 ELF32 recoveries advanced: onyx-3.4.0, mako,
+  hammerhead, grouper → UI_HANG (the recovery process now RUNS — it
+  execs /sbin/pigz!); merlin, osprey, m8, lux, m7 → BOOT_FAIL/None
+  (next-layer blockers, no linker errors); starlte UI_READY
+  (regression); cherry BOOT_FAIL/None (the 6-Z236 shim IS in the
+  preload chain — LD_PRELOAD=/sbin/libbionic_compat.so:/sbin/
+  libtwrp_fb_hook.so — no linker errors, recovery still exit-1 loops;
+  needs its next evidence round).
+- FIX 6-Z242: create_hwrng_device() — stage {rootfs}/dev/hw_random as a
+  512-byte regular file of /dev/urandom bytes (LCG fallback), mode 0444,
+  remove-first for clean re-staging. init's read returns real data →
+  the entropy mix succeeds → no "Security failure" reboot. Wired into
+  create_twrp_misc_devs (runs for every boot mode). Test extended:
+  hw_random must exist, be 512 bytes, readable, non-constant.
+- ALSO COLLECTED (c188c28): the arm32 UI_HANG recoveries (onyx, mako,
+  hammerhead, grouper) run the recovery binary (pigz exec'd = TWRP's
+  startup decompression) but the framebuffer UI never renders — the
+  arm32 fb_hook reports "(unknown-arch ...)" — the next class to
+  analyze (arm32 UI path).
+- GATES: 653 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- property class: 6-Z241 verified working (class advanced).
+- linker class: 6-Z240 verified working (class advanced).
+- new uniform blocker for the pi/older-init class: hw_random (6-Z242 fix).
+- NEXT: push; dispatch the property class + capricorn + merlin +
+  cherry + starlte/whyred regression; analyze the arm32 UI_HANG class
+  (fb_hook unknown-arch + minui on arm32).
