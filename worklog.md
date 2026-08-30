@@ -20977,3 +20977,356 @@ Stage Summary:
 - The hw_random class should now actually receive 512 entropy bytes.
 - In flight: wave-3 (batch:120:180 on c8458a1) + the parallel session's
   rounds. NEXT: push + dispatch the property class on this head.
+Task ID: MON-1
+Agent: CI Monitor
+Date: 2026-08-30
+Task: collect the 84afbf6 + bb132ef rounds
+
+Work Log:
+- POLLED /repos/Disable-OP/twoyi/actions/runs (workflow 'UI E2E Test (ARM64 via redroid on ubuntu-24.04-arm)', name contains 'UI E2E', head_sha 84afbf6*/bb132ef*). Brief said A=13 / B=9; ACTUAL: A=14 (dispatched 14:21:29-14:21:49Z) and B=69 (dispatched 14:32:39-14:36:24Z, full matrix). All 83 runs completed by 15:23Z; 2 polls needed (15:11Z, 15:23Z); all artifacts collected via scripts/collect_round.py; recovery names resolved from E2E job logs ('Downloading recovery image: ', $ tokens skipped).
+- Line format: run_id | head7 | recovery | overall/boot/ui/term/segv/pages/fail/workflow-conclusion
+- BATCH A (84afbf6, 14 runs, all workflow success):
+  - 33316641949 | 84afbf6 | twrp-3.7.0_9-0-whyred | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33316643065 | 84afbf6 | twrp-3.7.0_9-0-merlin | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33316644580 | 84afbf6 | twrp-3.7.0_9-0-starlte | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33316646115 | 84afbf6 | twrp-3.7.0_9-0-capricorn | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316647358 | 84afbf6 | twrp-3.7.0_9-0-cherry | BOOT_FAIL/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=-/wf=success
+  - 33316648543 | 84afbf6 | twrp-3.3.1-0-griffin | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316649863 | 84afbf6 | twrp-3.7.0_9-0-h830 | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316650970 | 84afbf6 | twrp-3.7.0_9-0-h850 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316652129 | 84afbf6 | twrp-3.7.0_9-0-h990 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316653298 | 84afbf6 | twrp-3.7.0_9-0-ido | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316654395 | 84afbf6 | twrp-3.7.0_9-0-kinzie | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316655500 | 84afbf6 | twrp-3.7.0_9-0-ls997 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316656832 | 84afbf6 | twrp-3.7.0_9-0-montana | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33316657911 | 84afbf6 | twrp-3.7.0_9-0-perry | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+- BATCH B (bb132ef = 6-Z243 forensics head, 69 runs: 66 success, 3 failure):
+  - 33317149118 | bb132ef | twrp-3.7.0_9-0-grouper | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317149992 | bb132ef | twrp-3.7.0_9-0-lux | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317151265 | bb132ef | twrp-3.7.0_9-0-m7 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317152481 | bb132ef | twrp-3.7.0_9-0-m8 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317153489 | bb132ef | twrp-3.7.0_9-0-osprey | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317159855 | bb132ef | twrp-3.4.0-0-onyx | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317164746 | bb132ef | twrp-3.7.0_9-0-kenzo | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317179959 | bb132ef | twrp-3.7.0_9-0-perseus | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317181283 | bb132ef | orangefox-mido | UI_READY/BOOT_OK/UI_READY/OK/segv=10/4pg:main>clear_vars>../fail=-/wf=success
+  - 33317182658 | bb132ef | twrp-3.7.0_9-0-pioneer | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317183737 | bb132ef | orangefox-z00ed | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317184774 | bb132ef | twrp-3.7.0_9-0-pme | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317186140 | bb132ef | orangefox-cereus | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317187061 | bb132ef | twrp-3.7.0_9-0-polaris | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317188046 | bb132ef | orangefox-daisy | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317189228 | bb132ef | twrp-3.7.0_9-0-potter | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317190266 | bb132ef | orangefox-dipper | UI_READY/BOOT_OK/UI_READY/OK/segv=34/4pg:main>clear_vars>../fail=-/wf=success
+  - 33317191372 | bb132ef | twrp-3.7.0_9-0-pyxis | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317192186 | bb132ef | orangefox-nitrogen | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317193165 | bb132ef | twrp-3.7.1_12-1-raphael | UI_HANG/BOOT_OK/SPLASH_HANG/FAIL/segv=8/1pg:system_readonly>../fail=-/wf=success
+  - 33317194096 | bb132ef | orangefox-riva | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317195241 | bb132ef | twrp-3.7.0_11-0-redfin | TIMEOUT_OR_UNKNOWN/UNKNOWN/NOT_REACHED/NOT_APPLICABLE/segv=?/-/fail=-/wf=failure
+  - 33317196044 | bb132ef | orangefox-santoni | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317196839 | bb132ef | twrp-3.7.1_12-0-rhode | TIMEOUT_OR_UNKNOWN/UNKNOWN/NOT_REACHED/NOT_APPLICABLE/segv=?/-/fail=-/wf=failure
+  - 33317197807 | bb132ef | orangefox-tulip | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317198930 | bb132ef | twrp-3.7.0_9-0-sanders | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317200148 | bb132ef | orangefox-ugglite | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317201132 | bb132ef | twrp-3.6.2_9-0-santoni | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317202310 | bb132ef | orangefox-vince | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317203301 | bb132ef | twrp-3.7.1_12-1-sargo | UI_READY/BOOT_OK/UI_READY/OK/segv=29/3pg:main>clear_vars>../fail=-/wf=success
+  - 33317204453 | bb132ef | orangefox-violet | UI_READY/BOOT_OK/UI_READY/OK/segv=40/6pg:main>clear_vars>../fail=-/wf=success
+  - 33317205753 | bb132ef | twrp-3.7.0_9-0-shamu | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317207019 | bb132ef | orangefox-whyred | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317208017 | bb132ef | twrp-3.0.2-0-sirius | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317209085 | bb132ef | orangefox-x00t | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317210530 | bb132ef | twrp-3.7.0_9-0-star2lte | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317211796 | bb132ef | orangefox-ysl | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317213111 | bb132ef | twrp-3.7.0_9-0-surnia | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317214791 | bb132ef | orangefox-x01bd | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317216116 | bb132ef | twrp-3.0.2-0-t6 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317217377 | bb132ef | orangefox-beryllium | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317218655 | bb132ef | twrp-3.7.0_9-0-taimen | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317220294 | bb132ef | orangefox-clover | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317221393 | bb132ef | twrp-3.7.0_9-0-thea | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317222660 | bb132ef | orangefox-ido | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317224110 | bb132ef | twrp-3.7.0_9-0-tilapia | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317225333 | bb132ef | orangefox-kenzo | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317226418 | bb132ef | twrp-3.7.0_9-0-tissot | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317227548 | bb132ef | orangefox-lavender | UI_READY/BOOT_OK/UI_READY/OK/segv=40/6pg:main>clear_vars>../fail=-/wf=success
+  - 33317228662 | bb132ef | twrp-3.7.0_9-0-titan | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317229721 | bb132ef | orangefox-polaris | UI_READY/BOOT_OK/UI_READY/OK/segv=40/4pg:main>clear_vars>../fail=-/wf=success
+  - 33317230856 | bb132ef | twrp-3.7.0_9-0-tucana | UI_READY/BOOT_OK/UI_READY/OK/segv=?/3pg:clear_vars>main2>../fail=-/wf=success
+  - 33317231735 | bb132ef | orangefox-raphael | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317232971 | bb132ef | twrp-3.7.0_11-0-venus | TIMEOUT_OR_UNKNOWN/UNKNOWN/NOT_REACHED/NOT_APPLICABLE/segv=?/-/fail=-/wf=failure
+  - 33317233887 | bb132ef | orangefox-rmx1851 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317235125 | bb132ef | twrp-3.7.0_9-0-victara | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317236588 | bb132ef | orangefox-seed | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317237895 | bb132ef | twrp-3.7.1_12-0-vince | UI_READY/BOOT_OK/UI_READY/OK/segv=36/3pg:main>clear_vars>../fail=-/wf=success
+  - 33317238751 | bb132ef | orangefox-shamrock | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317239758 | bb132ef | twrp-3.7.0_9-0-vs995 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317241079 | bb132ef | orangefox-wayne | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317242226 | bb132ef | twrp-3.3.0-0-walleye | UI_HANG/BOOT_OK/SPLASH_HANG/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317243465 | bb132ef | orangefox-zenfone3 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317244514 | bb132ef | twrp-3.7.0_9-0-wayne | UI_READY/BOOT_OK/UI_READY/OK/segv=?/12pg:advanced>terminalcommand>../fail=-/wf=success
+  - 33317245487 | bb132ef | orangefox-rmx1901 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=1/-/fail=property_area/wf=success
+  - 33317246603 | bb132ef | twrp-3.6.2_9-0-woods | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=3/-/fail=property_area/wf=success
+  - 33317247643 | bb132ef | twrp-3.5.0_9-0-xt1032 | BOOT_FAIL_EARLY_INIT/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=2/-/fail=property_area/wf=success
+  - 33317323734 | bb132ef | twrp-3.7.0_11-0-kebab | BOOT_FAIL/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=?/-/fail=-/wf=success
+  - 33317324720 | bb132ef | twrp-3.7.0_11-0-ocean | BOOT_FAIL/BOOT_FAIL/NOT_REACHED/NOT_APPLICABLE/segv=?/-/fail=-/wf=success
+- (bb132ef) VERBATIM 6-Z243 + SIGSEGV details lines (first instance per run; full raw dump: artifacts/mon1-kr64-verbatim.txt, 2652 lines):
+  - CLASS [aarch64] si_addr=0x0 pc-in=libc.so (21 runs; sp always [stack] rw-p):
+    * 33317186140 orangefox-cereus (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2583 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf06fd261e320, sp=0xffffc8cc69c0
+      [KR64][ptrace] 6-Z243 pc maps: 0xf06fd261e320 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffc8cc69c0 in [stack] rw-p
+    * 33317188046 orangefox-daisy (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2592 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe92251e5e620, sp=0xffffd88059b0
+      [KR64][ptrace] 6-Z243 pc maps: 0xe92251e5e620 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffd88059b0 in [stack] rw-p
+    * 33317192186 orangefox-nitrogen (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2580 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe5d9550a24a0, sp=0xffffcee3bcc0
+      [KR64][ptrace] 6-Z243 pc maps: 0xe5d9550a24a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffcee3bcc0 in [stack] rw-p
+    * 33317194096 orangefox-riva (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2588 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe60e8cc1e620, sp=0xffffd037abb0
+      [KR64][ptrace] 6-Z243 pc maps: 0xe60e8cc1e620 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffd037abb0 in [stack] rw-p
+    * 33317196044 orangefox-santoni (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2580 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf032d365f620, sp=0xffffd829b4e0
+      [KR64][ptrace] 6-Z243 pc maps: 0xf032d365f620 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffd829b4e0 in [stack] rw-p
+    * 33317197807 orangefox-tulip (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2600 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe0b237ca24a0, sp=0xfffff46805a0
+      [KR64][ptrace] 6-Z243 pc maps: 0xe0b237ca24a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfffff46805a0 in [stack] rw-p
+    * 33317200148 orangefox-ugglite (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2582 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xea420fbde620, sp=0xfffff83bc570
+      [KR64][ptrace] 6-Z243 pc maps: 0xea420fbde620 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfffff83bc570 in [stack] rw-p
+    * 33317207019 orangefox-whyred (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2597 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe0e8939214a0, sp=0xffffc3e3ce10
+      [KR64][ptrace] 6-Z243 pc maps: 0xe0e8939214a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffc3e3ce10 in [stack] rw-p
+    * 33317211796 orangefox-ysl (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2590 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe2d8d98df620, sp=0xffffdbd475a0
+      [KR64][ptrace] 6-Z243 pc maps: 0xe2d8d98df620 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffdbd475a0 in [stack] rw-p
+    * 33317214791 orangefox-x01bd (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2564 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf6727b9a2620, sp=0xfffffd731950
+      [KR64][ptrace] 6-Z243 pc maps: 0xf6727b9a2620 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfffffd731950 in [stack] rw-p
+    * 33317217377 orangefox-beryllium (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2560 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf0c638ca04a0, sp=0xfffffe8d10b0
+      [KR64][ptrace] 6-Z243 pc maps: 0xf0c638ca04a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfffffe8d10b0 in [stack] rw-p
+    * 33317220294 orangefox-clover (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2584 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xeafc503a04a0, sp=0xffffc85ec150
+      [KR64][ptrace] 6-Z243 pc maps: 0xeafc503a04a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffc85ec150 in [stack] rw-p
+    * 33317222660 orangefox-ido (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2593 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf85f34021320, sp=0xffffef55d760
+      [KR64][ptrace] 6-Z243 pc maps: 0xf85f34021320 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffef55d760 in [stack] rw-p
+    * 33317225333 orangefox-kenzo (instances=2):
+      [KR64][ptrace] SIGSEGV details: tid=2562 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe458c1101de0, sp=0xfffff7986110
+      [KR64][ptrace] 6-Z243 pc maps: 0xe458c1101de0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfffff7986110 in [stack] rw-p
+    * 33317231735 orangefox-raphael (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2586 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe2c7503e24a0, sp=0xffffeebbe9f0
+      [KR64][ptrace] 6-Z243 pc maps: 0xe2c7503e24a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffeebbe9f0 in [stack] rw-p
+    * 33317233887 orangefox-rmx1851 (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2572 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe637b64df4a0, sp=0xfffff2ea92e0
+      [KR64][ptrace] 6-Z243 pc maps: 0xe637b64df4a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfffff2ea92e0 in [stack] rw-p
+    * 33317238751 orangefox-shamrock (instances=2):
+      [KR64][ptrace] SIGSEGV details: tid=2588 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xec439a863aa0, sp=0xffffe87a7550
+      [KR64][ptrace] 6-Z243 pc maps: 0xec439a863aa0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffe87a7550 in [stack] rw-p
+    * 33317241079 orangefox-wayne (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2582 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf4c4a3c214a0, sp=0xffffef203390
+      [KR64][ptrace] 6-Z243 pc maps: 0xf4c4a3c214a0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffef203390 in [stack] rw-p
+    * 33317242226 twrp-3.3.0-0-walleye (instances=2):
+      [KR64][ptrace] SIGSEGV details: tid=2584 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xeb5bb98a6a60, sp=0xffffd353c3c0
+      [KR64][ptrace] 6-Z243 pc maps: 0xeb5bb98a6a60 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffd353c3c0 in [stack] rw-p
+    * 33317243465 orangefox-zenfone3 (instances=2):
+      [KR64][ptrace] SIGSEGV details: tid=2577 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xec1f0b704de0, sp=0xffffe570b300
+      [KR64][ptrace] 6-Z243 pc maps: 0xec1f0b704de0 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffe570b300 in [stack] rw-p
+    * 33317245487 orangefox-rmx1901 (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2595 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xebfa60ae0620, sp=0xffffca57e170
+      [KR64][ptrace] 6-Z243 pc maps: 0xebfa60ae0620 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffca57e170 in [stack] rw-p
+  - CLASS [aarch64] si_addr=0x0 pc-in=libbinder.so (8 runs; sp always [stack] rw-p):
+    * 33317181283 orangefox-mido (instances=10):
+      [KR64][ptrace] SIGSEGV details: tid=2597 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf17ce5453f14, sp=0xffffd0be8eb0
+      [KR64][ptrace] 6-Z243 pc maps: 0xf17ce5453f14 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffd0be8eb0 in [stack] rw-p
+    * 33317190266 orangefox-dipper (instances=42):
+      [KR64][ptrace] SIGSEGV details: tid=2604 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf1a111d783bc, sp=0xffffe1199410
+      [KR64][ptrace] 6-Z243 pc maps: 0xf1a111d783bc in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffe1199410 in [stack] rw-p
+    * 33317193165 twrp-3.7.1_12-1-raphael (instances=8):
+      [KR64][ptrace] SIGSEGV details: tid=2632 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe413e4b13e7c, sp=0xe4114f7fb570
+      [KR64][ptrace] 6-Z243 pc maps: 0xe413e4b13e7c in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xe4114f7fb570 in [anon:stack_and_tls:2632] rw-p
+    * 33317203301 twrp-3.7.1_12-1-sargo (instances=110):
+      [KR64][ptrace] SIGSEGV details: tid=2622 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xe6a32c360f14, sp=0xe6a0939fb570
+      [KR64][ptrace] 6-Z243 pc maps: 0xe6a32c360f14 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xe6a0939fb570 in [anon:stack_and_tls:2622] rw-p
+    * 33317204453 orangefox-violet (instances=122):
+      [KR64][ptrace] SIGSEGV details: tid=2623 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf02412b52200, sp=0xf021799fb570
+      [KR64][ptrace] 6-Z243 pc maps: 0xf02412b52200 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xf021799fb570 in [anon:stack_and_tls:2623] rw-p
+    * 33317227548 orangefox-lavender (instances=119):
+      [KR64][ptrace] SIGSEGV details: tid=2666 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xfd7a80d9c46c, sp=0xfd77ecbfb570
+      [KR64][ptrace] 6-Z243 pc maps: 0xfd7a80d9c46c in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfd77ecbfb570 in [anon:stack_and_tls:2666] rw-p
+    * 33317229721 orangefox-polaris (instances=121):
+      [KR64][ptrace] SIGSEGV details: tid=2585 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xefc62d1ac3bc, sp=0xffffef46e280
+      [KR64][ptrace] 6-Z243 pc maps: 0xefc62d1ac3bc in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffffef46e280 in [stack] rw-p
+    * 33317237895 twrp-3.7.1_12-0-vince (instances=72):
+      [KR64][ptrace] SIGSEGV details: tid=2599 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x0, pc=0xf56f52991f14, sp=0xfffff8221e70
+      [KR64][ptrace] 6-Z243 pc maps: 0xf56f52991f14 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/system/lib64/libbinder.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x0 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfffff8221e70 in [stack] rw-p
+  - CLASS [arm32] si_addr=0x2c pc-in=_sbin_recovery_0bf19504b502 (4 runs; sp always [stack] rw-p):
+    * 33317149118 twrp-3.7.0_9-0-grouper (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2573 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x2c, pc=0xbb2bcc0, sp=0xffe06f68
+      [KR64][ptrace] 6-Z243 pc maps: 0xbb2bcc0 in /data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_recovery_0bf19504b502 r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x2c in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffe06f68 in [stack] rw-p
+    * 33317159855 twrp-3.4.0-0-onyx (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2578 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x2c, pc=0x8928ed4, sp=0xffd207c8
+      [KR64][ptrace] 6-Z243 pc maps: 0x8928ed4 in /data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_recovery_0bf19504b502 r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x2c in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffd207c8 in [stack] rw-p
+    * 33317205753 twrp-3.7.0_9-0-shamu (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2583 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x2c, pc=0xda7a42c, sp=0xff7f0f48
+      [KR64][ptrace] 6-Z243 pc maps: 0xda7a42c in /data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_recovery_0bf19504b502 r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x2c in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xff7f0f48 in [stack] rw-p
+    * 33317224110 twrp-3.7.0_9-0-tilapia (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2550 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x2c, pc=0xbfaacc0, sp=0xffa65f88
+      [KR64][ptrace] 6-Z243 pc maps: 0xbfaacc0 in /data/user/0/io.twoyi.debug/cache/twoyi_stage/_sbin_recovery_0bf19504b502 r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x2c in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffa65f88 in [stack] rw-p
+  - CLASS [arm32] si_addr=0x90 pc-in=libc.so (2 runs; sp always [stack] rw-p):
+    * 33317208017 twrp-3.0.2-0-sirius (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2559 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x90, pc=0xefd7b576, sp=0xffde5d60
+      [KR64][ptrace] 6-Z243 pc maps: 0xefd7b576 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x90 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffde5d60 in [stack] rw-p
+    * 33317216116 twrp-3.0.2-0-t6 (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2567 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0x90, pc=0xf798a576, sp=0xffcc9990
+      [KR64][ptrace] 6-Z243 pc maps: 0xf798a576 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libc.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0x90 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xffcc9990 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfedbafe4 pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317149992 twrp-3.7.0_9-0-lux (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2587 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfedbafe4, pc=0xf1fb3cb8, sp=0xfedbb008
+      [KR64][ptrace] 6-Z243 pc maps: 0xf1fb3cb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfedbafe4 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfedbb008 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfed38ffc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317152481 twrp-3.7.0_9-0-m8 (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2560 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfed38ffc, pc=0xef9bccb8, sp=0xfed39020
+      [KR64][ptrace] 6-Z243 pc maps: 0xef9bccb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfed38ffc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfed39020 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfe987ffc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317153489 twrp-3.7.0_9-0-osprey (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2574 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfe987ffc, pc=0xebaaacb8, sp=0xfe988020
+      [KR64][ptrace] 6-Z243 pc maps: 0xebaaacb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfe987ffc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfe988020 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfe869fdc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317213111 twrp-3.7.0_9-0-surnia (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2600 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfe869fdc, pc=0xf2be3cb8, sp=0xfe86a000
+      [KR64][ptrace] 6-Z243 pc maps: 0xf2be3cb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfe869fdc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfe86a000 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfe8b9fdc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317221393 twrp-3.7.0_9-0-thea (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2577 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfe8b9fdc, pc=0xee2facb8, sp=0xfe8ba000
+      [KR64][ptrace] 6-Z243 pc maps: 0xee2facb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfe8b9fdc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfe8ba000 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfee12fdc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317228662 twrp-3.7.0_9-0-titan (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2586 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfee12fdc, pc=0xf57e0cb8, sp=0xfee13000
+      [KR64][ptrace] 6-Z243 pc maps: 0xf57e0cb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfee12fdc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfee13000 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfea3cfdc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317236588 orangefox-seed (instances=2):
+      [KR64][ptrace] SIGSEGV details: tid=2578 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfea3cfdc, pc=0xf0713cb8, sp=0xfea3d000
+      [KR64][ptrace] 6-Z243 pc maps: 0xf0713cb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfea3cfdc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfea3d000 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfe9f1ffc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317235125 twrp-3.7.0_9-0-victara (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2580 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfe9f1ffc, pc=0xf2735cb8, sp=0xfe9f2020
+      [KR64][ptrace] 6-Z243 pc maps: 0xf2735cb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfe9f1ffc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfe9f2020 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfedbdfdc pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317247643 twrp-3.5.0_9-0-xt1032 (instances=1):
+      [KR64][ptrace] SIGSEGV details: tid=2581 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfedbdfdc, pc=0xef7cfcb8, sp=0xfedbe000
+      [KR64][ptrace] 6-Z243 pc maps: 0xef7cfcb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfedbdfdc in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfedbe000 in [stack] rw-p
+  - CLASS [arm32] si_addr=0xfed60fe4 pc-in=libtwrp_fb_hook.so (1 runs; sp always [stack] rw-p):
+    * 33317246603 twrp-3.6.2_9-0-woods (instances=2):
+      [KR64][ptrace] SIGSEGV details: tid=2576 si_code=1 (1=MAPERR unmapped, 2=ACCERR permission), si_addr=0xfed60fe4, pc=0xf1969cb8, sp=0xfed61008
+      [KR64][ptrace] 6-Z243 pc maps: 0xf1969cb8 in /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libtwrp_fb_hook.so r-xp
+      [KR64][ptrace] 6-Z243 si_addr maps: 0xfed60fe4 in UNMAPPED
+      [KR64][ptrace] 6-Z243 sp maps: 0xfed61008 in [stack] rw-p
+- NO-DECODE set (sigsegv_count 2-3 but ZERO 6-Z243/SIGSEGV-details lines; tracer missed the child — next fix target):
+  - 33317151265 twrp-3.7.0_9-0-m7 segv=3 fail=property_area (kr64-app-stderr.log ends mid-syscall-stop, no crash dump)
+  - 33317164746 twrp-3.7.0_9-0-kenzo segv=3 fail=property_area (kr64-app-stderr.log ends mid-syscall-stop, no crash dump)
+  - 33317183737 orangefox-z00ed segv=3 fail=property_area (kr64-app-stderr.log ends mid-syscall-stop, no crash dump)
+  - 33317189228 twrp-3.7.0_9-0-potter segv=3 fail=property_area (kr64-app-stderr.log ends mid-syscall-stop, no crash dump)
+  - 33317202310 orangefox-vince segv=3 fail=property_area (kr64-app-stderr.log ends mid-syscall-stop, no crash dump)
+  - 33317209085 orangefox-x00t segv=3 fail=property_area (kr64-app-stderr.log ends mid-syscall-stop, no crash dump)
+  - 33317239758 twrp-3.7.0_9-0-vs995 segv=3 fail=property_area (kr64-app-stderr.log ends mid-syscall-stop, no crash dump)
+
+Stage Summary:
+- Batch A (84afbf6, pre-6-Z243): 2/14 UI_READY (whyred, starlte); 3/14 SPLASH_HANG (capricorn, h830, montana, segv=3); 9/14 BOOT_FAIL (merlin segv=2, cherry segv=2, griffin/h850/h990/ido/kinzie/ls997/perry segv=3); crash regs unreadable on this head as expected (pc=0/sp=0 blindspot).
+- Batch B (bb132ef, 6-Z243): 19/69 UI_READY+terminal OK (perseus, mido, pioneer, pme, dipper, polaris-twrp, pyxis, sanders, santoni-twrp3.6.2, sargo, violet, star2lte, taimen, tissot, lavender, polaris-orangefox, tucana, vince-twrp3.7.1, wayne-twrp); 9 UI_HANG/SPLASH_HANG (grouper, onyx, potter, raphael-twrp [terminal FAIL], ugglite, shamu, clover, tilapia, walleye); 36 BOOT_FAIL_EARLY_INIT; kebab+ocean bare BOOT_FAIL (no kr64 markers); redfin/rhode/venus TIMEOUT_OR_UNKNOWN (E2E workflow failure, no verdict).
+- 6-Z243 FORENSICS FIX VERIFIED AT SCALE: 49/69 runs produced decoded dumps; every traced crash names its owning mapping. Decoded crash locations:
+  1. [arm32] libtwrp_fb_hook.so r-xp, si_addr=sp-0x24 stack-adjacent (0xfeXXXfdc/fc/e4) x10: lux, m8, osprey, surnia, thea, titan, seed, victara, xt1032, woods -> BOOT_FAIL_EARLY_INIT. Same shape as 6-Z243's hand-decoded merlin fault (sp-0x24); merlin itself ran on batch A only (undecodable head).
+  2. [arm32] cache/twoyi_stage/_sbin_recovery_0bf19504b502 r-xp, si_addr=0x2c (near-NULL struct deref) x4: grouper, onyx, shamu, tilapia -> SPLASH_HANG. Matches the 6-Z243 grouper hand decode exactly.
+  3. [aarch64] rootfs/sbin/libc.so r-xp, si_addr=0x0 (null call) x21: 20 orangefox-* builds + twrp-3.3.0-0-walleye -> BOOT_FAIL_EARLY_INIT (19) / SPLASH_HANG (ugglite, clover, walleye). NEW class, needs its own round.
+  4. [aarch64] system/lib64/libbinder.so r-xp, si_addr=0x0, CRASH LOOP (8-122 instances/run) x8: mido, dipper, sargo, violet, lavender, polaris, vince-twrp3.7.1, raphael-twrp -> still UI_READY (recovery tolerates the dying binder thread); sargo/violet/lavender/polaris ~110-122 instances each.
+  5. [arm32] rootfs/sbin/libc.so r-xp, si_addr=0x90 x2: twrp-3.0.2-0 sirius, t6 -> BOOT_FAIL_EARLY_INIT (legacy TWRP struct deref).
+- NEXT: (a) trace-coverage fix for the 7 property_area no-decode runs (m7, kenzo-twrp, z00ed, potter, vince-orangefox, x00t, vs995 — child dies without a traced stop); (b) aarch64 libc.so null-call class (class 3); (c) fb_hook sp-0x24 fix (class 1, now reproducible with named library+offset); (d) recovery 0x2c struct deref (class 2); (e) libbinder crash-loop is cosmetic but noisy (110+ SIGSEGv per boot) worth silencing; (f) re-run merlin/cherry on bb132ef to confirm class 1 decode on their own dumps.
+- Artifacts: artifacts/run-<id>/ for all 83 runs; results TSV artifacts/mon1-results-final.tsv; raw verbatim lines artifacts/mon1-kr64-verbatim.txt; driver scripts/mon1_driver.py (idempotent, token never printed, <=3 retries/call).
