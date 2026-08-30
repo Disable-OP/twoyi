@@ -21527,3 +21527,80 @@ Stage Summary:
 - NEXT: commit+push; dispatch titan verify to read the 6-Z250 stage;
   collect the /twres theme evidence (grouper on 39233aa head); the
   spin class (ocean/kebab on b85cb30) results pending.
+
+---
+Task ID: 6-Z251
+Agent: Twoyi Recovery Display Engineer
+Date: 2026-08-30
+Task: ROOT CAUSE + FIX — OrangeFox (AOSP-style loader-path recoveries) never renders in Render2Activity although the guest UI is fully alive (touch works, pages change). Reference run 33317227548 (orangefox-lavender).
+
+Work Log:
+- EVIDENCE (run 33317227548 artifacts, bb132ef): result.json said UI_READY
+  (family_banner=OrangeFox, pages main→clear_vars→ext_custom_status→
+  navbar→filemanagerlist, terminal OK) — but EVERY screenshot
+  (boot_5s..60s, term-01..13, final) shows Render2Activity's
+  BootLogTexture loading layout (dark-green MAPS-dump texture), NOT the
+  OrangeFox UI. Guest side fully healthy: [twoyi_loader] open(fb0) fd=4
+  tracked; FBIOGET_VSCREENINFO -> 720x1600@32bpp; FSCREENINFO
+  smem_len=4608000; "single buffered"; "Using fbdev graphics";
+  "framebuffer: 4 (720 x 1600)"; ArmToArm64Assembler scanline
+  generation = pixels WERE drawn into the mmap'd fb0 regular file.
+- ROOT CAUSE (display-path gate, not a guest bug): OrangeFox lavender is
+  AOSP-layout (/init -> system/bin/init symlink, recovery at
+  /system/bin/recovery, no /sbin/recovery) so RomManager.isTwrpLayout()
+  correctly set boot_recovery=false (6-Z209b) and the guest boots through
+  the NORMAL loader path with the LD_PRELOAD fb-hook chain. But
+  core.rs renderer_thread_main gated the fb0 -> SurfaceView blit loop
+  (twrp_fb_render_loop) on is_boot_recovery_enabled() — false here — so
+  it started the AOSP emugl GL renderer instead. A recovery never speaks
+  GL; nobody ever read {rootfs}/dev/graphics/fb0; the SurfaceView stayed
+  on the loading/bootlog texture forever. Logcat proof:
+  "[CORE] Boot Recovery (TWRP) flag set to: false" and ZERO TWRP-FB
+  render-loop lines in the whole run. The input path is independent of
+  the display path, which is why touch "worked" while nothing was
+  visible.
+- FIX 6-Z251 (generic, layout-based — no device hacks):
+  1. Java RomManager.isAospRecoveryLayout(): init is the symlink form
+     (init.symlink sidecar on fresh import OR real /init symlink after
+     symlinks.rs materialization) AND /system/bin/recovery exists
+     (file or sidecar) AND /sbin/recovery absent. Covers OrangeFox R12 /
+     Lineage recovery-in-boot / modern AOSP recovery; a full-Android GSI
+     never matches (no /system/bin/recovery in a system image);
+     TWRP layouts short-circuit via isTwrpLayout as before.
+  2. Render2Activity.surfaceCreated(): when !bootRecovery &&
+     isAospRecoveryLayout() -> Renderer.setRecoveryLoader(true) (logged +
+     FileLogger.boot("recovery_loader_flag")).
+  3. Rust core.rs: new RECOVERY_LOADER AtomicBool + JNI setter;
+     is_recovery_blit_enabled() = BOOT_RECOVERY || RECOVERY_LOADER now
+     gates ALL five DISPLAY-path decisions (renderer_thread_main loop
+     selection, init_renderer file-guard branch, RENDERER_STARTED
+     branch, reset_window, remove_window). The kr64 boot mode is
+     UNCHANGED: --boot-recovery still passed only for BOOT_RECOVERY, so
+     loader recoveries keep the exact boot path that already works.
+  4. DIAGNOSTIC: twrp_fb_render_loop now counts changed frames and logs
+     "TWRP-FB frame #N blitted digest=<fnv1a> center=[r,g,b,a]" on the
+     first frame + every ~120th (rate-capped, silent when static) —
+     CI-verifiable proof that LIVE, CHANGING guest frames reach the
+     surface (page transitions included), not a single stale frame.
+  5. classify_result.py: new presentation marker (NONE / SINGLE_FRAME /
+     FLOWING from the digest lines) + display_mode marker
+     (twrp / recovery_loader / gl) so future runs self-report whether
+     pixels actually flowed (the 33317227548 run would read
+     presentation=NONE display_mode=gl — the bug signature).
+- GATES: kr64 crate fmt/clippy -D warnings/658 host tests green;
+  app/rs cargo check aarch64+x86_64-android green; classifier exercised
+  against the 33317227548 artifacts (presentation=NONE, display_mode=gl
+  — reproduces the bug signature) and a synthetic fixed logcat
+  (presentation=FLOWING, display_mode=recovery_loader); layout
+  detection unit-checked on 6 filesystem cases (fresh sidecar, 2nd-boot
+  real symlink, TWRP layout -> false, full GSI -> false, recovery
+  sidecar -> true, static init -> false).
+
+Stage Summary:
+- Loader-path recoveries now present through the same fb0 -> SurfaceView
+  blit loop TWRP uses; TWRP (boot_recovery=true) and full-Android (GL)
+  paths byte-identical to before.
+- NEXT: commit+push; dispatch orangefox-lavender verification (same image
+  URL as 33317227548) + twrp-angler regression; acceptance = OrangeFox UI
+  visible in Render2Activity screenshots + presentation=FLOWING in
+  result.json + multiple page transitions from touch.
