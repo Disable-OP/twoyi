@@ -178,6 +178,42 @@ menu_pages = {"main2", "main"}
 fb_lines = re.findall(r"framebuffer: (\d+) \((\d+) x (\d+)\)", rec)
 if fb_lines:
     result["markers"]["aosp_minui_fb"] = fb_lines[-1]
+
+# ── presentation: did guest pixels actually reach the SurfaceView? ──
+# The UI/page markers above prove the GUEST is alive internally; they do
+# NOT prove the app is PRESENTING its framebuffer. The fb0 blit loop
+# (core.rs twrp_fb_render_loop) logs one TWOYI_DIAG line per milestone:
+#   "TWRP-FB first frame blitted to surface (...)"
+#   "TWRP-FB frame #<n> blitted digest=<fnv1a> center=[r,g,b,a]"
+# (the digest line is rate-capped to every ~120th changed frame).
+# >= 2 DISTINCT digests with a rising frame counter = live, CHANGING
+# guest frames reached the screen (page transitions included) — the
+# acceptance signal for the OrangeFox display fix (run 33317227548:
+# guest UI alive internally but ZERO blit lines, screen stayed on the
+# loading texture forever).
+blit_frames = re.findall(
+    r"TWOYI_DIAG.*?TWRP-FB frame #(\d+) blitted digest=([0-9a-f]+)",
+    logcat)
+if blit_frames:
+    last_n = max(int(n) for n, _ in blit_frames)
+    digests = {d for _, d in blit_frames}
+    result["markers"]["blit_frames_last"] = last_n
+    result["markers"]["blit_digest_count"] = len(digests)
+    if last_n >= 2 and len(digests) >= 2:
+        result["markers"]["presentation"] = "FLOWING"
+    elif last_n >= 1:
+        result["markers"]["presentation"] = "SINGLE_FRAME"
+    else:
+        result["markers"]["presentation"] = "NONE"
+else:
+    result["markers"]["presentation"] = "NONE"
+# Which display mode did the app select? (Render2Activity logs both.)
+if re.search(r"Recovery \(loader path\) flag: true", logcat):
+    result["markers"]["display_mode"] = "recovery_loader"
+elif re.search(r"Boot Recovery \(TWRP\) flag: true", logcat):
+    result["markers"]["display_mode"] = "twrp"
+else:
+    result["markers"]["display_mode"] = "gl"
 brightness_vals = set(re.findall(r"Brightness: (\d+) \(", rec))
 result["markers"]["brightness_steps"] = sorted(brightness_vals)
 aosp_ui_live = bool(fb_lines) \
