@@ -19441,3 +19441,159 @@ Stage Summary:
   (lineage-22.2-sailfish 6-Z224 verify, orangefox-R12.0-lavender 6-Z224 verify,
   3 TWRP guards). kr64 lint+test on 59bc9cc: SUCCESS (push-triggered).
   Mapping run->recovery via job-log RECOVERY_NAME at completion.
+
+---
+Task ID: 6-Z224-mon
+Agent: CI monitor subagent
+Task: Monitor verification round 2 on head 59bc9cc (6-Z224).
+
+Work Log:
+- Polled GET /repos/Disable-OP/twoyi/actions/runs?per_page=15 at 00:20:32Z (all 5
+  in_progress), 00:24:43Z (still running), 00:28:51Z (3 done: 58247/59571/60621),
+  00:33:15Z (ALL 5 completed, conclusion=success; last updated 00:32:57Z — total
+  wall time ~9-16 min, consistent with round 1).
+- Mapped run → recovery via /runs/<id>/jobs then job-log "RECOVERY_NAME:":
+  33282958247=twrp-2.8.7.0-angler, 33282959571=twrp-3.7.0_9-0-angler,
+  33282960621=twrp-3.7.0_9-0-whyred, 33282961791=orangefox-R12.0-lavender,
+  33282962805=lineage-22.2-sailfish.
+- Downloaded ui-e2e-arm64-logs for all 5 (archive_download_url + curl -L), unpacked
+  zip → ui-e2e-logs.tar.xz → /tmp/ui-e2e-artifacts contents into
+  /home/z/my-project/artifacts/ver59bc9cc/run_<run_id>/.
+- Ran classify_result.py locally on each dir (usage: argv1=artifact dir,
+  argv2=out json; no --help flag — read source for usage) → result-local.json;
+  cross-checked against the CI-produced result.json (identical verdicts).
+- Evidence extraction: kmsg-stub.txt, kr64-app-stderr.log (new mmap diagnostics),
+  twrp-recovery-log-dockerexec.log, rootfs listing, final ps, screenshot pixel
+  stats (PIL greyscale mean/stdev as black-screen check).
+
+Stage Summary:
+- 33282958247 → twrp-2.8.7.0-angler → UI_READY (boot BOOT_OK, ui UI_READY,
+  theme OK, terminal OK [term-07 evidence], vfs CLEAN, instances 2) → GUARD PASS.
+- 33282959571 → twrp-3.7.0_9-0-angler → UI_READY (terminal OK, vfs CLEAN,
+  instances 2, pages ...→main2) → GUARD PASS.
+- 33282960621 → twrp-3.7.0_9-0-whyred → UI_READY (terminal OK, vfs CLEAN,
+  instances 1, pages ...→main2) → GUARD PASS.
+- 33282961791 → orangefox-R12.0-lavender → NOT UI_READY (classifier
+  TIMEOUT_OR_UNKNOWN; boot BOOT_OK, ui NOT_REACHED) — but BOTH round-1 blockers
+  FIXED; NEW blocker at theme load (see below).
+- 33282962805 → lineage-22.2-sailfish → classifier UI_HANG/SPLASH_HANG (no TWRP
+  "Set page:" pages exist in AOSP-layout recovery) — mmap blocker FIXED, minui
+  UI thread alive to end of capture; classification blind spot, not a boot
+  failure (see below).
+- KEY EVIDENCE lineage (33282962805): (a) "failed to mmap framebuffer" = ZERO
+  occurrences (round 1: x500 → "cannot open any framebuffer" → headless →
+  "Rebooting..." at 163.1s). The new 6-Z224 diagnostics ARE live and log the
+  REAL errno + fd identity, e.g. "[twoyi_loader] mmap FAILED fd=3 (fb_tracked=0)
+  len=0 prot=0x1 flags=0x1 errno=22 (Invalid argument) ->
+  .../rootfs/dev/__properties__/property_info" (6 occurrences, ALL non-fb,
+  benign len=0 mmaps; no ENOTTY/binder-probe masking anywhere). (b) "recovered
+  via O_RDWR re-open"/"MAP_ANONYMOUS fallback" = 0 — NOT NEEDED: fb0 mmap
+  succeeded directly because the ungated create_twrp_framebuffer now builds
+  full-size fb0 for boot_recovery=false ("TWRP framebuffer: fb0 (regular file,
+  4608000 bytes = 720x1600x4 RGBA8888)"; minui opened it
+  __open_2 fl=0x80002 O_RDWR|O_LARGEFILE → fd=7 [FB0 TRACKED], "geometry from
+  file: 720x1600"). (c) minui PAST framebuffer init: "[   10.108618] framebuffer:
+  7 (720 x 1600)" at 10.1s, then icon/progress/erasing_text/no_command_text
+  images loaded, "I:Starting recovery (pid 1) on Sun Aug 30 00:21:54 2026",
+  "I:locale is [en-US]", VolumeManager initialized. (d) UI_READY: not credited —
+  classifier has no AOSP-layout UI detector. UI THREAD IS ALIVE: brightness
+  dimming cycle "I:Brightness: 127 (50%)"@10.05s → "63 (25%)"@135.5s → "0
+  (off)"@255.5s, 120s-periodic /sys/class/android_usb state polls to 495.5s
+  (last log line), guest init "started service 'recovery' has pid 2590",
+  recovery (pid 2590 + child 2594) present in final ps, NO "Rebooting..." line
+  (round 1 rebooted at 163.1s). Remaining nits: battery info retry loop
+  ("W:Trying again for reinitializing battery info" every ~100ms —
+  /sys/class/power_supply/battery/type fd=-1) and cancel/factory/try-again
+  wipe-menu text PNGs fd=-1.
+- KEY EVIDENCE orangefox (33282961791): (a) BOOT LOOP STOPPED — 1 OrangeFox
+  banner vs round 1's 27; guest kmsg shows exactly ONE boot wave (early-init x1,
+  /dev/socket/logdr x1); "cannot set capabilities" x1, "cap_drop_bound(0)
+  failed: Operation not permitted" x1, "InitFatalReboot: signal 6" x1 — the
+  single residual fatal (logd service child) did NOT cascade into a guest
+  reboot: init continued (hwservicemanager/servicemanager/vndservicemanager/
+  keystore2 all started after it). (b) "recovered via O_RDWR re-open" for fb0 =
+  0 — not needed: fb0 opened (fl=0x2) → fd=4 [FB0 TRACKED], "geometry from env:
+  720x1600", FBIOGET_FSCREENINFO smem_len=4608000 (full 720x1600x4), minui
+  "framebuffer: 4 (720 x 1600)" → "Using fbdev graphics." → O_RDONLY-fd EACCES
+  blocker GONE. (c) UI_READY: NO — died at theme load on a NEW blocker (see
+  below). (d) keystore2 STILL SIGSEGVs (41 "SIGSEGV details:" in dockerexec
+  capture, 120 in app-stderr; comm "_system_bin_key", si_addr=0x0 MAPERR,
+  x0=0x0, pc ...46c pattern; 121 init restarts) — NON-FATAL: init survives the
+  storm, guest never rebooted (matches the round-1 re-classify prediction).
+- NEW BLOCKER SIGNATURES (quoted verbatim):
+  * orangefox: "[glog V/ashmem] Unable to open ashmem device
+    /dev/ashmem29a83eca-a3cd-49b8-9485-5e6361daba5a (error = No such file or
+    directory) and /dev/ashmem(error = No such file or directory)" → "Creating
+    code cache, ashmem_create_region failed with error 'No such file or
+    directory'" → "[glog F/abort] Creating code cache, ashmem_create_region
+    failed with error 'No such file or directory'" → "[twrp_fb_hook] ***
+    abort() INTERCEPTED *** caller_pc=0x0xed6f6a317318" → maps dump → recovery
+    log ends at 1300 lines (before any "Set page:"). Guest rootfs has NO
+    /dev/ashmem (not in rootfs-listing). Progress chain reached: "Starting the
+    UI..." → "framebuffer: 4 (720 x 1600)" → "I:Loading package: splash
+    (/twres/splash.xml)" → "I:Loading resources..." → ABORT.
+  * classifier gap: OrangeFox banner is "Starting OrangeFox Recovery R12.0 ...
+    (b6530c7a)]; pid 1)" — "; pid 1)" NOT "(pid 1)" — the 6-Z224 same-line pid
+    regex still misses it → recovery_instances=0 for a fully-booted recovery
+    (boot only credited via "Starting the UI").
+- FIXES VERDICT (6-Z224 on 59bc9cc): capset fake-success = VERIFIED (27→1 boot
+  cycles, guest survives one residual logd-child abort); shlib mmap real-errno
+  diagnostics = VERIFIED live (real EINVAL + /proc/self/fd target printed, no
+  ENOTTY masking); fb geometry-file ungating = VERIFIED (lineage full-size fb0 +
+  "geometry from file", orangefox "geometry from env", both minui fbdev init
+  OK); classifier same-line-pid regex = works for lineage ("Starting recovery
+  (pid 1) on <date>" → instances=1) but misses OrangeFox's "; pid 1)" variant.
+- GUARDS: all 3 TWRP recoveries UI_READY with terminal OK + vfs CLEAN — NO
+  regressions from the capset/mmap/geometry changes.
+- NEXT ACTIONS: (1) orangefox: create guest /dev/ashmem (stub device or tmpfs
+  entry, same pattern as fb0/geometry staging) — it is the last blocker before
+  "Set page:"; (2) classifier: add OrangeFox "; pid N)" banner variant + an
+  AOSP-layout UI detector (brightness-dim progression / minui image loads /
+  "started service 'recovery'" + liveness) so lineage stops being mis-filed
+  SPLASH_HANG; (3) lineage: stub /sys/class/power_supply/battery/type to stop
+  the 10Hz battery retry loop; (4) keystore2 SIGSEGV stays non-fatal —
+  re-classify after ashmem fix; (5) then corpus waves toward the 90% goal.
+
+---
+Task ID: 6-Z224b
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Fix the two residual blockers from verification round 2 (OrangeFox /dev/ashmem abort; lineage classifier blind spot) and re-classify round 2 with the fixed classifier.
+
+Work Log:
+- ROUND 2 RESULTS (head 59bc9cc, artifacts artifacts/ver59bc9cc/): BOTH 6-Z224 fixes
+  VERIFIED live. Lineage (33282962805): "failed to mmap framebuffer" GONE (was x500),
+  NO "Rebooting..."; un-gated create_twrp_framebuffer built the full 4,608,000-byte
+  fb0; minui "framebuffer: 7 (720 x 1600)"; UI thread alive 495s with the backlight
+  dim cycle 127->63->0. The new mmap diagnostics worked exactly as designed and
+  identified the round-1 mystery fd: fd=3 was the properties_info file (benign len=0
+  mmaps, errno=22 — NOT fb-related). OrangeFox (33282961791): boot loop STOPPED
+  (1 banner vs round 1's 27); capset fake-success verified (one residual EPERM log
+  but init SURVIVES all subsequent services); fb0 EACCES fixed via the created file
+  ("framebuffer: 4 (720 x 1600)" -> "Using fbdev graphics."); keystore2 SIGSEGVs are
+  now NON-FATAL as predicted (init survives them). Guards 3/3 GREEN — zero regressions.
+- ORANGEFOX FINAL BLOCKER (mechanism): libc++ ashmem_create_region("/dev/ashmem")
+  ENOENT during code-cache setup -> "[glog F/abort] Creating code cache,
+  ashmem_create_region failed" -> abort() intercepted at splash "Loading resources...".
+  ROOT CAUSE: create_twrp_misc_devs (/dev/ashmem + /dev/pmsg0 stand-ins, 6-Z171c) was
+  still gated behind cfg.boot_recovery (false for these boots).
+- FIXES (6-Z224b, generic §22):
+  * Un-gated create_twrp_misc_devs — every boot mode now gets /dev/ashmem + /dev/pmsg0
+    (empty regular files; the hooks fake the ASHMEM_* ioctls; idempotent/harmless).
+  * battery.rs refresh: write the `type` file ("Battery") — the Linux power_supply ABI
+    device-class file; AOSP health readers REJECT supplies without it (lineage's
+    10 Hz "W:Trying again for reinitializing battery info" loop, run 33282962805).
+    Doc comments + test updated (7 files -> 8).
+  * classify_result.py: (a) OrangeFox R12's "; pid N)" banner variant added; (b) NEW
+    AOSP-layout UI detector — "framebuffer: N (W x H)" (minui fbdev init tail) PLUS
+    >= 2 distinct "Brightness: N (" values (the UI thread's dim cycle — runs only
+    while the menu loop is alive). Verified against round-2 artifacts: lineage ->
+    UI_READY (aosp_minui, brightness [0,127,63]); OrangeFox corpse -> SPLASH_HANG
+    (0 dim steps — correctly refuses to fire on fbdev-init-only); TWRP guards ->
+    UI_READY via the legacy page path, untouched.
+
+Stage Summary:
+- Round 2 = both 6-Z224 fixes verified; round 3 should clear OrangeFox's splash abort
+  (ashmem) and let the classifier's AOSP detector see a live dim cycle there too.
+- NEXT: dispatch round 3 (lineage + orangefox + 3 guards). If both go UI_READY, start
+  the corpus waves (batch:0:60) toward the 90% goal.

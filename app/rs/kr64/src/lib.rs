@@ -5579,15 +5579,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             e
         );
     }
-    if cfg.boot_recovery {
-        // 6-Z171c: /dev/ashmem + /dev/pmsg0 stand-ins (regular files) so
-        // minui's opens succeed; the hook fakes the ASHMEM_* ioctls.
-        if let Err(e) = devices::create_twrp_misc_devs(&rootfs_prefix) {
-            warning!(
-                "[KR64] PARENT: failed to create TWRP misc devs (/dev/ashmem,/dev/pmsg0): {}",
-                e
-            );
-        }
+    // 6-Z171c: /dev/ashmem + /dev/pmsg0 stand-ins (regular files) so
+    // minui's opens succeed; the hook fakes the ASHMEM_* ioctls.
+    //
+    // 6-Z224b: NO LONGER gated on cfg.boot_recovery. Run 33282961791
+    // (orangefox-R12.0-lavender, boot_recovery=false — per-design): with
+    // the capset + fb0 fixes in, OrangeFox's libc++ reached
+    // ashmem_create_region("/dev/ashmem") during code-cache setup and
+    // got ENOENT — "[glog F/abort] Creating code cache, ashmem_create_region
+    // failed" -> abort() -> splash "Loading resources..." was the last
+    // sign of life. Every modern AOSP-layout recovery's libc++/art maps
+    // ashmem for JIT/code-cache regions, exactly like a TWRP boot does.
+    // The stand-ins are empty regular files (the ASHMEM_* ioctls are
+    // faked by the hooks) — harmless in every boot mode, idempotent.
+    if let Err(e) = devices::create_twrp_misc_devs(&rootfs_prefix) {
+        warning!(
+            "[KR64] PARENT: failed to create TWRP misc devs (/dev/ashmem,/dev/pmsg0): {}",
+            e
+        );
     }
 
     // TWRP BOOT: pre-create {rootfs}/dev/input/event0 + event1 as EMPTY
