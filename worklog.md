@@ -21728,3 +21728,57 @@ Stage Summary:
   env-loss stage will be named by the extended scan.
 - NEXT: commit+push; dispatch one orangefox build (cereus) on this
   head; collect the 6-Z254 arm32 wave (8 runs) — the decisive round.
+
+---
+Task ID: 6-Z251-verify-rounds
+Agent: Twoyi Recovery Display Engineer
+Date: 2026-08-30
+Task: Verification iterations for the OrangeFox Render2Activity display fix (post-6-Z251 rounds 1-2, pre-round-3).
+
+Work Log:
+- ROUND 1 (run 33322760296, fix 37a80d6): recovery_loader flag ENGAGED
+  (logcat-filtered.log: "Recovery (loader path) flag: true"), fb0 render
+  loop started, "TWRP-FB frame #1 blitted" — and the SCREENSHOTS SHOW
+  THE ORANGEFOX UI (search bar, /sdcard breadcrumb, Fox folder entry,
+  bottom nav Files/Backups/Wipe/Menu with fox accents, live clock) for
+  the first time in any run. Two residual defects visible:
+  (a) background pixels showed the activity's BootLogTexture through
+      them — OrangeFox leaves the legacy fbdev alpha byte at 0; the
+      RGBA window buffer honored it and SurfaceFlinger composited the
+      activity background through every transparent pixel;
+  (b) only ONE digest line (frame #1) — the 120-frame threshold was
+      too coarse for a page-transition-driven session (only ~dozens of
+      changed frames in 10 min).
+- TWRP REGRESSION on the same head (run 33322764390): TWRP angler
+  renders PERFECTLY (screenshot-term-01-main-menu: charcoal #1a1a1a +
+  TWRP blue #0090CA menu, full Install/Wipe/Backup/Restore grid,
+  terminal + file-manager navigation all worked, result UI_READY).
+- FIX 6-Z251b (ade11c2): twrp_blit_to_surface writes alpha=0xff
+  unconditionally (legacy fbdev alpha is undefined; a recovery display
+  is opaque); digest cadence 120 -> 20.
+- ROUND 2 (run 33324706378, ad3a109): UI rendered again (4 warm cream
+  shades evenly spread — the texture no longer dominates), but the
+  KR64 RAW-STOP bootlog TextView still drew OVER the UI: the loading/
+  bootlog overlay is z-ABOVE the SurfaceView (added at index 0) and
+  its 300 s BOOT_COMPLETED wait never ends for a recovery (a recovery
+  never sets sys.boot_completed); at timeout it also fired a bogus
+  "boot timeout" toast over the UI. The alpha=0 transparency in round
+  1 had masked this z-order defect (everything showed through anyway).
+- FIX 6-Z251d (988dc94): mRecoveryDisplay computed in onCreate
+  (surface callbacks fire async — too late for showBootingProcedure);
+  for loader-path recoveries the loading overlay is dismissed
+  IMMEDIATELY and the wait-boot thread skipped; TWRP's
+  BOOT_COMPLETED-driven dismissal untouched. Classifier now also scans
+  app-logs/log/logcat.log* archives (fae4870) — the docker-exec logcat
+  window misses the app's own tags (round-1's flag+blit lines were
+  ONLY in the archives; the classifier then falsely read
+  display_mode=gl for a run that visibly rendered).
+- Also captured: round-2 classifier rerun on round-1 artifacts reads
+  presentation=SINGLE_FRAME display_mode=recovery_loader (truth), the
+  broken reference run 33317227548 still reads NONE/gl (bug signature).
+
+Stage Summary:
+- OrangeFox now RENDERS its UI in Render2Activity (round-1/2 screenshot
+  evidence) with TWRP unregressed. Round-3 (run 33325977950, 988dc94)
+  verifies the complete acceptance chain: opaque UI with NO overlay,
+  digest lines every 20 changed frames, page transitions visible.
