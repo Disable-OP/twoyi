@@ -203,6 +203,14 @@ public class SettingsActivity extends AppCompatActivity {
             CheckBoxPreference debugRenderer = (CheckBoxPreference) findPreference(R.string.settings_key_debug_renderer);
             CheckBoxPreference bootRecovery = (CheckBoxPreference) findPreference(R.string.settings_key_boot_recovery);
             Preference selectRom = findPreference(R.string.settings_key_select_rom);
+
+            // 6-Z262: derive the 'Select ROM' summary from LIVE state on
+            // every view creation. Previously the summary was written only
+            // as a side effect of a successful import, so any fragment or
+            // activity recreation silently reset it to the static XML
+            // prompt — the user could not tell a ROM was already imported
+            // (the "import description only updates once" report).
+            updateSelectRomSummary(selectRom);
             Preference factoryReset = findPreference(R.string.settings_key_factory_reset);
 
             Preference sendLog = findPreference(R.string.settings_key_sendlog);
@@ -325,7 +333,22 @@ public class SettingsActivity extends AppCompatActivity {
             bootRecovery.setChecked(ProfileSettings.isBootRecoveryEnabled(getActivity()));
             bootRecovery.setOnPreferenceChangeListener((preference, newValue) -> {
                 ProfileSettings.setBootRecovery(getActivity(), (Boolean) newValue);
-                Toast.makeText(getActivity(), R.string.settings_display_change_reboot, Toast.LENGTH_SHORT).show();
+                // 6-Z263: precise wording — the old toast reused the
+                // display-settings string ("take effect after reboot"),
+                // which read as if the PHONE would reboot.
+                Toast.makeText(getActivity(), R.string.settings_boot_recovery_applies, Toast.LENGTH_SHORT).show();
+                return true;
+            });
+            // 6-Z263: tapping the ROW (not the checkbox) opens the full
+            // explanation — the option's meaning was the #1 confusion
+            // report ("we are already booting a recovery, what does this
+            // do?").
+            bootRecovery.setOnPreferenceClickListener(preference -> {
+                new androidx.appcompat.app.AlertDialog.Builder(getActivity())
+                        .setTitle(R.string.settings_boot_recovery_dialog_title)
+                        .setMessage(R.string.settings_boot_recovery_dialog_text)
+                        .setPositiveButton(android.R.string.ok, null)
+                        .show();
                 return true;
             });
 
@@ -339,6 +362,15 @@ public class SettingsActivity extends AppCompatActivity {
                 UIHelper.startActivity(getContext(), SelectAppActivity.class);
                 return true;
             });
+
+            // 6-Z264: built-in rootfs file manager (browse/edit/chmod).
+            Preference rootfsFm = findPreference(R.string.settings_key_rootfs_fm);
+            if (rootfsFm != null) {
+                rootfsFm.setOnPreferenceClickListener(preference -> {
+                    startActivity(new Intent(getContext(), FileManagerActivity.class));
+                    return true;
+                });
+            }
 
             export.setOnPreferenceClickListener(preference -> {
                 try {
@@ -643,15 +675,53 @@ public class SettingsActivity extends AppCompatActivity {
                         String name = uri.getLastPathSegment();
                         if (name == null || name.isEmpty()) name = uri.toString();
                         selectRomPref.setSummary(name);
+                        // 6-Z262: persist the identity so the label
+                        // survives recreation AND rom.ini records it for
+                        // the About screen.
+                        ProfileSettings.setLastImportedRom(activity, name);
+                        RomManager.writeImportedRomInfo(activity, name);
                     }
                 } else {
                     String msg = result != null && result.startsWith("FAIL:") ? result.substring(5) : "unknown error";
                     Toast.makeText(activity, getString(R.string.rom_import_failed) + ": " + msg, Toast.LENGTH_LONG).show();
+                    // 6-Z262: re-derive the summary from live state so a
+                    // failed re-import no longer leaves a stale file name
+                    // on screen.
+                    updateSelectRomSummary(findPreference(R.string.settings_key_select_rom));
                 }
             }).fail(result -> activity.runOnUiThread(() -> {
                 Toast.makeText(activity, getString(R.string.rom_import_error, result.getMessage()), Toast.LENGTH_SHORT).show();
                 dialog.dismiss();
+                // 6-Z262: same freshness guarantee on the error path.
+                updateSelectRomSummary(findPreference(R.string.settings_key_select_rom));
             }));
+        }
+    }
+
+    /**
+     * 6-Z262: set the 'Select ROM' preference summary from live state:
+     * the recorded import name when a ROM exists, the install hint when
+     * the label is known-but-unrecorded, or the default import prompt
+     * when nothing is installed. Kept free of the literal "import rootfs"
+     * substring whenever a ROM exists — the E2E verifier
+     * (scripts/ui-navigate.py::verify_rom_imported) treats that
+     * substring as "no ROM imported".
+     */
+    private void updateSelectRomSummary(Preference selectRomPref) {
+        if (selectRomPref == null) {
+            return;
+        }
+        Context ctx = getActivity();
+        if (ctx == null) {
+            return;
+        }
+        String label = RomManager.getInstalledRomLabel(ctx);
+        if (label == null) {
+            selectRomPref.setSummary(getString(R.string.settings_select_rom_summary));
+        } else if (label.isEmpty()) {
+            selectRomPref.setSummary(getString(R.string.settings_rom_installed_unnamed));
+        } else {
+            selectRomPref.setSummary(label);
         }
     }
 }
