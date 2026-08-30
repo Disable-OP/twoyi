@@ -21412,3 +21412,38 @@ Stage Summary:
 - NEXT: commit+push; re-dispatch m7 + the other no-decode runs
   (kenzo-twrp, z00ed, potter, vince-of, x00t, vs995) to read the
   trail; keep the 6-Z246 verify round in flight.
+
+---
+Task ID: 6-Z248
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: stop the tracer's boot trail going DARK past stop #20000/#30000 — the 3.7.0_11 AOSP spin class (ocean/kebab) had zero syscall identification in its interesting window.
+
+Work Log:
+- EVIDENCE (ocean run 33317324720, bb132ef): guest init (pid 2584, with
+  children 2592/2593 — the AOSP recovery-service preload chain loaded,
+  bootstrap/libc.so + bootstrap/libdl.so mapped, /system init rc files
+  parsed) is ALIVE and spinning when the run ends — the last 5000 log
+  lines are pure 6-Z213 RAW STOP / RESUME pairs because the
+  informative 6-Z210 broad DIAG (the ONLY per-stop syscall-number
+  feed) hard-capped at 20000. Result classified "bare BOOT_FAIL (no
+  kr64 markers)" — the trail literally went dark exactly where the
+  blocker lives. Same shape as the 6-Z241 note: "ENDLESS
+  anonymous-mmap loop (tracer loop cap 30000 hit, no exit_group, no
+  SIGSEGV)".
+- FIX 6-Z248 (ptrace_emu.rs): sampling instead of hard caps.
+  1. 6-Z210 broad DIAG: full logging to 20000, then 1-in-64 sampling
+     (tagged "sampled #N past cap") — a spin loop's syscall SHAPE
+     stays on the record for the whole boot, bounded log growth.
+  2. 6-Z213 RAW STOP feed: full to 30000, then 1-in-256 sampling
+     (tagged "(sampled)").
+- NOTE (unchanged root cause, now observable): the spin's syscall mix
+  was getpid/prctl-heavy in the wave-2 3.7.0_11 evidence; with the
+  new sampling the next ocean/kebab run will NAME the loop.
+- GATES: 658 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- No boot can go trail-dark again; long-spin classes become
+  diagnosable from ONE run.
+- NEXT: commit+push; re-dispatch ocean+kebab to identify the spin;
+  collect the 6-Z246/6-Z247 verify rounds when they land.
