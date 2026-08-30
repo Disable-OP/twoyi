@@ -96,6 +96,14 @@
             android:exported="false"
             android:screenOrientation="portrait" />
 
+        <!-- 6-Z264: rootfs file manager (browse/edit/chmod the active
+             profile's backing rootfs from the host side). -->
+        <activity
+            android:name=".ui.FileManagerActivity"
+            android:label="@string/settings_rootfs_fm_title"
+            android:exported="false"
+            android:configChanges="orientation|screenSize" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="io.twoyi.fileprovider"

@@ -27,6 +27,12 @@
             android:summary="@string/settings_export_summary"
             android:title="@string/settings_key_manage_files" />
 
+        <!-- 6-Z264: built-in rootfs file manager (browse/edit/chmod). -->
+        <Preference
+            android:key="@string/settings_key_rootfs_fm"
+            android:summary="@string/settings_rootfs_fm_summary"
+            android:title="@string/settings_rootfs_fm_title" />
+
         <Preference
             android:key="@string/settings_key_shutdown"
             android:title="@string/settings_key_shutdown" />
