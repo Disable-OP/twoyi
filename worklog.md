@@ -21907,3 +21907,65 @@ Work Log:
 Stage Summary:
 - Wave recorded; monitoring delegated; continue local work on the
   arm32 6-Z254 verification set + the fb_hook sp-0x24 class decode.
+
+---
+Task ID: 6-Z258
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: act on the MON-2 verification results — the strlen class is FIXED and daisy reached the first full OrangeFox UI_READY pass, but init STILL died at the property socket (a raw fchmodat ENOENT leaked through a missed ENTRY stop); translate fchmodat/fchownat paths so the real syscalls execute inside the sandbox.
+
+Work Log:
+- MON-2 COLLECTED (see the MON-2 entry): 571fe08 wave —
+  * orangefox-daisy: UI_READY/BOOT_OK/UI_READY/OK, display_mode=twrp,
+    presentation=SINGLE_FRAME, 0 SIGSEGVs — the FIRST full OrangeFox
+    pass (boot+UI+terminal).
+  * cereus/nitrogen/riva: BOOT_OK, 0 SIGSEGVs (strlen class GONE),
+    but SPLASH_HANG/timeout with display_mode=gl presentation=NONE —
+    the remaining hang is the loader-path display surface (owned by
+    the parallel 6-Z251d/e/f display track), NOT process death.
+  * ad3a109 (6-Z251b opaque blit): UI_READY + terminal OK + vfs CLEAN
+    — the OrangeFox opaque-blit display fix VERIFIED.
+  * init-death marker "start_property_service socket creation failed"
+    STILL present (once, kmsg tail) in cereus/daisy/nitrogen WITH the
+    6-Z257 rewrites firing elsewhere in the same runs → the ENTRY
+    stop for that specific fchmodat was itself missed (the 6-Z210
+    race is per-stop). Boot no longer fails (BOOT_OK) — the 6-Z49
+    recovery is self-sufficient — but init's death still forfeits
+    ueventd/adbd/logd + on property: triggers, and AOSP-layout boots
+    (ocean/kebab class) have NO 6-Z49 fork, so init survival matters.
+  * whyred/starlte guards: dl.twrp.me mirror refused at <0.3s —
+    workflow failure, no logs; re-dispatch needed.
+- FIX 6-Z258 (ptrace_emu.rs, the 6-Z257 arm upgraded in place — same
+  dispatch slot): fchmodat/fchownat paths are now TRANSLATED
+  (write_translated_path discipline, 6-Z135 fresh-regs) so the REAL
+  syscall executes against the backing store:
+  * dirfd==AT_FDCWD + absolute path → translate; real chmod lands in
+    the sandbox (real mode changes now possible — strictly more
+    faithful; previously the raw call always resolved against the
+    HOST root and was only masked).
+  * dirfd!=AT_FDCWD → real fd resolution, already sandboxed — left
+    to run; relative+AT_FDCWD → guest cwd IS the sandbox root
+    (6-Z187b) — left to run.
+  * untranslatable (scratch==0) → fall back to the 6-Z257 getpid
+    rewrite (kernel executes getpid instead of a host-root chmod).
+  Layer 2 KEPT: pending_chmod_fake_pid + EXIT consume still force the
+  family return to 0 (the established blanket-0 contract — fchownat
+  on root-owned nodes legitimately EPERMs for untrusted_app). The
+  6-Z185 backstop runs LAST on fresh registers and sees the
+  TRANSLATED (sandbox) path — verdict Allow.
+  ACCEPTANCE for the next wave: kmsg must show
+  "init: Created socket '/dev/socket/property_service'" and NO
+  "start_property_service socket creation failed"; ueventd/adbd
+  service starts visible; the 6-Z258 translated-path log lines
+  present.
+- GATES: 665 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- Boot-fatal chain fully decoded and neutralized at three levels:
+  env (6-Z256), missed-stop fakes (6-Z257), host-path exposure
+  (6-Z258). The remaining OrangeFox hang surface is the gl-path
+  display track (6-Z251d/e/f, parallel session).
+- NEXT: commit+push; dispatch cereus (init-survival anchor) + daisy
+  (UI_READY guard) + retry whyred/starlte guards; after the display
+  track lands its loader-path fix, re-run nitrogen/riva to confirm
+  the full OrangeFox family.
