@@ -20296,3 +20296,64 @@ Stage Summary:
 - NEXT: collect merlin verify 33299552663 (dispatched on 728785c, pre-6-Z228);
   if it fails on tracer register garbage (expected without 6-Z228), dispatch
   the 5 ELF32 verifies again on the 6-Z228 head — that is the decisive run.
+
+---
+Task ID: 6-Z229
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Class B fixes — property socket FATAL (starlte/chiron) + property-area restart EEXIST (capricorn/cedric) — from re-downloaded wave-1 artifacts.
+
+Work Log:
+- Re-downloaded the wave-1 artifacts (previous session's local copies were lost):
+  capricorn run 33286311295 + starlte run 33286288959 ui-e2e-arm64-logs.
+- STARLTE/CHIRON ROOT CAUSE (CONFIRMED, run 33286288959 line 9754):
+  6-Z163's bind rewrite appends the TRACER-SIDE PID to the translated socket
+  path: bind("/dev/socket/property_service") created
+  {rootfs}/dev/socket/property_service.2582. Init's follow-up
+  fchownat("/dev/socket/property_service") was NOT translated (backstop
+  denied the raw host path — redroid's own socket is there — faked 0,
+  harmless), but init's fchmodat("/dev/socket/property_service") WAS
+  translated to the canonical rootfs path → ENOENT (the node carries the
+  .pid suffix!) → "Failed to fchmodat socket ... No such file or directory"
+  → "start_property_service socket creation failed" → LOG(FATAL) → exit 127.
+  Only ONE property_service bind exists in the whole starlte log — the
+  two-binder wedge the suffix guarded did not materialize.
+  FIX: the .pid suffix is now applied ONLY to the binder-proxy class
+  (/dev/binder|/dev/hwbinder|/dev/vndbinder — the path the tracer itself
+  pre-binds; its live listener would EADDRINUSE the guest's bind, and guest
+  clients are 6-Z110-connect-intercepted anyway). Every other bind uses the
+  CANONICAL translated path — the parent-side prep already unlinks stale
+  nodes first, so a restart cycle re-binds the canonical name cleanly (the
+  old wedge scenario is handled BY the stale-removal, better than the
+  suffix).
+- CAPRICORN/CEDRIC MECHANISM (strong hypothesis + instrumentation):
+  capricorn kmsg = "init second stage started!" + "Failed to initialize
+  property area" ONLY. Tracer log: mkdirat(/dev/__properties__) translated
+  (loop 548) → openat (loop 550) → FATAL writev (loop 553) — the openat
+  failed, no mmap/ftruncate followed. The 6-Z196 clean-dir had NO stale
+  files at parent start (no "removed stale" lines). EEXIST is the only
+  O_CREAT|O_EXCL-compatible errno: init RESTARTED (an earlier cycle created
+  properties_serial), and the SECOND cycle's area init hit the FIRST
+  cycle's file. Real hardware gives every boot cycle a fresh tmpfs /dev —
+  Twoyi's rootfs /dev is persistent.
+  FIX 1 (generic semantic): when init exits (6-Z98 hook point), remove
+  {rootfs}/dev/__properties__/{property_info,properties_serial} —
+  "fresh-ephemeral-/dev per boot cycle". Safe for surviving children:
+  unlink does not break an existing mmap; a running recovery keeps its
+  mapped area.
+  FIX 2 (evidence, §10): 6-Z229 property-area open-result DIAG — every open
+  whose translated path is under /dev/__properties__ logs path → ret/errno
+  (first 40, NOT loop_count-gated — the capricorn failure is past loop 500,
+  which is exactly why the old logs are blind there).
+- GATES: 644 host tests green, clippy -D warnings clean on x86_64 AND
+  aarch64-linux-android, fmt clean.
+
+Stage Summary:
+- Class B socket FATAL: root-caused + fixed (evidence-confirmed).
+- Class B property-area: fixed via boot-cycle semantics + instrumented for
+  decisive confirmation in the next capricorn run.
+- Class B part 3 (APEX libdl gating for PT_INTERP inits) deliberately NOT
+  touched yet: starlte's init ran past property init without a libdl
+  segfault, so the libdl WARN may be a false alarm — re-evaluate from the
+  next artifacts once the confirmed fixes land (§25: no speculative fixes).
+- NEXT: push, then dispatch capricorn + starlte verifies on the new head.
