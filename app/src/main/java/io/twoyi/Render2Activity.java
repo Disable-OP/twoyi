@@ -78,6 +78,23 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
     private int mSurfaceOffsetY;
 
     /**
+     * 6-Z251: the container boots a LOADER-PATH recovery (AOSP-style:
+     * dynamic /init + /system/bin/recovery — OrangeFox R12, Lineage
+     * recovery-in-boot, …). Display output goes through the fb0 blit
+     * loop (Renderer.setRecoveryLoader) and — crucially — the guest
+     * NEVER sends BOOT_COMPLETED: it is a recovery, not a booting
+     * Android. The old flow kept the loading/bootlog overlay ON TOP of
+     * the SurfaceView for the whole 300 s wait-boot window and then
+     * showed the "boot timeout" toast — verify run 33324706378: the
+     * OrangeFox UI rendered perfectly underneath but the bootlog
+     * TextView drew OVER it (the overlay is z-ABOVE the surface, added
+     * at index 0). Computed in onCreate (BEFORE bootSystem() arms the
+     * overlay) because SurfaceView holder callbacks fire asynchronously
+     * — surfaceCreated would be too late for showBootingProcedure().
+     */
+    private boolean mRecoveryDisplay;
+
+    /**
      * 6-Z186: debug touch-injection receiver — the CI-probe's
      * InputManager-independent input channel.
      *
@@ -204,11 +221,12 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
             // which a recovery never uses. Without this, the guest UI was
             // alive internally (touch + page transitions) but the app showed
             // the black loading screen forever — nobody read fb0.
-            boolean recoveryLoader = !bootRecovery
-                    && io.twoyi.utils.RomManager.isAospRecoveryLayout(getApplicationContext());
-            Renderer.setRecoveryLoader(recoveryLoader);
-            Log.i(TAG, "Recovery (loader path) flag: " + recoveryLoader);
-            FileLogger.boot("recovery_loader_flag", "enabled=" + recoveryLoader);
+            // mRecoveryDisplay was already computed in onCreate (surface
+            // callbacks fire asynchronously — see the field javadoc); reuse
+            // it so both the native flag and the overlay logic agree.
+            Renderer.setRecoveryLoader(mRecoveryDisplay);
+            Log.i(TAG, "Recovery (loader path) flag: " + mRecoveryDisplay);
+            FileLogger.boot("recovery_loader_flag", "enabled=" + mRecoveryDisplay);
 
             // Calculate proper DPI based on physical screen and virtual display scaling
             WindowManager windowManager = getWindowManager();
@@ -302,6 +320,12 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
         mLoadingLayout.setVisibility(View.VISIBLE);
         mLoadingView.startAnimation();
+
+        // 6-Z251: detect the loader-path recovery display BEFORE
+        // bootSystem() arms the boot-completion overlay (see the
+        // mRecoveryDisplay javadoc for the ordering rationale).
+        mRecoveryDisplay = !io.twoyi.utils.ProfileSettings.isBootRecoveryEnabled(getApplicationContext())
+                && io.twoyi.utils.RomManager.isAospRecoveryLayout(getApplicationContext());
 
         // The upstream Android-12 guide gate is REMOVED (v5.3).
         // UITips.checkForAndroid12(this, this::bootSystem) used to block
@@ -476,6 +500,23 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private void showBootingProcedure() {
         FileLogger.boot("show_booting_procedure", "waiting for BOOT_COMPLETED (60s timeout)");
+        // 6-Z251: loader-path RECOVERY display — BOOT_COMPLETED is a
+        // full-Android concept and never arrives (a recovery never sets
+        // sys.boot_completed), so waiting 300 s only kept the loading/
+        // bootlog overlay drawn OVER the recovery UI and ended with a
+        // bogus "boot timeout" toast (verify run 33324706378: OrangeFox
+        // rendered perfectly underneath, KR64 RAW-STOP bootlog lines
+        // scribbled over it). The recovery IS the destination: reveal
+        // the framebuffer surface immediately and skip the wait-boot
+        // thread entirely. TWRP (--boot-recovery) keeps the original
+        // flow — kr64 synthesizes its BOOT_COMPLETED on the recovery
+        // child's execve, which dismisses the overlay there.
+        if (mRecoveryDisplay) {
+            FileLogger.boot("show_booting_procedure", "recovery display — revealing framebuffer surface immediately (no BOOT_COMPLETED gate)");
+            mLoadingView.stopAnimation();
+            mLoadingLayout.setVisibility(View.GONE);
+            return;
+        }
         // mLoadingText.setText(R.string.booting_tips);
         mLoadingText.setVisibility(View.GONE);
         mBootLogView.setVisibility(View.VISIBLE);
