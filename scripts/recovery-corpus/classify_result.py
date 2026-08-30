@@ -72,12 +72,20 @@ kr_and_kmsg = kr + "\n" + kmsg
 #     (pid 1) on <date>" — the pid is on the SAME line. The old
 #     same-line-only regex missed it and counted recovery_instances=0,
 #     which misjudged a fully-booted recovery as BOOT_FAIL.
+# 6-Z224b: OrangeFox R12's banner spells the pid WITHOUT a paren
+#     ("...; pid 1)" — run 33282961791) — match that variant too.
 banners = re.findall(
     r"Starting (TWRP|OrangeFox|SkyHawk|SHRP|recovery)[^\n]*\n\s*\(pid (\d+)\)",
     rec)
 banners += [
     (fam, pid) for fam, pid in re.findall(
         r"Starting (TWRP|OrangeFox|SkyHawk|SHRP|recovery)[^\n]*\(pid (\d+)\)[^\n]*",
+        rec)
+    if (fam, pid) not in banners
+]
+banners += [
+    (fam, pid) for fam, pid in re.findall(
+        r"Starting (TWRP|OrangeFox|SkyHawk|SHRP|recovery)[^\n]*;\s*pid (\d+)\)[^\n]*",
         rec)
     if (fam, pid) not in banners
 ]
@@ -143,8 +151,36 @@ else:
 pages = re.findall(r"Set page: '([^']+)'", rec)
 result["markers"]["pages"] = pages[-12:]
 menu_pages = {"main2", "main"}
+
+# ── 6-Z224b: AOSP-layout (minui-era) UI liveness ────────────────────
+# Lineage-22.2-class recoveries have NO TWRP theme/page system — the
+# legacy "Set page:" detector can never fire for them (run
+# 33282962805: fully-alive UI thread, 495s, brightness dim cycle, but
+# classified SPLASH_HANG). TWO hard, non-forgeable liveness signals:
+#   (1) "framebuffer: <fd> (<W> x <H>)" — printed by AOSP minui's
+#       fbdev Init ONLY after open+FSCREENINFO+VSCREENINFO+mmap all
+#       succeeded;
+#   (2) the UI THREAD's backlight dim cycle — "Brightness: <n> (%)"
+#       stepping DOWN over time (127 -> 63 -> 0) — runs only while the
+#       menu loop is actually alive (run 33282961791 proves the need
+#       for (2): OrangeFox died at the ashmem abort AFTER printing
+#       "framebuffer: 4 (720 x 1600)" but its log has ZERO dim steps;
+#       the alive lineage run has 2). Require >= 2 distinct brightness
+#       values (initial + at least one dim step).
+fb_lines = re.findall(r"framebuffer: (\d+) \((\d+) x (\d+)\)", rec)
+if fb_lines:
+    result["markers"]["aosp_minui_fb"] = fb_lines[-1]
+brightness_vals = set(re.findall(r"Brightness: (\d+) \(", rec))
+result["markers"]["brightness_steps"] = sorted(brightness_vals)
+aosp_ui_live = bool(fb_lines) \
+    and len(brightness_vals) >= 2 \
+    and len({pid for _, pid in banners}) <= 1 \
+    and "Rebooting..." not in rec.split("framebuffer:")[-1]
 if any(p in menu_pages for p in pages):
     result["ui"] = "UI_READY"
+elif aosp_ui_live:
+    result["ui"] = "UI_READY"
+    result["markers"]["ui_source"] = "aosp_minui"
 elif "system_readonly" in rec and "Set page:" not in rec:
     result["ui"] = "UI_HANG"
 elif banners:

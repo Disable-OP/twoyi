@@ -23,7 +23,7 @@
 //!
 //! # Files we materialise
 //!
-//! All seven files live at `{rootfs}/sys/class/power_supply/battery/`
+//! All eight files live at `{rootfs}/sys/class/power_supply/battery/`
 //! and contain a single ASCII value with a trailing newline (the
 //! Linux `power_supply` ABI convention; the trailing newline is
 //! harmless — Android's `BatteryMonitor::readStringFromFile` / kin
@@ -34,6 +34,7 @@
 //!  | `capacity`     | ASCII `0`..`100`               | `jni_get_battery_level`|
 //!  | `status`       | `Charging`/`Discharging`/...   | `jni_get_battery_status`|
 //!  | `charging`     | `0` or `1`                     | derived from status     |
+//!  | `type`         | `Battery` (constant)           | hard-coded (6-Z224b)    |
 //!  | `voltage_now`  | ASCII uV (e.g. `4200000`)      | `jni_get_battery_voltage` (mV → uV) |
 //!  | `temp`         | ASCII 1/10 °C (e.g. `280`)     | `jni_get_battery_temperature`|
 //!  | `technology`   | `Li-ion` (constant for now)    | hard-coded              |
@@ -205,13 +206,13 @@ pub struct BatteryDevice {
 
 impl BatteryDevice {
     /// Materialise the sysfs tree under `{rootfs}/sys/class/power_supply/battery/`
-    /// and write default values to all seven files.
+    /// and write default values to all eight files.
     ///
     /// Idempotent — calling it twice on the same rootfs simply
     /// overwrites the files (no `EEXIST` errors). Missing parent
     /// directories (`sys/`, `sys/class/`, `sys/class/power_supply/`)
     /// are created on demand with mode 0755; the battery dir itself
-    /// is created with mode 0755; the seven files are created with
+    /// is created with mode 0755; the eight files are created with
     /// mode 0644 (world-readable so the guest's `system_server` can
     /// read them regardless of its uid inside the chroot).
     pub fn new(rootfs: &str) -> std::io::Result<Self> {
@@ -247,7 +248,7 @@ impl BatteryDevice {
         &self.dir
     }
 
-    /// Absolute path to one of the seven files inside the battery dir.
+    /// Absolute path to one of the eight files inside the battery dir.
     fn file(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
@@ -372,7 +373,7 @@ impl BatteryDevice {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    /// Refresh all seven files from the (stubbed) JNI up-calls.
+    /// Refresh all eight files from the (stubbed) JNI up-calls.
     ///
     /// Called once at `new()` time and then every
     /// [`BATTERY_REFRESH_INTERVAL_SECS`] seconds by the refresh
@@ -451,7 +452,7 @@ fn write_file_at(dir: &Path, name: &str, value: &str) -> std::io::Result<()> {
     writeln!(f, "{}", value)
 }
 
-/// Refresh all seven battery files from the (stubbed) JNI up-calls.
+/// Refresh all eight battery files from the (stubbed) JNI up-calls.
 /// Called once at `BatteryDevice::new()` time and then every
 /// [`BATTERY_REFRESH_INTERVAL_SECS`] seconds by the refresh thread.
 ///
@@ -478,6 +479,13 @@ fn refresh_dir(dir: &Path) -> std::io::Result<()> {
     try_write!("capacity", &level.min(100).to_string());
     try_write!("status", status.as_str());
     try_write!("charging", if status.is_charging() { "1" } else { "0" });
+    // 6-Z224b: `type` — the Linux power_supply ABI's device-class file.
+    // AOSP's health/battery readers REJECT a power supply that has no
+    // `type` (recovery's BatteryMonitor reinit loop: "W: Trying again
+    // for reinitializing battery info" at ~10 Hz for the whole boot —
+    // lineage-22.2-sailfish run 33282962805 kmsg). "Battery" is the
+    // canonical class for /sys/class/power_supply/battery.
+    try_write!("type", "Battery");
     // `voltage_now` is in microvolts (uV) per the Linux `power_supply` ABI;
     // `voltage` (from `jni_get_battery_voltage`) is in millivolts (mV).
     // Convert mV → uV so the guest's health HAL reads the right value.
@@ -868,7 +876,7 @@ mod tests {
     // -------- refresh -------------------------------------------------
 
     #[test]
-    fn refresh_writes_all_seven_files_from_jni_stubs() {
+    fn refresh_writes_all_eight_files_from_jni_stubs() {
         // Since the JNI stubs return DEFAULT_* constants, refresh()
         // must produce exactly the same files as `new` did.
         let rootfs = tmpdir();
