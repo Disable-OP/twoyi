@@ -161,6 +161,80 @@ else
     exit 1
 fi
 
+# ── 6-Z226: armeabi-v7a (32-bit ARM) hook builds ─────────────────────
+# Wave-1 corpus runs 251 (merlin), 265 (ali), 266 (athene), 267 (bacon),
+# 263 (a7xelte): the guest recovery is ELF32 EM_ARM, but the staged
+# LD_PRELOAD chain was the aarch64 build — bionic's linker refuses it:
+#   CANNOT LINK EXECUTABLE "/sbin/recovery": ".../sbin/libtwrp_fb_hook.so"
+#   is 64-bit instead of 32-bit  → guest init exit 1 (4-5 of the 14
+#   wave-1 failures, the single largest failure class).
+# Fix: build the SAME hook sources for armv7a and ship them in
+# jniLibs/armeabi-v7a/ so kr64 can stage the bitness-correct chain.
+# NDK r27c still ships the armv7a sysroot (unlike i686), so a normal
+# -lc build works; --hash-style=sysv kept for old-bionic DT_HASH parity
+# with the i686/aarch64 hook builds above.
+echo '=========================================='
+echo "Building 32-bit ARM hooks (armeabi-v7a, for ELF32 guest recoveries)"
+echo '=========================================='
+V7A_JNILIBS_DIR=$SCRIPT_DIR/../src/main/jniLibs/armeabi-v7a
+mkdir -p "$V7A_JNILIBS_DIR"
+V7A_BUILD_DIR=$SCRIPT_DIR/build/twoyi_loader/armeabi-v7a
+rm -rf "$V7A_BUILD_DIR"
+mkdir -p "$V7A_BUILD_DIR"
+# (a) libtwoyi_loader_shlib.so (32-bit ARM) — part of the AOSP-layout
+#     LD_PRELOAD chain for 32-bit system-as-root recoveries.
+$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+    -target armv7a-linux-androideabi24 \
+    --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+    -shared -fPIC -O2 -g \
+    -D_GNU_SOURCE \
+    -o $V7A_BUILD_DIR/libtwoyi_loader_shlib.so \
+    $SCRIPT_DIR/twoyi_loader/src/twoyi_loader_shlib.c \
+    -lc -ldl 2>&1 || { echo "  ✗ twoyi_loader_shlib (armv7a) build failed" >&2; exit 1; }
+cp -v $V7A_BUILD_DIR/libtwoyi_loader_shlib.so $V7A_JNILIBS_DIR/libtwoyi_loader_shlib.so
+# (b) getpid_hook (32-bit ARM) — chain member.
+V7A_HOOK_BUILD_DIR=$SCRIPT_DIR/build/getpid_hook/armeabi-v7a
+rm -rf "$V7A_HOOK_BUILD_DIR"
+mkdir -p "$V7A_HOOK_BUILD_DIR"
+cmake -S $SCRIPT_DIR/getpid_hook -B $V7A_HOOK_BUILD_DIR \
+    -DCMAKE_TOOLCHAIN_FILE=$NDK_BUILD_DIR/build/cmake/android.toolchain.cmake \
+    -DANDROID_ABI=armeabi-v7a \
+    -DANDROID_PLATFORM=android-24 \
+    -DCMAKE_BUILD_TYPE=Release
+cmake --build $V7A_HOOK_BUILD_DIR -j$(nproc)
+cp -v $V7A_HOOK_BUILD_DIR/libgetpid_hook.so $V7A_JNILIBS_DIR/libgetpid_hook.so
+# (c) libtwrp_fb_hook.so (32-bit ARM) — the TWRP-mode /sbin hook.
+V7A_TWRP_HOOK_BUILD_DIR=$SCRIPT_DIR/build/twrp_fb_hook/armv7a
+rm -rf "$V7A_TWRP_HOOK_BUILD_DIR"
+mkdir -p "$V7A_TWRP_HOOK_BUILD_DIR"
+$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+    -target armv7a-linux-androideabi24 \
+    --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+    -nostdlib -shared -fPIC -O2 -g \
+    -fno-builtin -fno-builtin-memset -fno-builtin-strcmp -fno-builtin-strlen \
+    -Wl,--hash-style=sysv \
+    -Wl,--exclude-libs,ALL \
+    -D_GNU_SOURCE \
+    -I$SCRIPT_DIR/twoyi_loader/include -I$SCRIPT_DIR/twoyi_loader/src \
+    -o $V7A_TWRP_HOOK_BUILD_DIR/libtwrp_fb_hook.so \
+    $SCRIPT_DIR/twoyi_loader/src/twrp_fb_hook.c 2>&1 \
+    || { echo "  ✗ twrp_fb_hook (armv7a) build failed" >&2; exit 1; }
+cp -v $V7A_TWRP_HOOK_BUILD_DIR/libtwrp_fb_hook.so $V7A_JNILIBS_DIR/libtwrp_fb_hook.so
+echo "  ✓ libtwrp_fb_hook.so (armv7a): $(file -b $V7A_TWRP_HOOK_BUILD_DIR/libtwrp_fb_hook.so)"
+
+# (d) 6-Z226: ALSO ship the v7a hooks as APK ASSETS. Android's package
+#     manager extracts only the DEVICE's ABI jniLibs — on an arm64 device
+#     the armeabi-v7a libs above stay inside the APK. RomManager extracts
+#     these assets to {data_dir}/files/ at app init (the libdl.so
+#     Option-D pattern), and kr64's hook_library_candidates reads them
+#     from there for ELF32 guests (detect_guest_recovery_bitness).
+ASSETS_DIR=$SCRIPT_DIR/../src/main/assets
+mkdir -p "$ASSETS_DIR"
+cp -v $V7A_TWRP_HOOK_BUILD_DIR/libtwrp_fb_hook.so $ASSETS_DIR/libtwrp_fb_hook_arm32.so
+cp -v $V7A_BUILD_DIR/libtwoyi_loader_shlib.so $ASSETS_DIR/libtwoyi_loader_shlib_arm32.so
+cp -v $V7A_HOOK_BUILD_DIR/libgetpid_hook.so $ASSETS_DIR/libgetpid_hook_arm32.so
+echo "  ✓ arm32 hook assets staged into app/src/main/assets/"
+
 echo '=========================================='
 echo 'Build complete!'
 echo '=========================================='

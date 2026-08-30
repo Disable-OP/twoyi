@@ -19775,3 +19775,303 @@ Stage Summary:
 - The 90%-goal measurement pipeline is live: wave 1 (60/729) in flight.
 - NEXT: collect wave-1 verdicts (classify each artifact, keep a per-recovery
   PASS/FAIL table in the worklog); dispatch batch:60:120 when collection lands.
+---
+Task ID: 6-Z225-wave1
+Agent: wave-1 collector subagent
+Date: 2026-08-30
+Task: Collect wave-1 (batch:0:60) corpus verdicts + round-4 verification results on head f06ab55; first hard measurement toward the 90%-boot goal.
+
+Work Log:
+- All 65 dispatched UI E2E runs on f06ab55 are terminal: 60 success + 5 cancelled.
+  Run->recovery mapping done from job logs (evaluated RECOVERY_NAME env line +
+  "Downloading recovery image:" runtime line); cached to /tmp/w1_map.json.
+- 5 corpus runs (235 twrp-2.8.7.0-angler, 236 orangefox-R12.0-lavender,
+  237 lineage-22.2-sailfish, 241 twrp-3.7.0_9-0-angler, 242 twrp-3.7.0_9-0-whyred)
+  were CANCELLED before their test job started: the round-4 verification dispatch
+  used the same recovery_name values, and the workflow's per-recovery concurrency
+  group (ui-e2e-test-arm64-<ref>-<recovery_name>) cancelled the in-flight corpus
+  runs. Their recoveries are fully covered by the 5 verification runs, so no
+  re-dispatch is needed for the wave-1 scoreboard. LESSON: never dispatch
+  verification runs while corpus runs with the same recovery_name are queued.
+- Artifacts (ui-e2e-arm64-logs) downloaded + extracted to
+  /home/z/my-project/artifacts/wave1/run_<id>/, classified with
+  scripts/recovery-corpus/classify_result.py -> /tmp/w1_<id>.json; merged
+  scoreboard at /home/z/my-project/wave1_work/w1_final.json (also validated a
+  concurrent collector's partial results.json: run->name agreement 54/54).
+- ROUND-4 VERIFICATION (all 5 GREEN, overall UI_READY):
+  * lineage-22.2-sailfish (run 299): BOOT_OK / UI_READY / terminal OK / vfs CLEAN,
+    aosp-minui banner, recovery_instances=1, brightness dim 127->63 (no reinit loop).
+  * orangefox-R12.0-lavender (run 298): BOOT_OK / UI_READY / theme OK / terminal OK
+    / vfs CLEAN, OrangeFox banner, pages main->filemanagerlist, backstop_denied=61.
+    dev-__kmsg__ AND kmsg-stub: "InitFatalReboot" 0 hits, "cap_drop_bound" 0 hits —
+    the caps-strip (strip_service_capabilities_options) KILLED the OrangeFox
+    soft-reboot residual entirely. (recovery_instances=0 remains: "Welcome to
+    OrangeFox Recovery!" has no pid banner; classifier family-marker covers it.)
+  * Guards twrp-2.8.7.0-angler (295), twrp-3.7.0_9-0-angler (296),
+    twrp-3.7.0_9-0-whyred (297): all UI_READY.
+- Corpus failures (14) cluster in 3 classes: BOOT_FAIL x7 (merlin, a7xelte, ali,
+  athene, bacon, cherry, enchilada), BOOT_FAIL_EARLY_INIT x4 (starlte, capricorn,
+  cedric, chiron — linker failure + SIGSEGV x3, exit 127), UI_HANG/SPLASH_HANG x3
+  (PL2, Z01RD, equuleus). No OrangeFox/Lineage corpus entries failed.
+
+Stage Summary:
+- WAVE-1 SCOREBOARD: 46 UI_READY of 60 collected (76.7%). Remaining in flight: 0.
+- Wave-1 verdicts (name -> overall):
+  twrp-2.8.7.2-angler -> UI_READY
+  twrp-3.0.0-0-angler -> UI_READY
+  twrp-3.2.3-0-angler -> UI_READY
+  twrp-3.7.0_9-0-lavender -> UI_READY
+  twrp-3.7.0_9-0-sailfish -> UI_READY
+  twrp-3.7.0_9-0-bullhead -> UI_READY
+  twrp-3.1.1-0-angler -> UI_READY
+  twrp-3.3.1-0-angler -> UI_READY
+  twrp-3.5.2_9-0-angler -> UI_READY
+  twrp-3.5.2_9-0-flounder -> UI_READY
+  twrp-3.5.2_9-0-begonia -> UI_READY
+  twrp-3.7.0_9-0-merlin -> BOOT_FAIL
+  twrp-3.7.0_9-0-starlte -> BOOT_FAIL_EARLY_INIT
+  twrp-3.7.0_9-0-berkeley -> UI_READY
+  twrp-3.2.3-1-NB1 -> UI_READY
+  twrp-3.3.1-1-PL2 -> UI_HANG
+  twrp-3.7.0_9-0-PLE -> UI_READY
+  twrp-3.7.0_9-0-Z00T -> UI_READY
+  twrp-3.7.1_12-0-Z01RD -> UI_HANG
+  twrp-3.7.0_9-0-a30 -> UI_READY
+  twrp-3.7.0_9-0-a40 -> UI_READY
+  twrp-3.7.0_9-0-a5xelte -> UI_READY
+  twrp-3.7.0_9-0-a70q -> UI_READY
+  twrp-3.7.0_9-0-a7xelte -> BOOT_FAIL
+  twrp-3.7.0_9-0-addison -> UI_READY
+  twrp-3.7.0_9-0-ali -> BOOT_FAIL
+  twrp-3.2.1-0-athene -> BOOT_FAIL
+  twrp-3.6.2_9-0-bacon -> BOOT_FAIL
+  twrp-3.7.0_9-0-begonia -> UI_READY
+  twrp-3.7.0_9-0-berlin -> UI_READY
+  twrp-3.7.0_9-0-beryllium -> UI_READY
+  twrp-3.7.0_9-1-beyondx -> UI_READY
+  twrp-3.7.1_12-0-blueline -> UI_READY
+  twrp-3.7.1_12-1-bonito -> UI_READY
+  twrp-3.7.0_9-0-cactus -> UI_READY
+  twrp-3.7.0_9-0-capricorn -> BOOT_FAIL_EARLY_INIT
+  twrp-3.5.2_9-0-cedric -> BOOT_FAIL_EARLY_INIT
+  twrp-3.5.2_9-0-cepheus -> UI_READY
+  twrp-3.4.0-1-cheeseburger -> UI_READY
+  twrp-3.7.0_9-0-cherry -> BOOT_FAIL
+  twrp-3.3.1-1-chiron -> BOOT_FAIL_EARLY_INIT
+  twrp-3.7.0_9-0-clark -> UI_READY
+  twrp-3.7.1_12-0-coral -> UI_READY
+  twrp-3.7.1_12-0-crosshatch -> UI_READY
+  twrp-3.7.0_9-1-d1 -> UI_READY
+  twrp-3.7.0_9-1-d1x -> UI_READY
+  twrp-3.7.0_9-1-d2s -> UI_READY
+  twrp-3.7.0_9-0-dipper -> UI_READY
+  twrp-3.7.0_9-0-discovery -> UI_READY
+  twrp-3.7.0_9-0-dora -> UI_READY
+  twrp-3.5.1_9-0-dumpling -> UI_READY
+  twrp-3.7.0_11-0-enchilada -> BOOT_FAIL
+  twrp-3.5.2_10-0-equuleus -> UI_HANG
+  twrp-3.7.0_9-0-evert -> UI_READY
+  twrp-3.7.0_9-0-fajita -> UI_READY
+  twrp-2.8.7.0-angler -> UI_READY
+  twrp-3.7.0_9-0-angler -> UI_READY
+  twrp-3.7.0_9-0-whyred -> UI_READY
+  orangefox-R12.0-lavender -> UI_READY
+  lineage-22.2-sailfish -> UI_READY
+- NEXT (handoff): (1) triage the 14 failures by class — early-init linker SIGSEGV
+  (old-ABI devices) vs BOOT_FAIL vs splash-hang — before batch:60:120; (2) dispatch
+  batch:60:120 (avoid same-name concurrency collisions); (3) wave 2 + re-runs of
+  any fixed classes must lift 46/60 (76.7%) toward the 90% goal; (4) artifact
+  evidence ~2.8 GB under /home/z/my-project/artifacts/wave1/ — prune PASS-run
+  screenshots if disk is tight (keep twrp-recovery*.log + kmsg).
+
+---
+Task ID: 6-Z226-triage
+Agent: wave-1 triage subagent
+Task: Triage the 14 wave-1 failures into mechanism classes.
+
+Work Log:
+- NOTE on artifact layout: the 14 run dirs under /home/z/my-project/artifacts/wave1/run_<id>/ are
+  NOT flat — the extractors leave everything in run_<id>/tmp/ui-e2e-artifacts/ (guest-side copies in
+  app-logs/log/{logcat.log,logcat.log.N,kr64.log} + top-level {dev-__kmsg__,kmsg-stub.txt,twrp-recovery.log,
+  recovery-ld-debug.txt,recovery-ldd.txt,recovery-direct-linker.txt,sbin-lib-magic.txt,proc.log,...}).
+  Run-id mapping (scoreboard short id -> GitHub run): merlin 251->33286288076, starlte 252->33286288959,
+  PL2 255->33286291422, Z01RD 258->33286293587, a7xelte 263->33286298354, ali 265->33286300412,
+  athene 266->33286301648, bacon 267->33286302784, capricorn 275->33286311295, cedric 276->33286312324,
+  cherry 279->33286314950, chiron 280->33286315888, enchilada 291->33286325404, equuleus 292->33286326245.
+- ARCH FORENSICS (sbin-lib-magic.txt "== recovery ==" ELF header): merlin/ali/athene/bacon = ELF32 EM_ARM
+  (7f454c4601... 03 00 28 00); cherry/a7xelte/starlte/capricorn/cedric/chiron/PL2 = ELF64 EM_AARCH64
+  (03 00 b7 00); Z01RD/equuleus confirmed 64-bit via "detected child bitness: 64-bit (aarch64)" in
+  kr64-app-stderr.log. So the corpus mixes armv7 (32-bit) and arm64 recovery binaries — the first fork
+  in mechanisms.
+- CLASS A evidence:
+  * merlin (33286288076): FIRST fatal = logcat-dockerexec.txt:13423
+    "F linker : CANNOT LINK EXECUTABLE \"/sbin/recovery\": \".../rootfs/sbin/libtwrp_fb_hook.so\" is
+    64-bit instead of 32-bit"; then "[KR64][ptrace] 6-Z97: init_pid 2585 exited 1 ... genuine init exit".
+    recovery-ld-debug.txt reproduces it standalone. A/B=N/A; 32-bit.
+  * ali (33286300412): same line ("F libc : CANNOT LINK EXECUTABLE \"/sbin/recovery\": ... 64-bit instead
+    of 32-bit") + recovery-direct-linker.txt "env: exec .../sbin/linker64: No such file or directory"
+    (32-bit ramdisk has /sbin/linker only). 32-bit.
+  * athene (33286301648) + bacon (33286302784): same mechanism; recovery-ld-debug.txt =
+    "CANNOT LINK EXECUTABLE: \"/data/.../sbin/libtwrp_fb_hook.so\" is 64-bit instead of 32-bit" followed
+    by 32-bit allocator noise "page record for 0xf79e408c/0xf381e10c was not found (block_size=64)".
+  * cherry (33286314950): DIFFERENT — 64-bit, statically-linked TWRP init runs fine (kmsg: services
+    started), but "Service 'recovery' (pid 2583) exited with status 1" in a restart loop; the harness
+    linker probe nails it: recovery-ld-debug.txt / recovery-ldd.txt = "CANNOT LINK EXECUTABLE: library
+    \"libcrypto.so\" not found" (DT_NEEDED missing from /sbin linker path). Guest also logs "F libc :
+    page record for 0xe870501be010 was not found (block_size=16)" at 02:01:29.419.
+  * enchilada (33286325404): DIFFERENT — no crash at all. Guest init is /system/bin/init (system-as-root,
+    staged as _system_bin_init_8d58dbd62cc8), twoyi_loader hooks install ("runtime ready — guest can
+    boot"), then init NEVER reaches second stage: zero init kmsg output, proc.log shows "2575 ... 0 R init"
+    (state R, spinning) + child "2586 ... poll_schedule_timeout 0 S init", kr64 tail = ~30k traced
+    iterations dominated by nr=222 mmap (3454), nr=34 mkdirat (2601), nr=64 write, nr=226 mprotect,
+    nr=215 munmap, nr=56 openat. App: "wait_boot_timeout ... boot_failed | trackBootFailure" at +346s.
+  * a7xelte (33286298354): straddles classes — 64-bit; init second stage starts, then kmsg ends
+    "<3>init: Failed to fchmodat socket '/dev/socket/property_service': No such file or directory" +
+    "<3>init: start_property_service socket creation failed" (non-fatal for this omni init); the loader
+    daemonizes ("6-Z97: init_pid 2585 exited 1 but traced child(ren) [2586] ALIVE — the loader DAEMONIZED"),
+    then the recovery child SIGSEGVs: "SIGSEGV details: tid=2586 si_code=1 ... si_addr=0x0 ... SIGSEGV
+    thread comm: \"_sbin_recovery_\"" (x2 crashes, loop ends "child exit code: -11").
+- CLASS B evidence:
+  * capricorn (33286311295) + cedric (33286312324): kmsg is exactly 2 lines past start:
+    "<5>init: init second stage started!" then "<3>init: Failed to initialize property area";
+    kr64-app-stderr: "mkdirat translated: /dev/__properties__ -> ... (created: 0)" then
+    "6-Z110-TWRP-GATE-DIAG-WRITEV: writev(fd=44...): \"<3>init: Failed to initialize property area\\n\"";
+    "child 2578 exited with code 1 (after 576 iterations)" + "genuine init exit, ending the ptrace loop".
+    result.json failure marker = property_area.
+  * starlte (33286288959) + chiron (33286315888): init gets further (loads prop files), then kmsg
+    "<2>init: start_property_service socket creation failed: No such file or directory" (LOG(FATAL) —
+    preceded by "Failed to fchmodat socket '/dev/socket/property_service'"). starlte:
+    "PTRACE_EVENT_EXIT pid=2582 status=0x7f00 (exit code 127)"; re-anchored child
+    (comm "_sbin_recovery_") then "SIGSEGV details: tid=2583 si_code=1 ... si_addr=0x0" with the stack
+    window full of "/sbin/lib..." dlopen strings. chiron: "child 2605 exited with code 127 ... genuine
+    init exit (return 127)". ALL FOUR (capricorn/cedric/starlte/chiron) share the wrong-skip WARN:
+    "[KR64 INFO] TWRP boot: skipping APEX libdl.so extraction (init is statically linked, doesn't need
+    libdl.so)" + "[KR64 WARN] PARENT: real libdl.so NOT extracted — guest init will use the 5848-byte
+    stub at /apex/com.android.runtime/lib64/bionic/libdl.so and may crash at offset 0xaf174 in linker64
+    (5-K's diagnosis)" + "[KR64 CHILD] libdl.so NOT found at /dev/libdl.so ... EXPECT linker64 segfault
+    at 0xaf174" — while starlte's own log proves init is DYNAMIC: "Task 6-Z50: PT_INTERP offset=568,
+    filesz=15, path=\"/sbin/linker64\" (ELF64)".
+- CLASS C evidence:
+  * Z01RD (33286293587): recovery log shows full boot: splash.xml loaded, scanlines generated,
+    "I:Switching packages (TWRP)" and "I:Set page: 'system_readonly'" (theme OK) — but 38 SIGSEGVs in a
+    deterministic crash-restart loop: "SIGSEGV details: tid=2593 si_code=1 si_addr=0x0 pc=0xe15a36faef14
+    ... SIGSEGV thread comm: \"Binder:1_2\"" — pc symbolizes (via the in-run MAPS dump) to
+    rootfs/system/lib64/libbinder.so +0x14f14 (every crash pc ends f14 = same offset). Each crash spawns
+    debuggerd which fails: "F linker : CANNOT LINK EXECUTABLE \"crash_dump64\": cannot locate symbol
+    \"_ZN11unwindstack15UnwinderFromPid4InitENS_8ArchEnumE\" referenced by \"/system/bin/crash_dump64\""
+    (273 hits) — no tombstones, init restarts recovery, splash re-renders -> classifier sees SPLASH_HANG.
+  * equuleus (33286326245): same binder crash loop, bigger: 122 "SIGSEGV details" events, first = tid=2598
+    si_addr=0x0 in rootfs/system/lib64/libbinder.so +0x1aa1c, repeat sites +0x1e6f4 etc.; twrp-recovery.log
+    tail is wall-to-wall twoyi_loader binder-proxy traffic including the root cause candidate:
+    "[twoyi_loader] mmap FAILED fd=6 (fb_tracked=0) len=1040384 prot=0x1 flags=0x4002 errno=19 (No such
+    device) -> socket:[222562]" followed by "[twoyi_loader] mmap on binder fd -> using MAP_ANONYMOUS"
+    (binder heap = anonymous map the proxy can't fill) and repeated "binder proxy WRITE_READ ... first
+    BR=0x00007211". ashmem signature x1325 = per-restart re-open of /dev/ashmem.
+  * PL2 (33286291422): splash rendered ("I:Switching packages (splash)"), INPUT bridge probes come back
+    "E:Unable to query event object." (EVIOCGNAME->0), fstab processing starts ("I:Processing '/system'"
+    is the LAST recovery.log line), then only 2 SIGSEGVs and the guest DIES: tid=2568 si_addr=0x0 in
+    rootfs/sbin/libc.so +0x1cca0; tid=2575 si_code=2 in rootfs/sbin/linker64 +0x29b20 with
+    x6=0xfefefefefefefeff (heap-poison pattern -> corruption/UAF signature);
+    "child 2575 killed by signal 11 ... 6-Z97: init_pid 2575 killed by signal 11 and no traced child is
+    alive — genuine init death, ending the ptrace loop (return -11)". UI freezes on splash. PL2's kmsg
+    also has the non-fatal "/dev/socket/property_service" ENOENT pair (its 3.3.1 init ignores it), and it
+    is A/B: "6-Z219: guest fstab uses slotselect -> androidboot.slot_suffix=\"_a\"".
+- Chronological first-fatal per run verified: the CANNOT LINK line precedes everything fatal in the
+  32-bit quartet; property-area/socket fatals precede everything in Class B; first libbinder SIGSEGV
+  precedes the crash loop in Class C.
+
+Stage Summary:
+- Class A (7) — is really 3 mechanisms under one label:
+  (1) merlin+ali+athene+bacon: 32-bit ARM (EM_ARM) recovery images, but twoyi injects the aarch64-only
+      LD_PRELOAD (libtwrp_fb_hook.so) into every guest -> bionic linker rejects the executable:
+      "CANNOT LINK EXECUTABLE \"/sbin/recovery\": \".../sbin/libtwrp_fb_hook.so\" is 64-bit instead of
+      32-bit" -> guest exits 1 before any UI. Generic fix direction: build an armeabi-v7a fb_hook (APK
+      already ships armeabi-v7a ABIs) and select LD_PRELOAD per guest bitness (kr64 already detects child
+      bitness post-execve) — or skip fb_hook for 32-bit guests and rely on the kr64-side fb0 emulation.
+  (2) cherry: 64-bit, missing DT_NEEDED — recovery service exit-1 loop, "CANNOT LINK EXECUTABLE: library
+      \"libcrypto.so\" not found". Fix direction: at ramdisk import, scan the staged recovery's DT_NEEDED
+      against /sbin and synthesize missing libs (symlink into /sbin, which is already on LD_LIBRARY_PATH).
+  (3) enchilada: 64-bit system-as-root init spins in first stage (mmap/mkdirat/openat loop, state R, no
+      kmsg) until boot timeout. Fix direction: rate-limited DIAG of openat/mkdirat args during the spin to
+      find which faked syscall feeds the retry loop (suspect first-stage /dev cold-boot or mount fake).
+- Class B (4) — early-init death, two stacked gaps: (i) "skipping APEX libdl.so extraction (init is
+  statically linked)" mis-fires on dynamic inits (starlte has PT_INTERP=/sbin/linker64) so the guest gets
+  a 5848-byte libdl stub -> predicted linker64 segfault at 0xaf174 (WARN present in all 4); (ii) /dev
+  virtualization gaps kill init at property services: capricorn+cedric die at "Failed to initialize
+  property area" right after "init second stage started!" (twoyi policy "clean dir, NO files pre-created
+  (6-Z196)" leaves __system_property_area_init without a working property_info/mmap backing), starlte+
+  chiron die at "/dev/socket/property_service" ENOENT ("Failed to fchmodat socket" -> "<2>start_property
+  _service socket creation failed" LOG(FATAL) -> exit 127 + child SIGSEGV). a7xelte (Class A label) is
+  mechanistically here too. Fix direction: (a) detect PT_INTERP instead of the static-init heuristic for
+  the libdl extraction, (b) pre-create /dev/socket and accept/fake fchmodat on socket files, (c) emulate
+  property-area init (pre-create property_info + ashmem-like ftruncate/mmap backing in rootfs/dev/__properties__).
+- Class C (3) — UI reaches theme/splash then dies silently: Z01RD + equuleus loop forever on SIGSEGV
+  inside the guest's own rootfs/system/lib64/libbinder.so (fixed offsets, binder threads, si_addr=0x0)
+  — consistent with twoyi_loader's binder mmap failing (errno 19 ENODEV -> MAP_ANONYMOUS fallback) so
+  libbinder reads transactions from an empty heap; debuggerd can't even produce tombstones ("CANNOT LINK
+  EXECUTABLE \"crash_dump64\": cannot locate symbol ...UnwinderFromPid4Init..." — redroid-14 crash_dump64
+  vs TWRP libunwindstack mismatch). PL2 is a variant: 2 SIGSEGVs (libc.so+0x1cca0 NULL, linker64+0x29b20
+  with 0xfefe... poison pattern) kill the guest after splash + fstab processing starts, freezing the UI.
+  Fix direction: make the binder-proxy mmap path return a real mapping the proxy can populate (or fake
+  BINDER_MMAP region + service manager replies so TWRP's binder threads never deref NULL), and intercept
+  the crash path so one SIGSEGV doesn't restart the UI loop.
+- Outliers vs the class labels: a7xelte (labelled BOOT_FAIL but its mechanism is Class B — property-
+  socket ENOENT + daemonized recovery SIGSEGV, not the 64-bit-hook failure); enchilada (BOOT_FAIL with
+  no crash — pure init spin); cherry (BOOT_FAIL via missing lib, not bitness); PL2 (SPLASH_HANG caused by
+  guest death, not by a crash-restart loop like Z01RD/equuleus). Also worth noting for re-runs: 4/14
+  (merlin, ali, athene, bacon) should flip to UI_READY-testable as soon as a 32-bit hook exists, and
+  Z01RD actually rendered a TWRP page ('system_readonly') between crashes — it is the closest Class C
+  member to PASS.
+
+---
+Task ID: 6-Z226
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Fix the wave-1 failure classes. Wave 1 = 46/60 UI_READY (76.7%). This task: the 32-bit ARM hook class (5 failures — the single largest).
+
+Work Log:
+- WAVE-1 SCOREBOARD (head f06ab55, artifacts artifacts/wave1/): 46/60 UI_READY.
+  Failures triaged (6-Z226-triage in worklog): Class A BOOT_FAIL x7 (32-bit hook
+  mismatch x4-5, cherry missing libcrypto.so, enchilada init spin); Class B
+  BOOT_FAIL_EARLY_INIT x4 (APEX libdl stub skipped for PT_INTERP images + property
+  area/socket gaps); Class C UI_HANG x3 (Z01RD/equuleus guest libbinder SIGSEGV
+  loops; PL2 corruption).
+- 32-BIT CLASS MECHANISM: guest recovery is ELF32 EM_ARM (merlin/ali/athene/bacon/
+  a7xelte) but the staged LD_PRELOAD chain is the aarch64 build → bionic refuses:
+  'CANNOT LINK EXECUTABLE "/sbin/recovery": ".../sbin/libtwrp_fb_hook.so" is 64-bit
+  instead of 32-bit' → guest init exit 1.
+- FIXES (6-Z226, generic §22):
+  * app/cpp/build.sh: armeabi-v7a builds of libtwrp_fb_hook.so (nostdlib + sysv hash,
+    same as i686/aarch64 hook builds), libtwoyi_loader_shlib.so (-lc -ldl), and
+    libgetpid_hook.so (CMake). NDK r27c still ships the armv7a sysroot.
+  * The v7a outputs ALSO ship as APK assets (libtwrp_fb_hook_arm32.so,
+    libtwoyi_loader_shlib_arm32.so, libgetpid_hook_arm32.so) — the package manager
+    extracts only the DEVICE's ABI jniLibs, so assets are the only delivery path to
+    an arm64 device (libdl.so Option-D pattern).
+  * RomManager.extractArm32HookAssets(): extracts the 3 assets to {data_dir}/files/
+    at app init; missing assets degrade gracefully (bionic ignores a missing
+    LD_PRELOAD entry — strictly better than the wrong-arch lib).
+  * lib.rs: detect_guest_recovery_bitness(rootfs) reads the ELF header of
+    sbin/recovery or system/bin/recovery (Some(true)=64/Some(false)=32/None→64);
+    guest_hook_lib_name() maps the 3 hook names to their _arm32 variants for ELF32
+    guests; hook_library_candidates gained the {data_dir}/files/<name> candidate
+    (#4b, after the rootfs symlinks, before the APK scan). The DEST paths in the
+    guest (sbin/libtwrp_fb_hook.so, /dev/*) are UNCHANGED — only the staged content
+    differs, so the rc patch + AOSP chain strings need no changes.
+  * app/build.gradle: abiFilters += armeabi-v7a (packaging for jniLibs completeness).
+  * Tests: guest_hook_lib_name mapping (3 hooks + generic fallback),
+    detect_guest_recovery_bitness (ELF32/ELF64/non-ELF/missing), candidate-order
+    updates for the two hook_library_candidates tests. 640 total, all green;
+    fmt + clippy -D warnings clean.
+
+Stage Summary:
+- The 32-bit class (5/14 wave-1 failures) should flip to UI_READY once the APK with
+  the v7a builds lands. Projected wave-1 equivalent: 51/60 = 85%.
+- REMAINING failure classes for the next iterations: cherry (synthesize missing
+  DT_NEEDED libs), enchilada (init spin diagnostics), Class B (APEX libdl gating +
+  property area/socket gaps), Class C (guest libbinder SIGSEGV loops — binder proxy
+  connect path; PL2 corruption).
+- IN FLIGHT: wave 2 (batch:60:120, head 6e645cb, queued at 03:17Z).
+- DISPATCH NOTE (from the wave-1 collector): never dispatch verification runs whose
+  recovery_name matches in-flight corpus runs — the per-recovery concurrency group
+  cancels them.

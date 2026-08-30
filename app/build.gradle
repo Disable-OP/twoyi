@@ -43,7 +43,15 @@ android {
             //   libOpenglRender.so  — app/cpp/emugl  (AOSP emugl, CMake)
             //   libloader.so        — app/rs/loader  (Rust, open source)
             //   libtwoyi.so         — app/rs         (Rust, open source)
-            abiFilters "arm64-v8a", "x86_64"
+            // 6-Z226: armeabi-v7a — 32-bit ARM GUEST hook support. NOT used
+            //   by the app itself (the app is arm64 on real devices) — these
+            //   libs are the LD_PRELOAD hook binaries for 32-bit guest
+            //   recoveries (wave-1 runs 251/265/266/267: an aarch64 hook
+            //   preloaded into an ELF32 guest = "CANNOT LINK EXECUTABLE
+            //   .../sbin/libtwrp_fb_hook.so is 64-bit instead of 32-bit" →
+            //   guest init exit 1). kr64 stages them into the guest rootfs
+            //   after locating them in the installed APK directory.
+            abiFilters "arm64-v8a", "x86_64", "armeabi-v7a"
         }
         archivesBaseName = "twoyi_${versionName}"
     }
