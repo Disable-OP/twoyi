@@ -5173,8 +5173,101 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // mismatch that killed lineage-22.2-sailfish (r25 run 33261943269).
     // The relative target keeps the resolution inside the rootfs (§8:
     // never an absolute host path).
+    //
+    // ── 6-Z233: GUEST-RAMDISK libdl preference (capricorn + merlin
+    // class, CI runs 33305049683 / 33305055239) ──
+    //
+    // TWRP recoveries ship their OWN libdl.so in the ramdisk /sbin
+    // (capricorn: 5968-byte aarch64 ELF; merlin: 10064-byte EM_ARM
+    // ELF32). The /dev/libdl.so slot existed ONLY for the host-extracted
+    // copy: the APK asset is still the 5848-byte "PLAC" PLACEHOLDER
+    // (never replaced — magic PLAC, rejected by is_real_libdl) and the
+    // APEX extraction pipeline needs CAP_MKNOD + CAP_SYS_ADMIN + the
+    // loop driver (all unavailable on redroid, 5-L/5-N/5-O/5-P/5-U).
+    // Result: "real libdl.so NOT extracted" → the guest linker resolved
+    // DT_NEEDED:libdl.so against the 5848-byte bootstrap stub →
+    // "EXPECT linker64 segfault at 0xaf174" → CANNOT LINK / SIGSEGV →
+    // boot dead for BOTH devices.
+    //
+    // Generic fix (§9/§22: resolve from ACTUAL guest contents): when the
+    // guest's own ramdisk ships a libdl.so whose e_machine MATCHES the
+    // guest recovery binary's, COPY its bytes into /dev/libdl.so (the
+    // same write path as the hook libs). The guest linker then sees ITS
+    // OWN bionic generation's libdl — the private-ABI-safe choice (the
+    // linker implements dlopen/dlsym internally; libdl only carries the
+    // symbol table, and a same-bionic copy is correct by construction).
+    // Bounded: only the /dev/libdl.so slot, only on an exact e_machine
+    // match, COPY not symlink (§6: no namespace leaks).
+    //
+    // Priority order for the /dev/libdl.so slot becomes:
+    //   1. 6-Z215 ROM /system/lib64 symlink (native-guest full-ROM mode)
+    //   2. 6-Z233 guest ramdisk sbin/libdl.so (ABI-matched COPY)
+    //   3. host APK asset (when the asset is the REAL library)
+    //   4. APEX extraction (legacy fallback)
     let native_guest_libdl = format!("{}/system/lib64/libdl.so", rootfs_prefix);
     let native_guest_libdl_ok = native_guest && std::path::Path::new(&native_guest_libdl).is_file();
+    // 6-Z233: set when the guest's OWN ramdisk libdl was staged into
+    // /dev/libdl.so — the host-asset/APEX write below must NOT clobber it.
+    let mut z233_staged = false;
+    if !native_guest_libdl_ok {
+        let guest_machine = elf_machine(&format!("{}/sbin/recovery", rootfs_prefix))
+            .or_else(|| elf_machine(&format!("{}/sbin/libc.so", rootfs_prefix)));
+        let candidates = [
+            format!("{}/sbin/libdl.so", rootfs_prefix),
+            format!("{}/system/lib64/libdl.so", rootfs_prefix),
+            format!("{}/system/lib/libdl.so", rootfs_prefix),
+        ];
+        'z233: for cand in &candidates {
+            if !std::path::Path::new(cand).is_file() {
+                continue;
+            }
+            let cand_machine = elf_machine(cand);
+            // ABI guard: an e_machine mismatch would recreate the 6-Z226
+            // wrong-ABI class inside the guest's own library slot. When
+            // the guest machine is unknown, accept the candidate only if
+            // its own class parses cleanly (better than the stub either
+            // way — the ramdisk copy IS the guest's own bionic era).
+            let abi_ok = match (guest_machine, cand_machine) {
+                (Some(g), Some(c)) => g == c,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            if !abi_ok {
+                info!(
+                    "[KR64] 6-Z233: skipping {} (e_machine {:?} != guest {:?})",
+                    cand, cand_machine, guest_machine
+                );
+                continue;
+            }
+            match std::fs::read(cand) {
+                Ok(bytes) => {
+                    info!(
+                        "[KR64] 6-Z233: staging guest's own {} ({} bytes, e_machine {:?}) to {}/libdl.so — real libdl from the guest ramdisk wins over the 5848-byte host stub",
+                        cand,
+                        bytes.len(),
+                        cand_machine,
+                        dev_stage_dir
+                    );
+                    write_hook_library_to_dev(
+                        "libdl.so",
+                        cand,
+                        &bytes,
+                        &format!("{}/libdl.so", dev_stage_dir),
+                    );
+                    z233_staged = true;
+                    break 'z233;
+                }
+                Err(e) => {
+                    warning!(
+                        "[KR64] 6-Z233: failed to read {}: {} — trying next candidate",
+                        cand,
+                        e
+                    );
+                }
+            }
+        }
+    }
     if native_guest_libdl_ok {
         let link_path = format!("{}/libdl.so", dev_stage_dir);
         let target = "../system/lib64/libdl.so";
@@ -5209,7 +5302,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             );
         }
     }
-    let real_libdl_still_needed = if native_guest_libdl_ok {
+    let real_libdl_still_needed = if native_guest_libdl_ok || z233_staged {
         None
     } else {
         real_libdl.as_ref()
@@ -5228,9 +5321,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             &format!("{}/libdl.so", dev_stage_dir),
         );
     } else {
-        warning!(
-            "[KR64] PARENT: real libdl.so NOT extracted — guest init will use the 5848-byte stub at /apex/com.android.runtime/lib64/bionic/libdl.so and may crash at offset 0xaf174 in linker64 (5-K's diagnosis)"
-        );
+        if !z233_staged {
+            warning!(
+                "[KR64] PARENT: real libdl.so NOT extracted and no ABI-matched guest ramdisk copy — guest init will use the 5848-byte stub at /apex/com.android.runtime/lib64/bionic/libdl.so and may crash at offset 0xaf174 in linker64 (5-K's diagnosis; 6-Z233)"
+            );
+        }
     }
 
     // ---------------------------------------------------------------

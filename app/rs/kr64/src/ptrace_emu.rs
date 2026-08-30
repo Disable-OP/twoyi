@@ -10291,6 +10291,9 @@ pub fn run_ptrace_loop(
     // between mkdirat(/dev/__properties__) and the LOG(FATAL) wrote no
     // evidence because every existing open log is loop_count-gated).
     let mut prop_area_diag_count: u64 = 0;
+    // 6-Z234: passthrough (untranslated) open DIAG counter, second-stage
+    // property window (loop_count 500-700) only.
+    let mut passthrough_open_diag_count: u64 = 0;
     let mut pending_mount_enodev: std::collections::HashSet<libc::pid_t> =
         std::collections::HashSet::new();
     // 6-Z168: log cap for the block-storage mount -ENODEV overrides (the
@@ -15072,6 +15075,48 @@ pub fn run_ptrace_loop(
                                         // `write_translated_path` failure mode
                                         // well-defined.
                                         write_child_string(pid, path_addr, &translated);
+                                    }
+                                } else if loop_count >= 500 && loop_count <= 700 {
+                                    // ── 6-Z234: PASSTHROUGH-open DIAG (capricorn
+                                    // class) ──
+                                    //
+                                    // Run 33305049683: capricorn init FATALed
+                                    // "Failed to initialize property area" via
+                                    // an openat at loop 549 that produced ZERO
+                                    // diagnostics — the 6-Z231 ENTRY DIAG
+                                    // matches only /dev/__properties__ paths,
+                                    // so the failing open's path was something
+                                    // else that resolved AGAINST THE HOST
+                                    // (translated == path: relative paths,
+                                    // /proc/**, /system runtime-fallbacks, or
+                                    // a rootfs-prefixed string). The
+                                    // second-stage property window is
+                                    // loops 500-700 (observed FATAL at 552 in
+                                    // both capricorn runs; starlte's property
+                                    // open at 3291 is outside it). Log every
+                                    // PASSTHROUGH open in that window —
+                                    // bounded, first 40 — so the next run
+                                    // NAMES the host-resolving path.
+                                    passthrough_open_diag_count =
+                                        passthrough_open_diag_count.saturating_add(1);
+                                    if passthrough_open_diag_count <= 40 {
+                                        let ex_flags = if syscall_num == abi.open
+                                            || syscall_num == abi.openat
+                                        {
+                                            let flags_reg = if syscall_num == abi.open {
+                                                abi.reg_arg2
+                                            } else {
+                                                abi.reg_arg3
+                                            };
+                                            get_syscall_arg(&regs, flags_reg) as i32
+                                        } else {
+                                            0
+                                        };
+                                        log(&format!(
+                                            "6-Z234: open PASSTHROUGH (untranslated, resolves against the HOST) \"{}\" flags=0x{:x} pid={} loop={} (occurrence {})",
+                                            path, ex_flags, pid, loop_count,
+                                            passthrough_open_diag_count
+                                        ));
                                     }
                                 }
                             } else if past_first_execve {
