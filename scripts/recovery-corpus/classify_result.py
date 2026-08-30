@@ -94,8 +94,16 @@ if banners:
     result["markers"]["family_banner"] = sorted({f for f, _ in banners})
 
 # ── boot: did the guest recovery process start at all? ──────────────
+# 6-Z225: OrangeFox R12 prints "Welcome to OrangeFox Recovery!" +
+# "Switching packages (OrangeFox)" instead of the TWRP-style
+# "Starting ... (pid N)" banner (run 33284467693) — count those as a
+# reached boot, with the family marker for the result record.
 if banners or "Starting the UI" in rec:
     result["boot"] = "BOOT_OK"
+elif "Welcome to OrangeFox Recovery!" in rec or "Switching packages (OrangeFox)" in rec:
+    result["boot"] = "BOOT_OK"
+    result["markers"]["family_banner"] = sorted(
+        set(result["markers"].get("family_banner", [])) | {"OrangeFox"})
 elif "exit code 127" in kr or "exited with code 127" in kr:
     result["boot"] = "BOOT_FAIL"
     result["markers"]["exit_code"] = "127"
