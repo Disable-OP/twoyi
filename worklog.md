@@ -21447,3 +21447,42 @@ Stage Summary:
   diagnosable from ONE run.
 - NEXT: commit+push; re-dispatch ocean+kebab to identify the spin;
   collect the 6-Z246/6-Z247 verify rounds when they land.
+
+---
+Task ID: 6-Z249
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: decode the arm32 "recovery-internal si_addr=0x2c" crash class (grouper/onyx/shamu/tilapia UI_HANG) down to the exact TWRP source semantics.
+
+Work Log:
+- STATIC DECODE (grouper recovery sha256 prefix 4d68a038, run
+  33317149118): pc offset 0x4FCC0 = `ldr r4, [r0, #4]` with r0 = 0x28
+  => fault at 0x2c. lr offset 0x4FD1F (thumb).
+- The crashing function (0x4FCBC) is an intrusive-list FIND:
+  head=[this+4], walk node->next=[node+8], compare via
+  0x4FAA4(node+0x10, key). The caller (0x4FCF8) computed
+  `add.w r7, r1, #0x28` — the inline list head inside a resource
+  OBJECT at +0x28 — and called the find with r1 = NULL, so
+  this = NULL+0x28.
+- SEMANTIC IDENTIFICATION: the caller's literal pool holds
+  "error" + "String resource '%s' not found. Using default value.\n"
+  => this is TWRP's gui ResourceManager/GetValue path (string
+  resource lookup). The resource OBJECT pointer was NULL.
+- CHAIN (matches the parallel session's 6-Z244 evidence): theme
+  (/twres) load fails ("Package splash failed to load") => the
+  resource/page object never materializes => GUI init still calls
+  FindResource on it => SIGSEGV si_addr=0x2c => UI thread dead =>
+  BOOT_OK + black splash (UI_HANG). This class is DOWNSTREAM of the
+  /twres stat/open failure — the primary fix is the one 6-Z244's
+  DIAG (c8458a1) is collecting evidence for. No separate fix needed
+  for the 0x2c crash itself.
+- NO CODE this round (pure decode). Evidence persisted for the
+  /twres fix: crash offsets, TWRP source semantics, the NULL object
+  provenance (caller arg r1).
+
+Stage Summary:
+- grouper/onyx/shamu/tilapia UI_HANG = theme-load failure -> NULL
+  resource object -> FindResource crash at [NULL+0x2c]. One primary
+  fix (the /twres stat path) should clear all four.
+- NEXT: collect the /twres stat-family DIAG evidence (6-Z244's
+  dispatched runs) and the 6-Z246/6-Z247 verify rounds.
