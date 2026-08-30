@@ -21874,3 +21874,36 @@ Stage Summary:
   socket (kmsg shows no "start_property_service socket creation
   failed") and for the 6-Z257/6-Z163 DIAG lines naming any residual
   gate skip.
+
+---
+Task ID: 6-Z256-CI
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: record the 6-Z256/6-Z257 verification wave dispatch (head 571fe08).
+
+Work Log:
+- Pushed 571fe08 (rebased over the parallel 6-Z251d/e/f display+E2E
+  commits; worklog conflict merged append-only; gates re-verified
+  post-rebase: 665 tests, clippy clean, fmt clean).
+- Dispatched 6 E2E runs at 2026-08-30T18:25:38-45Z, all head 571fe08:
+  * 33328035447 orangefox-cereus (the strlen-class anchor; expect
+    ANDROID_ROOT present, no libc strlen crash)
+  * 33328036716 orangefox-daisy (strlen class)
+  * 33328037878 orangefox-nitrogen (strlen class)
+  * 33328039248 orangefox-riva (strlen class)
+  * 33328040541 twrp-3.7.0_9-0-whyred (UI_READY regression guard)
+  * 33328041794 twrp-3.7.0_9-0-starlte (UI_READY regression guard;
+    also exercises the 6-Z257 fchmodat rewrite — its property socket
+    previously needed the 6-Z229 bind fix)
+- ACCEPTANCE for the wave: (a) no "6-Z243 pc maps ... libc.so
+  strlen-class" SIGSEGV in the 4 OrangeFox runs; (b) kmsg must show
+  init SURVIVING the property socket (no "start_property_service
+  socket creation failed") on at least the TWRP guards; (c)
+  whyred/starlte stay UI_READY; (d) the 6-Z257 ENTRY/EXIT lines +
+  6-Z163 outer-gate DIAGs name any residual skip.
+- Also in flight: ad3a109 (6-Z251b opaque blit) E2E run 33324706378 —
+  collect its verdict too.
+
+Stage Summary:
+- Wave recorded; monitoring delegated; continue local work on the
+  arm32 6-Z254 verification set + the fb_hook sp-0x24 class decode.
