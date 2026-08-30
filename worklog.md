@@ -20075,3 +20075,8 @@ Stage Summary:
 - DISPATCH NOTE (from the wave-1 collector): never dispatch verification runs whose
   recovery_name matches in-flight corpus runs — the per-recovery concurrency group
   cancels them.
+- 6-Z226 VERIFY DISPATCH: twrp-3.7.0_9-0-merlin, twrp-3.7.0_9-0-a7xelte,
+  twrp-3.7.0_9-0-ali (3.7.0-era 32-bit) + twrp-3.2.1-0-athene + twrp-3.6.2_9-0-bacon
+  on head 92273ff. kr64 lint+test runs on push will validate the CI v7a build.
+  Expect: the ELF32 guests link the armv7a chain and boot (some may still fail on
+  OTHER stages — the v7a chain fixes the CANNOT LINK class specifically).
