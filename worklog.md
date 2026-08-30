@@ -20177,3 +20177,30 @@ Stage Summary:
   keep the other 4 until ABI_ARM32 lands (per §28 focused-first discipline).
 - Wave 2 (60 runs, head 6e645cb) still queued on the arm64 runner pool; it predates
   6-Z226 and builds fine — do NOT cancel (dispatch-note: no same-recovery overlap).
+
+---
+Task ID: 6-Z227-dispatch
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Record the 6-Z227 CI dispatch.
+
+Work Log:
+- 6-Z227 pushed as commit 728785c758597ee9dbb65f4e0a2e664f971d7ac4 (main).
+- LOCAL VERIFICATION COMPLETE before dispatch (NDK r27c downloaded locally,
+  664MB from dl.google.com): all three armv7a targets compile clean and produce
+  ELF32 EM_ARM EABI5 objects (shlib v7a, fb_hook v7a, getpid_hook v7a);
+  aarch64 shlib+fb_hook and i686 fb_hook regression builds clean. No CI round
+  was burned on header/field-name mistakes.
+- DISPATCHED: focused ELF32 verify — twrp-3.7.0_9-0-merlin on head 728785c,
+  run 33299552663 (workflow ui-e2e-test-arm64.yml, boot_wait_seconds=30).
+  Per §28 focused-first: 1 of the 5 ELF32 recoveries first; the other 4 wait
+  for ABI_ARM32 (6-Z228) + this run's evidence.
+- The push also queued kr64 lint+test on 728785c (Rust untouched; guard run).
+
+Stage Summary:
+- APK build class (6-Z226 fallout) is CLOSED pending the merlin run proving
+  the APK artifact builds.
+- Next: 6-Z228 kr64 ABI_ARM32 — the tracer currently assumes aarch64 children
+  are 64-bit; ELF32 EM_ARM guests on the arm64 host get garbage register
+  views (72-byte compat user_regs_struct read into the 272-byte user_pt_regs
+  view). Watch merlin run 33299552663 for the concrete failure signature.
