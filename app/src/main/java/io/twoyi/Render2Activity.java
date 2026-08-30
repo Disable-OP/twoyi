@@ -33,6 +33,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.core.view.WindowCompat;
 
 import com.cleveroad.androidmanimation.LoadingAnimationView;
 
@@ -59,6 +60,14 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     private static final String TAG = "Render2Activity";
     private static final int REQUEST_SELECT_ROM = 1001;
+
+    /**
+     * 6-Z264: coarse "a container guest is (or was recently) running"
+     * flag, used by the rootfs file manager to warn the user that
+     * editing the backing rootfs while the guest has it open can be
+     * overwritten or corrupt the running session.
+     */
+    public static volatile boolean containerRunning = false;
 
     private SurfaceView mSurfaceView;
 
@@ -292,8 +301,25 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         // BOOT_COMPLETED socket listener are co-located.
         BootCompletionServer.getInstance().reset();
         TwoyiStatusManager.getInstance().reset();
+        // 6-Z264: this instance is committing to run the container.
+        io.twoyi.Render2Activity.containerRunning = true;
 
         NavUtils.hideNavigation(getWindow());
+
+        // 6-Z261: full-screen render, cutout included. The recovery guest
+        // renders its own complete UI; the host must NOT reserve the
+        // notch/cutout area (that letterboxed the picture on devices with
+        // a display cutout — the window was forced inside the safe area).
+        // Draw edge-to-edge AND allow the window to extend into the
+        // cutout short edges. (The v27 theme already sets
+        // windowLayoutInDisplayCutoutMode=shortEdges; this runtime arm
+        // makes the intent explicit and covers theme overrides.)
+        if (Build.VERSION.SDK_INT >= 28) {
+            getWindow().getAttributes().layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            getWindow().setAttributes(getWindow().getAttributes());
+        }
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
 
         // Load virtual display settings from profile
         mVirtualDisplayWidth = ProfileSettings.getDisplayWidth(this);
@@ -348,6 +374,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
 
     @Override
     protected void onDestroy() {
+        // 6-Z264: the container goes down with this activity instance.
+        io.twoyi.Render2Activity.containerRunning = false;
         // Remove the SurfaceHolder callback to prevent surfaceCreated/Changed/Destroyed
         // from firing on a destroyed Activity with a stale Surface pointer.
         if (mSurfaceView != null && mSurfaceCallback != null) {
@@ -759,6 +787,16 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
                     }
                     io.twoyi.utils.IOUtils.deleteDirectory(aside);
                     RomManager.initRootfs(this);
+                    // 6-Z262: the first-boot import path must record the
+                    // identity too — otherwise the Settings 'Select ROM'
+                    // summary falls back to the unnamed-installed hint
+                    // after this reboot.
+                    String importedName = uri.getLastPathSegment();
+                    if (importedName == null || importedName.isEmpty()) {
+                        importedName = tempFile.getName();
+                    }
+                    io.twoyi.utils.ProfileSettings.setLastImportedRom(this, importedName);
+                    RomManager.writeImportedRomInfo(this, importedName);
                     return true;
                 }
                 return false;
