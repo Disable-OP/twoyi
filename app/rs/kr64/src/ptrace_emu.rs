@@ -14649,15 +14649,38 @@ pub fn run_ptrace_loop(
                     // together with the exit code and PC, so the forensics of
                     // the silent exit(0) (which syscalls preceded the mprotect
                     // sweep) are always on record.
+                    //
+                    // 6-Z247: TWO coverage gaps closed.
+                    //   1. The old gate `exit_code < 128` skipped the
+                    //      classic abnormal exit(-1) = 255 — exactly the
+                    //      m7 run (33317151265): init exit_group(255)
+                    //      after an mprotect sweep, NO trail, empty guest
+                    //      logs, un-diagnosable. Any NONZERO exit is now
+                    //      trailed; exit_group(0) stays untrailed (the
+                    //      healthy restart path floods the log otherwise).
+                    //   2. The "rip" read was the x86_64 user_regs_struct
+                    //      slot (index 16) on EVERY host — on aarch64 that
+                    //      is x16 (a scratch register!), and for arm32
+                    //      compat children the widened view (see the
+                    //      re-read at the loop top) keeps pc at slot 32,
+                    //      so the printed "rip" was always garbage off
+                    //      x86_64. Read the per-arch pc slot: 32 on
+                    //      aarch64 hosts (both native user_pt_regs and
+                    //      the widened arm32 view), 16 on x86_64 hosts.
                     if pid == init_pid && syscall_num == abi.exit_group_nr {
                         let exit_code = get_syscall_arg(&regs, abi.reg_arg1);
-                        if exit_code < 128 {
-                            // x86_64 user_regs_struct: RIP is u64 index 16
-                            // (same raw-index read the SIGSEGV forensics
-                            // uses below). Tells us WHERE in the (closed
-                            // ROM) binary the exit_group was issued.
+                        if exit_code != 0 {
+                            // PC slot: aarch64 user_pt_regs.pc = u64 index
+                            // 32 (x86_64: index 16). The loop-top re-read
+                            // already widened arm32 compat children into
+                            // that layout, so one index per host covers
+                            // every child ABI.
+                            #[cfg(target_arch = "aarch64")]
+                            let pc_idx = 32usize;
+                            #[cfg(target_arch = "x86_64")]
+                            let pc_idx = 16usize;
                             let regs_ptr = &regs as *const Regs as *const u64;
-                            let rip = unsafe { *regs_ptr.add(16) };
+                            let rip = unsafe { *regs_ptr.add(pc_idx) };
                             let tail: std::collections::VecDeque<i64> = recent_all_syscalls
                                 .iter()
                                 .rev()
