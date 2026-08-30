@@ -21691,3 +21691,40 @@ Stage Summary:
 - NEXT: commit+push; dispatch the full arm32 verify set (grouper,
   osprey, lux, m8, titan, merlin, onyx, shamu) + ocean/kebab; this
   is the highest-impact single change of the session.
+
+---
+Task ID: 6-Z255
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: decode the aarch64 libc null-call class (20 OrangeFox builds + walleye) down to strlen(getenv("ANDROID_ROOT")) with getenv → NULL; instrument the execve env scan to locate where the standard Android env is lost.
+
+Work Log:
+- STATIC DECODE (cereus OrangeFox R11, run 33317186140): crash pc =
+  guest libc.so + 0x1e320 = bionic's optimized strlen (`ldp x2, x3,
+  [x0]` with the 0x0101..01 zero-detect idiom), x0 = 0 → strlen(NULL).
+  Caller LR = recovery + 0x45cb4; the call site is
+    x0 = "ANDROID_ROOT" (literal @0xdd0dd)
+    x20 = getenv(x0)          ; PLT 0xf8b0
+    ... zero std::string inline buffer ...
+    bl  strlen                 ; x0 still = the getenv result = NULL
+  => strlen(getenv("ANDROID_ROOT")) with getenv → NULL. x6/x7 held
+  "/boot.img" (the string being built around it — OrangeFox boot-image
+  path handling).
+- WHY IT MATTERS: init.rc line 34 DOES `export ANDROID_ROOT /system`
+  (verified in the extracted cereus ramdisk) — so on the real flow the
+  recovery service inherits it. getenv NULL means the var was lost
+  either (a) in init's rc action queue (an earlier action aborted) or
+  (b) in the execve envp staging. 20 corpus builds crash here → the
+  single biggest remaining OrangeFox family.
+- FIX 6-Z255 (ptrace_emu.rs, 6-Z238 env scan extension): every logged
+  exec now also records ANDROID_ROOT / ANDROID_DATA / ANDROID_BOOTLOGO
+  / EXTERNAL_STORAGE presence (x/4) + total envp entry count; the log
+  fires when LD vars exist OR any standard var is MISSING. The next
+  orangefox round names the losing stage.
+- GATES: 658 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- OrangeFox libc null-call = strlen(getenv("ANDROID_ROOT")) — the
+  env-loss stage will be named by the extended scan.
+- NEXT: commit+push; dispatch one orangefox build (cereus) on this
+  head; collect the 6-Z254 arm32 wave (8 runs) — the decisive round.
