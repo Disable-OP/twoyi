@@ -6778,7 +6778,36 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         // the property_contexts file is reachable on the post-pivot_root
         // root) and BEFORE the guest's init is exec'd in the child below.
         // Idempotent: a no-op if the file is already missing.
-        patch_property_contexts_delete(&rootfs_prefix);
+        //
+        // 6-Z241 ARCH SCOPE (capricorn class, run 33310479551): the
+        // deletion is correct ONLY for i386 guests — the parser-overflow
+        // bug lives in the i386 TWRP init's libselinux (angler evidence).
+        // Android 9 (pi)-based AARCH64 inits REQUIRE the file: their
+        // property_init does mkdirat(/dev/__properties__) → openat(
+        // /property_contexts) [serializes the contexts into
+        // property_info] and LOG(FATAL)s "Failed to initialize property
+        // area" when the read fails (trace: mkdirat SUCCESS → openat
+        // ENOENT → writev FATAL with NO property_info open between —
+        // CreateSerializedPropertyInfo died before serializing). Real
+        // devices boot these images WITH the file, so the shipped content
+        // is the real-device condition (§22: do not destroy guest content
+        // the guest expects). Gate: delete for EM_386 guests only —
+        // the i386 parser bug is an ABI-level init implementation
+        // distinction, not a device-specific one.
+        {
+            let guest_init_machine = elf_machine(&format!("{}/init", rootfs_prefix))
+                .or_else(|| elf_machine(&format!("{}/sbin/recovery", rootfs_prefix)))
+                .or_else(|| elf_machine(&format!("{}/system/bin/recovery", rootfs_prefix)));
+            let is_i386_guest = guest_init_machine == Some(EM_386);
+            if is_i386_guest {
+                patch_property_contexts_delete(&rootfs_prefix);
+            } else {
+                info!(
+                    "[KR64] PARENT: 6-Z241: keeping /property_contexts (guest init is {:?}, not i386 — pi-based aarch64/arm32 inits FATAL 'Failed to initialize property area' when the file is missing; run 33310479551)",
+                    guest_init_machine
+                );
+            }
+        }
 
         // TWRP BOOT: DELETE /file_contexts (+ .homedirs + .local) ENTIRELY.
         // Same root-cause pattern as /property_contexts (6-O): the TWRP

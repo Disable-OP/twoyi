@@ -20733,3 +20733,52 @@ Stage Summary:
 - NEXT: push; dispatch the linker-class recoveries + capricorn/cherry +
   starlte/whyred regression on the new head; analyze the next blocker
   layer (property_area class is now the biggest remaining family).
+
+---
+Task ID: 6-Z241
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: property_area class root cause — /property_contexts deletion breaks pi-based aarch64 inits; deletion now gated to i386 guests.
+
+Work Log:
+- EVIDENCE (capricorn run 33310479551, head 0e22465, 6-Z237/6-Z238
+  diagnostics): the property FATAL trace is now fully visible:
+    loop 548: mkdirat(/dev/__properties__) → SUCCESS (created: 0)
+    loop 550: openat(/property_contexts) → ENOENT (the file was DELETED
+              by the 6-O crash workaround — "DELETED /property_contexts —
+              was 4701 bytes")
+    loop 552: writev "<3>init: Failed to initialize property area"
+  NO property_info open between mkdirat and the FATAL — Android 9
+  (pi)-based init's property_init is mkdirat(dir) →
+  CreateSerializedPropertyInfo (READS /property_contexts and serializes
+  it into /dev/__properties__/property_info) → __system_property_area_init.
+  When the /property_contexts read fails, the serialization never
+  happens and the area init fails → LOG(FATAL). The deletion (6-O) was
+  introduced for the I386 angler parser-overflow crash
+  (DISPATCHER-FINAL-3..8) where even an emptied file crashed the i386
+  libselinux parser — on aarch64 the shipped file is the REAL-DEVICE
+  condition and parses fine.
+- The whole property_area class (10 wave-2 failures: griffin-3.3.1,
+  capricorn, h830, h850, h990, ido, kinzie, ls997, montana, perry) is
+  this single mechanism: pi-based inits + deleted /property_contexts.
+  starlte/whyred-class inits tolerate the deletion (their init builds
+  don't gate on it) — which is why the regression set stayed green.
+- FIX 6-Z241: gate patch_property_contexts_delete on the guest init's
+  ELF machine — DELETE only for EM_386 (i386) guests (the parser-overflow
+  ABI class); KEEP the shipped file for aarch64/arm32 (real-device
+  content, §22: do not destroy guest content the guest expects).
+  Arch-level distinction (init implementation), not device-specific.
+- OTHER ANALYSIS (no code): the 3.7.0_11 AOSP-layout generation
+  (hotdog, hotdogv2, instantnoodle, kebab, ocean — BOOT_FAIL/None):
+  guest init LOADS the full LD_PRELOAD chain (PLT hooks installed,
+  property_info pre-created) then enters an ENDLESS anonymous-mmap loop
+  (tracer loop cap 30000 hit, no exit_group, no SIGSEGV) — a distinct
+  class needing its own evidence chain (next round).
+- GATES: 653 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- property_area class (10 recoveries) root-caused + fixed generically.
+- In flight: 12-run 6-Z240 verification (merlin + 32-bit linker class +
+  capricorn/cherry + starlte regression) on c188c28.
+- NEXT: commit+push 6-Z241; collect the 6-Z240 round; dispatch
+  capricorn + property-class verifies on the 6-Z241 head.
