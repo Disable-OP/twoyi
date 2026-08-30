@@ -223,6 +223,85 @@ $NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
 cp -v $V7A_TWRP_HOOK_BUILD_DIR/libtwrp_fb_hook.so $V7A_JNILIBS_DIR/libtwrp_fb_hook.so
 echo "  ✓ libtwrp_fb_hook.so (armv7a): $(file -b $V7A_TWRP_HOOK_BUILD_DIR/libtwrp_fb_hook.so)"
 
+# ── 6-Z236: bionic FORTIFY-compat shim (libbionic_compat.so) ─────────
+# Cherry class (run 33306474686): 6-Z230 stages host-runtime libs (e.g.
+# libcrypto.so) into guest sbin; those reference the HOST bionic's
+# FORTIFY family (__write_chk, __read_chk, ...) which the GUEST's own
+# libc.so does not export → "cannot locate symbol __write_chk" →
+# CANNOT LINK → recovery exit-1 restart loop. The shim implements the
+# FORTIFY family on raw syscalls (-nostdlib, no libc) and is prepended
+# to the recovery LD_PRELOAD chain whenever 6-Z230 stages host libs —
+# LD_PRELOAD libs load FIRST so their exports satisfy later relocations.
+BIONIC_COMPAT_SRC=$SCRIPT_DIR/twoyi_loader/src/bionic_compat.c
+
+# (i) aarch64 → jniLibs/arm64-v8a/
+COMPAT_BUILD_DIR_ARM64=$SCRIPT_DIR/build/bionic_compat/aarch64
+rm -rf "$COMPAT_BUILD_DIR_ARM64"; mkdir -p "$COMPAT_BUILD_DIR_ARM64"
+$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+    -target aarch64-linux-android24 \
+    --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+    -nostdlib -shared -fPIC -O2 -g \
+    -fno-builtin -fno-builtin-memset -fno-builtin-strcmp -fno-builtin-strlen \
+    -Wl,--hash-style=sysv \
+    -Wl,--exclude-libs,ALL \
+    -D_GNU_SOURCE \
+    -o $COMPAT_BUILD_DIR_ARM64/libbionic_compat.so \
+    $BIONIC_COMPAT_SRC 2>&1 \
+    || { echo "  ✗ bionic_compat (aarch64) build failed" >&2; exit 1; }
+cp -v $COMPAT_BUILD_DIR_ARM64/libbionic_compat.so $TWRP_HOOK_JNILIBS_DIR_ARM64/libbionic_compat.so
+echo "  ✓ libbionic_compat.so (aarch64): $(file -b $COMPAT_BUILD_DIR_ARM64/libbionic_compat.so)"
+
+# (ii) armeabi-v7a → jniLibs/armeabi-v7a/ + assets (ELF32 guests)
+COMPAT_BUILD_DIR_V7A=$SCRIPT_DIR/build/bionic_compat/armv7a
+rm -rf "$COMPAT_BUILD_DIR_V7A"; mkdir -p "$COMPAT_BUILD_DIR_V7A"
+$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+    -target armv7a-linux-androideabi24 \
+    --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+    -nostdlib -shared -fPIC -O2 -g -marm -fomit-frame-pointer \
+    -fno-builtin -fno-builtin-memset -fno-builtin-strcmp -fno-builtin-strlen \
+    -Wl,--hash-style=sysv \
+    -Wl,--exclude-libs,ALL \
+    -D_GNU_SOURCE \
+    -o $COMPAT_BUILD_DIR_V7A/libbionic_compat.so \
+    $BIONIC_COMPAT_SRC 2>&1 \
+    || { echo "  ✗ bionic_compat (armv7a) build failed" >&2; exit 1; }
+cp -v $COMPAT_BUILD_DIR_V7A/libbionic_compat.so $V7A_JNILIBS_DIR/libbionic_compat.so
+echo "  ✓ libbionic_compat.so (armv7a): $(file -b $COMPAT_BUILD_DIR_V7A/libbionic_compat.so)"
+
+# (iii) x86_64 → jniLibs/x86_64/ (x86_64 corpus parity)
+COMPAT_BUILD_DIR_X64=$SCRIPT_DIR/build/bionic_compat/x86_64
+rm -rf "$COMPAT_BUILD_DIR_X64"; mkdir -p "$COMPAT_BUILD_DIR_X64"
+$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+    -target x86_64-linux-android24 \
+    --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+    -nostdlib -shared -fPIC -O2 -g \
+    -fno-builtin -fno-builtin-memset -fno-builtin-strcmp -fno-builtin-strlen \
+    -Wl,--hash-style=sysv \
+    -Wl,--exclude-libs,ALL \
+    -D_GNU_SOURCE \
+    -o $COMPAT_BUILD_DIR_X64/libbionic_compat.so \
+    $BIONIC_COMPAT_SRC 2>&1 \
+    || { echo "  ✗ bionic_compat (x86_64) build failed" >&2; exit 1; }
+cp -v $COMPAT_BUILD_DIR_X64/libbionic_compat.so $TWRP_HOOK_JNILIBS_DIR_X86/libbionic_compat.so
+echo "  ✓ libbionic_compat.so (x86_64): $(file -b $COMPAT_BUILD_DIR_X64/libbionic_compat.so)"
+
+# (iv) i686 → jniLibs/x86_64/ (x86 corpus — same slot as the i686 hooks)
+COMPAT_BUILD_DIR_I686=$SCRIPT_DIR/build/bionic_compat/i686
+rm -rf "$COMPAT_BUILD_DIR_I686"; mkdir -p "$COMPAT_BUILD_DIR_I686"
+$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/clang \
+    -target i686-linux-android24 \
+    --sysroot=$NDK_BUILD_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+    -nostdlib -shared -fPIC -O2 -g \
+    -fno-builtin -fno-builtin-memset -fno-builtin-strcmp -fno-builtin-strlen \
+    -Wl,--hash-style=sysv \
+    -Wl,--exclude-libs,ALL \
+    -D_GNU_SOURCE \
+    -o $COMPAT_BUILD_DIR_I686/libbionic_compat.so \
+    $BIONIC_COMPAT_SRC 2>&1 \
+    || { echo "  ✗ bionic_compat (i686) build failed" >&2; exit 1; }
+cp -v $COMPAT_BUILD_DIR_I686/libbionic_compat.so $TWRP_HOOK_JNILIBS_DIR_X86/libbionic_compat_i686.so
+echo "  ✓ libbionic_compat.so (i686): $(file -b $COMPAT_BUILD_DIR_I686/libbionic_compat.so)"
+
 # (d) 6-Z226: ALSO ship the v7a hooks as APK ASSETS. Android's package
 #     manager extracts only the DEVICE's ABI jniLibs — on an arm64 device
 #     the armeabi-v7a libs above stay inside the APK. RomManager extracts
@@ -234,6 +313,7 @@ mkdir -p "$ASSETS_DIR"
 cp -v $V7A_TWRP_HOOK_BUILD_DIR/libtwrp_fb_hook.so $ASSETS_DIR/libtwrp_fb_hook_arm32.so
 cp -v $V7A_BUILD_DIR/libtwoyi_loader_shlib.so $ASSETS_DIR/libtwoyi_loader_shlib_arm32.so
 cp -v $V7A_HOOK_BUILD_DIR/libgetpid_hook.so $ASSETS_DIR/libgetpid_hook_arm32.so
+cp -v $COMPAT_BUILD_DIR_V7A/libbionic_compat.so $ASSETS_DIR/libbionic_compat_arm32.so
 echo "  ✓ arm32 hook assets staged into app/src/main/assets/"
 
 echo '=========================================='

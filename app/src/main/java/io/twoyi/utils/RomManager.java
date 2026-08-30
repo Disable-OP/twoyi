@@ -197,6 +197,9 @@ public final class RomManager {
             "libtwrp_fb_hook_arm32.so",
             "libtwoyi_loader_shlib_arm32.so",
             "libgetpid_hook_arm32.so",
+            // 6-Z236: bionic FORTIFY-compat shim for host-staged libs
+            // (cherry class — see bionic_compat.c).
+            "libbionic_compat_arm32.so",
         };
         for (String name : assets) {
             File target = new File(context.getFilesDir(), name);

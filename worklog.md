@@ -20553,3 +20553,105 @@ Stage Summary:
   linker segfault; merlin expected to reach its NEXT blocker.
 - NEXT: commit, push, dispatch capricorn + merlin + starlte (regression)
   + cherry (6-Z230 verify); analyze the 6-Z234 passthrough evidence.
+
+---
+Task ID: 6-Z235
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: analyze the 6-Z233 verify round (4 runs on beda55c) — cherry linker symbol gap root-caused, capricorn instrumentation blindspot confirmed, merlin .dynamic parse failure still unexplained.
+
+Work Log:
+- COLLECTED all four runs on beda55c (6-Z233 head), artifacts in
+  /home/z/my-project/artifacts/run-<id>:
+  run 33306472031 = starlte UI_READY (6-Z229 regression-stable, 3rd green
+  run in a row). run 33306473590 = capricorn BOOT_FAIL_EARLY_INIT
+  ("Failed to initialize property area", failure=property_area).
+  run 33306470979 = merlin BOOT_FAIL (failure=linker, sigsegv_count=3).
+  run 33306474686 = cherry BOOT_FAIL (recovery service exit-1 restart
+  loop in kmsg, backstop_denied=6).
+- 6-Z233 VERIFIED WORKING for both ELF32 + ELF64: merlin staged its own
+  10064-byte e_machine=40 libdl from the guest ramdisk to /dev/libdl.so;
+  capricorn staged its 5968-byte e_machine=183 copy. "libdl.so (REAL ...)
+  found at /dev/libdl.so" on both. The stub-libdl segfault class did NOT
+  reappear as the PRIMARY blocker — the guests progressed past it.
+- CHERRY ROOT CAUSE (recovery-ld-debug.txt + recovery-ldd.txt, decisive):
+  "CANNOT LINK EXECUTABLE: cannot locate symbol \"__write_chk\" referenced
+  by /data/user/0/io.twoyi.debug/profiles/default/rootfs/sbin/libcrypto.so"
+  — 6-Z230 DT_NEEDED staging WORKED (the host libcrypto.so landed in
+  guest sbin and the guest linker PARSED it) but the host runtime's
+  libcrypto was built against the HOST's bionic (redroid Android 16) whose
+  FORTIFY wrappers reference __write_chk (libc.so, FORTIFY_SOURCE); the
+  GUEST bionic (TWRP's own libc.so) does not export that symbol →
+  relocation failure → recovery exit-1 restart loop. 6-Z230 has an
+  e_machine (ABI) guard but no bionic-version/symbol-coverage guard.
+  FIX (6-Z236): bionic-compat FORTIFY shim library (libbionic_compat.so)
+  built for aarch64 + armeabi-v7a (+ x86_64/i686 parity) with -nostdlib,
+  raw-syscall implementations of the FORTIFY family (__write_chk,
+  __read_chk, __memmove_chk, __memcpy_chk, __memset_chk, __strcpy_chk,
+  __strncpy_chk, __strcat_chk, __strncat_chk, __strlen_chk, __recvfrom_chk);
+  staged into sbin whenever 6-Z230 stages ANY host-runtime lib, and
+  prepended to the recovery service LD_PRELOAD chain (both the legacy
+  /sbin TWRP chain and the AOSP /dev chain). LD_PRELOAD libs load FIRST
+  so their exported symbols satisfy later DT_NEEDED resolutions.
+  NOTE: the __snprintf_chk/__sprintf_chk family needs a vsnprintf
+  implementation (no libc in the shim) — deliberately NOT covered in
+  6-Z236; if a corpus image needs it, extend the shim (documented).
+- CAPRICORN (33306473590): the property FATAL reproduced at loop ~549-552
+  (pid 2578): mkdirat(/dev/__properties__) translated (created: 0 = EEXIST)
+  → openat → writev FATAL, NO ftruncate/mmap/fsetxattr between → the OPEN
+  failed kernel-side again. The 6-Z231 ENTRY/EXIT property DIAG + the
+  6-Z234 passthrough DIAG logged NOTHING for this openat — the failing
+  open does not match is_property_metadata_file (property_info /
+  properties_serial / properties_ctxt<N>) NOR the passthrough predicate.
+  The path (and errno) of the failing open REMAINS UNKNOWN — predicate
+  gap, not tracer blindness. FIX (6-Z237): un-gated ENTRY-side DIAG for
+  EVERY open/openat whose original OR translated path CONTAINS
+  "__properties__" as a SUBSTRING (any form: dir opens, relative dirfd
+  forms, suffixed variants), logging path/translated/flags/O_EXCL/loop;
+  EXIT-side ret/errno for the same set; PLUS a bounded failed-open DIAG
+  for any open under the guest /dev tree in the boot window (loop 400-800,
+  first 20) with errno — catches the EEXIST/EACCES story whatever it is.
+- MERLIN (33306470979): NEW error signature (progress from 6-Z226's
+  "is 64-bit instead of 32-bit"): CANNOT LINK EXECUTABLE "/sbin/recovery":
+  ".../profiles/default/rootfs/sbin/libtwrp_fb_hook.so" .dynamic section
+  header was not found. BYTE-LEVEL VERIFICATION of the actual APK asset
+  (downloaded arm64-v8a-apk artifact, unzipped assets/libtwrp_fb_hook_arm32.so,
+  162480 bytes): valid ELF32 EM_ARM ET_DYN, e_shoff=0x27650 (inside file),
+  28 sections, SHT_DYNAMIC at shdr 11 offset=0x7cb4 size=0x90 link=3 —
+  EXACTLY matching PT_DYNAMIC p_offset=0x7cb4 p_filesz=0x90 — the asset
+  PASSES every check merlin's own linker (/sbin/linker, Android R+ bionic
+  which validates .dynamic THROUGH SECTION HEADERS — error strings found
+  in the linker binary itself: "has invalid shdr offset/size", "shdr mmap
+  failed", ".dynamic section header was not found", ".dynamic section has
+  invalid offset/size/sh_link") can throw. The parent staged 162480 bytes
+  from files/libtwrp_fb_hook_arm32.so (PRE-FORK DIAG: exists, 162480,
+  mode 0100755). The linker's realpath in the error (profiles/default/...
+  form) is the kernel-resolved fd path (rootfs symlink resolved) — same
+  inode, cosmetic. CONCLUSION: the guest linker read a DIFFERENT BYTE
+  STREAM than the file on disk — interception-level content divergence
+  (mmap/read of the hook file served/altered somewhere) OR an open that
+  resolved to a different inode. NOT determinable from the current logs
+  (the linker's openat predates the loop-500 gate; no ELF dump exists).
+  FIX (6-Z238, evidence): open-EXIT ELF-structure dump — when an open
+  resolves to a path ending .so, read the ELF header + shdr table THROUGH
+  the fd (/proc/<pid>/fd/<n>) and log EI_CLASS/e_machine/e_shoff/e_shnum/
+  e_shentsize/SHT_DYNAMIC(index,offset,size,link)/PT_DYNAMIC(offset,filesz);
+  un-gated first 40 for hook-chain names, loop-gated otherwise. PLUS:
+  execve ENTRY env scan — when the exec target is a staged/guest recovery
+  or init, read the envp array and log LD_PRELOAD/LD_LIBRARY_PATH values
+  (one line, bounded) — settles WHICH preload chain the linker saw.
+  ALSO observed: guest /proc/self/maps leaks host paths
+  (/data/user/0/.../rootfs/sbin/*.so in the fb_hook fatal dump) — known
+  §24 class, still open, not this round's blocker.
+- GATES: n/a (analysis round; no code).
+
+Stage Summary:
+- cherry class root-caused: host-staged libs carry FORTIFY symbol deps the
+  guest bionic lacks → shim plan (6-Z236).
+- capricorn: instrumentation predicate gap proven (the DIAGs can't see the
+  failing open) → substring-based un-gated property DIAG (6-Z237).
+- merlin: guest-side byte divergence suspected; open-side ELF dump +
+  execve env dump will name the divergence (6-Z238).
+- starlte 3x green (6-Z229 regression-stable).
+- NEXT: implement 6-Z236/6-Z237/6-Z238, host gates, commit, push, dispatch
+  capricorn + merlin + cherry + starlte (regression) + wave-2 batch.
