@@ -1358,6 +1358,371 @@ pub fn stage_guest_bootstrap_bionic(rootfs_prefix: &str) -> (usize, usize) {
     (staged, already)
 }
 
+// ============================================================
+// 6-Z230: missing DT_NEEDED library staging (host-runtime donor).
+// ============================================================
+
+/// 6-Z230: parse the DT_NEEDED library names from an in-memory ELF
+/// image (ELF32 + ELF64, little-endian — Android is LE everywhere).
+///
+/// Uses the PROGRAM-header route (PT_DYNAMIC + DT_STRTAB resolved
+/// through PT_LOAD vaddr→offset), NOT section headers: stripped
+/// release binaries keep program headers but can lose sections.
+///
+/// Returns `None` when the image is not an ELF / has no PT_DYNAMIC /
+/// the dynamic segment is malformed. An ELF with a PT_DYNAMIC but ZERO
+/// DT_NEEDED entries returns Some(vec![]).
+pub fn dt_needed_names_from_bytes(data: &[u8]) -> Option<Vec<String>> {
+    const PT_LOAD: u32 = 1;
+    const PT_DYNAMIC: u32 = 2;
+    const DT_NULL: u64 = 0;
+    const DT_NEEDED: u64 = 1;
+    const DT_STRTAB: u64 = 5;
+
+    if data.len() < 52 || data[0..4] != [0x7f, b'E', b'L', b'F'] {
+        return None;
+    }
+    let is64 = data[4] == 2;
+    let le = data[5] == 1;
+    if !le {
+        // Android is little-endian on every ABI this tracer serves.
+        return None;
+    }
+
+    // Header fields: e_phoff, e_phentsize, e_phnum
+    let (phoff, phentsize, phnum): (usize, usize, usize) = if is64 {
+        (
+            u64::from_le_bytes(data[0x20..0x28].try_into().ok()?) as usize,
+            u16::from_le_bytes(data[0x36..0x38].try_into().ok()?) as usize,
+            u16::from_le_bytes(data[0x38..0x3A].try_into().ok()?) as usize,
+        )
+    } else {
+        (
+            u32::from_le_bytes(data[0x1C..0x20].try_into().ok()?) as usize,
+            u16::from_le_bytes(data[0x2A..0x2C].try_into().ok()?) as usize,
+            u16::from_le_bytes(data[0x2C..0x2E].try_into().ok()?) as usize,
+        )
+    };
+    if phnum == 0 || phnum > 64 {
+        return None;
+    }
+
+    // Walk the program headers once: collect PT_LOAD ranges and find
+    // PT_DYNAMIC's (file offset, filesz).
+    struct Load {
+        vaddr: u64,
+        off: u64,
+        filesz: u64,
+    }
+    let mut loads: Vec<Load> = Vec::with_capacity(phnum);
+    let mut dyn_off = None;
+    let mut dyn_sz = 0usize;
+    for i in 0..phnum {
+        let base = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if base + 32 > data.len() {
+            return None;
+        }
+        if is64 {
+            let p_type = u32::from_le_bytes(data[base..base + 4].try_into().ok()?);
+            let p_offset = u64::from_le_bytes(data[base + 8..base + 16].try_into().ok()?);
+            let p_vaddr = u64::from_le_bytes(data[base + 16..base + 24].try_into().ok()?);
+            let p_filesz = u64::from_le_bytes(data[base + 32..base + 40].try_into().ok()?);
+            if base + 40 > data.len() {
+                return None;
+            }
+            if p_type == PT_LOAD {
+                loads.push(Load {
+                    vaddr: p_vaddr,
+                    off: p_offset,
+                    filesz: p_filesz,
+                });
+            } else if p_type == PT_DYNAMIC {
+                dyn_off = Some(p_offset as usize);
+                dyn_sz = p_filesz as usize;
+            }
+        } else {
+            let p_type = u32::from_le_bytes(data[base..base + 4].try_into().ok()?);
+            let p_offset = u32::from_le_bytes(data[base + 4..base + 8].try_into().ok()?);
+            let p_vaddr = u32::from_le_bytes(data[base + 8..base + 12].try_into().ok()?);
+            let p_filesz = u32::from_le_bytes(data[base + 16..base + 20].try_into().ok()?);
+            if p_type == PT_LOAD {
+                loads.push(Load {
+                    vaddr: p_vaddr as u64,
+                    off: p_offset as u64,
+                    filesz: p_filesz as u64,
+                });
+            } else if p_type == PT_DYNAMIC {
+                dyn_off = Some(p_offset as usize);
+                dyn_sz = p_filesz as usize;
+            }
+        }
+    }
+
+    let dyn_off = dyn_off?;
+    if dyn_off.checked_add(dyn_sz)? > data.len() || dyn_sz == 0 {
+        return None;
+    }
+
+    // vaddr → file offset via the PT_LOAD ranges.
+    let vaddr_to_off = |vaddr: u64| -> Option<usize> {
+        for l in &loads {
+            if vaddr >= l.vaddr && vaddr < l.vaddr.checked_add(l.filesz)? {
+                return Some((l.off + (vaddr - l.vaddr)) as usize);
+            }
+        }
+        None
+    };
+
+    // First dynamic pass: DT_STRTAB.
+    let entsz = if is64 { 16 } else { 8 };
+    let mut strtab_vaddr = None;
+    let mut i = 0usize;
+    while i + entsz <= dyn_sz {
+        let (tag, val) = if is64 {
+            (
+                u64::from_le_bytes(data[dyn_off + i..dyn_off + i + 8].try_into().ok()?),
+                u64::from_le_bytes(data[dyn_off + i + 8..dyn_off + i + 16].try_into().ok()?),
+            )
+        } else {
+            (
+                u32::from_le_bytes(data[dyn_off + i..dyn_off + i + 4].try_into().ok()?) as u64,
+                u32::from_le_bytes(data[dyn_off + i + 4..dyn_off + i + 8].try_into().ok()?) as u64,
+            )
+        };
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_STRTAB {
+            strtab_vaddr = Some(val);
+        }
+        i += entsz;
+    }
+    let strtab_vaddr = strtab_vaddr?;
+    let strtab_off = vaddr_to_off(strtab_vaddr)?;
+
+    // Second dynamic pass: collect DT_NEEDED names.
+    let mut names = Vec::new();
+    let mut i = 0usize;
+    while i + entsz <= dyn_sz {
+        let (tag, val) = if is64 {
+            (
+                u64::from_le_bytes(data[dyn_off + i..dyn_off + i + 8].try_into().ok()?),
+                u64::from_le_bytes(data[dyn_off + i + 8..dyn_off + i + 16].try_into().ok()?),
+            )
+        } else {
+            (
+                u32::from_le_bytes(data[dyn_off + i..dyn_off + i + 4].try_into().ok()?) as u64,
+                u32::from_le_bytes(data[dyn_off + i + 4..dyn_off + i + 8].try_into().ok()?) as u64,
+            )
+        };
+        if tag == DT_NULL {
+            break;
+        }
+        if tag == DT_NEEDED && val != 0 {
+            let start = strtab_off.checked_add(val as usize)?;
+            if start >= data.len() {
+                continue;
+            }
+            let end = data[start..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| start + p)
+                .unwrap_or(data.len());
+            if end > start {
+                names.push(String::from_utf8_lossy(&data[start..end]).into_owned());
+            }
+        }
+        i += entsz;
+    }
+    Some(names)
+}
+
+/// 6-Z230: stage HOST-runtime copies of DT_NEEDED libraries the guest
+/// ramdisk does not ship, into `{rootfs}/sbin/` (already first on the
+/// guest's LD_LIBRARY_PATH).
+///
+/// ROOT CAUSE (cherry, run 33286314950): TWRP 3.7 builds for devices
+/// with ROM-provided recovery dependencies link `libcrypto.so` (FBE/
+/// fscrypt decryption support) and EXPECT the ROM's /system/lib64 to
+/// provide it. The guest searched LD_LIBRARY_PATH=/sbin:/system/lib:/
+/// /system/lib64 — but the twoyi rootfs ships a MINIMAL /system tree
+/// (no libcrypto) → "CANNOT LINK EXECUTABLE: library \"libcrypto.so\"
+/// not found" → the recovery service exit-1 restart loop → BOOT_FAIL
+/// with zero UI. On a real device the ROM's /system provides the lib.
+///
+/// THE FIX: scan the guest's own /sbin ELF binaries+libraries for
+/// DT_NEEDED names, resolve each against the guest's own trees first
+/// (sbin, system/lib{,64}, vendor/lib64, odm/lib64), and for names the
+/// guest lacks, COPY the host runtime's copy (same ABI only — the
+/// candidate's e_machine must match the guest's recovery binary) into
+/// {rootfs}/sbin/<name>. COPY (not symlink): a rootfs-internal symlink
+/// to an absolute host path would leak the host namespace (§6/§23) and
+/// fail the sandbox backstop. Never overwrites an existing file;
+/// idempotent.
+///
+/// Transitive: staged libs are themselves scanned (closure, depth-
+/// bounded via the visited set + the file cap). Capped at 48 staged
+/// libs and 96 parsed images per run — bounded cost, bounded blast
+/// radius.
+///
+/// Returns (staged_count, missing_names_not_found_anywhere).
+pub fn stage_missing_dt_needed(rootfs_prefix: &str) -> (usize, Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    const MAX_STAGED: usize = 48;
+    const MAX_PARSED: usize = 96;
+    const GUEST_LIB_DIRS: [&str; 6] = [
+        "sbin",
+        "system/lib64",
+        "system/lib",
+        "vendor/lib64",
+        "vendor/lib",
+        "odm/lib64",
+    ];
+    // Host runtime donor dirs, in priority order. Android 12+ keeps
+    // libcrypto/libssl inside the conscrypt APEX, so both flat and
+    // APEX candidates must be probed.
+    let host_lib_dirs: Vec<String> = {
+        let mut v = vec![
+            "/system/lib64".to_string(),
+            "/system/lib".to_string(),
+            "/vendor/lib64".to_string(),
+            "/vendor/lib".to_string(),
+        ];
+        if let Ok(rd) = std::fs::read_dir("/apex") {
+            let mut apex_dirs: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .flat_map(|p| {
+                    [
+                        p.join("lib64").to_string_lossy().into_owned(),
+                        p.join("lib64/boringssl").to_string_lossy().into_owned(),
+                        p.join("lib").to_string_lossy().into_owned(),
+                    ]
+                })
+                .collect();
+            apex_dirs.sort();
+            v.append(&mut apex_dirs);
+        }
+        v
+    };
+
+    // Guest ABI anchor: the recovery binary itself (falls back to the
+    // guest's sbin libc). Host candidates whose e_machine differs are
+    // rejected — staging a wrong-ABI lib would recreate the 6-Z226
+    // "is 64-bit instead of 32-bit" class.
+    let recovery_path = {
+        let a = format!("{}/sbin/recovery", rootfs_prefix);
+        let b = format!("{}/system/bin/recovery", rootfs_prefix);
+        if std::path::Path::new(&a).exists() {
+            a
+        } else {
+            b
+        }
+    };
+    let guest_machine = elf_machine(&recovery_path)
+        .or_else(|| elf_machine(&format!("{}/sbin/libc.so", rootfs_prefix)));
+    let guest_machine = match guest_machine {
+        Some(m) if m != 0 => m,
+        _ => return (0, vec![]),
+    };
+
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut parse_queue: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut staged = 0usize;
+
+    // Seed: the recovery binary + every regular ELF in sbin.
+    if std::path::Path::new(&recovery_path).exists() {
+        parse_queue.push(recovery_path.clone());
+    }
+    if let Ok(rd) = std::fs::read_dir(format!("{}/sbin", rootfs_prefix)) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            // Regular files ONLY: the busybox applet farm is hundreds of
+            // symlinks to one staged binary — symlink_metadata().is_file()
+            // is false for them and the parse queue stays meaningful.
+            match std::fs::symlink_metadata(&p) {
+                Ok(md) if md.is_file() => {
+                    parse_queue.push(p.to_string_lossy().into_owned());
+                }
+                _ => {}
+            }
+        }
+    }
+    parse_queue.truncate(MAX_PARSED);
+
+    while let Some(path) = parse_queue.pop() {
+        if visited.contains(&path) || visited.len() >= MAX_PARSED {
+            continue;
+        }
+        visited.insert(path.clone());
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let names = match dt_needed_names_from_bytes(&data) {
+            Some(n) => n,
+            None => continue, // not an ELF or no PT_DYNAMIC
+        };
+        for name in names {
+            if name.is_empty() || !name.starts_with("lib") || !name.ends_with(".so") {
+                continue;
+            }
+            // Resolvable inside the guest already?
+            let guest_hit = GUEST_LIB_DIRS.iter().any(|d| {
+                std::path::Path::new(&format!("{}/{}/{}", rootfs_prefix, d, name)).exists()
+            });
+            if guest_hit {
+                continue;
+            }
+            // Host runtime donor, same ABI only.
+            let mut staged_path: Option<String> = None;
+            for dir in &host_lib_dirs {
+                let cand = format!("{}/{}", dir, name);
+                if elf_machine(&cand) != Some(guest_machine) {
+                    continue; // wrong ABI — would recreate the 6-Z226 class
+                }
+                let dst = format!("{}/sbin/{}", rootfs_prefix, name);
+                match std::fs::copy(&cand, &dst) {
+                    Ok(_) => {
+                        let _ =
+                            std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
+                        staged_path = Some(dst);
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            match staged_path {
+                Some(dst) => {
+                    staged += 1;
+                    crate::info!(
+                        "[KR64] 6-Z230: staged host-runtime lib {} -> {} (guest DT_NEEDED not shipped by ramdisk)",
+                        name, dst
+                    );
+                    if staged < MAX_STAGED {
+                        // Transitive closure: the staged lib may itself
+                        // need libs the guest lacks.
+                        parse_queue.push(dst);
+                    }
+                }
+                None => {
+                    if !missing.contains(&name) {
+                        missing.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    for m in &missing {
+        crate::info!(
+            "[KR64] 6-Z230: DT_NEEDED {} not shipped by the ramdisk and not found in any host runtime dir — the guest linker will report it if genuinely required",
+            m
+        );
+    }
+    (staged, missing)
+}
+
 /// Write hook-library bytes to `/dev/<lib>` (tmpfs) and chmod 0644.
 ///
 /// This is the "write" phase of the hook-library copy. It MUST be called
@@ -5161,6 +5526,25 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             info!(
                 "[KR64] 6-Z218b: staged {} bootstrap-bionic symlinks ({} already present) into {{rootfs}}/system/lib64/bootstrap + {{rootfs}}/apex/com.android.runtime/lib64/bootstrap — the guest linker's bootstrap libc lookup now resolves to the ROM's own bionic",
                 boot_staged, boot_already
+            );
+        }
+    }
+
+    // 6-Z230: stage host-runtime copies of DT_NEEDED libraries the guest
+    // ramdisk doesn't ship (cherry: libcrypto.so — TWRP 3.7 builds that
+    // expect the ROM's /system/lib64 to provide it). MUST run in the
+    // PARENT before pivot_root (host paths are still readable), and
+    // BEFORE the guest execs anything dynamic. Runs for every boot
+    // mode: any dynamic guest benefits; static-only guests parse as
+    // no-PT_DYNAMIC and the pass is a cheap no-op.
+    {
+        let (libs_staged, libs_missing) = stage_missing_dt_needed(&rootfs_prefix);
+        if libs_staged > 0 || !libs_missing.is_empty() {
+            info!(
+                "[KR64] 6-Z230: staged {} missing DT_NEEDED libs from the host runtime into {{rootfs}}/sbin ({} unresolvable: {:?})",
+                libs_staged,
+                libs_missing.len(),
+                libs_missing
             );
         }
     }
@@ -13781,6 +14165,152 @@ mod tests {
     #[test]
     fn elf_machine_file_missing_returns_none() {
         assert_eq!(elf_machine("/nonexistent/twoyi-test/nope.so"), None);
+    }
+
+    // ── 6-Z230: DT_NEEDED parser tests ──────────────────────────────
+
+    /// Build a minimal but structurally-valid ELF64 LE image with a
+    /// PT_DYNAMIC segment whose DT_NEEDED entries point into a DT_STRTAB.
+    fn make_elf64_with_dt_needed(names: &[&str]) -> Vec<u8> {
+        // Layout: [ehdr 64][phdr2 2*56][pad][dyn entries][strtab]
+        let mut img: Vec<u8> = Vec::new();
+        // --- ELF header ---
+        img.extend_from_slice(b"\x7fELF");
+        img.push(2); // ELFCLASS64
+        img.push(1); // little-endian
+        img.push(1); // EV_CURRENT
+        img.push(0); // ELFOSABI_NONE
+        img.extend_from_slice(&[0u8; 8]); // padding
+        img.extend_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        img.extend_from_slice(&183u16.to_le_bytes()); // e_machine = EM_AARCH64
+        img.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        img.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+        let phoff = 64u64;
+        img.extend_from_slice(&phoff.to_le_bytes()); // e_phoff
+        img.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+        img.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        img.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        img.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        img.extend_from_slice(&2u16.to_le_bytes()); // e_phnum
+        img.extend_from_slice(&64u16.to_le_bytes()); // e_shentsize
+        img.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+        img.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+        assert_eq!(img.len(), 64);
+        // --- Program headers: PT_LOAD + PT_DYNAMIC ---
+        // dyn must start AFTER both phdrs (64 + 2*56 = 176):
+        let dyn_vaddr: u64 = 176; // identity-mapped (vaddr == file offset)
+        let dyn_off: u64 = 176;
+        // strtab offset == dyn_off + dyn entries bytes (computed below);
+        // strtab VADDR is identity-mapped to the same value so the
+        // parser's PT_LOAD vaddr->offset walk resolves it.
+        let n_entries = names.len() as u64 + 2; // needed*N + strtab + null
+        let strtab_off: u64 = dyn_off + n_entries * 16;
+        let strtab_vaddr: u64 = strtab_off;
+        // PT_LOAD: [0, strtab_off+strsz) — covers everything.
+        // strtab[0] is the mandatory empty string (real-ELF convention —
+        // that's WHY DT_NEEDED offsets are never 0); names start at 1.
+        let strsz: u64 = 1 + names.iter().map(|n| n.len() as u64 + 1).sum::<u64>();
+        let load_filesz = strtab_off + strsz;
+        // p_type=1 (PT_LOAD), p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, align
+        img.extend_from_slice(&1u32.to_le_bytes());
+        img.extend_from_slice(&5u32.to_le_bytes());
+        img.extend_from_slice(&0u64.to_le_bytes()); // offset 0
+        img.extend_from_slice(&0u64.to_le_bytes()); // vaddr 0
+        img.extend_from_slice(&0u64.to_le_bytes()); // paddr
+        img.extend_from_slice(&load_filesz.to_le_bytes());
+        img.extend_from_slice(&load_filesz.to_le_bytes());
+        img.extend_from_slice(&0x1000u64.to_le_bytes());
+        // PT_DYNAMIC: p_type=2, offset=dyn_off, vaddr=dyn_vaddr, filesz=n_entries*16
+        img.extend_from_slice(&2u32.to_le_bytes());
+        img.extend_from_slice(&6u32.to_le_bytes());
+        img.extend_from_slice(&dyn_off.to_le_bytes());
+        img.extend_from_slice(&dyn_vaddr.to_le_bytes());
+        img.extend_from_slice(&dyn_vaddr.to_le_bytes());
+        img.extend_from_slice(&(n_entries * 16).to_le_bytes());
+        img.extend_from_slice(&(n_entries * 16).to_le_bytes());
+        img.extend_from_slice(&8u64.to_le_bytes());
+        assert_eq!(img.len(), 64 + 112);
+        // pad to dyn_off
+        img.resize(dyn_off as usize, 0);
+        // --- dynamic entries (each entry = tag u64 + val u64) ---
+        let mut dyn_img: Vec<u8> = Vec::new();
+        let mut cur = 1u64; // strtab[0] = the mandatory empty string
+        for n in names {
+            dyn_img.extend_from_slice(&1u64.to_le_bytes()); // DT_NEEDED tag
+            dyn_img.extend_from_slice(&cur.to_le_bytes()); // strtab offset
+            cur += n.len() as u64 + 1;
+        }
+        dyn_img.extend_from_slice(&5u64.to_le_bytes()); // DT_STRTAB tag
+        dyn_img.extend_from_slice(&strtab_vaddr.to_le_bytes());
+        dyn_img.extend_from_slice(&0u64.to_le_bytes()); // DT_NULL tag
+        dyn_img.extend_from_slice(&0u64.to_le_bytes()); // DT_NULL val
+        assert_eq!(dyn_img.len() as u64, n_entries * 16);
+        img.extend_from_slice(&dyn_img);
+        assert_eq!(img.len(), strtab_off as usize);
+        // --- strtab (offset 0 = the mandatory empty string) ---
+        img.push(0);
+        for n in names {
+            img.extend_from_slice(n.as_bytes());
+            img.push(0);
+        }
+        img
+    }
+
+    #[test]
+    fn dt_needed_parser_6z230_extracts_names() {
+        let img = make_elf64_with_dt_needed(&["libcrypto.so", "libssl.so", "libc.so"]);
+        let names = dt_needed_names_from_bytes(&img).expect("parse");
+        assert_eq!(names, vec!["libcrypto.so", "libssl.so", "libc.so"]);
+    }
+
+    #[test]
+    fn dt_needed_parser_6z230_empty_needed_ok() {
+        // A PT_DYNAMIC with ONLY DT_STRTAB + DT_NULL → Some(vec![]).
+        let img = make_elf64_with_dt_needed(&[]);
+        assert_eq!(dt_needed_names_from_bytes(&img), Some(vec![]));
+    }
+
+    #[test]
+    fn dt_needed_parser_6z230_rejects_non_elf_and_truncated() {
+        assert_eq!(dt_needed_names_from_bytes(b"not an elf at all....."), None);
+        assert_eq!(dt_needed_names_from_bytes(&[0u8; 16]), None);
+        // ELF magic but no PT_DYNAMIC (phnum=0):
+        let mut img = vec![0u8; 64];
+        img[0..4].copy_from_slice(b"\x7fELF");
+        img[4] = 2;
+        img[5] = 1;
+        assert_eq!(dt_needed_names_from_bytes(&img), None);
+    }
+
+    #[test]
+    fn dt_needed_parser_6z230_real_artifact_binaries() {
+        // Real-artifact check: our own NDK-built test libs (written by
+        // the 6-Z227 local build). If they exist, parse them — the v7a
+        // shlib links -lc -ldl (2 DT_NEEDED), the fb_hook is nostdlib
+        // (0 or None). Tolerate absence (artifact envs without /tmp).
+        for (path, expect_dynamic) in [
+            ("/tmp/shlib_v7a.so", true),
+            ("/tmp/shlib_a64.so", true),
+            ("/tmp/fbhook_v7a.so", false),
+        ] {
+            if let Ok(data) = std::fs::read(path) {
+                let names = dt_needed_names_from_bytes(&data);
+                if expect_dynamic {
+                    let names = names.expect("dynamic ELF must parse");
+                    assert!(
+                        names.iter().any(|n| n == "libc.so"),
+                        "{} should DT_NEEDED libc.so, got {:?}",
+                        path,
+                        names
+                    );
+                } else {
+                    assert!(
+                        names.map_or(true, |n| n.is_empty()),
+                        "nostdlib fb_hook should have no DT_NEEDED"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
