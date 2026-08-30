@@ -19436,3 +19436,8 @@ Stage Summary:
   minui-era recovery (AOSP 10+ layout).
 - NEXT: dispatch CI round 2 (lineage + orangefox + 3 guards) on the 6-Z224 head; then
   corpus waves for the 90% goal.
+- CI DISPATCH round 2 (2026-08-30, on 59bc9cc / 6-Z224): 5x ui-e2e-test-arm64 —
+  run IDs 33282958247, 33282959571, 33282960621, 33282961791, 33282962805
+  (lineage-22.2-sailfish 6-Z224 verify, orangefox-R12.0-lavender 6-Z224 verify,
+  3 TWRP guards). kr64 lint+test on 59bc9cc: SUCCESS (push-triggered).
+  Mapping run->recovery via job-log RECOVERY_NAME at completion.
