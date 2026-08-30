@@ -6573,12 +6573,12 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         );
     }
 
-    // TWRP BOOT: pre-create {rootfs}/dev/input/event0 + event1 as EMPTY
-    // regular files (0644). minui's /dev/input scan (readdir + fstatat
-    // probes) needs openable "event*" names to exist; when one of them
-    // is subsequently OPENED, the i686 fb hook's input bridge intercepts
-    // the open and hands back the connected touch-events socket instead
-    // — so the files themselves never need contents.
+    // RECOVERY INPUT: pre-create {rootfs}/dev/input/event0 + event1 as
+    // EMPTY regular files (0644). minui's /dev/input scan (readdir +
+    // fstatat probes) needs openable "event*" names to exist; when one
+    // of them is subsequently OPENED, the fb hook's input bridge
+    // intercepts the open and hands back the connected touch-events
+    // socket instead — so the files themselves never need contents.
     //
     // This REPLACES the fb hook constructor's raw staging (mkdir_raw +
     // openat(O_CREAT) issued from inside the guest): those raw syscalls
@@ -6587,7 +6587,22 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // (si_code=128 SI_KERNEL, rip inside the hook's text) ~20s in,
     // BEFORE minui ran; all 600s stayed solid black. Staging here is
     // purely parent-side — no guest syscalls are involved.
-    if cfg.boot_recovery {
+    //
+    // 6-Z251g: NO LONGER gated on cfg.boot_recovery. The LD_PRELOAD fb
+    // hook (which owns the input bridge) loads in EVERY loader-path
+    // recovery boot too (OrangeFox/Lineage/AOSP — boot_recovery=false
+    // by design since 6-Z209b), and their EventHub found an EMPTY
+    // /dev/input: no event* entries -> zero input devices registered ->
+    // every tap from the host (real surface touch, debug broadcast,
+    // adb input, sendevent) vanished without a trace. Verify runs
+    // 33325977950/33327023870: the fox-nav Menu tap never produced a
+    // page marker and the guest recovery log has no event0 open at all
+    // — the touch pipeline was dead BEFORE the first tap. Same
+    // rationale as the 6-Z224 fb0/6-Z224b ashmem un-gating: creation is
+    // idempotent and harmless for full-Android guests (EventHub opens
+    // the empty regular files, the EVIOCGBIT ioctls ENOTTY, the entry
+    // is skipped; the GSI's input flows through the same touch device).
+    {
         use std::os::unix::fs::PermissionsExt;
         let input_dir = format!("{}/dev/input", rootfs_prefix);
         if let Err(e) = std::fs::create_dir_all(&input_dir) {
