@@ -403,6 +403,139 @@ static struct mount_entry g_mounts[MAX_MOUNTS];
 static pthread_mutex_t g_mount_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ---------------------------------------------------------------------------
+// 6-Z265: kernel-true BR_REPLY data backing.
+//
+// EVIDENCE (run 33334415274, OrangeFox R12 lavender): the guest's REAL
+// libbinder.so (recovery + keystore2) dereferences tr.data_ptr from every
+// BR_REPLY. The proxy used to hand v1 clients a wire tr with data_ptr=0
+// and NO reply bytes on the wire — libbinder built its reply Parcel over
+// NULL and SIGSEGV'd at si_addr=0x0. The recovery died 7 times (init kept
+// restarting it — the "soft reboots to flash back again" user report) and
+// keystore2 crash-looped 56 times (63 libbinder NULL crashes in one run).
+//
+// The proxy now appends the reply parcel bytes to the response frame as
+// a v2-style trailer even for v1 requests. Here we:
+//   1. parse that trailer,
+//   2. malloc real backing memory for [data][offsets],
+//   3. patch tr.data_ptr / tr.offsets_ptr inside the BR stream we just
+//      copied into the guest's read buffer,
+//   4. free the backing memory when the guest returns the buffer via
+//      BC_FREE_BUFFER (kernel-true lifecycle).
+// ---------------------------------------------------------------------------
+#define BP_WIRE_V2_MAGIC 0x30325657u   /* "WV20" little-endian */
+#define BP_BR_REPLY      0x80407203u   /* _IOR('r', 3, binder_transaction_data=64) */
+#define BP_TR_DATA_PTR_OFF     48u     /* binder_transaction_data.data.ptr.buffer */
+#define BP_TR_OFFSETS_PTR_OFF  56u     /* binder_transaction_data.data.ptr.offsets */
+
+#define BP_REPLY_ALLOC_MAX 32
+struct bp_reply_alloc {
+    void *base;
+    uint64_t size;
+};
+static struct bp_reply_alloc g_bp_reply_allocs[BP_REPLY_ALLOC_MAX];
+static size_t g_bp_reply_alloc_next = 0;
+static pthread_mutex_t g_bp_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void bp_alloc_register(void *base, uint64_t size) {
+    pthread_mutex_lock(&g_bp_alloc_lock);
+    // Prefer a free slot; otherwise overwrite the oldest (round-robin).
+    // Recovery traffic is a handful of transactions, so eviction of a
+    // still-live buffer would only matter for pathological floods — and
+    // a freed-under-client buffer is exactly what the real kernel does
+    // under memory pressure anyway (BR_FROZEN_REPLY / transaction
+    // failure), which libbinder handles.
+    size_t start = g_bp_reply_alloc_next;
+    size_t slot = start;
+    for (size_t i = 0; i < BP_REPLY_ALLOC_MAX; i++) {
+        size_t idx = (start + i) % BP_REPLY_ALLOC_MAX;
+        if (g_bp_reply_allocs[idx].base == NULL) { slot = idx; break; }
+    }
+    g_bp_reply_allocs[slot].base = base;
+    g_bp_reply_allocs[slot].size = size;
+    g_bp_reply_alloc_next = (slot + 1) % BP_REPLY_ALLOC_MAX;
+    pthread_mutex_unlock(&g_bp_alloc_lock);
+}
+
+static void bp_alloc_free(uintptr_t ptr) {
+    if (ptr == 0) return;
+    pthread_mutex_lock(&g_bp_alloc_lock);
+    for (size_t i = 0; i < BP_REPLY_ALLOC_MAX; i++) {
+        if (g_bp_reply_allocs[i].base != NULL &&
+            (uintptr_t)g_bp_reply_allocs[i].base == ptr) {
+            free(g_bp_reply_allocs[i].base);
+            g_bp_reply_allocs[i].base = NULL;
+            g_bp_reply_allocs[i].size = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_alloc_lock);
+}
+
+/// Walk the copied BR stream for BR_REPLY commands and give every one a
+/// real backing allocation from the proxy's reply-blob trailer.
+static void bp_patch_reply_data(uint8_t *stream, uint64_t stream_len,
+                                const uint8_t *tail, uint64_t tail_len) {
+    if (tail_len < 8) return;
+    uint32_t magic;
+    memcpy(&magic, tail, 4);
+    if (magic != BP_WIRE_V2_MAGIC) return;
+    uint32_t blob_count;
+    memcpy(&blob_count, tail + 4, 4);
+    const uint8_t *p = tail + 8;
+    uint64_t rem = tail_len - 8;
+    uint32_t blob_idx = 0;
+
+    uint64_t pos = 0;
+    while (pos + 4 <= stream_len && blob_idx < blob_count) {
+        uint32_t cmd;
+        memcpy(&cmd, stream + pos, 4);
+        uint32_t sz = (cmd >> 16) & 0x3fff;
+        if (cmd == BP_BR_REPLY && pos + 4 + 64 <= stream_len) {
+            if (rem < 8) return;
+            uint32_t dlen, olen;
+            memcpy(&dlen, p, 4);
+            memcpy(&olen, p + 4, 4);
+            p += 8; rem -= 8;
+            if (rem < (uint64_t)dlen + olen) return;
+            // [data][offsets] in one allocation; offsets_ptr = base + dlen.
+            uint8_t *back = (uint8_t *)malloc((size_t)(dlen + olen ? dlen + olen : 1));
+            if (back) {
+                if (dlen) memcpy(back, p, dlen);
+                if (olen) memcpy(back + dlen, p + dlen, olen);
+                bp_alloc_register(back, (uint64_t)dlen + olen);
+                uint64_t data_ptr = (uint64_t)(uintptr_t)back;
+                uint64_t offsets_ptr = (uint64_t)(uintptr_t)(back + dlen);
+                memcpy(stream + pos + 4 + BP_TR_DATA_PTR_OFF, &data_ptr, 8);
+                memcpy(stream + pos + 4 + BP_TR_OFFSETS_PTR_OFF, &offsets_ptr, 8);
+            }
+            // On malloc failure the tr keeps data_ptr=0 (the pre-6-Z265
+            // behavior) — no worse than before.
+            p += dlen + olen; rem -= (uint64_t)dlen + olen;
+            blob_idx++;
+        }
+        pos += 4 + sz;
+    }
+}
+
+/// Release the backing memory for buffers the guest returned via
+/// BC_FREE_BUFFER (type 'c', nr 3, payload = binder_uintptr_t buffer).
+static void bp_free_returned_buffers(const uint8_t *wb, uint64_t ws) {
+    uint64_t pos = 0;
+    while (pos + 4 <= ws) {
+        uint32_t cmd;
+        memcpy(&cmd, wb + pos, 4);
+        uint32_t sz = (cmd >> 16) & 0x3fff;
+        if ((uint8_t)((cmd >> 8) & 0xff) == (uint8_t)'c' &&
+            (uint8_t)(cmd & 0xff) == 3 && sz == 8 && pos + 4 + 8 <= ws) {
+            uint64_t bufptr;
+            memcpy(&bufptr, wb + pos + 4, 8);
+            bp_alloc_free(bufptr);
+        }
+        pos += 4 + sz;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Binder fallback fd tracking.
 //
 // When binder_open_fallback() returns a /dev/null fd in place of a real
@@ -758,6 +891,15 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
     // Single frame: [u32 WRITE_READ][u32 8+ws][u32 ws][u32 read_cap][bytes]
     uint64_t ws = bwr->write_size - bwr->write_consumed;
     uint32_t req_len = (uint32_t)(8 + ws);
+
+    // 6-Z265: peek the outgoing BC stream for BC_FREE_BUFFER commands and
+    // release the backing allocations the guest is returning (kernel-true
+    // transaction-buffer lifecycle). Must happen BEFORE the forwarding so
+    // even a transport failure can't leak them.
+    if (ws > 0 && bwr->write_buffer != 0) {
+        bp_free_returned_buffers(
+            (const uint8_t *)(uintptr_t)(bwr->write_buffer + bwr->write_consumed), ws);
+    }
     unsigned char *req = (unsigned char *)malloc(req_len);
     if (!req) { errno = ENOMEM; return -1; }
     uint32_t ws32 = (uint32_t)ws;
@@ -799,6 +941,15 @@ static int binder_proxy_write_read(int fd, struct bp_binder_write_read *bwr) {
                      ? (uint64_t)srv_read : bwr->read_size;
     if (ncopy > 0) {
         memcpy((void *)(uintptr_t)bwr->read_buffer, resp + 4, (size_t)ncopy);
+        // 6-Z265: the proxy appends a v2-style trailer with the reply
+        // parcel bytes even for v1 requests. Back every BR_REPLY's
+        // data_ptr/offsets_ptr with real memory so real libbinder clients
+        // never build a Parcel over NULL (the OrangeFox R12 lavender
+        // recovery + keystore2 SIGSEGV class).
+        if ((uint64_t)rlen > 4ull + srv_read) {
+            bp_patch_reply_data((uint8_t *)(uintptr_t)bwr->read_buffer, ncopy,
+                                resp + 4 + srv_read, (uint64_t)rlen - 4ull - srv_read);
+        }
         if (ncopy < (uint64_t)srv_read) {
             char msg[192];
             snprintf(msg, sizeof(msg),
@@ -845,6 +996,14 @@ static int binder_proxy_ioctl(int fd, unsigned req, void *argp) {
     // never forward it down the wire).
     if (req == 0x4018620du) {
         write_str(2, "[twoyi_loader] ioctl(BINDER_SET_CONTEXT_MGR_EXT) -> success\n");
+        return 0;
+    }
+    // 6-Z265: BINDER_ENABLE_ONEWAY_SPAM_DETECTION = 0x40046210 — Android
+    // 11+ libbinder arms it right after the handshake; the real kernel
+    // always accepts, so satisfy it locally instead of an EINVAL round
+    // trip (run 33334415274: OrangeFox R12 recovery + keystore2 both hit
+    // the unknown-ioctl path).
+    if (req == 0x40046210u) {
         return 0;
     }
 

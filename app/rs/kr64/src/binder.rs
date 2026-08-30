@@ -416,6 +416,13 @@ pub const BINDER_SET_IDLE_TIMEOUT: u32 = _IOW(BINDER_IOC_TYPE, 3, 8);
 /// decide when to send `BR_SPAWN_LOOPER`.
 pub const BINDER_SET_MAX_THREADS: u32 = _IOW(BINDER_IOC_TYPE, 5, 4);
 
+/// `BINDER_ENABLE_ONEWAY_SPAM_DETECTION` — Android 11+ libbinder arms
+/// oneway spam detection right after the handshake (run 33334415274:
+/// OrangeFox R12 lavender's recovery + keystore2 both issued ioctl
+/// 0x40046210; the proxy's "unknown ioctl → -EINVAL" answer turned each
+/// process start into an error path — 6-Z265).
+pub const BINDER_ENABLE_ONEWAY_SPAM_DETECTION: u32 = _IOW(BINDER_IOC_TYPE, 16, 4);
+
 /// `BINDER_SET_IDLE_PRIORITY` — historical, no longer used.
 #[allow(dead_code)]
 pub const BINDER_SET_IDLE_PRIORITY: u32 = _IOW(BINDER_IOC_TYPE, 6, 4);
@@ -1816,6 +1823,20 @@ fn dispatch_request(
             }
         }
 
+        BINDER_ENABLE_ONEWAY_SPAM_DETECTION => {
+            // 6-Z265: the real kernel accepts this unconditionally (it
+            // only arms an internal flood counter) — ACK with 0 so real
+            // libbinder clients don't log/handle EINVAL on handshake.
+            info!(
+                "[KR64][binder][vm{}] ENABLE_ONEWAY_SPAM_DETECTION (acknowledged)",
+                vm_id
+            );
+            Resp {
+                ret: 0,
+                payload: Vec::new(),
+            }
+        }
+
         BINDER_SET_CONTEXT_MGR | BINDER_SET_CONTEXT_MGR_KERNEL => {
             // Both spellings accepted: the kernel/bionic header spells it
             // `_IOW('b',7,__s32)` = 0x40046207 (BINDER_SET_CONTEXT_MGR_KERNEL);
@@ -1993,17 +2014,14 @@ fn handle_write_read(
                         // then loops to read BR_REPLY.
                         push_br_transaction_complete(&mut read_buf);
                         push_br_reply(&mut read_buf, data.len() as u64, offsets.len() as u64);
-                        if is_v2 {
-                            // v2: the reply parcel bytes ride in the
-                            // response trailer; tr.data_ptr / tr.offsets_ptr
-                            // stay 0 on the wire (the client patches them
-                            // from the blob index before copying into mIn).
-                            reply_blobs.push((data, offsets));
-                        }
-                        // v1: the reply parcel bytes are not on the wire —
-                        // the z113 client can't dereference tr.data_ptr=0
-                        // anyway, so the legacy synthetic shapes are the
-                        // best we can do (6-Z114 §2.4 / §4.4).
+                        // The reply parcel bytes ALWAYS ride the response
+                        // trailer (6-Z265): v2 clients (z113 shim) patch
+                        // tr.data_ptr/offsets_ptr from the blob index; v1
+                        // clients are REAL libbinder users that dereference
+                        // tr.data_ptr, so the hook backs that pointer with
+                        // the blob bytes. On the wire tr.data_ptr stays 0
+                        // in both cases.
+                        reply_blobs.push((data, offsets));
                     }
                 }
             }
@@ -2085,10 +2103,18 @@ fn handle_write_read(
 
     // Build the wire response: [u32 read_size][read_size BR_* bytes] plus
     // the optional v2 trailer [u32 WIRE_V2_MAGIC][u32 blob_count][blobs…].
+    //
+    // 6-Z265: the trailer is ALSO appended for v1 requests when the BC
+    // stream produced reply parcels. v1 clients are REAL libbinder users
+    // (OrangeFox R12 recovery, keystore2 — anything not built against the
+    // z113 shim): they dereference tr.data_ptr, so the hook needs the
+    // actual reply bytes to back that pointer with real memory. Hooks
+    // that don't parse the trailer already bound their copy by srv_read
+    // and simply ignore the extra bytes — backward compatible.
     let mut resp_payload = Vec::with_capacity(4 + read_buf.len() + 8);
     resp_payload.extend_from_slice(&(read_buf.len() as u32).to_ne_bytes());
     resp_payload.extend_from_slice(&read_buf);
-    if is_v2 {
+    if is_v2 || !reply_blobs.is_empty() {
         resp_payload.extend_from_slice(&WIRE_V2_MAGIC.to_ne_bytes());
         resp_payload.extend_from_slice(&(reply_blobs.len() as u32).to_ne_bytes());
         for (data, offsets) in &reply_blobs {
@@ -2974,6 +3000,125 @@ mod tests {
     }
 
     // -------- ThreadPool ----------------------------------------------
+
+    // -------- 6-Z265: kernel-true reply delivery for v1 (real-libbinder)
+    // clients ----------------------------------------------------------
+    //
+    // EVIDENCE (run 33334415274, OrangeFox R12 lavender): the guest's
+    // REAL libbinder.so sends plain-v1 BC_TRANSACTION (no v2 trailer).
+    // The old wire dropped the reply bytes for v1 and returned
+    // tr.data_ptr=0 — real libbinder dereferences that pointer → SIGSEGV
+    // si_addr=0x0 in libbinder.so → recovery died 7 times (init kept
+    // restarting it = the "soft reboots to flash back again" report) and
+    // keystore2 crash-looped 56 times. The proxy must now append the
+    // reply blob to the response even for v1 requests; the hook backs
+    // the pointer with real memory.
+
+    #[test]
+    fn z265_v1_transaction_response_carries_reply_blob_trailer() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // A REAL libbinder BC_TRANSACTION: target handle 0 (servicemanager),
+        // code 1 (SVC_MGR_GET_SERVICE), NO v2 trailer after the BC stream.
+        let mut tx = [0u8; std::mem::size_of::<BinderTransactionData>()];
+        tx[0..4].copy_from_slice(&0u32.to_ne_bytes()); // target handle 0
+        tx[16..20].copy_from_slice(&1u32.to_ne_bytes()); // code = GET_SERVICE
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&((4 + tx.len()) as u32).to_ne_bytes()); // write_size
+        payload.extend_from_slice(&256u32.to_ne_bytes()); // read_capacity
+        payload.extend_from_slice(&BC_TRANSACTION.to_ne_bytes()); // cmd
+        payload.extend_from_slice(&tx);
+
+        let mut req = Vec::new();
+        req.extend_from_slice(&BINDER_WRITE_READ.to_ne_bytes());
+        req.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
+        req.extend_from_slice(&payload);
+        stream.write_all(&req).expect("write request");
+
+        let mut hdr = [0u8; 8];
+        stream.read_exact(&mut hdr).expect("read response header");
+        let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
+        let arg_len = u32::from_ne_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        assert_eq!(ret, 0);
+        let mut resp = vec![0u8; arg_len];
+        stream.read_exact(&mut resp).expect("read response payload");
+
+        // [u32 read_size][BR stream][trailer: magic + count + blob…]
+        let read_size = u32::from_ne_bytes(resp[0..4].try_into().unwrap()) as usize;
+        assert!(read_size >= 72, "expect BR_TRANSACTION_COMPLETE + BR_REPLY");
+        let cmd0 = u32::from_ne_bytes(resp[4..8].try_into().unwrap());
+        assert_eq!(cmd0, BR_TRANSACTION_COMPLETE, "batch starts with COMPLETE");
+        let cmd1 = u32::from_ne_bytes(resp[8..12].try_into().unwrap());
+        assert_eq!(cmd1, BR_REPLY, "then BR_REPLY");
+        // The on-wire tr still carries data_ptr=0 (the hook patches it to
+        // the backing allocation it makes for the client).
+        let wire_data_ptr = u64::from_ne_bytes(resp[8 + 4 + 48..8 + 4 + 56].try_into().unwrap());
+        assert_eq!(wire_data_ptr, 0, "wire tr.data_ptr stays 0 (hook patches)");
+
+        // The trailer MUST be present for the v1 request now.
+        let tail = &resp[4 + read_size..];
+        assert!(tail.len() >= 8, "v1 response must carry the blob trailer");
+        let magic = u32::from_ne_bytes(tail[0..4].try_into().unwrap());
+        assert_eq!(magic, WIRE_V2_MAGIC, "trailer magic");
+        let count = u32::from_ne_bytes(tail[4..8].try_into().unwrap());
+        assert_eq!(count, 1, "one reply blob");
+        let dlen = u32::from_ne_bytes(tail[8..12].try_into().unwrap()) as usize;
+        let olen = u32::from_ne_bytes(tail[12..16].try_into().unwrap()) as usize;
+        assert_eq!(dlen, 28, "status-ok (4) + flat_binder_object (24)");
+        assert_eq!(olen, 8, "one offsets entry (binder_size_t = u64)");
+        assert!(
+            tail.len() >= 16 + dlen + olen,
+            "trailer must carry the full blob bytes"
+        );
+        // Reply must parse as AIDL Status::ok (EX_NONE = 0)…
+        let status = i32::from_ne_bytes(tail[16..20].try_into().unwrap());
+        assert_eq!(status, 0, "EX_NONE");
+        // …followed by a BINDER_TYPE_BINDER null-binder flat object.
+        let ftype = u32::from_ne_bytes(tail[20..24].try_into().unwrap());
+        assert_eq!(ftype, BINDER_TYPE_BINDER, "null binder (service miss)");
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    #[test]
+    fn z265_oneway_spam_detection_ioctl_is_acknowledged() {
+        let rootfs = tmpdir();
+        let path = create_binder_device(&rootfs, 0).expect("create_binder_device");
+        let proxy = BinderProxy::new(0, &path).expect("BinderProxy::new");
+        let handle = proxy.spawn().expect("BinderProxy::spawn");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut stream = UnixStream::connect(&path).expect("connect");
+
+        // The exact number real libbinder sends (Android 11+):
+        // _IOW('b', 16, __u32) = 0x40046210.
+        assert_eq!(BINDER_ENABLE_ONEWAY_SPAM_DETECTION, 0x4004_6210);
+        let mut req = Vec::new();
+        req.extend_from_slice(&BINDER_ENABLE_ONEWAY_SPAM_DETECTION.to_ne_bytes());
+        req.extend_from_slice(&4u32.to_ne_bytes());
+        req.extend_from_slice(&0u32.to_ne_bytes());
+        stream.write_all(&req).expect("write request");
+
+        let mut hdr = [0u8; 8];
+        stream.read_exact(&mut hdr).expect("read response header");
+        let ret = i32::from_ne_bytes(hdr[0..4].try_into().unwrap());
+        assert_eq!(ret, 0, "ENABLE_ONEWAY_SPAM_DETECTION must ACK, not EINVAL");
+
+        drop(stream);
+        drop(handle);
+        let _ = fs::remove_dir_all(&rootfs);
+    }
+
+    // -------- ThreadPool (original) ------------------------------------
 
     #[test]
     fn thread_pool_executes_jobs() {
