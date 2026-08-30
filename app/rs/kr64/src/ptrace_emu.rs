@@ -9454,7 +9454,42 @@ fn write_translated_path(
     scratch_offset: &mut usize,
     translated: &str,
 ) -> bool {
+    // 6-Z250: named failure stages — the bare `false` left the call-site
+    // WARNING unable to distinguish "scratch never reserved" from "POKE
+    // failed (errno?)" from "fresh-regs getregs/setregs failed", and the
+    // titan fstab class (run 33320923222: /etc/recovery.fstab open ->
+    // ENOENT -> "Failing out of recovery") was undiagnosable. Rate-capped
+    // so retry loops do not flood the log.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WTP_FAIL_DIAG: AtomicU64 = AtomicU64::new(0);
+    macro_rules! wtp_fail {
+        ($stage:expr) => {{
+            let n = WTP_FAIL_DIAG.fetch_add(1, Ordering::Relaxed);
+            if n < 40 {
+                // This is a free fn outside the ptrace loop's `log`
+                // closure — mirror its discipline (prefix + cap) directly.
+                let msg = format!(
+                    "6-Z250: write_translated_path FAILED stage={} pid={} addr={:#x} off={} path={:?} errno={}",
+                    $stage,
+                    pid,
+                    scratch_addr,
+                    scratch_offset,
+                    translated,
+                    std::io::Error::last_os_error()
+                );
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(
+                    format!(
+                        "[KR64][ptrace] {}\n",
+                        crate::cap_log_line(&msg, crate::MAX_LOG_LINE)
+                    )
+                    .as_bytes(),
+                );
+            }
+        }};
+    }
     if scratch_addr == 0 {
+        wtp_fail!("scratch-not-allocated");
         return false; // scratch page not yet allocated
     }
     // Task 6-Z14: check for overflow BEFORE writing. The scratch area is
@@ -9470,6 +9505,7 @@ fn write_translated_path(
     }
     let new_addr = scratch_addr + *scratch_offset as u64;
     if !write_child_string_unchecked(pid, new_addr, translated) {
+        wtp_fail!("poke");
         return false;
     }
     // 6-Z135: FRESH-REGS DISCIPLINE — take a FRESH getregs snapshot and
@@ -9489,10 +9525,12 @@ fn write_translated_path(
     {
         let mut fresh: Regs = unsafe { std::mem::zeroed() };
         if ptrace_getregs(pid, &mut fresh).is_err() {
+            wtp_fail!("fresh-getregs");
             return false;
         }
         set_syscall_arg(&mut fresh, path_arg_index, new_addr);
         if ptrace_setregs(pid, &fresh, iov_len).is_err() {
+            wtp_fail!("fresh-setregs");
             return false;
         }
     }
