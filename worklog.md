@@ -21486,3 +21486,44 @@ Stage Summary:
   fix (the /twres stat path) should clear all four.
 - NEXT: collect the /twres stat-family DIAG evidence (6-Z244's
   dispatched runs) and the 6-Z246/6-Z247 verify rounds.
+
+---
+Task ID: 6-Z250
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: decode the titan fstab failure (run 33320923222 — the one 6-Z246 verify run with a non-0x2c signature) + instrument write_translated_path's failure stages.
+
+Work Log:
+- TITAN DECODE (run 33320923222, cf25594 head): recovery printed
+  "E:Critical Error: Unable to open fstab at '/etc/recovery.fstab'."
+  then "E:Failing out of recovery due to problem with fstab." — clean
+  exit, no SIGSEGV. Local titan ramdisk inspection: /etc contains ONLY
+  mke2fs.conf + twrp.fstab — NO recovery.fstab, NO /fstab.<hw> at
+  root. h830 (same TWRP generation) survives via /fstab.h1 at root;
+  titan's fallback chain ends at /etc/twrp.fstab — so the fstab glob
+  / read failed in the virtualized env.
+- SMOKING GUN in the trace (loop 4596+): TWO+ openat("/etc/
+  recovery.fstab") each hit "WARNING: write_translated_path FAILED
+  ... falling back to in-place overwrite (will likely fail for longer
+  paths)" — the tracer could not stage the LONGER host path into the
+  child scratch, the in-place overwrite of a longer string cannot
+  work, the guest openat consumed a corrupted/truncated path →
+  ENOENT → TWRP failed out. Note the SAR-detection open of the SAME
+  path had WORKED moments earlier (scratch reserve at that sp
+  succeeded) — the failure is sp/stack-layout dependent, not
+  path-dependent.
+- FIX 6-Z250 (ptrace_emu.rs write_translated_path): named failure
+  stages — scratch-not-allocated / poke (+errno) / fresh-getregs /
+  fresh-setregs — rate-capped (40), mirrors the loop log's prefix +
+  line-cap discipline. The next titan-class run names the exact
+  failing stage + errno instead of a bare false.
+- GATES: 658 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- titan = write_translated_path staging failure class; instrumented.
+- The 6-Z246 verify round (6 runs): 5/6 BOOT_OK (was BOOT_FAIL),
+  crashes moved to the 0x2c theme class; 6-Z246 DIAGs fired in every
+  run (16 lines each) — the guard is live and effective.
+- NEXT: commit+push; dispatch titan verify to read the 6-Z250 stage;
+  collect the /twres theme evidence (grouper on 39233aa head); the
+  spin class (ocean/kebab on b85cb30) results pending.
