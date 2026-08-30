@@ -969,6 +969,24 @@ struct ChildAbi {
     // `lchown`/`chown`/`mknod`/`pause` (all -1 on aarch64).
     mmap: i64,
     mmap2: i64,
+    // 6-Z240: does this ABI's HOST runtime block file-backed mmap2 via
+    // seccomp, so the tracer must rewrite every file-backed mmap to
+    // ANONYMOUS + inject content at EXIT (Task 6-Z2/6-Y/6-Z62)? TRUE for
+    // i386 ONLY: the x86_64 zygote's seccomp filter blocks ALL file-backed
+    // mmap2 for i386 compat children. FALSE for every other ABI —
+    // CRITICALLY for ABI_ARM32 (6-Z227): an arm32 child on an arm64 host
+    // (redroid / real device) executes its mmap2 NATIVELY and the kernel
+    // serves the REAL file bytes. 6-Z227 added mmap2=192 to ABI_ARM32 for
+    // syscall-table completeness, which accidentally re-armed this rewrite
+    // for arm32 guests — every file-backed library mmap was rewritten to
+    // anonymous and the 6-Z62 injection served garbage, recreating the
+    // EXACT 6-Z133 corruption class on arm64 hosts (merlin run
+    // 33310476565: the guest linker's MAP_PRIVATE shdr-table mmap of the
+    // arm32 fb_hook (fd=3) was rewritten → zeros → "\"...libtwrp_fb_hook.so\"
+    // .dynamic section header was not found" despite the fd serving
+    // byte-perfect content (6-Z238 fd-dump proof). The rewrite is an i386
+    // compat workaround, NOT a generic virtualization semantic (§22).
+    mmap2_rewrite_for_seccomp: bool,
     // socketcall — Task 6-Z3. i386 multiplexed socket syscall
     // (nr=102). arg1 = sub-call number (1=socket, 2=bind, 3=connect,
     // 4=listen, 5=accept, ...); arg2 = pointer to an array of the
@@ -1504,6 +1522,9 @@ const ABI_X86_64: ChildAbi = ChildAbi {
     // mmap of /dev/__properties__ to anonymous (Task 6-Y).
     mmap: 9,
     mmap2: -1, // x86_64 has no mmap2 — sentinel.
+    // 6-Z240: x86_64 guests mmap file-backed regions natively (and this
+    // ABI never enters the mmap2 arm — the sentinel above).
+    mmap2_rewrite_for_seccomp: false,
     // x86_64 socketcall = -1 (SENTINEL — x86_64 has no socketcall;
     // x86_64 uses the direct socket/bind/listen/connect/accept
     // syscalls instead, per /usr/include/x86_64-linux-gnu/asm/
@@ -1856,6 +1877,10 @@ const ABI_X86_32: ChildAbi = ChildAbi {
     // root-cause analysis.
     mmap: -1,   // i386 plain mmap (nr=90) — unused by modern bionic.
     mmap2: 192, // i386 mmap2 — the value that fires at runtime.
+    // 6-Z240: the ONLY ABI where the rewrite is correct — the x86_64
+    // zygote's seccomp blocks ALL file-backed mmap2 for i386 compat
+    // children (Task 6-Z2 evidence), so anonymous+inject is required.
+    mmap2_rewrite_for_seccomp: true,
     // i386 socketcall = 102 (per /usr/include/x86_64-linux-gnu/asm/
     // unistd_32.h: __NR_socketcall 102, verified directly against the
     // kernel's UAPI header in Task 6-Z3). THIS is the value that fires
@@ -2212,6 +2237,8 @@ const ABI_AARCH64: ChildAbi = ChildAbi {
     // `ChildAbi` for the full root-cause analysis (Task 6-Y).
     mmap: 222,
     mmap2: -1, // asm-generic has no mmap2 — sentinel.
+    // 6-Z240: aarch64 guests mmap file-backed regions natively.
+    mmap2_rewrite_for_seccomp: false,
     // aarch64 socketcall = -1 (SENTINEL — asm-generic has NO
     // socketcall; aarch64 uses the direct socket/bind/listen/connect/
     // accept syscalls instead, per /usr/include/asm-generic/unistd.h:
@@ -2383,6 +2410,14 @@ const ABI_ARM32: ChildAbi = ChildAbi {
     read: 3,
     mmap: -1, // arm plain mmap(90) = old_mmap semantics — unused by bionic
     mmap2: 192,
+    // 6-Z240: arm32 children execute mmap2 NATIVELY on the arm64 host —
+    // the kernel serves real file bytes and NO seccomp filter blocks it
+    // (probe evidence run 33310476565: the guest linker mapped 30+ arm32
+    // libs natively). The anonymous rewrite here recreated the 6-Z133
+    // corruption class for every ELF32 guest (merlin: the linker's
+    // MAP_PRIVATE shdr-table mmap of fd=3 → zeros → ".dynamic section
+    // header was not found"). Must NEVER rewrite for this ABI.
+    mmap2_rewrite_for_seccomp: false,
     socketcall_nr: -1, // arm bionic uses DIRECT socket syscalls (281+)
     poll_nr: 168,
     set_thread_area_nr: -1, // x86-only; arm TLS uses the private ARM_NR range
@@ -15875,7 +15910,10 @@ pub fn run_ptrace_loop(
                             // file mappings (app-owned files —
                             // allowed, and cross-process property
                             // sharing actually works).
-                            if (flags & libc::MAP_ANONYMOUS) == 0 && abi.mmap2 != -1 {
+                            if (flags & libc::MAP_ANONYMOUS) == 0
+                                && abi.mmap2 != -1
+                                && abi.mmap2_rewrite_for_seccomp
+                            {
                                 // ── Task 6-Z62: snapshot the ORIGINAL mmap
                                 // args for the EXIT-side content injection.
                                 //
@@ -28724,6 +28762,50 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!is_property_metadata_file("/dev/__properties__x/file"));
         assert!(!is_property_metadata_file("relative"));
     }
+
+    // ── 6-Z240: the file-backed mmap2→anonymous rewrite is I386-ONLY ────
+    //
+    // 6-Z227 added mmap2=192 to ABI_ARM32 for syscall-table completeness,
+    // which re-armed the 6-Z2/6-Y/6-Z62 anonymous rewrite for arm32 guests:
+    // the guest linker's MAP_PRIVATE library mmaps were rewritten to
+    // anonymous and the injection served garbage — the 6-Z133 corruption
+    // class again, now on arm64 hosts (merlin run 33310476565: fd=3 = the
+    // arm32 fb_hook; the linker's shdr-table mmap read zeros → ".dynamic
+    // section header was not found"). The rewrite exists ONLY because the
+    // x86_64 zygote's seccomp blocks file-backed mmap2 for i386 compat
+    // children; every other ABI must run file-backed mmaps NATIVELY.
+    #[test]
+    fn z240_mmap2_rewrite_is_i386_only() {
+        assert!(
+            ABI_X86_32.mmap2_rewrite_for_seccomp,
+            "i386 compat children NEED the anonymous rewrite (zygote seccomp)"
+        );
+        assert!(
+            !ABI_X86_64.mmap2_rewrite_for_seccomp,
+            "x86_64 mmaps natively (6-Z133 evidence)"
+        );
+        // The gate must also be consistent with the sentinel contract:
+        // only ABIs that HAVE an mmap2 number can ever enter the arm.
+        assert_ne!(ABI_X86_32.mmap2, -1);
+        assert_eq!(ABI_X86_64.mmap2, -1);
+        // ABI_AARCH64 / ABI_ARM32 exist only on aarch64 host builds (the
+        // redroid E2E target — exactly where the 6-Z240 arm32 corruption
+        // fired).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(
+                !ABI_ARM32.mmap2_rewrite_for_seccomp,
+                "arm32 children mmap file-backed regions natively — the rewrite corrupts every ELF32 guest link"
+            );
+            assert!(
+                !ABI_AARCH64.mmap2_rewrite_for_seccomp,
+                "aarch64 mmaps natively (6-Z133 evidence)"
+            );
+            assert_ne!(ABI_ARM32.mmap2, -1);
+            assert_eq!(ABI_AARCH64.mmap2, -1);
+        }
+    }
+
     // ── 6-Z203: ashmem ioctl request parsing (mirrors the hook's
     // 6-Z171c constants — run 33189885036 whyred's CodeCache abort) ────
 
