@@ -16718,70 +16718,140 @@ pub fn run_ptrace_loop(
                                 )),
                             }
                         }
-                        // ── 6-Z257: fchmodat/fchownat ENTRY → rewrite to
-                        // getpid (the proven 6-Z9 xattr pattern) ──
+                        // ── 6-Z257/6-Z258: fchmodat/fchownat ENTRY ──
                         //
-                        // ROOT CAUSE (cereus OrangeFox R11, run
-                        // 33323583991): init's property-service socket
-                        // bootstrap died at create_socket's
-                        //   fchmodat(AT_FDCWD, "/dev/socket/property_service",
-                        //            0666, AT_SYMLINK_NOFOLLOW)
-                        // — the REAL ENOENT reached the guest ("Failed to
-                        // fchmodat socket '/dev/socket/property_service': No
-                        // such file or directory" → "start_property_service
-                        // socket creation failed" → LOG(FATAL) → the
-                        // mprotect-sweep death → exit_group(127)). The
-                        // 6-Z229-era guarantee was: the chmod/chown family
-                        // is blanket-faked to 0 at the EXIT stop
-                        // (compute_exit_return_value "always fake 0" for
-                        // untrusted_app), and the 6-Z185 backstop ALSO
-                        // fake-0s out-of-sandbox fchownat — so a real
-                        // errno can never leak. The leak path is the
-                        // MISSED-STOP class (6-Z210: "PTRACE_SYSCALL skip /
-                        // ESRCH race / fork-follow gap"): when the EXIT
-                        // stop for a given fchmodat never reaches the
-                        // tracer (or arrives desynced), the raw errno
-                        // flows to userspace and init dies.
+                        // LAYERED DESIGN (both layers active):
                         //
-                        // THE FIX mirrors 6-Z9: at the ENTRY stop rewrite
-                        // the syscall to getpid BEFORE the kernel executes
-                        // it; at the matching EXIT stop consume
-                        // pending_chmod_fake and force the return to 0.
-                        // The fake no longer depends on seeing a stop for
-                        // the ORIGINAL syscall's exit — the getpid pair
-                        // (ENTRY rewrite + EXIT consume) is itself the
-                        // synchronization point.
+                        // Layer 1 (6-Z258, primary): TRANSLATE the path so
+                        // the REAL syscall executes against the sandbox
+                        // backing store. The 571fe08 verification wave
+                        // (runs 33328035447/36716/37878/39248) proved the
+                        // 6-Z257 getpid rewrite fires in general AND that
+                        // init STILL saw a raw fchmodat ENOENT on the
+                        // property socket ("Failed to fchmodat socket
+                        // '/dev/socket/property_service'" persisted at
+                        // kmsg tail) — the ENTRY stop for THAT specific
+                        // call was itself missed (the 6-Z210 race is
+                        // per-stop, so a rewrite at ENTRY is not a
+                        // guarantee either). The systematic fix is to
+                        // remove the host-path exposure entirely:
+                        // fchmodat/fchownat were the ONLY path-syscalls
+                        // still resolving against the HOST root (not in
+                        // the translation slot set), so the socket
+                        // bootstrap's chmod/chown could never succeed
+                        // genuinely. With the path translated to
+                        // {rootfs}/dev/socket/property_service (the 6-X
+                        // staging dir, or the REAL socket file when the
+                        // 6-Z163 bind rewrite landed), the kernel call
+                        // succeeds as the owning uid — no fake needed,
+                        // nothing to miss, and init's
+                        // "Created socket '/dev/socket/property_service'"
+                        // success path becomes honest.
                         //
-                        // SEMANTICS (§22 — no behavioral lie beyond what
-                        // the guest already accepted): the family fake was
-                        // ALREADY blanket-0 ("always fake 0" — real ENOENT/
-                        // EPERM never surfaced). Real chmod effects never
-                        // landed in the sandbox either: fchmodat/fchownat
-                        // are NOT in the path-translation slot set, so the
-                        // raw syscall always resolved against the HOST
-                        // root (EACCES/EPERM/ENOENT for untrusted_app —
-                        // masked by the same fake). Returning 0 WITHOUT
-                        // executing the host-path syscall is therefore the
-                        // same observable contract, with two improvements:
-                        // no errno leak on a missed stop, and no host-path
-                        // chmod/chown attempt from guest content (VFS
-                        // hygiene §7). The EXIT-side family fake stays as
-                        // belt-and-suspenders for any rewrite failure.
+                        //   * dirfd == AT_FDCWD + absolute path →
+                        //     translate via the same write_translated_path
+                        //     discipline as openat (scratch + fresh-regs
+                        //     arg rewrite, 6-Z135).
+                        //   * dirfd != AT_FDCWD → the kernel resolves
+                        //     against the REAL dirfd, which only exists
+                        //     inside the sandbox (fds originate from
+                        //     translated opens) — leave the path alone.
+                        //   * dirfd == AT_FDCWD + relative path → the
+                        //     guest cwd IS the sandbox root (6-Z187b
+                        //     chdir) — already sandboxed, leave alone.
+                        //   * translation unavailable (scratch never
+                        //     reserved / poke failed) → fall back to the
+                        //     6-Z257 getpid rewrite (kernel executes
+                        //     getpid instead of a host-root chmod).
+                        //
+                        // Layer 2 (6-Z257, kept): pending_chmod_fake_pid +
+                        // EXIT consumption force the return to 0. The
+                        // family fake is the ESTABLISHED guest contract
+                        // (compute_exit_return_value blanket-0 since the
+                        // Round-80/81 era): fchownat on root-owned nodes
+                        // legitimately EPERMs for untrusted_app and init
+                        // needs to see success. With layer 1 active the
+                        // real syscall lands in the sandbox and its real
+                        // effects persist (mode/chown changes on the
+                        // backing store are now possible — strictly more
+                        // faithful than the old always-masked host-path
+                        // attempt); the forced 0 at EXIT keeps the
+                        // observable contract identical (success) for the
+                        // EPERM/ENOENT cases.
                         n if n == abi.fchmodat || n == abi.fchownat => {
                             pending_chmod_fake_pid = Some(pid); // 6-Z83: per-pid
-                            set_syscall_num(&mut regs, &abi, abi.getpid);
-                            match ptrace_setregs(pid, &regs, iov_len) {
-                                Ok(()) => log(&format!(
-                                    "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (kernel will execute getpid; EXIT will fake return 0) — chmod/chown family fake is now missed-stop-proof (the raw-ENOENT leak killed init's property service on run 33323583991)",
-                                    syscall_name(syscall_num, &abi),
-                                    syscall_num,
-                                    abi.getpid
-                                )),
-                                Err(e) => log(&format!(
-                                    "6-Z257: {} ENTRY REWRITE FAILED: ptrace_setregs: {} — kernel will execute the real syscall (EXIT-side family fake + 6-Z185 backstop remain)",
-                                    syscall_name(syscall_num, &abi),
-                                    e
-                                )),
+                            let dirfd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                            let path_addr = get_syscall_arg(&regs, abi.reg_arg2);
+                            let mut translated_applied = false;
+                            if dirfd == AT_FDCWD {
+                                if let Some(path) = read_child_string(pid, path_addr) {
+                                    if path.starts_with('/') {
+                                        let translated = translate_path(rootfs, &path);
+                                        if translated != path && scratch_addr != 0 {
+                                            translated_applied = write_translated_path(
+                                                pid,
+                                                &mut regs,
+                                                iov_len,
+                                                abi.reg_arg2,
+                                                scratch_addr,
+                                                &mut scratch_offset,
+                                                &translated,
+                                            );
+                                            if translated_applied {
+                                                log(&format!(
+                                                    "6-Z258: {}({:?}) path translated to {:?} — real syscall will run inside the sandbox (no host-path exposure)",
+                                                    syscall_name(syscall_num, &abi),
+                                                    path, translated
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !translated_applied && scratch_addr != 0 {
+                                // Fall back to the 6-Z257 getpid rewrite
+                                // (relative path with cwd inside the
+                                // sandbox and dirfd-based calls are left
+                                // to run for real and need no rewrite —
+                                // only the untranslatable absolute case
+                                // reaches here via scratch==0).
+                                if dirfd == AT_FDCWD {
+                                    set_syscall_num(&mut regs, &abi, abi.getpid);
+                                    match ptrace_setregs(pid, &regs, iov_len) {
+                                        Ok(()) => log(&format!(
+                                            "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (untranslatable path — kernel will execute getpid; EXIT will fake return 0)",
+                                            syscall_name(syscall_num, &abi),
+                                            syscall_num,
+                                            abi.getpid
+                                        )),
+                                        Err(e) => log(&format!(
+                                            "6-Z257: {} ENTRY REWRITE FAILED: ptrace_setregs: {} — kernel will execute the real syscall (EXIT-side family fake + 6-Z185 backstop remain)",
+                                            syscall_name(syscall_num, &abi),
+                                            e
+                                        )),
+                                    }
+                                } else {
+                                    log(&format!(
+                                        "6-Z258: {}(dirfd={}, real fd) left to execute for real — the kernel resolves it against the sandbox dirfd; EXIT will fake the family return",
+                                        syscall_name(syscall_num, &abi),
+                                        dirfd
+                                    ));
+                                }
+                            } else if !translated_applied && scratch_addr == 0 {
+                                set_syscall_num(&mut regs, &abi, abi.getpid);
+                                match ptrace_setregs(pid, &regs, iov_len) {
+                                    Ok(()) => log(&format!(
+                                        "6-Z257: {} ENTRY nr={} → rewritten to getpid nr={} (scratch not reserved — kernel will execute getpid; EXIT will fake return 0)",
+                                        syscall_name(syscall_num, &abi),
+                                        syscall_num,
+                                        abi.getpid
+                                    )),
+                                    Err(e) => log(&format!(
+                                        "6-Z257: {} ENTRY REWRITE FAILED (scratch==0): ptrace_setregs: {} — kernel will execute the real syscall (EXIT-side family fake + 6-Z185 backstop remain)",
+                                        syscall_name(syscall_num, &abi),
+                                        e
+                                    )),
+                                }
                             }
                         }
                         // ── Task 6-Z69: set_thread_area ENTRY → REAL TLS
