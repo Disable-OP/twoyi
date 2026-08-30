@@ -15,6 +15,10 @@ SELECT="${1:?usage: dispatch_corpus.sh <pr|nightly|all|NAME> [boot_wait]}"
 BOOT_WAIT="${2:-60}"
 
 TOKEN=$(sed -n 's|https://Disable-OP:\([^@]*\)@github.com|\1|p' ~/.git-credentials)
+# 6-Z225: GITHUB_TOKEN fallback (same as dispatch_by_name.sh) — the dev
+# sandbox keeps the fine-grained PAT in /tmp/.ghpat (exported as
+# GITHUB_TOKEN by the caller); ~/.git-credentials does not always exist.
+[ -n "$TOKEN" ] || TOKEN="${GITHUB_TOKEN:-}"
 [ -n "$TOKEN" ] || { echo "no token in ~/.git-credentials"; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -19754,3 +19754,24 @@ Stage Summary:
   classify UI_READY end-to-end; the caps-strip is the last known init-fatal class.
 - NEXT: dispatch round 4 (2 verify + 3 guards) AND the first corpus wave batch:0:60
   toward the 90% goal.
+
+---
+Task ID: 6-Z225-dispatch
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Dispatch corpus wave 1 (batch:0:60) + verification round 4 on head f06ab55.
+
+Work Log:
+- Patched dispatch_corpus.sh with the same GITHUB_TOKEN fallback dispatch_by_name.sh
+  already had (~/.git-credentials does not always exist in the sandbox).
+- DISPATCHED corpus wave 1: batch:0:60 — 60 manifest entries, dispatched=60 failed=0
+  (per-recovery concurrency groups; last two dispatched: twrp-3.7.0_9-0-evert,
+  twrp-3.7.0_9-0-fajita).
+- DISPATCHED verification round 4 on f06ab55 (6-Z225): lineage-22.2-sailfish +
+  orangefox-R12.0-lavender + 3 guards — expect: caps-strip kills the OrangeFox
+  InitFatalReboot entirely; classifier UI_READY on all 5.
+
+Stage Summary:
+- The 90%-goal measurement pipeline is live: wave 1 (60/729) in flight.
+- NEXT: collect wave-1 verdicts (classify each artifact, keep a per-recovery
+  PASS/FAIL table in the worklog); dispatch batch:60:120 when collection lands.
