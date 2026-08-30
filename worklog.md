@@ -20900,3 +20900,50 @@ Stage Summary:
 - NEXT: dispatch merlin+grouper+osprey+m8+m7+cherry+kenzo on the
   6-Z243 head; analyze maps ground truth; also collect the
   in-flight 6-Z242 (hw_random) verify round for the property class.
+
+---
+Task ID: 6-Z244
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: arm32 UI class analysis (grouper splash-load) + /twres stat-family DIAG + wave-3 dispatch. (Renumbered from an earlier 6-Z243 draft — that ID was taken by the parallel crash-forensics fix, bb132ef.)
+
+Work Log:
+- ARM32 UI CLASS (c188c28 round: grouper/hammerhead/mako UI_HANG, the
+  recovery process RUNNING — execs /sbin/pigz): the recovery reaches
+  TWRP's GUI init — brightness set, PageManager loads — then:
+    "I:Loading package: splash (/twres/splash.xml)"
+    "I:PageManager::LoadFileToBuffer loading filename: '/twres/splash.xml' directly"
+    "E:Package splash failed to load."
+    "E:Failed to load splash screen XML."
+  followed by a libminuitwrp SIGSEGV (maps dumps around libminuitwrp).
+  DECISIVE OBSERVATION: NO openat of splash.xml exists in the whole
+  trace and no 6-Z169/6-Z170 DIAGs fired — PageManager STATs the file
+  first (an fstatat64 is the last path syscall before the failure) and
+  SKIPS the load when the stat fails, so every open-side DIAG stays
+  silent. Whether the fstatat64 was translated (and its errno) is not
+  on the record.
+- DIAG ADDED (code c8458a1): stat-family EXIT result for every /twres
+  path, un-gated first 40 — settles ENOENT-vs-parse on the next round.
+- FB bridge note for arm32: with 6-Z240 the guest's fb0 MAP_SHARED mmap
+  is NO LONGER rewritten — the kernel maps the REAL fb0 file shared, so
+  guest writes reach the app-polled file natively (the 6-Z73 bridge is
+  i386-only machinery). Black screen on grouper is therefore a
+  REACHED-THE-RENDER problem, not a transport problem — consistent with
+  the splash-load failure.
+- CHERRY next layer (c188c28 run 33315004069): the 6-Z236 shim IS in
+  the chain and the FORTIFY link failure is GONE — the recovery now
+  SIGSEGVs with pc=si_addr=0x1404b4 (jump to unmapped low address) in a
+  restart loop. NOTE: the parallel session's 6-Z243 forensics fix
+  (bb132ef) makes the NEXT round's arm32 crash evidence authoritative —
+  re-read cherry's crash through it.
+- WAVE-3 dispatched: batch:120:180 (60 runs) on c8458a1 (all accumulated
+  fixes: 6-Z240 arm32-mmap gate + 6-Z241 property_contexts arch gate +
+  6-Z242 hw_random + 6-Z243/c8458a1 twres stat DIAG).
+- GATES: 653 host tests green; clippy clean; fmt clean.
+
+Stage Summary:
+- verified working: 6-Z240 (ELF32 linker class), 6-Z241 (property class).
+- in flight: the 14-run 6-Z242 verification round (hw_random), wave-3
+  (60 runs), plus the parallel session's forensics round.
+- NEXT: collect all rounds; analyze the arm32 UI class via the /twres
+  stat DIAG + the 6-Z243 forensics; cherry's 0x1404b4 crash class.
