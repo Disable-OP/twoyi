@@ -1298,6 +1298,58 @@ pub fn create_twrp_misc_devs(rootfs: &str) -> std::io::Result<()> {
             path
         );
     }
+    create_hwrng_device(rootfs)?;
+    Ok(())
+}
+
+/// 6-Z242: /dev/hw_random — readable entropy stand-in.
+///
+/// ROOT CAUSE (capricorn class, run 33315421169 on 17c573b): after the
+/// 6-Z241 /property_contexts fix unblocked property init, the pi/older
+/// init generation progressed through default.prop loading, rc parsing,
+/// and ueventd coldboot — then died at init's `mix-hwrng-into-linux-rng`
+/// boot action:
+///   "Failed to read from /dev/hw_random: EOF"
+///   "Unable to set adequate mmap entropy value!"
+///   "Security failure; rebooting into recovery mode..."
+/// (read returns 0 bytes → the entropy-mix action treats it as a hard
+/// failure → init reboots the whole guest). On a real device /dev/hw_random
+/// is the hardware RNG char device and always serves bytes.
+///
+/// FIX: stage /dev/hw_random as a 512-byte regular file of pseudo-random
+/// bytes (host `getrandom`-seeded). Reads return real data, the mix
+/// action succeeds, and the guest keeps booting. Harmless for guests that
+/// never touch the node. 512 bytes matches init's typical read size.
+fn create_hwrng_device(rootfs: &str) -> std::io::Result<()> {
+    use std::io::Read;
+    let path = format!("{}/dev/hw_random", rootfs);
+    // Remove first: the staged file is 0444 (read-only for the guest) and
+    // a second boot must replace it cleanly.
+    let _ = fs::remove_file(&path);
+    let mut bytes = [0u8; 512];
+    // Best-effort kernel entropy; any bytes work for the mix action.
+    match fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)) {
+        Ok(()) => {}
+        Err(_) => {
+            // Fallback: LCG fill (deterministic but non-constant).
+            let mut x: u64 = 0x2545F4914F6CDD1D;
+            for b in bytes.iter_mut() {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (x >> 33) as u8;
+            }
+        }
+    }
+    fs::write(&path, &bytes)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o444));
+    }
+    info!(
+        "[KR64][devices] TWRP entropy dev: {} (512 bytes readable — init mix-hwrng-into-linux-rng needs it; 6-Z242)",
+        path
+    );
     Ok(())
 }
 
@@ -1328,6 +1380,19 @@ mod tests {
         let rootfs = tmpdir();
         fs::create_dir_all(format!("{}/dev", rootfs)).unwrap();
         create_twrp_misc_devs(&rootfs).expect("misc devs");
+        // 6-Z242: the entropy stand-in must exist and be READABLE
+        // (init's mix-hwrng-into-linux-rng FATALs on EOF).
+        {
+            let p = format!("{}/dev/hw_random", rootfs);
+            let meta = fs::metadata(&p).expect("hw_random exists");
+            assert!(meta.is_file(), "hw_random should be a regular file");
+            assert_eq!(meta.len(), 512, "hw_random should carry 512 bytes");
+            let content = fs::read(&p).expect("hw_random readable");
+            assert!(
+                content.iter().any(|&b| b != 0),
+                "hw_random must not be all-zero"
+            );
+        }
         for rel in ["dev/ashmem", "dev/pmsg0"] {
             let p = format!("{}/{}", rootfs, rel);
             let meta = fs::metadata(&p).expect("file exists");
