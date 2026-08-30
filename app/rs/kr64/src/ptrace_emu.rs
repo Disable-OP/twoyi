@@ -9711,6 +9711,82 @@ fn poke_capget_data(pid: libc::pid_t, addr: u64) -> bool {
 
 // ── Ptrace loop ────────────────────────────────────────────────────
 
+// ── 6-Z260: stop-forensics ring buffer ─────────────────────────────
+//
+// PROBLEM (measured, daisy OrangeFox boot run 33331891637): the 6-Z213
+// RESUME + RAW STOP per-iteration lines emitted 61,456 stderr lines of
+// the 91,797-line boot log (67%), each pumped through the stderr pipe →
+// app-side tee → logcat → FileLogger disk write chain. On the physical
+// phone the same chain adds wall time to EVERY ptrace iteration (kr64
+// blocks when the pipe fills, and the whole guest is frozen while the
+// tracer waits on write()), a visible share of the "OrangeFox takes a
+// minute to boot" report.
+//
+// FIX: keep the same per-event lines, but land them in an in-memory
+// RING instead of stderr. The evidence is strictly BETTER for the
+// stop-accounting investigation (6-Z259): at the moment something goes
+// wrong (signal death, waitpid failure, the 6-Z257 outer-gate bind
+// window) the last ~3000 resume/stop pairs are dumped verbatim around
+// the anomaly — exactly the window the investigation needs — instead of
+// being scattered across a 10 MB log. Steady-state stderr volume drops
+// by ~2/3 per boot.
+static STOP_RING: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+/// Cap: 6000 lines ≈ the last ~3000 resume+stop pairs (~700 KB).
+const STOP_RING_CAP: usize = 6000;
+/// Dumps are rate-limited: at most one per reason-window per 5 s and a
+/// hard lifetime budget per boot, so a hot anomaly site can never turn
+/// the ring into a new flood source.
+const STOP_RING_DUMP_MIN_INTERVAL_MS: u64 = 5000;
+const STOP_RING_MAX_DUMPS: u64 = 24;
+static STOP_RING_LAST_DUMP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STOP_RING_DUMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn stop_ring_push(line: String) {
+    if let Ok(mut ring) = STOP_RING.lock() {
+        if ring.len() >= STOP_RING_CAP {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+}
+
+/// Drain the ring for a `reason`. Rate-limited; returns the lines to log
+/// (header first, payload next, footer last) — empty when suppressed or
+/// empty. The caller owns the actual logging, which keeps this free of
+/// closure-lifetime coupling with the loop's `log` helper.
+fn stop_ring_drain(reason: &str) -> Vec<String> {
+    let now_ms = crate::boot_elapsed_ms() as u64;
+    let last = STOP_RING_LAST_DUMP_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let dumps = STOP_RING_DUMPS.load(std::sync::atomic::Ordering::Relaxed);
+    if dumps >= STOP_RING_MAX_DUMPS
+        || (dumps > 0 && now_ms.saturating_sub(last) < STOP_RING_DUMP_MIN_INTERVAL_MS)
+    {
+        return Vec::new();
+    }
+    let drained: Vec<String> = match STOP_RING.lock() {
+        Ok(mut ring) => ring.drain(..).collect(),
+        Err(_) => return Vec::new(),
+    };
+    let n = drained.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    STOP_RING_LAST_DUMP_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+    STOP_RING_DUMPS.store(dumps + 1, std::sync::atomic::Ordering::Relaxed);
+    let mut out = Vec::with_capacity(n + 2);
+    out.push(format!(
+        "6-Z260 STOP-RING DUMP (reason={}, lines={}): ── last {} resume/stop pairs before this anomaly ──",
+        reason, n, n
+    ));
+    out.extend(drained);
+    out.push(format!(
+        "6-Z260 STOP-RING DUMP (reason={}): ── end ──",
+        reason
+    ));
+    out
+}
+
 /// Check if ptrace is likely to work on this device.
 pub fn ptrace_available() -> bool {
     let r = unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
@@ -9738,9 +9814,16 @@ pub fn run_ptrace_loop(
         // app-side FileLogger tee re-reads this process's stderr
         // line-by-line, and a huge diagnostic line OOM'd the whole app
         // (run 32786386000: a single 145 MB "line").
+        // 6-Z260: carry the boot-elapsed stamp on every ptrace-loop line
+        // (the info!/warning!/error! macros carry the same stamp) so a
+        // raw kr64-app-stderr.log converts directly into a boot-phase
+        // timeline — the "OrangeFox takes a minute on the physical
+        // phone" class needs per-phase wall times, which the artifact
+        // alone could not provide (no timestamps on this stream).
         let _ = writeln!(
             std::io::stderr(),
-            "[KR64][ptrace] {}",
+            "[KR64][ptrace][+{}ms] {}",
+            crate::boot_elapsed_ms(),
             crate::cap_log_line(msg, crate::MAX_LOG_LINE)
         );
     };
@@ -11022,16 +11105,18 @@ pub fn run_ptrace_loop(
             static RESUME_DIAG_LOGGED: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = RESUME_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 30000 {
-                log(&format!(
-                    "6-Z213 RESUME #{}: pid={} loop_count={} resume_signal={} tracked_pids={:?}",
-                    n + 1,
-                    current_pid,
-                    loop_count,
-                    resume_signal,
-                    tracked_pids,
-                ));
-            }
+            // 6-Z260: ring-buffered — emitted to stderr only in the
+            // anomaly-window dumps (see stop_ring_dump). Keeps the full
+            // resume correlation evidence at near-zero steady-state I/O.
+            let _ = n;
+            stop_ring_push(format!(
+                "6-Z213 RESUME #{}: pid={} loop_count={} resume_signal={} tracked_pids={:?}",
+                n + 1,
+                current_pid,
+                loop_count,
+                resume_signal,
+                tracked_pids,
+            ));
             unsafe {
                 libc::ptrace(
                     libc::PTRACE_SYSCALL,
@@ -11406,6 +11491,11 @@ pub fn run_ptrace_loop(
         if waited == -1 {
             let e = std::io::Error::last_os_error();
             log(&format!("waitpid failed: {}", e));
+            // 6-Z260: the ring holds the last resume/stop pairs — dump
+            // them so the teardown window is attributable.
+            for line in stop_ring_drain("ptrace-loop-waitpid-failed") {
+                log(&line);
+            }
             return -1;
         }
         // ── 6-Z213 RAW STOP FORENSICS ──────────────────────────────────
@@ -11432,22 +11522,18 @@ pub fn run_ptrace_loop(
             static RAW_STOP_LOGGED: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = RAW_STOP_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // 6-Z248: same treatment as the broad DIAG — hard cap 30000
-            // then 1-in-256 sampling, so the raw stop feed never fully
-            // goes dark on long boots (the ocean/kebab spin class ran
-            // its whole interesting window past this cap).
-            let sampled = n >= 30000 && (n % 256) == 0;
-            if n < 30000 || sampled {
-                log(&format!(
-                    "6-Z213 RAW STOP #{}{}: pid={} status=0x{:08x} wstopsig={} ptrace_event={}",
-                    n + 1,
-                    if sampled { " (sampled)" } else { "" },
-                    waited,
-                    status as u32,
-                    libc::WSTOPSIG(status),
-                    ((status as u32) >> 16) & 0xFFFF,
-                ));
-            }
+            // 6-Z260: ring-buffered — emitted to stderr only in the
+            // anomaly-window dumps (see stop_ring_dump).
+            let _ = n;
+            stop_ring_push(format!(
+                "6-Z213 RAW STOP #{}{}: pid={} status=0x{:08x} wstopsig={} ptrace_event={}",
+                n + 1,
+                String::new(),
+                waited,
+                status as u32,
+                libc::WSTOPSIG(status),
+                ((status as u32) >> 16) & 0xFFFF,
+            ));
         }
         // 6-Z126: a successfully received stop proves the tracee
         // relationship is healthy — reset its ESRCH streak (the streak
@@ -12160,6 +12246,14 @@ pub fn run_ptrace_loop(
                                 "6-Z78: PTRACE_EVENT_EXIT pid={} status={:#x} ({}) — child entering exit now; falling through to standard resume",
                                 pid, exit_status, decoded
                             ));
+                            // 6-Z260: a SIGNAL death is exactly the moment the
+                            // stop-ring exists for — dump the last resume/stop
+                            // pairs around it.
+                            if libc::WIFSIGNALED(ws) {
+                                for line in stop_ring_drain("tracee-killed-by-signal") {
+                                    log(&line);
+                                }
+                            }
                         } else {
                             log(&format!(
                                 "6-Z78: PTRACE_EVENT_EXIT pid={} status=? (PTRACE_GETEVENTMSG failed: {}) — child entering exit now; falling through to standard resume",
@@ -12724,13 +12818,20 @@ pub fn run_ptrace_loop(
                         } else {
                             format!("sampled #{} past cap", n + 1)
                         };
+                        // 6-Z260: arg0 (usually the fd / pointer of interest)
+                        // rides along so a hot read/lseek/fstat spin can be
+                        // attributed to its FILE without a second dispatch
+                        // (the daisy OrangeFox boot showed an 18k-iteration
+                        // nr=80/62/63 fstat+lseek+read loop that we could
+                        // not attribute to a file).
                         log(&format!(
-                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} [{}]",
+                            "6-Z210 DIAG (broad): syscall-stop nr={} pid={} loop_count={} in_syscall={} abi.mount={} arg0={:#x} [{}]",
                             syscall_num,
                             pid,
                             loop_count,
                             in_syscall,
                             abi.mount,
+                            get_syscall_arg(&regs, 0),
                             tag
                         ));
                     }
@@ -14229,6 +14330,13 @@ pub fn run_ptrace_loop(
                                     scratch_addr,
                                     spin_diag_bind_skip_count
                                 ));
+                                // 6-Z260: this is the property-socket failure
+                                // window (6-Z259's tracer stop-accounting
+                                // investigation) — dump the surrounding
+                                // resume/stop pairs with it.
+                                for line in stop_ring_drain("6-Z257-bind-outer-gate") {
+                                    log(&line);
+                                }
                             }
                         }
                         if boot_recovery
@@ -23562,6 +23670,61 @@ pub fn run_ptrace_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 6-Z260: stop-forensics ring buffer ────────────────────────────
+    //
+    // The ring replaced the 6-Z213 RESUME/RAW-STOP stderr feed (61,456
+    // of 91,797 boot-log lines on daisy run 33331891637). Locks three
+    // properties: (1) cap eviction keeps the ring bounded at
+    // STOP_RING_CAP; (2) drain returns header + payload + footer and
+    // EMPTIES the ring; (3) drains are rate-limited so a hot anomaly
+    // site cannot turn the ring into a new flood source.
+    // Both ring tests share the crate-global ring + dump counters, so
+    // they serialize on this lock (cargo runs tests in parallel threads).
+    static Z260_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn z260_stop_ring_caps_evicts_and_drains() {
+        let _guard = Z260_TEST_LOCK.lock();
+        // Drain anything left by other tests; also resets the dump
+        // bookkeeping for THIS test's window below.
+        let _ = stop_ring_drain("z260-test-reset");
+        STOP_RING_DUMPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        STOP_RING_LAST_DUMP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        for i in 0..(STOP_RING_CAP + 100) {
+            stop_ring_push(format!("line-{}", i));
+        }
+        let out = stop_ring_drain("z260-cap-test");
+        assert!(out.len() >= 3);
+        // header first, footer last
+        assert!(out[0].starts_with("6-Z260 STOP-RING DUMP (reason=z260-cap-test,"));
+        assert!(out[out.len() - 1].starts_with("6-Z260 STOP-RING DUMP (reason=z260-cap-test)"));
+        // payload bounded by the cap, and it holds the NEWEST lines
+        let payload = out.len() - 2;
+        assert_eq!(payload, STOP_RING_CAP);
+        assert_eq!(out[1], format!("line-{}", 100)); // oldest survivor
+        assert_eq!(out[out.len() - 2], format!("line-{}", STOP_RING_CAP + 99));
+        // ring is empty after a drain
+        let second = stop_ring_drain("z260-empty-test");
+        assert!(second.is_empty(), "drain must empty the ring");
+    }
+
+    #[test]
+    fn z260_stop_ring_rate_limits_hot_anomaly_sites() {
+        let _guard = Z260_TEST_LOCK.lock();
+        let _ = stop_ring_drain("z260-test-reset-2");
+        STOP_RING_DUMPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        STOP_RING_LAST_DUMP_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        stop_ring_push("a".to_string());
+        assert!(!stop_ring_drain("z260-rate-1").is_empty());
+        // Immediate second drain must be suppressed (boot_elapsed_ms is
+        // anchored at daemon start, so in-test it is ~0 ms — far below
+        // STOP_RING_DUMP_MIN_INTERVAL_MS).
+        stop_ring_push("b".to_string());
+        assert!(stop_ring_drain("z260-rate-2").is_empty());
+    }
 
     // ── 6-Z257: fchmodat/fchownat ENTRY-rewrite reachability ─────────
     //

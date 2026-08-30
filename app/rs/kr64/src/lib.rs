@@ -120,10 +120,32 @@ pub(crate) fn cap_log_line(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{}...[log line truncated]", &s[..end]))
 }
 
+/// 6-Z260: wall-clock anchor for boot-time forensics. The first call
+/// initializes it (effectively daemon start — the first log happens on
+/// the daemon's startup path). Every emitted line carries `[+Nms]` so
+/// any artifact can be turned into a boot-phase timeline without
+/// relying on external timestamps (kr64's stderr has no clock of its
+/// own, and the app-side logcat tee only covers a filtered slice).
+pub(crate) static BOOT_CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Milliseconds since the boot clock anchor (0 until initialized).
+pub(crate) fn boot_elapsed_ms() -> u128 {
+    match BOOT_CLOCK.get() {
+        Some(t) => t.elapsed().as_millis(),
+        None => 0,
+    }
+}
+
+/// Initialize the boot clock (call once at daemon entry).
+pub(crate) fn boot_clock_init() {
+    let _ = BOOT_CLOCK.set(std::time::Instant::now());
+}
+
 /// Log an info-level message to stderr.
 macro_rules! info {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 INFO] {}", $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
+        eprintln!("[KR64 INFO][+{}ms] {}", $crate::boot_elapsed_ms(),
+                  $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
     };
 }
 
@@ -134,14 +156,16 @@ macro_rules! info {
 /// makes the bare name `warn` ambiguous in `pub(crate) use` exports.
 macro_rules! warning {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 WARN] {}", $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
+        eprintln!("[KR64 WARN][+{}ms] {}", $crate::boot_elapsed_ms(),
+                  $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
     };
 }
 
 /// Log an error-level message to stderr.
 macro_rules! error {
     ($($arg:tt)*) => {
-        eprintln!("[KR64 ERROR] {}", $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
+        eprintln!("[KR64 ERROR][+{}ms] {}", $crate::boot_elapsed_ms(),
+                  $crate::cap_log_line(&format!($($arg)*), $crate::MAX_LOG_LINE))
     };
 }
 
@@ -4507,6 +4531,9 @@ fn z192_property_format_probe_detects_new_format() {
 }
 
 pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
+    // 6-Z260: anchor the boot clock as the very first action so every
+    // subsequent log line's [+Nms] prefix measures from daemon start.
+    boot_clock_init();
     let mut cfg = match parse_args(args) {
         Ok(c) => c,
         Err(e) => {
