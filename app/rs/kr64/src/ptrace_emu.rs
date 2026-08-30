@@ -13075,6 +13075,25 @@ pub fn run_ptrace_loop(
                             if envp_addr != 0 && exec_env_diag_count <= 24 {
                                 let stride: u64 = if abi.execve == 11 { 4 } else { 8 };
                                 let mut ld_hits: Vec<String> = Vec::new();
+                                // 6-Z255: standard-Android-env presence scan —
+                                // the 20-orangeefox libc null-call class decoded
+                                // (cereus: recovery+0x45cb4 = strlen(getenv(
+                                // "ANDROID_ROOT")) with getenv → NULL → bionic
+                                // optimized strlen (ldp x2,x3,[x0] at libc+0x1e320)
+                                // → si_addr=0). init.rc line 34 DOES `export
+                                // ANDROID_ROOT /system`, so the question is
+                                // WHERE it was lost (rc action queue vs execve
+                                // envp staging). Record the four standard vars'
+                                // presence + the total entry count per exec.
+                                const STD_VARS: [&str; 4] = [
+                                    "ANDROID_ROOT=",
+                                    "ANDROID_DATA=",
+                                    "ANDROID_BOOTLOGO=",
+                                    "EXTERNAL_STORAGE=",
+                                ];
+                                let mut std_hits: Vec<&str> = Vec::new();
+                                let mut std_found = 0usize;
+                                let mut total_entries = 0usize;
                                 let mut slot = 0usize;
                                 let mut cursor = envp_addr;
                                 while slot < 96 {
@@ -13092,22 +13111,33 @@ pub fn run_ptrace_loop(
                                         break;
                                     }
                                     if let Some(env) = read_child_string(pid, entry_ptr) {
-                                        if env.starts_with("LD_PRELOAD=")
-                                            || env.starts_with("LD_LIBRARY_PATH=")
-                                        {
+                                        total_entries += 1;
+                                        let is_ld = env.starts_with("LD_PRELOAD=")
+                                            || env.starts_with("LD_LIBRARY_PATH=");
+                                        let std_var =
+                                            STD_VARS.iter().find(|v| env.starts_with(*v)).copied();
+                                        if is_ld {
                                             ld_hits.push(env);
+                                        }
+                                        if let Some(v) = std_var {
+                                            std_found += 1;
+                                            std_hits.push(v);
                                         }
                                     }
                                     cursor += stride;
                                     slot += 1;
                                 }
-                                if !ld_hits.is_empty() {
+                                if !ld_hits.is_empty() || std_found < STD_VARS.len() {
                                     exec_env_diag_count += 1;
                                     log(&format!(
-                                        "6-Z238: execve(\"{}\") pid={} LD env: {}",
+                                        "6-Z238: execve(\"{}\") pid={} LD env: {} | std-vars {}/{} present {:?} total_entries={}",
                                         exec_path,
                                         pid,
-                                        ld_hits.join(" | ")
+                                        ld_hits.join(" | "),
+                                        std_found,
+                                        STD_VARS.len(),
+                                        std_hits,
+                                        total_entries
                                     ));
                                 }
                             }
