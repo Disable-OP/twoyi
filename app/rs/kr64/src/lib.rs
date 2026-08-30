@@ -1340,6 +1340,105 @@ fn write_hook_library_to_dev(lib_name: &str, src: &str, content: &[u8], dst: &st
     }
 }
 
+/// 6-Z225: strip `capabilities` service options from every guest .rc
+/// file. Mechanism: init's forked service child runs SetCapsForExec()
+/// (init/service.cpp) for services whose .rc declares `capabilities` —
+/// it calls capset() AND prctl(PR_CAPBSET_DROP) per bounding cap; in
+/// the non-root sandbox some of those still reach the kernel for real
+/// (tracer fakes cover capset, but the cap_drop_bound prctl EPERM'd —
+/// OrangeFox run 33284467693: "cap_drop_bound(0) failed: Operation not
+/// permitted" -> "cannot set capabilities for logd" LOG(FATAL) ->
+/// InitFatalReboot soft reboot of the whole guest). Capabilities are
+/// UNENFORCEABLE in the sandbox anyway: every service runs as the app's
+/// uid, and the tracer fake-successes capset so the child cannot tell —
+/// the option is dead weight whose only effect is the FATAL path.
+/// Stripping the option at staging (BEFORE init parses the files)
+/// removes the entire class: no caps requested -> no SetCapsForExec ->
+/// no FATAL.
+///
+/// Keyword form verified against the actual OrangeFox R12.0 image
+/// (init.recovery.logd.rc line 12: `    capabilities SYSLOG
+/// AUDIT_CONTROL SETGID SETUID` — keyword, whitespace, cap names; also
+/// accepts the `capabilities:` spelling seen in some vendor trees).
+/// Only service-option lines are touched; anything else passes through.
+/// Idempotent by construction (a stripped file no longer matches).
+/// Returns the number of files modified.
+pub fn strip_service_capabilities_options(rootfs_prefix: &str) -> usize {
+    // Service .rc locations across Android generations/ramdisk layouts.
+    // .rc files are matched by extension; size-capped (init.rc files
+    // are tiny — the 1 MiB cap only guards against pathological trees).
+    const SCAN_DIRS: &[&str] = &[
+        "system/etc/init",
+        "system/etc/init/hw",
+        "system/system_ext/etc/init",
+        "vendor/etc/init",
+        "odm/etc/init",
+        "", // ramdisk root: init.rc, init.recovery*.rc, init.<hw>.rc
+    ];
+    let base = if rootfs_prefix.is_empty() {
+        "/"
+    } else {
+        rootfs_prefix
+    };
+    let mut modified = 0usize;
+    for dir in SCAN_DIRS {
+        let full = if dir.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}/{}", base, dir)
+        };
+        let rd = match std::fs::read_dir(&full) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".rc") {
+                continue;
+            }
+            let path = format!("{}/{}", full, name);
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) if c.len() <= 1 << 20 => c, // 1 MiB cap
+                _ => continue,
+            };
+            let mut changed = false;
+            let mut out = String::with_capacity(content.len());
+            for line in content.lines() {
+                let t = line.trim_start();
+                let is_caps_opt = t == "capabilities"
+                    || t.starts_with("capabilities ")
+                    || t.starts_with("capabilities:");
+                if is_caps_opt {
+                    changed = true;
+                    // Drop the line entirely — init tolerates a missing
+                    // service option; keeping byte-identical spacing for
+                    // everything else avoids parser edge cases.
+                    continue;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            if changed {
+                match std::fs::write(&path, &out) {
+                    Ok(()) => {
+                        modified += 1;
+                        info!(
+                            "[KR64] PARENT: 6-Z225: stripped capabilities option(s) from {}",
+                            path
+                        );
+                    }
+                    Err(e) => warning!(
+                        "[KR64] PARENT: 6-Z225: failed to rewrite {} (caps option kept): {}",
+                        path,
+                        e
+                    ),
+                }
+            }
+        }
+    }
+    modified
+}
+
 /// Patch TWRP's init.rc to add `setenv LD_PRELOAD /sbin/libtwrp_fb_hook.so`
 /// to the recovery service definition.
 ///
@@ -5946,6 +6045,19 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         cfg.height,
         service_preload_chain,
     );
+
+    // 6-Z225: strip `capabilities` service options from every guest .rc
+    // (see strip_service_capabilities_options() for the OrangeFox
+    // cap_drop_bound/InitFatalReboot evidence chain). Runs in the same
+    // staging phase as the recovery-service patch — BEFORE init parses
+    // the files.
+    let caps_stripped = strip_service_capabilities_options(&rootfs_prefix);
+    if caps_stripped > 0 {
+        info!(
+            "[KR64] PARENT: 6-Z225: stripped capabilities options from {} .rc file(s)",
+            caps_stripped
+        );
+    }
 
     if cfg.boot_recovery {
         // TWRP BOOT: DELETE /property_contexts ENTIRELY.
@@ -13653,6 +13765,85 @@ mod tests {
         let p = root.join(sub);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, content).unwrap();
+    }
+
+    // ── 6-Z225: capabilities-option stripping ────────────────────────
+
+    #[test]
+    fn strip_caps_options_strips_all_spellings_and_keeps_rest_6z225() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z225-strip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // logd.rc — the exact OrangeFox init.recovery.logd.rc shape
+        // (keyword + space + caps, indented 4) that FATAL'd the guest.
+        std::fs::create_dir_all(dir.join("init.recovery.logd.rc.parent")).unwrap();
+        std::fs::write(
+            dir.join("init.recovery.logd.rc"),
+            "service logd /system/bin/logd\n    class core\n    socket logd stream 0666 logd logd\n    capabilities SYSLOG AUDIT_CONTROL SETGID SETUID\n\nservice other /system/bin/other\n    class late_start\n    capabilities: WAKE_ALARM\n    seclabel u:r:logd:s0\n",
+        )
+        .unwrap();
+        // An .rc file WITHOUT the option must not be rewritten (mtime
+        // content check) and non-.rc files must be ignored.
+        std::fs::write(
+            dir.join("init.plain.rc"),
+            "service a /bin/a\n    class core\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("capabilities.txt"), "capabilities FAKE\n").unwrap();
+        // A comment line mentioning capabilities must be KEPT.
+        std::fs::write(
+            dir.join("init.comment.rc"),
+            "# capabilities are declared per service\nservice b /bin/b\n",
+        )
+        .unwrap();
+
+        let n = strip_service_capabilities_options(dir.to_str().unwrap());
+        assert_eq!(n, 1, "only the logd rc has the option");
+
+        let logd = std::fs::read_to_string(dir.join("init.recovery.logd.rc")).unwrap();
+        assert!(!logd.contains("capabilities"), "both spellings stripped");
+        assert!(
+            logd.contains("socket logd stream 0666 logd logd"),
+            "kept lines intact"
+        );
+        assert!(
+            logd.contains("seclabel u:r:logd:s0"),
+            "later options intact"
+        );
+        assert!(logd.contains("class late_start"), "other service intact");
+        // Comment lines mentioning the keyword survive (trim_start only
+        // matches the KEYWORD at line start).
+        let comment = std::fs::read_to_string(dir.join("init.comment.rc")).unwrap();
+        assert!(comment.contains("# capabilities are declared per service"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_caps_options_is_idempotent_and_tolerates_missing_dirs_6z225() {
+        let dir = std::env::temp_dir().join(format!("twoyi-6z225-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("vendor/etc/init")).unwrap();
+        std::fs::write(
+            dir.join("vendor/etc/init/svc.rc"),
+            "service hwservicemanager /system/bin/hwservicemanager\n    class core\n    capabilities WAKE_ALARM\n",
+        )
+        .unwrap();
+        let first = strip_service_capabilities_options(dir.to_str().unwrap());
+        assert_eq!(first, 1);
+        assert!(!std::fs::read_to_string(dir.join("vendor/etc/init/svc.rc"))
+            .unwrap()
+            .contains("capabilities"));
+        // Second pass: nothing left to strip.
+        let second = strip_service_capabilities_options(dir.to_str().unwrap());
+        assert_eq!(second, 0, "idempotent");
+        // Missing rootfs is safe.
+        assert_eq!(
+            strip_service_capabilities_options(&format!(
+                "{}/does-not-exist-6z225",
+                dir.to_str().unwrap()
+            )),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
