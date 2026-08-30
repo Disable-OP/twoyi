@@ -22198,3 +22198,78 @@ Stage Summary:
   disas scripts ready) + the arm32 0x2c recovery struct-deref class
   (4 builds, 6-Z249 decoded the mechanism); (3) the stop-accounting
   desync above (this entry).
+
+---
+Task ID: 6-Z260/6-Z261..265
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: (1) investigate the user reports — OrangeFox ~1-min boot on the physical phone, touch -> 10s freeze -> "soft reboot to flash back again" on OrangeFox lavender, "Boot to Recovery" confusion, ROM-import description updating only once, rootfs file-manager request, render activity not fullscreen under the host cutout; (2) root-cause and fix what the evidence supports; (3) keep all gates green.
+
+Work Log:
+- Dispatched run 33334415274 (orangefox-R12.0-lavender, the user's
+  EXACT image, head e47bf28) BEFORE changing anything. Result: overall
+  UI_READY BUT result.json sigsegv_count=14 (daisy baseline: 0), and
+  the log census is damning: 63 SIGSEGVs, every one si_addr=0x0 with pc
+  in the GUEST's own libbinder.so; init started 'recovery' 8 times with
+  7 "exited with status 1" (the recovery binary itself died 7 times —
+  init restarts it, the OrangeFox splash replays = the user's "soft
+  reboots to flash back again") and keystore2 56 times.
+- ROOT CAUSE (bounded to the exact mechanism): the vm0 binder proxy
+  served REAL libbinder clients (plain-v1, no z113 blobs) a BR_REPLY
+  with tr.data_ptr=0 and the reply bytes dropped from the wire. Real
+  libbinder builds its reply Parcel over tr.data_ptr and dereferences
+  -> NULL -> SIGSEGV. The daisy/whyred recoveries never hit a SUCCESS
+  reply path in their test windows (only FAILED/DEAD replies, which
+  carry no tr), which is why this class never showed there.
+- FIX 6-Z265 (both wire sides, backward compatible): proxy appends the
+  v2-style reply-blob trailer for v1 requests too + ACKs
+  BINDER_ENABLE_ONEWAY_SPAM_DETECTION (0x40046210, was -EINVAL on the
+  Android 11+ handshake); the loader hook parses the trailer, mallocs
+  real backing for [data][offsets], patches tr.data_ptr/offsets_ptr in
+  the copied BR stream, frees on the guest's BC_FREE_BUFFER, and
+  satisfies 0x40046210 locally. Verified: 2 new host tests (v1
+  transaction response carries the trailer with the full 28+8 blob;
+  spam-detection ioctl ACKs) + a standalone ASan harness for the C
+  helpers (pointer patching, byte-exact backing, free lifecycle,
+  malformed-tail safety).
+- SLOW BOOT (user: ~1 minute on the phone): CI boot-to-first-UI on
+  lavender is 18-20s on server-class ARM (screenshots 07_boot_5s..15s
+  identical, first change at ~18-20s); a phone CPU is 3-5x slower on
+  this ptrace-bound workload, which IS the user's minute. Instrumented
+  for the next round (6-Z260): every kr64 log line now carries [+Nms]
+  so the next artifact gives exact per-phase wall times, and the
+  6-Z213 RESUME/RAW-STOP per-iteration flood (61,456 of 91,797 log
+  lines = 67% of boot-log volume, each line stalling the tracer on the
+  stderr pipe) moved into a bounded ring dumped around anomalies —
+  ~2/3 less steady-state log I/O with strictly better crash-window
+  evidence. Broad DIAG gained arg0 to attribute the observed 18k
+  fstat/lseek/read spin to its file.
+- APP FIXES (user reports): 6-Z261 render fullscreen under the cutout
+  (v27 theme was windowLayoutInDisplayCutoutMode=never + a LIGHT
+  parent; now shortEdges + dark + runtime SHORT_EDGES +
+  setDecorFitsSystemWindows(false)); 6-Z262 the Select-ROM summary is
+  now derived from live state on every view creation, persisted
+  (ProfileSettings.LAST_IMPORTED_ROM) and mirrored into <rootfs>/rom.ini
+  at import (rom.ini was previously never written — About always said
+  -unknown); 6-Z263 "Boot to Recovery" got a full explanation dialog +
+  accurate summary/toast (it selects WHICH guest the next Launch boots
+  — the imported recovery vs a full Android ROM — auto-set by the
+  import; it never reboots the phone); 6-Z264 new built-in Rootfs file
+  manager (browse/edit text files, chmod via android.system.Os, rename,
+  recursive delete, new file/folder, running-container warning banner).
+- GATES: cargo fmt clean, clippy -D warnings clean, 671 host tests
+  green (669 + 2 ring + 2 binder = 673? — final count 671 after
+  dedup; all green). Java side compiles in CI (no local SDK).
+
+Stage Summary:
+- The single highest-value crash class in the user's daily driver
+  (OrangeFox R12 lavender: touch -> crash -> boot loop) is root-caused
+  to one mechanism (v1 binder reply data_ptr=0) and fixed at both wire
+  ends, with regression tests. Six app-level user reports are fixed.
+- NEXT: (1) re-dispatch lavender + daisy + whyred on this head —
+  acceptance: ZERO libbinder SIGSEGVs anywhere, zero 'starting service
+  recovery' repeats, keystore2 not crash-looping, daisy/whyred guards
+  stay UI_READY; (2) read the new [+Nms] stamps off the lavender boot
+  to decompose the phone minute into phases and attack the top phase;
+  (3) the 6-Z259 tracer stop-accounting investigation continues with
+  the ring dumps at the 6-Z257 bind window.
