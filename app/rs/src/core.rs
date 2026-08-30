@@ -1449,8 +1449,12 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
     // the center pixel. This is the CI-verifiable proof that guest
     // pixels are actually FLOWING (and changing across page
     // transitions), not merely that a single stale frame was posted
-    // once. Rate: one line per ~120 changed frames (~4 s at 30 fps) —
-    // silent while the screen is static.
+    // once. Rate: one line on the first frame + every 20th changed
+    // frame (~0.7 s at 30 fps) — dense enough that a CI run with page
+    // transitions always produces multiple digest lines (the OrangeFox
+    // verify run changed the fb only ~dozens of times; a 120 threshold
+    // left the whole session with a single digest line), silent while
+    // the screen is static.
     let mut changed_frames: u64 = 0;
 
     // Render loop: read fb0 → (dirty-check) → blit to the LIVE window.
@@ -1534,7 +1538,7 @@ fn twrp_fb_render_loop(fb_path: String, virtual_width: i32, virtual_height: i32)
                 // Periodic frame-flow digest (see changed_frames above):
                 // proves the blit loop is presenting LIVE, CHANGING guest
                 // frames — the acceptance signal for page transitions.
-                if changed_frames == 1 || changed_frames % 120 == 0 {
+                if changed_frames == 1 || changed_frames % 20 == 0 {
                     let mut hash: u64 = 0xcbf29ce484222325;
                     for chunk in fb_buf.chunks_exact(8) {
                         for &b in chunk {
@@ -1738,7 +1742,18 @@ unsafe fn twrp_blit_to_surface(
             let fb_b = fb[src_idx] as u32;
             let fb_g = fb[src_idx + 1] as u32;
             let fb_r = fb[src_idx + 2] as u32;
-            let a = fb[src_idx + 3] as u32;
+            // Force the pixel OPAQUE. A legacy fbdev's alpha byte is
+            // undefined — real panels ignore it — but an ANativeWindow
+            // RGBA_8888 buffer honors it: recoveries that leave alpha=0
+            // in background pixels (OrangeFox R12's theme engine does;
+            // TWRP fills 0xff) blitted as TRANSPARENT pixels, and
+            // SurfaceFlinger composited the activity's BootLogTexture
+            // loading background through them (verify run
+            // 33322760296: OrangeFox UI elements rendered perfectly but
+            // the green MAPS-dump texture showed through every
+            // background pixel). A recovery display is opaque by
+            // definition — write 0xff unconditionally.
+            let a = 0xffu32;
             let pixel = if buffer_is_bgra {
                 // little-endian BGRA_8888: bytes [B,G,R,A]
                 (a << 24) | (fb_r << 16) | (fb_g << 8) | fb_b
