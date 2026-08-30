@@ -22123,3 +22123,78 @@ Work Log:
 
 Stage Summary:
 - Wave recorded; monitoring delegated (MON-5).
+
+---
+Task ID: 6-Z259
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: bound the residual init property-socket failure to its exact mechanism and record the next decisive investigation — the tracer stop-accounting miss.
+
+Work Log:
+- MON-5 (head 139c013) VERIFIED: (a) the 6-Z258c regression class is
+  EXTINCT (0 SIGSEGVs, 0 linker64 dumps, 0 6-Z243 lines across all
+  three runs); (b) translation scope is correct — cereus 6/6, daisy
+  7/7, whyred 5/5 "path translated" lines, ALL guest paths
+  (/proc/cmdline, /dev/socket/property_service, /cache/recovery/*,
+  /data/recovery/*), ZERO data_dir/bootstrap translations, and the
+  child's bootstrap chmod now routes to the 6-Z257 getpid fallback
+  (structurally fixed); (c) daisy = full UI_READY pass RESTORED
+  (12-page fox-nav, vfs CLEAN, theme OK); (d) whyred = MON-1 baseline
+  RESTORED (UI_READY, 12pg, FLOWING); (e) guest dev-__kmsg__ dumps
+  are back in the artifacts.
+- RESIDUAL FAILURE CHARACTERIZED (cereus run 33331890045, exact
+  sequence): 6-X pre-creates {rootfs}/dev/socket/property_service as
+  a DIRECTORY → init: socket() seen → unlinkat seen → bind(fd=8)
+  EXIT SEEN with -98 EADDRINUSE → 6-Z101 faked 0 (NO 6-Z163b/c skip
+  log, NO rewrite log, NO 6-Z257 outer-gate DIAG → the bind's ENTRY
+  stop was MISSED by the tracer) → fchmodat stops BOTH MISSED (no
+  6-Z258 line, no family-fake EXIT line; raw ENOENT reached init) →
+  fchownat ENTRY SEEN (translated to the 6-X dir → EPERM → masked) →
+  "Failed to fchmodat socket" → "start_property_service socket
+  creation failed" → init death. Boot STILL completes on every
+  OrangeFox run (the 6-Z49 recovery is self-sufficient) — the death
+  forfeits ueventd/adbd/logd + on property: triggers only.
+- WHY THE MISSED STOPS ARE THE ROOT CAUSE: MON-3's cereus run PROVED
+  the alive path is reachable with identical code — when the stops
+  ARE seen, the chain works end-to-end (bind faked → fchmodat
+  translated → chmod on the 6-X dir succeeds → fchownat masked →
+  listen faked → "Created socket" SUCCESS). The host-side /dev/socket
+  state is NOT controllable (untrusted_app cannot write /dev), so no
+  host-side pre-creation can mask a missed fchmodat; the ONLY fix is
+  at the tracer stop-accounting level.
+- NEXT INVESTIGATION (named, with evidence): the stop-accounting
+  desync — specific syscall pairs (this bind, this fchmodat) lose
+  their ENTRY stops while neighbors are seen. Known repair precedent:
+  the PTRACE_EVENT_CLONE in_syscall reset (6-Z211f/h — the
+  "in_syscall=true after clone" desync that mis-classified the next
+  syscall-stop as an EXIT). Suspects to audit: the same stale
+  in_syscall state after OTHER event stops (PTRACE_EVENT_EXEC,
+  EVENT_EXIT, group-stop/signal-delivery-stop interleavings) in the
+  window around init's second-stage property bootstrap; the
+  "protect]"-labeled entries in the 6-Z98 exit trail (undecoded
+  label — likely seccomp-protect interceptions shifting the
+  entry/exit alternation). The fchmodat dies ~352-356 ptrace
+  iterations in (MON-4 datum).
+- ACCEPTANCE CRITERIA FOR THE FIX: three consecutive cereus+daisy
+  runs with "Created socket" PRESENT and zero death markers; adbd/
+  ueventd service starts visible in kmsg; whyred/starlte guards
+  stay UI_READY.
+
+Stage Summary:
+- Session deliverables: 6-Z256 (recovery-child std Android env +
+  guest rc exports — killed the 21-build OrangeFox strlen class),
+  6-Z257 (missed-stop-proof family fake + 6-Z163 outer-gate DIAG),
+  6-Z258/258b/258c (kernel-semantics dirfd + sandbox-translator scope
+  + real fchmodat/fchownat execution in-sandbox). Verified by four
+  CI waves (MON-2..MON-5): strlen class extinct, daisy/whyred/
+  starlte full UI_READY passes, regression class introduced+fixed
+  within the session, translation scope correct. Boot rate on the
+  dispatched samples: 4/6 distinct recoveries at full UI_READY
+  (daisy, whyred, starlte, plus cereus reaching its UI with the
+  system_readonly dialog pending on the display track).
+- The remaining boot-blocker surface: (1) the gl-path display track
+  (6-Z251d/e/f, parallel session — cereus/nitrogen/riva);
+  (2) the arm32 libtwrp_fb_hook.so sp-0x24 class (10 builds, local
+  disas scripts ready) + the arm32 0x2c recovery struct-deref class
+  (4 builds, 6-Z249 decoded the mechanism); (3) the stop-accounting
+  desync above (this entry).
