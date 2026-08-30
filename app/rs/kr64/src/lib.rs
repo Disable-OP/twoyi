@@ -2035,6 +2035,203 @@ fn twrp_recovery_setenv_lines(fb_width: i32, fb_height: i32, rootfs: &str) -> St
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// 6-Z256: the proactive recovery child's environment — pure core
+//
+// ROOT CAUSE (cereus OrangeFox R11, run 33323583991): the 20-build
+// aarch64 OrangeFox libc null-call class is
+//   strlen(getenv("ANDROID_ROOT")) with getenv → NULL
+// (crash pc = guest libc.so+0x1e320 = bionic's optimized strlen, x0=0,
+// caller LR = recovery+0x45cb4 building a "/boot.img" path string).
+// The 6-Z238/6-Z255 env scan named the losing stage DECISIVELY: the
+// recovery execve envp had `std-vars 0/4 present [] total_entries=4`
+// — and total_entries=4 matches Task 6-Z49's hardcoded envp EXACTLY
+// (LD_PRELOAD, LD_LIBRARY_PATH, PATH, TWOYI_ROOTFS). init NEVER forks
+// recovery for TWRP-family boots (Task 6-Z49 proactively forks it
+// before the ptrace loop starts), so init.rc's `export ANDROID_ROOT
+// /system` (verified present at line 34 of the extracted cereus
+// ramdisk init.rc, `on init` section) NEVER reaches the recovery
+// process. Every recovery that reads a standard Android env var
+// without a NULL check crashes at startup — the single biggest
+// remaining boot-failure family (20 OrangeFox builds + walleye, and
+// the 7 no-decode property_area runs share the fail=property_area
+// marker).
+//
+// THE FIX: give the proactive recovery child the environment a real
+// device's init would have exported by the time it starts the
+// recovery service (init.rc `on init` — AOSP rootdir/init.rc has
+// exported these on EVERY generation from 5.0 through 12):
+//   ANDROID_ROOT=/system, ANDROID_DATA=/data, EXTERNAL_STORAGE=/sdcard
+// plus ANDROID_BOOTLOGO=1 (exported by many TWRP/OEM init.rcs; minui
+// reads it for the splash path). GUEST OWNERSHIP (§10/§22): when the
+// guest's own init.rc files export a variable, the GUEST'S value wins
+// (we never override a guest-declared value with ours — the reverse
+// only for the twoyi-owned LD_*/TWOYI_* keys below).
+// ─────────────────────────────────────────────────────────────────────
+
+/// The standard Android environment a real init exports in `on init`,
+/// as (name, twoyi-default value) pairs. Applied to the proactive
+/// recovery child when the guest's own rc files do not export the name.
+pub const ANDROID_STD_ENV_DEFAULTS: [(&str, &str); 4] = [
+    ("ANDROID_ROOT", "/system"),
+    ("ANDROID_DATA", "/data"),
+    ("EXTERNAL_STORAGE", "/sdcard"),
+    ("ANDROID_BOOTLOGO", "1"),
+];
+
+/// 6-Z256: keys twoyi OWNS in the recovery child's envp — the guest's
+/// rc `export` lines for these are never copied over the twoyi-staged
+/// values (the virtualization stack depends on them; §22).
+fn twoyi_owned_env_key(name: &str) -> bool {
+    name == "LD_PRELOAD"
+        || name == "LD_LIBRARY_PATH"
+        || name == "PATH"
+        || name.starts_with("TWOYI_")
+}
+
+/// 6-Z256: collect the guest's own init.rc `export <name> <value>`
+/// directives (init.rc + its imports + init.recovery.*.rc — the same
+/// candidate set the recovery-service patcher scans). These are the
+/// environment variables the guest's init would have put into its own
+/// environ (and into every service, via export/add_environment) by the
+/// time the recovery service starts. Guest-owned truth, never guessed.
+///
+/// Grammar: `export <name> <value>` — value is the rest of the line,
+/// trimmed (init.rc values are single tokens on every real recovery;
+/// keeping the full remainder is strictly more faithful than taking
+/// the first token). Comment/blank lines skipped. Lines inside service
+/// blocks cannot start with `export` in any init generation (service
+/// options are name-only), so no section tracking is needed.
+fn parse_rc_export_lines(content: &str, out: &mut Vec<(String, String)>) {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("export ") {
+            let rest = rest.trim();
+            if let Some(sp) = rest.find(' ') {
+                let name = &rest[..sp];
+                let value = rest[sp + 1..].trim();
+                if !name.is_empty() && !value.is_empty() {
+                    out.push((name.to_string(), value.to_string()));
+                }
+            }
+            // `export NAME` with no value — skip (not a real export).
+        }
+    }
+}
+
+/// 6-Z256: read the guest rc export set from disk. Best-effort: missing
+/// files are skipped silently (the baseline std-env still applies).
+fn collect_guest_rc_exports(rootfs_prefix: &str) -> Vec<(String, String)> {
+    let mut exports: Vec<(String, String)> = Vec::new();
+    let init_rc_path = format!("{}/init.rc", rootfs_prefix);
+    let mut candidate_files: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if seen.insert(init_rc_path.clone()) {
+        candidate_files.push(init_rc_path.clone());
+    }
+    if let Ok(init_rc_content) = std::fs::read_to_string(&init_rc_path) {
+        collect_imported_rc_files(
+            &init_rc_path,
+            &init_rc_content,
+            rootfs_prefix,
+            &mut seen,
+            &mut candidate_files,
+            0,
+            5,
+        );
+    }
+    // init.recovery.*.rc glob (mirrors the recovery-service patcher step 4;
+    // step 3's exact init.recovery.rc is covered by the glob too).
+    let dir_path = if rootfs_prefix.is_empty() {
+        "/".to_string()
+    } else {
+        rootfs_prefix.to_string()
+    };
+    if let Ok(entries) = std::fs::read_dir(&dir_path) {
+        let mut glob_matches: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with("init.recovery.") && name.ends_with(".rc") {
+                    glob_matches.push(entry.path().to_string_lossy().into_owned());
+                }
+            }
+        }
+        glob_matches.sort();
+        for m in glob_matches {
+            if seen.insert(m.clone()) {
+                candidate_files.push(m);
+            }
+        }
+    }
+    for path in &candidate_files {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            parse_rc_export_lines(&content, &mut exports);
+        }
+    }
+    exports
+}
+
+/// 6-Z256: build the proactive recovery child's envp (pure, unit-locked).
+///
+/// Layers, in order (first occurrence of a name wins — vec order is the
+/// envp order the child sees):
+///   1. twoyi's virtualization stack: LD_PRELOAD (compat shim prepended
+///      when staged — the same chain the init.rc setenv patch writes),
+///      LD_LIBRARY_PATH, PATH, TWOYI_ROOTFS (the fb_hook INPUT bridge).
+///   2. guest rc exports (guest-owned truth) for names twoyi doesn't own.
+///   3. the standard Android defaults for names still absent.
+/// The result is deterministic and duplicate-free (envp duplicate names
+/// are undefined behavior per execve(3) — glibc/bionic use the FIRST).
+fn build_recovery_service_envp(
+    rootfs: &str,
+    compat_shim_staged: bool,
+    rc_exports: &[(String, String)],
+) -> Vec<String> {
+    let ld_preload = if compat_shim_staged {
+        format!(
+            "{}/sbin/libbionic_compat.so:{}/sbin/libtwrp_fb_hook.so",
+            rootfs, rootfs
+        )
+    } else {
+        format!("{}/sbin/libtwrp_fb_hook.so", rootfs)
+    };
+    let ld_library_path = format!(
+        "{}/sbin:{}/system/lib:{}/system/lib64",
+        rootfs, rootfs, rootfs
+    );
+    let mut entries: Vec<String> = vec![
+        format!("LD_PRELOAD={}", ld_preload),
+        format!("LD_LIBRARY_PATH={}", ld_library_path),
+        "PATH=/sbin:/system/bin".to_string(),
+        format!("TWOYI_ROOTFS={}", rootfs),
+    ];
+    let has_key = |entries: &Vec<String>, name: &str| -> bool {
+        let prefix = format!("{}=", name);
+        entries.iter().any(|e| e.starts_with(&prefix))
+    };
+    // Layer 2: guest rc exports (skip twoyi-owned keys).
+    for (name, value) in rc_exports {
+        if twoyi_owned_env_key(name) {
+            continue;
+        }
+        if has_key(&entries, name) {
+            continue;
+        }
+        entries.push(format!("{}={}", name, value));
+    }
+    // Layer 3: standard Android defaults (only for still-absent names).
+    for (name, default_value) in ANDROID_STD_ENV_DEFAULTS.iter() {
+        if has_key(&entries, name) {
+            continue;
+        }
+        entries.push(format!("{}={}", name, default_value));
+    }
+    entries
+}
+
 #[cfg(test)]
 fn patch_twrp_init_rc_recovery_service(content: &str) -> Option<String> {
     patch_twrp_init_rc_recovery_service_with_env(content, "")
@@ -9835,10 +10032,26 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                     recovery_path.clone()
                 };
 
-                let ld_preload = format!("{}/sbin/libtwrp_fb_hook.so", cfg.rootfs);
-                let ld_library_path = format!(
-                    "{}/sbin:{}/system/lib:{}/system/lib64",
-                    cfg.rootfs, cfg.rootfs, cfg.rootfs
+                // 6-Z256: the envp is now built by the pure builder —
+                // the old hardcoded 4-entry envp (LD_PRELOAD,
+                // LD_LIBRARY_PATH, PATH, TWOYI_ROOTFS) is exactly the
+                // `total_entries=4, std-vars 0/4` the 6-Z238/6-Z255 env
+                // scan observed on the 20-build OrangeFox strlen(NULL)
+                // class (run 33323583991): init never forks recovery for
+                // TWRP-family boots (this proactive fork IS the exec),
+                // so init.rc's `export ANDROID_ROOT /system` never
+                // reached the process. The builder layers the twoyi
+                // virtualization stack, the guest's own rc `export`
+                // lines (guest-owned truth), then the standard Android
+                // defaults — see ANDROID_STD_ENV_DEFAULTS.
+                let guest_rc_exports = collect_guest_rc_exports(&rootfs_prefix);
+                let recovery_envp =
+                    build_recovery_service_envp(&cfg.rootfs, compat_shim_staged, &guest_rc_exports);
+                info!(
+                    "[KR64] Task 6-Z256: recovery child envp ({} entries, {} rc exports): {:?}",
+                    recovery_envp.len(),
+                    guest_rc_exports.len(),
+                    recovery_envp
                 );
                 info!(
                     "[KR64] Task 6-Z49: proactively forking recovery child at {}",
@@ -9848,20 +10061,10 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 let path_c = std::ffi::CString::new(recovery_path.as_str()).unwrap_or_default();
                 let argv_c: Vec<std::ffi::CString> =
                     vec![std::ffi::CString::new("/sbin/recovery").unwrap_or_default()];
-                let envp_c: Vec<std::ffi::CString> = vec![
-                    std::ffi::CString::new(format!("LD_PRELOAD={}", ld_preload))
-                        .unwrap_or_default(),
-                    std::ffi::CString::new(format!("LD_LIBRARY_PATH={}", ld_library_path))
-                        .unwrap_or_default(),
-                    std::ffi::CString::new("PATH=/sbin:/system/bin").unwrap_or_default(),
-                    // 6-Z96: the fb hook's INPUT bridge computes the host
-                    // touch socket path as $TWOYI_ROOTFS/../dev/touch-events —
-                    // without this env its connect() ENOENTs (run 32652894955:
-                    // 'INPUT bridge connect FAILED for "event0"' all 600s while
-                    // the socket was bound the whole time).
-                    std::ffi::CString::new(format!("TWOYI_ROOTFS={}", cfg.rootfs))
-                        .unwrap_or_default(),
-                ];
+                let envp_c: Vec<std::ffi::CString> = recovery_envp
+                    .iter()
+                    .filter_map(|s| std::ffi::CString::new(s.as_str()).ok())
+                    .collect();
                 let mut argv_ptr: Vec<*const libc::c_char> =
                     argv_c.iter().map(|s| s.as_ptr()).collect();
                 argv_ptr.push(std::ptr::null());
@@ -11068,6 +11271,143 @@ mod tests {
         std::iter::once("kr64".to_string())
             .chain(v.iter().map(|s| s.to_string()))
             .collect()
+    }
+
+    // ── 6-Z256: recovery-child envp builder ──────────────────────────
+    //
+    // Regression anchors: the 20-build aarch64 OrangeFox
+    // strlen(getenv("ANDROID_ROOT")) null-call class (run 33323583991).
+    // The old hardcoded 4-entry envp (LD_PRELOAD, LD_LIBRARY_PATH, PATH,
+    // TWOYI_ROOTFS) had `std-vars 0/4 present` per the 6-Z238/6-Z255
+    // scan — every standard-var getenv() returned NULL.
+
+    fn env_names(entries: &[String]) -> Vec<&str> {
+        entries
+            .iter()
+            .map(|e| e.split('=').next().unwrap_or(""))
+            .collect()
+    }
+
+    fn env_get<'a>(entries: &'a [String], name: &str) -> Option<&'a str> {
+        let prefix = format!("{}=", name);
+        entries
+            .iter()
+            .find(|e| e.starts_with(&prefix))
+            .map(|e| &e[prefix.len()..])
+    }
+
+    #[test]
+    fn z256_envp_includes_standard_android_vars() {
+        let envp = build_recovery_service_envp("/host/rootfs", false, &[]);
+        let names = env_names(&envp);
+        for std_name in [
+            "ANDROID_ROOT",
+            "ANDROID_DATA",
+            "EXTERNAL_STORAGE",
+            "ANDROID_BOOTLOGO",
+        ] {
+            assert!(
+                names.contains(&std_name),
+                "envp must carry {} (the 20-build OrangeFox strlen(NULL) class)",
+                std_name
+            );
+        }
+        assert_eq!(env_get(&envp, "ANDROID_ROOT"), Some("/system"));
+        // twoyi's virtualization stack entries must survive unchanged.
+        assert_eq!(
+            env_get(&envp, "LD_PRELOAD"),
+            Some("/host/rootfs/sbin/libtwrp_fb_hook.so")
+        );
+        assert_eq!(env_get(&envp, "TWOYI_ROOTFS"), Some("/host/rootfs"));
+        // No duplicate keys (execve(3) envp duplicate names are UB).
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "duplicate env names: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn z256_envp_rc_exports_override_defaults_but_not_twoyi_keys() {
+        let rc_exports: Vec<(String, String)> = vec![
+            // Guest-owned truth: the guest's own export must WIN over the
+            // twoyi default for a non-twoyi key...
+            ("ANDROID_ROOT".to_string(), "/system2".to_string()),
+            // ...but the virtualization stack keys are twoyi-owned: the
+            // guest rc export must NOT clobber them (§22).
+            ("LD_PRELOAD".to_string(), "/evil.so".to_string()),
+            ("TWOYI_ROOTFS".to_string(), "/evil".to_string()),
+            // Guest-specific extras are carried through (e.g. mksh's ENV).
+            ("ENV".to_string(), "/etc/mkshrc".to_string()),
+        ];
+        let envp = build_recovery_service_envp("/host/rootfs", false, &rc_exports);
+        assert_eq!(env_get(&envp, "ANDROID_ROOT"), Some("/system2"));
+        assert_eq!(env_get(&envp, "ENV"), Some("/etc/mkshrc"));
+        assert_eq!(
+            env_get(&envp, "LD_PRELOAD"),
+            Some("/host/rootfs/sbin/libtwrp_fb_hook.so"),
+            "guest rc export must never override the twoyi preload chain"
+        );
+        assert_eq!(env_get(&envp, "TWOYI_ROOTFS"), Some("/host/rootfs"));
+    }
+
+    #[test]
+    fn z256_envp_compat_shim_prepends_to_preload_chain() {
+        let envp = build_recovery_service_envp("/host/rootfs", true, &[]);
+        let ld_preload = env_get(&envp, "LD_PRELOAD").unwrap();
+        let shim = ld_preload.find("libbionic_compat.so");
+        let fb = ld_preload.find("libtwrp_fb_hook.so");
+        assert!(shim.is_some() && fb.is_some());
+        assert!(
+            shim.unwrap() < fb.unwrap(),
+            "the FORTIFY shim must precede the fb hook (6-Z236 order)"
+        );
+    }
+
+    #[test]
+    fn z256_parse_rc_export_lines_guest_truth() {
+        let rc = concat!(
+            "# comment — skipped\n",
+            "\n",
+            "on init\n",
+            "    export PATH /sbin:/system/bin\n",
+            "    export LD_LIBRARY_PATH /sbin\n",
+            "\n",
+            "    export ANDROID_ROOT /system\n",
+            "    export EMPTY\n",
+            "service recovery /sbin/recovery\n",
+            "    seclabel u:r:recovery:s0\n",
+        );
+        let mut out: Vec<(String, String)> = Vec::new();
+        parse_rc_export_lines(rc, &mut out);
+        let got: Vec<(String, String)> = out;
+        assert_eq!(
+            got,
+            vec![
+                ("PATH".to_string(), "/sbin:/system/bin".to_string()),
+                ("LD_LIBRARY_PATH".to_string(), "/sbin".to_string()),
+                ("ANDROID_ROOT".to_string(), "/system".to_string()),
+            ],
+            "comments, blanks, value-less exports and service options must be skipped"
+        );
+    }
+
+    #[test]
+    fn z256_parse_rc_export_lines_keeps_multiword_value() {
+        let rc = "    export LD_CONFIG_FILE /sbin/ld.config.txt.extra\n";
+        let mut out: Vec<(String, String)> = Vec::new();
+        parse_rc_export_lines(rc, &mut out);
+        assert_eq!(
+            out,
+            vec![(
+                "LD_CONFIG_FILE".to_string(),
+                "/sbin/ld.config.txt.extra".to_string()
+            )]
+        );
     }
 
     #[test]
