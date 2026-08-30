@@ -20080,3 +20080,30 @@ Stage Summary:
   on head 92273ff. kr64 lint+test runs on push will validate the CI v7a build.
   Expect: the ELF32 guests link the armv7a chain and boot (some may still fail on
   OTHER stages — the v7a chain fixes the CANNOT LINK class specifically).
+
+---
+Task ID: SESSION-CHECKPOINT
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Session checkpoint — all work committed and pushed; CI queue draining.
+
+Work Log:
+- SESSION TOTALS (this session, tips a8e8167 → f6a4f36): 6-Z223 (hybrid cmdline,
+  VERIFIED), 6-Z224 (capset fake + mmap errno/recovery + fb0 un-gate + classifier pid,
+  VERIFIED), 6-Z224b (ashmem un-gate + battery type + AOSP UI detector, VERIFIED),
+  6-Z225 (rc caps-strip + OrangeFox banner, VERIFIED — OrangeFox InitFatalReboot
+  eliminated), 6-Z226 (armeabi-v7a hook builds + ELF-bitness-aware staging, queued
+  for verification). Corpus wave 1 measured: 46/60 UI_READY (76.7%).
+- TARGET RECOVERIES: lineage-22.2-sailfish UI_READY (multiple consecutive rounds);
+  orangefox-R12.0-lavender UI_READY (round 4, InitFatalReboot eliminated). Guards
+  (angler x2 + whyred) GREEN through every round.
+- IN FLIGHT (queued behind the arm64 runner pool): wave 2 (60 runs, 6e645cb) +
+  ELF32 verify x5 (92273ff: merlin/a7xelte/ali/athene/bacon).
+- NEXT SESSION: (1) collect the 5 ELF32 verdicts — expect the CANNOT LINK class
+  gone; any remaining failures there are the Class B (APEX libdl/property area) or
+  Class C (binder SIGSEGV) mechanisms per the 6-Z226-triage entry; (2) collect wave
+  2 (~60 more data points → updated %); (3) fix cherry (synthesize missing
+  DT_NEEDED libs), enchilada (init spin diagnostics), Class B/C; (4) waves
+  batch:120:180+ toward the 90% goal. Current measured+projected: 46/60 measured,
+  +5 (32-bit, pending verify) ≈ 85%; Class B/C fixes needed to clear 90% on the
+  wave-1 sample.
