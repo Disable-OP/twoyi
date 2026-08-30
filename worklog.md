@@ -20357,3 +20357,59 @@ Stage Summary:
   segfault, so the libdl WARN may be a false alarm — re-evaluate from the
   next artifacts once the confirmed fixes land (§25: no speculative fixes).
 - NEXT: push, then dispatch capricorn + starlte verifies on the new head.
+
+---
+Task ID: 6-Z230
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Stage missing DT_NEEDED libraries from the host runtime (cherry class).
+
+Work Log:
+- Evidence (cherry run 33286314950 artifacts, re-downloaded):
+  recovery-ld-debug.txt / recovery-ldd.txt = "CANNOT LINK EXECUTABLE:
+  library \"libcrypto.so\" not found"; guest LD_LIBRARY_PATH=/sbin:/system/
+  lib:/system/lib64; the twoyi rootfs ships a MINIMAL /system tree (the
+  listing shows only build.prop/etc/lib64/usr with an empty lib64); the
+  ramdisk /sbin carries libc/liblog/libminuitwrp/libaosprecovery/
+  libcrecovery but NO libcrypto.so. TWRP 3.7 builds for devices whose ROM
+  provides recovery dependencies (FBE/fscrypt) link libcrypto.so and expect
+  the ROM's /system/lib64 to supply it — on a real device it does; in Twoyi
+  the rootfs /system is minimal → the recovery service exit-1 loop.
+- IMPLEMENTATION (app/rs/kr64/src/lib.rs):
+  * dt_needed_names_from_bytes(): program-header-route ELF parser (PT_DYNAMIC
+    + DT_STRTAB resolved through PT_LOAD vaddr→off; ELF32+ELF64, LE only —
+    Android is LE on every ABI served). Section headers deliberately NOT used
+    (stripped release binaries keep phdrs but can lose sections).
+  * stage_missing_dt_needed(rootfs_prefix): scan {rootfs}/sbin regular files
+    (symlinks skipped — the busybox applet farm) + sbin/recovery for
+    DT_NEEDED; resolve each name against the guest's own trees first (sbin,
+    system/lib{,64}, vendor/lib64, odm/lib64); for names the guest lacks,
+    COPY the host runtime's same-ABI copy (candidate e_machine must equal
+    the guest recovery's machine — wrong-ABI staging would recreate the
+    6-Z226 class) from /system/lib{,64}, /vendor/lib{,64}, and the /apex/
+    flat+boringssl dirs (Android 12+ keeps libcrypto in the conscrypt APEX)
+    into {rootfs}/sbin/<name>. COPY not symlink (§6: a rootfs-internal
+    symlink to an absolute host path would leak the host namespace and fail
+    the backstop). Transitive closure over staged libs; caps: 48 staged /
+    96 parsed; never overwrites; idempotent.
+  * Call site: run prep, right after 6-Z218b (PARENT, pre-pivot_root — host
+    paths still readable; before any dynamic guest exec). Runs for every
+    boot mode; static-only guests parse as no-PT_DYNAMIC → cheap no-op.
+  * Tests: synthetic ELF64 fixture (tag+val pairs, strtab[0]=empty-string
+    convention — which is WHY DT_NEEDED offsets are never 0), extraction,
+    empty-DT case, non-ELF/truncated/phnum=0 rejection, real-artifact
+    parses of the 6-Z227 NDK-built libs. 648 host tests green; clippy -D
+    warnings clean x86_64 + aarch64-linux-android; fmt clean.
+- Fixture-debugging note: two rounds of self-inflicted fixture bugs (phdr
+  truncation by resize to dyn_off; strtab vaddr outside PT_LOAD; missing
+  empty-string at strtab[0]) — the PARSER was never wrong; kept the tests
+  as permanent coverage.
+
+Stage Summary:
+- cherry class (missing ROM-provided DT_NEEDED libs) now gets the host
+  runtime's copies staged into sbin at import — generic, ABI-guarded,
+  bounded.
+- IN FLIGHT: capricorn + starlte verifies on 9ac5f2d (6-Z229); merlin on
+  728785c (pre-6-Z228 — expect tracer-garbage evidence, re-verify after).
+- NEXT: check verify results; then Class C (libbinder SIGSEGV loops) or
+  enchilada (first-stage spin) depending on runner availability.
