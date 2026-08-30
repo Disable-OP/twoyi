@@ -143,4 +143,40 @@
     <string name="profile_import_failed">匯入設定檔失敗：%1$s</string>
     <string name="profile_from_scratch">從零開始</string>
     <string name="profile_from_import">從匯入</string>
+    <!-- 6-Z26x translations -->
+    <string name="settings_boot_recovery_summary">此開關決定點按「啟動容器」時容器引導哪個系統。開啟 = 引導你匯入的復原映像（TWRP/OrangeFox 等）——復原模式的常規用法。關閉 = 引導完整的 Android ROM。透過「選擇 ROM」匯入復原映像後會自動開啟，通常無需手動變更。下次啟動容器時生效。</string>
+    <string name="settings_boot_recovery_dialog_title">關於「引導復原模式」</string>
+    <string name="settings_boot_recovery_dialog_text">Twoyi 在容器中執行你透過「選擇 ROM」匯入的映像。\n\n• 匯入的是復原映像（TWRP/OrangeFox/SHRP 等的 .img/.zip）→ 保持開啟，點按啟動將直接進入該復原模式。\n• 匯入的是完整 Android ROM → 關閉此項，點按啟動將引導該 Android 系統。\n\n應用程式會根據匯入映像的版面自動設定此項；變更只影響下次啟動，不會重新啟動你的手機。\n\n為什麼已經在復原畫面了還叫「引導復原模式」？容器在你點按「啟動容器」之前並不存在——此開關告訴啟動器引導哪個客戶系統。</string>
+    <string name="settings_boot_recovery_applies">引導模式已儲存 — 下次「啟動容器」時生效</string>
+    <string name="settings_rom_installed_unnamed">已安裝 ROM — 點按可匯入其他映像</string>
+    <string name="settings_rootfs_fm_title">Rootfs 檔案管理器</string>
+    <string name="settings_rootfs_fm_summary">瀏覽並編輯已匯入系統的每個檔案：內容、名稱和權限（chmod）。進階工具。</string>
+    <string name="fm_warning_running">容器正在（或最近）執行。直接編輯可能與客戶端的暫存檔案衝突——建議先關閉容器再編輯。</string>
+    <string name="fm_empty">空目錄</string>
+    <string name="fm_new_folder">新增資料夾</string>
+    <string name="fm_new_file">新增檔案</string>
+    <string name="fm_refresh">重新整理</string>
+    <string name="fm_action_edit">檢視 / 編輯</string>
+    <string name="fm_action_details">詳細資訊</string>
+    <string name="fm_action_chmod">修改權限 (chmod)</string>
+    <string name="fm_action_rename">重新命名</string>
+    <string name="fm_action_delete">刪除</string>
+    <string name="fm_details_path">路徑</string>
+    <string name="fm_details_size">大小</string>
+    <string name="fm_details_mode">權限（八進位）</string>
+    <string name="fm_chmod_title">chmod %s</string>
+    <string name="fm_chmod_message">以八進位輸入新的權限遮罩，例如 755 = rwxr-xr-x，644 = rw-r--r--，4755 = setuid。</string>
+    <string name="fm_chmod_invalid">無效的權限值 — 請輸入 3 或 4 位八進位數字 (0-7)</string>
+    <string name="fm_chmod_failed">chmod 失敗 (errno %d)</string>
+    <string name="fm_rename_title">重新命名</string>
+    <string name="fm_invalid_name">名稱無效</string>
+    <string name="fm_rename_failed">重新命名失敗</string>
+    <string name="fm_delete_title">刪除</string>
+    <string name="fm_delete_message">刪除 %s？目錄將被遞迴刪除。</string>
+    <string name="fm_delete_failed">刪除失敗</string>
+    <string name="fm_read_failed">無法讀取檔案</string>
+    <string name="fm_save">儲存</string>
+    <string name="fm_save_failed">儲存失敗</string>
+    <string name="fm_edit_truncated_suffix">（前 256 KB）</string>
+    <string name="fm_create_failed">建立失敗</string>
 </resources>

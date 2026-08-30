@@ -138,6 +138,9 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         ev.recycle();
     }
 
+    // WrongConstant: the RECEIVER_EXPORTED flag must stay a literal until
+    // compileSdk reaches 33 (see the call site below).
+    @androidx.annotation.SuppressLint("WrongConstant")
     private void registerDebugTouchReceiver() {
         mDebugTouchReceiver = new BroadcastReceiver() {
             @Override
@@ -175,7 +178,8 @@ public class Render2Activity extends Activity implements View.OnTouchListener {
         if (Build.VERSION.SDK_INT >= 26) {
             // Context.RECEIVER_EXPORTED == 0x2 (constant added in
             // compileSdk 33; the flag VALUE is stable since API 26 —
-            // use the literal so older compileSks build too).
+            // use the literal so older compileSks build too). The
+            // WrongConstant lint suppression sits on the method.
             registerReceiver(mDebugTouchReceiver, filter, 0x2);
         } else {
             registerReceiver(mDebugTouchReceiver, filter);
