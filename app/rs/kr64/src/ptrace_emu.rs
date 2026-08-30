@@ -297,6 +297,39 @@ fn pid_is_arm32(pid: libc::pid_t) -> bool {
     ARM32_PIDS.with(|s| s.borrow().contains(&pid))
 }
 
+/// 6-Z254: ABI-aware register fetch for the EXIT-path decision reads.
+///
+/// `ptrace_getregs` on an aarch64 host requests the 272-byte NT_PRSTATUS
+/// regset; for an AArch32 compat child the kernel fills only the first
+/// 72 bytes and clamps the iov, leaving every widened-view slot above
+/// uregs[17] STALE-ZERO. Any EXIT-side decision read through that raw
+/// buffer is garbage for a compat child:
+///   * `get_syscall_num` (ABI_ARM32 reg_syscall = r7) reads the u64 slot
+///     7 = (r14 | pc<<32) — the chronic "fresh-regs2 syscall_num=
+///     -1542791040932091243 — snapshot diverged" noise;
+///   * `get_syscall_arg(regs2, reg_ret)` (r0) reads (r0 | r1<<32) — the
+///     high half makes every `fresh_ret == -38 / -9` gate MISS, so the
+///     seccomp-ENOSYS and fake-fd fakes never fire on arm32, and the
+///     6-Z60 preserve path logs garbage return values.
+/// Route ALL EXIT-path fresh reads through this wrapper: it re-reads
+/// compat children through the 72-byte regset and widens (r0..r12, sp,
+/// lr, pc land in the standard slots), everyone else uses the plain
+/// 272-byte read. On x86_64 hosts PTRACE_GETREGS zero-extends i386
+/// children into the full struct already, so the wrapper is identity.
+#[cfg(target_arch = "aarch64")]
+fn ptrace_getregs_wide(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
+    if pid_is_arm32(pid) {
+        ptrace_getregs_arm32(pid, regs)
+    } else {
+        ptrace_getregs(pid, regs)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn ptrace_getregs_wide(pid: libc::pid_t, regs: &mut Regs) -> std::io::Result<usize> {
+    ptrace_getregs(pid, regs)
+}
+
 /// 6-Z228: GETREGSET through the AArch32 compat layout and widen into
 /// the 64-bit view. Always requests exactly the compat regset size —
 /// on a compat child the kernel clamps a larger iov anyway, but asking
@@ -9524,7 +9557,7 @@ fn write_translated_path(
     // the whole class.
     {
         let mut fresh: Regs = unsafe { std::mem::zeroed() };
-        if ptrace_getregs(pid, &mut fresh).is_err() {
+        if ptrace_getregs_wide(pid, &mut fresh).is_err() {
             wtp_fail!("fresh-getregs");
             return false;
         }
@@ -12864,7 +12897,7 @@ pub fn run_ptrace_loop(
                         };
                         if new_ret != -38 {
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                            if ptrace_getregs(pid, &mut regs2).is_ok() {
+                            if ptrace_getregs_wide(pid, &mut regs2).is_ok() {
                                 set_syscall_ret(&mut regs2, &abi, new_ret);
                                 let _ = ptrace_setregs(pid, &regs2, std::mem::size_of::<Regs>());
                             }
@@ -13232,7 +13265,9 @@ pub fn run_ptrace_loop(
                                                     let verify_arg1 = |p: &str| -> bool {
                                                         let mut vr: Regs =
                                                             unsafe { std::mem::zeroed() };
-                                                        if ptrace_getregs(pid, &mut vr).is_err() {
+                                                        if ptrace_getregs_wide(pid, &mut vr)
+                                                            .is_err()
+                                                        {
                                                             return false;
                                                         }
                                                         let a = get_syscall_arg(&vr, abi.reg_arg1);
@@ -13421,7 +13456,7 @@ pub fn run_ptrace_loop(
                                     // only the write path was unreliable.
                                     let verify_arg1 = |p: &str| -> bool {
                                         let mut vr: Regs = unsafe { std::mem::zeroed() };
-                                        if ptrace_getregs(pid, &mut vr).is_err() {
+                                        if ptrace_getregs_wide(pid, &mut vr).is_err() {
                                             return false;
                                         }
                                         let a = get_syscall_arg(&vr, abi.reg_arg1);
@@ -13461,7 +13496,7 @@ pub fn run_ptrace_loop(
                                         let rf = translate_path(rootfs, &orig);
                                         if rf != orig {
                                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                            if ptrace_getregs(pid, &mut regs2).is_ok() {
+                                            if ptrace_getregs_wide(pid, &mut regs2).is_ok() {
                                                 let sp2 = get_syscall_arg(&regs2, abi.reg_sp);
                                                 for slot in 1..=4usize {
                                                     let scratch_local = sp2
@@ -14295,7 +14330,7 @@ pub fn run_ptrace_loop(
                                             if write_child_blob(pid, sa_scratch, &new_sa) {
                                                 let new_len = new_sa.len() as i64;
                                                 let mut fresh: Regs = unsafe { std::mem::zeroed() };
-                                                if ptrace_getregs(pid, &mut fresh).is_ok() {
+                                                if ptrace_getregs_wide(pid, &mut fresh).is_ok() {
                                                     set_syscall_arg(
                                                         &mut fresh,
                                                         abi.reg_arg2,
@@ -16975,7 +17010,7 @@ pub fn run_ptrace_loop(
                     // so the existing boot-critical semantics survive.
                     if let Some(fake_ret) = pending_sandbox_deny.remove(&pid) {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        match ptrace_getregs(pid, &mut regs2) {
+                        match ptrace_getregs_wide(pid, &mut regs2) {
                             Ok(len2) => {
                                 set_syscall_ret(&mut regs2, &abi, fake_ret);
                                 if let Err(e) = ptrace_setregs(pid, &regs2, len2) {
@@ -17000,7 +17035,7 @@ pub fn run_ptrace_loop(
                     // executes sys_read (nr=0) instead of execve (nr=59).
                     if pending_64bit_execve {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        match ptrace_getregs(pid, &mut regs2) {
+                        match ptrace_getregs_wide(pid, &mut regs2) {
                             Ok(len2) => {
                                 let current_rax = get_syscall_arg(&regs2, 10);
                                 set_syscall_arg(&mut regs2, 10, 59); // rax = 59 (x86_64 execve)
@@ -17008,7 +17043,7 @@ pub fn run_ptrace_loop(
                                     Ok(()) => {
                                         // Verify the SETREGS worked
                                         let mut verify_regs: Regs = unsafe { std::mem::zeroed() };
-                                        if ptrace_getregs(pid, &mut verify_regs).is_ok() {
+                                        if ptrace_getregs_wide(pid, &mut verify_regs).is_ok() {
                                             let verify_rax = get_syscall_arg(&verify_regs, 10);
                                             log(&format!("DIAG 64-bit execve: EXIT stop — re-set rax 0→59 (was {}, verify={}) (Task 6-Z45)", current_rax, verify_rax));
                                         } else {
@@ -17713,7 +17748,7 @@ pub fn run_ptrace_loop(
                                             // value (new length).
                                             if write_child_bytes_pokedata(pid, buf, &out) > 0 {
                                                 let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                                if ptrace_getregs(pid, &mut regs2).is_ok() {
+                                                if ptrace_getregs_wide(pid, &mut regs2).is_ok() {
                                                     set_syscall_ret(
                                                         &mut regs2,
                                                         &abi,
@@ -17775,7 +17810,7 @@ pub fn run_ptrace_loop(
                                         if out.len() <= ret as usize {
                                             if write_child_bytes_pokedata(pid, buf, &out) > 0 {
                                                 let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                                if ptrace_getregs(pid, &mut regs2).is_ok() {
+                                                if ptrace_getregs_wide(pid, &mut regs2).is_ok() {
                                                     set_syscall_ret(
                                                         &mut regs2,
                                                         &abi,
@@ -18168,7 +18203,7 @@ pub fn run_ptrace_loop(
                     // the mechanism.
                     if syscall_num == abi.mmap || syscall_num == abi.mmap2 {
                         let mut regs_le: Regs = unsafe { std::mem::zeroed() };
-                        if ptrace_getregs(pid, &mut regs_le).is_ok() {
+                        if ptrace_getregs_wide(pid, &mut regs_le).is_ok() {
                             let le_ret = get_syscall_arg(&regs_le, abi.reg_ret) as i64;
                             if le_ret == -1 || le_ret == -38 {
                                 // i386 preserves arg registers across
@@ -18242,7 +18277,7 @@ pub fn run_ptrace_loop(
                             // dedicated handlers above; the fresh read is
                             // authoritative for rax).
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                            match ptrace_getregs(pid, &mut regs2) {
+                            match ptrace_getregs_wide(pid, &mut regs2) {
                                 Ok(len2) => {
                                     let mmap_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
                                     if !mmap_return_is_valid_mapping_address(mmap_ret, &abi) {
@@ -18710,7 +18745,7 @@ pub fn run_ptrace_loop(
                                     let count = get_syscall_arg(&regs, abi.reg_arg3) as i64;
                                     let fake_ret = if count > 0 { count } else { 0 };
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    match ptrace_getregs(pid, &mut regs2) {
+                                    match ptrace_getregs_wide(pid, &mut regs2) {
                                         Ok(len) => {
                                             set_syscall_ret(&mut regs2, &abi, fake_ret);
                                             match ptrace_setregs(pid, &regs2, len) {
@@ -18810,7 +18845,7 @@ pub fn run_ptrace_loop(
                                     let fake_len = (fake_ctx.len() as i64) + 1;
                                     if write_child_string_unchecked(pid, buf_addr, fake_ctx) {
                                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                        match ptrace_getregs(pid, &mut regs2) {
+                                        match ptrace_getregs_wide(pid, &mut regs2) {
                                             Ok(len) => {
                                                 set_syscall_ret(&mut regs2, &abi, fake_len);
                                                 match ptrace_setregs(pid, &regs2, len) {
@@ -18924,7 +18959,7 @@ pub fn run_ptrace_loop(
                             if ret >= 0 {
                                 let emulated = emulated_prctl_ret(prctl_option, prctl_arg2);
                                 let mut regs_pr: Regs = unsafe { std::mem::zeroed() };
-                                if ptrace_getregs(pid, &mut regs_pr).is_ok() {
+                                if ptrace_getregs_wide(pid, &mut regs_pr).is_ok() {
                                     set_syscall_ret(&mut regs_pr, &abi, emulated);
                                     let _ = ptrace_setregs(pid, &regs_pr, iov_len);
                                 }
@@ -19248,7 +19283,7 @@ pub fn run_ptrace_loop(
                         // rewind already happened above; a signal-delivery
                         // stop in between would have kept nr intact).
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                        if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                             // `abi` was unwrapped above (it is the
                             // local `ChildAbi` for this syscall-stop)
                             // and is guaranteed Some because we only
@@ -19310,7 +19345,7 @@ pub fn run_ptrace_loop(
                         pending_xattr_fake_pid = None;
                         let exit_syscall_num = syscall_num;
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        match ptrace_getregs(pid, &mut regs2) {
+                        match ptrace_getregs_wide(pid, &mut regs2) {
                             Ok(len) => {
                                 let original_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
                                 set_syscall_ret(&mut regs2, &abi, 0);
@@ -19365,7 +19400,7 @@ pub fn run_ptrace_loop(
                         if syscall_num == abi.poll_nr {
                             pending_poll_fake.remove(&pid);
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                            match ptrace_getregs(pid, &mut regs2) {
+                            match ptrace_getregs_wide(pid, &mut regs2) {
                                 Ok(len) => {
                                     let original_ret =
                                         get_syscall_arg(&regs2, abi.reg_ret) as i64;
@@ -19425,7 +19460,7 @@ pub fn run_ptrace_loop(
                         pending_set_thread_area_fake_pid = None;
                         let exit_syscall_num = syscall_num;
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        match ptrace_getregs(pid, &mut regs2) {
+                        match ptrace_getregs_wide(pid, &mut regs2) {
                             Ok(len) => {
                                 let original_ret =
                                     get_syscall_arg(&regs2, abi.reg_ret) as i64;
@@ -19747,7 +19782,7 @@ pub fn run_ptrace_loop(
                                             let mut regs2: Regs = unsafe {
                                                 std::mem::zeroed()
                                             };
-                                            match ptrace_getregs(pid, &mut regs2) {
+                                            match ptrace_getregs_wide(pid, &mut regs2) {
                                                 Ok(len) => {
                                                     set_syscall_ret(
                                                         &mut regs2,
@@ -19974,7 +20009,7 @@ pub fn run_ptrace_loop(
                         || syscall_num == abi.fgetxattr_nr
                     {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        if let Ok(len2) = ptrace_getregs(pid, &mut regs2) {
+                        if let Ok(len2) = ptrace_getregs_wide(pid, &mut regs2) {
                             let fresh_ret = get_syscall_arg(&regs2, abi.reg_ret) as i64;
                             if fresh_ret == -61 || fresh_ret == -1 {
                                 let name_addr = get_syscall_arg(&regs2, abi.reg_arg2);
@@ -20065,7 +20100,7 @@ pub fn run_ptrace_loop(
                     // 6-Z228: 252=i386 exit_group, 248=arm32 — use the ABI field
                     {
                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                        match ptrace_getregs(pid, &mut regs2) {
+                        match ptrace_getregs_wide(pid, &mut regs2) {
                             Ok(len) => {
                                 let name = syscall_name(syscall_num, &abi);
                                 // ── Task 6-Z60: fresh-return-gated fake ──
@@ -20381,7 +20416,7 @@ pub fn run_ptrace_loop(
                                 {
                                     if _forced_ret.is_some() {
                                         let mut readback: Regs = unsafe { std::mem::zeroed() };
-                                        if ptrace_getregs(pid, &mut readback).is_ok() {
+                                        if ptrace_getregs_wide(pid, &mut readback).is_ok() {
                                             let readback_rax =
                                                 get_syscall_arg(&readback, abi.reg_ret) as i64;
                                             if loop_count <= 200 {
@@ -20506,7 +20541,7 @@ pub fn run_ptrace_loop(
                                     }
                                     fake_netlink_fds.entry(pid).or_default().insert(fd as i64);
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                         set_syscall_ret(&mut regs2, &abi, fd as i64);
                                         if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                             log(&format!(
@@ -20553,7 +20588,7 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                         set_syscall_ret(&mut regs2, &abi, 0);
                                         if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                             log(&format!(
@@ -20605,7 +20640,7 @@ pub fn run_ptrace_loop(
                                     // still wins first for fake fds — no
                                     // double fake.
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                         set_syscall_ret(&mut regs2, &abi, 0);
                                         if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                             log(&format!(
@@ -20637,7 +20672,7 @@ pub fn run_ptrace_loop(
                                     // and NOT 0 (0 = orderly-shutdown would
                                     // look like a valid empty uevent).
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                         set_syscall_ret(&mut regs2, &abi, -11);
                                         let _ = ptrace_setregs(pid, &regs2, len);
                                         if netlink_recv_log_count < 20 {
@@ -20673,7 +20708,7 @@ pub fn run_ptrace_loop(
                                         1
                                     };
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                         set_syscall_ret(&mut regs2, &abi, new_ret);
                                         let _ = ptrace_setregs(pid, &regs2, len);
                                         log(&format!(
@@ -20778,7 +20813,7 @@ pub fn run_ptrace_loop(
                                             &abi,
                                         ) {
                                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                                 // -111 = ECONNREFUSED (canonical "no listener"
                                                 // errno for AF_UNIX; matches bionic's
                                                 // __system_property_set error path).
@@ -20817,7 +20852,7 @@ pub fn run_ptrace_loop(
                                         // Track the fd + fake the return to 0.
                                         fake_propserv_fds.entry(pid).or_default().insert(fd as i64);
                                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                        if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                             set_syscall_ret(&mut regs2, &abi, 0);
                                             if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                                 log(&format!(
@@ -20929,7 +20964,7 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                     let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                    if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                    if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                         set_syscall_ret(&mut regs2, &abi, new_ret);
                                         if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                             log(&format!(
@@ -20983,7 +21018,7 @@ pub fn run_ptrace_loop(
                             .map_or(false, |s| s.contains(&fd));
                         if is_tracked {
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                 set_syscall_ret(&mut regs2, &abi, 0);
                                 if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                     log(&format!(
@@ -21108,7 +21143,7 @@ pub fn run_ptrace_loop(
                                 }
                                 fake_netlink_fds.entry(pid).or_default().insert(fd as i64);
                                 let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                     set_syscall_ret(&mut regs2, &abi, fd as i64);
                                     if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                         log(&format!(
@@ -21142,7 +21177,7 @@ pub fn run_ptrace_loop(
                                     _ => 1,
                                 };
                                 let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                     set_syscall_ret(&mut regs2, &abi, new_ret);
                                     if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                         log(&format!(
@@ -21238,7 +21273,7 @@ pub fn run_ptrace_loop(
                                     }
                                 }
                                 let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                     set_syscall_ret(&mut regs2, &abi, new_ret);
                                     if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                         log(&format!(
@@ -21344,7 +21379,7 @@ pub fn run_ptrace_loop(
                                             &abi,
                                         ) {
                                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                                 set_syscall_ret(&mut regs2, &abi, -111);
                                                 if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                                     log(&format!(
@@ -21395,7 +21430,7 @@ pub fn run_ptrace_loop(
                                     ) {
                                         fake_propserv_fds.entry(pid).or_default().insert(fd as i64);
                                         let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                                        if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                                        if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                             set_syscall_ret(&mut regs2, &abi, 0);
                                             if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                                 log(&format!(
@@ -21425,7 +21460,7 @@ pub fn run_ptrace_loop(
                             // 6-W SIGSYS-handler pattern — avoids the
                             // stale-value race).
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                 set_syscall_ret(&mut regs2, &abi, 0);
                                 if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                     log(&format!(
@@ -21510,7 +21545,7 @@ pub fn run_ptrace_loop(
                             // the 6-W SIGSYS-handler pattern — avoids
                             // the stale-value race).
                             let mut regs2: Regs = unsafe { std::mem::zeroed() };
-                            if let Ok(len) = ptrace_getregs(pid, &mut regs2) {
+                            if let Ok(len) = ptrace_getregs_wide(pid, &mut regs2) {
                                 set_syscall_ret(&mut regs2, &abi, 0);
                                 if let Err(e) = ptrace_setregs(pid, &regs2, len) {
                                     log(&format!(
@@ -21728,7 +21763,7 @@ pub fn run_ptrace_loop(
                 recent_stops.push_back(format!("(loop={},pid={},sigsys)", loop_count, pid));
                 let in_syscall_at_sigsys = in_syscall;
                 let mut sigsys_regs: Regs = unsafe { std::mem::zeroed() };
-                match ptrace_getregs(pid, &mut sigsys_regs) {
+                match ptrace_getregs_wide(pid, &mut sigsys_regs) {
                     Ok(len) => {
                         // Initialize the PER-CHILD ABI (Task 6-Z75) on
                         // the first successful register read FOR THIS
@@ -22747,7 +22782,7 @@ pub fn run_ptrace_loop(
                                 // Readback verification, mirroring the NORMAL
                                 // branch's 5-J diagnostic below.
                                 let mut readback: Regs = unsafe { std::mem::zeroed() };
-                                if ptrace_getregs(pid, &mut readback).is_ok() {
+                                if ptrace_getregs_wide(pid, &mut readback).is_ok() {
                                     let readback_rax = get_syscall_arg(&readback, a.reg_ret) as i64;
                                     sigsys_log(&format!(
                                         "[KR64][ptrace] SIGSYS DESYNC POKEUSER wrote rax={} for nr={} [{}], readback rax={}",
@@ -22781,7 +22816,7 @@ pub fn run_ptrace_loop(
                             // loops).
                             if sigsys_repeat_count <= 5 {
                                 let mut readback: Regs = unsafe { std::mem::zeroed() };
-                                if ptrace_getregs(pid, &mut readback).is_ok() {
+                                if ptrace_getregs_wide(pid, &mut readback).is_ok() {
                                     let readback_rax = get_syscall_arg(&readback, a.reg_ret) as i64;
                                     sigsys_log(&format!(
                                         "[KR64][ptrace] SIGSYS handler wrote rax={} for nr={} [{}], readback rax={}",
