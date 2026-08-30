@@ -171,8 +171,63 @@ public final class RomManager {
         // for the real libdl.so), so the I/O cost on every app start
         // is negligible (~0.1ms).
         extractLibdlAsset(context);
+        extractArm32HookAssets(context);
 
         saveLastKmsg(context);
+    }
+
+    /**
+     * Extract the 32-bit ARM (armeabi-v7a) hook libraries from APK assets
+     * to the app's files dir (6-Z226). Android's package manager extracts
+     * only the DEVICE's ABI jniLibs, so the armeabi-v7a builds — the
+     * LD_PRELOAD hook chain for 32-bit (ELF32 EM_ARM) guest recoveries —
+     * ship as assets instead. kr64's
+     * {@code detect_guest_recovery_bitness()} +
+     * {@code hook_library_candidates()} read them from
+     * {@code getFilesDir()} for ELF32 guests.
+     *
+     * <p>Missing assets (CI hasn't built them yet) degrade gracefully:
+     * kr64 stages NO hook for a 32-bit guest, which bionic treats as an
+     * ignorable LD_PRELOAD entry — strictly better than the wave-1
+     * behavior of staging the wrong-arch aarch64 library ("CANNOT LINK
+     * EXECUTABLE ... is 64-bit instead of 32-bit" → guest init exit 1).
+     */
+    private static void extractArm32HookAssets(Context context) {
+        String[] assets = {
+            "libtwrp_fb_hook_arm32.so",
+            "libtwoyi_loader_shlib_arm32.so",
+            "libgetpid_hook_arm32.so",
+        };
+        for (String name : assets) {
+            File target = new File(context.getFilesDir(), name);
+            File parent = target.getParentFile();
+            if (parent != null && !parent.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                parent.mkdirs();
+            }
+            InputStream in = null;
+            FileOutputStream out = null;
+            try {
+                in = context.getAssets().open(name);
+                out = new FileOutputStream(target);
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+                out.flush();
+                Log.i(TAG, "extractArm32HookAssets: extracted " + name + " ("
+                        + target.length() + " bytes) to " + target);
+            } catch (IOException e) {
+                Log.w(TAG, "extractArm32HookAssets: " + name
+                        + " asset not readable (expected until the CI build runs"
+                        + " app/cpp/build.sh which stages the armv7a outputs): "
+                        + e.getMessage());
+            } finally {
+                IOUtils.closeSilently(in);
+                IOUtils.closeSilently(out);
+            }
+        }
     }
 
     /**
