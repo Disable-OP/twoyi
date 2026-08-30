@@ -1565,8 +1565,11 @@ pub fn dt_needed_names_from_bytes(data: &[u8]) -> Option<Vec<String>> {
 /// libs and 96 parsed images per run — bounded cost, bounded blast
 /// radius.
 ///
-/// Returns (staged_count, missing_names_not_found_anywhere).
-pub fn stage_missing_dt_needed(rootfs_prefix: &str) -> (usize, Vec<String>) {
+/// Returns (staged_count, missing_names_not_found_anywhere, staged_from_host).
+/// `staged_from_host` is true when at least ONE host-runtime library was
+/// copied — the signal for the 6-Z236 FORTIFY-shim staging (host bionic
+/// libs reference __*_chk symbols the guest libc may not export).
+pub fn stage_missing_dt_needed(rootfs_prefix: &str) -> (usize, Vec<String>, bool) {
     use std::os::unix::fs::PermissionsExt;
     const MAX_STAGED: usize = 48;
     const MAX_PARSED: usize = 96;
@@ -1623,13 +1626,14 @@ pub fn stage_missing_dt_needed(rootfs_prefix: &str) -> (usize, Vec<String>) {
         .or_else(|| elf_machine(&format!("{}/sbin/libc.so", rootfs_prefix)));
     let guest_machine = match guest_machine {
         Some(m) if m != 0 => m,
-        _ => return (0, vec![]),
+        _ => return (0, vec![], false),
     };
 
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut parse_queue: Vec<String> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
     let mut staged = 0usize;
+    let mut staged_from_host = false;
 
     // Seed: the recovery binary + every regular ELF in sbin.
     if std::path::Path::new(&recovery_path).exists() {
@@ -1696,6 +1700,7 @@ pub fn stage_missing_dt_needed(rootfs_prefix: &str) -> (usize, Vec<String>) {
             match staged_path {
                 Some(dst) => {
                     staged += 1;
+                    staged_from_host = true;
                     crate::info!(
                         "[KR64] 6-Z230: staged host-runtime lib {} -> {} (guest DT_NEEDED not shipped by ramdisk)",
                         name, dst
@@ -1720,7 +1725,100 @@ pub fn stage_missing_dt_needed(rootfs_prefix: &str) -> (usize, Vec<String>) {
             m
         );
     }
-    (staged, missing)
+    (staged, missing, staged_from_host)
+}
+
+/// 6-Z236: stage the bionic FORTIFY-compat shim (libbionic_compat.so)
+/// next to the host-runtime libraries staged by [`stage_missing_dt_needed`].
+///
+/// ROOT CAUSE (cherry, run 33306474686): the host runtime's libcrypto.so
+/// references the FORTIFY wrapper family (__write_chk, __read_chk, ...)
+/// exported by the HOST's bionic libc. The GUEST's own libc.so (an older
+/// bionic generation) does not export them → "cannot locate symbol
+/// \"__write_chk\" referenced by .../sbin/libcrypto.so" → CANNOT LINK →
+/// the recovery service exit-1 restart loop.
+///
+/// THE FIX: the shim (app/cpp/twoyi_loader/src/bionic_compat.c) is a
+/// -nostdlib shared object that implements the FORTIFY family on raw
+/// syscalls and exports the symbols. It is staged into {rootfs}/sbin
+/// (LD_LIBRARY_PATH[0] proximity) AND {rootfs}/dev (the AOSP-chain
+/// /dev slot) and PREPENDED to the recovery service's LD_PRELOAD chain:
+/// bionic loads LD_PRELOAD libraries BEFORE DT_NEEDED resolution, so the
+/// shim's exports satisfy the host libs' relocations. Inert for guests
+/// that don't need it. Never overwrites a guest-shipped
+/// libbionic_compat.so (respect guest contents, §10/§22).
+///
+/// Source resolution is bitness-aware (§9): EM_ARM (40) guests read the
+/// RomManager-extracted `libbionic_compat_arm32.so` asset; other ABIs
+/// read the jniLibs `libbionic_compat.so` (x86_64 corpus additionally
+/// has the `libbionic_compat_i686.so` slot).
+/// 6-Z236: the shim SOURCE FILE NAME for a guest ABI. Pure decision core
+/// (unit-locked): EM_ARM (40) guests read the RomManager-extracted
+/// `libbionic_compat_arm32.so` asset; EM_386 (3) reads the i686 slot;
+/// EM_AARCH64 (183) / EM_X86_64 (62) read `libbionic_compat.so`; any other
+/// machine → None (never guess an ABI, §9/§22).
+fn z236_compat_shim_source_name(guest_machine: u16) -> Option<&'static str> {
+    const EM_386: u16 = 3;
+    const EM_ARM: u16 = 40;
+    const EM_X86_64: u16 = 62;
+    const EM_AARCH64: u16 = 183;
+    match guest_machine {
+        EM_ARM => Some("libbionic_compat_arm32.so"),
+        EM_386 => Some("libbionic_compat_i686.so"),
+        EM_AARCH64 | EM_X86_64 => Some("libbionic_compat.so"),
+        _ => None,
+    }
+}
+
+fn stage_bionic_compat_shim(cfg: &Config, rootfs_prefix: &str, guest_machine: u16) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let source_name = match z236_compat_shim_source_name(guest_machine) {
+        Some(n) => n,
+        None => return false, // unknown ABI — never guess
+    };
+    // Respect guest content: if the ramdisk ships its own shim, leave it.
+    let sbin_dst = format!("{}/sbin/libbionic_compat.so", rootfs_prefix);
+    if std::path::Path::new(&sbin_dst).exists() {
+        crate::info!(
+            "[KR64] 6-Z236: guest ships its own sbin/libbionic_compat.so — not staging ours"
+        );
+        return true;
+    }
+    let candidates = hook_library_candidates(cfg, source_name);
+    for src in &candidates {
+        let Ok(content) = std::fs::read(src) else {
+            continue;
+        };
+        if content.len() < 4 || content[0..4] != *b"\x7fELF" {
+            continue; // placeholder/asset guard — stage real ELFs only
+        }
+        if elf_machine_from_bytes(&content) != Some(guest_machine) {
+            continue; // wrong-ABI copy — would recreate the 6-Z226 class
+        }
+        let mut written = false;
+        if std::fs::write(&sbin_dst, &content).is_ok() {
+            let _ = std::fs::set_permissions(&sbin_dst, std::fs::Permissions::from_mode(0o755));
+            crate::info!(
+                "[KR64] 6-Z236: staged FORTIFY-compat shim {} ({} bytes from {}) -> {}",
+                source_name,
+                content.len(),
+                src,
+                sbin_dst
+            );
+            written = true;
+        }
+        // Also cover the /dev slot used by the AOSP-chain prepend.
+        let dev_dst = format!("{}/dev/libbionic_compat.so", rootfs_prefix);
+        if std::fs::write(&dev_dst, &content).is_ok() {
+            let _ = std::fs::set_permissions(&dev_dst, std::fs::Permissions::from_mode(0o755));
+        }
+        return written;
+    }
+    crate::info!(
+        "[KR64] 6-Z236: no usable {} shim source found in candidates (host libs staged WITHOUT the FORTIFY shim — if the guest linker reports __*_chk failures, extend the shim build)",
+        source_name
+    );
+    false
 }
 
 /// Write hook-library bytes to `/dev/<lib>` (tmpfs) and chmod 0644.
@@ -5632,8 +5730,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     // BEFORE the guest execs anything dynamic. Runs for every boot
     // mode: any dynamic guest benefits; static-only guests parse as
     // no-PT_DYNAMIC and the pass is a cheap no-op.
+    //
+    // 6-Z236: when ANY host-runtime lib was staged, ALSO stage the
+    // bionic FORTIFY-compat shim (the host libs reference __*_chk
+    // symbols the guest libc may not export — cherry evidence run
+    // 33306474686) and PREPEND it to the recovery LD_PRELOAD chains
+    // below (rc setenv + the init env string).
+    let mut compat_shim_staged = false;
     {
-        let (libs_staged, libs_missing) = stage_missing_dt_needed(&rootfs_prefix);
+        let (libs_staged, libs_missing, staged_from_host) = stage_missing_dt_needed(&rootfs_prefix);
         if libs_staged > 0 || !libs_missing.is_empty() {
             info!(
                 "[KR64] 6-Z230: staged {} missing DT_NEEDED libs from the host runtime into {{rootfs}}/sbin ({} unresolvable: {:?})",
@@ -5641,6 +5746,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
                 libs_missing.len(),
                 libs_missing
             );
+        }
+        if staged_from_host {
+            // The shim source is bitness-matched against the same ABI
+            // anchor the DT_NEEDED staging used (sbin/recovery, falling
+            // back to sbin/libc.so — §9: resolve from actual guest
+            // contents, never guess).
+            let abi_anchor = elf_machine(&format!("{}/sbin/recovery", rootfs_prefix))
+                .or_else(|| elf_machine(&format!("{}/sbin/libc.so", rootfs_prefix)));
+            if let Some(machine) = abi_anchor {
+                compat_shim_staged = stage_bionic_compat_shim(&cfg, &rootfs_prefix, machine);
+            }
         }
     }
 
@@ -6596,16 +6712,29 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
     //     AOSP_SERVICE_PRELOAD_CHAIN via the same init.rc setenv patch.
     //     The stub rc in the x86 emulator rootfs has no `service recovery`
     //     line → the patcher is a no-op there, preserving x86 behavior.
-    let service_preload_chain: Option<&str> = if cfg.boot_recovery {
-        None // legacy 32-bit TWRP: /sbin/libtwrp_fb_hook.so
+    // 6-Z236: when host-runtime libs were staged (6-Z230), PREPEND the
+    // FORTIFY-compat shim to whichever chain applies — bionic loads
+    // LD_PRELOAD libs BEFORE DT_NEEDED resolution so the shim's exports
+    // satisfy the host libs' __*_chk relocations (cherry class).
+    let service_preload_chain: Option<String> = if cfg.boot_recovery {
+        if compat_shim_staged {
+            Some("/sbin/libbionic_compat.so:/sbin/libtwrp_fb_hook.so".to_string())
+        } else {
+            None // legacy 32-bit TWRP: /sbin/libtwrp_fb_hook.so
+        }
+    } else if compat_shim_staged {
+        Some(format!(
+            "/dev/libbionic_compat.so:{}",
+            AOSP_SERVICE_PRELOAD_CHAIN
+        ))
     } else {
-        Some(AOSP_SERVICE_PRELOAD_CHAIN)
+        Some(AOSP_SERVICE_PRELOAD_CHAIN.to_string())
     };
     patch_twrp_init_rc_recovery_service_in_rootfs(
         &rootfs_prefix,
         cfg.width,
         cfg.height,
-        service_preload_chain,
+        service_preload_chain.as_deref(),
     );
 
     // 6-Z225: strip `capabilities` service options from every guest .rc
@@ -8901,7 +9030,14 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
         //   - init is statically linked (ignores LD_PRELOAD)
         //   - recovery is i386 and its 32-bit linker can't load x86_64 libs
         let ld_preload_str = if cfg.boot_recovery {
-            "LD_PRELOAD=/sbin/libtwrp_fb_hook.so".to_string()
+            if compat_shim_staged {
+                // 6-Z236: host libs staged → the FORTIFY shim rides the
+                // init env chain too (inert for static init, satisfies
+                // __*_chk for dynamic init + the forked recovery).
+                "LD_PRELOAD=/sbin/libbionic_compat.so:/sbin/libtwrp_fb_hook.so".to_string()
+            } else {
+                "LD_PRELOAD=/sbin/libtwrp_fb_hook.so".to_string()
+            }
         } else {
             // 6-Z216: append the FB hook so AOSP-layout recoveries
             // (launched by init from /system/bin/recovery, never touched
@@ -8925,7 +9061,17 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> i32 {
             // path translation and property-area virtualization are
             // preserved for every other fd. Order asserted by
             // assert_aosp_preload_order() + AOSP_LD_PRELOAD_ENV.
-            AOSP_LD_PRELOAD_ENV.to_string()
+            if compat_shim_staged {
+                // 6-Z236: shim FIRST so its FORTIFY exports are visible
+                // to every later library (LD_PRELOAD load order = PLT
+                // search order).
+                format!(
+                    "LD_PRELOAD=/dev/libbionic_compat.so:{}",
+                    AOSP_LD_PRELOAD_ENV.trim_start_matches("LD_PRELOAD=")
+                )
+            } else {
+                AOSP_LD_PRELOAD_ENV.to_string()
+            }
         };
         // TWRP BOOT: use a minimal env that mirrors TWRP's init.rc exports.
         // TWRP's init.rc does its own:
@@ -14406,6 +14552,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn z236_compat_shim_source_name_per_machine() {
+        // Pure decision core: the shim source file must match the guest's
+        // ABI exactly (the 6-Z226 wrong-arch class must not reappear via
+        // the shim), and unknown machines must NEVER guess (§9).
+        assert_eq!(
+            z236_compat_shim_source_name(40),
+            Some("libbionic_compat_arm32.so")
+        );
+        assert_eq!(
+            z236_compat_shim_source_name(183),
+            Some("libbionic_compat.so")
+        );
+        assert_eq!(
+            z236_compat_shim_source_name(62),
+            Some("libbionic_compat.so")
+        );
+        assert_eq!(
+            z236_compat_shim_source_name(3),
+            Some("libbionic_compat_i686.so")
+        );
+        assert_eq!(z236_compat_shim_source_name(0), None);
+        assert_eq!(z236_compat_shim_source_name(8), None); // MIPS — not served
+        assert_eq!(z236_compat_shim_source_name(243), None); // RISCV — not served
+    }
+
+    #[test]
+    fn z236_stage_missing_dt_needed_returns_host_flag_on_no_guest() {
+        // An empty temp rootfs: no recovery binary + no sbin libc → the
+        // ABI anchor is unknown → (0, [], false) without any staging.
+        let dir = std::env::temp_dir().join(format!("twoyi-6z236-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sbin")).unwrap();
+        let (staged, missing, from_host) = stage_missing_dt_needed(dir.to_str().unwrap());
+        assert_eq!(staged, 0);
+        assert!(missing.is_empty());
+        assert!(!from_host);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
