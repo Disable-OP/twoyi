@@ -21381,3 +21381,34 @@ Stage Summary:
   verifies; the grouper-class 0x2c recovery-internal deref and the
   aarch64 libc.so null-call class (20 orangefox builds) are the next
   fronts; libbinder crash-loop silencing after that.
+
+---
+Task ID: 6-Z247
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: close the 6-Z98 exit-trail coverage gaps that made the m7-class silent exit(255) un-diagnosable.
+
+Work Log:
+- EVIDENCE (m7 run 33317151265, bb132ef head): guest init ran ~2805
+  loop iterations, finished mprotect(125) x3 (+ nr=91), then
+  exit_group(248) with code 255. The 6-Z98 trail did NOT fire — its
+  gate was `exit_code < 128` and 255 >= 128. Guest logs empty
+  (twrp-init.log/kmsg 0 bytes) => zero ground truth on WHY init
+  exited -1. This is one of MON-1's 7 "no-decode" runs.
+- GAP 2 (decisive for aarch64): the trail's PC read used the x86_64
+  user_regs_struct slot (index 16) on EVERY host. On aarch64 index 16
+  is x16 (scratch); every aarch64/arm32 exit trail ever printed a
+  bogus "rip". The loop-top 6-Z228 re-read already widens arm32 compat
+  children into the standard view, so pc = slot 32 on aarch64 for
+  BOTH native and compat children.
+- FIX 6-Z247 (ptrace_emu.rs, exit_group ENTRY trail):
+  1. gate `exit_code < 128` -> `exit_code != 0` (exit(0) stays
+     untrailed — the healthy restart path would flood the log);
+  2. per-arch pc slot: 32 on aarch64 hosts, 16 on x86_64 hosts.
+- GATES: 658 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- The next m7-class silent exit names its PC and full syscall tail.
+- NEXT: commit+push; re-dispatch m7 + the other no-decode runs
+  (kenzo-twrp, z00ed, potter, vince-of, x00t, vs995) to read the
+  trail; keep the 6-Z246 verify round in flight.
