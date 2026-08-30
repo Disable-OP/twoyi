@@ -20835,3 +20835,68 @@ Stage Summary:
 - NEXT: push; dispatch the property class + capricorn + merlin +
   cherry + starlte/whyred regression; analyze the arm32 UI_HANG class
   (fb_hook unknown-arch + minui on arm32).
+
+---
+Task ID: 6-Z243
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: fix the compat crash-forensics blindspot for AArch32 recovery children so the ELF32 SIGSEGV class (merlin/osprey/m8/m7/lux + onyx/mako/hammerhead/grouper UI_HANG) becomes diagnosable; decode the two known crash shapes.
+
+Work Log:
+- COLLECTED the 12-run c188c28 (6-Z240) round independently
+  (artifacts run-33315xxxxx): starlte UI_READY; grouper/hammerhead/
+  lux/mako/onyx BOOT_OK->SPLASH_HANG (segv=2); merlin/osprey/m8
+  BOOT_FAIL (segv=2); m7 BOOT_FAIL (segv=3); cherry BOOT_FAIL
+  (segv=182); capricorn CANCELLED (superseded). Confirms the
+  parallel session's read: linker class closed, recovery child now
+  runs (execs /sbin/pigz) but dies or never renders.
+- CRASH SHAPES DECODED (runs 33315000432 merlin, 33315005068
+  grouper): grouper's recovery child dies si_addr=0x2c (near-NULL
+  struct deref) after write/close/fstatat64/write/write; merlin's
+  dies si_addr=0xfefd0ffc. MERLIN DECODED BY HAND: the "regs" dump
+  is the COMPAT regset read through a 272-byte aarch64 iov — the
+  x0..x7 "registers" are interleaved u32 pairs (r0|r1<<32 ...);
+  r13(sp)=0xfefd1020, r15(pc)=0 -> the printed pc/sp were slots
+  32/31 which the kernel NEVER fills for a 72-byte compat regset.
+  The real fault: access at sp-0x24 in the region ending
+  0xfefd1000 — stack-adjacent, deterministic, identical both
+  instances (init-restart reproduces it).
+- FORENSICS ROOT CAUSE (6-Z243): the 6-Z180 SIGSEGV dump calls
+  ptrace_getregs() (272-byte aarch64 NT_PRSTATUS GETREGSET). For an
+  AArch32 compat child the kernel fills only 72 bytes and CLAMPS
+  iov_len; slots 9..33 of the widened view stay zeroed => "pc=0x0,
+  sp=0x0" on EVERY arm32 crash + garbage x-regs. The tracer already
+  has the compat path (ptrace_getregs_arm32 + widen_arm32, 6-Z228);
+  the crash path never dispatched through it. si_addr likewise read
+  as u64 from a COMPAT siginfo (upper half garbage).
+- FIX 6-Z243 (ptrace_emu.rs):
+  1. crash regs: pid_is_arm32(pid) => re-read via
+     ptrace_getregs_arm32 + widen (pc=r15, sp=r13, x30=r14 land in
+     the 6-Z180 slot contract);
+  2. si_addr masked to 32 bits for compat children;
+  3. maps ground truth: si_addr/pc/sp resolved against
+     /proc/<pid>/maps via new parse_map_line() +
+     resolve_addr_in_maps() — the next crash names its owning
+     mapping ("inside libX.so r-xp", "UNMAPPED", stack region),
+     per §25 evidence-over-speculation.
+- GATES: 658 host tests green (5 new z243 tests pin the maps-line
+  format: file-backed, anonymous, exclusive end, garbage);
+  clippy -D warnings clean (x86_64); fmt clean. aarch64-gated
+  additions reuse only pre-existing 6-Z228 helpers; cfg-on-
+  statement verified compilable; NDK build exercised by CI.
+- NOTE: ID collision — the parallel session's hw_random fix also
+  used "6-Z242"; this entry renumbers MY crash-forensics work to
+  6-Z243 (content identical to the briefly-pushed 02e084e, rebased
+  onto 84afbf6). Coordinate next IDs from 6-Z244 upward.
+- EXPECTED NEXT ROUND: merlin/grouper/osprey/m8/m7 + UI_HANG
+  members produce readable dumps (faulting library + offset);
+  3.7.0_11 anon-mmap loop class + aarch64 UI_HANG class still need
+  their own rounds.
+
+Stage Summary:
+- Every future crash (32- and 64-bit) now logs the owning mapping
+  for si_addr/pc/sp — the ELF32 SIGSEGV class becomes diagnosable
+  in ONE run instead of speculation rounds.
+- NEXT: dispatch merlin+grouper+osprey+m8+m7+cherry+kenzo on the
+  6-Z243 head; analyze maps ground truth; also collect the
+  in-flight 6-Z242 (hw_random) verify round for the property class.
