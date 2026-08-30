@@ -21995,3 +21995,39 @@ Stage Summary:
 - Wave recorded; monitoring delegated; local work continues on the
   arm32 libtwrp_fb_hook.so sp-0x24 crash class (10 builds) using the
   MON-1 crash dumps + the local disas scripts.
+
+---
+Task ID: 6-Z258b
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: fix the dirfd sign-extension bug MON-3 caught in the 6-Z258 arm — the AT_FDCWD compare never matched (bionic's `mov w0, #0xffffff9c` zero-extends into the 64-bit tracer slot), so the translate branch never fired and the property-socket fchmodat kept resolving against the HOST root.
+
+Work Log:
+- MON-3 RESULTS: cereus init SURVIVED for the first time ("Created
+  socket '/dev/socket/property_service'" + real socket node + ueventd
+  service start) — but daisy's init still died with the SAME head, and
+  ALL 6-Z258 log lines were the dirfd variant with dirfd printed as
+  4294967196 (= 0xFFFFFF9C zero-extended). DECISIVE: the
+  `dirfd == AT_FDCWD` i64 compare can never match a zero-extended
+  32-bit -100; cereus's survival was host-socket timing luck
+  (redroid's own /dev/socket state is non-deterministic), NOT the fix.
+  The kernel truncates dirfd to int — the tracer must too.
+- FIX 6-Z258b (ptrace_emu.rs): `syscall_dirfd(raw: u64) -> i64` —
+  truncate to the low 32 bits, re-interpret signed (exactly the kernel
+  ABI). Applied at BOTH sites: the 6-Z258 fchmodat/fchownat arm AND
+  the 6-Z185 backstop's relative-path base resolver (same latent bug —
+  relative *at calls with AT_FDCWD would have resolved "no resolvable
+  base directory" and been DENIED).
+- REGRESSION TEST: z258b_dirfd_reads_kernel_semantics (zero-extended,
+  sign-extended, real-fd and the exact MON-3 value).
+- GATES: 666 host tests green; clippy -D warnings clean; fmt clean.
+
+Stage Summary:
+- The 6-Z258 translate branch is now reachable for every AT_FDCWD
+  fchmodat/fchownat. Next wave must show the "6-Z258: ... path
+  translated" variant (not just the dirfd variant) and init survival
+  on BOTH cereus and daisy deterministically.
+- TWRP guard downloads: dl.twrp.me returns an HTML interstitial
+  without the Referer header (both whyred/starlte waves failed at the
+  download step with a 6.8KB <!DOCTYP payload). Re-dispatch with
+  recovery_referer input from the manifest.

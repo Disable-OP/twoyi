@@ -4254,6 +4254,25 @@ struct PathArgSlot {
 
 const AT_FDCWD: i64 = -100;
 
+/// 6-Z258b: read a *at-family dirfd argument the way the KERNEL does.
+///
+/// The kernel's dirfd parameter is `int` (32-bit signed): the syscall
+/// entry layer truncates the 64-bit register to the low 32 bits and the
+/// C prototype interprets them signed. Bionic loads AT_FDCWD (-100) with
+/// a `mov w0, #0xffffff9c` on aarch64 (and the arm32/x86 compat paths
+/// zero-extend their 32-bit registers into the 64-bit tracer slots) —
+/// so the raw 64-bit register value is 0x00000000FFFFFF9C, NOT the
+/// sign-extended -100. Comparing the raw i64 against AT_FDCWD never
+/// matches (MON-3 run evidence: every logged dirfd printed as
+/// 4294967196, the 6-Z258 translate branch never fired, and the
+/// property-socket fchmodat kept resolving against the HOST root —
+/// cereus's MON-3 init survival was host-socket timing luck, not the
+/// fix). Truncate to the low 32 bits and re-interpret signed.
+#[inline]
+fn syscall_dirfd(raw: u64) -> i64 {
+    (raw as u32) as i32 as i64
+}
+
 /// The path-taking syscalls that actually EXECUTE against the kernel
 /// (mount/chroot/etc. are seccomp-trapped + EXIT-faked, and rewriting
 /// them here would break those fakes — they are intentionally absent).
@@ -4939,7 +4958,10 @@ fn sandbox_backstop_at_entry(
             // Relative: resolve against dirfd when present, else cwd.
             let base: Option<std::path::PathBuf> = match slot.dirfd_reg {
                 Some(dirfd_reg) => {
-                    let dirfd = get_syscall_arg(&regs, dirfd_reg) as i64;
+                    // 6-Z258b: kernel-semantics dirfd (low 32 bits, signed)
+                    // — the raw 64-bit slot zero-extends 32-bit children's
+                    // registers so AT_FDCWD never matched the raw i64.
+                    let dirfd = syscall_dirfd(get_syscall_arg(&regs, dirfd_reg));
                     if dirfd == AT_FDCWD {
                         cwd.clone()
                     } else {
@@ -16780,7 +16802,12 @@ pub fn run_ptrace_loop(
                         // EPERM/ENOENT cases.
                         n if n == abi.fchmodat || n == abi.fchownat => {
                             pending_chmod_fake_pid = Some(pid); // 6-Z83: per-pid
-                            let dirfd = get_syscall_arg(&regs, abi.reg_arg1) as i64;
+                                                                // 6-Z258b: kernel-semantics dirfd (low 32 bits,
+                                                                // signed) — the raw i64 compare never matched
+                                                                // AT_FDCWD because bionic's `mov w0,#-100`
+                                                                // zero-extends (MON-3: dirfd printed as
+                                                                // 4294967196 in every run).
+                            let dirfd = syscall_dirfd(get_syscall_arg(&regs, abi.reg_arg1));
                             let path_addr = get_syscall_arg(&regs, abi.reg_arg2);
                             let mut translated_applied = false;
                             if dirfd == AT_FDCWD {
@@ -23526,6 +23553,31 @@ mod tests {
     // 6-Z257 arm is silently unreachable and the missed-stop errno leak
     // it fixes comes back. This test locks the collision-free property
     // for every supported ABI (the arm's dispatch reachability).
+    // ── 6-Z258b: kernel-semantics dirfd reading ──────────────────────
+    //
+    // MON-3 (runs 33329277798/33329279170) evidence: every logged dirfd
+    // was 4294967196 = 0x00000000FFFFFF9C — bionic's `mov w0, #0xffffff9c`
+    // zero-extends into the 64-bit tracer register slot, so a raw i64
+    // compare against AT_FDCWD (-100) NEVER matched and the 6-Z258
+    // translate branch never fired (the property-socket fchmodat kept
+    // resolving against the HOST root; cereus's init survival was
+    // host-socket timing luck). The kernel truncates dirfd to int —
+    // the tracer must too.
+    #[test]
+    fn z258b_dirfd_reads_kernel_semantics() {
+        // Zero-extended -100 (aarch64 w0 write, arm32/x86-compat slots).
+        assert_eq!(syscall_dirfd(0x0000_0000_FFFF_FF9C), -100);
+        // Sign-extended -100 (a caller that loaded the full x register).
+        assert_eq!(syscall_dirfd(0xFFFF_FFFF_FFFF_FF9C), -100);
+        // Real directory fds pass through (positive, low 32 bits).
+        assert_eq!(syscall_dirfd(7), 7);
+        assert_eq!(syscall_dirfd(0x0000_0000_0000_0003), 3);
+        // The exact MON-3 logged value.
+        assert_eq!(syscall_dirfd(4294967196), -100);
+        // AT_FDCWD comparison now behaves like the kernel's.
+        assert!(syscall_dirfd(0x0000_0000_FFFF_FF9C) == AT_FDCWD);
+    }
+
     #[test]
     fn z257_chmod_family_numbers_reachable_in_entry_dispatch() {
         fn check(abi_name: &str, abi: &ChildAbi) {
