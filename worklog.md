@@ -22031,3 +22031,23 @@ Stage Summary:
   without the Referer header (both whyred/starlte waves failed at the
   download step with a 6.8KB <!DOCTYP payload). Re-dispatch with
   recovery_referer input from the manifest.
+
+---
+Task ID: 6-Z258b-CI
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: record the 6-Z258b verification wave (head 781887c).
+
+Work Log:
+- Dispatched 4 E2E runs at 2026-08-30T19:16:36-46Z, all head 781887c:
+  * 33330412661 orangefox-cereus (init-survival anchor — EXPECT the
+    "6-Z258: ... path translated" variant now + deterministic init
+    survival)
+  * 33330413764 orangefox-daisy (determinism check — init must ALSO
+    survive here)
+  * 33330417214 twrp-3.7.0_9-0-whyred (guard retry WITH the manifest
+    recovery_referer input — the HTML-interstitial fix)
+  * 33330421502 twrp-3.7.0_9-0-starlte (guard retry with referer)
+
+Stage Summary:
+- Wave recorded; monitoring delegated.
