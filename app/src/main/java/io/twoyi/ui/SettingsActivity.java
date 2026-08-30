@@ -182,6 +182,33 @@ public class SettingsActivity extends AppCompatActivity {
             return findPreference(key);
         }
 
+        /**
+         * 6-Z262: set the 'Select ROM' preference summary from live state:
+         * the recorded import name when a ROM exists, the install hint when
+         * the label is known-but-unrecorded, or the default import prompt
+         * when nothing is installed. Kept free of the literal "import rootfs"
+         * substring whenever a ROM exists — the E2E verifier
+         * (scripts/ui-navigate.py::verify_rom_imported) treats that
+         * substring as "no ROM imported".
+         */
+        private void updateSelectRomSummary(Preference selectRomPref) {
+            if (selectRomPref == null) {
+                return;
+            }
+            Activity ctx = getActivity();
+            if (ctx == null) {
+                return;
+            }
+            String label = RomManager.getInstalledRomLabel(ctx);
+            if (label == null) {
+                selectRomPref.setSummary(getString(R.string.settings_select_rom_summary));
+            } else if (label.isEmpty()) {
+                selectRomPref.setSummary(getString(R.string.settings_rom_installed_unnamed));
+            } else {
+                selectRomPref.setSummary(label);
+            }
+        }
+
         @Override
         public void onViewCreated(View view, @Nullable Bundle savedInstanceState) {
             super.onViewCreated(view, savedInstanceState);
@@ -695,33 +722,6 @@ public class SettingsActivity extends AppCompatActivity {
                 // 6-Z262: same freshness guarantee on the error path.
                 updateSelectRomSummary(findPreference(R.string.settings_key_select_rom));
             }));
-        }
-    }
-
-    /**
-     * 6-Z262: set the 'Select ROM' preference summary from live state:
-     * the recorded import name when a ROM exists, the install hint when
-     * the label is known-but-unrecorded, or the default import prompt
-     * when nothing is installed. Kept free of the literal "import rootfs"
-     * substring whenever a ROM exists — the E2E verifier
-     * (scripts/ui-navigate.py::verify_rom_imported) treats that
-     * substring as "no ROM imported".
-     */
-    private void updateSelectRomSummary(Preference selectRomPref) {
-        if (selectRomPref == null) {
-            return;
-        }
-        Context ctx = getActivity();
-        if (ctx == null) {
-            return;
-        }
-        String label = RomManager.getInstalledRomLabel(ctx);
-        if (label == null) {
-            selectRomPref.setSummary(getString(R.string.settings_select_rom_summary));
-        } else if (label.isEmpty()) {
-            selectRomPref.setSummary(getString(R.string.settings_rom_installed_unnamed));
-        } else {
-            selectRomPref.setSummary(label);
         }
     }
 }
