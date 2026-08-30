@@ -22273,3 +22273,55 @@ Stage Summary:
   to decompose the phone minute into phases and attack the top phase;
   (3) the 6-Z259 tracer stop-accounting investigation continues with
   the ring dumps at the 6-Z257 bind window.
+
+---
+Task ID: 6-Z265 verification wave (heads 2691ff4/b08ca4c)
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-31
+Task: verify the 6-Z265 binder fix on the user's exact image + regression guards + ship the release APK.
+
+Work Log:
+- Wave dispatched on 2691ff4 (all core fixes): lavender + daisy + whyred E2E.
+  RESULTS:
+  * lavender (orangefox-R12.0, the user's device image): overall
+    UI_READY, boot BOOT_OK, vfs CLEAN, theme OK, terminal OK,
+    ZERO SIGSEGVs in the whole 608k-line kr64 log (baseline run
+    33334415274: 63 libbinder NULL crashes), "starting service
+    'recovery'" = 1 (was 8 — the restart/"flash back" loop is GONE),
+    "starting service 'keystore2'" = 1 (was 56), backstop_denied 0
+    (was 53). The nav went DEEPER than before (12 classifier pages incl.
+    OrangeFox's file-manager OPTIONS + CHMOD pages — i.e. real
+    touch-driven settings actions now survive).
+  * daisy guard: full UI_READY pass (12 pages, terminal OK, 0 crash
+    dumps) — the binder wire change did not regress the loader-path
+    guard.
+  * whyred guard: full UI_READY pass (12 pages, 0 crash dumps).
+- Boot timeline (new 6-Z260 [+Nms] stamps, lavender): daemon +0ms,
+  ptrace loop +36ms, guest recovery execve +10.7s, first UI ~18-20s
+  (CI server-class ARM). The phone minute = this timeline scaled by the
+  slower CPU; per-phase attribution data now lands in every artifact.
+- Release builds: three failures were build-infra, not code — (1) my
+  dispatch passed armeabi-v7a which kr64/build.sh rejects (arm64+x86_64
+  only); (2) Maven Central 403 on junit 4.12 (transient); (3) lint
+  gate: 35 errors = 1 WrongConstant (6-Z186 literal RECEIVER_EXPORTED,
+  now //noinspection'd) + 34 MissingTranslation (new 6-Z26x strings now
+  fully translated in ja/zh-rCN/zh-rTW; the outdated
+  settings_boot_recovery_summary originals removed after the resource
+  merger flagged duplicates). One javac round-trip: SuppressLint
+  annotation unresolved on the debug classpath -> //noinspection
+  comment instead.
+- SHIPPED: release build-b08ca4c
+  (twoyi-build-b08ca4c-20260830.apk, arm64-v8a, real rootfs bundled)
+  with 6-Z261 cutout fullscreen, 6-Z262 import-label persistence +
+  rom.ini, 6-Z263 Boot-to-Recovery dialog, 6-Z264 rootfs file manager,
+  6-Z265 binder fix, 6-Z260 instrumentation.
+
+Stage Summary:
+- The user's #1 crash (touch -> freeze -> recovery death -> boot loop)
+  is FIXED and CI-verified on their exact image; both regression guards
+  hold; the APK is on the releases page.
+- NEXT: (1) user device validation of the touch path on physical
+  lavender; (2) read the [+Nms] phases off a physical-device log pack
+  (Settings -> send log) to target the remaining phone-minute phases;
+  (3) the 6-Z259 tracer stop-accounting investigation now has ring
+  dumps at the 6-Z257 bind window for the next cereus/daisy wave.
