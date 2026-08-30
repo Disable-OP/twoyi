@@ -7932,6 +7932,51 @@ fn is_property_metadata_file(path: &str) -> bool {
     false
 }
 
+/// 6-Z243: parse one line of /proc/<pid>/maps into
+/// `(start, end, perms, path)`.
+///
+/// Layout: "<start>-<end> <perms> <offset> <dev> <inode> <path?>" —
+/// the path is ABSENT for anonymous regions. Returns None for
+/// malformed lines so the caller can skip them without aborting the
+/// scan (a truncated read races the child's mmap churn — maps lines
+/// are only ever appended/rewritten, never partially formatted).
+///
+/// Host-side unit tests pin the exact kernel format for both the
+/// file-backed and anonymous forms.
+fn parse_map_line(line: &str) -> Option<(u64, u64, &str, &str)> {
+    let mut fields = line.splitn(6, ' ');
+    let range = fields.next()?;
+    let perms = fields.next()?;
+    let mut range_it = range.splitn(2, '-');
+    let start = u64::from_str_radix(range_it.next()?, 16).ok()?;
+    let end = u64::from_str_radix(range_it.next()?, 16).ok()?;
+    if end <= start {
+        return None;
+    }
+    // The path is the remainder AFTER the 5th space; an anonymous
+    // region yields an empty remainder.
+    let rest = line.splitn(6, ' ').nth(5).unwrap_or("").trim_start();
+    let path = rest.split(' ').next().unwrap_or("");
+    Some((start, end, perms, path))
+}
+
+/// 6-Z243: resolve `want` against a /proc/<pid>/maps snapshot.
+///
+/// Returns `"0x… in <path> <perms>"` for the containing mapping
+/// (file-backed or anon), `"0x… in UNMAPPED"` when no mapping covers
+/// the address. Guest-rootfs-backed paths appear verbatim (host-side
+/// diagnostic log only — never reaches the guest, §6).
+fn resolve_addr_in_maps(maps: &str, want: u64) -> String {
+    for line in maps.lines() {
+        if let Some((start, end, perms, path)) = parse_map_line(line) {
+            if want >= start && want < end {
+                return format!("{:#x} in {} {}", want, path, perms);
+            }
+        }
+    }
+    format!("{:#x} in UNMAPPED", want)
+}
+
 /// 6-Z231: pure decision core of the fresh-create guarantee — should the
 /// tracer remove a stale backing file before the guest's exclusive create?
 ///
@@ -22830,7 +22875,42 @@ pub fn run_ptrace_loop(
                         // Read the child's registers to get the instruction
                         // pointer (RIP on x86_64, EIP on i386 compat).
                         let mut crash_regs: Regs = unsafe { std::mem::zeroed() };
-                        if ptrace_getregs(pid, &mut crash_regs).is_ok() {
+                        #[cfg(target_arch = "aarch64")]
+                        let mut crash_regs_ok = ptrace_getregs(pid, &mut crash_regs).is_ok();
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let crash_regs_ok = ptrace_getregs(pid, &mut crash_regs).is_ok();
+                        // ── 6-Z243: compat-correct crash forensics ──
+                        //
+                        // ptrace_getregs() on an aarch64 host requests the
+                        // 272-byte NT_PRSTATUS regset. For an AArch32 compat
+                        // child the kernel only fills the first 72 bytes
+                        // (arm user_regs = 18 x u32) and CLAMPS iov_len —
+                        // slots 9..33 of the widened view stay ZEROED, so
+                        // pc (slot 32) and sp (slot 31) printed 0x0 for
+                        // every arm32 crash (merlin/grouper wave: "pc=0x0,
+                        // sp=0x0" — unreadable dumps), and the x0..x7
+                        // "registers" were actually interleaved u32 pairs
+                        // (r0|r1<<32, r2|r3<<32, ...). Re-read the crash
+                        // registers through the compat regset and widen:
+                        // pc=r15, sp=r13, lr=r14 — the SAME slot contract
+                        // the generic dump below already prints.
+                        #[cfg(target_arch = "aarch64")]
+                        if pid_is_arm32(pid) {
+                            let mut compat_regs: Regs = unsafe { std::mem::zeroed() };
+                            if ptrace_getregs_arm32(pid, &mut compat_regs).is_ok() {
+                                crash_regs = compat_regs;
+                                crash_regs_ok = true;
+                            } else {
+                                log(&format!(
+                                    "6-Z243: arm32 crash regset re-read failed pid={}: {}",
+                                    pid,
+                                    std::io::Error::last_os_error()
+                                ));
+                            }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let _ = crash_regs_ok;
+                        if crash_regs_ok {
                             if let Some(a) = abi {
                                 // ── 6-Z180: ARCH-CORRECT register read ──
                                 //
@@ -22897,11 +22977,55 @@ pub fn run_ptrace_loop(
                                 let si_ptr = &siginfo as *const libc::siginfo_t as *const u8;
                                 let si_code = unsafe { *si_ptr.add(8) as i32 };
                                 // si_addr is at offset 16 (on x86_64)
-                                let si_addr = unsafe { *(si_ptr.add(16) as *const u64) };
+                                let si_addr_raw = unsafe { *(si_ptr.add(16) as *const u64) };
+                                // 6-Z243: PTRACE_GETSIGINFO on a compat child
+                                // returns the COMPAT siginfo (si_addr is a
+                                // 32-bit _addr at the same offset); mask the
+                                // upper garbage half instead of printing a
+                                // bogus 64-bit fault address.
+                                // (pid_is_arm32 is aarch64-host-only; on other
+                                // hosts no compat-ARM32 registry exists.)
+                                #[cfg(target_arch = "aarch64")]
+                                let si_addr = if pid_is_arm32(pid) {
+                                    si_addr_raw & 0xffff_ffff
+                                } else {
+                                    si_addr_raw
+                                };
+                                #[cfg(not(target_arch = "aarch64"))]
+                                let si_addr = si_addr_raw;
                                 log(&format!(
                                     "SIGSEGV details: tid={} si_code={} (1=MAPERR unmapped, 2=ACCERR permission), si_addr={:#x}, pc={:#x}, sp={:#x}{}",
                                     pid, si_code, si_addr, pc, rsp, extra_regs
                                 ));
+                                // ── 6-Z243: maps ground truth ──
+                                //
+                                // Name the file-backed mapping (library /
+                                // binary / anon region) that owns si_addr,
+                                // pc and sp. This is the single most
+                                // decisive line for triage: it converts
+                                // "SIGSEGV somewhere" into "SIGSEGV inside
+                                // <lib>.so+<off>" or "stack overflow in the
+                                // sigpage-adjacent region" without a gdb
+                                // attach. Unmapped addresses report
+                                // "UNMAPPED" (itself diagnostic: a jump
+                                // into unmapped memory vs a data access in
+                                // a known library).
+                                {
+                                    let resolve_maps = |want: u64| -> String {
+                                        match std::fs::read_to_string(format!("/proc/{}/maps", pid))
+                                        {
+                                            Ok(maps) => resolve_addr_in_maps(&maps, want),
+                                            Err(_) => format!("{:#x} in UNREADABLE-MAPS", want),
+                                        }
+                                    };
+                                    log(&format!("6-Z243 si_addr maps: {}", resolve_maps(si_addr)));
+                                    if pc != 0 {
+                                        log(&format!("6-Z243 pc maps: {}", resolve_maps(pc)));
+                                    }
+                                    if rsp != 0 {
+                                        log(&format!("6-Z243 sp maps: {}", resolve_maps(rsp)));
+                                    }
+                                }
                                 // 6-Z180: crashing THREAD identity — waitpid
                                 // reports TIDs for threads, so /proc/<tid>/comm
                                 // names the exact thread ("RenderThread" vs
@@ -28878,5 +29002,74 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!is_ashmem_backing_path("/dev/graphics/fb0"));
         assert!(!is_ashmem_backing_path("/dev/pmsg0"));
         assert!(!is_ashmem_backing_path("ashmem"));
+    }
+
+    // ── 6-Z243: compat crash forensics — maps ground truth ──────────
+
+    #[test]
+    fn z243_parse_map_line_file_backed() {
+        let line = "7f0000000000-7f0000010000 r-xp 00001000 fd:01 12345  /data/user/0/io.twoyi.debug/rootfs/sbin/libtwrp_fb_hook.so";
+        let (start, end, perms, path) = parse_map_line(line).expect("parses");
+        assert_eq!(start, 0x7f0000000000);
+        assert_eq!(end, 0x7f0000010000);
+        assert_eq!(perms, "r-xp");
+        assert_eq!(
+            path,
+            "/data/user/0/io.twoyi.debug/rootfs/sbin/libtwrp_fb_hook.so"
+        );
+    }
+
+    #[test]
+    fn z243_parse_map_line_anonymous() {
+        // Anonymous regions have NO path field (5 fields total).
+        let line = "7ffd0ffc0000-7ffd0ffd0000 rw-p 00000000 00:00 0";
+        let (start, end, perms, path) = parse_map_line(line).expect("parses");
+        assert_eq!(start, 0x7ffd0ffc0000);
+        assert_eq!(end, 0x7ffd0ffd0000);
+        assert_eq!(perms, "rw-p");
+        assert_eq!(path, "");
+    }
+
+    #[test]
+    fn z243_parse_map_line_rejects_garbage() {
+        assert!(parse_map_line("").is_none());
+        assert!(parse_map_line("not-a-map-line").is_none());
+        // end <= start is invalid:
+        assert!(parse_map_line("1000-0fff rw-p 00000000 00:00 0").is_none());
+    }
+
+    #[test]
+    fn z243_resolve_addr_in_maps_names_library_and_offset() {
+        let maps = concat!(
+            "7f0000000000-7f0000010000 r-xp 00001000 fd:01 12345  /rootfs/sbin/libcrypto.so\n",
+            "7ffd0ffc0000-7ffd0ffd0000 rw-p 00000000 00:00 0\n",
+        );
+        // Inside the library region:
+        assert_eq!(
+            resolve_addr_in_maps(maps, 0x7f0000001234),
+            "0x7f0000001234 in /rootfs/sbin/libcrypto.so r-xp"
+        );
+        // Inside the anon region:
+        assert_eq!(
+            resolve_addr_in_maps(maps, 0x7ffd0ffc0088),
+            "0x7ffd0ffc0088 in  rw-p"
+        );
+        // Unmapped:
+        assert_eq!(
+            resolve_addr_in_maps(maps, 0xfefd0ffc),
+            "0xfefd0ffc in UNMAPPED"
+        );
+    }
+
+    #[test]
+    fn z243_resolve_addr_exclusive_end_boundary() {
+        // end is EXCLUSIVE: an address exactly at end belongs to the
+        // NEXT mapping (or none).
+        let maps = concat!(
+            "1000-2000 r-xp 00000000 fd:01 1  /lib.so\n",
+            "2000-3000 rw-p 00000000 00:00 0\n",
+        );
+        assert!(resolve_addr_in_maps(maps, 0x2000).contains("rw-p"));
+        assert!(resolve_addr_in_maps(maps, 0x1fff).contains("/lib.so"));
     }
 }
