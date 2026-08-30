@@ -20413,3 +20413,77 @@ Stage Summary:
   728785c (pre-6-Z228 — expect tracer-garbage evidence, re-verify after).
 - NEXT: check verify results; then Class C (libbinder SIGSEGV loops) or
   enchilada (first-stage spin) depending on runner availability.
+
+---
+Task ID: 6-Z231
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: capricorn property-area FATAL — root-cause analysis from run 33301978767 + open-path instrumentation + generic fresh-create guarantee.
+
+Work Log:
+- COLLECTED the three dispatched verifies: capricorn+starlte on 9ac5f2d (runs
+  33301981353 / 33301978767), merlin on 728785c (run 33299552663, pre-6-Z228).
+- STARLTE (run 33301981353) = UI_READY — the 6-Z229 canonical-bind fix works.
+  kmsg shows one earlier-cycle "Failed to fchmodat socket" + "start_property_service
+  socket creation failed" (recovered on a later cycle). Decisive positive
+  evidence: "6-Z111: property-area fd captured: open() returned fd=4 for pid=2584
+  {rootfs}/dev/__properties__/properties_serial" at loop 3291 — the O_EXCL
+  create SUCCEEDED, then fsetxattr was rewritten to getpid+fake-0 (existing
+  xattr handler), then a REAL file-backed MAP_SHARED mmap of fd=4 ran natively
+  (aarch64 allows it) — the full modern property-init chain works when the
+  open succeeds.
+- CAPRICORN (run 33301978767) = BOOT_FAIL_EARLY_INIT "Failed to initialize
+  property area". Trace (kr64-app-stderr, loop 543-552, pid 2574):
+  openat+close (reader probe) → mkdirat(/dev/__properties__) [translated,
+  created: 0 = EEXIST] → openat → writev FATAL → mprotect sweep → exit_group(1).
+  NO ftruncate (46) / mmap (222) / fsetxattr (7) between the openat and the
+  FATAL → the OPEN ITSELF failed kernel-side. The 6-Z229 fresh-ephemeral
+  exit-hook logged NOTHING → no property file ever existed at any init exit →
+  the create failed in EVERY cycle while the dir was clean (drwxrwxrwx u0_a87,
+  same uid as the tracee — kernel EACCES/EEXIST both implausible on the
+  translated path).
+- DIAGNOSTIC BLINDSPOT ROOT-CAUSED (two gates stacked):
+  1. The "intercepted open(...)" log is gated `loop_count <= 500`; the failing
+     open was at loop ~549 — JUST past the gate. Silent.
+  2. The 6-Z229 property-area DIAG (ptrace_emu ~16567 pre-edit) was nested
+     INSIDE `if ret >= 0` — failed opens never log, exactly the case the DIAG
+     was built for. The failure-side `else if` branch only DIAGs /tmp and
+     /twres paths.
+- FIX (app/rs/kr64/src/ptrace_emu.rs):
+  * z231_fresh_create_needed(is_open_family, flags, translated) — pure decision
+    core: open/openat + O_EXCL (0x80) + is_property_metadata_file(translated).
+    The bare old-format path stays with the 6-Z61 strip; readers never delete.
+  * ENTRY-side fresh-create guarantee: when the guest exclusively creates a
+    NEW-format property-area file (property_info / properties_serial /
+    properties_ctxt<N>) and a stale backing file exists, UNLINK it first —
+    fresh-tmpfs-/dev semantics per boot cycle, generic (§10/§22: no device
+    checks; bounded to /dev/__properties__/<file>; unlink cannot break an
+    existing mmap of the old inode). Every unlink logged.
+  * ENTRY-side property DIAG (un-gated, first 40): original path, translated
+    path, flags hex, O_EXCL state — settles "translated-but-failed" vs "never
+    intercepted" decisively on the next run.
+  * FAILURE-side property DIAG in the open-EXIT `else if` branch (original,
+    translated, ret, -errno, first 40) — closes the ret>=0 blindspot.
+  * "intercepted open" log un-gated for property-area paths (mkdirat-style:
+    rare + diagnostically critical).
+  * Tests: z231_fresh_create_decision_core (12 asserts: canonical creates,
+    reader rejection, openat2 rejection, non-property paths, bare dir,
+    deeper/superstring). 649 host tests green; clippy -D warnings clean
+    (x86_64); fmt clean.
+- MERLIN run 33299552663 (728785c, pre-6-Z228) = BOOT_FAIL, 2 SIGSEGV — the
+  expected tracer-garbage signature on an ELF32 guest without ABI_ARM32;
+  needs re-verify on the current head.
+- LOCAL TOOLING NOTE: host stable toolchain installed (rustc 1.98.0); the
+  aarch64-linux-android cross-check could NOT run locally (no NDK in this
+  sandbox — build.rs cc needs aarch64-linux-android-clang). The 6-Z231 diff
+  is target-independent Rust in the generic openat arm (no cfg(target_arch)
+  surface, no new uapi constants) — aarch64 compile risk nil; CI kr64 lint+
+  test re-verifies the host gates.
+
+Stage Summary:
+- starlte class CLOSED (UI_READY verified on the 6-Z229 fix).
+- capricorn class: generic fresh-create fix landed + full open-path
+  instrumentation; the next capricorn run is DECISIVE (the open errno, if the
+  open still fails, will be on the record via 6-Z231 FAILED DIAG).
+- NEXT: push; dispatch capricorn + starlte (regression) + whyred (NEW-format
+  class per §31) + merlin (ELF32 on 6-Z228+ head) on the new head; analyze.

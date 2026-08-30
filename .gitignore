@@ -101,3 +101,5 @@ scripts/__pycache__/
 # Universal recovery corpus: manifest is tracked, images/extracted trees are NOT
 corpus/images/
 corpus/results/
+scripts/gh_api.sh
+scripts/dl_artifact.sh

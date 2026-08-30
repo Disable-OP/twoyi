@@ -7897,6 +7897,32 @@ fn is_property_metadata_file(path: &str) -> bool {
     false
 }
 
+/// 6-Z231: pure decision core of the fresh-create guarantee — should the
+/// tracer remove a stale backing file before the guest's exclusive create?
+///
+/// True only when ALL hold:
+///   - the syscall is open()/openat() (openat2's arg3 is a pointer —
+///     6-Z184 — and cannot be flags-checked safely),
+///   - flags carry O_EXCL (0x80 — the exclusive-create bit, same value on
+///     i386/x86_64/aarch64),
+///   - the TRANSLATED path is a NEW-format property-area file
+///     (is_property_metadata_file: property_info / properties_serial /
+///     properties_ctxt<N> under /dev/__properties__).
+///
+/// The bare OLD-format single-file area (`/dev/__properties__` itself) is
+/// deliberately NOT covered — its pre-created file + 6-Z61 O_EXCL-strip
+/// machinery already owns that class.
+///
+/// Rejects (returns false):
+///   - read-only / non-exclusive opens (readers must NEVER delete the
+///     area the guest is using),
+///   - non-open syscalls (openat2, others),
+///   - any path outside /dev/__properties__/<file> — the guest namespace
+///     must never gain a deletion power over anything else (§6).
+fn z231_fresh_create_needed(is_open_family: bool, flags: i32, translated_path: &str) -> bool {
+    is_open_family && (flags & 0x80) != 0 && is_property_metadata_file(translated_path)
+}
+
 /// 6-Z121: the (st_mode, st_uid, st_gid) byte offsets inside the
 /// child's `struct stat` for the plain-fstat syscalls we virtualize.
 /// Dispatched by the syscall NUMBER (the only per-ABI discriminator
@@ -14906,10 +14932,117 @@ pub fn run_ptrace_loop(
                                         }
                                     }
                                 }
+                                // ── 6-Z231: property-area ENTRY diagnostics +
+                                // fresh-create guarantee ──
+                                //
+                                // Run 33301978767 (capricorn, 9ac5f2d):
+                                // init second-stage did mkdirat(/dev/
+                                // __properties__) [translated, EEXIST]
+                                // → openat → IMMEDIATELY writev "Failed to
+                                // initialize property area" → exit_group(1).
+                                // No ftruncate/mmap followed the openat, so
+                                // the OPEN ITSELF failed kernel-side — but
+                                // the log showed NOTHING: the "intercepted
+                                // open" log is loop_count-gated (the failure
+                                // happened at loop ~549, just past the 500
+                                // gate) and the 6-Z229 exit-side DIAG was
+                                // nested inside `if ret >= 0` (failed opens
+                                // never log). This block closes the ENTRY
+                                // blindspot: every property-area open logs
+                                // its original path, translated path, flags
+                                // and O_EXCL state, un-gated (first 40 —
+                                // property-area opens are rare).
+                                if is_property_metadata_file(&path)
+                                    || is_property_metadata_file(&translated)
+                                    || path.ends_with("__properties__")
+                                    || translated.ends_with("__properties__")
+                                {
+                                    prop_area_diag_count = prop_area_diag_count.saturating_add(1);
+                                    if prop_area_diag_count <= 40 {
+                                        let ex_flags = if syscall_num == abi.open
+                                            || syscall_num == abi.openat
+                                        {
+                                            let flags_reg = if syscall_num == abi.open {
+                                                abi.reg_arg2
+                                            } else {
+                                                abi.reg_arg3
+                                            };
+                                            get_syscall_arg(&regs, flags_reg) as i32
+                                        } else {
+                                            0
+                                        };
+                                        log(&format!(
+                                            "6-Z231: open ENTRY \"{}\" -> \"{}\" flags=0x{:x} (O_EXCL={}) (event {})",
+                                            path,
+                                            translated,
+                                            ex_flags,
+                                            ex_flags & 0x80 != 0,
+                                            prop_area_diag_count
+                                        ));
+                                    }
+                                    // ── 6-Z231: fresh-create guarantee ──
+                                    //
+                                    // A real device gives every boot cycle a
+                                    // FRESH tmpfs /dev: init's
+                                    // O_CREAT|O_EXCL create of
+                                    // property_info / properties_serial can
+                                    // never collide. Twoyi's {rootfs}/dev is
+                                    // PERSISTENT — any pre-existing backing
+                                    // file (a previous cycle the 6-Z229
+                                    // exit-hook did not cover, an importer
+                                    // artifact, a stale staged copy) turns
+                                    // the guest's exclusive create into
+                                    // EEXIST → "Failed to initialize
+                                    // property area" → LOG(FATAL) → exit(1)
+                                    // (the capricorn/cedric/whyred class).
+                                    //
+                                    // Generic semantic fix (§10: the guest
+                                    // must be able to create and own the
+                                    // files it expects): for a NEW-format
+                                    // property-area file opened with
+                                    // O_CREAT|O_EXCL, remove the stale
+                                    // backing file FIRST so the exclusive
+                                    // create behaves exactly like a fresh
+                                    // tmpfs. Bounded: only files matched by
+                                    // is_property_metadata_file() (property_info,
+                                    // properties_serial, properties_ctxt<N>)
+                                    // inside /dev/__properties__ — never any
+                                    // other path. unlink() does not break an
+                                    // existing mmap of the old inode, so a
+                                    // surviving process keeps its area.
+                                    if z231_fresh_create_needed(
+                                        syscall_num == abi.open || syscall_num == abi.openat,
+                                        {
+                                            let flags_reg = if syscall_num == abi.open {
+                                                abi.reg_arg2
+                                            } else {
+                                                abi.reg_arg3
+                                            };
+                                            get_syscall_arg(&regs, flags_reg) as i32
+                                        },
+                                        &translated,
+                                    ) && std::path::Path::new(&translated).exists()
+                                    {
+                                        match std::fs::remove_file(&translated) {
+                                            Ok(()) => log(&format!(
+                                                "6-Z231: removed stale property file {} before O_EXCL create (fresh-tmpfs-/dev semantics; guest owns the new file)",
+                                                translated
+                                            )),
+                                            Err(e) => log(&format!(
+                                                "6-Z231: failed to remove stale {} before O_EXCL create: {} (open may EEXIST — fd=42 fake / failure DIAG will follow)",
+                                                translated, e
+                                            )),
+                                        }
+                                    }
+                                }
                                 // Task 6-V: save translated path for fd
                                 // tracking at the matching open EXIT.
                                 pending_open_translated_path.insert(pid, translated.clone());
-                                if translated != path && loop_count <= 500 {
+                                if translated != path
+                                    && (loop_count <= 500
+                                        || is_property_metadata_file(&translated)
+                                        || translated.ends_with("__properties__"))
+                                {
                                     log(&format!("intercepted open({}) -> {}", path, translated));
                                 }
                                 if translated != path {
@@ -16660,6 +16793,38 @@ pub fn run_ptrace_loop(
                                 }
                             }
                         } else if let Some(p) = pending_open_translated_path.get(&pid).cloned() {
+                            // ── 6-Z231: property-area open-FAILURE DIAG ──
+                            // The 6-Z229 DIAG was added ONLY on the ret >= 0
+                            // (success) arm — run 33301978767 (capricorn):
+                            // init's property-area open FAILED, the failure
+                            // side had ZERO property diagnostics (only /tmp
+                            // and /twres), and the FATAL
+                            // "Failed to initialize property area" was
+                            // undiagnosable. Log every FAILED open whose
+                            // translated path is a property-area file —
+                            // original + translated + ret/errno, un-gated
+                            // (first 40). "Translated but failed" vs "never
+                            // intercepted" is decidable from the pair of
+                            // logs (the ENTRY arm always stashes
+                            // pending_open_translated_path, so an entry here
+                            // PROVES the ENTRY arm ran and what it wrote).
+                            if is_property_metadata_file(&p) || p.ends_with("__properties__") {
+                                prop_area_diag_count = prop_area_diag_count.saturating_add(1);
+                                if prop_area_diag_count <= 40 {
+                                    let orig = pending_open_original_path
+                                        .get(&pid)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    log(&format!(
+                                        "6-Z231: open FAILED original={:?} translated={:?} ret={} (-errno {}) (event {})",
+                                        orig,
+                                        p,
+                                        ret,
+                                        -ret,
+                                        prop_area_diag_count
+                                    ));
+                                }
+                            }
                             // ── 6-Z164: /tmp open-FAILURE DIAG ──
                             // The 6-Z163f arm above only covers ret >= 0;
                             // run 32996812991's jailed /tmp/recovery.log
@@ -27548,6 +27713,87 @@ cccc0000-cccc1000 r--p 00000000 00:01 3  /third.so\n";
         assert!(!is_property_metadata_file("property_info"));
         assert!(!is_property_metadata_file(""));
         assert!(!is_property_metadata_file("/dev/null"));
+    }
+
+    // ── Task 6-Z231: fresh-create guarantee (capricorn/cedric class) ──
+    //
+    // Run 33301978767 regression: init's O_CREAT|O_EXCL open of a
+    // /dev/__properties__/<file> must see a FRESH namespace (fresh-tmpfs-/dev
+    // semantics), so a stale backing file is removed before the create. The
+    // decision core below must NEVER fire for readers or non-property paths —
+    // the guest namespace gains a deletion power over exactly these files.
+    #[test]
+    fn z231_fresh_create_decision_core() {
+        const O_EXCL: i32 = 0x80;
+        // The canonical capricorn/cedric create:
+        // openat(AT_FDCWD, "/dev/__properties__/property_info",
+        //        O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0444).
+        assert!(z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL | 0o400000 | 0o2000000,
+            "/data/user/0/io.twoyi.debug/rootfs/dev/__properties__/property_info"
+        ));
+        // properties_serial create (the starlte-successful path — must ALSO
+        // be covered so a restart cycle never EEXISTs against its own
+        // previous cycle's file).
+        assert!(z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL,
+            "/dev/__properties__/properties_serial"
+        ));
+        // per-context area files share the semantics.
+        assert!(z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL,
+            "/dev/__properties__/properties_ctxt0"
+        ));
+        // READER opens must never delete: no O_EXCL → false.
+        assert!(!z231_fresh_create_needed(
+            true,
+            0o0,
+            "/dev/__properties__/property_info"
+        ));
+        assert!(!z231_fresh_create_needed(
+            true,
+            0o4, // O_NONBLOCK — not O_EXCL
+            "/dev/__properties__/property_info"
+        ));
+        // openat2 (arg3 is a struct open_how POINTER — 6-Z184) → never.
+        assert!(!z231_fresh_create_needed(
+            false,
+            0o2 | 0o100 | O_EXCL,
+            "/dev/__properties__/property_info"
+        ));
+        // Any path OUTSIDE the property tree → never (§6: no deletion
+        // power beyond /dev/__properties__/<file>).
+        assert!(!z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL,
+            "/dev/null"
+        ));
+        assert!(!z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL,
+            "/system/bin/linker64"
+        ));
+        // The BARE old-format dir path is the 6-Z61 strip's domain, not
+        // this one.
+        assert!(!z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL,
+            "/dev/__properties__"
+        ));
+        // Deeper paths / superstrings → never.
+        assert!(!z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL,
+            "/dev/__properties__/sub/file"
+        ));
+        assert!(!z231_fresh_create_needed(
+            true,
+            0o2 | 0o100 | O_EXCL,
+            "/dev/__properties__x"
+        ));
     }
 
     #[test]
