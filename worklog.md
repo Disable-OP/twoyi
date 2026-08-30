@@ -20107,3 +20107,73 @@ Work Log:
   batch:120:180+ toward the 90% goal. Current measured+projected: 46/60 measured,
   +5 (32-bit, pending verify) ≈ 85%; Class B/C fixes needed to clear 90% on the
   wave-1 sample.
+
+---
+Task ID: 6-Z227
+Agent: Twoyi Universal Recovery Compatibility Engineer
+Date: 2026-08-30
+Task: Fix the APK build failure introduced by 6-Z226 (armv7a hook builds), so the 5 ELF32 verify runs can dispatch.
+
+Work Log:
+- USER-REPORTED BLOCKER: every UI E2E run on head 92273ff (the 5 ELF32 verifies:
+  merlin/a7xelte/ali/athene/bacon) failed at the "Build arm64-v8a APK" job BEFORE the
+  E2E stage — no verdict was produced for the 32-bit class. Evidence:
+  job 99201367303 log, run 33290555795.
+- ROOT CAUSE (build): twoyi_loader_shlib.c had arch blocks ONLY for __x86_64__ and
+  __aarch64__. The new armv7a compile failed with 20+ "use of undeclared identifier"
+  (NR_openat/NR_mkdirat/NR_unlinkat/NR_fchmodat/NR_fchownat/NR_write/NR_close/SYS_mmap/
+  SYS_newfstatat; fatal error limit stopped the rest). twrp_fb_hook.c would have failed
+  next: its raw-syscall block #errors on any non-i386/non-aarch64 target.
+- FIXES (all numbers VERIFIED against torvalds/linux arch/arm/tools/syscall.tbl +
+  arch/x86/entry/syscalls/syscall_32.tbl, NOT from memory):
+  * twoyi_loader_shlib.c: new `#elif defined(__arm__) && !defined(__aarch64__)` block:
+    TWOYI_AUDIT_ARCH=0x40000028 (AUDIT_ARCH_ARM), NR_mount=21, NR_umount2=52,
+    NR_chroot=61, NR_mknod=14, NR_mknodat=324, NR_openat=322, NR_mkdirat=323,
+    NR_unlinkat=328, NR_fchmodat=333, NR_fchownat=325, NR_close=6, NR_write=4,
+    NR_getpid=20, NR_setuid=213 (setuid32 — bionic arm32 issues the *32 variants),
+    NR_setgid=214, NR_setgroups=206, NR_setresuid=208, NR_setresgid=210,
+    NR_unshare=337, NR_rt_sigaction=174, NR_sched_yield=158, NR_fstatat64=327,
+    NR_mmap2=192. GET_ARG/SET_RET map to uc_mcontext.arm_r0..arm_r5/arm_r0.
+  * twoyi_loader_shlib.c: new twoyi_sys_fstatat(dirfd, path, struct stat*, flags)
+    portable helper — arm32 converts via fstatat64 into struct stat64 then copies
+    fields (st_atime/_nsec macro-compatible spellings); all 8 former
+    syscall(SYS_newfstatat,...) call sites (lstat/stat/fstatat hooks + execve
+    staging) now go through it. 64-bit targets keep byte-identical behavior.
+  * twoyi_loader_shlib.c: mmap() hook tail — arm32 uses mmap2 (offset in page
+    units; unaligned/negative offsets rejected EINVAL); 64-bit path unchanged.
+  * twrp_fb_hook.c: new `__arm__` raw_syscall1..4 block (EABI svc #0, number in
+    r7) + marked variants using r6 as the marker channel (kernel preserves r6
+    across svc). arm32 marker = 0x69313233 ("i123", low 32 of "twoyi123") since a
+    32-bit register cannot hold the 64-bit aarch64 marker — kr64 ABI_ARM32 must
+    compare the 32-bit value (6-Z228).
+  * twrp_fb_hook.c: the hardcoded aarch64 raw syscall numbers were WRONG on other
+    arches — getsockopt 209→arm32 295/ia32 365, socketpair 199→arm32 288/ia32 360,
+    dup3 24→arm32 358/ia32 330, fcntl 25→arm32 55/ia32 55. New TWOYI_NR_* per-arch
+    defines; all 6 call sites (pty_fd_is_stream_socket, socketpair+backup dup,
+    slave dup + F_DUPFD escape, backup recovery dup) now use them. aarch64 values
+    unchanged; i386 values FIXED (were aarch64 numbers — the i386 getsockopt/dup3
+    path could never have worked).
+  * build.sh: armv7a fb_hook compile now passes -marm -fomit-frame-pointer (r7 is
+    the Thumb frame pointer; the asm register-var r7 constraint requires it).
+- AUDIT NOTES: getpid_hook.c is arch-agnostic (no changes needed). The seccomp BPF
+  filter structure is arch-independent (nr@0, arch@4); for arm32 compat tasks the
+  kernel reports seccomp_data.arch = AUDIT_ARCH_ARM = 0x40000028. Known residual
+  risk: 16-bit legacy uid syscalls (23/46/81/164/170) are NOT trapped on arm32 —
+  modern bionic never issues them; accepted.
+- STILL PENDING (next task, 6-Z228): kr64 ptrace_emu assumes aarch64 children are
+  64-bit ("On aarch64 there is no 32-bit userspace" — WRONG for ELF32 EM_ARM guests
+  on arm64 hosts/CONFIG_COMPAT). Needs ABI_ARM32 (72-byte compat user_regs_struct
+  via PTRACE_GETREGSET/NT_PRSTATUS, arm32 syscall table, reg_marker=6 comparing
+  0x69313233). Without it the tracer misreads 32-bit child registers as 272-byte
+  user_pt_regs. The 5 ELF32 verify runs may fail on this even after the build fix —
+  their artifacts will provide the runtime evidence.
+- LOCAL VERIFICATION: NDK r27c being downloaded for a local armv7a/aarch64/i686
+  compile check of all three hook targets BEFORE dispatching CI (avoids burning a
+  verify round on a header-name mistake).
+
+Stage Summary:
+- 6-Z227 unblocks the ELF32 verify class (APK builds again on the armv7a code path).
+- After commit+push: re-dispatch 1 focused ELF32 verify (merlin) on the new head;
+  keep the other 4 until ABI_ARM32 lands (per §28 focused-first discipline).
+- Wave 2 (60 runs, head 6e645cb) still queued on the arm64 runner pool; it predates
+  6-Z226 and builds fine — do NOT cancel (dispatch-note: no same-recovery overlap).
